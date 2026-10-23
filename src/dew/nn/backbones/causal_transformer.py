@@ -738,18 +738,23 @@ class CausalTransformer(nn.Module):
         mixer = self.layer_mixer
         specs = self._layer_specs(types, kinds, mixer)
         factories = self.feedforward_factories()
-        loop_start, loop_end = (0, self.num_layers) if self.loop is None or self.loop.layers is None else (
-            self.loop.layers)
         total = 0.0
         for index in range(self.num_layers):
             block = self._block(specs, mixer, factories, self.wiring, index, f'layers_{index}')
-            passes = self.loop.steps if self.loop is not None and loop_start <= index < loop_end else 1
-            total += passes * counter(block, lengths)
+            total += self.layer_passes(index) * counter(block, lengths)
         if self.per_layer_input_dim:
             total += projection_flops(lengths, *self.projections()['per_layer_model_projection'])
         if self.loop is not None and self.loop.exit_gate:
             total += self.loop.steps * projection_flops(lengths, *self.projections()['early_exit_gate'])
         return total
+
+    @nn.nowrap
+    def layer_passes(self, index: int) -> int:
+        """How many times a call runs layer `index`: a loop's steps for a layer it repeats, else once."""
+        if self.loop is None:
+            return 1
+        start, end = (0, self.num_layers) if self.loop.layers is None else self.loop.layers
+        return self.loop.steps if start <= index < end else 1
 
     @nn.nowrap
     def logits_flops(self, lengths) -> float:
@@ -1064,13 +1069,14 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def cross_flops(self, lengths, context_lengths) -> float:
         """The cross-attention blocks' work over rows of `lengths` tokens reading contexts of
-        `context_lengths` tokens (`GatedCrossAttention.cross_flops`), which `model_flops`
-        leaves out: a call without a context runs none of it."""
+        `context_lengths` tokens (`GatedCrossAttention.cross_flops`), each block on every pass of its
+        layer (`layer_passes`), which `model_flops` leaves out: a call without a context runs none
+        of it."""
         cross = self.cross_attention
         if cross is None:
             return 0.0
-        return sum(self._cross_layer(index)(parent=None).cross_flops(lengths, context_lengths)
-                   for index in cross.layer_ids)
+        return sum(self.layer_passes(index) * self._cross_layer(index)(parent=None).cross_flops(
+            lengths, context_lengths) for index in cross.layer_ids)
 
     @nn.nowrap
     def _prediction_depths(self, types: Sequence[str], kinds: dict[str, ResolvedKind], mixer_spec,

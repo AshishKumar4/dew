@@ -44,7 +44,7 @@ from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
 from dew.inference.tasks import Processor, TextSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
-from dew.nn.cross_attention import crossing
+from dew.nn.cross_attention import crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import (
     CONTEXT,
@@ -781,8 +781,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         if held is None or FROZEN not in held or not isinstance(model, CrossAttending) or (
                 model.cross_attention is None):
             return False
-        return all(crossing(("params", *(entry.key for entry in path)))
-                   for path, _ in jax.tree_util.tree_leaves_with_path(held["params"]))
+        return crosses_alone(held["params"])
 
     def _context_flops(self, model, batch: Batch) -> float:
         """The forward work of the cross-attention blocks over the batch's context

@@ -38,6 +38,7 @@ from dew.nn.inputs import ModelInputs
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mixers.mlp import MLPMixer
+from dew.nn.ngpt import stepped
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.sampling import Sampling
@@ -292,6 +293,22 @@ def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_ste
     dew, reference = jax.jit(dew), jax.jit(reference)
     label = f'Dory {name} gradients'
     assert_as_exact(dew, reference, draw, label, seeds=DORY_GRADIENT_SEEDS[name])
+
+
+def test_a_step_computes_in_the_widest_of_its_operands():
+    """nGPT's residual step runs in at least fp32 of its residual, its branch and its rate: a float32
+    residual stepped toward a float64 branch by a float64 rate, or by a float64 rate alone, takes its
+    rate and its difference in float64 and rounds once to the residual's float32."""
+    with jax.enable_x64(new_val=True):
+        residual = jnp.ones((2, 4), jnp.float32)
+        for branch, alpha in ((jnp.ones((2, 4), jnp.float64), jnp.ones(4, jnp.float64)),
+                              (jnp.ones((2, 4), jnp.float32), jnp.ones(4, jnp.float64))):
+            traced = jax.make_jaxpr(lambda residual, branch, alpha: stepped(residual, branch, alpha, 0.5))(
+                residual, branch, alpha)
+            stepping = {equation.outvars[0].aval.dtype for equation in traced.jaxpr.eqns
+                        if equation.primitive.name in ("abs", "sub")}
+            assert stepping == {np.dtype(np.float64)}
+            assert traced.out_avals[0].dtype == np.float32
 
 
 def test_a_float64_model_computes_in_float64():

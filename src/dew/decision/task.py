@@ -44,6 +44,7 @@ from dew.decision.layout import (
     MarkerLayout,
     Specials,
     StateFirstLayout,
+    context_tokens,
     render,
 )
 from dew.decision.model import DecisionModel
@@ -294,21 +295,30 @@ class Decide:
             "budget": to_record(self.budget, Budget), "name": self.name}, indent=1) + "\n")
 
     def __call__(self, state: JSON, questions: Mapping[str, Question], *,
-                 images: Sequence[Image.Image] = ()) -> dict[str, Answer]:
+                 images: Sequence[Image.Image] = (), context: JSON | None = None) -> dict[str, Answer]:
         """Return one answer per question in `questions`, about `state` and any `images`.
 
         Images need a layout with a place for them (`Layout.image`) and the
-        backbone's processor, as a joint-head release brings.
+        backbone's processor, as a joint-head release brings. `context` is a
+        sequence the decision reads beside the state through the backbone's
+        cross-attention (`Example.context`).
         """
-        return self._seen(state, questions, images)[0] if images else self.batch([(state, questions)])[0][0]
+        if images:
+            return self._seen(state, questions, images, context)[0]
+        return self.batch([(state, questions)], contexts=[context])[0][0]
 
-    def batch(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]]
-              ) -> list[tuple[dict[str, Answer], Usage]]:
+    def batch(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]], *,
+              contexts: Sequence[JSON | None] | None = None) -> list[tuple[dict[str, Answer], Usage]]:
         """Return each request's answers and usage.
 
-        The rows of every request are scored together within the budget.
+        The rows of every request are scored together within the budget. `contexts`
+        holds each request's context, in order (`__call__`), or None for none.
         """
-        return self._answered([self._encoded(state, questions) for state, questions in requests],
+        contexts = [None] * len(requests) if contexts is None else list(contexts)
+        if len(contexts) != len(requests):
+            raise ValueError(f"{len(contexts)} contexts for {len(requests)} requests")
+        return self._answered([self._encoded(state, questions, context=context)
+                               for (state, questions), context in zip(requests, contexts, strict=True)],
                               [questions for _, questions in requests])
 
     def _answered(self, encoded: Sequence[Sequence[Encoded]], asked: Sequence[Mapping[str, Question]]
@@ -328,18 +338,18 @@ class Decide:
                              usage_of([encoded for encoded, _ in own])))
         return answered
 
-    def _seen(self, state: JSON, questions: Mapping[str, Question],
-              images: Sequence[Image.Image]) -> tuple[dict[str, Answer], Usage]:
+    def _seen(self, state: JSON, questions: Mapping[str, Question], images: Sequence[Image.Image],
+              context: JSON | None = None) -> tuple[dict[str, Answer], Usage]:
         """One request's answers and usage, its images laid out in its one row."""
-        return self._looked(questions, *self._shown(state, questions, images))
+        return self._looked(questions, *self._shown(state, questions, images, context))
 
-    def _shown(self, state: JSON, questions: Mapping[str, Question],
-               images: Sequence[Image.Image]) -> tuple[Encoded, Images]:
+    def _shown(self, state: JSON, questions: Mapping[str, Question], images: Sequence[Image.Image],
+               context: JSON | None = None) -> tuple[Encoded, Images]:
         """A request's one row with its images laid out before the state, and the images."""
         if self.processor is None or self.layout.image is None:
             raise ValueError("images need a backbone with a vision encoder, which this task does not have")
         media = Images.of(self.processor, images, self.layout.image)
-        rows = self._encoded(state, questions, media.tokens)
+        rows = self._encoded(state, questions, media.tokens, context=context)
         if len(rows) != 1:
             raise ValueError("a request's images go in a layout of one row")
         return rows[0], media
@@ -348,16 +358,28 @@ class Decide:
                 ) -> tuple[dict[str, Answer], Usage]:
         """A request's answers and usage from its one row and images (`_shown`), by a pass of its own."""
         assert self.processor is not None, "a row of images was laid out with the processor"
-        scores = np.asarray(self._forward(self.variables, DecisionInputs.collate([row], self.specials.pad),
+        inputs = DecisionInputs.collate([row], self.specials.pad, context_length=self.context_length)
+        scores = np.asarray(self._forward(self.variables, inputs,
                                           media=media.inputs(self.processor, row)))[0]
         answers = {laid.name: self._answer(questions[laid.name], _ordered(laid, scores[slot]))
                    for slot, laid in enumerate(row.questions)}
         return ({name: answers[name] for name in questions},
                 Usage(len(row.tokens), row.state_tokens, row.state_kept, row.trimmed))
 
+    @property
+    def context_length(self) -> int | None:
+        """The most context tokens a request carries (`DecisionModel.context_length`)."""
+        return self.model.context_length
+
     def _encoded(self, state: JSON, questions: Mapping[str, Question],
-                 media: Sequence[int] = ()) -> list[Encoded]:
+                 media: Sequence[int] = (), *, context: JSON | None = None) -> list[Encoded]:
         rows = self.layout.rows(self.tokenizer, self.specials, state, questions, media=media)
+        if context is not None:
+            if self.context_length is None:
+                raise ValueError(f"a request's context is read by a backbone's cross-attention, which this "
+                                 f"task's {type(self.model.backbone).__name__} does not have")
+            tokens = tuple(context_tokens(self.tokenizer, context, self.context_length).tolist())
+            rows = [replace(row, context=tokens) for row in rows]
         for row in rows:
             if not self.layout.fits(row):
                 raise ValueError(f"the schema needs {len(row.tokens)} tokens besides the state, more than "
@@ -404,7 +426,8 @@ class Decide:
         questions = max(len(row.questions) for row in rows)
         options = max(len(laid.options) for row in rows for laid in row.questions)
         inputs = DecisionInputs.collate(rows, self.specials.pad, questions=shape_bucket(questions, 1),
-                                        options=shape_bucket(options, 1))
+                                        options=shape_bucket(options, 1),
+                                        context_length=self.context_length)
         length = shape_bucket(inputs.tokens.shape[1], 64)
         inputs = replace(
             inputs, tokens=_widened(inputs.tokens, length, self.specials.pad),
@@ -767,6 +790,7 @@ def laid_out(batch: Mapping[str, object], max_segments: int) -> DecisionInputs:
                           option_spans=array("option_spans"), options=array("options"),
                           positions=array("positions"), slots=given("slots"),
                           option_slots=given("option_slots"), slotted=given("slotted"),
+                          context=given("context"), context_lengths=given("context_lengths"),
                           max_segments=max_segments)
 
 
