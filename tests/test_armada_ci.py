@@ -498,6 +498,8 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     assert len(ran("test_red")) == 2, "a red row is never reused"
     assert ci.gpu_lane("3.12", names, out, cache=True, processes=4, deadline=600.0) == 0
     assert all(len(ran(Path(name).stem)) == 2 for name in names), "the third lane reused the green rows"
+    # Their records, of these inputs as the lane keys them, read no backend: none is in the GPU tier.
+    assert not set(names) & set(ci.gpu_tier("3.12"))
 
 
 def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(

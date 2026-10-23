@@ -709,13 +709,14 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
     """The test files that take another path on a GPU, each with its evidence: where its tests read
     the backend and its marks of `session.MARKS`, over every record of its rows,
     on every class, a split file's under each count of groups it was planned as. A file is out
-    only where every record is of these inputs (`fresh`) and says neither, so a file whose inputs
-    changed since it ran is in as "changed", and one without a record, or with one the Worker did not
-    return, as "unrecorded": a new file, or one no green run of these tools has recorded."""
+    only where every record is of these inputs (`fresh`), a CPU task's (`shared`) or a GPU lane's
+    (`lane_inputs`), and says neither, so a file whose inputs changed since it ran is in as "changed",
+    and one without a record, or with one the Worker did not return, as "unrecorded": a new file, or one
+    no green run of these tools has recorded."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         raise SystemExit("the GPU tier is chosen from the test cache's records, which need its URL and token")
-    common = shared(python)
+    inputs = (shared(python), lane_inputs(python))
     prefix = f"{CACHE_PREFIX}/{python}/"
 
     def evidence_of(key: str) -> tuple[str, list[str]]:
@@ -723,7 +724,8 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
         found = recorded(f"{prefix}{key}", token)
         if found is None:
             return name, ["unrecorded"]
-        return name, found["reads"] or ([] if fresh(found, name, common) else ["changed"])
+        current = any(fresh(found, name, common) for common in inputs)
+        return name, found["reads"] or ([] if current else ["changed"])
 
     try:
         keys = listed(prefix, token)
