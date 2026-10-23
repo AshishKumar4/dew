@@ -192,25 +192,33 @@ the joint head's scores themselves are held to its release's by
 test_the_stored_joint_head_matches_its_release_under_the_float64_rule."""
 
 
-def scorer_gap(objective: DecisionObjective, variables, grid) -> float:
+def scorer_inputs(objective: DecisionObjective):
+    """The features `scorer_hidden` takes (`nn.intercept_methods`) in the objective's forward of
+    `(variables, inputs)`, compiled once for every draw: the first two quarters of their width are
+    the scorer's `repeated` and `options`."""
+    def features(variables, inputs):
+        seen = []
+
+        def record(next_fun, args, kwargs, context):
+            if context.method_name == "__call__" and context.module.name == "scorer_hidden":
+                seen.append(args[0])
+            return next_fun(*args, **kwargs)
+
+        with nn.intercept_methods(record):
+            objective.model.logits(variables, inputs)
+        return seen[0]
+    return jax.jit(features)
+
+
+def scorer_gap(objective: DecisionObjective, features, variables, grid) -> float:
     """The least gap, over the grid's real option slots and the scorer's width, between the two sides
-    of its `abs(repeated - options)` feature in float64: read off the features `scorer_hidden` takes
-    (`nn.intercept_methods`), whose first two quarters are `repeated` and `options`."""
-    seen = []
-
-    def record(next_fun, args, kwargs, context):
-        if context.method_name == "__call__" and context.module.name == "scorer_hidden":
-            seen.append(args[0])
-        return next_fun(*args, **kwargs)
-
+    of its `abs(repeated - options)` feature in float64, read off `features` (`scorer_inputs`)."""
     with jax.enable_x64(new_val=True):
         wide_variables, wide_grid = widened((variables, grid))
         inputs = laid_out(wide_grid, objective.bounds.segments)
-        with nn.intercept_methods(record):
-            objective.model.logits(wide_variables, inputs)
-    features = np.asarray(seen[0])
-    width = features.shape[-1] // 4
-    difference = features[..., :width] - features[..., width:2 * width]
+        taken = np.asarray(features(wide_variables, inputs))
+    width = taken.shape[-1] // 4
+    difference = taken[..., :width] - taken[..., width:2 * width]
     options = np.asarray(inputs.options).reshape(difference.shape[:-1])
     real = np.broadcast_to(options[..., None], difference.shape)
     above, below = difference[real & (difference >= 0)], difference[real & (difference < 0)]
@@ -245,6 +253,7 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     assert laid_out(slotted, bounds.segments).option_slots.shape == (len(options), capacity)
 
     variables = objective.init(jax.random.key(0))
+    features = scorer_inputs(objective)
 
     def draw(seed):
         """A seed's rows and a cotangent drawn apart from them (each real option's, the loss's 1), from
@@ -253,7 +262,7 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
         for attempt in range(64):
             index = 1 + 64 * seed + attempt
             slotted, grid = ragged_batches(objective, index)
-            if scorer_gap(objective, variables, grid) > SCORER_MARGIN:
+            if scorer_gap(objective, features, variables, grid) > SCORER_MARGIN:
                 options = np.asarray(grid["options"]).astype(bool)
                 readout = np.random.default_rng([0x5107, index]).standard_normal(options.shape, np.float32)
                 return variables, grid, slotted, (readout * options, np.float32(1.0))
