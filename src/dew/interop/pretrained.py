@@ -642,7 +642,8 @@ class PretrainedDecoder(Pretrained):
         weights. Gemma 4 writes frozen or trainable layer-scalar values into HF
         buffers; reloading that layout reproduces the computation, but not which
         scalars were trainable. The config is derived from a `causal_transformer`'s
-        fields, so any other model is refused.
+        fields, so any other model is refused. A decoder with cross-attention takes the
+        config of the decoder its blocks join and runs as a bundle, but `save` refuses it.
 
         `tokenizer` is the vocabulary the weights were trained with, as an object or
         by name. `save` writes its files next to the weights, so the directory that
@@ -654,7 +655,9 @@ class PretrainedDecoder(Pretrained):
             decoder = from_record(CausalTransformer, model)
         except ValueError as error:
             raise TypeError(f"{type(model).__name__} has no Hugging Face decoder layout") from error
-        config = decoders.export_config(decoder)
+        # Cross-attention blocks have no layout in any family: the config is the decoder's they join,
+        # and `export` refuses the blocks themselves.
+        config = decoders.export_config(decoder.with_cross_attention(None))
         built = rebuilt(dict, decoder)
         return cls(decoder, variables, None, config, None, built,
                    {**decoders.GENERATION_DEFAULTS, 'use_cache': config.get('use_cache', decoder.causal)}
