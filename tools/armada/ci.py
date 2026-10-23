@@ -235,15 +235,14 @@ def cache_key(common: str, name: str, depends: list[str]) -> str:
 
 
 def cpu_class() -> str:
-    """This host's CPU microarchitecture (vendor, family, model). XLA:CPU emits the same code on every
-    host, but hardware estimate instructions (vrsqrtps) differ between microarchitectures, so float32
-    results, and thus numerical verdicts, belong to the class that produced them."""
-    fields = {}
-    for line in Path("/proc/cpuinfo").read_text().splitlines():
-        key, _, value = line.partition(":")
-        if key.strip() in ("vendor_id", "cpu family", "model") and key.strip() not in fields:
-            fields[key.strip()] = value.strip()
-    return "-".join(fields.get(key, "unknown") for key in ("vendor_id", "cpu family", "model"))
+    """This host's CPU microarchitecture, the one class the records, Dew's compilation cache and the
+    shared XLA bundles key it by (src/dew/_host.py, loaded by its path, as this file puts nothing on
+    sys.path)."""
+    spec = importlib.util.spec_from_file_location("dew_host", REPO / "src" / "dew" / "_host.py")
+    assert spec is not None and spec.loader is not None
+    host = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(host)
+    return host.cpu_class()
 
 
 def device_class() -> str:
@@ -304,16 +303,20 @@ def record_of(key: str, token: str) -> bytes | None:
         return None
 
 
-def reused(python: str, name: str, split: str, common: str) -> dict | None:
+def reused(python: str, name: str, split: str, common: str, stale: tuple[str, ...] = ()) -> dict | None:
     """The green row of test file `name` (in `split`'s group) recorded on this host's class
-    (`device_class`), if it ran green there on exactly these inputs; else None. The record of the
-    last run on these shared inputs decides: a key hashes them (`cache_key`), so no run on others,
-    whose record the last run's may be, can be fresh here."""
+    (`device_class`), if it ran green there on exactly these inputs and read nothing under the `stale`
+    directories (the policy's, `policy`); else None. The record of the last run on these shared inputs
+    decides: a key hashes them (`cache_key`), so no run on others, whose record the last run's may be,
+    can be fresh here."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
     found = recorded(record_key(python, row(python, name, split), device_class(), common), token)
-    return found["row"] if found is not None and fresh(found, name, common) else None
+    if found is None or not fresh(found, name, common) or any(
+            path.startswith(stale) for path in found["depends"]):
+        return None
+    return found["row"]
 
 
 def fresh(recorded: dict, name: str, common: str) -> bool:
@@ -436,12 +439,39 @@ def packed(weights: dict[str, float], count: int) -> list[tuple[float, list[str]
     return [(held, sorted(names)) for held, _, names in sorted(bins, key=lambda bin_: bin_[1])]
 
 
+PLACED = ("src/", "tests/", "tools/", "examples/", "recipes/", "docs/", "tutorials/", "site/")
+"""Where a changed file is placed by the records (executed.py): a Python file a test ran, a page or a
+notebook it read, a fixture every key covers (`shared`). A change elsewhere is placed by none, and runs
+the whole suite (`policy`)."""
+PLACED_FILES = ("README.md", "CONTRIBUTING.md", "AGENTS.md", "LICENSE")
+"""The checkout's own files at its root that tests read as a page is read."""
+
+
+def policy(base: str) -> str:
+    """The test cache's policy (DEW_TEST_CACHE) for this checkout's change from `base`: 'off', every file
+    run, for a change to what every test process runs or reads (`SHARED`, a lock, the environment's
+    files) or to a file the records do not place (`PLACED`); 'stale:tools/' for a change under tools/,
+    where every file whose run read a tool runs again; else 'on', each file run where its inputs
+    changed."""
+    changed = subprocess.run(["git", "diff", "--name-only", f"{base}...HEAD"], check=True,
+                             capture_output=True, text=True).stdout.split()
+    whole = {*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), ".python-version"}
+    if any(name in whole or not (name.startswith(PLACED) or name in PLACED_FILES) for name in changed):
+        return "off"
+    return "stale:tools/" if any(name.startswith("tools/") for name in changed) else "on"
+
+
+def stale_of(cache: str) -> tuple[str, ...]:
+    """The directories policy `cache` reruns every file that read them of (`policy`)."""
+    return tuple(cache.removeprefix("stale:").split(",")) if cache.startswith("stale:") else ()
+
+
 def plan(target: float, timings: dict) -> list[dict]:
     """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has
     timed runs alone, so however long it takes it holds up no other file, and its time is known from
     then on. Files marked `torchax` (`APART`) share tasks only with one another. Each entry carries
-    the test cache's policy, DEW_TEST_CACHE here, to its task."""
-    cache = "off" if os.environ.get("DEW_TEST_CACHE") == "off" else "on"
+    the test cache's policy, DEW_TEST_CACHE here (`policy`), to its task."""
+    cache = os.environ.get("DEW_TEST_CACHE") or "on"
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
     recorded = recorded_tests()
     entries = []
@@ -549,7 +579,7 @@ def apportioned(own_seconds: Mapping[str, float], wall: float, rows: int) -> dic
     return {name: own * pace if pace else wall / rows for name, own in own_seconds.items()}
 
 
-def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: bool = True,
+def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str = "on",
          grace: float = session.GRACE, coverage: Path | None = None) -> int:
     """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds, killing
     their process group `grace` seconds after that, and giving it `SETTLE` seconds to be gone.
@@ -563,11 +593,13 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     return tested(python, tests, split, out, deadline, cache, grace, shared(python), {}, coverage)
 
 
-def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: bool, grace: float,
+def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None) -> int:
-    """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's."""
+    """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's, a green row
+    reused as the cache's policy (`policy`) allows."""
     began = time.monotonic()
-    rows = [found for name in tests if cache and (found := reused(python, name, split, common))]
+    rows = [found for name in tests
+            if cache != "off" and (found := reused(python, name, split, common, stale_of(cache)))]
     tests = [name for name in tests if row(python, name, split) not in {found["name"] for found in rows}]
     if rows:
         print(f"{len(rows)} files ran green on these inputs on {device_class()}; their rows are reused")
@@ -831,7 +863,7 @@ def borrowed_records(names: list[str], python: str, held: str, token: str) -> di
     return borrowed
 
 
-def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes: int,
+def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes: int,
              deadline: float) -> int:
     """Run `tests` on this process's share of the one GPU it sees, each file once, as a task of its
     own (`tested`), and write their verdict rows to `out`.
@@ -887,8 +919,8 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
                     environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total),
                                **({"XLA_PYTHON_CLIENT_PREALLOCATE": "false"} if shares[fits] >= budget
                                   else {})}
-                    running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache, 60.0,
-                                        common, environ)] = fits
+                    running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache,
+                                        session.GRACE, common, environ)] = fits
                     continue
                 done, _ = concurrent.futures.wait(running, return_when=concurrent.futures.FIRST_COMPLETED)
                 for future in done:
@@ -1041,6 +1073,8 @@ def pythons(*, check: bool) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(prog="tools/armada/ci.py")
     operations = parser.add_subparsers(dest="operation", required=True)
+    deciding = operations.add_parser("policy", help="the test cache's policy for this checkout's change")
+    deciding.add_argument("base", help="the commit the change is read from (its merge-base with HEAD)")
     planning = operations.add_parser("plan")
     planning.add_argument("--target", type=float, required=True)
     planning.add_argument("--timings", type=Path, required=True)
@@ -1050,8 +1084,8 @@ def main() -> int:
     running.add_argument("--split", default="")
     running.add_argument("--out", type=Path, required=True)
     running.add_argument(
-        "--cache", choices=("on", "off"), required=True,
-        help="whether a file that ran green on these inputs is reused (the plan's DEW_TEST_CACHE)")
+        "--cache", required=True,
+        help="the plan's DEW_TEST_CACHE (`policy`): on, off, or stale:<directories> whose readers run again")
     running.add_argument("--deadline", type=float, default=session.DEADLINE,
                          help="seconds before armada's own task timeout (.armada.json) to interrupt at")
     running.add_argument("--coverage", type=Path, default=None,
@@ -1077,7 +1111,7 @@ def main() -> int:
     lane = operations.add_parser("gpu-lane")
     lane.add_argument("--tests", required=True)
     lane.add_argument("--out", type=Path, required=True)
-    lane.add_argument("--cache", choices=("on", "off"), required=True)
+    lane.add_argument("--cache", required=True, help="the test cache's policy (`policy`)")
     lane.add_argument("--processes", type=int, required=True, help="the most test files running at once")
     lane.add_argument("--deadline", type=float, default=3600.0, help="seconds a file may run")
     operations.add_parser("gangs")
@@ -1115,7 +1149,7 @@ def main() -> int:
         arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
         return targeted(args.python, arguments, args.report)
     if args.operation == "gpu-lane":
-        return gpu_lane(PYTHONS[0], args.tests.split(), args.out, cache=args.cache == "on",
+        return gpu_lane(PYTHONS[0], args.tests.split(), args.out, cache=args.cache,
                         processes=args.processes, deadline=args.deadline)
     if args.operation == "coverage":
         if args.stage == "report":
@@ -1123,13 +1157,16 @@ def main() -> int:
         timings = json.loads(args.timings.read_text()) if args.timings.is_file() else {}
         print(json.dumps(coverage_items(args.target, timings)))
         return 0
+    if args.operation == "policy":
+        print(policy(args.base))
+        return 0
     if args.operation == "plan":
         timings = json.loads(args.timings.read_text()) if args.timings.is_file() else {}
         print(json.dumps({"include": plan(args.target, timings)}))
         return 0
     if args.split == COLLECT:
         return collect(args.python, args.tests.split(), args.out, args.deadline)
-    return task(args.python, args.tests.split(), args.split, args.out, args.deadline, args.cache == "on",
+    return task(args.python, args.tests.split(), args.split, args.out, args.deadline, args.cache,
                 coverage=args.coverage)
 
 
