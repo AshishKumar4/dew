@@ -1,8 +1,8 @@
 """PPO with a separate trainable critic, clipped value loss and episode GAE."""
 
 import math
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 
 import jax
 import jax.numpy as jnp
@@ -36,8 +36,9 @@ from dew.sampling.text import Generation, Sampling
 from dew.training.distributed import shard_batch
 from dew.training.state import TrainState
 
-from .episodes import EpisodeInference, EpisodeRollout
+from .episodes import EpisodeCollector, EpisodeInference
 from .grpo import GRPOObjective, onto_ids
+from .scheduler import RolloutScheduler, SchedulerRecord, Synchronous, task_ids
 from .sessions import (
     ADVANTAGES_KEY,
     CALL_INDEX_KEY,
@@ -46,6 +47,7 @@ from .sessions import (
     RESPONSE_MASK_KEY,
     SEGMENT_IDS_KEY,
     SESSION_INDEX_KEY,
+    TOKEN_REWARDS_KEY,
 )
 
 OLD_VALUES_KEY = "old_values"
@@ -219,9 +221,9 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         The batch must hold `old_values` and `returns` from the rollout,
         aligned with `response_mask`, or the loss raises `ValueError`.
         """
-        for field in (OLD_VALUES_KEY, RETURNS_KEY):
-            if field not in batch or jnp.shape(batch[field]) != jnp.shape(batch[RESPONSE_MASK_KEY]):
-                raise ValueError(f"PPO requires response-aligned {field} from the rollout")
+        for column in (OLD_VALUES_KEY, RETURNS_KEY):
+            if column not in batch or jnp.shape(batch[column]) != jnp.shape(batch[RESPONSE_MASK_KEY]):
+                raise ValueError(f"PPO requires response-aligned {column} from the rollout")
         policy_step = replace(step, ema=None if step.ema is None else part(step.ema, "policy"))
         pg, aux = self.actor.loss(part(variables, "policy"), batch, policy_step)
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
@@ -266,16 +268,20 @@ def _over_processes(moments: jax.Array) -> jax.Array:
 
 @dataclass(frozen=True)
 class PPORollout:
-    """Collects episodes, then adds critic baselines and targets from verl's masked GAE.
+    """Collects episodes through `rollout`, then adds critic baselines and targets from verl's masked GAE.
 
-    GAE runs across the action tokens of all turns in one episode, wherever
-    the packer placed them. Tool observations and padding are outside the
-    mask, so they get no targets. Each step reward the environment paid
-    (`Observation.reward`) goes on the last action id of the call it paid
-    for, and the verifier's terminal reward on the episode's last action,
-    with no bootstrap value after it, which matches the input convention of
-    the pinned verl GAE. The packer masks truncated episodes, so they take
-    no targets either.
+    `episodes` collects `groups` episodes of each task through the
+    rollout scheduler (`RolloutScheduler`, `Synchronous`), its policy
+    `objective.policy({})`, which binds each step's policy subtree; `credit`
+    and `log` are the scheduler's. GAE runs across the action tokens of all turns in one episode,
+    wherever the packer placed them. Tool observations and padding are
+    outside the mask, so they get no targets. The rewards are the packed
+    `token_rewards`: each step reward the environment paid
+    (`Observation.reward`) on the last action id of the call it paid for,
+    and the verifier's terminal reward on the episode's last action, with no
+    bootstrap value after it, which matches the input convention of the
+    pinned verl GAE. The packer masks truncated episodes, so they take no
+    targets either.
 
     A cohort with no trainable token at all returns zero targets and zero
     mass. A cohort with a single trainable token raises `ValueError`,
@@ -287,22 +293,36 @@ class PPORollout:
     """
 
     objective: PPOObjective
-    episodes: EpisodeRollout
+    episodes: EpisodeCollector
+    groups: int = 2
     gamma: float = 1.
     lam: float = .95
+    credit: str = "session"
+    log: Callable[[SchedulerRecord], None] | None = None
+    rollout: RolloutScheduler = field(init=False)
 
     def __post_init__(self) -> None:
         if any(not math.isfinite(value) or not 0 <= value <= 1 for value in (self.gamma, self.lam)):
             raise ValueError("PPO gamma and lam must be finite values in [0, 1]")
-        if self.objective.seq_len != self.episodes.max_prompt_tokens + self.episodes.max_new_tokens - 1:
+        if self.objective.seq_len != self.episodes.width - 1:
             raise ValueError("PPO objective and episode token budgets must agree")
+        object.__setattr__(self, "rollout", RolloutScheduler(Synchronous(self.episodes), groups=self.groups,
+                                                             credit=self.credit, log=self.log))
+
+    @property
+    def metrics(self) -> Mapping[str, float]:
+        return self.rollout.metrics
+
+    @property
+    def shown(self) -> Mapping[str, Shown]:
+        return self.rollout.shown
 
     def _order(self, batch: Mapping[str, np.ndarray], count: int) -> np.ndarray:
         """Per episode, the flat packed positions of its action ids in the order they were drawn.
 
-        `[episodes, max_turns * max_new_tokens]`, padded with -1. A call's
-        ids sit in one chain in order, so sorting by call then position
-        reads an episode's actions across its chains and rows.
+        `[episodes, max_turns * max_new_tokens]`, padded with -1. A call's ids
+        sit in one chain in order, so sorting by call then position reads an
+        episode's actions across its chains and rows.
         """
         mask = np.asarray(batch[RESPONSE_MASK_KEY]).reshape(-1) != 0
         owner = np.asarray(batch[SESSION_INDEX_KEY]).reshape(-1)
@@ -315,30 +335,21 @@ class PPORollout:
             order[episode, :mine.size] = mine
         return order
 
-    def _targets(self, values: np.ndarray, batch: Mapping[str, np.ndarray], rewards: np.ndarray,
-                 steps: Sequence[Sequence[float | None]]) -> dict[str, np.ndarray]:
+    def _targets(self, values: np.ndarray, batch: Mapping[str, np.ndarray],
+                 count: int) -> dict[str, np.ndarray]:
         """Run verl's masked GAE over each episode's actions, then whiten over every process.
 
-        Each episode's call `c` with a step reward `steps[episode][c]` has it on
-        its last action id, and the episode's reward lands on its last action
-        id; GAE runs across the actions of all its turns at once. Whitening
-        reads the global action count and moments, as it did over one device
-        batch.
+        GAE runs across the actions of all an episode's turns at once, on
+        the packed `token_rewards`. Whitening reads the global action count
+        and moments, as it did over one device batch.
         """
-        order = self._order(batch, rewards.shape[0])
+        order = self._order(batch, count)
         keep = order >= 0
         flat = values.reshape(-1)
-        baselines = np.where(keep, flat[np.maximum(order, 0)], 0).astype(np.float32)
-        last = np.where(keep.any(axis=1), keep.shape[1] - 1 - np.argmax(keep[:, ::-1], axis=1), -1)
-        token_rewards = np.zeros_like(baselines)
-        calls = np.where(keep, np.asarray(batch[CALL_INDEX_KEY]).reshape(-1)[np.maximum(order, 0)], -1)
-        for episode, paid in enumerate(steps):
-            for call, reward in enumerate(paid):
-                ids = np.flatnonzero(calls[episode] == call)
-                if reward is not None and ids.size:
-                    token_rewards[episode, ids[-1]] += reward
-        scored = last >= 0
-        token_rewards[scored, last[scored]] += rewards[scored]
+        placed = np.maximum(order, 0)
+        baselines = np.where(keep, flat[placed], 0).astype(np.float32)
+        token_rewards = np.where(keep, np.asarray(batch[TOKEN_REWARDS_KEY]).reshape(-1)[placed], 0
+                                 ).astype(np.float32)
         raw = np.asarray(gae_advantages(jnp.asarray(token_rewards), jnp.asarray(baselines),
                                         jnp.asarray(keep, jnp.float32), self.gamma, self.lam))
         returns = raw + baselines
@@ -355,8 +366,8 @@ class PPORollout:
         self, state: TrainState, batch: Mapping[str, object], key: jax.Array
     ) -> dict[str, np.ndarray]:
         """Collect one cohort of episodes and return its packed rows with critic targets."""
-        episodes = self.episodes.collect(state, batch, key)
-        projected = agreed("PPO episode projection", lambda: self.episodes.project(episodes))
+        projected = self.rollout(state, batch, key)
+        episodes = len(task_ids(batch)) * self.groups
         count = sum(from_every_process(min(2, int(np.count_nonzero(projected[RESPONSE_MASK_KEY])))))
         if int(count) == 0:
             # Every episode was masked (truncated): zero mass, so the step makes no update.
@@ -370,8 +381,4 @@ class PPORollout:
         )
         critic = self.objective.program("values", self.objective.values)
         values = agreed("PPO critic values", lambda: local_rows(critic(state.variables, device)))
-        rewards = np.asarray(
-            [0.0 if episode.reward is None else episode.reward for episode in episodes], np.float32
-        )
-        steps = [[turn.observation.reward for turn in episode.transitions] for episode in episodes]
-        return {**projected, **self._targets(np.asarray(values), projected, rewards, steps)}
+        return {**projected, **self._targets(np.asarray(values), projected, episodes)}

@@ -237,8 +237,8 @@ def _calls(row: Mapping[str, object], version: int | None,
         offset = begin - len(prompt)
         calls.append(
             Call(
-                prompt_ids=tuple(full[:begin]),
-                sampled_ids=tuple(full[begin : begin + length]),
+                prompt=tuple(full[:begin]),
+                tokens=tuple(full[begin : begin + length]),
                 behavior_log_probs=tuple(logprobs[offset : offset + length]),
                 finish_reason=text(
                     meta.get("finish_reason", "stop" if number == len(runs) - 1 else "tool_calls"),

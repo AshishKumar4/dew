@@ -6,14 +6,14 @@ one request at a time, so turns of different sessions interleave in the
 engine's continuous batch instead of waiting on a lock-step cohort.
 
 `EnvironmentSource` runs the in-process `Environment` protocol that
-`EpisodeRollout` runs, one session per sample on a worker thread, through
+`EpisodeCollector` runs, one session per sample on a worker thread, through
 the same per-episode state, `EpisodeProgress`: its context limit, its
 record of each call with the observation that followed it, and its finite
 verifier reward. Each turn submits the observation's context and steps the
 environment with the drawn action; the episode becomes a `Session` through
-`session_of`, the converter `EpisodeRollout` packs with, so both paths feed
-one packer. Each call keeps the version its request was submitted under, so
-a session that spans a weight push carries both versions.
+`session_of`, as `EpisodeCollector`'s do, so both feed one packer. Each
+call keeps the version its request was submitted under, so a session that
+spans a weight push carries both versions.
 
 The statuses follow the scheduler's failure policy. An infrastructure
 failure is an INFRA_ERROR session, retried and never scored: a draw the
@@ -37,7 +37,6 @@ verification overlaps generation.
 
 from __future__ import annotations
 
-import hashlib
 import threading
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -46,25 +45,13 @@ from dataclasses import dataclass, field, replace
 from uuid import uuid4
 
 import jax
-import numpy as np
 
-from dew.data.prompts import PromptRecord
 from dew.inference.rollouts import Draw, InfrastructureError, RolloutServer
 from dew.inference.serving import settled
-from dew.objectives.base import Batch
 
-from .episodes import (
-    Action,
-    Environment,
-    Episode,
-    EpisodeId,
-    EpisodeProgress,
-    EpisodeStatus,
-    session_of,
-    step_action,
-)
-from .rollout import Reward, drawn_call, prompt_rows, scored_draw
-from .sessions import Session, Status, Task
+from .episodes import Environment, Episode, EpisodeId, EpisodeProgress, EpisodeStatus, session_of, step_action
+from .rollout import PromptTask, Reward, scored_draw
+from .sessions import Call, Session, Status, Task
 
 _INFRASTRUCTURE = (InfrastructureError, OSError)
 """What a draw or a callback fails with when its external boundary, not its code, failed."""
@@ -183,15 +170,9 @@ class EnvironmentSource:
             return None
         return pending
 
-    def _action(self, draw: Draw, context: tuple[int, ...]) -> Action:
-        if draw.prompt != context:
-            raise ValueError("the server returned a draw for another context")
-        return Action(context, draw.tokens, draw.raw_log_probs, draw.behavior_log_probs, draw.terminated,
-                      draw.version, self.server.sampling)
-
-    def _play(self, episode: EpisodeProgress, environment: Environment, key: jax.Array, handle: _Handle,
-              draws: list[Draw]) -> None:
-        """Run the episode's turns, each a draw on the server and an environment step, appending each draw."""
+    def _play(self, episode: EpisodeProgress, environment: Environment, key: jax.Array,
+              handle: _Handle) -> None:
+        """Run the episode's turns, each a draw on the server and an environment step."""
         episode.begin(environment.reset())
         for turn in range(self.max_turns):
             context = episode.next_context(max_prompt_tokens=self.max_prompt_tokens)
@@ -206,20 +187,19 @@ class EnvironmentSource:
                 episode.stop(EpisodeStatus.ERROR, failed)
                 return
             draw = drawn.result()
-            action = self._action(draw, context)
-            draws.append(draw)
-            episode.pending = action
-            episode.commit(action, step_action(environment, action))
+            if draw.prompt != context:
+                raise ValueError("the server returned a draw for another context")
+            episode.pending = draw
+            episode.commit(draw, step_action(environment, draw))
 
     def _run(self, task: Task, identity: EpisodeId, version: int, key: jax.Array, handle: _Handle) -> Session:
-        episode = EpisodeProgress(identity)
-        draws: list[Draw] = []
+        episode = EpisodeProgress(identity, self.server.sampling)
         binding = uuid4().hex
         broken = False
         try:
             with self.environment(task, identity) as environment:
                 try:
-                    self._play(episode, environment, key, handle, draws)
+                    self._play(episode, environment, key, handle)
                 except _INFRASTRUCTURE:
                     raise
                 except BaseException:
@@ -234,44 +214,8 @@ class EnvironmentSource:
                 raise
             # The draw's, the environment's or the verifier's boundary failed: infrastructure, retried.
             episode.abort(EpisodeStatus.ERROR, _failure(error))
-        session = session_of(episode.episode(version, binding), group="")
-        # An episode records what the environment saw; the engine records of
-        # each call (routing, sampling support) come from its draw.
-        calls = tuple(replace(call, routed_experts=draw.routed_experts, support=draw.support)
-                      for call, draw in zip(session.calls, draws, strict=True))
-        return replace(session, task=task.id, calls=calls)
-
-
-def prompt_tasks(batch: Batch) -> list[Task]:
-    """Return one single-turn task per prompt row, with its prompt ids and its `PromptRecord`.
-
-    A task's id is a digest of its prompt ids, so repeated prompts share an
-    id; their groups keep them apart.
-    """
-    prompts, lengths, records = prompt_rows(batch)
-    rows, width = prompts.shape
-    tasks = []
-    for row in range(rows):
-        ids = tuple(int(token) for token in prompts[row, width - int(lengths[row]):])
-        name = hashlib.sha256(np.asarray(ids, np.int64).tobytes()).hexdigest()[:16]
-        tasks.append(Task(name, {"prompt": ids, "record": records[row]}))
-    return tasks
-
-
-@dataclass(frozen=True)
-class _Prompt:
-    """What `prompt_tasks` puts in a task: the prompt ids and the `PromptRecord` its reward reads."""
-
-    ids: tuple[int, ...]
-    record: PromptRecord
-
-    @classmethod
-    def of(cls, task: Task) -> _Prompt:
-        ids, record = task.data.get("prompt"), task.data.get("record")
-        if not (isinstance(ids, tuple) and isinstance(record, PromptRecord)):
-            raise TypeError(f"task {task.id!r} is not a prompt_tasks task: it needs prompt ids "
-                            "and a PromptRecord")
-        return cls(ids, record)
+        # Each call keeps its draw whole, the engine's routing and sampling support with it.
+        return replace(session_of(episode.episode(version, binding), group=""), task=task.id)
 
 
 class PromptSource:
@@ -304,7 +248,7 @@ class PromptSource:
         self._scorers = ThreadPoolExecutor(max_workers=scorers, thread_name_prefix="dew-reward")
 
     def submit(self, task: Task, samples: int, *, version: int, key: jax.Array) -> list[Future[Session]]:
-        prompt = _Prompt.of(task)
+        prompt = PromptTask.of(task)
         return [self._scored(task, prompt, version, self.server.submit(prompt.ids, self.max_new_tokens,
                                                                        key=jax.random.fold_in(key, k)))
                 for k in range(samples)]
@@ -318,7 +262,7 @@ class PromptSource:
         """Stop the reward threads. The caller closes the server; this method does not."""
         self._scorers.shutdown(wait=True, cancel_futures=True)
 
-    def _rollout(self, task: Task, prompt: _Prompt, version: int, drawn: Future[Draw]) -> Session:
+    def _rollout(self, task: Task, prompt: PromptTask, version: int, drawn: Future[Draw]) -> Session:
         failed = _draw_failure(drawn)
         if failed is not None:
             return Session(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {}, failed)
@@ -326,12 +270,10 @@ class PromptSource:
         if draw.version != version:
             return Session(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {},
                            f"draw: served by version {draw.version}, submitted under {version}")
-        call = drawn_call(draw.prompt, draw.tokens, draw.behavior_log_probs, draw.terminated, draw.version,
-                          routed_experts=draw.routed_experts, support=draw.support)
-        return scored_draw(task.id, 0, call, self.decode(draw.response(self.server.sampling)), prompt.record,
-                           self.reward)
+        return scored_draw(task.id, 0, Call.of(draw), self.decode(draw.response(self.server.sampling)),
+                           prompt.record, self.reward)
 
-    def _scored(self, task: Task, prompt: _Prompt, version: int, drawn: Future[Draw]) -> Future[Session]:
+    def _scored(self, task: Task, prompt: PromptTask, version: int, drawn: Future[Draw]) -> Future[Session]:
         """The draw's future, chained into its reward on a scorer thread."""
         scored: Future[Session] = Future()
 

@@ -258,7 +258,7 @@ def test_a_native_draw_ends_on_the_stop_string_it_completes(pieces):
         episodes.close()
         server.close()
     assert session.status == Status.COMPLETED
-    assert [(call.sampled_ids, call.finish_reason) for call in session.calls] == [
+    assert [(call.tokens, call.finish_reason) for call in session.calls] == [
         ((ids["st"], ids["op"]), "stop")] * 2
     packed = pack([session], 16)
     np.testing.assert_array_equal(packed["input_ids"][0][packed["response_mask"][0] > 0],
@@ -272,7 +272,7 @@ def test_a_draw_that_terminated_ends_as_its_policy_ends_one():
     from dew.inference import Draw
 
     def draw(tokens, terminated):
-        return Draw((1,), tokens, (-0.5,) * len(tokens), None, terminated, 0)
+        return Draw((1,), tokens, (-0.5,) * len(tokens), "stop" if terminated else "length", 0)
 
     stopping, plain = Sampling(eos_token_ids=EOS, stop=("x",)), Sampling(eos_token_ids=EOS)
     for tokens, terminated in (((4, EOS), True), ((4, 5), True), ((4, 5), False)):

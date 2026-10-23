@@ -3,10 +3,11 @@
 import functools
 from collections.abc import Mapping
 
+from dew.inference.rollouts import Draw
 from dew.records import finite, integer, integers, listed, record as section, text
 from dew.sampling.text import Sampling
 
-from .episodes import Action, Episode, EpisodeId, EpisodeStatus, Observation, Transition
+from .episodes import Episode, EpisodeId, EpisodeStatus, Observation, Transition
 
 reals = functools.partial(listed, read=finite, what="a list of finite numbers")
 """One list of finite numbers: a row's likelihoods (`listed`)."""
@@ -25,19 +26,22 @@ messages = functools.partial(listed, read=section, what="a list of chat messages
 """A list of chat messages, each a JSON object, kept as written (`listed`)."""
 
 
-def action_record(value: Mapping[str, object]) -> Action:
+def draw_record(value: Mapping[str, object], sampling: Sampling) -> Draw:
+    """Read a draw `asdict` wrote, checked to end as `sampling`, its episode's policy, ends one.
+    An episode's draws carry no engine records (routing, supports), so none is read."""
+    record = section(value, "draw")
+    raw = record["raw_log_probs"]
+    return Draw(integers(record["prompt"], "prompt"), integers(record["tokens"], "tokens"),
+                reals(record["behavior_log_probs"], "behavior_log_probs"),
+                text(record["finish_reason"], "finish_reason"), integer(record["version"], "version"),
+                None if raw is None else reals(raw, "raw_log_probs")).checked(sampling)
+
+
+def sampling_record(value: object) -> Sampling:
+    """Read the sampling policy `asdict` wrote, every control included."""
     from dew.registry import from_record
 
-    record = section(value, "action")
-    terminated, raw = record["terminated"], record["raw_log_probs"]
-    if not isinstance(terminated, bool):
-        raise ValueError("episode terminated must be a boolean")
-    return Action(integers(record["context"], "context"), integers(record["tokens"], "tokens"),
-                  None if raw is None else reals(raw, "raw_log_probs"),
-                  reals(record["behavior_log_probs"], "behavior_log_probs"),
-                  terminated, integer(record["policy_step"], "policy_step"),
-                  from_record(Sampling, section(record["sampling"], "sampling"), dtypes=False),
-                  _binding_id=text(record["_binding_id"], "_binding_id"))
+    return from_record(Sampling, section(value, "sampling"), dtypes=False)
 
 
 def episode_from_record(value: Mapping[str, object]) -> Episode:
@@ -45,13 +49,14 @@ def episode_from_record(value: Mapping[str, object]) -> Episode:
     record = section(value, "episode")
     identity = section(record["identity"], "identity")
     initial, reward = record["initial"], record["reward"]
+    sampling = sampling_record(record["sampling"])
     transitions = tuple(
-        Transition(action_record(section(turn["action"], "action")),
+        Transition(draw_record(section(turn["action"], "action"), sampling),
                    observation_record(section(turn["observation"], "observation")))
         for turn in listed(record["transitions"], "transitions", read=section, what="a list of transitions"))
     return Episode(EpisodeId(integer(identity["task"], "task"), integer(identity["attempt"], "attempt"),
                              integer(identity["sample"], "sample"), integers(identity["seed"], "seed")),
-                   integer(record["policy_step"], "policy_step"),
+                   integer(record["policy_step"], "policy_step"), sampling,
                    None if initial is None else observation_record(section(initial, "initial")),
                    transitions, EpisodeStatus(integer(record["status"], "status")),
                    text(record["detail"], "detail"),
