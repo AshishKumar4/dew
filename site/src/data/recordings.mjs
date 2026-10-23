@@ -12,7 +12,7 @@ const json = (relative) => JSON.parse(site(relative));
 /** `code` after checking `recorded` is its sha256: `name`'s recording is of exactly the code the page shows. */
 export function checked(name, code, recorded) {
 	if (recorded !== createHash('sha256').update(code).digest('hex')) {
-		throw new Error(`${name}: the recording is of other code than the page shows; record it again (site/scripts/capture_snippets.py), or, where the change only renames, keep it (site/scripts/redigest.py)`);
+		throw new Error(`${name}: the recording is of other code than the page shows; record it again (site/scripts/capture_snippets.py), or, where the change cannot alter what it shows, take its new digest (site/scripts/digest.py)`);
 	}
 	return code;
 }
