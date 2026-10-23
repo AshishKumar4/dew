@@ -14,10 +14,9 @@ from dew.config import JsonDict, ModelConfig, ObjectiveConfig, OptimConfig, Prep
 from dew.data.compile import fitted
 from dew.data.pipeline import ObjectiveData
 from dew.inputs import Field
+from dew.objectives.jepa.masking import MultiBlockMask
+from dew.objectives.jepa.probes import KnnProbe, LinearProbe
 from dew.registry import models
-
-from .masking import MultiBlockMask
-from .probes import KnnProbe, LinearProbe
 
 SHARED_MODEL_KEYS = ("emb_features", "num_heads", "mlp_ratio", "ssm_attention_ratio",
                      "ssm_state_dim", "dropout_rate", "precision")
@@ -33,7 +32,7 @@ class JepaRunConfig(RunConfig):
     Its EMA ramps over the whole run unless it names `momentum_steps`."""
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("jepa_encoder", {"precision": "default", "dtype": "bfloat16"}))
-    optim: OptimConfig = dataclasses.field(default_factory=lambda: OptimConfig(learning_rate=1e-3))
+    optim: OptimConfig = dataclasses.field(default_factory=lambda: OptimConfig(rate=1e-3))
     predictor: JsonDict = dataclasses.field(default_factory=dict)
     """Predictor kwargs, over the encoder's shared ones."""
     num_target_blocks: int = 4
@@ -80,3 +79,5 @@ class JepaRunConfig(RunConfig):
         return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=probes,
                                                       validation=held))
 
+
+__all__ = ["JepaRunConfig"]

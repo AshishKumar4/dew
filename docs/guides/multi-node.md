@@ -149,7 +149,7 @@ model = CausalTransformer(vocab_size=256, emb_features=512,
                           num_layers=8, num_heads=8, max_seq_len=1024)
 # fsdp over the eight GPUs of each node, and the data axis of 2 across the nodes.
 mesh = MeshSpec(fsdp=8, replicas=2)
-trainer = Trainer(LMObjective(model, seq_len=1024), OptimConfig(learning_rate=3e-4),
+trainer = Trainer(LMObjective(model, seq_len=1024), OptimConfig(rate=3e-4),
                   key=jax.random.key(0), mesh=mesh)
 ```
 

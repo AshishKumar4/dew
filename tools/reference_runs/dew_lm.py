@@ -122,13 +122,12 @@ def build(args: argparse.Namespace) -> Run:
     from dew.config import OptimConfig
     from dew.interop import Pretrained
     from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.inputs import coordinates
     from dew.nn.multimodal import MultimodalTransformer
     from dew.objectives.lm import TEXT_KEY, LMObjective
+    from dew.optim import Cosine, ParamGroup
     from dew.training import MeshSpec, Trainer
     from dew.training.distributed import batch_shardings
-    from dew.training.optim import Cosine, ParamGroup
-
-    from dew.nn.inputs import coordinates
 
     data = np.load(args.data)
     windows, order = data["windows"], data["order"]
@@ -173,7 +172,7 @@ def build(args: argparse.Namespace) -> Run:
     # and biases too.
     solver = OptimConfig(
         optimizer="adamw", b1=args.b1, b2=args.b2, optimizer_opts={"eps": args.eps},
-        state_dtype=args.state_dtype, schedule=schedule, weight_decay=args.weight_decay, clip_grads=args.clip,
+        state_dtype=args.state_dtype, rate=schedule, weight_decay=args.weight_decay, clip_grads=args.clip,
         param_groups=(ParamGroup("all", ("*",)),)).build(schedule_steps)
     devices = jax.device_count()
     mesh = {"data": MeshSpec(), "fsdp": MeshSpec(fsdp=devices), "expert": MeshSpec(expert=devices)}[args.mesh]
@@ -296,7 +295,7 @@ def record(args: argparse.Namespace, run: Run, curves: Curves, probe: RouterProb
                    "mesh": dict(run.trainer.device_mesh.shape),
                    "optimizer": "optax.chain(recorded_norm, clip_by_global_norm, adamw) "
                                 "via OptimConfig.build",
-                   "schedule": "dew.training.optim.Cosine", "ema": None,
+                   "schedule": "dew.optim.Cosine", "ema": None,
                    "model_config": {k: v for k, v in run.trainer.objective.model.__dict__.items()
                                     if isinstance(v, (int, float, str, bool, type(None)))}},
         "versions": built_from,
