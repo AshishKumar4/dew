@@ -11,11 +11,10 @@ from functools import cached_property
 
 import grain.python as grain
 
-from dew.data.dataset import Batch, Loading
+from dew.data.dataset import Batch, Loading, Ranges
 from dew.data.storage import Store, local, on_gcs
 
 from .codec import decode
-from .index import Ranges
 
 _MAX_OPEN_SHARDS = Loading().threads
 
