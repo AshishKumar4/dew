@@ -1098,9 +1098,11 @@ def test_a_replay_reads_the_float32_program_whatever_its_callers_mode():
     np.testing.assert_array_equal(widened_call.view(np.uint64), plain.view(np.uint64))
     direct = np.asarray(_widened_draw("normal", jax.random.key(2), (4, 97)))
     np.testing.assert_array_equal(drawn.view(np.uint64), direct.view(np.uint64))
-    assert_as_exact(lambda key: DRAWS["normal"](key), lambda key: DRAWS["normal"](key),
-                    lambda seed: (jax.random.key(seed),), "normal draw", seeds=8,
-                    truth_fn=float64_replay(DRAWS["normal"]))
+    def seeded(seed):
+        return DRAWS["normal"](jax.random.key(seed))
+
+    assert_as_exact(seeded, seeded, lambda seed: (np.int32(seed),), "normal draw", seeds=8,
+                    truth_fn=float64_replay(seeded))
 
 
 def _arithmetic(x):
