@@ -248,6 +248,18 @@ def test_the_operands_are_checked_as_the_decode_steps():
                                                       beta=jnp.ones((1, 4, 1))))
 
 
+def test_aligned_unit_keys_erase_the_decay_gradient():
+    """In one dimension k=beta=1 writes S'=v, independently of the decay. The WY inverse/readout
+    paths cancelled only after rounding, leaving a spurious 4.74e-8 gradient in this exact zero."""
+    unit = jnp.ones((1, 4, 1, 1), jnp.float32)
+    value = jnp.array([0.314159, -0.271828, 0.577216, 1.414214], jnp.float32).reshape(unit.shape)
+    decay = jnp.array([-0.17, -0.23, -0.31, -0.41], jnp.float32).reshape(unit.shape)
+    beta = jnp.ones((1, 4, 1), jnp.float32)
+    gradient = jax.jit(jax.grad(lambda g: jnp.sum(recurrence_chunk.chunk_delta_rule(
+        unit, unit, value, g, beta, chunk_size=4, scale=1.0)[0])))(decay)
+    np.testing.assert_array_equal(np.asarray(gradient), np.zeros_like(np.asarray(gradient)))
+
+
 @pytest.mark.parametrize('packed', PACKED, ids=['one sequence', 'packed'])
 @pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[8], HOOKS[6]], ids=str)
 def test_composed_chunks_leave_the_memory_the_recurrence_leaves(hooks, packed):
