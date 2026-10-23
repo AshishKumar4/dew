@@ -288,8 +288,9 @@ def recorded(root: Path, source: str) -> None:
         "a key a **kwargs collects renamed", "a class's parameter and its keyword renamed",
         "a lambda's parameter renamed and not its keyword",
         "a method's parameter renamed and not its keyword",
-        "a method's parameter and its keyword renamed", "a key a **kwargs collected becomes a parameter",
-        "another callable's keyword renamed beside a parameter"])
+        "a method's parameter and its keyword renamed",
+        "another callable's keyword renamed beside a parameter",
+        "a key a **kwargs collected becomes a parameter"])
 def test_the_programs_parsed_roles_decide_what_is_a_rename(site, before, after, kept):
     """A rename is read in the parsed program: an import's name and its binding apart, a parameter a
     variable and the keyword a call to its function passes it, an f-string's conversion and literal text
