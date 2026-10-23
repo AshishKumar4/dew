@@ -93,7 +93,111 @@ def decoder_residual_orders():
     return forward, draw, truth
 
 
-CLASSES = {"cross-entropy-columns": cross_entropy_columns, "decoder-residual-orders": decoder_residual_orders}
+ORDERS = 4
+"""The orders of an orbit class's draws (`orbited`): the draw's own and ORDERS - 1 others."""
+
+
+def orbited(permuting):
+    """An orbit (`assert_as_exact`'s `orbit`) of ORDERS orders, the draw's own first: `permuting(inputs,
+    order)` the inputs at a permutation the order's own stream draws."""
+    def orbit(inputs):
+        return [inputs, *(permuting(inputs, order) for order in range(1, ORDERS))]
+    return orbit
+
+
+def contraction_terms():
+    """A float32 matrix product, [64, 1024] by [1024, 64], over the orbit of its contraction's orders:
+    the terms of every sum taken in other orders, the same sums."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    @jax.jit
+    def reference(x, w):
+        return {"y": jnp.dot(x, w, precision="highest")}
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (rng.standard_normal((64, 1024)).astype(np.float32),
+                rng.standard_normal((1024, 64)).astype(np.float32))
+
+    def permuting(inputs, order):
+        x, w = inputs
+        terms = np.random.default_rng([0x0C, order]).permutation(x.shape[1])
+        return x[:, terms], w[terms]
+
+    return reference, draw, None, orbited(permuting)
+
+
+def mean_loss_rows():
+    """A two-layer tanh network's gradients of a mean squared loss over 256 rows, over the orbit of the
+    rows' orders: the mean's terms, every gradient's sum over the rows, in other orders."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from reference_error import with_gradients
+
+    rng = np.random.default_rng(0x0E)
+    params = {"inner": (rng.standard_normal((64, 256)) / 8).astype(np.float32),
+              "outer": (rng.standard_normal((256, 1)) / 16).astype(np.float32)}
+
+    def loss(params, x, targets):
+        hidden = jnp.tanh(jnp.dot(x, params["inner"], precision="highest"))
+        return jnp.mean(jnp.square(jnp.dot(hidden, params["outer"], precision="highest")[:, 0] - targets))
+
+    @jax.jit
+    def reference(x, targets, one):
+        _, gradient = with_gradients(lambda params: loss(params, x, targets))(params, one)
+        return gradient
+
+    def truth(x, targets, one):
+        _, gradient = with_gradients(lambda params: loss(params, x, targets))(
+            jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), params), one)
+        return gradient
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (rng.standard_normal((256, 64)).astype(np.float32),
+                rng.standard_normal(256).astype(np.float32), np.float32(1))
+
+    def permuting(inputs, order):
+        x, targets, one = inputs
+        rows = np.random.default_rng([0x0E, order]).permutation(len(x))
+        return x[rows], targets[rows], one
+
+    return reference, draw, truth, orbited(permuting)
+
+
+def attention_keys():
+    """Softmax attention, 4 heads of 128 queries over 256 keys 64 wide, over the orbit of its keys'
+    orders: each softmax's and each weighted sum's terms in other orders, the same outputs."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    @jax.jit
+    def reference(q, k, v):
+        logits = jnp.einsum("hqd,hkd->hqk", q, k, precision="highest") / 8
+        return {"out": jnp.einsum("hqk,hkd->hqd", jax.nn.softmax(logits, -1), v, precision="highest")}
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return tuple(rng.standard_normal(shape).astype(np.float32)
+                     for shape in ((4, 128, 64), (4, 256, 64), (4, 256, 64)))
+
+    def permuting(inputs, order):
+        q, k, v = inputs
+        keys = np.random.default_rng([0x0A, order]).permutation(k.shape[1])
+        return q, k[:, keys], v[:, keys]
+
+    return reference, draw, None, orbited(permuting)
+
+
+CLASSES = {"cross-entropy-columns": cross_entropy_columns, "decoder-residual-orders": decoder_residual_orders,
+           "contraction-terms": contraction_terms, "mean-loss-rows": mean_loss_rows,
+           "attention-keys": attention_keys}
+"""Each class's reference, draw and truth (None: the reference widened), and for an orbit class its
+orbit (`orbited`), which `--orbit` judges its rows over."""
 
 
 def _faulted(change):
@@ -155,6 +259,49 @@ def _dropped(arguments):
     return (states, matrix, scale, bias, *rest)
 
 
+def _input_fault(position, change):
+    """A fault of the input at `position`, `change(array)` a copy of it changed before the reference
+    runs, refused where it changes nothing."""
+    def changed(arguments):
+        import numpy as np
+
+        arguments = list(arguments)
+        before = np.asarray(arguments[position])
+        arguments[position] = _changed(before, change(before.copy()))
+        return tuple(arguments)
+    return _faulted(changed)
+
+
+def _zeroed(index):
+    def change(array):
+        array[index] = 0
+        return array
+    return change
+
+
+def _negated(index):
+    def change(array):
+        array[index] = -array[index]
+        return array
+    return change
+
+
+def _in_float16(reference):
+    """A fault of the reference run on its float inputs in float16, its products and sums at float16's
+    precision where float32 is claimed, returned as float32."""
+    def run(*arguments):
+        import jax
+        import jax.numpy as jnp
+        import numpy as np
+
+        # A scalar cotangent stays at the loss's dtype, which the float32 parameters keep.
+        narrowed = [jnp.asarray(value, jnp.float16)
+                    if np.ndim(value) and np.issubdtype(np.asarray(value).dtype, np.floating) else value
+                    for value in arguments]
+        return jax.tree.map(lambda leaf: np.asarray(leaf, np.float32), reference(*narrowed))
+    return run
+
+
 FAULTS = {
     "cross-entropy-columns": {
         "scale-2^-10": _faulted(_scaled(1 + 2.0 ** -10)),
@@ -167,11 +314,30 @@ FAULTS = {
         "scale-2^-20": _faulted(_parameters_scaled(1 + 2.0 ** -20)),
         "bf16-parameters": _faulted(_parameters(_parameters_bfloat16)),
     },
+    "contraction-terms": {
+        "dropped-term": _input_fault(0, _zeroed((slice(None), 0))),
+        "flipped-sign": _input_fault(1, _negated(0)),
+        "float16": _in_float16,
+        "skipped-chunk": _input_fault(0, _zeroed((slice(None), slice(0, 128)))),
+    },
+    "mean-loss-rows": {
+        "dropped-term": _input_fault(0, _zeroed(0)),
+        "flipped-sign": _input_fault(1, _negated(0)),
+        "float16": _in_float16,
+        "skipped-chunk": _input_fault(0, _zeroed(slice(0, 32))),
+    },
+    "attention-keys": {
+        "dropped-term": _input_fault(2, _zeroed((slice(None), 0))),
+        "flipped-sign": _input_fault(2, _negated((slice(None), 0))),
+        "float16": _in_float16,
+        "skipped-chunk": _input_fault(2, _zeroed((slice(None), slice(0, 32)))),
+    },
 }
 """Real faults of each class, its own computation changed before it runs, for the procedures' power on
 it (`null_runs`'s `dew_fn`): the cross-entropy head's states scaled by a wrong factor at three sizes,
 its column scale rounded to bfloat16 where float32 is claimed, a column of its vocabulary dropped; the
-decoder's parameters scaled, or rounded to bfloat16."""
+decoder's parameters scaled, or rounded to bfloat16; for each orbit class a term dropped, a term's sign
+flipped, its arithmetic in float16, and a chunk of its terms skipped."""
 
 
 def _law(name: str, rng, size: int):
@@ -202,7 +368,7 @@ def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stag
     rng = np.random.default_rng([chunk, int(ratio * 1000), seeds])
     span = (1 + REDRAW) * seeds
     if law in CLASSES:
-        reference, draw, truth = CLASSES[law]()
+        reference, draw, truth, *_ = CLASSES[law]()
         pool = _drawn(reference, reference, draw, range(3 * OFFSET * 1024, 3 * OFFSET * 1024 + 512), truth)
         names, values = pool.names, np.asarray(pool.mine)
     verdicts = []
@@ -239,6 +405,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--draws", type=int, help="instead, print the reference's own mean squared error "
                         "from float64 by leaf over this many draws past every run's, for a sizing model")
     parser.add_argument("--chunk", type=int, default=0)
+    parser.add_argument("--orbit", action="store_true", help="judge an orbit class's rows over its orbit")
     options = parser.parse_args(argv)
     from reference_error import null_runs, seeds_for
 
@@ -248,7 +415,8 @@ def main(argv: list[str]) -> int:
         print(json.dumps({"control": options.name, "ratio": options.ratio, "seeds": options.seeds,
                           "today": options.today, "chunk": options.chunk, "verdicts": verdicts}), flush=True)
         return 0
-    reference, draw, truth = CLASSES[options.name]()
+    reference, draw, truth, *orbits = CLASSES[options.name]()
+    orbit = orbits[0] if options.orbit else None
     if options.draws is not None:
         import numpy as np
         from reference_error import _drawn
@@ -266,10 +434,11 @@ def main(argv: list[str]) -> int:
         return 0
     verdicts = null_runs(reference, draw, options.name, seeds=options.seeds, runs=options.runs,
                          first=OFFSET + options.chunk * options.runs, truth_fn=truth,
-                         two_stage=not options.today,
+                         two_stage=not options.today, orbit=orbit,
                          dew_fn=FAULTS[options.name][options.fault](reference) if options.fault else None)
     print(json.dumps({"class": options.name, "chunk": options.chunk, "seeds": options.seeds,
-                      "today": options.today, "fault": options.fault, "verdicts": verdicts}), flush=True)
+                      "today": options.today, "fault": options.fault, "orbit": options.orbit,
+                      "verdicts": verdicts}), flush=True)
     return 0
 
 
