@@ -172,7 +172,7 @@ class Store:
         except (OSError, http.client.HTTPException) as error:  # a request that did not complete
             raise Unavailable(f"{what} did not complete: {error}") from error
         with contextlib.closing(stream):
-            if status >= 300 and status not in (304, 404):
+            if not 200 <= status < 300 and status not in (304, 404):
                 raised = (Conflict if status in (409, 412) else
                           Unavailable if status == 429 or status >= 500 else Refused)
                 raise raised(f"the R2 Worker answered {status} to {what}")
