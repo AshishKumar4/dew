@@ -16,6 +16,15 @@ mesh's peak, or None where the model has no count. Each case is timed twice over
 steps: once with the asynchronous dispatch a real run uses, which gives
 ms/step, and once waiting on every step, which gives the p10/p50/p90 spread.
 
+A case's peak memory is measured, not planned: each device's high-water of
+its allocator (`memory_stats`' peak_bytes_in_use) over the warm-up and the
+timed steps, native workspaces (cuBLAS, cuDNN, Mosaic scratch) included. JAX
+resets no high-water, and a compile's autotuning allocates through the same
+allocator, so a process of the case's own reads it (`measured_peak`), loading
+every program from a compilation cache a process before it wrote, and
+compiling nothing. Its planned bytes, XLA's plan of arguments, outputs and
+temporaries, stand beside it (`planned_device_bytes`).
+
 Two registry architectures are composites: `multimodal_transformer` wraps a
 decoder in an image tower and projector, and `diffusion_gemma` reads one
 decoder both ways for the official block-diffusion loss. A case builds those
@@ -49,7 +58,9 @@ import dataclasses
 import io
 import json
 import os
+import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal
@@ -61,6 +72,7 @@ import tyro
 from dew.files import write_atomically
 from dew.nn.attention import AttentionImpl
 from dew.nn.flops import MissingFlopsCount
+from dew.pool import COORDINATOR, PROCESS_COUNT, detected_cluster
 from dew.registry import models
 from dew.telemetry.instrumentation import COLLECTIVES, model_flops_utilization
 from dew.telemetry.profile import capture_options
@@ -184,6 +196,12 @@ class BenchmarkConfig:
     json_out: str | None = None
     quiet: bool = True
     """Silence the trainer's own prints, which are per-run noise here."""
+    peak_stage: Literal['warm', 'measure'] | None = None
+    """A case's own process for its measured peak (`measured_peak`), run by the tool itself: 'warm'
+    compiles the case's programs into `peak_cache`, 'measure' loads them from it, runs the warm-up and
+    the timed steps, and prints each device's high-water."""
+    peak_cache: str | None = None
+    """The compilation cache a case's peak processes share."""
 
 
 def build_cases(config: BenchmarkConfig) -> list[Case]:
@@ -231,8 +249,8 @@ def build_cases(config: BenchmarkConfig) -> list[Case]:
 def step_bytes(executable: jax.stages.Compiled | None) -> int | None:
     """The bytes one device holds while the compiled step runs, as XLA planned
     them: its arguments, the outputs not written over them, and the
-    temporaries. Per case, where the allocator's high-water mark only ever
-    grows over a sweep."""
+    temporaries; native workspaces (cuBLAS, cuDNN, a kernel's scratch) are
+    outside the plan, which `measured_peak` reads."""
     stats = None if executable is None else executable.memory_analysis()
     if stats is None:
         return None
@@ -321,8 +339,69 @@ def training_work(trainer: Trainer, case: Case, step_time: float) -> tuple[float
     return flops, model_flops_utilization(flops / trainer.device_mesh.devices.size, step_time)
 
 
-def measure(case: Case, config: BenchmarkConfig) -> Row:
-    """Warm up, then time the compiled step over a fixed number of steps."""
+CACHE_MISS = "/jax/compilation_cache/cache_misses"
+"""JAX's event for a compile the persistent cache did not hold."""
+
+
+def pooled() -> bool:
+    """Whether this process is one of a pool the environment declares (`dew launch`'s, a coordinator's,
+    a cluster's), read before a backend opens: its processes hold one mesh between them, which a
+    process of one case's own cannot build."""
+    cluster = detected_cluster()
+    return (any(name in os.environ for name in (PROCESS_COUNT, COORDINATOR))
+            or (cluster is not None and cluster.count > 1))
+
+
+def measured_peak(case: Case, config: BenchmarkConfig) -> list[int | None]:
+    """Each local device's high-water over the case's warm-up and timed steps, read in a process of the
+    case's own (`peak_process`) that loads every program it runs from a compilation cache a process
+    before it filled, so no compile, and no autotuning, joins it. Run before this process opens a
+    backend, which would hold the device they need."""
+    case_json = json.dumps([dataclasses.asdict(case)])
+    with tempfile.TemporaryDirectory(prefix="dew-peak-") as cache:
+        printed = ""
+        for stage in ("warm", "measure"):
+            done = subprocess.run(
+                [sys.executable, os.path.abspath(__file__), "--cases", case_json, "--dtype", config.dtype,
+                 "--attention-impl", config.attention_impl, "--warmup", str(config.warmup),
+                 "--steps", str(config.steps), "--fixed-batch" if config.fixed_batch else "--no-fixed-batch",
+                 *(["--xla-flags", config.xla_flags] if config.xla_flags else []),
+                 "--peak-stage", stage, "--peak-cache", cache],
+                capture_output=True, text=True)
+            if done.returncode:
+                raise RuntimeError(f"{case.label}: its {stage} peak process exited {done.returncode}:\n"
+                                   f"{done.stderr[-4000:]}")
+            printed = done.stdout
+    return json.loads(printed.splitlines()[-1])
+
+
+def peak_process(config: BenchmarkConfig) -> None:
+    """One case's peak process (`measured_peak`): its programs compiled into `config.peak_cache` ('warm'),
+    or loaded from it, its warm-up and timed steps run, and each local device's high-water printed
+    ('measure'), which a compile the cache missed would not be the step's own."""
+    missed: list[str] = []
+    jax.monitoring.register_event_listener(
+        lambda event, **_: missed.append(event) if event == CACHE_MISS else None)
+    # Dew's cache keeps every compile and the GPU autotuner's picks beside it (`dew.cache`).
+    prepare_process(multi_host=False, xla_flags=config.xla_flags, compilation_cache_dir=config.peak_cache)
+    (case,) = build_cases(config)
+    trainer = build_trainer(case, config.attention_impl)
+    with compiled_step(case, trainer, fixed_batch=config.fixed_batch) as compiled:
+        if config.peak_stage == 'warm':
+            return
+        state, _, _, _ = timed_steps(compiled.step, compiled.state, max(config.warmup, 1))
+        timed_steps(compiled.step, state, config.steps)
+    if missed:
+        raise RuntimeError(f"{case.label}: {len(missed)} programs compiled in its peak process, which a "
+                           "compile's own allocations would join; the warm process filled no cache entry "
+                           "for them")
+    print(json.dumps([(device.memory_stats() or {}).get("peak_bytes_in_use")
+                      for device in jax.local_devices()]))
+
+
+def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None) -> Row:
+    """Warm up, then time the compiled step over a fixed number of steps. `peaks` is each device's
+    measured high-water (`measured_peak`), None in a pool."""
     if config.steps < 1:
         raise ValueError(f"--steps must be at least 1, got {config.steps}")
     trainer = build_trainer(case, config.attention_impl)
@@ -374,7 +453,7 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
         step_time = elapsed / config.steps
         utilization = model_flops_utilization(flops, step_time)
         training_flops, mfu = training_work(trainer, case, step_time)
-        peak = step_bytes(trainer.executable)
+        planned = step_bytes(trainer.executable)
         row: Row = {
             "architecture": case.architecture,
             "batch_size": case.batch_size,
@@ -413,12 +492,13 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
             "utilization": utilization,
             "training_flops": training_flops,
             "mfu": mfu,
-            "peak_device_bytes": peak,
+            "planned_device_bytes": planned,
             "loss": float(loss),
             "finite": bool(is_finite),
             **timeline,
         }
-        return row
+    measured = None if peaks is None or None in peaks else max(peaks)
+    return {**row, "peak_device_bytes": measured, "peak_bytes_by_device": peaks}
 
 
 TABLE_COLUMNS = (
@@ -436,10 +516,12 @@ TABLE_COLUMNS = (
     ("utilization", "util %", 7, "{:.1f}"),
     ("mfu", "mfu %", 7, "{:.1f}"),
     ("peak_device_bytes", "peak GiB", 9, "{:.2f}"),
+    ("planned_device_bytes", "plan GiB", 9, "{:.2f}"),
 )
 # Units the table shows a column in: FLOPs as GFLOP, a fraction as a
 # percentage, bytes as GiB.
-TABLE_SCALE = {"flops_per_step": 1e-9, "utilization": 100.0, "mfu": 100.0, "peak_device_bytes": 2 ** -30}
+TABLE_SCALE = {"flops_per_step": 1e-9, "utilization": 100.0, "mfu": 100.0, "peak_device_bytes": 2 ** -30,
+               "planned_device_bytes": 2 ** -30}
 
 
 def format_table(rows: list[Row]) -> str:
@@ -463,17 +545,19 @@ def format_table(rows: list[Row]) -> str:
     return "\n".join(lines)
 
 
-def run(config: BenchmarkConfig) -> list[Row]:
+def run(config: BenchmarkConfig, peaks: list[list[int | None]] | None) -> list[Row]:
+    """Every case measured, with its devices' measured high-water (`measured_peak`) from `peaks`, one a
+    case in order; None in a pool."""
     rows: list[Row] = []
     # Every process of a pool measures its own devices; process 0 speaks.
     speaker = jax.process_index() == 0
-    for case in build_cases(config):
+    for index, case in enumerate(build_cases(config)):
         # The trainer narrates state generation and input shapes per case,
         # which buries the numbers this tool exists to print.
         sink = (contextlib.redirect_stdout(io.StringIO()) if config.quiet
                 else contextlib.nullcontext())
         with sink:
-            row = measure(case, config)
+            row = measure(case, config, None if peaks is None else peaks[index])
         rows.append(row)
         if not speaker:
             continue
@@ -502,6 +586,8 @@ def run(config: BenchmarkConfig) -> list[Row]:
 def main(config: BenchmarkConfig) -> list[Row]:
     # A step's compile seconds are a cold compile's, which no cached executable stands in for.
     jax.config.update("jax_enable_compilation_cache", val=False)
+    # Before this process opens a backend, which would hold the device each case's peak process needs.
+    peaks = None if pooled() else [measured_peak(case, config) for case in build_cases(config)]
     # Joins a `dew launch` pool when one launched this process, and applies
     # the flags before the backend opens either way.
     prepare_process(xla_flags=config.xla_flags)
@@ -511,7 +597,7 @@ def main(config: BenchmarkConfig) -> list[Row]:
               f"{jax.process_count()} process(es)")
         print(f"dtype {config.dtype}, attention_impl {config.attention_impl}, "
               f"XLA_FLAGS {os.environ.get('XLA_FLAGS', '')!r}")
-    rows = run(config)
+    rows = run(config, peaks)
     if not speaker:
         return rows
     print()
@@ -525,4 +611,8 @@ def main(config: BenchmarkConfig) -> list[Row]:
 
 
 if __name__ == "__main__":
-    main(tyro.cli(BenchmarkConfig))
+    parsed = tyro.cli(BenchmarkConfig)
+    if parsed.peak_stage is None:
+        main(parsed)
+    else:
+        peak_process(parsed)
