@@ -6,7 +6,9 @@ Rebuilding one imports the module and calls the class with its fields, each
 converted to the type its annotation declares, so a record loads in a process
 that imported nothing beforehand, and a class outside Dew needs nothing to be
 recorded: its import path is its name. A record Dew writes carries the path,
-so rebuilding it never depends on an alias.
+so rebuilding it never depends on an alias, with one exception: a run's own
+record names its run class by its alias in `runs`, so a saved run reads back
+wherever its class moves, and only that kind is consulted for it.
 
 Where a person writes a record, in a config file or on the command line, the
 class may be a short alias instead, `{"class": "simple_dit"}`. Each kind's
@@ -62,8 +64,8 @@ if TYPE_CHECKING:
     from dew.nn.mixers import MixerBase
     from dew.nn.vision import ProjectorBase, TowerBase
     from dew.objectives.base import Metric, Objective
+    from dew.optim import ScheduleBase
     from dew.sampling.solvers import Solver
-    from dew.training.optim import ScheduleBase
 
 # A type annotation as a value: a class, a union of them, a subscripted
 # generic, a PEP 695 alias, or the None a field with no resolvable annotation
@@ -221,6 +223,11 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
         """The alias of the class at import `path`, or its class name where
         it has none, for a run's human-readable name."""
         return next((alias for alias, held in self.paths.items() if held == path), path.rpartition(":")[2])
+
+    def name_of(self, member: Importable) -> str:
+        """The name a record writes for `member`: its alias in this kind, else its import path."""
+        path = import_path(member)
+        return next((alias for alias, held in self.paths.items() if held == path), path)
 
     def alias_of(self, member: Importable) -> str:
         """The alias of `member`, for a run's human-readable name; KeyError
@@ -1332,12 +1339,22 @@ projectors: Aliases[type[ProjectorBase], ProjectorBase] = Aliases("projector", {
     "qwen3_5": "dew.nn.vision.qwen35:Qwen35Projector",
 }, base="dew.nn.vision.common:ProjectorBase")
 schedules: Aliases[type[ScheduleBase], ScheduleBase] = Aliases("schedule", {
-    "cosine": "dew.training.optim:Cosine",
-    "exponential": "dew.training.optim:Exponential",
-    "linear": "dew.training.optim:Linear",
-    "one_cycle": "dew.training.optim:OneCycle",
-    "power": "dew.training.optim:Power",
-}, base="dew.training.optim:ScheduleBase")
+    "cosine": "dew.optim:Cosine",
+    "exponential": "dew.optim:Exponential",
+    "linear": "dew.optim:Linear",
+    "one_cycle": "dew.optim:OneCycle",
+    "power": "dew.optim:Power",
+}, base="dew.optim:ScheduleBase")
+
+
+# A run config's own class sits above the registry, so the table's type names none. A run record
+# names its class by this table's alias (`RunConfig.record`), apart from every other kind.
+runs: Aliases[Callable[..., Any], Any] = Aliases("run", {
+    "decision": "dew.decision.config:DecisionRunConfig",
+    "diffusion": "dew.config.diffusion:DiffusionRunConfig",
+    "jepa": "dew.config.jepa:JepaRunConfig",
+    "lm": "dew.config.lm:LMRunConfig",
+}, base="dew.config:RunConfig")
 
 
 KINDS: tuple[Aliases, ...] = (models, presets, solvers, encoders, metrics, objectives, mixers, towers,
@@ -1363,6 +1380,7 @@ __all__ = [
     "presets",
     "projectors",
     "record_fields",
+    "runs",
     "schedules",
     "solvers",
     "to_record",

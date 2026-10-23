@@ -289,27 +289,6 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
 
 
 @dataclasses.dataclass(frozen=True)
-class Members:
-    """A mixture's members as a lowering reads them: its weights, which the `Mixture` checked, and a
-    key for each member, distinct, as a mix saves each member's position and draws under its key
-    (`dew.data.analysis._member_keys`)."""
-
-    weights: tuple[float, ...]
-    keys: tuple[str, ...]
-
-    def __post_init__(self) -> None:
-        if len(self.weights) != len(self.keys) or len(set(self.keys)) != len(self.keys):
-            raise ValueError(f"a mix needs one weight and one distinct key per member, not "
-                             f"{len(self.weights)} weights and keys {list(self.keys)}")
-
-    def corpora[Read](self, parents: Sequence[Read]) -> tuple[Read, ...]:
-        """`parents`, one corpus for each member, in the members' order."""
-        if len(parents) != len(self.keys):
-            raise ValueError(f"a mix of {len(self.keys)} members reads {len(parents)} corpora")
-        return tuple(parents)
-
-
-@dataclasses.dataclass(frozen=True)
 class Proportions:
     """A weighted mix's selection policy, Grain's (`MapDataset.mix`): the weights scaled so the least
     is 100 and truncated to whole proportions, and position k of the mix read from the corpus whose
@@ -386,7 +365,8 @@ class TokenDeficit(pygrain.IterDataset[Batch]):
     def __init__(
         self,
         parents: Sequence[pygrain.IterDataset[Batch]],
-        members: Members,
+        weights: Sequence[float],
+        keys: Sequence[str],
         *,
         tokens: Callable[[Batch], int],
         names: Sequence[str],
@@ -394,16 +374,16 @@ class TokenDeficit(pygrain.IterDataset[Batch]):
     ):
         filtered = tuple(
             Accepted(parent, name, label, tokens=tokens)
-            for parent, name, label in zip(members.corpora(parents), names, labels, strict=True)
+            for parent, name, label in zip(parents, names, labels, strict=True)
         )
         super().__init__(filtered)
-        ratios = tuple(Fraction(weight) for weight in members.weights)
+        ratios = tuple(Fraction(weight) for weight in weights)
         scale = math.lcm(*(ratio.denominator for ratio in ratios))
         self._corpora, self._weights, self._tokens, self._keys = (
             filtered,
             tuple(ratio.numerator * (scale // ratio.denominator) for ratio in ratios),
             tokens,
-            members.keys,
+            tuple(keys),
         )
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
@@ -546,10 +526,10 @@ class PrimedMix(pygrain.IterDataset[Batch]):
     restores those it finds, so a member that joins starts at its first row and one that left is
     dropped while the others resume where they were."""
 
-    def __init__(self, parents: Sequence[pygrain.IterDataset[Batch]], members: Members):
-        corpora = members.corpora(parents)
-        super().__init__(corpora)
-        self._corpora, self._weights, self._keys = corpora, members.weights, members.keys
+    def __init__(self, parents: Sequence[pygrain.IterDataset[Batch]], weights: Sequence[float],
+                 keys: Sequence[str]):
+        super().__init__(parents)
+        self._corpora, self._weights, self._keys = tuple(parents), tuple(weights), tuple(keys)
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
         group = _PrimeReads([iter(parent) for parent in self._corpora])
