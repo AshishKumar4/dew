@@ -87,6 +87,12 @@ class Forward:
         return not self.natural and self.score_mod is None and factor < 1.0
 
     @property
+    def factor(self) -> float:
+        """The factor the logits are the products times (`modify`): 1 raw, the scale times log2(e) folded,
+        the scale natural, rounded to fp32 as the kernels multiply by it (a scale below fp32's range is 0)."""
+        return float(np.float32(1.0 if self.raw else self.scale * LOG2E if self.base2 else self.scale))
+
+    @property
     def guarded(self) -> bool:
         """Whether a query can see no key, so its maxima and denominators need the empty row's guard: a
         call of no keys, one whose spans narrow, or one a score hook may mask."""
@@ -494,28 +500,64 @@ def resumed(spec: Forward, m: jax.Array, total: jax.Array, acc: jax.Array, *,
 
 
 def modify(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array, ...] = (),
-           masked: bool = True) -> jax.Array:
+           masked: bool | jax.Array = True) -> jax.Array:
     """A tile's logits from its products `s` `[bq, bk]` (fp32): scaled (by log2(e) too in base 2; raw in
     the raw form, `Forward.raw`), then the score hook, then -inf at each key the query does not see.
     `masked` False is a tile every query of the block sees whole (a full tile of the block map), which
-    takes no mask."""
-    logits = s if spec.raw else s * (spec.scale * LOG2E if spec.base2 else spec.scale)
+    takes no mask; a traced `masked` chooses at run time. Without a hook the mask is taken on the products,
+    at the infinity the scale takes to -inf, and the scale after it, so a mainloop's multiply feeds the
+    weights' subtraction whole, which its compiler contracts to one FMA (`weights`), whichever the tile."""
+    return logits_of(spec, s, coords, params, masked)[0]
+
+
+def logits_of(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array, ...] = (),
+              masked: bool | jax.Array = True) -> tuple[jax.Array, jax.Array | None]:
+    """`modify`'s logits and, where they are the products (masked) times `Forward.factor` alone, those
+    products, whose extreme the tile's maximum takes exactly (`peak`), so the logits' multiply feeds only
+    the weights' subtraction, one FMA (`weights`); None under a hook or a zero factor."""
+    factor = spec.factor
+    if spec.score_mod is None and factor != 0:
+        # The infinity the factor takes to -inf (a zero factor takes none, so it masks after scaling).
+        unseen = -jnp.inf if factor > 0 else jnp.inf
+        products = _chosen(masked, lambda: _masked(spec, s, coords, unseen), lambda: s)
+        return (products if spec.raw else products * factor), products
+    logits = s * factor
     if spec.score_mod is not None:
         logits = hooked(spec.score_mod, logits, coords.q_pos, coords.k_pos, params)
-    if not masked:
-        return logits
-    seen = None
+    return _chosen(masked, lambda: _masked(spec, logits, coords, -jnp.inf), lambda: logits), None
+
+
+def _chosen(masked: bool | jax.Array, mask: Callable[[], jax.Array], whole: Callable[[], jax.Array]):
+    """`mask()` where `masked`, else `whole()`: at trace time for a Python flag, at run time for a traced
+    one."""
+    if isinstance(masked, bool):
+        return mask() if masked else whole()
+    return jax.lax.cond(masked, mask, whole)
+
+
+def _masked(spec: Forward, s: jax.Array, coords: Coords, unseen: float) -> jax.Array:
+    """`s` `[bq, bk]` at `unseen` at each key the query does not see (`seen`)."""
+    visible = seen(spec, coords, s)
+    return s if visible is None else jnp.where(visible, s, unseen)
+
+
+def seen(spec: Forward, coords: Coords, like: jax.Array) -> jax.Array | None:
+    """Whether each query of a tile `like` `[bq, bk]` sees each key (`within`), every mainloop's one
+    predicate, forward and backward; None where each sees every key. A spans call's intervals and, with
+    documents, ids (its mainloops give each tile its queries' intervals and both blocks' ids); a causal
+    call's diagonal; and the call's keys, where a tile reaches past them: no walk visits a tile wholly past
+    them, so a call whose keys are whole tiles reads no padding."""
+    visible = None
     if coords.spans is not None:
-        # The spans' form: its mainloops give each tile its queries' intervals and, with documents, ids.
         start, end = coords.spans
-        ids = None if coords.ids is None else (expand(coords.ids[0], s), across(coords.ids[1], s))
-        seen = within(coords.k_pos, expand(start, s), expand(end, s), ids)
+        ids = None if coords.ids is None else (expand(coords.ids[0], like), across(coords.ids[1], like))
+        visible = within(coords.k_pos, expand(start, like), expand(end, like), ids)
     elif spec.form == "causal":
-        seen = coords.k_pos <= coords.q_pos
-    if spec.form != "spans" and spec.keys % s.shape[1]:
+        visible = coords.k_pos <= coords.q_pos
+    if spec.form != "spans" and spec.keys % like.shape[1]:
         # A tile past the call's last key reads padding.
-        seen = coords.k_pos < spec.keys if seen is None else seen & (coords.k_pos < spec.keys)
-    return logits if seen is None else jnp.where(seen, logits, -jnp.inf)
+        visible = coords.k_pos < spec.keys if visible is None else visible & (coords.k_pos < spec.keys)
+    return visible
 
 
 def _safe(spec: Forward, m: jax.Array) -> jax.Array:
@@ -523,13 +565,21 @@ def _safe(spec: Forward, m: jax.Array) -> jax.Array:
     return jnp.where(m == -jnp.inf, 0.0, m) if spec.guarded else m
 
 
-def peak(spec: Forward, m: jax.Array, s: jax.Array) -> tuple[jax.Array, jax.Array]:
+def peak(spec: Forward, m: jax.Array, s: jax.Array, products: jax.Array | None = None
+         ) -> tuple[jax.Array, jax.Array]:
     """The running maximum after a tile's logits `s`, and `alpha`, the factor the state before it
     takes to the new maximum. In the accurate form the exponent `m - new` is compensated (its subtraction's
     rounding, by TwoSum, carried to first order): every weight before the new maximum shares this one
     factor, so its exponent's rounding would not average out over them as the reference's per-key exponents'
-    do, an error some sqrt(keys) times the reference's where the maximum jumps far."""
-    new = jnp.maximum(m, s.max(axis=-1))
+    do, an error some sqrt(keys) times the reference's where the maximum jumps far. Where the logits are
+    `products` times `Forward.factor` (`logits_of`), the tile's maximum is their extreme times it, the
+    same bits (fp32's rounding is monotonic: the largest of `fl(p c)` is `fl(max(p) c)` for a positive `c`,
+    `fl(min(p) c)` for a negative one), taken once a row."""
+    if products is None:
+        tile = s.max(axis=-1)
+    else:
+        tile = (products.max(axis=-1) if spec.factor > 0 else products.min(axis=-1)) * spec.factor
+    new = jnp.maximum(m, tile)
     return new, carried(spec, m, _safe(spec, new))
 
 
@@ -605,13 +655,19 @@ def started(spec: Forward, initial: tuple[jax.Array, jax.Array, jax.Array] | Non
 
 class Keys(NamedTuple):
     """A key tile as a mainloop gives it the algebra: its coordinates and (modified) logits `[bq, bk]`,
-    `load()` its values `[bk, Dv]`, which a step calls after the softmax (where jax's mha loads them), and
-    the mainloop's product `dot(a, b)`, `a @ b` in fp32."""
+    `load()` its values `[bk, Dv]`, which a step calls after the softmax (where jax's mha loads them), the
+    mainloop's product `dot(a, b)`, `a @ b` in fp32, where the mainloop holds the running sums of the
+    weighted values itself (an MMA's accumulator), `accumulate(scale, p, value)`, which takes them by
+    `scale` and adds the narrowed weights' product with the values in place (the plain walk's step), and the
+    products the logits are a factor of, where they are (`logits_of`), whose extreme the tile's maximum
+    takes (`peak`)."""
 
     coords: Coords
     logits: jax.Array
     load: Callable[[], jax.Array]
     dot: Callable[[jax.Array, jax.Array], jax.Array]
+    accumulate: Callable[[Callable[[jax.Array], jax.Array], jax.Array, jax.Array], None] | None = None
+    products: jax.Array | None = None
 
 
 Carry = tuple[Partial, Argmax, jax.Array, jax.Array]
@@ -627,7 +683,7 @@ def _times(dot: Callable[[jax.Array, jax.Array], jax.Array], value: jax.Array, p
 def _softmax(spec: Forward, state: Partial, keys: Keys):
     """A tile's softmax: the running maximum, the factor the state's sums take, the weights for the
     product (the guarded walk's at the row's shift, `tile`), the tile's values and the guarded `Room`."""
-    m, alpha = peak(spec, state.m, keys.logits)
+    m, alpha = peak(spec, state.m, keys.logits, keys.products)
     p = weights(spec, keys.logits, m)
     value = keys.load()
     p, factor, held = tile(state, alpha, p, value)
@@ -635,8 +691,14 @@ def _softmax(spec: Forward, state: Partial, keys: Keys):
 
 
 def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
-    """The state after a tile `keys`: its softmax and the product of its weights with its values."""
+    """The state after a tile `keys`: its softmax and the product of its weights with its values, into the
+    mainloop's own running sums where it holds them (`Keys.accumulate`; the state's `acc` then is the
+    mainloop's to read, passed through)."""
     m, factor, p, value, held = _softmax(spec, state, keys)
+    if held is None and keys.accumulate is not None:
+        keys.accumulate(lambda acc: carry_factor(acc, factor, None), narrow(p, value.dtype), value)
+        denominator = carry_factor(state.total, factor, None) + beyond_weights(p.sum(axis=-1), None)
+        return Partial(state.acc, m, denominator)
     times = functools.partial(_times, keys.dot, value)
     return stepped(state, m, factor, p, times(p), held, times)
 
@@ -1124,6 +1186,14 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
     anchored = jnp.abs(about_anchor) <= jnp.abs(about_zero)
     return (jnp.where(anchored, anchor, 0.0), jnp.where(anchored, about_anchor, about_zero),
             jnp.where(anchored, key_index, -1))
+
+
+def split_mass(own: jax.Array, others_total: jax.Array, total: jax.Array, shift: jax.Array) -> jax.Array:
+    """The keys' share of a query's weights from a training forward's split sums (`split_delta`'s), the
+    initial state's the rest: 0 exactly where no key weighs anything (`dq_finish`'s mass, for a backward
+    with no dQ pass)."""
+    over = jnp.where(shift < 0, 1.0, inverse(power2(total, -shift)))
+    return (own + others_total) * over
 
 
 Parts = tuple[tuple[jax.Array, jax.Array | None], ...]
