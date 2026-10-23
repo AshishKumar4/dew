@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.nn.hyper_connections import (
     HyperConnection,
@@ -35,68 +35,47 @@ SEEDS = {"site": 256, "head": 8, "mean": 16}
 
 
 def site_draw(seed):
-    """Streams, a block output, the site's parameters and a cotangent, drawn from `seed`."""
+    """Streams, a block output, the site's parameters and a cotangent for each of the site's outputs
+    (the collapsed input and the mix), drawn from `seed` in float32."""
     rng = np.random.default_rng(seed)
     params = {"fn": rng.standard_normal(((2 + H) * H, H * D)) * 0.3,
               "base": rng.standard_normal((2 + H) * H) * 0.5, "scale": 1 + rng.random(3)}
-    return (rng.standard_normal((B, S, H, D)), rng.standard_normal((B, S, D)), params,
-            rng.standard_normal((B, S, H, D)))
+    drawn = (rng.standard_normal((B, S, H, D)), rng.standard_normal((B, S, D)), params,
+             (rng.standard_normal((B, S, D)), rng.standard_normal((B, S, H, D))))
+    return jax.tree.map(lambda leaf: np.asarray(leaf, np.float32), drawn)
 
 
 def reference_site(wide: bool):
     """The reference site and mix as a function of a draw, in float32, or in float64 where `wide`: the
-    collapsed input, the mix, and the gradient of `sum(mix * cotangent)` into the streams and each
-    parameter."""
+    collapsed input and the mix, and the gradients into the streams, the block output and each
+    parameter under the drawn cotangents (`torch_with_gradients`)."""
     from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
     from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextHyperConnection
 
     from tools.diffusers_wan_reference import float64
 
-    dtype = torch.float64 if wide else torch.float32
-
-    def run(streams, output, params, cotangent):
+    def forward(streams, output, params):
         with float64() if wide else contextlib.nullcontext():
             config = Glm5NextTextConfig(hidden_size=D, hc_mult=H, hc_sinkhorn_iters=SPEC.hc_sinkhorn_iters,
                                         hc_eps=SPEC.hc_eps, rms_norm_eps=1e-5)
-            module = Glm5NextTextHyperConnection(config).to(dtype)
-            module.load_state_dict({name: torch.tensor(value, dtype=dtype)
-                                    for name, value in params.items()})
-            hidden = torch.tensor(streams, dtype=dtype, requires_grad=True)
-            post, comb, collapsed = module(hidden)
-            mixed = post.unsqueeze(-1) * torch.tensor(output, dtype=dtype).unsqueeze(-2) + torch.matmul(
-                comb.transpose(-1, -2), hidden)
-            grads = torch.autograd.grad((mixed * torch.tensor(cotangent, dtype=dtype)).sum(),
-                                        [hidden, module.fn, module.base, module.scale])
-        return {"collapsed": collapsed.detach().numpy(), "mixed": mixed.detach().numpy(),
-                "grad": dict(zip(("streams", "fn", "base", "scale"), (grad.numpy() for grad in grads),
-                                 strict=True))}
-    return run
+            module = Glm5NextTextHyperConnection(config).to(streams.dtype)
+            post, comb, collapsed = torch.func.functional_call(module, params, (streams,))
+            mixed = post.unsqueeze(-1) * output.unsqueeze(-2) + torch.matmul(comb.transpose(-1, -2), streams)
+        return collapsed, mixed
+    return torch_with_gradients(forward)
 
 
-@jax.jit
-def dew_site(streams, output, params, cotangent):
-    """Dew's site and mix over a draw: what `reference_site` returns."""
-    module = HyperConnection(spec=SPEC, emb_features=D, norm_eps=1e-5)
-
-    def loss(streams, params):
-        post, comb, collapsed = module.apply({"params": params}, streams)
-        mixed = mix_streams(post, comb, output, streams)
-        return jnp.sum(mixed * cotangent), (collapsed, mixed)
-
-    (_, (collapsed, mixed)), (into_streams, into_params) = jax.value_and_grad(
-        loss, argnums=(0, 1), has_aux=True)(streams, params)
-    return {"collapsed": collapsed, "mixed": mixed, "grad": {"streams": into_streams, **into_params}}
-
-
-def single(streams, output, params, cotangent):
-    """A draw as float32 JAX arrays, as Dew computes in."""
-    return jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32), (streams, output, params, cotangent))
+def site(streams, output, params):
+    """Dew's site and mix: the collapsed input and the mix."""
+    post, comb, collapsed = HyperConnection(spec=SPEC, emb_features=D, norm_eps=1e-5).apply(
+        {"params": params}, streams)
+    return collapsed, mix_streams(post, comb, output, streams)
 
 
 def test_the_site_mixes_and_differentiates_as_the_reference():
     """Through the mapping, the Sinkhorn loop and the mix, the outputs and the gradients into the
-    streams and every parameter on par with the reference's float32 (check 1)."""
-    assert_as_exact(lambda *draw: dew_site(*single(*draw)), reference_site(wide=False), site_draw,
+    streams, the block output and every parameter on par with the reference's float32 (check 1)."""
+    assert_as_exact(jax.jit(with_gradients(site)), reference_site(wide=False), site_draw,
                     "hyper-connection site", seeds=SEEDS["site"], truth_fn=reference_site(wide=True))
 
 

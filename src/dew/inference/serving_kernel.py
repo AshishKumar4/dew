@@ -21,6 +21,7 @@ from jax.experimental.layout import Format, Layout
 from jax.sharding import Mesh, NamedSharding
 
 from dew.inference.tasks import cache_sized
+from dew.nn.cross_attention import CROSS_KEY, CROSS_VALUE
 from dew.nn.inputs import Admitted, ModelInputs
 from dew.nn.kernels.options import compiler_options
 from dew.nn.kernels.tuning import tune
@@ -431,8 +432,8 @@ def state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
     `pages` split over the same axes, one part per group of rows. Keys,
     values and their scales keep their heads where the key and value
     projections leave them (`activation_kv`), and the logits their
-    vocabulary (`activation_vocab`). `state` is abstract: only its shapes
-    are read.
+    vocabulary (`activation_vocab`), as a row's cross-attention keys and
+    values keep theirs. `state` is abstract: only its shapes are read.
     """
     if mesh is None:
         device = jax.sharding.SingleDeviceSharding(jax.devices()[0])
@@ -446,6 +447,9 @@ def state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
     def cached(
         path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.ShapeDtypeStruct | jax.Array
     ) -> NamedSharding:
+        if leaf_name(path) in (CROSS_KEY, CROSS_VALUE):
+            # A row's context keys and values, its heads where the key and value projections leave them.
+            return placed(leaf, "activation_batch", None, "activation_kv")
         if leaf_name(path) not in POOLED:
             return placed(leaf, "activation_batch")
         if paged:

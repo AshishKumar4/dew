@@ -129,15 +129,43 @@ jobs:
         grep -q "No matching distribution found for jax" plain.txt || { cat plain.txt; exit 1; }
     - name: Resolve the accelerator extras
       run: |
-        index=$(python -c "import runpy; print(runpy.run_path('src/dew/telemetry/builds.py')['PACKAGE_INDEX'])")
+        index=$(python -c "import runpy; print(runpy.run_path('src/dew/builds.py')['PACKAGE_INDEX'])")
         for extras in cuda12,quantization,profile cuda13,quantization,profile tpu,quantization,profile; do
           echo "dewml[$extras] @ file://$(realpath dist/*.whl)" \
             | uv pip compile - --extra-index-url "$index" \
               --python-version "$(tr -d '\n' < .python-version)" --python-platform x86_64-manylinux_2_31 --quiet > /dev/null
         done
 
+  # What the run's suite covers (tools/armada/ci.py policy), read before the test job starts, as its armada
+  # group depends on it: the daily run and a land-queue train's full run (ci/full-*) run every file; any other
+  # run reruns what its change reaches, and the whole suite where it cannot place it: from main, for a fix on a
+  # train (ci/fix-*) from the train's tip it fixes, its first parent, and for a base/<producer> promote
+  # (ci/base-<sha>-*) from the producer branch's tip it merges onto, <sha>.
+  scope:
+    runs-on: ubuntu-latest
+    outputs:
+      policy: ${{ steps.policy.outputs.policy }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - id: policy
+      env:
+        DEW_TEST_CACHE: ${{ (github.event_name == 'schedule' || startsWith(github.ref_name, 'ci/full-')) && 'off' || '' }}
+      run: |
+        if [ -z "$DEW_TEST_CACHE" ]; then
+          case "$GITHUB_REF_NAME" in
+            ci/fix-*) from=HEAD^1 ;;
+            ci/base-*) from=${GITHUB_REF_NAME#ci/base-}; from=${from%%-*} ;;
+            *) from=origin/main ;;
+          esac
+          DEW_TEST_CACHE=$(python3 tools/armada/ci.py policy "$from")
+        fi
+        echo "the test cache's policy: $DEW_TEST_CACHE"
+        echo "policy=$DEW_TEST_CACHE" >> "$GITHUB_OUTPUT"
+
   test:
-    needs: proven
+    needs: [proven, scope]
     runs-on: ubuntu-latest
     # The suite runs on armada (.armada.json, tools/armada/ci.py): both
     # Pythons as tasks of about five minutes each on Dew's own armada
@@ -166,9 +194,18 @@ jobs:
     # MODELS, so every case runs in one. A commit proven on another push is not run
     # again. One run's armada jobs at a time (`armada`, queued in order): two
     # runs' suites fill the deployment's fleet, and the gangs, which need
-    # four containers at once, then wait out their deadline (armada#49).
+    # four containers at once, then wait out their deadline (armada#49). The
+    # land queue's one train at a time takes `armada`. A base/<producer>
+    # promote that reruns what its change reaches (ci/base-*) takes a group of
+    # its own, and so does the whole suite on main, every fifth publish, in the
+    # background (ci/full-whole-*); both run no gangs, which every train runs,
+    # so no train waits on them. A base promote that falls back to the whole
+    # suite takes `armada`.
     concurrency:
-      group: armada
+      group: >-
+        ${{ (startsWith(github.ref_name, 'ci/full-whole-') && 'armada-whole')
+        || (needs.scope.outputs.policy != 'off' && startsWith(github.ref_name, 'ci/base-') && 'armada-base')
+        || 'armada' }}
       cancel-in-progress: false
       queue: max
     timeout-minutes: 60
@@ -188,14 +225,18 @@ jobs:
       env:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
-        DEW_TEST_CACHE: ${{ github.event_name == 'schedule' && 'off' || 'on' }}
+        DEW_TEST_CACHE: ${{ needs.scope.outputs.policy }}
         PROVEN: ${{ needs.proven.outputs.run }}
       run: |
         armada=armada
+        # The test cache's policy, as the scope job read it.
+        echo "the test cache's policy: $DEW_TEST_CACHE"
         # Each client runs in a session of its own, so the interrupt a cancelled run sends this shell
         # reaches it and it cancels its armada job; the shell waits on them, where a trap runs.
         trap 'for group in ${gangs:-} ${suite:-}; do kill -INT -- "-$group" 2>/dev/null || true; done' INT TERM
-        if [ -z "$PROVEN" ]; then
+        # A base/<producer> promote and the background whole suite run no gangs: main's trains run them.
+        case "$GITHUB_REF_NAME" in ci/base-*|ci/full-whole-*) gangless=1 ;; *) gangless= ;; esac
+        if [ -z "$PROVEN" ] && [ -z "$gangless" ]; then
           # A gang member lost before the start fails it within 300 s (armada#22).
           items=$(python3 tools/armada/ci.py gangs)
           echo "$items" | setsid $armada map --commit=${{ github.sha }} --items=- --size=medium \
@@ -221,6 +262,21 @@ jobs:
           wait "$gangs" || failed=1
           echo "--- the multi-host gangs"
           cat "$RUNNER_TEMP/gangs.log"
+          # A red gang's logs, every rank's and attempt's with each one's relay (armada's GET
+          # /jobs/<id>/tasks/<i>/runs, and each run's log): the map's summary names no cause, and a gang's
+          # cause can sit on a rank other than the one that failed first.
+          job=$(grep -oE '\bjob [0-9]{14}-[0-9a-f]{8}' "$RUNNER_TEMP/gangs.log" | head -1 | cut -d' ' -f2)
+          # A task row: its index, then "exit <code>" or what else ended it (TIMEOUT, LOST, CANCELLED).
+          for task in $(awk '$1 ~ /^[0-9]+$/ && (($2 == "exit" && $3 != 0) || $2 ~ /^(TIMEOUT|LOST|CANCELLED)$/) { print $1 }' \
+                          "$RUNNER_TEMP/gangs.log"); do
+            runs=$(curl -sS --compressed --fail-with-body "${ARMADA_URL%/}/jobs/$job/tasks/$task/runs" \
+              -H "authorization: Bearer $ARMADA_TOKEN" -H "armada-protocol: 10") || runs='{"runs": []}'
+            for run in $(echo "$runs" | jq -r '.runs[] | "\(.vessel).\(.attempt):\(.rank)"'); do
+              echo "--- gang $task of job $job, rank ${run#*:} (${run%:*})"
+              curl -sS --compressed --fail-with-body "${ARMADA_URL%/}/jobs/$job/tasks/$task/runs/${run%:*}/log" \
+                -H "authorization: Bearer $ARMADA_TOKEN" -H "armada-protocol: 10" || echo "(armada stored no log for it)"
+            done
+          done
         fi
         exit $failed
     - name: Cancel the armada jobs of a cancelled run

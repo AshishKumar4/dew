@@ -11,7 +11,7 @@ from collections.abc import Callable
 import jax.numpy as jnp
 import numpy as np
 
-from dew.telemetry.devices import deterministic_ops_requested
+from dew.devices import deterministic_ops_requested
 
 from .kernels import decode_attention, generation
 from .kernels.generation import (
@@ -84,6 +84,13 @@ SPLASH_LANES = 128
 # preferred_element_type=float32, and the running max, sum and output stay
 # fp32 to the last block, which is the reference softmax.
 SPLASH_DTYPES = (jnp.bfloat16, jnp.float32)
+# The shortest sequence 'auto' hands splash. tools/qualify_splash.py on one
+# v6e (jax 0.11.1, bf16, 16 query heads over 8 key heads of width 128, 16384
+# causal tokens a step), a training step: splash 3.24 ms against XLA's 2.62
+# at 256 keys, 2.57 against 4.64 at 512, 28.9 against 144.2 at 16384; width
+# 64 crosses at the same length. Softcap, sinks and packed ids cost splash
+# at most 16% more from 512 to 16384.
+SPLASH_MIN_LENGTH = 512
 
 
 @dataclasses.dataclass(frozen=True)
@@ -95,9 +102,10 @@ class AttentionCase:
     (a windowed decode step's first key, `key_value_seq_starts`); `mask`
     is an arbitrary mask only the generic path takes. `arithmetic` is a call asking what only the
     reference path computes (`reference_only`), `narrows` one jax.nn's xla kernel would compute
-    below its precision (`_xla_kernel_narrows`, `_xla_kernel_chains`), `folds` one of few query
-    positions `folded_attention` reads on a GPU, and `splash` one splash's blocking tiles and its
-    mask describes (`tpu_runs`)."""
+    below its precision or a CPU's reference path (`_xla_kernel_narrows`, `_xla_kernel_on_cpu`),
+    `folds` one of few query positions `folded_attention` reads on a GPU, and `splash_mask` one whose
+    mask splash's descriptor describes, formed only where splash may run, under a name that may
+    choose it on a TPU (`TPU_BACKEND`), and False elsewhere."""
 
     queries: int
     keys: int
@@ -120,7 +128,7 @@ class AttentionCase:
     arithmetic: bool
     narrows: bool
     folds: bool
-    splash: bool
+    splash_mask: bool
     shards: int
 
 
@@ -297,10 +305,14 @@ most 64 wide where it was measured faster (an RTX 4080's SimpleDiT-B attention 5
 causal 3-layer decoder's 1.82 to 1.24; Qwen3-0.6B's 128-wide 9.13 to 9.24), and no window, mask, bias,
 sinks, softcap, documents or key lengths or starts."""
 
+TPU_BACKEND = _Need('backend', lambda case: generation.backend() == 'tpu', "it runs on a TPU", row=INHERENT,
+                    kind='measured')
+"""Splash's first requirement, a TPU, which the case builder also reads before it builds splash's mask
+descriptor (`AttentionCase.splash_mask`), the one fact that costs host-side work."""
+
 TPU_SUPPORTS = (
     # Elsewhere it runs interpreted, where 'tpu' is named.
-    _Need('backend', lambda case: generation.backend() == 'tpu', "it runs on a TPU", row=INHERENT,
-                kind='measured'),
+    TPU_BACKEND,
     _Need('bias', lambda case: not case.bias, "splash takes no bias", row=INHERENT, kind='measured'),
     _Need('key_lengths', lambda case: not (case.lengths or case.starts),
                 "splash takes key lengths and starts only as a mask it cannot describe", row=INHERENT,
@@ -313,7 +325,9 @@ TPU_SUPPORTS = (
         ('dtype', lambda case: case.dtype in SPLASH_DTYPES, "splash takes bf16 and fp32"),
         ('shards', lambda case: case.shards == 1,
          "an automatic sequence axis gathers the keys, and a pallas call would gather the queries back"),
-        ('tiles', lambda case: case.splash,
+        ('tiles', lambda case: (case.queries % SPLASH_LANES == 0 and case.keys % SPLASH_LANES == 0
+                                and min(case.queries, case.keys) >= SPLASH_MIN_LENGTH
+                                and case.splash_mask),
          "splash's blocking does not tile the lengths, or its descriptor cannot describe the mask"),
     )),
     _ARITHMETIC,
@@ -330,7 +344,7 @@ XLA_SUPPORTS = (
     _Need('softcap', lambda case: case.softcap is None, "jax.nn's attention has no softcap",
                 row=INHERENT, kind='handoff'),
     _Need('narrows', lambda case: not case.narrows,
-                "jax.nn's xla kernel would compute the call below its precision or sum it in one chain",
+                "jax.nn's xla kernel would compute the call below its precision or a CPU's reference path",
                 row=INHERENT, kind='handoff'),
     _Need('arithmetic', lambda case: not case.arithmetic,
                 "the call asks for arithmetic only the reference path computes (`reference_only`)",
@@ -341,7 +355,8 @@ the reference path."""
 
 
 def _attention_preferred(case: AttentionCase) -> str:
-    """The kernel the target measured fastest for `case`: splash on a TPU and xla on a CPU; on a GPU
+    """The kernel the target measured fastest for `case`: splash on a TPU and xla on a CPU, where its
+    calls take the reference path (`_xla_kernel_on_cpu`); on a GPU
     xla for a query no fused kernel takes the dtype of, else its row's ('attention', cuDNN by
     default), and the narrow heads' row's ('attention_narrow') for heads at most 64 wide with no
     window, mask, bias, documents, key lengths or key starts (`_narrow`): by default tokamax's Triton

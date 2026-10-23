@@ -119,7 +119,7 @@ def cross_document_mask(segment_ids: CrossDocuments, *, causal: bool,
     """`[B, 1, Q, K]`: each query's document's keys (`document_mask`), under causality and a window
     aligned to the document's last key (`aligned_places`); causality keeps the keys at or before a
     query's place, a window of w the w - 1 before it, or without causality those within w - 1 of it
-    (`dew.nn.attention.window_sides`). A key's rank in its document is its distance from the
+    (`dew.nn.visibility.window_sides`). A key's rank in its document is its distance from the
     document's first key, the keys running in ascending id order."""
     _, keys = document_ids(segment_ids)
     ordered = _padding_last(keys)

@@ -6,7 +6,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-// Dew's package index, the one place Dew's JAX build is served (dew.telemetry.builds.PACKAGE_INDEX).
+// Dew's package index, the one place Dew's JAX build is served (dew.builds.PACKAGE_INDEX).
 // BEGIN package index (site/scripts/gen_install.py)
 const PACKAGE_INDEX = 'https://pypi.dewml.dev/simple';
 // END package index

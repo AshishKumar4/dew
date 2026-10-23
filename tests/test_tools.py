@@ -21,7 +21,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, chain_roundings
 from test_moe import OUTPUT_TOLERANCE, ROUTER_TOLERANCE
 from test_t5_encoders import TOLERANCE as T5_TOLERANCE
 from test_text_encoders import transformers_clip
@@ -354,8 +354,9 @@ def test_layout_parity_orders_preserve_the_tiny_nemotron_function():
         model = loaded.model.clone(dtype=jnp.float64)
         truth = np.asarray(model.apply(wide, ids))
         reordered = np.asarray(model.apply(permuted(wide, order), ids))
+        roundings = chain_roundings(jax.make_jaxpr(lambda variables: model.apply(variables, ids))(wide))
     tool.order_invariance({'logits': reordered}, {'logits': truth},
-                          float(reordered.sum()), float(truth.sum()))
+                          float(reordered.sum()), float(truth.sum()), roundings=roundings)
 
 
 def test_residual_orders_preserve_a_decoder_whose_heads_are_the_residual_width():
@@ -378,8 +379,41 @@ def test_residual_orders_preserve_a_decoder_whose_heads_are_the_residual_width()
         truth = np.asarray(model.apply(wide, ids))
         order = orders(residual_width(variables), 2, seed=6)[1]
         reordered = np.asarray(model.apply(permuted(wide, order), ids))
+        roundings = chain_roundings(jax.make_jaxpr(lambda variables: model.apply(variables, ids))(wide))
     load('layout_parity').order_invariance({'logits': reordered}, {'logits': truth},
-                                           float(reordered.sum()), float(truth.sum()))
+                                           float(reordered.sum()), float(truth.sum()), roundings=roundings)
+
+
+def test_a_nonfinite_order_fails_the_invariance_check():
+    """A residual order whose function or loss is not finite fails the check, as a NaN compares
+    with nothing."""
+    tool = load('layout_parity')
+    for logits, loss in ((np.array([np.nan, 1.0]), 1.0), (np.array([1.0, 2.0]), np.nan)):
+        with pytest.raises(ValueError):
+            tool.order_invariance({'logits': logits}, {'logits': np.array([1.0, 2.0])}, loss, 1.0,
+                                  roundings=1)
+
+
+def test_residual_orders_preserve_a_looped_ngpt():
+    """A residual order is an exact symmetry of Dory's looped nGPT decoder: its per-feature step rates
+    (`attn_alpha`, `mlp_alpha`) live on the residual stream and are reordered with it, as its norms'
+    scales are; left in place, the reordered model computes another function (the 4B release's order 1
+    sat at an RMS of 10 from vLLM's log probabilities)."""
+    from residual_orders import orders, permuted, residual_width
+
+    from dew.interop import Pretrained
+
+    loaded = Pretrained.load(FIXTURES / 'hf/dory-tiny', dtype='float32', attention_impl='reference')
+    ids = jnp.array([[2, 7, 11, 3, 5, 1, 9, 4]], jnp.int32)
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), loaded.variables)
+        model = loaded.model.clone(dtype=jnp.float64)
+        truth = np.asarray(model.apply(wide, ids))
+        order = orders(residual_width(loaded.variables), 2, seed=6)[1]
+        reordered = np.asarray(model.apply(permuted(wide, order), ids))
+        roundings = chain_roundings(jax.make_jaxpr(lambda variables: model.apply(variables, ids))(wide))
+    load('layout_parity').order_invariance({'logits': reordered}, {'logits': truth},
+                                           float(reordered.sum()), float(truth.sum()), roundings=roundings)
 
 
 @pytest.mark.parametrize("model", ["dit", "dense_mdlm"])
@@ -1535,3 +1569,50 @@ def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_pat
     })
     assert found == [*[("src/sparx/graph.py", line, "SLOP012") for line in (8, 9, 20, 27)],
                      *[("tools/bench.py", line, "SLOP012") for line in (5, 6, 7, 8, 8, 9, 10, 16)]]
+
+
+# ---------------------------------------------------------------------------
+# tools/benchmark_data.py
+# ---------------------------------------------------------------------------
+
+def test_the_data_benchmark_counts_a_grain_packing_and_dews_alike_as_the_objective_counts_them():
+    """The data benchmark counts a batch's tokens and work as the run's objective counts them
+    (`real_lengths`, `training_flops`), whichever packer laid the batch out: Grain's first-fit
+    windows, laid out as Dew's read lays its own (`Coordinated`), hold the same real tokens as Dew's
+    windows of the same documents. An image's rows count, and its objective declares no work."""
+    import grain.experimental as gx
+    import grain.python as grain
+
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources.memory import Memory
+    from dew.data.steps.generic import Coordinated
+
+    tool = load("benchmark_data")
+    worker = tool.Worker("dew", "text", Path("in"), Path("out"), tool.Measurement(seq_len=8))
+    objective = tool.objective_for(worker)
+    documents = [{"text": np.arange(1, size + 1, dtype=np.int32)} for size in (3, 5, 2, 4, 6)]
+    rows = grain.MapDataset.source(documents).to_iter_dataset()
+    native = list(gx.FirstFitPackIterDataset(rows, length_struct={"text": 9}, num_packing_bins=2,
+                                             shuffle_bins=False))
+    stacked = {name: np.stack([window[name] for window in native]) for name in native[0]}
+    laid = Coordinated(("text",), None).map(stacked)
+    loader = compile(Pipeline(Memory(documents)).pack(9, bins=2).batch(len(native)), read="memory",
+                     loading=Loading(workers=0, threads=1, read_buffer=0))
+    reader = loader.train(DataPartition())
+    try:
+        ours = next(reader)
+    finally:
+        reader.close()
+    expected = int(np.sum(objective.real_lengths(ours)))
+    counted = [tool.batch_counts(batch, objective)["tokens"] for batch in (laid, ours)]
+    assert counted == [expected, expected]
+    work = tool.Counted(iter([laid]), objective)
+    next(work)
+    assert work.counts.get()["model_flops"] == objective.training_flops(None, ours) > 0
+    image = tool.objective_for(tool.Worker("dew", "image", Path("in"), Path("out"), tool.Measurement()))
+    pictures = tool.Counted(iter([{"image": np.zeros((2, 8, 8, 3), np.uint8)}]), image)
+    next(pictures)
+    assert {key: value for key, value in pictures.counts.get().items() if key != "padded_tokens"} == {
+        "rows": 2, "tokens": 2, "model_flops": None}

@@ -63,7 +63,7 @@ The recipe's data is a chain, which it records with the run. Its settings change
 # byte_demo.py
 from dew.data import Loading, presets
 from dew.data.sources import TokenFiles
-from dew.objectives.lm import LMRunConfig
+from dew.config.lm import LMRunConfig
 
 loading = Loading(workers=0, threads=1, read_buffer=2)
 windows = {"seq_len": 16, "batch": 8}
@@ -111,24 +111,26 @@ Every recipe's configuration extends `RunConfig` with five parts:
 | `model` (`ModelConfig`) | The model's class and its constructor fields, compute dtype and attention kernel among them. | `--model causal_transformer --model.num-layers 12` |
 | `objective` (`ObjectiveConfig`) | The objective's class and the constructor arguments the run states. | `--objective lm --objective.ema-decay 0.999` |
 | `data`, `validation` | Chains: a source, its steps and a preset, recorded with the run. | `--set data.token_windows.seq_len=16` |
-| `optim` (`OptimConfig`) | Optimizer, learning rate, schedule, weight decay, clipping, optimizer-state dtype. | `--optim.learning-rate 0.0001` |
+| `optim` (`OptimConfig`) | Optimizer, constant or scheduled rate, weight decay, clipping, optimizer-state dtype. | `--optim.rate 0.0001` |
 | `trainer` (`TrainerConfig`) | Run length, checkpoint and logging intervals, mesh and layout, tracking. | `--trainer.steps 1000` |
 
 A dotted flag sets a field inside a configuration object, and `--set path=value`, applied after the flags, sets one inside the run's data chain: `data.<preset>.<setting>` for the preset's settings and `data.source.url` for its store. `--model` picks the model's class by alias or import path (`--model hybrid_dit`, `--model mypackage.models:Net`), and every field that class declares is then a flag of its own, typed by its annotation: `--model.num-layers 12`, `--model.dtype float32`, `--model.precision highest`. A field holding records, such as a UNet's `attention_configs`, takes one JSON value. Naming another class starts from that class's defaults and keeps the recipe's compute dtype. `--objective` works the same way: it picks the objective's class, and each argument of its constructor is a flag, `--objective.<argument>`, except th…
 
-| Setting | Default | Notes |
-|---|---|---|
-| `--model.dtype` | `bfloat16` | The model's compute dtype, which each recipe's default model states. Parameters are stored in float32. A run-wide matmul precision is `jax.default_matmul_precision`; a model's own is `--model.precision`. |
-| `--model.attention-impl` | `auto` | A name `AttentionImpl` declares ([dew/nn/attention.py](../src/dew/nn/attention.py)). The example uses `reference` so no device-specific kernel runs. |
-| `--optim.optimizer` | `adamw` | `adam`, `adamw`, `lamb`, `muon` or `muonclip`. |
-| `--optim.learning-rate` | `2.7e-4` | The constant rate when no schedule is named. |
-| `--optim.state-dtype` | `float32` | `bfloat16` stores Adam's moments stochastically rounded, for `adam` and `adamw` only. |
-| `--trainer.steps` / `--trainer.epochs` | | Run length; set one, not both. |
-| `--set data.<preset>.batch` | `32` | Global batch across all JAX processes, the preset's (`data.token_windows.batch`, `data.images.batch`). |
-| `--trainer.eval-every`, `--trainer.checkpoint-every` | `epoch` | A step interval, `epoch`, or `None`. |
-| `--trainer.checkpoint-dir`, `--trainer.name` | `./checkpoints`, none | The run's directory is `<checkpoint-dir>/<name>`. |
-| `--trainer.multi-host` | `None` | Join the JAX process pool: `None` asks and continues alone when no cluster is configured, `True` requires the pool, `False` never asks. |
-| `--trainer.xla-flags` | `None` | Extra `XLA_FLAGS`, applied before JAX opens a backend. |
+Each setting's default is the recipe's own, which can differ from the configuration class's: the language-model recipe states its own optimizer settings (`LMRunConfig`). A recipe's `--help` prints every flag with the default that recipe runs with, for example `python recipes/lm/train.py --help`.
+
+| Setting | Notes |
+|---|---|
+| `--model.dtype` | The model's compute dtype, which each recipe's default model states. Parameters are stored in float32. A run-wide matmul precision is `jax.default_matmul_precision`; a model's own is `--model.precision`. |
+| `--model.attention-impl` | A name `AttentionImpl` declares ([dew/nn/attention.py](../src/dew/nn/attention.py)). The example uses `reference` so no device-specific kernel runs. |
+| `--optim.optimizer` | `adam`, `adamw`, `lamb`, `muon` or `muonclip`. |
+| `--optim.rate` | The learning rate: a number, or a schedule's record as JSON (`'{"class": "cosine", "fields": {...}}'`). |
+| `--optim.state-dtype` | `bfloat16` stores Adam's moments stochastically rounded, for `adam` and `adamw` only. |
+| `--trainer.steps` / `--trainer.epochs` | Run length; set one, not both. |
+| `--set data.<preset>.batch` | Global batch across all JAX processes, the preset's (`data.token_windows.batch`, `data.images.batch`). |
+| `--trainer.eval-every`, `--trainer.checkpoint-every` | A step interval, `epoch`, or `None`. |
+| `--trainer.checkpoint-dir`, `--trainer.name` | The run's directory is `<checkpoint-dir>/<name>`. |
+| `--trainer.multi-host` | Join the JAX process pool: `None` asks and continues alone when no cluster is configured, `True` requires the pool, `False` never asks. |
+| `--trainer.xla-flags` | Extra `XLA_FLAGS`, applied before JAX opens a backend. |
 
 A chain's `workers(n)`, `threads(n)` or `loading(Loading(...))` control how the host reads data; they do not change the batch size on the device. With zero workers the loader starts no worker processes. [Training data](concepts/data.md) covers the loading settings.
 
@@ -157,7 +159,7 @@ python "$DEW_REPO/recipes/diffusion/train.py" --help
 python "$DEW_REPO/recipes/jepa/train.py" --help
 ```
 
-A diffusion configuration adds a training `preset`, a text condition and an optional autoencoder. You pick a preset with a subcommand such as `preset:edm`. The objective (`--objective`, `diffusion` by default) holds the EMA, the condition dropout and how validation samples: `--objective.ema-decay 0.9999`, `--objective.steps 40`, and records for the solver and the guidance, `--objective.solver '{"class": "heun"}'` and `--objective.guidance '{"class": "dew.sampling.guidance:CFG", "fields": {"scale": 4.0}}'`. Another objective trains a loss of its own in place of the denoising loss: `mean_flow`, `shortcut`, `flow_grpo`, or a distillation of a saved run, `rcm`, `ladd` or `guidance_distillation` with `--objective.teacher-run <run directory>`. Each refuses a p…
+A diffusion configuration adds a training `preset`, a text condition and an optional autoencoder. You pick a preset with a subcommand such as `preset:edm`. The objective (`--objective`, `diffusion` by default) holds the EMA, the condition dropout and how validation samples: `--objective.ema-decay 0.9999`, `--objective.steps 40`, and records for the solver and the guidance, `--objective.solver '{"class": "heun"}'` and `--objective.guidance '{"class": "dew.sampling.guidance:CFG", "fields": {"scale": 4.0}}'`. Another objective trains a loss of its own in place of the denoising loss: `mean_flow`, `shortcut`, `flow_grpo`, or a distillation of a saved run, `rcm`, `ladd` or `guidance_distillation` with `--teacher-run <run directory>`. Each refuses a p…
 
 By default the recipe trains on Oxford Flowers with a CLIP condition encoder. Prepare TFDS separately and point the chain's source at it, `--set data.source.path=...` (see Installation). Large corpora use the same `images` preset over `Files` URLs, including ArrayRecord and Parquet, in a run file. Choose the read mode explicitly; preparation and provisioning are not step-zero fallbacks.
 
@@ -212,7 +214,7 @@ Each `--set path=value` changes the field at a dotted path, read as the field's 
 
 `dew train` imports the file as the module its name names, so the model, loss and metrics it defines are recorded by import path (`experiment:MLP`), and a lambda is refused where the run states it. Reading a record constructs only what its field declares: a model is a Flax module, an objective an `Objective`, and a loss or metric a function, or a class whose instances are called from Dew, Flax, the experiment's own module or a package `--trust` names. `dew train <checkpoint-dir>/<name>/run.json --trust experiment` rebuilds the run from its record alone, with `experiment.py` importable (`PYTHONPATH`); it continues from the run's checkpoints, or trains it again elsewhere with `--set trainer.checkpoint_dir=...`. [`examples/train_supervised.py`](../examples/train_supervised.py) is a complete experiment. `dew train` also trains a recipe's run from its `run.json`, which names the run's class.
 
-A run is a frozen dataclass that extends `RunConfig`: `LMRunConfig` (`dew.objectives.lm`), `DiffusionRunConfig` (`dew.objectives.diffusion`), `JepaRunConfig` (`dew.objectives.jepa`) and `DecisionRunConfig` (`dew.decision.config`). `config.run()` sets up the process, builds what the run trains (`prepare`), and trains it under `--trainer.name`, or `<objective>-<dataset>/date-<time>` when that is unset; the name is recorded in `run.json`, so training the record again continues the same run. A kind of run adds its own settings and builds from them in `prepare`. The [diffusion](guides/diffusion.md) and [representation learning](guides/representation-learning.md) guides cover task-specific settings.
+A run is a frozen dataclass that extends `RunConfig`: `LMRunConfig` (`dew.config.lm`), `DiffusionRunConfig` (`dew.config.diffusion`), `JepaRunConfig` (`dew.config.jepa`) and `DecisionRunConfig` (`dew.decision.config`). `config.run()` sets up the process, builds what the run trains (`prepare`), and trains it under `--trainer.name`, or `<objective>-<dataset>/date-<time>` when that is unset; the name is recorded in `run.json`, so training the record again continues the same run. A kind of run adds its own settings and builds from them in `prepare`. The [diffusion](guides/diffusion.md) and [representation learning](guides/representation-learning.md) guides cover task-specific settings.
 
 ## Scaling up
 

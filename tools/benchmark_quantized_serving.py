@@ -77,7 +77,7 @@ class Config:
     """Names of modules to leave unquantized, matched anywhere in their path."""
     model: str = "dewml/hybrid-dit-176m"
     """A Hugging Face Hub repository, or a local Dew run directory."""
-    revision: str | None = "9ae074a357738c1634971627608fce3bd7fa3167"
+    revision: str | None = "8d891d967319e51cd0e73d3e5b7c29d68a238b52"
     """The Hub commit or tag to load; local run directories do not use it."""
     clip: bool = True
     """Sample every prompt at both seeds and score the images with CLIP."""
@@ -137,7 +137,8 @@ def sample(pipe: TextToImage, key: int | jax.Array, decode_batch: int) -> tuple[
 
 def quality(pipe: TextToImage, decode_batch: int) -> dict:
     from dew.data.text import load_tokenizer
-    from dew.eval.images import DEFAULT_MODEL, clip_image_text_cosine
+    from dew.eval.images import clip_image_text_cosine
+    from dew.nn.text_encoders import DEFAULT_MODEL
 
     tokenizer = load_tokenizer(DEFAULT_MODEL)
     tokens = tokenizer(list(PROMPTS), padding="max_length", max_length=tokenizer.model_max_length,
