@@ -264,6 +264,13 @@ def _torch_bicubic_weights(size_in: int, size_out: int, antialias: bool) -> np.n
     return matrix.astype(np.float32)
 
 
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+"""The ImageNet pixel statistics, per RGB channel, that encoders trained on ImageNet read their
+inputs under: transformers' `IMAGENET_DEFAULT_MEAN` and `IMAGENET_DEFAULT_STD`, which a test holds
+these equal to (Dew imports no transformers at module level)."""
+
+
 def torch_bicubic_resize(x, height: int, width: int, *, antialias: bool = False):
     """Resample `[B, H, W, C]` to `height` by `width` as torch's
     `F.interpolate(mode="bicubic", align_corners=False)` does.
