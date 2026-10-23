@@ -435,10 +435,10 @@ def token_draw(rows):
     return lambda seed: (token_rows(VOCAB, rows, SEQ_LEN, seed=seed)["text"],)
 
 
-PIPELINED_STATES_SEEDS = 0
-"""The pipelined layer states' check-1 seeds, sized by `seeds_for` on armada."""
-FETCHED_STATES_SEEDS = 0
-"""The host-fetched layer states' check-1 seeds, sized by `seeds_for` on armada."""
+PIPELINED_STATES_SEEDS = 8
+"""The pipelined layer states' check-1 seeds, sized by `seeds_for` on armada (f913cd36a)."""
+FETCHED_STATES_SEEDS = 8
+"""The host-fetched layer states' check-1 seeds, sized by `seeds_for` on armada (f913cd36a)."""
 
 
 def pipelined_layer_states():
