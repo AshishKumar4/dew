@@ -55,6 +55,7 @@ from .kernels.generation import bf16_dot_runs, gpu_placed
 from .kernels.selection import forced, select
 from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import (
+    FP32_SUMS,
     asks_default_precision,
     at_default_precision,
     at_least_fp32,
@@ -1624,8 +1625,9 @@ def _xla_kernel_on_cpu(query) -> bool:
     reference path. jax's sums fp32 products in fp32, as XLA:CPU's dot does, where Dew sums a CPU's
     in float64 (`precision.accumulated`), and it differentiates the softmax through rowsum(dO * O),
     which leaves a query that reads one key a rounding's gradient where the softmax's own derivative,
-    the reference path's, is exactly zero."""
-    return generation.backend() == 'cpu'
+    the reference path's, is exactly zero. A scope that stands for an accelerator (`FP32_SUMS`)
+    runs the kernel an accelerator runs."""
+    return generation.backend() == 'cpu' and jax.config.jax_default_matmul_precision != FP32_SUMS
 
 
 def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_softmax=True, softcap=None,
