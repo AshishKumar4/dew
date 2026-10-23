@@ -8,7 +8,7 @@ import json
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Self, overload
 
 import jax
 import jax.numpy as jnp
@@ -301,8 +301,15 @@ class Decide:
 
         The rows of every request are scored together within the budget.
         """
-        rows = [(index, encoded) for index, (state, questions) in enumerate(requests)
-                for encoded in self._encoded(state, questions)]
+        return self._answered([self._encoded(state, questions) for state, questions in requests],
+                              [questions for _, questions in requests])
+
+    def _answered(self, encoded: Sequence[Sequence[Encoded]], asked: Sequence[Mapping[str, Question]]
+                ) -> list[tuple[dict[str, Answer], Usage]]:
+        """Each request's answers and usage, from the rows it encodes to (`_encoded`) and its
+        questions, every request's rows scored together within the budget."""
+        requests = list(zip(encoded, asked, strict=True))
+        rows = [(index, row) for index, (own, _) in enumerate(requests) for row in own]
         logits = self.logits([encoded for _, encoded in rows])
         answered: list[tuple[dict[str, Answer], Usage]] = []
         for index, (_, questions) in enumerate(requests):
@@ -527,9 +534,22 @@ class Decide:
                       else Abstention(default=float(min_confidence)))
         return replace(self, calibration=replace(self.calibration, abstention=abstention))
 
+    @overload
     def systemone(self, request: Mapping[str, object], *, details: bool = False,
-                  strict: bool = False, whole: bool = False) -> dict[str, JSON]:
-        """Answer a Jev request body with a Jev response body.
+                  strict: bool = False, whole: bool = False) -> dict[str, JSON]: ...
+
+    @overload
+    def systemone(self, request: Sequence[Mapping[str, object]], *, details: bool = False,
+                  strict: bool = False, whole: bool = False) -> list[dict[str, JSON] | ValueError]: ...
+
+    def systemone(self, request, *, details=False, strict=False, whole=False):
+        """Answer a Jev request body with a Jev response body, or a list of bodies with a list of
+        responses, in order.
+
+        A list's bodies are answered as each would be alone, their rows scored
+        together within the budget (`batch`); a body Jev would refuse takes its
+        refusal, the ValueError a lone body raises, in its place, and the others
+        are answered all the same.
 
         The request holds `state` and `questions` in Jev's wire format, and
         optionally `model`, which this task ignores. The response holds `model` (this
@@ -552,6 +572,46 @@ class Decide:
         """
         if strict and details:
             raise ValueError("strict answers hold Jev's fields alone, so they carry no details")
+        if isinstance(request, Mapping):
+            [answered] = self._systemone([request], details=details, strict=strict, whole=whole)
+            if isinstance(answered, ValueError):
+                raise answered
+            return answered
+        return self._systemone(list(request), details=details, strict=strict, whole=whole)
+
+    def _systemone(self, requests: Sequence[Mapping[str, object]], *, details: bool, strict: bool,
+                   whole: bool) -> list[dict[str, JSON] | ValueError]:
+        """`systemone` over a list of bodies: each parsed and laid out on its own, so a refusal is its
+        body's alone, and the text bodies' rows scored in one batch."""
+        answered: dict[int, dict[str, JSON] | ValueError] = {}
+        asked: dict[int, tuple[JSON, dict[str, Question]]] = {}
+        laid: dict[int, list[Encoded]] = {}
+        seen: dict[int, tuple[dict[str, Answer], Usage]] = {}
+        for index, request in enumerate(requests):
+            try:
+                state, questions, images = self._read_wire(request, strict=strict)
+                asked[index] = state, questions
+                if images:
+                    seen[index] = self._seen(state, questions, images)
+                else:
+                    laid[index] = self._encoded(state, questions)
+            except ValueError as refused:
+                answered[index] = refused
+        order = sorted(laid)
+        scored = {} if not order else dict(zip(order, self._answered(
+            [laid[index] for index in order], [asked[index][1] for index in order]), strict=True))
+        for index, (answers, usage) in {**scored, **seen}.items():
+            try:
+                answered[index] = self._wire_response(asked[index][1], answers, usage, details=details,
+                                                      whole=whole)
+            except ValueError as refused:
+                answered[index] = refused
+        return [answered[index] for index in range(len(requests))]
+
+    def _read_wire(self, request: Mapping[str, object], *, strict: bool
+                   ) -> tuple[JSON, dict[str, Question], list[Image.Image]]:
+        """A Jev body's state, questions and images (none where `strict`), refused with a ValueError
+        where Jev would refuse it."""
         unknown = set(request) - {"state", "questions", "model", *EXTENSIONS}
         if unknown:
             raise ValueError(f"a request holds state, questions and model, not {sorted(unknown)}")
@@ -562,9 +622,12 @@ class Decide:
         if not questions:
             raise ValueError("a request needs at least one question")
         state = json_value(request["state"], "state")
-        images = [] if strict else decoded_images(request.get("images"))
-        answers, usage = (self._seen(state, questions, images) if images
-                          else self.batch([(state, questions)])[0])
+        return state, questions, [] if strict else decoded_images(request.get("images"))
+
+    def _wire_response(self, questions: Mapping[str, Question], answers: Mapping[str, Answer], usage: Usage,
+                       *, details: bool, whole: bool) -> dict[str, JSON]:
+        """A Jev response body of a request's answers and usage, refused where `whole` and the layout
+        cut the request to fit."""
         if whole and (usage.truncated or usage.trimmed):
             cut = "state" if usage.truncated else "instructions or options"
             raise ValueError(f"the request does not fit the maximum context length, max_len="

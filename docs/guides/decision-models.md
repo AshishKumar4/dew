@@ -48,7 +48,9 @@ decide.systemone({
 
 The response has exactly Jev's fields, with numbers rounded to four places. `details=True` adds what Laya's server adds: a noul's confidence, whether a gated answer abstained, and how much of the state the rows kept. A request may also carry `images`, PIL images or encoded images, bare or as `data:` URLs, which a task whose backbone reads images lays out with the state, as a joint-head release does (`decide(state, questions, images=[...])` takes them too); `strict=True` answers exactly as Jev's endpoint does, dropping such extension fields.
 
-Dew ships no HTTP server of its own, but `systemone` is all one needs. `examples/serve_decisions.py` serves it with Starlette in about forty lines, at Jev's `POST /v1/systemone`, with Jev's 422 for a request it refuses and an optional bearer key:
+`systemone` also takes a list of request bodies and returns their responses in order, each as it would answer the body alone, the bodies' rows scored together in one pass per budget's worth (`Decide.batch`). A body with images is answered by its own pass within the call, and a body Jev would refuse takes the `ValueError` it would raise alone in its place, the others answered all the same.
+
+Dew ships no HTTP server of its own, but `systemone` is all one needs. `examples/serve_decisions.py` serves it with Starlette, at Jev's `POST /v1/systemone`, with Jev's 422 for a request it refuses and an optional bearer key. It answers concurrent requests together: those arriving within `--batch-window` seconds of the first, up to `--max-batch`, go through one `systemone` call:
 
 ```bash
 uv pip install "dewml[serve] @ git+https://github.com/AshishKumar4/dew" \

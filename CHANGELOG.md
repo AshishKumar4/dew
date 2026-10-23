@@ -5,6 +5,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- `Decide.systemone` takes a list of request bodies and answers each as it
+  would alone, their rows scored together, a refused body's `ValueError` in its
+  place; `examples/serve_decisions.py` answers concurrent requests in batches
+  (`--batch-window`, `--max-batch`) instead of one at a time.
 - `train/flops`, a step's analytical training work, is logged on every device,
   CPU and TPU included; `train/mfu` still needs a device with a known peak.
 - `dew.figures` draws SVG figures for notebooks and docs. Their colors follow
