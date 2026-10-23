@@ -9,7 +9,15 @@ so the mixed f32 x bf16 backward products run at the fp32 rate. XLA's
 fp32 accumulation, whatever the storage), and jax carries `precision` into
 the transpose rules, so the backward follows; jax's own xla attention sets it
 for this reason (jax-ml/jax#24047).
-"""
+
+A CPU sums every float32 product of the dot family, dot_general, einsum and matmul, in float64 and
+rounds once (`accumulated`): XLA:CPU chooses its fp32 dot accumulation by shape, instruction set and
+release, and jax 0.12's summed twice numpy's error from float64 where 0.11's summed 0.6 of it.
+Convolutions, depthwise ones included, keep XLA's fp32 sum on a CPU: no convolution's check 1
+failed there, and XLA:CPU's float64 convolution cost a 3x3 one's training step 44 times (15.5 to
+675 ms on a 4x32x32x128 map), its best rewrite 2 to 4. Should a convolution's check 1 resolve above
+its bar, the recorded fix is that rewrite: the kernel's shifted windows taken inside the float64
+scope and contracted with the taps as one 2D product (stride 1 train 3.9 times, stride 2 1.6)."""
 
 from __future__ import annotations
 

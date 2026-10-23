@@ -57,6 +57,8 @@ The GPU tier uses real checkpoints and representative shapes on each target a ch
 
 `tests/reference_error.py` owns the acceptance rule and states it: every comparison of Dew's outputs and gradients with float64 truth goes through its assertion, and nothing here restates the rule. A failure is a defect in Dew, the reference arm or the rule's derivation. Find which one. Never widen a tolerance, change the reference to one Dew already matches, drop failing positions or gradients, or compare only argmax when logits disagree.
 
+A CPU's float32 products follow Dew's accumulation policy, which `dew.nn.precision` states with its boundary: the dot family sums in float64, convolutions keep XLA's fp32 sum.
+
 The committed generator uses the reference's public interface. Kernel qualification records forward, backward and forward-mode behavior where the consuming objective needs it.
 
 ## Tests must catch a defect
