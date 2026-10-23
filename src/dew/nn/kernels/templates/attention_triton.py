@@ -579,7 +579,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     def step(index, carry):
         # Each cotangent over the prior denominator, in the reference's order, and taken to the pass's
         # own at the end (`algebra.dq_finish`); the weights' sums unnormalized.
-        dq, residual, mass, grads, weighed = carry
+        dq, residual, mass, grads, weighed, keyed = carry
         keys, k_pos, seen, params = tile(index)
         key, value = key_ref[keys, :], value_ref[keys, :]
         weights, _, cotangents, slopes = _tile_scores(score_mod, query, key, value, dout, peak, prior, anchor,
@@ -590,17 +590,19 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
         dq = dq + algebra.cotangent_product(logits * scale, key, product)
         grads = tuple(grad + piece if row else grad for grad, row, piece in zip(grads, summed, pieces,
                                                                                strict=True))
+        # The weights' own product with the keys, which takes dQ to the refined D (`algebra.dq_finish`).
+        pulled_weights, pieces = algebra.pulled(weights, slopes, seen, score_kinds)
+        keyed = keyed + product(algebra.narrow(pulled_weights * scale, key.dtype), key)
         if any(summed):
-            _, pieces = algebra.pulled(weights, slopes, seen, score_kinds)
             weighed = tuple(sums + piece if row else sums for sums, row, piece in zip(weighed, summed, pieces,
                                                                                     strict=True))
-        return (dq, residual + cotangents.sum(axis=-1), mass + weights.sum(axis=-1), grads, weighed)
+        return (dq, residual + cotangents.sum(axis=-1), mass + weights.sum(axis=-1), grads, weighed, keyed)
 
     nothing = jnp.zeros((block_q,), jnp.float32)
     rows = tuple(nothing for _ in score_kinds)
+    zeros = jnp.zeros(query.shape, jnp.float32)
     sums = algebra.DqSums(*jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], step,
-                                             (jnp.zeros(query.shape, jnp.float32), nothing, nothing, rows,
-                                              rows)))
+                                             (zeros, nothing, nothing, rows, rows, zeros)))
     dq, delta, total, mass, grads = algebra.dq_finish(sums, prior, state_total, peak0, shares, peak, anchor,
                                                       delta)
     dq_ref[...] = dq
