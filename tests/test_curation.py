@@ -2,7 +2,7 @@
 n-gram decontamination against evaluation texts, a fastText classifier and language
 identification, each dropping the records it rejects, counted by the reason it names, and each
 keyed in the plan by the rules and the model it runs; and sealing it without its near-duplicates
-by DataTrove's MinHash stages."""
+by DataTrove's MinHash stages, read once."""
 
 import pytest
 
@@ -100,10 +100,29 @@ def test_a_corpus_sealed_without_its_near_duplicates_keeps_one_record_of_each_gr
     copied = PROSE[1].replace("bread", "loaf", 1)
     pages = [PROSE[0], PROSE[1], PROSE[0], PROSE[2], copied]
     corpus = Memory([{"id": index, "text": page} for index, page in enumerate(pages)], shard_rows=len(pages))
-    manifest = text.deduplicated(Pipeline(corpus), str(tmp_path / "sealed"))
+    manifest = Pipeline(corpus).snapshot(str(tmp_path / "sealed"), deduplicate=text.NearDuplicates())
     stored = Files(str(tmp_path / "sealed")).records("indexed")
     kept = [int(stored[index]["id"]) for index in range(len(stored))]
     assert sorted({pages[index] for index in kept}) == sorted(set(PROSE))
     assert kept == sorted(kept) and len(kept) == len(PROSE)
     assert manifest["rows"] == len(PROSE)
     assert manifest["metadata"]["near_duplicates"]["removed"] == len(pages) - len(PROSE)
+
+
+def test_a_quality_rule_takes_its_filters_own_settings_a_list_among_them():
+    """A setting is the filter's constructor argument: Gopher's stop words, a list, given as a tuple,
+    replace its own, so prose that holds none of them is rejected for that, and the step's identity
+    keys the plan by them."""
+    rule = text.Quality("gopher", settings=(("stop_words", ("zyzzyva", "quux")),))
+    kept, dropped = one_pass(Pipeline(web_pages()).filter_map(rule))
+    assert kept == [] and sum(dropped.values()) == len(PROSE) + 2
+
+
+def test_curation_reads_alike_on_many_threads():
+    """A process's readers share each DataTrove filter, built once: eight reader threads drop and
+    keep what one does."""
+    chain = Pipeline(web_pages()).filter_map(text.Quality("gopher"),
+                                             text.Decontaminated(against=(EVALUATION,)))
+    alone = [int(record["id"]) for record in iterate(chain.read("indexed").threads(1), read="indexed")]
+    together = [int(record["id"]) for record in iterate(chain.read("indexed").threads(8), read="indexed")]
+    assert together == alone == [0, 1, 2]

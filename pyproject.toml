@@ -192,7 +192,7 @@ delta = ["deltalake>=1.0"]
 # dew.data.text's curation steps (Language, Quality, Classifier, Decontaminated): DataTrove's language,
 # quality, fastText and n-gram decontamination filters. DataTrove splits English into words with a blank
 # spaCy pipeline, which its own multilingual extra brings beside TensorFlow; spaCy alone is enough here.
-curation = ["datatrove[processing]==0.10.1", "spacy"]
+curation = ["datatrove[processing]==0.10.1", "spacy>=3.8.2"]
 # lm-evaluation-harness task suites through dew.eval.harness.DewLM, which
 # subclasses TemplateLM. Before 0.4.10, TemplateLM keeps the BOS that DewLM's
 # tokenizer puts at the start of an empty-context continuation, and scores it
