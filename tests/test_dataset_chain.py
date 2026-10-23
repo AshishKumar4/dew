@@ -91,9 +91,13 @@ def test_filtered_memory_roots_compact_before_global_counts_and_share_cuts(grain
 
 
 def test_holdout_puts_each_record_in_one_part_by_its_identity_the_same_in_every_read():
-    """A 3-way holdout: the parts are disjoint and together every record, each about its share,
-    the same whether the store is read whole or streamed, with the steps replayed on each."""
-    corpus = Memory(rows("a", 4000)).map(lambda row: {**row, "seen": True})
+    """A 3-way holdout: the parts are disjoint and together every record, the same whether the store
+    is read whole or streamed, with the steps replayed on each, and each part's share is its
+    fraction's: a chi-square test of the parts' sizes against 0.85, 0.05 and 0.1 passes at a false
+    alarm of one in a billion, and over 12000 records fails a share 0.02 off any of them."""
+    from scipy import stats
+
+    corpus = Memory(rows("a", 12000)).map(lambda row: {**row, "seen": True})
     train, val, test = corpus.holdout(val=0.05, test=0.1)
 
     def keys(part, read):
@@ -102,10 +106,11 @@ def test_holdout_puts_each_record_in_one_part_by_its_identity_the_same_in_every_
 
     parts = [keys(part, "memory") for part in (train, val, test)]
     assert [keys(part, "streamed") for part in (train, val, test)] == parts
-    assert sum(map(len, parts)) == len(set().union(*parts)) == 4000
-    assert [len(part) / 4000 for part in parts] == pytest.approx([0.85, 0.05, 0.1], abs=0.02)
+    assert sum(map(len, parts)) == len(set().union(*parts)) == 12000
+    shares = stats.chisquare([len(part) for part in parts], [12000 * 0.85, 12000 * 0.05, 12000 * 0.1])
+    assert shares.pvalue > 1e-9
     # With a key, a document's other versions land in its part: the split follows "i" alone.
-    revised = Memory([{**row, "origin": "a2"} for row in rows("a", 4000)])
+    revised = Memory([{**row, "origin": "a2"} for row in rows("a", 12000)])
     revised = revised.map(lambda row: {**row, "seen": True})
     by_key = [{i for _, i in keys(part, "memory")} for part in corpus.holdout(0.1, key="i")]
     assert by_key == [{i for _, i in keys(part, "memory")} for part in revised.holdout(0.1, key="i")]
