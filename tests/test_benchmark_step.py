@@ -60,7 +60,8 @@ def peak_row(tmp_path, platform: str, *arguments: str) -> dict:
     done = subprocess.run([sys.executable, tool, "--preset", "cpu-smoke",
                            "--architectures", "causal_transformer", "--warmup", "1", "--steps", "2",
                            "--dtype", "float32", "--mesh", "{}", "--json-out", str(out), *arguments],
-                          env={**environment, "JAX_PLATFORMS": platform, "PYTHONPATH": str(tmp_path)},
+                          env={**environment, "JAX_PLATFORMS": platform,
+                               "PYTHONPATH": os.pathsep.join((str(REPO_ROOT / "src"), str(tmp_path)))},
                           capture_output=True, text=True, timeout=900)
     assert done.returncode == 0, done.stderr[-4000:]
     (row,) = json.loads(out.read_text())
