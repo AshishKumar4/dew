@@ -740,8 +740,9 @@ class Server:
 
         `prompt` is one text prompt, `ModelInputs` row or token row, without
         media or positions; a `ModelInputs` row may carry the context a
-        cross-attention decoder reads (`dew.nn.inputs.CONTEXT`). It is validated as `TextGeneration` validates it,
-        against the server's capacity in place of the model's context.
+        cross-attention decoder reads (`dew.nn.inputs.CONTEXT`). It is
+        validated as `TextGeneration` validates it, against the server's
+        capacity in place of the model's context.
         Without `max_new_tokens`, the task's default budget applies, its
         `max_new_tokens` or what its `max_length` leaves past the prompt. A
         request with a zero budget resolves at once, with the prompt alone.
@@ -770,7 +771,8 @@ class Server:
             inputs = prepared_inputs(self.processor, prompt, images=None)
             conditioning = dict(inputs.conditioning)
             if self.cross is not None and CONTEXT in conditioning:
-                context = self._context(conditioning.pop(CONTEXT), conditioning.pop(CONTEXT_LENGTHS, None))
+                context = self._request_context(conditioning.pop(CONTEXT),
+                                                  conditioning.pop(CONTEXT_LENGTHS, None))
             if set(inputs.token_fields) - {"attention_mask", "positions"} or conditioning:
                 raise ValueError(
                     "a served prompt carries tokens, validity and a cross-attention decoder's context "
@@ -797,7 +799,7 @@ class Server:
         return _Row(ids[0][valid[0]].astype(np.int32), budget, seed, fold, Ticket(), context=context,
                     salt=salt)
 
-    def _context(self, embeddings: ArrayLike, lengths: ArrayLike | None) -> np.ndarray:
+    def _request_context(self, embeddings: ArrayLike, lengths: ArrayLike | None) -> np.ndarray:
         """A request's context as its real tokens on the host, `[length, features]`, in float32,
         refused where it is not one row of the model's width or holds more tokens than the
         cross-attention layers cache (`CrossAttention.context_length`)."""
