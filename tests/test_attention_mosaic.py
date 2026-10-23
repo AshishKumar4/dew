@@ -16,7 +16,7 @@ from generation_support import INTERPRETS
 from jax.sharding import Mesh
 from reference_error import assert_as_exact
 from test_attention_template import CASES, ROWS, arguments, geometry as core_geometry
-from test_attention_triton import HOOKS, SCORE_HOOKS, gate_of, hooks_for, score_hooks
+from test_attention_triton import BACKWARD_SEEDS, HOOKS, SCORE_HOOKS, gate_of, hooks_for, score_hooks
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import (
@@ -97,11 +97,12 @@ def _check_forward(call: str, dtype, shape, *, natural: bool, interpret: bool):
 def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool, backward: bool = False,
                  accurate: bool = False, score: tuple = (), gate: bool = False, dtype=jnp.bfloat16,
                  natural: bool = False):
-    """The forward, or the backward in the form `accurate` names, over `spans` at `FORM_TILES` under the
-    score hooks `score` (`test_attention_triton.score_hooks`, their parameters and initial state drawn with
-    the operands) and with `gate` an output gate (`hooks_for`), draws of `shape` (rows, queries, query and
-    key heads, four and two under a hook) over the spans' keys in `dtype`, the forward's logits `natural` or
-    folded."""
+    """The forward, or the backward in the form `accurate` names, over `spans` at `FORM_TILES` under the score
+    hooks `score` (`test_attention_triton.score_hooks`, their parameters and initial state drawn with the
+    operands) and with `gate` an output gate (`hooks_for`), draws of `shape` (rows, queries, query and key
+    heads, four and two under a hook) over the spans' keys in `dtype`, the forward's logits `natural` or
+    folded. The backward differentiates the queries, keys, values, the hook's parameters and the initial
+    state."""
     queries = shape[1]
     score_mod, kinds, draw_hooks = score_hooks(score, queries, spans.keys, 64)
     output = hooks_for(HOOKS["gate" if gate else "none"], queries, 64, gate_of(queries, 64))
@@ -125,19 +126,23 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
         grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
                                           accurate=accurate, tiles=FORM_TILES, interpret=interpret,
                                           family=_family(interpret))
-        return grads.query, grads.key, grads.value
+        return grads.query, grads.key, grads.value, grads.score_params, grads.initial
 
     def reference(query, key, value, dout, params, initial):
-        hooks = hooked(params, initial)
         if not backward:
-            return template.reference(query, key, value, spans, hooks)
-        _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, hooks), query, key, value)
+            return template.reference(query, key, value, spans, hooked(params, initial))
+
+        def attend(query, key, value, params, initial):
+            return template.reference(query, key, value, spans, hooked(params, initial))
+
+        _, pull = jax.vjp(attend, query, key, value, params, initial)
         return pull(dout)
 
     name = (f"mosaic {'backward' if backward else 'forward'} {label} {score}{' gate' if gate else ''} "
             f"{jnp.dtype(dtype).name}{' accurate' if accurate else ''}{' natural' if natural else ''}")
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, name,
-                    seeds=ALL_HOOKS_SEEDS if len(score) + gate > 1 else SEEDS)
+    seeds = (BACKWARD_SEEDS.get((score, jnp.dtype(dtype).name), SEEDS) if backward
+             else ALL_HOOKS_SEEDS if len(score) + gate > 1 else SEEDS)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, name, seeds=seeds)
 
 
 def _check_hooks(hooks: str, dtype, natural: bool, *, interpret: bool):
@@ -149,6 +154,17 @@ def _check_hooks(hooks: str, dtype, natural: bool, *, interpret: bool):
     score, gate = FORWARD_HOOKS[hooks]
     _check_spans("causal-documents-window", spans, (ROWS, queries, 4, 2), interpret=interpret, score=score,
                  gate=gate, dtype=dtype, natural=natural)
+
+
+def _check_hooked_backward(hooks: str, *, accurate: bool, interpret: bool):
+    """The backward in the form `accurate` names under the score hook `SCORE_HOOKS[hooks]` over the template
+    core's causal packed documents under a window (`_check_hooks`' site): the gradients of the queries, keys,
+    values, of the hook's parameters and of the initial state."""
+    case = CASES["causal-documents-window"]
+    queries, keys = core_geometry(case)
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
+    _check_spans("causal-documents-window", spans, (ROWS, queries, 4, 2), interpret=interpret, backward=True,
+                 accurate=accurate, score=SCORE_HOOKS[hooks])
 
 
 def _check_call_form(form: str, *, interpret: bool, backward: bool = False, accurate: bool = False):
@@ -248,6 +264,16 @@ def test_a_causal_backward_of_more_keys_than_queries_is_on_par_interpreted():
     _check_backward("causal", (1, 64, 2, 1), accurate=False, interpret=True, keys=256)
 
 
+@INTERPRETS
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
+@pytest.mark.parametrize("hooks", SCORE_HOOKS)
+def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, accurate):
+    """The backward in both forms under each score hook over causal packed documents under a window, under
+    the interpreter: the gradients of the queries, keys and values, of each hook parameter and of the initial
+    state."""
+    _check_hooked_backward(hooks, accurate=accurate, interpret=True)
+
+
 @pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
 @pytest.mark.parametrize("call", ["causal", "causal-documents-window"])
 def test_the_launches_lower_for_an_h100(call, accurate):
@@ -280,6 +306,35 @@ def test_the_launches_lower_for_an_h100(call, accurate):
         jax.jit(lambda q, k, v, dout, residuals: attention_mosaic.backward(
             q, k, v, spans, None, dout, residuals=residuals, accurate=accurate)).trace(
             q, kv, kv, q, residuals).lower(lowering_platforms=("cuda",))
+
+
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
+@pytest.mark.parametrize("hooks", SCORE_HOOKS)
+def test_the_backward_under_every_score_hook_lowers_for_an_h100(hooks, accurate):
+    """The backward under each score hook lowers for an H100 on any host, as the GPU gate runs it: each hook
+    parameter and the initial state read per tile by the dQ and dK/dV programs."""
+    case = CASES["causal-documents-window"]
+    queries, keys = core_geometry(case)
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
+    q = jax.ShapeDtypeStruct((ROWS, queries, 4, 128), jnp.bfloat16)
+    kv = jax.ShapeDtypeStruct((ROWS, keys, 2, 128), jnp.bfloat16)
+    rows_shape = jax.ShapeDtypeStruct((ROWS, 4, queries), jnp.float32)
+    others = jax.ShapeDtypeStruct((ROWS, 4, queries, 128), jnp.float32)
+    split = template.Split(others, rows_shape, rows_shape, rows_shape)
+    residuals = (rows_shape, rows_shape, jax.ShapeDtypeStruct((ROWS, 4, queries), jnp.int32), split)
+    score_mod, kinds, draw_hooks = score_hooks(SCORE_HOOKS[hooks], queries, keys, 128)
+    params, initial = draw_hooks(0)
+
+    def backward_of(q, k, v, dout, residuals, params, initial):
+        hooked = template.Hooks(score_mod, tuple(template.Param(value, kind)
+                                                 for value, kind in zip(params, kinds, strict=True)),
+                                initial)
+        return attention_mosaic.backward(q, k, v, spans, hooked, dout, residuals=residuals, accurate=accurate)
+
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(backward_of).trace(q, kv, kv, q, residuals, params, initial).lower(
+            lowering_platforms=("cuda",))
 
 
 @ON_HOPPER
@@ -340,3 +395,12 @@ def test_a_causal_backward_of_more_keys_than_queries_is_on_par_on_an_h100():
 def test_the_backward_is_on_par_on_an_h100(call, accurate):
     """The backward in both forms compiled on an H100."""
     _check_backward(call, SHAPES["compiled"], accurate=accurate, interpret=False)
+
+
+@ON_HOPPER
+@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
+@pytest.mark.parametrize("hooks", SCORE_HOOKS)
+def test_the_backward_is_on_par_under_every_score_hook_on_an_h100(hooks, accurate):
+    """The backward in both forms under each score hook compiled on an H100."""
+    _check_hooked_backward(hooks, accurate=accurate, interpret=False)
