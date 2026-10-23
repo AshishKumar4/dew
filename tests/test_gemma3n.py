@@ -378,7 +378,9 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
                     size = np.sqrt(np.mean(b ** 2))
                     if size > 0:
                         backward.append((float(np.sqrt(np.mean((a - b) ** 2)) / size), name))
-            print("BACKWARD", seed, [f"{name.split('layers.')[-1]} {value:.1e}" for value, name in sorted(backward)[::-1][:10]], flush=True)
+            order = {name: index for index, name in enumerate(grads)}
+            print("BACKWARD", seed, [f"{name.split('layers.')[-1]} {value:.1e}" for value, name in
+                                     sorted(backward, key=lambda pair: order[pair[1]]) if ".layers.1" in name or name.endswith(".layers.0")], flush=True)
             outputs = {}
             for dtype in (torch.float32, torch.float64):
                 model_ = references[dtype]
