@@ -25,7 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import assert_transformer_exports, extract_fixture, fixture_arrays, source_transformer
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference
+from reference_error import assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import z_image_fields, z_image_path
@@ -66,21 +66,20 @@ def load(source, name):
 
 
 def z_image_walk(model, params, lengths):
-    """A compiled native flow and every gradient on a draw: the source's latents channels last, the
-    model time from the source's 1 - sigma, and each prompt padded to the budget and masked."""
+    """A compiled native forward on a draw as the source's output, the negated flow, and the gradients
+    of the latents, the prompts and every parameter under the draw's probe, its cotangent
+    (`with_gradients`): the source's latents channels last, the model time from the source's
+    1 - sigma, and each prompt padded to the budget and masked."""
     mask = jnp.asarray(np.arange(BUDGET)[None] < np.asarray(lengths)[:, None])
 
     @jax.jit
     def walk(latents, times, context, probe):
         time = 1000.0 * (1.0 - times)
 
-        def objective(params, latents, context):
-            flow = model.apply({"params": params}, latents, time, DenoisingCondition(context, mask=mask))
-            return jnp.sum(flow * probe), flow
+        def forward(latents, context, params):
+            return -model.apply({"params": params}, latents, time, DenoisingCondition(context, mask=mask))
 
-        (_, flow), gradients = jax.value_and_grad(objective, argnums=(0, 1, 2), has_aux=True)(
-            params, latents, context)
-        return flow, gradients
+        return with_gradients(forward)(latents, context, params, probe)
 
     return walk
 
@@ -125,7 +124,7 @@ def test_the_flow_and_its_gradients_match_the_source(source, arrays, record, nam
         """The fixture's inputs, its rows ROWS times over and its images tiled HEIGHT times down, at
         seed 0, else fresh normal draws of those shapes."""
         if seed == 0:
-            return (original,)
+            return ({key: np.asarray(value, np.float32) for key, value in original.items()},)
         generator = torch.Generator().manual_seed(31 + seed)
         return ({**{key: torch.randn(original[key].shape, generator=generator).numpy()
                     for key in ("latents", "probe", *captions)}, "times": original["times"]},)
@@ -137,39 +136,46 @@ def test_the_flow_and_its_gradients_match_the_source(source, arrays, record, nam
         wide_model = ZImageTransformer2DModel.from_pretrained(
             checkpoint, torch_dtype=torch.float64, local_files_only=True).eval()
 
-    def reference_walk(model, dtype, drawn):
-        inputs = [torch.tensor(drawn[key], dtype=dtype).requires_grad_() for key in ("latents", *captions)]
-        named = list(model.named_parameters())
-        output = torch.stack(model(list(inputs[0].unbind(0)), torch.tensor(drawn["times"], dtype=dtype),
-                                   inputs[1:], return_dict=False)[0])
-        gradients = torch.autograd.grad((output * torch.tensor(drawn["probe"], dtype=dtype)).sum(),
-                                        inputs + [value for _, value in named])
-        return {"output": nhwc(output.detach().numpy()), "grad_latents": nhwc(gradients[0].numpy()),
-                **{f"grad_{caption}": gradient.numpy()
-                   for caption, gradient in zip(captions, gradients[1:1 + len(captions)], strict=True)},
-                **{f"grad_param.{key}": gradient.numpy()
-                   for (key, _), gradient in zip(named, gradients[1 + len(captions):], strict=True)}}
+    weights = {model: {key: value.detach().numpy() for key, value in model.named_parameters()}
+               for model in (narrow_model, wide_model)}
+
+    def reference_walk(model, drawn):
+        """The source's call in the draw's dtype, and the same gradients under the same cotangent as
+        `z_image_walk`'s (`torch_with_gradients`), channels last."""
+        times = torch.from_numpy(np.asarray(drawn["times"]))
+
+        def forward(latents, prompts, params):
+            return torch.stack(torch.func.functional_call(
+                model, params, (list(latents.unbind(0)), times.to(latents.dtype), list(prompts)),
+                {"return_dict": False})[0])
+
+        output, grad_latents, grad_prompts, grad_params = torch_with_gradients(forward)(
+            drawn["latents"], tuple(drawn[caption] for caption in captions), weights[model], drawn["probe"])
+        return {"output": nhwc(output), "grad_latents": nhwc(grad_latents),
+                **{f"grad_{caption}": gradient
+                   for caption, gradient in zip(captions, grad_prompts, strict=True)},
+                "grad_params": grad_params}
 
     def truth(inputs):
         with float64():
-            return reference_walk(wide_model, torch.float64, inputs)
+            return reference_walk(wide_model, inputs)
 
     def native(inputs):
         width = inputs[captions[0]].shape[-1]
         context = np.zeros((len(lengths), BUDGET, width), np.float32)
         for row, length in enumerate(lengths):
             context[row, :length] = inputs[f"caption.{row}"]
-        flow, (grad_params, grad_latents, grad_context) = walk(
+        output, grad_latents, grad_context, grad_params = walk(
             jnp.asarray(nhwc(inputs["latents"])), jnp.asarray(inputs["times"], jnp.float32),
             jnp.asarray(context), jnp.asarray(nhwc(inputs["probe"])))
         grad_context = np.asarray(grad_context)
         assert not any(grad_context[row, length:].any() for row, length in enumerate(lengths))
-        return {"output": -np.asarray(flow), "grad_latents": -np.asarray(grad_latents),
-                **{f"grad_caption.{row}": -grad_context[row, :length] for row, length in enumerate(lengths)},
-                **{f"grad_param.{tensor}": -np.asarray(layout.export({"params": grad_params}))
-                   for tensor, layout in tensors.items()}}
+        return {"output": np.asarray(output), "grad_latents": np.asarray(grad_latents),
+                **{f"grad_caption.{row}": grad_context[row, :length] for row, length in enumerate(lengths)},
+                "grad_params": {tensor: np.asarray(layout.export({"params": grad_params}))
+                                for tensor, layout in tensors.items()}}
 
-    assert_as_exact(native, lambda inputs: reference_walk(narrow_model, torch.float32, inputs), draw,
+    assert_as_exact(native, lambda inputs: reference_walk(narrow_model, inputs), draw,
                     f"Z-Image {name}", seeds=CASE_SEEDS[name], truth_fn=truth)
 
 
@@ -190,40 +196,113 @@ def streamed(source):
     return Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla", mesh=MeshSpec())
 
 
-def test_prompt_encoding_matches_the_source_pipeline(pipeline, arrays, record):
-    """The conditioner reads what `_encode_prompt` reads: the chat template
-    with thinking on, the output of the encoder's second-to-last layer, and
-    the real tokens, which the mask marks."""
+PIPELINE_SEEDS = {"prompts": 16, "walk": 16}
+"""Check 1's declared seeds for the pipeline's prompt encoding and its walk (to size)."""
+WORDS = ("a", "red", "cat", "on", "mat", "tiny", "photo", "of", "the", "blue", "sea", "under", "light")
+
+
+def source_pipelines(source):
+    """Diffusers' own `ZImagePipeline` the fixture saved, loaded in float32 and widened to float64,
+    the scheduler's tables and float32 pins widened with it (`float64_scheduler`)."""
+    import torch
+    from diffusers import ZImagePipeline
+
+    from tools.diffusers_wan_reference import float64
+
+    def loaded(dtype):
+        return ZImagePipeline.from_pretrained(source / "pipeline", torch_dtype=dtype, local_files_only=True)
+
+    narrow = loaded(torch.float32)
+    with float64():
+        wide = loaded(torch.float64)
+    for pipe in (narrow, wide):
+        pipe.set_progress_bar_config(disable=True)
+    return narrow, wide
+
+
+def widened_call(pipe, run):
+    """`run(pipe)` with the source's float32 pins widened, as its float64 truth runs."""
+    from diffusers.pipelines.z_image import pipeline_z_image
+
+    from tools.diffusers_wan_reference import float64, float64_scheduler
+
+    with float64(), float64_scheduler(pipeline_z_image):
+        return run(pipe)
+
+
+def test_prompt_encoding_matches_the_source_pipeline(pipeline, source, record):
+    """The conditioner reads what `_encode_prompt` reads: the chat template with thinking on, the
+    output of the encoder's second-to-last layer, and the real tokens, which the mask marks; on par
+    with the source's own float32 encoding over drawn prompts and the empty one (check 1), the states
+    past each prompt's tokens held to zero on both sides."""
+    import torch
+
     encoder = pipeline.inputs.conditions["conditioning"].encoder
     params = pipeline.variables["encoders"]["conditioning"]
-    prompts = [*record["pipeline"]["prompts"], ""]
-    condition = encoder.encode(params, encoder.tokenize(prompts))
-    for row in range(len(prompts)):
-        expected = arrays[f"pipeline.context.{row}"]
-        length = expected.shape[0]
-        np.testing.assert_array_equal(np.asarray(condition.mask[row]), np.arange(encoder.tokens) < length)
-        assert_as_exact_as_the_reference(condition.context[row, :length], expected,
-                                         arrays[f"pipeline.fp64.context.{row}"], f"prompt {row}")
+    narrow, wide = source_pipelines(source)
+
+    def draw(seed):
+        rng = np.random.default_rng([7, seed])
+        return (*(" ".join(rng.choice(WORDS, size=rng.integers(1, 9))) for _ in range(2)), "")
+
+    def encoded(prompts):
+        condition = encoder.encode(params, encoder.tokenize(list(prompts)))
+        mask = np.asarray(condition.mask)
+        return np.asarray(condition.context) * mask[..., None], mask
+
+    def source_encoded(pipe, prompts):
+        rows = np.zeros((len(prompts), encoder.tokens, record["pipeline"]["config"]["cap_feat_dim"]))
+        with torch.no_grad():
+            for row, prompt in enumerate(prompts):
+                (states,) = pipe._encode_prompt(prompt=prompt, device=torch.device("cpu"))
+                rows[row, :states.shape[0]] = states.numpy()
+        return rows
+
+    prompts = draw(0)
+    _, mask = encoded(prompts)
+    lengths = [np.count_nonzero(np.abs(row).sum(-1)) for row in source_encoded(narrow, prompts)]
+    np.testing.assert_array_equal(mask, np.arange(encoder.tokens)[None] < np.asarray(lengths)[:, None])
+    assert_as_exact(lambda *prompts: encoded(prompts)[0], lambda *prompts: source_encoded(narrow, prompts),
+                    draw, "Z-Image prompts", seeds=PIPELINE_SEEDS["prompts"],
+                    truth_fn=lambda *prompts: widened_call(wide, lambda pipe: source_encoded(pipe, prompts)))
 
 
 @pytest.mark.parametrize("load", ["pipeline", "streamed"])
-def test_pipeline_walk_matches_the_source(load, arrays, record, request):
-    """`Pretrained.load().text_to_image()` reproduces the source's call: its
-    50 default steps guided at 5.0 its way, which is Dew's 6.0, and at the
-    recorded step count the latent it ends on and the image it decodes,
-    loaded whole or streamed onto a mesh."""
+def test_pipeline_walk_matches_the_source(load, source, record, request):
+    """`Pretrained.load().text_to_image()` reproduces the source's call: its 50 default steps guided
+    at 5.0 its way, which is Dew's 6.0, and at the recorded step count the latent it ends on and the
+    image it decodes, loaded whole or streamed onto a mesh, on par with the source's own float32 call
+    over drawn starting latents (check 1)."""
+    import torch
+
     pipeline = request.getfixturevalue(load)
     recorded = record["pipeline"]
     task = pipeline.text_to_image()
     assert task.steps == 50 and task.guidance is not None and task.guidance.scale == recorded["guidance"] + 1
-    initial = arrays["pipeline.x_T"].transpose(0, 2, 3, 1)
-    walked = task(task.prepare(recorded["prompts"], initial=initial, key=0, steps=recorded["steps"]),
-                  key=jax.random.PRNGKey(0)).host()
-    images = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
-    latents = np.asarray(walked.latents)
-    for row in range(len(recorded["prompts"])):
-        expected, truth = (arrays[f"pipeline.{kind}latents.{row}"].transpose(0, 2, 3, 1)[0]
-                           for kind in ("", "fp64."))
-        assert_as_exact_as_the_reference(latents[row], expected, truth, f"latents {row}")
-        assert_as_exact_as_the_reference(images[row], arrays[f"pipeline.images.{row}"][0],
-                                         arrays[f"pipeline.fp64.images.{row}"][0], f"images {row}")
+    narrow, wide = source_pipelines(source)
+    height, width, steps = recorded["height"], recorded["width"], recorded["steps"]
+    shape = (len(recorded["prompts"]), recorded["config"]["in_channels"], height // 2, width // 2)
+
+    def draw(seed):
+        return (torch.randn(shape, generator=torch.Generator().manual_seed(53 + seed)).numpy(),)
+
+    def native(x_T):
+        prepared = task.prepare(recorded["prompts"], initial=x_T.transpose(0, 2, 3, 1), key=0, steps=steps)
+        walked = task(prepared, key=jax.random.PRNGKey(0)).host()
+        return {"latents": np.asarray(walked.latents),
+                "images": np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)}
+
+    def source_walk(pipe, x_T):
+        latents, images = [], []
+        with torch.no_grad():
+            for row, prompt in enumerate(recorded["prompts"]):
+                call = {"prompt": prompt, "height": height, "width": width, "num_inference_steps": steps,
+                        "guidance_scale": recorded["guidance"]}
+                start = torch.from_numpy(np.asarray(x_T[row:row + 1]))
+                latents.append(pipe(**call, latents=start.clone(), output_type="latent").images.numpy()[0])
+                images.append(pipe(**call, latents=start.clone(), output_type="np").images[0])
+        return {"latents": np.stack(latents).transpose(0, 2, 3, 1), "images": np.stack(images)}
+
+    assert_as_exact(native, lambda x_T: source_walk(narrow, x_T), draw, f"Z-Image {load} walk",
+                    seeds=PIPELINE_SEEDS["walk"],
+                    truth_fn=lambda x_T: widened_call(wide, lambda pipe: source_walk(pipe, x_T)))

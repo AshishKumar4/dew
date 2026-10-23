@@ -24,7 +24,12 @@ import numpy as np
 import pytest
 import tool_support
 from interop_support import assert_transformer_exports, extract_fixture, fixture_arrays, source_transformer
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference
+from reference_error import (
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    torch_with_gradients,
+    with_gradients,
+)
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, flux2_fields, flux2_path
@@ -64,27 +69,23 @@ def load(source, name):
 
 
 def flux2_walk(model, params, grid):
-    """A compiled native forward and every gradient on a draw: the latent and the probe are the
-    source's packed rows, folded to the grid and back."""
+    """A compiled native forward on a draw, and the gradients of the latent, the context and every
+    parameter under the draw's `probe`, its cotangent (`with_gradients`): the latent and the probe
+    are the source's packed rows, folded to the grid and back."""
     rows, columns = grid
 
     @jax.jit
     def walk(inputs):
         batch = inputs["latent"].shape[0]
-        latent = inputs["latent"].reshape(batch, rows, columns, -1)
-        probe = inputs["probe"].reshape(batch, rows, columns, -1)
         guidance = inputs["guidance"] if inputs["guidance"].size else None
 
-        def objective(params, latent, context):
-            output = model.apply({"params": params}, latent, inputs["times"],
+        def forward(latent, context, params):
+            folded = latent.reshape(batch, rows, columns, -1)
+            output = model.apply({"params": params}, folded, inputs["times"],
                                  DenoisingCondition(context, guidance=guidance))
-            return jnp.sum(output * probe), output
+            return output.reshape(batch, rows * columns, -1)
 
-        (_, output), gradients = jax.value_and_grad(objective, argnums=(0, 1, 2), has_aux=True)(
-            params, latent, inputs["context"])
-        return {"output": output.reshape(batch, rows * columns, -1),
-                "grad_latent": gradients[1].reshape(batch, rows * columns, -1),
-                "grad_context": gradients[2], "grad_params": gradients[0]}
+        return with_gradients(forward)(inputs["latent"], inputs["context"], params, inputs["probe"])
 
     return walk
 
@@ -132,31 +133,33 @@ def test_the_forward_and_every_gradient_match_the_source(source, arrays, record,
             checkpoint, torch_dtype=torch.float64, local_files_only=True).eval()
     text_ids, image_ids = tool_support.load("diffusers_flux2_reference").ids(rows, columns)
 
-    def reference_walk(model, dtype, drawn):
-        inputs = [torch.tensor(drawn[key], dtype=dtype).requires_grad_() for key in ("latent", "context")]
-        named = list(model.named_parameters())
+    weights = {model: {key: value.detach().numpy() for key, value in model.named_parameters()}
+               for model in (narrow_model, wide_model)}
+
+    def reference_walk(model, drawn):
+        """The source's forward in the draw's dtype, and the same gradients under the same cotangent
+        as `flux2_walk`'s (`torch_with_gradients`)."""
+        dtype = torch.from_numpy(np.asarray(drawn["latent"])).dtype
         guidance = torch.tensor(drawn["guidance"], dtype=dtype) if drawn["guidance"].size else None
-        output = model(hidden_states=inputs[0], encoder_hidden_states=inputs[1],
-                       timestep=torch.tensor(drawn["times"], dtype=dtype) / 1000, guidance=guidance,
-                       img_ids=image_ids, txt_ids=text_ids, return_dict=False)[0]
-        gradients = torch.autograd.grad((output * torch.tensor(drawn["probe"], dtype=dtype)).sum(),
-                                        inputs + [value for _, value in named])
-        return {"output": output.detach().numpy(), "grad_latent": gradients[0].numpy(),
-                "grad_context": gradients[1].numpy(),
-                **{f"grad_param.{key}": gradient.numpy()
-                   for (key, _), gradient in zip(named, gradients[2:], strict=True)}}
+
+        def forward(latent, context, params):
+            return torch.func.functional_call(model, params, (), {
+                "hidden_states": latent, "encoder_hidden_states": context,
+                "timestep": torch.tensor(drawn["times"], dtype=dtype) / 1000, "guidance": guidance,
+                "img_ids": image_ids, "txt_ids": text_ids, "return_dict": False})[0]
+
+        return torch_with_gradients(forward)(drawn["latent"], drawn["context"], weights[model],
+                                             drawn["probe"])
 
     def truth(inputs):
         with float64():
-            return reference_walk(wide_model, torch.float64, inputs)
+            return reference_walk(wide_model, inputs)
 
     def native(inputs):
-        values = walk(inputs)
-        gradients = values.pop("grad_params")
-        return {**values, **{f"grad_param.{tensor}": layout.export({"params": gradients})
-                             for tensor, layout in tensors.items()}}
+        *values, gradients = walk(inputs)
+        return (*values, {tensor: layout.export({"params": gradients}) for tensor, layout in tensors.items()})
 
-    assert_as_exact(native, lambda inputs: reference_walk(narrow_model, torch.float32, inputs), draw,
+    assert_as_exact(native, lambda inputs: reference_walk(narrow_model, inputs), draw,
                     f"Flux.2 {name}", seeds=CASE_SEEDS[name], truth_fn=truth)
 
 
