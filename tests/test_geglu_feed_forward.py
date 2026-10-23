@@ -8,10 +8,12 @@ import numpy as np
 import pytest
 from reference_error import with_gradients
 
+from dew.diffusion.process import DenoisingCondition
 from dew.nn.activations import gated_product
 from dew.nn.dense import Dense
 from dew.nn.mlp import GatedMLP, geglu_feed_forward
 from dew.nn.precision import float32_dot_general
+from dew.nn.sharding import declarations, declared_axes, parameter_path
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
@@ -38,6 +40,24 @@ def test_the_packed_feed_forward_is_diffusers_geglu_bit_for_bit(approximate, dty
     theirs = jax.jit(with_gradients(diffusers))(params, x, cotangent)
     for mine, reference in zip(jax.tree.leaves(ours), jax.tree.leaves(theirs), strict=True):
         np.testing.assert_array_equal(np.asarray(mine, np.float32), np.asarray(reference, np.float32))
+
+
+def test_a_unets_feed_forward_declares_its_kernels_axes():
+    """Every leaf of a UNet's feed-forward, the packed projection's included, carries its declared
+    axes, the hidden width `mlp`, so a tensor axis splits it as it splits any MLP."""
+    from dew.registry import models
+
+    model = models.build("unet_2d_condition", stages=[{"features": 32, "heads": 2}], blocks_per_level=1)
+    params = jax.eval_shape(lambda: model.init(
+        jax.random.key(0), jnp.zeros((1, 8, 8, 4)), jnp.ones((1,)),
+        conditioning=DenoisingCondition(jnp.zeros((1, 3, 768)))))["params"]
+    declared = declarations(params)
+    leaves = {parameter_path(path): leaf for path, leaf in jax.tree_util.tree_leaves_with_path(params)
+              if "feed_forward" in parameter_path(path)}
+    assert {names[-2] for names in leaves} == {"gate_up_proj", "down_proj"}
+    for names, leaf in leaves.items():
+        axes = declared_axes(names, len(leaf.shape), declared)
+        assert axes is not None and "mlp" in axes, names
 
 
 def test_a_packed_order_names_the_gate_and_up_projections():
