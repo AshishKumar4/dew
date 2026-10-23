@@ -1007,8 +1007,9 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
     again, and only that one, and so does its removal, and so does an __init__.py added to, or taken
     from, a namespace package on the way to one; a top-level package added under src/, which may
     shadow any import, runs every file."""
-    # src/pkg/space is a namespace package: importing pkg.space.used executes no file of it.
-    for name, source in {"src/pkg/__init__.py": "", "src/pkg/space/used.py": "def value(): return 1\n",
+    # src/pkg/space is a namespace package on the way to pkg.space.sub.used: its import executes no file.
+    for name, source in {"src/pkg/__init__.py": "", "src/pkg/space/sub/__init__.py": "",
+                         "src/pkg/space/sub/used.py": "def value(): return 1\n",
                          "src/other/__init__.py": "", "src/other/lone.py": "def value(): return 2\n",
                          "src/idle/__init__.py": ""}.items():
         (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
@@ -1020,7 +1021,7 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
                            f"    from {package} import value\n"
                            f"    with open('runs-{name}', 'a') as runs: runs.write('x')\n"
                            "    assert value()\n"
-        for name, package in (("uses", "pkg.space.used"), ("lone", "other.lone"))})
+        for name, package in (("uses", "pkg.space.sub.used"), ("lone", "other.lone"))})
     interpreter(tmp_path, "3.12")
     url, _, _ = cache_worker
     monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
