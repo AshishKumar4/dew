@@ -118,7 +118,7 @@ def _dot(a, b, *, exact: bool, ieee: bool = False, solve: jnp.dtype | None = Non
     elif wide:
         narrow_call = solve is not None and jnp.dtype(solve).itemsize < 4
         precision = (jax.lax.Precision.HIGHEST if ieee else jax.lax.Precision.DEFAULT if narrow_call
-                     else jax.lax.DotAlgorithmPreset.TF32_TF32_F32_X3)
+                     else jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6)
     else:
         precision = None
     return jnp.dot(a, b, preferred_element_type=jnp.float32, precision=precision)
