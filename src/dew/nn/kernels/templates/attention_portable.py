@@ -293,7 +293,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
         nothing = jnp.zeros((block_q,), jnp.float32)
         rows_sums = tuple(nothing for _ in score_kinds)
         zeros = jnp.zeros((block_q, width), jnp.float32)
-        start = algebra.DqSums(zeros, nothing, nothing, rows_sums, rows_sums, zeros)
+        start = algebra.DqSums(zeros, nothing, nothing, rows_sums, rows_sums, zeros, nothing)
         found = jax.lax.fori_loop(lo, hi, step, start)
         dq, delta, denominator, mass, grads = algebra.dq_finish(found, prior, state_total, peak0,
                                                                 (total0, mean0), m, anchor, delta)

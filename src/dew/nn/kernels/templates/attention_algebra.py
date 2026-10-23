@@ -1015,8 +1015,10 @@ class DqSums(NamedTuple):
     """A dQ pass's sums over its keys: dQ `[bq, D]` and the score cotangents' row sums and the HEAD and
     QUERY hook parameters' pullbacks of them (`grads`), each cotangent taken over a `prior` denominator
     (the forward's, or the first pass's; `grad_scores`); and the unnormalized weights' row sums, the hook
-    parameters' pullbacks of them (`weighed`) and their product with the keys as dQ's over the prior
-    denominator too (`keyed`, `[bq, D]`, a weighted mean of the keys, so finite wherever they are), fp32."""
+    parameters' pullbacks of them (`weighed`) and their product with the keys as dQ's, scaled and pulled
+    through the hook over the prior denominator, held as its coefficients' magnitude `keyed_mass` `[bq]`
+    times a mean of the keys under coefficients of magnitudes summing to at most one, `keyed` `[bq, D]`, so
+    finite wherever the keys are, whatever the scale and the hook's slopes, fp32."""
 
     dq: jax.Array
     residual: jax.Array
@@ -1024,6 +1026,7 @@ class DqSums(NamedTuple):
     grads: tuple[jax.Array, ...]
     weighed: tuple[jax.Array, ...]
     keyed: jax.Array
+    keyed_mass: jax.Array
 
 
 def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array, key: jax.Array,
@@ -1039,14 +1042,19 @@ def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, see
     grads = tuple(grad + piece if row else grad for grad, row, piece in zip(sums.grads, summed, pieces,
                                                                            strict=True))
     pulled_weights, pieces = pulled(weights, slopes, seen, kinds)
-    over = expand(scale * inverse(prior), pulled_weights)
-    keyed = sums.keyed + weights_product(pulled_weights * over, key, dot)
+    # The tile's coefficients against the keys joined into the running mean, as a softmax's sums are joined
+    # under a running maximum: its magnitude grows by the tile's, the mean taken to it.
+    coefficients = pulled_weights * expand(scale * inverse(prior), pulled_weights)
+    keyed_mass = sums.keyed_mass + jnp.abs(coefficients).sum(axis=-1)
+    kept = jnp.where(keyed_mass > 0, sums.keyed_mass / jnp.where(keyed_mass > 0, keyed_mass, 1.0), 0.0)
+    keyed = (expand(kept, sums.keyed) * sums.keyed
+             + weights_product(coefficients * expand(inverse(keyed_mass), coefficients), key, dot))
     weighed = sums.weighed
     if any(summed):
         weighed = tuple(total + piece if row else total
                         for total, row, piece in zip(sums.weighed, summed, pieces, strict=True))
     return DqSums(dq, sums.residual + cotangents.sum(axis=-1), sums.mass + weights.sum(axis=-1), grads,
-                  weighed, keyed)
+                  weighed, keyed, keyed_mass)
 
 
 def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax.Array,
@@ -1066,7 +1074,7 @@ def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax
     refined = refinement(residual, mass, peak0, shares, peak, total, anchor, delta)
     grads = tuple(grad * ratio - refined * (weighed * over)
                   for grad, weighed in zip(sums.grads, sums.weighed, strict=True))
-    dq = (sums.dq - expand(refined, sums.keyed) * sums.keyed) * expand(ratio, sums.dq)
+    dq = (sums.dq - expand(refined * sums.keyed_mass, sums.keyed) * sums.keyed) * expand(ratio, sums.dq)
     return dq, delta + refined, total, mass, grads
 
 
