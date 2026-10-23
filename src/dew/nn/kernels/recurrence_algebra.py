@@ -310,8 +310,9 @@ def readout(query, entering, entered, key, pairs, corrected, issue: Issue = port
     """A chunk's output `[..., C, Dv]`: the memory it entered read through the decayed queries
     (`remembered`), and the chunk's own pairs over its corrected values (the inclusive lower `pairs` read
     the token itself)."""
-    return (remembered(query * entering, entered, issue)
-            + remembered(paired("scores", query, key, pairs, issue), corrected, issue, "local"))
+    memory: jax.Array = remembered(query * entering, entered, issue)
+    local: jax.Array = remembered(paired("scores", query, key, pairs, issue), corrected, issue, "local")
+    return memory + local
 
 
 @functools.partial(jax.custom_jvp, nondiff_argnums=(2, 3))
@@ -424,7 +425,8 @@ def inverted(blocks: dict, issue: Issue) -> dict:
     for distance in range(1, count):
         for i in range(distance, count):
             j = i - distance
-            inner = sum(issue("merge", blocks[i, m], inverse[m, j]) for m in range(j, i))
+            inner = functools.reduce(jnp.add, (issue("merge", blocks[i, m], inverse[m, j])
+                                               for m in range(j, i)))
             inverse[i, j] = -issue("merge", inverse[i, i], inner)
     return inverse
 

@@ -28,7 +28,7 @@ import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels import recurrence
+from dew.nn.kernels import recurrence, recurrence_algebra as algebra
 from dew.nn.kernels.chunked_launch import (
     _CHUNK,
     Sequences,
@@ -118,18 +118,9 @@ def _dot(a, b, *, exact: bool, ieee: bool = False, solve: jnp.dtype | None = Non
     return jnp.dot(a, b, preferred_element_type=jnp.float32, precision=precision)
 
 
-def _tril_inverse(diagonal, index):
-    """`(I + D)^-1` of a strictly lower square block `D`, row by row: fla's forward substitution
-    (chunk_fwd.py's solve, chunk_intra.py's for Kimi's delta attention). `index` is the block's
-    `arange` of rows, which the caller's other masks share."""
-    sub = diagonal.shape[0]
-    inverse = -diagonal
-    for i in range(2, sub):
-        row = jnp.sum(jnp.where((index == i)[:, None], -diagonal, 0.0), axis=0)
-        row = jnp.where(index < i, row, 0.0)
-        row = row + jnp.sum(row[:, None] * inverse, axis=0)
-        inverse = jnp.where((index == i)[:, None], row[None, :], inverse)
-    return inverse + (index[:, None] == index[None, :])
+_tril_inverse = algebra.tril_inverse
+"""`(I + D)^-1` of a strictly lower square block, row by row: fla's forward substitution (chunk_fwd.py's
+solve, chunk_intra.py's for Kimi's delta attention), the algebra's (`recurrence_algebra.tril_inverse`)."""
 
 
 def _kkt_solve_kernel(chunk_ref, k_ref, g_ref, beta_ref, a_ref, *, chunk: int, aligned: bool,
