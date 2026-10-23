@@ -188,10 +188,17 @@ jobs:
       env:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
-        DEW_TEST_CACHE: ${{ github.event_name == 'schedule' && 'off' || 'on' }}
+        DEW_TEST_CACHE: ${{ (github.event_name == 'schedule' || startsWith(github.ref_name, 'ci/full-')) && 'off' || '' }}
         PROVEN: ${{ needs.proven.outputs.run }}
       run: |
         armada=armada
+        # The daily run and a land-queue train's full run (ci/full-*) run every file; any other run reruns what
+        # its change reaches from main (tools/armada/ci.py policy), and the whole suite where it cannot place it.
+        if [ -z "$DEW_TEST_CACHE" ]; then
+          DEW_TEST_CACHE=$(python3 tools/armada/ci.py policy origin/main)
+        fi
+        echo "the test cache's policy: $DEW_TEST_CACHE"
+        export DEW_TEST_CACHE
         # Each client runs in a session of its own, so the interrupt a cancelled run sends this shell
         # reaches it and it cancels its armada job; the shell waits on them, where a trap runs.
         trap 'for group in ${gangs:-} ${suite:-}; do kill -INT -- "-$group" 2>/dev/null || true; done' INT TERM
