@@ -489,11 +489,14 @@ class Gmm(_Triton):
             + tiles / chunks * config.block_m * config.block_n * _hook_work(
                 hooks.after(), jnp.float32, epilogue_sides, hooks.epilogue_axes,
                 (config.block_m, config.block_n), extents))
+        # Every step's operand tiles come through the L2, rereads or not.
+        loaded = ((config.block_m + config.block_n) * config.block_k * size
+                  + _side_tile_bytes(prologue_sides, hooks.prologue_axes, extents))
         return cost.Cost(
             programs=chunks * columns, device_bytes=moved,
             program_flops=flops / (chunks * columns), program_staged=staged,
             program_exponentials=exponentials, mode=_mode(tokens.dtype), steps=steps, stages=config.stages,
-            resident=self._resident(ba, config, target))
+            resident=self._resident(ba, config, target), l2_bytes=chunks * columns * steps * loaded)
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
@@ -573,10 +576,13 @@ class Tgmm(_Triton):
         exponentials = steps * config.block_m * config.block_k * _hook_work(
             hooks.before(), tokens.dtype, sides, hooks.prologue_axes, (config.block_m, config.block_k),
             self.extents(config))
+        # Every step's operand tiles come through the L2 (`Gmm.costed`).
+        loaded = ((config.block_k + config.block_n) * config.block_m * size
+                  + _side_tile_bytes(sides, hooks.prologue_axes, self.extents(config)))
         return cost.Cost(
             programs=programs, device_bytes=moved, program_flops=flops, program_staged=staged,
             program_exponentials=exponentials, mode=_mode(tokens.dtype), steps=steps, stages=config.stages,
-            resident=self._resident(ba, config, target))
+            resident=self._resident(ba, config, target), l2_bytes=programs * steps * loaded)
 
     def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,
@@ -677,12 +683,17 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         epilogue_exponentials = config.block_m * config.block_n * _hook_work(
             hooks.after(), jnp.float32, epilogue_sides, hooks.epilogue_axes, (config.block_m, config.block_n),
             extents)
+        # Every step's operand tiles come through the L2, rereads or not: counted so, the H100 sweep's
+        # Mixtral forward and input gradient pick within 10% of their best (they ran 1.17x and 1.15x).
+        loaded = ((config.block_m + config.block_n) * config.block_k * size
+                  + _side_tile_bytes(prologue_sides, hooks.prologue_axes, extents))
         return cost.Cost(
             programs=tiles, device_bytes=moved,
             program_flops=2 * steps * config.block_m * config.block_n * config.block_k,
             program_staged=steps * step + config.block_m * config.block_n * out,
             program_exponentials=epilogue_exponentials, mode=_mode(tokens.dtype), steps=steps,
-            stages=config.stages, serial_staged=rewritten, serial_exponentials=prologue_exponentials)
+            stages=config.stages, serial_staged=rewritten, serial_exponentials=prologue_exponentials,
+            l2_bytes=tiles * steps * loaded)
 
     def _multiprocessors(self, interpret: bool) -> int:
         # The interpreter runs one block (jax/_src/pallas/mosaic_gpu/interpret).
