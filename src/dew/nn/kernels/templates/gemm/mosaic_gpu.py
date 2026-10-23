@@ -98,35 +98,11 @@ class GroupInfo:
     actual_size: jax.Array
 
     @classmethod
-    def create(cls, group_lengths, tile, tid):
-        """Get the group info for the current block."""
-
+    def create(cls, table, tile, tid):
+        """Dew: the group info of row tile `tid`, read from `tile_groups`' table (its group, its block, its
+        group's first and past-last row) rather than walked over every group's length in each tile."""
         tile = jnp.int32(tile)
-        group_boundaries = [group_lengths[i] for i in range(len(group_lengths))]
-
-        # We usually only have very few groups, so we unroll the loop processing
-        # them. Normally we'd break out of the loop early, once we'd have found our
-        # boundary, but we can't do that when unrolling, so we rely on many selects
-        # to mask out the epilogue of the loop.
-        group_end = group_start = block = group = end = jnp.array(0, dtype=jnp.int32)
-
-        for i, b in enumerate(group_boundaries):
-            # Start/end are inclusive
-            start = end
-            end = start + b
-            final = end - 1
-            start_block = lax.div(start, tile)
-            final_block = lax.div(final, tile)
-            block_end = final_block + 1
-            tid_begin = start_block + i
-            tid_end = block_end + i
-            # How many blocks after is our block?
-            this_is_group = (tid_begin <= tid) & (tid < tid_end)
-            block = lax.select(this_is_group, tid - tid_begin + start_block, block)
-            group = lax.select(this_is_group, jnp.int32(i), group)
-            group_start = lax.select(this_is_group, start, group_start)
-            group_end = lax.select(this_is_group, end, group_end)
-
+        group, block, group_start, group_end = (table[tid, column] for column in range(4))
         block_start = block * tile
         actual_start = jnp.maximum(group_start, block_start)
         actual_end = jnp.minimum(group_end, block_start + tile)
@@ -135,6 +111,29 @@ class GroupInfo:
         return cls(group_id=group, block=block, block_start=block_start, actual_start=actual_start,
                    actual_end=actual_end, start_within_block=start_within_block, actual_size=actual_size)
 
+
+def tile_groups(lengths: jax.Array, tile: int, tiles: int) -> jax.Array:
+    """Dew: each row tile's group info for `GroupInfo.create`, in XLA before the launch: of tiles `0` to
+    `tiles`, the group (`lengths`' index), its block of `tile` rows, and its group's first and past-last
+    row, int32 `[tiles, 4]`; a tile no group reaches, zeros. Upstream's `GroupInfo.create` walked every
+    group's length in every tile, unrolled: at 129 groups (Qwen3's 128 experts and the unrouted rows) two
+    thirds of a down projection's instructions, and its global loads a third of its stalls (NCU-full)."""
+    lengths = lengths.astype(jnp.int32)
+    ends = jnp.cumsum(lengths)
+    starts = ends - lengths
+    index = jnp.arange(lengths.shape[0], dtype=jnp.int32)
+    tile = jnp.int32(tile)
+    # A group's tiles are its blocks shifted by its index (one tile per group boundary a block shares),
+    # as upstream counted them, its divisions truncating as `lax.div` does.
+    begin = lax.div(starts, tile) + index
+    end = lax.div(ends - 1, tile) + 1 + index
+    tids = jnp.arange(tiles, dtype=jnp.int32)[:, None]
+    ours = (begin[None] <= tids) & (tids < end[None])
+    # The last group whose range holds the tile, as upstream's selects let the last match win.
+    group = (lengths.shape[0] - 1 - jnp.argmax(ours[:, ::-1], axis=1)).astype(jnp.int32)
+    found = jnp.any(ours, axis=1)
+    columns = (group, tids[:, 0] - group, starts[group], ends[group])
+    return jnp.stack([jnp.where(found, column, 0) for column in columns], axis=1)
 
 def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles, transpose_rhs: bool,
         out_dtype, multiprocessors: int, interpret: bool | plgpu.InterpretGPUParams = False,
@@ -164,13 +163,15 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     m = lhs.shape[0]
     lengths = jnp.concatenate([group_sizes.astype(jnp.int32),
                                jnp.maximum(m - jnp.sum(group_sizes, dtype=jnp.int32), 0)[None]])
+    row_tile = tiles.block_m * tiles.cluster
+    table = tile_groups(lengths, row_tile, pl.cdiv(m, row_tile) + g)
     prologue_operands = tuple(_side_padded(side, axes) for side, axes in zip(prologue_operands, prologue_axes,
                                                                                strict=True))
     epilogue_operands = tuple(_side_padded(side, axes) for side, axes in zip(epilogue_operands, epilogue_axes,
                                                                                strict=True))
     dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
     launch = _gmm_cooperative if tiles.warpgroups == 2 else _gmm_alone
-    outs = launch(lhs, rhs, lengths, (m, n, k, g), tiles=tiles, transpose_rhs=transpose_rhs, dtypes=dtypes,
+    outs = launch(lhs, rhs, table, (m, n, k, g), tiles=tiles, transpose_rhs=transpose_rhs, dtypes=dtypes,
                   multiprocessors=multiprocessors, interpret=interpret,
                   hooks=(prologue, prologue_axes, epilogue, epilogue_axes),
                   sides=(prologue_operands, epilogue_operands))
@@ -178,7 +179,7 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     return outs if out_dtypes else outs[0]
 
 
-def _gmm_alone(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rhs: bool, dtypes: tuple,
+def _gmm_alone(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs: bool, dtypes: tuple,
                multiprocessors: int, interpret, hooks: tuple, sides: tuple) -> tuple:
     """`gmm`'s product at a tile one warpgroup computes, loading and multiplying (upstream's kernel), with
     `_gmm_cooperative`'s arguments."""
@@ -188,7 +189,7 @@ def _gmm_alone(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rhs: 
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     side_count = len(prologue_operands) + len(epilogue_operands)
 
-    def body(rows_per_expert_gmem, lhs_gmem, rhs_gmem, *refs):
+    def body(table_gmem, lhs_gmem, rhs_gmem, *refs):
         prologue_gmems = refs[:len(prologue_operands)]
         epilogue_gmems = refs[len(prologue_operands):side_count]
         o_gmems = refs[side_count:]
@@ -198,7 +199,7 @@ def _gmm_alone(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rhs: 
         @plgpu.nd_loop((grid_m * grid_n,), collective_axes="sm")
         def mn_loop(loop_info: plgpu.NDLoopInfo):
             mi, ni = plgpu.planar_snake(loop_info.index[0], (grid_m, grid_n), 1, tiles.grid_block_n)
-            group_info = GroupInfo.create(rows_per_expert_gmem, block_m, mi)
+            group_info = GroupInfo.create(table_gmem, block_m, mi)
             # Dew: each prologue side operand's block at the launch axes it follows.
             side_block = {'rows': (block_m, lambda k: group_info.block), 'depth': (block_k, lambda k: k)}
             side_specs = [plgpu.BlockSpec(tuple(side_block[axis][0] for axis in axes),
@@ -261,17 +262,17 @@ def _gmm_alone(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rhs: 
         compiler_params=hopper.compiler_params(),
         interpret=interpret,
     )
-    return kernel(lengths, lhs, rhs, *prologue_operands, *epilogue_operands)
+    return kernel(table, lhs, rhs, *prologue_operands, *epilogue_operands)
 
 
-def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rhs: bool, dtypes: tuple,
+def _gmm_cooperative(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs: bool, dtypes: tuple,
                      multiprocessors: int, interpret, hooks: tuple, sides: tuple) -> tuple:
     """Dew: `gmm` at a tile two consumer warpgroups compute beside a producer issuing the loads (as
     `hopper_matmul_mgpu`), each half its rows by all its columns, one MMA a step (CUTLASS's cooperative
     split: it ran every H100 scoreboard row 2-7% faster than halving the columns into two MMAs);
     `tiles.cluster` 2 pairs two row tiles of one group, which load each matrix block once, multicast. A
-    prologue's consumers each rewrite their own half of the rows' shared stage. `lhs` is padded,
-    `lengths` ends with the unrouted rows' group (`gmm`)."""
+    prologue's consumers each rewrite their own half of the rows' shared stage. `lhs` is padded, and
+    `table` is `tile_groups`' at the pair's rows, the unrouted rows a last group (`gmm`)."""
     prologue, prologue_axes, epilogue, epilogue_axes = hooks
     prologue_operands, epilogue_operands = sides
     m, n, k, g = shape
@@ -289,7 +290,7 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
     pipeline = functools.partial(_gmm_pipeline, tiles, transpose_rhs, k // block_k,
                                  tuple(prologue_axes[i] for i in stepped))
 
-    def body(lengths_gmem, lhs_gmem, rhs_gmem, *refs):
+    def body(table_gmem, lhs_gmem, rhs_gmem, *refs):
         prologue_gmems, side_gmems, o_gmems = _split(refs, len(prologue_operands), len(epilogue_operands))
         grid_m, grid_n = pl.cdiv(m, block_m * pair) + g, n // block_n  # pairs: g groups, the unrouted rows
         rhs_columns = functools.partial(_matrix_columns, block_n=block_n, transpose_rhs=transpose_rhs)
@@ -319,7 +320,7 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
             @plgpu.nd_loop((grid_m * grid_n,), collective_axes="cluster_grid")
             def mn_loop(loop_info: plgpu.NDLoopInfo):
                 mi, ni = plgpu.planar_snake(loop_info.index[0], (grid_m, grid_n), 1, tiles.grid_block_n)
-                group_info = GroupInfo.create(lengths_gmem, block_m * pair, mi)
+                group_info = GroupInfo.create(table_gmem, block_m * pair, mi)
                 # This multiprocessor's row tile of the pair and its group's rows there.
                 row_block = group_info.block * pair + cta
                 row_start = row_block * block_m
@@ -377,7 +378,7 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
     kernel = hopper.cooperative(body, tuple(jax.ShapeDtypeStruct((m, n), dtype) for dtype in dtypes),
                                 consumers=2, cluster=tiles.cluster, multiprocessors=multiprocessors,
                                 interpret=interpret)
-    return kernel(lengths, lhs, rhs, *prologue_operands, *epilogue_operands)
+    return kernel(table, lhs, rhs, *prologue_operands, *epilogue_operands)
 
 
 def _gmm_pipeline(tiles: Tiles, transpose_rhs: bool, steps: int, side_axes: tuple, body, context):
