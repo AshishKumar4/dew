@@ -161,6 +161,25 @@ class Flux2Transformer(TextStream, nn.Module):
                 'single_stream_modulation': 3, 'norm_out': 2}
 
     @nn.nowrap
+    def _double(self, **where) -> DoubleStreamBlock:
+        """A joint block as the model runs it, named by `where` (or unbound, `parent=None`, where a FLOP
+        count reads it): one factory, so the count and the execution build the same block."""
+        return DoubleStreamBlock(self.features, self.heads, self.head_dim, context_first=True, bias=False,
+                                 mlp_hidden=int(self.features * self.mlp_ratio), swiglu=True,
+                                 shared_modulation=True, **self._block_fields(), **where)
+
+    @nn.nowrap
+    def _single(self, **where) -> Flux2SingleBlock:
+        """A single-stream block as the model runs it (`_double`)."""
+        return Flux2SingleBlock(self.features, self.heads, self.head_dim, int(self.features * self.mlp_ratio),
+                                **self._block_fields(), **where)
+
+    @nn.nowrap
+    def _block_fields(self) -> dict:
+        return {"epsilon": self.eps, "dtype": self.dtype, "precision": self.precision,
+                "attention_impl": self.attention_impl}
+
+    @nn.nowrap
     def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
         return patch_lengths(sample_shape, (1, 1), rows)
 
@@ -176,12 +195,9 @@ class Flux2Transformer(TextStream, nn.Module):
         count += (1 + self.guidance_embeds) * time
         count += sum(Modulation(self.features, pieces, parent=None).model_flops(rows)
                      for pieces in self.modulation_pieces.values())
-        hidden = int(self.features * self.mlp_ratio)
-        block = DoubleStreamBlock(self.features, self.heads, self.head_dim, mlp_hidden=hidden,
-                                   swiglu=True, shared_modulation=True, parent=None)
-        count += self.num_layers * block.multisequence_flops(lengths, context_lengths)
-        single = Flux2SingleBlock(self.features, self.heads, self.head_dim, hidden, parent=None)
-        count += self.num_single_layers * single.model_flops((image + context).astype(np.int64))
+        count += self.num_layers * self._double(parent=None).multisequence_flops(lengths, context_lengths)
+        joined = (image + context).astype(np.int64)
+        count += self.num_single_layers * self._single(parent=None).model_flops(joined)
         return count + projection_flops(lengths, self.features, self.out_channels)
 
     @nn.compact
@@ -221,19 +237,11 @@ class Flux2Transformer(TextStream, nn.Module):
         tables = axis_tables(flux2_positions(rows, columns, context.shape[1]), self.axes_dims_rope,
                              self.rope_theta, dtype=np.float64)
         rotation = tuple(jnp.asarray(table[None], at_least_fp32(image.dtype)) for table in tables)
-        hidden = int(self.features * self.mlp_ratio)
-        block = {"epsilon": self.eps, "dtype": self.dtype, "precision": self.precision,
-                 "attention_impl": self.attention_impl}
         for index in range(self.num_layers):
-            image, context = DoubleStreamBlock(
-                self.features, self.heads, self.head_dim, context_first=True, bias=False, mlp_hidden=hidden,
-                swiglu=True, shared_modulation=True, name=f"transformer_blocks_{index}", **block)(
-                image, context, mods, rotation)
+            image, context = self._double(name=f"transformer_blocks_{index}")(image, context, mods, rotation)
         joined = jnp.concatenate([context, image], axis=1)
         for index in range(self.num_single_layers):
-            joined = Flux2SingleBlock(self.features, self.heads, self.head_dim, hidden,
-                                      name=f"single_transformer_blocks_{index}", **block)(
-                joined, single_mods, rotation)
+            joined = self._single(name=f"single_transformer_blocks_{index}")(joined, single_mods, rotation)
         image = joined[:, context.shape[1]:]
         scale, shift = modulation("norm_out")
         image = modulate(layer_norm(self.dtype, self.eps)(image), shift, scale)
