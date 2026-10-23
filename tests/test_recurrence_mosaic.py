@@ -3,8 +3,10 @@ chunked op's explicit route (`recurrence_chunk.chunk(..., mainloop='mosaic')`), 
 instruction family its bundle claims (mma.sync): check 1 (`reference_error.assert_as_exact`) of its output and
 final memory against the recurrence a token at a time (`test_recurrence_chunk.token_by_token`), both from
 float64, over one sequence a row and packed documents, value heads over fewer key heads, keys 64 and 128 wide,
-values off a block's width, bf16 and fp32 operands and lengths off the chunks. Mosaic GPU's interpreter takes
-no mma.sync, so the gate is the compiled kernels'; the stability suite holds the mainloop under its regimes
+values off a block's width, bf16 and fp32 operands and lengths off the chunks, and every hook combination the
+mainloop takes (a decay a head or none, with and without the delta rule, Mamba2's rated decay, the skip and
+the norm) on the chunked op's own draws (`test_recurrence_chunk`). Mosaic GPU's interpreter takes no mma.sync,
+so the gate is the compiled kernels'; the stability suite holds the mainloop under its regimes
 (tests/test_recurrence_stability.py)."""
 
 import functools
@@ -14,7 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact
-from test_recurrence_chunk import token_by_token
+from test_recurrence_chunk import FORMED, HOOKS, SEEDS as HOOK_SEEDS, draw as hooked_draw, token_by_token
 
 from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
@@ -82,3 +84,19 @@ def test_the_mosaic_forward_is_as_exact_as_the_recurrence_token_by_token(case, d
     reference = jax.jit(functools.partial(token_by_token, hooks))
     assert_as_exact(dew, reference, functools.partial(draw, dtype, **SHAPES[case]),
                     f'the mosaic forward, {case} in {jnp.dtype(dtype).name}', seeds=SEEDS)
+
+
+TAKEN = [hooks for hooks in HOOKS + FORMED if hooks.decay != 'vector']
+"""The chunked op's hook combinations the mainloop takes: a decay a head or none."""
+
+
+@pytest.mark.parametrize('packed', (False, True), ids=['one sequence', 'packed'])
+@pytest.mark.parametrize('hooks', TAKEN, ids=str)
+def test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(hooks, packed):
+    """The chunked op on the mainloop, each hook combination it takes, its output and final memory on par with
+    the recurrence a token at a time's from float64 over the site's declared draws (check 1), as
+    test_recurrence_chunk holds the portable math."""
+    dew = jax.jit(functools.partial(chunk, hooks, mainloop='mosaic'))
+    reference = jax.jit(functools.partial(token_by_token, hooks))
+    assert_as_exact(dew, reference, functools.partial(hooked_draw, hooks, packed),
+                    f'the mosaic forward, {hooks} packed={packed}', seeds=HOOK_SEEDS[hooks, packed])

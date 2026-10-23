@@ -462,14 +462,20 @@ def inverted(blocks: dict, issue: Issue, *, across: Across | None = None) -> dic
 def weighted(name: str, inverse, tile, beta, issue: Issue, decay=None):
     """`inverse (tile beta [decay])`, the scaled operand rounded to `tile`'s dtype before the product:
     'apply_u' on the values, 'apply_w' on the keys under their decay `exp2(g)` (`[C, 1]` a head's, `[C,
-    BK]` a key dimension's)."""
+    BK]` a key dimension's). Without the delta rule (`inverse` None) nothing is corrected and there is no
+    product: the gated tile, fp32 (`apply`'s)."""
     scaled = tile * beta[:, None] if decay is None else tile * beta[:, None] * decay
+    if inverse is None:
+        return scaled.astype(jnp.float32)
     return issue(name, inverse, scaled.astype(tile.dtype))
 
 
-def corrected(values, weights: Load, state, dtype, issue: Issue):
+def corrected(values, weights: Load | None, state, dtype, issue: Issue):
     """A chunk's corrected values `u - w S` `[C, BV]`, fp32: `values` its `u`, `weights(i)` its `w`'s
-    key slice `i` of the memory's (`state`, fp32), each slice cast to `w`'s `dtype` for its product."""
+    key slice `i` of the memory's (`state`, fp32), each slice cast to `w`'s `dtype` for its product; without
+    the delta rule (`weights` None) `u` itself."""
+    if weights is None:
+        return values.astype(jnp.float32)
     predicted = sum(issue("corrected", weights(i), part.astype(dtype)) for i, part in enumerate(state))
     return values.astype(jnp.float32) - predicted
 

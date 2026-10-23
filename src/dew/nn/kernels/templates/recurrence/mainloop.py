@@ -345,20 +345,24 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
                    staging=_staging(held, (CHUNK, BLOCK)))(k, v, a, hi, lo, beta, taken)
 
 
-def _states(k, w, u, hi, lo, h0, sequences, call: _Call, tiles: Tiles):
+def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
     """`(h [chunks * HV * Dk, Dv], corrected [R, HV * Dv], final [B * HV * Dk, Dv])`: the memory each chunk
     enters and the corrected values as `call.held`, and each row's final memory, fp32, each sequence's chunks
-    in order over a value block (`algebra.corrected`, `scalar_write`, `carried`). `sequences` `[N, 5]` is each
-    sequence's first chunk, its chunks, its row and whether it begins and ends its row; `h0` `[B * HV * Dk,
-    Dv]` fp32 each row's initial memory."""
+    in order over a value block (`algebra.corrected`, `scalar_write`, `carried`). Under the delta rule `u` is
+    the weighted values and `w` the weighted keys (`_weighted`); without it (`w` None) `u` is the values,
+    each chunk's write gated by `beta` (`algebra.weighted`'s identity inverse) and nothing corrected.
+    `sequences` `[N, 5]` is each sequence's first chunk, its chunks, its row and whether it begins and ends
+    its row; `h0` `[B * HV * Dk, Dv]` fp32 each row's initial memory."""
     width, value_width, bv = call.width, call.value_width, tiles.block_v
     slices = width // BLOCK
     held, memories = dataclasses.replace(call.held, rows=call.rows), call.memories
     batch = h0.shape[0] // (call.heads * width)
     initial = _Operand(h0.shape[0], 1, jnp.dtype(jnp.float32))
+    delta = w is not None
+    values = held if delta else call.given
 
-    def program(k_ref, w_ref, u_ref, hi_ref, lo_ref, h0_ref, seq_ref, h_ref, corrected_ref, final_ref, *,
-                streams, staging):
+    def program(k_ref, w_ref, u_ref, hi_ref, lo_ref, beta_ref, h0_ref, seq_ref, h_ref, corrected_ref,
+                final_ref, *, streams, staging):
         j, s, h = lax.axis_index("blocks"), lax.axis_index("sequences"), lax.axis_index("heads")
         first, count, row, begins, ends = (seq_ref[s, i] for i in range(5))
         (staged,) = staging
@@ -369,18 +373,24 @@ def _states(k, w, u, hi, lo, h0, sequences, call: _Call, tiles: Tiles):
 
         def views(index):
             row_ = (first + index) * CHUNK
-            return _views(w=held.views(w_ref, row_, CHUNK, h * width, width),
+            return _views(**({"w": held.views(w_ref, row_, CHUNK, h * width, width)} if delta else {}),
                           keys=call.given.views(k_ref, row_, CHUNK, h // call.group * width, width),
-                          values=held.views(u_ref, row_, CHUNK, h * value_width + j * bv, bv))
+                          values=values.views(u_ref, row_, CHUNK, h * value_width + j * bv, bv))
 
         def step(index, slots, state, accumulators):
             n = first + index
             span = pl.ds(n * CHUNK, CHUNK)
             for i, part in enumerate(state):
                 memories.store(h_ref, part, memory(n, i), BLOCK, j * bv, bv)
-            corrected = algebra.corrected(
-                _tile(slots, "values", held).value(),
-                lambda i: _tile(slots, "w", held, columns=pl.ds(i * BLOCK, BLOCK)), state, held.dtype, issue)
+            tile = _tile(slots, "values", values).value()
+            if delta:
+                def weights(i):
+                    return _tile(slots, "w", held, columns=pl.ds(i * BLOCK, BLOCK))
+
+                corrected = algebra.corrected(tile, weights, state, held.dtype, issue)
+            else:
+                written = algebra.weighted("apply_u", None, tile, FAMILY.rows_of(beta_ref.at[h, span]), issue)
+                corrected = algebra.corrected(written, None, state, held.dtype, issue)
             held.store(corrected_ref, corrected, n * CHUNK, CHUNK, h * value_width + j * bv, bv)
             # The chunk's last prefix as a row's vector of it, each of whose entries is the decay a key
             # slice's rows take (Mosaic GPU's warpgroup lowering bitcasts no scalar, which `algebra.raised`
@@ -423,11 +433,12 @@ def _states(k, w, u, hi, lo, h0, sequences, call: _Call, tiles: Tiles):
 
     out_type = (memories.shape(value_width), held.shape(call.heads * value_width),
                 jax.ShapeDtypeStruct((batch * call.heads * width, value_width), jnp.float32))
-    blocks = _streamed(w=((CHUNK, width), held), keys=((CHUNK, width), call.given),
-                       values=((CHUNK, bv), held))
+    blocks = _streamed(**({"w": ((CHUNK, width), held)} if delta else {}), keys=((CHUNK, width), call.given),
+                       values=((CHUNK, bv), values))
     return _kernel(program, call, out_type=out_type, grid=(value_width // bv, sequences.shape[0], call.heads),
                    grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=tiles.stages,
-                   staging=_staging(held, (BLOCK, bv)))(k, w, u, hi, lo, h0, sequences)
+                   staging=_staging(held, (BLOCK, bv)))(k, k if w is None else w, u, hi, lo, beta, h0,
+                                                        sequences)
 
 
 def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, scale: float, out_dtype):
@@ -540,7 +551,7 @@ def _layout(batch: int, length: int, starts, max_segments: int | None):
 
 
 def forward(q, k, v, g, beta, h0=None, *, starts=None, max_segments: int | None = None,
-            scale: float | None = None, tiles: Tiles | None = None, wide: bool = False,
+            scale: float | None = None, delta: bool = True, tiles: Tiles | None = None, wide: bool = False,
             interpret: bool = False):
     """The gated delta rule's forward on this mainloop, a decay a head: `(o [B, T, HV, Dv], final [B, HV, Dk,
     Dv])` for `q`, `k` `[B, T, H, Dk]`, `v` `[B, T, HV, Dv]`, the natural log decay `g` `[B, T, HV]`, the
@@ -549,7 +560,9 @@ def forward(q, k, v, g, beta, h0=None, *, starts=None, max_segments: int | None 
     `max_segments` a row (the row's length where None, which the chunks' layout is sized by), each a sequence
     of its own from a zero memory but a row's first, which takes `h0` unless its first token begins a
     document; the queries scaled by `scale` (`Dk^-1/2` where None); the output in the operands' common dtype,
-    fp32 where `wide`, the final memory fp32. Keys and values at most `WIDEST` wide, padded to whole
+    fp32 where `wide`, the final memory fp32. Without the `delta` rule nothing is corrected and each token
+    writes its values gated by `beta` (the identity inverse: Mamba2's SSD through its rated decay's log gates,
+    the gated linear attentions with a decay a head). Keys and values at most `WIDEST` wide, padded to whole
     blocks."""
     batch, length, _, key_width = k.shape
     heads, value_width = v.shape[2:]
@@ -575,10 +588,12 @@ def forward(q, k, v, g, beta, h0=None, *, starts=None, max_segments: int | None 
     hi, lo = prefix(laid(g.astype(jnp.float32)).reshape(chunks, CHUNK, heads))
     hi, lo, beta = (x.reshape(rows, heads).T for x in (hi, lo, laid(beta)))
     q, k, v = (given.split(laid(x).reshape(rows, -1)) for x in (q, k, v))
-    a = _solve(k, hi, lo, beta, taken, call)
-    w, u = _weighted(k, v, a, hi, lo, beta, taken, call)
+    w, u = None, v
+    if delta:
+        a = _solve(k, hi, lo, beta, taken, call)
+        w, u = _weighted(k, v, a, hi, lo, beta, taken, call)
     tiles = DEFAULT[held.parts] if tiles is None else tiles
-    h, corrected, final = _states(k, w, u, hi, lo, h0.reshape(-1, columns), sequences, call, tiles)
+    h, corrected, final = _states(k, w, u, hi, lo, beta, h0.reshape(-1, columns), sequences, call, tiles)
     o = _output(q, k, h, corrected, hi, lo, taken, call, tiles, scale=scale,
                 out_dtype=jnp.float32 if wide else dtype)
     o = unlaid(o.reshape(rows, heads, columns))[..., :value_width]
