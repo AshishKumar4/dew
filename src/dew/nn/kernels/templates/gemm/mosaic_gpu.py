@@ -456,7 +456,7 @@ def _staged_columns(block_n: int, dtypes) -> int:
     return columns
 
 
-_IN_FLIGHT = 1
+_IN_FLIGHT = 0
 """The MMAs the cooperative kernels keep in flight while they prepare the next stage. A pipeline's last
 stage is released one step late, past its end, so a persistent kernel's producer would load the next
 tile's first stages over one an MMA still reads: the consumers report each tile drained (`hopper.drain`;
