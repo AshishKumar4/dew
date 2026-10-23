@@ -505,9 +505,10 @@ def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
     measured peak (the largest any class holds), so its files run side by side as a measured lane's do,
     not each alone. A file red under a borrowed share because its memory ran out runs once more, alone,
     with the lane's whole share, and its row says so (interference) with that first failure; one whose
-    first failure is its own (an assertion) stays red, run once. The lane records this class's own
-    measurement, so the next lane on it reads its own, not the borrowed one. A file no class measured runs
-    alone, as every unmeasured one does where the Worker does not list its records."""
+    first failure is its own (an assertion, whatever its message names) stays red, run once. The lane
+    records this class's own measurement, so the next lane on it reads its own, not the borrowed one. A
+    file no class measured runs alone, as every unmeasured one does where the Worker does not list its
+    records."""
     url, stored, _ = cache_worker
     names, source = gpu_lane_at(tmp_path, monkeypatch, url, 4), LANE_TEST
     # Out of memory on any share but the whole: run again alone, its second row green, the first failure kept
@@ -515,7 +516,8 @@ def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
     (tmp_path / "tests/test_tight.py").write_text(
         source + "    if share != '0.5':\n"
                  "        raise RuntimeError('RESOURCE_EXHAUSTED: Out of memory allocating 9.0GiB')\n")
-    (tmp_path / "tests/test_wrong.py").write_text(source + "    assert share == '0.5', 'an accuracy miss'\n")
+    (tmp_path / "tests/test_wrong.py").write_text(
+        source + "    assert share == '0.5', 'an accuracy miss, not RESOURCE_EXHAUSTED: out of memory'\n")
     (tmp_path / "tests/test_new.py").write_text(source)
     every = [*names, "tests/test_tight.py", "tests/test_wrong.py", "tests/test_new.py"]
     interpreter(tmp_path, "3.12")
