@@ -16,7 +16,7 @@ There are three templates: attention, linear recurrence and GEMM. Each one meets
 4. **There is no duplication:** every hand kernel and external route it replaces is deleted once its scoreboard row is met. One owner exists per math (§9).
 5. **It meets the gate, both checks, as `tests/reference_error.py` states them ([Numerical accuracy](testing.md#numerical-accuracy)):** check 1 (parity against independent float64 truth) and check 2 (every element within its certified bound), for every form, hook and gradient on every target. Check 2 is required wherever the zero-element certificate covers the operations, and its coverage grows with the template rather than waiting. The reference is never changed to match an implementation ([testing](testing.md#numerical-accuracy)'s ban).
 
-**One consequence needs the owner** (§13, question 1). FlashAttention's backward computes D = rowsum(dO·O), which fails check 1 on peaked rows: 5–50× in fp32, up to 1,400× in bf16. Every D form that passes costs products FA skips; the anchored pass adds +1.03 ms on the H100, 79% of FA3's whole backward. The gate stands. The speed bar stands too, until the owner changes it: the attention backward must beat FA2/FA3 while passing both checks. The +1.03 ms is one measured form, not a lower bound on every accurate one. Candidate (b′), a masked-column P·V, could make an accurate D nearly free; it is the first measurement. The FA2/FA3 routes stay until the template beats them, and §13 question 1 asks the owner what happens if no accurate form can.
+**The attention backward's forms (the owner's answer to §13 question 1, 2026-10-23).** FlashAttention's backward computes D = rowsum(dO·O), which fails check 1 on peaked rows (5–50× in fp32, up to 1,400× in bf16), and its score cotangents without the anchor test fail it at a query of one key. So the default is the fast form: FlashAttention's arithmetic wherever it passes the gate (one 16-bit product for each score cotangent's product with the keys and queries, dK/dV at the refined D), with D about each query's anchor key from the forward's split sums for dQ, the score cotangents in the reference's order with the anchor test (§3; `ACCURATE`). The accurate form, one option away (`natural=True, accurate=True`), takes the cotangents' products to fp32's accuracy and dQ at the refined D, and holds check 1 on every stability family. Both pass check 1 on ordinary draws. The FA2/FA3 routes stay until the template's default beats them at the gate, in time and in memory (§9).
 
 ## 2. Boundaries
 
@@ -416,7 +416,7 @@ Each entry also names the deletion it enables.
 
 ## 13. Owner decisions (2026-10-21)
 
-Questions 1 and 2 as recommended. Question 3: support all of them (§12). Question 4: not deterministic by default; the fastest passing form is the default, and deterministic mode is one flag away (§8).
+Questions 1 and 2 as recommended. Question 3: support all of them (§12). Question 4: not deterministic by default; the fastest passing form is the default, and deterministic mode is one flag away (§8). Question 1, answered again (2026-10-23): the attention backward's default is the fast form, FlashAttention's arithmetic where it passes the gate with the anchored D for dQ, and the accurate form is one option away (§1).
 
 ## Appendix A. Coverage: attention
 
@@ -549,7 +549,7 @@ The template enters each Op as one `Kernel('template', TEMPLATE_SUPPORTS)`. Its 
 
 | Kernel today | Replaced by | Deletion it enables (when its scoreboard row is met) |
 |---|---|---|
-| `flash` (FA2/FA3 wheel) | template | `flash_attention`, `FLASH_SUPPORTS`, `flash_architectures`/`flash_built_for`, `FLASH_PACKED_SEGMENTS`, the dew_flash_attn wheel and its build. Per §13 Q1, these go once an accurate template backward is within reach. |
+| `flash` (FA2/FA3 wheel) | template | `flash_attention`, `FLASH_SUPPORTS`, `flash_architectures`/`flash_built_for`, `FLASH_PACKED_SEGMENTS`, the dew_flash_attn wheel and its build. Per §1 and §13 Q1, these go once the template's default beats them at the gate, in time and in memory. |
 | `triton` (tokamax Triton) | template | `triton_attention`, `TRITON_SUPPORTS`, the `attention_narrow` rows in TARGETS. |
 | `cudnn` | template | `cudnn_attention`, `CUDNN_SUPPORTS`, `cudnn_takes_mask`, `kernel_for_materialized_mask`, `widen_value_heads`, `cudnn_max_head_dim`. |
 | `tpu` (Splash, Pallas flash interpreted) | template's TPU mainloop (Splash's MaskInfo adopted) | `splash_attention`, `splash_mask_descriptor`, `splash_dense_mask`, `splash_block_sizes`, `pallas_flash_attention`, `TPU_SUPPORTS`. |

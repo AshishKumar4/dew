@@ -1,9 +1,8 @@
 """The attention template's Mosaic GPU mainloop (design §6, one mainloop per overlap structure): the order of
 an instruction family's bundle's steps (`mosaic.Family`: its roles, operand streams, products and layouts)
 around the template's algebra (`attention_algebra`), FlashAttention-3's structure on the wgmma family
-(`mosaic_sm90.WGMMA`) and FlashAttention-2's on mma.sync (`mosaic_sm80.Mma`, one consumer a program). It holds
-no instruction, layout or stream barrier of its own: only the overlap structure, the query block's load and
-the consumers' schedule.
+(`mosaic_sm90.WGMMA`). It holds no instruction, layout or stream barrier of its own: only the overlap
+structure, the query block's load and the consumers' schedule.
 
 One program a query head and the family's consumers' query blocks (two warpgroups on wgmma, each a block of
 `Tiles.block_q` rows), beside the family's loads streaming the key and value tiles (`Family.stream`,
@@ -28,7 +27,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, mosaic_sm80, mosaic_sm90
+from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, mosaic_sm90
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
     NATURAL,
@@ -47,10 +46,9 @@ COLUMNS = 64
 def family_of(dtype) -> mosaic.Family:
     """The bundle of the device's instruction family (`generation.family`) for operands of `dtype`."""
     name = generation.family(generation.device_generation())
+    del dtype
     if name == "wgmma":
         return mosaic_sm90.WGMMA
-    if name == "mma.sync":
-        return mosaic_sm80.Mma(jnp.dtype(dtype))
     raise NotImplementedError(f"the Mosaic attention mainloop has no bundle for the {name!r} family")
 
 
@@ -68,11 +66,10 @@ class Tiles:
             raise ValueError(f"{self}: two stages or more")
 
 
-DEFAULTS = {"wgmma": Tiles(64, 128, 2), "mma.sync": Tiles(64, 64, 3)}
+DEFAULTS = {"wgmma": Tiles(64, 128, 2)}
 """The forward's tiles by family: wgmma's FlashAttention-3's at width 128, a warpgroup's 64 queries over 128
 keys in two stages, the fastest of 64 or 128 queries over 64 or 128 keys in two to four stages on an H100
-(llama-d128 causal bf16, 2 x 4096: 0.53 ms; 128 queries a consumer spill, 2.9 to 4.6 ms); mma.sync's a
-warpgroup's 64 queries over 64 keys in three stages, as FlashAttention-2's on an A100."""
+(llama-d128 causal bf16, 2 x 4096: 0.49 ms; 128 queries a consumer spill, 2.9 to 4.6 ms)."""
 
 
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
@@ -252,7 +249,7 @@ def _launch(query, key, value, *, spec: algebra.Forward, tiles: Tiles, family: m
                          consumers=consumers, interpret=interpret)(query, key, value)
 
 
-BACKWARD_DEFAULTS = {"wgmma": Tiles(64, 64, 2), "mma.sync": Tiles(64, 64, 2)}
+BACKWARD_DEFAULTS = {"wgmma": Tiles(64, 64, 2)}
 """The backward's tiles by family: each consumer's 64 queries over 64-key tiles, two stages, so a dQ program's
 key and value streams, its consumers' queries and output cotangents, and their fp32 sums fit a block's shared
 memory."""
