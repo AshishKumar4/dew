@@ -45,6 +45,10 @@ CHUNK_SIZE = 64
 recurrent form agree at any size; the size only trades memory for
 parallelism, and 64 is what the reference's kernels assume."""
 
+ADJOINT_CHUNKS = 16
+"""Chunks replayed at once in the portable backward: bounded groups keep a token span's memories
+from growing with the sequence, while every group's rows and heads run in parallel."""
+
 
 def held_chunk(chunk_size: int, key_width: int) -> int:
     """The delta rule's chunk at `key_width`: `chunk_size`, at most twice the keys' width. A measured
@@ -182,16 +186,16 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     entered passing through only where no document starts in it. A document
     computes as it would alone.
 
-    The reverse rule erases before differentiating a token's decay, within every chunk at once
+    The reverse rule erases before differentiating a token's decay, within independently replayed chunks
     (`_chunk_delta_backward`). Differentiating the WY products instead cancelled independently
     rounded paths through the inverse, pairwise decays and readout: under aligned keys their RMS
     magnitudes summed to 16.2 times the resulting decay gradient on one draw. Over 40 draws its
     fp32 error was 1.883 times the token recurrence's, and 2.941 at 128-wide keys with 64-token
     chunks; regrouped it is 1.068 and 0.989. The vector decay's is 1.021, and the formed gates'
     gate, log_a and bias 1.053, 1.038 and 1.023 over 320 draws. All arithmetic remains fp32.
-    Only the chunk boundaries scan sequentially across the sequence; each token scan spans C
-    positions, not the sequence's T. Forward-mode callers keep the primal's tangent, as the port's
-    forward-mode fallback does (`FORWARD_MODE`).
+    Only the chunk boundaries couple across the sequence; bounded groups schedule each chunk's C-step
+    token scans, not one scan over the sequence's T. Forward-mode callers keep the primal's tangent,
+    as the port's forward-mode fallback does (`FORWARD_MODE`).
     """
     dtype = jnp.result_type(query, key, value) if dtype is None else jnp.dtype(dtype)
     work = at_least_fp32(jnp.result_type(query, key, value))
@@ -263,13 +267,13 @@ def _chunk_delta_residual(query, key, value, g, beta, state, chunk_size, starts,
 
 
 def _chunk_delta_backward(chunk_size, delta, scale, dtype, residual, cotangent):
-    """The token adjoint within each chunk, all chunks parallel; only their memory cotangents cross
+    """The token adjoint within independently replayed chunks; only their memory cotangents cross
     boundaries. Replay C tokens from each entered memory, derive their terminal cotangents from
     `readout_entered_gradient` and the transitions, then reverse C tokens. Replaying keeps a token's
     erasure beside its decay, rather than cancelling separately rounded WY derivatives afterwards.
-    Checkpoint every SUB tokens, then bisect each span's replay: retain its midpoint, reverse the
-    right half, then the left. The memories kept are C/SUB checkpoints and log2(SUB) midpoints,
-    not a memory for every token. Replays and adjoints preserve the token recurrence's order."""
+    Checkpoint every SUB tokens, then replay one span at a time inside the reverse scan. Groups of
+    ADJOINT_CHUNKS bound the live span and checkpoints independently of the sequence's length.
+    Replays and adjoints preserve the token recurrence's arithmetic and order."""
     del chunk_size, dtype
     query, key, value, g, beta, resets, entered, transition, decayed_query, weights, scores = residual
     cotangent, final_cotangent = cotangent
@@ -298,8 +302,6 @@ def _chunk_delta_backward(chunk_size, delta, scale, dtype, residual, cotangent):
         final, _ = jax.lax.scan(replay, state, inputs)
         return final, state
 
-    span_tokens = tuple(map(span_major, tokens))
-    _, checkpoints = jax.lax.scan(checkpoint, entered, span_tokens)
     source = algebra.readout_entered_gradient(decayed_query, weights, scores, cotangent)
 
     def across(state_gradient, inputs):
@@ -318,32 +320,41 @@ def _chunk_delta_backward(chunk_size, delta, scale, dtype, residual, cotangent):
         state_gradient, *gradients = pull((out_gradient, state_gradient))
         return state_gradient, tuple(gradients)
 
-    def reverse_interval(state_gradient, checkpoint, out_gradient, tokens):
-        count = out_gradient.shape[0]
-        if count == 1:
-            initial, gradients = adjoint(
-                state_gradient, (checkpoint, out_gradient[0], *(x[0] for x in tokens)))
-            return initial, tuple(x[None] for x in gradients)
-        middle = count // 2
-        first, second = (tuple(x[:middle] for x in tokens), tuple(x[middle:] for x in tokens))
-        midpoint, _ = jax.lax.scan(replay, checkpoint, first)
-        gradient, right = reverse_interval(state_gradient, midpoint, out_gradient[middle:], second)
-        initial, left = reverse_interval(gradient, checkpoint, out_gradient[:middle], first)
-        return initial, tuple(jnp.concatenate((x, y), axis=0) for x, y in zip(left, right, strict=True))
-
     def reverse_span(state_gradient, inputs):
         checkpoint, out_gradient, *tokens = inputs
-        return reverse_interval(state_gradient, checkpoint, out_gradient, tuple(tokens))
+        _, before = jax.lax.scan(replay, checkpoint, tuple(tokens))
+        return jax.lax.scan(adjoint, state_gradient, (before, out_gradient, *tokens), reverse=True)
 
-    initial, gradients = jax.lax.scan(
-        reverse_span, terminal, (checkpoints, span_major(cotangent), *span_tokens), reverse=True)
+    def within(inputs):
+        entered, terminal, cotangent, *tokens = inputs
+        span_tokens = tuple(map(span_major, tokens))
+        _, checkpoints = jax.lax.scan(checkpoint, entered, span_tokens)
+        initial, gradients = jax.lax.scan(
+            reverse_span, terminal, (checkpoints, span_major(cotangent), *span_tokens), reverse=True)
 
-    def sequence(x):
-        x = x.reshape(spans * span_width, *x.shape[2:])[:width]
-        return _chunk_sequence(jnp.moveaxis(x, 0, 3), length)
+        def rows(x):
+            return jnp.moveaxis(x.reshape(spans * span_width, *x.shape[2:])[:width], 0, 3)
 
-    dq, dk, dv, dg, dbeta = map(sequence, gradients)
-    return dq * scale, dk, dv, dg, dbeta, initial[:, :, 0], None
+        return initial, tuple(map(rows, gradients))
+
+    count = entered.shape[2]
+    group_width = min(ADJOINT_CHUNKS, count)
+    groups = (count + group_width - 1) // group_width
+
+    def grouped(x):
+        padding = [(0, 0)] * x.ndim
+        padding[2] = (0, groups * group_width - count)
+        x = jnp.pad(x, padding)
+        return jnp.moveaxis(x.reshape(*x.shape[:2], groups, group_width, *x.shape[3:]), 2, 0)
+
+    def ungrouped(x):
+        x = jnp.moveaxis(x, 0, 2)
+        return x.reshape(*x.shape[:2], groups * group_width, *x.shape[4:])[:, :, :count]
+
+    initial, gradients = jax.lax.map(
+        within, tuple(map(grouped, (entered, terminal, cotangent, *tokens))))
+    dq, dk, dv, dg, dbeta = (_chunk_sequence(ungrouped(x), length) for x in gradients)
+    return dq * scale, dk, dv, dg, dbeta, ungrouped(initial)[:, :, 0], None
 
 
 _differentiable_chunk_delta_rule = jax.custom_vjp(_chunk_delta_rule, nondiff_argnums=(6, 8, 9, 10))

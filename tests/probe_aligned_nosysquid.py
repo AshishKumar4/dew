@@ -43,6 +43,8 @@ def run(mode, name, seed):
     if "DEW_PROBE_CHUNK" in os.environ:
         st.CHUNK = int(os.environ["DEW_PROBE_CHUNK"])
         c.held_chunk = lambda size, width: size
+    if "DEW_PROBE_GROUP" in os.environ:
+        c.ADJOINT_CHUNKS = int(os.environ["DEW_PROBE_GROUP"])
     regime = os.environ.get("DEW_PROBE_REGIME", "aligned keys")
     with jax.enable_x64(False):
         drawn = st.cotangents(st.SITES[name], regime, seed)

@@ -17,8 +17,11 @@ def unregrouped(*args, **kwargs):
 
 
 @pytest.mark.parametrize("variant", ["current", "chunk-adjoint", "chunk-adjoint-fast",
-                                    "chunk-adjoint-uncheckpointed", "comp-core"])
+                                    "chunk-adjoint-uncheckpointed", "comp-core",
+                                    "chunk-adjoint-g4", "chunk-adjoint-g8", "chunk-adjoint-g16"])
 def test_backward_wall_time(variant):
+    if variant.startswith("chunk-adjoint-g"):
+        recurrence_chunk.ADJOINT_CHUNKS = int(variant.removeprefix("chunk-adjoint-g"))
     if variant == "comp-core":
         import probe_aligned_dots_nosysquid as dots
         from probe_aligned_compensated_nosysquid import dot
@@ -26,7 +29,8 @@ def test_backward_wall_time(variant):
         os.environ["DEW_PROBE_REDUCE"] = "1"
         dots.wide_dot = dot
         dots.install(CORE)
-    fn = {"current": unregrouped, "chunk-adjoint": chunk_adjoint,
+    fn = recurrence_chunk.chunk_delta_rule if variant.startswith("chunk-adjoint-g") else {
+          "current": unregrouped, "chunk-adjoint": chunk_adjoint,
           "chunk-adjoint-fast": recurrence_chunk.chunk_delta_rule,
           "chunk-adjoint-uncheckpointed": chunk_adjoint_wy_source, "comp-core": unregrouped}[variant]
     shape = (2, 4096, 16, 128)
