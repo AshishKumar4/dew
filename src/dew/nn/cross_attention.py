@@ -186,7 +186,8 @@ class GatedCrossAttention(nn.Module):
         def joined(stream: jax.Array, name: str, branch: jax.Array) -> jax.Array:
             gate = jnp.tanh(self.param(name, nn.initializers.zeros, (1,), jnp.float32).astype(jnp.float32))
             branch = dropout(branch, deterministic=not train)
-            return jnp.where(present, self._join(stream, branch, gate), stream)
+            return jnp.where(present, gated_join(stream, branch, gate, ngpt=self.ngpt,
+                                                 precision=self.precision), stream)
 
         stream = joined(stream, "alpha_cross_attn", output)
         hidden = self.feedforward(name="mlp")(self._normed("post_attention_layernorm", read(stream)))
@@ -194,27 +195,6 @@ class GatedCrossAttention(nn.Module):
 
     def _normed(self, name: str, x: jax.Array) -> jax.Array:
         return x if self.norm is None else self.norm(name=name)(x)
-
-    def _join(self, stream: jax.Array, branch: jax.Array, gate: jax.Array) -> jax.Array:
-        """`stream` with `branch` joined through `gate`, in at least float32 of
-        the three and rounded once to the stream's dtype: added, broadcast over
-        any axis the stream has beside the states', or under nGPT moved by the
-        step of `gate` from the unit stream toward the unit branch, nGPT's step
-        on the unit sphere, at the stream's own length (`_moved_on_the_sphere`),
-        so a zero gate leaves the stream bit for bit, whatever its length:
-        before a first layer the input embeddings are not unit."""
-        wide = stream.astype(at_least_fp32(jnp.result_type(stream, branch, gate)))
-        if self.ngpt:
-            # The stream over its largest element, whose squares no finite stream overflows: the
-            # move scales back by its length there, then by that element, so a zero move adds zero.
-            peak = jnp.max(jnp.abs(wide), axis=-1, keepdims=True)
-            scaled = wide / jnp.where(peak > 0, peak, 1)
-            length = sqrt_or_zero(jnp.sum(jnp.square(scaled), axis=-1, keepdims=True))
-            start, end = l2norm(scaled), l2norm(branch).astype(wide.dtype)
-            move = _moved_on_the_sphere(start, _gated(end - start, gate, self.precision))
-            return (wide + peak * (length * move)).astype(stream.dtype)
-        widened = branch.reshape(branch.shape[:2] + (1,) * (stream.ndim - branch.ndim) + branch.shape[2:])
-        return (wide + _gated(widened, gate, self.precision)).astype(stream.dtype)
 
     def _keys_values(self, embeddings: jax.Array) -> tuple[jax.Array, jax.Array]:
         """The context's keys and values, `[B, C, kv_heads, head_dim]` each."""
@@ -257,6 +237,28 @@ class GatedCrossAttention(nn.Module):
         return key, value, context.lengths
 
 
+def gated_join(stream: jax.Array, branch: jax.Array, gate: jax.Array, *, ngpt: bool = False,
+               precision: PrecisionLike = None) -> jax.Array:
+    """`stream` with `branch` joined through `gate`, in at least float32 of the three and rounded once
+    to the stream's dtype: added, broadcast over any axis the stream has beside the states', or with
+    `ngpt` moved by the step of `gate` from the unit stream toward the unit branch, nGPT's step on the
+    unit sphere, at the stream's own length (`_moved_on_the_sphere`). The stream is scaled by its
+    largest element first, so no square of a finite stream overflows, and a zero gate leaves it bit for
+    bit, whatever its length: before a first layer the input embeddings are not unit."""
+    wide = stream.astype(at_least_fp32(jnp.result_type(stream, branch, gate)))
+    if ngpt:
+        # The move scales back by the length of the scaled stream, then by its largest element, so a
+        # zero move adds zero.
+        peak = jnp.max(jnp.abs(wide), axis=-1, keepdims=True)
+        scaled = wide / jnp.where(peak > 0, peak, 1)
+        length = sqrt_or_zero(jnp.sum(jnp.square(scaled), axis=-1, keepdims=True))
+        start, end = l2norm(scaled), l2norm(branch).astype(wide.dtype)
+        move = _moved_on_the_sphere(start, _gated(end - start, gate, precision))
+        return (wide + peak * (length * move)).astype(stream.dtype)
+    widened = branch.reshape(branch.shape[:2] + (1,) * (stream.ndim - branch.ndim) + branch.shape[2:])
+    return (wide + _gated(widened, gate, precision)).astype(stream.dtype)
+
+
 def _moved_on_the_sphere(start: jax.Array, step: jax.Array) -> jax.Array:
     """`l2norm(start + step) - l2norm(start)` along the last axis, written so a zero step moves by
     exactly zero: with N = |start|^2 + eps and M = N + 2<start, step> + |step|^2 the two points' squared
@@ -281,4 +283,4 @@ def _gated(branch: jax.Array, gate: jax.Array, precision: PrecisionLike) -> jax.
 
 
 __all__ = ["CROSS_CACHE", "CROSS_KEY", "CROSS_LENGTHS", "CROSS_VALUE", "NAME", "CrossAttention",
-           "GatedCrossAttention", "crossing"]
+           "GatedCrossAttention", "crossing", "gated_join"]
