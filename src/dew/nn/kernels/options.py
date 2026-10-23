@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
 
+from dew.devices import xla_flag
 from dew.nn.kernels.generation import backend, gpu_target
-from dew.telemetry.devices import xla_flag
 
 if TYPE_CHECKING:
     from flax import linen as nn

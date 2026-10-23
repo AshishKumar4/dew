@@ -31,9 +31,9 @@ import tempfile
 import venv
 from pathlib import Path
 
-INDEX = runpy.run_path(str(Path(__file__).resolve().parents[1] / "src/dew/telemetry/builds.py"))[
+INDEX = runpy.run_path(str(Path(__file__).resolve().parents[1] / "src/dew/builds.py"))[
     "PACKAGE_INDEX"]
-"""Dew's package index, the one place Dew's JAX build is served (dew.telemetry.builds.PACKAGE_INDEX)."""
+"""Dew's package index, the one place Dew's JAX build is served (dew.builds.PACKAGE_INDEX)."""
 
 TRAIN = """
 import sys
