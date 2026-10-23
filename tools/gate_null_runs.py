@@ -1,5 +1,5 @@
-"""The bible-section-10 null runs of check 1 on the order sites' operation classes (tests/reference_error.py
-`null_runs`; docs of the design: the gate's orders-through-check1 review): per class, the reference against
+"""The null runs of check 1 on the order sites' operation classes (tests/reference_error.py
+`null_runs`): per class, the reference against
 itself on disjoint draws of the site's own draw law, run after run on fresh draws, every nonpassing verdict
 counted, and the one-sided Clopper-Pearson bound of the red rate.
 
