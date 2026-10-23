@@ -413,7 +413,12 @@ class _Triton(_GroupedLaunch[Tile]):
         loaded = self.loaded(config) + (_products(ba) - 1) * config.block_k * config.block_n
         step = loaded * jnp.dtype(ba.arguments['tokens'].dtype).itemsize + _side_tile_bytes(
             ba.arguments['prologue_operands'], ba.arguments['hooks'].prologue_axes, self.extents(config))
-        return step * (config.stages - held)
+        # A 128-deep step's dot also keeps a scratch of its own, by warps and 64-row blocks: compiled for an
+        # A100 at 22 tiles (PAIRED-a100-fit), Triton launched with 4096 to 16384 bytes past the stages, at
+        # most this; at 32 and 64 deep, with none.
+        scratch = (16 * config.block_k * config.warps * max(1, config.block_m // 64)
+                   if config.block_k >= 128 else 0)
+        return step * (config.stages - held) + scratch
 
     @staticmethod
     @abc.abstractmethod
