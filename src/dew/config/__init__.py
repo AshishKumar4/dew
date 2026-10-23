@@ -648,8 +648,8 @@ class TrainerConfig:
 
     name: str | None = None
     checkpoint_dir: str = "./checkpoints"
-    keep: Annotated[int | Keep, _keep_argument()] = 2
-    """The number of latest checkpoints kept, besides the best one."""
+    keep: Annotated[int | Keep, _keep_argument()] = Keep.latest
+    """The number of latest checkpoints kept, besides the best one (`Keep`'s own default)."""
     best: Annotated[str | Best | tuple[Best, ...] | None, _best_argument()] = None
     """The metric name and ranking policy; None selects validation loss or training loss."""
     update_tokens: int | None = None

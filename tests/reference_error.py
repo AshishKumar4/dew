@@ -115,6 +115,30 @@ def widened(tree):
         leaf, np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype), tree)
 
 
+WITHOUT_YNN = {"xla_cpu_experimental_ynn_fusion_type": ""}
+"""XLA:CPU's compiler options with every YNNPACK fusion off (dots, reductions, element-wise and layout
+ops alike), so that a program runs on XLA's own code, compiled for the host's instruction set with no
+dispatch at run time. YNNPACK picks its microkernels at run time by that instruction set, and both
+the interpreted SSD kernel and XLA's scan fuse parts of themselves to it by default, which moved
+check 1 between the two across PARITY by host; without the fusions the verdicts held on two hosts
+of different instruction sets, though the bits still part with the host (docs/performance.md, "The
+SSD kernel's host check 1 without YNNPACK"). The empty list, not the documented `-individual_dot`,
+because compiler options take no such spelling and that one leaves a scan's reductions fused."""
+
+
+def without_ynn(fn, **jit_options):
+    """`fn` jitted with WITHOUT_YNN on the CPU lane, the process's default backend
+    (`jax.default_backend()`), and plain `jax.jit` elsewhere. It compiles both arms of a check 1
+    between two Dew paths, such as an interpreted kernel and the XLA program it replaces, the latter
+    the arm the check measures against, so that the two run the same kind of code on any host. A
+    program Dew's users run compiles with the fusions, as they do. Call it at top level, since on the
+    CPU lane its compiler options refuse to be nested in another jit or differentiated through. A
+    caller's own compiler options take precedence over WITHOUT_YNN's."""
+    if jax.default_backend() == "cpu":
+        jit_options["compiler_options"] = {**WITHOUT_YNN, **(jit_options.get("compiler_options") or {})}
+    return jax.jit(fn, **jit_options)
+
+
 def with_gradients(fn):
     """`fn` as `run(*inputs, cotangent)`, which returns `fn(*inputs)` and the gradients of its inputs
     under the cotangent passed last: a differentiated call's leaves, as the gate compares them."""
