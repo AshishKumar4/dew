@@ -146,7 +146,8 @@ def floored(root: Path, least: str) -> Path:
 
 @pytest.mark.parametrize(("have", "fetched", "running"), [
     ("0.13.9", ["https://astral.sh/uv/0.14.2/install.sh"], "0.14.2"),
-    ("0.14.2-rc.1", ["https://astral.sh/uv/0.14.2/install.sh"], "0.14.2"), ("0.14.10", [], "0.14.10")])
+    ("0.14.2-rc.1", ["https://astral.sh/uv/0.14.2/install.sh"], "0.14.2"),
+    ("0.14.2+build.1", [], "0.14.2+build.1"), ("0.14.10", [], "0.14.10")])
 def test_an_older_uv_is_replaced_by_the_least_one_which_runs_the_install(tmp_path, have, fetched, running):
     command, asked = installed(floored(tmp_path, "0.14.2"), "NVIDIA L4, 580.82.07, 8.9", uv=have)
     assert asked == fetched and command[:3] == [running, "pip", "install"]
