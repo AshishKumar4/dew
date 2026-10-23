@@ -799,9 +799,11 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
         # The natural denominator: the unshifted one where finite, else the shifted one taken back.
         finite = jnp.isfinite(fields.plain_total)
         denominator = jnp.where(finite, fields.plain_total, power2(denominator, fields.shift))
-        # Each element from the unshifted sums where they and their denominator are finite, as the plain
-        # walk's; the shifted sums' ratio where they overflowed (`Partial.plain`).
-        kept = jnp.isfinite(fields.plain) & expand(finite & (fields.plain_total > 0), out)
+        # A live row's elements from the unshifted sums where they and their denominator are finite, as
+        # the plain walk's; the shifted sums' ratio where they overflowed (`Guard.plain`). Every other
+        # row shifted nothing, so its sums are the plain walk's own (a training walk's joined split sums).
+        kept = (jnp.isfinite(fields.plain)
+                & expand(fields.live & finite & (fields.plain_total > 0), out))
         safe = expand(jnp.where(finite & (fields.plain_total > 0), fields.plain_total, 1.0), out)
         out = jnp.where(kept, fields.plain / safe, out)
     if output_mod is not None:
