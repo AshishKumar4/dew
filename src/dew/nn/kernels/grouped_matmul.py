@@ -618,10 +618,10 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     """Whether the kernel adds each depth step's product apart (`exact_sums`); one that does not is not
     eligible where the call asks for it."""
     CONTRACTED: ClassVar[str]
+    """The launch axis its steps walk."""
     STREAMS: ClassVar[bool] = False
     """Whether its cooperative kernel streams its stages across tiles (`hopper.Ring`), its pipeline
     filling once a launch, not once a tile."""
-    """The launch axis its steps walk."""
 
     def eligible(self, ba, target) -> bool:
         first, second = (value.dtype for name, value in ba.arguments.items()
