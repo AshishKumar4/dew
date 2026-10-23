@@ -44,6 +44,9 @@ Scope is per rule, because the rules are not all about the same thing:
   still hold such comparisons are the inventory
   (`tools/tolerance_inventory.json`), each at its count and lane, and it only
   shrinks.
+- SLOP021 is about every file: a private attribute of JAX's own objects
+  (`JAX_PRIVATE`) is read nowhere (bible: no private attributes of other
+  libraries), whose public way the finding names.
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -91,6 +94,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lint_scopes as scopes
 import lint_tolerances as tolerance_rules
+from forked import forked_map
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -628,6 +632,21 @@ def mocks(module: Module) -> Iterator[Finding]:
             continue
         yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP008",
                       f"patches {target}; the fix is a seam the test can pass a double to")
+
+
+JAX_PRIVATE = {
+    "_cache_size": "count the programs a jitted function needs with dew.telemetry.instrumentation.Compiles",
+}
+"""The private attributes of JAX's objects Dew has read, each with the public way to what it was read
+for."""
+
+
+def jax_private(module: Module) -> Iterator[Finding]:
+    """SLOP021: a read of a private attribute of JAX's objects (`JAX_PRIVATE`)."""
+    for node in ast.walk(module.tree):
+        if isinstance(node, ast.Attribute) and node.attr in JAX_PRIVATE:
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP021",
+                          f"reads JAX's private {node.attr}; {JAX_PRIVATE[node.attr]}")
 
 
 def size(module: Module) -> Iterator[Finding]:
@@ -1754,7 +1773,7 @@ GATE = frozenset({"tests/reference_error.py", "tests/op_certificates.py", "tools
                   "tests/test_reference_orders.py", "tests/test_reference_graph.py",
                   "tests/test_gate_calibration.py", "tests/test_float64_terms.py"})
 """The gate's modules and the tests of the gate itself, the one place a float is compared within a
-bound (bible §7, 2026-10-20): every other comparison goes through its assertion."""
+bound (bible §7): every other comparison goes through its assertion."""
 INVENTORY = "tools/tolerance_inventory.json"
 RULE = "tools/lint_tolerances.py"
 """SLOP020's reading of a file (`tolerance_rules`), whose change may grow what the inventory holds."""
@@ -2014,7 +2033,7 @@ def tolerances(module: Module) -> Iterator[Finding]:
 
 
 CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections)
-UNIVERSAL_RULES = (suppressions, swallowed, comments, size)
+UNIVERSAL_RULES = (suppressions, swallowed, comments, size, jax_private)
 
 
 def check(module: Module, models: ModelIndex | None = None) -> Iterator[Finding]:
@@ -2033,7 +2052,7 @@ RECORDED = {"site/src/data/hero.py": "site/src/data/capture.json"}
 """Python files whose bytes a recording pins, each with the recording that names their sha256
 (`meta.script_sha256`): the landing hero's script, whose capture the site's build checks it against
 (site/src/pages/index.astro), so an edit fails the build until the hero is recorded again on a host as
-fast as the recording's (user, 2026-10-16: the 60 s recording stays). The gate reads such a file only
+fast as the recording's (the owner keeps the 60 s recording). The gate reads such a file only
 once its bytes are no longer the recorded ones, which an edit makes them."""
 
 
@@ -2045,11 +2064,12 @@ def recorded(checkout: Path, relative: str, path: Path) -> bool:
     return capture["meta"]["script_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def collect(roots: Sequence[str], checkout: Path = ROOT, package: str = "dew") -> Iterator[Module]:
+def files(roots: Sequence[str], checkout: Path = ROOT) -> Iterator[tuple[Path, str]]:
     """Every Python file under the named roots of `checkout`, or the root
-    itself when it names a file, skipping stub-only trees, the site's
-    installed npm packages (node-gyp ships Python) and a file whose bytes
-    are still those a recording pins (`RECORDED`)."""
+    itself when it names a file, with its path from the checkout, skipping
+    stub-only trees, the site's installed npm packages (node-gyp ships
+    Python) and a file whose bytes are still those a recording pins
+    (`RECORDED`)."""
     for root in roots:
         named = checkout / root
         for path in [named] if named.is_file() else sorted(named.rglob("*.py")):
@@ -2058,7 +2078,27 @@ def collect(roots: Sequence[str], checkout: Path = ROOT, package: str = "dew") -
                 continue
             if recorded(checkout, relative, path):
                 continue
-            yield Module(path, relative, path.read_text(), ast.parse(path.read_text()), package)
+            yield path, relative
+
+
+def parsed(path: Path, relative: str, package: str = "dew") -> Module:
+    return Module(path, relative, path.read_text(), ast.parse(path.read_text()), package)
+
+
+def collect(roots: Sequence[str], checkout: Path = ROOT, package: str = "dew") -> Iterator[Module]:
+    """Every file `files` names, parsed."""
+    for path, relative in files(roots, checkout):
+        yield parsed(path, relative, package)
+
+
+INDEX: ModelIndex | None = None
+"""The model index `checked` reads: built once by `main`, before any fork, and inherited, never sent."""
+
+
+def checked(file: tuple[Path, str, str]) -> list[Finding]:
+    """One file's findings, against the model index `main` built (`INDEX`)."""
+    assert INDEX is not None, "main builds the index before it reads a file"
+    return list(check(parsed(*file), INDEX))
 
 
 def default_roots(package: str) -> list[str]:
@@ -2067,7 +2107,10 @@ def default_roots(package: str) -> list[str]:
     return [f"src/{package}", "tests", "tools", "recipes", "examples", "site", "docs/assets", "kernels"]
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None, forked: bool = False) -> int:
+    """The gate, its files read in forked processes when `forked` (`forked_map`), as the script reads them,
+    its findings printed in the files' order, as one process prints them. A caller in a process that may
+    hold threads (a test, under JAX) reads them in its own process."""
     parser = argparse.ArgumentParser(description="Report low-evidence Python, `path:line:col: SLOPxxx`.")
     parser.add_argument("roots", nargs="*", help="directories or files under the checkout; by default the "
                         "package's source, tests, tools, recipes, examples, site, docs/assets and kernels")
@@ -2091,27 +2134,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     roots = args.roots or default_roots(args.package)
     counts: dict[str, int] = {}
-    files: dict[str, set[str]] = {}
-    models = ModelIndex.build(list(collect([f"src/{args.package}"], args.root.resolve(), args.package)))
-    seen = set()
-    for module in collect(roots, args.root.resolve(), args.package):
-        seen.add(module.relative)
-        for finding in check(module, models):
-            print(finding)
-            counts[finding.code] = counts.get(finding.code, 0) + 1
-            files.setdefault(finding.code, set()).add(finding.path)
+    coded: dict[str, set[str]] = {}
+    global INDEX
+    INDEX = ModelIndex.build(list(collect([f"src/{args.package}"], args.root.resolve(), args.package)))
+    read = [(path, relative, args.package) for path, relative in files(roots, args.root.resolve())]
+    seen = {relative for _, relative, _ in read}
+    found = forked_map(checked, read) if forked else [checked(file) for file in read]
+    for finding in (finding for each in found for finding in each):
+        print(finding)
+        counts[finding.code] = counts.get(finding.code, 0) + 1
+        coded.setdefault(finding.code, set()).add(finding.path)
     if not args.roots:
         # Every file the inventory names is read on a whole run, so one it names that is gone is stale.
         for relative in sorted(set(_inventory(args.root.resolve()).get("files", {})) - seen):
             print(Finding(INVENTORY, 1, 1, "SLOP020", f"names {relative}, which is gone: remove its entry"))
             counts["SLOP020"] = counts.get("SLOP020", 0) + 1
-            files.setdefault("SLOP020", set()).add(INVENTORY)
+            coded.setdefault("SLOP020", set()).add(INVENTORY)
     for code, count in sorted(counts.items()):
-        print(f"{code}: {count} in {len(files[code])} files", file=sys.stderr)
+        print(f"{code}: {count} in {len(coded[code])} files", file=sys.stderr)
     failures = sum(counts.values())
     print(f"{failures} findings", file=sys.stderr)
     return 1 if failures else 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(forked=True))

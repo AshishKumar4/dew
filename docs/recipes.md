@@ -116,19 +116,21 @@ Every recipe's configuration extends `RunConfig` with five parts:
 
 A dotted flag sets a field inside a configuration object, and `--set path=value`, applied after the flags, sets one inside the run's data chain: `data.<preset>.<setting>` for the preset's settings and `data.source.url` for its store. `--model` picks the model's class by alias or import path (`--model hybrid_dit`, `--model mypackage.models:Net`), and every field that class declares is then a flag of its own, typed by its annotation: `--model.num-layers 12`, `--model.dtype float32`, `--model.precision highest`. A field holding records, such as a UNet's `attention_configs`, takes one JSON value. Naming another class starts from that class's defaults and keeps the recipe's compute dtype. `--objective` works the same way: it picks the objective's class, and each argument of its constructor is a flag, `--objective.<argument>`, except th…
 
-| Setting | Default | Notes |
-|---|---|---|
-| `--model.dtype` | `bfloat16` | The model's compute dtype, which each recipe's default model states. Parameters are stored in float32. A run-wide matmul precision is `jax.default_matmul_precision`; a model's own is `--model.precision`. |
-| `--model.attention-impl` | `auto` | A name `AttentionImpl` declares ([dew/nn/attention.py](../src/dew/nn/attention.py)). The example uses `reference` so no device-specific kernel runs. |
-| `--optim.optimizer` | `adamw` | `adam`, `adamw`, `lamb`, `muon` or `muonclip`. |
-| `--optim.learning-rate` | `2.7e-4` | The constant rate when no schedule is named. |
-| `--optim.state-dtype` | `float32` | `bfloat16` stores Adam's moments stochastically rounded, for `adam` and `adamw` only. |
-| `--trainer.steps` / `--trainer.epochs` | | Run length; set one, not both. |
-| `--set data.<preset>.batch` | `32` | Global batch across all JAX processes, the preset's (`data.token_windows.batch`, `data.images.batch`). |
-| `--trainer.eval-every`, `--trainer.checkpoint-every` | `epoch` | A step interval, `epoch`, or `None`. |
-| `--trainer.checkpoint-dir`, `--trainer.name` | `./checkpoints`, none | The run's directory is `<checkpoint-dir>/<name>`. |
-| `--trainer.multi-host` | `None` | Join the JAX process pool: `None` asks and continues alone when no cluster is configured, `True` requires the pool, `False` never asks. |
-| `--trainer.xla-flags` | `None` | Extra `XLA_FLAGS`, applied before JAX opens a backend. |
+Each setting's default is the recipe's own, which can differ from the configuration class's: the language-model recipe states its own optimizer settings (`LMRunConfig`). A recipe's `--help` prints every flag with the default that recipe runs with, for example `python recipes/lm/train.py --help`.
+
+| Setting | Notes |
+|---|---|
+| `--model.dtype` | The model's compute dtype, which each recipe's default model states. Parameters are stored in float32. A run-wide matmul precision is `jax.default_matmul_precision`; a model's own is `--model.precision`. |
+| `--model.attention-impl` | A name `AttentionImpl` declares ([dew/nn/attention.py](../src/dew/nn/attention.py)). The example uses `reference` so no device-specific kernel runs. |
+| `--optim.optimizer` | `adam`, `adamw`, `lamb`, `muon` or `muonclip`. |
+| `--optim.learning-rate` | The constant rate when no schedule is named. |
+| `--optim.state-dtype` | `bfloat16` stores Adam's moments stochastically rounded, for `adam` and `adamw` only. |
+| `--trainer.steps` / `--trainer.epochs` | Run length; set one, not both. |
+| `--set data.<preset>.batch` | Global batch across all JAX processes, the preset's (`data.token_windows.batch`, `data.images.batch`). |
+| `--trainer.eval-every`, `--trainer.checkpoint-every` | A step interval, `epoch`, or `None`. |
+| `--trainer.checkpoint-dir`, `--trainer.name` | The run's directory is `<checkpoint-dir>/<name>`. |
+| `--trainer.multi-host` | Join the JAX process pool: `None` asks and continues alone when no cluster is configured, `True` requires the pool, `False` never asks. |
+| `--trainer.xla-flags` | Extra `XLA_FLAGS`, applied before JAX opens a backend. |
 
 A chain's `workers(n)`, `threads(n)` or `loading(Loading(...))` control how the host reads data; they do not change the batch size on the device. With zero workers the loader starts no worker processes. [Training data](concepts/data.md) covers the loading settings.
 

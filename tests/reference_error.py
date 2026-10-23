@@ -29,9 +29,9 @@ dropped term, a wrong scale, a format coarser than the reference's, a mask
 one step off) moves the RMS error by more than that and fails.
 
 Why not once, the reference's own distance plus a floor for summing in
-another order. Measured over the suite (2026-10-14: 862 float64
-comparisons in 85 files), Dew's distance over the reference's sits at a
-median of 1.00, p25 0.94, p75 1.07 and p95 1.55: exactly as exact, the two
+another order. Measured over the suite (862 float64 comparisons in 85
+files), Dew's distance over the reference's sits at a median of 1.00,
+p25 0.94, p75 1.07 and p95 1.55: exactly as exact, the two
 part by their own rounding draws, so a ratio above one is as likely as
 below. At once, 95 comparisons in 20 files failed with no defect behind
 them, and holding them needed a reduction-length floor of half the
@@ -80,7 +80,7 @@ row (`rows_over`). An RMS over every entry averages a few wrong rows into a
 large tensor, so each comparison also holds Dew's worst row to the
 reference's. The worst of many rows is an extreme value, not an average,
 and parts further by chance: over the suite's 3,660 comparisons whose rows
-differ from float64 at all (99 files, 2026-10-14), Dew's worst row over the
+differ from float64 at all (99 files), Dew's worst row over the
 reference's sat at a median of 0.21, p99 1.55 and at most 2.42 (Mixtral's
 exported logits). A row that differs rather than rounds moves further: the
 suite's deliberate failures, a GDN chunk's plain fp32 prefix and a MiMo tower
@@ -113,6 +113,30 @@ def widened(tree):
     inputs of a float64 truth."""
     return jax.tree.map(lambda leaf: np.asarray(
         leaf, np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype), tree)
+
+
+WITHOUT_YNN = {"xla_cpu_experimental_ynn_fusion_type": ""}
+"""XLA:CPU's compiler options with every YNNPACK fusion off (dots, reductions, element-wise and layout
+ops alike), so that a program runs on XLA's own code, compiled for the host's instruction set with no
+dispatch at run time. YNNPACK picks its microkernels at run time by that instruction set, and both
+the interpreted SSD kernel and XLA's scan fuse parts of themselves to it by default, which moved
+check 1 between the two across PARITY by host; without the fusions the verdicts held on two hosts
+of different instruction sets, though the bits still part with the host (docs/performance.md, "The
+SSD kernel's host check 1 without YNNPACK"). The empty list, not the documented `-individual_dot`,
+because compiler options take no such spelling and that one leaves a scan's reductions fused."""
+
+
+def without_ynn(fn, **jit_options):
+    """`fn` jitted with WITHOUT_YNN on the CPU lane, the process's default backend
+    (`jax.default_backend()`), and plain `jax.jit` elsewhere. It compiles both arms of a check 1
+    between two Dew paths, such as an interpreted kernel and the XLA program it replaces, the latter
+    the arm the check measures against, so that the two run the same kind of code on any host. A
+    program Dew's users run compiles with the fusions, as they do. Call it at top level, since on the
+    CPU lane its compiler options refuse to be nested in another jit or differentiated through. A
+    caller's own compiler options take precedence over WITHOUT_YNN's."""
+    if jax.default_backend() == "cpu":
+        jit_options["compiler_options"] = {**WITHOUT_YNN, **(jit_options.get("compiler_options") or {})}
+    return jax.jit(fn, **jit_options)
 
 
 def with_gradients(fn):
@@ -224,7 +248,7 @@ def assert_as_exact_as_the_reference(dew, reference, truth, label: str, *, terms
 
 
 PARITY = 1.5
-"""The owner's factor (bible §7, 2026-10-20): each leaf's RMS error from float64 within 1.5 times the
+"""The owner's factor (bible §7): each leaf's RMS error from float64 within 1.5 times the
 reference's, on the same inputs, with no floor of any kind. Check 1 (`assert_as_exact`) holds it now;
 the one-draw rule's FACTOR joins it once every site that rule would then fail has moved to check 1."""
 
@@ -293,7 +317,7 @@ def _status(ratio: float, low: float, high: float, *, contained: bool = True) ->
     pass certifies the ratio's high end at most PARITY², whether the interval lies wholly at or under
     PARITY or is resolved (no wider than PARITY) with the ratio under it, and an over its low end above
     one. Straddling PARITY and wider than it, the leaf is inconclusive, as is a ratio or end that is not
-    a number. Not `contained`, the rule before 2026-10-21: the interval as it is, a leaf over PARITY
+    a number. Not `contained`, the earlier rule: the interval as it is, a leaf over PARITY
     by its ratio wherever the interval does not straddle it unresolved."""
     if not contained:
         if low <= PARITY < high and not _resolves(low, high):
@@ -555,7 +579,7 @@ def _staged(drawn, seeds: int, label: str, *, two_stage: bool = True) -> tuple[l
     `seeds`, a site whose every leaf passes (`_judgement`: its ratio, rows and values) passes; any leaf
     that does not draws the second stage, REDRAW times as many further seeds, and every leaf is judged
     again over all of them, that verdict final. Its findings, the leaves left inconclusive and the stage
-    reached. With `two_stage` false, the procedure before it (2026-10-21), for comparison: tails
+    reached. With `two_stage` false, the procedure before it, for comparison: tails
     PREVIOUS_TAILS, the interval as it is, only a leaf whose ratio is over PARITY drawing again."""
     tails = (LOWER_TAIL, UPPER_TAIL) if two_stage else PREVIOUS_TAILS
     draws = drawn(0, seeds)
@@ -586,7 +610,7 @@ def _logged(label: str, stage: int, verdict: str) -> None:
 
 
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None) -> None:
-    """Check 1 of the owner's gate (bible §7, 2026-10-20): on par. Each leaf's RMS error from float64,
+    """Check 1 of the owner's gate (bible §7): on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst; each row of float64 zero (below RESOLUTION
     of its leaf where a live reference does not measure it, `_paired`) no further from it than
@@ -1284,7 +1308,7 @@ def _assert_rows_over_orders(dew, members, label: str, sizes=None) -> None:
 STAGES = 4
 """The batches of ORDERS fresh orders an element is measured over before it fails
 (`assert_elements_as_exact`): the first, and a confirmation of each element still flagged in each of
-the rest. Provisional, from the review of the rule (2026-10-19): with errors independent across
+the rest. Provisional, from the review of the rule: with errors independent across
 elements and orders, K = ORDERS a side needs three stages for a familywise FALSE_FAILURE at Dory's
 43.5M elements where the errors are Gaussian, and four where they are Laplace. Shapes with heavier
 or rarer tails (a Student t of 3 degrees, rare bf16 flips) are certified at none of these: the stage

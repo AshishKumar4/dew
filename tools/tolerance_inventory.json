@@ -89,10 +89,6 @@
    "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_causal_transformer.py": {
-   "comparisons": 41,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_checkpoint_ranking.py": {
    "comparisons": 4,
    "lane": "Training"
@@ -349,10 +345,6 @@
    "comparisons": 4,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_hyper_connections.py": {
-   "comparisons": 5,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_image_metrics.py": {
    "comparisons": 5,
    "lane": "Training"
@@ -380,10 +372,6 @@
   "tests/test_instrumentation.py": {
    "comparisons": 8,
    "lane": "Training"
-  },
-  "tests/test_jepa.py": {
-   "comparisons": 16,
-   "lane": "Models, Serving & RL"
   },
   "tests/test_jit.py": {
    "comparisons": 2,
@@ -617,10 +605,6 @@
    "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_quantization.py": {
-   "comparisons": 16,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_quantization_sites.py": {
    "comparisons": 1,
    "lane": "Models, Serving & RL"
@@ -732,10 +716,6 @@
   "tests/test_text_data.py": {
    "comparisons": 1,
    "lane": "Training"
-  },
-  "tests/test_text_encoders.py": {
-   "comparisons": 4,
-   "lane": "Models, Serving & RL"
   },
   "tests/test_token_accuracy.py": {
    "comparisons": 3,
