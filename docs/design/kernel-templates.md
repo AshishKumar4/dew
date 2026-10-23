@@ -1,8 +1,20 @@
 # Dew's kernel templates: design
 
-Approved 2026-10-21 (§13). This document is the one source for the templates' structure: the algebra,
-hooks, structure, toolkit, mainloops and choice layer of attention, linear recurrence and GEMM. Its
-appendix maps every variant each template covers, and every current dispatch it replaces, to the design.
+Approved 2026-10-21, updated with the owner's decisions through 2026-10-23 (§13). This document is the one source for the templates' structure: the algebra, hooks, structure, toolkit, mainloops and choice layer of attention, linear recurrence and GEMM. Its appendix maps every variant each template covers, and every current dispatch it replaces, to the design.
+
+## 0. The vision
+
+Three templates, attention, linear recurrence and GEMM, replace every hand kernel and every vendored kernel Dew uses. A template is one algorithm, written once, that compiles a kernel tailored to the device it runs on.
+
+- **General before fast.** A template's first duty is coverage: every variant in its coverage table (Appendices A to C), every consumer that calls it, every form (forward, backward, decode), on every architecture family it claims. Speed comes on top of a covered cell, never instead of one. Progress is measured as a coverage matrix (rows: variants and consumers; columns: architecture families; each cell: supported, passing the gate, and its time and memory against the route it replaces), not as one shape's number.
+- **One algebra, one toolkit, thin mainloops.** The math lives once in each template's algebra. Variants are hooks traced into the kernel, never per-model kernels. Everything that differs by architecture lives once in the shared Mosaic toolkit, as one Family bundle per architecture (operand loader, matrix-instruction issuer, accumulator home, barriers and roles), used by all three templates. A mainloop holds no math and no pipeline machinery, only the order of its bundle's steps around the algebra. One mainloop skeleton per template serves every architecture whose overlap structure is the same, and a separate thin mainloop exists only where the structure differs, with the difference stated (attention's tcgen05 mainloop, for its tensor-memory accumulator and correction role).
+- **Mosaic everywhere.** Mosaic GPU on every NVIDIA family (mma.sync, wgmma, tcgen05) and Mosaic TPU on TPU. Pallas Triton is deprecated upstream: the existing Triton kernels stay in use as production routes and as speed references, unmaintained, and each is deleted when its template cell matches or beats it.
+- **Configs from the device, never tables.** Device attributes are read at runtime; architecture facts follow the instruction family; facts that need measuring default to the family's value and are refined only by opt-in calibration. Legality prunes and one shared analytic cost model ranks. A template claims instruction families, not devices, so a GPU nobody has measured (a B300, a future part of a known family) compiles a kernel tailored to its own facts by default. Only a GPU outside every claimed family runs XLA.
+- **Vendored kernels are candidates, not a table.** FlashAttention 2/3, cuDNN, CUTLASS's grouped GEMM and the Triton references are routes the same chooser ranks by predicted time and memory, until the template beats each one on its rows and the route is deleted. Today's fixed preference order goes.
+- **Two measures only.** The accuracy gate (testing.md: float64 truth, check 1 at 1.5× the reference, check 2 per element) and performance, meaning compute time and peak memory, measured on clean exclusive runs at the chooser's default pick, in operator rows and in the model step. Nothing else decides whether code lands or a route is replaced: not code equality, not bitwise agreement between implementations.
+- **Fast by default, accurate one option away.** The default is the fastest form that passes the gate on ordinary inputs and stays finite at adversarial ones: attention's base-2 fold and its fast backward (FlashAttention's arithmetic, with the anchored D for dQ). The accurate forms hold 1.5× and no merging at adversarial inputs too. Deterministic mode is one flag away.
+- **Fusion is the payoff.** Hooks pull neighbouring operations into the kernel: norms, activations, gating, routing weights, biases, LoRA's low-rank product. A fixed vendored kernel can't compose that way.
+- **Templates first, then the megakernel.** Tile functions keep explicit operands, outputs and resources, so Dew's own persistent runtime can later schedule them as instructions across a layer or a decode step.
 
 ## 1. The bar, with the comparison defined
 
@@ -395,9 +407,18 @@ A row that needs a signature change is designed now, not retrofitted: rank-2 W, 
 
 Each entry also names the deletion it enables.
 
-## 13. Owner decisions (2026-10-21)
+## 13. Owner decisions
 
 Questions 1 and 2 as recommended. Question 3: support all of them (§12). Question 4: not deterministic by default; the fastest passing form is the default, and deterministic mode is one flag away (§8).
+
+Later decisions (2026-10-22 and 2026-10-23), which §0 states as the design; where a section below still says otherwise, §0 wins until the section is updated:
+- Attention's default is the fast form: the base-2 fold, and FlashAttention's backward arithmetic with the anchored D for dQ. The accurate form is one option away and holds 1.5× and no merging at adversarial inputs; the default stays finite there.
+- Mosaic GPU on every NVIDIA family; the Triton kernels stay as unmaintained references until replaced.
+- Per-architecture Family bundles in the shared toolkit and thin mainloops, not a full mainloop per template per generation (§6).
+- Templates claim instruction families; unseen GPUs of a claimed family get tailored kernels by default (§6, §7).
+- Vendored kernels, CUTLASS's grouped GEMM included, are candidates the chooser ranks by the cost model (§7, superseding "external kernels are not configurations").
+- The only measures are the accuracy gate and performance (time and peak memory); no code-equality or bitwise cross-implementation gate (§1, §9).
+- The megakernel is Dew's own persistent runtime, after the templates; no XLA patches and no Dew-built jaxlib.
 
 ## Appendix A. Coverage: attention
 
