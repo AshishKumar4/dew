@@ -487,7 +487,8 @@ def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
     measured peak (the largest any class holds), so its files run side by side as a measured lane's do,
     not each alone; a file red under a borrowed share runs once more, alone, with the lane's whole share,
     and its row says so (interference); and the lane records this class's own measurement, so the next
-    lane on it reads its own, not the borrowed one. A file no class measured runs alone."""
+    lane on it reads its own, not the borrowed one. A file no class measured runs alone, as every unmeasured
+    one does where the Worker does not list its records."""
     url, stored, _ = cache_worker
     cached(monkeypatch, url)
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
@@ -537,6 +538,28 @@ def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
     tight = rows["3.12:tests/test_tight.py"]
     assert tight["exitCode"] == 0 and "borrowed from NVIDIA-H100-80GB-HBM3-x86" in tight["interference"]
     assert all("interference" not in row for name, row in rows.items() if name != "3.12:tests/test_tight.py")
+    # A Worker that does not list its records: nothing is borrowed, and an unmeasured file runs alone.
+    (tmp_path / "tests/test_listless.py").write_text(source)
+    for other in ("NVIDIA-H100-80GB-HBM3-x86",):
+        at = "/" + ci.record_key("3.12", ci.row("3.12", "tests/test_listless.py", ""), other)
+        stored[at] = json.dumps({"key": None, "depends": [], "row": {}, "reads": [], "peak": 2 ** 30,
+                                 "shares": 0, "pools": 0}).encode()
+    real_store = ci.store
+
+    def unlisting(token):
+        found = real_store(token)
+
+        def refused(prefix):
+            raise ci.r2.Unavailable("listing refused")
+            yield
+
+        found.keys = refused
+        return found
+
+    monkeypatch.setattr(ci, "store", unlisting)
+    assert ci.gpu_lane("3.12", ["tests/test_listless.py"], out, cache=False, processes=4, deadline=600.0) == 0
+    assert [share for share, *_ in ran("test_listless")] == ["0.5"]
+    monkeypatch.setattr(ci, "store", real_store)
     # This class's own records now: the next lane reads them, the tight file alone as its own last run was.
     assert ci.gpu_lane("3.12", ["tests/test_tight.py"], out, cache=False, processes=4, deadline=600.0) == 0
     assert [share for share, *_ in ran("test_tight")][-1] != borrowed
