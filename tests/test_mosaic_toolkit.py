@@ -1,4 +1,4 @@
-"""Hopper's toolkit (dew.nn.kernels.templates.hopper) under Mosaic GPU's interpreter: a ring streaming one
+"""The Mosaic toolkit (dew.nn.kernels.templates.mosaic) under Mosaic GPU's interpreter: a ring streaming one
 operand across persistent tiles of their own trip counts, one consumer or two sharing its slots. The
 interpreter is coverage, not proof (it treats wgmma_wait as a no-op); each kernel also lowers for an H100
 here, and runs on one in the GPU gate."""
@@ -15,7 +15,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.sharding import Mesh
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import hopper
+from dew.nn.kernels.templates import mosaic
 
 pytestmark = pytest.mark.kernel
 
@@ -37,11 +37,11 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
     columns = BLOCK[1] // consumers
 
     def body(x_gmem, out_gmem):
-        @functools.partial(pl.run_scoped, **hopper.ring(BLOCK, x.dtype, STAGES, consumers=consumers),
+        @functools.partial(pl.run_scoped, **mosaic.ring(BLOCK, x.dtype, STAGES, consumers=consumers),
                            out_smem=plgpu.SMEM((consumers, BLOCK[0], columns), jnp.float32),
                            collective_axes="wg")
         def _(smem, full, consumed, out_smem):
-            ring = hopper.Ring(smem, full, consumed)
+            ring = mosaic.Ring(smem, full, consumed)
             wg = jax.lax.axis_index("wg")
 
             def producer():
@@ -78,11 +78,11 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
                     plgpu.copy_smem_to_gmem(out_smem.at[wg], mine)
                 plgpu.wait_smem_to_gmem(0)
 
-            hopper.roles(wg, consumers, consumer, producer)
+            mosaic.roles(wg, consumers, consumer, producer)
 
     return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((TILES, *BLOCK), jnp.float32), grid=(1,),
                         grid_names=("sm",), num_threads=consumers + 1, thread_name="wg",
-                        compiler_params=hopper.compiler_params(), interpret=interpret)(x)
+                        compiler_params=mosaic.compiler_params(), interpret=interpret)(x)
 
 
 def _expected(x):

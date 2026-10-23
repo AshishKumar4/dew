@@ -42,7 +42,7 @@ from jax.extend import core as jax_core
 
 from ..precision import rounded_operand
 from . import generation
-from .templates import base, cost, hopper
+from .templates import base, cost, mosaic
 from .templates.gemm import mosaic_gpu, mosaic_tpu
 from .templates.product import declared
 
@@ -642,7 +642,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             ba.arguments['prologue_operands'], hooks.prologue_axes, extents)
         epilogue = _side_tile_bytes(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes, extents)
         # One warpgroup stages each output in turn; two hold every output's staging buffer at once, and
-        # each consumer its own copy of an epilogue side tile without rows (`hopper.staging`; a
+        # each consumer its own copy of an epilogue side tile without rows (`mosaic.staging`; a
         # prologue side's per-consumer copies are within the stages' count of it).
         staged_outs = sum(outs) if config.warpgroups == 2 else max(outs)
         if config.warpgroups == 2:
@@ -771,7 +771,7 @@ class MosaicTgmm(_Mosaic):
         # `emit_pipeline_warp_specialized`: 232).
         return tuple(tile for tile in fits
                      if 2 * tile.block_m * tile.block_n // (128 * tile.warpgroups)
-                     < (hopper.CONSUMER_REGISTERS if tile.warpgroups == 2 else cost.THREAD_REGISTERS))
+                     < (mosaic.CONSUMER_REGISTERS if tile.warpgroups == 2 else cost.THREAD_REGISTERS))
 
     @staticmethod
     def extents(tile: mosaic_gpu.Tiles) -> dict:
