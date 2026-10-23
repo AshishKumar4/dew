@@ -281,8 +281,13 @@ def test_typed_root_key_round_trips_and_resumes_bit_exactly(tmp_path):
 def test_closed_checkpoints_leave_no_writer_running_across_trials(tmp_path):
     """Trials in one process each close their checkpoints, as RunConfig.train does, so Orbax's
     managers and metadata stores leave no thread behind: two more trials run no more threads than
-    the first left, and a closed Checkpoints reopens to read what it wrote."""
+    the first left, and a closed Checkpoints reopens to read what it wrote. A neighbour's thread that
+    ends meanwhile, as another test's pool does in a shared process, is not a trial's."""
     import threading
+
+    release = threading.Event()
+    neighbour = threading.Thread(target=release.wait)
+    neighbour.start()
 
     def trial(index):
         with Checkpoints(str(tmp_path / str(index))) as checkpoints:
@@ -290,11 +295,17 @@ def test_closed_checkpoints_leave_no_writer_running_across_trials(tmp_path):
                 dataset(), steps=2, checkpoint_every=1, log_every=1)
         return checkpoints
 
-    trial(0)
-    settled = threading.active_count()
-    for index in (1, 2):
-        reopened = trial(index)
-        assert threading.active_count() == settled
+    try:
+        trial(0)
+        settled = threading.active_count()
+        release.set()
+        neighbour.join()
+        for index in (1, 2):
+            reopened = trial(index)
+            assert threading.active_count() == settled
+    finally:
+        release.set()
+        neighbour.join()
     assert reopened.latest == 2
 
 
