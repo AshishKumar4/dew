@@ -123,6 +123,8 @@ ENTRIES = (
         "MinistralForCausalLM",
         lambda model: {},
         preserve_source_layout=False,
+        # MinistralConfig's window, which an omitted sliding_window means.
+        defaults={"sliding_window": 4096},
     ),
     DecoderFamily(
         ("llama",),

@@ -451,6 +451,8 @@ GLM5_NEXT_TEXT = DecoderFamily(
     weight_path=layer_depth_path,
     export_weights=_glm5_next_export_weights,
     preserve_source_layout=True,
+    # The config class's norm epsilon.
+    defaults={'rms_norm_eps': 1e-5},
 )
 
 GLM4_MOE = DecoderFamily(
@@ -466,6 +468,8 @@ GLM4_MOE = DecoderFamily(
     lambda model: {},
     weight_path=layer_depth_path,
     preserve_source_layout=True,
+    # The config class's norm epsilon.
+    defaults={'rms_norm_eps': 1e-5},
 )
 
 
@@ -484,4 +488,6 @@ GLM_MOE_DSA = DecoderFamily(
     lambda model: {},
     weight_path=layer_depth_path,
     preserve_source_layout=True,
+    # The config class's norm epsilon.
+    defaults={'rms_norm_eps': 1e-5},
 )

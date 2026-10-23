@@ -61,5 +61,6 @@ OLMO3 = DecoderFamily(
     lambda model: {},
     sandwich_norms=True,
     preserve_source_layout=True,
-    defaults={'rms_norm_eps': 1e-5},
+    # Olmo3Config's norm epsilon and window.
+    defaults={'rms_norm_eps': 1e-5, 'sliding_window': 4096},
 )

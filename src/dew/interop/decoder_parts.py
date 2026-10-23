@@ -416,6 +416,9 @@ class RopeSpelling:
     layer types."""
     local_theta: float | None = None
     """A per-kind class's default base for its sliding record."""
+    legacy_kinds: tuple[str, ...] = ('full_attention',)
+    """The records a per-kind class updates from a legacy rope_scaling: the full layers' alone
+    (Gemma 3, Gemma 3n, OLMo 3), or both kinds' (ModernBERT, configuration_modernbert.py:134-136)."""
     local_field: str | None = None
     """The flat field a per-kind class reads its sliding base from
     (Gemma 3's rope_local_base_freq)."""
@@ -498,6 +501,8 @@ def rope_records(hf_config: Mapping[str, object], spelling: RopeSpelling
         full.setdefault('rope_theta', spelling.theta if base is None else base)
         sliding = dict(records.record((record.get('sliding_attention') if nested else None)
                                       or {'rope_type': 'default'}, 'rope_parameters.sliding_attention'))
+        if scaling is not None and 'sliding_attention' in spelling.legacy_kinds:
+            sliding.update(records.record(scaling, 'rope_scaling'))
         local = hf_config.get(spelling.local_field) if spelling.local_field is not None else None
         sliding.setdefault('rope_theta', local if local is not None else
                            spelling.local_theta if spelling.local_theta is not None else full['rope_theta'])
@@ -833,8 +838,17 @@ def translate_family_config(hf_config: Mapping[str, object],
     if not family.bidirectional and bidirectional and bidirectional != 'vision':
         refuse(f"use_bidirectional_attention={bidirectional!r}", "the backbone is causal")
     used = {'model_type', 'use_bidirectional_attention', 'num_hidden_layers'}
-    # An omitted field is the config class's default; an explicit null stays null.
-    config = family.translate_config({**family.defaults, **hf_config}, used)
+    # A field spelled under its class's alias is that field (`DecoderFamily.aliases`); an omitted
+    # field is the config class's default, and an explicit null stays null.
+    spelled = dict(hf_config)
+    for alias, canonical in family.aliases.items():
+        if alias in spelled:
+            value = spelled.pop(alias)
+            if canonical in spelled and spelled[canonical] != value:
+                refuse(f"{alias}={value!r} beside {canonical}={spelled[canonical]!r}", "they name one field")
+            spelled[canonical] = value
+            used.add(alias)
+    config = family.translate_config({**family.defaults, **spelled}, used)
 
     return config, _unread(hf_config, used)
 
@@ -1696,6 +1710,9 @@ class DecoderFamily:
     omits them, which the shared readers would otherwise default for every
     family alike: Gemma's GELU, Gemma 2's caps and query scalar, OLMo 3's
     norm epsilon. Rope bases are the class's `RopeSpelling`."""
+    aliases: Mapping[str, str] = field(default_factory=dict)
+    """The config class's `attribute_map`: another spelling of a field, read as that field before
+    `defaults` fill what neither spells."""
     bidirectional: bool = False
     """The family's decoder attends both ways by construction, as the masked diffusion families'
     do (LLaDA's bidirectional bias, Dream's hard-coded is_causal=False, DiffusionGemma's decoder):
