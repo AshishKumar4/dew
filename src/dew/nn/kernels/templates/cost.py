@@ -16,7 +16,7 @@ multiprocessor's `resident` programs (`resident`) wait together (Little's law). 
     program  = max(program_flops / tensor rate, program_staged / shared-memory rate,
                    program_exponentials / special-function rate, program_issued / issue rate)
              + serial_staged / shared-memory rate + serial_exponentials / special-function rate
-    issue rate = min(SCHEDULERS / resident, warps / ISSUE_INTERVAL)
+    issue rate = min(SCHEDULERS, resident · warps / ISSUE_INTERVAL)
     waiting  = steps · load latency / (stages - 1)
     compute  = ceil(programs / (multiprocessors · resident)) · max(resident · program, waiting)
     memory   = device_bytes / memory bandwidth
@@ -127,7 +127,8 @@ def program_seconds(cost: Cost, rate: float, clock: float) -> float:
     """One program's service time on a multiprocessor: its tensor-core, shared-memory, special-function or
     issue work, whichever takes longest at `rate` tensor FLOPs a clock and `clock` Hz, plus its serial work
     (the module's docstring)."""
-    issue = min(SCHEDULERS / cost.resident, cost.warps / ISSUE_INTERVAL)
+    # The schedulers the multiprocessor's resident programs share, each warp issuing at its interval.
+    issue = min(SCHEDULERS, cost.resident * cost.warps / ISSUE_INTERVAL)
     return (max(cost.program_flops / (rate * clock),
                 cost.program_staged / (SHARED_BYTES_PER_CLOCK * clock),
                 cost.program_exponentials / (EXPONENTIALS_PER_CLOCK * clock),
