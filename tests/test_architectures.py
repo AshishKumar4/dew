@@ -419,11 +419,18 @@ units in other runs, a difference no precision bounds."""
 
 
 def selects(case: Case) -> bool:
-    """Whether the cell's model selects discontinuously: a lightning indexer's top-k or Gemma 3n's
-    gaussian top-k (`selection_margin`)."""
+    """Whether the cell's model selects discontinuously: a lightning indexer's top-k, Gemma 3n's
+    gaussian top-k or a mixture's routing (`selection_margin`)."""
     fields = case.config.get("mixer", {}).get("fields", {})
     sparsities = case.config.get("activation_sparsity_pattern", ())
-    return case.is_lm and bool(fields.get("index_topk") or any(sparsities))
+    return case.is_lm and bool(fields.get("index_topk") or any(sparsities) or routes(case))
+
+
+def routes(case: Case) -> bool:
+    """Whether the cell's mixture routes by its router's scores: hash routing selects by the token
+    alone, which no rounding moves."""
+    mixture = case.config.get("mixture")
+    return mixture is not None and not mixture.get("hash_layers")
 
 
 @functools.cache
@@ -434,6 +441,7 @@ def selections_forward(name: str):
     gather fusion among the many small programs an unjitted capture compiles."""
     from dew.nn.mla import SparseIndexer
     from dew.nn.mlp import GatedMLP
+    from dew.nn.moe import Router
 
     case = next(case for case in CASES if case.name == name)
     model = models.build(case.architecture, **case.config)
@@ -441,6 +449,8 @@ def selections_forward(name: str):
     def selecting(module, method):
         if isinstance(module, SparseIndexer):
             return method == "scores"
+        if isinstance(module, Router):
+            return method == "logits"
         parent = module.parent
         gated = isinstance(parent, GatedMLP) and bool(parent.activation_sparsity)
         return method == "__call__" and isinstance(module, nn.Dense) and module.name == "gate_proj" and gated
@@ -464,14 +474,53 @@ def gate_margin(values: np.ndarray, sparsity: float) -> float:
     return float(np.min(np.minimum(kept - cutoff, cutoff - dropped) / deviation))
 
 
+def top_margin(values: np.ndarray, kept: int) -> np.ndarray:
+    """Each row's gap between its `kept`-th largest value and the next, over its largest's size: how
+    far a top-`kept` selection over the row's last axis is from flipping. Infinite where the row
+    holds no more than `kept` finite values, which decide nothing."""
+    ranked = -np.sort(-values, axis=-1)
+    chosen, next_best = ranked[..., kept - 1], ranked[..., kept]
+    scale = np.maximum(np.abs(ranked[..., 0]), np.finfo(np.float32).tiny)
+    return np.where(np.isfinite(next_best), (chosen - next_best) / scale, np.inf)
+
+
+def router_margin(mixture: dict, logits: np.ndarray, bias: np.ndarray | None) -> float:
+    """The smallest margin of a mixture's routing over its router's `logits`, as `dew.nn.moe.Router`
+    selects: its scores (`score_function`) plus the balancing bias, the best `groups_per_token` of
+    its expert groups by their two best scores (or their best), then the `top_k` experts among them
+    (`top_margin` of each)."""
+    function = mixture.get("score_function", "softmax")
+    if function == "softmax":
+        scores = np.exp(logits - logits.max(-1, keepdims=True))
+        scores /= scores.sum(-1, keepdims=True)
+    elif function == "sqrtsoftplus":
+        scores = np.sqrt(np.logaddexp(0, logits))
+    else:
+        scores = 1 / (1 + np.exp(-logits))
+    selection = scores + (0 if bias is None else bias)
+    groups = mixture.get("groups", 1)
+    margin = np.inf
+    if groups > 1:
+        grouped = selection.reshape(*selection.shape[:-1], groups, -1)
+        best = -np.sort(-grouped, axis=-1)
+        group_scores = best[..., 0] if mixture.get("group_score", "top2") == "max" else best[..., :2].sum(-1)
+        chosen = mixture.get("groups_per_token", 1)
+        margin = min(margin, float(np.min(top_margin(group_scores, chosen))))
+        kept = np.argsort(-group_scores, axis=-1)[..., :chosen]
+        allowed = np.zeros(group_scores.shape, bool)
+        np.put_along_axis(allowed, kept, values=True, axis=-1)
+        selection = np.where(np.repeat(allowed, grouped.shape[-1], axis=-1), selection, -np.inf)
+    return min(margin, float(np.min(top_margin(selection, mixture.get("top_k", 2)))))
+
+
 def selection_margin(case: Case, variables, tokens) -> float:
     """The smallest margin, over the forward of `variables`, of the model's
     discontinuous selections relative to their scale: the lightning indexer's top-k (the gap between
-    the k-th and the next visible key's score, over the query's largest) and Gemma 3n's gaussian top-k
+    the k-th and the next visible key's score, over the query's largest), Gemma 3n's gaussian top-k
     (the gate's distance from its cutoff, the row's mean plus the sparsity's normal quantile times its
-    population deviation, over that deviation, as `dew.nn.mlp.gaussian_topk` forms it). A query that
-    sees no more keys than its budget, and an exact zero tie of relu'd scores, ordered alike by index
-    in every run, decide nothing."""
+    population deviation, over that deviation, as `dew.nn.mlp.gaussian_topk` forms it) and a
+    mixture's routing (`router_margin`). A query that sees no more keys than its budget, and an exact
+    zero tie of relu'd scores, ordered alike by index in every run, decide nothing."""
     fields = case.config.get("mixer", {}).get("fields", {})
     sparsities = case.config.get("activation_sparsity_pattern", ())
     margin, seen = np.inf, 0
@@ -483,6 +532,15 @@ def selection_margin(case: Case, variables, tokens) -> float:
         if "gate_proj" in names:
             layer = int(next(name for name in names if name.startswith("layers_")).split("_")[1])
             margin = min(margin, gate_margin(values, sparsities[layer]))
+            continue
+        if "logits" in names:
+            module = names[:names.index("logits")]
+            bias = variables.get("moe", {})
+            for name in module:
+                bias = bias.get(name, {}) if isinstance(bias, dict) else {}
+            bias = bias.get("e_score_correction_bias") if isinstance(bias, dict) else None
+            margin = min(margin, router_margin(case.config["mixture"], values,
+                                               None if bias is None else np.asarray(bias, np.float64)))
             continue
         budget, (queries, keys) = fields["index_topk"], values.shape[-2:]
         if keys <= budget:
@@ -699,8 +757,9 @@ def test_a_val_metric_records_its_own_constructors_defaults():
         replace(run, val_metrics=("psnr",))
 
 
-SELECTING_SEEDS = {"8x1 data": 16, "2x4 fsdp": 16}
-"""The selecting pieces' declared seeds for check 1 on each layout (to size)."""
+SELECTING_SEEDS = {"8x1 data": 32, "2x4 fsdp": 32}
+"""The selecting pieces' declared seeds for check 1 on each layout, sized by `seeds_for` paired with
+the layout's arm on armada."""
 
 
 class Selecting(nn.Module):
