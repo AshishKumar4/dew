@@ -392,7 +392,8 @@ def _token_ids(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping
 
 RENDERER_KEYS = frozenset({"conversation", "tools", "documents", "tokenize", "return_dict", "return_tensors",
                            "add_generation_prompt", "continue_final_message", "chat_template",
-                           "enable_thinking", "padding", "truncation", "max_length"})
+                           "enable_thinking", "padding", "truncation", "max_length", "tokenizer_kwargs",
+                           "return_assistant_tokens_mask"})
 """The keywords the template call itself owns (`apply_chat_template`'s and this module's own
 controls), which a template's variables (`options`) never set: each has its own field."""
 
