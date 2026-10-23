@@ -118,7 +118,6 @@ Dew requires `jax>=0.11.2.post6,<0.11.3`: JAX 0.11.2 with fixes no JAX release h
 
 - A computation that spans processes keys the persistent compilation cache alike on every process ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940), sent as [jax-ml/jax#41776](https://github.com/jax-ml/jax/pull/41776)). The 0.11.2 release keys a compiled step by the topology of the process that compiled it, which on a GPU includes its NVLink links, so in a pool across GPUs linked differently some processes load a step from the cache while the others compile it, and that compile waits forever for every process to join.
 - A Pallas Triton kernel's cache key leaves out its source locations ([jax-ml/jax#41502](https://github.com/jax-ml/jax/issues/41502), sent as [jax-ml/jax#41777](https://github.com/jax-ml/jax/pull/41777)), so two checkouts share one compiled kernel.
-- `linear_call` batches (an all-unmapped call stays unmapped), and differentiates in its residuals, which the experts' fused SwiGLU route needs.
 
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
 

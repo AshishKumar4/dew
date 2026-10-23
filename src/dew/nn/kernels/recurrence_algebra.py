@@ -36,8 +36,8 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
-from jax.custom_derivatives import linear_call
 
+from dew.nn.kernels.generation import linear_map
 from dew.nn.precision import compensated_add, compensated_difference
 
 Issue = Callable[[str, jax.Array, jax.Array], jax.Array]
@@ -173,7 +173,7 @@ def _decays_tangent(primals, tangents):
     g, documents = primals
     dg, _ = tangents
     gc, decay = decays(g, documents)
-    return (gc, decay), (_cumulated(dg, documents)[0], linear_call(_ranged, _ranged_transpose, decay, dg))
+    return (gc, decay), (_cumulated(dg, documents)[0], linear_map(_ranged, _ranged_transpose, decay, dg))
 
 
 def factor(a, issue: Issue = portable):
