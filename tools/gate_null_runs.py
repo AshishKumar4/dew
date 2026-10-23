@@ -386,6 +386,7 @@ FAULTS = {
         "skipped-chunk": _input_fault(2, _zeroed((slice(None), slice(0, 32)))),
         "scale-2^-22": _scaled_output(1 + 2.0 ** -22),
         "one-row": _one_row(2.0 ** -14),
+        "one-row-2^-20": _one_row(2.0 ** -20),
     },
 }
 """Real faults of each class, its own computation changed before it runs, for the procedures' power on
@@ -393,7 +394,8 @@ it (`null_runs`'s `dew_fn`): the cross-entropy head's states scaled by a wrong f
 its column scale rounded to bfloat16 where float32 is claimed, a column of its vocabulary dropped; the
 decoder's parameters scaled, or rounded to bfloat16; for each orbit class a term dropped, a term's sign
 flipped, its arithmetic in float16, a chunk of its terms skipped, its outputs scaled by 1 + 2^-22, and one
-row of each output moved by 2^-14 of itself."""
+row of each output moved by 2^-14 of itself; and attention's one row by 2^-20, sixteen float32 units in
+its last place, which the worst-row rule alone resolves among its 512 rows."""
 
 
 def _law(name: str, rng, size: int):
