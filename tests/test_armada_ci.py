@@ -890,12 +890,13 @@ def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
     ({"src/pkg/mod.py": "VALUE = 2\n"}, "on"), ({"docs/page.md": "page\n"}, "on"),
     ({"tutorials/notes.ipynb": "{}\n"}, "on"), ({"tools/tool.py": "VALUE = 2\n"}, "stale:tools/"),
     ({"pyproject.toml": "[project]\nname = 'changed'\n"}, "off"), ({"locks/cpu.txt": "jax==9\n"}, "off"),
-    ({"tools/armada/session.py": "# the session\n"}, "off"), ({".github/workflows/ci.yml": "on: []\n"}, "off"),
+    ({"tools/armada/session.py": "# the session\n"}, "off"),
+    ({".github/workflows/ci.yml": "on: []\n"}, "off"),
     ({"Makefile": "all:\n"}, "off"),
 ], ids=["a source module", "a docs page", "a notebook", "a tool", "the project", "a lock",
         "the test session", "a workflow", "a file no record places"])
-def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_place_it(ci, tmp_path, changed,
-                                                                                        policy):
+def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_place_it(
+        ci, tmp_path, changed, policy):
     """CI's test cache policy for a change from main: each file's own inputs decide ('on') where the records
     place what changed, every file that read a tool runs again where a tool changed, and every file runs
     ('off') for a change to what every test process runs or reads, or to a file the records do not place."""
