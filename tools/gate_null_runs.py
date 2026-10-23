@@ -210,8 +210,8 @@ def attention_keys():
     return reference, draw, None, permuting
 
 
-def heavy_sums():
-    """Sums of 256 float32 terms over 64 rows, each draw's terms scaled by one heavy-tailed factor
+def heavy_sums(rows: int = 64, terms: int = 256):
+    """Sums of `terms` float32 terms over `rows` rows, each draw's terms scaled by one heavy-tailed factor
     (a Pareto of index one, plus one), over the orbit of the terms' orders: each arm's error grows with
     the draw's scale, so across draws it is heavy-tailed (its mean square of index one half), and two
     orders of one sum share that scale draw by draw. The class of a site whose arms share their
@@ -227,7 +227,7 @@ def heavy_sums():
 
     def draw(seed):
         rng = np.random.default_rng([0x4E, seed])
-        return ((rng.pareto(1.0) + 1) * rng.standard_normal((64, 256))).astype(np.float32),
+        return ((rng.pareto(1.0) + 1) * rng.standard_normal((rows, terms))).astype(np.float32),
 
     def permuting(inputs, order):
         (x,) = inputs
