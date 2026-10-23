@@ -330,6 +330,15 @@ def test_a_block_aligned_launch_counts_the_tiles_its_groups_take():
     assert grouped_matmul._block_tiles(100, 8, 64) == 2 + 7
 
 
+@pytest.mark.parametrize("block_m,block_n", [(64, 128), (128, 192), (128, 512)])
+def test_a_cooperative_tile_refuses_what_its_consumers_cannot_compute(block_m, block_n):
+    """A cooperative tile's two consumers each take half its rows in one warpgroup MMA (64 rows by at most
+    256 columns), staged for the store in equal chunks: a tile whose halves are not that refuses, rather
+    than leaving output columns unwritten."""
+    with pytest.raises(ValueError):
+        mosaic_gpu.Tiles(block_m, block_n, 64, 2, 1, warpgroups=2)
+
+
 def test_the_cost_model_names_a_fact_its_target_lacks():
     """A generation that states no tensor rate gives no estimate, naming the fact; the grouped kernels are
     then not eligible there, so XLA's ragged dot runs without one."""

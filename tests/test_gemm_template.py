@@ -199,9 +199,9 @@ def _kernels(taken) -> set:
 @runs("sm90")
 @pytest.mark.parametrize("case", ["norm and bias", "gated prologue", "cast prologue"])
 def test_a_cooperative_tile_holds_check_1_with_its_hooks(case):
-    """The Hopper launches pinned to a cooperative tile, interpreted: each consumer rewrites half the stage
-    both read and computes half the columns' epilogue, as exact as the plain program from float64 truth;
-    the Mosaic kernels ran."""
+    """The Hopper launches pinned to a cooperative tile, interpreted: each consumer rewrites and multiplies
+    its half of the stage's rows and computes their epilogue, as exact as the plain program from float64
+    truth; the Mosaic kernels ran."""
     spec = CASES[case]
     pinned = {grouped_matmul.MosaicGmm: COOPERATIVE, grouped_matmul.MosaicTgmm: COOPERATIVE}
     with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"), tuning.pinned(pinned),

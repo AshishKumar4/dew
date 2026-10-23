@@ -59,7 +59,7 @@ from dew.nn.kernels.templates import hopper
 class Tiles:
     """One launch's output tile (`block_m` x `block_n`), contraction step (`block_k`), the steps in flight
     (`stages`, upstream's `max_concurrent_steps`) and the column tiles in each band of the planar snake
-    (`grid_block_n`); Dew: the warpgroups computing a tile (`warpgroups`: 2 halve `block_n` between two
+    (`grid_block_n`); Dew: the warpgroups computing a tile (`warpgroups`: 2 halve `block_m` between two
     consumer warpgroups beside a producer that issues the loads, CUTLASS's cooperative sm90 schedule), and
     the multiprocessors of a cluster (`cluster`: 2 pair two row tiles of one group of `gmm`, which load
     their matrix block once between them, multicast), only for a cooperative tile; `tgmm` takes no pair."""
@@ -76,8 +76,10 @@ class Tiles:
         if self.warpgroups not in (1, 2) or self.cluster not in (1, 2) or paired:
             raise ValueError(f"{self}: one warpgroup alone, or two in a cluster of one or two "
                              "multiprocessors")
-        if self.warpgroups == 2 and (self.block_m % 128 or self.block_n > 256):
-            # Each consumer's half of the rows is one warpgroup MMA's, 64 rows by at most 256 columns.
+        if self.warpgroups == 2 and (self.block_m % 128 or self.block_n > 256
+                                     or self.block_n % min(self.block_n, _STAGED_COLUMNS)):
+            # Each consumer's half of the rows is one warpgroup MMA's, 64 rows by at most 256 columns,
+            # staged for its store in equal chunks (`_STAGED_COLUMNS`).
             raise ValueError(f"{self}: two warpgroups halve the tile's rows into warpgroup MMAs")
         if self.warpgroups == 2 and self.stages < 2:
             # A stage is released a step late (an MMA in flight), so one stage would wait on itself.
