@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -865,6 +866,24 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
 
 
 
+def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
+    """The checkout's one 3.12 task, run green on one CPU class against the shared test cache as armada
+    starts it (`armada_task`), its verdict written beside the checkout's entries, not among them (the
+    checkout's own directory is an input): each call, how many times its test has run, which it counts
+    in `runs`."""
+    interpreter(root, "3.12")
+    url, _, _ = cache_worker
+    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    cached(monkeypatch, url)
+    (root / ".verdict").mkdir()
+
+    def run() -> int:
+        assert armada_task(ci, monkeypatch, root / ".verdict/verdict.json")["exitCode"] == 0
+        return len((root / "runs").read_text())
+
+    return run
+
+
 def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_changes(
         ci, tmp_path, monkeypatch, cache_worker):
     """A file's green row is kept across a change its tests never meet: the plan's own code (ci.py, which
@@ -874,21 +893,11 @@ def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_c
         "from pathlib import Path\n"
         "def test_kept():\n"
         "    with Path('runs').open('a') as runs: runs.write('x')\n")
-    interpreter(tmp_path, "3.12")
-    url, _, _ = cache_worker
-    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
-    cached(monkeypatch, url)
-    (tmp_path / ".verdict").mkdir()
-    out = tmp_path / ".verdict/verdict.json"
     armada = tmp_path / "tools/armada"
     armada.mkdir(parents=True)
     for tool in (ROOT / "tools/armada").glob("*.py"):
         (armada / tool.name).write_text(tool.read_text())
-
-    def run():
-        assert armada_task(ci, monkeypatch, out)["exitCode"] == 0
-        return len((tmp_path / "runs").read_text())
-
+    run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
     changes = [(None, "", 1), ("tools/armada/ci.py", "# the plan's own code\n", 1),
                ("src/unrelated.py", "VALUE = 1\n", 1), ("tests/helpers.py", "VALUE = 2\n", 1),
                ("tools/armada/executed.py", "# a plugin loaded into it\n", 2),
@@ -927,18 +936,7 @@ def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_
         "        os.close(os.open('plan.md', os.O_RDONLY, dir_fd=folder))\n"
         "    finally:\n"
         "        os.close(folder)\n")
-    interpreter(tmp_path, "3.12")
-    url, _, _ = cache_worker
-    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
-    cached(monkeypatch, url)
-    # Beside the checkout's entries, not among them: the checkout's own directory is an input.
-    (tmp_path / ".verdict").mkdir()
-    out = tmp_path / ".verdict/verdict.json"
-
-    def run():
-        assert armada_task(ci, monkeypatch, out)["exitCode"] == 0
-        return len((tmp_path / "runs").read_text())
-
+    run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
     # Each page changed, added or listed anew runs the file again, and the run after reuses that row.
     # Python bytecode a run leaves beside a page (a directory, `None` here) is no change to the pages.
     changes = [(None, "", 1), ("docs/model.md", "width 8\n", 2), ("docs/serving.md", "serve\n", 3),
