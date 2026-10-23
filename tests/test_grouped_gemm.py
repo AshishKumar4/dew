@@ -15,7 +15,7 @@ from generation_support import INTERPRETS, generations, lowers
 from jax.sharding import Mesh
 from reference_error import assert_as_exact_as_the_reference, equations
 
-from dew.nn.kernels import generation, grouped_matmul
+from dew.nn.kernels import generation, grouped_matmul, ragged_dot
 from dew.nn.kernels.templates import cost
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 from dew.nn.moe import expert_projection
@@ -84,11 +84,11 @@ def test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla(sizes
 
 @INTERPRETS
 @pytest.mark.parametrize("sizes", ["ragged", "unrouted-tail"])
-def test_a_paired_hopper_product_gates_both_matrices_as_exactly_as_xla(sizes):
-    """A paired product (a gated activation's gate and up, `mosaic_gpu.gmm(paired=)`), interpreted on a CPU,
-    one warpgroup a tile and two, both orientations: the epilogue of its two accumulators as exact as XLA's
-    two ragged dots and the same epilogue from float64 sums of the same rounded operands, unrouted rows
-    zero."""
+def test_a_paired_product_gates_both_matrices_as_exactly_as_xla(sizes):
+    """A paired product (a gated activation's gate and up, `paired=`), interpreted on a CPU, through Mosaic
+    GPU's kernel at one warpgroup a tile and two and through Triton's, both orientations: the epilogue of
+    its two accumulators as exact as XLA's two ragged dots and the same epilogue from float64 sums of the
+    same rounded operands, unrouted rows zero."""
     sizes = SIZES[sizes]
     dtype = jnp.bfloat16
     x, gate, _, group = operands(sizes, dtype)
@@ -105,13 +105,18 @@ def test_a_paired_hopper_product_gates_both_matrices_as_exactly_as_xla(sizes):
     reference = gated(xla(gate), xla(up)).astype(dtype)
     truth_gate, truth_up = oracle.forward(x, gate, sizes), oracle.forward(x, up, sizes)
     truth = truth_gate / (1 + np.exp(-truth_gate)) * truth_up
-    tiled = (mosaic_gpu.Tiles(64, 64, 64, 2, 1), mosaic_gpu.Tiles(128, 64, 64, 2, 1, warpgroups=2))
-    for tiles, transpose in itertools.product(tiled, (False, True)):
+    for transpose in (False, True):
         first, second = (jnp.asarray(np.swapaxes(m, 1, 2) if transpose else m, dtype) for m in (gate, up))
-        got = mosaic_gpu.gmm(jnp.asarray(x, dtype), first, group_sizes, tiles=tiles, transpose_rhs=transpose,
-                             out_dtype=dtype, multiprocessors=1, interpret=grouped_matmul.INTERPRETED,
-                             epilogue=gated, paired=second)
-        check(got, reference, truth, group, f"paired {tiles} transpose={transpose}")
+        for tiles in (mosaic_gpu.Tiles(64, 64, 64, 2, 1),
+                      mosaic_gpu.Tiles(128, 64, 64, 2, 1, warpgroups=2)):
+            got = mosaic_gpu.gmm(jnp.asarray(x, dtype), first, group_sizes, tiles=tiles,
+                                 transpose_rhs=transpose, out_dtype=dtype, multiprocessors=1,
+                                 interpret=grouped_matmul.INTERPRETED, epilogue=gated, paired=second)
+            check(got, reference, truth, group, f"paired {tiles} transpose={transpose}")
+        got = ragged_dot.gmm(jnp.asarray(x, dtype), first, group_sizes, block_m=64, block_k=64, block_n=64,
+                             trans_rhs=transpose, interpret=True, out_dtype=dtype, epilogue=gated,
+                             paired=second)
+        check(got, reference, truth, group, f"paired triton transpose={transpose}")
 
 
 def check(got, reference, truth, group, label):

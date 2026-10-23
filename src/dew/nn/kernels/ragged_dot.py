@@ -137,9 +137,8 @@ def _side_tile(ref, axes, origins: dict, masks: dict):
 def _gpu_ragged_dot_kernel(
   # inputs
   x_ref,  # [m, k]
-  A_ref,  # [k, n] or [n, k]
-  group_metadata_ref: GMMGroupLookupMetadata,
-  # Dew: the prologue's and the epilogue's side operands, then the outputs
+  # Dew: the matrices ([k, n] or [n, k], `matrices` of them: a paired product's two), the group metadata,
+  # the prologue's and the epilogue's side operands, then the outputs
   *refs,
   # static problem shapes
   chunk_m: int,
@@ -153,7 +152,9 @@ def _gpu_ragged_dot_kernel(
   epilogue=None,
   epilogue_axes: tuple = (),
   exact_sums: bool = False,
+  matrices: int = 1,
 ):
+  A_refs, group_metadata_ref, refs = refs[:matrices], refs[matrices], refs[matrices + 1:]
   prologue_refs = refs[:len(prologue_axes)]
   epilogue_refs = refs[len(prologue_axes):len(prologue_axes) + len(epilogue_axes)]
   out_refs = refs[len(prologue_axes) + len(epilogue_axes):]
@@ -179,7 +180,7 @@ def _gpu_ragged_dot_kernel(
     rhs_cols_idx = pl.ds(0, block.n)
     rhs_cols_mask = (block.n * pid.j + arange(block.n)) < size.n
 
-    def inner_compute(k, acc):
+    def inner_compute(k, accs):
       inner_idx = pl.ds(k * block.k, block.k)
       inner_mask = (k * block.k + arange(block.k)) < size.k
       _load = partial(plgpu.load, other=0)
@@ -192,32 +193,36 @@ def _gpu_ragged_dot_kernel(
                  for ref, axes in zip(prologue_refs, prologue_axes, strict=True)]
         # Dew: the padding a hook made something of (1 / 0) is zero again before the product.
         x = jnp.where(mask, prologue(x, *tiles), 0)
-      if not trans_rhs:
-        mask = inner_mask[:, None] & rhs_cols_mask[None, :]
-        A = _load(A_ref.at[pid.gi, inner_idx, rhs_cols_idx], mask=mask)
-      else:
-        mask = rhs_cols_mask[:, None] & inner_mask[None, :]
-        A = _load(A_ref.at[pid.gi, rhs_cols_idx, inner_idx], mask=mask)
-      x, A = x.astype(compute_dtype), A.astype(compute_dtype)
+      x = x.astype(compute_dtype)
       dim_nums = (
           (((1,), (0,)), ((), ()))  # normal matmul product x @ y
           if not trans_rhs else
           (((1,), (1,)), ((), ()))  # transposed matmul product x @ y.T
       )
-      # Dew: the default precision named, so a configured one does not reach the kernel (TF32 for fp32).
-      xA = lax.dot_general(
-          x, A, dimension_numbers=dim_nums, precision=lax.Precision.DEFAULT, preferred_element_type=acc_dtype
-      )
-      return _summed(acc, xA.astype(acc_dtype), group_sz > 0, exact_sums=exact_sums)
+      summed = []
+      for A_ref, acc in zip(A_refs, accs, strict=True):
+        if not trans_rhs:
+          mask = inner_mask[:, None] & rhs_cols_mask[None, :]
+          A = _load(A_ref.at[pid.gi, inner_idx, rhs_cols_idx], mask=mask)
+        else:
+          mask = rhs_cols_mask[:, None] & inner_mask[None, :]
+          A = _load(A_ref.at[pid.gi, rhs_cols_idx, inner_idx], mask=mask)
+        # Dew: the default precision named, so a configured one does not reach the kernel (TF32 for fp32).
+        xA = lax.dot_general(
+            x, A.astype(compute_dtype), dimension_numbers=dim_nums, precision=lax.Precision.DEFAULT,
+            preferred_element_type=acc_dtype
+        )
+        summed.append(_summed(acc, xA.astype(acc_dtype), group_sz > 0, exact_sums=exact_sums))
+      return tuple(summed)
 
-    acc = jnp.zeros((block.m, block.n), dtype=acc_dtype)
-    acc = lax.fori_loop(0, pl.cdiv(size.k, block.k), inner_compute, acc)
-    stored(acc, ridx, lhs_rows_mask)
+    accs = tuple(jnp.zeros((block.m, block.n), dtype=acc_dtype) for _ in A_refs)
+    accs = lax.fori_loop(0, pl.cdiv(size.k, block.k), inner_compute, accs)
+    stored(accs, ridx, lhs_rows_mask)
 
   # Dew: the epilogue on each fp32 accumulator tile and its side operands' tiles, its outputs stored.
   stored = partial(_store_epilogued, out_refs, epilogue, epilogue_refs, epilogue_axes, pid.j, block, size)
   lax.fori_loop(0, pl.cdiv(group_sz, block.m), outer_compute, None)
-  _store_past_routed(stored, group_metadata_ref, pid, block, size, acc_dtype)
+  _store_past_routed(stored, group_metadata_ref, pid, block, size, acc_dtype, matrices)
 
 
 def _summed(acc, partial_sum, live, *, exact_sums: bool):
@@ -229,23 +234,24 @@ def _summed(acc, partial_sum, live, *, exact_sums: bool):
   return acc + partial_sum
 
 
-def _store_epilogued(out_refs, epilogue, refs, axes_of, column_block, block, size, acc, row, rows_mask):
-  """Dew: each output of the epilogue on an fp32 accumulator tile at `row` and its side operands' tiles
-  (the accumulator itself without one), stored at its rows and the program's columns."""
+def _store_epilogued(out_refs, epilogue, refs, axes_of, column_block, block, size, accs, row, rows_mask):
+  """Dew: each output of the epilogue on the fp32 accumulator tiles (one, or a paired product's two) at
+  `row` and its side operands' tiles (the accumulator itself without one), stored at its rows and the
+  program's columns."""
   cols_mask = (column_block * block.n + arange(block.n)) < size.n
-  outs = (acc,)
+  outs = accs
   if epilogue is not None:
     tiles = [_side_tile(ref, axes, {'rows': (row, block.m), 'columns': (column_block * block.n, block.n)},
                         {'rows': rows_mask, 'columns': cols_mask})
              for ref, axes in zip(refs, axes_of, strict=True)]
-    outs = epilogue(acc, *tiles)
+    outs = epilogue(*accs, *tiles)
     outs = outs if isinstance(outs, tuple) else (outs,)
   mask = rows_mask[:, None] & cols_mask[None, :]
   for y_ref, out in zip(out_refs, outs, strict=True):
     plgpu.store(y_ref.at[pl.ds(row, block.m), pl.ds(0, block.n)], out.astype(y_ref.dtype), mask=mask)
 
 
-def _store_past_routed(stored, group_metadata_ref, pid, block, size, acc_dtype):
+def _store_past_routed(stored, group_metadata_ref, pid, block, size, acc_dtype, matrices: int):
   """Dew: the rows past sum(group_sizes) sum nothing: by the last program along m, each output there is
   the epilogue of a zero accumulator, zero without one (`stored`)."""
   last_offset = (
@@ -262,7 +268,8 @@ def _store_past_routed(stored, group_metadata_ref, pid, block, size, acc_dtype):
   def _():
     def store_empty(i, _):
       row = last_offset + i * block.m
-      stored(jnp.zeros((block.m, block.n), acc_dtype), row, (row + arange(block.m)) < size.m)
+      zeros = tuple(jnp.zeros((block.m, block.n), acc_dtype) for _ in range(matrices))
+      stored(zeros, row, (row + arange(block.m)) < size.m)
 
     lax.fori_loop(0, pl.cdiv(size.m - last_offset, block.m), store_empty, None)
 
@@ -295,6 +302,7 @@ def gmm(
   epilogue_axes: tuple = (),
   out_dtypes: tuple | None = None,
   exact_sums: bool = False,
+  paired: jax.Array | None = None,
 ) -> jax.Array | tuple[jax.Array, ...]:
   """Compute grouped matmul on GPU via a Pallas lowering.
 
@@ -302,7 +310,9 @@ def gmm(
   `epilogue(acc, *side_tiles)` each fp32 accumulator tile, returning one output or a tuple of them
   (`out_dtypes`). Each side operand's dimensions follow the launch axes its `*_axes` entry names
   (`_side_tile`): 'rows' and 'depth' for the prologue's, 'rows' and 'columns' for the epilogue's.
-  `exact_sums` adds each depth step's product into the fp32 sum by an IEEE add (`_summed`)."""
+  `exact_sums` adds each depth step's product into the fp32 sum by an IEEE add (`_summed`). `paired`, a
+  second matrix of `A`'s shape, makes each tile two products of one `x` tile, combined by
+  `epilogue(acc, paired_acc, *side_tiles)` (a gated activation's gate and up)."""
 
   msg = "This gmm kernel only supports either (m, k) x (g, k, n) -> (m, n) "
   msg += f"or (m, k) x (g, n, k) -> (m, n), but got {x.shape=} {A.shape=}"
@@ -331,10 +341,13 @@ def gmm(
   group_metadata = _make_gmm_group_metadata(
     group_sizes=group_sizes, m=size.m, chunk_m=chunk_m
   )
+  if paired is not None and (paired.shape != A.shape or epilogue is None):
+    raise ValueError("a paired product takes a second matrix of the first's shape and an epilogue of both")
+  matrices = (A,) if paired is None else (A, paired)
   sides = (*prologue_operands, *epilogue_operands)
   in_specs = [
     pl.BlockSpec((size.m, size.k), lambda i, j: (0, 0)),
-    A_spec,
+    *(A_spec for _ in matrices),
     jax.tree.map(
       lambda x: pl.BlockSpec(x.shape, lambda *args: (0,) * x.ndim),
       group_metadata,
@@ -358,6 +371,7 @@ def gmm(
     "epilogue": epilogue,
     "epilogue_axes": epilogue_axes,
     "exact_sums": exact_sums,
+    "matrices": len(matrices),
   }
   with jax.named_scope("pallas_triton_ragged_dot"):
     outs = pl.pallas_call(
@@ -374,7 +388,7 @@ def gmm(
         num_warps=num_warps, num_stages=num_stages
       ),
       name="pallas_triton_ragged_dot",
-    )(x, A, group_metadata, *sides)
+    )(x, *matrices, group_metadata, *sides)
   return outs if out_dtypes else outs[0]
 
 
