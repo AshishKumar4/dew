@@ -62,8 +62,6 @@ for seed in range(first, first + count):
     for name, form in [*FORMS.items(), ("reference", None)]:
         found = ref if form is None else np.einsum("bhqk,bqhd->bkhd", form(ds), q64)
         err = np.abs(found - truth).max(axis=(1, 2, 3)) / size
-        row = int(np.argmax(err / np.maximum(ref_err, 1e-12)))
-        ratio = float(err[row] / max(ref_err[row], 1e-12))
-        if ratio > worst[name][0]:
-            worst[name] = (ratio, float(err[row]))
-print(json.dumps({"seeds": [first, count], "worst_ratio_to_reference": worst}))
+        rms = float(np.sqrt(np.mean(((found - truth) / size[:, None, None, None]) ** 2)))
+        worst[name] = (max(worst[name][0], float(err.max())), worst[name][1] + rms ** 2)
+print(json.dumps({"seeds": [first, count], "worst_row_and_rms2": worst}))
