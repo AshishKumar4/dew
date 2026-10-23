@@ -61,15 +61,21 @@ def relative(got, want) -> float:
 
 
 def tiled(kernel, call, *operands) -> list:
-    """`call(*operands)` at each of `kernel`'s tiles the tuner may pick on this GPU (tests/tuned.py's
-    `each_config`), or at its unmeasured tiles where the kernels interpret: a kernel's gate holds at
-    every config of its space."""
+    """`call(*operands)` at its default config and at each of `kernel`'s tiles the tuner may pick on this
+    GPU (tests/tuned.py's `each_config`), or at its unmeasured tiles where the kernels interpret: a
+    kernel's gate holds at every config of its space. A config whose block a call's shape puts past this
+    GPU's resources (`tuning._resource_exhausted`) the tuner drops where it measures, so it is never
+    picked; the default must fit."""
     if INTERPRETED:
         return [call(*operands)]
-    found = []
+    found = [call(*operands)]
     for tiles in each_config(kernel, call, *operands):
         with tuning.pinned({kernel: tiles}):
-            found.append(call(*operands))
+            try:
+                found.append(call(*operands))
+            except jax.errors.JaxRuntimeError as error:
+                if not tuning._resource_exhausted(error):
+                    raise
     return found
 
 

@@ -353,13 +353,19 @@ def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, pa
     def kernels(x, weights):
         return run(kernel_conv, x, weights, None, None, parts, dtype, grads, segments=segments)
 
-    want, want_grads = run(xla_conv1d, x, weights, None, None, parts, dtype, grads, segments=segments)
-    exact, exact_grads = truth(x, weights, None, None, parts, grads, segments=segments)
+    # Each result moves to the host as it is computed, so the GPU holds one computation's arrays at a
+    # time, and the float64 truth, a depthwise conv, runs on the host's CPU: held together on the GPU, the
+    # 9b's truth, XLA's conv and a config's ran a 24 GB A10 out of memory.
+    want, want_grads = jax.device_get(run(xla_conv1d, x, weights, None, None, parts, dtype, grads,
+                                          segments=segments))
+    with jax.default_device(jax.devices("cpu")[0]):
+        exact, exact_grads = jax.device_get(truth(*jax.device_get((x, weights)), None, None, parts,
+                                                  jax.device_get(grads), segments=jax.device_get(segments)))
     pins = [{}] + [{op: config} for op in (short_conv.ConvForward, short_conv.ConvBackward)
                    for config in each_config(op, kernels, x, weights)]
     for pin in pins:
         with tuning.pinned(pin):
-            got, got_grads = kernels(x, weights)
+            got, got_grads = jax.device_get(kernels(x, weights))
         labels = ("q", "k", "v", "dx", "dtaps")
         # The gradients of the projection and the taps; there is no bias.
         for label, mine, theirs, value in zip(labels, (*got, *got_grads[:2]), (*want, *want_grads[:2]),
