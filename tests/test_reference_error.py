@@ -88,6 +88,11 @@ def test_a_torch_arm_pulls_back_the_cotangent_it_is_given():
         for got, want in zip((grad_x, *(grads[name] for name in params)), wanted, strict=True):
             np.testing.assert_array_equal(got, want.numpy())
         np.testing.assert_array_equal(grad_unused, np.zeros_like(unused))
+    # A scalar loss pulls back its scalar one, and a scalar input takes a scalar gradient.
+    loss, gradient = torch_with_gradients(lambda a: 3 * a * a)(np.float32(2), np.float32(1))
+    np.testing.assert_array_equal(loss, np.float32(12))
+    np.testing.assert_array_equal(gradient, np.float32(12))
+    assert np.shape(gradient) == ()
     # A bfloat16 output, of float32 inputs cast inside, comes back in float32, its values exactly.
     x = np.arange(4, dtype=np.float32) / 3
     out, grad = torch_with_gradients(lambda x: (x.bfloat16() * 3).bfloat16())(x, np.ones(4, np.float32))

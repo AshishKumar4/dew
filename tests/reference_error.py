@@ -161,7 +161,8 @@ def torch_with_gradients(fn):
         import torch
 
         def tensor(value):
-            value = torch.from_numpy(np.ascontiguousarray(value))
+            # A copy, contiguous and of the array's own shape: `ascontiguousarray` lifts a 0-d array to 1-d.
+            value = torch.as_tensor(np.array(value))
             return value.requires_grad_() if value.is_floating_point() else value
 
         inputs = jax.tree.map(tensor, arguments[:-1])
@@ -171,7 +172,7 @@ def torch_with_gradients(fn):
             raise ValueError(f"{len(cotangents)} cotangents for {len(leaves)} outputs")
         wanted = [leaf for leaf in jax.tree.leaves(inputs) if leaf.requires_grad]
         pulled = torch.autograd.grad(
-            leaves, wanted, grad_outputs=[torch.from_numpy(np.ascontiguousarray(c)).to(leaf.dtype)
+            leaves, wanted, grad_outputs=[torch.as_tensor(np.array(c)).to(leaf.dtype)
                                           for leaf, c in zip(leaves, cotangents, strict=True)],
             allow_unused=True)
         def array(value):
