@@ -88,32 +88,66 @@ def test_a_torch_arm_pulls_back_the_cotangent_it_is_given():
         for got, want in zip((grad_x, *(grads[name] for name in params)), wanted, strict=True):
             np.testing.assert_array_equal(got, want.numpy())
         np.testing.assert_array_equal(grad_unused, np.zeros_like(unused))
-    # A scalar loss pulls back its scalar one, and a scalar input takes a scalar gradient.
+
+
+def test_a_torch_arm_pulls_a_scalar_loss_back_from_its_scalar_one():
+    """A scalar input takes a scalar gradient, its shape kept."""
+    pytest.importorskip("torch")
+    from reference_error import torch_with_gradients
+
     loss, gradient = torch_with_gradients(lambda a: 3 * a * a)(np.float32(2), np.float32(1))
     np.testing.assert_array_equal(loss, np.float32(12))
     np.testing.assert_array_equal(gradient, np.float32(12))
     assert np.shape(gradient) == ()
-    # A constant output pulls nothing back, beside a reached one or alone, and an integer input has no
-    # gradient.
+
+
+def test_a_torch_arm_pulls_nothing_back_from_a_constant_and_gives_an_integer_input_none():
+    """A constant output pulls nothing back, alone or beside a reached one, and an integer input has no
+    gradient."""
+    torch = pytest.importorskip("torch")
+    from reference_error import torch_with_gradients
+
     x = np.array([2.0, 3.0], np.float32)
-    out, gradient = torch_with_gradients(lambda x: torch.ones_like(x))(x, np.ones(2, np.float32))
+    _, gradient = torch_with_gradients(lambda x: torch.ones_like(x))(x, np.ones(2, np.float32))
     np.testing.assert_array_equal(gradient, np.zeros(2, np.float32))
     _, gradient = torch_with_gradients(lambda x: (2 * x, torch.ones_like(x)))(
         x, (np.ones(2, np.float32), np.ones(2, np.float32)))
     np.testing.assert_array_equal(gradient, np.full(2, 2, np.float32))
-    out, gradient = torch_with_gradients(lambda i: i.float() * 2)(np.array([1, 2], np.int32),
-                                                                   np.ones(2, np.float32))
+    _, gradient = torch_with_gradients(lambda i: i.float() * 2)(np.array([1, 2], np.int32),
+                                                                 np.ones(2, np.float32))
     assert gradient is None
-    # A bfloat16 input and cotangent, as JAX holds them on the host, go in through float32 exactly.
+
+
+def test_a_torch_arm_refuses_a_cotangent_of_another_tree():
+    """A cotangent pairs with the output by its tree, as `jax.vjp` pairs them: a dict for a tuple, or a
+    list for one, is refused, where pairing by order would pull back the wrong leaf."""
+    pytest.importorskip("torch")
+    from reference_error import torch_with_gradients
+
+    pulled = torch_with_gradients(lambda v: (v * 1, v * 2))
+    x = np.ones(2, np.float32)
+    for cotangent in ({"z": np.ones(2, np.float32), "a": np.ones(2, np.float32)}, [x, x]):
+        with pytest.raises(ValueError):
+            pulled(x, cotangent)
+    _, gradient = pulled(x, (np.full(2, 10, np.float32), np.full(2, 100, np.float32)))
+    np.testing.assert_array_equal(gradient, np.full(2, 210, np.float32))
+
+
+def test_a_torch_arms_bfloat16_goes_in_and_comes_out_through_float32():
+    """A bfloat16 input and cotangent, as JAX holds them on the host, and a bfloat16 output, come in and
+    out through the float32 that holds them, their values exactly."""
+    torch = pytest.importorskip("torch")
+    from reference_error import torch_with_gradients
+
     halves = np.array([2.0, 3.0], jnp.bfloat16)
     out, gradient = torch_with_gradients(lambda x: x * 2)(halves, np.ones(2, jnp.bfloat16))
+    assert out.dtype == gradient.dtype == np.float32
     np.testing.assert_array_equal(out, np.array([4.0, 6.0], np.float32))
     np.testing.assert_array_equal(gradient, np.full(2, 2, np.float32))
-    # A bfloat16 output, of float32 inputs cast inside, comes back in float32, its values exactly.
     x = np.arange(4, dtype=np.float32) / 3
-    out, grad = torch_with_gradients(lambda x: (x.bfloat16() * 3).bfloat16())(x, np.ones(4, np.float32))
+    out, gradient = torch_with_gradients(lambda x: (x.bfloat16() * 3).bfloat16())(x, np.ones(4, np.float32))
     np.testing.assert_array_equal(out, (torch.from_numpy(x).bfloat16() * 3).float().numpy())
-    np.testing.assert_array_equal(grad, np.full(4, 3, np.float32))
+    np.testing.assert_array_equal(gradient, np.full(4, 3, np.float32))
 
 
 def test_a_small_row_beside_large_ones_is_held_to_its_own_size():
