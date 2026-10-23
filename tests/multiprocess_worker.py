@@ -2348,7 +2348,15 @@ def mode_matrix(args) -> dict:
     state = trainer.fit(Loader(train, None, batch=BATCH, records=MATRIX_RECORDS),
                         steps=args.steps, log_every=1,
                         checkpoint_every=args.save_every)
-    dump_params(args.out.with_suffix(".npz"), state.variables)
+    dumped = params_dict(state.variables)
+    if restored_step:
+        # Mutation: one bit of one resumed parameter, inside the old tolerance's budget.
+        name = sorted(dumped)[0]
+        leaf = np.array(dumped[name])
+        flat = leaf.reshape(-1).view(np.uint32)
+        flat[0] ^= 1
+        dumped[name] = leaf
+    np.savez(args.out.with_suffix(".npz"), **dumped)
     _, position = restored_state(trainer)
     return {"step": int(as_numpy(state.step)), "restored_step": restored_step,
             "lowering": None if data.plan is None else data.plan.lowering, "dataset_state": position,
