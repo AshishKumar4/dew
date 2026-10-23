@@ -366,7 +366,7 @@ def assert_as_exact_as_the_reference(dew, reference, truth, label: str, *, terms
 
 
 PARITY = 1.5
-"""The gate's factor: each leaf's RMS error from float64 within 1.5 times the
+"""The gate's on-par factor: each leaf's RMS error from float64 within 1.5 times the
 reference's, on the same inputs, with no floor of any kind. Check 1 (`assert_as_exact`) holds it now;
 the one-draw rule's FACTOR joins it once every site that rule would then fail has moved to check 1."""
 
