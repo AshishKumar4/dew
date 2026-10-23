@@ -67,7 +67,7 @@ from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import MultimodalTransformer
 from dew.objectives.base import Variables
-from dew.registry import dtype_name, from_record, projectors, rebuilt, resolve_dtype, towers
+from dew.registry import dtype_name, from_record, projectors, record_fields, resolve_dtype, towers
 from dew.sampling.pipelines import TextToImage
 from dew.sampling.text import Sampling
 
@@ -656,7 +656,7 @@ class PretrainedDecoder(Pretrained):
         # Cross-attention blocks have no layout in any family: the config is the decoder's they join,
         # and `export` refuses the blocks themselves.
         config = decoders.export_config(decoder.with_cross_attention(None))
-        built = rebuilt(dict, decoder)
+        built = record_fields(decoder, CausalTransformer)
         return cls(decoder, variables, None, config, None, built,
                    {**decoders.GENERATION_DEFAULTS, 'use_cache': config.get('use_cache', decoder.causal)}
                    if generation_config is None else generation_config,
