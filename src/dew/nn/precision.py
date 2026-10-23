@@ -127,30 +127,33 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     EPYC); a GPU or TPU product, and any whose products are 16-bit, are the product itself. float64
     runs on these ops alone, under `jax.enable_x64` for their own trace, which nothing outside
     reads, and their gradients and tangents are float64 sums too."""
+    from dew.nn.kernels.generation import linear_tangent
+
     narrow = functools.partial(product, preferred_element_type=preferred_element_type)
     if products_dtype(*operands) != jnp.dtype(jnp.float32):
         return narrow(*operands)
     dtype = jax.eval_shape(narrow, *operands).dtype
 
-    def summed(*terms):
-        """The float64 sum of the products of each of `terms`' operand lists, rounded once."""
+    def widened(*operands):
+        return tuple(operand.astype(jnp.float64) for operand in operands)
+
+    def summed(*operands):
         with jax.enable_x64(new_val=True):
-            wide = [product(*(operand.astype(jnp.float64) for operand in term), preferred_element_type=None)
-                    for term in terms]
-            return functools.reduce(jnp.add, wide).astype(dtype)
+            return product(*widened(*operands), preferred_element_type=None).astype(dtype)
 
-    # The tangent is the products of each operand's tangent with the others, summed in float64 too.
-    # A rule of its own keeps it there: JAX differentiates a platform's branch after tracing it,
-    # outside the scope that widened its operands.
-    @jax.custom_jvp
-    def wide(*operands):
-        return summed(operands)
+    def pulled(saved, operands, cotangent):
+        """The operands' cotangents, each the float64 sum of its products rounded once: JAX
+        transposes a product after its trace, outside the scope that widened it, so the pullback
+        is formed in that scope here."""
+        with jax.enable_x64(new_val=True):
+            _, pullback = jax.vjp(lambda *wide: product(*wide, preferred_element_type=None),
+                                  *widened(*operands))
+            return tuple(gradient.astype(operand.dtype)
+                         for gradient, operand in zip(pullback(cotangent.astype(jnp.float64)), operands,
+                                                      strict=True))
 
-    @wide.defjvp
-    def _(primals, tangents):
-        return wide(*primals), summed(*((*primals[:index], tangent, *primals[index + 1:])
-                                        for index, tangent in enumerate(tangents)))
-
+    # Forward mode differentiates `summed` as it traces, inside its scope; reverse mode runs `pulled`.
+    wide = linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed)
     return jax.lax.platform_dependent(*operands, cpu=wide, default=narrow)
 
 
