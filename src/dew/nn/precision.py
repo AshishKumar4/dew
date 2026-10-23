@@ -214,12 +214,12 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     from dew.nn.kernels.generation import linear_tangent
 
     narrow = functools.partial(product, preferred_element_type=preferred_element_type)
-    # A wider result asked of the product converts its operands to it, so its products are not float32's.
-    wider = (preferred_element_type is not None and products_dtype(*operands) is not None
-             and jnp.promote_types(products_dtype(*operands), preferred_element_type) != jnp.float32)
-    if wider or not _sums_in_float64(*operands):
+    if not _sums_in_float64(*operands):
         return narrow(*operands)
     dtype = jax.eval_shape(narrow, *operands).dtype
+    if jnp.promote_types(dtype, jnp.float32) != jnp.float32:
+        # A wider result converts the operands to it, so the products are not float32's.
+        return narrow(*operands)
 
     def summed(*operands):
         return float64_sum(product, *operands, dtype=dtype)
