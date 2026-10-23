@@ -3,13 +3,15 @@ differentiates (`dew.nn.moe.expert_projection` through it), and XLA's portable p
 
 Three products, in MaxText's megablox shape: the forward `gmm`, the input gradient `gmm` against the
 transposed kernel, and the kernel gradient `tgmm`. Each is a template launch (`templates.base`) with
-two implementations, chosen per call by the cost model (`templates.cost`) among those that run it:
+its implementations chosen per call by the cost model (`templates.cost`) among those that run it:
 JAX's Pallas Triton kernels (`ragged_dot.py`, vendored), on every CUDA GPU from sm80 and on a CPU that
-interprets them, and Dew's Pallas Mosaic GPU kernels for Hopper (`templates.gemm.mosaic_gpu`), whose
-warpgroup MMA Triton's lowering does not reach. `ragged_dot_refusal` says which products they compute
-exactly. They run only for a CUDA lowering, chosen where the call lowers
-(`jax.lax.platform_dependent`), so a CPU computation on a GPU host lowers to `jax.lax.ragged_dot`; an
-explicit request interprets them on the CPU, as the CPU suite checks them.
+interprets them; Dew's Pallas Mosaic GPU kernels for Hopper (`templates.gemm.mosaic_gpu`), whose
+warpgroup MMA Triton's lowering does not reach; and CUTLASS's grouped GEMMs (`kernels/cutlass`, the
+dew-cutlass wheel) where it is installed, a vendored kernel ranked by its measured rows until the
+template's beat it. `ragged_dot_refusal` says which products they compute exactly. They run only for
+a CUDA lowering, chosen where the call lowers (`jax.lax.platform_dependent`), so a CPU computation on a
+GPU host lowers to `jax.lax.ragged_dot`; an explicit request interprets them on the CPU, as the CPU
+suite checks them.
 
 Each launch's config is its cost model's fastest that fits the GPU, the same on every run; a tuning
 run measures its space (`tuning.tune`). JAX's one tile for every shape left a wide expert's products
@@ -809,7 +811,7 @@ class MosaicTgmm(_Mosaic):
 
 
 @functools.cache
-def _cutlass_architectures() -> tuple[str, ...]:
+def cutlass_architectures() -> tuple[str, ...]:
     """The GPU generations the installed dew_cutlass holds code for, or none where it is not installed."""
     if importlib.util.find_spec('dew_cutlass') is None:
         return ()
@@ -847,7 +849,7 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
         # need: every extent a multiple of 8 elements.
         extents = {extent for operand in operands for extent in operand.shape[1:]}
         built = generation.effective(target).generation
-        return (built in self.MEASURED and built in _cutlass_architectures()
+        return (built in self.MEASURED and built in cutlass_architectures()
                 and all(operand.dtype == jnp.bfloat16 for operand in operands)
                 and jnp.dtype(ba.arguments['out_dtype']) in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32))
                 and ba.arguments['sizes'].dtype == jnp.int32 and all(extent % 8 == 0 for extent in extents)
@@ -875,7 +877,8 @@ class CutlassGmm(_Cutlass):
     ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
     TILE: ClassVar[mosaic_gpu.Tiles] = mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2)
     COSTED_AS: ClassVar[_Mosaic] = MosaicGmm()
-    MEASURED: ClassVar[dict[str, float]] = {'sm90': 1.0}
+    # CUTLASS-4: forward and input gradient of the scoreboard's grouped rows, bf16 out.
+    MEASURED: ClassVar[dict[str, float]] = {'sm90': 0.72}
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
@@ -900,7 +903,8 @@ class CutlassTgmm(_Cutlass):
     ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
     TILE: ClassVar[mosaic_gpu.Tiles] = mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2)
     COSTED_AS: ClassVar[_Mosaic] = MosaicTgmm()
-    MEASURED: ClassVar[dict[str, float]] = {'sm90': 1.0}
+    # CUTLASS-4: the kernel gradient of the scoreboard's grouped rows, bf16 out.
+    MEASURED: ClassVar[dict[str, float]] = {'sm90': 1.16}
 
     def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,
