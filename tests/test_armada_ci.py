@@ -199,6 +199,35 @@ def install_compiler(directory: Path) -> None:
     (directory / "ptxas").chmod(0o755)
 
 
+def test_a_batchs_marks_come_from_fresh_records_and_only_the_rest_is_collected(
+        ci, tmp_path, monkeypatch, cache_worker, capsys):
+    """Per batch, `gpu-tier --marked` names the files whose tests are marked for a GPU. A file a green CPU
+    task ran on these inputs has its marks in that run's record (executed.py), so it is not imported
+    again to learn them; a file changed since is collected, its new marks counted. Each module notes its
+    import in imports.log, beside the checkout's tests and outside every key."""
+    url, _, _ = cache_worker
+    cached(monkeypatch, url)
+    noted = "with open('imports.log', 'a') as log: log.write(__name__ + '\\n')\n"
+    written(tmp_path, {"test_on_a_gpu.py": noted + "import pytest\n@pytest.mark.gpu\ndef test_gpu(): pass\n",
+                       "test_on_the_cpu.py": noted + "def test_cpu(): pass\n"})
+    interpreter(tmp_path, "3.12")
+    tests = ["tests/test_on_a_gpu.py", "tests/test_on_the_cpu.py"]
+    # Each in a task of its own: a task's collection imports join each of its files' records (row 1399).
+    for name in tests:
+        ci.task("3.12", [name], "", tmp_path / "verdict.json", 600.0)
+    imports = (tmp_path / "imports.log").read_text().split()
+    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--marked"])
+    capsys.readouterr()
+    assert ci.main() == 0
+    assert capsys.readouterr().out.split() == ["tests/test_on_a_gpu.py"]
+    assert (tmp_path / "imports.log").read_text().split() == imports, "a recorded file imported again"
+    (tmp_path / "tests/test_on_the_cpu.py").write_text(
+        noted + "import pytest\n@pytest.mark.kernel\ndef test_lowers(): pass\n")
+    assert ci.main() == 0
+    assert capsys.readouterr().out.split() == tests
+    assert (tmp_path / "imports.log").read_text().split() == [*imports, "test_on_the_cpu"]
+
+
 def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_for_a_gpu(
         ci, tmp_path, monkeypatch, cache_worker, capsys):
     """A task keeps, beside each green file's key, where its run read the
