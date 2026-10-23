@@ -80,10 +80,10 @@ class Kernels:
                                                    "content": content}))
 
             status = "ok"
+            if not code.startswith(("import model_client", "import live_training")):
+                self.ran.append(code)
             if code.startswith(("import model_client", "import live_training")):
                 await self.phase("preload")
-            else:
-                self.ran.append(code)
             elif code.startswith("panel "):
                 transient = {"display_id": "panel"}
                 await reply("display_data", {"data": {"text/plain": "frame 0"}, "transient": transient})
