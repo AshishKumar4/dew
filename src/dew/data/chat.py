@@ -390,6 +390,24 @@ def _token_ids(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping
     return ids
 
 
+RENDERER_KEYS = frozenset({"conversation", "tools", "documents", "tokenize", "return_dict", "return_tensors",
+                           "add_generation_prompt", "continue_final_message", "chat_template",
+                           "enable_thinking", "padding", "truncation", "max_length"})
+"""The keywords the template call itself owns (`apply_chat_template`'s and this module's own
+controls), which a template's variables (`options`) never set: each has its own field."""
+
+
+def template_options(options: Mapping[str, JSON], *, where: str) -> Mapping[str, JSON]:
+    """`options` as a chat template's own variables, refused (ValueError) where one names a keyword
+    the template call owns (`RENDERER_KEYS`): thinking, the template and the rest have their own
+    fields, so an option never overrides one silently or collides with it."""
+    owned = sorted(set(options) & RENDERER_KEYS)
+    if owned:
+        raise ValueError(f"{where}: {owned} are the chat template call's own controls, not template "
+                         "variables; set them through their own fields")
+    return options
+
+
 def _rendered(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping[str, object]], *,
               generation_prompt: bool, where: str, thinking: bool | None, tokenize: bool,
               chat_template: str | None = None, options: Mapping[str, JSON] | None = None
@@ -401,7 +419,8 @@ def _rendered(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping[
         render = functools.partial(
             tokenizer.apply_chat_template, rows, tools=[dict(tool) for tool in tools] or None,
             tokenize=tokenize, return_dict=False, add_generation_prompt=generation_prompt,
-            **({} if chat_template is None else {"chat_template": chat_template}), **(options or {}))
+            **({} if chat_template is None else {"chat_template": chat_template}),
+            **template_options(options or {}, where=where))
         return render() if thinking is None else render(enable_thinking=thinking)
     except (TemplateError, TypeError) as exc:
         raise ValueError(f"{where}: the chat template refused the conversation: {exc}") from exc

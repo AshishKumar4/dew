@@ -503,20 +503,34 @@ class Framing:
     chat_template: str | None = None
     options: Mapping[str, JSON] = dataclasses.field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        from dew.data.chat import template_options
+
+        template_options(self.options, where="Framing.options")
+        if self.chat_template is not None and not self.template:
+            raise ValueError("a framing with its own chat_template frames through it; template=False frames "
+                             "as plain text, so the two are not one framing")
+
     def around(self, encoder: Tokenizer) -> tuple[str, str]:
         """The text before the user's turn's content and after it, to the assistant's prefill."""
         from dew.registry import to_record
 
-        return _framed(_same(encoder), json.dumps(to_record(self, Framing), sort_keys=True))
+        # The record keeps the options in their own order, which a template that walks them reads.
+        return _framed(_same(encoder), json.dumps(to_record(self, Framing)))
 
 
 @functools.lru_cache(maxsize=64)
 def _framed(encoder: _Same, recorded: str) -> tuple[str, str]:
-    """`Framing.around`, rendered once a tokenizer and framing, the framing by its record (`_same`)."""
+    """`Framing.around`, rendered once a tokenizer and framing, the framing by its record (`_same`).
+    A chat template of the framing's own renders through a tokenizer that renders templates
+    (`HFTokenizer`), and is refused (ValueError) over one that does not, rather than left unread."""
     from dew.registry import from_record
 
-    framing = from_record(Framing, json.loads(recorded))
+    framing = from_record(Framing, json.loads(recorded), dtypes=False)
     tokenizer = encoder.encoder
+    if framing.chat_template is not None and not isinstance(tokenizer, HFTokenizer):
+        raise ValueError(f"a framing's own chat template renders through a tokenizer with a chat "
+                         f"template renderer, which {type(tokenizer).__name__} is not")
     templated = isinstance(tokenizer, HFTokenizer) and (
         framing.chat_template is not None or tokenizer.tokenizer.chat_template)
     if framing.template and templated and isinstance(tokenizer, HFTokenizer):

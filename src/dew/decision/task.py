@@ -218,8 +218,9 @@ class Decide:
         # the backbone would where the caller overrides the compute dtype.
         model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype))
         laid = records.record(settings.layout, "layout")
+        # A layout is plain data, its framing's template variables included: no field is a dtype.
         rows = from_record(_LAYOUTS[records.text(laid["name"], "layout.name")],
-                           records.json_value(laid["fields"], "layout.fields"))
+                           records.json_value(laid["fields"], "layout.fields"), dtypes=False)
         if settings.tokenizer is None:
             raise ValueError("the run records no tokenizer to lay its rows out with")
         processor = None if settings.processor is None else load_processor(settings.processor, backbone)
