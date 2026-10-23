@@ -26,19 +26,29 @@ def programs(directory: Path) -> dict[str, bytes]:
             for path in directory.glob(f"*{remote_cache.SUFFIX}")}
 
 
-def test_a_cpu_bundle_is_its_host_class_s_alone(monkeypatch):
+def test_a_cpu_bundle_is_its_host_class_s_alone():
     """On the CPU, whose device kind is "cpu" on every host, a bundle is its host class's
     (`dew._host.cpu_class`): XLA:CPU compiles for the host that compiles, and armada's hosts span classes,
     so a program from another class need not link here ("Failed to materialize symbols"), after which the
     process compiles nothing more."""
-    import dew._host
+    import os
+    import subprocess
+    import sys
 
-    prefixes = {}
-    for named in ("AuthenticAMD-25-17", "AuthenticAMD-25-1"):
-        monkeypatch.setattr(dew._host, "cpu_class", lambda named=named: named)
-        prefixes[named] = remote_cache.prefix()
-    assert len(set(prefixes.values())) == 2
-    assert all(prefix.endswith(f"/cpu/{named}") for named, prefix in prefixes.items())
+    # On the CPU backend, whatever this lane's: a CUDA or TPU lane's prefix is its device kind's.
+    script = """
+import dew._host
+import remote_cache
+for named in ("AuthenticAMD-25-17", "AuthenticAMD-25-1"):
+    dew._host.cpu_class = lambda named=named: named
+    print(remote_cache.prefix())
+"""
+    path = os.pathsep.join([os.path.dirname(__file__), os.environ.get("PYTHONPATH", "")])
+    env = {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": path}
+    done = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=300)
+    assert done.returncode == 0, done.stderr[-2000:]
+    zen4, zen3 = done.stdout.split()
+    assert zen4.endswith("/cpu/AuthenticAMD-25-17") and zen3.endswith("/cpu/AuthenticAMD-25-1")
 
 
 def test_an_unreachable_remote_only_slows_a_task_by_its_first_failed_requests(monkeypatch, tmp_path):
@@ -124,7 +134,9 @@ print(remote.programs_fetched, remote.uploaded, int(counts.get("train/cache_miss
     assert (value, fetched, uploaded) == ("18.0", "0", "1") and int(compiled) >= 1
     [key] = stored
     assert key.startswith(f"/jaxlib{__import__('jaxlib').__version__}/")
-    assert key.endswith("/cpu/bundles/tests/test_step.py")
+    from dew._host import cpu_class
+
+    assert key.endswith(f"/cpu/{cpu_class()}/bundles/tests/test_step.py")
     programs = len(list(remote_cache.unpacked(stored[key])))
     assert programs >= 1
     # Read back, nothing compiles: JAX's persistent cache misses nothing.
