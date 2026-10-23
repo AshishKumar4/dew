@@ -5,6 +5,19 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- Module moves, each name at one path: the run configurations are
+  `dew.config.lm.LMRunConfig`, `dew.config.jepa.JepaRunConfig` and
+  `dew.config.diffusion.DiffusionRunConfig` (with `FlowRolloutConfig`); the
+  condition records `TextCondition` and `AudioCondition` are `dew.inputs`';
+  `PretrainedAutoencoder` is `dew.nn.autoencoders.pretrained`'s; the optimizers
+  and schedules are `dew.optim`; the device facts and CUDA builds are
+  `dew.devices` and `dew.builds`. A record names a class by its alias where the
+  registry holds one (`"class": "diffusion"`), so it reads back wherever the
+  class moves; a run.json written before this names the old import path and
+  no longer loads. A distillation's teacher run is the run config's
+  `--teacher-run`, and the objectives take the loaded teacher
+  (`teacher_variables=`, and guidance distillation's `teacher=`).
+
 - `dew.figures` draws SVG figures for notebooks and docs. Their colors follow
   the page's light or dark theme (dewml.dev, Colab, JupyterLab, VS Code, and
   the system setting elsewhere), and their animations are CSS, so they play

@@ -1,5 +1,5 @@
 {
-  "class": "dew.objectives.diffusion.config:DiffusionRunConfig",
+  "class": "diffusion",
   "fields": {
     "model": {
       "name": "dew.nn.backbones.ssm_dit:HybridSSMAttentionDiT",
@@ -252,7 +252,7 @@
           }
         },
         "solver": {
-          "class": "dew.sampling.solvers.dpm:DPMSolverMultistep",
+          "class": "dpmsolver_multistep",
           "fields": {
             "order": 2,
             "algorithm": "dpmsolver++",
@@ -274,7 +274,7 @@
     },
     "lora": null,
     "preset": {
-      "class": "dew.diffusion.presets:EDM",
+      "class": "edm",
       "fields": {
         "sigma_min": 0.002,
         "sigma_max": 80.0,
@@ -306,6 +306,8 @@
     },
     "pretrained": null,
     "pretrained_param_dtype": "float32",
+    "teacher_run": null,
+    "rollout": null,
     "val_metrics": [],
     "data": {
       "version": 1,
@@ -326,7 +328,8 @@
               "shard_bytes": 67108864,
               "storage_options": null,
               "spark": false,
-              "file_info": null
+              "file_info": null,
+              "suffixes": null
             }
           },
           "start": 512,
@@ -413,7 +416,8 @@
               "shard_bytes": 67108864,
               "storage_options": null,
               "spark": false,
-              "file_info": null
+              "file_info": null,
+              "suffixes": null
             }
           },
           "start": 0,
