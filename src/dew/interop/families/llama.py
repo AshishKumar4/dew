@@ -18,9 +18,11 @@ from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
     FUSED_EXPERTS,
     MOE_NAMES,
+    PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
     Packed,
+    RopeSpelling,
     base_config,
     every_layer_windowed,
     read_rope,
@@ -39,7 +41,7 @@ def llama_config(hf_config, used):
     # attends every key, and LlamaMLP's projections carry mlp_bias's biases.
     # LlamaRotaryEmbedding builds any rope_type the rope utilities do, YaRN
     # among them (modeling_llama.py:82-86).
-    rope = read_rope(hf_config, used, records.integer(hf_config.get(
+    rope = read_rope(hf_config, used, PLAIN_SPELLING, yarn_max_pos=records.integer(hf_config.get(
         'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'))
     return base_config(hf_config, used, rope=rope, reads=frozenset({'attention_bias', 'mlp_bias'}))
 
@@ -47,11 +49,16 @@ def llama_config(hf_config, used):
 def ministral_config(hf_config, used):
     # MinistralConfig declares layer_types and sliding_window, and its
     # attention builds no biases.
-    return base_config(hf_config, used, reads=frozenset({'layer_types', 'sliding_window'}))
+    return base_config(hf_config, used, rope=PLAIN_SPELLING,
+                       reads=frozenset({'layer_types', 'sliding_window'}))
+
+
+# MixtralConfig's default_theta (configuration_mixtral.py:45), the base an omitted rope_theta means.
+_MIXTRAL_SPELLING = RopeSpelling(theta=1000000.0)
 
 
 def _mixtral_config(hf_config, used):
-    config = _mistral_config(hf_config, used)
+    config = _mistral_config(hf_config, used, _MIXTRAL_SPELLING)
     used.update(('num_local_experts', 'router_jitter_noise'))
     if hf_config.get('router_jitter_noise', 0.0):
         refuse('router_jitter_noise', 'training-time input jitter has no counterpart')
@@ -61,12 +68,13 @@ def _mixtral_config(hf_config, used):
     return config
 
 
-def _mistral_config(hf_config, used):
+def _mistral_config(hf_config, used, spelling: RopeSpelling = PLAIN_SPELLING):
+    """MistralConfig's decoder, under `spelling`, the class's rope (Mixtral's base differs)."""
     layers = int(hf_config['num_hidden_layers'])
     window = hf_config.get('sliding_window')
     # MistralConfig declares sliding_window alone; MistralAttention builds
     # no biases.
-    return base_config(hf_config, used, layer_types=(
+    return base_config(hf_config, used, rope=spelling, layer_types=(
         'full_attention' if window is None else 'sliding_attention',) * layers,
         reads=frozenset({'sliding_window'}))
 

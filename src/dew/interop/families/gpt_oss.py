@@ -29,9 +29,9 @@ from dew.nn.backbones.decoder_block import Mixture
 
 
 def _gpt_oss_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    ropes = read_rope(hf_config, used, records.integer(hf_config.get(
-        'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'),
-        RopeSpelling(theta=150000.0), ramps=('yarn',), per_kind=False)
+    ropes = read_rope(hf_config, used, RopeSpelling(theta=150000.0), yarn_max_pos=records.integer(
+        hf_config.get('max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'),
+        ramps=('yarn',), per_kind=False)
     layers = hf_config['num_hidden_layers']
     experts = hf_config['num_local_experts']
     top_k = hf_config['num_experts_per_tok']

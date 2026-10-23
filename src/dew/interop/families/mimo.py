@@ -35,7 +35,6 @@ from dew.interop.decoder_parts import (
     KindFields,
     Renames,
     Ropes,
-    RopeSpelling,
     base_config,
     decoder_kinds,
     grouped_qkv,
@@ -61,23 +60,23 @@ def _default_layers(layers: int) -> tuple[str, ...]:
                  for index in range(layers))
 
 
-# MiMoV2FlashConfig's per-kind pretrained thetas (configuration_mimo_v2_flash.py:122-126), each
-# kind's base where its entry or flat field states none.
-_FLASH_SPELLINGS = {'full_attention': RopeSpelling(theta=5_000_000.0),
-                    'sliding_attention': RopeSpelling(theta=10_000.0)}
+# MiMoV2FlashConfig's per-kind pretrained bases where a config states no rope_parameters
+# (configuration_mimo_v2_flash.py:122-126), which the released flat fields override.
+_FLASH_THETAS = {'full_attention': 5_000_000.0, 'sliding_attention': 10_000.0}
 
 
 def _rope(hf: Mapping[str, object], kind: str) -> tuple[float, float]:
     """One kind's (rope_theta, partial_rotary_factor): a `rope_parameters`
-    entry, or the released flat fields, with the reference's defaults."""
+    entry, which states its base, or the released flat fields with the reference's defaults."""
     nested = hf.get('rope_parameters')
     if nested is not None:
         entry = records.record(records.record(nested, 'rope_parameters').get(kind),
                                f'rope_parameters {kind}')
-        return plain_partial_rope({'rope_parameters': entry}, _FLASH_SPELLINGS[kind], default_factor=0.334,
+        # MiMoV2FlashRotaryEmbedding indexes each entry's base and defaults its factor
+        # (modeling_mimo_v2_flash.py:109-110).
+        return plain_partial_rope({'rope_parameters': entry}, None, default_factor=0.334,
                                   reference='MiMoV2FlashRotaryEmbedding')
-    theta = hf.get('rope_theta' if kind == 'full_attention' else 'swa_rope_theta',
-                   _FLASH_SPELLINGS[kind].theta)
+    theta = hf.get('rope_theta' if kind == 'full_attention' else 'swa_rope_theta', _FLASH_THETAS[kind])
     return (records.number(theta, 'rope_theta'),
             records.number(hf.get('partial_rotary_factor', 0.334), 'partial_rotary_factor'))
 

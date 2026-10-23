@@ -21,6 +21,7 @@ from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
     MOE_NAMES,
+    PLAIN_SPELLING,
     SERIALIZED_ENCODER_FIELDS,
     SERIALIZED_TEXT_FIELDS,
     DecoderFamily,
@@ -277,7 +278,7 @@ def deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
     three things from the config: `layer_types`, one entry per layer; the MLA
     `mixer` record; and the routed `mixture`.
     """
-    ropes = read_rope(hf_config, used, records.integer(hf_config.get(
+    ropes = read_rope(hf_config, used, PLAIN_SPELLING, yarn_max_pos=records.integer(hf_config.get(
         'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'),
         ramps=('yarn',), per_kind=False)
     config = base_config(hf_config, used, rope=ropes)

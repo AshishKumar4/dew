@@ -22,6 +22,7 @@ from dew.interop.decoder_parts import (
     MixtureFields,
     Packed,
     Renames,
+    RopeSpelling,
     base_config,
     kind_mixers,
     read_rope,
@@ -33,6 +34,9 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.llama4 import Llama4Mixer
+
+# Llama4TextConfig's default_theta (configuration_llama4.py:111), the base an omitted rope_theta means.
+_LLAMA4_SPELLING = RopeSpelling(theta=500000.0)
 
 
 def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -60,7 +64,8 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     # ramp is the model's, and every rotated layer applies it.
     used.update(('no_rope_layers', 'no_rope_layer_interval', 'layer_types'))
     config = base_config(hf_config, used, layer_types=layer_types,
-                          rope=dataclasses.replace(read_rope(hf_config, used), local_theta=None))
+                          rope=dataclasses.replace(read_rope(hf_config, used, _LLAMA4_SPELLING),
+                                                   local_theta=None))
     if hf_config.get('router_jitter_noise', 0.0):
         refuse("router_jitter_noise", "the router selects on the logits alone")
     if hf_config.get('output_router_logits', False):

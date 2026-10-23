@@ -28,7 +28,7 @@ def _phi_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     if hf.get('qk_layernorm', False):
         refuse('qk_layernorm', 'Phi q/k LayerNorm has no RMSNorm counterpart')
     config = base_config({**hf, 'hidden_act': 'silu', 'rope_theta': theta,
-                           'rope_parameters': rope or None}, used, reads=frozenset())
+                           'rope_parameters': rope or None}, used, rope=PLAIN_SPELLING, reads=frozenset())
     used.update(('partial_rotary_factor', 'qk_layernorm', 'layer_norm_eps', 'resid_pdrop',
                  'embd_pdrop', 'attention_dropout'))
     config.update({

@@ -32,7 +32,8 @@ def _gpt_neox_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     activation = records.text(hf.get('hidden_act', 'gelu'), 'hidden_act')
     mlp = ungated_mlp(activation, ('gelu', 'gelu_new', 'gelu_pytorch_tanh', 'relu'), 'hidden_act', 'GPT-NeoX')
     config = base_config({**hf, 'hidden_act': 'gelu', 'rope_theta': theta,
-                           'rope_parameters': rope or None}, used, reads=frozenset({'attention_bias'}))
+                           'rope_parameters': rope or None}, used, rope=PLAIN_SPELLING,
+                         reads=frozenset({'attention_bias'}))
     used.update(('rotary_pct', 'rotary_emb_base', 'use_parallel_residual', 'layer_norm_eps',
                  'hidden_dropout', 'classifier_dropout', 'is_decoder'))
     config.update({
