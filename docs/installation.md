@@ -107,6 +107,9 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - A computation that spans processes keys the persistent compilation cache alike on every process ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940), sent as [jax-ml/jax#41776](https://github.com/jax-ml/jax/pull/41776)). The 0.11.2 release keys a compiled step by the topology of the process that compiled it, which on a GPU includes its NVLink links, so in a pool across GPUs linked differently some processes load a step from the cache while the others compile it, and that compile waits forever for every process to join.
 - A Pallas Triton kernel's cache key leaves out its source locations ([jax-ml/jax#41502](https://github.com/jax-ml/jax/issues/41502), sent as [jax-ml/jax#41777](https://github.com/jax-ml/jax/pull/41777)), so two checkouts share one compiled kernel.
 - `linear_call` batches (an all-unmapped call stays unmapped), and differentiates in its residuals, which the experts' fused SwiGLU route needs.
+- The device-to-host transfer guard holds on a CPU array's implicit host read (`float`, `item`, `np.asarray`, its buffer) as on an accelerator's copy, which a steady state's guard needs on the CPU suite.
+- Pallas Triton divides 16-bit floats and computes `erf_inv` through float32, correctly rounded, which a GEMM template's prologue dividing in bfloat16 needs on CUDA.
+- A `custom_vjp` call (and Mosaic GPU's `custom_jvp` call) in a Pallas Triton or Mosaic GPU kernel lowers as its primal function, which a template's score hook through a `jax.custom_vjp` needs.
 
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
 
