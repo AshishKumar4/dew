@@ -34,3 +34,18 @@ def traced_reference(slope):
 
 
 # print("traced param reference dq", np.asarray(jax.jit(traced_reference)(jnp.full((1,), 2e38, jnp.float32)))[0, 0, 0, :2])
+
+
+def forward_traced(slope, q, k):
+    hooked = template.Hooks(score_mod=lambda s, q_pos, k_pos, slope: slope * s,
+                            score_params=(template.Param(slope, template.Kind.HEAD),))
+    return attention_portable.attend(q, k, value, spans, hooked, scale=4.0, residuals=True, **tiles)
+
+
+for name, q in (("q zero", query), ("q tiny", query.at[..., 0].set(1e-30))):
+    res = jax.jit(forward_traced)(jnp.full((1,), 2e38, jnp.float32), q, key)
+    print("forward", name, [np.asarray(x).ravel()[:3].tolist() for x in jax.tree.leaves(res)])
+    scored = jax.jit(lambda slope, q, k: template.scores(q, k, spans, template.Hooks(
+        score_mod=lambda s, q_pos, k_pos, slope: slope * s, score_params=(template.Param(slope, template.Kind.HEAD),)),
+        scale=4.0))(jnp.full((1,), 2e38, jnp.float32), q, key)
+    print("scores", name, np.asarray(scored).ravel()[:4])
