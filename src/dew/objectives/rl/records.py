@@ -37,11 +37,11 @@ def draw_record(value: Mapping[str, object], sampling: Sampling) -> Draw:
                 None if raw is None else reals(raw, "raw_log_probs")).checked(sampling)
 
 
-def sampling_record(value: object) -> Sampling:
+def sampling_record(value: Mapping[str, object]) -> Sampling:
     """Read the sampling policy `asdict` wrote, every control included."""
     from dew.registry import from_record
 
-    return from_record(Sampling, section(value, "sampling"), dtypes=False)
+    return from_record(Sampling, value, dtypes=False)
 
 
 def episode_from_record(value: Mapping[str, object]) -> Episode:
@@ -49,7 +49,7 @@ def episode_from_record(value: Mapping[str, object]) -> Episode:
     record = section(value, "episode")
     identity = section(record["identity"], "identity")
     initial, reward = record["initial"], record["reward"]
-    sampling = sampling_record(record["sampling"])
+    sampling = sampling_record(section(record["sampling"], "sampling"))
     transitions = tuple(
         Transition(draw_record(section(turn["action"], "action"), sampling),
                    observation_record(section(turn["observation"], "observation")))
