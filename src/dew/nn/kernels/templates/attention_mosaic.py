@@ -247,9 +247,11 @@ def _launch(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpret
 BACKWARD_DEFAULT = Tiles(64, 64, 2)
 """The backward's tiles: each consumer's 64 queries over 64-key tiles, two stages, so a dQ program's key and
 value rings, its consumers' queries and output cotangents, and their fp32 sums fit a block's shared memory."""
-BACKWARD_CONSUMERS = 1
-"""The backward's consumer warpgroups a program: one, whose threads take every register a producer leaves
-(two consumers' 232 a thread spilled 0.4 to 18 GB a launch on an H100)."""
+BACKWARD_CONSUMERS = {False: 2, True: 1}
+"""The backward's consumer warpgroups a program, by form (`accurate`), each a block of its own, their products
+interleaved on the tensor cores: the fast form's two (an H100, llama-d128 causal bf16: the dQ launch 1.10 ms
+against one consumer's 1.41), the accurate form's one, whose staged cotangent parts two consumers' blocks
+would hold past a block's shared memory."""
 
 
 def _rows(ref, row, head, first, count: int):
@@ -536,7 +538,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
 def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
              dout: jax.Array, *, residuals: tuple[jax.Array, jax.Array, jax.Array, Split],
              scale: float | None = None, natural: bool = NATURAL, accurate: bool = ACCURATE,
-             tiles: Tiles = BACKWARD_DEFAULT, consumers: int = BACKWARD_CONSUMERS,
+             tiles: Tiles = BACKWARD_DEFAULT, consumers: int | None = None,
              interpret: bool = False) -> Gradients:
     """The template's backward on this mainloop (`gradients`) from a training forward's `residuals` (its
     maxima, denominators, anchor keys and split sums): D about each query's anchor from the split sums
@@ -548,12 +550,13 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
         raise NotImplementedError(f"the sm90 backward takes full and causal calls, not {spans.form!r} ones")
     if jnp.dtype(query.dtype) != jnp.dtype(jnp.bfloat16):
         raise NotImplementedError(f"the sm90 backward takes bf16 operands, not {jnp.dtype(query.dtype)}")
+    count = BACKWARD_CONSUMERS[accurate] if consumers is None else consumers
     factor = query.shape[3] ** -0.5 if scale is None else scale
     how = algebra.recompute(algebra.Forward("full", 0, ids=False, scale=factor, natural=natural))
     launch = functools.partial(_launch_backward, how=how, causal=spans.form == "causal",
-                               keys_count=spans.keys, accurate=accurate, tiles=tiles, consumers=consumers,
+                               keys_count=spans.keys, accurate=accurate, tiles=tiles, consumers=count,
                                interpret=interpret)
-    block = max(consumers * tiles.block_q, consumers * tiles.block_k)
+    block = max(count * tiles.block_q, count * tiles.block_k)
     return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=block, scale=factor)
 
 
