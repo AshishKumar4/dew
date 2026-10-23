@@ -71,7 +71,7 @@ def test_a_strict_endpoint_drops_the_images_jev_does_not_know(example, decide):
 
 
 class Counted:
-    """`task` whose passes are counted, each by the requests it answers; its first pass waits until
+    """`task` whose passes are counted, each by the rows it scores; its first pass waits until
     `expected` requests were admitted, so the rest wait in the queue meanwhile."""
 
     def __init__(self, task, expected: int):
@@ -85,17 +85,23 @@ class Counted:
             self.all_in.set()
         return scored
 
-    def score(self, variables, payloads):
+    def fits(self, rows):
+        return self.task.fits(rows)
+
+    def forward(self, variables, rows):
         if not self.calls:
-            assert self.all_in.wait(60), "the requests posted at once were not all admitted"
-        self.calls.append(len(payloads))
-        return self.task.score(variables, payloads)
+            self.all_in.wait()
+        self.calls.append(len(rows))
+        return self.task.forward(variables, rows)
+
+    def answer(self, payload, outputs):
+        return self.task.answer(payload, outputs)
 
 
 def test_concurrent_requests_are_answered_together_each_with_its_own_response(example, decide):
     """Six requests posted at once, one of them a body Jev refuses: the refused one gets its own 422
-    at admission, and the five are answered in at most two passes, the first one's wait for them all
-    holding the rest in the queue, each as it is alone in every field a batch cannot move
+    at admission, and the five's rows are answered in at most two passes, the first one's wait for
+    them all holding the rest in the queue, each as it is alone in every field a batch cannot move
     (tests/test_decision_batches.py)."""
     from test_decision_batches import CASES, discrete
 
@@ -110,7 +116,7 @@ def test_concurrent_requests_are_answered_together_each_with_its_own_response(ex
 
         with ThreadPoolExecutor(len(bodies)) as pool:
             responses = list(pool.map(post, bodies))
-    assert sum(counted.calls) == len(bodies) - 1 and len(counted.calls) <= 2 and max(counted.calls) >= 4
+    assert counted.admitted == len(bodies) - 1 and len(counted.calls) <= 2 and max(counted.calls) >= 4
     for body, response in zip(bodies, responses, strict=True):
         if "state" not in body:
             assert response.status_code == 422 and response.json()["error"]
