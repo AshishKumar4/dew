@@ -90,6 +90,7 @@ MUSE_GLIMMER_TEXT = DecoderFamily(
     _muse_text_export,
     sandwich_norms=True,
     preserve_source_layout=True,
-    # MuseGlimmerTextConfig's norm epsilon and untied head.
-    defaults={'rms_norm_eps': 1e-5, 'tie_word_embeddings': False},
+    # MuseGlimmerTextConfig's defaults for the fields its decoder reads.
+    defaults={'rms_norm_eps': 1e-5, 'tie_word_embeddings': False, 'num_key_value_heads': 2, 'head_dim': 128,
+              'max_position_embeddings': 131072},
 )

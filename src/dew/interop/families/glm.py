@@ -468,8 +468,9 @@ GLM4_MOE = DecoderFamily(
     lambda model: {},
     weight_path=layer_depth_path,
     preserve_source_layout=True,
-    # The config class's norm epsilon.
-    defaults={'rms_norm_eps': 1e-5},
+    # Glm4MoeConfig's defaults for the fields its decoder reads.
+    defaults={'rms_norm_eps': 1e-5, 'num_key_value_heads': 8, 'max_position_embeddings': 131072,
+              'n_shared_experts': 1, 'first_k_dense_replace': 1, 'num_nextn_predict_layers': 1},
 )
 
 
