@@ -24,7 +24,7 @@ def test_a_torch_processors_images_read_as_its_model_inputs_do():
     pictures = [Image.fromarray(array) for array in np.load(LLAMA4 / "raw_images.npy")[:1]]
     text = "<|image|>"
     media = Images.of(processor, pictures, text)
-    direct = processor([text + "\n"], images=[pictures])
+    direct = processor([text + "\n"], images=list(pictures))
     assert media.fields and all(isinstance(value, np.ndarray) for value in media.fields.values())
     for name, value in media.fields.items():
         np.testing.assert_array_equal(value, np.asarray(direct.conditioning[name]))

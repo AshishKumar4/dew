@@ -122,7 +122,7 @@ def test_a_string_prompt_opens_as_training_text_does_and_never_closes(tmp_path):
     opened = [1, *ids]
     np.testing.assert_array_equal(batch[PROMPT_KEY][0, WINDOW - len(opened):], opened)
     np.testing.assert_array_equal(batch[PROMPT_KEY][0, :WINDOW - len(opened)], 0)
-    assert int(batch[LENGTH_KEY][0]) == len(ids)
+    assert int(batch[LENGTH_KEY][0]) == len(opened)
 
 
 def test_messages_render_with_the_generation_prompt():
