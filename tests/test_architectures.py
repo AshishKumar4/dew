@@ -230,10 +230,15 @@ CASES = [
     # Gemma 3n at toy width: three copies of the residual stream under
     # AltUp, the LAuReL block, gaussian top-k on the first layer, widths
     # that differ per layer, per-layer inputs and the last layer sharing the
-    # first's keys and values.
+    # first's keys and values. The first layer's 192 units keep about ten a
+    # token at 0.95 sparsity, where the released models keep hundreds: at 48,
+    # about two, a token whose kept units all sit just above the cutoff gives
+    # the feed-forward's post-norm a near-zero input, whose direction float32
+    # resolves poorly, and four draws in 320 held 60% of a layer-0 leaf's
+    # pooled error (at 192, under 20%; at 384, 6%).
     Case("causal_transformer", {
         **LM, "num_heads": 4, "num_kv_heads": 2, "head_dim": 8, "mlp": "geglu",
-        "mlp_features": (48, 64), "activation_sparsity_pattern": (0.95, 0.0),
+        "mlp_features": (192, 64), "activation_sparsity_pattern": (0.95, 0.0),
         "sandwich_norms": True, "qk_norm": True, "v_norm": True,
         "embedding_scale": True, "attention_scale": 1.0, "final_logit_softcap": 30.0,
         "layer_types": ("sliding_attention", "sliding_attention"),
