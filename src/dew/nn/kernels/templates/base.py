@@ -37,6 +37,11 @@ class Template[Config: Hashable](tuning.KernelOp):
         """The shared memory, in bytes, a program of the launch of `ba` stages at `config`."""
         raise NotImplementedError(f"{type(self).__name__} declares no staged bytes")
 
+    def registers(self, ba: tokamax.BoundArguments, config: Config) -> int | None:
+        """The 32-bit registers a thread of the launch's program holds live at `config`, from its tiles'
+        sizes; None where the launch states none. Past `cost.THREAD_REGISTERS` the program spills."""
+        return None
+
     def costed(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> cost.Cost:
         """The work, bytes and geometry the estimate of the launch of `ba` at `config` on `target` reads
         (`cost.Cost`): the analytic estimate's inputs as they are, for the choice layer's timing log."""
@@ -53,23 +58,29 @@ class Template[Config: Hashable](tuning.KernelOp):
         return True
 
     def fitting(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[Config, ...]:
-        """The configs of `space` whose programs fit a block of `target` (`generation.shared_budget`),
-        in `space`'s order. A call none fits raises, naming the least any config stages and the
-        budget: the template's own requirements refuse the call before it reaches a launch."""
+        """The configs of `space` whose programs fit a block of `target` (`generation.shared_budget`) and
+        a thread's registers (`registers`, `cost.THREAD_REGISTERS`), in `space`'s order. A call none fits
+        raises, naming the least any config stages and the budget: the template's own requirements refuse
+        the call before it reaches a launch."""
         budget = generation.shared_budget(target)
         space = tuple(self.space(ba))
-        fits = tuple(config for config in space if self.staged_bytes(ba, config) <= budget)
+        fits = tuple(config for config in space if self.staged_bytes(ba, config) <= budget
+                     and (self.registers(ba, config) or 0) <= cost.THREAD_REGISTERS)
         if not fits:
             raise Unfitted(type(self).__name__, min((self.staged_bytes(ba, config) for config in space),
                                                      default=None), budget, target.generation)
         return fits
 
     def unpinnable(self, ba: tokamax.BoundArguments, config: Hashable) -> str:
-        """Why `config` is not among `ba`'s legal configs: outside `space`, or staging more shared
-        memory than a block of the GPU holds."""
+        """Why `config` is not among `ba`'s legal configs: outside `space`, holding more registers than a
+        thread does, or staging more shared memory than a block of the GPU holds."""
         held = [candidate for candidate in self.space(ba) if candidate == config]
         if not held:
             return "not in its space at this launch's key"
+        registers = self.registers(ba, held[0]) or 0
+        if registers > cost.THREAD_REGISTERS:
+            return (f"its threads hold {registers} registers live, past the {cost.THREAD_REGISTERS} a "
+                    "thread has")
         target = generation.gpu_target()
         return (f"its programs stage {self.staged_bytes(ba, held[0])} bytes of shared memory, past the "
                 f"{generation.shared_budget(target)} a block of {target.generation} holds")
