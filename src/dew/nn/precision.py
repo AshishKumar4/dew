@@ -54,14 +54,37 @@ def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     a bfloat16 bias added to bfloat16 products sums its gradient over every position in bfloat16,
     where torch's addmm sums its in float32: Qwen 2's projection biases, summed over 8192 tokens,
     came out up to 3.75 times further from float64 than torch's own bfloat16 gradients. Broadcast
-    at fp32, the gradient sums at fp32 and rounds once into the bias.
+    at fp32, the gradient sums at fp32 and rounds once into the bias. A CPU sums it in float64, as
+    it sums a float32 product (`spread`).
     """
     dtype, wide = jnp.result_type(product, bias), at_least_fp32(bias.dtype)
     # The bias takes the product's rank before the sum, as flax's layers reshape it, so no rank is
     # promoted implicitly. Broadcast at fp32 and rounded back, it adds as flax adds it (XLA folds
     # the round trip, so the product and bias fuse as before) and its gradient sums at fp32.
     bias = jnp.reshape(bias.astype(wide), (1,) * (product.ndim - bias.ndim) + bias.shape)
-    return product.astype(dtype) + jnp.broadcast_to(bias, product.shape).astype(dtype)
+    return product.astype(dtype) + spread(bias, product.shape).astype(dtype)
+
+
+def spread(value: jax.Array, shape: tuple[int, ...]) -> jax.Array:
+    """`value` broadcast to `shape`, whose transpose, the sum of a cotangent over every position the
+    value spread over (a bias's gradient), a CPU takes in float64 and rounds once, as it sums a
+    float32 product (`accumulated`): there the broadcast is the outer product of ones and the
+    value, whose transpose is a product. Elsewhere, or where `accumulated` leaves a product its
+    own sum, it is the broadcast, whose transpose JAX sums in the value's dtype."""
+    axes = tuple(axis for axis, (size, total) in enumerate(zip(value.shape, shape, strict=True))
+                 if size == 1 and total != 1)
+    if not axes or not _sums_in_float64(value):
+        return jnp.broadcast_to(value, shape)
+    kept = tuple(axis for axis in range(len(shape)) if axis not in axes)
+
+    def outer(value: jax.Array) -> jax.Array:
+        ones = jnp.ones((int(np.prod([shape[axis] for axis in axes])),), value.dtype)
+        product = accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((), ()), ((), ()))),
+                              ones, jnp.reshape(value, (-1,)))
+        laid = jnp.reshape(product, tuple(shape[axis] for axis in (*axes, *kept)))
+        return jnp.transpose(laid, tuple(np.argsort((*axes, *kept))))
+
+    return jax.lax.platform_dependent(value, cpu=outer, default=lambda value: jnp.broadcast_to(value, shape))
 
 
 def precision_names(precision: jax.lax.PrecisionLike) -> frozenset[str]:
@@ -147,6 +170,14 @@ precision, the statement that its fp32 products sum as an accelerator sums them,
 honors on a CPU."""
 
 
+def _sums_in_float64(*operands) -> bool:
+    """Whether a CPU sums these operands' products in float64 (`accumulated`): float32 arrays, in no
+    scope that states fp32 sums (`FP32_SUMS`), with JAX's products JAX's own (`_intercepted`)."""
+    return (jax.config.jax_default_matmul_precision != FP32_SUMS and not _intercepted()
+            and all(isinstance(operand, jax.Array | np.ndarray) for operand in operands)
+            and products_dtype(*operands) == jnp.dtype(jnp.float32))
+
+
 def float64_sum(product: Callable[..., jax.Array], *operands, dtype: DTypeLike) -> jax.Array:
     """`product(*operands)`, a sum of products, taken in float64 from its operands widened exactly and
     rounded once to `dtype`, under `jax.enable_x64` for its own trace: the sum `accumulated` takes on a
@@ -184,9 +215,7 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     from dew.nn.kernels.generation import linear_tangent
 
     narrow = functools.partial(product, preferred_element_type=preferred_element_type)
-    if (jax.config.jax_default_matmul_precision == FP32_SUMS or _intercepted()
-            or not all(isinstance(operand, jax.Array | np.ndarray) for operand in operands)
-            or products_dtype(*operands) != jnp.dtype(jnp.float32)):
+    if not _sums_in_float64(*operands):
         return narrow(*operands)
     dtype = jax.eval_shape(narrow, *operands).dtype
 
