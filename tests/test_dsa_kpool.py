@@ -108,7 +108,7 @@ MARGIN = 1e-3
 rounding, so float64 and fp32 select the same pools."""
 
 SEEDS = {'output': 8, 'biased': 8, 'dense': 8, 'gradients': 64, 'parallel': 8, 'decode': 8,
-         'padded decode': 8, 'hole': 8}
+         'padded decode': 8, 'hole': 8, 'reordered draft': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 
 
@@ -471,14 +471,36 @@ def test_prediction_selection_empty_seed_inactive_rows_and_reordering():
     _, extended = selection_step(block, variables, allocated["cache"], x[:, :1], valid, "extend")
     np.testing.assert_array_equal(extended["cache"]["selection_position"], [0, -1])
     np.testing.assert_array_equal(extended["cache"]["selection_indices"], -jnp.ones((2, 4), jnp.int32))
-    out, drafted = selection_step(block, variables, extended["cache"], x[:, 1:2], valid, "draft")
+    _, drafted = selection_step(block, variables, extended["cache"], x[:, 1:2], valid, "draft")
     np.testing.assert_array_equal(drafted["cache"]["selection_indices"][0], [-1, -1, -1, -1])
     for name, value in extended["cache"].items():
         np.testing.assert_array_equal(drafted["cache"][name][1], value[1])
+
+    # Drafting the cache's rows gathered (one row twice) is on par with gathering the batch's draft
+    # (check 1), the inactive row defined by neither; the truth is the latter in float64.
     rows = jnp.asarray([1, 0, 0])
-    reordered, _ = selection_step(block, variables, gather_cache_rows(extended["cache"], rows),
-                                  x[rows, 1:2], valid[rows], "draft")
-    np.testing.assert_array_equal(reordered, out[rows])
+
+    def drafting(dtype, *, gathered):
+        kpool = module(index_kpool_always_select_tail=False, dtype=dtype)
+        weights = variables if dtype == jnp.float32 else widened(variables)
+
+        def run(hidden):
+            x = jnp.asarray(hidden, dtype)
+            _, allocated = kpool.apply(weights, x[:, :1], MixerCall(decode=True), prediction_phase="extend",
+                                      mutable=["cache"])
+            cache = selection_step(kpool, weights, allocated["cache"], x[:, :1], valid, "extend")[1]["cache"]
+            if gathered:
+                cache, x, active = gather_cache_rows(cache, rows), x[rows], valid[rows]
+                out, _ = selection_step(kpool, weights, cache, x[:, 1:2], active, "draft")
+            else:
+                out = selection_step(kpool, weights, cache, x[:, 1:2], valid, "draft")[0][rows]
+            return jnp.where(valid[rows][..., None], out, 0)
+
+        return jax.jit(run)
+
+    assert_as_exact(drafting(jnp.float32, gathered=True), drafting(jnp.float32, gathered=False),
+                    lambda seed: inputs(1 + seed)[:1], 'reordered draft', seeds=SEEDS['reordered draft'],
+                    truth_fn=drafting(jnp.float64, gathered=False))
 
 
 def test_prediction_selection_rewind_recomputes_only_invalidated_row():
