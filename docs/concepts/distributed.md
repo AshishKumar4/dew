@@ -32,7 +32,7 @@ model = CausalTransformer(vocab_size=512, emb_features=256, num_layers=2,
 rows = np.random.default_rng(0).integers(0, 512, (16, 65), dtype=np.int32)
 data = Loader(train=lambda partition: itertools.repeat({"text": rows}), val=None,
                records=16, batch=16)
-trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=jax.random.key(0),
+trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(rate=1e-3), key=jax.random.key(0),
                   mesh=MeshSpec(fsdp=2, tensor=2))
 state = trainer.fit(data, steps=4, log_every=2)
 
@@ -94,7 +94,7 @@ from jax.sharding import AxisType
 mesh = jax.make_mesh((2, 2, 2), ("replica", "zero", "zero2"), axis_types=(AxisType.Auto,) * 3)
 layout = Layout(rules={"embed": ("zero", "zero2"), "mlp": "zero", "vocab": "zero"},
                 data_axes=("replica", "zero", "zero2"))
-trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0,
+trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(rate=1e-3), key=0,
                   mesh=mesh, layout=layout)
 trainer.fit(data, steps=2, log_every=2)
 ```

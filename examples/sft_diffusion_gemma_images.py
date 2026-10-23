@@ -42,9 +42,9 @@ from dew.data.dataset import DataPartition, Loader
 from dew.interop.diffusion_gemma import build
 from dew.nn.inputs import ModelInputs
 from dew.objectives.lm import Perplexity
+from dew.optim import Cosine
 from dew.records import record as read_record, strings
 from dew.training import MeshSpec, prepare_process
-from dew.training.optim import Cosine
 
 EOS, PAD, IMAGE = 256, 257, 258
 """The ids past the 256 bytes: end of caption, padding and the image placeholder."""
@@ -254,7 +254,7 @@ def main(config: Config) -> Path:
         model=ModelConfig.from_model(model), data=train, validation=test,
         objective=ObjectiveConfig("block_diffusion", {"prompt_length": config.prompt_tokens,
                                                       "pad_token_id": PAD}),
-        optim=OptimConfig(weight_decay=0.05, clip_grads=1.0, schedule=Cosine(
+        optim=OptimConfig(weight_decay=0.05, clip_grads=1.0, rate=Cosine(
             peak=config.learning_rate, warmup_steps=config.warmup_steps, end=config.learning_rate / 20)),
         # A smoke run keeps both of its checkpoints, so what training moved between them can be read.
         trainer=TrainerConfig(checkpoint_dir=str(config.out / "checkpoints"), keep=2 if config.smoke else 1,

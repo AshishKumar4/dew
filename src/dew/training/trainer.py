@@ -79,6 +79,7 @@ from dew.objectives.base import (
     select,
     taken_record,
 )
+from dew.optim import learning_rate, with_rate_scales
 from dew.records import JSON, boolean, json_value, record
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import (
@@ -155,7 +156,6 @@ from dew.training.model_flops import (
 )
 from dew.training.narrow import narrowed, narrowed_paths
 from dew.training.observe import Observe
-from dew.training.optim import learning_rate, with_rate_scales
 from dew.training.planning import Candidate, Planned, Timer, plan_step, settled, splits, whole_step
 from dew.training.profiling import ProfileWindow, owned_capture, start_capture, stop_capture
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung

@@ -18,10 +18,12 @@ from reference_error import assert_as_exact_as_the_reference, float64_terms, wid
 
 import dew
 from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
+from dew.config.diffusion import DiffusionRunConfig
 from dew.diffusion.presets import Flow
+from dew.inputs import TextCondition
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import TEACHER, Step
-from dew.objectives.diffusion import AdversarialDistillationObjective, DiffusionRunConfig, TextCondition
+from dew.objectives.diffusion import AdversarialDistillationObjective
 from dew.objectives.diffusion.adversarial import Head
 from dew.objectives.diffusion.objective import DISCRIMINATOR, SPECTRAL
 from dew.sampling import Consistency, Euler, TextToImage
@@ -183,8 +185,8 @@ def runs(tmp_path_factory):
                                   {"solver": Euler(), "guidance": None, "steps": 2, "ema_decay": None}))
     _, _, batch = saved_after_one_step(teacher, lambda task: batch_for(task, 4), root / "teacher", 1e-2,
                                        key=0)
-    student = dataclasses.replace(teacher, objective=ObjectiveConfig("ladd", {
-        "teacher_run": str(root / "teacher"), "feature_layers": ["dit_block_0", "dit_block_1"], "cmap_dim": 8,
+    student = dataclasses.replace(teacher, teacher_run=str(root / "teacher"), objective=ObjectiveConfig(
+        "ladd", {"feature_layers": ["dit_block_0", "dit_block_1"], "cmap_dim": 8,
         "kernel_size": [3, 3], "solver": Consistency(), "steps": 2, "ema_decay": None}))
     return student, batch
 

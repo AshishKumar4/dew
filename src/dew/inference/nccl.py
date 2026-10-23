@@ -48,9 +48,9 @@ from jax.sharding import SingleDeviceSharding
 
 from dew.batch import Variables
 from dew.coordination import agreed, byte_groups, collective_host
+from dew.devices import primary_context
 from dew.nn.inputs import mesh_of
 from dew.records import JSON
-from dew.telemetry.devices import primary_context
 
 from .rollouts import _on_every, _post, _served, _vllm_publication
 

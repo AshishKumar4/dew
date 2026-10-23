@@ -36,7 +36,7 @@ The seams named in `CONTRIBUTING.md:9` are crossed in these places, all confirme
 | The trainer publishes and deletes | `save()` pushes to the W&B registry, ranks the run against the W&B API and removes the local checkpoint (`objective_trainer.py:531-565, 388-529`). |
 | Constructors have effects | `SimpleTrainer.__init__` enables the compile cache, builds the mesh, opens W&B, downloads an artifact, creates the Orbax manager and restores state (`trainer.py:89-217`). `ConditionalInputConfig.__post_init__` runs the encoder (`inputs/__init__.py:26-31`). |
 | Data is a dict protocol | Six loaders return `{"train", "train_len", "val", "val_len", "local_batch_size", "global_batch_size"}`; `fit` reads them by name (`trainer.py:599-604`). |
-| Sharding is a string table | `DEFAULT_LOGICAL_PARAM_AXES` keyed on trailing module names (`training/distributed.py:63-91`), read again by Muon grouping (`training/optim.py:95`). A rename in a model file changes both, silently. |
+| Sharding is a string table | `DEFAULT_LOGICAL_PARAM_AXES` keyed on trailing module names (`training/distributed.py:63-91`), read again by Muon grouping (`optim.py:95`). A rename in a model file changes both, silently. |
 | One fact, two owners | The training schedule holds the transform for min-SNR (`schedules/common.py:22,58`) while the objective receives the transform again; presets return a 3-tuple (`transforms.py:157`). Gradient accumulation lives in `OptimConfig`, `optax.MultiSteps` and the trainer. |
 | Randomness is an object | `RandomMarkovState` (`random_state.py`) appears in schedules, every sampler, the objective and the trainer state, and is checkpointed. |
 

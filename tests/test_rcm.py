@@ -175,10 +175,12 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     from dew.batch import FROZEN
     from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
+    from dew.config.diffusion import DiffusionRunConfig
     from dew.diffusion.presets import Flow
+    from dew.inputs import TextCondition
     from dew.lora import LoRA
     from dew.objectives.base import TEACHER, Step
-    from dew.objectives.diffusion import ConsistencyDistillationObjective, DiffusionRunConfig, TextCondition
+    from dew.objectives.diffusion import ConsistencyDistillationObjective
     from dew.objectives.diffusion.objective import FAKE_SCORE
     from dew.sampling import Consistency, Euler, TextToImage
     from dew.training import Trainer
@@ -204,9 +206,8 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     teacher_run.save(str(tmp_path / "teacher"))
 
     def distilling(**fields):
-        return dataclasses.replace(teacher_run, objective=ObjectiveConfig("rcm", {
-            "teacher_run": str(tmp_path / "teacher"), "solver": Consistency(), "steps": 3, "ema_decay": None,
-            **fields}))
+        objective = ObjectiveConfig("rcm", {"solver": Consistency(), "steps": 3, "ema_decay": None, **fields})
+        return dataclasses.replace(teacher_run, teacher_run=str(tmp_path / "teacher"), objective=objective)
 
     # The checkpoint's Fourier table is authoritative, whatever scale the model record names.
     for time_scale in (16, 0.001):
@@ -277,9 +278,10 @@ def test_an_accumulated_distillation_alternates_its_networks_update_by_update(tm
 
     from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
+    from dew.config.diffusion import DiffusionRunConfig
     from dew.diffusion.presets import Flow
+    from dew.inputs import TextCondition
     from dew.objectives.base import Step
-    from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
     from dew.objectives.diffusion.objective import FAKE_SCORE
     from dew.sampling import Consistency, Euler
     from dew.training import Trainer
@@ -302,9 +304,9 @@ def test_an_accumulated_distillation_alternates_its_networks_update_by_update(tm
     checkpoints.save(1, state, None)
     checkpoints.wait()
     teacher_run.save(str(tmp_path / "teacher"))
-    task = dataclasses.replace(teacher_run, objective=ObjectiveConfig("rcm", {
-        "teacher_run": str(tmp_path / "teacher"), "solver": Consistency(), "steps": 3, "ema_decay": None,
-        "tangent_warmup": 1, "student_update_freq": 2, "max_simulation_steps": 2})).build()
+    task = dataclasses.replace(teacher_run, teacher_run=str(tmp_path / "teacher"), objective=ObjectiveConfig(
+        "rcm", {"solver": Consistency(), "steps": 3, "ema_decay": None, "tangent_warmup": 1,
+                "student_update_freq": 2, "max_simulation_steps": 2})).build()
 
     trainer = Trainer(task, optax.sgd(1e-2), key=jax.random.PRNGKey(5), accumulation=2)
     distilled, _, _ = trainer.place()
@@ -342,10 +344,11 @@ def test_a_pretrained_run_distills_the_model_it_loads_without_a_teacher_run(tmp_
     from test_diffusion_run_sources import precision
 
     from dew.config import ObjectiveConfig
+    from dew.config.diffusion import DiffusionRunConfig
     from dew.diffusion.presets import Flow
     from dew.interop.pretrained import load_diffusion_source
     from dew.objectives.base import TEACHER
-    from dew.objectives.diffusion import ConsistencyDistillationObjective, DiffusionRunConfig
+    from dew.objectives.diffusion import ConsistencyDistillationObjective
     from dew.objectives.diffusion.objective import model_part
     from dew.registry import to_record
     from dew.sampling.pipelines import ImageSettings

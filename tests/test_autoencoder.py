@@ -136,7 +136,7 @@ def _published(kind: str, directory: Path):
     `PretrainedAutoencoder` builds it: by the class the fixture's config names."""
     from interop_support import extract_fixture
 
-    from dew.objectives.diffusion import PretrainedAutoencoder
+    from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
 
     archive, inside = ARCHIVES[kind]
     source = extract_fixture(FIXTURE_ROOT / archive, directory) / inside
