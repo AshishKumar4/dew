@@ -16,6 +16,7 @@ from reference_error import (
     assert_as_exact_as_the_reference,
     assert_rounds_where_the_reference_does,
     equations,
+    with_gradients,
     within,
 )
 from tuned import each_config, launches, timed
@@ -59,13 +60,16 @@ def cotangents(x, parts, dtype, seed=1):
 
 def run(conv, x, weights, shift, valid, parts, dtype, grads, activation=True, segments=None):
     """`conv`'s pieces and its gradients for `x`, the taps and the bias under `grads`."""
-    def loss(x, weights, shift):
-        out = conv(x, weights, activation, shift, valid=valid, segments=segments, parts=parts, dtype=dtype)
-        return sum(jnp.sum(piece.astype(jnp.float32) * grad.astype(jnp.float32))
-                   for piece, grad in zip(out, grads, strict=True)), out
+    def pieces(x, weights, shift):
+        return conv(x, weights, activation, shift, valid=valid, segments=segments, parts=parts, dtype=dtype)
 
-    (_, out), found = jax.value_and_grad(loss, argnums=(0, 1, 2), has_aux=True)(x, weights, shift)
-    return out, found
+    # Each piece pulls back its cotangent cast through float32 to the piece's dtype, as a float32 sum of
+    # their products pulls it back, through the gate (`reference_error.with_gradients`).
+    shapes = jax.eval_shape(pieces, x, weights, shift)
+    cotangents = tuple(grad.astype(jnp.float32).astype(shape.dtype)
+                       for grad, shape in zip(grads, shapes, strict=True))
+    out, *found = with_gradients(pieces)(x, weights, shift, cotangents)
+    return out, tuple(found)
 
 
 def kernel_conv(x, weights, activation, shift, *, valid, segments, parts, dtype):
