@@ -70,7 +70,6 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Sequence
-from concurrent.futures import Future
 from dataclasses import dataclass, field
 
 import jax
@@ -81,6 +80,7 @@ from jax.experimental import checkify
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike
 
+from dew.inference.engine import Timed, normalized, reloaded, settled
 from dew.inference.pages import Pages
 from dew.inference.projections import pack_projections, packed_layout
 from dew.inference.serving_kernel import (
@@ -158,7 +158,7 @@ def admission_share(waiting: int, share: int) -> int:
     return min(share, 1 << max(waiting - 1, 0).bit_length())
 
 
-class Ticket(Future):
+class Ticket(Timed):
     """A submitted request's future `Generation`, with when it was
     submitted, admitted to a slot, when its first token reached the host
     and when it finished, in `time.perf_counter` seconds; `admitted`,
@@ -176,10 +176,7 @@ class Ticket(Future):
 
     def __init__(self) -> None:
         super().__init__()
-        self.submitted = time.perf_counter()
-        self.admitted: float | None = None
         self.first: float | None = None
-        self.finished: float | None = None
         self.tokens: tuple[int, ...] = ()
         self._token_callbacks: list[Callable[[Ticket], None]] = []
 
@@ -196,20 +193,6 @@ class Ticket(Future):
                 callback(self)
             except Exception as error:
                 _log.error("exception calling a tokens callback for %r", self, exc_info=error)
-
-
-def settled[T](future: Future[T], outcome: T | BaseException) -> None:
-    """Complete `future` with `outcome`, a result or an error, unless its caller cancelled it first.
-
-    A future its owner claimed (`set_running_or_notify_cancel`) can no
-    longer be cancelled; one still pending is claimed here.
-    """
-    if not future.running() and not future.set_running_or_notify_cancel():
-        return
-    if isinstance(outcome, BaseException):
-        future.set_exception(outcome)
-    else:
-        future.set_result(outcome)
 
 
 _KEY_DATA = jax.eval_shape(lambda: jax.random.key_data(jax.random.key(0)))
@@ -509,6 +492,9 @@ class Server:
         never waits for a step (a deque's append and popleft are atomic)."""
         self._ingress = threading.Lock()
         """Orders a submission's append with a failure's sweep."""
+        self.arrived: Callable[[], None] = _nothing
+        """Called after each submission: an `Engine` serving this kind wakes to it
+        (`dew.inference.engine.Kind`)."""
         self._rows: dict[int, _Row] = {}
         self._pending: tuple[checkify.Error, Draws] | None = None
         self._failed: BaseException | None = None
@@ -692,6 +678,11 @@ class Server:
     def queued(self) -> int:
         return len(self._queue)
 
+    @property
+    def busy(self) -> bool:
+        """Whether a request waits or runs, or a call's draws wait to be read."""
+        return bool(self._queue or self._rows or self._pending is not None)
+
     def reload(self, variables: Variables) -> None:
         """Serve `variables` from the next step on, in place of the current weights.
 
@@ -704,34 +695,8 @@ class Server:
         prefix pages the old weights wrote are no longer shared. `reload` is
         not thread-safe against `step`, so the caller must serialize the two.
         """
-        # A frozen and a plain mapping flatten to different tree structures but
-        # the same leaf paths, so the paths are what must match.
-        incoming, incoming_structure = jax.tree_util.tree_flatten_with_path(variables)
-        source = self._source_shapes
-        if [path for path, _ in incoming] != [path for path, _ in source]:
-            raise ValueError("reloaded variables must have the served tree structure")
-        for (_, new), (_, old) in zip(incoming, source, strict=True):
-            kind, served_kind = jnp.result_type(new), old.dtype
-            if np.shape(new) != np.shape(old) or (kind != served_kind and not (
-                    jnp.issubdtype(kind, jnp.floating) and jnp.issubdtype(served_kind, jnp.floating))):
-                raise ValueError(
-                    f"a reloaded leaf is {kind}{list(np.shape(new))}, "
-                    f"the served leaf {served_kind}{list(np.shape(old))}")
-        normalized = jax.tree.unflatten(
-            incoming_structure, [jnp.asarray(np.asarray(new, dtype=old.dtype)
-                                             if isinstance(new, np.ndarray) else new, dtype=old.dtype)
-                                 for (_, new), (_, old) in zip(incoming, source, strict=True)])
-        packed = pack_projections(normalized, self._weight_groups)
-        incoming, _ = jax.tree_util.tree_flatten_with_path(packed)
-        served, structure = jax.tree_util.tree_flatten_with_path(self.variables)
-        leaves = []
-        for (_, new), (_, old) in zip(incoming, served, strict=True):
-            served_kind = jnp.result_type(old)
-            # A placement can alias a shard of the caller's array; the copy
-            # owns its buffer whatever the caller donates next.
-            placement = old.sharding if isinstance(old, jax.Array) else None
-            leaves.append(jnp.array(jax.device_put(new, placement), dtype=served_kind, copy=True))
-        self.variables = jax.tree.unflatten(structure, leaves)
+        packed = pack_projections(normalized(variables, self._source_shapes), self._weight_groups)
+        self.variables = reloaded(packed, self.variables)
         self.rows.reloaded()
 
     def submit(self, prompt: Prompt, max_new_tokens: int | None = None, *,
@@ -760,6 +725,7 @@ class Server:
                 raise RuntimeError("the server stopped after a device check failed") from self._failed
             if row.budget:
                 self._queue.append(row)
+        self.arrived()
         if not row.budget:
             self._finish(row, terminated=False)
         return row.ticket
@@ -829,6 +795,10 @@ class Server:
         """
         if self._failed is not None:
             raise RuntimeError("the server stopped after a device check failed") from self._failed
+        if not (self._queue or self._rows):
+            # Nothing to run: the host reads the last call's draws.
+            self._settle()
+            return
         admission = self._admit()
         with self._context():
             program = self._step if admission is None else self._admitting
@@ -977,7 +947,7 @@ class Server:
         try:
             error.throw()
         except BaseException as failure:
-            self._fail(failure)
+            self.fail(failure)
             raise
         now = time.perf_counter()
         drew: dict[int, _Row] = {}
@@ -1000,7 +970,9 @@ class Server:
         for row in drew.values():
             row.ticket._drew(row.tokens)
 
-    def _fail(self, failure: BaseException) -> None:
+    def fail(self, failure: BaseException) -> None:
+        """Stop after `failure`: every waiting and running request settles with it, and a later
+        submission or step is refused."""
         with self._ingress:
             self._failed = failure
             waiting = [*self._rows.values(), *self._queue]
@@ -1023,3 +995,7 @@ class Server:
         settled(row.ticket, Generation(
             np.concatenate([row.prompt[None], drawn], axis=1), np.array([count], np.int32),
             np.array([terminated]), behavior, raw, rows=1, decoder=decoder))
+
+
+def _nothing() -> None:
+    """No engine to wake."""

@@ -13,8 +13,8 @@ import shutil
 import sys
 from collections.abc import Mapping, Sequence
 
+from dew.builds import CUDA_BUILDS, QUERY, listed_gpus, newest_build, runs_on
 from dew.pool import answered, runs_on_gpu
-from dew.telemetry.builds import CUDA_BUILDS, QUERY, listed_gpus, newest_build, runs_on
 
 _log = logging.getLogger(__name__)
 _late_policy_warned = False

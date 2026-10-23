@@ -170,7 +170,7 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives import Step
     from dew.objectives.lm import LMObjective
-    from dew.training.optim import scale_by_qk_clip
+    from dew.optim import scale_by_qk_clip
 
     # QK-Clip bounds logits only where no QK-norm divides the kernels' scale
     # back out, and refuses a normed layer.
@@ -323,7 +323,7 @@ def test_an_accumulating_step_updates_the_optimizer_in_its_commit_alone():
 
     model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
                               max_seq_len=8)
-    train = Trainer(LMObjective(model, 8), OptimConfig(learning_rate=1e-3).build(10),
+    train = Trainer(LMObjective(model, 8), OptimConfig(rate=1e-3).build(10),
                     key=jax.random.PRNGKey(0), accumulation=2)
     state = train.initial_state()
     rows = jax.device_count()

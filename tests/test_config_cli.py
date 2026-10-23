@@ -11,12 +11,12 @@ import pytest
 from diffusion_support import images_of
 
 from dew.config import RunConfig, ScheduleSpec
+from dew.config.diffusion import DiffusionRunConfig
+from dew.config.jepa import JepaRunConfig
+from dew.config.lm import LMRunConfig
 from dew.data import Files
 from dew.data.dataset import Loader, record_argument
 from dew.diffusion.presets import Flow
-from dew.objectives.diffusion import DiffusionRunConfig
-from dew.objectives.jepa import JepaRunConfig
-from dew.objectives.lm import LMRunConfig
 from dew.registry import import_path
 from dew.sampling import Heun
 from dew.training import MeshSpec
@@ -85,7 +85,7 @@ def test_a_point_sets_a_runs_fields_and_its_chains_settings_together():
     """A run's own fields and its chain's settings are one point, built once: audio conditioning and
     clips that carry audio are valid only together, and a point that sets both reads as both."""
     from dew.data import presets
-    from dew.objectives.diffusion import AudioCondition
+    from dew.inputs import AudioCondition
 
     clips = Files("clips", format="files").pipe(presets.clips, 2 / 25, frames=2, fps=25, size=8, batch=8)
     audio = DiffusionRunConfig(text=None, audio=AudioCondition()).to_dict()["audio"]
@@ -211,15 +211,17 @@ def test_a_jepa_run_without_probes_trains_and_validates_its_loss(tmp_path):
 
 def test_param_groups_on_the_command_line_read_their_schedules_as_records():
     """A group's schedule is the record that names it, as the run's record
-    writes it, and the config's own schedule steps per epoch by its flag."""
-    from dew.training.optim import Cosine, OneCycle, ParamGroup
+    writes it, and the config's own rate is one value: a number, or a schedule's record that steps
+    per epoch by its `every`."""
+    from dew.optim import Cosine, OneCycle, ParamGroup
     groups = [{"name": "delays", "patterns": ["*/delay"], "bounds": [0, 24],
                "schedule": {"class": "cosine", "fields": {"peak": 0.1, "warmup_steps": 0, "every": 40}}},
               {"name": "rest", "patterns": ["*"],
                "b1": {"class": "one_cycle", "fields": {"peak": 0.85, "init": 0.95, "end": 0.95}}}]
-    config = parse(RunConfig, ["--optim.param-groups", json.dumps(groups), "optim.schedule:one-cycle",
-                               "--optim.schedule.peak", "5e-3", "--optim.schedule.every", "40"])
-    assert config.optim.schedule == OneCycle(peak=5e-3, every=40)
+    rate = {"class": "one_cycle", "fields": {"peak": 5e-3, "every": 40}}
+    config = parse(RunConfig, ["--optim.param-groups", json.dumps(groups), "--optim.rate", json.dumps(rate)])
+    assert config.optim.rate == OneCycle(peak=5e-3, every=40)
+    assert parse(RunConfig, ["--optim.rate", "3e-4"]).optim.rate == 3e-4
     assert config.optim.param_groups == (
         ParamGroup("delays", ("*/delay",), schedule=Cosine(peak=0.1, warmup_steps=0, every=40),
                    bounds=(0.0, 24.0)),
@@ -237,7 +239,7 @@ class _Schedules(RunConfig):
 def test_a_mapping_of_class_records_reads_from_one_flag_and_round_trips_its_record():
     """#45: each schedule is the record that names it, read from one JSON
     object on the command line and written back by the run's record."""
-    from dew.training.optim import Exponential, Linear
+    from dew.optim import Exponential, Linear
 
     given = {"sigma": {"class": "linear", "fields": {"peak": 0.5, "warmup_steps": 0, "end": 0.1}},
              "delay": {"class": "exponential", "fields": {"init": 10.0, "end": 1.0, "every": 4}}}

@@ -123,7 +123,7 @@ from dew.objectives.lm import LMObjective
 data = Hub("winglian/tiny-shakespeare").pipe(presets.lm, "byte", seq_len=64, batch=64)
 model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
                           mlp_features=64, max_seq_len=128)
-state = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0).fit(data, steps=1000)
+state = Trainer(LMObjective(model, seq_len=64), OptimConfig(rate=1e-3), key=0).fit(data, steps=1000)
 assert int(state.step) == 20
 from dew.interop import PretrainedDecoder
 from dew.sampling import Sampling
