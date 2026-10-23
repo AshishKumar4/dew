@@ -998,6 +998,52 @@ def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_
         assert run() == runs
         assert run() == runs
 
+def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests_executed(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A train that loses a head loses the test modules and modules the head added, and its other
+    files keep their rows (the land queue's recompose after a pull): a test module, or a module in a
+    package no test imported, added or taken away runs no other file again. A module added beside
+    one a file's tests executed under src/, which an import there may now find, runs that file
+    again, and only that one, and so does its removal; a top-level package added under src/, which
+    may shadow any import, runs every file."""
+    for name, source in {"src/pkg/__init__.py": "", "src/pkg/used.py": "def value(): return 1\n",
+                         "src/other/__init__.py": "", "src/other/lone.py": "def value(): return 2\n",
+                         "src/idle/__init__.py": ""}.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(source)
+    written(tmp_path, {
+        f"test_{name}.py": "import sys\nsys.path.insert(0, 'src')\n"
+                           f"from {package} import value\n"
+                           f"def test_{name}():\n"
+                           f"    with open('runs-{name}', 'a') as runs: runs.write('x')\n"
+                           "    assert value()\n"
+        for name, package in (("uses", "pkg.used"), ("lone", "other.lone"))})
+    interpreter(tmp_path, "3.12")
+    url, _, _ = cache_worker
+    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    cached(monkeypatch, url)
+    out = tmp_path / "verdict.json"
+
+    def run():
+        ci.task("3.12", ["tests/test_uses.py", "tests/test_lone.py"], "", out, 600.0)
+        assert [row["exitCode"] for row in json.loads(out.read_text())["rows"]] == [0, 0]
+        return [len((tmp_path / f"runs-{name}").read_text()) for name in ("uses", "lone")]
+
+    changes = [(None, None, [1, 1]), ("tests/test_added.py", "def test_added(): pass\n", [1, 1]),
+               ("src/idle/new.py", "def value(): return 3\n", [1, 1]),
+               ("src/other/extra.py", "def value(): return 4\n", [1, 2]),
+               ("src/other/extra.py", None, [1, 3]), ("tests/test_added.py", None, [1, 3]),
+               ("src/top/__init__.py", "", [2, 4])]
+    for path, source, runs in changes:
+        if path and source is None:
+            (tmp_path / path).unlink()
+        elif path:
+            (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+            (tmp_path / path).write_text(source)
+        assert run() == runs, path
+        assert run() == runs, path
+
+
 def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(ci, tmp_path):
     """A hang is graded: the task interrupts pytest at its deadline, short of
     armada's own timeout, kills its process group where the interrupt is not
