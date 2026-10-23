@@ -334,11 +334,12 @@ def _dq_step(walk: _Backward, rings: tuple, operands: tuple, stats: tuple, first
     # the keyed sums' places in the step's sums empty, as they accumulate in place.
     residual, mass, keyed_mass, keyed_shift = rows
     sums = algebra.DqSums(empty, residual, mass, (), (), empty, keyed_mass, keyed_shift)
-    sums, products = algebra.dq_terms(sums, exponentials, cotangents, None, None, prior, scale=walk.scale,
-                                      kinds=(), summed=(), dtype=k_slot.dtype, accurate=walk.accurate)
-    dq_acc = mosaic_sm90.register_products(dq_acc, products.parts, k_slot, walk.interpret)
-    if products.keyed is not None:
-        keyed_acc = mosaic_sm90.register_products(keyed_acc, products.keyed, k_slot, walk.interpret)
+    sums, parts = algebra.dq_terms(sums, exponentials, cotangents, None, None, scale=walk.scale, kinds=(),
+                                   summed=(), dtype=k_slot.dtype, accurate=walk.accurate)
+    dq_acc = mosaic_sm90.register_products(dq_acc, parts, k_slot, walk.interpret)
+    if walk.accurate:
+        sums, keyed = algebra.keyed_terms(sums, exponentials, prior, scale=walk.scale, dtype=k_slot.dtype)
+        keyed_acc = mosaic_sm90.register_products(keyed_acc, keyed, k_slot, walk.interpret)
     # The key slot's reads done before it is released.
     plgpu.wgmma_wait(0)
     keys.release(index)
