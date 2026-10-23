@@ -62,10 +62,11 @@ SHAPES = ((2, 3, 8), (4, 16), (3, 2, 5, 6))
 SCALES = (1.0, 1e-4, 30.0)
 """The draws' scales: unit normals, values near zero, and values large enough to leave a function's
 linear regime (a saturating activation, an exponential)."""
-STEP = {"float32": 2e-3, "bfloat16": 3e-2}
+STEP = {"float32": 1e-4, "bfloat16": 3e-2}
 """A draw's grid step (`_alike`), relative to the two outputs' largest magnitude: coarse enough that two
-orders of one sum, or two roundings of one formula, are alike, fine enough that another epsilon's floor
-or another constant is not."""
+orders of one sum, or two roundings of one formula, are alike (float32's chains part by about 1e-6,
+bfloat16's by its 2^-8), fine enough that an approximation is not (tanh GELU parts from the exact one
+by 1.7e-4 of its largest output at unit scale)."""
 MOST_ARGUMENTS = 4
 
 
