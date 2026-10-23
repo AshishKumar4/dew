@@ -116,55 +116,73 @@ def widened(tree):
         leaf, np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype), tree)
 
 
-def _stacked(trees, *, host: bool):
-    """`trees`' leaves stacked on a new leading axis: as NumPy arrays of their own dtypes (`host`, a
-    looped arm's outputs, a torch or NumPy reference's float64 among them), or a draw's for a JAX arm,
-    a JAX array or Python scalar as JAX stacks it, its weak type kept, and a host array as NumPy."""
+def _stack_draws(trees):
+    """A draw's leaves of each window stacked on a new leading axis: a JAX array or Python scalar as JAX
+    stacks it, its weak type kept, and a host array as NumPy stacks it, its dtype kept."""
     def stack(*leaves):
-        if not host and all(isinstance(leaf, jax.Array | bool | int | float | complex) for leaf in leaves):
+        if all(isinstance(leaf, jax.Array | bool | int | float | complex) for leaf in leaves):
             return jnp.stack([jnp.asarray(leaf) for leaf in leaves])
         return np.stack([np.asarray(leaf) for leaf in leaves])
     return jax.tree.map(stack, *trees)
 
 
+def _stack_host(trees):
+    """An arm's outputs of each window stacked on a new leading axis as host arrays of their own dtypes."""
+    return jax.tree.map(lambda *leaves: np.stack([np.asarray(leaf) for leaf in leaves]), *trees)
+
+
+def _window_count(arguments) -> int:
+    """The windows an arm's stacked arguments hold, the leading axis of each."""
+    leaves = jax.tree.leaves(arguments)
+    count = len(leaves[0]) if leaves else 0
+    if count < 1:
+        raise ValueError(f"an arm over {count} windows")
+    return count
+
+
 def windows(draw, count: int):
-    """A check-1 draw of `count` windows a seed. Seed `s` gives the site's own draws of seeds
-    `s * count` to `s * count + count - 1`, each of their leaves stacked on a new leading axis, every
-    argument one a window. A seed's evidence then pools `count` draws, as independent as the site's
-    draws of different seeds are, and a leaf of one row a draw (a parameter's gradient) becomes
-    `count` rows; its arms take the windows through `over_windows`."""
+    """A check-1 draw of `count` windows a seed. Seed `s` gives the site's draws of seeds `s * count` to
+    `s * count + count - 1`, each leaf stacked on a new leading axis, and every argument is a window. A
+    seed's evidence then pools `count` draws, as independent as the site's draws of different seeds
+    are. A leaf that is one row in a draw, such as a parameter's gradient, becomes `count` rows. Its
+    arms take the windows through `over_windows`."""
     if count < 1:
         raise ValueError(f"windows of {count} draws")
 
     def drawn(seed):
-        return _stacked([draw(seed * count + index) for index in range(count)], host=False)
+        return _stack_draws([draw(seed * count + index) for index in range(count)])
     return drawn
 
 
 def over_windows(fn, *, looped: bool = False):
-    """`fn`, an arm of one draw, over `windows`' stacked ones, each argument sliced by window and the
-    outputs stacked on their leading axis, as host arrays.
-    - Batched (the default), one compiled program over every window (`jax.vmap`). A batch axis may
-      change the program XLA compiles (its fusions, a kernel's route), so the first call at each
-      signature (every argument's `jax.typeof` and their tree, and x64's setting, for a reference and
-      its float64 truth are two programs) also runs `jax.jit(fn)` window by window and fails unless
-      every window's output is the same bit for bit.
-    - `looped`, `fn` as given, window by window: a torch or NumPy reference, or a JAX arm a batch axis
-      changes, passed jitted (`over_windows(jax.jit(fn), looped=True)`) so each window runs the
-      program one draw compiles."""
+    """`fn`, an arm of one draw, run over `windows`' stacked arguments, each sliced by window, with its
+    outputs stacked on their leading axis as host arrays.
+
+    By default it is one compiled program over every window (`jax.vmap`). A batch axis may change the
+    program XLA compiles (its fusions, a kernel's route), so the first call at each signature also runs
+    `jax.jit(fn)` window by window and fails unless every window's output is the same bit for bit. The
+    signature is every argument's `jax.typeof`, their tree, x64's setting and the default matmul
+    precision; a reference and its float64 truth have two. Any other configuration a call changes needs
+    an `over_windows` of its own.
+
+    `looped` runs `fn` window by window instead, for a torch or NumPy reference, for a JAX arm a batch
+    axis changes, and for a `without_ynn` arm, whose compiler options refuse to be nested in the batched
+    program. Pass a JAX arm jitted, `over_windows(jax.jit(fn), looped=True)`, so each window runs the
+    program one draw compiles."""
     def each(single, *arguments):
-        count = len(jax.tree.leaves(arguments)[0])
-        return _stacked([single(*jax.tree.map(lambda leaf, index=index: leaf[index], arguments))
-                         for index in range(count)], host=True)
+        count = _window_count(arguments)
+        return _stack_host([single(*jax.tree.map(lambda leaf, index=index: leaf[index], arguments))
+                            for index in range(count)])
 
     if looped:
         return functools.partial(each, fn)
     batched, single, checked = jax.jit(jax.vmap(fn)), jax.jit(fn), set()
 
     def run(*arguments):
+        _window_count(arguments)
         found = jax.tree.map(np.asarray, batched(*arguments))
-        # Every argument's shape, dtype and weak type (`jax.typeof`), their tree, and x64's setting.
-        signature = (bool(jax.config.jax_enable_x64), jax.tree.structure(arguments),
+        signature = (bool(jax.config.jax_enable_x64), str(jax.config.jax_default_matmul_precision),
+                     jax.tree.structure(arguments),
                      tuple(jax.typeof(leaf) for leaf in jax.tree.leaves(arguments)))
         if signature not in checked:
             expected = each(single, *arguments)
@@ -173,10 +191,17 @@ def over_windows(fn, *, looped: bool = False):
             for (path, got), want in zip(jax.tree_util.tree_leaves_with_path(found),
                                          jax.tree.leaves(expected), strict=True):
                 if got.dtype != want.dtype or got.shape != want.shape or got.tobytes() != want.tobytes():
+                    where = jax.tree_util.keystr(path) or "the output"
+                    differs = ""
+                    if got.shape == want.shape and got.dtype == want.dtype and got.size:
+                        moved = np.flatnonzero(np.any((got != want).reshape(len(got), -1), axis=1))
+                        if moved.size:
+                            gap = np.max(np.abs(np.asarray(got, np.float64) - np.asarray(want, np.float64)))
+                            differs = f" (from window {moved[0]}, by up to {gap:.3e})"
                     raise AssertionError(
-                        f"{jax.tree_util.keystr(path)}: the batched arm over windows computes otherwise "
-                        "than one draw's compiled arm does, window by window; take "
-                        "`over_windows(jax.jit(fn), looped=True)`")
+                        f"{where}: the batched arm over windows computes otherwise than one draw's "
+                        f"compiled arm does, window by window{differs}. Take "
+                        "`over_windows(jax.jit(fn), looped=True)`.")
             checked.add(signature)
         return found
     return run
