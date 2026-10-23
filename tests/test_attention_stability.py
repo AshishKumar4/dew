@@ -8,11 +8,18 @@ from Dew (`attention_oracle.exact_attention`), its float64 truth's derivative an
 gradients zero. The accurate form (natural logits, `template.NATURAL`'s other form, and the backward's
 accurate form, `template.ACCURATE`'s) holds check 1 (`reference_error.assert_as_exact`) on every family,
 as exact as the reference. The default, which folds log2(e) into the scale where the scale allows and
-takes FlashAttention's arithmetic for the backward's products and dQ, holds the owner's stability rule
-(`assert_stable`, bible §6) on every family but the fold's documented divergences
-(`algebra.Forward.base2`; docs/design/kernel-templates.md, §3, the exponent's forms), which the accurate
-form alone runs: its error at these inputs is no claim, its departures from check 1 here the divergence
-the design documents."""
+takes FlashAttention's arithmetic for the backward's products and dQ (about the template's own anchored
+D, not FlashAttention's rowsum(dO * O)), is finite wherever the reference is and holds the exact-zero
+claims (`assert_finite`, `_held_empty`; the owner's ruling, 2026-10-23) on every family but the fold's
+documented divergences (`algebra.Forward.base2`; docs/design/kernel-templates.md, §3, the exponent's
+forms), which the accurate form alone runs. Its error at these inputs is no claim, and it ties values the
+reference keeps apart, its documented divergence (docs/design/testing.md, a template's stability suite):
+groups of a leaf's entries it returns equal whose reference values spread past twice the reference's own
+error and two ulps more, over 16 seeds of the plain-JAX mainloop, are the output's, by the fold, at
+logits near 1e4 (1 group, 374 ulps), keys an ulp apart in bf16 (3, 8 ulps) and a sink and one key (1, 5
+ulps); dQ's, by FlashAttention's one bf16 product at the first D, at keys an ulp apart in bf16 (278
+groups, 379 ulps); dK's at a small weight on a large value in bf16 (12, 8 ulps); and dV's, by the fold's
+recomputed weights, at keys an ulp apart in fp32 (100, 16 ulps)."""
 
 import dataclasses
 import functools
@@ -23,7 +30,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from attention_oracle import exact_attention
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened, with_gradients
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, with_gradients
 
 from dew.nn.documents import CrossDocuments
 from dew.nn.kernels import decode_attention, generation, tuning
@@ -730,35 +737,17 @@ def _held_empty(family: Family, found, label: str) -> None:
         np.testing.assert_array_equal(np.asarray(array, np.float32)[rows], 0.0, err_msg=f"{label} {leaf}")
 
 
-def assert_stable(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn) -> None:
-    """The owner's stability rule (bible §6) over `seeds` draws: each leaf of `dew_fn`'s outputs is finite
-    wherever the reference's is, and no entries it returns equal are values the reference keeps apart,
-    where keeping apart is resolving past the reference's own rounding: over every group of a leaf's
-    entries Dew ties, the reference's values spread no more than twice its largest distance from float64
-    over them (`truth_fn` on the draw widened, as check 1 takes its truth). A pair the reference rounds an
-    ulp apart from truths within an ulp is no structure it keeps; a tie of values it resolves is a merge."""
+def assert_finite(dew_fn, reference_fn, draw, label: str, *, seeds: int) -> None:
+    """The stability rule's finiteness over `seeds` draws: each leaf of `dew_fn`'s outputs finite wherever
+    the reference's is."""
     for seed in range(seeds):
         inputs = draw(seed)
-        with jax.enable_x64(new_val=True):
-            truth = truth_fn(*widened(inputs))
         found = jax.tree_util.tree_leaves_with_path(dew_fn(*inputs))
-        for (path, mine), theirs, exact in zip(found, jax.tree.leaves(reference_fn(*inputs)),
-                                               jax.tree.leaves(truth), strict=True):
-            name = f"{label}{jax.tree_util.keystr(path)} seed {seed}"
-            mine, theirs, exact = (np.asarray(np.asarray(leaf, np.float32), np.float64).ravel()
-                                   for leaf in (mine, theirs, exact))
-            finite = np.isfinite(theirs) & np.isfinite(exact)
-            lost = finite & ~np.isfinite(mine)
-            assert not lost.any(), f"{name}: {int(lost.sum())} values not finite where the reference's are"
-            order = np.lexsort((theirs[finite], mine[finite]))
-            tied, kept, error = (x[finite][order] for x in (mine, theirs, np.abs(theirs - exact)))
-            starts = np.flatnonzero(np.concatenate([[True], tied[1:] != tied[:-1]]))
-            spread = np.maximum.reduceat(kept, starts) - np.minimum.reduceat(kept, starts)
-            merged = spread > 2 * np.maximum.reduceat(error, starts)
-            assert not merged.any(), (
-                f"{name}: {int(merged.sum())} groups of values tied that the reference keeps apart, the "
-                f"widest {float(spread.max()):.3e} apart where its error is "
-                f"{float(np.maximum.reduceat(error, starts)[np.argmax(spread)]):.3e}")
+        for (path, mine), theirs in zip(found, jax.tree.leaves(reference_fn(*inputs)), strict=True):
+            mine, theirs = (np.asarray(leaf, np.float32) for leaf in (mine, theirs))
+            lost = np.isfinite(theirs) & ~np.isfinite(mine)
+            assert not lost.any(), (f"{label}{jax.tree_util.keystr(path)} seed {seed}: {int(lost.sum())} "
+                                    "values not finite where the reference's are")
 
 
 @pytest.mark.parametrize("family", TEMPLATE_FAMILIES)
@@ -777,17 +766,17 @@ def test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edge
 
 
 @pytest.mark.parametrize("family", [family for family in TEMPLATE_FAMILIES if FAMILIES[family].folded])
-def test_the_default_form_holds_the_stability_rule_at_fp32s_edges(family):
-    """Each template mainloop's output and query, key and value gradients in the default form, the
-    stability rule (`assert_stable`) over the family's draws; a row that sees nothing, zero."""
+def test_the_default_form_is_finite_where_the_reference_is_at_fp32s_edges(family):
+    """Each template mainloop's output and query, key and value gradients in the default form, finite
+    wherever the reference's are (`assert_finite`) over the family's draws; a row that sees nothing, zero.
+    Its error here is no claim, and its ties the documented divergence (the module's docstring)."""
     seeds, family = SEEDS[family], FAMILIES[family]
     draw = _cast(family, family.draw)
     reference = jax.jit(with_gradients(_reference(family, anchored=False)))
-    truth = with_gradients(_reference(family, anchored=True))
     for name, mainloop in _mainloops(family, {}).items():
         label = f"{name} default {family.dtype}"
         differentiated = jax.jit(with_gradients(mainloop))
-        assert_stable(differentiated, reference, draw, label, seeds=seeds, truth_fn=truth)
+        assert_finite(differentiated, reference, draw, label, seeds=seeds)
         _held_empty(family, differentiated(*draw(0)), label)
 
 
