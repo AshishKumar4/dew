@@ -358,7 +358,7 @@ def test_a_run_that_fails_after_a_failed_write_raises_its_own_error_and_closes_i
     release = threading.Event()
     neighbour = threading.Thread(target=release.wait)
     neighbour.start()
-    settled = threading.active_count()
+    settled = set(threading.enumerate())
     primary = ValueError("calibration failed")
 
     def after(state, directory):
@@ -370,7 +370,7 @@ def test_a_run_that_fails_after_a_failed_write_raises_its_own_error_and_closes_i
     with pytest.raises(ValueError) as raised:
         run.train(Regression(), dataset(), name="failed", after=after)
     assert raised.value is primary and primary.__notes__
-    assert threading.active_count() == settled
+    assert set(threading.enumerate()) <= settled
 
 
 class Keyed(Regression):
