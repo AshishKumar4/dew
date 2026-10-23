@@ -268,8 +268,9 @@ def unfolded(spec: Forward) -> Forward:
     return dataclasses.replace(spec, natural=True, scaled=True)
 
 
-def walked[C, O](spec: Forward, walk: Callable[[Forward, jax.Array | None], C],
-                 finished: Callable[[Forward, C], O], weighted: Callable[[C], jax.Array] | None = None) -> O:
+def walked[C: (Partial, tuple), O](spec: Forward, walk: Callable[[Forward, jax.Array | None], C],
+                                   finished: Callable[[Forward, C], O],
+                                   weighted: Callable[[C], jax.Array] | None = None) -> O:
     """A program's walk and its outputs under the guards its form takes: `walk(form, live)` its walk in
     `form`, plain where `live` is None, else those rows shifting (`guarded`), its carry a `Partial` or a
     tuple whose first element is one, and `finished(form, carry)` its outputs. Under headroom the walk is
@@ -277,20 +278,30 @@ def walked[C, O](spec: Forward, walk: Callable[[Forward, jax.Array | None], C],
     `FOLD_REACH` walks again in the natural form (`unfolded`), guarded as the call's form is, its outputs
     that form's (its maximum natural, as the fold's are once finished). Ordinary inputs take the plain walk
     alone, their bits and cost unchanged but for these checks."""
-    def guarded_walk(form: Forward, carry=None):
-        def plain():
-            return walk(form, None) if carry is None else carry
+    def guarded_walk(form: Forward, plain: Callable[[], C]) -> C:
+        def shifted(live: jax.Array) -> C:
+            return walk(form, live)
 
-        return guarded(plain, functools.partial(walk, form), weighted) if form.headroom else plain()
+        return guarded(plain, shifted, weighted) if form.headroom else plain()
+
+    def walked_plain(form: Forward) -> C:
+        return walk(form, None)
 
     if not spec.base2:
-        return finished(spec, guarded_walk(spec))
+        return finished(spec, guarded_walk(spec, functools.partial(walked_plain, spec)))
     carry = walk(spec, None)
     state = carry if isinstance(carry, Partial) else carry[0]
     reach = jnp.max(jnp.where(jnp.isfinite(state.m), jnp.abs(state.m), 0.0))
     natural = unfolded(spec)
-    return jax.lax.cond(reach >= FOLD_REACH, lambda: finished(natural, guarded_walk(natural)),
-                        lambda: finished(spec, guarded_walk(spec, carry)))
+
+    def folded() -> C:
+        return carry
+
+    def unfolded_walk() -> C:
+        return guarded_walk(natural, functools.partial(walked_plain, natural))
+
+    return jax.lax.cond(reach >= FOLD_REACH, lambda: finished(natural, unfolded_walk()),
+                        lambda: finished(spec, guarded_walk(spec, folded)))
 
 
 POWER2_REACH = 381.0
@@ -666,6 +677,15 @@ def normalized_pass(spec: Forward, carry: Carry, keys_at: Callable[[jax.Array], 
     split, arg, _, _ = carry
     state = joined(carry, rows)
     _, maximum, total = finish(spec, state, initial=initial is not None)
+    share = None
+    if initial is not None:
+        # The initial state's factor to the walk's maximum, in the walk's own units, at most 1: folded, its
+        # maximum taken to base 2 as the walk resumed from it (`resumed`), whose own may round back below it.
+        m0 = initial[0].astype(jnp.float32)
+        carried = jnp.where(m0 == -jnp.inf, 0.0,
+                            jnp.exp2(jnp.minimum(base2_maximum(m0) - state.m, 0.0)) if spec.base2
+                            else jnp.exp(jnp.minimum(m0 - maximum, 0.0)))
+        share = carried, initial[1]
 
     def difference(logits):
         # Each exponent in the walk's own units: folded logits against its base-2 maximum, natural ones
@@ -687,7 +707,7 @@ def normalized_pass(spec: Forward, carry: Carry, keys_at: Callable[[jax.Array], 
 
     nothing = jnp.zeros_like(total)
     lo, hi = bounds
-    start = normalized_start(initial, maximum, total, split.acc.shape[-1])
+    start = normalized_start(share, total, split.acc.shape[-1])
     return jax.lax.fori_loop(lo, hi, walk, (start, nothing, nothing))
 
 
@@ -771,17 +791,15 @@ def normalized_terms(difference: jax.Array, total: jax.Array, at_anchor: jax.Arr
     return rest, jnp.where(at_anchor, rounded, zero).astype(jnp.float32).sum(axis=-1), small
 
 
-def normalized_start(initial: tuple[jax.Array, jax.Array] | None, maximum: jax.Array, total: jax.Array,
-                     width: int) -> jax.Array:
+def normalized_start(initial: tuple[jax.Array, jax.Array] | None, total: jax.Array, width: int) -> jax.Array:
     """The normalized split sums' start (`normalized_terms`): the initial state's weighted values at the
-    walk's maximum over its natural denominator, `acc0 exp(m0 - m) / T` from `initial` `(m0, acc0)` (its
+    walk's maximum over its natural denominator, `acc0 exp(m0 - m) / T` from `initial` `(exp(m0 - m), acc0)`,
+    the state's factor to the walk's maximum (in the walk's units, `normalized_pass`) and its values (its
     share of `B`, which `split_delta` reads inside it), zero without one. The factor is at most 1 and the
     product is taken before the division, so it stays within `acc0`'s magnitude."""
     if initial is None:
         return jnp.zeros((total.shape[0], width), jnp.float32)
-    m0, acc0 = initial
-    # The walk's maximum is at least the state's, the same units (the accurate form's, never raw with one).
-    carried = jnp.where(m0 == -jnp.inf, 0.0, jnp.exp(m0 - maximum))
+    carried, acc0 = initial
     acc0 = acc0.astype(jnp.float32)
     return expand(carried, acc0) * acc0 * expand(inverse(total), acc0)
 
