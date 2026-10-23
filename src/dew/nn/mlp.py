@@ -77,6 +77,9 @@ def _erfinv(value: float) -> float:
 @logical_axes({
     ("gate_proj",): ("embed", "mlp"),
     ("up_proj",): ("embed", "mlp"),
+    # The packed kernel's columns are both halves' hidden widths: a tensor axis splits them flat,
+    # which the product's [..., 2, H] (`PACKED_HIDDEN`) redistributes.
+    ("gate_up_proj",): ("embed", "mlp"),
     ("down_proj",): ("mlp", "embed"),
 })
 class GatedMLP(nn.Module):
