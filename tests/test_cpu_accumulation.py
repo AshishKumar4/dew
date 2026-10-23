@@ -1,6 +1,7 @@
 """Dew's CPU policy for float32 products (`dew.nn.precision.accumulated`): a CPU sums them in float64
-and rounds once, through every product a layer forms, its gradient's and tangent's included, with x64
-off; 16-bit products and other backends keep their own arithmetic."""
+and rounds once, through every product a layer forms, its gradient's and tangent's included, and a
+bias's gradient (`dew.nn.precision.spread`), with x64 off; 16-bit products and other backends keep their
+own arithmetic."""
 
 import contextlib
 
@@ -55,6 +56,23 @@ def test_a_layers_gradient_and_tangent_sum_in_float64():
     _, tangent = jax.jvp(lambda x: rows.apply(weights, x), (np.zeros((1, 3), np.float32),),
                          (CANCELLING[None],))
     assert np.asarray(tangent).tolist() == [[1.0]]
+
+
+def test_a_bias_gradient_sums_its_positions_in_float64():
+    """A bias broadcast over the positions it adds to (`dew.nn.precision.biased`) takes the sum of
+    their cotangents in float64, rounded once: 1 exactly over the cancelling terms, where a float32
+    sum in that order gives 0; its forward adds the bias itself to every position, and its tangent
+    the bias's own."""
+    layer = Dense(1)
+    x = np.zeros((3, 1), np.float32)
+    params = {"params": {"kernel": np.ones((1, 1), np.float32), "bias": np.asarray([0.5], np.float32)}}
+    applied = jax.jit(with_gradients(lambda params: layer.apply(params, x)))
+    out, gradient = applied(params, CANCELLING[:, None])
+    assert np.asarray(out).tolist() == [[0.5]] * 3
+    assert np.asarray(gradient["params"]["bias"]).tolist() == [1.0]
+    tangent = {"params": {"kernel": np.zeros((1, 1), np.float32), "bias": np.asarray([0.25], np.float32)}}
+    _, moved = jax.jvp(lambda params: layer.apply(params, x), (params,), (tangent,))
+    assert np.asarray(moved).tolist() == [[0.25]] * 3
 
 
 def test_16_bit_products_keep_their_float32_accumulation():
