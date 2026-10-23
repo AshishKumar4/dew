@@ -16,16 +16,23 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 find_package(CUDAToolkit REQUIRED)
 
-add_library(dew_cutlass SHARED ffi.cu)
-target_include_directories(dew_cutlass PRIVATE "${XLA_FFI_INCLUDE}" "${UPSTREAM}/include"
-    "${UPSTREAM}/tools/util/include")
+# Each architecture's kernels compile for it alone (grouped_sm90.cu for sm90a), so no file holds code its
+# instructions cannot run; ffi.cu's handlers and zeroing kernels compile for every architecture.
+add_library(dew_cutlass_sm90 OBJECT grouped_sm90.cu)
+set_target_properties(dew_cutlass_sm90 PROPERTIES CUDA_ARCHITECTURES 90a-real)
+add_library(dew_cutlass SHARED ffi.cu $<TARGET_OBJECTS:dew_cutlass_sm90>)
+foreach(target dew_cutlass dew_cutlass_sm90)
+  target_include_directories(${target} PRIVATE "${XLA_FFI_INCLUDE}" "${UPSTREAM}/include"
+      "${UPSTREAM}/tools/util/include")
+  target_compile_definitions(${target} PRIVATE NDEBUG)
+  target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
+      -O3 --expt-relaxed-constexpr --expt-extended-lambda>)
+endforeach()
 # The library reports the architectures it holds code for (dew_cutlass.ARCHITECTURES), so Dew asks the
 # installed wheel rather than knowing each release's list.
 get_target_property(compiled dew_cutlass CUDA_ARCHITECTURES)
 list(JOIN compiled "," ARCHITECTURES)
-target_compile_definitions(dew_cutlass PRIVATE DEW_CUTLASS_ARCHITECTURES="${ARCHITECTURES}" NDEBUG)
-target_compile_options(dew_cutlass PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
-    -O3 --expt-relaxed-constexpr --expt-extended-lambda>)
+target_compile_definitions(dew_cutlass PRIVATE DEW_CUTLASS_ARCHITECTURES="${ARCHITECTURES}")
 target_link_libraries(dew_cutlass PRIVATE CUDA::cudart)
 # The CUDA runtime comes from the nvidia wheel jax's CUDA plugin installs beside this one: CUDA 12's
 # nvidia/cuda_runtime/lib, CUDA 13's nvidia/cu13/lib.
