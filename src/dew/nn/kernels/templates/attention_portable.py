@@ -435,7 +435,12 @@ def _launch(query, key, value, dout, peak, total, initial_term, maximum, key_ind
                                                key_index, anchor_value, shift, sums, spans, score_params,
                                                split=split, **shared)
     delta, anchor, m, denominator, _ = softmax
-    dk, dv, key_grads = _dkv_launch(query, key, value, dout, m, denominator, anchor, delta, chosen, spans,
+    # Probe: dK/dV at the first pass's D, unrefined (a fused backward's, which has no dQ scan before it).
+    _, state_total = algebra.off_anchor_start(peak, total, maximum, value.shape[-1], shift)
+    _, first_delta, _ = algebra.split_delta(others, own, others_total, forward_total, state_total,
+                                            jnp.swapaxes(anchor_value, 1, 2),
+                                            jnp.swapaxes(dout, 1, 2).astype(jnp.float32), key_index, shift)
+    dk, dv, key_grads = _dkv_launch(query, key, value, dout, m, denominator, anchor, first_delta, chosen, spans,
                                     score_params, **shared)
     return (dq, *softmax, chosen, *dq_grads, dk, dv, *key_grads)
 
