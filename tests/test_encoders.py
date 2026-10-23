@@ -57,6 +57,8 @@ def test_the_text_conditioning_projects_each_row_once_not_each_token():
         return embed.apply(params, temb, None) + masked_mean(tokens, mask)
 
     label = "pooled text conditioning"
+    from reference_error import seeds_for
+    print("SIZED", label, seeds_for(projected, draw, label, dew_fn=pooled), flush=True)
     assert_as_exact(pooled, projected, draw, label, seeds=SEEDS[label])
 
 
