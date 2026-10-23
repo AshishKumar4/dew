@@ -2168,6 +2168,23 @@ def test_a_mixture_a_run_cuts_without_a_repeat_counts_its_cut():
     assert loader.records == 3
 
 
+@pytest.mark.parametrize(("order", "endless"), [("take, then repeat", True), ("repeat, then take", False),
+                                               ("neither", True), ("take", False)])
+def test_a_training_stream_says_it_never_runs_out_by_its_stages_read_in_turn(order, endless):
+    """A corpus of 8 cut to 4 and repeated for ever never runs out, and one repeated and then cut
+    does, as one only cut does; one written with neither repeats for ever as training reads it. Its
+    training stream says so, and reads on past 4 records exactly where it never runs out."""
+    from dew.data.dataset import stream_endless
+
+    rows = _tagged(1, 8)
+    written = {"take, then repeat": rows.take(4).repeat(), "repeat, then take": rows.repeat().take(4),
+               "neither": rows, "take": rows.take(4)}[order]
+    reader = compile(written.batch(1), loading=READ).train(DataPartition())
+    said = stream_endless(reader)
+    assert len(_ids(reader, 6)) == (6 if endless else 4)
+    assert said is endless
+
+
 def test_a_mixture_of_a_repeated_corpus_and_one_read_once_counts_what_a_run_reads():
     """A mix of a corpus of 8 repeated and one of 4 written without a repeat, at even weights, ends
     where the one read once does, at 8, and a run reads that many records: the order repeats
