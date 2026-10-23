@@ -673,7 +673,8 @@ class MultiHeadLatentAttention(nn.Module):
             force_fp32_for_softmax=force_fp32_for_softmax,
             implementation=implementation, causal=causal, mask=mask)
         if unselected is not None:
-            uniform = jnp.mean(value.astype(jnp.float32), axis=1, keepdims=True).astype(attention.dtype)
+            wide = value.astype(at_least_fp32(value.dtype))
+            uniform = jnp.mean(wide, axis=1, keepdims=True).astype(attention.dtype)
             attention = jnp.where(unselected, uniform, attention)
         return self._output(attention, x)
 
