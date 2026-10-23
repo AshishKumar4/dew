@@ -124,10 +124,13 @@ _BLACKWELL = Architecture('tcgen05', {'16bit': 8192, 'tf32': 4096, 'fp32': 256},
 _BLACKWELL_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256}, load_latency=541.5,
                                    l2_bytes_per_clock=38.8)
 # A TPU's: its MXU's FLOPs a clock (v5e 197 TF over 1.5 GHz -> 131072), the scoped VMEM limit at XLA's
-# default (v5e 16 MiB, read from a Mosaic kernel's refusal: "limit 16.00M"), and a grid step's fixed
-# seconds (v5e 0.356 us, pending GEMMTPU-GRIDSTEP's probe). T4: 65 TF fp16 summed in fp32 and 8.1 TF fp32
+# default (v5e 16 MiB, read from a Mosaic kernel's refusal: "limit 16.00M"; v6e's pending GEMMTPU-VMEM's),
+# and a grid step's fixed seconds, the slope of time over 1 to 65536 Pallas grid steps each issuing one
+# small DMA (GEMMTPU-GRIDSTEP: v5e 0.1785 us, v6e 0.2835 us). v6e: two 256x256 MXUs, 918 TF over its
+# clock -> 524288. T4: 65 TF fp16 summed in fp32 and 8.1 TF fp32
 # over 40 SMs at 1590 MHz -> 1024 and 128.
-_TPUS = {'v5e': Architecture('tpu', {'16bit': 131072}, scoped_vmem=16 * 2 ** 20, grid_step_seconds=0.356e-6)}
+_TPUS = {'v5e': Architecture('tpu', {'16bit': 131072}, scoped_vmem=16 * 2 ** 20, grid_step_seconds=1.785e-7),
+         'v6e': Architecture('tpu', {'16bit': 524288}, grid_step_seconds=2.835e-7)}
 
 
 def architecture(generation: str) -> Architecture | None:
