@@ -196,11 +196,6 @@ def _held[Layout](layout: Layout | None, what: str, kind: str) -> Layout:
     return layout
 
 
-def projector_weight_path(kind: str, name: str) -> tuple[str, ...]:
-    """The projector's canonical tensor path, shared by load and source export."""
-    return projector_layout(kind).path(name)
-
-
 def _vision_section(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     """The vision half of a wrapper config, or a bare vision config."""
     return records.record(hf_config.get("vision_config", hf_config), "vision_config")
