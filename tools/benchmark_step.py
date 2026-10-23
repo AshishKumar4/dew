@@ -400,9 +400,11 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
                     if primary is None:
                         raise
                     primary.add_note(f"Profiler stop failed: {error!r}")
-            planes = device_events(directory)[0]
-            timeline = {**device_timeline(directory, config.profile_steps, planes=planes),
-                        **communication(directory, config.profile_steps, planes=planes)}
+            # A peak process traces the steps for their memory; their timeline is the case process's.
+            if not config.peak_run:
+                planes = device_events(directory)[0]
+                timeline = {**device_timeline(directory, config.profile_steps, planes=planes),
+                            **communication(directory, config.profile_steps, planes=planes)}
         flops = trainer.step_flops and trainer.step_flops.hardware
         step_time = elapsed / config.steps
         utilization = model_flops_utilization(flops, step_time)
