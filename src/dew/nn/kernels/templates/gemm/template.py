@@ -48,14 +48,15 @@ LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
 def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *, transpose_rhs: bool = False,
          prologue=None, prologue_operands: tuple = (), epilogue=None, epilogue_operands: tuple = (),
          out_dtype, out_dtypes: tuple | None = None, precision: PrecisionLike = None,
-         interpret_on_cpu: bool = False, prologue_vjp=None, compute=None):
+         interpret_on_cpu: bool = False, prologue_jvp=None, compute=None):
     """Each group's rows of `lhs` times its matrix of `rhs`, through the hooks (the module's docstring):
     `[rows, width]` in `out_dtype`, or a tuple in `out_dtypes`. A `precision` above the default
     (explicitly or through `jax_default_matmul_precision`) sums an fp32 output in IEEE fp32, in XLA as in
     the kernels: the product `precision` declares (`templates.product.declared`), which every launch of
-    the call and of its derivative keeps. `prologue_vjp(lhs, *side_arrays)`, where given, is the prologue's
-    derivative in place of the prologue's own: a function of the multiplied operand's cotangent giving
-    `lhs`'s and each side array's (a fused producer's whole VJP, `fused`). `compute`, where given, is the
+    the call and of its derivative keeps. `prologue_jvp(lhs, *side_arrays)`, where given, is the prologue's
+    derivative in place of the prologue's own: a function of `lhs`'s and each side array's tangent giving
+    the multiplied operand's (a fused producer's whole JVP, `fused`), which forward mode takes, reverse mode
+    transposes and every higher order differentiates (`_prologued`). `compute`, where given, is the
     dtype the products take, `lhs` rounded to it as `rhs` is, where `lhs`'s own dtype is what its
     cotangent takes, summed in fp32 and rounded once to it (an fp32 input's of a bf16 product); the
     rounding passes tangents through unrounded, the MoE projection's law
@@ -65,6 +66,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
     straight = compute is not None
     compute = jnp.dtype(lhs.dtype if compute is None else compute)
     dense = group_sizes is None
+    prologue = _prologued(prologue, prologue_jvp)
     rhs, group_sizes = _grouped(lhs, rhs, group_sizes)
     prologue_arrays, prologue_axes = _split(prologue_operands, 'prologue')
     epilogue_arrays, epilogue_axes = _split(epilogue_operands, 'epilogue')
@@ -127,7 +129,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
         d_lhs, d_prologue = d_operand, ()
         if prologue is not None:
             d_lhs, d_prologue = _prologue_cotangents(prologue, lhs, prologue_arrays, prologue_axes,
-                                                     group_sizes, d_operand, prologue_vjp)
+                                                     group_sizes, d_operand)
         return (d_lhs.astype(lhs.dtype), d_rhs, np.zeros(group_sizes.shape, jax.dtypes.float0),
                 tuple(_as_cotangent(d, a) for d, a in zip(d_prologue, prologue_arrays, strict=True)),
                 tuple(_as_cotangent(d, a) for d, a in zip(d_epilogue, epilogue_arrays, strict=True)))
@@ -220,10 +222,26 @@ def _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, epilogue, e
     return outs if several else outs[0]
 
 
-def _prologue_cotangents(prologue, lhs, arrays, axes_of, group_sizes, d_operand, vjp=None):
+def _prologued(prologue, prologue_jvp):
+    """`prologue`, its derivative `prologue_jvp`'s where given (`gemm`): one derivative contract for
+    forward mode, which takes it, reverse mode, which transposes it, and every higher order."""
+    if prologue is None or prologue_jvp is None:
+        return prologue
+
+    @jax.custom_jvp
+    def prologued(lhs, *sides):
+        return prologue(lhs, *sides)
+
+    @prologued.defjvp
+    def _(primals, tangents):
+        return prologued(*primals), prologue_jvp(*primals)(*tangents)
+
+    return prologued
+
+
+def _prologue_cotangents(prologue, lhs, arrays, axes_of, group_sizes, d_operand):
     """The cotangents of `lhs` and the prologue's side operands from the multiplied operand's: through
-    the VJP of `prologue(...)` rounded to `lhs`'s dtype, or `vjp`'s where given. A row past the routed
-    ones multiplied nothing,
+    the VJP of `prologue(...)` rounded to `lhs`'s dtype. A row past the routed ones multiplied nothing,
     so its cotangent is zero, and its inputs are taken at the first row's, a routed one's where any is,
     so that a derivative its own inputs leave undefined (`rsqrt` of an empty row's zero mean square)
     reaches no gradient the routed rows share."""
@@ -238,10 +256,7 @@ def _prologue_cotangents(prologue, lhs, arrays, axes_of, group_sizes, d_operand,
     rows_at = tuple(axes.index('rows') if 'rows' in axes else None for axes in axes_of)
     inputs = (kept(lhs, 0), *(array if axis is None else kept(array, axis)
                               for array, axis in zip(arrays, rows_at, strict=True)))
-    if vjp is None:
-        _, pull = jax.vjp(lambda x, *sides: prologue(x, *sides).astype(lhs.dtype), *inputs)
-    else:
-        pull = vjp(*inputs)
+    _, pull = jax.vjp(lambda x, *sides: prologue(x, *sides).astype(lhs.dtype), *inputs)
     d_lhs, *d_sides = pull(d_operand.astype(lhs.dtype))
     d_lhs = jnp.where(routed[:, None] & nonempty, d_lhs, 0)
     d_sides = [d if d.dtype == jax.dtypes.float0 else jnp.where(nonempty, d, 0) for d in d_sides]
