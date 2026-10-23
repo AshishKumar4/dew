@@ -10,6 +10,7 @@ order that may follow how many rows they multiply.
 
 import dataclasses
 import json
+from collections.abc import Sequence
 from pathlib import Path
 
 import flax.linen as nn
@@ -105,11 +106,14 @@ def test_the_stored_joint_head_scores_compacted_options_as_it_scores_the_grid():
     assert drawn[0] == drawn[1] == drawn[2]
 
 
-SLOT_SEEDS = 8
-"""The compacted-options site's declared draws (`seeds_for`): each draw is the ragged rows' states and
-answers from its seed, over the objective initialized from key 0. Drawn with the rows, the
-initialization set each draw's scale: the reference's own error from float64 swung 45 times across
-draws, and the site did not resolve within 64."""
+SLOT_SEEDS = 512
+"""The compacted-options site's declared draws (`seeds_for`, paired): each draw is DRAW_COPIES sets of
+the ragged rows' states and answers from its seed, over the objective initialized from key 0."""
+
+DRAW_COPIES = 4
+"""The sets of ragged rows a draw packs: each parameter's gradient sums over all of them, so one
+draw's rounding is many rows', whose ratio to the reference's varies less across draws than one
+set's, heavy-tailed in the head's attention query and key gradients."""
 
 ALGEBRAIC_ZEROS = ("to_k", "scorer_out")
 """The head's modules whose bias gradient is zero by algebra: a key's bias shifts every key's logit
@@ -117,7 +121,7 @@ of a query alike, and the scorer's shared bias every option's, so the softmax an
 move with either (their float64 values are residue)."""
 
 
-def ragged(seed: int = 0) -> list[Example]:
+def ragged(seed: int | Sequence[int] = 0) -> list[Example]:
     """Ragged rows: one question of forty options, six of three and one of twenty-four, their states
     and answers drawn from `seed` at fixed lengths, so every draw packs alike. A window's grid is its
     bound's questions times forty slots, of which a row holds 40, 18 or 24 real options; compacted, a
@@ -154,11 +158,12 @@ def ragged_objective() -> DecisionObjective:
                              attention_impl="xla"), shuffle_options=False)
 
 
-def ragged_batches(objective: DecisionObjective, seed: int = 0):
-    """The ragged rows of `seed` packed into windows of a grid as many questions deep as a window
-    holds, with their options compacted into the slots its bounds allow (`slotted`) and without
-    (`batch`)."""
-    examples = ragged(seed)
+def ragged_batches(objective: DecisionObjective, seed: int = 0, copies: int = 1):
+    """The ragged rows of `seed`, `copies` sets of them each drawn apart, packed into windows of a
+    grid as many questions deep as a window holds, with their options compacted into the slots its
+    bounds allow (`slotted`) and without (`batch`)."""
+    examples = ragged(seed) if copies == 1 else [example for copy in range(copies)
+                                                 for example in ragged([seed, copy])]
     data = decision_rows(examples, len(examples), examples, objective=objective.data())
     (slotted,) = list(data.val(DataPartition()))
     slotted = {name: value for name, value in slotted.items() if name != VALID_ROWS}
@@ -267,7 +272,7 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
         ragged's seeds past 0, which the structure above reads."""
         for attempt in range(64):
             index = 1 + 64 * seed + attempt
-            slotted, grid = ragged_batches(objective, index)
+            slotted, grid = ragged_batches(objective, index, DRAW_COPIES)
             if scorer_gap(objective, features, variables, grid) > SCORER_MARGIN:
                 options = np.asarray(grid["options"]).astype(bool)
                 readout = np.random.default_rng([0x5107, index]).standard_normal(options.shape, np.float32)
