@@ -16,7 +16,8 @@ import pytest
 from tool_support import git
 
 REPO = Path(__file__).resolve().parents[1]
-COPIED = ("site/scripts/redigest.py", "site/snippets/cells.py", "site/snippets/cells.json",
+COPIED = ("site/scripts/redigest.py", "site/scripts/gen_api.py", "tools/lint_scopes.py",
+          "site/snippets/cells.py", "site/snippets/cells.json",
           "site/snippets/framework.py", "site/src/data/hero.py", "site/src/data/text.py",
           "site/src/data/sampler.py", "site/src/data/capture.json")
 DIGEST = re.compile(rb"[0-9a-f]{64}")
@@ -47,15 +48,17 @@ def redigest(root: Path, *renames: str) -> subprocess.CompletedProcess:
 def api_renamed(root: Path, owner: str, old: str, new: str | None) -> str:
     """Dew's API at the base holds `owner.old`, a constructor's parameter, and the change renames it
     `owner.new` (None: keeps it), committed: `recorded` the base, `change` the head. The rename to declare."""
-    (root / "src/dew").mkdir(parents=True, exist_ok=True)
+    package = root / "src" / "dew"  # the scratch commit's own Dew, which the tool reads at each commit
+    package.mkdir(parents=True, exist_ok=True)
+    (package / "__init__.py").write_text("")
     api = "class {0}:\n    def __init__(self, {1}):\n        self.{1} = {1}\n"
-    (root / "src/dew/api.py").write_text(api.format(owner, old))
-    git(root, "add", "src/dew")
+    (package / "api.py").write_text(api.format(owner, old))
+    git(root, "add", "src")
     git(root, "commit", "-qm", "Dew's API")
     git(root, "checkout", "-q", "-b", "change")
-    (root / "src/dew/api.py").write_text(api.format(owner, new or old))
+    (package / "api.py").write_text(api.format(owner, new or old))
     git(root, "commit", "-qam", "Dew's API renamed", "--allow-empty")
-    return f"{owner}.{old}={owner}.{new or old}"
+    return f"dew.api.{owner}.{old}=dew.api.{owner}.{new or old}"
 
 
 def recordings(root: Path) -> dict[str, bytes]:
@@ -111,25 +114,14 @@ def rewrite(root: Path, relative: str, spans: list[tuple[ast.AST, str]]) -> None
     (root / relative).write_bytes(text)
 
 
-def renamed_keyword(root: Path, relative: str, name: str, new: str) -> None:
-    """Keyword `name` renamed `new` everywhere the program passes it."""
-    source = (root / relative).read_text()
-    spans = [(keyword, f"{new}={ast.get_source_segment(source, keyword.value)}")
-             for keyword in passed(source) if keyword.arg == name]
-    assert spans
-    rewrite(root, relative, spans)
-
-
 def test_a_rename_rewrites_the_digests_of_the_programs_it_reaches_and_keeps_every_other_byte(site):
+    """A variable renamed in the lm cell's file and the hero: every capture naming their programs takes the
+    new digest, and nothing else of it changes, byte for byte."""
     before = recordings(site)
     shown = programs(site)
-    shared = sorted({keyword.arg for keyword in passed(shown["lm"])} &
-                    {keyword.arg for keyword in passed(shown["hero.py"])})
-    declared = api_renamed(site, "Config", shared[0], f"{shared[0]}_renamed")
-    for relative in (FRAMEWORK, HERO):
-        renamed_keyword(site, relative, shared[0], f"{shared[0]}_renamed")
-    assert redigest(site).returncode == 1 and recordings(site) == before, "a rename not declared"
-    assert redigest(site, declared).returncode == 0
+    for relative, program in ((FRAMEWORK, "lm"), (HERO, "hero.py")):
+        renamed_everywhere(site, relative, (variables(shown[program])[0],), "renamed_variable")
+    assert redigest(site).returncode == 0
     after = recordings(site)
     changed = {path for path in before if before[path] != after[path]}
     assert {"site/src/data/capture.json", "site/public/examples/framework/lm/capture.json"} <= changed
@@ -142,7 +134,22 @@ def test_a_rename_rewrites_the_digests_of_the_programs_it_reaches_and_keeps_ever
     assert (hero["cell_sha256"], hero["script_sha256"]) == (program_digest(site, "hero"),
                                                             program_digest(site, "hero.py"))
     # Run again, it finds every recording of the program the page shows.
-    assert redigest(site, declared).returncode == 0 and recordings(site) == after
+    assert redigest(site).returncode == 0 and recordings(site) == after
+
+
+def test_a_rename_of_dews_api_keeps_a_recording_only_as_declared_and_where_it_holds(site):
+    """A keyword to a class Dew defines, renamed as Dew renames it: kept only under that rename's declaration
+    (--rename dew.api.Config.steps=dew.api.Config.num_steps), which the two commits' Dew must hold; the same
+    spelling passed to another callable (dict) is not that rename, and keeps no recording."""
+    recorded(site, "from dew.api import Config\nprint(Config(steps=3), dict(steps=3))\n")
+    declared = api_renamed(site, "Config", "steps", "num_steps")
+    before = recordings(site)
+    renamed = "from dew.api import Config\nprint(Config(num_steps=3), dict({}=3))\n"
+    for spelled, declaring, kept in (("steps", (), False), ("num_steps", (declared,), False),
+                                     ("steps", (declared,), True)):
+        (site / TEXT).write_text(renamed.format(spelled))
+        assert redigest(site, *declaring).returncode == (0 if kept else 1), (spelled, declaring)
+        assert (recordings(site) != before) == kept
 
 
 def an_operation(source: str) -> tuple[ast.Attribute, str]:
@@ -163,7 +170,8 @@ def test_a_program_that_runs_another_operation_keeps_no_recording(site):
     node, other = an_operation(source)
     rewrite(site, HERO, [(node, f"{ast.get_source_segment(source, node.value)}.{other}")])
     assert programs(site)["hero.py"] != source, "the hero's script is a recorded program"
-    for declared in ((), (f"{node.attr}={other}",), (unchanged,), ("Config.steps=Config.absent",)):
+    absent = "dew.api.Config.steps=dew.api.Config.absent"
+    for declared in ((), (f"{node.attr}={other}",), (unchanged,), (absent,)):
         assert redigest(site, *declared).returncode == 1 and recordings(site) == before, declared
 
 
@@ -253,7 +261,7 @@ def recorded(root: Path, source: str) -> None:
      "value = 9\ndef f(value=0):\n    return value\nprint(f())\n", False),
     ("x = 1\nprint(f'{x!r}')\n", "x = 1\nprint(f'{x!s}')\n", False),
     ("x = 1\nprint(f'{x=}')\n", "x = 1\nprint(f'{ x = }')\n", False),
-    ("print(dict(steps=3))\nsteps = 1\n", "print(dict(num_steps=3))\nsteps = 1\n", True),
+    ("print(dict(steps=3))\nsteps = 1\n", "print(dict(num_steps=3))\nsteps = 1\n", False),
     ("def f(x):\n    return x\nprint(f(x=1))\n", "def f(y):\n    return y\nprint(f(y=1))\n", True),
     ("def f(x):\n    return x\nprint(f(x=1))\n", "def f(y):\n    return y\nprint(f(x=1))\n", False),
     ("def f(x):\n    return x\nprint(f(x=1))\n", "def f(x):\n    return x\nprint(f(y=1))\n", False),
@@ -265,20 +273,23 @@ def recorded(root: Path, source: str) -> None:
     ("class C:\n    def m(self, x):\n        return x\nprint(C().m(x=1))\n",
      "class C:\n    def m(self, y):\n        return y\nprint(C().m(x=1))\n", False),
     ("class C:\n    def m(self, x):\n        return x\nprint(C().m(x=1))\n",
-     "class C:\n    def m(self, y):\n        return y\nprint(C().m(y=1))\n", True),
+     "class C:\n    def m(self, y):\n        return y\nprint(C().m(y=1))\n", False),
+    ("def unused(x):\n    return x\nprint(dict(x=1))\n",
+     "def unused(y):\n    return y\nprint(dict(y=1))\n", False),
     ("def f(x=0, **options):\n    return x, options['y']\nprint(f(y=1))\n",
      "def f(y=0, **options):\n    return y, options['y']\nprint(f(y=1))\n", False),
 ], ids=["an alias renamed", "an alias added", "an alias that takes another import's name",
         "an imported name given an alias", "an alias added to a dotted import", "an alias taken from one",
         "two variables swapped",
         "a parameter renamed to another variable's name", "an f-string's conversion", "an f-string's label",
-        "a keyword renamed beside a variable of its spelling",
+        "a keyword to a builtin renamed beside a variable of its spelling",
         "a function's parameter and its keyword renamed",
         "a function's parameter renamed and not its keyword", "a keyword renamed and not its parameter",
         "a key a **kwargs collects renamed", "a class's parameter and its keyword renamed",
         "a lambda's parameter renamed and not its keyword",
         "a method's parameter renamed and not its keyword",
-        "a method's parameter and its keyword renamed", "a key a **kwargs collected becomes a parameter"])
+        "a method's parameter and its keyword renamed", "a key a **kwargs collected becomes a parameter",
+        "another callable's keyword renamed beside a parameter"])
 def test_the_programs_parsed_roles_decide_what_is_a_rename(site, before, after, kept):
     """A rename is read in the parsed program: an import's name and its binding apart, a parameter a
     variable and the keyword a call to its function passes it, an f-string's conversion and literal text
@@ -292,14 +303,15 @@ def test_the_programs_parsed_roles_decide_what_is_a_rename(site, before, after, 
     assert changed == ({"site/public/examples/text/capture.json"} if kept else set())
 
 
-def a_good_rename_writes_nothing(site: Path, relative: str) -> None:
-    """The first keyword `relative` passes renamed, a good rename, and the refusal the base's recordings
-    hold writes nothing."""
+def a_good_rename_writes_nothing(site: Path, relative: str, broken: str) -> None:
+    """A variable `relative` defines renamed, a good rename, and the refusal the base's capture `broken` holds
+    writes nothing; with `broken` as it was before, the same rename is written."""
     before = recordings(site)
-    name = passed((site / relative).read_text())[0].arg
-    renamed_keyword(site, relative, name, f"{name}_renamed")
+    renamed_everywhere(site, relative, (variables((site / relative).read_text())[0],), "renamed_variable")
     assert redigest(site).returncode == 1
     assert recordings(site) == before
+    git(site, "checkout", "-q", "HEAD~1", "--", broken)
+    assert redigest(site).returncode == 0 and recordings(site) != before
 
 
 def test_a_refusal_found_after_a_good_rename_writes_nothing(site):
@@ -308,7 +320,7 @@ def test_a_refusal_found_after_a_good_rename_writes_nothing(site):
     capture = site / "site/src/data/capture.json"
     capture.write_bytes(capture.read_bytes().replace(b'"cell_sha256": "', b'"cell_sha256":"'))
     git(site, "commit", "-qam", "a capture written by hand")
-    a_good_rename_writes_nothing(site, HERO)
+    a_good_rename_writes_nothing(site, HERO, "site/src/data/capture.json")
 
 
 def test_a_recording_already_of_other_code_writes_nothing(site):
@@ -316,4 +328,4 @@ def test_a_recording_already_of_other_code_writes_nothing(site):
     capture = json.loads(stale.read_text())
     stale.write_text(stale.read_text().replace(capture["script_sha256"], "0" * 64))
     git(site, "commit", "-qam", "a stale recording")
-    a_good_rename_writes_nothing(site, FRAMEWORK)
+    a_good_rename_writes_nothing(site, FRAMEWORK, "site/public/examples/framework/jepa/capture.json")
