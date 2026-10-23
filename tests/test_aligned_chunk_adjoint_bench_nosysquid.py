@@ -7,6 +7,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from probe_aligned_chunk_adjoint_nosysquid import ORIGINAL, chunk_adjoint, chunk_adjoint_wy_source
+from dew.nn.attention import forward_mode_attention
+from dew.nn.kernels import recurrence_chunk
+
+
+def unregrouped(*args, **kwargs):
+    with forward_mode_attention():
+        return recurrence_chunk.chunk_delta_rule(*args, **kwargs)
 
 
 @pytest.mark.parametrize("variant", ["current", "chunk-adjoint", "chunk-adjoint-fast", "comp-core"])
@@ -18,8 +25,8 @@ def test_backward_wall_time(variant):
         os.environ["DEW_PROBE_REDUCE"] = "1"
         dots.wide_dot = dot
         dots.install(CORE)
-    fn = {"current": ORIGINAL, "chunk-adjoint": chunk_adjoint,
-          "chunk-adjoint-fast": chunk_adjoint_wy_source, "comp-core": ORIGINAL}[variant]
+    fn = {"current": unregrouped, "chunk-adjoint": chunk_adjoint,
+          "chunk-adjoint-fast": recurrence_chunk.chunk_delta_rule, "comp-core": unregrouped}[variant]
     shape = (2, 4096, 16, 128)
     rng = jax.random.split(jax.random.key(20261023), 7)
     q, k, v = (jax.random.normal(key, shape) for key in rng[:3])
