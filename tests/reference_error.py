@@ -76,7 +76,8 @@ FACTOR = 2.0
 
 ROW_FACTOR = 4.0
 """How far Dew's worst row may sit from float64 against the reference's worst
-row (`rows_over`; check 1's at rows of one or two values is NARROW_FACTORS'). An RMS over every entry averages a few wrong rows into a
+row (`rows_over`; check 1's at rows of one or two values is NARROW_FACTORS').
+An RMS over every entry averages a few wrong rows into a
 large tensor, so each comparison also holds Dew's worst row to the
 reference's. The worst of many rows is an extreme value, not an average,
 and parts further by chance: over the suite's 3,660 comparisons whose rows
