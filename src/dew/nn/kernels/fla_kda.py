@@ -108,7 +108,7 @@ class IntraRows(_Launch):
     NAME = "intra_rows"
     KEYS, VALUES = "k", None
     # fla autotunes BH over 1, 2, 4, 8 and warps over 1, 2, 4, 8 (chunk_intra_token_parallel.py:13-20).
-    revision: int = 2
+    revision: int = 3
     SPACES = _spaces(frozenset(Tiles(0, 0, warps, 1, bh) for bh in (1, 2, 4, 8) for warps in (1, 2, 4, 8)))
     PICKS = _picks(Tiles(0, 0, 4, 1, 4))
 
