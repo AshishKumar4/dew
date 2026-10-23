@@ -66,3 +66,22 @@ if len(sys.argv) > 3:
         print("LEAF", name, "first", np.array2string(first.theirs[:, index], precision=2),
               "second", np.array2string(second.theirs[:, index], precision=2), f"interval {low:.3f} {high:.3f}",
               flush=True)
+
+if len(sys.argv) > 3 and sys.argv[3] == "flips":
+    amax = np.float32(0.01) * np.float32(448)
+    multiplier = np.float32(np.float32(1) / amax) * np.float32(448)
+    lat32_fn = jax.jit(latents)
+    with jax.enable_x64(True):
+        lat64_fn = jax.jit(latents)
+        wide = widened(params)
+    flips = []
+    for seed in range(int(sys.argv[4])):
+        (hidden,) = hidden_draw(seed)
+        lat32 = np.asarray(lat32_fn(params, hidden))
+        with jax.enable_x64(True):
+            lat64 = np.asarray(lat64_fn(wide, widened(hidden)))
+        codes32 = (lat32 * multiplier).astype(jnp.float8_e4m3fn)
+        codes64 = (lat64.astype(np.float32) * multiplier).astype(jnp.float8_e4m3fn)
+        flips.append(int(np.sum(codes32.astype(np.float32) != codes64.astype(np.float32))))
+    flips = np.asarray(flips)
+    print("FLIPS seeds", len(flips), "with a flip", int(np.sum(flips > 0)), "first", np.nonzero(flips)[0][:10].tolist(), flush=True)
