@@ -2185,6 +2185,51 @@ def test_a_training_stream_says_it_never_runs_out_by_its_stages_read_in_turn(ord
     assert said is endless
 
 
+def test_a_finite_pass_repeated_after_its_batch_is_one_global_order_on_any_number_of_readers():
+    """Three records cut, batched in twos and the batches repeated: the pass's one whole batch is
+    replayed, the same records in the same steps on one reader or two."""
+    chain = _tagged(1, 8).take(3).batch(2).repeat()
+    loader = compile(chain, loading=READ)
+    alone = [sorted(step) for step in _steps(loader.train(DataPartition()), 3)]
+    shares = [_steps(loader.train(DataPartition(index, 2)), 3) for index in range(2)]
+    together = [sorted(first + second) for first, second in zip(*shares, strict=True)]
+    assert together == alone == [[100, 101]] * 3
+
+
+def _steps(reader, count):
+    try:
+        return [[int(value) for value in batch["id"]] for batch in itertools.islice(reader, count)]
+    finally:
+        reader.close()
+
+
+@pytest.mark.parametrize(("repeated", "endless"), [(False, False), (True, True)])
+def test_a_grain_transformation_of_its_own_may_end_an_order_unless_a_repeat_follows(repeated, endless):
+    """A Grain transformation of a chain's own (`grain`) may end an order a repeat made endless, as
+    one that keeps the first two records does: its stream does not say it never runs out unless a
+    repeat after it makes it so, and it reads what that makes."""
+    from dew.data.dataset import stream_endless
+
+    chain = _tagged(1, 8).take(4).repeat().grain(lambda rows: rows[:2])
+    reader = compile((chain.repeat() if repeated else chain).batch(1), read="indexed",
+                     loading=READ).train(DataPartition())
+    said = stream_endless(reader)
+    assert len(_ids(reader, 6)) == (6 if endless else 2)
+    assert said is endless
+
+
+def test_a_streamed_mix_of_a_repeated_part_and_one_written_without_says_it_never_runs_out():
+    """A stream cut per share repeats a part written without a repeat at its own root, so a mix of
+    a repeated part and one written without never runs out: its stream says so and reads on."""
+    from dew.data.dataset import stream_endless
+
+    reader = compile(mix([_tagged(1, 4).repeat(), _tagged(2, 2)], weights=(1, 1)).batch(1), read="streamed",
+                     loading=READ).train(DataPartition())
+    said = stream_endless(reader)
+    assert len(_ids(reader, 12)) == 12
+    assert said
+
+
 def test_a_mixture_of_a_repeated_corpus_and_one_read_once_counts_what_a_run_reads():
     """A mix of a corpus of 8 repeated and one of 4 written without a repeat, at even weights, ends
     where the one read once does, at 8, and a run reads that many records: the order repeats
