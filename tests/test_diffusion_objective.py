@@ -365,6 +365,12 @@ def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_
         # The draw is its seed, the step's key, which draws the times, the noise and the dropped rows.
         return (np.int64(seed),)
 
+    import time
+
+    from reference_error import seeds_for
+    began = time.perf_counter()
+    print("SIZED", probability, seeds_for(reference, draw, f"null dropout at {probability}", truth_fn=truth,
+                                          dew_fn=dew), f"{time.perf_counter() - began:.0f}s", flush=True)
     assert_as_exact(dew, reference, draw, f"null dropout at {probability}",
                     seeds=NULL_DROPOUT_SEEDS[probability], truth_fn=truth)
 
