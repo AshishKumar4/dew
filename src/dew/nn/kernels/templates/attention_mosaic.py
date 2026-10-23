@@ -257,7 +257,7 @@ would hold past a block's shared memory."""
 
 def _rows(ref, row, head, first, count: int):
     """A query block's per-row statistic `[count]` of a `[B, H, Q]` array, in a row's layout."""
-    return plgpu.load(ref.at[row, head, pl.ds(first, count)], (), layout=mosaic_sm90.ROW, optimized=False)
+    return plgpu.load(ref.at[row, head, pl.ds(first, count)], layout=mosaic_sm90.ROW, optimized=False)
 
 
 class _Tile(NamedTuple):
