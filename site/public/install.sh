@@ -9,25 +9,23 @@
 #
 #   -y              take every default without asking (or DEW_YES=1); so does a run
 #                   with no terminal
-#   --cuda 12|13    the CUDA build, whatever the driver says
+#   --cuda N        the CUDA build N (one of cuda_builds below), whatever the driver says
 #   --tpu, --cpu    the TPU or the CPU build
 #   --venv PATH     install into the virtual environment at PATH, created if missing
 #   --conda NAME    install into the conda environment NAME, created if missing
 #   --version X     install dewml X instead of the newest release
 #   --pip           use pip instead of uv
 #
-# The CUDA build follows the driver and every GPU's SM, using the generated minima below
-# (JAX's installation guide; NVIDIA's CUDA release notes, table 3). Dew needs Python python_min or newer.
+# The CUDA build is the newest of cuda_builds below, each build:least driver:least SM, generated from
+# dew.telemetry.builds.CUDA_BUILDS, that the driver and every GPU's SM run. Dew needs Python python_min or
+# newer.
 set -eu
 
 # BEGIN install facts (site/scripts/gen_install.py)
 python_min=3.12
 package_index=https://pypi.dewml.dev/simple
 pip_least='pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70'
-cuda13_driver=580
-cuda13_sm=7.5
-cuda12_driver=525
-cuda12_sm=5.2
+cuda_builds='cuda13:580:7.5 cuda12:525:5.2'
 # END install facts
 
 if [ -t 1 ]; then
@@ -40,6 +38,8 @@ die() {
 	printf '%serror:%s %s\n' "$red" "$plain" "$1" >&2
 	exit 1
 }
+# The CUDA majors of cuda_builds, each after a space.
+majors() { for entry in $cuda_builds; do printf ' %s' "${entry%%:*}"; done | sed 's/cuda//g'; }
 # A word as a shell would read it back: as it is when it is plain, else in single quotes.
 quote() {
 	case $1 in
@@ -52,7 +52,8 @@ yes=${DEW_YES:-} build='' target='' conda_name='' version='' use_pip=''
 while [ $# -gt 0 ]; do
 	case $1 in
 		-y | --yes) yes=1 ;;
-		--cuda) [ "${2:-}" = 12 ] || [ "${2:-}" = 13 ] || die "--cuda takes 12 or 13"; build=cuda$2; shift ;;
+		--cuda) case " $cuda_builds " in *" cuda${2:-}:"*) ;; *) die "--cuda takes one of$(majors)" ;; esac
+			build=cuda$2; shift ;;
 		--tpu) build=tpu ;;
 		--cpu) build=cpu ;;
 		--venv) [ -n "${2:-}" ] || die "--venv needs a path"; target=$2; shift ;;
@@ -91,11 +92,16 @@ if [ -n "$gpus" ]; then
 	sm=$(printf '%s\n' "$gpus" | cut -s -d, -f3 | tr -d ' ' | sort -n | head -n 1)
 	at_least() { awk -v sm="$sm" -v need="$1" 'BEGIN { exit !(sm + 0 >= need) }'; }
 	major=${driver%%.*}
-	if [ "$major" -lt "$cuda12_driver" ]; then runs=cpu why="CUDA 12 needs driver $cuda12_driver or newer; update the driver to use the GPU"
-	elif [ -z "$sm" ]; then runs=cpu why="nvidia-smi did not report its compute capability; choose with --cuda 12 or 13"
-	elif [ "$major" -ge "$cuda13_driver" ] && at_least "$cuda13_sm"; then runs=cuda13
-	elif at_least "$cuda12_sm"; then runs=cuda12
-	else runs=cpu why="SM $sm is older than JAX's CUDA builds support"
+	# The oldest build, the last entry, and its least driver.
+	oldest=${cuda_builds##* } least=${cuda_builds##* } least=${least#*:} least=${least%%:*}
+	runs=cpu why="SM $sm is older than JAX's CUDA builds support" name=${oldest%%:*}
+	if [ "$major" -lt "$least" ]; then why="CUDA ${name#cuda} needs driver $least or newer; update the driver to use the GPU"
+	elif [ -z "$sm" ]; then why="nvidia-smi did not report its compute capability; choose with --cuda, one of$(majors)"
+	else
+		for entry in $cuda_builds; do
+			least=${entry#*:} least=${least%%:*}
+			if [ "$major" -ge "$least" ] && at_least "${entry##*:}"; then runs=${entry%%:*}; break; fi
+		done
 	fi
 	if [ "$runs" = cpu ]; then hardware="$gpu, driver $driver: no GPU build, as $why"
 	else hardware="$gpu, driver $driver, runs CUDA ${runs#cuda}"
