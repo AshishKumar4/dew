@@ -555,7 +555,8 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
     items = [shlex.split(item.split(" && ", 1)[1]) for item in ci.coverage_items(300.0, {})]
     assert items and all({"--python=3.12", "--cache=off", f"--coverage={ci.ARTIFACTS}"} <= set(words)
                          for words in items)
-    tests = [word.removeprefix("--tests=") for words in items for word in words if word.startswith("--tests=")]
+    tests = [word.removeprefix("--tests=") for words in items for word in words
+             if word.startswith("--tests=")]
     assert sorted(name for names in tests for name in names.split()) == [
         "tests/test_negative.py", "tests/test_positive.py"]
     interpreter(tmp_path, "3.12")
@@ -651,6 +652,16 @@ SPLIT = ("import pytest\n@pytest.mark.parametrize('n', [2, 10, \"it's\", 'a b'])
 Each test it runs writes its id to runs.log."""
 
 
+def logged_test(name: str) -> str:
+    """One more test for SPLIT's file, which writes its name to runs.log as it runs."""
+    return f"def {name}(): open('runs.log', 'a').write('{name}\\n')\n"
+
+
+def logged(root: Path) -> list[str]:
+    """What runs.log saw run, a test a line."""
+    return (root / "runs.log").read_text().splitlines() if (root / "runs.log").exists() else []
+
+
 def split_entries(ci, target: float, timings: dict | None = None) -> list[dict]:
     return [entry for entry in ci.plan(target, timings or {}) if entry["python"] == "3.12" and entry["split"]]
 
@@ -662,8 +673,7 @@ def ran_by(ci, tmp_path, monkeypatch, entries: list[dict]) -> list[list[str]]:
         (tmp_path / "runs.log").unlink(missing_ok=True)
         [verdict] = filled(ci, monkeypatch, entry, tmp_path / f"verdict-{index}.json")
         assert verdict["exitCode"] == 0, verdict["output"]
-        logged = (tmp_path / "runs.log").read_text().splitlines() if (tmp_path / "runs.log").exists() else []
-        assert len(logged) == len(verdict["tests"])
+        assert len(logged(tmp_path)) == len(verdict["tests"])
         ran.append(sorted(verdict["tests"]))
     return ran
 
@@ -673,7 +683,7 @@ def test_a_split_files_groups_run_every_test_once(ci, tmp_path, monkeypatch):
     (`ranges`), its task started from .armada.json's command, so the groups together run every test once:
     one added since that run (test_new), ids that sort as strings, and one holding a quote and a space,
     included. Without that run's times, each group is cut by count, and every test still runs once."""
-    (tmp_path / "tests/test_split.py").write_text(SPLIT + "def test_new(): pass\n")
+    (tmp_path / "tests/test_split.py").write_text(SPLIT + logged_test("test_new"))
     interpreter(tmp_path, "3.12")
     every = sorted(["tests/test_split.py::test_n[2]", "tests/test_split.py::test_n[10]",
                     "tests/test_split.py::test_n[it's]", "tests/test_split.py::test_n[a b]",
@@ -719,20 +729,19 @@ def test_a_split_rows_record_is_reused_only_for_the_tests_its_range_ran(ci, tmp_
         entries = split_entries(ci, 4.0)
         return [entry["bounds"] for entry in entries], ran_by(ci, tmp_path, monkeypatch, entries)
 
-    def logged() -> int:
-        return len((tmp_path / "runs.log").read_text().split()) if (tmp_path / "runs.log").exists() else 0
-
     first, ran = run(dict.fromkeys(nodes, 2.0))
     assert sorted(node for group in ran for node in group) == nodes
+    # The same total, so the same G/N, with times that would cut the file elsewhere.
+    lopsided = {nodes[0]: 5.0, **dict.fromkeys(nodes[1:], 1.0)}
     rows = {f"3.12:tests/test_split.py#{index}/2": bounds for index, bounds in enumerate(first, start=1)}
-    kept, _ = run(dict.fromkeys(nodes, 9.0), rows)
-    assert kept == first and logged() == 0, "kept ranges: the rows are reused, nothing runs"
-    moved, ran = run({nodes[0]: 6.0, **dict.fromkeys(nodes[1:], 1.0)})
-    assert moved != first and logged() > 0, "moved ranges at the same G/N run again"
+    kept, _ = run(lopsided, rows)
+    assert kept == first and not logged(tmp_path), "kept ranges: the rows are reused, nothing runs"
+    moved, ran = run(lopsided)
+    assert moved != first and logged(tmp_path), "moved ranges at the same G/N run again"
     assert sorted(node for group in ran for node in group) == nodes
-    (tmp_path / "tests/test_split.py").write_text(SPLIT + "def test_added(): pass\n")
+    (tmp_path / "tests/test_split.py").write_text(SPLIT + logged_test("test_added"))
     rows = {f"3.12:tests/test_split.py#{index}/2": bounds for index, bounds in enumerate(moved, start=1)}
-    again, ran = run(dict.fromkeys(nodes, 9.0), rows)
+    again, ran = run(dict.fromkeys(nodes, 2.0), rows)
     assert again == moved and "tests/test_split.py::test_added" in {node for group in ran for node in group}
 
 
