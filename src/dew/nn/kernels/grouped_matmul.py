@@ -695,13 +695,13 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # Every step's operand tiles come through the L2, rereads or not, a pair's multicast matrix tile
         # once for both; so do its prologue side tiles, but a cooperative tile's sides without the
         # contraction come once a consumer an output tile (`hopper.load_fixed`), as do its epilogue side
-        # tiles, a side with columns cut between the consumers. Counted so, the H100 sweep's Mixtral
-        # forward and input gradient pick within 10% of their best (they ran 1.17x and 1.15x).
+        # tiles, a side without rows read by both consumers. The stages arrive by bulk copy (TMA), and
+        # each step spends `_STEP_CLOCKS` outside the overlapped work.
         cooperative = config.warpgroups == 2
         loaded = (config.block_m + config.block_n / config.cluster) * config.block_k * size
         fixed = _side_tile_bytes(epilogue_sides, hooks.epilogue_axes, extents)
         if cooperative:
-            fixed += _side_tile_bytes(*_uncut(epilogue_sides, hooks.epilogue_axes, 'columns'), extents)
+            fixed += _side_tile_bytes(*_uncut(epilogue_sides, hooks.epilogue_axes), extents)
         for side, axes in zip(prologue_sides, hooks.prologue_axes, strict=True):
             tile = _side_tile_bytes((side,), (axes,), extents)
             if cooperative and self.CONTRACTED not in axes:
@@ -714,7 +714,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             program_staged=steps * step + config.block_m * config.block_n * out,
             program_exponentials=epilogue_exponentials, mode=_mode(tokens.dtype), steps=steps,
             stages=config.stages, serial_staged=rewritten, serial_exponentials=prologue_exponentials,
-            l2_bytes=tiles * (steps * loaded + fixed))
+            l2_bytes=tiles * (steps * loaded + fixed), bulk_loads=True,
+            step_clocks=_STEP_CLOCKS[config.warpgroups])
 
     def _multiprocessors(self, interpret: bool) -> int:
         # The interpreter runs one block (jax/_src/pallas/mosaic_gpu/interpret).
@@ -1053,6 +1054,13 @@ def _side_arrays(sides: tuple, axes_of: tuple) -> tuple:
     named 'width'."""
     return tuple((side.shape, tuple('width' if axis == 'columns' else axis for axis in axes),
                   jnp.dtype(side.dtype).itemsize) for side, axes in zip(sides, axes_of, strict=True))
+
+
+_STEP_CLOCKS = {1: 120.0, 2: 240.0}
+"""Clocks a Hopper mainloop step spends outside its overlapped loads and MMAs, by the warpgroups
+computing a tile: one warpgroup issuing its MMAs and waiting on its stages, two consumers handing the
+producer each stage back. Fitted with `stage_latency` to a canonical 8192^3 bf16 product at every
+fitting tile (CALIB-mainloop, H100 SXM), not to the MoE sweeps the ranking test holds the model to."""
 
 
 def _uncut(sides: tuple, axes_of: tuple) -> tuple[tuple, tuple]:

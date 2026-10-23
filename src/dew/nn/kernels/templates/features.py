@@ -91,8 +91,7 @@ def _predictions(costed: cost.Cost, facts: generation.GpuTarget) -> dict[str, fl
     service = 1.0 if not costed.program_flops else rate
     program = (cost.program_seconds(costed, service, clock)
                if service is not None and clock is not None else None)
-    waiting = (cost.waiting_seconds(costed, facts.load_latency, clock)
-               if facts.load_latency is not None and clock is not None else None)
+    waiting = cost.program_waiting(costed, facts)
     return {
         'flops': flops, 'intensity': intensity, 'balance': balance,
         'ridge': intensity / balance if intensity is not None and balance else None,

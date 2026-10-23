@@ -84,7 +84,8 @@ class Architecture:
     'fp32': IEEE fp32 on the CUDA cores, the rate a dot at Precision.HIGHEST takes), Hopper's warpgroup
     MMA, Blackwell's tensor memory columns (PTX ISA, tcgen05.alloc), and the model values of what only a
     measurement states, which the opt-in calibration replaces on a device (`GpuTarget.calibration`): the
-    global-memory load latency in multiprocessor clocks and the bytes the L2 serves a multiprocessor a
+    global-memory load latency in multiprocessor clocks, a bulk copy's (Hopper's TMA) issue-to-arrival
+    latency before its bytes stream (`stage_latency`), and the bytes the L2 serves a multiprocessor a
     clock; on a TPU the scoped VMEM limit at XLA's default, the VMEM a kernel may raise its limit to
     (`vmem_bytes`), and a grid step's fixed seconds."""
 
@@ -93,6 +94,7 @@ class Architecture:
     wgmma: bool = False
     tmem_columns: int | None = None
     load_latency: float | None = None
+    stage_latency: float | None = None
     l2_bytes_per_clock: float | None = None
     scoped_vmem: int | None = None
     vmem_bytes: int | None = None
@@ -108,7 +110,10 @@ class Architecture:
 # fp32 at half the rate (the GA102 and Ada whitepapers), which their catalogued peaks give
 # (`GpuTarget.tensor_rate`). Global-memory load latency in clocks, a pointer chase's (Luo et al.,
 # "Benchmarking and Dissecting the Nvidia Hopper GPU Architecture", IPDPS 2024, arXiv 2402.13499, Table
-# IV): A100 466.3, H800 478.8, RTX 4090 541.5. L2 bytes a multiprocessor a clock, Dew's streaming probe
+# IV): A100 466.3, H800 478.8, RTX 4090 541.5. A bulk copy's latency before its bytes stream, Hopper 850
+# clocks: a canonical 8192^3 bf16 product's two-stage Mosaic tiles, one load in flight, step time less
+# its transfer at the L2's rate and the step's issue (CALIB-mainloop, H100 SXM; the 22 tiles' times
+# within 10% rms, their pairwise order 219 of 231). L2 bytes a multiprocessor a clock, Dew's streaming probe
 # (L2PROBE, probe_l2.py) over SMs x clock: A100 5.43 TB/s -> 35.7, A10 4.74 -> 38.8, H100 SXM 13.2 -> 54.6.
 # A family no device of which was measured takes its nearest measured family's model values, said so
 # below; the opt-in calibration measures the device's own.
@@ -118,7 +123,7 @@ _AMPERE_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32':
                                 l2_bytes_per_clock=38.8)
 _TURING = Architecture('mma.sync', {'16bit': 1024, 'fp32': 128}, load_latency=541.5, l2_bytes_per_clock=38.8)
 _HOPPER = Architecture('wgmma', {'16bit': 4096, 'tf32': 2048, 'fp32': 256}, wgmma=True, load_latency=478.8,
-                       l2_bytes_per_clock=54.6)
+                       stage_latency=850.0, l2_bytes_per_clock=54.6)
 # Blackwell's tcgen05 family: no member measured, its latency and L2 Hopper's.
 _BLACKWELL = Architecture('tcgen05', {'16bit': 8192, 'tf32': 4096, 'fp32': 256}, tmem_columns=512,
                           load_latency=478.8, l2_bytes_per_clock=54.6)
@@ -258,6 +263,13 @@ class GpuTarget:
         """The global-memory load latency in multiprocessor clocks (the cost model's waiting term): the
         device's calibrated one, else its family's model value."""
         return self.calibration.get('load_latency', self.architecture.load_latency)
+
+    @property
+    def stage_latency(self) -> float | None:
+        """A bulk copy's (TMA's) issue-to-arrival latency in multiprocessor clocks before its bytes
+        stream (the waiting term of a launch staging by bulk copies): its family's model value, None
+        where it has none."""
+        return self.architecture.stage_latency
 
     @property
     def l2_bandwidth(self) -> float | None:
