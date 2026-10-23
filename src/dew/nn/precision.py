@@ -281,6 +281,54 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
     return product, rounded(tail - lost if subtract else lost + tail)
 
 
+@jax.custom_jvp
+def correctly_rounded_divide(numerator: jax.typing.ArrayLike, denominator: jax.typing.ArrayLike) -> jax.Array:
+    """The correctly rounded fp32 quotient, IEEE division's, on XLA's approximate
+    dividers too: XLA:CPU rewrites a division by a broadcast into a multiplication
+    by its reciprocal (openxla/xla#51148), and XLA:GPU's fp32 a / b is off IEEE on
+    30 to 50% of quotients (DIVIDE-a100, DIVIDE-h100 receipts), where a quantizer's
+    scales and a diffusion schedule's states must round as the reference's host or
+    CUDA division does (compressed-tensors' NVFP4, the FP8 block cast, PyTorch's
+    schedulers).
+
+    A Dekker TwoProduct gives the exact residual of the approximate
+    quotient, split into two fp32 values. One residual correction puts the
+    quotient within one ulp; comparing its exact residual with each
+    neighbour's half-spacing times the divisor chooses nearest-even.
+    That threshold product is exact because the half-spacing is a power
+    of two. The quantizer's observed scales and quotients keep these
+    intermediates normal; dense and midpoint checks hold the result to
+    NumPy's IEEE divide without enabling x64. Dense keeps its own precision.
+    A zero or non-finite quotient (a zero divisor, an overflow, a signed
+    zero) is the division's, which leaves no residual to correct. Its
+    derivative is the division's, as JAX differentiates `a / b`.
+    """
+    quotient = numerator / denominator
+    special = (quotient == 0) | ~jnp.isfinite(quotient)
+    plain = quotient
+    product, error = two_product(quotient, denominator, bit_split=True, subtract=True)
+    residual = (numerator - product) - error
+    quotient = quotient + residual / denominator
+    product, error = two_product(quotient, denominator, bit_split=True, subtract=True)
+    difference = numerator - product
+    high = difference - error
+    recovered = high - difference
+    low = (difference - (high - recovered)) - (error + recovered)
+    above, below = jnp.nextafter(quotient, jnp.inf), jnp.nextafter(quotient, -jnp.inf)
+    upper = (above - quotient) * 0.5 * denominator
+    lower = (quotient - below) * 0.5 * denominator
+    odd = (jax.lax.bitcast_convert_type(quotient, jnp.uint32) & 1) != 0
+    up = (high > upper) | ((high == upper) & ((low > 0) | ((low == 0) & odd)))
+    down = (high < -lower) | ((high == -lower) & ((low < 0) | ((low == 0) & odd)))
+    return jnp.where(special, plain, jnp.where(up, above, jnp.where(down, below, quotient)))
+
+
+@correctly_rounded_divide.defjvp
+def _divide_jvp(primals, tangents):
+    """The rounding is a selection among neighbours, so the quotient's tangent is the division's."""
+    return correctly_rounded_divide(*primals), jax.jvp(jnp.divide, primals, tangents)[1]
+
+
 def compensated_add(left, right):
     """Add two double-float values, `(hi, lo)` pairs whose sum is the value:
     `hi` is the sum rounded and `lo` what the rounding dropped (the his'
