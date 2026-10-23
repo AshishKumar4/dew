@@ -403,3 +403,393 @@ def rsqrt_rounded(x, fmt: Format) -> np.ndarray:
         else:
             result.flat[index] = float(fraction_rounded(midpoint, fmt))
     return result
+
+
+
+# Check 2 as a gate: a site's computation run one primitive at a time, each held to its contract.
+
+FLUSHES = True
+"""Whether the platform's float arithmetic flushes: XLA on the CPU lane treats a subnormal operand as
+zero and flushes a subnormal result to zero (FTZ and DAZ), jitted or eager, with YNNPACK's fusions or
+without (tests/test_op_certificates.py holds it, so a JAX that changes it fails there first). Every
+contract reads operands and results so; gradual underflow is IEEE's, not this lane's."""
+
+STRUCTURAL = frozenset({"jit", "pjit", "closed_call", "core_call", "custom_jvp_call", "custom_vjp_call",
+                        "custom_vjp_call_jaxpr", "remat", "checkpoint", "cond"})
+"""Primitives that only call a jaxpr of their own, which `certified` runs equation by equation in
+place of binding them (so a call's body is never compiled fused)."""
+
+
+def _format(dtype) -> Format | None:
+    return FORMATS.get(np.dtype(dtype).name)
+
+
+def _host(value):
+    """A value on the host: an array as NumPy's, a typed key as it is (its bits are its data)."""
+    import jax
+
+    if jax.dtypes.issubdtype(getattr(value, "dtype", np.float32), jax.dtypes.prng_key):
+        return value
+    return np.asarray(value)
+
+
+def _daz(value, fmt: Format) -> np.ndarray:
+    """`value` (float64) with every subnormal of `fmt` read as a zero of its sign, as the lane reads it."""
+    value = np.asarray(value, np.float64)
+    if not FLUSHES:
+        return value
+    return np.where(np.abs(value) < 2.0 ** fmt.emin, np.copysign(0.0, value), value)
+
+
+def _same(native, expected) -> np.ndarray:
+    """Bit for bit, element by element, zeros by sign and NaN by NaN."""
+    native, expected = np.asarray(native, np.float64), np.asarray(expected, np.float64)
+    return ((native == expected) & (np.signbit(native) == np.signbit(expected))) | (
+        np.isnan(native) & np.isnan(expected))
+
+
+def _flushed(native, rounded_value, fmt: Format) -> np.ndarray:
+    """Whether `native` is `rounded_value` (a result rounded with gradual underflow) as the lane holds
+    it: itself where it is normal, and where it is below the least normal or rounds onto it (a tiny
+    result, which the lane may detect before rounding) itself or a zero of its sign."""
+    native = np.asarray(native, np.float64)
+    exact = _same(native, rounded_value)
+    if not FLUSHES:
+        return exact
+    tiny = np.abs(rounded_value) <= 2.0 ** fmt.emin
+    return exact | (tiny & (native == 0) & (np.signbit(native) == np.signbit(rounded_value)))
+
+
+def _correctly_rounded(native, hi, lo, fmt: Format) -> np.ndarray:
+    return _flushed(native, rounded(hi, lo, fmt), fmt)
+
+
+def _faithful(native, low, high, fmt: Format) -> np.ndarray:
+    """Whether `native` is one of the two values of `fmt` around an exact value enclosed in [low, high]
+    (float64, outward), or the value itself where it is one: below the enclosure's least neighbour or
+    above its greatest is unfaithful. A zero of either sign is faithful to a tiny value."""
+    native = np.asarray(native, np.float64)
+    down = rounded(low, np.zeros_like(low), fmt)
+    down = np.where(down > low, down - _quantum(np.abs(down), fmt), down)
+    up = rounded(high, np.zeros_like(high), fmt)
+    up = np.where(up < high, up + _quantum(np.abs(up), fmt), up)
+    spacing = _quantum(np.maximum(np.abs(down), np.abs(up)), fmt)
+    inside = (native >= down) & (native <= up) & (up - down <= 2 * spacing)
+    tiny = FLUSHES & (np.minimum(np.abs(low), np.abs(high)) <= 2.0 ** fmt.emin) & (native == 0)
+    return inside | tiny | (np.isnan(native) & np.isnan(low))
+
+
+def _outward(end: fractions.Fraction, direction: float) -> float:
+    """The float64 nearest an exact end, moved one step `direction` where rounding took it inward."""
+    value = float(end)
+    inward = fractions.Fraction(value) > end if direction < 0 else fractions.Fraction(value) < end
+    return math.nextafter(value, direction) if inward else value
+
+
+def _enclosed(function, values, bits: int = 96) -> tuple[np.ndarray, np.ndarray]:
+    """An outward float64 enclosure of `function` (an mpmath interval function) at each value."""
+    low, high = np.empty(values.shape), np.empty(values.shape)
+    with interval_precision(bits) as iv:
+        for index, value in enumerate(values.flat):
+            if not np.isfinite(value):
+                low.flat[index] = high.flat[index] = np.nan
+                continue
+            a, b = interval_ends(function(iv, iv.mpf(float(value))), bits)
+            low.flat[index] = _outward(a, -math.inf)
+            high.flat[index] = _outward(b, math.inf)
+    return low, high
+
+
+def _erfinv_enclosed(values, bits: int = 96) -> tuple[np.ndarray, np.ndarray]:
+    """An outward enclosure of erfinv at each value in (-1, 1): mpmath's erfinv at `bits`, widened by
+    2^-(bits - 24) of itself, verified at its two ends by erfc at `bits` + 64 bits, 2^40 times finer
+    than the width (erfinv is odd and erfc decreasing: erfc(b) < 1 - |x| < erfc(a) for |x|'s ends)."""
+    import mpmath
+
+    low, high = np.empty(values.shape), np.empty(values.shape)
+    for index, value in enumerate(values.flat):
+        if not -1 < value < 1:
+            low.flat[index] = high.flat[index] = np.copysign(np.inf, value) if abs(value) == 1 else np.nan
+            continue
+        with mpmath.workprec(bits):
+            estimate = mpmath.erfinv(mpmath.mpf(float(value)))
+            width = abs(estimate) * mpmath.mpf(2) ** -(bits - 24) + mpmath.mpf(2) ** -(bits + 40)
+            ends = float(estimate - width), float(estimate + width)
+        a, b = math.nextafter(ends[0], -math.inf), math.nextafter(ends[1], math.inf)
+        with mpmath.workprec(bits + 64):
+            near, far = (a, b) if value >= 0 else (-b, -a)
+            rest = 1 - abs(mpmath.mpf(float(value)))
+            if not (mpmath.erfc(mpmath.mpf(far)) < rest < mpmath.erfc(mpmath.mpf(near))):
+                raise ArithmeticError(f"erfinv({value!r}) not enclosed at {bits} bits")
+        low.flat[index], high.flat[index] = a, b
+    return low, high
+
+
+def _sum_holds(native, terms, axis, fmt: Format) -> np.ndarray:
+    """Whether each native sum of `terms` (exact float64 values) along `axis` is within the bound of any
+    order of summing them in `fmt`, fused multiply-adds included: γ_n Σ|terms| (Higham, Accuracy and
+    Stability, 2002, §3.1, for n terms, n - 1 roundings at most along any path), plus a flushed partial
+    sum's 2^emin at each of the n roundings, around the terms' float64-rounded exact sum (`exact_sum`,
+    within 2^-53 of it relative to Σ|terms|, added to the allowance)."""
+    count = terms.shape[axis]
+    magnitude = magnitude_sum(terms, axis)
+    allowance = (gamma(max(count, 1), fmt) + 2.0 ** -52) * magnitude + count * 2.0 ** fmt.emin
+    error = np.abs(np.asarray(native, np.float64) - exact_sum(terms, axis))
+    return np.isfinite(error) & (error <= np.nextafter(allowance, np.inf))
+
+
+def _read(value) -> np.ndarray:
+    """An operand as float64, as the lane reads it (`_daz`) where it is a float of a known format."""
+    fmt = _format(np.asarray(value).dtype)
+    return np.asarray(value, np.float64) if fmt is None else _daz(np.asarray(value, np.float64), fmt)
+
+
+def _floats(operands, fmt):
+    return [_daz(np.asarray(value, np.float64), fmt) for value in operands]
+
+
+def _rn(build):
+    """A correctly rounded contract: `build(*operands)` the exact result as a double-double."""
+    def contract(params, operands, result, fmt):
+        hi, lo = build(*_floats(operands, fmt))
+        return _correctly_rounded(result, hi, lo, fmt)
+    return contract
+
+
+def _product(a, b):
+    product = a * b
+    return product, np.zeros_like(product)
+
+
+def _quotient(a, b):
+    quotient = a / b
+    return quotient, np.zeros_like(quotient)
+
+
+def _root(a):
+    root = np.sqrt(a)
+    # float64's correctly rounded root of a p-bit value is never within 2^-(2p+2) of a p-bit midpoint.
+    return root, np.zeros_like(root)
+
+
+def _converted(params, operands, result, fmt):
+    """A cast: correctly rounded to a float format, and to an integer or boolean as NumPy casts it
+    (truncating a float, nonzero to true), bit for bit."""
+    (value,) = operands
+    if fmt is None:
+        return np.asarray(result) == _read(value).astype(np.asarray(result).dtype)
+    source = _format(np.asarray(value).dtype)
+    value = np.asarray(value, np.float64)
+    if source is not None:
+        value = _daz(value, source)
+    return _correctly_rounded(result, value, np.zeros_like(value), fmt)
+
+
+def _transcendental(enclose):
+    def contract(params, operands, result, fmt):
+        (value,) = _floats(operands, fmt)
+        return _faithful(result, *enclose(value), fmt)
+    return contract
+
+
+def _reduced_sum(params, operands, result, fmt):
+    (terms,) = _floats(operands, fmt)
+    axes = tuple(params["axes"])
+    moved = np.moveaxis(terms, axes, tuple(range(-len(axes), 0)))
+    flat = moved.reshape(*moved.shape[:moved.ndim - len(axes)], -1)
+    return _sum_holds(result, flat, -1, fmt)
+
+
+def _dot(params, operands, result, fmt):
+    """A dot_general's products, exact in float64 for operands no wider than fp32, summed (`_sum_holds`)
+    over the contracting dimensions in any order."""
+    (contract_l, contract_r), (batch_l, batch_r) = params["dimension_numbers"]
+    left, right = (_read(value) for value in operands)
+    free_l = [axis for axis in range(left.ndim) if axis not in contract_l and axis not in batch_l]
+    free_r = [axis for axis in range(right.ndim) if axis not in contract_r and axis not in batch_r]
+    left = np.transpose(left, [*batch_l, *free_l, *contract_l])
+    right = np.transpose(right, [*batch_r, *free_r, *contract_r])
+    batch = left.shape[:len(batch_l)]
+    width = int(np.prod(left.shape[len(batch) + len(free_l):], dtype=np.int64))
+    left = left.reshape(*batch, -1, 1, width)
+    right = right.reshape(*batch, 1, -1, width)
+    products = left * right
+    native = np.asarray(result, np.float64).reshape(products.shape[:-1])
+    return _sum_holds(native, products, -1, fmt).reshape(np.shape(result))
+
+
+def _exactly(oracle):
+    """A contract with no rounding: the result is `oracle(params, operands)` bit for bit (a comparison,
+    a selection, a move of data, an integer operation), floats read as the lane reads them."""
+    def contract(params, operands, result, fmt):
+        read = [_read(value).astype(np.asarray(value).dtype) if _format(np.asarray(value).dtype) else
+                np.asarray(value) for value in operands]
+        expected = np.asarray(oracle(params, *read))
+        native = np.asarray(result)
+        if native.dtype.kind in "biu" or expected.dtype.kind in "biu":
+            return np.broadcast_to(native == expected.astype(native.dtype), native.shape)
+        return _same(native, expected)
+    return contract
+
+
+def _selected(params, which, *cases):
+    return np.choose(np.asarray(which).astype(np.int64), cases)
+
+
+def _broadcast(params, value):
+    shape, dimensions = params["shape"], params["broadcast_dimensions"]
+    expanded = np.reshape(value, [value.shape[dimensions.index(axis)] if axis in dimensions else 1
+                                  for axis in range(len(shape))])
+    return np.broadcast_to(expanded, shape)
+
+
+def _random_bits(params, operands, result, fmt):
+    """Random bits are integers, whatever program computes them: the bits a separate `jax.random.bits`
+    of the same key draws, bit for bit."""
+    import jax
+
+    (key,) = operands
+    dtype = np.dtype(f"uint{params['bit_width']}")
+    expected = jax.jit(lambda key: jax.random.bits(key, params["shape"], dtype))(key)
+    return np.asarray(result) == np.asarray(expected)
+
+
+def _comparison(operator):
+    def compared(params, a, b):
+        return operator(*(np.asarray(value, np.float64) if _format(value.dtype) else value
+                          for value in (a, b)))
+    return _exactly(compared)
+
+
+CONTRACTS = {
+    "add": _rn(two_sum),
+    "sub": _rn(lambda a, b: two_sum(a, -b)),
+    "mul": _rn(_product),
+    "square": _rn(lambda a: _product(a, a)),
+    "div": _rn(_quotient),
+    "sqrt": _rn(_root),
+    "neg": _exactly(lambda params, a: -a),
+    "abs": _exactly(lambda params, a: np.abs(a)),
+    "max": _exactly(lambda params, a, b: np.maximum(a, b)),
+    "min": _exactly(lambda params, a, b: np.minimum(a, b)),
+    "convert_element_type": _converted,
+    "log": _transcendental(lambda value: _enclosed(lambda iv, x: iv.log(x), value)),
+    "exp": _transcendental(lambda value: _enclosed(lambda iv, x: iv.exp(x), value)),
+    "erf_inv": _transcendental(_erfinv_enclosed),
+    "reduce_sum": _reduced_sum,
+    "dot_general": _dot,
+    "eq": _comparison(np.equal),
+    "ne": _comparison(np.not_equal),
+    "lt": _comparison(np.less),
+    "le": _comparison(np.less_equal),
+    "gt": _comparison(np.greater),
+    "ge": _comparison(np.greater_equal),
+    "and": _exactly(lambda params, a, b: np.bitwise_and(a, b)),
+    "or": _exactly(lambda params, a, b: np.bitwise_or(a, b)),
+    "not": _exactly(lambda params, a: np.invert(a)),
+    "shift_right_logical": _exactly(lambda params, a, b: np.right_shift(a, b)),
+    "shift_left": _exactly(lambda params, a, b: np.left_shift(a, b)),
+    "bitcast_convert_type": _exactly(lambda params, a: a.view(params["new_dtype"])),
+    "reduce_and": _exactly(lambda params, a: np.all(a, axis=tuple(params["axes"]))),
+    "reduce_or": _exactly(lambda params, a: np.any(a, axis=tuple(params["axes"]))),
+    "reduce_max": _exactly(lambda params, a: np.max(a, axis=tuple(params["axes"]))),
+    "reduce_min": _exactly(lambda params, a: np.min(a, axis=tuple(params["axes"]))),
+    "select_n": _exactly(_selected),
+    "broadcast_in_dim": _exactly(_broadcast),
+    "reshape": _exactly(lambda params, a: np.reshape(a, params["new_sizes"])),
+    "squeeze": _exactly(lambda params, a: np.squeeze(a, tuple(params["dimensions"]))),
+    "expand_dims": _exactly(lambda params, a: np.expand_dims(a, tuple(params["dimensions"]))),
+    "transpose": _exactly(lambda params, a: np.transpose(a, params["permutation"])),
+    "copy": _exactly(lambda params, a: a),
+    "copy_p": _exactly(lambda params, a: a),
+    "random_bits": _random_bits,
+    "random_wrap": None,
+    "random_unwrap": None,
+}
+"""Each primitive's contract, `contract(params, operands, result, fmt) -> ok`, the result's elements
+that hold it, `fmt` the result's float format (None for an integer or boolean result): a correctly
+rounded result (IEEE arithmetic), a faithful one (a transcendental, within its two neighbours of the
+exact value whatever its vendor documents), a sum within its bound in any order, or a result with no
+rounding at all, bit for bit. A key's wrapping holds no arithmetic (None: it is data, moved). A
+primitive missing here cannot be certified, which fails the site's coverage."""
+
+
+def certified(fn, *arguments) -> tuple:
+    """`fn` on `arguments` run one primitive at a time, each executed alone and natively (an eager
+    bind, its own compiled program), and each held to its contract (CONTRACTS) on the operands it was
+    given: `(outputs, findings)`, the outputs as that run computed them, and every equation whose
+    result breaks its contract or that has none, by primitive, with its first element that breaks.
+    This certifies the op-by-op program; a fused program's internals are check 1's."""
+    import jax
+
+    closed, shape = jax.make_jaxpr(fn, return_shape=True)(*arguments)
+    findings: list[str] = []
+    outputs = _run(closed.jaxpr, closed.consts, jax.tree.leaves(arguments), findings)
+    return jax.tree.unflatten(jax.tree.structure(shape), outputs), findings
+
+
+def _run(jaxpr, consts, arguments, findings, where: str = "") -> list:
+    from jax.extend import core
+
+    env = {}
+
+    def read(var):
+        return var.val if isinstance(var, core.Literal) else env[var]
+
+    env.update(zip(jaxpr.constvars, consts, strict=True))
+    env.update(zip(jaxpr.invars, arguments, strict=True))
+    for index, eqn in enumerate(jaxpr.eqns):
+        operands = [read(var) for var in eqn.invars]
+        name = eqn.primitive.name
+        at = f"{where}{name}#{index}"
+        if name in STRUCTURAL:
+            results = _called(eqn, operands, findings, at)
+        else:
+            results = eqn.primitive.bind(*operands, **eqn.params)
+            results = list(results) if eqn.primitive.multiple_results else [results]
+            _held(eqn, operands, results, findings, at)
+        env.update(zip(eqn.outvars, results, strict=True))
+    return [read(var) for var in jaxpr.outvars]
+
+
+def _called(eqn, operands, findings, at) -> list:
+    params = eqn.params
+    if eqn.primitive.name == "cond":
+        branch = params["branches"][int(np.asarray(operands[0]))]
+        return _run(branch.jaxpr, branch.consts, operands[1:], findings, at + "/")
+    body = next(params[key] for key in ("jaxpr", "call_jaxpr", "fun_jaxpr") if key in params)
+    jaxpr, consts = (body.jaxpr, body.consts) if hasattr(body, "consts") else (body, ())
+    return _run(jaxpr, consts, operands, findings, at + "/")
+
+
+def _held(eqn, operands, results, findings, at) -> None:
+    name = eqn.primitive.name
+    if name not in CONTRACTS:
+        findings.append(f"{at}: uncertifiable, no contract for {name}")
+        return
+    contract = CONTRACTS[name]
+    if contract is None:
+        return
+    for result in results:
+        result = _host(result)
+        if not isinstance(result, np.ndarray):
+            findings.append(f"{at}: uncertifiable, a key result of {name}")
+            return
+        fmt = _format(result.dtype)
+        if fmt is None and np.asarray(result).dtype.kind == "f":
+            findings.append(f"{at}: uncertifiable, no format for {np.asarray(result).dtype}")
+            return
+        ok = np.asarray(contract(eqn.params, [_host(value) for value in operands], result, fmt))
+        if not np.all(ok):
+            first = np.unravel_index(int(np.argmin(ok.ravel())), ok.shape) if ok.ndim else ()
+            findings.append(f"{at}: {int(ok.size - ok.sum())} of {ok.size} elements break the contract, "
+                            f"first at {first}: {np.asarray(result)[first]!r}")
+
+
+def assert_certified(fn, draw, label: str, *, seeds: int) -> None:
+    """Check 2 of the gate: `fn` on `draw(seed)`'s inputs for each of `seeds`, run one primitive at a
+    time (`certified`), every element of every equation within its own operation's contract and every
+    primitive covered by one."""
+    for seed in range(seeds):
+        _, findings = certified(fn, *draw(seed))
+        assert not findings, f"{label}, seed {seed}: " + "; ".join(findings[:8])
