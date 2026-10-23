@@ -632,6 +632,27 @@ def test_accumulation_two_logs_the_real_tokens_of_both_microbatches():
     assert ticks[0]["train/tokens_per_s"] > 0
 
 
+def test_a_run_on_a_device_without_a_known_peak_still_reports_its_training_flops():
+    """train/flops, the step's analytical training work over the mesh, needs no device peak: a run on
+    the CPU, which has none and so reports no train/mfu, logs every step's count, the objective's own
+    for its batch. The counts are sums of float32 per-row shares, exact below 2**21 (a share is the
+    count over eight rows, three more bits), so they compare exactly."""
+    import optax
+
+    from dew.training import Trainer
+
+    batch = {"text": np.broadcast_to((np.arange(7) < 5).astype(np.int32), (8, 7))}
+    tracker = RecordingTracker()
+    objective = LMObjective(decoder().clone(num_layers=1), seq_len=6, pad_id=0)
+    work = objective.training_flops(None, batch)
+    assert 0 < work < 2**21
+    trainer = Trainer(objective, optax.sgd(0.01), key=0, tracker=tracker)
+    trainer.fit(Loader(lambda partition: iter([batch, batch]), None, batch=8, records=16), steps=2, log_every=1)
+    logged = [scalars for _, scalars in tracker.scalars if "train/loss" in scalars]
+    assert [scalars["train/flops"] for scalars in logged] == [work, work]
+    assert not any("train/mfu" in scalars for scalars in logged)
+
+
 def test_s5_write_read_matches_the_native_scanned_path():
     """CPU/GPU chunked S5 executes extra pole-power GEMMs, which belong to HFU.
     The native TPU scan implements the recurrent function directly and its
