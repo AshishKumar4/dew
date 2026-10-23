@@ -839,16 +839,19 @@ def translate_family_config(hf_config: Mapping[str, object],
         refuse(f"use_bidirectional_attention={bidirectional!r}", "the backbone is causal")
     used = {'model_type', 'use_bidirectional_attention', 'num_hidden_layers'}
     # A field spelled under its class's alias is that field (`DecoderFamily.aliases`); an omitted
-    # field is the config class's default, and an explicit null stays null.
+    # field is the config class's default, and an explicit null stays null. Both are the family's own
+    # class's: a type verified as the family (`dew.interop.verify`) brings a class of its own, whose
+    # defaults its probe compares.
+    own = hf_config.get('model_type') in family.model_types
     spelled = dict(hf_config)
-    for alias, canonical in family.aliases.items():
+    for alias, canonical in (family.aliases if own else {}).items():
         if alias in spelled:
             value = spelled.pop(alias)
             if canonical in spelled and spelled[canonical] != value:
                 refuse(f"{alias}={value!r} beside {canonical}={spelled[canonical]!r}", "they name one field")
             spelled[canonical] = value
             used.add(alias)
-    config = family.translate_config({**family.defaults, **spelled}, used)
+    config = family.translate_config({**(family.defaults if own else {}), **spelled}, used)
 
     return config, _unread(hf_config, used)
 
