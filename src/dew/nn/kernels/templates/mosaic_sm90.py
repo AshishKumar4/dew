@@ -7,6 +7,7 @@ import functools
 
 import jax
 import jax.numpy as jnp
+from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
@@ -15,7 +16,8 @@ from dew.nn.kernels.templates import mosaic
 FAMILY = mosaic.Family("wgmma", plgpu.Layout.WGMMA, rows=64)
 """wgmma's facts: its accumulator's layout and a warpgroup's 64 rows."""
 ROW = FAMILY.layout.reduce(1)
-"""A per-row vector's layout in the accumulator's."""
+COLUMN = FAMILY.layout.reduce(0)
+"""A per-row and a per-column vector's layouts in the accumulator's."""
 
 
 def product(lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
@@ -39,27 +41,57 @@ def registers_product(lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
     return product(lhs, rhs, (lhs.shape[0], rhs.shape[1]))
 
 
-def staged_products(acc_ref, parts, rhs, buffers, *, transposed: bool = False) -> None:
-    """`parts`' products with `rhs` (a shared-memory tile) issued into the warpgroup accumulator `acc_ref` in
-    place, in order, each part staged in shared memory first, a buffer of `buffers` apiece (its transpose
-    the left operand where `transposed`). A part is a tile with the power of two its product takes back,
-    which only None (no scaling, bf16's parts, `attention_algebra.cotangent_parts`) issues in place. The
-    buffers are free for the next tile's parts once these MMAs are waited for."""
+def register_products(acc, parts, rhs, interpret: bool):
+    """`acc` with `parts`' products with `rhs` (a shared-memory tile) issued into it in place, in order: a
+    warpgroup accumulator, or interpreted the array its value is (`walked_products`). Each part is a 16-bit
+    tile in registers, the warpgroup MMA's left operand, with the power of two its product takes back, which
+    only None (no scaling, bf16's parts, `attention_algebra.cotangent_parts`) issues in place. Mosaic GPU's
+    interpreter (jax 0.11.2) takes no register operand to a warpgroup MMA: interpreted, each product is the
+    dot it would compute, added."""
+    if any(exponent is not None for _, exponent in parts):
+        raise NotImplementedError("a scaled part's product is no in-place accumulation (fp16's)")
+    for part, _ in parts:
+        if interpret:
+            acc = acc + jnp.dot(part, rhs[...], preferred_element_type=jnp.float32)
+        else:
+            plgpu.wgmma(acc, part, rhs)
+    return acc
+
+
+def staged_products(acc, parts, rhs, buffers, interpret: bool, *, transposed: bool = False):
+    """`register_products` of `parts` each staged in shared memory first, a buffer of `buffers` apiece (its
+    transpose the left operand where `transposed`), so a left operand the MMA takes only from shared memory
+    (a transpose) is one. The buffers are free for the next tile's parts once these MMAs are waited for."""
     if any(exponent is not None for _, exponent in parts):
         raise NotImplementedError("a scaled part's product is no in-place accumulation (fp16's)")
     for place, (part, _) in enumerate(parts):
         buffers.at[place][...] = part.astype(buffers.dtype)
     plgpu.commit_smem()
     for place in range(len(parts)):
-        lhs = buffers.at[place]
-        plgpu.wgmma(acc_ref, lhs.transpose((1, 0)) if transposed else lhs, rhs)
+        lhs = buffers.at[place].transpose((1, 0)) if transposed else buffers.at[place]
+        if interpret:
+            acc = acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
+        else:
+            plgpu.wgmma(acc, lhs, rhs)
+    return acc
 
 
-def accumulating(walk, *shapes: tuple[int, int]):
-    """`walk(*accumulators)`'s result, the warpgroup accumulators of `shapes` (fp32, zero) scoped across it:
-    products issued into them in place over every step (`staged_products`), their values read once its MMAs
-    are waited for, `walk` returning them."""
-    return pl.run_scoped(walk, *(plgpu.WGMMAAccumulatorRef(shape, jnp.float32) for shape in shapes))
+def walked_products[C](step, start: C, lo, hi, shapes: tuple[tuple[int, int], ...], interpret: bool
+                       ) -> tuple[C, tuple[jax.Array, ...]]:
+    """A walk of steps `lo` to `hi`, `step(index, carry, accumulators) -> (carry, accumulators)`, from
+    `start`, with fp32 accumulators of `shapes` (zero) its products issue into in place (`register_products`,
+    `staged_products`): warpgroup accumulators scoped across the walk, read once its MMAs are waited for;
+    interpreted, arrays the walk carries. Returns the carry and the accumulators' values."""
+    if interpret:
+        return lax.fori_loop(lo, hi, lambda index, both: step(index, *both),
+                             (start, tuple(zeros(shape) for shape in shapes)))
+
+    def run(*accumulators):
+        carry = lax.fori_loop(lo, hi, lambda index, carry: step(index, carry, accumulators)[0], start)
+        plgpu.wgmma_wait(0)
+        return carry, tuple(acc[...] for acc in accumulators)
+
+    return pl.run_scoped(run, *(plgpu.WGMMAAccumulatorRef(shape, jnp.float32) for shape in shapes))
 
 
 def zeros(shape: tuple[int, ...]) -> jax.Array:
