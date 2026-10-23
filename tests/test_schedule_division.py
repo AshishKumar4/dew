@@ -14,8 +14,8 @@ from dew.diffusion.schedules import divided
 from dew.diffusion.transforms import EpsilonPredictionTransform, from_clean
 from dew.sampling.solvers.sigma import _euler_step
 
-SHAPE = (4, 8, 8, 3)
-"""A batch of latents, each row its own rate."""
+SHAPE = (64, 4, 4, 3)
+"""A batch of latents, each row its own rate: enough rows that every draw spans the rates."""
 
 DIVISION_SEEDS = 16
 """Check 1's declared seeds for each schedule site (to size)."""
@@ -23,10 +23,12 @@ DIVISION_SEEDS = 16
 
 def draw(seed):
     """Latents, a clean prediction, a noise prediction and each row's signal and noise rates, the
-    rates in (0.01, 1) as a schedule's are."""
+    rates in (0.01, 1) as a schedule's are, uniform in log: a quotient's error scales with one over
+    its rate, so rates uniform in value leave each draw's error to its smallest few, a tail no
+    count of seeds resolves."""
     rng = np.random.default_rng([23, seed])
     states = [rng.standard_normal(SHAPE).astype(np.float32) for _ in range(3)]
-    rates = [rng.uniform(0.01, 1.0, (SHAPE[0], 1, 1, 1)).astype(np.float32) for _ in range(2)]
+    rates = [np.exp(rng.uniform(np.log(0.01), 0.0, (SHAPE[0], 1, 1, 1))).astype(np.float32) for _ in range(2)]
     return (*states, *rates)
 
 
