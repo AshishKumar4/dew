@@ -251,15 +251,8 @@ def changed(found: list[Candidate], base: str) -> set[str]:
 
 def groups(found: list[Candidate]) -> tuple[list[tuple[list[str], list[str]]], int]:
     """The matching functions in groups, each with its pairs' coverage, and the pairs left out as
-    delegation (one calls the other)."""
-    parent = {candidate.label: candidate.label for candidate in found}
-
-    def root(label):
-        while parent[label] != label:
-            parent[label] = parent[parent[label]]
-            label = parent[label]
-        return label
-
+    delegation (one names the other). A group is the functions linked by matching pairs, transitively."""
+    linked: dict = collections.defaultdict(set)
     covered: dict = {}
     delegating = 0
     for index, first in enumerate(found):
@@ -270,16 +263,22 @@ def groups(found: list[Candidate]) -> tuple[list[tuple[list[str], list[str]]], i
             if first.name in second.names or second.name in first.names:
                 delegating += 1
                 continue
-            parent[root(first.label)] = root(second.label)
+            linked[first.label].add(second.label)
+            linked[second.label].add(first.label)
             covered[(first.label, second.label)] = coverage
-    members: dict = {}
-    for label in parent:
-        members.setdefault(root(label), []).append(label)
-    result = []
-    for labels in members.values():
-        if len(labels) > 1:
-            pairs = [f"{a} ~ {b}: {coverage}" for (a, b), coverage in covered.items() if a in labels]
-            result.append((sorted(labels), pairs))
+    result, seen = [], set()
+    for label in linked:
+        if label in seen:
+            continue
+        group, frontier = set(), [label]
+        while frontier:
+            current = frontier.pop()
+            if current not in group:
+                group.add(current)
+                frontier.extend(linked[current] - group)
+        seen |= group
+        pairs = [f"{a} ~ {b}: {coverage}" for (a, b), coverage in covered.items() if a in group]
+        result.append((sorted(group), pairs))
     return sorted(result), delegating
 
 
