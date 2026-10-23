@@ -277,7 +277,7 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, *
     shape = (block_q, block_k)
 
     def body(q_ref, k_ref, v_ref, do_ref, peak_ref, prior_ref, anchor_ref, delta_ref, index_ref, dq_ref,
-             keyed_ref, rows_ref, q_smem, do_smem, out_smem, row_smem, staged, q_loaded, do_loaded, key_ring,
+             keyed_ref, rows_ref, q_smem, do_smem, out_smem, row_smem, q_loaded, do_loaded, key_ring,
              value_ring):
         keys, values = mosaic.Ring(**key_ring), mosaic.Ring(**value_ring)
         row, head, wg = lax.axis_index("batch"), lax.axis_index("heads"), lax.axis_index("wg")
@@ -298,14 +298,15 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, *
             whole = program.whole(first, walked)
             q_pos, columns = first + mosaic_sm90.iota(shape, 0), mosaic_sm90.iota(shape, 1)
             nothing = mosaic_sm90.zeros((block_q,))
-            # The row sums carried, dQ's and the keyed sums' places empty: they accumulate in place
-            # (`mosaic_sm90.accumulating`).
+            # The row sums carried; dQ and the keyed sums accumulate in place (`mosaic_sm90.walked_products`),
+            # their places in a step's sums empty (a constant the walk would forward, which no kernel's
+            # scope may return).
             empty = jnp.zeros((), jnp.float32)
-            start = algebra.DqSums(empty, nothing, nothing, (), (), empty, nothing,
-                                   nothing + algebra.NO_SHIFT)
-            parts = staged.at[wg]
+            start = (nothing, nothing, nothing, nothing + algebra.NO_SHIFT)
 
-            def step(index, sums, dq_acc, keyed_acc):
+            def step(index, rows, accumulators):
+                dq_acc, keyed_acc = accumulators
+                sums = algebra.DqSums(empty, rows[0], rows[1], (), (), empty, rows[2], rows[3])
                 k_slot, v_slot = keys.acquire(index), values.acquire(index)
                 s = mosaic_sm90.product(q_smem.at[wg], k_slot.transpose((1, 0)), shape)
                 dp = mosaic_sm90.product(do_smem.at[wg], v_slot.transpose((1, 0)), shape)
@@ -325,22 +326,17 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, *
                 sums, products = algebra.dq_terms(sums, exponentials, cotangents, slopes, seen, prior,
                                                   scale=scale, kinds=(), summed=(), dtype=k_slot.dtype,
                                                   accurate=accurate)
-                mosaic_sm90.staged_products(dq_acc, products.parts, k_slot,
-                                            parts.at[pl.ds(0, len(products.parts))])
+                dq_acc = mosaic_sm90.register_products(dq_acc, products.parts, k_slot, interpret)
                 if products.keyed is not None:
-                    mosaic_sm90.staged_products(keyed_acc, products.keyed, k_slot,
-                                                parts.at[pl.ds(len(products.parts), 1)])
-                # The key slot's and the staged parts' reads done before either is reused.
+                    keyed_acc = mosaic_sm90.register_products(keyed_acc, products.keyed, k_slot, interpret)
+                # The key slot's reads done before it is released.
                 plgpu.wgmma_wait(0)
                 keys.release(index)
-                return sums
+                return (sums.residual, sums.mass, sums.keyed_mass, sums.keyed_shift), (dq_acc, keyed_acc)
 
-            def walk(dq_acc, keyed_acc):
-                sums = lax.fori_loop(0, walked, lambda index, sums: step(index, sums, dq_acc, keyed_acc),
-                                     start)
-                return sums._replace(dq=dq_acc[...], keyed=keyed_acc[...])
-
-            sums = mosaic_sm90.accumulating(walk, (block_q, width), (block_q, width))
+            rows, (dq, keyed) = mosaic_sm90.walked_products(step, start, 0, walked,
+                                                            ((block_q, width), (block_q, width)), interpret)
+            sums = algebra.DqSums(dq, rows[0], rows[1], (), (), keyed, rows[2], rows[3])
 
             @pl.loop(walked, most)
             def _(index):
@@ -387,9 +383,6 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, *
             plgpu.SMEM((consumers, block_q, value_width), dout.dtype),
             plgpu.SMEM((consumers, block_q, width), jnp.float32),
             plgpu.SMEM((consumers, 4, block_q), jnp.float32),
-            # A tile's parts staged as the products' left operands: dQ's cotangents in as many parts as the
-            # form takes (`algebra.cotangent_parts`, three in the accurate form's bf16), and its weights.
-            plgpu.SMEM((consumers, 4 if accurate else 1, block_q, block_k), query.dtype),
             plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_barriers=consumers),
             key_ring=mosaic.ring((block_k, width), key.dtype, program.stages, consumers=consumers),
             value_ring=mosaic.ring((block_k, value_width), value.dtype, program.stages,
@@ -456,7 +449,8 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
                 douts.acquire(index - least)
                 douts.release(index - least)
 
-            def step(index, carry, dk_acc, dv_acc):
+            def step(index, carry, accumulators):
+                dk_acc, dv_acc = accumulators
                 q_slot, do_slot = queries_ring.acquire(index - least), douts.acquire(index - least)
                 q_first = index * block_q
                 peak, denominator, centre, rest, chosen = (_rows(ref, row, head, q_first, block_q)
@@ -477,21 +471,19 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
                 cotangent_parts = algebra.cotangent_parts(pulled * scale, q_slot.dtype, accurate=accurate)
                 buffers = staged.at[wg]
                 # Each staged part's transpose the left operand (`algebra.cotangent_product`'s `aᵀ @ b`).
-                mosaic_sm90.staged_products(dv_acc, ((narrowed, None),), do_slot, buffers.at[pl.ds(0, 1)],
-                                            transposed=True)
-                mosaic_sm90.staged_products(dk_acc, cotangent_parts, q_slot,
-                                            buffers.at[pl.ds(1, len(cotangent_parts))], transposed=True)
+                dv_acc = mosaic_sm90.staged_products(dv_acc, ((narrowed, None),), do_slot,
+                                                     buffers.at[pl.ds(0, 1)], interpret, transposed=True)
+                dk_acc = mosaic_sm90.staged_products(dk_acc, cotangent_parts, q_slot,
+                                                     buffers.at[pl.ds(1, len(cotangent_parts))], interpret,
+                                                     transposed=True)
                 # The slots' and the staged parts' reads done before either is reused.
                 plgpu.wgmma_wait(0)
                 queries_ring.release(index - least)
                 douts.release(index - least)
-                return carry
+                return carry, (dk_acc, dv_acc)
 
-            def walk(dk_acc, dv_acc):
-                lax.fori_loop(mine, q_steps, lambda index, carry: step(index, carry, dk_acc, dv_acc), None)
-                return dk_acc[...], dv_acc[...]
-
-            dk, dv = mosaic_sm90.accumulating(walk, (block_k, width), (block_k, value_width))
+            _, (dk, dv) = mosaic_sm90.walked_products(step, None, mine, q_steps,
+                                                      ((block_k, width), (block_k, value_width)), interpret)
             out = (row, pl.ds(k_first, block_k), head)
             for target, part in ((dk_ref, dk), (dv_ref, dv)):
                 out_smem.at[wg][...] = part
