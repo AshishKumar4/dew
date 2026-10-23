@@ -32,15 +32,21 @@ def draw(seed):
     return (*states, *rates)
 
 
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 @pytest.mark.parametrize("broadcast", [True, False], ids=["per-row", "full"])
-def test_a_schedules_division_is_ieee_division(broadcast):
+def test_a_schedules_division_is_ieee_division(broadcast, dtype):
     """The quotient of every element, a per-row rate broadcast over a state's or a full-shape
-    divisor, compiled, is IEEE's correctly rounded fp32 quotient, bit for bit."""
+    divisor, compiled, is IEEE's correctly rounded fp32 quotient, bit for bit; a bfloat16 or float16
+    one that quotient of the widened operands rounded to its dtype, as PyTorch's opmath divides."""
     numerator, _, _, rate, _ = draw(0)
     if not broadcast:
         rate = np.broadcast_to(rate, SHAPE).copy()
+    numerator, rate = (np.asarray(array.astype(dtype)) for array in (numerator, rate))
     got = np.asarray(jax.jit(divided)(numerator, rate))
-    np.testing.assert_array_equal(got.view(np.uint32), (numerator / rate).view(np.uint32))
+    expected = (numerator.astype(np.float32) / rate.astype(np.float32)).astype(numerator.dtype)
+    assert got.dtype == expected.dtype
+    bits = f"uint{8 * got.itemsize}"
+    np.testing.assert_array_equal(got.view(bits), expected.view(bits))
 
 
 def torch_wide(fn, dtype):
