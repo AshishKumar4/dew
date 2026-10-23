@@ -21,6 +21,7 @@ from dew.data.compile import compile
 from dew.data.sources.tokens import TokenFiles
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
+from dew.nn.kernels.generation import chosen
 from dew.nn.sharding import LayoutRefused
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_tile
@@ -452,12 +453,15 @@ DELTA = {"mixer": mixers.build("gated_delta_net", linear_num_key_heads=2, linear
 def test_a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further(monkeypatch):
     """With room for four microbatches when a delta rule recomputes its memory alone, which no
     recomputation needs more than, the plan is four at that half rung: no plan splits the batch further
-    at a rung where the half rung fits it, and the search asks each split there after it misses."""
+    at a rung where the half rung fits it, and the search asks each split there after it misses. The
+    delta rule runs its port (`chosen`), whatever the generation's row names: the half rung recomputes
+    the memory the port names (`checkpoint_name`), and the portable route, an A10's, names none."""
     half = "all_but_delta_memory"
-    free(monkeypatch, needs(monkeypatch, lm(split=4, remat=half, **DELTA)))
-    trainer = lm(**DELTA)
-    state, _, _ = trainer.place()
-    trainer.compile(state, BATCH, lambda steps: pytest.fail("the plan at its first split was timed"))
+    with chosen(gated_delta_rule="fla"):
+        free(monkeypatch, needs(monkeypatch, lm(split=4, remat=half, **DELTA)))
+        trainer = lm(**DELTA)
+        state, _, _ = trainer.place()
+        trainer.compile(state, BATCH, lambda steps: pytest.fail("the plan at its first split was timed"))
     assert (trainer.plan["split"], trainer.plan["remat"]) == (4, half)
     assert trainer.objective.model.remat == REMAT_POLICIES[half]
     assert_searched(asked(trainer), (4, half), 2, (1, "minimal_with_conv"), half=half)

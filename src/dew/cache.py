@@ -16,7 +16,7 @@ from collections.abc import Callable
 import jax
 
 from dew._host import cpu_class
-from dew.telemetry.devices import deterministic_ops_requested, xla_flag
+from dew.devices import deterministic_ops_requested, xla_flag
 
 
 def dew_cache_dir() -> str:

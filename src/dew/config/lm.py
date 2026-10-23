@@ -26,11 +26,10 @@ import jax.numpy as jnp
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig
 from dew.data.compile import fitted
 from dew.data.text import HFTokenizer, tokenizer_for
+from dew.objectives.lm.objective import Perplexity, Samples
 from dew.records import integer, text
 from dew.registry import DtypeName, objectives, resolve_dtype
 from dew.sampling.text import Sampling
-
-from .objective import Perplexity, Samples
 
 
 class Tokens(NamedTuple):
@@ -52,7 +51,7 @@ class LMRunConfig(RunConfig):
         default_factory=lambda: ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
     optim: OptimConfig = dataclasses.field(
         default_factory=lambda: OptimConfig(
-            learning_rate=6e-4,
+            rate=6e-4,
             weight_decay=0.1, clip_grads=1.0))
     tokenizer: str = "byte"
     """The tokenizer the ids were written with: 'byte', or an HF tokenizer name."""
@@ -278,3 +277,6 @@ def same_vocabulary(written: str, loaded, name: str) -> bool:
         return written == name
     carried = HFTokenizer(str(loaded.source), local_files_only=True).tokenizer
     return HFTokenizer(written).tokenizer.get_vocab() == carried.get_vocab()
+
+
+__all__ = ["LMRunConfig"]

@@ -20,7 +20,7 @@ import shutil
 
 import pytest
 from process_support import run_pool
-from test_multiprocess import assert_same_parameters, dumped_params
+from test_multiprocess import assert_identical_parameters, assert_same_parameters, dumped_params
 
 from dew.data.dataset import DataPartition
 from dew.training import Checkpoints
@@ -65,11 +65,14 @@ def test_a_saved_position_resumes_where_an_uninterrupted_pool_lands(tmp_path, ce
         whole = run_pool("matrix", tmp_path / f"whole{processes}-out", processes,
                          run_dir=tmp_path / f"whole{processes}" / "run", cell=cell, name="matrix",
                          steps=2 * STEPS)
+        # On the count that saved it a resume reduces in the order the run it continues did, so it lands
+        # on that run's parameters bit for bit; on another count it reduces otherwise.
+        same = assert_identical_parameters if processes == saved_by else assert_same_parameters
         for index, report in enumerate(resumed):
             assert report["restored_step"] == STEPS
             assert report["step"] == 2 * STEPS
             assert report["batches"][:STEPS] == whole[index]["batches"][STEPS:2 * STEPS]
             assert report["dataset_state"] == whole[index]["dataset_state"]
             name = f"process{index}.json"
-            assert_same_parameters(dumped_params(tmp_path / f"resumed{processes}-out" / name),
-                                   dumped_params(tmp_path / f"whole{processes}-out" / name))
+            same(dumped_params(tmp_path / f"resumed{processes}-out" / name),
+                 dumped_params(tmp_path / f"whole{processes}-out" / name))

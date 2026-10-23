@@ -85,6 +85,7 @@ from dew.objectives.base import (
     select,
     taken_record,
 )
+from dew.optim import learning_rate, with_rate_scales
 from dew.records import JSON, boolean, json_value, record
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import (
@@ -161,7 +162,6 @@ from dew.training.model_flops import (
 )
 from dew.training.narrow import narrowed, narrowed_paths
 from dew.training.observe import Observe
-from dew.training.optim import learning_rate, with_rate_scales
 from dew.training.planning import Candidate, Planned, Timer, plan_step, settled, splits, whole_step
 from dew.training.profiling import ProfileWindow, owned_capture, start_capture, stop_capture
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
@@ -574,6 +574,15 @@ class Trainer(Generic[Loss, Effects]):
         # The state holds its trees as dicts, whichever Flax container (a FrozenDict) the objective's
         # tree came in, so its placement, its updates and its restores share one structure.
         params = unfreeze(nn.unbox(initialized))
+        # A held tree's initializer returns the objective's own arrays (`Objective.held_variables`),
+        # which the step's donation would free: the state takes buffers of its own, as a placed one
+        # does (`distributed.placed_held`). Traced, no leaf is a held array, so nothing is copied; a
+        # state held on the host is never donated, and takes the arrays over leaf by leaf as it is
+        # placed (`_placed_host`), so it takes them as they are.
+        if not self.host_master:
+            held = {id(leaf) for leaf in jax.tree.leaves(self.objective.held_variables())
+                    if isinstance(leaf, jax.Array)}
+            params = jax.tree.map(lambda leaf: leaf.copy() if id(leaf) in held else leaf, params)
         if "params" not in params:
             raise ValueError(
                 f"the objective's tree has no params collection, only {sorted(params)}; "

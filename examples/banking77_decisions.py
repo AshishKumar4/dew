@@ -99,7 +99,7 @@ def main(options: Options) -> None:
         objective = DecisionObjective(qwen, loss=LogLoss() + 0.5 * Brier(), layout=layout)
 
     checkpoints = Checkpoints(options.run, keep=1)
-    state = Trainer(objective, OptimConfig(learning_rate=options.learning_rate), key=0,
+    state = Trainer(objective, OptimConfig(rate=options.learning_rate), key=0,
                     checkpoints=checkpoints).fit(
         table(train).shuffle().repeat().batch(options.batch), epochs=options.epochs,
         validation=table(held_out[:options.batch * 8]).batch(options.batch), eval_every=options.eval_every,
