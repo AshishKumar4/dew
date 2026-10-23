@@ -196,6 +196,40 @@ def test_a_streamed_mix_of_a_repeated_part_and_one_written_without_says_it_never
     assert said
 
 
+def _not_201(row):
+    return int(row["id"]) != 201
+
+
+@pytest.mark.parametrize("shares", [1, 2])
+def test_a_part_repeated_at_its_root_and_then_cut_ends_the_mix_that_reads_it(shares):
+    """A read cut per share repeats a part written without a repeat at its own root, and the part's
+    own limit then ends it: a mix of a repeated part and one cut to three and filtered runs out on
+    every share, and its stream says so; its batch of two splits over two shares."""
+    from dew.data.dataset import stream_endless
+
+    chain = mix([_tagged(1, 8).repeat(), _tagged(2, 8).take(3).filter(_not_201)], weights=(1, 1))
+    loader = compile(chain.batch(2), read="indexed", loading=READ)
+    for index in range(shares):
+        reader = loader.train(DataPartition(index, shares))
+        said = stream_endless(reader)
+        assert len(_ids(reader, 64)) < 64
+        assert said is False
+
+
+def test_a_nested_mix_cut_per_share_by_the_mix_around_it_never_runs_out():
+    """A mix nested in one a filter cuts per share is cut per share too, so its part written without a
+    repeat repeats at its root: the nested mix never ends, nor the one around it, whose stream says so
+    and reads on past every part's records."""
+    from dew.data.dataset import stream_endless
+
+    inner = mix([_tagged(1, 4).repeat(), _tagged(2, 2)], weights=(1, 1))
+    chain = mix([inner, _tagged(3, 4).repeat()], weights=(1, 1)).filter(lambda row: True)
+    reader = compile(chain.batch(1), read="indexed", loading=READ).train(DataPartition())
+    said = stream_endless(reader)
+    assert len(_ids(reader, 24)) == 24
+    assert said
+
+
 def test_a_mixture_of_a_repeated_corpus_and_one_read_once_counts_what_a_run_reads():
     """A mix of a corpus of 8 repeated and one of 4 written without a repeat, at even weights, ends
     where the one read once does, at 8, and a run reads that many records: the order repeats
