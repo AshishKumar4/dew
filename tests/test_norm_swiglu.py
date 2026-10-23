@@ -119,7 +119,7 @@ SEEDS = {(2, 3, 31): 32, (3, 257, 17): 32, (5, 1000): 32, (2, 3, 4, 31): 64, (2,
          (2, 1, 16, 128): 32, (7, 1000): 32, (3, 4096): 32, (5, 37): 32, (24576, 1000): 8, (2, 31): 32,
          "composed": 32}
 """Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for which
-XLA compared with itself resolves the factor in every output and gradient (2026-10-20, on armada)."""
+XLA compared with itself resolves the factor in every output and gradient (on armada)."""
 
 
 def assert_drawn_as_exact(fused, xla, exact, draw, leaves, label, seeds):
@@ -790,7 +790,9 @@ def test_a_fused_kernel_differentiates_at_every_order_through_its_portable_arith
 
         def score(first, *rest):
             out = fused(first, *rest)
-            return sum(jnp.square(leaf.astype(jnp.float32)).sum() for leaf in jax.tree.leaves(out))
+            # At least float32, so the float64 truth scores in float64.
+            return sum(jnp.square(leaf.astype(jnp.promote_types(leaf.dtype, jnp.float32))).sum()
+                       for leaf in jax.tree.leaves(out))
 
         def gradient(function, one):
             # The first operand's gradient, through the gate's pullback of the score's one at its dtype.
