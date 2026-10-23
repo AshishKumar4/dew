@@ -71,11 +71,16 @@ ROWS = 32
 seeds (`reference_error.seeds_for`): each row its own drawn values under the family's structure."""
 RESUMED = 128
 """The resumed family's rows, more, as each holds one query over two keys."""
+SINK_ROWS = 2
+"""The sink-and-one-key families' rows, fewer, their draws holding their sinks' gradients across heads: the
+interpreted Triton mainloop's time a seed grows faster than its programs, 21.6 s at 32 rows of 16 heads,
+0.92 at 4 and 0.18 at 2 (a 26-core CPU), and `seeds_for` sizes the families at 2 rows at 64, 32 and 8
+seeds."""
 SEEDS = {"ties at scale 1": 64, "ties at scale 1, cotangents near 2**125": 64, "ties at scale 1/2": 64,
          "ties at scale 1/2, cotangents near 2**125": 64, "ties at scale 1/4": 64,
          "ties at scale 1/4, cotangents near 2**125": 64, "a logit near fp32's largest": 8,
          "a logit near fp32's largest at scale 1/4": 8, "values near fp32's largest over 2 equal keys": 8,
-         "values near fp32's largest over 64 equal keys": 8, "one key": 8, "a sink and one key": 32,
+         "values near fp32's largest over 64 equal keys": 8, "one key": 8, "a sink and one key": 64,
          "a sink near fp32's largest and one key": 8, "a sink and one key, its logit near fp32's largest": 8,
          "a sink near fp32's largest at scale 1/4": 8, "logits near 1e4": 32, "logits near 1e30": 8,
          "a small weight on a large value, float32": 128, "a small weight on a large value, bfloat16": 256,
@@ -99,7 +104,7 @@ SEEDS = {"ties at scale 1": 64, "ties at scale 1, cotangents near 2**125": 64, "
          "fp16 values near their largest beside a state near fp32's largest": 32,
          "keys an ulp apart, float32": 32, "keys an ulp apart, bfloat16": 32,
          "keys near fp32's largest at equal logits": 32, "a far maximum in a later key tile": 8,
-         "a decode step's sink and one key": 8, "a decode step's sink near fp32's largest and one key": 8,
+         "a decode step's sink and one key": 32, "a decode step's sink near fp32's largest and one key": 8,
          "documents of one key": 8}
 """Each family's declared seeds, the fewest over which the reference compared with itself resolves check
 1's parity (`reference_error.seeds_for`), sized for every family at the suite's own draws and reference."""
@@ -256,8 +261,8 @@ def _least_normal_column(seed: int, rows: int = 64):
             dout)
 
 
-def _kept(queries: int, keys: int) -> np.ndarray:
-    return np.ones((ROWS, 1, queries, keys), bool)
+def _kept(queries: int, keys: int, rows: int = ROWS) -> np.ndarray:
+    return np.ones((rows, 1, queries, keys), bool)
 
 
 def _near_max_logit(width: int):
@@ -479,7 +484,8 @@ def _families() -> dict[str, Family]:
         # 1 within an ulp of its logit's exponent.
         "one key": Family(_drawn(4, 1), _kept(4, 1), folded=False),
         # Sixteen heads, so each draw holds sixteen sinks' gradients.
-        "a sink and one key": Family(_with_sinks(_drawn(16, 1, heads=16), -3.0, 3.0), _kept(16, 1)),
+        "a sink and one key": Family(_with_sinks(_drawn(16, 1, rows=SINK_ROWS, heads=16), -3.0, 3.0),
+                                     _kept(16, 1, SINK_ROWS)),
         "a sink near fp32's largest and one key": Family(_with_sinks(_drawn(16, 1), 1e38, 3e38),
                                                          _kept(16, 1), folded=False),
         "a sink and one key, its logit near fp32's largest": Family(
@@ -561,9 +567,9 @@ def _families() -> dict[str, Family]:
     for low, high, label in ((-3.0, 3.0, ""), (1e38, 3e38, " near fp32's largest")):
         # One query a row, so the decode kernel takes the family too.
         name = f"a decode step's sink{label} and one key"
-        # Thirty-two heads a row of 32, so each draw holds 32 sinks' gradients over few rows.
-        families[name] = Family(_with_sinks(_drawn(1, 1, rows=32, heads=32), low, high),
-                                np.ones((32, 1, 1, 1), bool), folded=low < 0)
+        # Thirty-two heads a row, so each draw holds 32 sinks' gradients over few rows.
+        families[name] = Family(_with_sinks(_drawn(1, 1, rows=SINK_ROWS, heads=32), low, high),
+                                _kept(1, 1, SINK_ROWS), folded=low < 0)
     ids = np.tile(np.asarray([[1, 2, 3, 3]], np.int32), (ROWS, 1))
     families["documents of one key"] = Family(_drawn(4, 4), _causal(4, 4, ROWS) & (ids[:, None, :, None] ==
                                                                                   ids[:, None, None, :]),
