@@ -12,11 +12,12 @@ from dew.nn.kernels import generation
 
 
 def tripled(x, index):
-    """Three times `x`, whose backward kernel returns four times the cotangent: a gradient says by its
-    value which program ran, 4 the backward kernel, 3 the portable arithmetic's pullback. `index`, an
-    integer operand, takes float0's cotangent."""
+    """Three times `x`, whose backward kernel returns four times the cotangent, not the portable
+    arithmetic's pullback, so a gradient says by its value which program ran: 4 the backward kernel, 3
+    the portable arithmetic's. The forward kernel has no derivative of its own (a stop_gradient), so a
+    tangent of 3 is the portable arithmetic's. `index`, an integer operand, takes float0's cotangent."""
     return generation.linear_tangent(
-        lambda x, index: (3 * x, ()),
+        lambda x, index: (jax.lax.stop_gradient(3 * x), ()),
         lambda saved, operands, cotangent: (4 * cotangent, np.zeros(operands[1].shape, jax.dtypes.float0)),
         lambda x, index: 3 * x)(x, index)
 
@@ -89,3 +90,11 @@ def test_forward_mode_takes_the_portable_tangent_however_the_call_is_staged(stag
 
     run = jax.jit(tangent) if staging == "jit" else tangent
     np.testing.assert_array_equal(np.asarray(run(x)), np.full(x.shape, 3.0))
+
+
+def test_forward_over_reverse_differentiates_the_portable_pullback():
+    """`jax.jvp` of a gradient: the backward kernel's tangent is the portable pullback's, which for a
+    linear map is zero, its integer operand's tangent float0's along the way."""
+    x, index = jnp.arange(8.0), jnp.arange(8)
+    tangent = jax.jvp(lambda x: jax.grad(summed)(x, index), (x,), (jnp.ones_like(x),))[1]
+    np.testing.assert_array_equal(np.asarray(tangent), np.zeros(x.shape))
