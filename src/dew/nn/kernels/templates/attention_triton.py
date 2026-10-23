@@ -35,6 +35,7 @@ from dew.nn.kernels.templates.attention import (
     kept_dtype,
     kernel_dot,
     padded_call,
+    within,
 )
 from dew.nn.kernels.templates.base import Template, dividing
 
@@ -338,7 +339,7 @@ class TritonForward(Template[Tiles]):
         # The accurate form alone guards its sums (`algebra.Forward.headroom`); the fold walks as ever.
         spec = algebra.Forward(self.form, keys if self.keys is None else self.keys, ids, self.scale,
                                self.score_mod, self.natural,
-                               self.natural and algebra.headroom(value.dtype, initial), initial)
+                               self.natural and algebra.headroom(value.dtype), initial)
         kernel = functools.partial(
             _forward_kernel, spec=spec, score_kinds=self.score_kinds, output_kinds=self.output_kinds,
             initial=initial, residuals=residuals, output_mod=self.output_mod, block_k=block_k,
@@ -542,15 +543,15 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     q_pos = pl.program_id(0) * block_q + jnp.arange(block_q)[:, None]
     query, dout = query_ref[...], dout_ref[...]
     peak, total = peak_ref[...], total_ref[...]
+    product = functools.partial(kernel_dot, interpret=interpret)
     start, end = start_ref[...], end_ref[...]
     query_ids = [ref[...] for ref in id_refs[:1]]
 
     def tile(index):
         keys = pl.ds(index * block_k, block_k)
         k_pos = index * block_k + jnp.arange(block_k)[None, :]
-        seen = (k_pos >= start[:, None]) & (k_pos < end[:, None])
-        if ids:
-            seen &= query_ids[0][:, None] == id_refs[1][keys][None, :]
+        seen = within(k_pos, start[:, None], end[:, None],
+                      (query_ids[0][:, None], id_refs[1][keys][None, :]) if ids else None)
         params = [_tile_param(ref, kind, head, q_pos, keys)
                   for ref, kind in zip(score_refs, score_kinds, strict=True)]
         return keys, k_pos, seen, params
@@ -596,28 +597,19 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     def step(index, carry):
         # Each cotangent over the prior denominator, in the reference's order, and taken to the pass's
         # own at the end (`algebra.dq_finish`); the weights' sums unnormalized.
-        dq, residual, mass, grads, weighed = carry
         keys, k_pos, seen, params = tile(index)
         key, value = key_ref[keys, :], value_ref[keys, :]
         weights, _, cotangents, slopes = _tile_scores(score_mod, query, key, value, dout, peak, prior, anchor,
                                                    delta, seen, q_pos, k_pos, params, key_index=key_index,
                                                    scale=scale, how=how, interpret=interpret)
-        logits, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
-        # Scaled before it narrows to the operands' dtype and meets the keys, as the reference's is.
-        dq = dq + kernel_dot((logits * scale).astype(key.dtype), key, interpret)
-        grads = tuple(grad + piece if row else grad for grad, row, piece in zip(grads, summed, pieces,
-                                                                               strict=True))
-        if any(summed):
-            _, pieces = algebra.pulled(weights, slopes, seen, score_kinds)
-            weighed = tuple(sums + piece if row else sums for sums, row, piece in zip(weighed, summed, pieces,
-                                                                                    strict=True))
-        return (dq, residual + cotangents.sum(axis=-1), mass + weights.sum(axis=-1), grads, weighed)
+        return algebra.dq_step(carry, weights, cotangents, slopes, seen, key, prior, scale=scale,
+                               kinds=score_kinds, summed=summed, dot=product)
 
     nothing = jnp.zeros((block_q,), jnp.float32)
     rows = tuple(nothing for _ in score_kinds)
-    sums = algebra.DqSums(*jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], step,
-                                             (jnp.zeros(query.shape, jnp.float32), nothing, nothing, rows,
-                                              rows)))
+    zeros = jnp.zeros(query.shape, jnp.float32)
+    sums = jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], step,
+                             algebra.DqSums(zeros, nothing, nothing, rows, rows, zeros))
     dq, delta, total, mass, grads = algebra.dq_finish(sums, prior, state_total, peak0, shares, peak, anchor,
                                                       delta)
     dq_ref[...] = dq
@@ -651,15 +643,15 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
     k_pos = pl.program_id(0) * block_k + jnp.arange(block_k)[None, :]
     key, value = key_ref[...], value_ref[...]
     key_ids = [ref[...] for ref in id_refs[1:]]
+    product = functools.partial(kernel_dot, interpret=interpret)
 
     def step(index, carry):
         dk, dv, *grads = carry
         rows = pl.ds(index * block_q, block_q)
         query, dout = query_ref[rows, :], dout_ref[rows, :]
         q_pos = index * block_q + jnp.arange(block_q)[:, None]
-        seen = (k_pos >= start_ref[rows][:, None]) & (k_pos < end_ref[rows][:, None])
-        if ids:
-            seen &= id_refs[0][rows][:, None] == key_ids[0][None, :]
+        seen = within(k_pos, start_ref[rows][:, None], end_ref[rows][:, None],
+                      (id_refs[0][rows][:, None], key_ids[0][None, :]) if ids else None)
         params = [_key_param(ref, kind, head, rows)
                   for ref, kind in zip(score_refs, score_kinds, strict=True)]
         exponentials, weights, cotangents, slopes = _tile_scores(
@@ -668,8 +660,8 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
             interpret=interpret)
         logits, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
         dv = dv + kernel_dot(*algebra.value_operands(exponentials, weights, dout, total_ref[rows]), interpret)
-        # Scaled before it narrows to the operands' dtype, so fp16 holds what fp32 does.
-        dk = dk + kernel_dot((logits * scale).astype(query.dtype).T, query, interpret)
+        # Scaled before it meets the queries, to fp32's accuracy (`algebra.cotangent_product`).
+        dk = dk + algebra.cotangent_product(logits * scale, query, product, transposed=True)
         for place, (kind, piece) in enumerate(zip(score_kinds, pieces, strict=True)):
             if kind == Kind.TILE:
                 # A tile parameter's entries, under the refined D (`algebra.refinement`).
@@ -851,9 +843,9 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
     and query head takes each query's D about 0 or about the anchor key `key_index`'s `anchor_value · dO`,
     whichever is nearer, from the forward's split sums (`sums`, `algebra.split_delta`), or where None from
     a first walk of the key blocks the block map gives it, weighed at the forward's `maximum` from the
-    initial state's maximum, denominator and share of `D`'s numerator (`peak`, `total`, `initial_term`;
-    `algebra.off_anchor_delta`); then walks them for dQ under the weights `exp(s - m)`, normalized at the
-    end by their own sum `T`, refining `D - c` from its own sums. Returns dQ
+    initial state's maximum, denominator and its values' mean's term (`peak`, `total`, `initial_term`;
+    `algebra.off_anchor_start`, `algebra.off_anchor_delta`); then walks them for dQ under the weights
+    `exp(s - m)`, normalized at the end by their own sum `T`, refining `D - c` from its own sums. Returns dQ
     `[B, Qp, H, Dp]` fp32, `D - c`, `c`, `m`, `T` and the keys' mass `[B, H, Qp]`, the anchor key it took
     (-1 where about 0) `[B, H, Qp]` int32, and the gradients of the score hook's head (`[nQb, B, H, 1]`
     partials) and query (`[B, H, Qp]`) parameters."""
@@ -1009,6 +1001,6 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     initial = hooks is not None and hooks.initial is not None
     # A guarded forward's live rows carry normalized split sums (`algebra.split_residuals`), which the first
     # pass cannot recompute without the forward's denominator: D comes from them.
-    split = split or (natural and algebra.headroom(value.dtype, initial))
+    split = split or (natural and algebra.headroom(value.dtype))
     launch = functools.partial(_launch, split=split, natural=natural, initial=initial, interpret=interpret)
     return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=BLOCK, scale=scale)
