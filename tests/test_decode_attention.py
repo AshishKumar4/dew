@@ -822,8 +822,9 @@ def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(t
     paged kernel at Qwen3-0.6B's (16 query heads over 8 of 128) with pages of 16 and 32 keys over 1024
     keys a row, each at every slice count (`tuning.pinned`), which their 8 rows' 32 steps take on
     every GPU here, lowered for each GPU on this CPU and compiled by Triton
-    within its block's shared memory. A first filter: the A100 runs them; the H100 and the RTX PRO
-    6000 have this check alone."""
+    within its block's shared memory; and the dense kernel in the accurate form (`natural`), raw without
+    sinks and scaled with them, which the interpreted suite lowers for no GPU. A first filter: the A100
+    runs them; the H100 and the RTX PRO 6000 have this check alone."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_kernels, failures
 
@@ -850,6 +851,16 @@ def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(t
             return jax.value_and_grad(loss, argnums=(0, 1, 2))(query, key, value)
         return step, (query, cache, cache, lengths)
 
+    def natural(sinks: bool):
+        lengths = jax.ShapeDtypeStruct((8,), jnp.int32)
+        query = jax.ShapeDtypeStruct((8, 4, 2, 256), jnp.bfloat16)
+        cache = jax.ShapeDtypeStruct((8, 1024, 2, 256), jnp.bfloat16)
+        held = jnp.asarray(SINKS[:2], jnp.float32) if sinks else None
+
+        def attend(query, key, value, lengths):
+            return decode_attention.attend(query, key, value, lengths, sinks=held, natural=True)
+        return attend, (query, cache, cache, lengths)
+
     def paged(page_size):
         per_row = 1024 // page_size
         pages = jax.ShapeDtypeStruct((8, 8 * per_row + 3, page_size, 128), jnp.bfloat16)
@@ -862,6 +873,10 @@ def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(t
                         lambda dtype=dtype, splits=splits: pinned(lambda: dense(dtype),
                                                                   decode_attention.DecodeAttention, splits))
              for dtype in (jnp.bfloat16, jnp.float32) for splits in decode_attention.SPLITS]
+    cases += [KernelCase(f"natural/{'sinks' if sinks else 'raw'}/{splits}",
+                         lambda sinks=sinks, splits=splits: pinned(lambda: natural(sinks),
+                                                                   decode_attention.DecodeAttention, splits))
+              for sinks in (False, True) for splits in decode_attention.SPLITS]
     paged_op = decode_attention.PagedDecodeAttention
     cases += [KernelCase(f"paged/{size}/{splits}",
                          lambda size=size, splits=splits: pinned(lambda: paged(size), paged_op, splits))
