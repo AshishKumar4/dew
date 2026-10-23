@@ -1,12 +1,12 @@
 """diffusers' GEGLU feed-forward as a packed `GatedMLP` (`geglu_feed_forward`): its one projection
 holds the up half first, as the checkpoint stores it, and computes what diffusers' `FeedForward`
-computes from it, bit for bit."""
+computes from it, on par with that computation from its float64 run (check 1)."""
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import with_gradients
+from reference_error import assert_as_exact, with_gradients
 
 from dew.diffusion.process import DenoisingCondition
 from dew.nn.activations import gated_product
@@ -15,31 +15,42 @@ from dew.nn.mlp import GatedMLP, geglu_feed_forward
 from dew.nn.precision import float32_dot_general
 from dew.nn.sharding import declarations, declared_axes, parameter_path
 
+GEGLU_SEEDS = {"tanh float32": 16, "tanh bfloat16": 16, "erf float32": 16, "erf bfloat16": 16}
+"""Check 1's declared seeds for each form (to size)."""
 
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["float32", "bfloat16"])
 @pytest.mark.parametrize("approximate", [True, False], ids=["tanh", "erf"])
-def test_the_packed_feed_forward_is_diffusers_geglu_bit_for_bit(approximate, dtype):
+def test_the_packed_feed_forward_computes_diffusers_geglu(approximate, dtype):
     """diffusers' `GEGLU`: one projection whose first half is the hidden state and second the gate,
-    `hidden * gelu(gate)`, then the output map. The packed GatedMLP's output and every gradient are
-    that computation's, to the bit."""
+    `hidden * gelu(gate)`, then the output map. The packed GatedMLP's output and every gradient are on
+    par with that computation's in the same dtype (check 1), from its float64 run, over drawn states,
+    parameters and cotangents."""
     dim = 8
-    rng = np.random.default_rng(0)
-    x = jnp.asarray(rng.standard_normal((2, 5, dim)), dtype)
-    cotangent = jnp.asarray(rng.standard_normal((2, 5, dim)), dtype)
+    shape = (4, 16, dim)
     packed = geglu_feed_forward(dim, approximate=approximate, dtype=dtype)
-    params = jax.tree.map(lambda leaf: jnp.asarray(rng.standard_normal(leaf.shape) * 0.3, leaf.dtype),
-                          packed.init(jax.random.key(0), x)["params"])
-    dense = {width: Dense(width, dtype=dtype, dot_general=float32_dot_general) for width in (8 * dim, dim)}
+    shapes = jax.eval_shape(packed.init, jax.random.key(0), jnp.zeros(shape, dtype))["params"]
 
-    def diffusers(params, x):
-        hidden, gate = jnp.split(dense[8 * dim].apply({"params": params["gate_up_proj"]}, x), 2, axis=-1)
-        activated = gated_product("geglu" if approximate else "geglu_exact")(gate, hidden)
-        return dense[dim].apply({"params": params["down_proj"]}, activated)
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        params = jax.tree.map(lambda leaf: np.asarray(rng.standard_normal(leaf.shape) * 0.3, leaf.dtype),
+                              shapes)
+        x, cotangent = (np.asarray(rng.standard_normal(shape), dtype) for _ in range(2))
+        return params, x, cotangent
 
-    ours = jax.jit(with_gradients(lambda p, x: packed.apply({"params": p}, x)))(params, x, cotangent)
-    theirs = jax.jit(with_gradients(diffusers))(params, x, cotangent)
-    for mine, reference in zip(jax.tree.leaves(ours), jax.tree.leaves(theirs), strict=True):
-        np.testing.assert_array_equal(np.asarray(mine, np.float32), np.asarray(reference, np.float32))
+    def diffusers(dtype):
+        dense = {width: Dense(width, dtype=dtype, dot_general=float32_dot_general)
+                 for width in (8 * dim, dim)}
+
+        def forward(params, x):
+            hidden, gate = jnp.split(dense[8 * dim].apply({"params": params["gate_up_proj"]}, x), 2, axis=-1)
+            activated = gated_product("geglu" if approximate else "geglu_exact")(gate, hidden)
+            return dense[dim].apply({"params": params["down_proj"]}, activated)
+        return jax.jit(with_gradients(forward))
+
+    label = f"{'tanh' if approximate else 'erf'} {jnp.dtype(dtype).name}"
+    assert_as_exact(jax.jit(with_gradients(lambda params, x: packed.apply({"params": params}, x))),
+                    diffusers(dtype), draw, label, seeds=GEGLU_SEEDS[label], truth_fn=diffusers(None))
 
 
 def test_a_unets_feed_forward_declares_its_kernels_axes():
