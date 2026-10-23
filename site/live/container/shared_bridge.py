@@ -330,7 +330,8 @@ class Gateway:
         try:
             self.contexts[session][None] = await self.start(session)
         except BaseException:
-            # A close took the session already, and a later create may have begun it again: that one is not this.
+            # A close took the session already, and a later create may have begun it again, which is
+            # not this one's to end.
             if self.creating.get(session) is mine:
                 self.contexts.pop(session, None)
             raise
