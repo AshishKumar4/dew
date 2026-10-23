@@ -60,7 +60,8 @@ def held_chunk(chunk_size: int, key_width: int) -> int:
     return min(chunk_size, 2 * key_width)
 
 
-def xla_chunk_states(key, k_cumdecay, out_vals, grown, last_decay, state, kept):
+def xla_chunk_states(key, k_cumdecay, out_vals, grown, last_decay, state, kept, *, last_token=None,
+                     delta: bool = True):
     """The memory crossing chunks, the one sequential part of the chunked
     rule, as a `lax.scan` over the algebra's `carry`: per chunk the reference's corrected values
     `v_new = value - k_cumdecay @ S` and its write `S * exp(gc[-1]) +
@@ -83,10 +84,15 @@ def xla_chunk_states(key, k_cumdecay, out_vals, grown, last_decay, state, kept):
     write does not keep. `kept` `[B, 1, NC, 1, 1]` marks the chunks no
     document starts in, the only ones the memory they entered passes through
     (`Chunked`).
+
+    With `last_token`, these operands describe the prefix through the penultimate real token
+    (`_peeled_chunk_inputs`); the last real token runs through `peeled_carry` afterwards. The
+    corrected values still cover every token, so the chunk's readout is unchanged.
     """
+    carry = algebra.carry if last_token is None else functools.partial(algebra.peeled_carry, delta=delta)
+    operands = key, k_cumdecay, out_vals, grown, last_decay, kept, *(last_token or ())
     final, (entered, corrected) = jax.lax.scan(
-        algebra.carry, state,
-        tuple(jnp.moveaxis(x, 2, 0) for x in (key, k_cumdecay, out_vals, grown, last_decay, kept)))
+        carry, state, tuple(jnp.moveaxis(x, 2, 0) for x in operands))
     return jnp.moveaxis(entered, 0, 2), jnp.moveaxis(corrected, 0, 2), final
 
 
@@ -213,7 +219,7 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
 
 
 def _chunk_delta_forward(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype):
-    """The unchanged chunked primal, and the operands its reverse rule keeps."""
+    """The chunked readout and peeled memory write, and the operands their reverse rule keeps."""
     B, S, H, _ = key.shape
     Dv = value.shape[-1]
     steps = chunked(query, key, value, g, beta, chunk_size, starts=starts, delta=delta, scale=scale)
@@ -224,8 +230,9 @@ def _chunk_delta_forward(query, key, value, g, beta, state, chunk_size, starts, 
     # The barrier materializes the zero. Remove it when XLA:CPU no longer
     # returns an uninitialized scan carry here.
     state = jax.lax.optimization_barrier(state)
-    entered, v_corrected, state = xla_chunk_states(steps.key, steps.w, steps.u, steps.grown, steps.last,
-                                                   state, steps.kept)
+    grown, last, kept, last_token = _peeled_chunk_inputs(steps, value, g, beta, starts, chunk_size)
+    entered, v_corrected, state = xla_chunk_states(
+        steps.key, steps.w, steps.u, grown, last, state, kept, last_token=last_token, delta=delta)
     # The pairs are zero above the diagonal, so this is the reference's inclusive
     # lower `masked_fill(triu(1), 0)`.
     core = algebra.readout(steps.query, steps.entering, entered, steps.key, steps.pairs, v_corrected)
@@ -253,11 +260,48 @@ def _chunk_sequence(x, length: int):
     return jnp.moveaxis(x.reshape(B, H, chunks * width, *x.shape[4:]), 1, 2)[:, :length]
 
 
+def _chunk_token(x, positions):
+    """One token per chunk of `[B, H, NC, C, ...]`, its local position `[NC]`, without its C axis."""
+    index = positions.reshape(1, 1, -1, 1, *((1,) * (x.ndim - 4)))
+    index = jnp.broadcast_to(index, (*x.shape[:3], 1, *x.shape[4:]))
+    return jnp.take_along_axis(x, index, axis=3)[:, :, :, 0]
+
+
+def _peeled_chunk_inputs(steps, value, g, beta, starts, chunk_size):
+    """The prefix's decay row and kept flag, and the last real token of every chunk.
+
+    The ragged last chunk peels its last unpadded token. An empty prefix has unit decay, no
+    writes and passes its entered memory on; a reset on the peeled token then drops it there.
+    Prefix `kept` sees only starts before the peeled token, while its pairwise decay row
+    already excludes previous documents. Thus a document starting on the boundary belongs to
+    the final token, not the WY prefix."""
+    count = steps.key.shape[2]
+    final = jnp.minimum(chunk_size, value.shape[1] - jnp.arange(count) * chunk_size) - 1
+    penultimate = jnp.maximum(final - 1, 0)
+    nonempty = final[None, None, :, None] > 0
+    grown = jnp.where(nonempty, _chunk_token(steps.grown, penultimate), 1.0)[..., None, :]
+    last = jnp.where(nonempty[..., None], _chunk_token(steps.pairs, penultimate), 0.0)
+    if starts is None:
+        kept = jnp.ones((1, 1, count, 1, 1), value.dtype)
+        reset = jnp.zeros(steps.key.shape[:3], bool)
+    else:
+        begins = jnp.broadcast_to(jnp.asarray(starts, bool)[..., None], value.shape[:3])
+        begins = _chunk_rows(begins, chunk_size)
+        prefix = jnp.arange(chunk_size)[None, None, None, :] < final[None, None, :, None]
+        kept = (~jnp.any(begins & prefix, axis=-1))[..., None, None].astype(value.dtype)
+        reset = _chunk_token(begins, final)
+    key = _chunk_token(steps.key, final)
+    value, g, beta = (_chunk_token(_chunk_rows(x, chunk_size), final) for x in (value, g, beta))
+    return grown, last, kept, (key, value, g, beta, reset)
+
+
 def _chunk_delta_residual(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype):
     """Keep chunk boundaries and the readout's memory-gradient operands, not per-token memories."""
     out, (steps, entered) = _chunk_delta_forward(
         query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
-    transition, _ = algebra.transition(steps.key, steps.w, steps.u, steps.grown, steps.last, steps.kept)
+    grown, last, kept, last_token = _peeled_chunk_inputs(steps, value, g, beta, starts, chunk_size)
+    transition, _ = algebra.peeled_transition(
+        steps.key, steps.w, steps.u, grown, last, kept, last_token, delta=delta)
     scores = algebra.paired("scores", steps.query, steps.key, steps.pairs)
     resets = (jnp.zeros(value.shape[:2], bool) if starts is None else jnp.asarray(starts, bool))
     resets = _chunk_rows(jnp.broadcast_to(resets[..., None], value.shape[:3]), chunk_size)
