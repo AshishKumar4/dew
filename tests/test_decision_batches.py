@@ -205,3 +205,64 @@ def test_a_long_scoring_backlog_does_not_hold_generation_back(decide):
         engine.close()
     assert finished.index("generation") < len(bodies) - 1
     assert drawn.result().text == bound("12", 3, key=0).text
+
+
+IMAGE_SEEDS = 8
+"""Check 1's declared seeds for two requests of images joined in one pass."""
+
+
+def test_two_requests_of_alike_images_join_one_pass_each_scored_as_alone(tmp_path):
+    """Two requests of one state, each with its own image of one size, are rows as long as each other
+    of alike images, so they join one pass (`WireScoring.fits`, `Images.joined`); each row's every
+    logit is on par from float64 with its pass alone (check 1), so each row reads its own image."""
+    from reference_error import widened
+
+    from dew.decision.model import DecisionModel
+    from dew.nn.multimodal import MultimodalTransformer
+
+    release = FIXTURES / "joint_checkpoint" / "tiny"
+    backbone = FIXTURES / "hf" / "qwen38-dense-tiny"
+    for source in [*backbone.iterdir(), release / "joint_head_config.json",
+                   release / "joint_head.safetensors"]:
+        (tmp_path / source.name).symlink_to(source.resolve())
+    decide = Decide.from_pretrained(tmp_path, attention_impl="xla")
+    pictures = [Image.fromarray(array) for array in np.load(backbone / "images.npy")][:2]
+    words = ["one", "two", "three", "four", "five", "six"]
+    task, variables = decide.scoring()
+
+    def rows_of(reading, seed):
+        rng = np.random.default_rng([0x1A6E, int(seed)])
+        state = " ".join(rng.choice(words, 8))
+        return [row for picture in pictures
+                for row in reading.admit({**CASES["quickstart"], "state": state, "images": [picture]}).rows]
+
+    assert task.fits(rows_of(task, 0))
+
+    def scored(reading, held, seed, *, together: bool) -> np.ndarray:
+        rows = rows_of(reading, seed)
+        outputs = reading.forward(held, rows) if together else [
+            output for row in rows for output in reading.forward(held, [row])]
+        # Each question's real options' logits, its row's slots past them being no option's.
+        return np.concatenate([np.asarray(output)[slot, :len(laid.order)]
+                               for row, output in zip(rows, outputs, strict=True)
+                               for slot, laid in enumerate(row.encoded.questions)])
+
+    wide = {}
+
+    def truth(seed):
+        with jax.enable_x64(new_val=True):
+            if "task" not in wide:
+                language = decide.model.backbone
+                assert isinstance(language, MultimodalTransformer)
+                exact = language.clone(dtype=jnp.float64,
+                                       language_model=language.language_model.clone(dtype=jnp.float64))
+                wide["task"] = dataclasses.replace(
+                    decide, model=DecisionModel(exact, decide.model.head.clone(dtype=jnp.float64)),
+                    variables=widened(decide.variables)).scoring()
+            reading, held = wide["task"]
+            return scored(reading, held, seed, together=False)
+
+    assert_as_exact(lambda seed: scored(task, variables, seed, together=True),
+                    lambda seed: scored(task, variables, seed, together=False),
+                    lambda seed: (np.int64(seed),), "two requests of images in one pass", seeds=IMAGE_SEEDS,
+                    truth_fn=truth)
