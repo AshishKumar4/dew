@@ -105,23 +105,15 @@ def _dot(a, b, *, exact: bool, ieee: bool = False, solve: jnp.dtype | None = Non
       where one TF32 put a Kimi linear layer's logits 100 times the reference's distance from
       float64 on an H100; one TF32, fla's, in a 16-bit call, whose operands' rounding it stays under
       and where TF32x3 cost Kimi Linear's bf16 layer 17% on an H100 and 19% on an A100.
-    - interpreted: each product exact in float64, summed in float64 along the depth in order and rounded
-      once to fp32."""
+    - interpreted: each product exact in float64 and the sum rounded once to fp32."""
     if jnp.dtype(a.dtype) != jnp.dtype(b.dtype):
         raise TypeError(f"Pallas dot operands must have the same dtype, got {a.dtype} and {b.dtype}")
     wide = jnp.dtype(a.dtype) == jnp.float32
     if exact:
-        # Each product exact in float64, summed in float64 along the depth in order and rounded once:
-        # what an MMA's fp32 accumulation rounds within a step, and one order however the program is
-        # mapped, where a CPU's dot picks its order by shape and batching (`dew.nn.precision`'s CPU policy).
+        # Each product exact in float64 and the sum rounded once to fp32, as Dew's CPU products sum
+        # (`dew.nn.precision`), where a CPU's own fp32 dot picks its order and rounding by shape and ISA.
         with jax.enable_x64(new_val=True):
-            wide_a, wide_b = a.astype(jnp.float64), b.astype(jnp.float64)
-
-            def term(depth, total):
-                return total + wide_a[:, depth][:, None] * wide_b[depth][None, :]
-
-            total = jnp.zeros((a.shape[0], b.shape[1]), jnp.float64)
-            return jax.lax.fori_loop(0, a.shape[1], term, total).astype(jnp.float32)
+            return jnp.dot(a.astype(jnp.float64), b.astype(jnp.float64)).astype(jnp.float32)
     elif wide:
         narrow_call = solve is not None and jnp.dtype(solve).itemsize < 4
         precision = (jax.lax.Precision.HIGHEST if ieee else jax.lax.Precision.DEFAULT if narrow_call
