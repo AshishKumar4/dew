@@ -1,5 +1,6 @@
 """A decision that reads a context beside its state, through gated cross-attention layers attached to a
-pretrained backbone: trained as an adapter, counted in its training work, and served."""
+pretrained backbone: trained as an adapter, counted in its training work, and served, each request's
+answer read from its own context."""
 
 import itertools
 from pathlib import Path
@@ -9,7 +10,9 @@ import numpy as np
 import optax
 import pytest
 from decision_support import decision_rows
+from model_support import flat_tree
 from recording import RecordingTracker
+from reference_error import assert_as_exact
 
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
@@ -19,39 +22,55 @@ from dew.decision.objective import DecisionObjective
 from dew.decision.questions import ChoiceAnswer
 from dew.interop import Pretrained
 from dew.nn.cross_attention import CrossAttention, crossing
-from dew.objectives.base import FROZEN
+from dew.objectives.base import FROZEN, thaw
 from dew.training import Trainer
 
 pytestmark = pytest.mark.mesh
 
 LLAMA = Path(__file__).parent / "fixtures" / "hf" / "llama-tiny"
 
-TICKETS = [("charged twice for March", "billing", "a card holder since 2019"),
-           ("the site is down", "technical", None),
-           ("how much is the pro plan", "sales", "asked about the price list before"),
-           ("refund my last invoice", "billing", "two refunds this year"),
-           ("error 500 on login", "technical", "uses the mobile app"),
-           ("can I upgrade", "sales", None)] * 4
-"""Tickets, their team, and a note about the customer a decision may read beside the ticket: none
-for some."""
+ROWS = [("one two three", "a", "a first note, longer than a short context holds"),
+        ("four five", "b", None),
+        ("six seven eight nine", "c", "a second note of some length"),
+        ("ten eleven", "a", "third"),
+        ("twelve thirteen", "b", "a fourth note"),
+        ("fourteen", "c", None)] * 4
+"""States, their option, and a note a decision may read beside the state: none for some, and some
+longer than a short context holds."""
 
 
 SPECIALS = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
 """A byte tokenizer's specials, over the fixture's 256-token vocabulary."""
 
-QUESTION = {"team": Choice("Which team?", ["billing", "technical", "sales"])}
+QUESTION = {"pick": Choice("Which one?", ["a", "b", "c"])}
+
+WORDS = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "note", "first"]
+
+CONTEXT_SEEDS = 16
+"""Check 1's declared seeds for the batched answers with their contexts."""
 
 
-def conditioned(length: int = 16, layers: tuple[int, ...] = (0, 1)) -> DecisionObjective:
+def conditioned(length: int = 16, layers: tuple[int, ...] = (0, 1),
+                dtype: str = "float32") -> DecisionObjective:
     """A decision over the tiny Llama with fresh cross-attention before `layers`, its context up to
-    `length` tokens, its rows laid out by bytes."""
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    `length` tokens, its rows laid out by bytes, computed and held in `dtype`."""
+    source = Pretrained.load(LLAMA, dtype=dtype, param_dtype=dtype, attention_impl="reference")
     return DecisionObjective(source.with_cross_attention(CrossAttention(layers, length), key=0),
                              tokenizer=ByteTokenizer(), specials=SPECIALS)
 
 
 def examples() -> list[Example]:
-    return [Example(text, QUESTION, {"team": label}, context=note) for text, label, note in TICKETS]
+    return [Example(text, QUESTION, {"pick": label}, context=note) for text, label, note in ROWS]
+
+
+def opened(variables, value: float = 1.0):
+    """`variables` with every cross-attention gate at `value`, so the blocks' reading joins the stream."""
+    tree = thaw(variables)
+
+    def gate(path, leaf):
+        return np.full_like(np.asarray(leaf), value) if "alpha_" in str(path[-1]) else leaf
+
+    return {**tree, "params": jax.tree_util.tree_map_with_path(gate, tree["params"])}
 
 
 def test_a_backbone_with_fresh_context_layers_scores_every_row_as_its_source_does():
@@ -71,9 +90,9 @@ def test_a_backbone_with_fresh_context_layers_scores_every_row_as_its_source_doe
     variables = crossed.init(jax.random.key(0))
     variables = {**variables, "params": {**variables["params"], "head": asked.variables["params"]["head"]}}
     reading = Decide(crossed.model, variables, crossed.layout, crossed.tokenizer, crossed.specials)
-    alone = asked("charged twice for March", QUESTION)["team"]
-    for context in (None, "a card holder since 2019"):
-        read = reading("charged twice for March", QUESTION, context=context)["team"]
+    alone = asked("one two three", QUESTION)["pick"]
+    for context in (None, "a first note"):
+        read = reading("one two three", QUESTION, context=context)["pick"]
         assert isinstance(read, ChoiceAnswer) and isinstance(alone, ChoiceAnswer)
         np.testing.assert_array_equal(read.probabilities, alone.probabilities)
 
@@ -82,8 +101,8 @@ def test_a_conditioned_run_logs_its_training_work_and_serves_with_its_context():
     """Examples with a context trained through context layers: every logged step reports its
     training work, and beyond what its batch's rows cost without their contexts by the
     cross-attention's work over them (`test_the_context_layers_work_is_counted_in_a_conditioned_batch`
-    holds the count itself), far past the float32 sum the step logs it by; the run's task answers a
-    request with its context."""
+    holds the count itself), far past the float32 sum the step logs it by. The gates move off zero and
+    every frozen leaf stays as it was; the run's task answers a request otherwise for another context."""
     objective = conditioned()
     data = decision_rows(examples(), 8, objective=objective.data())
     batches = list(itertools.islice(data.train(DataPartition()), 2))
@@ -91,14 +110,22 @@ def test_a_conditioned_run_logs_its_training_work_and_serves_with_its_context():
                                              if name != "context_lengths"}) for batch in batches]
     tracker = RecordingTracker()
     trainer = Trainer(objective, optax.adam(1e-3), key=0, tracker=tracker)
+    initial = trainer.initial_state()
     state = trainer.fit(data, steps=2, log_every=1)
     logged = [scalars["train/flops"] for _, scalars in tracker.scalars if "train/loss" in scalars]
     assert len(logged) == 2 and all(work > without for work, without in zip(logged, plain, strict=True))
+    for before, after in zip(jax.tree.leaves(initial.variables[FROZEN]),
+                             jax.tree.leaves(state.variables[FROZEN]), strict=True):
+        np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
+    gates = [np.asarray(leaf) for path, leaf in flat_tree(thaw(state.variables)["params"]).items()
+             if "alpha_" in path]
+    assert gates and all(np.all(gate != 0) for gate in gates)
 
     task = objective.pipeline(state)
     assert isinstance(task, Decide)
-    answer = task("charged twice for March", QUESTION, context="a card holder since 2019")["team"]
-    assert isinstance(answer, ChoiceAnswer) and answer.choice in ("billing", "technical", "sales")
+    read = [task("one two three", QUESTION, context=context)["pick"] for context in ("a first note", "ten")]
+    assert all(isinstance(answer, ChoiceAnswer) for answer in read)
+    assert not np.array_equal(read[0].probabilities, read[1].probabilities)
 
 
 def test_the_context_layers_work_is_counted_in_a_conditioned_batch():
@@ -123,3 +150,84 @@ def test_the_context_layers_work_is_counted_in_a_conditioned_batch():
     assert objective.training_flops(None, batch) == frozen + 3 * (cross + head)
     plain = {name: value for name, value in batch.items() if name != "context_lengths"}
     assert objective.training_flops(None, plain) == frozen + 3 * head
+
+
+def test_a_batch_answers_each_request_from_its_own_context():
+    """With the gates open, a request's answer reads its context: another context, or none, answers it
+    otherwise. In a batch, each request's every option probability is on par from float64 with its
+    answer alone (check 1), so each row reads its own context and not a neighbour's."""
+    objective = conditioned(16, (0, 1))
+    variables = opened(objective.init(jax.random.key(0)))
+    task = Decide(objective.model, variables, objective.layout, objective.tokenizer, objective.specials)
+    answers = [task("one two three", QUESTION, context=context)["pick"]
+               for context in ("a first note", "ten", None)]
+    probabilities = [np.asarray(answer.probabilities) for answer in answers
+                     if isinstance(answer, ChoiceAnswer)]
+    assert len(probabilities) == len(answers)
+    assert not np.array_equal(probabilities[0], probabilities[1])
+    assert not np.array_equal(probabilities[0], probabilities[2])
+
+    wide = {}
+
+    def requests(seed):
+        """Four requests of one question, two of them on one state, each with a context drawn from
+        `seed`, or none."""
+        rng = np.random.default_rng([0xC0E7, int(seed)])
+        states = [" ".join(rng.choice(WORDS, 6)) for _ in range(3)]
+        contexts = [" ".join(rng.choice(WORDS, int(rng.integers(1, 6)))) for _ in range(3)]
+        return [(states[0], QUESTION), (states[0], QUESTION), (states[1], QUESTION), (states[2], QUESTION)], [
+            contexts[0], contexts[1], None, contexts[2]]
+
+    def scored(reading: Decide, seed, *, together: bool) -> np.ndarray:
+        asked, contexts = requests(seed)
+        answered = (reading.batch(asked, contexts=contexts) if together else
+                    [reading.batch([one], contexts=[context])[0]
+                     for one, context in zip(asked, contexts, strict=True)])
+        return np.concatenate([answer.probabilities for answers, _ in answered
+                               for answer in answers.values()])
+
+    def truth(seed):
+        if "task" not in wide:
+            exact = conditioned(16, (0, 1), "float64")
+            widened = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64)
+                                   if np.issubdtype(np.asarray(leaf).dtype, np.floating) else leaf, variables)
+            wide["task"] = Decide(exact.model, widened, exact.layout, exact.tokenizer, exact.specials)
+        return scored(wide["task"], seed, together=False)
+
+    def draw(seed):
+        # The draw is its seed; the requests are made from it, their text no array the check widens.
+        return (np.int64(seed),)
+
+    assert_as_exact(lambda seed: scored(task, seed, together=True),
+                    lambda seed: scored(task, seed, together=False), draw,
+                    "batched answers with their contexts", seeds=CONTEXT_SEEDS, truth_fn=truth)
+
+
+def test_a_request_with_images_reads_its_context_beside_them():
+    """Over a backbone that reads images (a `MultimodalTransformer`), the blocks attach to its language
+    model. With their gates shut a request with images and a context is answered exactly as with its
+    images alone; with them open its context moves the answer."""
+    from PIL import Image
+
+    from dew.data.text import HFTokenizer
+    from dew.decision import JointLayout
+
+    directory = LLAMA.parent / "qwen38-dense-tiny"
+    source = Pretrained.load(directory, dtype="float32", attention_impl="xla")
+    tokenizer = HFTokenizer(str(directory), local_files_only=True)
+    layout = JointLayout(max_len=1024)
+    objective = DecisionObjective(source.with_cross_attention(CrossAttention((0,), 16), key=0),
+                                  tokenizer=tokenizer, layout=layout)
+    variables = objective.init(jax.random.key(0))
+    images = [Image.fromarray(array) for array in np.load(directory / "images.npy")]
+
+    def read(gates, context):
+        task = Decide(objective.model, gates, layout, tokenizer, objective.specials,
+                      processor=source.processor)
+        answer = task("one two three", QUESTION, images=images, context=context)["pick"]
+        assert isinstance(answer, ChoiceAnswer)
+        return np.asarray(answer.probabilities)
+
+    np.testing.assert_array_equal(read(variables, "a first note"), read(variables, None))
+    widened = opened(variables)
+    assert not np.array_equal(read(widened, "a first note"), read(widened, "ten"))
