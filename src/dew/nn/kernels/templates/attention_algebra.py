@@ -248,11 +248,28 @@ def guarded[C: (Partial, tuple)](plain: Callable[[], C], shifted: Callable[[jax.
     return jax.lax.cond(jnp.max(live.astype(jnp.int32)) > 0, shifted, kept, live)
 
 
+POWER2_REACH = 381.0
+"""The largest `|k|` `power2` takes apart: past it every fp32 `x * 2^k` is zero or infinite (`2^-381` of
+fp32's largest flushes, `2^381` of its least overflows), so `k` is held there."""
+
+
+def exact_power2(k: jax.Array) -> jax.Array:
+    """`2^k` exactly for an integral `k` in [-126, 127], built from its fp32 exponent bits: no `exp2`,
+    which XLA computes as `exp(k ln 2)`, inexactly, and whose products it fuses into one `exp` of their
+    sum (its algebraic simplifier's `exp(a) exp(b) -> exp(a + b)`), past fp32's range where each factor
+    is in it."""
+    bits = jax.lax.shift_left(jnp.asarray(k, jnp.float32).astype(jnp.int32) + 127, 23)
+    return jax.lax.bitcast_convert_type(bits, jnp.float32)
+
+
 def power2(x: jax.Array, k: jax.Array) -> jax.Array:
-    """`x * 2^k` for an integral `k` of any size within fp32's exponents, in two factors each within
-    2^±64, so no factor itself overflows or flushes (`2^128` is infinite in fp32, `2^-128` subnormal)."""
-    half = jnp.trunc(k / 2)
-    return x * jnp.exp2(half) * jnp.exp2(k - half)
+    """`x * 2^k` for an integral `k` of any size, exactly wherever the result is a normal fp32: three exact
+    factors each within 2^±127 (`exact_power2`), of `k`'s sign, so each partial product lies between `x`
+    and the result; `k` held within `POWER2_REACH`, past which the result is zero or infinite."""
+    k = jnp.clip(jnp.asarray(k, jnp.float32), -POWER2_REACH, POWER2_REACH)
+    first = jnp.trunc(k / 3)
+    second = jnp.trunc((k - first) / 2)
+    return x * exact_power2(first) * exact_power2(second) * exact_power2(k - first - second)
 
 
 def headroom(dtype) -> bool:
@@ -935,7 +952,7 @@ def off_anchor_weights(logits: jax.Array, maximum: jax.Array, at_anchor: jax.Arr
     and narrowed, whose product the mainloop issues apart (`off_anchor`), as the forward's (`room`)."""
     exponentials = below(logits, maximum, how)
     weight = expand(jnp.minimum(shift, WEIGHT_SHIFT), exponentials)
-    small = jnp.where(exponentials < jnp.exp2(weight - 126.0), exponentials, 0.0)
+    small = jnp.where(exponentials < power2(jnp.float32(1.0), weight - 126.0), exponentials, 0.0)
     exponentials = power2(exponentials - small, -weight)
     rounded = exponentials.astype(dtype)
     rest = jnp.where(at_anchor, jnp.zeros_like(rounded), rounded)
