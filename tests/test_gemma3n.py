@@ -17,7 +17,7 @@ import pytest
 from flax import linen as nn
 from interop_support import fixture_arrays
 from model_support import gate_margin
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.nn.gemma3n import AltUp, AltUpLayer, LaurelBlock
 from dew.nn.mlp import GatedMLP, gaussian_topk
@@ -125,28 +125,42 @@ def test_altup_trains_past_its_coefficient_clip_as_the_reference_does():
                     getattr(altup, name).weight.copy_(torch.from_numpy(tensors[f"altup.{name}.weight"]))
                 altup.router_norm.weight.copy_(torch.from_numpy(tensors["altup.router_norm.weight"]))
                 altup.correct_output_scale.copy_(torch.from_numpy(tensors["altup.correct_output_scale"]))
-            predictions = altup.predict(torch.tensor(stream, dtype=dtype))
-            corrected = altup.correct(predictions, torch.tensor(activated, dtype=dtype))
-            outputs = (predictions, corrected, altup.scale_corrected_output(corrected[0]))
-            sum((output * torch.tensor(cotangent, dtype=dtype)).sum()
-                for output, cotangent in zip(outputs, cotangents, strict=True)).backward()
-        return {"outputs": [output.detach().numpy() for output in outputs], "params": {"altup": {
-            **{name: {"kernel": getattr(altup, name).weight.grad.numpy().T} for name in names},
-            "router_norm": {"scale": altup.router_norm.weight.grad.numpy()},
-            "correct_output_scale": altup.correct_output_scale.grad.numpy()}}}
+            class Stepped(torch.nn.Module):
+                """AltUp's prediction, correction and scaled correction in one forward, which
+                `torch.func.functional_call` runs on the pullback's weights (the prediction weight
+                clamped in place, as the reference's training forward clamps it)."""
+
+                def __init__(self):
+                    super().__init__()
+                    self.altup = altup
+
+                def forward(self, stream, activated):
+                    predictions = self.altup.predict(stream)
+                    corrected = self.altup.correct(predictions, activated)
+                    return predictions, corrected, self.altup.scale_corrected_output(corrected[0])
+
+            stepped = Stepped()
+            held = {name: leaf.detach().numpy() for name, leaf in stepped.named_parameters()}
+            host = held["altup.router_norm.weight"].dtype
+            # The draw's cotangents, pulled back through the gate's torch twin.
+            outputs, gradients, _, _ = torch_with_gradients(
+                lambda stored, *inputs: torch.func.functional_call(stepped, stored, inputs))(
+                held, np.asarray(stream, host), np.asarray(activated, host), cotangents)
+        return {"outputs": list(outputs), "params": {"altup": {
+            **{name: {"kernel": gradients[f"altup.{name}.weight"].T} for name in names},
+            "router_norm": {"scale": gradients["altup.router_norm.weight"]},
+            "correct_output_scale": gradients["altup.correct_output_scale"]}}}
 
     params = altup_variables(tensors)["params"]
 
     @jax.jit
     def stepped(stream, activated, *cotangents):
-        def loss(params):
-            outputs = Steps(AltUp(num_inputs=COPIES, coef_clip=clip)).apply(
+        def run(params):
+            return Steps(AltUp(num_inputs=COPIES, coef_clip=clip)).apply(
                 {"params": params}, stream, activated, train=True)
-            terms = [jnp.sum(output * cotangent)
-                     for output, cotangent in zip(outputs, cotangents, strict=True)]
-            return sum(terms), outputs
 
-        (_, outputs), gradient = jax.value_and_grad(loss, has_aux=True)(params)
+        # The draw's cotangents, pulled back through the gate.
+        outputs, gradient = with_gradients(run)(params, tuple(cotangents))
         return {"outputs": list(outputs), "params": gradient}
 
     assert_as_exact(stepped, lambda *inputs: reference(torch.float32, *inputs), draw,
@@ -217,15 +231,16 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
 
     def draw(seed):
         """Rows of ids drawn uniformly from the vocabulary, the first draw of the seed whose gates
-        clear MARGIN at the step's weights."""
+        clear MARGIN at the step's weights, and the loss's cotangent, one, which the reference's
+        pullback takes (the Trainer's is its own)."""
         for attempt in range(64):
             rows = np.random.default_rng([0x3E, seed, attempt]).integers(
                 0, int(model.vocab_size), shape).astype(np.int32)
             if gate_margin(model, loaded.variables, rows[:, :-1], train=True) > MARGIN:
-                return (rows,)
+                return rows, np.float32(1)
         raise AssertionError(f"no rows of seed {seed} clear the gates' margin {MARGIN}")
 
-    def stepped(rows):
+    def stepped(rows, one):
         # The step donates the state it is given: each draw steps from its own copy.
         state, *_ = step(jax.tree.map(jnp.copy, initial), {"text": rows})
         trained = loaded.export({**loaded.variables, "params": state.variables["params"]})
@@ -240,7 +255,7 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
     references = {torch.float32: loaded_reference, torch.float64: wide}
     weights = {key: value.clone() for key, value in loaded_reference.state_dict().items()}
 
-    def reference(dtype, rows):
+    def reference(dtype, rows, one):
         # Each draw steps from the checkpoint's weights, loaded once a precision.
         reference = references[dtype]
         reference.load_state_dict(weights)
@@ -249,15 +264,28 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
         reference.zero_grad(set_to_none=True)
         solver = torch.optim.SGD(reference.parameters(), lr=rate, weight_decay=decay)
         tokens = torch.from_numpy(rows).long()
+        held = dict(reference.named_parameters())
+
+        def loss(stored):
+            return torch.func.functional_call(reference, stored, (),
+                                              {"input_ids": tokens, "labels": tokens}).loss
+
         with float64() if dtype == torch.float64 else torch.enable_grad():
-            reference(input_ids=tokens, labels=tokens).loss.backward()
+            # A training forward clamps the stored prediction weights in place, so the step updates
+            # the clamped ones; the loss's one is pulled back through the gate's torch twin.
+            with torch.no_grad():
+                reference(input_ids=tokens)
+            stored = {name: leaf.detach().numpy() for name, leaf in held.items()}
+            _, gradients = torch_with_gradients(loss)(stored, one)
+            for name, leaf in held.items():
+                leaf.grad = torch.from_numpy(gradients[name])
             solver.step()
         state_dict = reference.state_dict()
         return {name: state_dict[name].detach().numpy() for name in names}
 
     label = f"a clamped AltUp training step, decay {decay}"
-    assert_as_exact(stepped, lambda rows: reference(torch.float32, rows), draw, label,
-                    seeds=STEP_SEEDS[decay], truth_fn=lambda rows: reference(torch.float64, rows))
+    assert_as_exact(stepped, lambda *inputs: reference(torch.float32, *inputs), draw, label,
+                    seeds=STEP_SEEDS[decay], truth_fn=lambda *inputs: reference(torch.float64, *inputs))
 
 
 @pytest.mark.parametrize("optimizer", ["sgd", "adamw"])
@@ -394,27 +422,41 @@ def test_the_sparse_mlp_trains_on_padded_rows_as_the_reference_does():
         with torch.no_grad():
             for name in names:
                 getattr(mlp, name).weight.copy_(torch.from_numpy(tensors[f"mlp.{name}.weight"]))
-        x = torch.tensor(hidden, dtype=dtype, requires_grad=True)
-        output = mlp(x)
-        (output * torch.tensor(cotangent, dtype=dtype)).sum().backward()
-        return {"output": output.detach().numpy(), "input": x.grad.numpy(),
-                **{name: getattr(mlp, name).weight.grad.numpy().T for name in names}}
+        return pulled(mlp, names, np.asarray(hidden, torch.empty(0, dtype=dtype).numpy().dtype), cotangent)
 
     params = {name: {"kernel": jnp.asarray(tensors[f"mlp.{name}.weight"].T)} for name in names}
 
+    mlp = GatedMLP(hidden_features=48, out_features=HIDDEN, activation="geglu", activation_sparsity=0.95)
+
     @jax.jit
     def stepped(hidden, cotangent):
-        def loss(params, x):
-            output = GatedMLP(hidden_features=48, out_features=HIDDEN, activation="geglu",
-                              activation_sparsity=0.95).apply({"params": params}, x)
-            return jnp.sum(output * cotangent), output
-
-        (_, output), (kernels, inputs) = jax.value_and_grad(loss, (0, 1), has_aux=True)(params, hidden)
-        return {"output": output, "input": inputs, **{name: kernels[name]["kernel"] for name in names}}
+        return differentiated(mlp, params, hidden, cotangent)
 
     assert_as_exact(stepped, lambda *inputs: reference(torch.float32, *inputs), draw,
                     "a sparse MLP step over padded rows", seeds=PADDED_SEEDS,
                     truth_fn=lambda *inputs: reference(torch.float64, *inputs))
+
+
+def pulled(mlp, names, rows, cotangent) -> dict:
+    """The reference MLP's output and its input's and projections' gradients (kernels, transposed) under
+    the draw's `cotangent`, pulled back through the gate's torch twin from the weights `mlp` holds."""
+    import torch
+
+    def run(stored, x):
+        return torch.func.functional_call(mlp, stored, (x,))
+
+    stored = {f"{name}.weight": getattr(mlp, name).weight.detach().numpy() for name in names}
+    output, gradients, at_input = torch_with_gradients(run)(stored, rows, cotangent)
+    return {"output": output, "input": at_input, **{name: gradients[f"{name}.weight"].T for name in names}}
+
+
+def differentiated(mlp: GatedMLP, params, rows, cotangent) -> dict:
+    """Dew's MLP's output and its input's and projections' gradients under the draw's `cotangent`,
+    pulled back through the gate, by `pulled`'s names."""
+    output, kernels, at_input = with_gradients(lambda params, x: mlp.apply({"params": params}, x))(
+        params, rows, cotangent)
+    return {"output": output, "input": at_input,
+            **{name: kernel["kernel"] for name, kernel in kernels.items()}}
 
 
 def sparse_mlps(sparsity: float, width: int, rows: int, dtype, hidden: int = HIDDEN):
@@ -440,13 +482,10 @@ def sparse_mlps(sparsity: float, width: int, rows: int, dtype, hidden: int = HID
         with torch.no_grad():
             for name in names:
                 getattr(mlp, name).weight.copy_(torch.from_numpy(weights[name]))
-        x = torch.tensor(inputs if rows is None else rows).to(torch_dtype).requires_grad_()
-        output = mlp(x)
+        x = torch.tensor(inputs if rows is None else rows).to(torch_dtype)
         if cotangent is None:
-            return {"output": output.detach().float().numpy()}
-        (output * torch.tensor(cotangent, dtype=torch_dtype)).sum().backward()
-        return {"output": output.detach().numpy(), "input": x.grad.numpy(),
-                **{name: getattr(mlp, name).weight.grad.numpy().T for name in names}}
+            return {"output": mlp(x).detach().float().numpy()}
+        return pulled(mlp, names, x.numpy(), cotangent)
 
     model = GatedMLP(hidden_features=width, out_features=hidden, activation="geglu",
                      activation_sparsity=sparsity, dtype=dtype)
@@ -477,13 +516,7 @@ def test_the_sparse_mlp_is_as_exact_as_the_reference_at_each_sparsity(sparsity):
 
     @jax.jit
     def stepped(rows, cotangent):
-        def loss(params, x):
-            output = model.apply({"params": params}, x)
-            return jnp.sum(output * cotangent), output
-
-        (_, output), (kernels, inputs) = jax.value_and_grad(loss, (0, 1), has_aux=True)(params, rows)
-        return {"output": output, "input": inputs,
-                **{name: kernel["kernel"] for name, kernel in kernels.items()}}
+        return differentiated(model, params, rows, cotangent)
 
     assert_as_exact(stepped, lambda rows, cotangent: reference(torch.float32, cotangent, rows), draw,
                     f"a sparse MLP step at sparsity {sparsity}", seeds=SPARSITY_SEEDS[sparsity],
