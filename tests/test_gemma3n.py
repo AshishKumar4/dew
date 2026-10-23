@@ -298,6 +298,35 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
         state_dict = reference.state_dict()
         return {name: state_dict[name].detach().numpy() for name in names}
 
+    import os
+    if os.environ.get("FLIP_SEEDS"):
+        from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextMLP
+        records = []
+        original = Gemma3nTextMLP._gaussian_topk
+
+        def recorded(self, inputs):
+            out = original(self, inputs)
+            records.append((inputs.detach().double().numpy(), (out > 0).detach().numpy()))
+            return out
+
+        Gemma3nTextMLP._gaussian_topk = recorded
+        for seed in [int(value) for value in os.environ["FLIP_SEEDS"].split(",")]:
+            rows, one = draw(seed)
+            tokens = torch.from_numpy(rows).long()
+            patterns = {}
+            for dtype in (torch.float32, torch.float64):
+                records.clear()
+                model_ = references[dtype]
+                model_.load_state_dict(weights)
+                model_.train()
+                with float64() if dtype == torch.float64 else torch.no_grad(), torch.no_grad():
+                    model_(input_ids=tokens, labels=tokens)
+                patterns[dtype] = [kept for _, kept in records]
+            flips = [int(np.sum(a != b)) for a, b in zip(patterns[torch.float32], patterns[torch.float64], strict=True)]
+            print("FLIPS", seed, "gate_margin", gate_margin(model, loaded.variables, rows[:, :-1], train=True), "per call", flips, flush=True)
+        Gemma3nTextMLP._gaussian_topk = original
+        return
+
     label = f"a clamped AltUp training step, decay {decay}"
     assert_as_exact(stepped, lambda *inputs: reference(torch.float32, *inputs), draw, label,
                     seeds=STEP_SEEDS[decay], truth_fn=lambda *inputs: reference(torch.float64, *inputs))
