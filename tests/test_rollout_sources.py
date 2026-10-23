@@ -66,7 +66,8 @@ class Server:
         self.keys.append(words(key))
         future = Future()
         draw = Draw(tuple(prompt), self.tokens, (-.5,) * len(self.tokens),
-                    (-.4,) * len(self.tokens) if self.raw else None, self.tokens[-1] == EOS, self.version)
+                    "stop" if self.tokens[-1] == EOS else "length", self.version,
+                    (-.4,) * len(self.tokens) if self.raw else None)
         if self.hold:
             self.held.append((future, draw))
         else:
@@ -136,7 +137,7 @@ def test_a_multi_turn_session_keeps_each_calls_version_and_packs_into_one_chain(
     assert [call.version for call in rollout.calls] == [0, 1, 2]
     # Turn t of sample 0 draws under fold_in(fold_in(key, 0), t), the key's own stream.
     assert server.keys == [words(jax.random.fold_in(jax.random.fold_in(KEY, 0), turn)) for turn in range(3)]
-    assert [call.prompt_ids for call in rollout.calls] == [
+    assert [call.prompt for call in rollout.calls] == [
         (1, 2),
         (1, 2, 5, EOS, 4),
         (1, 2, 5, EOS, 4, 5, EOS, 4),
@@ -225,7 +226,7 @@ def test_each_call_lists_the_messages_the_observations_before_it_carried():
                                                             for step in (1, 2))]
     assert [call.transcript for call in rollout.calls] == [
         Transcript((user,)), Transcript((user, tools[0])), Transcript((user, *tools))]
-    assert [call.prompt_ids for call in rollout.calls] == [
+    assert [call.prompt for call in rollout.calls] == [
         (1, 2), (1, 2, 5, EOS, 4), (1, 2, 5, EOS, 4, 5, EOS, 4)]
     (episode,) = recorded
     assert episode_from_record(json.loads(json.dumps(asdict(episode)))) == episode

@@ -92,7 +92,7 @@ def test_a_live_gateway_session_is_the_engine_ids_and_likelihoods(engine):
     assert len(session.calls) == 3 and not session.errors
     for call, recorded in zip(session.calls, traces, strict=True):
         choice = recorded["raw_response"]["choices"][0]
-        assert call.sampled_ids == tuple(choice["response_token_ids"] if engine == "sglang"
+        assert call.tokens == tuple(choice["response_token_ids"] if engine == "sglang"
                                          else recorded["completion_token_ids"])
         assert call.behavior_log_probs == tuple(entry["logprob"] for entry in choice["logprobs"]["content"])
 
