@@ -69,8 +69,7 @@ class Condition:
 
     def to_json(self) -> dict:
         return {
-            "encoder": {"class": registry.recorded_name(type(self.encoder)),
-                        "fields": self.encoder.to_json()},
+            "encoder": {"class": registry.import_path(type(self.encoder)), "fields": self.encoder.to_json()},
             "field": self.field,
             "unconditional": self.unconditional,
         }
