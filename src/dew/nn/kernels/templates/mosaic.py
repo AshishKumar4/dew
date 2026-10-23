@@ -204,19 +204,29 @@ class Family:
     rows: int
 
 
-CONSUMER_REGISTERS, PRODUCER_REGISTERS = 232, 40
-"""The registers a thread holds in a cooperative block's two consumer warpgroups and its producer: the
-producer only issues loads, and JAX's warp-specialized pipeline gives the consumers the rest of the
-multiprocessor's (`pipeline._compute_registers(40, 2)`)."""
+PRODUCER_REGISTERS = 40
+"""The registers a thread of a cooperative block's producer warpgroup holds: it only issues loads."""
+
+
+def consumer_registers(consumers: int) -> int:
+    """The registers a thread of each of `consumers` consumer warpgroups holds: the multiprocessor's 64K less
+    the producer's, shared among them in setmaxnreg's steps of 8 and at most its 256 (two consumers' 232,
+    JAX's warp-specialized pipeline's `_compute_registers(40, 2)`)."""
+    share = (64 * 1024 // 128 - PRODUCER_REGISTERS) // consumers
+    return min(256, share // 8 * 8)
+
+
+CONSUMER_REGISTERS = consumer_registers(2)
+"""Two consumer warpgroups' registers a thread (`consumer_registers`)."""
 
 
 def roles(wg, consumers: int, consumer, producer) -> None:
     """Each warpgroup's role in a cooperative block: the `consumers` first run `consumer(wg)` with their
-    register budget raised to `CONSUMER_REGISTERS`, the last runs `producer()` with its lowered to
-    `PRODUCER_REGISTERS`."""
+    register budget raised to their share (`consumer_registers`), the last runs `producer()` with its
+    lowered to `PRODUCER_REGISTERS`."""
     @pl.when(wg < consumers)
     def _():
-        plgpu.set_max_registers(CONSUMER_REGISTERS, action="increase")
+        plgpu.set_max_registers(consumer_registers(consumers), action="increase")
         consumer(wg)
 
     @pl.when(wg == consumers)

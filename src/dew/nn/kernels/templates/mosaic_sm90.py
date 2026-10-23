@@ -39,6 +39,29 @@ def registers_product(lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
     return product(lhs, rhs, (lhs.shape[0], rhs.shape[1]))
 
 
+def staged_products(acc_ref, parts, rhs, buffers, *, transposed: bool = False) -> None:
+    """`parts`' products with `rhs` (a shared-memory tile) issued into the warpgroup accumulator `acc_ref` in
+    place, in order, each part staged in shared memory first, a buffer of `buffers` apiece (its transpose
+    the left operand where `transposed`). A part is a tile with the power of two its product takes back,
+    which only None (no scaling, bf16's parts, `attention_algebra.cotangent_parts`) issues in place. The
+    buffers are free for the next tile's parts once these MMAs are waited for."""
+    if any(exponent is not None for _, exponent in parts):
+        raise NotImplementedError("a scaled part's product is no in-place accumulation (fp16's)")
+    for place, (part, _) in enumerate(parts):
+        buffers.at[place][...] = part.astype(buffers.dtype)
+    plgpu.commit_smem()
+    for place in range(len(parts)):
+        lhs = buffers.at[place]
+        plgpu.wgmma(acc_ref, lhs.transpose((1, 0)) if transposed else lhs, rhs)
+
+
+def accumulating(walk, *shapes: tuple[int, int]):
+    """`walk(*accumulators)`'s result, the warpgroup accumulators of `shapes` (fp32, zero) scoped across it:
+    products issued into them in place over every step (`staged_products`), their values read once its MMAs
+    are waited for, `walk` returning them."""
+    return pl.run_scoped(walk, *(plgpu.WGMMAAccumulatorRef(shape, jnp.float32) for shape in shapes))
+
+
 def zeros(shape: tuple[int, ...]) -> jax.Array:
     """fp32 zeros in the accumulator's layout (`shape` two-dimensional) or a row's (one-dimensional)."""
     return plgpu.layout_cast(jnp.zeros(shape, jnp.float32), FAMILY.layout if len(shape) == 2 else ROW)
