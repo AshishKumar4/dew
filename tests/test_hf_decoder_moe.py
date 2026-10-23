@@ -360,6 +360,40 @@ def test_the_glm4_moe_mtp_depth_matches_the_reference_composition():
     assert float(np.max(np.abs(other - reference))) > 1e-2
 
 
+def relinked(fixture: Path, directory: Path, edit) -> Path:
+    """`fixture` linked file by file into `directory`, its config.json rewritten by `edit`."""
+    for path in fixture.iterdir():
+        if path.name != "config.json":
+            (directory / path.name).symlink_to(path)
+    config = json.loads((fixture / "config.json").read_text())
+    edit(config)
+    (directory / "config.json").write_text(json.dumps(config))
+    return directory
+
+
+def test_a_glm4_moe_config_without_its_rotary_factor_rotates_half_the_head_as_its_class_does(tmp_path):
+    """Glm4MoeConfig fills an absent partial_rotary_factor with 0.5, the fixture's own: the fixture
+    with its factor removed computes what the fixture computes, the reference's logits."""
+    def unstated(config):
+        config.pop("partial_rotary_factor", None)
+        config["rope_parameters"].pop("partial_rotary_factor")
+    model, variables = fp32_decoder(relinked(GLM4_MOE, tmp_path, unstated))
+    assert recorded_logit_difference(model, variables, GLM4_MOE) < 1e-4
+
+
+def test_a_mimo_v2_flash_rope_entry_without_its_base_takes_its_kinds_pretrained_base(tmp_path):
+    """MiMoV2FlashConfig's per-kind pretrained bases are 5e6 on the full layers and 1e4 on the
+    sliding ones, the fixture's own: the fixture with both entries' bases removed computes what the
+    fixture computes, the reference's logits."""
+    fixture = FIXTURES / "mimo-v2-flash-tiny"
+
+    def unstated(config):
+        for entry in config["rope_parameters"].values():
+            entry.pop("rope_theta")
+    model, variables = fp32_decoder(relinked(fixture, tmp_path, unstated))
+    assert recorded_logit_difference(model, variables, fixture) < 1e-4
+
+
 # --------------------------------------------------------------------------
 # GLM-5 (glm_moe_dsa): V3.2's sparse MLA with an interleaved indexer,
 # IndexShare layers and the MTP depth
