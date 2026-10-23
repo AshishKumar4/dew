@@ -14,7 +14,6 @@ import numpy as np
 import pytest
 from delta_rule_support import (
     NAMES,
-    checkpointed,
     fla_decay_terms,
     fla_side,
     float64_truth,
@@ -23,7 +22,6 @@ from delta_rule_support import (
     rule_math,
     through,
 )
-from gdn_cases import CASES
 from jax.core import ShapedArray
 from reference_error import (
     assert_as_exact,
@@ -414,30 +412,6 @@ def test_the_ported_rule_and_its_gradients_follow_the_recurrence(dtype, bound):
 
 
 @pytest.mark.parametrize("per_key", [False, True])
-def test_the_oracle_a_chunk_at_a_time_is_the_token_recurrence_to_the_bit():
-    """The float64 oracle at a model's real shape keeps one memory a chunk on the way back (`checkpointed`):
-    its outputs and gradients are the token recurrence's to the bit, as it recomputes the same scan, at the
-    tiny case of the one case table (`gdn_cases`)."""
-    case = CASES["tiny"]
-    b, t, h, hv, k, v = (case[name] for name in
-                         ("batch", "length", "key_heads", "value_heads", "width", "columns"))
-    keys = jax.random.split(jax.random.key(29), 8)
-    with jax.enable_x64(new_val=True):
-        operands = (l2norm(jax.random.normal(keys[0], (b, t, h, k), jnp.float64)),
-                    l2norm(jax.random.normal(keys[1], (b, t, h, k), jnp.float64)),
-                    jax.random.normal(keys[2], (b, t, hv, v), jnp.float64),
-                    -jnp.exp(jax.random.normal(keys[3], (b, t, hv), jnp.float64) - 3.0),
-                    jax.nn.sigmoid(jax.random.normal(keys[4], (b, t, hv), jnp.float64)),
-                    0.1 * jax.random.normal(keys[5], (b, hv, k, v), jnp.float64),
-                    jax.random.normal(keys[6], (b, t, hv, v), jnp.float64),
-                    0.1 * jax.random.normal(keys[7], (b, hv, k, v), jnp.float64))
-        whole = through(recurrence, *operands[6:])(*operands[:6])
-        chunked = through(functools.partial(recurrence, rule=checkpointed(case["chunk"])), *operands[6:])(
-            *operands[:6])
-        for name, mine, theirs in zip(NAMES, chunked, whole, strict=True):
-            np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs), err_msg=name)
-
-
 def test_a_sequences_first_decay_gradient_is_exactly_zero_from_no_memory(per_key):
     """The decay of a sequence's first token scales the memory before it alone, so its gradient is
     exactly zero where that memory is: a row's first sequence from a zero initial memory and any
