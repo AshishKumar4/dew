@@ -27,7 +27,7 @@ from reference_error import assert_as_exact, declared_seeds, indexed_recording, 
 from dew.nn.inputs import MixerCall
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels.recurrence_chunk import chunk_gated_delta_rule, recurrent_delta_rule
-from dew.nn.linear import l2norm as jax_l2norm
+from dew.nn.precision import l2norm as jax_l2norm
 from tools.kda_reference import (
     RECORDED,
     oracle_chunk,

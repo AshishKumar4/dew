@@ -35,8 +35,9 @@ class NGPT:
     that starts and stays at zero.
 
     A model under it keeps every hidden state on the unit sphere: no norm has a weight, the
-    keys and the attention's and feed-forward's outputs are unit-normed (`unit`), each sublayer
-    joins the residual by `stepped`, and no norm precedes the head.
+    keys and the attention's and feed-forward's outputs are unit-normed
+    (`dew.nn.precision.l2norm`), each sublayer joins the residual by `stepped`, and no norm
+    precedes the head.
     """
 
     std: float
