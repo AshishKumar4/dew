@@ -6,7 +6,6 @@ edits are found in the copied programs by parsing them, so the tests follow what
 import ast
 import hashlib
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -14,18 +13,13 @@ import sys
 from pathlib import Path
 
 import pytest
+from tool_support import git
 
 REPO = Path(__file__).resolve().parents[1]
 COPIED = ("site/scripts/redigest.py", "site/snippets/cells.py", "site/snippets/cells.json",
           "site/snippets/framework.py", "site/src/data/hero.py", "site/src/data/text.py",
           "site/src/data/sampler.py", "site/src/data/capture.json")
 DIGEST = re.compile(rb"[0-9a-f]{64}")
-
-
-def git(root: Path, *arguments: str) -> None:
-    subprocess.run(["git", "-C", str(root), *arguments], check=True, capture_output=True,
-                   env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
-                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
 
 
 @pytest.fixture
@@ -221,14 +215,20 @@ def recorded(root: Path, source: str) -> None:
     ("x = 1\nprint(f'{x!r}')\n", "x = 1\nprint(f'{x!s}')\n", False),
     ("x = 1\nprint(f'{x=}')\n", "x = 1\nprint(f'{ x = }')\n", False),
     ("print(dict(steps=3))\nsteps = 1\n", "print(dict(num_steps=3))\nsteps = 1\n", True),
+    ("def f(x):\n    return x\nprint(f(x=1))\n", "def f(y):\n    return y\nprint(f(y=1))\n", True),
+    ("def f(x):\n    return x\nprint(f(x=1))\n", "def f(y):\n    return y\nprint(f(x=1))\n", False),
+    ("def f(x):\n    return x\nprint(f(x=1))\n", "def f(x):\n    return x\nprint(f(y=1))\n", False),
 ], ids=["an alias renamed", "an alias added", "an alias that takes another import's name",
         "an imported name given an alias", "an alias added to a dotted import", "an alias taken from one",
         "two variables swapped",
         "a parameter renamed to another variable's name", "an f-string's conversion", "an f-string's label",
-        "a keyword renamed beside a variable of its spelling"])
+        "a keyword renamed beside a variable of its spelling",
+        "a function's parameter and its keyword renamed",
+        "a function's parameter renamed and not its keyword", "a keyword renamed and not its parameter"])
 def test_the_programs_parsed_roles_decide_what_is_a_rename(site, before, after, kept):
     """A rename is read in the parsed program: an import's name and its binding apart, a parameter a
-    variable, an f-string's conversion and literal text what it prints."""
+    variable and the keyword a call to its function passes it, an f-string's conversion and literal text
+    what it prints."""
     recorded(site, before)
     was = recordings(site)
     (site / TEXT).write_text(after)
