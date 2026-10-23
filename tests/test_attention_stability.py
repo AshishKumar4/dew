@@ -409,12 +409,13 @@ def _near_keys(dtype: str):
 
 
 def _large_keys(seed):
-    # One query a row of zeros over two keys near fp32's largest, so both logits are 0 and the two weigh
-    # alike, their values drawn: the keys' weighted sum overflows fp32 where their weighted mean does not,
-    # and the query's gradient is the cotangents' difference times a key (`algebra.DqSums.keyed`).
-    key = np.zeros((ROWS, 2, 1, 16), np.float32)
-    key[..., 0] = _uniform(seed, 1.7e38, 3.4e38, (ROWS, 2, 1))
-    value, dout = _normal(seed + 1, (ROWS, 2, 1, 16), (ROWS, 1, 1, 16))
+    # One query a row of zeros over eight keys near fp32's largest, so every logit is 0 and the eight weigh
+    # alike, their values drawn: the keys' weighted sum overflows fp32 even at the softmax's scale of 1/4,
+    # where their weighted mean does not, and the query's gradient is the cotangents' sum against the keys
+    # (`algebra.DqSums.keyed`).
+    key = np.zeros((ROWS, 8, 1, 16), np.float32)
+    key[..., 0] = _uniform(seed, 1.7e38, 3.4e38, (ROWS, 8, 1))
+    value, dout = _normal(seed + 1, (ROWS, 8, 1, 16), (ROWS, 1, 1, 16))
     return np.zeros((ROWS, 1, 1, 16), np.float32), key, value, None, dout
 
 
@@ -483,7 +484,7 @@ def _families() -> dict[str, Family]:
         "a subnormal share of an overflowing row, bfloat16": Family(
             _subnormal_share, np.ones((64, 1, 1, 256), bool), folded=False, dtype="bfloat16"),
         # Every weight but one 1/255, bf16's worst rounding of a weight, beside the subnormal share.
-        "keys near fp32's largest at equal logits": Family(_large_keys, _kept(1, 2)),
+        "keys near fp32's largest at equal logits": Family(_large_keys, _kept(1, 8)),
         # A query's gradient that cancels across its keys, in either dtype (`algebra.cotangent_product`).
         "keys an ulp apart, float32": Family(_near_keys("float32"), _kept(1, 2)),
         "keys an ulp apart, bfloat16": Family(_near_keys("bfloat16"), _kept(1, 2), dtype="bfloat16"),
