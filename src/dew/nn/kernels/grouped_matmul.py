@@ -45,7 +45,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu, tpu as pltpu
 from jax.extend import core as jax_core
 
 from ..precision import rounded_operand
-from . import generation
+from . import generation, tuning
 from .templates import base, cost, hopper
 from .templates.gemm import mosaic_gpu, mosaic_tpu
 from .templates.product import declared
@@ -135,10 +135,11 @@ def _routed(rows: int, groups: int) -> float:
 class Hooks:
     """A launch's prologue and epilogue (`templates.gemm`): each a JAX function of a tile and its side
     tiles, or None, with each side operand's launch axes ('rows', 'depth', 'columns'), the positions of
-    each side operand's dimensions of one the launch squeezed out (the hook gets them back), and the
-    dtypes of the epilogue's outputs where it returns several. The side operands themselves are the
-    launch's `prologue_operands` and `epilogue_operands`. A measured pick stores a module-level hook
-    (`tuning.encoded`)."""
+    each side operand's dimensions of one the launch squeezed out (the hook gets them back), the dtypes of
+    the epilogue's outputs where it returns several, and the dtypes a kernel traces each hook at (its tile's
+    then each side tile's: `prologue_dtypes`, `epilogue_dtypes`). The side operands themselves are the
+    launch's `prologue_operands` and `epilogue_operands`. A launch's picks key each hook by what it
+    computes (`_GroupedLaunch.traced`), never by the function object."""
     prologue: object = None
     prologue_axes: tuple = ()
     epilogue: object = None
@@ -146,6 +147,8 @@ class Hooks:
     out_dtypes: tuple | None = None
     prologue_broadcast: tuple = ()
     epilogue_broadcast: tuple = ()
+    prologue_dtypes: tuple = ()
+    epilogue_dtypes: tuple = ()
 
     def before(self):
         """The prologue as a kernel traces it: on the squeezed side tiles."""
@@ -303,10 +306,36 @@ def _sizes(specs: list[jax.ShapeDtypeStruct], seed: int, rows: int) -> jax.Array
     return jnp.asarray(sizes)
 
 
+TRACED_TILE = 16
+"""The square tile a launch's hooks are traced at to key its picks (`_GroupedLaunch.traced`)."""
+
+
 class _GroupedLaunch[Config: Hashable](base.Template[Config]):
     """A grouped launch: its space is a declared tuple, its group sizes drawn as a step routes them."""
     # Annotations stay evaluated (no postponed annotations in this module):
     # tokamax serializes a launch's arguments into the program by their types.
+    HOOKS: ClassVar[tuple[str, ...]] = ('hooks',)
+
+    def traced(self, name: str, value) -> str | None:
+        """The launch's `Hooks` as its picks key them (`tuning.KernelOp.traced`): each hook by what it
+        computes (`tuning.program`) as a kernel traces it (`Hooks.before`, `Hooks.after`), at a
+        `TRACED_TILE` square tile and each side tile as its axes lay it out there, in the dtypes the hooks
+        state, beside their axes, squeezed positions and output dtypes; an already traced key as it is."""
+        if isinstance(value, str):
+            return value
+
+        def program(hook, axes_of: tuple, dtypes: tuple) -> str | None:
+            if hook is None:
+                return None
+            tile, *sides = dtypes
+            return tuning.program(hook, jax.ShapeDtypeStruct((TRACED_TILE, TRACED_TILE), tile),
+                                  *(jax.ShapeDtypeStruct((TRACED_TILE,) * len(axes), dtype)
+                                    for axes, dtype in zip(axes_of, sides, strict=True)))
+
+        return "hooks:" + repr((program(value.before(), value.prologue_axes, value.prologue_dtypes),
+                                program(value.after(), value.epilogue_axes, value.epilogue_dtypes),
+                                value.prologue_axes, value.epilogue_axes, value.out_dtypes,
+                                value.prologue_broadcast, value.epilogue_broadcast))
 
     def keyed(self, ba):
         """`tuning.KernelOp.keyed`, each side operand's dimension that follows the rows bucketed with the

@@ -151,7 +151,8 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
 
     def kernel(lhs, rhs, group_sizes, prologue_arrays, *, interpret):
         sides, axes, broadcast = _launchable(prologue_arrays, prologue_axes)
-        hooks = grouped_matmul.Hooks(prologue, axes, prologue_broadcast=broadcast)
+        hooks = grouped_matmul.Hooks(prologue, axes, prologue_broadcast=broadcast,
+                                     prologue_dtypes=_dtypes(prologue, lhs, sides))
         call = {'out_dtype': out_dtype, 'hooks': hooks, 'interpret': interpret,
                 'promoted': declared(lhs.dtype, precision, outputs=(out_dtype,)).promoted, 'dense': dense}
         if not _taken(grouped_matmul.tgmm_refusal(lhs, rhs, group_sizes, sides, **call)):
@@ -174,6 +175,16 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays)
 
 
+_ACCUMULATOR = jax.ShapeDtypeStruct((), jnp.float32)
+"""An epilogue's tile: the fp32 accumulator's."""
+
+
+def _dtypes(hook, tile, sides: tuple) -> tuple[str, ...]:
+    """The dtypes a kernel traces `hook` at: its tile's (`tile`'s), then each side operand's; none without
+    a hook."""
+    return () if hook is None else tuple(jnp.dtype(array.dtype).name for array in (tile, *sides))
+
+
 def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
           epilogue_axes, dtypes, *, several: bool, transpose_rhs: bool, interpret_on_cpu: bool,
           precision: PrecisionLike, dense: bool = False):
@@ -183,7 +194,9 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
         after_sides, after_axes, after_broadcast = _launchable(epilogue_arrays, epilogue_axes)
         hooks = grouped_matmul.Hooks(prologue, before_axes, epilogue, after_axes,
                                      tuple(dtype.name for dtype in dtypes) if several else None,
-                                     prologue_broadcast=before_broadcast, epilogue_broadcast=after_broadcast)
+                                     prologue_broadcast=before_broadcast, epilogue_broadcast=after_broadcast,
+                                     prologue_dtypes=_dtypes(prologue, lhs, before_sides),
+                                     epilogue_dtypes=_dtypes(epilogue, _ACCUMULATOR, after_sides))
         call = {'out_dtype': dtypes[0], 'trans_rhs': transpose_rhs, 'hooks': hooks, 'interpret': interpret,
                 'promoted': declared(lhs.dtype, precision, outputs=dtypes).promoted, 'dense': dense}
         # A call no launch takes (a TPU's widths its blocks do not divide) runs XLA's program.
