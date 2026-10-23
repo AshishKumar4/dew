@@ -671,19 +671,20 @@ def committed_steps(checkpoints: Path) -> list[int]:
                   if step.name.isdigit() and committed(checkpoints, int(step.name)).exists())
 
 
-def channel(path: Path) -> int:
-    """A FIFO at `path`, opened to read before the worker that writes it starts: the worker tells it
-    how many batches its source handed out once it is blocked mid-epoch with its checkpoints landed
-    (multiprocess_worker.blocked)."""
+def channel(path: Path) -> Path:
+    """A FIFO at `path` for a worker to tell how many batches its source handed out once it is
+    blocked mid-epoch with its checkpoints landed (multiprocess_worker.blocked); `told` reads it."""
     os.mkfifo(path)
-    return os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    return path
 
 
-def told(pool: list[tuple[subprocess.Popen, int]], timeout: float = 600) -> list[int]:
+def told(pool: list[tuple[subprocess.Popen, Path]], timeout: float = 600) -> list[int]:
     """What each worker of `pool` tells its channel, read as it arrives: one blocking wait at a time
     on the channels and on the workers' exits, and a worker that ends before it tells fails the
-    test with its output. Every worker is killed if any fails."""
-    waiting = {reader: index for index, (_, reader) in enumerate(pool)}
+    test with its output. Every worker is killed, and the channels removed, however it ends. A
+    worker that opens its channel first waits there until this opens it to read."""
+    readers = [os.open(path, os.O_RDONLY | os.O_NONBLOCK) for _, path in pool]
+    waiting = {reader: index for index, reader in enumerate(readers)}
     exits = {os.pidfd_open(process.pid): index for index, (process, _) in enumerate(pool)}
     heard: dict[int, int] = {}
     deadline = time.monotonic() + timeout
@@ -700,12 +701,11 @@ def told(pool: list[tuple[subprocess.Popen, int]], timeout: float = 600) -> list
                     process = pool[exits[handle]][0]
                     pytest.fail(f"a run ended before it blocked\n{process.communicate()[0]}")
     finally:
-        for handle in exits:
+        for handle in [*exits, *readers]:
             os.close(handle)
-        for _, reader in pool:
-            os.close(reader)
-        for process, _ in pool:
+        for process, path in pool:
             terminate(process)
+            path.unlink()
     return [heard[index] for index in range(len(pool))]
 
 
@@ -737,10 +737,10 @@ def test_a_killed_run_resumes_on_the_batch_after_its_checkpoint(tmp_path, whole_
     """
     run_dir = tmp_path / "run"
     checkpoints = worker.checkpoint_dir(run_dir, "preempt")
-    reader = channel(tmp_path / "blocked")
+    blocked = channel(tmp_path / "blocked")
     killed = spawn("fit", tmp_path / "killed.json",
-                   **fit_flags(run_dir, block_after=BLOCK_AFTER, notify=tmp_path / "blocked"))
-    [handed] = told([(killed, reader)])
+                   **fit_flags(run_dir, block_after=BLOCK_AFTER, notify=blocked))
+    [handed] = told([(killed, blocked)])
 
     assert killed.returncode == -signal.SIGKILL, "the run was not preempted"
     assert handed == BLOCK_AFTER, "the run did not get past its checkpoint"
@@ -771,18 +771,18 @@ def test_two_preemptions_in_one_epoch_still_land_where_the_whole_run_did(tmp_pat
     run_dir = tmp_path / "run"
     checkpoints = worker.checkpoint_dir(run_dir, "preempt")
 
-    reader = channel(tmp_path / "blocked-first")
+    blocked = channel(tmp_path / "blocked-first")
     first = spawn("fit", tmp_path / "first.json",
-                  **fit_flags(run_dir, block_after=BLOCK_AFTER, notify=tmp_path / "blocked-first"))
-    told([(first, reader)])
+                  **fit_flags(run_dir, block_after=BLOCK_AFTER, notify=blocked))
+    told([(first, blocked)])
     assert first.returncode == -signal.SIGKILL
     assert committed(checkpoints, SAVE_EVERY).exists()
 
     # The second window: three more steps, a checkpoint at six, killed again.
-    reader = channel(tmp_path / "blocked-second")
+    blocked = channel(tmp_path / "blocked-second")
     second = spawn("fit", tmp_path / "second.json",
-                   **fit_flags(run_dir, block_after=SAVE_EVERY, notify=tmp_path / "blocked-second"))
-    told([(second, reader)])
+                   **fit_flags(run_dir, block_after=SAVE_EVERY, notify=blocked))
+    told([(second, blocked)])
     assert second.returncode == -signal.SIGKILL
     assert committed_steps(checkpoints)[-1] == 2 * SAVE_EVERY, "the run was not killed mid-epoch"
 
@@ -820,15 +820,14 @@ def killed_local_pool(tmp_path_factory):
     """The killed pool run: two processes, both SIGKILLed once every process
     has committed local step eight, with persistent steps three and six."""
     directory = tmp_path_factory.mktemp("killed-local")
-    channels = [directory / f"blocked{index}" for index in range(2)]
-    readers = [channel(path) for path in channels]
+    channels = [channel(directory / f"blocked{index}") for index in range(2)]
     coordinator = f"127.0.0.1:{free_port()}"
     (directory / "killed").mkdir()
     pool = [spawn("fit", directory / "killed" / f"process{index}.json", processes=2,
                   process_id=index, coordinator=coordinator,
                   **local_flags(directory, block_after=LOCAL_KILL_AFTER, notify=path))
             for index, path in enumerate(channels)]
-    handed = told(list(zip(pool, readers, strict=True)))
+    handed = told(list(zip(pool, channels, strict=True)))
     assert all(process.returncode == -signal.SIGKILL for process in pool)
     assert handed == [LOCAL_KILL_AFTER] * 2
     # Each process waited on its writes before it told: local step eight on each, persistent six.
