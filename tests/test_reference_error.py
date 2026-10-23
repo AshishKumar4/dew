@@ -1038,9 +1038,9 @@ def _widened_draw(name, key, shape):
         return jnp.minimum(high, jnp.maximum(low, drawn))
 
 
-DRAWS = {"uniform": lambda key: jax.random.uniform(key, (4, 97)),
-         "normal": lambda key: jax.random.normal(key, (4, 97)),
-         "truncated_normal": lambda key: jax.random.truncated_normal(key, -2.0, 2.0, (4, 97))}
+DRAWS = {"uniform": lambda key: jax.random.uniform(key, (4, 97), jnp.float32),
+         "normal": lambda key: jax.random.normal(key, (4, 97), jnp.float32),
+         "truncated_normal": lambda key: jax.random.truncated_normal(key, -2.0, 2.0, (4, 97), jnp.float32)}
 
 
 @pytest.mark.parametrize("name", sorted(DRAWS))
@@ -1049,9 +1049,8 @@ def test_a_float32_draws_replay_is_its_bits_transform_in_float64(name):
     transform in float64, written out directly: bit for bit, for several keys."""
     for seed in range(3):
         key = jax.random.key(seed)
-        with jax.enable_x64(new_val=True):
-            replayed = np.asarray(float64_replay(DRAWS[name])(key))
-            direct = np.asarray(_widened_draw(name, key, (4, 97)))
+        replayed = np.asarray(float64_replay(DRAWS[name])(key))
+        direct = np.asarray(_widened_draw(name, key, (4, 97)))
         assert replayed.dtype == np.float64
         np.testing.assert_array_equal(replayed.view(np.uint64), direct.view(np.uint64))
 
