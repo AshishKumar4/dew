@@ -21,5 +21,14 @@ with tuning.pinned(suite.PINS):
         grads = attention_triton.backward(q, k, v, spans, hooks, dout, natural=True, split=split, interpret=True)
         for name, leaf in zip(["dq", "dk", "dv", "m0", "total0", "acc0"], jax.tree.leaves(grads)):
             arr = np.asarray(leaf, np.float64)
-            print("split", split, name, "finite", bool(np.isfinite(arr).all()), "rows bad",
-                  int((~np.isfinite(arr.reshape(arr.shape[0], -1))).any(-1).sum()))
+            print("split", split, name, arr.shape, np.asarray(leaf).dtype, "max", float(np.nanmax(np.abs(arr))))
+print("state dtypes", [np.asarray(x).dtype for x in state], "q", np.asarray(q).dtype, "dout", np.asarray(dout).dtype)
+from reference_error import with_gradients
+ref = with_gradients(suite._reference(family, anchored=False))(q, k, v, state, dout)
+for i, leaf in enumerate(jax.tree.leaves(ref)):
+    arr = np.asarray(leaf, np.float64)
+    print("reference", i, np.asarray(leaf).dtype, "finite", bool(np.isfinite(arr).all()), "max", float(np.nanmax(np.abs(arr))))
+mine = with_gradients(suite._mainloops(family, True)["triton"])(q, k, v, state, dout)
+for i, leaf in enumerate(jax.tree.leaves(mine)):
+    arr = np.asarray(leaf, np.float64)
+    print("mine", i, np.asarray(leaf).dtype, "finite", bool(np.isfinite(arr).all()), "max", float(np.nanmax(np.abs(arr))))
