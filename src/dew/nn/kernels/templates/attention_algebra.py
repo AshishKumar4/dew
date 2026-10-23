@@ -338,13 +338,19 @@ def exact_power2(k: jax.Array) -> jax.Array:
     return jax.lax.bitcast_convert_type(bits, jnp.float32)
 
 
+def _trunc(x: jax.Array) -> jax.Array:
+    """`jnp.trunc` of an fp32 entry of magnitude below 2^31, by an int32 conversion: `jnp.trunc` is a select
+    between `ceil` and `floor`, and Mosaic GPU's lowering has neither."""
+    return x.astype(jnp.int32).astype(x.dtype)
+
+
 def power2(x: jax.Array, k: jax.Array) -> jax.Array:
     """`x * 2^k` for an integral `k` of any size, exactly wherever the result is a normal fp32: three exact
     factors each within 2^±127 (`exact_power2`), of `k`'s sign, so each partial product lies between `x`
     and the result; `k` held within `POWER2_REACH`, past which the result is zero or infinite."""
     k = jnp.clip(jnp.asarray(k, jnp.float32), -POWER2_REACH, POWER2_REACH)
-    first = jnp.trunc(k / 3)
-    second = jnp.trunc((k - first) / 2)
+    first = _trunc(k / 3)
+    second = _trunc((k - first) / 2)
     return x * exact_power2(first) * exact_power2(second) * exact_power2(k - first - second)
 
 
@@ -1231,7 +1237,7 @@ def _ceil(x: jax.Array) -> jax.Array:
     is already integral, infinite or NaN, and passes through."""
     small = jnp.abs(x) < 2.0 ** 23
     whole = jnp.where(small, x, 0.0)
-    truncated = whole.astype(jnp.int32).astype(x.dtype)
+    truncated = _trunc(whole)
     return jnp.where(small, truncated + (whole > truncated).astype(x.dtype), x)
 
 
