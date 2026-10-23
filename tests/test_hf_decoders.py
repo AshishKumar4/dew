@@ -1397,3 +1397,11 @@ def test_a_nemotron_h_trunk_whose_config_names_a_step_loads_as_the_trunk(name, t
     ids = jnp.asarray(np.load(FIXTURES / name / "input_ids.npy"), jnp.int32)
     plain, held = fp32_decoder(FIXTURES / name)
     np.testing.assert_array_equal(np.asarray(model.apply(variables, ids)), np.asarray(plain.apply(held, ids)))
+
+
+def test_a_bundle_made_from_a_model_carries_its_record_as_a_loaded_one_does():
+    """`PretrainedDecoder.from_model`'s model_config is the decoder's record, the form a load's
+    takes: written as JSON and read back, it builds the same decoder."""
+    loaded = Pretrained.load(str(FIXTURES / "qwen3-tiny"), dtype="float32", attention_impl="reference")
+    bundle = PretrainedDecoder.from_model(loaded.model, loaded.variables)
+    assert models.build("causal_transformer", **json.loads(json.dumps(bundle.model_config))) == loaded.model
