@@ -63,14 +63,15 @@ PARTS = 3
 
 @dataclasses.dataclass(frozen=True)
 class Tiles:
-    """A forward's tiles: the value block the states and output launches split the values into (`block_v`),
-    and the chunks the states launch has in flight (`stages`)."""
+    """A forward's tiles: the value block the states launch splits the values into (`block_v`), the chunks it
+    has in flight (`stages`), and the output launch's value block (`output_v`)."""
 
     block_v: int
     stages: int
+    output_v: int
 
 
-DEFAULT = {1: Tiles(64, 2), PARTS: Tiles(32, 1)}
+DEFAULT = {1: Tiles(64, 2, 128), PARTS: Tiles(32, 1, 32)}
 """The tiles by the parts an operand takes: an fp32 call's three hold one chunk in flight, 32 values wide, so
 the states and output launches' tiles at 128-wide keys fit an A100's block (163 KB of shared memory)."""
 
@@ -122,24 +123,37 @@ class _Parts:
 class _Issuer:
     """The algebra's products (`algebra.Issue`) on the family: an operand a `_Parts` tile in shared memory, or
     a register value the family stages first (`stage`) into its product's `buffers` (by product name, a tile a
-    part; a pair, the left operand's and the right's, where both are registers), an fp32 one as its parts, or
-    as `parts[name]` of them where a product takes fewer. Operands of three parts issue the products whose
-    parts' orders sum under three, smallest first; of two, under two."""
+    part), an fp32 one as its parts, or as `parts[name]` of them where a product takes fewer. A product whose
+    buffers are a list of such sets keeps each value it stages there for the products after it that take the
+    same value, staging a new one into the set its last product read longest ago. Operands of three parts
+    issue the products whose parts' orders sum under three, smallest first; of two, under two."""
 
     def __init__(self, buffers: dict | None = None, parts: dict | None = None):
         self.buffers, self.parts = buffers or {}, parts or {}
+        # By product name: each set's value (held, so its identity stays its own) and its last use.
+        self.held: dict = {}
 
-    def _operand(self, x, name: str, side: int) -> tuple:
+    def _operand(self, x, name: str, other=None) -> tuple:
         if isinstance(x, _Parts):
             return x.refs
         buffers = self.buffers[name]
-        if isinstance(buffers, dict):
-            buffers = buffers[side]
+        if isinstance(buffers, list):
+            held = self.held.setdefault(name, [[None, -1] for _ in buffers])
+            uses = max(use for _, use in held) + 1
+            for place, (value, _) in enumerate(held):
+                if value is x:
+                    held[place][1] = uses
+                    return buffers[place]
+            free = [place for place in range(len(buffers)) if held[place][0] is not other]
+            place = min(free, key=lambda place: held[place][1])
+            held[place] = [x, uses]
+            buffers = buffers[place]
         values = _split(x, self.parts.get(name, PARTS)) if _parts(x.dtype) > 1 else (x,)
         return tuple(FAMILY.stage(value, buffer) for value, buffer in zip(values, buffers, strict=True))
 
     def __call__(self, name: str, lhs, rhs) -> jax.Array:
-        left, right = self._operand(lhs, name, 0), self._operand(rhs, name, 1)
+        left = self._operand(lhs, name, rhs)
+        right = self._operand(rhs, name, lhs)
         shape = (lhs.shape[0], rhs.shape[1])
         count = max(len(left), len(right))
         terms = sorted(((i, j) for i in range(len(left)) for j in range(len(right)) if i + j < count),
@@ -262,18 +276,19 @@ past the TF32 (10) fla takes them in, where the inverse is rounded to the call's
 
 
 def _merges(call: _Call) -> tuple:
-    """The inverse's staging tiles (`algebra.doubled`'s 'merge' products, both operands fp32 registers): a
-    `[C, C]` tile a part, for the left operand and for the right."""
+    """The inverse's staging tiles (`algebra.doubled`'s 'merge' products, both operands fp32 registers): three
+    sets of a `[C, C]` tile a part, the system's kept across the levels, each level's inverse across its two
+    products."""
     parts = PARTS if call.held.parts > 1 else MERGED
     tile = (CHUNK, CHUNK)
     return tuple(tuple(plgpu.SMEM(tile, jnp.bfloat16, transforms=_sm80.swizzled(*tile, jnp.bfloat16))
-                       for _ in range(parts)) for _ in range(2))
+                       for _ in range(parts)) for _ in range(3))
 
 
 def _merging(staging, call: _Call) -> _Issuer:
     """The inverse's products on `_merges`' staging tiles."""
-    left, right = staging
-    return _Issuer({"merge": {0: left, 1: right}}, {"merge": len(left)})
+    del call
+    return _Issuer({"merge": list(staging)}, {"merge": len(staging[0])})
 
 
 def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, stages: int,
@@ -568,7 +583,8 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
     """Each chunk's output `[R, HV * Dv]` in `out_dtype`: under a decay a head its own pairs' scores
     (`algebra.chunk_output`), under one a key dimension the intra launch's (`scores`, `_intra`;
     `algebra.key_decayed_output`)."""
-    width, value_width, bv, gates = call.width, call.value_width, tiles.block_v, call.gates
+    width, value_width, gates = call.width, call.value_width, call.gates
+    bv = min(tiles.output_v, value_width)
     held, memories = dataclasses.replace(call.held, rows=call.rows), call.memories
 
     def program(q_ref, k_ref, h_ref, v_ref, hi_ref, lo_ref, taken_ref, o_ref, *, streams, staging):

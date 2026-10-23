@@ -445,17 +445,18 @@ def doubled(a, issue: Issue):
     """`factor`'s doubling on one tile: `(I - A)^-1` `[C, C]` of a strictly lower `a`, every level's blocks
     held in place in the tile, for a mainloop whose products take whole tiles (Mosaic GPU's, a warpgroup's 64
     rows, which hold no block of their own). From the two-wide blocks `[[1, 0], [a, 1]]`, each level joins
-    pairs of `s`-blocks as `X_2s = X_s + X_s A_s X_s` ('merge' twice), `A_s` the tile masked to each pair's
-    lower block, whose product with the block-diagonal `X_s` is `factor`'s `X2 A21 X1` there and zero
-    elsewhere: log2(C) - 1 levels of two products, where row-by-row substitution's C rows each wait on the
-    last (`tril_inverse`)."""
+    pairs of `s`-blocks as `X_2s = X_s + (M_s * (X_s A)) X_s` ('merge' twice), `M_s` each pair's lower
+    block: the block-diagonal `X_s` against the whole tile, masked there, is its odd blocks' rows of `A` over
+    the even ones', so the join is `factor`'s `X2 A21 X1` there and zero elsewhere, the same terms, and a
+    mainloop stages `A` once. log2(C) - 1 levels of two products, where row-by-row substitution's C rows each
+    wait on the last (`tril_inverse`)."""
     size = a.shape[-1]
     rows, cols = _grid(a.shape)
     inverse = jnp.where(rows == cols, 1.0, 0.0) + jnp.where((rows % 2 == 1) & (cols == rows - 1), a, 0.0)
     width = 2
     while width < size:
         lower = ((rows // width) % 2 == 1) & (cols // width == rows // width - 1)
-        inverse = inverse + issue("merge", issue("merge", inverse, jnp.where(lower, a, 0.0)), inverse)
+        inverse = inverse + issue("merge", jnp.where(lower, issue("merge", inverse, a), 0.0), inverse)
         width *= 2
     return inverse
 

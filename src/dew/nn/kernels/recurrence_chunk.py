@@ -309,8 +309,9 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         if mainloop != 'mosaic' or (hooks.decay == 'vector' and not hooks.delta):
             raise ValueError(f"the {mainloop!r} mainloop does not take {hooks}: the 'mosaic' one runs a "
                              "decay a head or none, and one a key dimension under the delta rule")
+        # Unrounded where an epilogue follows, as on the portable math.
         out, final = mosaic_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
-                                 scale=scale, delta=hooks.delta, wide=True)
+                                 scale=scale, delta=hooks.delta, wide=epilogue)
         out = recurrence.skipped(hooks, out, value, given, work)
     elif hooks.rated and not hooks.delta and not hooks.l2norm and hooks.scale is None:
         # Each of its routes adds the skip, the port in its kernels.
