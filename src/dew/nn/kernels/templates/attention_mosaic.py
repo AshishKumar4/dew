@@ -158,13 +158,13 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     q = family.held(q_smem)
     q_pos, columns = first + family.iota(shape, 0), family.iota(shape, 1)
     width = q_smem.shape[-1]
-    # The weighted values' running sums live in the family's accumulator (`Family.walk`), the state's
-    # `acc` an empty place the algebra passes through (`algebra.Keys.accumulate`).
-    state = algebra.Partial(jnp.zeros((), jnp.float32), family.full((tiles.block_q,), -jnp.inf),
-                            family.zeros((tiles.block_q,)))
+    # The weighted values' running sums live in the family's accumulator (`Family.walk`); the walk carries
+    # the maxima and denominators, the state's `acc` an empty place the algebra passes through
+    # (`algebra.Keys.accumulate`), a constant no loop may carry.
+    rows = (family.full((tiles.block_q,), -jnp.inf), family.zeros((tiles.block_q,)))
     pl.when(consumer == 1)(turn)
 
-    def step(index, slots, state, accumulators):
+    def step(index, slots, rows, accumulators):
         s = family.product(q, slots["keys"].transpose((1, 0)), shape, turn)
         slots.release("keys")
         coords = algebra.Coords(q_pos, index * tiles.block_k + columns)
@@ -189,11 +189,12 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         def accumulate(scale, p, value):
             held[0] = family.rescaled_products(held[0], scale, ((p, None),), value, interpret)
 
+        state = algebra.Partial(jnp.zeros((), jnp.float32), *rows)
         state = algebra.plain_step(spec, state, algebra.Keys(coords, logits, load, dot, accumulate))
-        return state, tuple(held)
+        return (state.m, state.total), tuple(held)
 
-    state, (acc,) = family.walk(streams, ((step, 0, walked),), state, ((tiles.block_q, width),), interpret)
-    state = state._replace(acc=acc)
+    rows, (acc,) = family.walk(streams, ((step, 0, walked),), rows, ((tiles.block_q, width),), interpret)
+    state = algebra.Partial(acc, *rows)
     # The slots a consumer whose diagonal ends first leaves its partner, the turns it would have taken.
     family.passed(streams, walked, most, between=lambda: (turn(), turn()))
     pl.when(consumer == 0)(turn)
