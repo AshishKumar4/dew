@@ -199,3 +199,22 @@ def test_calls_are_certified_inside_and_unsupported_types_refused():
         assert findings and "no format" in findings[0], dtype
     data = np.uint32([0, 7])
     assert oc.certified(lambda data: jax.random.key_data(jax.random.wrap_key_data(data)), data)[1] == []
+
+
+def test_extrema_order_zeros_and_propagate_nan_as_the_lane_does():
+    """max and min take -0 below +0 and propagate NaN, alone and reduced; a flipped zero breaks them;
+    boolean reductions, a scalar log, erf_inv's zero and an overflowing exp are each their own results."""
+    zeros = np.float32([0.0, -0.0, -0.0])
+    others = np.float32([-0.0, 0.0, -0.0])
+    for name, fn in (("max", jnp.maximum), ("min", jnp.minimum)):
+        native = np.asarray(jax.jit(fn)(zeros, others))
+        assert np.all(oc.CONTRACTS[name]({}, [zeros, others], native, oc.FLOAT32))
+        assert not np.any(oc.CONTRACTS[name]({}, [zeros, others], -native, oc.FLOAT32))
+    rows = np.float32([[-0.0, 0.0], [1.0, np.nan], [-0.0, -0.0]])
+    for fn in (lambda a: jnp.max(a, 1), lambda a: jnp.min(a, 1), lambda a: jnp.any(a > 0, 1),
+               lambda a: jnp.all(a > 0, 1)):
+        assert oc.certified(fn, rows)[1] == [], fn
+    assert oc.certified(jnp.log, np.float32(2.0))[1] == []
+    assert oc.certified(jax.lax.erf_inv, np.float32([0.0, -0.0, 2.0 ** -140]))[1] == []
+    assert not np.any(oc.CONTRACTS["erf_inv"]({}, [np.float32([0.0])], np.float32([2.0 ** -126]), oc.FLOAT32))
+    assert oc.certified(jnp.exp, np.float32([1000.0, 88.0, 89.0]))[1] == []

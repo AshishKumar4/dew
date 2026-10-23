@@ -533,7 +533,7 @@ def _outward(end: fractions.Fraction, direction: float) -> float:
     try:
         value = float(end)
     except OverflowError:
-        return math.copysign(math.inf, end)
+        return -math.inf if end < 0 else math.inf
     inward = fractions.Fraction(value) > end if direction < 0 else fractions.Fraction(value) < end
     return math.nextafter(value, direction) if inward else value
 
@@ -582,7 +582,9 @@ def _exp_special(value):
 
 
 def _erfinv_special(value):
-    return np.where(np.abs(value) == 1, np.copysign(np.inf, value), np.nan), ~(np.abs(value) < 1)
+    """erfinv's poles at ±1 and its zero, exactly ±0 (it is odd), named; NaN outside (-1, 1)."""
+    expected = np.where(np.abs(value) == 1, np.copysign(np.inf, value), np.where(value == 0, value, np.nan))
+    return expected, ~(np.abs(value) < 1) | (value == 0)
 
 
 def _transcendental(enclose, special):
@@ -592,7 +594,7 @@ def _transcendental(enclose, special):
     def contract(params, operands, result, fmt):
         (value,) = _floats(operands)
         expected, named = special(value)
-        holds = _same(result, expected)
+        holds = np.array(_same(result, expected), dtype=bool, copy=True)
         rest = np.flatnonzero(~named)
         for bits in (96, 192, 384, 768):
             if not rest.size:
@@ -688,9 +690,10 @@ def _converted(params, operands, result, fmt):
         return result == (_read(value) != 0)
     if source is not None:
         limits = np.iinfo(result.dtype)
-        read = np.trunc(_read(value))
-        expected = np.where(np.isnan(read), 0, np.clip(read, limits.min, limits.max))
-        return result == np.array([int(v) for v in expected.flat], dtype=object).reshape(result.shape)
+        # Each element's exact truncation, clamped in exact integers (64-bit limits are not float64s).
+        expected = [0 if math.isnan(v) else limits.max if v == math.inf else limits.min if v == -math.inf else
+                    min(max(int(v), int(limits.min)), int(limits.max)) for v in _read(value).flat]
+        return result == np.array(expected, dtype=object).reshape(result.shape)
     return result == value.astype(result.dtype)
 
 
@@ -754,17 +757,59 @@ def _compared(oracle):
     return contract
 
 
-def _extreme(choose):
-    """max or min: the chosen value of the operands as the lane reads them (`_read`), a zero of either
-    sign where both read as zero."""
+def _signed_max(a, b):
+    """The lane's max: NaN propagates and -0 is below +0."""
+    both = (a == 0) & (b == 0)
+    return np.where(both, np.where(np.signbit(a) & np.signbit(b), -0.0, 0.0), np.maximum(a, b))
+
+
+def _signed_min(a, b):
+    """The lane's min: NaN propagates and -0 is below +0."""
+    both = (a == 0) & (b == 0)
+    return np.where(both, np.where(np.signbit(a) | np.signbit(b), -0.0, 0.0), np.minimum(a, b))
+
+
+def _extreme(choose, integral):
+    """max or min of the operands as the lane's arithmetic reads them (`_read`), by its own order of
+    zeros and NaN (`choose`), as values; of integers or booleans, `integral`."""
     def contract(params, operands, result, fmt):
         if fmt is None:
-            return np.asarray(result) == choose(*(np.asarray(value) for value in operands))
-        a, b = _floats(operands)
-        expected = choose(a, b)
-        zeros = (a == 0) & (b == 0) & (np.asarray(result, np.float64) == 0)
-        return _same(result, expected) | zeros
+            return np.asarray(result) == integral(*(np.asarray(value) for value in operands))
+        return _same(result, choose(*_floats(operands)))
     return contract
+
+
+def _extremum(choose, integral):
+    """reduce_max or reduce_min over the reduced axes, by `choose` folded pairwise, as values; of
+    integers or booleans, `integral` (its identity the type's own)."""
+    def contract(params, operands, result, fmt):
+        axes = tuple(params["axes"])
+        (value,) = operands
+        if fmt is None:
+            return np.asarray(result) == integral(np.asarray(value), axes)
+        moved = np.moveaxis(_read(value), axes, tuple(range(-len(axes), 0)))
+        flat = moved.reshape(*moved.shape[:moved.ndim - len(axes)], -1)
+        if flat.shape[-1] == 0:
+            identity = -np.inf if choose is _signed_max else np.inf
+            return _same(result, np.full(flat.shape[:-1], identity))
+        folded = flat[..., 0]
+        for index in range(1, flat.shape[-1]):
+            folded = choose(folded, flat[..., index])
+        return _same(result, folded)
+    return contract
+
+
+def _integral_extremum(reduce, extreme: str):
+    """An integer or boolean extremum reduction from its type's identity: the least value for a max,
+    the greatest for a min (False and True for booleans)."""
+    def reduced(value, axes):
+        if np.dtype(value.dtype) == np.dtype(bool):
+            start = extreme == "min"
+        else:
+            limits = np.iinfo(value.dtype)
+            start = limits.max if extreme == "min" else limits.min
+        return reduce(value, axis=axes, initial=start)
+    return reduced
 
 
 def _selected(params, which, *cases):
@@ -833,14 +878,6 @@ def _unwrapped(params, operands, result, fmt):
     return _bits(result) == _bits(np.asarray(jax.random.key_data(operands[0])))
 
 
-def _lowest(dtype):
-    return -np.inf if np.dtype(dtype).kind == "f" or _format(dtype) else np.iinfo(dtype).min
-
-
-def _highest(dtype):
-    return np.inf if np.dtype(dtype).kind == "f" or _format(dtype) else np.iinfo(dtype).max
-
-
 CONTRACTS = {
     "add": _arithmetic(two_sum, _wrapping(np.add)),
     "sub": _arithmetic(lambda a, b: two_sum(a, -b), _wrapping(np.subtract)),
@@ -850,8 +887,8 @@ CONTRACTS = {
     "sqrt": _arithmetic(_root, None),
     "neg": _moved(lambda params, a: -a),
     "abs": _moved(lambda params, a: np.abs(a)),
-    "max": _extreme(np.maximum),
-    "min": _extreme(np.minimum),
+    "max": _extreme(_signed_max, np.maximum),
+    "min": _extreme(_signed_min, np.minimum),
     "convert_element_type": _converted,
     "log": _transcendental(_interval(lambda iv, x: iv.log(x)), _log_special),
     "exp": _transcendental(_interval(lambda iv, x: iv.exp(x)), _exp_special),
@@ -872,10 +909,8 @@ CONTRACTS = {
     "bitcast_convert_type": _moved(_bitcast),
     "reduce_and": _moved(lambda params, a: np.all(a, axis=tuple(params["axes"]))),
     "reduce_or": _moved(lambda params, a: np.any(a, axis=tuple(params["axes"]))),
-    "reduce_max": _compared(lambda params, a: np.max(a, axis=tuple(params["axes"]),
-                                                     initial=_lowest(a.dtype))),
-    "reduce_min": _compared(lambda params, a: np.min(a, axis=tuple(params["axes"]),
-                                                     initial=_highest(a.dtype))),
+    "reduce_max": _extremum(_signed_max, _integral_extremum(np.max, "max")),
+    "reduce_min": _extremum(_signed_min, _integral_extremum(np.min, "min")),
     "select_n": _moved(_selected),
     "broadcast_in_dim": _moved(_broadcast),
     "reshape": _moved(_reshaped),
