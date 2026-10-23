@@ -327,13 +327,21 @@ def float64_replay(fn):
     names a format. Operations on integers, bits and keys run as traced, so a draw's random bits
     and the uniform built from them are the program's own (`FORMATTED`); a float literal or constant
     is the program's value widened. The program's calls (`jit`), custom derivatives' calls and
-    scans are replayed inside; a float operation outside `REPLAYED` refuses by name. Returns a
-    function of `fn`'s arguments whose float results are float64, for check 1's `truth_fn` where a
-    float64 run of `fn` would be another program (a float64 draw reads 64-bit random bits)."""
+    scans are replayed inside, each equation under the context it was traced in; a float
+    operation outside `REPLAYED`, a complex one, and any other call of a program refuse by name.
+    Returns a function of `fn`'s arguments whose float results are float64, for check 1's
+    `truth_fn` where a float64 run of `fn` would be another program (a float64 draw reads 64-bit
+    random bits). It traces `fn` as the float32 program, x64 off, whatever the caller's mode and
+    however widened its arguments arrive (check 1 hands a truth widened inputs under x64), and
+    rounds each argument to its traced dtype before widening it, as the program would read it."""
     def run(*arguments):
-        graph, shapes = jax.make_jaxpr(fn, return_shape=True)(*arguments)
+        with jax.enable_x64(new_val=False):
+            graph, shapes = jax.make_jaxpr(fn, return_shape=True)(*arguments)
+        native = [value if jax.dtypes.issubdtype(aval.dtype, jax.dtypes.extended)
+                  else np.asarray(value).astype(aval.dtype)
+                  for value, aval in zip(jax.tree.leaves(arguments), graph.in_avals, strict=True)]
         with jax.enable_x64(new_val=True):
-            outputs = _replayed(graph.jaxpr, graph.consts, jax.tree.leaves(arguments))
+            outputs = _replayed(graph.jaxpr, graph.consts, native)
         return jax.tree.unflatten(jax.tree.structure(shapes), outputs)
     return run
 
@@ -357,17 +365,21 @@ def _replayed(graph, consts, arguments):
         return _widened(variable.val) if hasattr(variable, "val") else held[variable]
 
     for equation in graph.eqns:
-        outputs = _replayed_equation(equation, [read(variable) for variable in equation.invars])
+        with equation.ctx.manager:
+            outputs = _replayed_equation(equation, [read(variable) for variable in equation.invars])
         held.update(zip(equation.outvars, outputs, strict=True))
     return [read(variable) for variable in graph.outvars]
 
 
 def _replayed_equation(equation, values):
     name, params = equation.primitive.name, equation.params
-    avals = [variable.aval for variable in (*equation.invars, *equation.outvars)]
+    dtypes = [variable.aval.dtype for variable in (*equation.invars, *equation.outvars)
+              if hasattr(variable.aval, "dtype")]
+    if any(jnp.issubdtype(dtype, jnp.complexfloating) for dtype in dtypes):
+        raise NotImplementedError(f"float64_replay has no float64 rule for complex {name}")
     if name == "jit":
         return _replayed(params["jaxpr"].jaxpr, params["jaxpr"].consts, values)
-    if name == "custom_vjp_call":
+    if name in ("custom_jvp_call", "custom_vjp_call"):
         return _replayed(params["call_jaxpr"].jaxpr, params["call_jaxpr"].consts, values)
     if name == "scan":
         # The body, replayed in float64 for its operands' widened dtypes, as the scan's own.
@@ -376,18 +388,21 @@ def _replayed_equation(equation, values):
             *(jax.ShapeDtypeStruct(variable.aval.shape, jnp.float64 if _floating(variable.aval.dtype)
                                    else variable.aval.dtype) for variable in body.jaxpr.invars))
         return equation.primitive.bind(*values, **{**params, "jaxpr": widened})
-    if name in FORMATTED or not any(_floating(aval.dtype) for aval in avals if hasattr(aval, "dtype")):
+    if next(equations(params), None) is not None:
+        # A call this replay does not open may hold float arithmetic its integer boundary hides.
+        raise NotImplementedError(f"float64_replay does not replay inside {name}")
+    if name in FORMATTED or not any(_floating(dtype) for dtype in dtypes):
         traced = [jnp.asarray(value).astype(variable.aval.dtype) if hasattr(variable.aval, "dtype")
                   and _floating(variable.aval.dtype) else value
                   for value, variable in zip(values, equation.invars, strict=True)]
-        outputs = equation.primitive.bind(*traced, **params)
+        outputs = equation.primitive.bind(*traced, **equation.primitive.get_bind_params(params))
         outputs = outputs if equation.primitive.multiple_results else [outputs]
         return [_widened(output) if _floating(output.dtype) else output for output in outputs]
     if name not in REPLAYED:
         raise NotImplementedError(f"float64_replay has no float64 rule for {name}")
     widened = {key: jnp.float64 if key in ("dtype", "new_dtype") and value is not None
                and _floating(value) else value for key, value in params.items()}
-    outputs = equation.primitive.bind(*values, **widened)
+    outputs = equation.primitive.bind(*values, **equation.primitive.get_bind_params(widened))
     return outputs if equation.primitive.multiple_results else [outputs]
 
 
