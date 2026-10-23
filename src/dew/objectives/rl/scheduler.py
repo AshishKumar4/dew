@@ -277,7 +277,6 @@ class Synchronous:
 
     def __init__(self, collector: Collector):
         self.collector = collector
-        self._snapshot: Snapshot | None = None
         self._serial = 0
 
     @property
@@ -295,7 +294,7 @@ class Synchronous:
         """Nothing is in flight between calls."""
 
     def begin(self, snapshot: Snapshot, partition: DataPartition) -> None:
-        self._snapshot = snapshot
+        """Nothing is published: the collector draws from the snapshot itself."""
 
     def entries(self, batch: Batch, tasks_of: Callable[[Batch], Sequence[Task]]) -> list[_Entry]:
         entry = _Entry(self._serial, tuple(tasks_of(batch)))
@@ -306,10 +305,7 @@ class Synchronous:
         """Every process: the draw is one program every process of the mesh enters."""
         return True
 
-    def open(self, entry: _Entry, samples: int) -> None:
-        # The call's one entry consumes its snapshot, so no tree outlives the call it was bound for.
-        snapshot, self._snapshot = self._snapshot, None
-        assert snapshot is not None, "begin binds the call's snapshot before its entry opens"
+    def open(self, entry: _Entry, samples: int, snapshot: Snapshot) -> None:
         # Every session was submitted when the collection began.
         began = time.perf_counter()
         collected = self.collector.collect(snapshot, entry.tasks, samples)
@@ -443,7 +439,9 @@ class Asynchronous:
         """The share's first reader: independent draws would hand its readers different rows."""
         return partition.reader == 0
 
-    def open(self, entry: _Entry, samples: int) -> None:
+    def open(self, entry: _Entry, samples: int, snapshot: Snapshot) -> None:
+        """Submit the entry's groups, unless an earlier call opened them; the snapshot's weights
+        reach the engines through `begin`."""
         if entry.groups:
             return
         for row, task in enumerate(entry.tasks):
@@ -700,7 +698,7 @@ class RolloutScheduler:
         acquiring = self.acquisition.acquires(partition)
         rollouts, latencies, groups, tally, waited = _within(
             mesh, "rollout admission",
-            lambda: self._admitted(entries, snapshot.updates) if acquiring else ([], [], 0, _Tally(), 0.0))
+            lambda: self._admitted(entries, snapshot) if acquiring else ([], [], 0, _Tally(), 0.0))
         sampling = partition.reader == 0
         # A share's packing that fails (a support past its capacity) fails every process, not one.
         packed = _within(mesh, "rollout packing",
@@ -724,16 +722,16 @@ class RolloutScheduler:
                 self.log(record)
         return packed
 
-    def _admitted(self, entries: Sequence[_Entry], updates: int
+    def _admitted(self, entries: Sequence[_Entry], snapshot: Snapshot
                   ) -> tuple[list[Session], list[float], int, _Tally, float]:
         """This process's admitted rollouts for the call's entry, their latencies, the group count,
         the tally and the wait, the entries ahead of it opened as well."""
         # The wait counts a synchronous collection, which opening its entry runs.
         began = time.perf_counter()
         for pending in entries:
-            self.acquisition.open(pending, self.groups + self.oversample)
+            self.acquisition.open(pending, self.groups + self.oversample, snapshot)
         tally = _Tally()
-        admitted = self._admit(entries[0], updates, tally)
+        admitted = self._admit(entries[0], snapshot.updates, tally)
         waited = time.perf_counter() - began
         return ([rollout for group in admitted for rollout in group.done[:self.groups]],
                 [latency for group in admitted for latency in group.latencies[:self.groups]],

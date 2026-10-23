@@ -272,9 +272,10 @@ class PPORollout:
 
     `episodes` collects `groups` episodes of each task through the
     rollout scheduler (`RolloutScheduler`, `Synchronous`), its policy
-    `objective.policy({})`, which binds each step's policy subtree; `credit`
-    and `log` are the scheduler's. GAE runs across the action tokens of all turns in one episode,
-    wherever the packer placed them. Tool observations and padding are
+    `objective.policy({})`, which binds each step's policy subtree; `log`
+    receives the scheduler's record of each call. GAE runs across the
+    action tokens of all turns in one episode, wherever the packer placed
+    them. Tool observations and padding are
     outside the mask, so they get no targets. The rewards are the packed
     `token_rewards`: each step reward the environment paid
     (`Observation.reward`) on the last action id of the call it paid for,
@@ -297,7 +298,6 @@ class PPORollout:
     groups: int = 2
     gamma: float = 1.
     lam: float = .95
-    credit: str = "session"
     log: Callable[[SchedulerRecord], None] | None = None
     rollout: RolloutScheduler = field(init=False)
 
@@ -307,7 +307,7 @@ class PPORollout:
         if self.objective.seq_len != self.episodes.width - 1:
             raise ValueError("PPO objective and episode token budgets must agree")
         object.__setattr__(self, "rollout", RolloutScheduler(Synchronous(self.episodes), groups=self.groups,
-                                                             credit=self.credit, log=self.log))
+                                                             log=self.log))
 
     @property
     def metrics(self) -> Mapping[str, float]:
