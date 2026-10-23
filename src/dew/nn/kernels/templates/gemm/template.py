@@ -223,17 +223,18 @@ def _paired(lhs, rhs, paired, group_sizes, *, epilogue, dtypes: tuple, several: 
         matrices = (rhs, paired)
         transposed = {'transpose_rhs': not transpose_rhs, 'interpret_on_cpu': interpret_on_cpu,
                       'precision': precision, 'dense': dense}
-        # Each matrix rounded as the forward multiplied it, its products summed wide (an fp64's in fp64).
+        # Each matrix rounded as the forward multiplied it, each product rounded to `compute` as the
+        # unfused projections' input cotangents are, their sum wide (one pass, no wide intermediate).
         d_lhs, d_paired_lhs = (
-            jnp.asarray(_gemm(d_acc, matrix.astype(compute), group_sizes, None, (), (), None, (), (), (work,),
-                              several=False, **transposed))
+            jnp.asarray(_gemm(d_acc, matrix.astype(compute), group_sizes, None, (), (), None, (), (),
+                              (compute,), several=False, **transposed))
             for d_acc, matrix in zip(d_accs, matrices, strict=True))
         d_matrices = []
         for d_acc, matrix in zip(d_accs, matrices, strict=True):
             d_matrix = gemm_t(lhs.astype(compute), d_acc, None if dense else group_sizes,
                               out_dtype=matrix.dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
             d_matrices.append(jnp.swapaxes(d_matrix, 1, 2) if transpose_rhs else d_matrix)
-        return ((d_lhs + d_paired_lhs).astype(lhs.dtype), *d_matrices,
+        return ((d_lhs.astype(work) + d_paired_lhs.astype(work)).astype(lhs.dtype), *d_matrices,
                 np.zeros(group_sizes.shape, jax.dtypes.float0))
 
     differentiable = generation.linear_tangent(forward, backward, portable)
