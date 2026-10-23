@@ -32,7 +32,7 @@ from dew.nn.sparse_selection import selection_mask, sparse_latent_attention, top
 from dew.quantization import QUANTIZATION, InputQuantization
 
 HEADS, RANK, NOPE, ROPE, VALUE = 4, 24, 16, 8, 12
-SEEDS = {'selection': 8, 'packed selection': 8, 'sparse layer': 8, 'dropped-out adapter': 8}
+SEEDS = {'selection': 8, 'packed selection': 8, 'sparse layer': 8, 'dropped-out adapter': 16}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 
 
