@@ -16,14 +16,12 @@ mesh's peak, or None where the model has no count. Each case is timed twice over
 steps: once with the asynchronous dispatch a real run uses, which gives
 ms/step, and once waiting on every step, which gives the p10/p50/p90 spread.
 
-A case's peak memory is measured, not planned: each device's high-water of
-its allocator (`memory_stats`' peak_bytes_in_use) over the warm-up and the
-timed steps, native workspaces (cuBLAS, cuDNN, Mosaic scratch) included. JAX
-resets no high-water, and a compile's autotuning allocates through the same
-allocator, so a process of the case's own reads it (`measured_peak`), loading
-every program from a compilation cache a process before it wrote, and
-compiling nothing. Its planned bytes, XLA's plan of arguments, outputs and
-temporaries, stand beside it (`planned_device_bytes`).
+A case's peak memory is measured, not planned: each device's allocator
+high-water over the case's run, native workspaces (cuBLAS, cuDNN, Mosaic
+scratch) included, read in a process of the case's own that loads every
+program from a compilation cache and compiles nothing (`measured_peak`,
+tools/peak_memory.py). XLA's plan of the step's arguments, outputs and
+temporaries stands beside it (`planned_device_bytes`).
 
 Two registry architectures are composites: `multimodal_transformer` wraps a
 decoder in an image tower and projector, and `diffusion_gemma` reads one
@@ -58,9 +56,7 @@ import dataclasses
 import io
 import json
 import os
-import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal
@@ -81,6 +77,7 @@ from dew.training.memory import recompute_record
 from dew.training.runtime import prepare_process
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import peak_memory
 from benchmark_cases import (
     Case,
     canvas_split,
@@ -196,12 +193,9 @@ class BenchmarkConfig:
     json_out: str | None = None
     quiet: bool = True
     """Silence the trainer's own prints, which are per-run noise here."""
-    peak_stage: Literal['warm', 'measure'] | None = None
-    """A case's own process for its measured peak (`measured_peak`), run by the tool itself: 'warm'
-    compiles the case's programs into `peak_cache`, 'measure' loads them from it, runs the warm-up and
-    the timed steps, and prints each device's high-water."""
-    peak_cache: str | None = None
-    """The compilation cache a case's peak processes share."""
+    peak_run: bool = False
+    """A case run in a process of its own for its measured peak (`measured_peak`), its compiles taken
+    from the cache that run names, measuring no peak of its own."""
 
 
 def build_cases(config: BenchmarkConfig) -> list[Case]:
@@ -339,10 +333,6 @@ def training_work(trainer: Trainer, case: Case, step_time: float) -> tuple[float
     return flops, model_flops_utilization(flops / trainer.device_mesh.devices.size, step_time)
 
 
-CACHE_MISS = "/jax/compilation_cache/cache_misses"
-"""JAX's event for a compile the persistent cache did not hold."""
-
-
 def pooled() -> bool:
     """Whether this process is one of a pool the environment declares (`dew launch`'s, a coordinator's,
     a cluster's), read before a backend opens: its processes hold one mesh between them, which a
@@ -353,50 +343,14 @@ def pooled() -> bool:
 
 
 def measured_peak(case: Case, config: BenchmarkConfig) -> list[int | None]:
-    """Each local device's high-water over the case's warm-up and timed steps, read in a process of the
-    case's own (`peak_process`) that loads every program it runs from a compilation cache a process
-    before it filled, so no compile, and no autotuning, joins it. Run before this process opens a
-    backend, which would hold the device they need."""
-    case_json = json.dumps([dataclasses.asdict(case)])
-    with tempfile.TemporaryDirectory(prefix="dew-peak-") as cache:
-        printed = ""
-        for stage in ("warm", "measure"):
-            done = subprocess.run(
-                [sys.executable, os.path.abspath(__file__), "--cases", case_json, "--dtype", config.dtype,
-                 "--attention-impl", config.attention_impl, "--warmup", str(config.warmup),
-                 "--steps", str(config.steps), "--fixed-batch" if config.fixed_batch else "--no-fixed-batch",
-                 *(["--xla-flags", config.xla_flags] if config.xla_flags else []),
-                 "--peak-stage", stage, "--peak-cache", cache],
-                capture_output=True, text=True)
-            if done.returncode:
-                raise RuntimeError(f"{case.label}: its {stage} peak process exited {done.returncode}:\n"
-                                   f"{done.stderr[-4000:]}")
-            printed = done.stdout
-    return json.loads(printed.splitlines()[-1])
-
-
-def peak_process(config: BenchmarkConfig) -> None:
-    """One case's peak process (`measured_peak`): its programs compiled into `config.peak_cache` ('warm'),
-    or loaded from it, its warm-up and timed steps run, and each local device's high-water printed
-    ('measure'), which a compile the cache missed would not be the step's own."""
-    missed: list[str] = []
-    jax.monitoring.register_event_listener(
-        lambda event, **_: missed.append(event) if event == CACHE_MISS else None)
-    # Dew's cache keeps every compile and the GPU autotuner's picks beside it (`dew.cache`).
-    prepare_process(multi_host=False, xla_flags=config.xla_flags, compilation_cache_dir=config.peak_cache)
-    (case,) = build_cases(config)
-    trainer = build_trainer(case, config.attention_impl)
-    with compiled_step(case, trainer, fixed_batch=config.fixed_batch) as compiled:
-        if config.peak_stage == 'warm':
-            return
-        state, _, _, _ = timed_steps(compiled.step, compiled.state, max(config.warmup, 1))
-        timed_steps(compiled.step, state, config.steps)
-    if missed:
-        raise RuntimeError(f"{case.label}: {len(missed)} programs compiled in its peak process, which a "
-                           "compile's own allocations would join; the warm process filled no cache entry "
-                           "for them")
-    print(json.dumps([(device.memory_stats() or {}).get("peak_bytes_in_use")
-                      for device in jax.local_devices()]))
+    """Each local device's high-water over the case's run, measured (tools/peak_memory.py) in a process of
+    the case's own that loads its programs from a cache and compiles nothing. Run before this process
+    opens a backend, which would hold the device it needs."""
+    return peak_memory.measured(
+        [os.path.abspath(__file__), "--cases", json.dumps([dataclasses.asdict(case)]),
+         "--dtype", config.dtype, "--attention-impl", config.attention_impl, "--warmup", str(config.warmup),
+         "--steps", str(config.steps), "--fixed-batch" if config.fixed_batch else "--no-fixed-batch",
+         *(["--xla-flags", config.xla_flags] if config.xla_flags else []), "--peak-run"])
 
 
 def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None) -> Row:
@@ -584,10 +538,12 @@ def run(config: BenchmarkConfig, peaks: list[list[int | None]] | None) -> list[R
 
 
 def main(config: BenchmarkConfig) -> list[Row]:
-    # A step's compile seconds are a cold compile's, which no cached executable stands in for.
-    jax.config.update("jax_enable_compilation_cache", val=False)
+    if not config.peak_run:
+        # A step's compile seconds are a cold compile's, which no cached executable stands in for.
+        jax.config.update("jax_enable_compilation_cache", val=False)
     # Before this process opens a backend, which would hold the device each case's peak process needs.
-    peaks = None if pooled() else [measured_peak(case, config) for case in build_cases(config)]
+    measuring = not (pooled() or config.peak_run)
+    peaks = [measured_peak(case, config) for case in build_cases(config)] if measuring else None
     # Joins a `dew launch` pool when one launched this process, and applies
     # the flags before the backend opens either way.
     prepare_process(xla_flags=config.xla_flags)
@@ -611,8 +567,4 @@ def main(config: BenchmarkConfig) -> list[Row]:
 
 
 if __name__ == "__main__":
-    parsed = tyro.cli(BenchmarkConfig)
-    if parsed.peak_stage is None:
-        main(parsed)
-    else:
-        peak_process(parsed)
+    main(tyro.cli(BenchmarkConfig))
