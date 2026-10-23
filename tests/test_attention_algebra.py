@@ -601,18 +601,20 @@ def test_the_accurate_forms_rescale_is_as_exact_as_its_exponent_rounded_once(raw
                     f"the accurate form's rescale, {'raw' if raw else 'scaled'}", seeds=8)
 
 
-@pytest.mark.parametrize("scale, hook", [(2.0, None), (1.0, "doubled")], ids=["scale-2", "slope-2"])
-def test_a_querys_gradient_over_keys_near_fp32s_largest_is_finite_at_any_scale_and_slope(scale, hook):
-    """One query of zeros over two keys near fp32's largest at equal logits (each weighs 1/2), a scale of 2
-    or a score hook of slope 2: the query's gradient is the cotangents' difference times the keys, 0, and
-    D's refinement 0, so dQ is exactly 0 in both mainloops (`algebra.DqSums.keyed`, held as a magnitude times
-    a bounded mean of the keys, where their sum under coefficients summing to 2 would overflow)."""
+@pytest.mark.parametrize("scale, slope, size", [(2.0, None, 2e38), (1.0, 2.0, 2e38), (4.0, 1e38, 0.25)],
+                         ids=["scale-2", "slope-2", "slope-1e38"])
+def test_a_querys_gradient_over_keys_near_fp32s_largest_is_finite_at_any_scale_and_slope(scale, slope, size):
+    """One query of zeros over two equal keys at equal logits (each weighs 1/2) under a scale and a score
+    hook's slope: the query's gradient is the cotangents' difference times the keys, 0, and D's refinement 0,
+    so dQ is exactly 0 in both mainloops (`algebra.DqSums.keyed`): keys near fp32's largest at a scale or a
+    slope of 2, whose sum under coefficients summing to 2 would overflow, and small keys at a slope of 1e38,
+    whose coefficients' magnitudes would (held as a mantissa and an exponent, `keyed_shift`)."""
     query = jnp.zeros((1, 1, 1, 16), jnp.float32)
-    key = jnp.zeros((1, 2, 1, 16), jnp.float32).at[:, :, :, 0].set(2e38)
+    key = jnp.zeros((1, 2, 1, 16), jnp.float32).at[:, :, :, 0].set(size)
     value = jnp.asarray([[[[1.0] * 16]], [[[2.0] * 16]]], jnp.float32).reshape(1, 2, 1, 16)
     dout = jnp.ones((1, 1, 1, 16), jnp.float32)
     spans = template.spans(1, 2, 1)
-    hooks = template.Hooks(score_mod=(lambda s, q_pos, k_pos: 2 * s) if hook else None)
+    hooks = template.Hooks(score_mod=None if slope is None else (lambda s, q_pos, k_pos: slope * s))
     tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
     with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
         triton = attention_triton.backward(query, key, value, spans, hooks, dout, scale=scale, interpret=True)
