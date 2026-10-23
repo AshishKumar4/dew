@@ -52,7 +52,7 @@ def fp16_of(x, axis):
 
 def hi_bf16_lo_fp16(ds, q64):
     hi = bf16(ds)
-    lo = fp16_of(np.asarray(np.asarray(ds, np.float32), np.float64) - hi, -1)
+    lo = fp16_of(np.asarray(np.asarray(ds, np.float32), np.float64) - hi, (2, 3))
     return np.einsum("bhqk,bqhd->bkhd", hi, q64) + np.einsum("bhqk,bqhd->bkhd", lo, fp16_of(q64, (1, 3)))
 
 
