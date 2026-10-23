@@ -191,17 +191,18 @@ def accumulated(product: Callable[..., jax.Array], *operands,
         pullback is formed in that scope here, for the operands a reverse pass differentiates alone."""
         with jax.enable_x64(new_val=True):
             wide = [operand.astype(jnp.float64) for operand in operands]
+            wide_cotangent = cotangent.astype(jnp.float64)
 
-            def moving(*chosen):
-                full = list(wide)
-                for index, value in zip(live, chosen, strict=True):
-                    full[index] = value
-                return product(*full, preferred_element_type=None)
+            def transposed(index):
+                # The product is linear in each operand alone, so its transpose there forms the
+                # cotangent's products and nothing of the forward.
+                def alone(operand):
+                    return product(*wide[:index], operand, *wide[index + 1:], preferred_element_type=None)
 
-            _, pullback = jax.vjp(moving, *(wide[index] for index in live))
-            gradients = pullback(cotangent.astype(jnp.float64))
-            return tuple(gradient.astype(operands[index].dtype)
-                         for gradient, index in zip(gradients, live, strict=True))
+                (gradient,) = jax.linear_transpose(alone, wide[index])(wide_cotangent)
+                return gradient.astype(operands[index].dtype)
+
+            return tuple(transposed(index) for index in live)
 
     # Forward mode differentiates `summed` as it traces, inside its scope; reverse mode runs `pulled`.
     wide = linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, live_cotangents=True)
