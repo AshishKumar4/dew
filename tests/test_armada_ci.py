@@ -662,7 +662,7 @@ def ran_by(ci, tmp_path, monkeypatch, entries: list[dict]) -> list[list[str]]:
         (tmp_path / "runs.log").unlink(missing_ok=True)
         [verdict] = filled(ci, monkeypatch, entry, tmp_path / f"verdict-{index}.json")
         assert verdict["exitCode"] == 0, verdict["output"]
-        logged = (tmp_path / "runs.log").read_text().split() if (tmp_path / "runs.log").exists() else []
+        logged = (tmp_path / "runs.log").read_text().splitlines() if (tmp_path / "runs.log").exists() else []
         assert len(logged) == len(verdict["tests"])
         ran.append(sorted(verdict["tests"]))
     return ran
