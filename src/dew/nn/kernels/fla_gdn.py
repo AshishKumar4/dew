@@ -348,7 +348,8 @@ def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, gl_ref, h0_ref, h_ref, corre
                 return read(k_ref, pl.ds(i * 64, 64))
 
             if per_key:
-                decay = [jnp.exp2(g_ref[final, pl.ds(i * 64, 64)].astype(jnp.float32))[:, None]
+                decay = [algebra.raised(g_ref[final, pl.ds(i * 64, 64)].astype(jnp.float32),
+                                        gl_ref[final, pl.ds(i * 64, 64)].astype(jnp.float32))[:, None]
                          for i in range(slices)]
                 return algebra.carried(state, keys, corrected, decay, k_ref.dtype, issue)
             gated, decay = algebra.scalar_write(corrected, _row(g_ref, final),
@@ -489,7 +490,8 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, gl_ref, dht_ref, do_ref, d
 
             if per_key:
                 dv = dv + read(dv_ref).astype(jnp.float32)
-                kept = [jnp.exp2(g_ref[final, pl.ds(i * 64, 64)].astype(jnp.float32))[:, None]
+                kept = [algebra.raised(g_ref[final, pl.ds(i * 64, 64)].astype(jnp.float32),
+                                       gl_ref[final, pl.ds(i * 64, 64)].astype(jnp.float32))[:, None]
                         for i in range(slices)]
                 read_out = [read_out_of(i, lambda query, out, b: _dot(query.T, out.astype(query.dtype),
                                                                       exact=exact))

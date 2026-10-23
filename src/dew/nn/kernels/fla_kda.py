@@ -265,14 +265,14 @@ def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, gl_ref, *refs, 
             columns = pl.ds(block * bk, bk)
             key = read(k_ref, columns)
             gate = _gates(g_ref, start, taken, chunk, 0, columns)
+            low = _gates(gl_ref, start, taken, chunk, 0, columns)
+            grown = algebra.raised(gate, low)
             if q_ref is not None and qg_ref is not None:
-                write(qg_ref, columns, read(q_ref, columns) * jnp.exp2(gate))
+                write(qg_ref, columns, read(q_ref, columns) * grown)
             write(kg_ref, columns, algebra.key_decayed_write(
-                key, gate, _gates(gl_ref, start, taken, chunk, 0, columns),
-                _row(g_ref, (start + taken - 1, columns))[None, :],
+                key, gate, low, _row(g_ref, (start + taken - 1, columns))[None, :],
                 _row(gl_ref, (start + taken - 1, columns))[None, :]))
-            write(w_ref, columns,
-                  algebra.weighted("apply_w", inverse, key, beta, _issuer(exact), jnp.exp2(gate)))
+            write(w_ref, columns, algebra.weighted("apply_w", inverse, key, beta, _issuer(exact), grown))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -281,7 +281,7 @@ class RecomputeWU(_Launch):
 
     NAME = "recompute_w_u"
     KEYS, VALUES = "k", "v"
-    revision: int = 2
+    revision: int = 3
     SPACES = _spaces(_tiles([(64, 64)], (2, 4), (2, 3, 4)))
     PICKS = _picks(Tiles(64, 64, 4, 2))
 
@@ -332,7 +332,8 @@ def recompute_w_u(k, v, beta, a, g, q=None, *, chunk: int = 64, spans: Sequences
     return _RECOMPUTE_W_U(k, v, beta, a, *_halves(g), q, *spans, chunk=chunk, interpret=interpret)
 
 
-def _o_kernel(chunk_ref, q_ref, v_ref, g_ref, h_ref, a_ref, o_ref, *, chunk: int, aligned: bool, scale: float,
+def _o_kernel(chunk_ref, q_ref, v_ref, g_ref, gl_ref, h_ref, a_ref, o_ref, *, chunk: int, aligned: bool,
+              scale: float,
               bk: int, exact: bool):
     """fla's `chunk_gla_fwd_kernel_o` (fla/ops/gla/chunk.py:345-432) for one chunk of one head and `BV`
     value columns: `scale (q exp2(g))_narrow h + tril(Aqk) v`, the gated queries rounded to their
@@ -350,7 +351,8 @@ def _o_kernel(chunk_ref, q_ref, v_ref, g_ref, h_ref, a_ref, o_ref, *, chunk: int
             return pl.ds(c * bk, bk)
 
         out = algebra.key_decayed_output(lambda c: read(q_ref, columns(c)),
-                                         lambda c: _gates(g_ref, start, taken, chunk, 0, columns(c)),
+                                         lambda c: (_gates(g_ref, start, taken, chunk, 0, columns(c)),
+                                                    _gates(gl_ref, start, taken, chunk, 0, columns(c))),
                                          lambda c: h_ref[entered, columns(c), :], q_ref.shape[-1] // bk,
                                          read(a_ref), read(v_ref), scale, _issuer(exact))
         write_rows(_rows(o_ref, start, chunk), taken, out)
@@ -362,12 +364,13 @@ class ChunkFwdO(_Launch):
 
     NAME = "chunk_fwd_o"
     KEYS, VALUES = "q", "v"
+    revision: int = 2
     SPACES = _spaces(_tiles([(32, 64), (64, 64), (32, 128), (64, 128)], (2, 4, 8), (2, 3, 4)),
                      _tiles([(32, 64), (64, 64)], (2, 4, 8), (2,)))
     # Measured on an A100-40GB at Kimi Linear's 1 x 4096 x 32 x 128 bf16: 0.25 -> 0.23 ms.
     PICKS = _picks(Tiles(64, 128, 4, 2), small=Tiles(64, 64, 4, 2))
 
-    def _fwd(self, q: jax.Array, v: jax.Array, g: jax.Array, a: jax.Array, h: jax.Array,
+    def _fwd(self, q: jax.Array, v: jax.Array, g: jax.Array, gl: jax.Array, a: jax.Array, h: jax.Array,
              chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int, scale: float, interpret: bool,
              config: Tiles, wide: bool = False, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
@@ -386,12 +389,13 @@ class ChunkFwdO(_Launch):
             in_specs=[pl.BlockSpec((None, 4), lambda i_v, i_t, i_h: (i_t, 0)),
                       pl.BlockSpec((tokens, None, width), lambda i_v, i_t, i_h: (0, i_h // group, 0)), values,
                       pl.BlockSpec((tokens, None, width), lambda i_v, i_t, i_h: (0, i_h, 0)),
+                      pl.BlockSpec((tokens, None, width), lambda i_v, i_t, i_h: (0, i_h, 0)),
                       pl.BlockSpec((h.shape[0], None, width, bv), lambda i_v, i_t, i_h: (0, i_h, 0, i_v)),
                       pl.BlockSpec((tokens, None, chunk), lambda i_v, i_t, i_h: (0, i_h, 0))],
             out_specs=values, out_shape=jax.ShapeDtypeStruct((tokens, value_heads, columns), dtype),
             compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=config.stages),
             interpret=interpret, name="fla_kda_chunk_fwd_o",
-        )(spans.chunks, *_flat(q, v, g), h, *_flat(a))
+        )(spans.chunks, *_flat(q, v, g, gl), h, *_flat(a))
         return out.reshape(v.shape), None
 
 
@@ -406,7 +410,8 @@ def chunk_fwd_o(q, v, g, a, h, *, scale: float, chunk: int = 64, spans: Sequence
     K]`, `a` `Aqk` `[B, T, HV, BT]`, `h` the memories the chunks enter at their slots
     (`fla_gdn.chunk_fwd_h`'s)."""
     spans = sequences(*q.shape[:2], chunk=chunk) if spans is None else spans
-    return _CHUNK_FWD_O(q, v, g, a, h, *spans, chunk=chunk, scale=scale, interpret=interpret, wide=wide)
+    return _CHUNK_FWD_O(q, v, *_halves(g), a, h, *spans, chunk=chunk, scale=scale, interpret=interpret,
+                        wide=wide)
 
 
 def _dav_kernel(chunk_ref, v_ref, do_ref, a_ref, dv_ref, da_ref, *, chunk: int, aligned: bool, scale: float,
@@ -540,13 +545,12 @@ def _wy_dqkg_kernel(chunk_ref, q_ref, k_ref, v_ref, vn_ref, g_ref, gl_ref, beta_
                                                        (empty, empty, empty, jnp.zeros((bk,), jnp.float32)))
             key = read(k_ref, keys)
             gate = _gates(g_ref, start, taken, chunk, 0, keys)
-            final = _row(g_ref, (start + taken - 1, keys))
-            gate_exp = jnp.exp2(gate)
-            decay_grad = decay_grad * jnp.exp2(final)
+            low = _gates(gl_ref, start, taken, chunk, 0, keys)
+            final, final_low = _row(g_ref, (start + taken - 1, keys)), _row(gl_ref, (start + taken - 1, keys))
+            gate_exp = algebra.raised(gate, low)
+            decay_grad = decay_grad * algebra.raised(final, final_low)
             dq = dq * gate_exp * scale
-            final_low = _row(gl_ref, (start + taken - 1, keys))
-            dk = dk * jnp.exp2((final[None, :] - gate)
-                               + (final_low[None, :] - _gates(gl_ref, start, taken, chunk, 0, keys)))
+            dk = dk * jnp.exp2((final[None, :] - gate) + (final_low[None, :] - low))
             gated_key = key * gate_exp
             dw = -dw.astype(transposed.dtype)
             scores = scores + _dot(dw, gated_key.T.astype(transposed.dtype), exact=exact)
@@ -575,7 +579,7 @@ class BwdWyDqkg(_Launch):
     """`bwd_wy_dqkg`'s launch (tuning.KernelOp)."""
 
     NAME = "bwd_wy_dqkg"
-    revision: int = 3
+    revision: int = 4
     KEYS, VALUES = "k", "v"
     SPACES = _spaces(_tiles([(32, 32), (32, 64)], (2, 4), (1,)), _tiles([(32, 32)], (2, 4), (1,)))
     PICKS = _picks(Tiles(32, 64, 4, 1), small=Tiles(32, 32, 4, 1))
@@ -774,7 +778,7 @@ def cumulated_fwd(q, k, v, g, beta, h0, spans: Sequences, scale: float, chunk: i
     akk = checkpoint_name(akk, 'delta_inverse')
     w, u, kg, qg = recompute_w_u(k, v, beta, akk, g, q if keep else None, **kernels)
     h, corrected, final = fla_gdn.chunk_fwd_h(kg, w, u, g, h0, **kernels)
-    o = chunk_fwd_o(q, corrected, _halves(g)[0], aqk, h, scale=scale, wide=wide, **kernels)
+    o = chunk_fwd_o(q, corrected, g, aqk, h, scale=scale, wide=wide, **kernels)
     memory = checkpoint_name((w, kg, qg, h, corrected), 'delta_memory') if keep else None
     return (o, final), (q, k, v, g, beta, aqk, akk, h0, memory, spans)
 

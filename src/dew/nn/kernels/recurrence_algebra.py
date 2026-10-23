@@ -483,13 +483,14 @@ def key_decayed_write(key, gate, low, last, last_low):
 def key_decayed_output(queries: Load, gates: Load, entered: Load, columns: int, scores, value, scale: float,
                        issue: Issue):
     """A chunk's output `[C, BV]`, fp32, a decay a key dimension: `scale (q exp2(g))_narrow S +
-    tril(Aqk) v`, each key block's gated queries `queries(c) exp2(gates(c))` rounded to their dtype
+    tril(Aqk) v`, each key block's gated queries `queries(c) exp2(gates(c))` (`gates(c)` the prefix's
+    halves, `raised`) rounded to their dtype
     against the memory entered `entered(c)` ('memory'), the scores `scores` (`Aqk`, scaled) rounded to the
     values' dtype ('local')."""
     out = jnp.zeros((scores.shape[0], value.shape[-1]), jnp.float32)
     for c in range(columns):
         query = queries(c)
-        gated = (query * jnp.exp2(gates(c))).astype(query.dtype)
+        gated = (query * raised(*gates(c))).astype(query.dtype)
         out = out + issue("memory", gated, entered(c).astype(gated.dtype))
     out = out * scale
     index = jnp.arange(scores.shape[0])
