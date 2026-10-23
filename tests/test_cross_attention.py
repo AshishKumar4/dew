@@ -417,8 +417,8 @@ def test_a_served_request_reads_its_own_context(options):
     bound = served_task()
     alone = [bound(request(index), budget, key=index) for index, budget in enumerate(BUDGETS)]
     other = bound(request(2, 1), BUDGETS[2], key=2)
-    assert not np.array_equal(np.asarray(other.host().behavior_log_probs),
-                              np.asarray(alone[2].host().behavior_log_probs)), "the context is read"
+    assert not np.array_equal(np.asarray(other.host().raw_log_probs),
+                              np.asarray(alone[2].host().raw_log_probs)), "the context is read"
     server = Server.from_task(bound, slots=4, capacity=128, admission=2, **options)
     assert server.mixed_refusal is not None
     tickets = [server.submit(request(index), budget, key=index) for index, budget in enumerate(BUDGETS)]
