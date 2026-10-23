@@ -416,10 +416,11 @@ def layer_states_on(spec, model, variables, ids, microbatches=None):
 
 
 def float64_layer_states(model, variables, ids):
-    """`layer_states` of the model computing in float64 over its weights widened: the truth."""
-    with jax.enable_x64(new_val=True):
+    """`layer_states` of the model computing in float64 over its weights widened, on the CPU, which
+    every lane keeps for float64: the truth."""
+    with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
         return [np.asarray(state) for state in layer_states(model.clone(dtype=jnp.float64),
-                                                            widened(variables), ids)]
+                                                            widened(variables), np.asarray(ids))]
 
 
 @mesh_lane
