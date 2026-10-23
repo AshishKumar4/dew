@@ -439,6 +439,8 @@ def selections_forward(name: str):
     cell: the lightning indexer's scores from its `scores` method, Gemma 3n's gate from its gated MLP's
     Dense. One compiled forward rather than an op at a time: XLA:CPU's JIT failed to materialize a
     gather fusion among the many small programs an unjitted capture compiles."""
+    from dew.nn.gemma4_moe import Gemma4TextRouter
+    from dew.nn.gpt_oss import GptOssMLP
     from dew.nn.mla import SparseIndexer
     from dew.nn.mlp import GatedMLP
     from dew.nn.moe import Router
@@ -451,6 +453,10 @@ def selections_forward(name: str):
             return method == "scores"
         if isinstance(module, Router):
             return method == "logits"
+        if isinstance(module, nn.Dense) and method == "__call__" and (
+                (isinstance(module.parent, GptOssMLP) and module.name == "router")
+                or (isinstance(module.parent, Gemma4TextRouter) and module.name == "proj")):
+            return True
         parent = module.parent
         gated = isinstance(parent, GatedMLP) and bool(parent.activation_sparsity)
         return method == "__call__" and isinstance(module, nn.Dense) and module.name == "gate_proj" and gated
@@ -519,8 +525,10 @@ def selection_margin(case: Case, variables, tokens) -> float:
     the k-th and the next visible key's score, over the query's largest), Gemma 3n's gaussian top-k
     (the gate's distance from its cutoff, the row's mean plus the sparsity's normal quantile times its
     population deviation, over that deviation, as `dew.nn.mlp.gaussian_topk` forms it) and a
-    mixture's routing (`router_margin`). A query that sees no more keys than its budget, and an exact
-    zero tie of relu'd scores, ordered alike by index in every run, decide nothing."""
+    mixture's routing (`router_margin`; gpt-oss's and Gemma 4's routers, which rank their logits or
+    their softmax by a plain top-k, by `top_margin` of the logits). A query that sees no more keys
+    than its budget, and an exact zero tie of relu'd scores, ordered alike by index in every run,
+    decide nothing."""
     fields = case.config.get("mixer", {}).get("fields", {})
     sparsities = case.config.get("activation_sparsity_pattern", ())
     margin, seen = np.inf, 0
@@ -532,6 +540,11 @@ def selection_margin(case: Case, variables, tokens) -> float:
         if "gate_proj" in names:
             layer = int(next(name for name in names if name.startswith("layers_")).split("_")[1])
             margin = min(margin, gate_margin(values, sparsities[layer]))
+            continue
+        if "router" in names or "proj" in names:
+            # gpt-oss ranks its router's logits, Gemma 4's router their softmax: one order, by logit.
+            kept = case.config["mixture"].get("top_k", 2)
+            margin = min(margin, float(np.min(top_margin(values, kept))))
             continue
         if "logits" in names:
             module = names[:names.index("logits")]
