@@ -660,7 +660,10 @@ class Processor:
         none otherwise."""
         values = self.reference(text=[text], add_special_tokens=specials, padding=False, truncation=False,
                                 return_tensors=None)
-        return [int(token) for token in values["input_ids"][0]]
+        rows = values["input_ids"]
+        if not isinstance(rows, Sequence) or len(rows) != 1 or not isinstance(rows[0], Sequence):
+            raise TypeError(f"{type(self.reference).__name__} returned no one row of input ids for one text")
+        return [int(token) for token in rows[0]]
 
     def save_pretrained(self, directory: str | Path) -> None:
         """Save the tokenizer and the source's unchanged media processor files."""
