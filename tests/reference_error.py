@@ -117,8 +117,8 @@ def widened(tree):
 
 
 def _stack_draws(trees):
-    """A draw's leaves of each window stacked on a new leading axis: a JAX array or Python scalar as JAX
-    stacks it, its weak type kept, and a host array as NumPy stacks it, its dtype kept."""
+    """A draw's leaves of each window stacked on a new leading axis. A JAX array or Python scalar stacks
+    as JAX stacks it, its weak type kept, and a host array as NumPy stacks it, its dtype kept."""
     def stack(*leaves):
         if all(isinstance(leaf, jax.Array | bool | int | float | complex) for leaf in leaves):
             return jnp.stack([jnp.asarray(leaf) for leaf in leaves])
@@ -179,6 +179,7 @@ def over_windows(fn, *, looped: bool = False):
     batched, single, checked = jax.jit(jax.vmap(fn)), jax.jit(fn), set()
 
     def run(*arguments):
+        # Before the batched program, which would compile a batch of none.
         _window_count(arguments)
         found = jax.tree.map(np.asarray, batched(*arguments))
         signature = (bool(jax.config.jax_enable_x64), str(jax.config.jax_default_matmul_precision),
@@ -194,10 +195,12 @@ def over_windows(fn, *, looped: bool = False):
                     where = jax.tree_util.keystr(path) or "the output"
                     differs = ""
                     if got.shape == want.shape and got.dtype == want.dtype and got.size:
-                        moved = np.flatnonzero(np.any((got != want).reshape(len(got), -1), axis=1))
-                        if moved.size:
-                            gap = np.max(np.abs(np.asarray(got, np.float64) - np.asarray(want, np.float64)))
-                            differs = f" (from window {moved[0]}, by up to {gap:.3e})"
+                        # By bits, so a zero of the other sign names its window too.
+                        moved = [index for index in range(len(got))
+                                 if np.ascontiguousarray(got[index]).tobytes()
+                                 != np.ascontiguousarray(want[index]).tobytes()]
+                        gap = np.max(np.abs(np.asarray(got, np.float64) - np.asarray(want, np.float64)))
+                        differs = f" (from window {moved[0]}, by up to {gap:.3e})"
                     raise AssertionError(
                         f"{where}: the batched arm over windows computes otherwise than one draw's "
                         f"compiled arm does, window by window{differs}. Take "
@@ -224,8 +227,9 @@ def without_ynn(fn, **jit_options):
     between two Dew paths, such as an interpreted kernel and the XLA program it replaces, the latter
     the arm the check measures against, so that the two run the same kind of code on any host. A
     program Dew's users run compiles with the fusions, as they do. Call it at top level, since on the
-    CPU lane its compiler options refuse to be nested in another jit or differentiated through. A
-    caller's own compiler options take precedence over WITHOUT_YNN's."""
+    CPU lane its compiler options refuse to be nested in another jit, differentiated through or
+    batched; `over_windows` takes it with `looped=True`. A caller's own compiler options take
+    precedence over WITHOUT_YNN's."""
     if jax.default_backend() == "cpu":
         jit_options["compiler_options"] = {**WITHOUT_YNN, **(jit_options.get("compiler_options") or {})}
     return jax.jit(fn, **jit_options)

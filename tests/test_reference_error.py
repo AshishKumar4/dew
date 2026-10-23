@@ -127,8 +127,8 @@ def test_no_windows_are_refused():
 
 
 def moved_when(condition):
-    """An identity whose batching rule adds one where `condition(axis_size, x)` holds: a batch axis that
-    moves a rounding, as a fusion or a kernel's route may."""
+    """An identity whose batching rule adds one where `condition(axis_size, x)` holds, as a batch axis
+    that moves a rounding (a fusion, a kernel's route) would."""
     @jax.custom_batching.custom_vmap
     def arm(x):
         return x
@@ -154,9 +154,9 @@ def test_a_batched_arm_that_computes_otherwise_than_one_draws_is_refused():
 
 @pytest.mark.parametrize("change", ["x64", "windows", "tree", "format", "precision"])
 def test_the_bit_check_runs_again_at_each_new_signature(change):
-    """A signature the first call did not hold is checked again: x64's setting at the same float32 avals,
-    another count of windows, another tree of the same leaves, another narrow format of the same width,
-    and another default matmul precision."""
+    """A signature the first call did not hold is checked again. The changes are x64's setting at the
+    same float32 avals, another count of windows, another tree of the same leaves, another narrow format
+    of the same width, and another default matmul precision."""
     from reference_error import over_windows
 
     x = np.zeros((3, 2), np.float32)
@@ -191,11 +191,31 @@ def test_the_bit_check_runs_again_at_each_new_signature(change):
             arm(x)
 
 
+def test_a_batched_arm_of_another_dtype_of_the_same_bits_is_refused():
+    """A batched arm whose windows hold one draw's bits under another dtype is refused by its dtype."""
+    from reference_error import over_windows
+
+    @jax.custom_batching.custom_vmap
+    def arm(x):
+        return x
+
+    @arm.def_vmap
+    def batched(axis_size, in_batched, x):
+        return jax.lax.bitcast_convert_type(x, jnp.int32), in_batched[0]
+
+    with pytest.raises(AssertionError):
+        over_windows(arm)(np.ones((3, 2), np.float32))
+
+
 def test_a_without_ynn_arm_takes_the_looped_form():
-    """A `without_ynn` arm's compiler options refuse the batched program, and it runs looped."""
+    """A `without_ynn` arm's compiler options refuse the batched program on the CPU lane, and it runs
+    looped."""
     from reference_error import over_windows, without_ynn
 
     x = np.ones((3, 2), np.float32)
+    if jax.default_backend() == "cpu":
+        with pytest.raises(ValueError):
+            over_windows(without_ynn(lambda x: x * 2))(x)
     np.testing.assert_array_equal(over_windows(without_ynn(lambda x: x * 2), looped=True)(x), x * 2)
 
 
