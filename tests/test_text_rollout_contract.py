@@ -12,7 +12,8 @@ logits it reads are the raw likelihoods'. What is one computation, or a token,
 is held exactly.
 """
 
-from contextlib import contextmanager
+import functools
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import jax
@@ -80,11 +81,18 @@ def drawn_prompts(seed: int, attempt: int, vocab: int, *, width: int = 4, shorte
     return prompt, lengths
 
 
+@functools.cache
+def forward(model):
+    """`model`'s forward, one compiled program a model (equal clones share it), so every seed, attempt and
+    row reuses its compile."""
+    return jax.jit(model.apply)
+
+
 def row_logits(model, params, prompt, lengths, tokens, positions=None):
     """Each row's logits for its drawn `tokens`, from one full forward over its unpadded prompt and the
     tokens drawn before each, at `positions` where given (one row each, the prompt's and the tokens'),
     in the model's dtype: an array a row, a step each."""
-    apply = jax.jit(model.apply)
+    apply = forward(model)
     width = prompt.shape[1]
     found = []
     for row, length in enumerate(np.asarray(lengths)):
@@ -163,12 +171,14 @@ def generated(model, params, sampling, steps: int):
 
 def scored(model, params, sampling, dtype=None):
     """`policy_scores` of a draw's tokens, the model computing at `dtype` where given, on its
-    parameters widened to it under x64: a draw's reference, and at float64 its truth."""
+    parameters widened to it under x64: a draw's reference, and at float64 its truth. The model and its
+    parameters are fixed once, so only the draw goes through."""
+    if dtype is not None:
+        model, params = model.clone(dtype=dtype), widened(params)
+
     def run(prompt, lengths, key, tokens):
-        if dtype is None:
+        with jax.enable_x64(new_val=True) if dtype is not None else nullcontext():
             return policy_scores(model, params, prompt, lengths, tokens, sampling)
-        with jax.enable_x64(new_val=True):
-            return policy_scores(model.clone(dtype=dtype), widened(params), prompt, lengths, tokens, sampling)
     return run
 
 
@@ -266,13 +276,12 @@ def test_right_padding_and_logical_positions_survive_cached_generation(kind):
         return {"raw": result.raw_log_probs}
 
     def full(dtype=None):
+        at, weights = (model, params) if dtype is None else (model.clone(dtype=dtype), widened(params))
+
         def run(tokens, positions, drawn):
-            if dtype is None:
-                return policy_scores(model, params, tokens[:, :2], np.full(ROWS, 2), drawn, greedy,
+            with jax.enable_x64(new_val=True) if dtype is not None else nullcontext():
+                return policy_scores(at, weights, tokens[:, :2], np.full(ROWS, 2), drawn, greedy,
                                      walked(positions))
-            with jax.enable_x64(new_val=True):
-                return policy_scores(model.clone(dtype=dtype), widened(params), tokens[:, :2],
-                                     np.full(ROWS, 2), drawn, greedy, walked(positions))
         return run
 
     label = f"{kind} positions"
@@ -397,8 +406,9 @@ def test_prompt_perplexity_uses_unpadded_context_and_real_transitions(kind):
         return jnp.where(real, found.losses, 0)
 
     def full(model, params):
+        apply = forward(model)
+
         def run(prompt, lengths):
-            apply = jax.jit(model.apply)
             losses = []
             for row, length in enumerate(np.asarray(lengths)):
                 plain = jnp.asarray(prompt[row:row + 1, 4 - length:])
@@ -408,9 +418,11 @@ def test_prompt_perplexity_uses_unpadded_context_and_real_transitions(kind):
             return jnp.stack(losses)
         return run
 
+    wide = full(model.clone(dtype="float64"), widened(params))
+
     def truth(prompt, lengths):
         with jax.enable_x64(new_val=True):
-            return full(model.clone(dtype="float64"), widened(params))(prompt, lengths)
+            return wide(prompt, lengths)
 
     def draw(seed):
         return drawn_prompts(seed, 0, int(model.vocab_size), shortest=2)
@@ -453,12 +465,16 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
         return state.variables
 
     def by_hand(dtype=None):
+        if dtype is None:
+            return lambda key, rolled: stepped(objective, params, rolled)
+        weights = widened(params)
+        # Built under x64, as it computes, so nothing it holds narrows to float32.
+        with jax.enable_x64(new_val=True):
+            wide = GRPOObjective(model.clone(dtype=dtype), seq_len=7, variables=weights)
+
         def run(key, rolled):
-            if dtype is None:
-                return stepped(objective, params, rolled)
             with jax.enable_x64(new_val=True):
-                wide = GRPOObjective(model.clone(dtype=dtype), seq_len=7, variables=widened(params))
-                return stepped(wide, widened(params), widened(rolled))
+                return stepped(wide, weights, widened(rolled))
         return run
 
     def stepped(objective, params, rolled):
