@@ -315,17 +315,17 @@ def test_a_mig_slice_keeps_its_generations_tensor_rate():
     assert half.tensor_rate("16bit") == 512
 
 
-def test_an_unseen_gpu_runs_xla_s_grouped_matmul():
-    """A GPU generation that states no tensor rate (an sm103 the table does not name) runs an expert
-    projection on XLA's ragged dot, its route saying why, with no estimate asked of the kernels."""
+def test_a_gpu_of_no_family_runs_xla_s_grouped_matmul():
+    """A GPU outside every instruction family Dew knows (sm70, Volta) runs an expert projection on XLA's
+    ragged dot, its route saying why, with no estimate asked of the kernels."""
     x = jnp.ones((32, 64), jnp.bfloat16)
     w = jnp.ones((4, 64, 128), jnp.float32)
     sizes = jnp.asarray([8, 8, 8, 8], jnp.int32)
-    with generation.assumed("sm103"), generation.routes() as taken:
+    with generation.assumed("sm70"), generation.routes() as taken:
         jax.jit(lambda x, w: expert_projection(x, w, sizes, jnp.bfloat16, "auto", None)).trace(x, w)
     (route,) = {(route.kernel, route.refusal.detail if route.refusal else None) for route in taken
                 if route.choice == "grouped_matmul"}
-    assert route[0] == "xla" and "tensor rate" in route[1]
+    assert route[0] == "xla" and route[1]
 
 
 def test_a_block_aligned_launch_counts_the_tiles_its_groups_take():
@@ -360,10 +360,11 @@ def test_a_cooperative_tile_refuses_a_width_it_cannot_stage_whole():
 
 
 def test_the_cost_model_names_a_fact_its_target_lacks():
-    """A generation that states no tensor rate gives no estimate, naming the fact; the grouped kernels are
-    then not eligible there, so XLA's ragged dot runs without one."""
-    target = generation.GpuTarget("sm100", "an unseen GPU", 227 * 1024, multiprocessors=148, clock_hz=1.9e9,
-                                  memory_bandwidth=8e12)
+    """A GPU outside every instruction family (sm60, before Turing) states no tensor rate and gives no
+    estimate, naming the fact; the grouped kernels are then not eligible there, so XLA's ragged dot runs
+    without one."""
+    target = generation.GpuTarget("sm60", "a GPU of no family", 227 * 1024, multiprocessors=148,
+                                  clock_hz=1.9e9, memory_bandwidth=8e12)
     with pytest.raises(ValueError):
         cost.seconds(cost.Cost(programs=1, device_bytes=0, program_flops=1.0), target)
     ba = grouped_matmul.Gmm().bind(jax.ShapeDtypeStruct((64, 128), jnp.bfloat16),

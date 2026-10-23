@@ -77,6 +77,14 @@ Dew's outputs and gradients are measured from float64 truth: the same computatio
 
 The module's older assertions hold the comparisons not yet converted to check 1, and go once their last site moves.
 
+**A template's stability suite** holds its forms at adversarial inputs (fp32's edges, single keys, empty rows, near-overflow) to the owner's stability rule. Where the owner keeps a fast form as the default that departs from the reference only there, the suite holds the default to finiteness wherever the reference is finite and to its exact-zero claims, and holds the accurate form, one option away, to check 1 on every family; the default's departures are documented, never frozen (the owner's ruling, 2026-10-23: allow, document, accurate opt-in). Attention's (tests/test_attention_stability.py): the default ties values the reference keeps apart, measured as groups of a leaf's entries it returns equal whose reference values spread past twice the reference's own error and two ulps more (16 seeds, the plain-JAX mainloop):
+- the output, by the base-2 fold: logits near 1e4, 1 group, 374 ulps; keys an ulp apart in bf16, 3 groups, 8 ulps; a sink and one key, 1 group, 5 ulps;
+- dQ, by FlashAttention's one bf16 product at the first D: keys an ulp apart in bf16, 278 groups, 379 ulps;
+- dK: a small weight on a large value in bf16, 12 groups, 8 ulps;
+- dV, by the fold's recomputed weights: keys an ulp apart in fp32, 100 groups, 16 ulps.
+
+The accurate form, measured the same way, ties at keys an ulp apart alone: dV in fp32, 48 groups of at most 16 ulps; the output in bf16, 3 groups of at most 8 ulps, each within check 1's 1.5× of the reference's error.
+
 A failure is a defect in Dew, the reference arm or the gate's derivation. Find which one. Never widen a tolerance, change the reference to one Dew already matches, drop failing positions or gradients, or compare only argmax when logits disagree.
 
 The committed generator uses the reference's public interface. Kernel qualification records forward, backward and forward-mode behavior where the consuming objective needs it.
