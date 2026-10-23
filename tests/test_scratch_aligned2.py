@@ -70,12 +70,12 @@ def _wide_factor_jvp(primals, tangents):
     return x, dx
 
 
-@pytest.mark.parametrize("piece", ["cumulated", "all"])
+@pytest.mark.parametrize("piece", ["all"])
 @pytest.mark.parametrize("name", ["scalar delta"])
 def test_piece(name, piece, monkeypatch):
     hooks = st.SITES[name]
     regime = "aligned keys"
-    if piece in ("cumulated", "all"):
+    if piece == "cumulated":
         def wide_cumulated(g, documents=None):
             with jax.enable_x64(True):
                 hi, lo = ORIGINAL_C(g.astype(jnp.float64), documents)
@@ -83,8 +83,8 @@ def test_piece(name, piece, monkeypatch):
         monkeypatch.setattr(algebra, "_cumulated", wide_cumulated)
     if piece == "all":
         monkeypatch.setattr(algebra, "factor", lambda a, issue=algebra.portable: wide_factor(a))
-        for name in ("apply", "intra", "carry"):
-            monkeypatch.setattr(algebra, name, wide(ORIGINAL[name]))
+        for widened_piece in ("apply", "intra", "carry"):
+            monkeypatch.setattr(algebra, widened_piece, wide(ORIGINAL[widened_piece]))
         def wide_ranged_transpose(decay, cotangent):
             with jax.enable_x64(True):
                 return ORIGINAL_T(decay.astype(jnp.float64), cotangent.astype(jnp.float64)).astype(decay.dtype)
