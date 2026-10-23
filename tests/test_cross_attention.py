@@ -34,7 +34,7 @@ from dew.lora import LoRA
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import decoder_norm
-from dew.nn.cross_attention import CROSS_LENGTHS, CrossAttention, GatedCrossAttention, crossing
+from dew.nn.cross_attention import CROSS_LENGTHS, CrossAttention, GatedCrossAttention, crossing, gated_join
 from dew.nn.gemma3n import AltUp
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CrossContext, ModelInputs
@@ -464,12 +464,13 @@ def test_a_server_refuses_a_context_its_layers_cannot_read():
 
 
 def test_a_zero_gate_leaves_an_ngpt_stream_whatever_its_length():
-    """Under nGPT a zero gate moves the stream by nothing, tiny, large (1e20, whose squares overflow
-    float32) and zero rows alike, bit for bit, where a step normed back to the stream's length would
-    shrink a tiny one; the gradients stay finite, a zero row's included."""
+    """Under nGPT a zero gate moves the stream by nothing, tiny, large and zero rows alike, bit for
+    bit, where a step normed back to the stream's length would shrink a tiny one; the gradients stay
+    finite, a zero row's included. A stream whose squares overflow float32 (1e20), joined to a finite
+    branch, stays itself too (`gated_join`): its length is taken over its largest element."""
     block = BLOCK.clone(norm=None, ngpt=True)
     x, context, params, lengths, cotangent = block_draw(2)
-    x = x * np.asarray([1e-4, 1.0, 1e20, 0.0], np.float32)[:, None, None]
+    x = x * np.asarray([1e-4, 1.0, 30.0, 0.0], np.float32)[:, None, None]
     shut = {**params, "alpha_cross_attn": np.zeros(1, np.float32), "alpha_dense": np.zeros(1, np.float32)}
 
     def block_out(x, params):
@@ -478,6 +479,11 @@ def test_a_zero_gate_leaves_an_ngpt_stream_whatever_its_length():
     out, into_x, gradients = jax.jit(with_gradients(block_out))(x, shut, cotangent)
     np.testing.assert_array_equal(np.asarray(out), x)
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves((into_x, gradients)))
+    large = x * np.float32(1e20 / 30)
+    zero = jnp.zeros(1, jnp.float32)
+    np.testing.assert_array_equal(np.asarray(gated_join(large, x, zero, ngpt=True)), large)
+    moved = np.asarray(gated_join(large, x, jnp.ones(1, jnp.float32), ngpt=True))
+    assert np.isfinite(moved).all() and not np.array_equal(moved, large)
 
 
 def test_freeze_keeps_what_a_split_tree_trains():
