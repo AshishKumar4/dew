@@ -47,7 +47,7 @@ def clear(decide: Decide, request: dict) -> bool:
     """Whether every choice of `request`, alone, holds its two likeliest options `MARGIN` apart."""
     questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
     [(answers, _)] = decide.batch([(request["state"], questions)])
-    gaps = [np.diff(np.sort(answer.probabilities)[-2:]) for answer in answers.values()
+    gaps = [np.diff(np.sort(answer.probabilities)[-2:])[0] for answer in answers.values()
             if isinstance(answer, ChoiceAnswer) and len(answer.probabilities) > 1]
     return all(float(gap) > MARGIN for gap in gaps)
 
@@ -81,26 +81,31 @@ def test_a_batchs_probabilities_are_each_bodys_alone(decide):
     cases = list(CASES.values())
     wide = {}
 
-    def scored(task: Decide, bodies: list[dict], *, together: bool) -> np.ndarray:
+    def bodies_of(seed) -> list[dict]:
+        """Four bodies over the cases' questions, their states drawn from `seed`."""
+        rng = np.random.default_rng([0xBA7C, int(seed)])
+        return [{**cases[index % len(cases)], "state": " ".join(rng.choice(words, 12))} for index in range(4)]
+
+    def scored(task: Decide, seed, *, together: bool) -> np.ndarray:
+        bodies = bodies_of(seed)
         asked = [(body["state"], {name: Question.from_wire(wire)
                                   for name, wire in body["questions"].items()}) for body in bodies]
         answered = task.batch(asked) if together else [task.batch([one])[0] for one in asked]
         return np.concatenate([answer.probabilities for answers, _ in answered
                                for answer in answers.values()])
 
-    def truth(bodies):
+    def truth(seed):
         if "task" not in wide:
             wide["task"] = Decide.from_pretrained(LAYA, attention_impl="reference", dtype="float64",
                                                   param_dtype="float64")
-        return scored(wide["task"], bodies, together=False)
+        return scored(wide["task"], seed, together=False)
 
     def draw(seed):
-        rng = np.random.default_rng([0xBA7C, seed])
-        return ([{**cases[index % len(cases)], "state": " ".join(rng.choice(words, 12))}
-                 for index in range(4)],)
+        # The draw is its seed; the bodies are made from it, their text no array the check widens.
+        return (np.int64(seed),)
 
-    assert_as_exact(lambda bodies: scored(decide, bodies, together=True),
-                    lambda bodies: scored(decide, bodies, together=False), draw,
+    assert_as_exact(lambda seed: scored(decide, seed, together=True),
+                    lambda seed: scored(decide, seed, together=False), draw,
                     "batched probabilities", seeds=BATCH_SEEDS, truth_fn=truth)
 
 
