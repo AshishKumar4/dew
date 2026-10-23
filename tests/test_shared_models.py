@@ -25,7 +25,6 @@ def test_image_transport_keeps_native_pixels_and_preparation_keys(service, tmp_p
     progress callback is another program, so its last bits are its own. It reports each step and
     the decode, and hands back one image."""
     import jax
-    import jax.numpy as jnp
     import numpy as np
     from reference_error import assert_as_exact
     from test_inference import make_run
@@ -37,7 +36,7 @@ def test_image_transport_keeps_native_pixels_and_preparation_keys(service, tmp_p
     make_run(tmp_path)
     pipe = TextToImage.from_run(str(tmp_path))
     with jax.enable_x64(new_val=True):
-        wide = TextToImage.from_run(str(tmp_path), dtype=jnp.float64, param_dtype=jnp.float64)
+        wide = TextToImage.from_run(str(tmp_path), dtype="float64", param_dtype="float64")
     native = service.NativeModels.__new__(service.NativeModels)
     native.np, native.progress, native.cfg = np, progress, CFG
     native.repo, native.revision = "model", "pinned"
