@@ -37,8 +37,8 @@ from dew.data import ByteTokenizer, Files, HFTokenizer, Hub, Loading, presets, t
 from dew.data.compile import iterate
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import LMRunConfig, Perplexity
+from dew.optim import Cosine
 from dew.training import Evaluation, MeshSpec
-from dew.training.optim import Cosine
 
 SMOKE_TEXT = (
     "The cat sat on the warm mat and watched the rain.\n",

@@ -62,8 +62,8 @@ if TYPE_CHECKING:
     from dew.nn.mixers import MixerBase
     from dew.nn.vision import ProjectorBase, TowerBase
     from dew.objectives.base import Metric, Objective
+    from dew.optim import ScheduleBase
     from dew.sampling.solvers import Solver
-    from dew.training.optim import ScheduleBase
 
 # A type annotation as a value: a class, a union of them, a subscripted
 # generic, a PEP 695 alias, or the None a field with no resolvable annotation
@@ -1332,12 +1332,12 @@ projectors: Aliases[type[ProjectorBase], ProjectorBase] = Aliases("projector", {
     "qwen3_5": "dew.nn.vision.qwen35:Qwen35Projector",
 }, base="dew.nn.vision.common:ProjectorBase")
 schedules: Aliases[type[ScheduleBase], ScheduleBase] = Aliases("schedule", {
-    "cosine": "dew.training.optim:Cosine",
-    "exponential": "dew.training.optim:Exponential",
-    "linear": "dew.training.optim:Linear",
-    "one_cycle": "dew.training.optim:OneCycle",
-    "power": "dew.training.optim:Power",
-}, base="dew.training.optim:ScheduleBase")
+    "cosine": "dew.optim:Cosine",
+    "exponential": "dew.optim:Exponential",
+    "linear": "dew.optim:Linear",
+    "one_cycle": "dew.optim:OneCycle",
+    "power": "dew.optim:Power",
+}, base="dew.optim:ScheduleBase")
 
 
 KINDS: tuple[Aliases, ...] = (models, presets, solvers, encoders, metrics, objectives, mixers, towers,

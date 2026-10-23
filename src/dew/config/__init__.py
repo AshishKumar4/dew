@@ -58,6 +58,18 @@ from dew.files import write_atomically
 from dew.inputs import Field
 from dew.lora import AdapterRecord, LoRA
 from dew.objectives.base import Effects, Loss, Metric, Objective
+from dew.optim import (
+    BF16_STATE_OPTIMIZERS,
+    OPTIMIZER_MAP,
+    Optimizer,
+    ParamGroup,
+    ScheduleBase,
+    param_labels,
+    power_profiles,
+    scaled,
+    scaled_solver,
+    weight_decay_mask,
+)
 from dew.quantization import InputQuantization, Quantization
 from dew.records import JSON, duration, record, recorded_duration
 from dew.registry import (
@@ -77,18 +89,6 @@ from dew.registry import (
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
 from dew.training.display import TrainingDisplay
 from dew.training.distributed import Layout, MeshSpec
-from dew.training.optim import (
-    BF16_STATE_OPTIMIZERS,
-    OPTIMIZER_MAP,
-    Optimizer,
-    ParamGroup,
-    ScheduleBase,
-    param_labels,
-    power_profiles,
-    scaled,
-    scaled_solver,
-    weight_decay_mask,
-)
 from dew.training.profiling import ProfileWindow
 from dew.training.quantization import quantize_trunk
 from dew.training.selection import Best
@@ -450,7 +450,7 @@ class OptimConfig:
     learning_rate: float = 2.7e-4
     """The constant rate, when no schedule is named."""
     schedule: ScheduleSpec | None = None
-    """The learning-rate schedule, as one typed record per kind (`dew.training.optim`).
+    """The learning-rate schedule, as one typed record per kind (`dew.optim`).
 
     The kinds are cosine, power (lm-engine's power law with an optional linear
     tail), linear, one_cycle (torch's `OneCycleLR`) and exponential; each record
@@ -462,7 +462,7 @@ class OptimConfig:
     0); for 'adam' it is torch's coupled L2 penalty, added to the gradient before the moments
     read it, for 'adamw' the decoupled decay. Either decay, the default included, spares biases
     and vectors such as a norm's scale, timm's split for every optimizer
-    (`dew.training.optim.weight_decay_mask`); Muon decays them as Moonlight does, and
+    (`dew.optim.weight_decay_mask`); Muon decays them as Moonlight does, and
     `param_groups` replace the split. Records written before this change decayed every
     parameter; ParamGroup('all', ('*',)) restores that."""
     b1: float | None = None
@@ -479,7 +479,7 @@ class OptimConfig:
     state_dtype: Literal["float32", "bfloat16"] = "float32"
     """The dtype of Adam's moments in memory.
 
-    bfloat16 stores both with stochastic rounding (`dew.training.optim.bf16_moments`),
+    bfloat16 stores both with stochastic rounding (`dew.optim.bf16_moments`),
     for adam and adamw only. That halves the optimizer state and reduces the
     update's memory traffic.
     """
@@ -492,7 +492,7 @@ class OptimConfig:
     ema_profiles: tuple[float, ...] = ()
     """Relative standard deviations of the power-function EMAs a run keeps for post-hoc EMA.
 
-    See `dew.training.optim.power_profiles`; Karras et al. use (0.05, 0.10). Every
+    See `dew.optim.power_profiles`; Karras et al. use (0.05, 0.10). Every
     checkpoint save snapshots these averages, and `Checkpoints.posthoc_ema` builds
     an average with any other relative standard deviation from the snapshots.
     Empty keeps none.
@@ -507,7 +507,7 @@ class OptimConfig:
         none) times its multiplier, with its own weight decay, `b1` schedule and bounds
         (`ParamGroup.solver`); the global-norm clip still reads every gradient
         together, before the groups split them. Each solver holds its rate's
-        scale in its state (`dew.training.optim.scaled_solver`), so runs at
+        scale in its state (`dew.optim.scaled_solver`), so runs at
         rates of one schedule's shape compile one step.
         """
         opts = dict(self.optimizer_opts)
@@ -553,7 +553,7 @@ class OptimConfig:
 
     def rate_scales(self) -> dict[str | None, float]:
         """The rate scale each of `build`'s solvers holds in its state
-        (`dew.training.optim.scaled_solver`), by param group, or under None
+        (`dew.optim.scaled_solver`), by param group, or under None
         for the one solver of a config without groups. A resumed run sets
         them over its checkpoint's (`with_rate_scales`), so the configured
         rate is the one it steps at."""

@@ -170,7 +170,7 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives import Step
     from dew.objectives.lm import LMObjective
-    from dew.training.optim import scale_by_qk_clip
+    from dew.optim import scale_by_qk_clip
 
     # QK-Clip bounds logits only where no QK-norm divides the kernels' scale
     # back out, and refuses a normed layer.

@@ -14,7 +14,7 @@ import numpy as np
 import optax
 
 from dew.config import OptimConfig
-from dew.training.optim import Cosine, Exponential, OneCycle, ParamGroup
+from dew.optim import Cosine, Exponential, OneCycle, ParamGroup
 
 TORCH = np.load(Path(__file__).resolve().parent / "fixtures" / "torch_optim" / "reference.npz")
 EPOCHS, PER_EPOCH = 6, 2

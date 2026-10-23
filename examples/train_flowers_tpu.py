@@ -39,10 +39,10 @@ from dew.data.sources.codec import pack_dict_of_byte_arrays
 from dew.diffusion.presets import EDM
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
+from dew.optim import Cosine
 from dew.sampling import CFG
 from dew.sampling.solvers import Heun
 from dew.training import LocalTracker, MeshSpec, ProfileWindow, prepare_process
-from dew.training.optim import Cosine
 
 PROMPTS = ("a water lily", "a sunflower", "a red rose", "a purple orchid")
 
