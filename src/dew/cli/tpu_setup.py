@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import shlex
 
-from dew.telemetry.builds import PACKAGE_INDEX
+from dew.builds import PACKAGE_INDEX
 
 #: Paths the remote side owns, and the only thing the commands agree on.
 VENV = "$HOME/dew-venv"
