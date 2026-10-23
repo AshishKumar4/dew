@@ -473,6 +473,9 @@ def remat_record(remat: RematPolicy | None) -> JSON:
 @logical_axes({
     ("per_layer_input_gate",): ("embed", "mlp"),
     ("per_layer_projection",): ("mlp", "embed"),
+    # nGPT's per-feature step rates live on the residual stream, as its norms' scales do.
+    ("attn_alpha",): ("embed",),
+    ("mlp_alpha",): ("embed",),
 })
 class _Plain(NamedTuple):
     """The plain residual `[B, S, D]` inside a block, and Gemma 3n's AltUp
