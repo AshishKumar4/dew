@@ -31,6 +31,7 @@ from reference_error import (
     equations,
     float64_terms,
     widened,
+    with_gradients,
 )
 from sharded import assert_runs_per_shard, boundary_copies
 from tuned import each_config
@@ -912,21 +913,24 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
                 if equation.primitive.name == "pallas_call"]
     counted = {name: launched.count(name) for name in FORWARD}
     assert counted == {name: 1 + (name in recomputed) for name in FORWARD}, launched
-    reference_grad, remat_grad = jax.jit(jax.grad(loss)), jax.jit(jax.grad(remat))
-    want, got = reference_grad(params, x), remat_grad(params, x)
+    def pulled(fn):
+        """`fn`'s gradient in the parameters under the loss's cotangent the draw holds."""
+        return jax.jit(lambda params, x, one: with_gradients(fn)(params, x, one)[1])
+
+    reference_grad, remat_grad = pulled(loss), pulled(remat)
+    one = jnp.ones((), jnp.float32)
+    want, got = reference_grad(params, x, one), remat_grad(params, x, one)
 
     def draw(seed):
         keys = jax.random.split(jax.random.key(seed))
         x = jax.random.normal(keys[0], (REMAT_ROWS, REMAT_LENGTH, 64))
-        return initialize(keys[1], x), x
+        return initialize(keys[1], x), x, one
 
     wide = layer.clone(dtype=jnp.float64)
-
-    def truth(params, x):
-        return jax.grad(lambda params: jnp.sum(wide.apply(params, x) ** 2))(params)
+    truth = pulled(lambda params, x: jnp.sum(wide.apply(params, x) ** 2))
 
     assert_as_exact(remat_grad, reference_grad, draw, "remat policy gradient",
-                    seeds=REMAT_SEEDS, truth_fn=jax.jit(truth))
+                    seeds=REMAT_SEEDS, truth_fn=truth)
     if jax.default_backend() != "gpu":
         for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(got), jax.tree.leaves(want),
                                         strict=True):
