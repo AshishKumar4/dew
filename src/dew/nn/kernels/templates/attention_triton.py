@@ -22,6 +22,7 @@ from jax.experimental import pallas as pl
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import attention_algebra as algebra, cost as costs
 from dew.nn.kernels.templates.attention import (
+    ACCURATE,
     DKV_GRADS,
     DQ_GRADS,
     NATURAL,
@@ -528,7 +529,8 @@ def _tile_scores(score_mod, query, key, value, dout, peak, total, anchor, delta,
 
 
 def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tuple[Kind, ...], score_mod,
-               scale: float, how: algebra.Recompute, block_k: int, split: bool, interpret: bool):
+               scale: float, how: algebra.Recompute, block_k: int, split: bool, accurate: bool,
+               interpret: bool):
     refs = list(refs)
     id_refs = [refs.pop(0), refs.pop(0)] if ids else []
     (query_ref, key_ref, value_ref, dout_ref, peak_ref, total_ref, initial_ref, maximum_ref, index_ref,
@@ -602,7 +604,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
                                                    delta, seen, q_pos, k_pos, params, key_index=key_index,
                                                    scale=scale, how=how, interpret=interpret)
         return algebra.dq_step(carry, weights, cotangents, slopes, seen, key, prior, scale=scale,
-                               kinds=score_kinds, summed=summed, dot=product)
+                               kinds=score_kinds, summed=summed, dot=product, accurate=accurate)
 
     nothing = jnp.zeros((block_q,), jnp.float32)
     rows = tuple(nothing for _ in score_kinds)
@@ -611,7 +613,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
                              algebra.DqSums(zeros, nothing, nothing, rows, rows, zeros, nothing,
                                             jnp.full((block_q,), algebra.NO_SHIFT, jnp.float32)))
     dq, delta, total, mass, grads = algebra.dq_finish(sums, prior, state_total, peak0, shares, peak, anchor,
-                                                      delta)
+                                                      delta, accurate=accurate)
     dq_ref[...] = dq
     delta_ref[...] = delta
     anchor_ref[...] = anchor
@@ -627,7 +629,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
 
 
 def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tuple[Kind, ...], score_mod,
-                scale: float, how: algebra.Recompute, block_q: int, interpret: bool):
+                scale: float, how: algebra.Recompute, block_q: int, accurate: bool, interpret: bool):
     refs = list(refs)
     id_refs = [refs.pop(0), refs.pop(0)] if ids else []
     query_ref, key_ref, value_ref, dout_ref, peak_ref, total_ref, anchor_ref, delta_ref, index_ref = (
@@ -660,8 +662,9 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
             interpret=interpret)
         logits, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
         dv = dv + kernel_dot(*algebra.value_operands(exponentials, weights, dout, total_ref[rows]), interpret)
-        # Scaled before it meets the queries, to fp32's accuracy (`algebra.cotangent_product`).
-        dk = dk + algebra.cotangent_product(logits * scale, query, product, transposed=True)
+        # Scaled before it meets the queries, in the backward's form (`algebra.cotangent_product`).
+        dk = dk + algebra.cotangent_product(logits * scale, query, product, accurate=accurate,
+                                            transposed=True)
         for place, (kind, piece) in enumerate(zip(score_kinds, pieces, strict=True)):
             if kind == Kind.TILE:
                 # A tile parameter's entries, under the refined D (`algebra.refinement`).
@@ -726,13 +729,14 @@ class TritonBackward(Template[BackwardTiles]):
     scale: float = 1.0
     split: bool = True
     how: algebra.Recompute = algebra.PLAIN
+    accurate: bool = ACCURATE
 
     def _fwd(self, query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value,
              shift, others, own, others_total, forward_total, start, end, query_ids, key_ids, score_params, *,
              interpret: bool, config: BackwardTiles, return_residuals: bool = False):
         shared = {"score_mod": self.score_mod, "score_kinds": self.score_kinds, "scale": self.scale,
                   "how": self.how, "block_q": config.block_q, "block_k": config.block_k,
-                  "interpret": interpret}
+                  "accurate": self.accurate, "interpret": interpret}
         spans = start, end, query_ids, key_ids, score_params
         sums = (others, own, others_total, forward_total) if self.split else None
         dq_out = _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_index,
@@ -865,7 +869,8 @@ def _geometry(query, key, value, start, end, query_ids, key_ids, block_q: int, b
 def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value, shift,
                sums, start, end, query_ids, key_ids, score_params, *, score_mod,
                score_kinds: tuple[Kind, ...], scale: float, how: algebra.Recompute, block_q: int,
-               block_k: int, warps: int, stages: int, interpret: bool) -> tuple[jax.Array, ...]:
+               block_k: int, warps: int, stages: int, accurate: bool,
+               interpret: bool) -> tuple[jax.Array, ...]:
     """The backward's dQ launch over padded operands (`backward` pads them): a program per query block
     and query head takes each query's D about 0 or about the anchor key `key_index`'s `anchor_value · dO`,
     whichever is nearer, from the forward's split sums (`sums`, `algebra.split_delta`), or where None from
@@ -917,7 +922,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                 out_specs.append(per_head)
     kernel = functools.partial(_dq_kernel, ids=ids, score_kinds=score_kinds,
                                score_mod=score_mod, scale=scale, how=how, block_k=block_k,
-                               split=sums is not None, interpret=interpret)
+                               split=sums is not None, accurate=accurate, interpret=interpret)
     out = pl.pallas_call(
         kernel, grid=(queries // block_q, batch, heads), in_specs=in_specs, out_specs=out_specs,
         out_shape=out_shape, interpret=interpret, name="attention_dq",
@@ -928,7 +933,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
 
 def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, start, end, query_ids,
                 key_ids, score_params, *, score_mod, score_kinds: tuple[Kind, ...], scale: float,
-                how: algebra.Recompute, block_q: int, block_k: int, warps: int, stages: int,
+                how: algebra.Recompute, block_q: int, block_k: int, warps: int, stages: int, accurate: bool,
                 interpret: bool) -> tuple[jax.Array, ...]:
     """The backward's dK/dV launch over padded operands: a program per key block and query head walks the
     query blocks the block map gives it, under the dQ launch's softmax at the dQ launch's tiles (a
@@ -975,7 +980,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
             out_specs.append(columns)
     kernel = functools.partial(_dkv_kernel, ids=ids, score_kinds=score_kinds,
                                score_mod=score_mod, scale=scale, how=how, block_q=block_q,
-                               interpret=interpret)
+                               accurate=accurate, interpret=interpret)
     out = pl.pallas_call(
         kernel, grid=(keys // block_k, batch, heads), in_specs=in_specs, out_specs=out_specs,
         out_shape=out_shape, input_output_aliases=aliases, interpret=interpret, name="attention_dkv",
@@ -1001,25 +1006,25 @@ def _key_param_spec(kind: Kind, param: jax.Array, queries: int, block_k: int) ->
 
 
 def _launch(*arrays, score_mod, score_kinds: tuple[Kind, ...], score_dtypes: tuple[str, ...], scale: float,
-            split: bool, natural: bool, initial: bool, interpret: bool):
+            split: bool, natural: bool, accurate: bool, initial: bool, interpret: bool):
     """The Triton mainloop's two launches under one tuning decision (`TritonBackward`), recomputing the
     weights as a forward of the call's form computed them (`algebra.recompute`)."""
     how = algebra.recompute(algebra.Forward("full", 0, ids=False, scale=scale, score_mod=score_mod,
                                             natural=natural, initial=initial))
     op = TritonBackward(score_mod=score_mod, score_kinds=score_kinds, scale=scale, score_dtypes=score_dtypes,
-                        split=split, how=how)
+                        split=split, how=how, accurate=accurate)
     return op(*arrays, interpret=interpret)
 
 
 def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
              dout: jax.Array, *, residuals: tuple[jax.Array, jax.Array, jax.Array, Split] | None = None,
              split: bool = True, scale: float | None = None, natural: bool = NATURAL,
-             interpret: bool = False) -> Gradients:
+             accurate: bool = ACCURATE, interpret: bool = False) -> Gradients:
     """The template's backward on the Triton mainloop (`gradients`, `TritonBackward`), from the forward's
     `residuals`: its maxima, denominators, anchor keys and split sums (`forward`'s, which it takes again
     where None). With `split`, D comes from the split sums; without, the dQ launch takes its own first pass
-    over the keys (`algebra.off_anchor`). `natural` keeps the forward's logits natural. `interpret` runs
-    it on the CPU."""
+    over the keys (`algebra.off_anchor`). `natural` keeps the forward's logits natural; `accurate` takes
+    the backward's accurate form (`ACCURATE`). `interpret` runs it on the CPU."""
     if residuals is None:
         plain = Hooks() if hooks is None else Hooks(hooks.score_mod, hooks.score_params, hooks.initial)
         _, maxima, totals, anchors, sums = forward(query, key, value, spans, plain, scale=scale,
@@ -1029,5 +1034,6 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     # A guarded forward's live rows carry normalized split sums (`algebra.split_residuals`), which the first
     # pass cannot recompute without the forward's denominator: D comes from them.
     split = split or (natural and algebra.headroom(value.dtype))
-    launch = functools.partial(_launch, split=split, natural=natural, initial=initial, interpret=interpret)
+    launch = functools.partial(_launch, split=split, natural=natural, accurate=accurate, initial=initial,
+                               interpret=interpret)
     return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=BLOCK, scale=scale)

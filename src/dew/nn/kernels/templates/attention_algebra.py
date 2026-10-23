@@ -1077,22 +1077,26 @@ def exponent_product(mantissa: jax.Array, exponent: jax.Array) -> jax.Array:
 
 def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array, key: jax.Array,
             prior: jax.Array, *, scale: float, kinds: tuple, summed: tuple,
-            dot: Callable[[jax.Array, jax.Array], jax.Array]) -> DqSums:
+            dot: Callable[[jax.Array, jax.Array], jax.Array], accurate: bool) -> DqSums:
     """A dQ pass's sums after a key tile (`DqSums`): its score cotangents pulled through the score hook
-    (`pulled`) and scaled, times the keys to fp32's accuracy (`cotangent_product`); the HEAD and QUERY
-    parameters' pullbacks of them (`summed` marks which `kinds` sum per row); and the weights' own
-    pullbacks and their product with the keys over the prior denominator, which take dQ to the refined D
-    (`dq_finish`), the weights' sums unnormalized."""
+    (`pulled`) and scaled, times the keys (`cotangent_product`, in the form `accurate` names); the HEAD and
+    QUERY parameters' pullbacks of them (`summed` marks which `kinds` sum per row); the weights' sums
+    unnormalized; and in the accurate form the weights' own pullbacks and their product with the keys over
+    the prior denominator, which take dQ to the refined D (`dq_finish`). The fast form leaves dQ and the
+    hook parameters' gradients at the first pass's D (the forward's anchored one, `split_delta`, or the
+    dQ launch's own, `off_anchor_delta`), its `keyed` and `weighed` sums untouched."""
     pulled_cotangents, pieces = pulled(cotangents, slopes, seen, kinds)
-    dq = sums.dq + cotangent_product(pulled_cotangents * scale, key, dot)
+    dq = sums.dq + cotangent_product(pulled_cotangents * scale, key, dot, accurate=accurate)
     grads = tuple(grad + piece if row else grad for grad, row, piece in zip(sums.grads, summed, pieces,
                                                                            strict=True))
+    residual, mass = sums.residual + cotangents.sum(axis=-1), sums.mass + weights.sum(axis=-1)
+    if not accurate:
+        return sums._replace(dq=dq, residual=residual, mass=mass, grads=grads)
     pulled_weights, pieces = pulled(weights, slopes, seen, kinds)
     weighed = sums.weighed
     if any(summed):
         weighed = tuple(total + piece if row else total
                         for total, row, piece in zip(sums.weighed, summed, pieces, strict=True))
-    residual, mass = sums.residual + cotangents.sum(axis=-1), sums.mass + weights.sum(axis=-1)
     if slopes is None:
         # Without a score hook each coefficient is the scale times a weight over the prior denominator,
         # which holds every weight at its maximum: the weights over it sum to at most one, so their product
@@ -1126,20 +1130,25 @@ def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, see
 
 
 def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax.Array,
-              shares: tuple[jax.Array, jax.Array], peak: jax.Array, anchor: jax.Array, delta: jax.Array):
+              shares: tuple[jax.Array, jax.Array], peak: jax.Array, anchor: jax.Array, delta: jax.Array, *,
+              accurate: bool):
     """A dQ pass's results from its sums, each taken to the pass's own denominator, the initial state's
     `state_total` and its keys' weights, so the weights it differentiates sum to one over its own logits
     whichever pass gave D: the cotangents' sums from the prior by their ratio (one division, about 1),
-    the weights' over it. D is then refined once from its own sums (`refinement`), and dQ and the HEAD
-    and QUERY gradients with it, each less the refinement times its weights' own product (`keyed`,
-    `weighed`): a query's dQ cancels across its keys exactly as its cotangents sum to 0, so the D it takes
-    must be the one whose cotangents do, not the first pass's. Returns dQ, the refined `D - c`, the
+    the weights' over it. D is then refined once from its own sums (`refinement`), the D the dK/dV launch
+    takes. In the accurate form dQ and the HEAD and QUERY gradients take it too, each less the refinement
+    times its weights' own product (`keyed`, `weighed`): a query's dQ cancels across its keys exactly as
+    its cotangents sum to 0, so the D it takes must be the one whose cotangents do, not the first pass's;
+    the fast form leaves them at the first pass's (`dq_step`). Returns dQ, the refined `D - c`, the
     denominator, the keys' share of the weights, and the hook gradients."""
     total = state_total + sums.mass
     ratio = jnp.where(total > 0, prior / jnp.where(total > 0, total, 1.0), 0.0)
     over = inverse(total)
     mass, residual = sums.mass * over, sums.residual * ratio
     refined = refinement(residual, mass, peak0, shares, peak, total, anchor, delta)
+    if not accurate:
+        return (sums.dq * expand(ratio, sums.dq), delta + refined, total, mass,
+                tuple(grad * ratio for grad in sums.grads))
     grads = tuple(grad * ratio - refined * (weighed * over)
                   for grad, weighed in zip(sums.grads, sums.weighed, strict=True))
     # refined · mass · 2^shift · keyed, each factor's mantissa and exponent apart (`_split`), so no partial
@@ -1226,23 +1235,31 @@ def _fp16_scaled(x: jax.Array) -> tuple[jax.Array, jax.Array]:
 
 
 def cotangent_product(cotangents: jax.Array, operand: jax.Array,
-                      dot: Callable[[jax.Array, jax.Array], jax.Array], *,
+                      dot: Callable[[jax.Array, jax.Array], jax.Array], *, accurate: bool,
                       transposed: bool = False) -> jax.Array:
     """A tile's score cotangents `[bq, bk]` (fp32, scaled) times the call's queries or keys `operand` (its
-    transpose's product where `transposed`: dK's `dSᵀ Q`, else dQ's `dS K`), in fp32 to fp32's accuracy, as
-    the reference differentiates (its score cotangents are fp32), so a key's or a query's gradient whose
-    cotangents cancel across the other axis loses no more than the reference's fp32 product does, where one
-    16-bit product loses every bit the cancellation exposes. An fp32 operand takes the fp32 product. A bf16
-    one takes three bf16 products, the cotangents split exactly into three bf16 parts (each what the parts
-    before it lost, rounded), 24 bits in all, with no scaling: bf16 holds fp32's range, so no part leaves it
-    (measured on the H100: 28% over one product, where a scaled bf16-and-fp16 pair cost 3x). An fp16 one
-    takes two fp16 products at power-of-two scales that keep each part in its range: the cotangents' largest
-    at 2^14, and what their rounding lost likewise, 21 bits."""
+    transpose's product where `transposed`: dK's `dSᵀ Q`, else dQ's `dS K`), fp32. An fp32 operand takes the
+    fp32 product. The fast form (`accurate` False) narrows the cotangents to a 16-bit operand's dtype for
+    one product, FlashAttention's: fp16's at the power of two that puts their largest at 2^14, so none
+    leaves its range. The accurate form takes them to fp32's accuracy, as the reference differentiates (its
+    score cotangents are fp32), so a key's or a query's gradient whose cotangents cancel across the other
+    axis loses no more than the reference's fp32 product does, where one 16-bit product loses every bit the
+    cancellation exposes (bf16 small weights on large values: dK's worst row 3700x the reference's). A bf16
+    operand takes three bf16 products, the cotangents split exactly into three bf16 parts (each what the
+    parts before it lost, rounded), 24 bits in all, with no scaling: bf16 holds fp32's range, so no part
+    leaves it (measured on the H100: 28% over one product, where a scaled bf16-and-fp16 pair cost 3x). An
+    fp16 one takes two fp16 products at power-of-two scales that keep each part in its range: the
+    cotangents' largest at 2^14, and what their rounding lost likewise, 21 bits."""
     def oriented(x):
         return x.T if transposed else x
 
     if operand.dtype == jnp.float32:
         return dot(oriented(cotangents), operand)
+    if not accurate:
+        if operand.dtype == jnp.bfloat16:
+            return dot(oriented(cotangents.astype(jnp.bfloat16)), operand)
+        narrow, exponent = _fp16_scaled(cotangents)
+        return power2(dot(oriented(narrow), operand), exponent)
     if operand.dtype == jnp.bfloat16:
         high = cotangents.astype(jnp.bfloat16)
         rest = cotangents - high.astype(jnp.float32)

@@ -422,6 +422,15 @@ NATURAL = False
 (`attention_algebra.Forward.base2`): False, the base-2 fold, the fast form, until the natural form's cost
 closes; every kernel's default reads it, so the default switches here."""
 
+ACCURATE = False
+"""Whether attention's backward takes its accurate form unless a call says otherwise: False, the fast
+form, the template's own D about each query's anchor (`attention_algebra.split_delta`, not
+FlashAttention's rowsum(dO * O)) with each score cotangent narrowed to the operands' dtype for one product
+and dQ at that first D, as FlashAttention's arithmetic takes them; True, the cotangents' products to fp32's
+accuracy and dQ at the refined D (`attention_algebra.cotangent_product`, `dq_finish`), which the stability
+suite holds to check 1 at extreme inputs where the fast form holds to the stability rule alone (the
+owner's ruling, 2026-10-23). Every backward's default reads it."""
+
 
 def natural_exp(x: jax.Array) -> jax.Array:
     """The natural form's forward exponential (`attention_algebra.Forward.power`): `exp(x)` as the

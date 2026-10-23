@@ -1,15 +1,18 @@
 """The attention template's stability suite (bible §6): on inputs at fp32's edges, every attention form on
 every mainloop (the Triton one interpreted, the plain-JAX one, the decode kernel) gives a finite output
-and finite gradients wherever the reference does, and is as exact as it, which keeps logits it keeps
-apart apart. Each family fixes an adversarial structure (logits a ulp apart, near fp32's largest, a
-weight of exp(-87) on a value of 2^126, rows that see nothing) and draws its values by seed, held to
-check 1 (`reference_error.assert_as_exact`) against the reference written apart from Dew
-(`attention_oracle.exact_attention`), its float64 truth's derivative anchored
+and finite gradients wherever the reference does, and never ties values the reference keeps apart. Each
+family fixes an adversarial structure (logits a ulp apart, near fp32's largest, a weight of exp(-87) on a
+value of 2^126, rows that see nothing) and draws its values by seed, against the reference written apart
+from Dew (`attention_oracle.exact_attention`), its float64 truth's derivative anchored
 (`attention_oracle.anchored_softmax`); a row that sees no key is an exact claim, its output and
-gradients zero. Each family runs with the logits natural and with the default
-(`dew.nn.kernels.templates.attention.NATURAL`), which folds log2(e) into the scale where the scale
-allows; the fold's documented divergences (`algebra.Forward.base2`; docs/design/kernel-templates.md, §3,
-the exponent's forms) run natural alone."""
+gradients zero. The accurate form (natural logits, `template.NATURAL`'s other form, and the backward's
+accurate form, `template.ACCURATE`'s) holds check 1 (`reference_error.assert_as_exact`) on every family,
+as exact as the reference. The default, which folds log2(e) into the scale where the scale allows and
+takes FlashAttention's arithmetic for the backward's products and dQ, holds the owner's stability rule
+(`assert_stable`, bible §6) on every family but the fold's documented divergences
+(`algebra.Forward.base2`; docs/design/kernel-templates.md, §3, the exponent's forms), which the accurate
+form alone runs: its error at these inputs is no claim, its departures from check 1 here the divergence
+the design documents."""
 
 import dataclasses
 import functools
@@ -20,7 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from attention_oracle import exact_attention
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, with_gradients
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened, with_gradients
 
 from dew.nn.documents import CrossDocuments
 from dew.nn.kernels import decode_attention, generation, tuning
@@ -579,11 +582,13 @@ def _families() -> dict[str, Family]:
 
 FAMILIES = _families()
 FORMS = {"default": None, "natural": True}
-"""The forms each family runs in: the default (`template.NATURAL`) and natural logits."""
+"""The forms the decode kernel takes each family in: the default (`template.NATURAL`) and natural logits."""
 FAMILY_RUNS = [(family, form) for family in FAMILIES for form in FORMS
                if form == "natural" or FAMILIES[family].folded]
-RUNS = [(family, form) for family, form in FAMILY_RUNS if not FAMILIES[family].decode_only]
-"""The template's runs: every family's but a decode step's alone (`Family.decode_only`)."""
+TEMPLATE_FAMILIES = [family for family in FAMILIES if not FAMILIES[family].decode_only]
+"""The template's families: every one but a decode step's alone (`Family.decode_only`)."""
+ACCURATE = {"natural": True, "accurate": True}
+"""The template's accurate form: natural logits and the backward's accurate form."""
 
 
 def _spans(family: Family, query, key) -> template.KeySpans:
@@ -681,10 +686,11 @@ def _differentiated(forward: Callable, backward: Callable) -> Callable:
     return attend
 
 
-def _mainloops(family: Family, form) -> dict[str, Callable]:
-    """Each template mainloop as `(query, key, value, extra) -> out`, its derivative the mainloop's own
-    backward, the sinks' or resumed state's gradient through the softmax's initial state."""
-    natural = {} if form is None else {"natural": form}
+def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
+    """Each template mainloop as `(query, key, value, extra) -> out` at the form `options` names (`ACCURATE`,
+    or none for the default), its derivative the mainloop's own backward, the sinks' or resumed state's
+    gradient through the softmax's initial state."""
+    forward_options = {name: value for name, value in options.items() if name == "natural"}
     tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
 
     def mainloop(forward: Callable, backward: Callable) -> Callable:
@@ -703,15 +709,15 @@ def _mainloops(family: Family, form) -> dict[str, Callable]:
 
     def triton_forward(*operands):
         with tuning.pinned(PINS):
-            return attention_triton.forward(*operands, interpret=True, **natural)
+            return attention_triton.forward(*operands, interpret=True, **forward_options)
 
     def triton_backward(*operands):
         with tuning.pinned(PINS):
-            return attention_triton.backward(*operands, interpret=True, **natural)
+            return attention_triton.backward(*operands, interpret=True, **options)
 
     return {"triton": mainloop(triton_forward, triton_backward),
-            "portable": mainloop(functools.partial(attention_portable.attend, **tiles, **natural),
-                                 functools.partial(attention_portable.backward, **tiles, **natural))}
+            "portable": mainloop(functools.partial(attention_portable.attend, **tiles, **forward_options),
+                                 functools.partial(attention_portable.backward, **tiles, **options))}
 
 
 def _held_empty(family: Family, found, label: str) -> None:
@@ -724,18 +730,64 @@ def _held_empty(family: Family, found, label: str) -> None:
         np.testing.assert_array_equal(np.asarray(array, np.float32)[rows], 0.0, err_msg=f"{label} {leaf}")
 
 
-@pytest.mark.parametrize("family, form", RUNS, ids=[f"{family}-{form}" for family, form in RUNS])
-def test_attention_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, form):
-    """Each template mainloop's output and query, key and value gradients, check 1 over the family's
-    draws; a row that sees nothing, zero."""
+def assert_stable(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn) -> None:
+    """The owner's stability rule (bible §6) over `seeds` draws: each leaf of `dew_fn`'s outputs is finite
+    wherever the reference's is, and no entries it returns equal are values the reference keeps apart,
+    where keeping apart is resolving past the reference's own rounding: over every group of a leaf's
+    entries Dew ties, the reference's values spread no more than twice its largest distance from float64
+    over them (`truth_fn` on the draw widened, as check 1 takes its truth). A pair the reference rounds an
+    ulp apart from truths within an ulp is no structure it keeps; a tie of values it resolves is a merge."""
+    for seed in range(seeds):
+        inputs = draw(seed)
+        with jax.enable_x64(new_val=True):
+            truth = truth_fn(*widened(inputs))
+        found = jax.tree_util.tree_leaves_with_path(dew_fn(*inputs))
+        for (path, mine), theirs, exact in zip(found, jax.tree.leaves(reference_fn(*inputs)),
+                                               jax.tree.leaves(truth), strict=True):
+            name = f"{label}{jax.tree_util.keystr(path)} seed {seed}"
+            mine, theirs, exact = (np.asarray(np.asarray(leaf, np.float32), np.float64).ravel()
+                                   for leaf in (mine, theirs, exact))
+            finite = np.isfinite(theirs) & np.isfinite(exact)
+            lost = finite & ~np.isfinite(mine)
+            assert not lost.any(), f"{name}: {int(lost.sum())} values not finite where the reference's are"
+            order = np.lexsort((theirs[finite], mine[finite]))
+            tied, kept, error = (x[finite][order] for x in (mine, theirs, np.abs(theirs - exact)))
+            starts = np.flatnonzero(np.concatenate([[True], tied[1:] != tied[:-1]]))
+            spread = np.maximum.reduceat(kept, starts) - np.minimum.reduceat(kept, starts)
+            merged = spread > 2 * np.maximum.reduceat(error, starts)
+            assert not merged.any(), (
+                f"{name}: {int(merged.sum())} groups of values tied that the reference keeps apart, the "
+                f"widest {float(spread.max()):.3e} apart where its error is "
+                f"{float(np.maximum.reduceat(error, starts)[np.argmax(spread)]):.3e}")
+
+
+@pytest.mark.parametrize("family", TEMPLATE_FAMILIES)
+def test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family):
+    """Each template mainloop's output and query, key and value gradients in the accurate form
+    (`ACCURATE`), check 1 over the family's draws; a row that sees nothing, zero."""
     seeds, family = SEEDS[family], FAMILIES[family]
     draw = _cast(family, family.draw)
     reference = jax.jit(with_gradients(_reference(family, anchored=False)))
     truth = with_gradients(_reference(family, anchored=True))
-    for name, mainloop in _mainloops(family, FORMS[form]).items():
-        label = f"{name} {form} {family.dtype}"
+    for name, mainloop in _mainloops(family, ACCURATE).items():
+        label = f"{name} accurate {family.dtype}"
         differentiated = jax.jit(with_gradients(mainloop))
         assert_as_exact(differentiated, reference, draw, label, seeds=seeds, truth_fn=truth)
+        _held_empty(family, differentiated(*draw(0)), label)
+
+
+@pytest.mark.parametrize("family", [family for family in TEMPLATE_FAMILIES if FAMILIES[family].folded])
+def test_the_default_form_holds_the_stability_rule_at_fp32s_edges(family):
+    """Each template mainloop's output and query, key and value gradients in the default form, the
+    stability rule (`assert_stable`) over the family's draws; a row that sees nothing, zero."""
+    seeds, family = SEEDS[family], FAMILIES[family]
+    draw = _cast(family, family.draw)
+    reference = jax.jit(with_gradients(_reference(family, anchored=False)))
+    truth = with_gradients(_reference(family, anchored=True))
+    for name, mainloop in _mainloops(family, {}).items():
+        label = f"{name} default {family.dtype}"
+        differentiated = jax.jit(with_gradients(mainloop))
+        assert_stable(differentiated, reference, draw, label, seeds=seeds, truth_fn=truth)
         _held_empty(family, differentiated(*draw(0)), label)
 
 
