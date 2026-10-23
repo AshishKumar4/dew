@@ -118,6 +118,7 @@ from dew.data.steps.generic import Fields
 from dew.data.steps.text import LayoutRule, ValidTargets, counted_window, recounted
 from dew.data.text import Chunks
 from dew.data.tokens import _WrappingDataset
+from dew.objectives.base import VALID_ROWS
 from dew.records import boolean, integer, integers, record, strings
 
 if TYPE_CHECKING:
@@ -1490,6 +1491,22 @@ class _Build:
     def batched(
         self, pipeline: Pipeline, partition: DataPartition, offset: int = 0, *, fill: bool = True
     ) -> tuple[pygrain.IterDataset, tuple[int, ...]]:
+        """This share's batches as the reader reads them (`batch_order`), read in turn, a global
+        order's with the prefetch its stages before the batch name, and where the stages after the
+        batch left to run on them stand."""
+        batches, after = self.batch_order(pipeline, partition, offset, fill=fill)
+        if not isinstance(batches, pygrain.MapDataset):
+            return batches, after
+        stream = _as_iter(batches, self.loading)
+        batched_at = next(at for at, stage in enumerate(pipeline.stages) if isinstance(stage, BatchStage))
+        for at, stage in enumerate(pipeline.stages[:batched_at]):
+            if isinstance(stage, Prefetch):
+                stream = _as_iter(self.stage(stream, stage, pipeline, partition, at), self.loading)
+        return stream, after
+
+    def batch_order(
+        self, pipeline: Pipeline, partition: DataPartition, offset: int = 0, *, fill: bool = True
+    ) -> tuple[pygrain.MapDataset | pygrain.IterDataset, tuple[int, ...]]:
         """This share's batches as the reader reads them, which automatic
         loading also sizes its buffers by (`Loading.resolved`), and where the
         stages after the batch left to run on them stand. A global order is batched by
@@ -1548,11 +1565,7 @@ class _Build:
         read = offset % batch_stage.size
         if read > share:
             batches = batches.map_with_index(_Rest(-(-(read - share) // partition.count)))
-        stream = _as_iter(batches, self.loading)
-        for at, stage in enumerate(pipeline.stages[:batched_at]):
-            if isinstance(stage, Prefetch):
-                stream = _as_iter(self.stage(stream, stage, pipeline, partition, at), self.loading)
-        return stream, tuple(at for at in after if isinstance(pipeline.stages[at], _UNPLACED))
+        return batches, tuple(at for at in after if isinstance(pipeline.stages[at], _UNPLACED))
 
     def after_batch(
         self, stream: pygrain.IterDataset, after: tuple[int, ...], pipeline: Pipeline,
@@ -1672,16 +1685,22 @@ def _order_length(train: Pipeline, build: _Build) -> int | None:
 
 def _order_records(train: Pipeline, build: _Build) -> int | None:
     """The records a training read of `train`'s global order hands out where it ends, the same on
-    every share (`Loader.order_records`): its order before its batch, whole where its batch keeps a
-    short one, else cut to whole batches as the read cuts it (`_Build.batched`); None where it
-    never ends or its read counts none ahead."""
-    if not build.global_order or build.lowering.endless:
-        return None
-    length = _order_length(train, build)
+    every share (`Loader.order_records`): the rows of every batch its read yields
+    (`_Build.batch_order`), the stages after its batch, a repeat, a slice or a limit, included, a
+    kept short batch inside the order with its filled rows, which it marks, and the order's last
+    batch with its real rows alone, which its marks count; None where it never ends or its read
+    counts none ahead."""
     stage = next((stage for stage in train.stages if isinstance(stage, BatchStage)), None)
-    if length is None or stage is None or not stage.drop_remainder:
-        return length
-    return length // stage.size * stage.size
+    if not build.global_order or build.lowering.endless or stage is None:
+        return None
+    with _closing(build.batch_order(train, DataPartition())[0]) as batches:
+        if not isinstance(batches, pygrain.MapDataset):
+            return None
+        if not len(batches):
+            return 0
+        last = record(batches[len(batches) - 1], "the order's last batch")
+        real = int(np.count_nonzero(np.asarray(last[VALID_ROWS], bool))) if VALID_ROWS in last else stage.size
+        return (len(batches) - 1) * stage.size + real
 
 
 def _tail(train: Pipeline, build: _Build) -> Tail:
