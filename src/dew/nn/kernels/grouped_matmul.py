@@ -26,7 +26,7 @@ import importlib
 import importlib.util
 import itertools
 import math
-from collections.abc import Hashable
+from collections.abc import Callable, Hashable
 from typing import ClassVar
 
 import jax
@@ -316,7 +316,7 @@ class _GroupedLaunch[Config: Hashable](base.Template[Config]):
     # tokamax serializes a launch's arguments into the program by their types.
     HOOKS: ClassVar[tuple[str, ...]] = ('hooks',)
 
-    def traced(self, name: str, value: object) -> str | None:
+    def traced(self, name: str, value: Callable | str | None) -> str | None:
         """The launch's `Hooks` as its picks key them (`tuning.KernelOp.traced`): each hook by what it
         computes (`tuning.program`) as a kernel traces it (`Hooks.before`, `Hooks.after`), at a
         `TRACED_TILE` square tile and each side tile as its axes lay it out there, in the dtypes the hooks
