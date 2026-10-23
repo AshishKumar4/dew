@@ -14,7 +14,15 @@ import pytest
 from decision_support import decision_rows
 from model_support import flat_tree
 from recording import RecordingTracker
-from reference_error import assert_as_exact, widened
+import reference_error
+from reference_error import widened
+
+
+def assert_as_exact(dew, reference, draw, label, *, seeds, truth_fn=None):
+    """Sizing: the paired seeds this site resolves at, printed, then the declared check."""
+    print("SIZED", label, reference_error.seeds_for(reference, draw, label, truth_fn=truth_fn, dew_fn=dew),
+          flush=True)
+    return reference_error.assert_as_exact(dew, reference, draw, label, seeds=seeds, truth_fn=truth_fn)
 
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
