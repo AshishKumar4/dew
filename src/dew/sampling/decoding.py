@@ -38,6 +38,7 @@ from jax import lax
 
 from dew.nn.inputs import token_ids, valid_order
 from dew.nn.scatter import DROPPED
+from dew.records import finite
 from dew.sampling.vocabulary import (
     Referencing,
     Tokenizing,
@@ -160,27 +161,21 @@ def _counts(tokens: jax.Array, valid: jax.Array, vocab: int) -> jax.Array:
 
 
 def id_row(name: str, value: int | Sequence[int]) -> tuple[int, ...]:
-    """`value`, one token id or a row of them, as a tuple, read by the one law of token ids
-    (`dew.nn.inputs.token_id`)."""
-    return tuple(token_ids([value] if isinstance(value, int) else value, where=name))
-
-
-def real(name: str, value: object) -> float:
-    """`value`, a finite real number of Python's or NumPy's, as a float; a flag is no number here."""
-    if isinstance(value, bool | np.bool_) or not isinstance(value, numbers.Real) or not math.isfinite(value):
-        raise ValueError(f"{name} must be a finite number")
-    return float(value)
+    """`value`, one token id or a sequence of them (a range, an array's row), as a tuple, read by the
+    one law of token ids (`dew.nn.inputs.token_id`)."""
+    row = (value,) if isinstance(value, int | np.integer) else value
+    return tuple(token_ids(row if isinstance(row, np.ndarray) else tuple(row), where=name))
 
 
 def positive(name: str, value: float) -> float:
-    rate = real(name, value)
+    rate = finite(value, name)
     if rate <= 0:
         raise ValueError(f"{name} must be a finite positive number")
     return rate
 
 
 def unit_interval(name: str, value: float) -> float:
-    rate = real(name, value)
+    rate = finite(value, name)
     if not 0 <= rate <= 1:
         raise ValueError(f"{name} must be finite and between zero and one")
     return rate
