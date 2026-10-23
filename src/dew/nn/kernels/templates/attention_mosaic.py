@@ -396,7 +396,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, *, spec: a
     # the key and value rings. At DEFAULTS and D 128 the query's stage and the key ring take 96 KiB, and each
     # column of the value takes 768 bytes more (the value ring's two stages and the output's rows of both
     # consumers), so the widest value a Hopper block's 227 KiB (`generation.shared_budget`) holds is 128
-    # columns (192 KiB). At 256 columns (288 KiB), 64-key tiles (`FORM_TILES`) hold it in 192 KiB.
+    # columns (192 KiB). At 256 columns (288 KiB), 64-key tiles (`Tiles(64, 64, 2)`) hold it in 192 KiB.
     reuse = value.shape[-1] == width
 
     def body(q_ref, k_ref, v_ref, *refs, streams):
