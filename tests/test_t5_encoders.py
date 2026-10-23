@@ -26,7 +26,7 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures" / "t5"
 TINY = FIXTURES / "tiny"
 TINY_UMT5 = FIXTURES / "tiny-umt5"
 
-SEEDS = {"tiny T5 encoder": 8, "tiny UMT5 encoder": 8, "t5-small encoder": 8}
+SEEDS = {"tiny T5 encoder": 8, "tiny UMT5 encoder": 8, "t5-small encoder": 16}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 
 
