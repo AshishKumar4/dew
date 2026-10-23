@@ -369,7 +369,7 @@ class TritonForward(Template[Tiles]):
     def space(self, ba: tokamax.BoundArguments) -> Sequence[Tiles]:
         return _dividing(SPACE, ba)
 
-    def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
+    def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         """The shared memory Triton gives a program, in the operands' dtype: the key and value tiles of
         every stage but the one in use, the query tile, and the weights' tile on its way to the second
         product, which shares the query tile's memory where the block is 128 queries of heads at most
@@ -420,7 +420,7 @@ class TritonForward(Template[Tiles]):
             program_staged=staged,
             program_exponentials=float(tiles * config.block_q * config.block_k),
             mode=_mode(query.dtype), steps=tiles, stages=config.stages,
-            resident=costs.resident(target, self.staged_bytes(ba, config), 32 * config.warps,
+            resident=costs.resident(target, self.staged_bytes(ba, config, target), 32 * config.warps,
                                     self.registers(ba, config)),
             # Every query block stages its queries and every key tile it walks, from the L2.
             l2_bytes=programs * staged), target)
@@ -752,7 +752,8 @@ class TritonBackward(Template[BackwardTiles]):
     def space(self, ba: tokamax.BoundArguments) -> Sequence[BackwardTiles]:
         return _dividing(BACKWARD_SPACE, ba)
 
-    def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int:
+    def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles,
+                     target: generation.GpuTarget) -> int:
         """The shared memory Triton gives a program of either launch, the larger, in the operands' dtype: a
         dQ program its query and output-gradient tiles and the key and value tiles of every stage but the
         one in use; a dK/dV program its key and value tiles and the query and output-gradient tiles of
@@ -797,9 +798,9 @@ def _backward_registers(ba: tokamax.BoundArguments, config: BackwardTiles, *, dq
     return (config.block_k * (width + value_width) + tile) // (32 * config.dkv_warps)
 
 
-def _backward_staged(ba: tokamax.BoundArguments, config: BackwardTiles) -> int:
+def _backward_staged(ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget) -> int:
     """`TritonBackward.staged_bytes`, the larger launch's shared memory."""
-    return TritonBackward().staged_bytes(ba, config)
+    return TritonBackward().staged_bytes(ba, config, target)
 
 
 def _launch_cost(ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget,
@@ -845,7 +846,7 @@ def _launch_cost(ba: tokamax.BoundArguments, config: BackwardTiles, target: gene
         program_staged=staged,
         program_exponentials=float(tiles * config.block_q * config.block_k * exponentials),
         mode=_mode(query.dtype), steps=tiles, stages=stages,
-        resident=costs.resident(target, _backward_staged(ba, config), 32 * warps,
+        resident=costs.resident(target, _backward_staged(ba, config, target), 32 * warps,
                                 _backward_registers(ba, config, dq=dq)),
         # Every program stages each tile it walks from the L2: a smaller tile of the other axis, more
         # programs re-reading the same operands.

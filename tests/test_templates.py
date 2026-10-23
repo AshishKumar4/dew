@@ -32,7 +32,7 @@ class Doubling(Template):
     def space(self, ba):
         return [Block(rows) for rows in (8, 16, 32, 64)]
 
-    def staged_bytes(self, ba, config):
+    def staged_bytes(self, ba, config, target):
         return config.rows * ba.arguments["x"].shape[1] * 4
 
     def cost(self, ba, config, target):
@@ -106,7 +106,7 @@ class Unfitting(Doubling):
 
     name: ClassVar[str] = "unfitting"
 
-    def staged_bytes(self, ba, config):
+    def staged_bytes(self, ba, config, target):
         return 1 << 30
 
 

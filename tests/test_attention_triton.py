@@ -630,8 +630,9 @@ def test_the_shared_memory_bound_keeps_what_triton_compiles_and_prunes_what_it_r
         op = attention_triton.TritonBackward()
         config = attention_triton.BackwardTiles(tiles.block_q, tiles.block_k, tiles.warps, tiles.stages,
                                                 tiles.warps, tiles.stages)
-    staged = op.staged_bytes(tokamax.BoundArguments(op, arrays), config)
-    budget = generation.shared_budget(generation.TARGETS[generation_name])
+    target = generation.TARGETS[generation_name]
+    staged = op.staged_bytes(tokamax.BoundArguments(op, arrays), config, target)
+    budget = generation.shared_budget(target)
     if requested is None:
         assert staged <= budget
     else:
