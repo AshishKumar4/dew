@@ -79,7 +79,7 @@ def _launch(record):
         return launch, (bf16((rows, depth)), bf16((groups, depth, width)), sizes), {
             "out_dtype": "bfloat16", "trans_rhs": False}
     if product == "input_gradient":
-        launch = grouped_matmul.MosaicGmmTransposed() if mosaic else grouped_matmul.GmmTransposed()
+        launch = grouped_matmul.MosaicGmm() if mosaic else grouped_matmul.Gmm()
         return launch, (bf16((rows, width)), bf16((groups, depth, width)), sizes), {
             "out_dtype": "bfloat16", "trans_rhs": True}
     launch = grouped_matmul.MosaicTgmm() if mosaic else grouped_matmul.Tgmm()
