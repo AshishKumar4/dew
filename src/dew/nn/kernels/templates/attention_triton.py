@@ -206,9 +206,15 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         return algebra.Keys(coords, logits, lambda: value_ref[tile, :],
                             functools.partial(kernel_dot, interpret=interpret))
 
-    def rows(keys):
-        # Each row's value row at its key (the anchor's).
-        return value_ref[keys, :]
+    def rows(keys, where=None):
+        # Each row's value row at its key (the anchor's); with `where`, loaded only for those rows, the
+        # rest zero: a training step reads an old anchor's row only where the anchor moved, which after
+        # the first tiles few rows do, so most of its loads are not issued to memory.
+        if where is None:
+            return value_ref[keys, :]
+        from jax.experimental.pallas import triton as plgpu
+
+        return plgpu.load(value_ref.at[keys, :], mask=where[:, None], other=0)
 
     def walk(live=None):
         # The plain walk where `live` is None, else the guarded one, those rows shifting.

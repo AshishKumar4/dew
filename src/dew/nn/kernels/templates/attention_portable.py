@@ -102,8 +102,9 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             return algebra.Keys(coords, algebra.modify(spec, interpreted_dot(q, k_tile.T), coords, params),
                                 lambda: v_tile, interpreted_dot)
 
-        def anchor_rows(keys):
-            # Each row's value row at its key (the anchor's).
+        def anchor_rows(keys, where=None):
+            # Each row's value row at its key (the anchor's), every row's (`algebra.Rows`).
+            del where
             return value[row, keys, kv_head]
 
         resumed = None if initial is None else (initial[0][row, head, rows], initial[1][row, head, rows],

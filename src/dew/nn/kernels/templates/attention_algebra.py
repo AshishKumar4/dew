@@ -25,7 +25,7 @@ nothing (spans, a score hook) guards its maxima and denominators against an empt
 import dataclasses
 import functools
 from collections.abc import Callable
-from typing import NamedTuple
+from typing import NamedTuple, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -546,6 +546,13 @@ class Keys(NamedTuple):
 
 
 Carry = tuple[Partial, Argmax, jax.Array, jax.Array]
+
+
+class Rows(Protocol):
+    """A mainloop's value rows at each query's key `[bq]`, `[bq, Dv]`: every row's, or with `where` `[bq]`
+    those rows' alone, the rest zero, which a mainloop may then leave unread."""
+
+    def __call__(self, keys: jax.Array, where: jax.Array | None = None) -> jax.Array: ...
 """A training walk's carry: its state, whose values are `B`, every key's but the anchor's
 (`split_accumulate`), its anchor key, the anchor's own weight and the other keys' weights' sum."""
 
@@ -572,18 +579,18 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     return stepped(state, m, factor, p, times(p), held, times)
 
 
-def training_step(spec: Forward, carry: Carry, keys: Keys, rows: Callable[[jax.Array], jax.Array]) -> Carry:
+def training_step(spec: Forward, carry: Carry, keys: Keys, rows: Rows) -> Carry:
     """A training walk's carry after a tile `keys`: the anchor key and the split sums the backward reads
-    (`split_accumulate`), `rows(key)` each row's value row at its key `[bq]`, the old anchor's where it
-    moved."""
+    (`split_accumulate`), `rows(key, where)` each row's value row at its key `[bq]`, the old anchor's
+    read only where it moved (`where`)."""
     state, arg, own, others_total = carry
     m, factor, p, value, held = _softmax(spec, state, keys)
     anchor = argmax(arg, keys.logits, keys.coords.k_pos)
     moved = anchor.peak > arg.peak
     others, own_tile = anchor_split(narrow(p, value.dtype), keys.coords.k_pos == anchor.key[:, None])
     product = keys.dot(others, value)
-    acc, own, others_total = split_accumulate(state.acc, own, others_total, factor, moved, rows(arg.key),
-                                              product, others, own_tile, held)
+    acc, own, others_total = split_accumulate(state.acc, own, others_total, factor, moved,
+                                              rows(arg.key, moved), product, others, own_tile, held)
     times = functools.partial(_times, keys.dot, value)
     state = stepped(state, m, factor, p, jnp.zeros_like(acc), held, times)
     return state._replace(acc=acc), anchor, own, others_total
@@ -595,7 +602,7 @@ def plain_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys], star
 
 
 def training_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys],
-                  rows: Callable[[jax.Array], jax.Array], start: Partial) -> Carry:
+                  rows: Rows, start: Partial) -> Carry:
     """A training forward's walk (`plain_walk`), its carry also holding the anchor key and the split
     sums, from none (`training_step`)."""
     nothing = jnp.zeros(start.total.shape, jnp.float32)
@@ -603,7 +610,7 @@ def training_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys],
                              (start, no_argmax(start.total.shape[0]), nothing, nothing))
 
 
-def joined(carry: Carry, rows: Callable[[jax.Array], jax.Array]) -> Partial:
+def joined(carry: Carry, rows: Rows) -> Partial:
     """A training walk's state with its split sums joined, the anchor's term added back (`split_output`),
     the weighted values the output normalizes."""
     split, arg, own, _ = carry
@@ -611,7 +618,7 @@ def joined(carry: Carry, rows: Callable[[jax.Array], jax.Array]) -> Partial:
 
 
 def normalized_pass(spec: Forward, carry: Carry, keys_at: Callable[[jax.Array], Keys],
-                    rows: Callable[[jax.Array], jax.Array], bounds,
+                    rows: Rows, bounds,
                     initial: tuple[jax.Array, jax.Array] | None) -> tuple[jax.Array, jax.Array, jax.Array]:
     """A guarded training walk's live rows' split sums, normalized (`split_residuals`): a pass over its key
     tiles `bounds` (`keys_at`) at the walk's own maximum and natural denominator (`normalized_terms`), from
@@ -638,7 +645,7 @@ def normalized_pass(spec: Forward, carry: Carry, keys_at: Callable[[jax.Array], 
     return jax.lax.fori_loop(lo, hi, walk, (start, nothing, nothing))
 
 
-def split_written(carry: Carry, rows: Callable[[jax.Array], jax.Array],
+def split_written(carry: Carry, rows: Rows,
                   normalized: Callable[[], tuple[jax.Array, jax.Array, jax.Array]]
                   ) -> tuple[Partial, jax.Array, tuple[jax.Array, ...]]:
     """A training walk's state with its split sums joined (`joined`), its anchor keys, and its split sums
