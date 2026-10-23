@@ -30,8 +30,6 @@ from dew.nn.precision import L2NORM_EPS, compensated_add
 from . import chunked_launch, norm_swiglu, short_conv, tuning
 from .generation import triton_runs
 
-"""The queries' and keys' l2 norm's epsilon under the root, the FLA library's (`dew.nn.linear.l2norm`)."""
-
 
 @dataclasses.dataclass(frozen=True)
 class Conv:
