@@ -532,8 +532,8 @@ class Gmm(_Triton):
                                     out_dtypes=tuple(jnp.dtype(d) for d in (options.pop('out_dtypes')
                                                                             or (out_dtype,))),
                                     interpret=interpret, prologue_operands=prologue_operands,
-                                    epilogue_operands=epilogue_operands, exact_sums=exact_sums, paired=paired,
-                                    **options)
+                                    epilogue_operands=epilogue_operands, exact_sums=exact_sums,
+                                    paired=None if paired is None else paired[0], **options)
             return (outs if hooks.out_dtypes else outs[0]), None
         from . import ragged_dot
         return ragged_dot.gmm(tokens, kernel, sizes, block_m=config.block_m, block_k=config.block_k,

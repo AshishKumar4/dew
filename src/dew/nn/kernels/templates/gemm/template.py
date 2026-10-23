@@ -188,8 +188,9 @@ def _paired(lhs, rhs, paired, group_sizes, *, epilogue, dtypes: tuple, several: 
     """`gemm` of a paired product on grouped operands: each output tile `epilogue(acc, paired_acc)` of one
     `lhs` tile's two products. Its reverse mode is one paired launch that recomputes both accumulators and
     whose epilogue is `epilogue`'s VJP of the outputs' cotangents (side tiles), giving each accumulator's
-    cotangent in `compute`, as two unfused products' outputs' cotangents are; then each matrix's
-    products: the activation's backward reads and writes nothing of its own."""
+    cotangent at least fp32 (the portable program's derivative, the epilogue's VJP on its fp32
+    accumulators), then each matrix's products of it: the activation's backward reads and writes nothing
+    of its own."""
     transpose_rhs, interpret_on_cpu, precision, dense = (plain[key] for key in
                                                           ('transpose_rhs', 'interpret_on_cpu', 'precision',
                                                            'dense'))
@@ -215,20 +216,21 @@ def _paired(lhs, rhs, paired, group_sizes, *, epilogue, dtypes: tuple, several: 
             outs, pull = jax.vjp(lambda *accs: _tupled(epilogue, *accs), acc, paired_acc)
             return pull(tuple(c.astype(out.dtype) for c, out in zip(cotangents, outs, strict=True)))
 
+        work = jnp.promote_types(compute, jnp.float32)
         d_accs = _gemm(lhs.astype(compute), rhs, group_sizes, None, (), (), pulled, cotangents,
-                       (('rows', 'columns'),) * len(cotangents), (compute, compute), several=True,
+                       (('rows', 'columns'),) * len(cotangents), (work, work), several=True,
                        paired=paired, **plain)
         matrices = (rhs, paired)
         transposed = {'transpose_rhs': not transpose_rhs, 'interpret_on_cpu': interpret_on_cpu,
                       'precision': precision, 'dense': dense}
-        wide = (jnp.dtype(jnp.float32),)
+        # Each matrix rounded as the forward multiplied it, its products of the wide cotangent summed wide.
         d_lhs, d_paired_lhs = (
-            jnp.asarray(_gemm(d_acc, matrix.astype(compute), group_sizes, None, (), (), None, (), (), wide,
+            jnp.asarray(_gemm(d_acc, matrix.astype(compute), group_sizes, None, (), (), None, (), (), (work,),
                               several=False, **transposed))
             for d_acc, matrix in zip(d_accs, matrices, strict=True))
         d_matrices = []
         for d_acc, matrix in zip(d_accs, matrices, strict=True):
-            d_matrix = gemm_t(lhs.astype(compute), d_acc, None if dense else group_sizes,
+            d_matrix = gemm_t(lhs.astype(compute).astype(work), d_acc, None if dense else group_sizes,
                               out_dtype=matrix.dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
             d_matrices.append(jnp.swapaxes(d_matrix, 1, 2) if transpose_rhs else d_matrix)
         return ((d_lhs + d_paired_lhs).astype(lhs.dtype), *d_matrices,

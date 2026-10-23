@@ -499,9 +499,11 @@ def gated_projections(x: jax.Array, gate_kernel: jax.Array, up_kernel: jax.Array
                              compute=compute, out_dtype=compute,
                              precision=float32_products(compute, precision),
                              interpret_on_cpu=implementation == 'pallas')
-    gate, up = (expert_projection(x, kernel, group_sizes, dtype, implementation, precision)
-                for kernel in (gate_kernel, up_kernel))
-    return gated_product(activation)(*swiglu_clamped(jnp.asarray(gate), jnp.asarray(up), limit))
+    # The same residual names as the dense MLP's, so one remat policy covers both (mixer_base.RESIDUALS).
+    gate, up = (checkpoint_name(jnp.asarray(expert_projection(x, kernel, group_sizes, dtype, implementation,
+                                                              precision)), name)
+                for kernel, name in ((gate_kernel, 'gate_proj'), (up_kernel, 'up_proj')))
+    return gated_product(activation)(*swiglu_clamped(gate, up, limit))
 
 
 
