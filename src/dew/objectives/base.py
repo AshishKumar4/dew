@@ -42,7 +42,7 @@ from jax.tree_util import Partial
 from typing_extensions import TypeIs, TypeVar
 
 from dew.artifacts import Artifact, Artifacts, TokenScores
-from dew.batch import FROZEN, VALID_ROWS, Batch, Variables, merge
+from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, Variables, merge
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import compensated_sum
 from dew.nn.protocols import HiddenStates, ProjectsParameters
@@ -548,11 +548,6 @@ PARAMETER_ROOTS = (("params",), (FROZEN,))
 and a storage dtype casts: the trained ones and the frozen."""
 
 
-EXAMPLE_ROWS = "example_rows"
-"""A training batch's column of each row's place among its step's records, int32: the order the
-records' stream holds them in, whatever process read a row (`dew.training.distributed.marked`). The
-trainer's transaction reads it for the examples' draws (`Step.example_index`) and takes it out of the
-batch the objective sees."""
 def freeze(variables: Variables, trainable: PathFilter) -> Variables:
     """Move the `params` leaves that `trainable` rejects into the `FROZEN` collection.
 

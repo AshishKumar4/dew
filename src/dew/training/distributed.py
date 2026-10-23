@@ -24,7 +24,7 @@ from flax import linen as nn
 from jax.experimental import mesh_utils, multihost_utils
 from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionSpec as P
 
-from dew.batch import FROZEN, Batch, LayoutRefused, Variables
+from dew.batch import EXAMPLE_ROWS, FROZEN, Batch, LayoutRefused, Variables
 from dew.coordination import agreed, broadcast_from_process_zero, from_every_process, stop_at_exit
 from dew.data.dataset import (
     Budgeted,
@@ -62,7 +62,6 @@ from dew.nn.sharding import (
     microbatched,
     ruled_boxes,
 )
-from dew.objectives.base import EXAMPLE_ROWS
 from dew.records import JSON, number, record
 from dew.telemetry.profile import region
 from dew.training.state import VARIABLE_FIELDS

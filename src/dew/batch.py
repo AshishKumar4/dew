@@ -65,6 +65,12 @@ batches never have it.
 """
 
 
+EXAMPLE_ROWS = "example_rows"
+"""A training batch's column of each row's place among its step's records, int32: the order the
+records' stream holds them in, whatever process read a row (`dew.training.distributed.marked`). The
+trainer's transaction reads it for the examples' draws (`Step.example_index`) and takes it out of the
+batch the objective sees."""
+
 def padded_rows(rows: int, count: int) -> tuple[np.ndarray, np.ndarray]:
     """The rows `count` places hold of `rows` real ones, cycling through them, and which places
     hold a repeat: the rule a batch filled out with its own rows (`dew.data.dataset.FilledBatch`)
@@ -300,7 +306,7 @@ class LayoutRefused(ValueError):
     """
 
 
-__all__ = ["COORDINATES_FIELD", "FROZEN", "VALIDITY_FIELD", "VALID_ROWS", "Batch", "Coordinates",
-           "LayoutRefused", "Variables", "coordinates", "document_ranks", "document_starts", "merge",
-           "padded_rows", "real_places", "real_slots", "scored_targets", "token_id", "token_ids",
+__all__ = ["COORDINATES_FIELD", "EXAMPLE_ROWS", "FROZEN", "VALIDITY_FIELD", "VALID_ROWS", "Batch",
+           "Coordinates", "LayoutRefused", "Variables", "coordinates", "document_ranks", "document_starts",
+           "merge", "padded_rows", "real_places", "real_slots", "scored_targets", "token_id", "token_ids",
            "token_layout", "token_positions", "token_validity", "valid_order", "with_validity"]

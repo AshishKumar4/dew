@@ -74,7 +74,7 @@ count: `--devices 4` runs it on the process's first four, where four stages
 leave no axis for the rows.
 
 Process 0 prints a line per layout and writes the rows. A layout Dew refuses
-by design (`dew.nn.sharding.LayoutRefused`: a stage axis over a model that
+by design (`dew.batch.LayoutRefused`: a stage axis over a model that
 runs no pipeline) is a row with its reason, listed again at the end, and
 passes the run; the exit status is nonzero when a layout mismatches, repeats
 work or fails in any other way.
