@@ -112,8 +112,8 @@ def _dot(a, b, *, exact: bool, ieee: bool = False, solve: jnp.dtype | None = Non
     if exact:
         # Each product exact in float64 and the sum rounded once to fp32, as Dew's CPU products sum
         # (`dew.nn.precision`), where a CPU's own fp32 dot picks its order and rounding by shape and ISA.
-        with jax.enable_x64(new_val=True):
-            return jnp.dot(a.astype(jnp.float64), b.astype(jnp.float64)).astype(jnp.float32)
+        a, b = a.astype(jnp.float32), b.astype(jnp.float32)
+        return jnp.dot(a, b, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
     elif wide:
         narrow_call = solve is not None and jnp.dtype(solve).itemsize < 4
         precision = (jax.lax.Precision.HIGHEST if ieee else jax.lax.Precision.DEFAULT if narrow_call
