@@ -89,7 +89,7 @@ _QWEN_READS = frozenset({'layer_types', 'sliding_window', 'attention_bias'})
 def qwen2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
     # Qwen2Attention biases q, k and v and builds o_proj without one
     # (modeling_qwen2.py:189-192), whatever the config says.
-    config = base_config(hf_config, used, layer_types=qwen_layer_types(hf_config, used),
+    config = base_config(hf_config, used, rope=PLAIN_SPELLING, layer_types=qwen_layer_types(hf_config, used),
                           reads=_QWEN_READS)
     config.update(attention_bias=True, o_proj_bias=False)
     return config
@@ -103,7 +103,7 @@ def _qwen3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     ramp: Qwen3's model cards extend to 131072 tokens with it, and
     DeepSeek-R1-0528-Qwen3-8B ships it.
     """
-    rope = read_rope(hf_config, used, records.integer(hf_config.get(
+    rope = read_rope(hf_config, used, PLAIN_SPELLING, yarn_max_pos=records.integer(hf_config.get(
         'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'))
     return base_config(hf_config, used, qk_norm=True, rope=rope,
                         layer_types=qwen_layer_types(hf_config, used), reads=_QWEN_READS)
@@ -144,7 +144,7 @@ def _qwen3_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
                 and hf_config.get('sliding_window') is not None)
     layer_types = specified_layer_types(hf_config, used, (
         'sliding_attention' if windowed else 'full_attention',))
-    config = base_config(hf_config, used, qk_norm=True, layer_types=layer_types)
+    config = base_config(hf_config, used, rope=PLAIN_SPELLING, qk_norm=True, layer_types=layer_types)
     used.update(('num_experts', 'num_local_experts'))
     sparse = _sparse_step_layers(hf_config, layers, used)
     if not sparse:
@@ -201,7 +201,7 @@ def _qwen2_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
     if not enabled and 'sliding_attention' in types:
         refuse('layer_types', 'use_sliding_window=False disables the reference window')
     config = base_config({**hf_config, 'sliding_window': hf_config.get('sliding_window', 4096)},
-                          used, layer_types=types, reads=_QWEN_READS)
+                          used, rope=PLAIN_SPELLING, layer_types=types, reads=_QWEN_READS)
     config.update(attention_bias=bool(hf_config.get('qkv_bias', True)), o_proj_bias=False)
     used.update(('qkv_bias', 'use_sliding_window', 'max_window_layers', 'num_experts',
                  'shared_expert_intermediate_size'))

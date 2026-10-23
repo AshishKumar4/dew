@@ -18,6 +18,7 @@ from collections.abc import Mapping
 from dew import records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
+    PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
     base_config,
@@ -32,7 +33,8 @@ from dew.nn.backbones.layer_plan import LayerKind
 
 def _muse_text_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
     """Read a Muse Glimmer text config into `CausalTransformer` fields."""
-    config = base_config(hf_config, used, qk_norm=True, scale_after_cast=False, tie_embeddings=True)
+    config = base_config(hf_config, used, rope=PLAIN_SPELLING, qk_norm=True, scale_after_cast=False,
+                         tie_embeddings=True)
     layer_types = records.strings(config['layer_types'], 'layer_types')
     rope_theta = records.number(config['rope_theta'], 'rope_theta')
     thetas = hf_config.get('layer_rope_theta')

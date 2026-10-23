@@ -44,6 +44,7 @@ def _phi3_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     layers = records.integer(hf['num_hidden_layers'], 'num_hidden_layers')
     config = base_config({**hf, 'rope_scaling': None,
                            'rope_parameters': {'rope_type': 'default', 'rope_theta': theta}}, used,
+                          rope=PLAIN_SPELLING,
                           layer_types=('sliding_attention' if hf.get('sliding_window') is not None
                                        else 'full_attention',) * layers,
                           reads=frozenset({'sliding_window'}))

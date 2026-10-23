@@ -425,23 +425,30 @@ PLAIN_SPELLING = RopeSpelling()
 """The mixin's own spelling, which most config classes keep: one record, at 10000 when unnamed."""
 
 
-def partial_rope(hf_config: Mapping[str, object], spelling: RopeSpelling, *, default_factor: float,
-                 factor_field: str = 'partial_rotary_factor',
+def partial_rope(hf_config: Mapping[str, object], spelling: RopeSpelling | None, *,
+                 default_factor: float | None, factor_field: str = 'partial_rotary_factor',
                  theta_field: str = 'rope_theta') -> tuple[float, float, Mapping[str, object]]:
     """(rope_theta, partial_rotary_factor, the rest of the rotary's entry) of a config: the
     `rope_parameters` entry's values, else the flat fields under the family's spellings (GPT-NeoX's
     `rotary_emb_base` and `rotary_pct`), else the config class's defaults: its `spelling`'s base, as
-    `rope_records` reads it, and `default_factor`. The rest is the entry without its factor, which a
-    family whose rotary may scale hands `base_config`'s rope reader."""
+    `rope_records` reads it, and `default_factor`. A None default is a class that has none, whose
+    config states the value or is refused. The rest is the entry without its factor, which a family
+    whose rotary may scale hands `base_config`'s rope reader."""
     entry = records.record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
-    theta = records.number(entry.get('rope_theta', hf_config.get(theta_field, spelling.theta)), theta_field)
-    factor = records.number(entry.get('partial_rotary_factor', hf_config.get(factor_field, default_factor)),
-                            factor_field)
+
+    def stated(key: str, field: str, default: float | None) -> float:
+        value = entry.get(key, hf_config.get(field, default))
+        if value is None:
+            refuse(f"a config without {field}", "its config class has no default for it")
+        return records.number(value, field)
+    theta = stated('rope_theta', theta_field, None if spelling is None else spelling.theta)
+    factor = stated('partial_rotary_factor', factor_field, default_factor)
     return theta, factor, {key: value for key, value in entry.items() if key != 'partial_rotary_factor'}
 
 
-def plain_partial_rope(hf_config: Mapping[str, object], spelling: RopeSpelling, *, default_factor: float,
-                       reference: str, layout: tuple[str, ...] = ()) -> tuple[float, float]:
+def plain_partial_rope(hf_config: Mapping[str, object], spelling: RopeSpelling | None, *,
+                       default_factor: float | None, reference: str,
+                       layout: tuple[str, ...] = ()) -> tuple[float, float]:
     """(rope_theta, partial_rotary_factor) of a config whose rotary is plain (`partial_rope`), with
     `layout` the entry's fields that place the rotated pairs. A scaled type or any other field
     refuses, naming `reference`'s rotary."""
@@ -509,12 +516,14 @@ def rope_records(hf_config: Mapping[str, object], spelling: RopeSpelling
     return (field, {**record, 'rope_theta': record.get('rope_theta', theta)}), None
 
 
-def read_rope(hf_config: Mapping[str, object], used: set, yarn_max_pos: int | None = None,
-              spelling: RopeSpelling = PLAIN_SPELLING, *,
-              ramps: tuple[str, ...] | None = None, per_kind: bool = True) -> Ropes:
+def read_rope(hf_config: Mapping[str, object], used: set, spelling: RopeSpelling, *,
+              yarn_max_pos: int | None = None, ramps: tuple[str, ...] | None = None,
+              per_kind: bool = True) -> Ropes:
     """Read the rope of any HF spelling as the family's config class resolves it.
 
-    The class's records come first (`RopeSpelling`): flat rope_theta with a
+    `spelling` is the class's own (its `default_theta` among it), which every
+    family states: no class's default stands in for another's. The class's
+    records come first (`RopeSpelling`): flat rope_theta with a
     rope_scaling or rope_parameters beside it, Gemma 3's rope_local_base_freq,
     and per-layer-type records all land as one effective record per kind,
     a record that names its type as plain clearing an earlier ramp. Each is
@@ -681,8 +690,8 @@ def context_lengths(hf_config: Mapping[str, object], default: int | None = None)
 
 
 def base_config(hf_config: Mapping[str, object], used: set[str], *,
+                 rope: Ropes | RopeSpelling,
                  layer_types: tuple[str, ...] | None = None,
-                 rope: Ropes | None = None,
                  qk_norm: bool = False, scale_after_cast: bool = True,
                  tie_embeddings: bool = False,
                  reads: frozenset[str] = frozenset({'layer_types', 'sliding_window', 'attention_bias'})
@@ -717,7 +726,7 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
         refuse(f"hidden_act {activation!r}",
                 f"the gated MLP supports {sorted(ACTIVATIONS)}")
 
-    ropes = read_rope(hf_config, used) if rope is None else rope
+    ropes = read_rope(hf_config, used, rope) if isinstance(rope, RopeSpelling) else rope
     rope_theta, rope_local_theta = ropes.theta, ropes.local_theta
     if 'layer_types' in reads:
         layer_types = specified_layer_types(hf_config, used, layer_types)

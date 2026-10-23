@@ -21,6 +21,7 @@ from dew.interop.decoder_parts import (
     FUSED_EXPERTS,
     GEMMA3_MODEL_TYPE,
     MOE_SHARED,
+    PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
     MixtureFields,
@@ -134,7 +135,7 @@ def _gemma_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     :374). Its released config names hidden_act 'gelu', which the reference
     computes as the erf gelu (modeling_gemma.py:93, ACT2FN['gelu']).
     """
-    config = base_config(hf_config, used, scale_after_cast=False, tie_embeddings=True,
+    config = base_config(hf_config, used, rope=PLAIN_SPELLING, scale_after_cast=False, tie_embeddings=True,
                           reads=frozenset({'attention_bias'}))
     config.update(scale_offset=True, embedding_scale=True)
     return config
@@ -167,7 +168,7 @@ def _gemma2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     (configuration_gemma2.py:95-98, modeling_gemma2.py:203-206).
     """
     layer_types = specified_layer_types(hf_config, used, ('sliding_attention', 'full_attention'))
-    config = base_config(hf_config, used, scale_after_cast=False,
+    config = base_config(hf_config, used, rope=PLAIN_SPELLING, scale_after_cast=False,
                           tie_embeddings=True, layer_types=layer_types,
                           reads=frozenset({'layer_types', 'sliding_window', 'attention_bias'}))
     sliding = kinds_of(config).get('sliding_attention', native_fields(LayerKind)())
@@ -189,7 +190,7 @@ the full layers at 1e6 and the sliding ones at rope_local_base_freq or 1e4
 
 
 def _gemma3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    rope = read_rope(hf_config, used, spelling=_GEMMA3_ROPE)
+    rope = read_rope(hf_config, used, _GEMMA3_ROPE)
     config = base_config(hf_config, used, qk_norm=True, scale_after_cast=False, rope=rope,
                           tie_embeddings=True, layer_types=_gemma_layer_types(hf_config, used))
     _gemma_softcaps(hf_config, used, config)
@@ -205,7 +206,7 @@ def _gemma3n_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
     """
     # Gemma3nTextConfig fills every fifth layer full.
     layer_types = specified_layer_types(hf_config, used, ('sliding_attention',) * 4 + ('full_attention',))
-    ropes = read_rope(hf_config, used, spelling=_GEMMA3_ROPE)
+    ropes = read_rope(hf_config, used, _GEMMA3_ROPE)
     config = base_config(hf_config, used, qk_norm=True, scale_after_cast=False,
                           tie_embeddings=True, layer_types=layer_types, rope=ropes)
     layers = records.integer(config.get('num_layers'), 'num_layers')

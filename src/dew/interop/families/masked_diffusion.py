@@ -152,7 +152,9 @@ def _llada_geometry(hf_config: Mapping[str, object]) -> Mapping[str, object]:
         "rms_norm_eps": records.number(
             values.get("rms_norm_eps", 1e-6), "rms_norm_eps"
         ),
-        "rope_theta": records.number(values.get("rope_theta", 500000.0), "rope_theta"),
+        # The pinned LLaDA-8B's ModelConfig, which LLaDAConfig starts from, sets 10000; the release
+        # states its own 500000.
+        "rope_theta": records.number(values.get("rope_theta", 10000.0), "rope_theta"),
         "attention_bias": bool(values.get("attention_bias", False)),
         "tie_word_embeddings": bool(values.get("tie_word_embeddings", False)),
         "hidden_act": values.get("hidden_act", "silu"),
@@ -245,13 +247,7 @@ def _moe_decoder(hf_config: Mapping[str, object], used: set[str], *, qk_norm: bo
     -1 (configuration_lladamoe.py:32-33), so their configs state them."""
     if hf_config.get('rope_scaling') is not None:
         refuse('rope_scaling', 'the released MoE checkpoints use plain rotary positions')
-    if rope_defaults is None:
-        missing = [name for name in ('rope_theta', 'partial_rotary_factor') if name not in hf_config]
-        if missing:
-            refuse(f"a config without {' or '.join(missing)}",
-                   "LLaDA-MoE's config class defaults them to -1, which names no rotary")
-        rope_defaults = (PLAIN_SPELLING, 1.0)
-    spelling, rotary = rope_defaults
+    spelling, rotary = (None, None) if rope_defaults is None else rope_defaults
     theta, factor = plain_partial_rope(hf_config, spelling, default_factor=rotary,
                                        reference='LLaDA MoE rotary')
     used.update(('rope_theta', 'rope_scaling', 'rope_parameters', 'partial_rotary_factor'))
