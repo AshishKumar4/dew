@@ -97,7 +97,9 @@ def scored(task: Decide, asked: Sequence[tuple[str, str | None]], images=()) -> 
         inputs = DecisionInputs.collate([row], task.specials.pad, context_length=task.context_length)
         logits = forward(task.variables, inputs, media=media.inputs(task.processor, row))
     else:
-        rows = [row for state, context in asked for row in task._encoded(state, QUESTION, context=context)]
+        # Laid out as `Decide.batch` lays a batch out (`Decide.rows`).
+        rows = [row for own in task.rows([(state, QUESTION) for state, _ in asked],
+                                         contexts=[context for _, context in asked]) for row in own]
         inputs = DecisionInputs.collate(rows, task.specials.pad, context_length=task.context_length)
         logits = forward(task.variables, inputs)
     return np.asarray(logits)[np.asarray(inputs.options)]
@@ -216,8 +218,10 @@ def test_the_context_layers_work_is_counted_in_a_conditioned_batch():
 
 def test_a_batch_answers_each_request_from_its_own_context():
     """With the gates open, a request's answer reads its context: another context, or none, answers it
-    otherwise. In one pass of four, each request's every option logit is on par from float64 with its
-    pass alone (check 1), so each row reads its own context and not a neighbour's."""
+    otherwise. A batch lays each request out with its own context (`Decide.rows`, which `Decide.batch`
+    scores), each request's rows exactly its lone call's; and in one pass of four, each request's every
+    option logit is on par from float64 with its pass alone (check 1), so each row reads its own
+    context and not a neighbour's."""
     objective = conditioned(16, (0, 1))
     variables = opened(objective.init(jax.random.key(0)))
     task = Decide(objective.model, variables, objective.layout, objective.tokenizer, objective.specials)
@@ -239,6 +243,13 @@ def test_a_batch_answers_each_request_from_its_own_context():
         contexts = [" ".join(rng.choice(WORDS, int(rng.integers(1, 6)))) for _ in range(3)]
         return [(states[0], contexts[0]), (states[0], contexts[1]), (states[1], None),
                 (states[2], contexts[2])]
+
+    asked = requests(0)
+    together = [row.context for own in task.rows([(state, QUESTION) for state, _ in asked],
+                                                 contexts=[context for _, context in asked]) for row in own]
+    alone = [row.context for state, context in asked
+             for row in task.rows([(state, QUESTION)], contexts=[context])[0]]
+    assert together == alone and len(set(together)) == len(asked)
 
     def read(reading: Decide, seed, *, together: bool) -> np.ndarray:
         asked = requests(seed)
