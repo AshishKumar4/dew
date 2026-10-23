@@ -31,7 +31,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.artifacts import TokenScores
-from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
+from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, aligned
 from dew.inference.tasks import MaskedGeneration, MaskedSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import real_slots
@@ -222,9 +222,10 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         dropout_key = jax.random.fold_in(step.key, 2)
         masked = jnp.where(is_masked, self.process.mask_id, tokens)
 
-        read = final_read(self.model, params, masked, train=train,
-                          rngs=model_rngs(dropout_key, training=train), mutable=False,
-                          capture_intermediates=False, **prepared.kwargs())
+        # Each position's prediction, as the checkpoint's logits line up with its inputs.
+        read = aligned(self.model, final_read(self.model, params, masked, train=train,
+                                              rngs=model_rngs(dropout_key, training=train), mutable=False,
+                                              capture_intermediates=False, **prepared.kwargs()))
         # MDLM's SUBS parameterization gives the mask token no mass: it is
         # never a target, so the partition and the prediction leave it out.
         mask_id = self.process.mask_id

@@ -19,6 +19,15 @@ class Conditioned(nn.Module):
         return 2 * x + caption + conditioning.guidance[:, None] + time[:, None] / 1000
 
 
+class Sized(nn.Module):
+    """A denoiser that reads its row's size and crop (SDXL's `time_ids`) beside its caption."""
+
+    @nn.compact
+    def __call__(self, x, time, conditioning):
+        caption = jnp.mean(conditioning.context, axis=(1, 2))[:, None]
+        return 2 * x + caption + jnp.sum(conditioning.time_ids, axis=-1)[:, None]
+
+
 class Doubled(nn.Module):
     @nn.compact
     def __call__(self, x, time):
@@ -58,3 +67,20 @@ def test_guided_raw_batch_preserves_caption_axes_and_per_row_guidance():
         common = 2 * np.asarray(x) + np.float64([2., 4.])[:, None] + np.float64([.25, .5])[:, None]
         np.testing.assert_array_equal(conditional, common + np.float64([1., 2.])[:, None])
         np.testing.assert_array_equal(unconditional, common - 3)
+
+
+def test_a_blank_caption_keeps_its_rows_size_and_crop():
+    """SDXL's `time_ids` hold the image's size and crop, the row's and not its caption's, so the
+    unconditional branch reads the blank caption at its row's own geometry: the two branches differ by
+    the caption alone, as classifier-free guidance compares them."""
+    with jax.enable_x64():
+        process = Process(FlowMatchingScheduler(), EpsilonPredictionTransform())
+        context = jnp.broadcast_to(jnp.array([1., 2.])[:, None, None], (2, 3, 4))
+        sizes = jnp.array([[512., 512., 0., 0., 512., 512.], [768., 1024., 64., 0., 768., 768.]])
+        given = DenoisingCondition(context, time_ids=sizes)
+        null = DenoisingCondition(jnp.full((1, 3, 4), -3.), time_ids=jnp.full((1, 6), 1024.))
+        denoiser = process.denoiser(Sized(), {}, {"conditioning": given}, {"conditioning": null})
+        x = jnp.array([[1., 2., 3.], [4., 5., 6.]], jnp.float64)
+        conditional, unconditional = denoiser.raw_both(x, jnp.array([.25, .5]))
+        np.testing.assert_array_equal(np.asarray(conditional) - np.asarray(unconditional),
+                                      np.float64([1., 2.])[:, None] + 3)

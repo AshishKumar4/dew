@@ -141,6 +141,15 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
     np.testing.assert_allclose(actual.behavior_log_probs, expected.behavior_log_probs, atol=1e-7, rtol=1e-7)
 
 
+def test_the_recipe_trains_an_lm_objective_it_names_by_import_path(tmp_path):
+    """An objective Dew does not ship, named by its import path, builds from the arguments the recipe
+    gives an LM objective and trains, with no edit to the recipe."""
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    config = run_config(tokens, "--trainer.steps", "1", "--trainer.name", "own", "--objective",
+                        "lm_objectives:Anchored")
+    assert int(config.run().step) == 1
+
+
 def test_the_recipe_trains_on_weighted_corpora(tmp_path):
     """Two token stores, each packed by itself and mixed by their tokens 0.7 to 0.3, train one run:
     the vocabulary comes from the stores' shared meta.json, and run.json records the mixture's chain
