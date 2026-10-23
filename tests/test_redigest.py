@@ -5,6 +5,7 @@ it was, and writes nothing when a change is more than a renaming or a recording 
 import http.server
 import importlib.util
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -33,8 +34,8 @@ redigest_module = load_redigest()
 
 def git(root: Path, *arguments: str) -> None:
     subprocess.run(["git", "-C", str(root), *arguments], check=True, capture_output=True,
-                   env={"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
-                        "GIT_COMMITTER_EMAIL": "t@t", "PATH": "/usr/bin:/bin"})
+                   env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
 
 
 @pytest.fixture
@@ -56,7 +57,7 @@ def site(tmp_path: Path) -> Path:
 def redigest(root: Path, hub: str = "http://127.0.0.1:9") -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, str(root / "site/scripts/redigest.py"), "--base", "recorded"],
                           capture_output=True, text=True, timeout=60,
-                          env={"HF_ENDPOINT": hub, "PATH": "/usr/bin:/bin"})
+                          env={**os.environ, "HF_ENDPOINT": hub})
 
 
 def recordings(root: Path) -> dict[str, bytes]:
