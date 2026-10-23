@@ -15,9 +15,9 @@ autoencoder and convention; `--objective flow_grpo --rollout.reward clip_score`
 trains the model with Flow-GRPO on that reward instead of the denoising loss.
 """
 
+from dew.config.diffusion import DiffusionRunConfig
 from dew.data import images, presets
 from dew.data.sources import source
-from dew.config.diffusion import DiffusionRunConfig
 
 TEMPLATES = ("a photo of a {}", "a photo of a {} flower", "This is a photo of a {}",
              "This is a photo of a {} flower", "A photo of a {} flower")

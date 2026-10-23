@@ -12,6 +12,7 @@ from token_support import write_token_corpus
 from tool_support import load
 
 import dew
+from dew.config.lm import LMRunConfig
 from dew.data import Loading, presets
 from dew.data.compile import compile, held
 from dew.data.dataset import Loader
@@ -19,7 +20,6 @@ from dew.data.pipeline import Dataset
 from dew.data.sources.tokens import TokenFiles
 from dew.inference import TextGeneration
 from dew.objectives.lm import LMObjective
-from dew.config.lm import LMRunConfig
 from dew.sampling import Sampling
 
 pytestmark = pytest.mark.mesh

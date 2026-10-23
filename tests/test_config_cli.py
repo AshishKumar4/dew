@@ -11,12 +11,12 @@ import pytest
 from diffusion_support import images_of
 
 from dew.config import RunConfig, ScheduleSpec
-from dew.data import Files
-from dew.data.dataset import Loader, record_argument
-from dew.diffusion.presets import Flow
 from dew.config.diffusion import DiffusionRunConfig
 from dew.config.jepa import JepaRunConfig
 from dew.config.lm import LMRunConfig
+from dew.data import Files
+from dew.data.dataset import Loader, record_argument
+from dew.diffusion.presets import Flow
 from dew.registry import import_path
 from dew.sampling import Heun
 from dew.training import MeshSpec

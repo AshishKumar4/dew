@@ -18,14 +18,13 @@ import torch
 from diffusion_support import images_of
 
 from dew.config import ModelConfig, ObjectiveConfig
+from dew.config.diffusion import DiffusionRunConfig
 from dew.data import Loading, presets
 from dew.data.compile import fitted
 from dew.data.dataset import DataPartition
 from dew.data.sources.files import Files
-from dew.inputs import Condition, HFAudio
+from dew.inputs import AudioCondition, Condition, HFAudio
 from dew.objectives.base import Step
-from dew.config.diffusion import DiffusionRunConfig
-from dew.inputs import AudioCondition
 from dew.sampling import CFG
 from dew.training import Trainer
 

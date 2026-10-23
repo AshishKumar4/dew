@@ -12,10 +12,10 @@ from pathlib import Path
 import pytest
 
 from dew.config import ObjectiveConfig, RunConfig
-from dew.decision.config import DecisionRunConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.config.jepa import JepaRunConfig
 from dew.config.lm import LMRunConfig
+from dew.decision.config import DecisionRunConfig
 from dew.quantization import Quantization
 
 ROOT = Path(__file__).resolve().parents[1]

@@ -1132,9 +1132,9 @@ def _recipe_run(tmp_path, image_size, *args):
     TFDS image fixture, with `args` ending in the run's LoRA flags
     (`--lora.rank`, `--lora.modules`) and no subcommand. Returns the parsed
     config and the trained state."""
+    from dew.config.diffusion import DiffusionRunConfig
     from dew.data import images as image_steps, presets
     from dew.data.sources.tfds import TFDS
-    from dew.config.diffusion import DiffusionRunConfig
 
     # Each image captioned from its row (`images.caption`), the condition the run's text tower reads.
     images = TFDS("dew_images", path=str(IMAGES), split="all").shuffle(seed=0).repeat().pipe(
