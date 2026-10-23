@@ -34,7 +34,7 @@ from dew.diffusion.process import Process, aligned_conditions
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.schedules.source import SourceGrid
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
-from dew.inputs import InputSpec, unit_range
+from dew.inputs import InputSpec, encode_conditions, unit_range
 from dew.lora import unadapted
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.kl import posterior_latent
@@ -72,8 +72,7 @@ from dew.objectives.base import (
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, PERCEPTUAL, EndToEnd
 from dew.sampling.guidance import CFG, Guidance
-from dew.sampling.pipelines import ImageSettings, TextToImage, sampling_modules
-from dew.sampling.sample import sample
+from dew.sampling.pipelines import ImageSettings, TextToImage, sampling_modules, walk_and_decode
 from dew.sampling.solvers import DDIM, Consistency, Solver
 
 if TYPE_CHECKING:
@@ -552,8 +551,7 @@ class DiffusionObjective(Objective[Ratio]):
         if tokens is None:
             tokens = {keyword: condition.encoder.tokenize([condition.unconditional])
                       for keyword, condition in self.inputs.conditions.items()}
-        return {keyword: condition.encoder.encode(encoders[keyword], tokens[keyword])
-                for keyword, condition in self.inputs.conditions.items()}
+        return encode_conditions(self.inputs.encoders, encoders, tokens)
 
     def blank_conditions(self, params, like: dict) -> dict:
         """The configured unconditional conditions, encoded by `params`' own towers and cast to the
@@ -877,15 +875,14 @@ class DiffusionObjective(Objective[Ratio]):
     def _sample_impl(self, params, batch, key, *, count: int):
         given, unconditional = self._conditions(params, batch, key)
         process, times = sampling_grid(self.process, self.steps, self.grid)
-        denoise = self.denoiser(params, given, unconditional, process)
         noise_key, sample_key = jax.random.split(key)
         x_T = process.noise(noise_key, (count, *self.latent_shape))
-        samples = sample(denoise, x_T, solver=self.solver, guidance=self.guidance, key=sample_key,
-                         times=np.asarray(times), final_denoise=self.final_denoise)
-        autoencoder, params = self.published_autoencoder(params)
-        if autoencoder is not None:
-            samples = autoencoder.decode(params["autoencoder"], samples)
-        return jnp.clip(samples, -1.0, 1.0)
+        denoise = self.denoiser(params, given, unconditional, process)
+        autoencoder, published = self.published_autoencoder(params)
+        walked = walk_and_decode(denoise, autoencoder, published, x_T, solver=self.solver,
+                                 guidance=self.guidance, key=sample_key, times=np.asarray(times),
+                                 final_denoise=self.final_denoise)
+        return walked.images
 
     def _rows(self, batch) -> int:
         """How many samples a batch draws, one per real row: its images' count."""
