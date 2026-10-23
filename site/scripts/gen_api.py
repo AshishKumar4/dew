@@ -64,7 +64,7 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
                 "dew.nn.backbones.qwen_image", "dew.nn.backbones.sd3", "dew.nn.backbones.wan",
                 "dew.nn.backbones.z_image", "dew.nn.mp",
                 "dew.nn.diffusion_gemma", "dew.nn.gemma3n", "dew.nn.multimodal",
-                "dew.nn.autoencoders", "dew.nn.inputs", "dew.nn.mlp", "dew.nn.protocols", "dew.nn.kernels", "dew.nn.sharding",
+                "dew.nn.autoencoders", "dew.nn.autoencoders.pretrained", "dew.nn.inputs", "dew.nn.mlp", "dew.nn.protocols", "dew.nn.kernels", "dew.nn.sharding",
                 "dew.lora"]),
     ("Diffusion and sampling", ["dew.diffusion", "dew.diffusion.process", "dew.diffusion.schedules",
                                 "dew.diffusion.schedules.source", "dew.diffusion.schedules.source_grids",
@@ -76,7 +76,8 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
     ("Decision models", ["dew.decision", "dew.decision.config", "dew.decision.data", "dew.decision.objective",
                          "dew.decision.layout", "dew.decision.task"]),
     ("Conditions and evaluation", ["dew.inputs", "dew.inputs.encoders", "dew.eval", "dew.eval.harness"]),
-    ("Configuration", ["dew.config", "dew.config.sweep"]),
+    ("Configuration", ["dew.config", "dew.config.lm", "dew.config.jepa", "dew.config.diffusion",
+                       "dew.config.sweep"]),
     ("Utilities", ["dew.rl", "dew.artifacts", "dew.coordination", "dew.records", "dew.telemetry.profile",
                    "dew.telemetry.benchmark", "dew.figures"]),
 ]

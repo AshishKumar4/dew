@@ -1056,7 +1056,7 @@ from dew.data import TFDS, presets
 from dew.diffusion.presets import EDM
 from dew.inference import TextToImage
 from dew.nn.backbones import SimpleDiT
-from dew.objectives.diffusion import DiffusionRunConfig
+from dew.config.diffusion import DiffusionRunConfig
 from dew.sampling import Heun
 
 run = Path("runs/flowers-run")

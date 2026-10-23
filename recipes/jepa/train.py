@@ -8,12 +8,12 @@ Oxford flowers is the default, its validation split held to score the probes; it
 data is a chain (`dew.data.presets.images`) whose settings `--set data.images.<setting>=`
 changes. The encoder is --model, the predictor takes the encoder's width and heads plus
 --predictor, and the probes score the frozen encoder at every validation
-(`dew.objectives.jepa.JepaRunConfig`).
+(`dew.config.jepa.JepaRunConfig`).
 """
 
 from dew.data import presets
 from dew.data.sources import source
-from dew.objectives.jepa import JepaRunConfig
+from dew.config.jepa import JepaRunConfig
 
 TRAIN, HELD = source("tfds://oxford_flowers102").holdout(split="validation")
 FLOWERS = TRAIN.shuffle(seed=0).repeat().pipe(presets.images, 224, batch=64)

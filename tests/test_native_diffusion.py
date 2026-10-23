@@ -262,7 +262,8 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
     from dew.diffusion.schedules import DiscreteNoiseScheduler
     from dew.interop.pretrained import load_diffusion_source
     from dew.objectives import Step
-    from dew.objectives.diffusion import DiffusionObjective, DiffusionRunConfig
+    from dew.objectives.diffusion import DiffusionObjective
+    from dew.config.diffusion import DiffusionRunConfig
     from dew.registry import from_record, to_record
     from dew.sampling import sample
     from dew.sampling.pipelines import ImageSettings

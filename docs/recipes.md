@@ -63,7 +63,7 @@ The recipe's data is a chain, which it records with the run. Its settings change
 # byte_demo.py
 from dew.data import Loading, presets
 from dew.data.sources import TokenFiles
-from dew.objectives.lm import LMRunConfig
+from dew.config.lm import LMRunConfig
 
 loading = Loading(workers=0, threads=1, read_buffer=2)
 windows = {"seq_len": 16, "batch": 8}
@@ -159,7 +159,7 @@ python "$DEW_REPO/recipes/diffusion/train.py" --help
 python "$DEW_REPO/recipes/jepa/train.py" --help
 ```
 
-A diffusion configuration adds a training `preset`, a text condition and an optional autoencoder. You pick a preset with a subcommand such as `preset:edm`. The objective (`--objective`, `diffusion` by default) holds the EMA, the condition dropout and how validation samples: `--objective.ema-decay 0.9999`, `--objective.steps 40`, and records for the solver and the guidance, `--objective.solver '{"class": "heun"}'` and `--objective.guidance '{"class": "dew.sampling.guidance:CFG", "fields": {"scale": 4.0}}'`. Another objective trains a loss of its own in place of the denoising loss: `mean_flow`, `shortcut`, `flow_grpo`, or a distillation of a saved run, `rcm`, `ladd` or `guidance_distillation` with `--objective.teacher-run <run directory>`. Each refuses a p…
+A diffusion configuration adds a training `preset`, a text condition and an optional autoencoder. You pick a preset with a subcommand such as `preset:edm`. The objective (`--objective`, `diffusion` by default) holds the EMA, the condition dropout and how validation samples: `--objective.ema-decay 0.9999`, `--objective.steps 40`, and records for the solver and the guidance, `--objective.solver '{"class": "heun"}'` and `--objective.guidance '{"class": "dew.sampling.guidance:CFG", "fields": {"scale": 4.0}}'`. Another objective trains a loss of its own in place of the denoising loss: `mean_flow`, `shortcut`, `flow_grpo`, or a distillation of a saved run, `rcm`, `ladd` or `guidance_distillation` with `--teacher-run <run directory>`. Each refuses a p…
 
 By default the recipe trains on Oxford Flowers with a CLIP condition encoder. Prepare TFDS separately and point the chain's source at it, `--set data.source.path=...` (see Installation). Large corpora use the same `images` preset over `Files` URLs, including ArrayRecord and Parquet, in a run file. Choose the read mode explicitly; preparation and provisioning are not step-zero fallbacks.
 

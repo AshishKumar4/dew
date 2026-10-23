@@ -1134,7 +1134,7 @@ def _recipe_run(tmp_path, image_size, *args):
     config and the trained state."""
     from dew.data import images as image_steps, presets
     from dew.data.sources.tfds import TFDS
-    from dew.objectives.diffusion import DiffusionRunConfig
+    from dew.config.diffusion import DiffusionRunConfig
 
     # Each image captioned from its row (`images.caption`), the condition the run's text tower reads.
     images = TFDS("dew_images", path=str(IMAGES), split="all").shuffle(seed=0).repeat().pipe(

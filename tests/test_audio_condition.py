@@ -24,7 +24,8 @@ from dew.data.dataset import DataPartition
 from dew.data.sources.files import Files
 from dew.inputs import Condition, HFAudio
 from dew.objectives.base import Step
-from dew.objectives.diffusion import AudioCondition, DiffusionRunConfig
+from dew.config.diffusion import DiffusionRunConfig
+from dew.inputs import AudioCondition
 from dew.sampling import CFG
 from dew.training import Trainer
 
