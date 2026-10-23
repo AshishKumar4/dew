@@ -62,6 +62,7 @@ from dew.nn.protocols import (
     Serving,
 )
 from dew.objectives.base import Variables
+from dew.records import finite
 from dew.sampling import decoding, strategies
 from dew.sampling.decoding import (
     EndOfSequence,
@@ -159,12 +160,12 @@ class Sampling:
         # is greedy decoding, so the temperature is the one rate the controls' own checks do not cover.
         rates = {name: decoding.unit_interval(name, getattr(self, name))
                  for name in ("top_p", "min_p", "typical_p")}
-        rates["temperature"] = decoding.real("temperature", self.temperature)
+        rates["temperature"] = finite(self.temperature, "temperature")
         if rates["temperature"] < 0:
             raise ValueError("temperature must be finite and non-negative")
         rates["repetition_penalty"] = decoding.positive("repetition_penalty", self.repetition_penalty)
         for name in ("presence_penalty", "frequency_penalty"):
-            rates[name] = decoding.real(name, getattr(self, name))
+            rates[name] = finite(getattr(self, name), name)
         if self.top_k is not None:
             object.__setattr__(self, "top_k", decoding.positive_size("top_k", self.top_k))
         for name, rate in rates.items():
