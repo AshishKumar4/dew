@@ -147,15 +147,13 @@ def decays(g, documents=None):
     return grown_from(hi, lo, jnp.exp), jnp.where(inclusive, jnp.exp(diff), 0.0)
 
 
-LN2 = 0.6931471805599453
-"""ln 2: `exp2`'s derivative at zero, the base-2 prefix's unit (`raised`)."""
-
-
 def raised(hi, lo):
-    """`exp2(hi + lo)` of a compensated base-2 exponent, rounded about once (`grown_from`): a decay from a
-    chunk's start, whose exponent's rounded half alone carries its whole sum's rounding (a relative 3e-6
-    at the prefix -43 a single token at -30 a token reaches)."""
-    return grown_from(hi, lo, jnp.exp2, LN2)
+    """`exp2(hi + lo)` of a compensated base-2 exponent as `exp2(hi) exp2(lo)`: a decay from a chunk's start,
+    whose exponent's rounded half alone carries its whole sum's rounding (a relative 3e-6 at the prefix
+    -43 a single token at -30 a token reaches). `exp2(lo)`, near one, keeps `lo` to fp32's resolution
+    there, and a product of the two rounds the same in any program a compiler fuses it into, where a
+    first-order correction's multiply-add may contract to one rounding or not."""
+    return jnp.exp2(hi) * jnp.exp2(lo)
 
 
 def grown_from(hi, lo, exp, unit: float = 1.0):
@@ -292,35 +290,36 @@ def readout(query, entering, entered, key, pairs, corrected, issue: Issue = port
     (`remembered`), and the chunk's own pairs over its corrected values (the inclusive lower `pairs` read
     the token itself)."""
     return (remembered(query * entering, entered, issue)
-            + issue("local", paired("scores", query, key, pairs, issue), corrected))
+            + remembered(paired("scores", query, key, pairs, issue), corrected, issue, "local"))
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(2,))
-def remembered(decayed, entered, issue: Issue = portable):
-    """The memory a chunk entered read through its decayed queries, `decayed @ entered` ('memory'), whose
-    gradient in the memory sums the chunk's tokens from its last (`_remembered_transpose`): `decayed` falls
-    along the chunk with its decay, so the smallest terms add first, as the recurrence a token at a time
-    adds them. Summed from the first, the memory's gradient sat 1.76 to 1.89 times the token-by-token
-    recurrence's distance from float64 under every delta family (the carry widened to float64 changed
-    nothing, this product's sum widened took it to 0.85-1.16); from the last, 0.97-1.22
-    (tests/test_recurrence_stability.py)."""
-    return issue("memory", decayed, entered)
+@functools.partial(jax.custom_jvp, nondiff_argnums=(2, 3))
+def remembered(decayed, entered, issue: Issue = portable, name: str = "memory"):
+    """A chunk's tokens reading through their decays, `decayed @ entered` (the product `name`): the memory
+    the chunk entered read through its decayed queries ('memory'), or its corrected values through its
+    scores ('local'). The gradient in `entered` sums the chunk's tokens from its last
+    (`_remembered_transpose`): `decayed` falls along the chunk with its decay, so the smallest terms add
+    first, as the recurrence a token at a time adds them. Summed from the first, the memory's gradient sat
+    1.76 to 1.89 times the token-by-token recurrence's distance from float64 under every delta family, and
+    the corrected values' put the values' and the write gate's at 1.5 to 1.6 under aligned keys; from the
+    last, the memory's sat at 0.97-1.22 (tests/test_recurrence_stability.py)."""
+    return issue(name, decayed, entered)
 
 
-def _remembered_transpose(decayed, cotangent, issue: Issue):
+def _remembered_transpose(decayed, cotangent, issue: Issue, name: str):
     """`decayed^T @ cotangent`, the chunk's tokens summed from its last."""
-    return issue("memory", jnp.swapaxes(jnp.flip(decayed, -2), -1, -2), jnp.flip(cotangent, -2))
+    return issue(name, jnp.swapaxes(jnp.flip(decayed, -2), -1, -2), jnp.flip(cotangent, -2))
 
 
 @remembered.defjvp
-def _remembered_tangent(issue, primals, tangents):
-    """The product's tangent, its memory side linear in the memory with the transpose
+def _remembered_tangent(issue, name, primals, tangents):
+    """The product's tangent, its `entered` side linear in `entered` with the transpose
     `_remembered_transpose`, in forward and reverse mode alike."""
     decayed, entered = primals
     d_decayed, d_entered = tangents
-    read = linear_call(lambda decayed, entered: issue("memory", decayed, entered),
-                       functools.partial(_remembered_transpose, issue=issue), decayed, d_entered)
-    return remembered(decayed, entered, issue), issue("memory", d_decayed, entered) + read
+    read = linear_call(lambda decayed, entered: issue(name, decayed, entered),
+                       functools.partial(_remembered_transpose, issue=issue, name=name), decayed, d_entered)
+    return remembered(decayed, entered, issue, name), issue(name, d_decayed, entered) + read
 
 
 def compose(first, second, issue: Issue = portable):

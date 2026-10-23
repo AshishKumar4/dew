@@ -2,12 +2,12 @@
 the GPU mainloop runs them (fla's four, `dew.nn.kernels.fla_gdn`'s), each program's tiles gathered from
 its operands as the kernel loads them, and the algebra's tile functions (`recurrence_algebra`) mapped
 over every program at once. At the GPU mainloop's tiles it computes what that mainloop interpreted
-computes, bit for bit, which tests/test_recurrence_template.py holds it to.
+computes (tools/compare_recurrence_mainloops.py compares them value by value, a debugging aid).
 
 A program reads a chunk's rows from its first token, rows past the chunk's count zero (the kernels'
 masked loads) and its prefix's rows past the count the last real one (`chunked_launch._gates`), and
 writes only the rows the chunk holds. Its products are the GPU mainloop's interpreted ones
-(`fla_gdn._issuer`): its operands in fp32, the CPU's own dot.
+(`fla_gdn._issuer`): each product exact in float64 and the sum rounded once to fp32.
 """
 
 import functools
