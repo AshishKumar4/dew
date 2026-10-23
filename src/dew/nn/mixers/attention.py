@@ -55,6 +55,7 @@ from dew.nn.precision import at_least_fp32, float32_dot_general, rounded_to, sca
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, mrope_tables, rotary_freqs, rotate
 from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
+from dew.nn.visibility import visible, windowed
 
 
 def temperature_scale(positions, floor_scale: float, attn_scale: float, *, dtype: DTypeLike):
@@ -167,7 +168,7 @@ class CausalSelfAttention(nn.Module):
     index. causal=False is full attention, which a masked diffusion model reads
     its corrupted sequence with and an encoder reads its input with; with
     `bidirectional_window` a window keeps the keys within window - 1 positions
-    on either side (`dew.nn.attention.window_sides`). Decoding attends a bidirectional canvas
+    on either side (`dew.nn.visibility.window_sides`). Decoding attends a bidirectional canvas
     over the frozen prefix a causal prefill cached, and writes nothing back.
     kv_shared marks a layer without K/V projections (Gemma 3n/4 cross-layer
     sharing): it reads the keys, values and places its provider stashed in
@@ -498,12 +499,11 @@ class CausalSelfAttention(nn.Module):
         if self.ctx.sliding_window is not None and (self.ctx.causal or self.ctx.bidirectional_window):
             places = jnp.broadcast_to(query_slots if decode else counted, (batch, length))
             key_places = jnp.arange(key_length)[None, :] if decode else places
-            distance = places[:, None, :, None] - key_places[:, None, None, :]
             # A causal window bounds only the keys behind the query, so an
             # image's later tokens stay visible to its earlier ones; a
-            # two-sided one bounds both (`window_sides`).
-            keep = keep & ((distance < self.ctx.sliding_window) if self.ctx.causal
-                           else (jnp.abs(distance) < self.ctx.sliding_window))
+            # two-sided one bounds both (`windowed`).
+            keep = keep & windowed(places[:, None, :, None], key_places[:, None, None, :],
+                                   self.ctx.sliding_window, causal=self.ctx.causal)
         if valid is not None:
             keep = keep & valid[:, None, None, :]
         if decode:
@@ -788,7 +788,8 @@ class CausalSelfAttention(nn.Module):
                 mask, causal = causal_attention_mask(positions, kv_len, self.ctx.sliding_window), False
             else:
                 last = jnp.max(jnp.asarray(positions).reshape(B, S), axis=-1, keepdims=True)
-                documents, causal, window = self._cached_call(positions, jnp.arange(kv_len)[None, :] <= last)
+                documents, causal, window = self._cached_call(
+                    positions, visible(last, jnp.arange(kv_len)[None, :], causal=True))
             key_places = held_places
             # A quantized provider stashed its keys in the cache's rotation.
             rotation = self.ctx.kv_cache.key_rotation(self.ctx.head_dim)
@@ -872,8 +873,8 @@ class CausalSelfAttention(nn.Module):
                 raise ValueError("attention_key_positions must be [B, keys]")
             if self.ctx.sliding_window is not None:
                 query_positions = jnp.broadcast_to(jnp.asarray(rotary_positions), (B, S))
-                distance = query_positions[:, :, None] - key_positions[:, None, :]
-                mask = mask & (jnp.abs(distance) < self.ctx.sliding_window)[:, None]
+                mask = mask & windowed(query_positions[:, :, None], key_positions[:, None, :],
+                                       self.ctx.sliding_window, causal=False)[:, None]
         return mask, key_positions
 
     @property

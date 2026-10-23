@@ -200,6 +200,17 @@ def test_a_mixture_that_is_not_one_is_refused(count, weights):
         mix(corpora, weights=weights)
 
 
+@pytest.mark.parametrize("weights, keys", [((1.0, 2.0), ("0:a", "0:a")), ((1.0,), ("0:a", "0:b"))])
+def test_the_members_a_mix_is_read_by_hold_one_weight_and_one_distinct_key_each(weights, keys):
+    """What a lowering reads a mix by holds a mixture's weights, and a key for each member that no
+    other member shares, as a mix saves each member's position under it."""
+    from dew.data.mixing import Members
+
+    assert Members((1.0, 2.0), ("0:a", "0:b")).keys == ("0:a", "0:b")
+    with pytest.raises(ValueError):
+        Members(weights, keys)
+
+
 # --------------------------------------------------------------------------
 # Mixtures of stores of rows
 # --------------------------------------------------------------------------
@@ -242,7 +253,8 @@ def row_mix(sources: dict[str, float], *, read: str = "memory", seed: int = 0) -
 def test_a_weighted_mixture_of_two_datasets_holds_each_share_of_every_batch(two_splits):
     big, small = two_splits
     data = row_mix({big: 0.75, small: 0.25})
-    assert data.records == 54 and data.batch == 4 and data.steps_per_epoch == 13
+    # An epoch is the fewest records in which the big split's 40 are read, three in every four: 53.
+    assert data.records == 53 and data.batch == 4 and data.steps_per_epoch == 13
     stream = data.train(DataPartition())
     try:
         batches = taken(stream, 6)
@@ -500,12 +512,14 @@ def test_a_packed_stream_asks_each_corpus_its_position_only_after_the_corpus_rea
 
 
 def test_a_weighted_packed_pass_counts_and_scores_every_corpus(tmp_path):
-    """The pass is the windows in which every corpus has been read once, and
+    """The pass is the fewest windows in which every corpus has been read once, and
     the validation pass reads each held-out window at most once."""
     stores, first, second = weighted_packed(tmp_path, (1.0, 1.0))
     loaded = trained(mixed_packed(stores), batch=2)
     alone = [trained(ordered(packed(url)), batch=2).records for url in (first, second)]
-    assert loaded.records == 2 * max(alone)
+    # At even weights the mix reads its corpora in turn from the first, the larger, whose last
+    # window is the mix's 2 * 20 - 1th.
+    assert alone[0] == max(alone) and loaded.records == 2 * max(alone) - 1
     passed = held(mix([packed(url) for url in stores], weights=list(stores.values()), by="tokens").batch(2)
                   .read("memory").loading(READ))
     scored = [row for batch in passed(DataPartition()) for row in windows_of([batch])[0]]
@@ -1235,6 +1249,82 @@ def test_a_corpus_that_recurs_across_phases_continues_its_order_and_repeats_noth
         read = [value for phase in by_phase for value in phase if value // 1000 == tag]
         assert len(read) == len(set(read)), f"corpus {tag} repeated a record within its epoch"
     assert abs(sum(value // 1000 == 2 for value in by_phase[1]) - 68) <= 1
+
+
+def test_corpora_recurring_across_phases_continue_where_grains_weighted_mix_left_each():
+    """Shares of 1, 10 and 15, whose scaling to whole proportions Grain truncates: after two steps
+    of eight records the mix has read 1, 6 and 9 records of its corpora, so the next phase starts
+    each where that left it, and across the switch every corpus reads its own order, nothing
+    repeated and nothing skipped."""
+    from dew.data.pipeline import Phases
+
+    def corpus(tag):
+        return Pipeline(Memory(Indexed(tag, 200)), name=f"corpus-{tag}").shuffle(tag).repeat()
+
+    def mixed():
+        return mix(tuple(corpus(tag) for tag in (1, 2, 3)), weights=(1, 10, 15))
+
+    dataset = compile(Pipeline(Phases((mixed(), mixed()), (2, None))).batch(8), read="memory", seed=0,
+                      loading=READ)
+    read = [value for step in taken(dataset.train(DataPartition()), 6) for value in step]
+    for tag in (1, 2, 3):
+        alone = compile(corpus(tag).batch(1), read="memory", seed=0, loading=READ)
+        mine = [value for value in read if value // 1000 == tag]
+        assert mine == [step[0] for step in taken(alone.train(DataPartition()), len(mine))]
+
+
+@pytest.mark.parametrize("weights, lengths", [((1, 10, 15), (300, 40, 900)), ((0.3, 0.7), (300, 300)),
+                                              ((71, 20, 9), (50, 800, 7)), ((1.0,), (12,))])
+def test_dews_weighted_selection_reads_the_records_grains_mix_reads(weights, lengths):
+    """The selection Dew mixes indexed corpora by and counts a phase's prefix by reads each position
+    of the mixture from the corpus and record Grain's own weighted mix reads there, until the corpus
+    Grain's mix stops at would read a record twice; a corpus of no records is refused, as Grain
+    refuses it."""
+    from dew.data.mixing import ProportionalSelection
+
+    parents = [pygrain.MapDataset.range(1000 * (index + 1), 1000 * (index + 1) + length)
+               for index, length in enumerate(lengths)]
+    ours = pygrain.MapDataset.select_from_datasets(parents, ProportionalSelection(lengths, weights))
+    grains = pygrain.MapDataset.mix(parents, weights)
+    assert len(ours) == len(grains) and list(ours) == list(grains)
+    with pytest.raises(ValueError):
+        ProportionalSelection((*lengths[:-1], 0), weights)
+
+
+@pytest.mark.parametrize("weights, sizes", [((1, 10, 15), (50, 200, 400)), ((1.0, 1.0), (300, 40)),
+                                            ((0.3, 0.7), (1000, 1000))])
+def test_an_epoch_of_repeated_corpora_ends_where_grains_mix_has_read_every_one_once(weights, sizes):
+    """A mix of repeated corpora counts an epoch as the positions of Grain's own mix by which every
+    corpus has been read once, its slowest at its share: no fewer, no more."""
+    corpora = [Pipeline(Memory(Indexed(tag, size)), name=f"corpus-{tag}").repeat()
+               for tag, size in enumerate(sizes, start=1)]
+    data = compile(mix(corpora, weights=weights).batch(1), read="memory", loading=READ)
+    # Each position of Grain's mix of repeated corpora says which corpus it reads (its tag).
+    grains = pygrain.MapDataset.mix([pygrain.MapDataset.range(1).map(lambda _, tag=tag: tag).repeat()
+                                     for tag in range(len(sizes))], weights)
+    reads, covered = [0] * len(sizes), 0
+    while any(read < size for read, size in zip(reads, sizes, strict=True)):
+        reads[grains[covered]] += 1
+        covered += 1
+    assert data.records == covered
+
+
+def test_an_epoch_of_a_mix_of_corpora_written_without_repeats_reads_every_corpus_whole():
+    """A run's mix of corpora written without repeats reads, in an epoch's records, every record of
+    the corpus it ends on once and every record of the others: the slow corpus's tail is read, not
+    skipped by the mix starting over at its shortest corpus's end."""
+    from dew.data.compile import fitted
+    from dew.data.pipeline import ObjectiveData
+
+    corpora = [Pipeline(Memory(Indexed(tag, size)), name=f"corpus-{tag}")
+               for tag, size in ((1, 40), (2, 200))]
+    data, _ = fitted(mix(corpora, weights=(1, 10)).batch(4).read("memory").workers(0), None,
+                     objective=ObjectiveData())
+    steps = -(-data.records // 4)
+    values = [value for step in taken(data.train(DataPartition()), steps) for value in step][: data.records]
+    slow = sorted(value for value in values if value // 1000 == 1)
+    assert slow == [1000 + index for index in range(40)]
+    assert {value for value in values if value // 1000 == 2} == {2000 + index for index in range(200)}
 
 
 def test_one_corpus_starts_past_its_offset_as_a_mixed_one_does():

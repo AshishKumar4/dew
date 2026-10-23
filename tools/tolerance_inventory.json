@@ -265,10 +265,6 @@
    "comparisons": 5,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_fp8_base.py": {
-   "comparisons": 2,
-   "lane": "Kernels"
-  },
   "tests/test_gemma3n.py": {
    "comparisons": 9,
    "lane": "Models, Serving & RL"
@@ -343,10 +339,6 @@
   },
   "tests/test_host_training.py": {
    "comparisons": 4,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_hyper_connections.py": {
-   "comparisons": 5,
    "lane": "Models, Serving & RL"
   },
   "tests/test_image_metrics.py": {
@@ -609,10 +601,6 @@
    "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_quantization.py": {
-   "comparisons": 16,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_quantization_sites.py": {
    "comparisons": 1,
    "lane": "Models, Serving & RL"
@@ -692,10 +680,6 @@
   "tests/test_source_schedulers.py": {
    "comparisons": 5,
    "lane": "Training"
-  },
-  "tests/test_sparse_attention.py": {
-   "comparisons": 5,
-   "lane": "Kernels"
   },
   "tests/test_speculative.py": {
    "comparisons": 2,

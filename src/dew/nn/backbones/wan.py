@@ -233,6 +233,15 @@ class WanTransformer(nn.Module):
         return "conditioning"
 
     @nn.nowrap
+    def _block(self, **where) -> WanBlock:
+        """A block as the model runs it, named by `where` (or unbound, `parent=None`, where a FLOP count
+        reads it): one factory, so the count and the execution build the same block."""
+        return WanBlock(self.features, self.num_attention_heads, self.ffn_dim,
+                        qk_norm=self.qk_norm is not None, cross_attn_norm=self.cross_attn_norm,
+                        epsilon=self.eps, attention_impl=self.attention_impl, dtype=self.dtype,
+                        precision=self.precision, **where)
+
+    @nn.nowrap
     def _modulation(self):
         return Modulation(self.features, 6, dtype=self.dtype, precision=self.precision, name="time_proj")
 
@@ -255,7 +264,7 @@ class WanTransformer(nn.Module):
                  + embedding_flops(context_lengths, text_features, self.features)
                  + embedding_flops(rows, self.freq_dim, self.features)
                  + self._modulation().model_flops(rows))
-        block = WanBlock(self.features, self.num_attention_heads, self.ffn_dim, parent=None)
+        block = self._block(parent=None)
         return (count + self.num_layers * block.multisequence_flops(lengths, context_lengths)
                 + projection_flops(lengths, self.features, patch * self.out_channels))
 
@@ -300,10 +309,7 @@ class WanTransformer(nn.Module):
         rotation = tuple(jnp.asarray(table[None], wide)
                          for table in wan_rotation(frames, rows, columns, self.attention_head_dim))
         for index in range(self.num_layers):
-            tokens = WanBlock(self.features, self.num_attention_heads, self.ffn_dim,
-                              qk_norm=self.qk_norm is not None, cross_attn_norm=self.cross_attn_norm,
-                              epsilon=self.eps, attention_impl=self.attention_impl, name=f"blocks_{index}",
-                              **dense)(tokens, context, modulation, rotation)
+            tokens = self._block(name=f"blocks_{index}")(tokens, context, modulation, rotation)
 
         table = self.param("scale_shift_table", nn.initializers.normal(self.features ** -0.5),
                            (1, 2, self.features), jnp.float32)
