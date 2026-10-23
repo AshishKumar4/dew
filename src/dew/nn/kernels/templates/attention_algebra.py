@@ -357,18 +357,15 @@ def tile(state: Partial, alpha: jax.Array, p: jax.Array, value: jax.Array
     return held.weights, alpha, held
 
 
-def stepped(state: Partial, m: jax.Array, factor: jax.Array, p: jax.Array, product: jax.Array | None,
-            held: Room | None, times: Callable[[jax.Array], jax.Array],
-            into: Callable[[jax.Array], jax.Array] | None = None) -> Partial:
+def stepped(state: Partial, m: jax.Array, factor: jax.Array, p: jax.Array, product: jax.Array,
+            held: Room | None, times: Callable[[jax.Array], jax.Array]) -> Partial:
     """The state after a tile: its sums taken by `factor` (`carry_factor`) and the tile's `product` of its
-    weights `p` and their sum added at the row's shift (`beyond_weights`; `tile`), or on the plain walk the
-    taken sums given to `into`, which accumulates the product into them; with the tile's unshifted weights'
-    product, which the mainloop issues as `times` of them (their product with the tile's values), kept
-    unshifted (`Guard.plain`); the plain walk's arithmetic where `held` is None, which issues no other
-    product."""
+    weights `p` and their sum added at the row's shift (`beyond_weights`; `tile`), with the tile's
+    unshifted weights' product, which the mainloop issues as `times` of them (their product with the
+    tile's values), kept unshifted (`Guard.plain`); the plain walk's arithmetic where `held` is None,
+    which issues no other product."""
     denominator = carry_factor(state.total, factor, held) + beyond_weights(p.sum(axis=-1), held)
-    taken = carry_factor(state.acc, factor, held)
-    acc = into(taken) if into is not None else taken + beyond_weights(product, held)
+    acc = carry_factor(state.acc, factor, held) + beyond_weights(product, held)
     if held is None:
         return Partial(acc, m, denominator)
     # The unshifted sums beside them: finite in every column the plain walk kept finite (`finish`).
@@ -539,16 +536,13 @@ def started(spec: Forward, initial: tuple[jax.Array, jax.Array, jax.Array] | Non
 
 class Keys(NamedTuple):
     """A key tile as a mainloop gives it the algebra: its coordinates and (modified) logits `[bq, bk]`,
-    `load()` its values `[bk, Dv]`, which a step calls after the softmax (where jax's mha loads them), the
-    mainloop's product `dot(a, b)`, `a @ b` in fp32, and where the mainloop accumulates a product in place
-    (a warpgroup MMA into its accumulator), `accumulate(acc, a, b)`, `acc + a @ b`, which the plain walk
-    takes for its values' product."""
+    `load()` its values `[bk, Dv]`, which a step calls after the softmax (where jax's mha loads them), and
+    the mainloop's product `dot(a, b)`, `a @ b` in fp32."""
 
     coords: Coords
     logits: jax.Array
     load: Callable[[], jax.Array]
     dot: Callable[[jax.Array, jax.Array], jax.Array]
-    accumulate: Callable[[jax.Array, jax.Array, jax.Array], jax.Array] | None = None
 
 
 Carry = tuple[Partial, Argmax, jax.Array, jax.Array]
@@ -575,10 +569,6 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     """The state after a tile `keys`: its softmax and the product of its weights with its values."""
     m, factor, p, value, held = _softmax(spec, state, keys)
     times = functools.partial(_times, keys.dot, value)
-    if held is None and keys.accumulate is not None:
-        accumulate = keys.accumulate
-        return stepped(state, m, factor, p, None, held, times,
-                       lambda taken: accumulate(taken, narrow(p, value.dtype), value))
     return stepped(state, m, factor, p, times(p), held, times)
 
 

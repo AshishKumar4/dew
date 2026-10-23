@@ -117,7 +117,8 @@ def _consumer(program: _Program, spec: algebra.Forward, wg, q_view, out_view, q_
     q_pos, columns = first + mosaic_sm90.iota(shape, 0), mosaic_sm90.iota(shape, 1)
     width = q_smem.shape[-1]
     state = algebra.Partial(mosaic_sm90.zeros((tiles.block_q, width)),
-                            plgpu.layout_cast(jnp.full((tiles.block_q,), -jnp.inf, jnp.float32), FAMILY.row),
+                            plgpu.layout_cast(jnp.full((tiles.block_q,), -jnp.inf, jnp.float32),
+                                              mosaic_sm90.ROW),
                             mosaic_sm90.zeros((tiles.block_q,)))
     def awaited(index):
         @pl.when(index < walked)
@@ -144,17 +145,14 @@ def _consumer(program: _Program, spec: algebra.Forward, wg, q_view, out_view, q_
             plgpu.barrier_wait(schedule)
             return slot
 
-        def accumulate(acc, lhs, rhs):
-            acc = mosaic_sm90.accumulate(acc, lhs, rhs, interpret)
+        def dot(lhs, rhs):
+            product = mosaic_sm90.registers_product(lhs, rhs, interpret)
             values.release(index)
             # The next key tile's wait, before its scores need it.
             awaited(index + 1)
-            return acc
+            return product
 
-        def dot(lhs, rhs):
-            return accumulate(mosaic_sm90.zeros((lhs.shape[0], rhs.shape[1])), lhs, rhs)
-
-        return algebra.Keys(coords, logits, load, dot, accumulate)
+        return algebra.Keys(coords, logits, load, dot)
 
     state = algebra.plain_walk(spec, 0, walked, keys_at, state)
 
@@ -215,17 +213,16 @@ def _launch(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpret
     def entry(q_ref, k_ref, v_ref, out_ref):
         pl.run_scoped(
             lambda *scoped, **rings: body(q_ref, k_ref, v_ref, out_ref, *scoped, **rings),
-            plgpu.SMEM((CONSUMERS, block_q, width), query.dtype, transforms=FAMILY.transforms),
+            plgpu.SMEM((CONSUMERS, block_q, width), query.dtype),
             plgpu.Barrier(num_barriers=CONSUMERS), plgpu.Barrier(num_arrivals=CONSUMERS),
-            key_ring=mosaic.ring((block_k, width), key.dtype, program.stages, consumers=CONSUMERS,
-                                 transforms=FAMILY.transforms),
+            key_ring=mosaic.ring((block_k, width), key.dtype, program.stages, consumers=CONSUMERS),
             value_ring=mosaic.ring((block_k, value.shape[-1]), value.dtype, program.stages,
-                                   consumers=CONSUMERS, transforms=FAMILY.transforms),
+                                   consumers=CONSUMERS),
             collective_axes="wg")
 
     return plgpu.kernel(
         entry, out_type=jax.ShapeDtypeStruct((batch, queries, heads, value.shape[-1]), query.dtype),
         grid=(heads, queries // pair, batch), grid_names=("heads", "q_tiles", "batch"),
-        num_threads=CONSUMERS + 1, thread_name="wg", compiler_params=plgpu.CompilerParams(approx_math=True),
+        num_threads=CONSUMERS + 1, thread_name="wg", compiler_params=mosaic.compiler_params(approx_math=True),
         interpret=plgpu.InterpretGPUParams() if interpret else None,
     )(query, key, value)
