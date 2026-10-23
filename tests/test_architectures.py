@@ -404,7 +404,7 @@ LAYOUT_SEEDS: dict[str, int] = {
     "jepa_video_encoder": 256, "causal_transformer": 64, "causal_transformer+moe": 128,
     "causal_transformer+gpt_oss": 256, "causal_transformer+deepseek_v2": 128,
     "causal_transformer+glm4_moe": 256, "causal_transformer+llama4": 256,
-    "causal_transformer+gemma4_moe": 128,
+    "causal_transformer+gemma4_moe": 128, "causal_transformer+gemma3n": 512,
 }
 """Each cell's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada: the
 most any of its four layouts and step counts took; a cell not named takes DEFAULT_LAYOUT_SEEDS."""
@@ -720,7 +720,7 @@ class Selecting(nn.Module):
         return altup.correct(predictions, hidden)
 
 
-@pytest.mark.parametrize("layout", ["8x1 data", "2x4 fsdp"])
+@pytest.mark.parametrize("layout", ["8x1 data", "2x4 fsdp"], ids=["data", "fsdp"])
 def test_gemma3n_selecting_pieces_compute_on_every_layout_as_on_one_device(layout):
     """AltUp's router and the gaussian top-k feed-forward, whose cancelling backward the gemma3n
     layout cell leaves out, placed as that cell places them (8x1 data parallelism, 2x4 fsdp over
