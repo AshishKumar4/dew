@@ -16,6 +16,7 @@ api-tests	uv run --no-project --with-requirements site/scripts/requirements.txt 
 install-script	"$PYTHON" site/scripts/gen_install.py --check
 theme	"$PYTHON" site/scripts/gen_theme.py --check
 model-pin	"$PYTHON" site/scripts/gen_pin.py --check
+landing-programs	"$PYTHON" site/snippets/cells.py --check
 models	JAX_PLATFORMS=cpu "$PYTHON" site/scripts/gen_models.py --check
 examples	"$PYTHON" site/scripts/gen_examples.py --check
 exports	"$PYTHON" tools/gen_exports.py --check
