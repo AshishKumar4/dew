@@ -102,10 +102,10 @@ class AttentionCase:
     (a windowed decode step's first key, `key_value_seq_starts`); `mask`
     is an arbitrary mask only the generic path takes. `arithmetic` is a call asking what only the
     reference path computes (`reference_only`), `narrows` one jax.nn's xla kernel would compute
-    below its precision (`_xla_kernel_narrows`, `_xla_kernel_chains`), `folds` one of few query
-    positions `folded_attention` reads on a GPU, and `splash_mask` one whose mask splash's descriptor
-    describes, formed only where splash may run, under a name that may choose it on a TPU
-    (`TPU_BACKEND`), and False elsewhere."""
+    below its precision or a CPU's reference path (`_xla_kernel_narrows`, `_xla_kernel_on_cpu`),
+    `folds` one of few query positions `folded_attention` reads on a GPU, and `splash_mask` one whose
+    mask splash's descriptor describes, formed only where splash may run, under a name that may
+    choose it on a TPU (`TPU_BACKEND`), and False elsewhere."""
 
     queries: int
     keys: int
@@ -344,7 +344,7 @@ XLA_SUPPORTS = (
     _Need('softcap', lambda case: case.softcap is None, "jax.nn's attention has no softcap",
                 row=INHERENT, kind='handoff'),
     _Need('narrows', lambda case: not case.narrows,
-                "jax.nn's xla kernel would compute the call below its precision or sum it in one chain",
+                "jax.nn's xla kernel would compute the call below its precision or a CPU's reference path",
                 row=INHERENT, kind='handoff'),
     _Need('arithmetic', lambda case: not case.arithmetic,
                 "the call asks for arithmetic only the reference path computes (`reference_only`)",
@@ -355,7 +355,8 @@ the reference path."""
 
 
 def _attention_preferred(case: AttentionCase) -> str:
-    """The kernel the target measured fastest for `case`: splash on a TPU and xla on a CPU; on a GPU
+    """The kernel the target measured fastest for `case`: splash on a TPU and xla on a CPU, where its
+    calls take the reference path (`_xla_kernel_on_cpu`); on a GPU
     xla for a query no fused kernel takes the dtype of, else its row's ('attention', cuDNN by
     default), and the narrow heads' row's ('attention_narrow') for heads at most 64 wide with no
     window, mask, bias, documents, key lengths or key starts (`_narrow`): by default tokamax's Triton
