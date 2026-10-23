@@ -521,9 +521,9 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
              accumulators):
     """A dQ consumer's key tile `index`: its scores and score cotangents from the key and value slots
     (`slots`) and its queries and output cotangents (`operands`) under its rows' statistics (`stats`), the
-    tile's coordinates (`coords_of(k_first)`), its hook parameters (`params_of(like, k_first)`) and whether
-    its block sees it whole (`whole(index)`). The row sums are carried (`rows`); dQ's and the keyed sums'
-    products are issued into `accumulators` in place (`algebra.dq_issued`)."""
+    tile's coordinates (`coords_of(k_first)`), its hook parameters (`params_of(like, k_first=k_first)`) and
+    whether its block sees it whole (`whole(index)`). The row sums are carried (`rows`); dQ's and the keyed
+    sums' products are issued into `accumulators` in place (`algebra.dq_issued`)."""
     q, do = operands
     peak, prior, anchor, delta, chosen = stats
     family, tiles, empty = walk.program.family, walk.program.tiles, jnp.zeros((), jnp.float32)
@@ -533,7 +533,7 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
     s = family.product(q, k_slot.transpose((1, 0)), shape)
     dp = family.product(do, slots["values"].transpose((1, 0)), shape)
     slots.release("values")
-    params = params_of(s, k_first)
+    params = params_of(s, k_first=k_first)
     residual, mass, grads, weighed, keyed_mass, keyed_shift = rows
     # dQ's and the keyed sums' places stay empty: their products go to the accumulators.
     sums = algebra.DqSums(empty, residual, mass, grads, weighed, empty, keyed_mass, keyed_shift)
