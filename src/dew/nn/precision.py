@@ -120,10 +120,11 @@ L2NORM_EPS = 1e-6
 
 
 def l2norm(x: jax.Array, eps: float = L2NORM_EPS) -> jax.Array:
-    """`x` over its L2 length along the last axis, `x * rsqrt(sum(x**2) + eps)`, reduced in at least
-    fp32 (`at_least_fp32`, a float64 input's in float64) and returned in `x`'s dtype: the
-    normalization of FLA's `l2norm` (the linear attentions' queries and keys,
-    modeling_qwen3_next.py:368-371) and of nGPT's `justnorm` (its residual stream and weights)."""
+    """`x` over its L2 length along the last axis, `x * rsqrt(sum(x**2) + eps)` with `eps` added under
+    the root, computed in at least fp32 (`at_least_fp32`, a float64 input's in float64) and rounded
+    once to `x`'s dtype: the normalization of FLA's `l2norm` (the linear attentions' queries and
+    keys, modeling_qwen3_next.py:368-371) and of nGPT's `justnorm` (its residual stream and
+    weights)."""
     wide = x.astype(at_least_fp32(x.dtype))
     return (wide * jax.lax.rsqrt(jnp.sum(jnp.square(wide), axis=-1, keepdims=True) + eps)).astype(x.dtype)
 
