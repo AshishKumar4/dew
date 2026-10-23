@@ -5,8 +5,9 @@ functions (`recurrence_algebra`) between the bundle's products, for every rule t
 (`recurrence.Hooks`) as values rather than code paths: a decay a head, a key dimension's or none (zero), with
 or without the delta rule (without it the identity inverse: no solve, each token's write its values gated),
 Mamba2's rated decay through its log gates. It names no instruction, layout or barrier: the family streams a
-program's tiles into shared memory (`stream`, `walk`), issues its products (`product`), stages a register
-operand for one (`stage`) and lays its tiles and vectors (`rows_of`, `columns_of`, `iota`).
+program's tiles into shared memory (`stream`, `walk`), issues its products into accumulators (`issue`,
+`zeros`), stages a register operand for one (`stage`) and lays its tiles and vectors (`rows_of`, `columns_of`,
+`iota`).
 
 - solve (a decay a head, the delta rule): a chunk's `(I + A)^-1` for `A = tril(beta_s (k_s . k_t) exp2(g_s -
   g_t), -1)` (`algebra.system`), inverted by doubling on the chunk's tile (`algebra.doubled`): a family's
@@ -169,7 +170,8 @@ class _Issuer:
         count = max(len(left), len(right))
         terms = sorted(((i, j) for i in range(len(left)) for j in range(len(right)) if i + j < count),
                        key=lambda term: -sum(term))
-        return functools.reduce(jnp.add, (FAMILY.product(left[i], right[j], shape) for i, j in terms))
+        return functools.reduce(lambda acc, term: FAMILY.issue(acc, left[term[0]], right[term[1]]), terms,
+                                FAMILY.zeros(shape))
 
 
 def _diagonal(size: int) -> jax.Array:

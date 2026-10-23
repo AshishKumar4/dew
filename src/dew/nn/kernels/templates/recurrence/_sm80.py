@@ -161,13 +161,33 @@ class MmaSync(mosaic.Family):
         return plgpu.load(ref, layout=layout(ref.dtype))
 
     def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
-        if _INTERPRETED.get():
-            out = jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
-        else:
-            out = plgpu.mma(self.zeros(shape), self.operand(lhs, "lhs"), self.operand(rhs, "rhs"))
+        out = self.issue(self.zeros(shape), lhs, rhs)
         if then is not None:
             then()
         return out
+
+    def issue(self, acc, lhs, rhs, *, transpose_lhs: bool = False, transpose_rhs: bool = False) -> jax.Array:
+        """`acc + lhs @ rhs` of shared-memory tiles, either read transposed (its view's load, ldmatrix's)."""
+        lhs, rhs = lhs.T if transpose_lhs else lhs, rhs.T if transpose_rhs else rhs
+        if _INTERPRETED.get():
+            return acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
+        return plgpu.mma(acc, self.operand(lhs, "lhs"), self.operand(rhs, "rhs"))
+
+    def accumulators(self, shapes: tuple) -> tuple:
+        return tuple(self.zeros(shape) for shape in shapes)
+
+    def relayout(self, value, dtype):
+        """An accumulator as an operand in registers: None, Mosaic GPU finds no cast from mma.sync's
+        accumulator layout to its operands' (`stage` takes it through shared memory)."""
+        del value, dtype
+
+    def loaded(self, ref) -> jax.Array:
+        """A shared-memory tile in registers, in the accumulator's layout."""
+        return ref[...] if _INTERPRETED.get() else plgpu.load(ref, layout=self.layout, optimized=False)
+
+    def stored(self, ref, value) -> None:
+        """`value` into `ref` in its dtype."""
+        ref[...] = value.astype(ref.dtype)
 
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
         del interpret
@@ -197,7 +217,7 @@ class MmaSync(mosaic.Family):
         operand's way to an MMA. Mosaic GPU brackets a store with the warpgroup's barriers (its automatic
         barriers), so every warp's reads of `buffer` are done before it and its writes seen after; sm80 has no
         async proxy to fence (`commit_smem`'s fence.proxy.async does not select there)."""
-        buffer[...] = value.astype(buffer.dtype)
+        self.stored(buffer, value)
         return buffer
 
     def settled(self) -> None:
