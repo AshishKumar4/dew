@@ -143,26 +143,7 @@ A real `delete` checks whether a queued resource owns the TPU, and if so deletes
 
 ## Command reference
 
-| Command | Purpose |
-| --- | --- |
-| `init` | Write `tpu.toml` from flags, asking for what is missing in an interactive terminal. |
-| `create NAME` | Create a TPU VM or pod slice and wait until it is READY. `--spot`, `--queued`, `--disk`. |
-| `setup NAME` | Install uv, a virtualenv, JAX and Dew on every worker, then count the devices. `--from-source`, `--git-key`, `--gcs-bucket`. |
-| `sync NAME` | Copy the git working tree to `~/<repo>` on every worker; `--delete` also removes remote files absent locally. |
-| `copy NAME SRC DEST` | Copy a local file or directory to every worker, or one with `--worker N`. |
-| `train NAME -- RECIPE ...` | Sync the tree and start a recipe on every worker in the background, then follow worker 0's log. |
-| `logs NAME JOB` | Show a detached job's log; `--worker N` or `all`, `--follow`. |
-| `status NAME` | Show what each worker is doing. |
-| `run NAME -- CMD` | Run a shell command on every worker, or one with `--worker N`; `--detach` runs it in the background. |
-| `list` | List TPUs in the configured zones, with worker 0's external IP. |
-| `describe NAME` | Show what a TPU is and where its workers are. |
-| `ssh NAME --worker N -L PORT` | Open a worker shell with an optional local port forward. |
-| `ssh-config NAME` | Write `~/.ssh/config` entries: `NAME` for worker 0, `NAME-worker-N` for the others. `delete` removes them. |
-| `attach-disk NAME DISK` | Attach a persistent disk to an existing TPU and mount it at `/mnt/persist` on every worker. |
-| `start NAME` / `stop NAME` | Change a TPU's running state without deleting its name and disks. |
-| `reset NAME` | Kill whatever holds the accelerators on every worker. |
-| `delete NAME` | Delete a TPU, and the queued resource that holds it. |
-| `spawn BASE N -- CMD` | Create, set up and launch on N independent TPUs. Each adds cost. |
+`dew tpu --help` lists every command with its purpose, and `dew tpu COMMAND --help` lists a command's flags with the `tpu.toml` values each falls back to.
 
 Read each command's `--help` before passing an option that deletes or kills something.
 
