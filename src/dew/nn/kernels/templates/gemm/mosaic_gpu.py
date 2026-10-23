@@ -451,9 +451,9 @@ def _finish_half(acc, epilogue, sides: tuple, outs: tuple, place: tuple, wg) -> 
 
 
 _STAGED_COLUMNS = 128
-"""The most columns a consumer stages its output in at a time: a row-split part's 256 columns written to shared
-memory as one 512-byte row conflicted on its banks 280 times as often as two 256-byte halves (ncu, Qwen3's
-down projection: 18.3M conflicts against 64.6K, its forward 11% slower than the column split's)."""
+"""The most columns a consumer stages its output in at a time: a row-split part's 256 columns written to
+shared memory as one 512-byte row conflicted on its banks 280 times as often as two 256-byte halves (ncu,
+Qwen3's down projection: 18.3M conflicts against 64.6K, its forward 11% slower than the column split's)."""
 
 
 _IN_FLIGHT = 1
