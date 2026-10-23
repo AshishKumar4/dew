@@ -41,7 +41,7 @@ class Unlocked(Exception):
 def _builds():
     """dew.builds, this checkout's own, loaded by its path: Dew's
     package imports JAX, which no environment holds yet."""
-    path = Path(__file__).resolve().parents[1] / "src" / "dew" / "telemetry" / "builds.py"
+    path = Path(__file__).resolve().parents[1] / "src" / "dew" / "builds.py"
     spec = importlib.util.spec_from_file_location("dew_builds", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

@@ -6,7 +6,9 @@ Rebuilding one imports the module and calls the class with its fields, each
 converted to the type its annotation declares, so a record loads in a process
 that imported nothing beforehand, and a class outside Dew needs nothing to be
 recorded: its import path is its name. A record Dew writes carries the path,
-so rebuilding it never depends on an alias.
+so rebuilding it never depends on an alias, with one exception: a run's own
+record names its run class by its alias in `runs`, so a saved run reads back
+wherever its class moves, and only that kind is consulted for it.
 
 Where a person writes a record, in a config file or on the command line, the
 class may be a short alias instead, `{"class": "simple_dit"}`. Each kind's
@@ -115,13 +117,6 @@ def import_path(member: Importable) -> str:
     return f"{module}:{name}"
 
 
-def recorded_name(member: type) -> str:
-    """The name a record writes for the class `member`: its alias, where a kind (`KINDS`) holds it, so
-    the record reads back wherever the class moves; else its import path (`import_path`)."""
-    path = import_path(member)
-    return next((alias for kind in KINDS for alias, held in kind.paths.items() if held == path), path)
-
-
 def imported(path: str) -> Callable[..., Configured]:
     """The class or function an import path names, importing its module.
 
@@ -228,6 +223,11 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
         """The alias of the class at import `path`, or its class name where
         it has none, for a run's human-readable name."""
         return next((alias for alias, held in self.paths.items() if held == path), path.rpartition(":")[2])
+
+    def name_of(self, member: Importable) -> str:
+        """The name a record writes for `member`: its alias in this kind, else its import path."""
+        path = import_path(member)
+        return next((alias for alias, held in self.paths.items() if held == path), path)
 
     def alias_of(self, member: Importable) -> str:
         """The alias of `member`, for a run's human-readable name; KeyError
@@ -398,9 +398,8 @@ def to_record(value, annotation) -> JSON:
 
     The record is JSON: a dict, a list, or a scalar json.dump can write. A
     dataclass is the record of its fields where `annotation` names its class
-    exactly, and `{"class": <its name>, "fields": {...}}` where the field
-    declares a base, a union or nothing, so the reader knows what to build,
-    the name its alias or its import path (`recorded_name`);
+    exactly, and `{"class": <import path>, "fields": {...}}` where the field
+    declares a base, a union or nothing, so the reader knows what to build;
     a function is `{"function": <import path>}`. A Flax module held twice in
     one record, as `nn.Sequential([dense, dense])` holds its one shared layer,
     is written once as a class record with `"share": <n>`, and each later
@@ -426,7 +425,7 @@ def to_record(value, annotation) -> JSON:
                 return _referred(written, id(value))
             fields = record_fields(value, type(value))
             record = (fields if type(value) is _unwrapped(annotation)
-                      else {"class": recorded_name(type(value)), "fields": fields})
+                      else {"class": import_path(type(value)), "fields": fields})
             if isinstance(value, nn.Module):
                 written.modules[id(value)] = (value, record)
             return record
@@ -453,7 +452,7 @@ def to_record(value, annotation) -> JSON:
         # A plain class of Dew's or a trusted package's, rebuilt from its
         # constructor's parameters as `_built` builds one; it declares no
         # fields, so its record always names it.
-        return {"class": recorded_name(type(value)), "fields": _constructed(value)}
+        return {"class": import_path(type(value)), "fields": _constructed(value)}
     raise TypeError(
         f"{type(value).__name__} is not something a run record can carry; a "
         f"config field holds JSON scalars, sequences, mappings, dataclasses and "
@@ -1348,7 +1347,8 @@ schedules: Aliases[type[ScheduleBase], ScheduleBase] = Aliases("schedule", {
 }, base="dew.optim:ScheduleBase")
 
 
-# A run config's own class sits above the registry, so the table's type names none.
+# A run config's own class sits above the registry, so the table's type names none. A run record
+# names its class by this table's alias (`RunConfig.record`), apart from every other kind.
 runs: Aliases[Callable[..., Any], Any] = Aliases("run", {
     "decision": "dew.decision.config:DecisionRunConfig",
     "diffusion": "dew.config.diffusion:DiffusionRunConfig",
@@ -1358,7 +1358,7 @@ runs: Aliases[Callable[..., Any], Any] = Aliases("run", {
 
 
 KINDS: tuple[Aliases, ...] = (models, presets, solvers, encoders, metrics, objectives, mixers, towers,
-                              projectors, schedules, runs)
+                              projectors, schedules)
 """Every kind, which a record's alias is looked up across."""
 
 __all__ = [
@@ -1380,7 +1380,6 @@ __all__ = [
     "presets",
     "projectors",
     "record_fields",
-    "recorded_name",
     "runs",
     "schedules",
     "solvers",

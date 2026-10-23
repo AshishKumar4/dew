@@ -28,7 +28,7 @@ from dew.inputs import AudioCondition, Field, InputSpec, TextCondition
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
 from dew.nn.protocols import IntervalModel, TimeScaled
-from dew.objectives.base import Variables, merge
+from dew.objectives.base import TEACHER, Variables, merge
 from dew.objectives.diffusion.alignment import Alignment
 from dew.objectives.diffusion.end_to_end import AUTOENCODER
 from dew.objectives.diffusion.few_step import SMOOTH_TIME_SCALE, MeanFlowObjective
@@ -349,22 +349,26 @@ class DiffusionRunConfig(RunConfig):
         return objective
 
     def _teacher(self, variables: Variables | None) -> dict[str, object]:
-        """The teacher a distillation reads from `teacher_run`: the tree its run published, and for
-        guidance distillation the teacher's objective rebuilt from the run's record over the tree the
-        student holds frozen (`teacher_weights`), the starting tree's `TEACHER` where it holds one."""
+        """The teacher a distillation reads from `teacher_run`: the tree its run published, unless the
+        starting tree holds the teacher (`TEACHER`), and for guidance distillation the teacher's
+        objective rebuilt from the run's record over the tree the student holds frozen
+        (`teacher_weights`)."""
         if self.teacher_run is None:
             return {}
         kind = objectives[self.objective.name]
         if not issubclass(kind, FlowDistillationObjective | GuidanceDistillationObjective):
             raise ValueError(f"teacher_run names a distillation's teacher, and {self.objective.name} "
                              f"distills none")
-        with Checkpoints(self.teacher_run) as checkpoints:
-            published = checkpoints.variables(ema=None, step=None, mesh=None, layout=None, param_dtype=None)
-        if not issubclass(kind, GuidanceDistillationObjective):
-            return {"teacher_variables": published}
-        held = teacher_weights(variables, published, whole=True)
-        return {"teacher": DiffusionRunConfig.load(self.teacher_run).build(variables=held),
-                "teacher_variables": published}
+        given: dict[str, object] = {}
+        if variables is None or TEACHER not in variables:
+            # A resumed student holds its teacher, so only a fresh one reads the teacher's run.
+            with Checkpoints(self.teacher_run) as checkpoints:
+                given["teacher_variables"] = checkpoints.variables(ema=None, step=None, mesh=None,
+                                                                   layout=None, param_dtype=None)
+        if issubclass(kind, GuidanceDistillationObjective):
+            held = teacher_weights(variables, given.get("teacher_variables"), whole=True)
+            given["teacher"] = DiffusionRunConfig.load(self.teacher_run).build(variables=held)
+        return given
 
     def prepare(self) -> Prepared:
         """The objective `build` makes, with the run's Hub sources pinned
