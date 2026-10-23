@@ -551,25 +551,61 @@ def _status(ratio: float, low: float, high: float, *, contained: bool = True) ->
     return "inconclusive"
 
 
+ZeroRows = tuple[np.ndarray, np.ndarray, np.ndarray]
+"""One seed's rows of float64 zero of a leaf that check 1 judges by the reference's error on them
+(`_paired`): their indices, Dew's RMS errors on them and the reference's."""
+
+NO_ZERO_ROWS: ZeroRows = (np.zeros(0, np.int64), np.zeros(0), np.zeros(0))
+
+
 @dataclasses.dataclass
 class _Draws:
     """Each leaf's errors over a run of seeds: Dew's and the reference's mean squared error from
     float64 (seed by leaf), each seed's worst sized row over its size (Dew's, the reference's), each
-    seed's count of rows of float64 zero where Dew is further from it than ROW_FACTOR times the
-    reference, whether every value of the leaf was finite on every seed, and each leaf's row width (its
-    last axis's length, 0 for a leaf of no rows; NARROW_FACTORS)."""
+    seed's rows of float64 zero with Dew's and the reference's errors on them (`ZeroRows`, seed by leaf;
+    `pooled_zero_rows`), whether every value of the leaf was finite on every seed, and each leaf's row
+    width (its last axis's length, 0 for a leaf of no rows; NARROW_FACTORS)."""
     names: list[str]
     mine: np.ndarray
     theirs: np.ndarray
     worst: np.ndarray
-    zero_rows: np.ndarray
+    zero_rows: list[list[ZeroRows]]
     finite: np.ndarray
     widths: tuple[int, ...]
 
     def joined(self, other: "_Draws") -> "_Draws":
         return _Draws(self.names, *(np.concatenate([getattr(self, field), getattr(other, field)])
-                                    for field in ("mine", "theirs", "worst", "zero_rows", "finite")),
+                                    for field in ("mine", "theirs", "worst")),
+                      self.zero_rows + other.zero_rows, np.concatenate([self.finite, other.finite]),
                       self.widths)
+
+
+def pooled_zero_rows(evidence: list[ZeroRows]) -> list[tuple[int, float, float]]:
+    """The rows of float64 zero Dew is further from than ROW_FACTOR times the reference over a run's
+    seeds, as (row, Dew's RMS error, the reference's): each row's squared errors summed over the seeds
+    it is zero on, Dew's within ROW_FACTOR² of the reference's. A row of float64 zero is all residue,
+    float32's rounding of a sum float64 cancels, with no size to judge it at, so it is held to the
+    reference's residue on the same row; one seed's residues are heavy-tailed, and their ratio, a
+    ratio of two, failed equally exact pairs seed by seed where the pooled one does not, while one
+    row held ten times further still fails. Where the reference is exactly the float64 zero on a row
+    over every seed, Dew must be too.
+
+    Calibrated on attention's packed bias gradients, whose key rows are zero (`python
+    tools/gate_null_runs.py attention-key-bias --paired --seeds K --runs N --chunk C`, and `--fault
+    zero-row-10x`): 0 of 15,000 runs failed at 8 seeds (a red rate at most 4.6e-4 at 99.9%) and 0 of
+    3,000 at 40 (at most 2.3e-3), and the 10x row failed every run at both. Judged seed by seed, the
+    same pairs failed on 6.6% of runs of 8 seeds and 42% of 64."""
+    mine: dict[int, float] = {}
+    theirs: dict[int, float] = {}
+    seen: dict[int, int] = {}
+    for rows, my_errors, their_errors in evidence:
+        for row, my_error, their_error in zip(rows.tolist(), my_errors.tolist(), their_errors.tolist(),
+                                              strict=True):
+            mine[row] = mine.get(row, 0.0) + my_error ** 2
+            theirs[row] = theirs.get(row, 0.0) + their_error ** 2
+            seen[row] = seen.get(row, 0) + 1
+    return [(row, float(np.sqrt(mine[row] / seen[row])), float(np.sqrt(theirs[row] / seen[row])))
+            for row in sorted(mine) if not mine[row] <= ROW_FACTOR ** 2 * theirs[row]]
 
 
 SKETCH = 32
@@ -710,7 +746,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         zero_rows.append([entry[4] for entry in row])
         finite.append([entry[5] for entry in row])
     return _Draws(names, np.asarray(mine), np.asarray(theirs), np.asarray(worst).reshape(len(mine), -1, 2),
-                  np.asarray(zero_rows), np.asarray(finite), widths)
+                  zero_rows, np.asarray(finite), widths)
 
 
 def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
@@ -729,7 +765,7 @@ def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
             held = (np.shape(true) if recorded else np.shape(their_leaf), their.dtype)
             assert kept == held, (jax.tree_util.keystr(path), kept, held)
             assert np.shape(true) == np.shape(leaf), (jax.tree_util.keystr(path), np.shape(true))
-            row.append((0.0, 0.0, 0.0, 0.0, 0, True))
+            row.append((0.0, 0.0, 0.0, 0.0, NO_ZERO_ROWS, True))
             continue
         # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
         paired = (recorded or their_truth is truth
@@ -740,9 +776,9 @@ def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
 
 def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool = True) -> tuple:
     """One seed's evidence of a leaf for check 1 (`_Draws`), Dew's and the reference's alike from
-    `leaf_summary`: their mean squared errors, their worst sized rows, how many rows of float64 zero Dew
-    is further from than ROW_FACTOR times the reference is on that same row (`rows_over`'s rule for
-    them), and whether every value was finite. A row the truth sizes zero (below RESOLUTION of its leaf)
+    `leaf_summary`: their mean squared errors, their worst sized rows, the rows of float64 zero with
+    both arms' errors on them (`ZeroRows`, pooled over the run's seeds by `pooled_zero_rows`), and
+    whether every value was finite. A row the truth sizes zero (below RESOLUTION of its leaf)
     is one of float64 zero unless a live reference measures it: its error there below the row's own
     float64 RMS, so it carries the row better than zero would. That is an engineering definition of a
     measured row, not a proof of float64's accuracy on it; a sum that cancels to float64's residue is
@@ -755,7 +791,7 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     in Dew's truth the reference's lacks (a recorded truth recomputed otherwise) is refused. Not
     `paired`, the two held to truths of their own draws (`null_runs`), no row is paired."""
     if not paired:
-        return mine.mse, theirs.mse, mine.worst, theirs.worst, 0, mine.finite and theirs.finite
+        return mine.mse, theirs.mse, mine.worst, theirs.worst, NO_ZERO_ROWS, mine.finite and theirs.finite
     at_zero = dict(zip(theirs.zero_rows.tolist(), theirs.zero_errors.tolist(), strict=True))
     unrecorded = [at for at in mine.zero_rows.tolist() if at not in at_zero]
     if unrecorded:
@@ -763,14 +799,17 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
                              f"{unrecorded[:4]}")
     sizes = (dict(zip(theirs.zero_rows.tolist(), theirs.zero_sizes.tolist(), strict=True))
              if theirs.zero_sizes is not None else {})
-    worst, their_worst, zero = mine.worst, theirs.worst, 0
+    worst, their_worst, zero = mine.worst, theirs.worst, []
     for at, error in zip(mine.zero_rows.tolist(), mine.zero_errors.tolist(), strict=True):
         size = sizes.get(at, 0.0)
         if at_zero[at] < size:
             worst, their_worst = max(worst, error / size), max(their_worst, at_zero[at] / size)
-        elif not error <= ROW_FACTOR * at_zero[at]:
-            zero += 1
-    return mine.mse, theirs.mse, worst, their_worst, zero, mine.finite and theirs.finite
+        else:
+            zero.append((at, error, at_zero[at]))
+    rows, errors, their_errors = (np.asarray(column, dtype) for column, dtype in zip(
+        zip(*zero, strict=True) if zero else ((), (), ()), (np.int64, np.float64, np.float64), strict=True))
+    return (mine.mse, theirs.mse, worst, their_worst, (rows, errors, their_errors),
+            mine.finite and theirs.finite)
 
 
 def _judged(draws: _Draws, index: int, tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL)
@@ -812,9 +851,12 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
             over.append(f"{leaf}: the worst row over {count} seeds is {my_row:.3e} from float64 over its "
                         f"size, the reference's {their_row:.3e}, allowed {factor * their_row:.3e} ({factor} "
                         f"times it)")
-        if draws.zero_rows[:, index].any():
-            over.append(f"{leaf}: {int(draws.zero_rows[:, index].sum())} rows of float64 zero over {count} "
-                        f"seeds are further from it than ROW_FACTOR times the reference's own")
+        zero = pooled_zero_rows([seed[index] for seed in draws.zero_rows])
+        if zero:
+            at, my_error, their_error = zero[0]
+            over.append(f"{leaf}: {len(zero)} rows of float64 zero are further from it over {count} seeds "
+                        f"than ROW_FACTOR times the reference's own, row {at} by {my_error:.3e} against "
+                        f"{their_error:.3e} (`pooled_zero_rows`)")
     return over, unresolved
 
 
@@ -996,24 +1038,50 @@ def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth
         raise Inconclusive(found) if unresolved else AssertionError(found)
 
 
+SIZING_FROM = 1 << 20
+"""The first seed a paired sizing draws (`seeds_for` with `dew_fn`): past every site's verdict seeds
+and below every null run's (tools/gate_null_runs.py, from 2^16 runs of at least 80 seeds on), so the
+count a site declares is fixed by draws its verdict never sees."""
+
+
 def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = 512,
-              truth_fn=None) -> int:
-    """The seeds a site declares: the fewest, doubling from `start`, for which the reference compared
-    with itself (its errors on two disjoint seed sets, `_interval`'s control) resolves PARITY in every
-    leaf: the pooled ratio's interval no wider than PARITY. Fails past `most`, where the
-    site needs larger inputs or fewer shared factors, not more seeds."""
+              truth_fn=None, dew_fn=None) -> int:
+    """The seeds a site declares: the fewest, doubling from `start`, for which the pooled ratio's
+    interval is no wider than PARITY in every leaf. Of the reference compared with itself, its errors on
+    two disjoint seed sets resampled apart (`_interval`'s control), by default; with `dew_fn`, paired:
+    Dew's errors against the reference's on the same draws, the two resampled by the same seeds as the
+    verdict resamples them (`_interval`), on draws from SIZING_FROM on that no verdict takes. A pair
+    that shares its upstream rounding, the same inputs through the same upstream arithmetic, has errors
+    whose sizes vary across draws together: their ratio resolves where each alone, heavy-tailed across
+    draws, does not, and the verdict judges that same paired ratio. The width asked of it is PARITY
+    either way. Paired sizing holds out its draws only where `draw` keys an independent stream by the
+    whole seed: a draw that enumerates finitely or by a modulus (`(arange(n) + seed) % vocab`) repeats a
+    verdict's inputs at SIZING_FROM and needs a pilot stream of its own first, and a recorded reference
+    (`indexed_recording`), which holds its recorded seeds alone, is refused: its site keeps its
+    recorded count. Fails past `most`, where the site needs larger inputs or fewer shared factors, not
+    more seeds."""
+    if dew_fn is not None and getattr(reference_fn, "recorded", False):
+        raise ValueError(f"{label}: a recorded reference holds its recorded seeds alone, never a paired "
+                         f"sizing's from SIZING_FROM; its site keeps its recorded count")
     count = max(start, FEWEST_SEEDS)
     while count <= most:
-        first = _drawn(reference_fn, reference_fn, draw, range(count), truth_fn)
-        second = _drawn(reference_fn, reference_fn, draw, range(count, 2 * count), truth_fn)
-        wide = [name for index, name in enumerate(first.names)
-                if np.sum(first.theirs[:, index]) > 0 and np.sum(second.theirs[:, index]) > 0
-                and not _resolves(*_interval(first.theirs[:, index], control=second.theirs[:, index]))]
+        if dew_fn is None:
+            first = _drawn(reference_fn, reference_fn, draw, range(count), truth_fn)
+            second = _drawn(reference_fn, reference_fn, draw, range(count, 2 * count), truth_fn)
+            wide = [name for index, name in enumerate(first.names)
+                    if np.sum(first.theirs[:, index]) > 0 and np.sum(second.theirs[:, index]) > 0
+                    and not _resolves(*_interval(first.theirs[:, index], control=second.theirs[:, index]))]
+        else:
+            paired = _drawn(dew_fn, reference_fn, draw, range(SIZING_FROM, SIZING_FROM + count), truth_fn)
+            wide = [name for index, name in enumerate(paired.names)
+                    if np.sum(paired.theirs[:, index]) > 0
+                    and not _resolves(*_interval(paired.mine[:, index], paired.theirs[:, index]))]
         if not wide:
             return count
         count *= 2
-    raise AssertionError(f"{label}: the reference compared with itself does not resolve {PARITY} within "
-                         f"{most} seeds at {wide[:4]}; give the site larger inputs or fewer shared factors")
+    compared = "the reference compared with itself" if dew_fn is None else "Dew paired with the reference"
+    raise AssertionError(f"{label}: {compared} does not resolve {PARITY} within {most} seeds at {wide[:4]}; "
+                         f"give the site larger inputs or fewer shared factors")
 
 
 def recording(path) -> dict[str, np.ndarray]:
