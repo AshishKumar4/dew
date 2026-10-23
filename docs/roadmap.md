@@ -6,7 +6,7 @@ Correctness, contract gaps and duplicated paths come first. After those close, m
 
 ## Models and interop
 
-- Add gated cross-attention from a conditioning sequence into any pretrained decoder's blocks, zero-initialized so the model starts as the pretrained function, trained as an adapter, with the conditioning's keys and values cached in serving. `dew.decision` uses it to condition on a supplied sequence, such as the expected output schema. [1373, 1374]
+- Add gated cross-attention from a conditioning sequence into any pretrained decoder's blocks, zero-initialized so the model starts as the pretrained function, trained as an adapter, with the conditioning's keys and values cached in serving. [1373]
 - Pass dense MLA visibility descriptors to the shared attention core. [41]
 - Bind native Flax forward methods explicitly, including the objective's choice of forward method. [171]
 - Carry FlaxDiff's remaining capabilities, or record dropping them: the continuous and tangent cosine schedules and the exponential schedule's test, SimpleAutoEncoder, the learned-variance head and the old UViT and wrapper, the W&B sweep promotion and run loading, the older checkpoints. [864–867]
