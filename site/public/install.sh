@@ -27,6 +27,25 @@ package_index=https://pypi.dewml.dev/simple
 pip_least='pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70'
 cuda_builds='cuda13:580:7.5 cuda12:525:5.2'
 # END install facts
+# BEGIN uv bootstrap (site/scripts/gen_install.py)
+uv_least=0.13.4
+# uv at uv_least or newer (pyproject.toml's [tool.uv] required-version). bootstrap_uv [NAME=VALUE...]
+# installs that release from astral's installer, NAME=VALUE in the installer's environment, where uv is
+# missing or older; uv_older VERSION says whether VERSION is older.
+uv_older() {
+	awk -v have="$1" -v least="$uv_least" 'BEGIN {
+		split(have, h, "."); split(least, l, ".")
+		for (i = 1; i <= 3; i++) if (h[i] + 0 != l[i] + 0) exit !(h[i] + 0 < l[i] + 0)
+		exit 1
+	}'
+}
+bootstrap_uv() {
+	have=$(uv --version 2>/dev/null | awk '{print $2}')
+	if [ -z "$have" ] || uv_older "$have"; then
+		curl -LsSf "https://astral.sh/uv/$uv_least/install.sh" | env "$@" sh
+	fi
+}
+# END uv bootstrap
 
 if [ -t 1 ]; then
 	bold=$(printf '\033[1m') dim=$(printf '\033[2m') green=$(printf '\033[32m')
@@ -128,8 +147,11 @@ fi
 printf '%sDew installer%s\n' "$bold" "$plain"
 printf '  hardware  %s\n' "$hardware"
 printf '  python    %s\n' "${found:-no environment active}"
-if [ -z "$use_pip" ] && ! command -v uv >/dev/null 2>&1; then
-	printf '  uv        not installed; it will be, from astral.sh, unless you run this with --pip\n'
+if [ -z "$use_pip" ]; then
+	have=$(uv --version 2>/dev/null | awk '{print $2}')
+	if [ -z "$have" ]; then printf '  uv        not installed; uv %s will be, from astral.sh, unless you run this with --pip\n' "$uv_least"
+	elif uv_older "$have"; then printf '  uv        %s, older than %s, which will be installed from astral.sh, unless you run this with --pip\n' "$have" "$uv_least"
+	fi
 fi
 printf '\n'
 
@@ -152,14 +174,18 @@ if [ -z "$target" ] && [ -z "$conda_name" ]; then
 	esac
 fi
 
-# uv, from its own installer.
-if [ -z "$use_pip" ] && ! command -v uv >/dev/null 2>&1; then
-	curl -LsSf https://astral.sh/uv/install.sh | sh ||
-		die "uv's installer failed; install uv from https://docs.astral.sh/uv, or rerun with --pip"
-	# Where uv's installer puts it (https://docs.astral.sh/uv/reference/storage/#executable-directory).
-	bin=${UV_INSTALL_DIR:-${UV_UNMANAGED_INSTALL:-${XDG_BIN_HOME:-${XDG_DATA_HOME:+$XDG_DATA_HOME/../bin}}}}
-	PATH="${bin:-$HOME/.local/bin}:${bin:+$bin/bin:}$PATH"
-	command -v uv >/dev/null 2>&1 || die "uv is installed but not on PATH; open a new shell and rerun"
+# uv, from its own installer, where it is missing or older than uv_least.
+if [ -z "$use_pip" ]; then
+	bootstrap_uv || die "uv's installer failed; install uv $uv_least or newer from https://docs.astral.sh/uv, or rerun with --pip"
+	have=$(uv --version 2>/dev/null | awk '{print $2}')
+	if [ -z "$have" ] || uv_older "$have"; then
+		# Where uv's installer put it (https://docs.astral.sh/uv/reference/storage/#executable-directory).
+		bin=${UV_INSTALL_DIR:-${UV_UNMANAGED_INSTALL:-${XDG_BIN_HOME:-${XDG_DATA_HOME:+$XDG_DATA_HOME/../bin}}}}
+		PATH="${bin:-$HOME/.local/bin}:${bin:+$bin/bin:}$PATH"
+		have=$(uv --version 2>/dev/null | awk '{print $2}')
+	fi
+	[ -n "$have" ] || die "uv is installed but not on PATH; open a new shell and rerun"
+	! uv_older "$have" || die "uv $have, older than $uv_least, comes first on PATH; remove it or update it with uv self update"
 fi
 
 # The environment's Python, made if it does not exist yet.

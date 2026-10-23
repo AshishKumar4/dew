@@ -77,13 +77,27 @@ if [ "$(cat $override 2>/dev/null)" != "$wanted" ]; then
 fi
 
 step "uv"
-if ! command -v uv >/dev/null && [ ! -x "$HOME/.local/bin/uv" ]; then
-  installer=$(mktemp)
-  curl -fsSL -o "$installer" https://astral.sh/uv/install.sh
-  sh "$installer"
-  rm -f "$installer"
-fi
+# BEGIN uv bootstrap (site/scripts/gen_install.py)
+uv_least=0.13.4
+# uv at uv_least or newer (pyproject.toml's [tool.uv] required-version). bootstrap_uv [NAME=VALUE...]
+# installs that release from astral's installer, NAME=VALUE in the installer's environment, where uv is
+# missing or older; uv_older VERSION says whether VERSION is older.
+uv_older() {
+	awk -v have="$1" -v least="$uv_least" 'BEGIN {
+		split(have, h, "."); split(least, l, ".")
+		for (i = 1; i <= 3; i++) if (h[i] + 0 != l[i] + 0) exit !(h[i] + 0 < l[i] + 0)
+		exit 1
+	}'
+}
+bootstrap_uv() {
+	have=$(uv --version 2>/dev/null | awk '{print $2}')
+	if [ -z "$have" ] || uv_older "$have"; then
+		curl -LsSf "https://astral.sh/uv/$uv_least/install.sh" | env "$@" sh
+	fi
+}
+# END uv bootstrap
 export PATH="$HOME/.local/bin:$PATH"
+bootstrap_uv
 
 step "python $PYTHON_VERSION"
 have=$("$VENV/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)
