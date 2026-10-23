@@ -293,8 +293,9 @@ def conditional_mmdit():
     return objective, variables, batch, step
 
 
-NULL_DROPOUT_SEEDS = {0.5: 16, 1.0: 16}
-"""Check 1's declared seeds for the dropped route at each dropout probability."""
+NULL_DROPOUT_SEEDS = {0.5: 8, 1.0: 8}
+"""Check 1's declared seeds for the dropped route at each dropout probability, sized paired
+(`seeds_for` with the dropped route as `dew_fn`, 2026-10-23 on armada): 8 at each."""
 
 NULL_DROPOUT_ROWS = 32
 """The rows of each null-dropout draw: each weight's gradient sums over all of them."""
