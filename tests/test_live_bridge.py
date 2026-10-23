@@ -40,6 +40,8 @@ class Kernels:
         self.entered = {phase: asyncio.Event() for phase in ("create", "preload")}
         self.release = {phase: asyncio.Event() for phase in ("create", "preload")}
         self.live, self.interrupts, self.created = set(), {}, 0
+        # The code of every cell a kernel ran, its client's loading aside.
+        self.ran: list[str] = []
 
     async def phase(self, name):
         if name in self.held:
@@ -80,6 +82,8 @@ class Kernels:
             status = "ok"
             if code.startswith(("import model_client", "import live_training")):
                 await self.phase("preload")
+            else:
+                self.ran.append(code)
             elif code.startswith("panel "):
                 transient = {"display_id": "panel"}
                 await reply("display_data", {"data": {"text/plain": "frame 0"}, "transient": transient})
@@ -323,6 +327,40 @@ def test_a_session_closed_while_its_first_context_starts_leaves_no_kernel(bridge
             assert await asyncio.to_thread(rpc, port, f"{session}/close") == 200
             await settled(kernels)
             assert kernels.live == set()
+        finally:
+            server.close()
+            await runner.cleanup()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("kind", ["python3", "train"])
+def test_a_cell_stopped_while_its_context_starts_never_runs(bridge, monkeypatch, kind):
+    """The page's Stop of a cell, a training one too, while its context loads its client: the cell ends
+    aborted once the context is up, its code never sent to the kernel, and the next cell runs as usual."""
+    monkeypatch.setattr(bridge, "available", lambda: 1 << 40)
+
+    async def scenario():
+        kernels = Kernels()
+        _, server, runner, port = await serving(bridge, kernels)
+        try:
+            socket = await page(port, str(uuid.uuid4()))
+            await socket.send(json.dumps({"op": "execute", "id": "first", "cell": "a", "code": "print(1)"}))
+            await answer(socket, "first")
+            kernels.held.add("preload")
+            await socket.send(json.dumps({"op": "execute", "id": "stopped", "cell": "b", "code": "print(2)",
+                                          **({"kernel": "train"} if kind == "train" else {})}))
+            await asyncio.wait_for(kernels.entered["preload"].wait(), 30)
+            await socket.send(json.dumps({"op": "interrupt", "cell": "b"}))
+            await asyncio.sleep(0.5)
+            kernels.held.clear()
+            kernels.release["preload"].set()
+            assert (await answer(socket, "stopped"))[-1]["status"] == "aborted"
+            assert "print(2)" not in kernels.ran
+            await socket.send(json.dumps({"op": "execute", "id": "next", "cell": "b", "code": "print(3)"}))
+            assert (await answer(socket, "next"))[-1]["status"] == "ok"
+            await socket.close()
+            await settled(kernels)
         finally:
             server.close()
             await runner.cleanup()
