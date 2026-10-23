@@ -115,6 +115,30 @@ def widened(tree):
         leaf, np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype), tree)
 
 
+WITHOUT_YNN = {"xla_cpu_experimental_ynn_fusion_type": ""}
+"""XLA:CPU's compiler options with every YNNPACK fusion off (dots, reductions, element-wise and layout
+ops alike), so that a program runs on XLA's own code, compiled for the host's instruction set with no
+dispatch at run time. YNNPACK picks its microkernels at run time by that instruction set, and both
+the interpreted SSD kernel and XLA's scan fuse parts of themselves to it by default, which moved
+check 1 between the two across PARITY by host; without the fusions the verdicts held on two hosts
+of different instruction sets, though the bits still part with the host (docs/performance.md, "The
+SSD kernel's host check 1 without YNNPACK"). The empty list, not the documented `-individual_dot`,
+because compiler options take no such spelling and that one leaves a scan's reductions fused."""
+
+
+def without_ynn(fn, **jit_options):
+    """`fn` jitted with WITHOUT_YNN on the CPU lane, the process's default backend
+    (`jax.default_backend()`), and plain `jax.jit` elsewhere. It compiles both arms of a check 1
+    between two Dew paths, such as an interpreted kernel and the XLA program it replaces, the latter
+    the arm the check measures against, so that the two run the same kind of code on any host. A
+    program Dew's users run compiles with the fusions, as they do. Call it at top level, since on the
+    CPU lane its compiler options refuse to be nested in another jit or differentiated through. A
+    caller's own compiler options take precedence over WITHOUT_YNN's."""
+    if jax.default_backend() == "cpu":
+        jit_options["compiler_options"] = {**WITHOUT_YNN, **(jit_options.get("compiler_options") or {})}
+    return jax.jit(fn, **jit_options)
+
+
 def with_gradients(fn):
     """`fn` as `run(*inputs, cotangent)`, which returns `fn(*inputs)` and the gradients of its inputs
     under the cotangent passed last: a differentiated call's leaves, as the gate compares them."""
@@ -131,12 +155,14 @@ def torch_with_gradients(fn):
     floating input enters as a tensor of its own dtype that requires a gradient, and the cotangent
     (an array, or a tuple or dict of them matching the output) is cast to its output's dtype, as
     `jax.vjp` casts it. A module's parameters are inputs too, called through
-    `torch.func.functional_call`. An input the output does not reach has a zero gradient."""
+    `torch.func.functional_call`. An input the output does not reach has a zero gradient, and a
+    bfloat16 output comes back as the float32 array that holds it."""
     def run(*arguments):
         import torch
 
         def tensor(value):
-            value = torch.from_numpy(np.ascontiguousarray(value))
+            # A copy, contiguous and of the array's own shape: `ascontiguousarray` lifts a 0-d array to 1-d.
+            value = torch.as_tensor(np.array(value))
             return value.requires_grad_() if value.is_floating_point() else value
 
         inputs = jax.tree.map(tensor, arguments[:-1])
@@ -146,13 +172,18 @@ def torch_with_gradients(fn):
             raise ValueError(f"{len(cotangents)} cotangents for {len(leaves)} outputs")
         wanted = [leaf for leaf in jax.tree.leaves(inputs) if leaf.requires_grad]
         pulled = torch.autograd.grad(
-            leaves, wanted, grad_outputs=[torch.from_numpy(np.ascontiguousarray(c)).to(leaf.dtype)
+            leaves, wanted, grad_outputs=[torch.as_tensor(np.array(c)).to(leaf.dtype)
                                           for leaf, c in zip(leaves, cotangents, strict=True)],
             allow_unused=True)
-        gradients = iter(torch.zeros_like(leaf).numpy() if grad is None else grad.detach().numpy()
+        def array(value):
+            # NumPy holds no bfloat16, and float32 holds its every value exactly.
+            value = value.detach()
+            return (value.float() if value.dtype == torch.bfloat16 else value).numpy()
+
+        gradients = iter(torch.zeros_like(leaf).numpy() if grad is None else array(grad)
                          for leaf, grad in zip(wanted, pulled, strict=True))
         found = jax.tree.map(lambda leaf: next(gradients) if leaf.requires_grad else None, inputs)
-        return jax.tree.map(lambda leaf: leaf.detach().numpy(), out), *found
+        return jax.tree.map(array, out), *found
 
     return run
 
