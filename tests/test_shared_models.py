@@ -15,8 +15,19 @@ def service():
         yield module
 
 
+SERVED_SEEDS = 16
+"""Check 1's declared seeds for the served images against the pipeline's own call (to size)."""
+
+
 def test_image_transport_keeps_native_pixels_and_preparation_keys(service, tmp_path):
+    """The service samples what the pipeline's own call samples for the request's preparation and
+    sampling keys, on par with it over drawn keys from the same call in float64 (check 1): its
+    progress callback is another program, so its last bits are its own. It reports each step and
+    the decode, and hands back one image."""
+    import jax
+    import jax.numpy as jnp
     import numpy as np
+    from reference_error import assert_as_exact
     from test_inference import make_run
 
     from dew.sampling import CFG, Heun, TextToImage
@@ -25,20 +36,39 @@ def test_image_transport_keeps_native_pixels_and_preparation_keys(service, tmp_p
     client = load("model_client", "site/live/container")
     make_run(tmp_path)
     pipe = TextToImage.from_run(str(tmp_path))
+    with jax.enable_x64(new_val=True):
+        wide = TextToImage.from_run(str(tmp_path), dtype=jnp.float64, param_dtype=jnp.float64)
     native = service.NativeModels.__new__(service.NativeModels)
     native.np, native.progress, native.cfg = np, progress, CFG
     native.repo, native.revision = "model", "pinned"
     native.pipe = progress.Reporting(pipe)
     native.solvers = {"Heun": Heun}
-    request = {"repo": "model", "revision": "pinned", "prompt": "a lake", "negative": "",
-               "prepare_key": 3, "prepare_steps": 4, "key": 5, "steps": 4,
-               "solver": {"name": "Heun", "args": {}},
-               "guidance": {"scale": 2, "interval": [0, 1], "rescale": 0}}
-    prepared = pipe.prepare(["a lake"], key=3, steps=4, unconditional="")
-    expected = pipe(prepared, key=5, steps=4, solver=Heun(), guidance=CFG(2)).host().images
+
+    def request(prepare_key, key):
+        return {"repo": "model", "revision": "pinned", "prompt": "a lake", "negative": "",
+                "prepare_key": prepare_key, "prepare_steps": 4, "key": key, "steps": 4,
+                "solver": {"name": "Heun", "args": {}},
+                "guidance": {"scale": 2, "interval": [0, 1], "rescale": 0}}
+
+    def draw(seed):
+        return 3 + 2 * seed, 5 + 2 * seed
+
+    def called(pipe, prepare_key, key):
+        prepared = pipe.prepare(["a lake"], key=prepare_key, steps=4, unconditional="")
+        return np.asarray(pipe(prepared, key=key, steps=4, solver=Heun(), guidance=CFG(2)).host().images)
+
+    def truth(prepare_key, key):
+        with jax.enable_x64(new_val=True):
+            return called(wide, prepare_key, key)
+
+    def served(prepare_key, key):
+        return np.asarray(client.ImageResult(native.sample(request(prepare_key, key), lambda report: None))
+                          .host().images)
+
+    assert_as_exact(served, lambda *keys: called(pipe, *keys), draw, "served images", seeds=SERVED_SEEDS,
+                    truth_fn=truth)
     reports = []
-    result = client.ImageResult(native.sample(request, reports.append))
-    np.testing.assert_array_equal(result.host().images, expected)
+    result = client.ImageResult(native.sample(request(*draw(0)), reports.append))
     assert len(result.pil()) == 1
     assert [report["progress"] for report in reports] == [
         {"step": 1, "steps": 4}, {"step": 2, "steps": 4}, {"step": 3, "steps": 4}, {"stage": "decode"}]
