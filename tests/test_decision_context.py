@@ -91,8 +91,8 @@ def scored(task: Decide, asked: Sequence[tuple[str, str | None]], images=()) -> 
     forward = COMPILED.setdefault(id(task.model), without_ynn(task.model.logits))
     if images:
         [(state, context)] = asked
-        assert task.processor is not None and task.layout.image is not None
-        media = Images.of(task.processor, images, task.layout.image)
+        assert task.processor is not None and task.layout.images
+        media = Images.of(task.processor, images, task.processor.image_text())
         [row] = task._encoded(state, QUESTION, media.tokens, context=context)
         inputs = DecisionInputs.collate([row], task.specials.pad, context_length=task.context_length)
         logits = forward(task.variables, inputs, media=media.inputs(task.processor, row))

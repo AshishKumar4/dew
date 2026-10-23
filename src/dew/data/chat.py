@@ -46,7 +46,7 @@ from dew.data.facts import unshaped
 from dew.data.text import HFTokenizer, SavedTokenizer, tokenizer_name
 
 if TYPE_CHECKING:
-    from transformers import PreTrainedTokenizerBase
+    from transformers import BatchEncoding, PreTrainedTokenizerBase
 
     from dew.data.dataset import Batch
     from dew.data.steps.text import LengthPolicy
@@ -373,13 +373,8 @@ def _token_ids(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping
     string-valued dicts while its contract reads lists under `tool_calls` and
     `content`, so the honest type has no spelling the checker accepts.
     """
-    try:
-        render = functools.partial(
-            tokenizer.apply_chat_template, rows, tools=[dict(tool) for tool in tools] or None,
-            tokenize=True, return_dict=False, add_generation_prompt=generation_prompt)
-        rendered = render() if thinking is None else render(enable_thinking=thinking)
-    except (TemplateError, TypeError) as exc:
-        raise ValueError(f"{where}: the chat template refused the conversation: {exc}") from exc
+    rendered = _rendered(tokenizer, rows, tools, generation_prompt=generation_prompt, where=where,
+                         thinking=thinking, tokenize=True)
     if not isinstance(rendered, list):
         raise ValueError(
             f"tokenizer {where!r} answered the chat template with "
@@ -392,6 +387,62 @@ def _token_ids(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping
                 f"non-id {token!r}")
         ids.append(token)
     return ids
+
+
+def _rendered(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping[str, object]], *,
+              generation_prompt: bool, where: str, thinking: bool | None, tokenize: bool
+              ) -> str | list[int] | list[str] | list[list[int]] | BatchEncoding:
+    """The chat template's rendering of `rows`, as token ids (`tokenize`) or as text; `thinking` and a
+    refusal as `_token_ids` says."""
+    try:
+        render = functools.partial(
+            tokenizer.apply_chat_template, rows, tools=[dict(tool) for tool in tools] or None,
+            tokenize=tokenize, return_dict=False, add_generation_prompt=generation_prompt)
+        return render() if thinking is None else render(enable_thinking=thinking)
+    except (TemplateError, TypeError) as exc:
+        raise ValueError(f"{where}: the chat template refused the conversation: {exc}") from exc
+
+
+CONTENT = "\x00content\x00"
+"""The stand-in for a turn's content that `framed` renders and splits the conversation at: no
+template's own markup holds it, and none trims or escapes it."""
+
+
+def framed(tokenizer: PreTrainedTokenizerBase, system: str, *, where: str,
+           thinking: bool | None = None) -> tuple[str, str]:
+    """The text a chat template renders around one user turn's content: a system message and the
+    user's turn up to its content, then the rest of the turn and the assistant's opening (the
+    generation prompt), as `tokenizer`'s own template writes them, with `thinking` its
+    `_token_ids`' switch. A row that frames its own content between the two is the conversation the
+    template renders, its markup the template's own tokens, whatever the backbone's family; the
+    content is placed as written, never re-rendered, so its tokens and spans are the caller's."""
+    rows = [{"role": "system", "content": system}, {"role": "user", "content": CONTENT}]
+    text = _rendered(tokenizer, rows, (), generation_prompt=True, where=where, thinking=thinking,
+                     tokenize=False)
+    if not isinstance(text, str) or text.count(CONTENT) != 1:
+        raise ValueError(f"{where}: the chat template does not render a user turn's content once, as written")
+    before, after = text.split(CONTENT)
+    return before, after
+
+
+def image_text(processor, *, where: str) -> str:
+    """The text one image stands as in a user's turn, as `processor`'s own chat template writes an
+    image part: the turn rendered with an image before its text, less the same turn without it.
+    Qwen-VL's processors write `<|vision_start|><|image_pad|><|vision_end|>`, Llama 4's `<|image|>`;
+    the processor expands it to the image's tokens."""
+    def before(parts: list[dict[str, str]]) -> str:
+        rows = [{"role": "user", "content": [*parts, {"type": "text", "text": CONTENT}]}]
+        text = _rendered(processor, rows, (), generation_prompt=False, where=where, thinking=None,
+                         tokenize=False)
+        if not isinstance(text, str) or text.count(CONTENT) != 1:
+            raise ValueError(f"{where}: the chat template does not render a user turn's text once, "
+                             "as written")
+        return text.split(CONTENT)[0]
+
+    plain, seen = before([]), before([{"type": "image"}])
+    if not seen.startswith(plain) or seen == plain:
+        raise ValueError(f"{where}: the chat template writes no image part of its own before a turn's text")
+    return seen[len(plain):]
 
 
 def render_prompt(tokenizer: PreTrainedTokenizerBase, conversation: Conversation,
