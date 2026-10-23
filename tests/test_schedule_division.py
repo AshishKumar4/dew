@@ -67,6 +67,27 @@ def signed_draw(seed):
     return numerator, rate
 
 
+def test_a_schedules_division_rounds_once_at_the_normal_edge_and_below_it():
+    """Quotients of normal operands at the normal range's edge and below it are IEEE's, bit for bit,
+    as NumPy and the certificates' exact quotient (tests/op_certificates.py `exact_div`) give them: an
+    exact one just above the least normal whose significand is odd (2^-126 + 2^-149, where a half
+    spacing underflows), one at the least normal, and subnormal ones exact, rounded and tied, which
+    round once onto the subnormal grid, whatever a lane's flush does to its arithmetic."""
+    import op_certificates as oc
+
+    numerator = np.asarray([2.0 ** -125 + 2.0 ** -148, 2.0 ** -125, 2.0 ** -120, 2.0 ** -126,
+                            3 * 2.0 ** -126, -(2.0 ** -100), 3 * 2.0 ** -126, 2.0 ** -126, 1.0], np.float32)
+    rate = np.asarray([2.0, 2.0, 2.0 ** 20, 3.0, 2.0 ** 22, 3.0 * 2.0 ** 40, 2.0 ** 24, 2.0 ** 23,
+                       2.0 ** 127], np.float32)
+    got = np.asarray(jax.jit(divided)(numerator, rate))
+    with np.errstate(under="ignore"):
+        want = numerator / rate
+    np.testing.assert_array_equal(got.view(np.uint32), want.view(np.uint32))
+    certificate = oc.exact_div(numerator, rate, oc.FLOAT32).astype(np.float32)
+    np.testing.assert_array_equal(got.view(np.uint32), certificate.view(np.uint32))
+    assert np.any(np.abs(want) < np.finfo(np.float32).tiny) and np.all(want != 0)
+
+
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 @pytest.mark.parametrize("broadcast", [True, False], ids=["per-row", "full"])
 def test_a_schedules_division_is_ieee_division(broadcast, dtype):
