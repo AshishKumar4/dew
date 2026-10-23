@@ -1,6 +1,6 @@
 """Dew's rounding error held to the reference's own, both measured from float64.
 
-The gate the suite converts to holds every element over orders (bible §7): a comparison drawn over
+The gate the suite converts to holds every element over orders: a comparison drawn over
 exact symmetries of its computation (`assert_leaves_as_exact_over_orders`), each element against the
 worst admitted member of the reference's ensemble (`assert_elements_as_exact`), and a kernel held where
 it rounds, as a graph of the values it rounds and holds (`assert_graph_as_exact`). The one-draw rules
@@ -366,7 +366,7 @@ def assert_as_exact_as_the_reference(dew, reference, truth, label: str, *, terms
 
 
 PARITY = 1.5
-"""The owner's factor (bible §7): each leaf's RMS error from float64 within 1.5 times the
+"""The gate's factor: each leaf's RMS error from float64 within 1.5 times the
 reference's, on the same inputs, with no floor of any kind. Check 1 (`assert_as_exact`) holds it now;
 the one-draw rule's FACTOR joins it once every site that rule would then fail has moved to check 1."""
 
@@ -728,7 +728,7 @@ def _logged(label: str, stage: int, verdict: str) -> None:
 
 
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None) -> None:
-    """Check 1 of the owner's gate (bible §7): on par. Each leaf's RMS error from float64,
+    """Check 1 of the gate: on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst; each row of float64 zero (below RESOLUTION
     of its leaf where a live reference does not measure it, `_paired`) no further from it than
@@ -859,8 +859,8 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
     ratio, interval and rows), or as the procedure before it with `two_stage` false. Run r of
     a call takes draws no other run of any call with the same `first` grid takes: seeds from
     (first + r)·2·(1 + REDRAW)·seeds on, the first half its "Dew"'s and the second its reference's, so
-    the runs are independent repetitions as far as `draw` makes its draws so. The bible-§10 null
-    control of a site's operation class (orders-through-check1.md): its false-red rate, every
+    the runs are independent repetitions as far as `draw` makes its draws so. The null
+    control of a site's operation class: its false-red rate, every
     nonpassing verdict counted, bounds the gate's own on that class. With `dew_fn` a fault of the
     reference (a dropped term, a wrong scale), the runs measure the procedure's power on that class,
     both procedures on the same draws."""
@@ -1529,7 +1529,7 @@ def assert_elements_as_exact(batch, label: str, *, reference: str = REFERENCE, a
 
 
 def assert_graph_as_exact(dew, reference, truth, inputs, orbit, label: str) -> dict:
-    """A computation held where it rounds (bible §7's source-aware gate; tests/reference_graph.py).
+    """A computation held where it rounds (the gate's source-aware check; tests/reference_graph.py).
     `dew`, `reference` and `truth` are `Graph`s (src/dew/nn/kernels/graph.py) of one shape, `truth`
     the reference's in float64;
     `inputs` the case's inputs by name, and `orbit(order)` the case's exact symmetries:
@@ -1715,7 +1715,7 @@ def _batch(draw, stage: int, terms, rows: bool) -> tuple[object, dict, list, lis
 
 ADMISSION_MARGIN = 1.05
 """How much less exact than the reference, in RMS from float64 over a leaf, a member may be and still be
-admitted (`admitted_members`): 5%, the owner's (bible §7). With no margin an equally exact member is
+admitted (`admitted_members`): 5%. With no margin an equally exact member is
 admitted about half the time, by its orders' luck alone."""
 
 ADMISSION_CONFIDENCE = 0.99
