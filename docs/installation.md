@@ -99,7 +99,7 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.11.2.post12,<0.11.3`.
+Dew requires `jax>=0.11.2.post15,<0.11.3`.
 <!-- END JAX requirement -->
 
 It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves jax alone. Every other package, jaxlib and its CUDA plugins included, comes from PyPI. The fixes:
@@ -110,6 +110,8 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - The device-to-host transfer guard holds on a CPU array's implicit host read (`float`, `item`, `np.asarray`, its buffer) as on an accelerator's copy, which a steady state's guard needs on the CPU suite.
 - Pallas Triton divides 16-bit floats and computes `erf_inv` through float32, correctly rounded, which a GEMM template's prologue dividing in bfloat16 needs on CUDA.
 - A `custom_vjp` call (and Mosaic GPU's `custom_jvp` call) in a Pallas Triton or Mosaic GPU kernel lowers as its primal function, which a template's score hook through a `jax.custom_vjp` needs.
+- Mosaic GPU relays an MMA's accumulator out to a 16-bit MMA's left operand in registers, and an abstract device states its compute capability, which Mosaic GPU lowers for: the templates' Mosaic kernels need both on sm80.
+- The persistent compilation cache keys a program by jax's own build as well as jaxlib's, so two builds over one jaxlib never read each other's programs (on GPU nodes that ran several, reads of the other build's entries failed).
 
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
 
@@ -198,7 +200,7 @@ CI runs on CPUs, so a JAX bump first runs these on a GPU, on Colab, in one sessi
 
 ## Compilation cache
 
-A run, a recipe's or a library `Trainer.fit`'s, and a loaded task keep JAX's persistent compilation cache on by default, so a restart reads the programs the last run compiled instead of compiling them again. Dew stores compiled executables in `~/.cache/dew/xla/python3.X`, or `$XDG_CACHE_HOME/dew/xla/python3.X` when `XDG_CACHE_HOME` is set, and the GPU autotuner's picks beside them for each jaxlib. `JAX_ENABLE_COMPILATION_CACHE=false` turns the cache off. JAX writes entries from process 0 alone, so a process pool caches only where every process reads the cache directory as one, which Dew checks as the pool forms: a pool on one host, or on hosts that share a home directory, caches by default, and a pool whose hosts each keep their own compiles every run unless it names a directory on storage they share (`compilation_cache_dir`). Caches apart would find a step on one process and compile it on another, which waits for ever for its peers. JAX keeps every entry (`jax_compilation_cache_max_size` is unbounded by default); set it, or clear the directory, to bound its size. Each Python minor version has its own directory because JAX 0.11 on Python 3.14 compresses entries with `compression.zstd` while its cache key still says `zlib`, and an older interpreter cannot read them. A run that passes its own `compilation_cache_dir` uses that path as given, so do not share one explicit directory between Python versions.
+A run, a recipe's or a library `Trainer.fit`'s, and a loaded task keep JAX's persistent compilation cache on by default, so a restart reads the programs the last run compiled instead of compiling them again. Dew stores compiled executables in `~/.cache/dew/xla/python3.X/<CPU class>`, or `$XDG_CACHE_HOME/dew/xla/python3.X/<CPU class>` when `XDG_CACHE_HOME` is set, and the GPU autotuner's picks beside them for each jaxlib. The CPU class (`AuthenticAMD-25-17`, say) keeps hosts that share a home directory apart: XLA compiles a CPU program for the host that compiles it, and JAX's cache key leaves the host out, so a program from another CPU would not link. A directory named in `JAX_COMPILATION_CACHE_DIR` is used as it is, so give each CPU class its own. `JAX_ENABLE_COMPILATION_CACHE=false` turns the cache off. JAX writes entries from process 0 alone, so a process pool caches only where every process reads the cache directory as one, which Dew checks as the pool forms: a pool on one host, or on hosts that share a home directory, caches by default, and a pool whose hosts each keep their own compiles every run unless it names a directory on storage they share (`compilation_cache_dir`). Caches apart would find a step on one process and compile it on another, which waits for ever for its peers. JAX keeps every entry (`jax_compilation_cache_max_size` is unbounded by default); set it, or clear the directory, to bound its size. Each Python minor version has its own directory because JAX 0.11 on Python 3.14 compresses entries with `compression.zstd` while its cache key still says `zlib`, and an older interpreter cannot read them. A run that passes its own `compilation_cache_dir` uses that path as given, so do not share one explicit directory between Python versions.
 
 ## Preparing TFDS data
 

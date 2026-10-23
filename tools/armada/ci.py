@@ -235,15 +235,14 @@ def cache_key(common: str, name: str, depends: list[str]) -> str:
 
 
 def cpu_class() -> str:
-    """This host's CPU microarchitecture (vendor, family, model). XLA:CPU emits the same code on every
-    host, but hardware estimate instructions (vrsqrtps) differ between microarchitectures, so float32
-    results, and thus numerical verdicts, belong to the class that produced them."""
-    fields = {}
-    for line in Path("/proc/cpuinfo").read_text().splitlines():
-        key, _, value = line.partition(":")
-        if key.strip() in ("vendor_id", "cpu family", "model") and key.strip() not in fields:
-            fields[key.strip()] = value.strip()
-    return "-".join(fields.get(key, "unknown") for key in ("vendor_id", "cpu family", "model"))
+    """This host's CPU microarchitecture, the one class the records, Dew's compilation cache and the
+    shared XLA bundles key it by (src/dew/_host.py, loaded by its path, as this file puts nothing on
+    sys.path)."""
+    spec = importlib.util.spec_from_file_location("dew_host", REPO / "src" / "dew" / "_host.py")
+    assert spec is not None and spec.loader is not None
+    host = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(host)
+    return host.cpu_class()
 
 
 def device_class() -> str:
