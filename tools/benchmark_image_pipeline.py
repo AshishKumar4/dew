@@ -17,8 +17,10 @@ import importlib.metadata
 import io
 import itertools
 import json
+import os
 import platform
 import statistics
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +41,9 @@ from dew.data.image_codec import decode_image
 from dew.data.images import resize_image
 from dew.training.distributed import split_fields
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import peak_memory
+
 
 @dataclass
 class Config:
@@ -54,6 +59,14 @@ class Config:
     training: bool = True
     """Also time the real Trainer's prefetched pixel-diffusion update."""
     out: Path | None = None
+    peak_run: str | None = None
+    """Run this device pipeline (`DEVICE_PIPELINES`) alone, for its measured peak (tools/peak_memory.py),
+    writing nothing."""
+
+
+DEVICE_PIPELINES = {"device_flip_jitter": (1.0, 1.0), "device_crop_flip_jitter": (0.6, 1.0)}
+"""The pipelines that augment on the device, by name, each with its crop scale: the ones a measured peak is
+taken of."""
 
 
 def decoders(size):
@@ -238,6 +251,13 @@ def training_timing(config, backend):
 
 def main(config):
     cv2.setNumThreads(1)
+    if config.peak_run is not None:
+        pipeline_timing(config, "device", DEVICE_PIPELINES[config.peak_run])
+        return None
+    # Each device pipeline's measured peak, in a process of its own, before this one opens a backend.
+    peaks = {} if config.decoder_only else {
+        name: peak_memory.measured([os.path.abspath(__file__), *sys.argv[1:], "--peak-run", name])
+        for name in DEVICE_PIPELINES}
     source = TFDS("oxford_flowers102", path=config.flowers, split="all",
                   decoders={"image": tfds.decode.SkipDecoding()}).records("indexed")
     encoded = [source[index]["image"] for index in range(min(config.images, len(source)))]
@@ -269,6 +289,8 @@ def main(config):
             for mode, scale in (("flip_jitter", (1.0, 1.0)), ("crop_flip_jitter", (0.6, 1.0)))
             for backend in ("host", "device")
         }
+        for name, peak in peaks.items():
+            report["pipeline"][name]["peak_device_bytes"] = None if None in peak else max(peak)
         if config.training:
             report["training"] = {backend: training_timing(config, backend) for backend in ("host", "device")}
     text = json.dumps(report, indent=2)
