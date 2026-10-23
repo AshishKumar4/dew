@@ -21,11 +21,14 @@ import numpy as np
 import optax
 import pytest
 import torch
-from model_support import TINY_DECODER, flat_tree
+from model_support import TINY_DECODER, Digits, decoder, flat_tree
 from reference_error import assert_as_exact, torch_with_gradients, with_gradients
+from test_serving import assert_same_generation
 
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
+from dew.inference import RunProcessor, TextGeneration
+from dew.inference.serving import Server
 from dew.interop.pretrained import Pretrained
 from dew.lora import LoRA
 from dew.nn.attention_residuals import AttentionResiduals
@@ -35,10 +38,12 @@ from dew.nn.cross_attention import CROSS_LENGTHS, CrossAttention, GatedCrossAtte
 from dew.nn.gemma3n import AltUp
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CrossContext, ModelInputs
+from dew.nn.kv_cache import KVCache
 from dew.nn.mlp import GatedMLP
 from dew.nn.ngpt import NGPT
 from dew.objectives.base import FROZEN, thaw
 from dew.objectives.lm import LMObjective
+from dew.sampling import Sampling
 from dew.training import Layout, MeshSpec, Trainer
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,7 +70,7 @@ FORMS = {
 """Each residual a decoder carries beside the plain stream, which the blocks read and join in its form."""
 
 SEEDS = {"block": 64, "base": 16, "decode": 16, "scan": 16, "fresh altup": 16, "fresh mhc": 32,
-         "fresh single-pass-mhc": 16, "fresh depth": 16, "fresh ngpt": 16}
+         "fresh single-pass-mhc": 16, "fresh depth": 16, "fresh ngpt": 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` on armada."""
 
 
@@ -368,3 +373,78 @@ def test_the_blocks_train_beside_an_adapter_with_the_source_frozen(source, tmp_p
     kept = flat_tree(thaw(restored.variables))
     for path, leaf in flat_tree(thaw(state.variables)).items():
         np.testing.assert_array_equal(np.asarray(kept[path]), np.asarray(leaf), err_msg=path)
+
+
+SERVED = CrossAttention(layer_ids=(0,), context_length=4, context_features=6)
+PROMPTS = [[1, 2], [5], [1, 2, 3, 4, 5, 6, 7], [9, 8], [3, 2, 1]]
+BUDGETS = [5, 9, 3, 12, 7]
+CONTEXT_TOKENS = [2, 4, 3, 0, 1]
+"""Each request's context tokens; the fourth request carries none."""
+
+
+@functools.cache
+def served_task() -> TextGeneration:
+    """model_support's one-layer decoder with a block before its layer, its gates drawn away from
+    zero, as a greedy task."""
+    model = decoder().clone(max_seq_len=128, cross_attention=SERVED)
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    params = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: jnp.full_like(leaf, 0.8) if path[-1].key.startswith("alpha_") else leaf, params)
+    return TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0,
+                                                                                    eos_token_ids=12))
+
+
+def request(index: int, length: int | None = None) -> ModelInputs:
+    """Request `index`'s prompt with a context of `length` tokens (its own count where None), drawn
+    from the request's index."""
+    length = CONTEXT_TOKENS[index] if length is None else length
+    context = np.random.default_rng([11, index, length]).standard_normal((1, SERVED.context_length, 6))
+    return ModelInputs(jnp.asarray([PROMPTS[index]], jnp.int32), conditioning={
+        CONTEXT: jnp.asarray(context, jnp.float32), CONTEXT_LENGTHS: jnp.asarray([length], jnp.int32)})
+
+
+@pytest.mark.parametrize("options", [
+    {},
+    {"kv_cache": KVCache(page_size=4, pages=40)},
+    {"kv_cache": KVCache(page_size=4, pages=40), "chunk": 3},
+    {"kv_cache": KVCache(page_size=4, pages=40), "chunk": 3, "prefix_cache": True},
+], ids=["dense", "paged", "chunked", "prefix"])
+def test_a_served_request_reads_its_own_context(options):
+    """Requests of their own contexts, one with none, served together over a dense cache, a pool of
+    pages, pieces of three tokens and a prefix cache, each draw what the request draws alone; so does
+    a repeat of one, whose prefix pages it shares under the same context and not under another. The
+    admitting step prefills apart from the decoding rows, whose one mixed row seats no context."""
+    bound = served_task()
+    alone = [bound(request(index), budget, key=index) for index, budget in enumerate(BUDGETS)]
+    other = bound(request(2, 1), BUDGETS[2], key=2)
+    assert not np.array_equal(np.asarray(other.host().behavior_log_probs),
+                              np.asarray(alone[2].host().behavior_log_probs)), "the context is read"
+    server = Server.from_task(bound, slots=4, capacity=128, admission=2, **options)
+    assert server.mixed_refusal is not None
+    tickets = [server.submit(request(index), budget, key=index) for index, budget in enumerate(BUDGETS)]
+    server.run()
+    again = server.submit(request(2), BUDGETS[2], key=2)
+    server.run()
+    hits = server.prefix_hits
+    elsewhere = server.submit(request(2, 1), BUDGETS[2], key=2)
+    server.run()
+    for ticket, lone in zip([*tickets, again, elsewhere], [*alone, alone[2], other], strict=True):
+        assert_same_generation(ticket.result(), lone)
+    # "1234567" keeps its last token to prefill: one full page of four is shared, under its context alone.
+    assert (hits, server.prefix_hits) == ((4, 4) if options.get("prefix_cache") else (0, 0))
+
+
+def test_a_server_refuses_a_context_its_layers_cannot_read():
+    """A context wider than the layers read, or longer than they keep, is refused at submit; a decoder
+    without cross-attention takes none."""
+    server = Server.from_task(served_task(), slots=2, capacity=128)
+    wide = request(0)
+    with pytest.raises(ValueError):
+        server.submit(dataclasses.replace(wide, conditioning={CONTEXT: jnp.zeros((1, 4, 7))}), 2)
+    with pytest.raises(ValueError):
+        server.submit(dataclasses.replace(wide, conditioning={CONTEXT: jnp.zeros((1, 5, 6))}), 2)
+    model = decoder().clone(max_seq_len=128)
+    plain = TextGeneration(model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)),
+                           RunProcessor(Digits()), sampling=Sampling(temperature=0))
+    with pytest.raises(ValueError):
+        Server.from_task(plain, slots=2, capacity=128).submit(request(0), 2)

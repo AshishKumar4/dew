@@ -59,6 +59,7 @@ NAME = "cross_attention"
 CROSS_KEY, CROSS_VALUE, CROSS_LENGTHS = "cross_key", "cross_value", "cross_lengths"
 """The cache variables of the context a cached call keeps: its keys and values,
 `[rows, context_length, kv_heads, head_dim]`, and each row's real tokens, `[rows]`."""
+CROSS_CACHE = frozenset({CROSS_KEY, CROSS_VALUE, CROSS_LENGTHS})
 
 
 def crossing(path) -> bool:
@@ -246,5 +247,6 @@ def _gated(branch: jax.Array, gate: jax.Array, precision: PrecisionLike) -> jax.
     return product[..., 0]
 
 
-__all__ = ["CROSS_KEY", "CROSS_LENGTHS", "CROSS_VALUE", "NAME", "CrossAttention", "GatedCrossAttention",
+__all__ = ["CROSS_CACHE", "CROSS_KEY", "CROSS_LENGTHS", "CROSS_VALUE", "NAME", "CrossAttention",
+           "GatedCrossAttention",
            "crossing"]

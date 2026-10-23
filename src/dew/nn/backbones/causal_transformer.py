@@ -1319,7 +1319,7 @@ class CausalTransformer(nn.Module):
             feedforward=functools.partial(
                 gated_mlp, hidden_features=cross.intermediate_size or self.mlp_widths[index]),
             emb_features=self.emb_features,
-            context_features=cross.context_features or self.emb_features,
+            context_features=self.context_width,
             context_length=cross.context_length, heads=self.num_heads, kv_heads=self.kv_heads,
             head_dim=self.features_per_head, dropout_rate=self.dropout_rate,
             attention_impl=self.attention_impl, force_fp32_for_softmax=self.force_fp32_for_softmax,
@@ -2396,6 +2396,14 @@ class CausalTransformer(nn.Module):
         return clamped_predictions(params, self.altup.coef_clip)
 
     @nn.nowrap
+    @property
+    def context_width(self) -> int:
+        """The width of a context's tokens (`CrossAttending`): the spec's, or the decoder's own."""
+        cross = self.cross_attention
+        if cross is None or cross.context_features is None:
+            return self.emb_features
+        return cross.context_features
+
     def with_cross_attention(self, cross: CrossAttention | None) -> Self:
         """This decoder with `cross` as its cross-attention layers (`CrossAttending`), None for none."""
         return self.clone(cross_attention=cross)
@@ -2486,13 +2494,17 @@ class CausalTransformer(nn.Module):
 
     @nn.nowrap
     def mixed_admission_refusal(self) -> str | None:
-        """A cache rebuilt per request, a reader beyond the token, or a layer
-        whose mixer, over the context it is built with, would not run the mixed
-        call as the separate calls would (`MixerBase.mixed_refusal`)."""
+        """A cache rebuilt per request, a reader beyond the token, a context
+        read beside the tokens, or a layer whose mixer, over the context it is
+        built with, would not run the mixed call as the separate calls would
+        (`MixerBase.mixed_refusal`)."""
         position = self.cache_rebuild_position
         if position is not None:
             return (f'LongRoPE crossing position {position} requires separate admission so each '
                     'request keeps its own table and rebuild history')
+        if self.cross_attention is not None:
+            return ("cross-attention reads each row's own context, which the mixed call's one row of "
+                    "every slot's tokens does not seat")
         if self.position_embedding == "learned" or self.engram is not None or self.hash_layers:
             return "a learned position embedding, n-gram or hash routing reads beyond the token"
         types = self.per_layer_types
