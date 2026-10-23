@@ -111,24 +111,22 @@ def _own_loss(name: str, kwargs: dict) -> None:
     kwargs["guidance"] = None
 
 
-def teacher_weights(variables: Variables | None, run: str | None, *, whole: bool = False) -> Variables:
+def teacher_weights(variables: Variables | None, given: Variables | None, *,
+                    whole: bool = False) -> Variables:
     """A distillation's frozen teacher: the starting tree's `TEACHER` when it
-    holds one, as a saved student's does; else the weights the teacher's run
-    directory `run` published; else, with no run, the model the starting tree
-    holds, which the student then starts as. The model's own collections
-    alone (`model_part`) unless `whole`."""
+    holds one, as a saved student's does; else the teacher's tree `given`, as
+    a run config reads it from the teacher's run (`DiffusionRunConfig.teacher_run`);
+    else the model the starting tree holds, which the student then starts as.
+    The model's own collections alone (`model_part`) unless `whole`."""
     if variables is not None and TEACHER in variables:
         return variables[TEACHER]
-    if run is not None:
-        from dew.checkpoints import Checkpoints
-
-        with Checkpoints(run) as checkpoints:
-            tree = checkpoints.variables(ema=None, step=None, mesh=None, layout=None, param_dtype=None)
+    if given is not None:
+        tree = given
     elif variables is not None and "params" in variables:
         tree = variables
     else:
         raise ValueError(f"the teacher's weights come from the starting tree's {TEACHER!r}, the teacher's "
-                         f"run (teacher_run=) or the model the starting tree holds, and none is given")
+                         f"tree (teacher_variables=) or the model the starting tree holds, and none is given")
     return thaw(tree) if whole else model_part(tree)
 
 
@@ -941,8 +939,9 @@ class FlowDistillationObjective(DiffusionObjective):
 
     `teacher` is the teacher's model, by default the student's own without
     its adapter. Its weights, frozen under `TEACHER`, are the starting tree's
-    when it holds them, else those the teacher's run directory `teacher_run`
-    published, else the model the starting tree holds (`teacher_weights`). A
+    when it holds them, else `teacher_variables`, as a run config reads them
+    from the teacher's run, else the model the starting tree holds
+    (`teacher_weights`). A
     tree that lacks the loss's own `network` starts the student as the
     teacher, in buffers the step may donate, the weights under `FROZEN` in an
     adapter's split, which freezes all but its factors, beside that network
@@ -954,7 +953,7 @@ class FlowDistillationObjective(DiffusionObjective):
     """The network the loss trains beside the student under `params`."""
 
     def __init__(self, model: nn.Module, process: Process | Preset, inputs: InputSpec, *,
-                 teacher: nn.Module | None = None, teacher_run: str | None = None,
+                 teacher: nn.Module | None = None, teacher_variables: Variables | None = None,
                  solver: Solver = _CONSISTENCY, **kwargs):
         name = type(self).__name__
         _own_loss(name, kwargs)
@@ -964,7 +963,7 @@ class FlowDistillationObjective(DiffusionObjective):
             raise ValueError(f"{name} distills a velocity model on the linear path; build the process with "
                              "presets.Flow()")
         self.teacher = unadapted(self.model) if teacher is None else teacher
-        self.teacher_variables = teacher_weights(self.variables, teacher_run)
+        self.teacher_variables = teacher_weights(self.variables, teacher_variables)
 
     def program_key(self) -> tuple[ProgramModule, ...]:
         """The student, then the frozen teacher."""

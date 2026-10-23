@@ -8,7 +8,7 @@ standard deviation of that profile relative to T (σ_rel in the paper). The
 profile stretches with T, which an exponential EMA's fixed decay does not,
 so one σ_rel means the same thing at every point of a run.
 
-A run tracks a few such averages (`dew.training.optim.power_profiles`,
+A run tracks a few such averages (`dew.optim.power_profiles`,
 `OptimConfig.ema_profiles`), and every checkpoint save also keeps a
 snapshot of them (`Checkpoints.profile_steps`). Each snapshot is a linear
 combination of the weights along the trajectory, with a known profile. So
