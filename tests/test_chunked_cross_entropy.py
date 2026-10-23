@@ -273,7 +273,7 @@ def columns(vocab: int, seed: int = 0):
 
 
 SEEDS = {'bias': 128, 'fused': 512, 'quantized': 64, 'scale and bias': 128, 'vocabulary split': 512,
-         'column orders': 8, 'split bias': 32, 'quantized split': 32, 'backbone states': 16, 'backbone': 128,
+         'column orders': 32, 'split bias': 32, 'quantized split': 32, 'backbone states': 16, 'backbone': 128,
          'small vocabulary': 128, 'small vocabulary training': 128, 'bounded': 32, 'saturated': 256,
          'excluded': 32, 'token tiles': 16, 'both outputs': 64, 'gemma': 16, 'bf16 cotangent': 8,
          'whole logits': 512}

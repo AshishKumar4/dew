@@ -266,12 +266,13 @@ def test_the_autoencoder_folds_and_normalizes_as_the_pipeline_does(source, array
 def test_the_published_autoencoder_matches_the_source(monkeypatch):
     """FLUX.2's VAE as `FLUX.2-klein-4B` publishes it (the one FLUX.2 [dev]
     ships), downloaded, against the source loaded beside it in float32 and
-    float64: over drawn noisy versions of a 32x48 crop of a smooth image, codes
+    float64: over drawn noisy versions of a 64x96 crop of a smooth image, codes
     and cotangents, the pipeline's folded, normalized latent, its whole decode
     and both their input gradients on par with the source's float32 (check 1,
     `autoencoder_check`). The crop keeps every published weight in the walk at
-    a sixteenth of the full image's cost, which the float64 truth's sizing over
-    seeds needs. The source runs on a CUDA device where there is one, its
+    a quarter of the full image's cost, which the float64 truth's sizing over
+    seeds needs; at 32x48 the decoder's group norms read too few positions a
+    group for its code gradient to resolve. The source runs on a CUDA device where there is one, its
     float32 in IEEE float32 (no TF32), its float64 truth in float64."""
     import copy
 
@@ -290,9 +291,9 @@ def test_the_published_autoencoder_matches_the_source(monkeypatch):
     model = AutoencoderKLFlux2.from_pretrained(repo, subfolder="vae", revision=revision).eval().to(device)
     with float64():
         wide = copy.deepcopy(model).double()
-    smooth = tool.smooth_image()[..., :32, :48]
-    folded = (1, 128, 2, 3)
-    assert autoencoder.encode(params, nhwc(smooth)).shape == (1, 2, 3, 128)
+    smooth = tool.smooth_image()[..., :64, :96]
+    folded = (1, 128, 4, 6)
+    assert autoencoder.encode(params, nhwc(smooth)).shape == (1, 4, 6, 128)
 
     def draw(seed):
         """The smooth image with fresh noise, and normal codes and cotangents."""
