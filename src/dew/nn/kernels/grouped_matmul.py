@@ -837,19 +837,19 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
     CUTLASS 3's pointer-array cooperative kernel, a 128 x 256 x 64 tile on a pair of multiprocessors, its
     stages the shared memory its epilogue leaves, bf16 operands and bf16 or fp32 out, each group's shape
     set up on the device. A vendored kernel the chooser ranks beside the template's launches until they
-    beat it. The model has no terms of its own for it: it costs as the Mosaic tile of its geometry
-    (`TILE`, the same TMA-fed warpgroup MMAs, producer and two consumers), scaled by its measured rows
-    (`MEASURED`), so it is a candidate only on a generation whose rows were measured."""
+    beat it. It costs as the Mosaic tile of its geometry (`TILE`, the same TMA-fed warpgroup MMAs,
+    producer and two consumers), its mainloop's work scaled by its measured rows (`MEASURED`), so it is a
+    candidate only on a generation whose rows were measured."""
     name: ClassVar[str] = 'cutlass'
     config_cls: ClassVar[type[mosaic_gpu.Tiles]] = mosaic_gpu.Tiles
     TILE: ClassVar[mosaic_gpu.Tiles]
     COSTED_AS: ClassVar[_Mosaic]
     MEASURED: ClassVar[dict[tuple[str, bool], float]]
     """By generation and whether the call is dense (one group, which the template's launch runs without a
-    group's bookkeeping and CUTLASS's does not), the geometric mean over the scoreboard's rows of the
-    launch's measured seconds over the model's at `TILE`, as a share of the same ratio of the template's
-    Mosaic launch at its own pick: its time on the scale of the model's estimates of the template's
-    launches."""
+    group's bookkeeping and CUTLASS's does not), the share of the model's mainloop work at `TILE` that
+    CUTLASS's mainloop takes the time of, on the scale of the model's estimates of the template's Mosaic
+    launch: fitted over the scoreboard's rows to CUTLASS's measured seconds over the template's (each at
+    its pick) times the template's estimate."""
 
     def eligible(self, ba, target) -> bool:
         operands = [value for name, value in ba.arguments.items()
@@ -873,11 +873,14 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
         return self.space(ba)
 
     def costed(self, ba, config: mosaic_gpu.Tiles, target) -> cost.Cost:
-        return self.COSTED_AS.costed(ba, config, target)
-
-    def cost(self, ba, config: mosaic_gpu.Tiles, target) -> float:
-        measured = self.MEASURED[generation.effective(target).generation, bool(ba.arguments.get('dense'))]
-        return super().cost(ba, config, target) * measured
+        # Its mainloop's work in its measured share of the template's time; its bytes and its loads'
+        # latency the device's (at a gradient whose stores bound it, its DRAM traffic and throughput are
+        # the template's cooperative tile's: NCU-dw, kimi-linear's kernel gradients).
+        costed = self.COSTED_AS.costed(ba, config, target)
+        share = self.MEASURED[generation.effective(target).generation, bool(ba.arguments.get('dense'))]
+        work = ('program_flops', 'program_staged', 'program_exponentials', 'serial_staged',
+                'serial_exponentials')
+        return dataclasses.replace(costed, **{name: share * getattr(costed, name) for name in work})
 
 
 @dataclasses.dataclass(frozen=True)
