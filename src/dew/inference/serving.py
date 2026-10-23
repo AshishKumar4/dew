@@ -920,10 +920,10 @@ class Server:
         cross = self.cross
         # Every piece carries its row's context, so a row continuing over a former occupant's slot,
         # or after shared prefix pages, reads its own; a row without one reads none.
-        context_length, width, dtype = (0, 0, np.float32) if cross is None else (
+        context_length, features, dtype = (0, 0, np.float32) if cross is None else (
             cross[0].context_length, cross[1], cross[2])
-        contexts = np.zeros((count, context_length, width), dtype)
-        lengths = np.zeros((count,), np.int32)
+        contexts = np.zeros((count, context_length, features), dtype)
+        context_lengths = np.zeros((count,), np.int32)
         for index, slot, row in chosen:
             piece = row.prompt[row.prefilled:row.prefilled + width]
             tokens[index, width - len(piece):] = piece
@@ -942,7 +942,7 @@ class Server:
             history_valid[index, capacity - len(row.prompt):] = True
             if cross is not None and row.context is not None:
                 contexts[index, :len(row.context)] = row.context
-                lengths[index] = len(row.context)
+                context_lengths[index] = len(row.context)
             if final[index]:
                 self.rows.prefilled(row)
         placed = jax.device_put(
@@ -957,7 +957,7 @@ class Server:
                 final,
                 history,
                 history_valid,
-                *([] if cross is None else [contexts, lengths]),
+                *([] if cross is None else [contexts, context_lengths]),
             ],
             self._admitted,
         )

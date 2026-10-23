@@ -206,8 +206,9 @@ class GatedCrossAttention(nn.Module):
         if self.ngpt:
             start, end = unit(wide), unit(branch).astype(wide.dtype)
             length = sqrt_or_zero(jnp.sum(jnp.square(wide), axis=-1, keepdims=True))
-            moved = unit(start + _gated(end - start, gate, self.precision)) - unit(start)
-            return (wide + length * moved).astype(stream.dtype)
+            # One norm over both points, so a step of a zero gate, the same point, norms as it does.
+            normed = unit(jnp.stack([start, start + _gated(end - start, gate, self.precision)]))
+            return (wide + length * (normed[1] - normed[0])).astype(stream.dtype)
         widened = branch.reshape(branch.shape[:2] + (1,) * (stream.ndim - branch.ndim) + branch.shape[2:])
         return (wide + _gated(widened, gate, self.precision)).astype(stream.dtype)
 
