@@ -17,8 +17,10 @@ import importlib.metadata
 import io
 import itertools
 import json
+import os
 import platform
 import statistics
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +41,9 @@ from dew.data.image_codec import decode_image
 from dew.data.images import resize_image
 from dew.training.distributed import split_fields
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import peak_memory
+
 
 @dataclass
 class Config:
@@ -54,6 +59,14 @@ class Config:
     training: bool = True
     """Also time the real Trainer's prefetched pixel-diffusion update."""
     out: Path | None = None
+    peak_run: str | None = None
+    """Run this mode's device pipeline (`PIPELINES`) alone, for its measured peak (tools/peak_memory.py),
+    writing nothing."""
+
+
+PIPELINES = {"flip_jitter": (1.0, 1.0), "crop_flip_jitter": (0.6, 1.0)}
+"""The augmentation modes the pipeline is timed in, each with its crop scale: each runs on the host and on the
+device, and the device's measured peak is taken of each."""
 
 
 def decoders(size):
@@ -238,6 +251,13 @@ def training_timing(config, backend):
 
 def main(config):
     cv2.setNumThreads(1)
+    if config.peak_run is not None:
+        pipeline_timing(config, "device", PIPELINES[config.peak_run])
+        return None
+    # Each mode's device pipeline's measured peak, in a process of its own, before this one opens a backend.
+    peaks = {} if config.decoder_only else {
+        mode: peak_memory.measured([os.path.abspath(__file__), *sys.argv[1:], "--peak-run", mode])
+        for mode in PIPELINES}
     source = TFDS("oxford_flowers102", path=config.flowers, split="all",
                   decoders={"image": tfds.decode.SkipDecoding()}).records("indexed")
     encoded = [source[index]["image"] for index in range(min(config.images, len(source)))]
@@ -266,9 +286,11 @@ def main(config):
             source[index]
         report["pipeline"] = {
             f"{backend}_{mode}": pipeline_timing(config, backend, scale)
-            for mode, scale in (("flip_jitter", (1.0, 1.0)), ("crop_flip_jitter", (0.6, 1.0)))
+            for mode, scale in PIPELINES.items()
             for backend in ("host", "device")
         }
+        for mode, peak in peaks.items():
+            report["pipeline"][f"device_{mode}"]["peak_device_bytes"] = None if None in peak else max(peak)
         if config.training:
             report["training"] = {backend: training_timing(config, backend) for backend in ("host", "device")}
     text = json.dumps(report, indent=2)
