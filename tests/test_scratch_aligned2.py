@@ -40,22 +40,26 @@ def widened(fn):
     return run
 
 
-@pytest.mark.parametrize("piece", ["local", "memory", "factor64"])
-@pytest.mark.parametrize("name", ["scalar delta", "vector delta"])
+def wide(fn):
+    """`fn` on float64 copies of its float arguments, its float outputs cast back to fp32."""
+    def run(*args, issue=algebra.portable):
+        with jax.enable_x64(True):
+            cast = [a.astype(jnp.float64) if hasattr(a, "dtype") and jnp.issubdtype(a.dtype, jnp.floating) else a
+                    for a in args]
+            out = fn(*cast, issue=lambda name, x, y: jnp.matmul(x, y, precision="highest"))
+            return jax.tree.map(lambda x: x.astype(jnp.float32)
+                                if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating) else x, out)
+    return run
+
+
+@pytest.mark.parametrize("piece", ["none", "factor", "apply", "intra", "carry"])
+@pytest.mark.parametrize("name", ["scalar delta"])
 def test_piece(name, piece, monkeypatch):
     hooks = st.SITES[name]
     regime = "aligned keys"
-    if piece == "local":
-        monkeypatch.setattr(algebra, "readout", wide_local)
-    elif piece == "memory":
-        monkeypatch.setattr(algebra, "readout", wide_memory)
-    elif piece == "factor64":
-        def factor(a, issue=algebra.portable):
-            with jax.enable_x64(True):
-                return ORIGINAL["factor"](a.astype(jnp.float64)).astype(a.dtype)
-        monkeypatch.setattr(algebra, "factor", factor)
-    with jax.enable_x64(True):
-        dew = jax.jit(with_gradients(functools.partial(chunk, hooks, chunk_size=st.CHUNK, ported=False)))
+    if piece != "none":
+        monkeypatch.setattr(algebra, piece, wide(ORIGINAL[piece]))
+    dew = jax.jit(with_gradients(functools.partial(chunk, hooks, chunk_size=st.CHUNK, ported=False)))
     reference = jax.jit(with_gradients(functools.partial(token_by_token, hooks)))
     try:
         assert_as_exact(dew, reference, functools.partial(st.cotangents, hooks, regime), name,
