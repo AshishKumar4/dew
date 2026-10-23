@@ -334,7 +334,8 @@ def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_
     # Over the seeds, every row is dropped at probability one, and at a half some are and some not.
     masks = np.stack([masked(stepped(seed)) for seed in range(NULL_DROPOUT_SEEDS[probability])])
     assert masks.all() if probability == 1.0 else (masks.any() and not masks.all())
-    given = jax.jit(jax.grad(lambda values: conditional.scalar_loss(values, explicit(masked(step)), step)[0]))
+    tokens = explicit(masked(step))
+    given = jax.jit(jax.grad(lambda values: conditional.scalar_loss(values, tokens, step)[0]))
     assert float(jnp.linalg.norm(given(variables)["encoders"]["textcontext"]["table"])) > 1e-6
 
     def trained(loss_and_grads):
