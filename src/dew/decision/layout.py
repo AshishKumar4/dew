@@ -489,29 +489,42 @@ class Framing:
     holds, its template renders the system message, the user's turn around its content and the
     generation prompt (`dew.data.chat.framed`), `thinking` its reasoning switch (False: a reasoning
     model's empty thought, None: the template's own default), so every token of the markup is the
-    tokenizer's own special token, never ChatML spelled out for a vocabulary without it. A tokenizer
-    with no chat template, or `template` False, frames the turns as plain text: the system message,
-    then the user's content, each after a blank line."""
+    tokenizer's own special token, never ChatML spelled out for a vocabulary without it.
+    `chat_template`, a Jinja chat template, renders the turns in place of the tokenizer's own (a base
+    model's, which has none, or a framing of an experiment's), and `options` are the other variables
+    a template reads beside the messages; both are recorded with the layout, so a run reloads its
+    framing. A tokenizer with no chat template and none given, or `template` False, frames the turns
+    as plain text: the system message, then the user's content, each after a blank line."""
 
     system: str = JOINT_SYSTEM
     prefill: str = JOINT_PREFILL
     thinking: bool | None = False
     template: bool = True
+    chat_template: str | None = None
+    options: Mapping[str, JSON] = dataclasses.field(default_factory=dict)
 
     def around(self, encoder: Tokenizer) -> tuple[str, str]:
         """The text before the user's turn's content and after it, to the assistant's prefill."""
-        return _framed(_same(encoder), self)
+        from dew.registry import to_record
+
+        return _framed(_same(encoder), json.dumps(to_record(self, Framing), sort_keys=True))
 
 
 @functools.lru_cache(maxsize=64)
-def _framed(encoder: _Same, framing: Framing) -> tuple[str, str]:
-    """`Framing.around`, rendered once a tokenizer and framing (`_same`)."""
+def _framed(encoder: _Same, recorded: str) -> tuple[str, str]:
+    """`Framing.around`, rendered once a tokenizer and framing, the framing by its record (`_same`)."""
+    from dew.registry import from_record
+
+    framing = from_record(Framing, json.loads(recorded))
     tokenizer = encoder.encoder
-    if framing.template and isinstance(tokenizer, HFTokenizer) and tokenizer.tokenizer.chat_template:
+    templated = isinstance(tokenizer, HFTokenizer) and (
+        framing.chat_template is not None or tokenizer.tokenizer.chat_template)
+    if framing.template and templated and isinstance(tokenizer, HFTokenizer):
         from dew.data.chat import framed
 
         before, after = framed(tokenizer.tokenizer, framing.system, where=tokenizer.name,
-                               thinking=framing.thinking)
+                               thinking=framing.thinking, chat_template=framing.chat_template,
+                               options=framing.options)
         return before, after + framing.prefill
     return f"{framing.system}\n\n", f"\n\n{framing.prefill}"
 JOINT_NOUL = {"true": "The proposition is true or the answer is yes.",
