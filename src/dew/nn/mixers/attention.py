@@ -1104,12 +1104,12 @@ class CausalSelfAttention(nn.Module):
         if self.exclusive_self_attention:
             attention = exclusive_self_attention(attention, own_value)
         if gate is not None and self.ctx.ngpt is not None:
-            # nGPT scales the gate's logits by the square of their learned gain, gates in fp32 and
-            # unit-norms the gated heads together (dory.py:154-157).
+            # nGPT scales the gate's logits by the square of their learned gain, gates in at least
+            # fp32 and unit-norms the gated heads together (dory.py:154-157).
+            wide = at_least_fp32(jnp.result_type(gate, attention))
             scale = gain(self.s_gate, self.ctx.ngpt.gate(self.ctx.emb_features))
-            logits = gate.astype(jnp.float32) * jnp.square(scale).reshape(self.ctx.num_heads,
-                                                                           self.ctx.head_dim)
-            attention = (attention.astype(jnp.float32) * jax.nn.sigmoid(logits)).astype(attention.dtype)
+            logits = gate.astype(wide) * jnp.square(scale).reshape(self.ctx.num_heads, self.ctx.head_dim)
+            attention = (attention.astype(wide) * jax.nn.sigmoid(logits)).astype(attention.dtype)
         elif gate is not None:
             # The branch multiplies by the sigmoid of its gate, then projects
             # (modeling_qwen3_5.py:701, and modeling_qwen4_exp.py:836 the same).
