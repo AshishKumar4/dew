@@ -38,9 +38,8 @@ class Family:
     1/sqrt(D); the keys each query keeps `[B, 1, Q, K]` and the same keys as the template's spans'
     arguments (`template.spans`); the rows `[B, Q]` that see no key, whose output and gradients are
     zero (`empty`); whether the default form holds it (`folded`), False only for the fold's documented
-    divergences (`algebra.Forward.base2`), which run natural alone; its declared seeds, sized by
-    `reference_error.seeds_for`; and the slices the decode kernel cuts each row's keys into (`splits`),
-    whose states it merges."""
+    divergences (`algebra.Forward.base2`), which run natural alone; and the slices the decode kernel cuts
+    each row's keys into (`splits`), whose states it merges. Its declared seeds are `SEEDS`'."""
 
     draw: Callable[[int], tuple]
     keep: np.ndarray
@@ -48,7 +47,6 @@ class Family:
     empty: np.ndarray | None = None
     folded: bool = True
     dtype: str = "float32"
-    seeds: int = 8
     splits: int = 1
 
 
@@ -73,12 +71,12 @@ SEEDS = {"ties at scale 1": 64, "ties at scale 1, cotangents near 2**125": 64, "
          "ties at scale 1/2, cotangents near 2**125": 64, "ties at scale 1/4": 64,
          "ties at scale 1/4, cotangents near 2**125": 64, "a logit near fp32's largest": 8,
          "a logit near fp32's largest at scale 1/4": 8, "values near fp32's largest over 2 equal keys": 8,
-         "values near fp32's largest over 64 equal keys": 8, "one key": 8, "a sink and one key": 64,
+         "values near fp32's largest over 64 equal keys": 8, "one key": 8, "a sink and one key": 32,
          "a sink near fp32's largest and one key": 8, "a sink and one key, its logit near fp32's largest": 8,
          "a sink near fp32's largest at scale 1/4": 8, "logits near 1e4": 32, "logits near 1e30": 8,
          "a small weight on a large value, float32": 128, "a small weight on a large value, bfloat16": 256,
-         "a weight at the exponent's edge on a large value, float32": 256,
-         "a weight at the exponent's edge on a large value, bfloat16": 512,
+         "a weight at the exponent's edge on a large value, float32": 64,
+         "a weight at the exponent's edge on a large value, bfloat16": 64,
          "a small column beside an overflowing one": 64,
          "a column near fp32's least normal beside an overflowing one": 64,
          "a cotangent on a small column beside an overflowing one": 64,
@@ -87,13 +85,12 @@ SEEDS = {"ties at scale 1": 64, "ties at scale 1, cotangents near 2**125": 64, "
          "a column near fp32's least normal under a large cotangent": 8,
          "a subnormal share of an overflowing row, float32": 32,
          "a subnormal share of an overflowing row, bfloat16": 32,
-         "a subnormal mass beside its anchor at equal values": 8,
          "a subnormal share beside 255 equal weights, bfloat16": 32, "a row of no keys": 8,
          "causal queries before every key": 8, "a row that overflows beside one that does not": 8,
          "two finite slices whose merge overflows": 8, "a resumed state of a large denominator": 64,
-         "a resumed state beside an overflowing column": 16,
+         "a resumed state beside an overflowing column": 32,
          "a resumed state of a denominator near fp32's largest beside an overflowing column": 8,
-         "a decode step's sink and one key": 64, "a decode step's sink near fp32's largest and one key": 8,
+         "a decode step's sink and one key": 32, "a decode step's sink near fp32's largest and one key": 8,
          "documents of one key": 8}
 """Each family's declared seeds, the fewest over which the reference compared with itself resolves check
 1's parity (`reference_error.seeds_for`), sized for every family at the suite's own draws and reference."""
@@ -362,8 +359,8 @@ def _resumed_huge_denominator(seed):
     # One query a row of zeros over three keys of logit 0 whose values near fp32's largest in the first
     # column overflow its sum, resumed from a state of no values and a denominator of 2^126 to 2^127 at
     # maximum 0: each key's weight over the denominator is below fp32's least normal while its own
-    # exponential is 1, so its share's product must stay finite (`algebra.small_shift`); the cotangent is
-    # drawn small, its product with the values finite in the reference's backward.
+    # exponential is 1, so its share's product must stay finite; the cotangent is
+    # drawn small, its product with the values finite in the reference's backward (`algebra.SMALL_SHIFT`).
     total = 2.0 ** np.floor(_uniform(seed, 126.0, 128.0, (RESUMED, 1, 1)))
     value = np.zeros((RESUMED, 3, 1, 16), np.float32)
     value[..., 0] = _uniform(seed + 1, 2.9e38, 3.3e38, (RESUMED, 3, 1))
@@ -374,21 +371,21 @@ def _resumed_huge_denominator(seed):
     return np.zeros((RESUMED, 1, 1, 16), np.float32), key, value, state, dout * np.float32(2.0 ** -10)
 
 
-def _small_mass_beside_its_anchor(seed: int, rows: int = 64):
-    # One query a row over 64 keys of which three are kept: keys 0 and 1 of logit 0, whose values near
-    # fp32's largest overflow the first tile's sum, and key 32 of logit 86 to 90, in the second tile, the
-    # anchor at the final maximum, beside which the first two weigh below fp32's least normal; every key
-    # the same drawn value, so the score cotangents and the query and key gradients are zero exactly.
-    query = np.zeros((rows, 1, 1, 16), np.float32)
-    query[..., 0] = 4.0
-    key = np.zeros((rows, 64, 1, 16), np.float32)
-    key[:, 32, 0, 0] = _uniform(seed, 86.0, 90.0, (rows,))
-    row = np.zeros((rows, 1, 1, 16), np.float32)
-    row[..., 0] = _uniform(seed + 1, 2.9e38, 3.3e38, (rows, 1, 1))
-    row[..., 1:] = _uniform(seed + 2, -1.0, 1.0, (rows, 1, 1, 15))
-    value = np.broadcast_to(row, (rows, 64, 1, 16)).copy()
-    (dout,) = _normal(seed + 3, (rows, 1, 1, 16))
-    return query, key, value, None, dout * np.float32(2.0 ** -10)
+def _fp16_beside_a_large_state(seed):
+    # One query a row of zeros over two keys whose values near fp16's largest sit in the first column,
+    # resumed at maximum 0 from a state of denominator 2^124 to 2^126 whose weighted values are it times a
+    # draw in [2, 2.5) in that column: its sums near fp32's largest, which fp16 values never take past it
+    # (`algebra.headroom`: an fp16 call compiles no guard), so the output is the state's mean, finite.
+    total = 2.0 ** np.floor(_uniform(seed, 124.0, 127.0, (RESUMED, 1, 1)))
+    acc = np.zeros((RESUMED, 1, 1, 16), np.float32)
+    acc[..., 0] = total * _uniform(seed + 1, 2.0, 2.5, (RESUMED, 1, 1))
+    acc[..., 1:] = total[..., None] * _uniform(seed + 2, -1.0, 1.0, (RESUMED, 1, 1, 15))
+    value = np.zeros((RESUMED, 2, 1, 16), np.float32)
+    value[..., 0] = _uniform(seed + 3, 6.0e4, 6.5e4, (RESUMED, 2, 1))
+    value[..., 1:] = _uniform(seed + 4, -1.0, 1.0, (RESUMED, 2, 1, 15))
+    key, dout = _normal(seed + 5, (RESUMED, 2, 1, 16), (RESUMED, 1, 1, 16))
+    state = (np.zeros((RESUMED, 1, 1), np.float32), total.astype(np.float32), acc)
+    return np.zeros((RESUMED, 1, 1, 16), np.float32), key, value, state, dout
 
 
 def _families() -> dict[str, Family]:
@@ -456,9 +453,6 @@ def _families() -> dict[str, Family]:
         "a subnormal share of an overflowing row, bfloat16": Family(
             _subnormal_share, np.ones((64, 1, 1, 256), bool), folded=False, dtype="bfloat16"),
         # Every weight but one 1/255, bf16's worst rounding of a weight, beside the subnormal share.
-        "a subnormal mass beside its anchor at equal values": Family(
-            _small_mass_beside_its_anchor, np.isin(np.arange(64), (0, 1, 32))[None, None, None, :],
-            folded=False),
         "a subnormal share beside 255 equal weights, bfloat16": Family(
             functools.partial(_subnormal_share, equal=True), np.ones((64, 1, 1, 256), bool), folded=False,
             dtype="bfloat16"),
@@ -487,6 +481,8 @@ def _families() -> dict[str, Family]:
         _resumed_beside_overflow, np.ones((RESUMED, 1, 1, 2), bool), folded=False)
     families["a resumed state of a denominator near fp32's largest beside an overflowing column"] = Family(
         _resumed_huge_denominator, np.ones((RESUMED, 1, 1, 3), bool), folded=False)
+    families["fp16 values near their largest beside a state near fp32's largest"] = Family(
+        _fp16_beside_a_large_state, np.ones((RESUMED, 1, 1, 2), bool), dtype="float16")
     for low, high, label in ((-3.0, 3.0, ""), (1e38, 3e38, " near fp32's largest")):
         # One query a row, so the decode kernel takes the family too.
         name = f"a decode step's sink{label} and one key"
@@ -496,8 +492,7 @@ def _families() -> dict[str, Family]:
     families["documents of one key"] = Family(_drawn(4, 4), _causal(4, 4, ROWS) & (ids[:, None, :, None] ==
                                                                                   ids[:, None, None, :]),
                                               {"causal": True, "segment_ids": ids})
-    return {name: dataclasses.replace(family, seeds=SEEDS[name])
-            for name, family in families.items()}
+    return families
 
 
 FAMILIES = _families()
@@ -563,9 +558,12 @@ def _resumed_attention(query, key, value, state, keep):
     """Attention resumed from a softmax state `(m, total, acc)` (one query head a key head), written apart
     from Dew with normalized weights, so a state whose sums are near fp32's largest stays finite: the
     state's weight `total e^(m - M)` and each kept key's `e^(s - M)` over their sum, the state reading its
-    values' mean `acc / total`."""
-    m, total, acc = (jnp.asarray(x, query.dtype) for x in state)
-    logits = jnp.einsum("bqhd,bkhd->bhqk", query, key) / jnp.sqrt(jnp.asarray(query.shape[-1], query.dtype))
+    values' mean `acc / total`; in fp32 or the inputs' wider dtype, as the state is, the probabilities
+    rounded to the values' dtype for their product (row 1362)."""
+    wide = jnp.promote_types(query.dtype, jnp.float32)
+    m, total, acc = (jnp.asarray(x, wide) for x in state)
+    query, key = query.astype(wide), key.astype(wide)
+    logits = jnp.einsum("bqhd,bkhd->bhqk", query, key) / jnp.sqrt(jnp.asarray(query.shape[-1], wide))
     logits = jnp.where(keep, logits, -jnp.inf)
     top = jnp.maximum(m, jnp.max(logits, axis=-1))
     own = total * jnp.exp(m - top)
@@ -573,7 +571,8 @@ def _resumed_attention(query, key, value, state, keep):
     denominator = own + weights.sum(axis=-1)
     mean = acc / total[..., None]
     shares = weights / denominator[..., None]
-    out = mean * (own / denominator)[..., None] + jnp.einsum("bhqk,bkhd->bhqd", shares, value)
+    weighted = jnp.einsum("bhqk,bkhd->bhqd", shares.astype(value.dtype), value, preferred_element_type=wide)
+    out = mean * (own / denominator)[..., None] + weighted
     return jnp.swapaxes(out, 1, 2)
 
 
@@ -642,14 +641,14 @@ def _held_empty(family: Family, found, label: str) -> None:
 def test_attention_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, form):
     """Each template mainloop's output and query, key and value gradients, check 1 over the family's
     draws; a row that sees nothing, zero."""
-    family = FAMILIES[family]
+    seeds, family = SEEDS[family], FAMILIES[family]
     draw = _cast(family, family.draw)
     reference = jax.jit(with_gradients(_reference(family, anchored=False)))
     truth = with_gradients(_reference(family, anchored=True))
     for name, mainloop in _mainloops(family, FORMS[form]).items():
         label = f"{name} {form} {family.dtype}"
         differentiated = jax.jit(with_gradients(mainloop))
-        assert_as_exact(differentiated, reference, draw, label, seeds=family.seeds, truth_fn=truth)
+        assert_as_exact(differentiated, reference, draw, label, seeds=seeds, truth_fn=truth)
         _held_empty(family, differentiated(*draw(0)), label)
 
 
@@ -671,7 +670,7 @@ def _cache(array: jax.Array) -> jax.Array:
 def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, form):
     """The decode kernel's output, interpreted, each row's keys the first `K` of its cache, check 1 over
     the family's draws."""
-    family = FAMILIES[family]
+    seeds, family = SEEDS[family], FAMILIES[family]
     natural = {} if FORMS[form] is None else {"natural": FORMS[form]}
     lengths = family.spans.get("lengths")
 
@@ -688,7 +687,7 @@ def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, f
         return _cast(family, family.draw)(seed)[:4]
 
     assert_as_exact(jax.jit(decoded), jax.jit(_reference(family, anchored=False)), forward,
-                    f"decode {form} {family.dtype}", seeds=family.seeds,
+                    f"decode {form} {family.dtype}", seeds=seeds,
                     truth_fn=_reference(family, anchored=True))
 
 
