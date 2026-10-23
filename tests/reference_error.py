@@ -836,7 +836,7 @@ rate is a leaf's: a site of L narrow leaves may fail an equally exact Dew L time
 The power this gives up is local: a narrow row whose error is between ROW_FACTOR and these factors
 times the reference's worst no longer fails by its row (the pooled ratio and the leaf's other rows still
 judge it), and a narrow false alarm no longer draws the second stage for the site's other leaves, which
-that stage exists to judge on real findings. Check 2 (tests/op_certificates.py `assert_certified`) holds
+that stage exists to judge on real findings. Check 2 (tests/certified.py `assert_certified`) holds
 each element within its own operation's certified bound where a site runs it, which resolves such an
 error at a pointwise step or a short sum: a sum of n terms is held within γ_n Σ|terms|, about n·u
 Σ|terms| for u the unit roundoff, of its exact value, so its reach in units of the sum's own last place grows
@@ -929,7 +929,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
 
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
-    (tests/op_certificates.py)."""
+    (tests/certified.py)."""
     if seeds < FEWEST_SEEDS:
         raise Inconclusive(f"{label}: {seeds} seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
                            f"(`seeds_for`)")
