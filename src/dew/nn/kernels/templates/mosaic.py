@@ -1,6 +1,8 @@
-"""Hopper's (sm90) toolkit for the templates' Pallas Mosaic GPU mainloops (design §6): the launch,
-warpgroup roles, barriers, shared-memory staging and the TMA store every sm90 mainloop builds on. Each
-template keeps its own mainloop, product dependencies and launch DAG; only these primitives are shared.
+"""The templates' Pallas Mosaic GPU toolkit (design §6), every instruction family's: the launch,
+warpgroup roles, barriers, shared-memory staging, operand streams and stores every Mosaic mainloop builds on.
+The math is each template's algebra, written once; what an instruction family adds is its issue and its
+layout facts alone (`Family`: mosaic_sm90's wgmma; mma.sync's and tcgen05's to come). Each template keeps
+its own mainloop, product dependencies and launch DAG; only these primitives are shared.
 
 A cooperative launch (`cooperative`) runs a producer warpgroup issuing the loads beside consumer warpgroups
 computing, persistent over the multiprocessors, a pair of them a cluster where it shares one operand's blocks
@@ -16,7 +18,6 @@ streams each operand through a `Ring` whose counter runs across tiles, and takes
 """
 
 import dataclasses
-import functools
 import math
 
 from jax import lax, numpy as jnp
@@ -98,18 +99,6 @@ def meet(halves) -> None:
         plgpu.barrier_wait(barrier)
 
 
-def finished(run, shape: tuple[int, int], barrier, finish) -> None:
-    """A consumer's output tile: `run` on a scoped warpgroup accumulator of `shape`, its MMAs waited for,
-    the tile reported drained (`barrier`, the producer's cue to reload its stage), then `finish` of its
-    value."""
-    @functools.partial(pl.run_scoped, acc_ref=plgpu.WGMMAAccumulatorRef(shape))
-    def _(acc_ref):
-        run(acc_ref)
-        plgpu.wgmma_wait(0)
-        plgpu.barrier_arrive(barrier)
-        finish(acc_ref[...])
-
-
 def staging(name: str, shaped) -> dict:
     """Each consumer warpgroup's staging buffer for each operand a tile reads (`shaped`: its tile's shape and
     its operand) and a barrier for each, as `{name}_smems` and `{name}_barriers`."""
@@ -169,10 +158,16 @@ class Ring:
         plgpu.copy_gmem_to_smem(view, self.smem.at[slot], self.full.at[slot])
 
     def acquire(self, counter):
-        """A consumer's wait for step `counter`'s load: its slot."""
+        """A consumer's wait for step `counter`'s load: its slot. Each load is waited for once (a wait takes
+        the barrier's next phase)."""
         slot = self.slot(counter)
         plgpu.barrier_wait(self.full.at[slot])
         return self.smem.at[slot]
+
+    def at(self, counter):
+        """Step `counter`'s slot, its load waited for already (`acquire`, issued under an earlier step's
+        products)."""
+        return self.smem.at[self.slot(counter)]
 
     def release(self, counter) -> None:
         """A consumer's release of step `counter`'s slot, whose reads (and MMAs) are done."""
@@ -187,12 +182,28 @@ class Ring:
             pl.when(step >= 0)(lambda step=step: plgpu.barrier_wait(self.consumed.at[self.slot(step)]))
 
 
-def ring(block: tuple, dtype, stages: int, *, consumers: int = 1) -> dict:
-    """A `Ring`'s allocations for `pl.run_scoped`: `stages` slots of `block` in `dtype`, a load barrier
-    each, and a release barrier each that `consumers` arrive at. `Ring(**allocated)` once scoped."""
-    return {'smem': plgpu.SMEM((stages, *block), dtype),
+def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, transforms: tuple = ()) -> dict:
+    """A `Ring`'s allocations for `pl.run_scoped`: `stages` slots of `block` in `dtype` (laid out by an
+    instruction family's `transforms` where its MMAs read them, `Family.transforms`), a load barrier each,
+    and a release barrier each that `consumers` arrive at. `Ring(**allocated)` once scoped."""
+    return {'smem': plgpu.SMEM((stages, *block), dtype, transforms=transforms),
             'full': plgpu.Barrier(num_barriers=stages),
             'consumed': plgpu.Barrier(num_arrivals=consumers, num_barriers=stages)}
+
+
+@dataclasses.dataclass(frozen=True)
+class Family:
+    """An instruction family's facts a Mosaic mainloop issues by (`generation.family` names it): its
+    accumulator's register `layout` and a row's and a column's vectors in it, the rows one compute
+    warpgroup's MMA covers (`rows`), and its operand tiles' shared-memory layout (`transforms`, of a
+    16-bit dtype's tiles). Its issue functions are its module's (mosaic_sm90's wgmma)."""
+
+    name: str
+    layout: plgpu.Layout
+    row: plgpu.Layout
+    column: plgpu.Layout
+    rows: int
+    transforms: tuple
 
 
 CONSUMER_REGISTERS, PRODUCER_REGISTERS = 232, 40
