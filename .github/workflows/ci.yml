@@ -194,9 +194,14 @@ jobs:
         armada=armada
         # The daily run and a land-queue train's full run (ci/full-*) run every file; any other run reruns what
         # its change reaches (tools/armada/ci.py policy), and the whole suite where it cannot place it: from
-        # main, or for a fix on a train (ci/fix-*) from the train's tip it fixes, its first parent.
+        # main, for a fix on a train (ci/fix-*) from the train's tip it fixes, its first parent, and for a
+        # base/<producer> promote (ci/base-<sha>-*) from the producer branch's tip it merges onto, <sha>.
         if [ -z "$DEW_TEST_CACHE" ]; then
-          case "$GITHUB_REF_NAME" in ci/fix-*) from=HEAD^1 ;; *) from=origin/main ;; esac
+          case "$GITHUB_REF_NAME" in
+            ci/fix-*) from=HEAD^1 ;;
+            ci/base-*) from=${GITHUB_REF_NAME#ci/base-}; from=${from%%-*} ;;
+            *) from=origin/main ;;
+          esac
           DEW_TEST_CACHE=$(python3 tools/armada/ci.py policy "$from")
         fi
         echo "the test cache's policy: $DEW_TEST_CACHE"
