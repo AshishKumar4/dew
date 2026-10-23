@@ -48,7 +48,7 @@ from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 
 from .flops import conv_flops
-from .precision import accumulated, biased, float32_einsum, float32_products, products_dtype
+from .precision import accumulated, biased, float32_products, products_dtype
 from .sharding import SEQUENCE_AXIS, STAGE_AXIS, auto_part, logical_spec, mesh_axes
 
 # A linear boundary must survive in tangents and cotangents too: dropping it
@@ -170,7 +170,14 @@ def _shifted_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax
 
     windows = jnp.stack([window(row, column) for row in range(3) for column in range(3)])
     taps = rhs.astype(jnp.float32).reshape(9, rhs.shape[-1])
-    return float32_einsum('tbhwc,tc->bhwc', windows, taps).astype(lhs.dtype)
+    return accumulated(_tapped, windows, taps).astype(lhs.dtype)
+
+
+def _tapped(windows: jax.Array, taps: jax.Array, preferred_element_type=None) -> jax.Array:
+    """The nine windows `[9, B, H, W, C]` against their taps `[9, C]`, summed: elementwise, so XLA
+    fuses it where a contraction over nine broadcast rows would not."""
+    del preferred_element_type  # the operands' own
+    return jnp.sum(windows * taps[:, None, None, None, :], axis=0)
 
 
 def _materialized_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
