@@ -75,13 +75,14 @@ from ..mixers.mamba2 import Mamba2Mixer
 from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
 from ..mlp import GatedMLP
-from ..ngpt import NGPT, gain, unit
+from ..ngpt import NGPT, gain
 from ..precision import (
     at_least_fp32,
     capped_logits,
     float32_dot_general,
     head_dot_general,
     head_product,
+    l2norm,
     scaled,
     scaled_logits,
 )
@@ -2270,7 +2271,7 @@ class CausalTransformer(nn.Module):
         """The norm before the head and between a loop's passes: under nGPT the unit norm itself,
         its states being unit vectors, with the logits' per-token gain beside it."""
         if self.ngpt is not None:
-            self.norm = unit
+            self.norm = l2norm
             self.logit_scale = self.param('logit_scale', nn.initializers.constant(self.ngpt.start),
                                           (self.vocab_size,), jnp.float32)
         else:

@@ -39,7 +39,8 @@ from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, recurrence_chunk, tuning
 from dew.nn.kernels.recurrence import ChunkLocalCumsum, cumulated
 from dew.nn.kernels.recurrence_chunk import fla_rule
-from dew.nn.linear import GatedDeltaNet, l2norm
+from dew.nn.linear import GatedDeltaNet
+from dew.nn.precision import l2norm
 from dew.training._lowering import triton_calls
 
 pytestmark = pytest.mark.kernel

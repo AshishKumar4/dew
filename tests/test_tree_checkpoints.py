@@ -118,3 +118,18 @@ def test_a_sharded_tree_restores_onto_another_mesh(tmp_path):
     for name in written:
         assert restored[name].sharding == target
         np.testing.assert_array_equal(np.asarray(restored[name]), np.asarray(written[name]))
+
+
+@pytest.mark.parametrize("dtype", [np.bool_, np.uint8, jnp.bfloat16, np.int32, np.float64])
+def test_a_leaf_marks_the_same_from_the_host_as_on_the_devices(dtype):
+    """A frozen digest marks a host leaf on the host and a device leaf on the devices: the two give
+    one leaf's stored bytes the same marks, at any chunk the host reads them in, where JAX holds the
+    leaf as stored (a float64 leaf with x64 on)."""
+    from dew.checkpoints import _host_marks, _marks
+
+    values = np.abs(np.random.default_rng(0).normal(size=(3, 5, 7))) * 40
+    leaf = (values > 30) if dtype is np.bool_ else values.astype(dtype)
+    with jax.enable_x64(dtype is np.float64):
+        device = np.asarray(jax.device_get(_marks([jnp.asarray(leaf)])))[0]
+    for chunk in (1 << 24, 16, 7):
+        np.testing.assert_array_equal(_host_marks(leaf, chunk), device)
