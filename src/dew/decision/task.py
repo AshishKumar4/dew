@@ -300,6 +300,16 @@ class Decide:
             return self._seen(state, questions, images, context)[0]
         return self.batch([(state, questions)], contexts=[context])[0][0]
 
+    def rows(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]], *,
+             contexts: Sequence[JSON | None] | None = None) -> list[list[Encoded]]:
+        """Each request's rows as `batch` scores them: its state and questions laid out, with its
+        context (`contexts`, in order, or None for none) beside them."""
+        contexts = [None] * len(requests) if contexts is None else list(contexts)
+        if len(contexts) != len(requests):
+            raise ValueError(f"{len(contexts)} contexts for {len(requests)} requests")
+        return [self._encoded(state, questions, context=context)
+                for (state, questions), context in zip(requests, contexts, strict=True)]
+
     def batch(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]], *,
               contexts: Sequence[JSON | None] | None = None) -> list[tuple[dict[str, Answer], Usage]]:
         """Return each request's answers and usage.
@@ -307,12 +317,8 @@ class Decide:
         The rows of every request are scored together within the budget. `contexts`
         holds each request's context, in order (`__call__`), or None for none.
         """
-        contexts = [None] * len(requests) if contexts is None else list(contexts)
-        if len(contexts) != len(requests):
-            raise ValueError(f"{len(contexts)} contexts for {len(requests)} requests")
-        rows = [(index, encoded)
-                for index, ((state, questions), context) in enumerate(zip(requests, contexts, strict=True))
-                for encoded in self._encoded(state, questions, context=context)]
+        rows = [(index, encoded) for index, own in enumerate(self.rows(requests, contexts=contexts))
+                for encoded in own]
         logits = self.logits([encoded for _, encoded in rows])
         answered: list[tuple[dict[str, Answer], Usage]] = []
         for index, (_, questions) in enumerate(requests):
