@@ -75,13 +75,15 @@ DEFAULT = {1: Tiles(64, 2), PARTS: Tiles(32, 1)}
 the states and output launches' tiles at 128-wide keys fit an A100's block (163 KB of shared memory)."""
 
 
-def _split(x) -> tuple:
-    """fp32 `x` as three bf16 parts summing to it exactly, largest first: each rounding's remainder is exact.
-    """
-    first = x.astype(jnp.bfloat16)
-    rest = x - first.astype(jnp.float32)
-    second = rest.astype(jnp.bfloat16)
-    return first, second, (rest - second.astype(jnp.float32)).astype(jnp.bfloat16)
+def _split(x, parts: int = PARTS) -> tuple:
+    """fp32 `x` as `parts` bf16 parts, largest first, each the last's remainder rounded (exact): three sum to
+    `x` exactly, two to 16 of its significand's bits."""
+    pieces, rest = [], x
+    for _ in range(parts):
+        piece = rest.astype(jnp.bfloat16)
+        pieces.append(piece)
+        rest = rest - piece.astype(jnp.float32)
+    return tuple(pieces)
 
 
 def _parts(dtype) -> int:
@@ -120,21 +122,24 @@ class _Parts:
 class _Issuer:
     """The algebra's products (`algebra.Issue`) on the family: an operand a `_Parts` tile in shared memory, or
     a register value the family stages first (`stage`) into its product's `buffers` (by product name, a tile a
-    part), an fp32 one as its parts. Operands of three parts issue the products whose parts' orders sum under
-    three, smallest first."""
+    part; a pair, the left operand's and the right's, where both are registers), an fp32 one as its parts, or
+    as `parts[name]` of them where a product takes fewer. Operands of three parts issue the products whose
+    parts' orders sum under three, smallest first; of two, under two."""
 
-    def __init__(self, buffers: dict | None = None):
-        self.buffers = buffers or {}
+    def __init__(self, buffers: dict | None = None, parts: dict | None = None):
+        self.buffers, self.parts = buffers or {}, parts or {}
 
-    def _operand(self, x, name: str) -> tuple:
+    def _operand(self, x, name: str, side: int) -> tuple:
         if isinstance(x, _Parts):
             return x.refs
-        values = _split(x) if _parts(x.dtype) > 1 else (x,)
         buffers = self.buffers[name]
+        if isinstance(buffers, dict):
+            buffers = buffers[side]
+        values = _split(x, self.parts.get(name, PARTS)) if _parts(x.dtype) > 1 else (x,)
         return tuple(FAMILY.stage(value, buffer) for value, buffer in zip(values, buffers, strict=True))
 
     def __call__(self, name: str, lhs, rhs) -> jax.Array:
-        left, right = self._operand(lhs, name), self._operand(rhs, name)
+        left, right = self._operand(lhs, name, 0), self._operand(rhs, name, 1)
         shape = (lhs.shape[0], rhs.shape[1])
         count = max(len(left), len(right))
         terms = sorted(((i, j) for i in range(len(left)) for j in range(len(right)) if i + j < count),
@@ -148,14 +153,9 @@ def _diagonal(size: int) -> jax.Array:
     return FAMILY.iota(shape, 0) == FAMILY.iota(shape, 1)
 
 
-def _across(vector: jax.Array) -> jax.Array:
-    """A column's vector laid as a row's (`algebra.Across`): its diagonal's row sums, exactly."""
-    return jnp.sum(jnp.where(_diagonal(vector.shape[0]), vector[None, :], 0.0), axis=1)
-
-
 def _down(vector: jax.Array) -> jax.Array:
-    """A row's vector laid as a column's, `_across`'s inverse. Two loads of one view in the two layouts are
-    one load to Mosaic GPU's layout inference, which then finds none for it."""
+    """A row's vector laid as a column's: its diagonal's column sums, exactly. Two loads of one view in the
+    two layouts are one load to Mosaic GPU's layout inference, which then finds none for it."""
     return jnp.sum(jnp.where(_diagonal(vector.shape[0]), vector[:, None], 0.0), axis=0)
 
 
@@ -256,6 +256,26 @@ def _staging(operand: _Operand, *shapes) -> tuple:
                        for _ in range(operand.parts)) for shape in shapes)
 
 
+MERGED = 2
+"""The bf16 parts a 16-bit call's inverse takes its fp32 tiles' products ('merge') as: 16 significand bits,
+past the TF32 (10) fla takes them in, where the inverse is rounded to the call's 8 after."""
+
+
+def _merges(call: _Call) -> tuple:
+    """The inverse's staging tiles (`algebra.doubled`'s 'merge' products, both operands fp32 registers): a
+    `[C, C]` tile a part, for the left operand and for the right."""
+    parts = PARTS if call.held.parts > 1 else MERGED
+    tile = (CHUNK, CHUNK)
+    return tuple(tuple(plgpu.SMEM(tile, jnp.bfloat16, transforms=_sm80.swizzled(*tile, jnp.bfloat16))
+                       for _ in range(parts)) for _ in range(2))
+
+
+def _merging(staging, call: _Call) -> _Issuer:
+    """The inverse's products on `_merges`' staging tiles."""
+    left, right = staging
+    return _Issuer({"merge": {0: left, 1: right}}, {"merge": len(left)})
+
+
 def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, stages: int,
             staging: tuple = ()):
     """`program(*refs, streams, staging)` as a kernel over `grid`: its streams of `blocks` (`stages` deep) and
@@ -293,7 +313,6 @@ def _solve(k, hi, lo, beta, taken, call: _Call):
     width, held = call.width, dataclasses.replace(call.held, rows=call.rows)
 
     def program(k_ref, hi_ref, lo_ref, beta_ref, taken_ref, a_ref, *, streams, staging):
-        del staging
         n, h = lax.axis_index("chunks"), lax.axis_index("heads")
         row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
 
@@ -308,9 +327,9 @@ def _solve(k, hi, lo, beta, taken, call: _Call):
                 return _tile(slots, "keys", call.given, columns=pl.ds(c * BLOCK, BLOCK))
 
             gate, low, betas = (FAMILY.rows_of(ref.at[h, span]) for ref in (hi_ref, lo_ref, beta_ref))
-            inverse = algebra.solved(keys, [gate], [low], [betas], width // BLOCK, _Issuer(),
-                                     laid=([_down(gate)], [_down(low)]), across=_across)[0, 0]
-            held.store(a_ref, inverse, row, CHUNK, h * CHUNK, CHUNK)
+            block = algebra.system(keys, [gate], [low], [betas], width // BLOCK, _Issuer(),
+                                   laid=([_down(gate)], [_down(low)]))[0, 0]
+            held.store(a_ref, algebra.doubled(-block, _merging(staging, call)), row, CHUNK, h * CHUNK, CHUNK)
             return carry, accumulators
 
         @pl.when(taken_ref[n] > 0)
@@ -319,7 +338,7 @@ def _solve(k, hi, lo, beta, taken, call: _Call):
 
     return _kernel(program, call, out_type=held.shape(call.heads * CHUNK), grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=_streamed(keys=((CHUNK, width), call.given)),
-                   stages=1)(k, hi, lo, beta, taken)
+                   stages=1, staging=_merges(call))(k, hi, lo, beta, taken)
 
 
 def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
@@ -331,7 +350,6 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
     width, held, gates = call.width, dataclasses.replace(call.held, rows=call.rows), call.gates
 
     def program(q_ref, k_ref, hi_ref, lo_ref, beta_ref, taken_ref, a_ref, aqk_ref, *, streams, staging):
-        del staging
         n, h = lax.axis_index("chunks"), lax.axis_index("heads")
         row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
         keyed, columns = h // call.group * width, pl.ds(h * width, width)
@@ -359,9 +377,8 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
             scores, system = algebra.key_decayed_row(query, weighted, gate, low, earlier, CHUNK - 1, CHUNK,
                                                      scale)
             rows, cols = (FAMILY.iota((CHUNK, CHUNK), dimension) for dimension in (0, 1))
-            inverse = algebra.inverted({(0, 0): jnp.where(rows > cols, system, 0.0)}, _Issuer(),
-                                       across=_across)
-            held.store(a_ref, inverse[0, 0], row, CHUNK, h * CHUNK, CHUNK)
+            inverse = algebra.doubled(-jnp.where(rows > cols, system, 0.0), _merging(staging, call))
+            held.store(a_ref, inverse, row, CHUNK, h * CHUNK, CHUNK)
             held.store(aqk_ref, jnp.where(rows >= cols, scores, 0.0), row, CHUNK, h * CHUNK, CHUNK)
             return carry, accumulators
 
@@ -373,7 +390,8 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
                        gates=((CHUNK, width), gates), lows=((CHUNK, width), gates))
     out_type = (held.shape(call.heads * CHUNK),) * 2
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
-                   grid_names=("chunks", "heads"), blocks=blocks, stages=1)(q, k, hi, lo, beta, taken)
+                   grid_names=("chunks", "heads"), blocks=blocks, stages=1,
+                   staging=_merges(call))(q, k, hi, lo, beta, taken)
 
 
 def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):

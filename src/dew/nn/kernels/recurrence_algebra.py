@@ -394,49 +394,39 @@ def apart(rows, rows_lo, columns, columns_lo):
     return (rows[:, None] - columns[None, :]) + (rows_lo[:, None] - columns_lo[None, :])
 
 
-Across = Callable[[jax.Array], jax.Array]
-"""A column's vector `[C]` laid as a row's: a mainloop whose layouts keep the two apart (Mosaic GPU's, whose
-vectors are a row's or a column's of the accumulator's layout and never both) takes one to the other; where
-None, the vector itself serves as either."""
-
-
 def _grid(shape) -> tuple[jax.Array, jax.Array]:
-    """A tile's row and column indices `[R, C]` each, two iotas, so a mainloop lays each as its tile."""
+    """A tile's row and column indices `[R, C]` each, two iotas, so a mainloop lays each as its tile (a
+    vector broadcast both ways is one value Mosaic GPU's layout inference cannot lay twice)."""
     return jax.lax.broadcasted_iota(jnp.int32, shape, 0), jax.lax.broadcasted_iota(jnp.int32, shape, 1)
 
 
-def tril_inverse(diagonal, index, across: Across | None = None):
+def tril_inverse(diagonal, index):
     """`(I + D)^-1` of a strictly lower square block `D`, row by row: forward substitution. `index` is
-    the block's `arange` of columns; `across` lays each row found as the next one's weights (`Across`). A
-    block past `SUB` rows substitutes in a loop, where its rows unrolled took Mosaic GPU 110 s to compile at
-    64 (an A100's whole forward)."""
+    the block's `arange` of rows, which the caller's other masks share."""
     sub = diagonal.shape[0]
-    rows, columns = _grid(diagonal.shape)
-
-    def substituted(i, inverse):
-        row = jnp.sum(jnp.where(rows == i, -diagonal, 0.0), axis=0)
-        row = jnp.where(index < i, row, 0.0)
-        weights = row if across is None else across(row)
-        row = row + jnp.sum(weights[:, None] * inverse, axis=0)
-        return jnp.where(rows == i, row[None, :], inverse)
-
     inverse = -diagonal
-    if sub > SUB:
-        inverse = jax.lax.fori_loop(2, sub, substituted, inverse)
-    else:
-        for i in range(2, sub):
-            inverse = substituted(i, inverse)
-    return inverse + jnp.where(rows == columns, 1.0, 0.0)
+    for i in range(2, sub):
+        row = jnp.sum(jnp.where((index == i)[:, None], -diagonal, 0.0), axis=0)
+        row = jnp.where(index < i, row, 0.0)
+        row = row + jnp.sum(row[:, None] * inverse, axis=0)
+        inverse = jnp.where((index == i)[:, None], row[None, :], inverse)
+    return inverse + (index[:, None] == index[None, :])
 
 
-def solved(keys: Load, gates, lows, betas, columns: int, issue: Issue, *, laid: tuple | None = None,
-           across: Across | None = None) -> dict:
+def solved(keys: Load, gates, lows, betas, columns: int, issue: Issue) -> dict:
     """`(I + A)^-1`'s blocks `{(i, j): [SUB, SUB]}` for `j <= i` of one chunk's `A = tril(beta_s (k_s .
-    k_t) exp2(g_s - g_t), -1)`, a decay a head: `keys(i, c)` sub-chunk `i`'s key column block `c` of
-    `columns`, `gates`, `lows` and `betas` each sub-chunk's prefix halves and write gates, fp32, and `laid`
-    the halves `(gates, lows)` as a column's vectors where a mainloop's layouts keep them apart from a row's
-    (`Across`, which `across` crosses). Every block of `k k^T` sums its column blocks' products ('intra'),
-    and the blocks invert (`inverted`)."""
+    k_t) exp2(g_s - g_t), -1)`, a decay a head: `system`'s blocks, inverted (`inverted`)."""
+    return inverted(system(keys, gates, lows, betas, columns, issue), issue)
+
+
+def system(keys: Load, gates, lows, betas, columns: int, issue: Issue, *,
+           laid: tuple | None = None) -> dict:
+    """The blocks `{(i, j): [SUB, SUB]}` for `j <= i` of one chunk's `A = tril(beta_s (k_s . k_t) exp2(g_s -
+    g_t), -1)`, a decay a head: `keys(i, c)` sub-chunk `i`'s key column block `c` of `columns`, `gates`,
+    `lows` and `betas` each sub-chunk's prefix halves and write gates, fp32, and `laid` the halves `(gates,
+    lows)` as a column's vectors, where a mainloop's layouts keep a column's vector apart from a row's
+    (Mosaic GPU's, whose vectors are one or the other of a tile's). Every block of `k k^T` sums its column
+    blocks' products ('intra')."""
     count = len(gates)
     column_gates, column_lows = (gates, lows) if laid is None else laid
 
@@ -448,17 +438,36 @@ def solved(keys: Load, gates, lows, betas, columns: int, issue: Issue, *, laid: 
             decay = jnp.where(rows > cols, decay, 0.0)
         return product * decay * betas[i][:, None]
 
-    return inverted({(i, j): block(i, j) for i in range(count) for j in range(i + 1)}, issue, across=across)
+    return {(i, j): block(i, j) for i in range(count) for j in range(i + 1)}
 
 
-def inverted(blocks: dict, issue: Issue, *, across: Across | None = None) -> dict:
+def doubled(a, issue: Issue):
+    """`factor`'s doubling on one tile: `(I - A)^-1` `[C, C]` of a strictly lower `a`, every level's blocks
+    held in place in the tile, for a mainloop whose products take whole tiles (Mosaic GPU's, a warpgroup's 64
+    rows, which hold no block of their own). From the two-wide blocks `[[1, 0], [a, 1]]`, each level joins
+    pairs of `s`-blocks as `X_2s = X_s + X_s A_s X_s` ('merge' twice), `A_s` the tile masked to each pair's
+    lower block, whose product with the block-diagonal `X_s` is `factor`'s `X2 A21 X1` there and zero
+    elsewhere: log2(C) - 1 levels of two products, where row-by-row substitution's C rows each wait on the
+    last (`tril_inverse`)."""
+    size = a.shape[-1]
+    rows, cols = _grid(a.shape)
+    inverse = jnp.where(rows == cols, 1.0, 0.0) + jnp.where((rows % 2 == 1) & (cols == rows - 1), a, 0.0)
+    width = 2
+    while width < size:
+        lower = ((rows // width) % 2 == 1) & (cols // width == rows // width - 1)
+        inverse = inverse + issue("merge", issue("merge", inverse, jnp.where(lower, a, 0.0)), inverse)
+        width *= 2
+    return inverse
+
+
+def inverted(blocks: dict, issue: Issue) -> dict:
     """`(I + A)^-1`'s blocks `{(i, j): [SUB, SUB]}` for `j <= i` from `A`'s strictly lower blocks
     `blocks` (the diagonal ones strictly lower themselves): forward substitution inverts each diagonal
-    block (`tril_inverse`, its rows laid by `across`), and neighbouring inverses merge as `X_ij = -X_ii
-    sum_m A_im X_mj` ('merge'), nearest the diagonal first."""
+    block (`tril_inverse`), and neighbouring inverses merge as `X_ij = -X_ii sum_m A_im X_mj` ('merge'),
+    nearest the diagonal first."""
     count = max(i for i, _ in blocks) + 1
     index = jnp.arange(blocks[0, 0].shape[0])
-    inverse = {(i, i): tril_inverse(blocks[i, i], index, across) for i in range(count)}
+    inverse = {(i, i): tril_inverse(blocks[i, i], index) for i in range(count)}
     for distance in range(1, count):
         for i in range(distance, count):
             j = i - distance
@@ -508,7 +517,7 @@ def chunk_output(queries: Load, entered: Load, keys: Load, columns: int, gate, l
     g_t)) v)`, the key column blocks `queries(c)`, `entered(c)` (the memory the chunk entered) and
     `keys(c)` summed into fp32 ('memory', 'scores'), the scores cast to the values' dtype for 'local'.
     `laid` is the prefix's halves `(gate, low)` as a column's vectors where a mainloop's layouts keep them
-    apart from a row's (`Across`)."""
+    apart from a row's (`system`'s)."""
     out = jnp.zeros((gate.shape[0], value.shape[-1]), jnp.float32)
     scores = jnp.zeros((gate.shape[0], gate.shape[0]), jnp.float32)
     for c in range(columns):
