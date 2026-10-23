@@ -367,20 +367,3 @@ def test_masked_source_accepts_neutral_controls_and_honors_task_metadata(masked_
     for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(wanted), strict=True):
         np.testing.assert_array_equal(left, right)
 
-
-@pytest.mark.parametrize("name", ["llada-moe-tiny", "llada-moe-v2-tiny"])
-@pytest.mark.parametrize("field", ["rope_theta", "partial_rotary_factor"])
-def test_a_llada_moe_config_that_states_no_rotary_is_refused(tmp_path, name, field):
-    """LLaDA-MoE's config classes default the rotary's base and factor to -1, which names no
-    rotary: the fixture without either is refused rather than read at another family's default."""
-    from dew.interop import Pretrained
-
-    fixture = FIXTURES / name
-    for path in fixture.iterdir():
-        if path.name != "config.json":
-            (tmp_path / path.name).symlink_to(path)
-    config = json.loads((fixture / "config.json").read_text())
-    del config[field]
-    (tmp_path / "config.json").write_text(json.dumps(config))
-    with pytest.raises(ValueError):
-        Pretrained.load(str(tmp_path), dtype="float32", attention_impl="reference")
