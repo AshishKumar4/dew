@@ -143,15 +143,9 @@ def test_cpu_shifted_depthwise_is_as_exact_as_the_library_convolution(shape, dil
     """The CPU's shifted sum on par with XLA:CPU's library convolution, which it replaces so a sampled
     image keeps its accuracy, from the convolution in float64 over drawn images and kernels
     (check 1)."""
-    library = jax.jit(partial(convolve, dilation=dilation))
-
-    def truth(x, kernel):
-        with jax.enable_x64(new_val=True):
-            return library(np.asarray(x, np.float64), np.asarray(kernel, np.float64))
-
-    assert_as_exact(shared(dilation, shape[-1]), library, drawn(shape, dtype),
-                    f"shifted depthwise {shape} dilation {dilation} {dtype}",
-                    seeds=CPU_SEEDS[shape, dtype], truth_fn=truth)
+    assert_as_exact(shared(dilation, shape[-1]), jax.jit(partial(convolve, dilation=dilation)),
+                    drawn(shape, dtype), f"shifted depthwise {shape} dilation {dilation} {dtype}",
+                    seeds=CPU_SEEDS[shape, dtype])
 
 
 @pytest.mark.parametrize('dilation', [1, 2, 3])
