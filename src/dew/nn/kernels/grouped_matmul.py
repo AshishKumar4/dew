@@ -223,6 +223,11 @@ def _hooks_lower(ba, dtype, rules) -> bool:
                         tiles('epilogue_operands', hooks.epilogue_axes), rules))
 
 
+def _products(ba) -> int:
+    """The products each output tile computes: two of a paired product (`launched_gmm`), else one."""
+    return 1 if ba.arguments.get('paired') is None else 2
+
+
 def _traced_epilogue(ba):
     """The launch's epilogue as a function of one accumulator tile, as `_lowers` and `_hook_work` read it:
     a paired product's reads that tile for both of its accumulators, the same primitives on the same
@@ -369,7 +374,7 @@ class _Triton(_GroupedLaunch[Tile]):
         wgmma = generation.effective(target).wgmma
 
         exact_sums = ba.arguments.get('exact_sums')
-        accumulators = 2 if exact_sums else 1
+        accumulators = (2 if exact_sums else 1) * _products(ba)
 
         def fits(tile: Tile) -> bool:
             rows, columns = self.output(tile)
@@ -405,7 +410,8 @@ class _Triton(_GroupedLaunch[Tile]):
         # exactly those bytes, so a Hopper tile is sized for the larger. The prologue's side tiles load
         # in the same steps.
         held = 0 if generation.gpu_target().wgmma else 1
-        step = self.loaded(config) * jnp.dtype(ba.arguments['tokens'].dtype).itemsize + _side_tile_bytes(
+        loaded = self.loaded(config) + (_products(ba) - 1) * config.block_k * config.block_n
+        step = loaded * jnp.dtype(ba.arguments['tokens'].dtype).itemsize + _side_tile_bytes(
             ba.arguments['prologue_operands'], ba.arguments['hooks'].prologue_axes, self.extents(config))
         return step * (config.stages - held)
 
@@ -422,7 +428,7 @@ class _Triton(_GroupedLaunch[Tile]):
         # One MMA's k of 16 of each operand fragment, the warps' shares together.
         fragments = (rows + columns) * 16 // threads
         return cost.resident(target, self.staged_bytes(ba, config), threads,
-                             rows * columns // threads + fragments)
+                             _products(ba) * rows * columns // threads + fragments)
 
     @staticmethod
     @abc.abstractmethod
@@ -474,16 +480,21 @@ class Gmm(_Triton):
         chunks = _row_tiles(rows, groups, config.block_m if ba.arguments.get('dense') else CHUNK_M)
         columns = math.ceil(width / config.block_n)
         tiles = _row_tiles(rows, groups, config.block_m)
-        flops = 2 * tiles * config.block_m * depth * width
+        # A paired product's tile multiplies its rows by two matrices' blocks: their flops, loads and
+        # rereads twice, the rows' once.
+        products = _products(ba)
+        flops = 2 * tiles * config.block_m * depth * width * products
         steps = tiles * math.ceil(depth / config.block_k) / chunks
         staged = steps * _triton_staged(config.block_m, config.block_n, config.block_k, config.warps,
                                         generation.effective(target).wgmma) * size
+        staged *= 1 + (products - 1) * config.block_n / (config.block_m + config.block_n)
         hooks, prologue_sides = ba.arguments['hooks'], ba.arguments['prologue_operands']
         epilogue_sides = ba.arguments['epilogue_operands']
         # Side operands are read again as the operands are: with each column block, and with each row
         # tile where they follow no rows; the hooks' special functions on every element they see.
         rereads = {'rows': tiles, 'columns': columns}
-        moved = ((columns * rows * depth + tiles * depth * width) * size + rows * width * _output_bytes(ba)
+        moved = ((columns * rows * depth + products * tiles * depth * width) * size
+                 + rows * width * _output_bytes(ba)
                  + _side_bytes(prologue_sides, hooks.prologue_axes, rereads)
                  + _side_bytes(epilogue_sides, hooks.epilogue_axes, rereads))
         if ba.arguments.get('dense'):
@@ -650,7 +661,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         hooks = ba.arguments['hooks']
         outs = [jnp.dtype(dtype).itemsize for dtype in (hooks.out_dtypes or (ba.arguments['out_dtype'],))]
         extents = self.extents(config)
-        step = (config.block_m + config.block_n) * config.block_k * size + _side_tile_bytes(
+        step = (config.block_m + _products(ba) * config.block_n) * config.block_k * size + _side_tile_bytes(
             ba.arguments['prologue_operands'], hooks.prologue_axes, extents)
         epilogue = _side_tile_bytes(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes, extents)
         # One warpgroup stages each output in turn; two hold every output's staging buffer at once, and
@@ -680,7 +691,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # the stage of `lhs` and its side tiles and writes the stage back before the MMA may read it
         # (a commit to shared memory, and the consumers' meet): serial with the MMAs, not beside them
         # (GMMSB-h100-main: a gated prologue at 3.7x the Triton launch's time).
-        step = 2 * (config.block_m + config.block_n) * config.block_k * size
+        products = _products(ba)
+        step = 2 * (config.block_m + products * config.block_n) * config.block_k * size
         rewritten = 0.0
         if hooks.prologue is not None:
             rewritten = steps * (2 * math.prod(lhs) * size
@@ -692,7 +704,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             (config.block_m, config.block_n), extents)
         return cost.Cost(
             programs=tiles, device_bytes=moved,
-            program_flops=2 * steps * config.block_m * config.block_n * config.block_k,
+            program_flops=2 * steps * config.block_m * config.block_n * config.block_k * products,
             program_staged=steps * step + config.block_m * config.block_n * out,
             program_exponentials=epilogue_exponentials, mode=_mode(tokens.dtype), steps=steps,
             stages=config.stages, serial_staged=rewritten, serial_exponentials=prologue_exponentials)
@@ -712,6 +724,16 @@ class MosaicGmm(_Mosaic):
     """`Gmm` on Hopper (`mosaic_gpu.gmm`)."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
+
+    def fitting(self, ba, target) -> tuple[mosaic_gpu.Tiles, ...]:
+        """The tiles that fit `target` (`Template.fitting`), a paired product's those whose two fp32
+        accumulators stay in each consumer warpgroup's registers (`MosaicTgmm.fitting`'s rule)."""
+        fits = super().fitting(ba, target)
+        if _products(ba) == 1:
+            return fits
+        return tuple(tile for tile in fits
+                     if 2 * tile.block_m * tile.block_n // (128 * tile.warpgroups)
+                     < (hopper.CONSUMER_REGISTERS if tile.warpgroups == 2 else cost.THREAD_REGISTERS))
 
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         kernel = ba.arguments['kernel']
@@ -736,7 +758,8 @@ class MosaicGmm(_Mosaic):
         bands = math.ceil(columns / config.grid_block_n)
         in_flight = self._in_flight(config, target)
         per_group = tiles / max(min(groups, rows), 1)
-        matrices = _routed(rows, groups) * kernel.size * size * math.ceil(per_group / in_flight)
+        matrices = (_products(ba) * _routed(rows, groups) * kernel.size * size
+                    * math.ceil(per_group / in_flight))
         hooks = ba.arguments['hooks']
         rereads = {'rows': tiles, 'columns': bands}
         moved = (bands * rows * depth * size + matrices + rows * width * _output_bytes(ba)
@@ -864,9 +887,10 @@ class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
         outs = _output_bytes(ba)
         sides = (_side_tile_bytes(ba.arguments['prologue_operands'], hooks.prologue_axes, extents)
                  + _side_tile_bytes(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes, extents))
-        operands = self.loaded(config) * size + sides
+        products = _products(ba)
+        operands = (self.loaded(config) + (products - 1) * config.block_k * config.block_n) * size + sides
         rows, columns = self.output(config)
-        return 2 * (operands + outs * rows * columns) + 4 * rows * columns
+        return 2 * (operands + outs * rows * columns) + 4 * rows * columns * products
 
     def _lays_out(self, ba, blocks: mosaic_tpu.Blocks) -> bool:
         """Whether Mosaic TPU lays out every side operand's block at `blocks`: a one-dimensional block
@@ -946,11 +970,13 @@ class MosaicTpuGmm(_MosaicTpu):
         slots, columns = _block_tiles(rows, groups, config.block_m), width // config.block_n
         hooks = ba.arguments['hooks']
         grid = (('columns', columns), ('rows', slots), ('depth', depth // config.block_k))
-        moved = ((columns * rows * depth + slots * depth * width) * size + rows * width * _output_bytes(ba)
+        products = _products(ba)
+        moved = ((columns * rows * depth + products * slots * depth * width) * size
+                 + rows * width * _output_bytes(ba)
                  + _fetched_bytes(ba.arguments['prologue_operands'], hooks.prologue_axes, grid)
                  + _fetched_bytes(ba.arguments['epilogue_operands'], hooks.epilogue_axes, grid))
         return self._cost(depth / config.block_k, slots * columns,
-                          2 * config.block_m * config.block_n * depth, moved, tokens.dtype)
+                          2 * config.block_m * config.block_n * depth * products, moved, tokens.dtype)
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
