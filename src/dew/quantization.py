@@ -65,6 +65,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from dew.cache import QUANTIZED_TRACE
 from dew.nn.fake_quant import correctly_rounded_divide
 from dew.nn.kernels.generation import backend
+from dew.nn.precision import accumulated
 
 if TYPE_CHECKING:
     from qwix import QArray, QuantizationProvider
@@ -315,8 +316,9 @@ def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.
     from dew.interop.codecs import fp8_block_cast
 
     codes, scales = fp8_block_cast(values, (1, values.shape[1]))
-    product = jax.lax.dot_general(codes.astype(jnp.float32), rows.astype(jnp.float32),
-                                  (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
+    product = accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((1,), (1,)), ((), ()))),
+                          codes.astype(jnp.float32), rows.astype(jnp.float32),
+                          preferred_element_type=jnp.float32)
     return product * scales * row_scales.T
 
 
