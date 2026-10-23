@@ -30,7 +30,8 @@ with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
         print("fwd leaf", i, np.asarray(leaf).ravel()[:4])
 jax.config.update("jax_debug_nans", True)
 try:
-    with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
-        attention_triton.backward(query, key, value, spans, hooks, dout, scale=4.0, interpret=True)
+    with jax.disable_jit():
+        attention_portable.backward(query, key, value, spans, hooks, dout, scale=4.0, **tiles)
 except FloatingPointError:
-    print("\n".join(line for line in traceback.format_exc().split("\n") if "dew/" in line)[-3000:])
+    frames = [line for line in traceback.format_exc().split("\n") if "dew/" in line or "line" in line and "dew" in line]
+    print("\n".join(traceback.format_exc().split("\n")[-40:]))
