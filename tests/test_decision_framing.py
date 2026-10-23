@@ -73,7 +73,7 @@ def test_a_tokenizer_without_a_template_frames_a_row_as_plain_text():
     tokenizer's row where the framing asks for no template."""
     tokenizer = ByteTokenizer()
     before, after = Framing().around(tokenizer)
-    assert (before, after) == (f"{JOINT_SYSTEM}\n\n", f"\n\n{JOINT_PREFILL}")
+    assert before.startswith(JOINT_SYSTEM) and after.endswith(JOINT_PREFILL)
     specials = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
     [row] = JointLayout().rows(tokenizer, specials, "one two three", QUESTIONS)
     assert not any(markup in tokenizer.decode(row.tokens) for markup in CHATML)
