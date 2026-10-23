@@ -252,6 +252,13 @@ tutorials = ["dewml[streaming,interop,notebooks]", "matplotlib"]
 # Execute notebooks through a Jupyter kernel of the selected interpreter.
 notebooks = ["nbclient", "nbformat", "ipykernel"]
 
+# The least uv: 0.13.4 is the first whose own CA store leaves out emSign's (GHSA-hq85-5cpj-mr62). uv refuses
+# to run older in this project, setup-uv installs a release at least this, and site/scripts/gen_install.py
+# writes it into the installers that bootstrap uv before any checkout (install.sh, tools/armada/setup.sh, dew
+# tpu setup's script) and into the installation advice.
+[tool.uv]
+required-version = ">=0.13.4"
+
 [tool.ruff]
 target-version = "py312"
 # The tree's own width. A length histogram over src/dew puts p99 at 104 and
