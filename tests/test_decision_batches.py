@@ -104,6 +104,10 @@ def test_a_batchs_probabilities_are_each_bodys_alone(decide):
         # The draw is its seed; the bodies are made from it, their text no array the check widens.
         return (np.int64(seed),)
 
+    from reference_error import seeds_for
+    print("SIZED batched", seeds_for(lambda seed: scored(decide, seed, together=False), draw, "batched sizing",
+                                     truth_fn=truth, dew_fn=lambda seed: scored(decide, seed, together=True)),
+          flush=True)
     assert_as_exact(lambda seed: scored(decide, seed, together=True),
                     lambda seed: scored(decide, seed, together=False), draw,
                     "batched probabilities", seeds=BATCH_SEEDS, truth_fn=truth)
