@@ -99,31 +99,31 @@ ROWS = 32
 of a scalar resolving slowly (the z-loss gradient site's sizing, `seeds_for`)."""
 
 LM_SEEDS = {
-    "loss": 16,
-    "validity attention_mask": 16,
-    "validity coordinates": 16,
-    "padded loss": 16,
-    "perplexity": 16,
-    "evaluation": 16,
-    "ema evaluation": 16,
-    "scores with samples": 16,
-    "perplexity of counted targets": 16,
-    "perplexity of the mean": 16,
-    "validation perplexity": 16,
-    "packed scores": 16,
-    "packed against alone": 16,
-    "packed against its documents' heads": 16,
-    "packed batch dict": 16,
-    "loss role": 16,
-    "roles ignored": 16,
-    "z loss": 16,
-    "z-loss cross entropy": 16,
-    "router z-loss": 16,
-    "prediction": 16,
-    "tiled head fused 4": 16,
-    "tiled head unfused 4": 16,
-    "tiled head fused 16": 16,
-    "tiled head unfused 16": 16,
+    "loss": 256,
+    "validity attention_mask": 256,
+    "validity coordinates": 256,
+    "padded loss": 256,
+    "perplexity": 256,
+    "evaluation": 8,
+    "ema evaluation": 8,
+    "scores with samples": 8,
+    "perplexity of counted targets": 512,
+    "perplexity of the mean": 512,
+    "validation perplexity": 256,
+    "packed scores": 256,
+    "packed against alone": 256,
+    "packed against its documents' heads": 256,
+    "packed batch dict": 256,
+    "loss role": 256,
+    "roles ignored": 256,
+    "z loss": 512,
+    "z-loss cross entropy": 256,
+    "router z-loss": 512,
+    "prediction": 8,
+    "tiled head fused 4": 256,
+    "tiled head unfused 4": 256,
+    "tiled head fused 16": 256,
+    "tiled head unfused 16": 256,
 }
 """Check 1's declared draws by site (`seeds_for`): each draw is the objective's parameters initialized
 from the seed's key and the site's batch drawn from the seed."""
@@ -163,6 +163,16 @@ def shifted(forward, params, batch, **weighting):
     """The cross entropy of the batch's targets over the logits of the inputs before them."""
     tokens = np.asarray(batch[TEXT_KEY])
     return reference_cross_entropy(forward(params, jnp.asarray(tokens[:, :-1])), tokens[:, 1:], **weighting)
+
+
+def token_losses(forward, params, batch):
+    """Each target's negative log softmax over the logits of the inputs before it, in NumPy at the
+    logits' width: the per-token scores an evaluation is held to."""
+    tokens = np.asarray(batch[TEXT_KEY])
+    logits = np.asarray(forward(params, jnp.asarray(tokens[:, :-1])))
+    largest = logits.max(axis=-1, keepdims=True)
+    log_probs = logits - largest - np.log(np.exp(logits - largest).sum(axis=-1, keepdims=True))
+    return -np.take_along_axis(log_probs, tokens[:, 1:, None], axis=-1)[..., 0]
 
 
 ARGMAX_MARGIN = 1e-4
@@ -316,6 +326,7 @@ def test_pretrained_weights_are_what_init_returns():
     for restored, expected in zip(jax.tree.leaves(resumed), jax.tree.leaves(loaded), strict=True):
         assert jnp.array_equal(restored, expected)
 
+
 def make_trainer(tmp_path=None, fsdp=1, learning_rate=3e-3, tracker=None, **objective_kwargs):
     return Trainer(
         make_objective(**objective_kwargs),
@@ -369,8 +380,8 @@ def test_evaluation_correctness_is_the_same_full_forward_argmax():
 
 
 def test_evaluation_scores_every_target_of_the_batch():
-    """Evaluation scores every target of the batch, each counted once, and their mean is the cross
-    entropy of the shifted sequence (check 1)."""
+    """Evaluation scores every target of the batch, each counted once, each its cross entropy given the
+    tokens before it (check 1)."""
     objective = make_objective()
     params, batch = objective.init(jax.random.key(0)), token_batch()
 
@@ -378,16 +389,17 @@ def test_evaluation_scores_every_target_of_the_batch():
 
     assert scores.losses.shape == scores.weights.shape == (4, SEQ)
     np.testing.assert_array_equal(scores.weights, 1.0)
-    def scored(params, batch):
-        return jnp.mean(objective.evaluate(params, batch, step_at()).losses)
 
-    assert_objective_as_exact(objective, "evaluation", lambda seed: token_batch(ROWS, seed=seed), shifted,
-                              scored)
+    def scored(params, batch):
+        return objective.evaluate(params, batch, step_at()).losses
+
+    assert_objective_as_exact(objective, "evaluation", lambda seed: token_batch(ROWS, seed=seed),
+                              token_losses, scored)
 
 
 def test_evaluation_reads_the_ema_copy():
-    """Evaluation under an EMA scores the EMA copy: the cross entropy of its logits (check 1, over drawn
-    parameters and an EMA a unit from them), which the live weights' scores are not."""
+    """Evaluation under an EMA scores the EMA copy: each target's cross entropy over its logits (check 1,
+    over drawn parameters and an EMA a unit from them), which the live weights' scores are not."""
     objective = make_objective()
     forward, init = forwards(objective.model), initialized(objective)
 
@@ -397,13 +409,13 @@ def test_evaluation_reads_the_ema_copy():
 
     @jax.jit
     def averaged(params, ema, batch):
-        return jnp.mean(objective.evaluate(params, batch, step_at(ema=ema)).losses)
+        return objective.evaluate(params, batch, step_at(ema=ema)).losses
 
-    assert_as_exact(averaged, lambda params, ema, batch: shifted(forward, ema, batch), draw, "ema evaluation",
-                    seeds=LM_SEEDS["ema evaluation"])
+    assert_as_exact(averaged, lambda params, ema, batch: token_losses(forward, ema, batch), draw,
+                    "ema evaluation", seeds=LM_SEEDS["ema evaluation"])
     params, ema, batch = draw(0)
-    live = jnp.mean(objective.evaluate(params, batch, step_at()).losses)
-    assert float(live) != float(shifted(forward, ema, batch))
+    live = objective.evaluate(params, batch, step_at()).losses
+    assert not np.array_equal(live, averaged(params, ema, batch))
 
 
 def test_scoring_with_samples_configured_does_not_decode():
@@ -538,32 +550,35 @@ def test_perplexity_is_exp_of_the_mean_cross_entropy_not_the_mean_of_exps():
 def test_the_validation_pass_scores_perplexity_per_token_and_logs_it():
     """Objective artifacts through the trainer's loop and into the metric:
     two batches of different padding weigh by their counted targets. Each
-    draw is a run validating its drawn batches, whose logged perplexity is on
-    par with exp of the counted targets' mean cross entropy over the run's
-    own state (check 1): the run computes Dew's value, so the draw carries it."""
+    draw is one run of a trainer, a step and a validation pass over the
+    draw's batches, whose logged perplexity is on par with exp of the
+    counted targets' mean cross entropy over the run's own state (check 1):
+    the run computes Dew's value, so the draw carries it. Every run starts
+    from the trainer's one initial state and trains the same step, so the
+    draws vary the batches the pass reads."""
     wide = make_objective(model=tiny_decoder().clone(dtype=jnp.float64), pad_id=0)
+    tracker = RecordingTracker()
+    trainer = make_trainer(pad_id=0, tracker=tracker)
 
     def draw(seed):
         padded = {TEXT_KEY: jnp.asarray(np.where(np.arange(SEQ + 1) < 9,
                                                  token_batch(BATCH, seed=2 * seed)[TEXT_KEY], 0))}
         batches = [token_batch(BATCH, seed=2 * seed + 1), padded]
-        tracker = RecordingTracker()
-        trainer = make_trainer(pad_id=0, tracker=tracker)
         state = trainer.fit(dataset(cycle_batches, val=lambda: iter(batches)), steps=1, log_every=1,
                             eval_every=1, metrics=(Perplexity(),))
         logged = [scalars["val/perplexity"] for _, scalars in tracker.scalars if "val/perplexity" in scalars]
-        assert len(logged) == 1
-        return np.float32(logged[0]), jax.device_get(state.variables), batches
-
-    objective = make_objective(pad_id=0)
+        return np.float32(logged[-1]), jax.device_get(state.variables), batches
 
     def expected(logged, variables, batches):
-        scoring = wide if np.dtype(jax.tree.leaves(variables)[0].dtype) == np.float64 else objective
+        scoring = wide if np.dtype(jax.tree.leaves(variables)[0].dtype) == np.float64 else trainer.objective
         scores = [scoring.evaluate(variables, batch, step_at()) for batch in batches]
         # The pass scores the weights the step left, so it matches them.
         assert 0 < sum(float(jnp.sum(score.weights)) for score in scores) < 2 * BATCH * SEQ
         return perplexity_of(*((np.asarray(score.losses), np.asarray(score.weights)) for score in scores))
 
+    draw(0)
+    assert len([scalars for _, scalars in tracker.scalars if "val/perplexity" in scalars]) == 1, (
+        "a run logs one validation pass")
     assert_as_exact(lambda logged, variables, batches: logged, expected, draw, "validation perplexity",
                     seeds=LM_SEEDS["validation perplexity"])
 
@@ -572,6 +587,7 @@ def test_the_validation_pass_scores_perplexity_per_token_and_logs_it():
 
 def packed_objective(seq=SEQ, model=None, **kwargs):
     return LMObjective(model or tiny_decoder(), seq, **kwargs)
+
 
 def documents(first=7, second=3, seq=SEQ, rows=1, seed=11):
     """`rows` packed rows of two documents each, drawn from `seed`, plus the padding that follows them."""
@@ -930,7 +946,16 @@ def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
                               max_seq_len=8, mixture=Mixture(experts=4, top_k=2, expert_features=16))
     zed = LMObjective(model, 8, ema_decay=None, router_z_loss=0.3)
     init = initialized(zed)
-    captured = {np.dtype(np.float32): model, np.dtype(np.float64): model.clone(dtype=jnp.float64)}
+    def capturing(module):
+        # Each layer's normed input the router saw, captured by flax's intermediates; the block's norm
+        # owns its residual seam, which returns the stream beside the normed input.
+        def apply(params, ids):
+            return module.apply(params, ids, mutable=["intermediates"],
+                                capture_intermediates=lambda _, method: method == "seam")
+        return jax.jit(apply)
+
+    captured = {np.dtype(np.float32): capturing(model),
+                np.dtype(np.float64): capturing(model.clone(dtype=jnp.float64))}
 
     @jax.jit
     def dew(params, tokens):
@@ -939,11 +964,8 @@ def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
 
     def oracle(params, tokens):
         width = np.dtype(jax.tree.leaves(params)[0].dtype)
-        # Each layer's gate logits recomputed from its kernel and the normed input the router saw,
-        # captured by flax's intermediates; the block's norm owns its residual seam, which returns
-        # the stream beside the normed input.
-        logits, state = captured[width].apply(params, tokens[:, :-1], mutable=["intermediates"],
-                                              capture_intermediates=lambda module, method: method == "seam")
+        # Each layer's gate logits recomputed from its kernel and the normed input its router saw.
+        logits, state = captured[width](params, jnp.asarray(tokens)[:, :-1])
         term = 0
         for index in range(2):
             layer = state["intermediates"][f"layers_{index}"]
