@@ -82,11 +82,13 @@ ATTENTION = ("cudnn", "xla")
 # measured peak of a save and restore in a process of their own (tools/peak_memory.py), taken before this
 # one opens a backend.
 CHECKPOINT = """
-import json, os, sys, tempfile, time
+import importlib.util, json, os, sys, tempfile, time
 if sys.argv[2:] != ["--peak-run"]:
-    # The gate's own helper (its directory, the script's second argument), whatever tools/ the tree holds.
-    sys.path.insert(0, sys.argv[2])
-    import peak_memory
+    # The gate's own helper, by its path (the script's second argument), whatever tools/ the tree holds;
+    # the workload's modules still come from the tree's, as its peak runs' do.
+    spec = importlib.util.spec_from_file_location("peak_memory", sys.argv[2])
+    peak_memory = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(peak_memory)
     peaks = peak_memory.measured([os.path.abspath(__file__), sys.argv[1], "--peak-run"])
 import jax
 from benchmark_cases import Case
@@ -263,7 +265,7 @@ PROBES = [
            Row("peak checkpoint lm-dense save and restore", "GiB", "")),
           lambda _, out: [str(_script(out, CHECKPOINT)),
                           json.dumps({**STEP_CASES["step lm-dense 4x1024"], "batch_size": 1}),
-                          str(Path(__file__).resolve().parent)],
+                          str(Path(__file__).resolve().with_name("peak_memory.py"))],
           lambda printed, _: (lambda record: (record["save_ms"], record["restore_ms"], peak(record)))(
               json.loads(printed.strip().splitlines()[-1]))),
     Probe((Row("reference qwen3.5-0.8b 8x3072 vs torch", "items/s", "reference_runs/qwen35_pair.py",
