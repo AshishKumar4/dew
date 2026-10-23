@@ -153,7 +153,7 @@ def raised(hi, lo):
     -43 a single token at -30 a token reaches). `exp2(lo)`, near one, keeps `lo` to fp32's resolution
     there, and a product of the two rounds the same in any program a compiler fuses it into, where a
     first-order correction's multiply-add may contract to one rounding or not."""
-    return jnp.exp2(hi) * jnp.exp2(lo)
+    return jnp.exp2(hi)
 
 
 def grown_from(hi, lo, exp, unit: float = 1.0):
