@@ -18,7 +18,12 @@ python tools/optimizer_curve.py --dataset <tokens> --optimizer <name> \
 
 ## Model FLOPs, hardware FLOPs and real tokens
 
-`train/mfu` is `3 * sum(model_forward_flops) / (non_compile_seconds * aggregate_peak)`.
+`train/flops` is the logging interval's summed `Objective.training_flops` over its attempted
+steps, the whole mesh's analytical training work a step, logged on every device: `3 *
+sum(model_forward_flops)` where every counted network trains, the frozen and trainable work
+apart where some do not (an adapter, a frozen encoder). `train/mfu` is the interval's summed
+work over `non_compile_seconds * aggregate_peak`, `train/flops` over the time of a step at the
+mesh's peak, logged where the device's bf16 peak is known.
 The forward work is analytical, not inferred from HLO: `Counted.model_flops(lengths)`
 receives the real lengths of independent rows or packed segments. One multiply-add
 counts as two operations. A dense projection contributes `2 * in * out` per real
@@ -1749,9 +1754,10 @@ rule of `tests/reference_error.py`:
   which cost 10-30% more.
 - Blocks of 128 keys round closer to float64 (0.66-0.76x torch), but they
   double the partial products, and their forward cost up to 18% more.
-- Turning YNNPACK's dots off with
-  `--xla_cpu_experimental_ynn_fusion_type=-individual_dot` gives every CPU
-  dot Eigen's blocks. On two threads, Eigen ran the 176M hybrid DiT's MLP
+- `--xla_cpu_experimental_ynn_fusion_type=-individual_dot` moves each XLA
+  dot out of YNNPACK's fusions and leaves YNNPACK's other fusions, among
+  them reductions, in place ("The SSD kernel's host check 1 without
+  YNNPACK" counts them in the SSD scan). On two threads, Eigen ran the 176M hybrid DiT's MLP
   shapes (512 x 768 x 3072) 12% slower. It would also change every CPU
   result, including the live sampler's image.
 
@@ -3362,6 +3368,33 @@ Kernel matrix, 2026-09-22, jax 0.11.2, forward plus backward medians, every cell
 | RTX 4080 | 256 | 4096 to 65536 | 2.28 to 33.63 ms | does not compile: 590 KB of shared memory asked, 101 KB available |
 
 On the RTX 4080 that one-program kernel ran 6x to 12x slower than XLA as Triton wherever it compiled (chunk 64, width 32: 1.39 against 0.22 ms; at batch 8 and 16 heads, 22.7 against 2.2 ms), and every chunk of 128 or 256 asked for 131 to 590 KB of shared memory. So it runs on TPU only, and a GPU runs mamba_ssm's own decomposition.
+
+### The SSD kernel's host check 1 without YNNPACK
+
+Interpreted on the CPU, the Pallas SSD kernel and XLA's scan both compile dots, reductions,
+element-wise and layout ops to YNNPACK fusions by default, and YNNPACK picks their microkernels at run
+time by the host's instruction set. The two arms' pooled ratio per leaf, the statistic check 1 pools
+(`tests/test_ssd_kernel.py`), over 128 draws of each host case, with the fusions and without, measured
+on armada at commit 57a0f8666 with 4 usable CPUs (a medium container). A geometry the size of
+default-chunk moves with the CPU count, its fused state ratio by up to 0.41 between 2 and 4 CPUs;
+one-short and whole-chunk did not between 4 and 24.
+
+| host | fusions | one-short state | whole-chunk state | worst leaf over the nine cases |
+|---|---|---|---|---|
+| AMD EPYC 25/17 (Zen 4, AVX-512) | YNNPACK's | 1.597 | 1.608 | 1.608 (whole-chunk state) |
+| AMD EPYC 25/1 (Zen 3, AVX2) | YNNPACK's | 0.765 | 0.760 | 1.253 (fixture-one-chunk B) |
+| AMD EPYC 25/17 | none (`without_ynn`) | 1.002 | 1.002 | 1.175 (whole-chunk A dt) |
+| AMD EPYC 25/1 | none (`without_ynn`) | 1.016 | 1.016 | 1.166 (one-over A dt) |
+
+With YNNPACK's fusions the pooled ratio crossed PARITY by host; without them every leaf of the nine
+sat within 1.18 on both. On armada at commit 2ab575308, on AMD EPYC 25/17, check 1 passed all nine at
+their declared seeds. Which fused op moved the ratio was not isolated. In the one-short and
+whole-chunk scans, `-individual_dot` takes 24 of their 30 YNNPACK fusions out and leaves four
+reductions, two of them contractions XLA lowered to multiply and reduce, and two fusions that pair a
+layout op with an add or multiply. Without the fusions XLA still compiles for the host's
+instruction set, so the bits can differ by host though the verdicts did not. On one Intel Core
+i9-12900K (AVX2), jaxlib 0.11.2, the one-short case at seed 0 compiled with `--xla_cpu_max_isa=AVX`
+and with no cap differed bitwise in 2090 of the kernel's 4096 outputs and 2111 of the scan's.
 
 ### The Mamba-2 SSD scan on GPU: mamba_ssm's kernels
 

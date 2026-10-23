@@ -244,8 +244,15 @@ class QwenImageTransformer(nn.Module):
                  + projection_flops(timed, *maps['modulation'])
                  + projection_flops(rows, *maps['norm_out_linear'])
                  + projection_flops(lengths, *maps['proj_out']))
-        block = _Block(self.features, self.heads, self.head_dim, self.mlp_ratio, parent=None)
+        block = self._block(parent=None)
         return count + self.num_layers * block.multisequence_flops(lengths, context_lengths)
+
+    @nn.nowrap
+    def _block(self, **where) -> _Block:
+        """A joint block as the model runs it, named by `where` (or unbound, `parent=None`, where a FLOP
+        count reads it): one factory, so the count and the execution build the same block."""
+        return _Block(self.features, self.heads, self.head_dim, self.mlp_ratio, self.eps, dtype=self.dtype,
+                      precision=self.precision, attention_impl=self.attention_impl, **where)
 
     def _time(self, time):
         """`QwenImage21TimestepProjEmbeddings`: cosines first, then two
@@ -292,11 +299,8 @@ class QwenImageTransformer(nn.Module):
         rotation = axis_tables(_rotary_positions(lengths, text, rows, columns), self.axes_dims_rope, 10000.0,
                                dtype=wide)
         for index in range(self.num_layers):
-            joint = _Block(
-                self.features, self.heads, self.head_dim, self.mlp_ratio, self.eps,
-                dtype=self.dtype, precision=self.precision, attention_impl=self.attention_impl,
-                name=f"transformer_blocks_{index}")(joint, modulation, rotation, lengths,
-                                                     image_tokens)
+            joint = self._block(name=f"transformer_blocks_{index}")(joint, modulation, rotation, lengths,
+                                                                     image_tokens)
 
         # Only the image's rows leave; the text's final norm and projection
         # are rows the source computes and its pipeline drops.

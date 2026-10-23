@@ -281,8 +281,13 @@ def test_typed_root_key_round_trips_and_resumes_bit_exactly(tmp_path):
 def test_closed_checkpoints_leave_no_writer_running_across_trials(tmp_path):
     """Trials in one process each close their checkpoints, as RunConfig.train does, so Orbax's
     managers and metadata stores leave no thread behind: two more trials run no more threads than
-    the first left, and a closed Checkpoints reopens to read what it wrote."""
+    the first left, and a closed Checkpoints reopens to read what it wrote. A neighbour's thread that
+    ends meanwhile, as another test's pool does in a shared process, is not a trial's."""
     import threading
+
+    release = threading.Event()
+    neighbour = threading.Thread(target=release.wait)
+    neighbour.start()
 
     def trial(index):
         with Checkpoints(str(tmp_path / str(index))) as checkpoints:
@@ -290,11 +295,17 @@ def test_closed_checkpoints_leave_no_writer_running_across_trials(tmp_path):
                 dataset(), steps=2, checkpoint_every=1, log_every=1)
         return checkpoints
 
-    trial(0)
-    settled = threading.active_count()
-    for index in (1, 2):
-        reopened = trial(index)
-        assert threading.active_count() == settled
+    try:
+        trial(0)
+        settled = set(threading.enumerate())
+        release.set()
+        neighbour.join()
+        for index in (1, 2):
+            reopened = trial(index)
+            assert set(threading.enumerate()) <= settled
+    finally:
+        release.set()
+        neighbour.join()
     assert reopened.latest == 2
 
 
@@ -346,7 +357,8 @@ def test_a_run_that_fails_after_a_failed_write_raises_its_own_error_and_closes_i
         tmp_path, monkeypatch):
     """RunConfig.train closes the run's tracker and checkpoints however it ends: a run whose step
     after training fails, once its last checkpoint write failed, raises its own error with the
-    write's failure noted on it, and leaves no checkpoint thread behind."""
+    write's failure noted on it, and leaves no checkpoint thread behind. A neighbour's thread that
+    ends meanwhile, as another test's pool does in a shared process, is not the run's."""
     import threading
 
     from dew.config import RunConfig, TrainerConfig
@@ -354,17 +366,27 @@ def test_a_run_that_fails_after_a_failed_write_raises_its_own_error_and_closes_i
     run = RunConfig(trainer=TrainerConfig(steps=2, checkpoint_dir=str(tmp_path),
                                           eval_every=None, checkpoint_every=1))
     run.train(Regression(), dataset(), name="settled")
-    settled = threading.active_count()
+    release = threading.Event()
+    neighbour = threading.Thread(target=release.wait)
+    neighbour.start()
+    settled = set(threading.enumerate())
     primary = ValueError("calibration failed")
 
     def after(state, directory):
         failed_write(monkeypatch)
+        release.set()
+        neighbour.join()
         raise primary
 
-    with pytest.raises(ValueError) as raised:
-        run.train(Regression(), dataset(), name="failed", after=after)
+    try:
+        with pytest.raises(ValueError) as raised:
+            run.train(Regression(), dataset(), name="failed", after=after)
+    finally:
+        # A run that fails before `after` must not leave the neighbour waiting.
+        release.set()
+        neighbour.join()
     assert raised.value is primary and primary.__notes__
-    assert threading.active_count() == settled
+    assert set(threading.enumerate()) <= settled
 
 
 class Keyed(Regression):
@@ -1590,3 +1612,17 @@ def test_a_mesh_without_stages_takes_its_one_microbatch_asked_for():
     named, planned = fit(microbatches=1), fit()
     for left, right in zip(jax.tree.leaves(named.variables), jax.tree.leaves(planned.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
+
+
+def test_a_state_built_from_a_held_tree_steps_without_freeing_the_tree():
+    """A state the trainer builds eagerly from the objective's held tree (`Trainer.initial_state`),
+    stepped on one device, whose step takes its arguments' shardings and donates them: the objective's
+    held arrays stay alive, since the state holds buffers of its own, as a placed state does
+    (`distributed.placed_held`)."""
+    trainer, objective, _ = held_lm_trainer()
+    trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
+    state = trainer.initial_state()
+    batch = {"text": jnp.arange(1, 6, dtype=jnp.int32)[None]}
+    stepped, *_ = trainer.compile(state, batch)(state, batch)
+    jax.block_until_ready(stepped)
+    assert not any(leaf.is_deleted() for leaf in jax.tree.leaves(objective.variables))

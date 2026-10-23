@@ -34,6 +34,7 @@ import shlex
 import sys
 import types
 import typing
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from enum import Enum
 from pathlib import Path
@@ -94,7 +95,7 @@ from dew.training.quantization import quantize_trunk
 from dew.training.selection import Best
 from dew.training.state import TrainState
 from dew.training.tracker import LocalTracker, Tracker, Trackers, WandbTracker
-from dew.training.trainer import Rollout, Trainer
+from dew.training.trainer import Rollout, Trainer, run_length, run_steps
 
 JsonDict = Annotated[
     Mapping[str, object],
@@ -126,7 +127,41 @@ ModelWrapper = InputQuantization | AdapterRecord | Quantization
 
 
 @dataclasses.dataclass(frozen=True)
-class ModelConfig:
+class _Configured(ABC):
+    """A registered class, named by an alias or an import path and held as the path, and the arguments a
+    run gives it: `fields`, the ones the run states, and `defaults`, every other one the class
+    defaults as it defaulted them when the run was first recorded, so the record builds the same
+    thing after a default changes (`arguments`). Each kind names its registry (`_member`) and whether
+    its stated fields are held as their records (`_recorded`)."""
+
+    name: str
+    fields: JsonDict = dataclasses.field(default_factory=dict)
+    defaults: JsonDict = dataclasses.field(default_factory=dict)
+    """Each argument the class defaults and `fields` leaves out, as a record holds it;
+    one a record lacks, as an argument the class has since gained, takes the class's default now."""
+
+    _recorded: ClassVar[bool] = True
+
+    @staticmethod
+    @abstractmethod
+    def _member(name: str) -> type:
+        """The class `name` names, from the kind's registry."""
+
+    def __post_init__(self) -> None:
+        member = self._member(self.name)
+        object.__setattr__(self, "name", registry.import_path(member))
+        if self._recorded:
+            object.__setattr__(self, "fields", registry.argument_records(member, self.fields))
+        object.__setattr__(self, "defaults", _defaults(member, self.fields, self.defaults))
+
+    @property
+    def arguments(self) -> JsonDict:
+        """The arguments the class is built from, before those the caller derives (`_arguments`)."""
+        return _arguments(self._member(self.name), self.fields, self.defaults)
+
+
+@dataclasses.dataclass(frozen=True)
+class ModelConfig(_Configured):
     """A model's class and the fields the run gives it.
 
     `name` is an alias or an import path, held as the path. `fields` are the
@@ -140,26 +175,17 @@ class ModelConfig:
     """
 
     name: str = "simple_dit"
-    fields: JsonDict = dataclasses.field(default_factory=dict)
-    defaults: JsonDict = dataclasses.field(default_factory=dict)
-    """Each field the class defaults and `fields` leaves out, as a record holds it;
-    one a record lacks, as a field the class has since gained, takes the class's
-    default now."""
     wrappers: tuple[ModelWrapper, ...] = ()
     """What wraps the built model, innermost first, which `build` applies in
     order: a checkpoint's input quantization, a bound LoRA (its factors are
     stored with the checkpoint variables), the quantized training a run
     wrapped it in."""
 
-    def __post_init__(self) -> None:
-        member = models[self.name]
-        object.__setattr__(self, "name", registry.import_path(member))
-        object.__setattr__(self, "defaults", _defaults(member, self.fields, self.defaults))
+    _recorded: ClassVar[bool] = False
 
-    @property
-    def arguments(self) -> JsonDict:
-        """The fields the model is built from, before those a recipe derives (`_arguments`)."""
-        return _arguments(models[self.name], self.fields, self.defaults)
+    @staticmethod
+    def _member(name: str) -> type:
+        return models[name]
 
     @classmethod
     def from_dict(cls, values: Mapping[str, object]) -> Self:
@@ -199,7 +225,7 @@ class ModelConfig:
 
 
 @dataclasses.dataclass(frozen=True)
-class ObjectiveConfig:
+class ObjectiveConfig(_Configured):
     """An objective's class and the arguments the run gives it.
 
     `name` is an alias or an import path, held as the path. `fields` are the
@@ -213,21 +239,10 @@ class ObjectiveConfig:
     """
 
     name: str
-    fields: JsonDict = dataclasses.field(default_factory=dict)
-    defaults: JsonDict = dataclasses.field(default_factory=dict)
-    """Each argument the class defaults and `fields` leaves out, as a record holds it;
-    one a record lacks takes the class's default now."""
 
-    def __post_init__(self) -> None:
-        member = objectives[self.name]
-        object.__setattr__(self, "name", registry.import_path(member))
-        object.__setattr__(self, "fields", registry.argument_records(member, self.fields))
-        object.__setattr__(self, "defaults", _defaults(member, self.fields, self.defaults))
-
-    @property
-    def arguments(self) -> JsonDict:
-        """The arguments the objective is built from, before those the caller derives (`_arguments`)."""
-        return _arguments(objectives[self.name], self.fields, self.defaults)
+    @staticmethod
+    def _member(name: str) -> type:
+        return objectives[name]
 
     def build(self, **derived) -> Objective:
         """Build the objective from its arguments and those the caller
@@ -241,7 +256,7 @@ class ObjectiveConfig:
 
 
 @dataclasses.dataclass(frozen=True)
-class MetricConfig:
+class MetricConfig(_Configured):
     """A metric's class and the arguments the run gives it.
 
     `name` is an alias of `dew.registry.metrics` or an import path, held as
@@ -253,24 +268,17 @@ class MetricConfig:
     """
 
     name: str
-    fields: JsonDict = dataclasses.field(default_factory=dict)
-    defaults: JsonDict = dataclasses.field(default_factory=dict)
-    """Each argument the class defaults and `fields` leaves out, as a record holds it;
-    one a record lacks takes the class's default now."""
 
-    def __post_init__(self) -> None:
-        member = _metric_class(self.name)
-        object.__setattr__(self, "name", registry.import_path(member))
-        object.__setattr__(self, "fields", registry.argument_records(member, self.fields))
-        object.__setattr__(self, "defaults", _defaults(member, self.fields, self.defaults))
+    @staticmethod
+    def _member(name: str) -> type:
+        return _metric_class(name)
 
     def build(self, **derived) -> Metric:
         """Build the metric from its arguments and those the run `derived`
         where it states none of its own (the field a video run's sample
         is read from, say)."""
         unstated = {name: value for name, value in derived.items() if name not in self.fields}
-        arguments = _arguments(_metric_class(self.name), self.fields, self.defaults)
-        return metrics.build(self.name, arguments, **unstated)
+        return metrics.build(self.name, self.arguments, **unstated)
 
 
 def _metric_class(name: str) -> type:
@@ -648,8 +656,8 @@ class TrainerConfig:
 
     name: str | None = None
     checkpoint_dir: str = "./checkpoints"
-    keep: Annotated[int | Keep, _keep_argument()] = 2
-    """The number of latest checkpoints kept, besides the best one."""
+    keep: Annotated[int | Keep, _keep_argument()] = Keep.latest
+    """The number of latest checkpoints kept, besides the best one (`Keep`'s own default)."""
     best: Annotated[str | Best | tuple[Best, ...] | None, _best_argument()] = None
     """The metric name and ranking policy; None selects validation loss or training loss."""
     update_tokens: int | None = None
@@ -793,8 +801,7 @@ class TrainerConfig:
             raise ValueError("--trainer.split reads each step's batch in that many microbatches, at least 1")
         if self.publish and (self.wandb is None or not self.checkpoint_final):
             raise ValueError("trainer.publish requires trainer.wandb and trainer.checkpoint_final")
-        if self.steps is not None and self.epochs is not None:
-            raise ValueError("steps and epochs both name the run length; set one")
+        run_length(self.steps, self.epochs, self.tokens, required=False)
         if isinstance(self.checkpoint_every, str) and self.checkpoint_every != 'epoch':
             object.__setattr__(self, 'checkpoint_every', duration(self.checkpoint_every))
         if isinstance(self.keep, Mapping):
@@ -832,20 +839,9 @@ class TrainerConfig:
             return checkpoints.latest is not None
 
     def total_steps(self, dataset: Loader) -> int | None:
-        """Return the step cap from `steps` or `epochs`, None for a token-only run."""
-        if self.steps is not None:
-            return self.steps
-        if self.epochs is None:
-            if self.tokens is not None:
-                return None
-            raise ValueError("the run length is --trainer.steps or --trainer.epochs "
-                             "or --trainer.tokens")
-        if dataset.records is None:
-            raise ValueError(
-                "epochs need a dataset with a record count; this one streams without "
-                "one, so give the run length as --trainer.steps")
-        # A ramp's stages begin where updates do (`Ramp.stages`), as the trainer's stream cuts them.
-        return dataset.epoch_steps(self.epochs, self.accumulation)
+        """Return the step cap from `steps` or `epochs`, None for a token-only run (`run_steps`, the
+        one policy a direct fit applies too)."""
+        return run_steps(dataset, self.steps, self.epochs, self.tokens, self.accumulation)
 
     def eval_interval(self, dataset: Loader) -> int | None:
         """Return the steps between validation passes over `data`, or None for never."""
