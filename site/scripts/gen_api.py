@@ -22,12 +22,14 @@ from __future__ import annotations
 import argparse
 import ast
 import functools
+import io
 import json
 import re
 import shlex
 import subprocess
 import sys
 import tempfile
+import tokenize
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -108,6 +110,7 @@ class Package:
     generated: str = "site/src/generated"  # the sidebar and the name index
     usage: list[str] = field(default_factory=list)  # files whose imports must resolve
     declared: str = "site/scripts/gen_api.py"  # the file declaring `groups` at any commit (`groups_at`)
+    distribution: str = "dewml"  # the name pip installs the package by (`pinned`)
     usage_skip: tuple[str, ...] = ()
     special: tuple[str, ...] = ()  # private-looking methods a class documents, such as "__call__"
     fence_indented: bool = False  # an indented block after a blank line in a docstring is Python
@@ -935,33 +938,55 @@ def main() -> None:
     print(f"gen_api: {len(P.pages)} pages, {count} objects documented")
 
 
-INSTALLED = re.compile(r"^[A-Za-z0-9._-]+(?:\[[^\]]*\])?\s*@\s*git\+(?P<url>[^@\s]+)@(?P<rev>\S+)$")
-"""A requirement that installs a package from a git repository at a revision:
-`dewml[cuda13] @ git+https://github.com/AshishKumar4/dew@<revision>`, with or without the spaces."""
+REQUIREMENT = re.compile(r"^(?P<name>[A-Za-z0-9._-]+)(?:\[[^\]]*\])?\s*"
+                         r"(?:@\s*git\+(?P<url>[^@\s]+)(?:@(?P<rev>\S+))?)?(?:[=<>!~].*)?$")
+"""A requirement a pip install names: a distribution, its extras, and a git repository and revision it
+installs from, if any (`dewml[cuda13] @ git+https://github.com/AshishKumar4/dew@<revision>`, with or
+without the spaces)."""
 COMMIT = re.compile(r"[0-9a-f]{7,40}")
 
 
+def install_commands(source: str) -> Iterator[list[str]]:
+    """The arguments of each `pip install` or `uv pip install` a code cell runs as IPython does: a line
+    that starts with `%` or `!`, outside a Python string, with its backslash continuations joined."""
+    lines = source.splitlines()
+    magic = [index for index, line in enumerate(lines) if line.lstrip().startswith(("%", "!"))]
+    # A magic line inside a string literal is the string's text: read the cell as Python with each magic
+    # line a statement, and keep those no string token spans.
+    python = "\n".join("pass" if index in magic else line for index, line in enumerate(lines))
+    tokens = tokenize.generate_tokens(io.StringIO(python).readline)
+    strings = [(token.start[0], token.end[0]) for token in tokens if token.type == tokenize.STRING]
+    index = 0
+    while index < len(lines):
+        command, start = lines[index], index
+        while command.endswith("\\") and index + 1 < len(lines):
+            index += 1
+            command = command[:-1] + " " + lines[index]
+        index += 1
+        if start in magic and not any(first < start + 1 <= last for first, last in strings):
+            words = shlex.split(command.lstrip().lstrip("%!"), comments=True)
+            if words[:2] == ["pip", "install"] or words[:3] == ["uv", "pip", "install"]:
+                yield words
+
+
 def pinned(path: Path) -> str | None:
-    """The commit a notebook's install of the package (its repository, `P.source`) pins it to, which the
-    API it shows is that commit's; None where it installs none, or one at a branch or tag. Each `pip
-    install` a code cell runs is read (a comment is not one), and two installs of different revisions are
-    refused: which API a cell sees would turn on the cell."""
+    """The commit a notebook's installs of the package (`Package.distribution`) pin it to, which the API
+    it shows is that commit's; None where it installs none, or the package as published or at a branch or
+    tag. Two installs of different revisions are refused: which API a cell sees would turn on the cell."""
     if path.suffix != ".ipynb":
         return None
     repository = P.source.split("/blob/")[0].removesuffix("/")
-    revisions = []
+    revisions: list[str | None] = []
     for cell in json.loads(path.read_text())["cells"]:
-        for line in "".join(cell["source"]).splitlines() if cell["cell_type"] == "code" else ():
-            if not line.lstrip().lstrip("%!").startswith(("pip ", "uv ")):
-                continue
-            words = shlex.split(line, comments=True)
-            if "install" in words:
-                revisions += [found["rev"] for word in words if (found := INSTALLED.match(word))
-                              and found["url"].removesuffix(".git").removesuffix("/") == repository]
+        for words in install_commands("".join(cell["source"])) if cell["cell_type"] == "code" else ():
+            for found in filter(None, map(REQUIREMENT.match, words)):
+                if found["name"] == P.distribution:
+                    url = (found["url"] or "").removesuffix(".git").removesuffix("/")
+                    revisions.append(found["rev"] if url == repository and found["rev"] else None)
     if len(set(revisions)) > 1:
         raise Unresolved(f"it installs the package at {len(set(revisions))} revisions: "
-                         f"{', '.join(revisions)}")
-    return revisions[0] if revisions and COMMIT.fullmatch(revisions[0]) else None
+                         f"{', '.join(str(revision) for revision in revisions)}")
+    return revisions[0] if revisions and revisions[0] and COMMIT.fullmatch(revisions[0]) else None
 
 
 def groups_at(commit: str) -> list[tuple[str, list[str]]]:

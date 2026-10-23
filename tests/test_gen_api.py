@@ -211,7 +211,8 @@ def test_a_notebook_pinned_to_a_commit_is_held_to_that_commits_api(gen_api, refe
     commit = git(root, "rev-parse", "HEAD").strip()
     source.write_text("def new_name(): ...\n")
     install = f'%pip install -q "example[extra] @ git+https://example.org@{commit}"\n'
-    reference = dataclasses.replace(gen_api.P, usage=["*.ipynb"], declared="reference.json")
+    reference = dataclasses.replace(gen_api.P, usage=["*.ipynb"], declared="reference.json",
+                                    distribution="example")
     monkeypatch.setattr(gen_api, "P", reference)
     monkeypatch.setattr("sys.argv", ["gen_api.py", "--check"])
     notebook(root / "pinned.ipynb", install, "from example import old_name\nold_name()\n")
@@ -237,16 +238,24 @@ def notebook(path, *cells: str) -> None:
     (['%pip install "other @ git+https://other.org/other@1234abc"\n'], None),
     (['%pip install "example @ git+https://example.org@1234abc"\n',
       '%pip install "example @ git+https://example.org@1234abc"\n'], "1234abc"),
+    (['%pip install -q \\\n  "example @ git+https://example.org@1234abc"\n'], "1234abc"),
+    (['text = """\n%pip install "example @ git+https://example.org@1234abc"\n"""\n'], None),
+    (['%pip install other\n'], None),
 ], ids=["a quoted requirement", "a compact one", "a commented install", "a branch", "another repository",
-        "the same commit twice"])
+        "the same commit twice", "a continued install", "an install a string holds", "another package"])
 def test_a_notebooks_pin_is_the_commit_an_install_of_the_package_names(gen_api, reference_package, tmp_path,
-                                                                       cells, pin):
+                                                                       monkeypatch, cells, pin):
+    monkeypatch.setattr(gen_api, "P", dataclasses.replace(gen_api.P, distribution="example"))
     notebook(tmp_path / "notes.ipynb", *cells)
     assert gen_api.pinned(tmp_path / "notes.ipynb") == pin
 
 
-def test_a_notebook_that_installs_two_revisions_is_refused(gen_api, reference_package, tmp_path):
-    notebook(tmp_path / "notes.ipynb", '%pip install "example @ git+https://example.org@1234abc"\n',
-             '%pip install "example @ git+https://example.org@5678def"\n')
+@pytest.mark.parametrize("later", ['%pip install "example @ git+https://example.org@5678def"\n',
+                                   '%pip install --force-reinstall example\n'],
+                         ids=["another commit", "the package as published"])
+def test_a_notebook_that_installs_two_revisions_is_refused(gen_api, reference_package, tmp_path, monkeypatch,
+                                                           later):
+    monkeypatch.setattr(gen_api, "P", dataclasses.replace(gen_api.P, distribution="example"))
+    notebook(tmp_path / "notes.ipynb", '%pip install "example @ git+https://example.org@1234abc"\n', later)
     with pytest.raises(gen_api.Unresolved):
         gen_api.pinned(tmp_path / "notes.ipynb")
