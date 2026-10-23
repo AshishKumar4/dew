@@ -12,7 +12,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from tool_support import load
+from tool_support import git, load
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -389,13 +389,13 @@ def test_a_gpu_lane_fetches_the_pinned_fixtures_before_any_file_and_stops_where_
         "def test_reads(): Path('read').write_text(str(time.monotonic()))\n")
     out = tmp_path / "verdict.json"
     fetched = fetcher(tmp_path)
-    assert ci.gpu_lane("3.12", ["tests/test_reads.py"], out, cache=True, processes=1, deadline=600.0) == 0
+    assert ci.gpu_lane("3.12", ["tests/test_reads.py"], out, cache="on", processes=1, deadline=600.0) == 0
     assert float(fetched.read_text()) < float((tmp_path / "read").read_text())
     fetched.unlink()
     (tmp_path / "read").unlink()
     fetcher(tmp_path, due=True)
     with pytest.raises(subprocess.CalledProcessError):
-        ci.gpu_lane("3.12", ["tests/test_reads.py"], out, cache=True, processes=1, deadline=600.0)
+        ci.gpu_lane("3.12", ["tests/test_reads.py"], out, cache="on", processes=1, deadline=600.0)
     assert fetched.is_file() and not (tmp_path / "read").exists()
 
 
@@ -461,7 +461,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
         return lane_runs(tmp_path, stem)
 
     out = tmp_path / "verdict.json"
-    assert ci.gpu_lane("3.12", every, out, cache=True, processes=4, deadline=600.0) == 0
+    assert ci.gpu_lane("3.12", every, out, cache="on", processes=4, deadline=600.0) == 0
     rows = json.loads(out.read_text())["rows"]
     assert [(row["name"], row["exitCode"]) for row in rows] == [
         (f"3.12:{name}", int(name == "tests/test_red.py")) for name in every]
@@ -480,7 +480,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
         at = "/" + ci.record_key("3.12", ci.row("3.12", name, ""), ci.device_class(), inputs)
         stored[at] = json.dumps({"key": None, "depends": [name], "row": {}, "reads": [], "peak": 4 * 2 ** 30,
                                  "shares": int(name == "tests/test_spawner.py"), "pools": 0}).encode()
-    assert ci.gpu_lane("3.12", every, out, cache=True, processes=4, deadline=600.0) == 0
+    assert ci.gpu_lane("3.12", every, out, cache="on", processes=4, deadline=600.0) == 0
     rows = json.loads(out.read_text())["rows"]
     assert [row["exitCode"] for row in rows] == [int(name == "tests/test_red.py") for name in every]
     measured = [ran(Path(name).stem)[-1] for name in names]
@@ -493,10 +493,10 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     assert ci.gpu_needs({"depends": None, "peak": 4 * gib}, budget) == (budget, budget)
     held = {"depends": [], "peak": 4 * gib, "shares": 2, "pools": gib}
     assert ci.gpu_needs(held, budget) == (6 * gib, 19 * gib), "6 GiB, twice more for its children, and 1 GiB"
-    assert ci.gpu_lane("3.12", [], out, cache=True, processes=4, deadline=600.0) == 0
+    assert ci.gpu_lane("3.12", [], out, cache="on", processes=4, deadline=600.0) == 0
     assert json.loads(out.read_text()) == {"rows": []}, "an empty lane runs nothing"
     assert len(ran("test_red")) == 2, "a red row is never reused"
-    assert ci.gpu_lane("3.12", names, out, cache=True, processes=4, deadline=600.0) == 0
+    assert ci.gpu_lane("3.12", names, out, cache="on", processes=4, deadline=600.0) == 0
     assert all(len(ran(Path(name).stem)) == 2 for name in names), "the third lane reused the green rows"
     # Their records, of these inputs as the lane keys them, read no backend: none is in the GPU tier.
     assert not set(names) & set(ci.gpu_tier("3.12"))
@@ -545,7 +545,7 @@ def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
         return lane_runs(tmp_path, stem)
 
     out = tmp_path / "verdict.json"
-    assert ci.gpu_lane("3.12", every, out, cache=True, processes=4, deadline=600.0) == 0
+    assert ci.gpu_lane("3.12", every, out, cache="on", processes=4, deadline=600.0) == 0
     rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
     borrowed = str(6 * 2 ** 30 / (81920 * 2 ** 20))
     first = [ran(Path(name).stem)[0] for name in names]
@@ -578,11 +578,11 @@ def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
         yield
 
     monkeypatch.setattr(ci.r2.Store, "keys", refused)
-    assert ci.gpu_lane("3.12", ["tests/test_listless.py"], out, cache=False, processes=4, deadline=600.0) == 0
+    assert ci.gpu_lane("3.12", ["tests/test_listless.py"], out, cache="off", processes=4, deadline=600.0) == 0
     assert [share for share, *_ in ran("test_listless")] == ["0.5"]
     monkeypatch.setattr(ci.r2.Store, "keys", listing)
     # This class's own records now: the next lane reads them, the tight file alone as its own last run was.
-    assert ci.gpu_lane("3.12", ["tests/test_tight.py"], out, cache=False, processes=4, deadline=600.0) == 0
+    assert ci.gpu_lane("3.12", ["tests/test_tight.py"], out, cache="off", processes=4, deadline=600.0) == 0
     assert [share for share, *_ in ran("test_tight")][-1] != borrowed
     assert "interference" not in json.loads(out.read_text())["rows"][0]
 
@@ -649,7 +649,7 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
     for index, name in enumerate(("negative", "positive")):
         (tmp_path / "runs" / str(index)).mkdir(parents=True)
         ci.task("3.12", [f"tests/test_{name}.py"], "", tmp_path / "runs" / str(index) / "rows.json", 600.0,
-                cache=False, coverage=tmp_path / "runs" / str(index))
+                cache="off", coverage=tmp_path / "runs" / str(index))
     (tmp_path / "runs/logs").mkdir()
     assert ci.coverage_report(tmp_path / "runs") == 0
     files = {Path(name).name: measured for name, measured in
@@ -660,7 +660,7 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
     # A task interrupted at its deadline leaves its later tests' coverage out: the pass is refused.
     (tmp_path / "tests/test_slow.py").write_text("import time\ndef test_slow(): time.sleep(30)\n")
     (tmp_path / "runs/2").mkdir()
-    ci.task("3.12", ["tests/test_slow.py"], "", tmp_path / "runs/2/rows.json", 1.0, cache=False, grace=5.0,
+    ci.task("3.12", ["tests/test_slow.py"], "", tmp_path / "runs/2/rows.json", 1.0, cache="off", grace=5.0,
             coverage=tmp_path / "runs/2")
     assert ci.coverage_report(tmp_path / "runs") == 1
     [interrupted] = json.loads((tmp_path / "runs/2/rows.json").read_text())["rows"]
@@ -870,20 +870,64 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
 
 def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
     """The checkout's one 3.12 task, run green on one CPU class against the shared test cache as armada
-    starts it (`armada_task`), its verdict written beside the checkout's entries, not among them (the
-    checkout's own directory is an input): each call, how many times its test has run, which it counts
-    in `runs`."""
+    starts it (`armada_task`) under the cache's policy, its verdict written beside the checkout's entries,
+    not among them (the checkout's own directory is an input): each call, how many times its test has run,
+    which it counts in `runs`."""
     interpreter(root, "3.12")
     url, _, _ = cache_worker
     monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
     cached(monkeypatch, url)
     (root / ".verdict").mkdir()
 
-    def run() -> int:
-        assert armada_task(ci, monkeypatch, root / ".verdict/verdict.json")["exitCode"] == 0
+    def run(policy: str = "on") -> int:
+        assert armada_task(ci, monkeypatch, root / ".verdict/verdict.json", policy)["exitCode"] == 0
         return len((root / "runs").read_text())
 
     return run
+
+
+@pytest.mark.parametrize(("changed", "policy"), [
+    ({"src/pkg/mod.py": "VALUE = 2\n"}, "on"), ({"docs/page.md": "page\n"}, "on"),
+    ({"tutorials/notes.ipynb": "{}\n"}, "on"), ({"tools/tool.py": "VALUE = 2\n"}, "stale:tools/"),
+    ({"pyproject.toml": "[project]\nname = 'changed'\n"}, "off"), ({"locks/cpu.txt": "jax==9\n"}, "off"),
+    ({"tools/armada/session.py": "# the session\n"}, "off"),
+    ({".github/workflows/ci.yml": "on: []\n"}, "off"),
+    ({"Makefile": "all:\n"}, "off"),
+], ids=["a source module", "a docs page", "a notebook", "a tool", "the project", "a lock",
+        "the test session", "a workflow", "a file no record places"])
+def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_place_it(
+        ci, tmp_path, changed, policy):
+    """CI's test cache policy for a change from main: each file's own inputs decide ('on') where the records
+    place what changed, every file that read a tool runs again where a tool changed, and every file runs
+    ('off') for a change to what every test process runs or reads, or to a file the records do not place."""
+    for name, text in {"src/pkg/mod.py": "VALUE = 1\n", "pyproject.toml": "[project]\nname = 'x'\n",
+                       "locks/cpu.txt": "jax==1\n"}.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    git(tmp_path, "init", "-q", "-b", "main")
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-qm", "base")
+    for name, text in changed.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-qm", "change")
+    assert ci.policy("HEAD~1") == policy
+
+
+def test_a_stale_policy_reruns_every_file_whose_run_read_a_tool(ci, tmp_path, monkeypatch, cache_worker):
+    """Under 'stale:tools/' a green row whose test ran a file under tools/ runs again, though that file is
+    unchanged, and under 'on' it is reused."""
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools/helper.py").write_text("VALUE = 1\n")
+    (tmp_path / "tests/test_tool.py").write_text(
+        "import runpy\n"
+        "from pathlib import Path\n"
+        "def test_tool():\n"
+        "    with Path('runs').open('a') as runs: runs.write('x')\n"
+        "    assert runpy.run_path('tools/helper.py')['VALUE'] == 1\n")
+    run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
+    assert [run(), run(), run("stale:tools/"), run()] == [1, 1, 2, 2]
 
 
 def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_changes(
