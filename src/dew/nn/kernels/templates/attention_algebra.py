@@ -1051,12 +1051,12 @@ def exponent_product(mantissa: jax.Array, exponent: jax.Array) -> jax.Array:
     return jnp.where(mantissa == 0, 0.0, power2(mantissa, exponent))
 
 
-def _shifted(x: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """`x` (`[bq, ...]`) taken by each row's power of two to magnitudes at most one, and that power's
-    exponent `[bq]`, `NO_SHIFT` for a row of zeros."""
-    top = jnp.max(jnp.abs(x), axis=tuple(range(1, x.ndim)))
-    shift = jnp.where(top > 0, jnp.ceil(jnp.log2(jnp.where(top > 0, top, 1.0))), NO_SHIFT)
-    return power2(x, expand(-shift, x)), shift
+def _shifted(mantissa: jax.Array, exponent: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Entries `mantissa · 2^exponent` (`[bq, bk]`, `_split`'s form) taken by each row's power of two to
+    magnitudes at most one, never formed whole, and that power's exponent `[bq]`, the row's largest entry's,
+    `NO_SHIFT` for a row of zeros."""
+    shift = jnp.where(mantissa != 0, exponent, NO_SHIFT).max(axis=-1)
+    return exponent_product(mantissa, exponent - expand(shift, exponent)), shift
 
 
 def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array, key: jax.Array,
@@ -1075,7 +1075,12 @@ def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, see
     # The tile's coefficients against the keys joined into the running mean, as a softmax's sums are joined
     # under a running maximum: each taken by a power of two to magnitudes at most one (`_shifted`), the
     # running mass and the tile's brought to the larger exponent, the mean taken to their sum.
-    coefficients, tile_shift = _shifted(pulled_weights * expand(scale * inverse(prior), pulled_weights))
+    # Each coefficient `pulled weight · scale / prior` as its factors' mantissas and exponents, so none is
+    # formed whole where it would overflow (a hook's slope near fp32's largest).
+    weight_mantissa, weight_exponent = _split(pulled_weights)
+    factor_mantissa, factor_exponent = _split(scale * inverse(prior))
+    coefficients, tile_shift = _shifted(weight_mantissa * expand(factor_mantissa, weight_mantissa),
+                                        weight_exponent + expand(factor_exponent, weight_exponent))
     keyed_shift = jnp.maximum(sums.keyed_shift, tile_shift)
     before = power2(sums.keyed_mass, sums.keyed_shift - keyed_shift)
     coefficients = power2(coefficients, expand(tile_shift - keyed_shift, coefficients))
