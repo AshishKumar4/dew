@@ -119,6 +119,13 @@ class _Program:
     keys: int
     causal: bool
 
+    def query_tile(self, count: int):
+        """This program's query tile of the grid's `count`: a causal call's longest first (its last query
+        tiles see the most keys), so the grid's tail holds its shortest programs, as FlashAttention-3's
+        scheduler orders them; a full call's in order."""
+        index = lax.axis_index("q_tiles")
+        return count - 1 - index if self.causal else index
+
     def __post_init__(self):
         unit = self.family.rows
         if self.tiles.block_q % unit or self.tiles.block_k % unit:
@@ -200,7 +207,7 @@ def _launch(query, key, value, *, spec: algebra.Forward, tiles: Tiles, family: m
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
         views = _views_of({"keys": k_ref, "values": v_ref}, row, lax.div(head, group), block_k)
         streams = family.opened(streams, views)
-        pair_first = lax.axis_index("q_tiles") * pair
+        pair_first = program.query_tile(queries // pair) * pair
         most = program.walked(pair_first + pair - block_q)
 
         def turn(*, arrive: bool = True, wait: bool = True):
@@ -357,7 +364,7 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, *
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
         views = _views_of({"keys": k_ref, "values": v_ref}, row, lax.div(head, heads // kv_heads), block_k)
         streams = family.opened(streams, views)
-        pair_first = lax.axis_index("q_tiles") * pair
+        pair_first = program.query_tile(queries // pair) * pair
         most = program.walked(pair_first + pair - block_q)
 
         def consumer(index):
