@@ -475,7 +475,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     # Measured peaks of 4 GiB: each file then holds 6 GiB of the 40, and four run at once. Records without
     # a key, as a run on these inputs leaves to be run again, under the last run's and these inputs'.
     # The spawner's child took its fraction, so it holds two shares: 12 GiB beside the others' 24.
-    common = ci.shared("3.12")
+    common = ci.lane_inputs("3.12")
     for name, inputs in itertools.product([*names, "tests/test_spawner.py"], (None, common)):
         at = "/" + ci.record_key("3.12", ci.row("3.12", name, ""), ci.device_class(), inputs)
         stored[at] = json.dumps({"key": None, "depends": [name], "row": {}, "reads": [], "peak": 4 * 2 ** 30,
@@ -498,6 +498,8 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     assert len(ran("test_red")) == 2, "a red row is never reused"
     assert ci.gpu_lane("3.12", names, out, cache=True, processes=4, deadline=600.0) == 0
     assert all(len(ran(Path(name).stem)) == 2 for name in names), "the third lane reused the green rows"
+    # Their records, of these inputs as the lane keys them, read no backend: none is in the GPU tier.
+    assert not set(names) & set(ci.gpu_tier("3.12"))
 
 
 def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
@@ -929,11 +931,10 @@ def test_a_stale_policy_reruns_every_file_whose_run_read_a_tool(ci, tmp_path, mo
 
 def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_changes(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A file's green row is kept across a change its tests never meet: the plan's own code (ci.py, which
-    runs outside every test process), and another test module added, which nothing imports; it runs again
-    once what its test process runs or reads changes: a plugin loaded into it, a fixture, a conftest.py or
-    a package's __init__.py added, which can change what an import finds, or the process group it runs
-    as."""
+    """A file's green row is kept across a change its tests never meet, the plan's own code (ci.py, which
+    runs outside every test process); it runs again once what its test process runs or reads changes: a
+    plugin loaded into it, a fixture, a Python file added (a conftest.py, a package's __init__.py, a test
+    module), which can change what an import finds, or the process group it runs as."""
     (tmp_path / "tests/test_kept.py").write_text(
         "from pathlib import Path\n"
         "def test_kept():\n"
@@ -944,11 +945,10 @@ def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_c
         (armada / tool.name).write_text(tool.read_text())
     run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
     changes = [(None, "", 1), ("tools/armada/ci.py", "# the plan's own code\n", 1),
-               ("tests/more/test_added.py", "def test_added():\n    pass\n", 1),
                ("tools/armada/executed.py", "# a plugin loaded into it\n", 2),
                ("tests/fixtures/data.json", "{}\n", 3), ("tests/conftest.py", "VALUE = 1\n", 4),
-               ("src/package/__init__.py", "", 5),
-               ("tools/armada/child_groups.py", "# its process group\n", 6)]
+               ("src/package/__init__.py", "", 5), ("tests/more/test_added.py", "VALUE = 2\n", 6),
+               ("tools/armada/child_groups.py", "# its process group\n", 7)]
     for path, text, runs in changes:
         if path:
             (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
