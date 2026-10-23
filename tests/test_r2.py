@@ -32,18 +32,22 @@ def test_what_the_contract_refuses_never_reaches_the_worker(cache_worker):
     assert seen == [] and stored == {}
 
 
-def test_an_answer_that_ends_before_its_announced_length_is_unavailable():
+def test_an_answer_that_ends_before_its_announced_length_is_unavailable_and_a_head_has_no_body():
     """A Worker whose answer stops short, the connection closed before the length it announced, gave no
-    object: the read is `Unavailable`, which a caller counts as a failure, never a shorter object."""
+    object: a read of it, whole or at once, is `Unavailable`, which a caller counts as a failure, never a
+    shorter object. A HEAD's Content-Length is the object's, and its answer has no body to read."""
 
     class Short(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
 
-        def do_GET(self):
+        def do_HEAD(self):
             self.send_response(200)
             self.send_header("Content-Length", "100")
             self.end_headers()
+
+        def do_GET(self):
+            self.do_HEAD()
             self.wfile.write(b"x" * 10)
             self.close_connection = True
 
@@ -53,5 +57,9 @@ def test_an_answer_that_ends_before_its_announced_length_is_unavailable():
         store = r2.Store(f"http://127.0.0.1:{server.server_address[1]}", "token", "dew-test", timeout=10)
         with pytest.raises(r2.Unavailable):
             store.get("records/short")
+        with pytest.raises(r2.Unavailable), store.request("GET", "records/short") as reply:
+            reply.body.read()
+        with store.request("HEAD", "records/short") as reply:
+            assert (reply.status, reply.headers["Content-Length"], reply.body) == (200, "100", None)
     finally:
         server.shutdown()
