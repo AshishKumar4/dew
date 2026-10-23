@@ -4,6 +4,7 @@ JAX's cache directory is the boundary: a program JAX compiles is a `<key>-cache`
 `compiled` writes as JAX does where a test needs no real compilation."""
 
 import http.server
+import json
 import socket
 import threading
 import time
@@ -477,6 +478,27 @@ def test_a_program_another_file_compiled_while_a_bundle_was_on_its_way_stays_tha
     stored = bundles_while_one_is_on_its_way(tmp_path, lambda: compiled(tmp_path, "jit_slow-1", b"mine"))
     bundle = stored["/jax/cpu/bundles/tests/other.py"]
     assert dict(remote_cache.unpacked(bundle)) == {"jit_slow-1": b"mine"}
+
+
+def test_a_bundle_takes_what_fits_within_the_workers_bound_and_round_trips(cache_worker, tmp_path):
+    """The Worker takes no body past its contract's bound (tools/armada/r2.json, 100 MB): a program just
+    over it goes without, and the bundle of the programs that fit reaches the next cache whole. The large
+    program's file is sparse, so a close that leaves it out never reads it."""
+    url, stored, _ = cache_worker
+    bound = json.loads((Path(__file__).resolve().parents[1] / "tools" / "armada" / "r2.json").read_text())
+    (tmp_path / "first").mkdir()
+    cache = remote_cache.RemoteCache(tmp_path / "first", url, "token", "jax/cpu")
+    cache.opened("tests/large.py")
+    with (tmp_path / "first" / f"jit_large-1{remote_cache.SUFFIX}").open("wb") as large:
+        large.truncate(bound["max_bytes"] - 16)
+    compiled(tmp_path / "first", "jit_small-1", b"small")
+    cache.closed("tests/large.py")
+    cache.drain()
+    assert all(len(body) <= bound["max_bytes"] for body in stored.values())
+    (tmp_path / "next").mkdir()
+    after = remote_cache.RemoteCache(tmp_path / "next", url, "token", "jax/cpu")
+    after.opened("tests/large.py")
+    assert programs(tmp_path / "next") == {"jit_small-1": b"small"}
 
 
 def test_a_program_past_the_cap_leaves_its_files_bundle_as_it_was(cache_worker, tmp_path, monkeypatch):
