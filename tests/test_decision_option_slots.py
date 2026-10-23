@@ -105,11 +105,13 @@ def test_the_stored_joint_head_scores_compacted_options_as_it_scores_the_grid():
     assert drawn[0] == drawn[1] == drawn[2]
 
 
-SLOT_SEEDS = 8
-"""The compacted-options site's declared draws (`seeds_for`): each draw is the ragged rows' states and
-answers from its seed, over the objective initialized from key 0. Drawn with the rows, the
-initialization set each draw's scale: the reference's own error from float64 swung 45 times across
-draws, and the site did not resolve within 64."""
+SLOT_SEEDS = 512
+"""The compacted-options site's declared draws, sized paired (`seeds_for` with the compacted arm as
+`dew_fn`, 2026-10-23 on armada, on the pooled rule for rows of float64 zero): each draw is the ragged
+rows' states and answers from its seed, over the objective initialized from key 0. The head's
+attention query and key gradients, and the key biases' residues around their algebraic zero, are
+heavy-tailed across draws in both arms alike, and their paired ratio resolves PARITY at 512 draws,
+none fewer."""
 
 ALGEBRAIC_ZEROS = ("to_k", "scorer_out")
 """The head's modules whose bias gradient is zero by algebra: a key's bias shifts every key's logit
