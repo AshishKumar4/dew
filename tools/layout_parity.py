@@ -901,7 +901,8 @@ def order_invariance(actual: Mapping[str, NDArray], truth: Mapping[str, NDArray]
     apart = math.sqrt(sum(float(np.sum(np.square(actual[name] - truth[name]))) for name in truth))
     scale = math.sqrt(sum(float(np.sum(np.square(values))) for values in truth.values()))
     relative = apart / scale if scale else 0.0 if apart == 0 else float('inf')
-    if relative > 1e-12 or abs(loss - truth_loss) > 1e-12 * abs(truth_loss):
+    # Written so a NaN anywhere, which no comparison holds for, fails it.
+    if not (relative <= 1e-12 and abs(loss - truth_loss) <= 1e-12 * abs(truth_loss)):
         raise ValueError(
             f'float64 residual order changes the function: gradient relative error {relative:.3e}')
     return relative

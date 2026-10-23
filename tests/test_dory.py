@@ -17,6 +17,7 @@ from interop_support import assert_reloads, assert_same_stored_tensors
 from reference_error import (
     assert_as_exact,
     assert_as_exact_as_the_reference,
+    assert_computes_the_oracle,
     assert_rounds_where_the_reference_does,
 )
 from tool_support import load as load_tool
@@ -290,6 +291,41 @@ def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_ste
     dew, reference = jax.jit(dew), jax.jit(reference)
     label = f'Dory {name} gradients'
     assert_as_exact(dew, reference, draw, label, seeds=DORY_GRADIENT_SEEDS[name])
+
+
+def test_a_float64_model_computes_in_float64():
+    """A float64 Dory computes its logits and gradients in float64 end to end, its nGPT attention
+    included: each within float64's rounding of the torch reference's own float64 run, an
+    independent implementation of the same tensors (`assert_computes_the_oracle`), where one fp32
+    rounding point on the path would sit many orders further."""
+    loaded = load()
+    tensors = {key: np.array(value, copy=True) for key, value in loaded.export().items()}
+    with jax.enable_x64(new_val=True):
+        model = loaded.model.clone(dtype=jnp.float64)
+        variables = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), loaded.variables)
+        ids, cotangent = REFERENCE['input_ids'], REFERENCE['cotangent'].astype(np.float64)
+
+        def loss(params):
+            return jnp.sum(model.apply({**variables, 'params': params}, ids) * cotangent)
+
+        logits = np.asarray(model.apply(variables, ids))
+        written = loaded.export({'params': jax.grad(loss)(variables['params'])})
+    reference = TOOL.DoryReference(loaded.config, tensors, TOOL.torch.float64)
+    expected = reference.forward(ids)
+    gradients = reference.gradients(np.array(ids), np.array(cotangent), TOOL.GRADIENTS)
+    assert logits.dtype == np.float64
+    # Each layer pass reduces over the width (the projections), a head (the logits), the keys (the
+    # weights) and the heads' and the feed-forward's widths; the backward runs every pass again.
+    config = loaded.config
+    passes = (config['n_input_layers'] + config['n_recurrent_loops'] * config['n_recurrent_layers']
+              + config['n_output_layers'])
+    layer = (3 * config['hidden_size'] + config['head_dim'] + ids.shape[1]
+             + config['num_attention_heads'] * config['head_dim'] + config['intermediate_size'])
+    roundings = 2 * (passes * layer + config['hidden_size'])
+    assert_computes_the_oracle(logits, expected, 'float64 logits', roundings=roundings)
+    for tensor in TOOL.GRADIENTS:
+        assert_computes_the_oracle(np.asarray(written[tensor]), gradients[tensor], f'float64 {tensor}',
+                                   roundings=roundings)
 
 
 def test_a_cut_loop_trains_the_layers_before_it_through_the_input_every_pass_reads():
