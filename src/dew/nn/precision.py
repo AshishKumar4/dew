@@ -19,6 +19,7 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax.typing import Dtype, PrecisionLike
 from jax.typing import DTypeLike
 
@@ -126,11 +127,14 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     0.6 of it). It costs a CPU product about twice the time (2048-cubed 56 to 126 ms on armada's
     EPYC); a GPU or TPU product, and any whose products are 16-bit, are the product itself. float64
     runs on these ops alone, under `jax.enable_x64` for their own trace, which nothing outside
-    reads, and their gradients and tangents are float64 sums too."""
+    reads, and their gradients and tangents are float64 sums too. An operand that is not an array (a
+    quantized one, Qwix's `QArray`) leaves the product to its own library, whose dequantized sum
+    keeps XLA's accumulation."""
     from dew.nn.kernels.generation import linear_tangent
 
     narrow = functools.partial(product, preferred_element_type=preferred_element_type)
-    if products_dtype(*operands) != jnp.dtype(jnp.float32):
+    if (not all(isinstance(operand, jax.Array | np.ndarray) for operand in operands)
+            or products_dtype(*operands) != jnp.dtype(jnp.float32)):
         return narrow(*operands)
     dtype = jax.eval_shape(narrow, *operands).dtype
 
@@ -236,10 +240,9 @@ def fp32_result_dot_general(precision: PrecisionLike = None):
     def dot_general(lhs, rhs, dimension_numbers, precision=None,
                     preferred_element_type=None):
         del precision, preferred_element_type  # this head's policy, not the layer's
-        return jax.lax.dot_general(
-            lhs, rhs, dimension_numbers,
-            precision=operand_precision(lhs.dtype, requested),
-            preferred_element_type=at_least_fp32(lhs.dtype))
+        return accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=dimension_numbers,
+                                             precision=operand_precision(lhs.dtype, requested)),
+                           lhs, rhs, preferred_element_type=at_least_fp32(lhs.dtype))
 
     return dot_general
 
@@ -444,11 +447,15 @@ def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
                     preferred_element_type=None):
         del precision, preferred_element_type  # this head's policy, not the layer's
         if rounds:
-            rhs = _algorithm_operand(rhs)
-        logits = jax.lax.dot_general(lhs, rhs, dimension_numbers,
-                                     precision=float32_products(products_dtype(lhs, rhs), resolved),
-                                     preferred_element_type=at_least_fp32(lhs.dtype))
-        return bf16_logits(logits) if rounds else logits
+            # The BF16 algorithm's product, exact in fp32 by design (`bf16_product`).
+            return bf16_logits(jax.lax.dot_general(
+                lhs, _algorithm_operand(rhs), dimension_numbers,
+                precision=float32_products(products_dtype(lhs, rhs), resolved),
+                preferred_element_type=at_least_fp32(lhs.dtype)))
+        return accumulated(functools.partial(
+            jax.lax.dot_general, dimension_numbers=dimension_numbers,
+            precision=float32_products(products_dtype(lhs, rhs), resolved)),
+            lhs, rhs, preferred_element_type=at_least_fp32(lhs.dtype))
 
     return dot_general
 
@@ -489,8 +496,8 @@ def head_product(subscripts: str, hidden: jax.Array, head: jax.Array,
     if rounds_to_bf16(hidden.dtype if compute is None else compute, precision):
         return bf16_product(subscripts, hidden, head)
     wide = at_least_fp32(hidden.dtype)
-    return jnp.einsum(subscripts, hidden.astype(wide), head,
-                      precision=float32_products(wide, precision), preferred_element_type=wide)
+    return float32_einsum(subscripts, hidden.astype(wide), head, precision=precision,
+                          preferred_element_type=wide)
 
 
 def bf16_product(subscripts: str, hidden: jax.Array, head: jax.Array) -> jax.Array:

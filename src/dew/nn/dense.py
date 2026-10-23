@@ -23,14 +23,15 @@ from flax import linen as nn
 from flax.core import meta
 from flax.typing import Array
 
-from .precision import biased
+from .precision import biased, float32_dot_general
 
 
 def _product(layer: nn.Dense | nn.DenseGeneral):
-    """The layer's product: its `dot_general_cls`, its `dot_general`, or lax's, as flax picks it."""
+    """The layer's product: its `dot_general_cls` or its `dot_general`, as flax picks it, else Dew's
+    (`float32_dot_general`, whose fp32 sum a CPU takes in float64)."""
     if layer.dot_general_cls is not None:
         return layer.dot_general_cls()
-    return layer.dot_general if layer.dot_general is not None else jax.lax.dot_general
+    return layer.dot_general if layer.dot_general is not None else float32_dot_general
 
 
 def _biased(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, dimensions, bias: Array | None,

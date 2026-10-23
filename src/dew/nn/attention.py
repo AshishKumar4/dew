@@ -317,9 +317,9 @@ def max_attention_logits(query: jax.Array, key: jax.Array, *, causal: bool = Fal
     heads = query.shape[-2]
     key = repeat_kv_heads(key, heads)
     scale = 1.0 / math.sqrt(query.shape[-1])
-    logits = jnp.einsum('...qhd,...khd->...hqk',
-                        query.astype(jnp.float32) * jnp.asarray(scale, jnp.float32),
-                        key.astype(jnp.float32), precision=operand_precision(jnp.float32))
+    logits = float32_einsum('...qhd,...khd->...hqk',
+                            query.astype(jnp.float32) * jnp.asarray(scale, jnp.float32),
+                            key.astype(jnp.float32), precision=operand_precision(jnp.float32))
     if bias is not None:
         logits = logits + bias.astype(jnp.float32)
     combined = combined_attention_mask(
@@ -1135,10 +1135,6 @@ def triton_attention(query, key, value, causal: bool):
         query, key, value, is_causal=causal, implementation='triton'), query, key, value)
 
 
-VALUE_BLOCK = 256
-"""Keys per block of `weighted_values`' fp32 sum on XLA:CPU."""
-
-
 def weighted_values(equation, weights, value, *, precision=None) -> jax.Array:
     """The probability-value product, with the probabilities in the value's dtype.
 
@@ -1151,36 +1147,12 @@ def weighted_values(equation, weights, value, *, precision=None) -> jax.Array:
     that produced them still reduced in fp32, which is where the precision
     was needed.
 
-    `equation` is flax's value product, '...hqk,...khd->...qhd'. On XLA:CPU
-    an fp32 product sums each block of VALUE_BLOCK keys apart and the
-    blocks' sums after. YNNPACK, XLA:CPU's dot, sums up to about 1024 keys
-    in one chain: fp32 attention over 512, 2048 and 8192 keys rounded 1.34,
-    1.75 and 1.63 times as far from float64 as torch's SDPA does, and 0.98,
-    0.96 and 0.87 times in blocks. Writing each block's product costs a
-    forward 3% to 9% at 512 to 1024 keys on two threads (docs/performance.md).
+    `equation` is flax's value product, '...hqk,...khd->...qhd'; a CPU sums
+    an fp32 one in float64 and rounds once (`precision.accumulated`).
     """
     if equation != '...hqk,...khd->...qhd':
         raise ValueError(f"weighted_values takes flax's value product, got {equation!r}")
-    weights = weights.astype(value.dtype)
-    plain = functools.partial(float32_einsum, equation, precision=precision)
-    if value.dtype != jnp.float32 or value.shape[-3] <= VALUE_BLOCK or generation.backend() != 'cpu':
-        return plain(weights, value)
-    # Both modes differentiate the plain product: neither sums over the keys, and the blocked
-    # form's own cost the backward an eighth more on two threads.
-    return forward_differentiable(functools.partial(_blocked_values, precision=precision), plain,
-                                  weights, value)
-
-
-def _blocked_values(weights, value, precision) -> jax.Array:
-    """`weighted_values`' product summed in blocks of VALUE_BLOCK keys."""
-    keys = value.shape[-3]
-    blocks = -(-keys // VALUE_BLOCK)
-    pad = blocks * VALUE_BLOCK - keys
-    weights = jnp.pad(weights, [(0, 0)] * (weights.ndim - 1) + [(0, pad)])
-    value = jnp.pad(value, [(0, 0)] * (value.ndim - 3) + [(0, pad), (0, 0), (0, 0)])
-    weights = weights.reshape(*weights.shape[:-1], blocks, VALUE_BLOCK)
-    value = value.reshape(*value.shape[:-3], blocks, VALUE_BLOCK, *value.shape[-2:])
-    return float32_einsum('...hqck,...ckhd->...qhdc', weights, value, precision=precision).sum(-1)
+    return float32_einsum(equation, weights.astype(value.dtype), value, precision=precision)
 
 
 
@@ -1631,12 +1603,11 @@ def _xla_kernel_narrows(query) -> bool:
         query.dtype == jnp.bfloat16 and generation.backend() == 'gpu' and not bf16_dot_runs())
 
 
-def _xla_kernel_chains(query, key) -> bool:
-    """Whether jax.nn's xla attention would sum this call's fp32 value
-    product over more than VALUE_BLOCK keys in one chain, as YNNPACK,
-    XLA:CPU's dot, does, so 'auto' and 'xla' take the reference path, whose
-    `weighted_values` sums it in blocks."""
-    return query.dtype == jnp.float32 and key.shape[-3] > VALUE_BLOCK and generation.backend() == 'cpu'
+def _xla_kernel_sums_in_fp32(query) -> bool:
+    """Whether jax.nn's xla attention would sum this call's fp32 products in fp32, as XLA:CPU's dot
+    does, where Dew sums a CPU's fp32 products in float64 (`precision.accumulated`): 'auto' and 'xla'
+    take the reference path, whose products do."""
+    return query.dtype == jnp.float32 and generation.backend() == 'cpu'
 
 
 def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_softmax=True, softcap=None,
@@ -1657,7 +1628,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         mask=mask is not None, bias=bias is not None,
         sinks=sinks is not None, softcap=softcap,
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax),
-        narrows=_xla_kernel_narrows(query) or _xla_kernel_chains(query, key),
+        narrows=_xla_kernel_narrows(query) or _xla_kernel_sums_in_fp32(query),
         folds=folds(query, key, bias, mask, causal, sliding_window),
         splash_mask=False, shards=sequence_shards())
     # Splash's descriptor reads a concrete mask on the host, so it is built only where splash may run,

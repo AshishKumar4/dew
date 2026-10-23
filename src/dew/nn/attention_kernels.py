@@ -102,7 +102,7 @@ class AttentionCase:
     (a windowed decode step's first key, `key_value_seq_starts`); `mask`
     is an arbitrary mask only the generic path takes. `arithmetic` is a call asking what only the
     reference path computes (`reference_only`), `narrows` one jax.nn's xla kernel would compute
-    below its precision (`_xla_kernel_narrows`, `_xla_kernel_chains`), `folds` one of few query
+    below its precision (`_xla_kernel_narrows`, `_xla_kernel_sums_in_fp32`), `folds` one of few query
     positions `folded_attention` reads on a GPU, and `splash_mask` one whose mask splash's descriptor
     describes, formed only where splash may run, under a name that may choose it on a TPU
     (`TPU_BACKEND`), and False elsewhere."""
