@@ -31,8 +31,8 @@ from .attention_kernels import (
     ATTENTION,
     DECODE,
     SPLASH_BLOCK,
-    SPLASH_DTYPES,
     SPLASH_LANES,
+    TPU_BACKEND,
     AttentionCase,
     decodes,
 )
@@ -81,6 +81,7 @@ from .sharding import (
     sequence_shards,
     split_positions,
 )
+from .visibility import same_chunk, visible, window_sides, windowed
 
 AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "triton", "flash", "tpu"]
 """Names which kernel an attention call runs.
@@ -139,10 +140,8 @@ def causal_attention_mask(query_positions, kv_len: int, sliding_window=None, *, 
     if positions.ndim == 1:
         positions = positions[None, :]
     q_pos = positions[:, :, None]
-    k_pos = jnp.arange(kv_len)[None, None, :]
-    mask = (q_pos >= 0) & (k_pos <= q_pos)
-    if sliding_window is not None:
-        mask = mask & (k_pos > q_pos - sliding_window)
+    keys = jnp.arange(kv_len)[None, None, :]
+    mask = (q_pos >= 0) & visible(q_pos, keys, causal=True, window=sliding_window)
     if key_valid is not None:
         mask = mask & jnp.asarray(key_valid, bool)[:, None, :]
     return mask[:, None]
@@ -168,20 +167,6 @@ def alibi_bias(key_positions, num_heads: int, *, dtype) -> jax.Array:
             * positions[:, None, None, :]).astype(dtype)
 
 
-def window_sides(causal: bool, sliding_window: int) -> tuple[int, int]:
-    """The keys a window of `sliding_window` keeps before and after each query,
-    counted as `jax.nn.dot_product_attention`'s `local_window_size` counts them.
-
-    A causal window keeps the query and the w - 1 keys before it. A
-    bidirectional one keeps the keys within w - 1 positions on either side,
-    |q - k| < w: ModernBERT's |q - k| <= local_attention // 2, which is w =
-    local_attention // 2 + 1 (masking_utils.py:141-158, transformers 5.16.1).
-    A model layer passes one only where its kind asks for it
-    (`LayerKind.bidirectional_window`).
-    """
-    return sliding_window - 1, 0 if causal else sliding_window - 1
-
-
 def structural_mask(query_positions, kv_len: int, causal: bool,
                     sliding_window: int | None) -> jax.Array | None:
     """The `[B, 1, T, S]` keys that causality and a window leave each query,
@@ -194,8 +179,9 @@ def structural_mask(query_positions, kv_len: int, causal: bool,
     positions = jnp.asarray(query_positions)
     if positions.ndim == 1:
         positions = positions[None, :]
-    distance = positions[:, :, None] - jnp.arange(kv_len)[None, None, :]
-    return ((positions[:, :, None] >= 0) & (jnp.abs(distance) < sliding_window))[:, None]
+    keys = jnp.arange(kv_len)[None, None, :]
+    queries = positions[:, :, None]
+    return ((queries >= 0) & windowed(queries, keys, sliding_window, causal=False))[:, None]
 
 
 def chunk_mask(query_positions, key_positions, chunk_size: int):
@@ -205,9 +191,8 @@ def chunk_mask(query_positions, key_positions, chunk_size: int):
     counted from the sequence start, so a packed document's positions place
     its chunks from its own first token.
     """
-    query_chunks = jnp.asarray(query_positions) // chunk_size
-    key_chunks = jnp.asarray(key_positions) // chunk_size
-    same = query_chunks[..., :, None] == key_chunks[..., None, :]
+    same = same_chunk(jnp.asarray(query_positions)[..., :, None], jnp.asarray(key_positions)[..., None, :],
+                      chunk_size)
     return same[..., None, :, :] if same.ndim == 3 else same[None, None]
 
 
@@ -274,20 +259,20 @@ def visible_rows(query_length: int, key_length: int, causal: bool, sliding_windo
         rows = rows.reshape((1,) * (3 - rows.ndim) + rows.shape)
         return jnp.swapaxes(rows, -1, -2)[..., None]
     # The keys row i may see run from 0 to the last one; causality keeps 0 in
-    # reach, and a window ends `left` keys before the row. A row's start must
-    # lie at or before the last key it may see: the last, the row itself
-    # under causality, or `right` keys past it under a two-sided window.
-    left, right = (None, None) if sliding_window is None else window_sides(causal, sliding_window)
+    # reach, and a window ends w - 1 keys before the row (`windowed`). A row's
+    # start must lie at or before the last key it may see: the last, the row
+    # itself under causality, or `right` keys past it under a two-sided window.
+    right = None if sliding_window is None else window_sides(causal, sliding_window)[1]
     rows = np.arange(query_length)[None]
     if key_value_seq_lengths is None and starts is None:
         last = np.full((1, 1), key_length - 1)
-        reach = (last >= 0) if left is None else (rows - left <= last)
+        reach = (last >= 0) if sliding_window is None else windowed(rows, last, sliding_window, causal=True)
         if segment_ids is None:
             return None if reach.all() else jnp.asarray(reach)[:, :, None, None]
         return (jnp.asarray(reach) & (jnp.asarray(segment_ids) != 0))[:, :, None, None]
     last = (jnp.full((1, 1), key_length - 1) if key_value_seq_lengths is None
             else jnp.asarray(key_value_seq_lengths)[:, None] - 1)
-    reach = (last >= 0) if left is None else (rows - left <= last)
+    reach = (last >= 0) if sliding_window is None else windowed(rows, last, sliding_window, causal=True)
     if starts is not None:
         seen = last
         if causal:
@@ -1662,7 +1647,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
     `AttentionImpl`, which decides whether splash might run it."""
     cross = isinstance(segment_ids, CrossDocuments)
     q_len, kv_len = query.shape[-3], key.shape[-3]
-    return AttentionCase(
+    case = AttentionCase(
         queries=q_len, keys=kv_len, heads=query.shape[-2], kv_heads=key.shape[-2],
         head_dim=query.shape[-1], dtype=jnp.dtype(query.dtype), key_dtype=jnp.dtype(key.dtype),
         causal=bool(causal), window=sliding_window,
@@ -1674,17 +1659,14 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax),
         narrows=_xla_kernel_narrows(query) or _xla_kernel_chains(query, key),
         folds=folds(query, key, bias, mask, causal, sliding_window),
-        # Splash's descriptor reads a concrete mask on the host, so only a call splash could take
-        # builds it: one that names it or chooses, a TPU's, of its dtypes, with no bias or sequence
-        # axis, at lengths it tiles.
-        splash=(named in ('auto', 'tpu') and generation.backend() == 'tpu'
-                and jnp.dtype(query.dtype) in SPLASH_DTYPES
-                and bias is None and sequence_shards() == 1
-                and q_len % SPLASH_LANES == 0 and kv_len % SPLASH_LANES == 0
-                and min(q_len, kv_len) >= SPLASH_MIN_LENGTH
-                and splash_mask_descriptor(q_len, kv_len, shard_heads(query), causal, sliding_window,
-                                           mask) is not None),
-        shards=sequence_shards())
+        splash_mask=False, shards=sequence_shards())
+    # Splash's descriptor reads a concrete mask on the host, so it is built only where splash may run,
+    # under a name that may choose it on a TPU (`TPU_BACKEND`); its tiling and every other requirement
+    # read the case (`TPU_SUPPORTS`).
+    if named in ('auto', 'tpu') and TPU_BACKEND.holds(case):
+        described = splash_mask_descriptor(q_len, kv_len, shard_heads(query), causal, sliding_window, mask)
+        case = dataclasses.replace(case, splash_mask=described is not None)
+    return case
 
 
 def resolve_implementation(implementation, query, key, *, dtype=None, precision=None,
@@ -1755,13 +1737,6 @@ def cudnn_takes_mask(implementation: str, query, *, softcap=None, sinks: bool = 
 # device memory that grows with the batch. 4 Mi cells is a 16-head 512x512.
 SPLASH_DENSE_MASK_CELLS = 1 << 22
 
-# The shortest sequence 'auto' hands splash. tools/qualify_splash.py on one
-# v6e (jax 0.11.1, bf16, 16 query heads over 8 key heads of width 128, 16384
-# causal tokens a step), a training step: splash 3.24 ms against XLA's 2.62
-# at 256 keys, 2.57 against 4.64 at 512, 28.9 against 144.2 at 16384; width
-# 64 crosses at the same length. Softcap, sinks and packed ids cost splash
-# at most 16% more from 512 to 16384.
-SPLASH_MIN_LENGTH = 512
 
 
 def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,

@@ -128,7 +128,7 @@ A source is already a `Dataset`, and every verb returns a new one. A preset of `
 
 A `Dataset` is immutable. Its methods add ordered stages: `map`, `random_map`, `map_with_index`, `filter`, `filter_map`, `random_filter_map`, `flat_map`, `shuffle`, `repeat`, `slice`, `mix`, `interleave`, `windows`, `pack`, `batch`, `workers`, `prefetch`, `take` and `cache`; a `map` after `batch` is a host step on the training batch. `batch` takes the global row batch. Host batch steps run after workers in the training process. `compile(..., host=(step,))` applies common steps to both branches.
 
-Sources implement `Source`: `Memory` holds records or columns, `Files` opens a format over URLs, `Hub` opens prepared Arrow or physical Hub Parquet shards, `TFDS` opens prepared ArrayRecords, and `Torch` adapts map-style PyTorch samples with explicit tuple field names. A `DataLoader` keeps its own sampler and collator and is refused.
+Sources implement `Source`: `Memory` holds records or columns, `Files` opens a format over URLs, `Hub` opens prepared Arrow or physical Hub Parquet shards, `TFDS` opens prepared ArrayRecords, and `from_torch` adapts map-style PyTorch samples with explicit tuple field names, as `from_grain`, `from_hf` and `from_iter` adapt Grain datasets, Hugging Face datasets and resumable iterators. A `DataLoader` keeps its own sampler and collator and is refused.
 
 `read="memory"` materializes deterministic transforms and packing. `read="indexed"` requires a producer index or provisioning. `read="streamed"` reads physical shards. The mode applies to every leaf, including validation; with no `read`, the sources choose it. `Trainer.fit` provisions what the read needs, logging each artifact it prepares; under `compile`'s default, `provision=False`, a missing artifact is a named error.
 
@@ -597,6 +597,6 @@ Splash's mask is a block-sparse descriptor built along with the executable, so a
 
 An additive bias, a mask that is a value of the trace (a KV-cache decode mask, or the striped mask sequence parallelism builds), a mask past the published cell budget, or a length that is not a multiple of 128 sends an explicit `'tpu'` call to the older Pallas flash kernel and keeps `'auto'` on `'xla'`. Splash applies a logit softcap (Gemma 2) and attention sinks (GPT-OSS) itself, and a packed batch reaches it as segment IDs instead of a mask. The flash kernel has neither a softcap nor sinks, so an explicit `'tpu'` call that splash cannot describe refuses them. On a GPU, `'auto'` runs both on `'xla'`, and `'cudnn'` refuses them by name.
 
-Below 512 keys `'auto'` stays on `'xla'`, where XLA's attention measured faster on a v6e (`SPLASH_MIN_LENGTH` in `dew/nn/attention.py`). The parameter tree does not change with the implementation, so checkpoints are interchangeable across hardware.
+Below 512 keys `'auto'` stays on `'xla'`, where XLA's attention measured faster on a v6e (`SPLASH_MIN_LENGTH` in `dew/nn/attention_kernels.py`). The parameter tree does not change with the implementation, so checkpoints are interchangeable across hardware.
 
 The [README model list](https://github.com/AshishKumar4/dew/blob/main/README.md#models) names which model configurations run the whole workflow; each task guide covers its own data and objective.
