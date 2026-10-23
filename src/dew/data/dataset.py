@@ -1418,6 +1418,19 @@ def _global_position(state: Position) -> bytes:
     return state
 
 
+def _joined(kept: Batch, new: Batch) -> Batch:
+    """The rows of `kept` then `new`, a ramp's buffer as a read adds to it: a batch that marks its
+    real rows (`VALID_ROWS`), a kept short one, beside one that does not, all of whose rows are."""
+    if (VALID_ROWS in kept) != (VALID_ROWS in new):
+        kept, new = (batch if VALID_ROWS in batch else {**batch, VALID_ROWS: np.ones(rows_of(batch), bool)}
+                     for batch in (kept, new))
+
+    def join(held: list | np.ndarray, read: list | np.ndarray) -> list | np.ndarray:
+        return held + read if isinstance(held, list) else np.concatenate([held, read])
+
+    return jax.tree.map(join, kept, new, is_leaf=lambda column: isinstance(column, list))
+
+
 class RampedStream(Forwarding):
     """Grows a training stream's step over the run's first records.
 
@@ -1477,13 +1490,7 @@ class RampedStream(Forwarding):
             read = next(self._source, None)
             if read is None:
                 break
-            self._held = (
-                read
-                if self._held is None
-                else jax.tree.map(lambda kept, new: kept + new if isinstance(kept, list)
-                                  else np.concatenate([kept, new]), self._held, read,
-                                  is_leaf=lambda column: isinstance(column, list))
-            )
+            self._held = read if self._held is None else _joined(self._held, read)
         if self._held is None or not rows_of(self._held):
             raise StopIteration
         if left is not None and left < stage.batch:
