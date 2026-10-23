@@ -72,7 +72,7 @@ from dew.data.pipeline import (
     with_children,
 )
 from dew.data.plan import Manifest, StepIdentity, _changed, _semantic, identified
-from dew.data.sources.base import READS, Read, Source, _consumed
+from dew.data.sources.base import READS, SAME_ROWS, Read, Source, View, _consumed, beneath, materialized
 from dew.data.sources.concatenate import Concatenate
 from dew.data.sources.memory import Memory
 from dew.records import json_value, record
@@ -87,20 +87,6 @@ _STAGES = get_args(Stage.__value__)
 class _Provisionable(Protocol):
     def can_provision(self, read: Read) -> bool: ...
     def provision(self) -> Source: ...
-
-
-@runtime_checkable
-class _Wrapping(Protocol):
-    source: Source
-
-
-@runtime_checkable
-class _RestrictedReads(Protocol):
-    """A holdout or slice that takes fewer reads than its store, and says why
-    and what reads instead (`refusal`)."""
-
-    reads: tuple[Read, ...]
-    refusal: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -121,12 +107,16 @@ class _ConcatenationPreparers:
 
 
 def _provisioner(source: Source, read: Read) -> _Provisionable | None:
-    """The source that can prepare `read`, through any split or slice wrapping it; for a
-    concatenation, each of its stores that cannot take `read` yet, all of which must prepare it."""
-    while isinstance(source, _Wrapping) and not isinstance(source, _Provisionable):
-        if isinstance(source, _RestrictedReads) and read not in source.reads:
+    """The source that can prepare `read`, through the views whose rows are their source's
+    (`SAME_ROWS`) over it, unless one takes no such read; for a concatenation, each of its stores
+    that cannot take `read` yet, all of which must prepare it."""
+    preparing = source
+    for preparing in beneath(source, SAME_ROWS):
+        if isinstance(preparing, _Provisionable):
+            break
+        if isinstance(preparing, View) and read not in preparing.reads:
             return None
-        source = source.source
+    source = preparing
     if isinstance(source, Concatenate):
         preparers = [_provisioner(member, read) for member in source.sources if not member.supports(read)]
         if not preparers or any(preparer is None for preparer in preparers):
@@ -137,10 +127,10 @@ def _provisioner(source: Source, read: Read) -> _Provisionable | None:
 
 
 def _store(source: Source) -> Source:
-    """The store under any source slices or holdouts."""
-    while isinstance(source, _Wrapping):
-        source = source.source
-    return source
+    """The store under the views whose rows are its own, or some of them (`SAME_ROWS`): holdouts,
+    a compile's pinned read, a decision table."""
+    *_, store = beneath(source, SAME_ROWS)
+    return store
 
 
 def _in_memory(source: Source) -> bool:
@@ -578,7 +568,7 @@ def _manifest(
     fill: Mapping[str, object] | None = None,
 ) -> Manifest:
     """The manifest of the rows `sources` hold, named by `snapshot`, through
-    `steps`. A source a memory read made (`_Ran`) names the steps it already
+    `steps`. A source a memory read made (`materialized`) names the steps it already
     ran by what they compute; their modules join the environment here."""
     ran = tuple(_identity(stage) for source in sources for stage in _written(source, ()))
     return Manifest.of(snapshot, steps, ran=ran, fill=fill)
@@ -701,21 +691,12 @@ def _drops(stage: Stage) -> bool:
     )
 
 
-@runtime_checkable
-class _Ran(Protocol):
-    """Rows the first stages of a pipeline already made, as a memory read
-    holds them (`dew.data.materialize`), with the source they came from."""
-
-    original: Source
-    ran: tuple[Stage, ...]
-
-
 def _written(source: Source, stages: Sequence[Stage]) -> tuple[Stage, ...]:
     """A corpus's stages as its pipeline wrote them: the ones a memory read
-    already ran, then the ones left to lower."""
-    while isinstance(source, _Ran):
+    already ran (`materialized`), then the ones left to lower."""
+    while materialized(source):
         stages = (*source.ran, *stages)
-        source = source.original
+        source = source.source
     return tuple(stages)
 
 
@@ -1007,10 +988,9 @@ def _refusal(source: Source, read: Read, *, provision: bool) -> str:
     """Why `source` cannot take `read`: a holdout or slice over its store that
     reads no such way, which says what does, else its store, which a run
     that did not provision may prepare."""
-    while isinstance(source, _Wrapping):
-        if isinstance(source, _RestrictedReads) and read not in source.reads:
-            return source.refusal
-        source = source.source
+    for view in beneath(source, SAME_ROWS):
+        if isinstance(view, View) and read not in view.reads:
+            return view.refusal
     if provision:
         return "its store takes no such read, and provisioning prepared none"
     return "provision the named artifact with dew data provision or provision=True"
