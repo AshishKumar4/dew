@@ -9,6 +9,7 @@ encoder beside the validation loss.
 from __future__ import annotations
 
 import dataclasses
+from typing import ClassVar
 
 from dew.config import JsonDict, ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig, media_field
 from dew.data.compile import fitted
@@ -26,6 +27,8 @@ SHARED_MODEL_KEYS = ("emb_features", "num_heads", "mlp_ratio", "ssm_attention_ra
 @dataclasses.dataclass(frozen=True)
 class JepaRunConfig(RunConfig):
     """A run, plus the JEPA objective's own knobs."""
+
+    RESUMABLE: ClassVar[tuple[str, ...]] = (*RunConfig.RESUMABLE, "probe_classes", "knn_k")
 
     objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("jepa"))
     """The JEPA objective and its arguments (`--objective.momentum 0.996 1.0`).

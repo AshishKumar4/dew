@@ -1297,6 +1297,14 @@ class LMObjective(TokenScorer):
     def _warmup(self) -> bool:
         return self.indexer is not None and self.indexer.phase == "warmup"
 
+    def scored_tokens(self, batch: Batch) -> np.ndarray:
+        """Each row's targets the loss scores, or in an indexer's warm-up, which scores its KL alone,
+        each row's real queries (`_query_weights`)."""
+        if not self._warmup:
+            return super().scored_tokens(batch)
+        valid, _ = self._counted_tokens(batch)
+        return np.sum(valid[:, :-1], axis=-1, dtype=np.int64)
+
     def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
         """Split the tree as the indexer phase trains it.
 

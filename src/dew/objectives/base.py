@@ -891,9 +891,16 @@ class Objective(ABC, Generic[Loss, Effects]):
     another's batches, a distillation's, counts as that one does."""
 
     def scored_tokens(self, batch: Batch) -> np.ndarray:
-        """Each row's targets the loss scores, read before device placement: what a token budget
-        commits. The FLOP count reads the inputs instead (`real_lengths`)."""
-        raise TypeError(f"{type(self).__name__} counts no tokens (counts_tokens)")
+        """Each row's tokens the loss scores, read before device placement: what a token budget
+        commits. By default every real input, each row's `real_lengths` summed; an objective that
+        scores fewer, a language model its shifted targets, counts those. The FLOP count reads the
+        inputs (`real_lengths`)."""
+        from dew.data.dataset import rows_of
+
+        rows = rows_of(batch)
+        return np.asarray([np.sum(self.real_lengths(jax.tree.map(
+            lambda leaf, index=index: leaf[index:index + 1] if np.ndim(leaf) and np.shape(leaf)[0] == rows
+            else leaf, batch))) for index in range(rows)], np.int64)
 
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """Real row (or packed-segment) lengths, read before device placement.

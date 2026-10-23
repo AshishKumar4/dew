@@ -18,7 +18,7 @@ wrote, which decide the vocabulary.
 from __future__ import annotations
 
 import dataclasses
-from typing import NamedTuple
+from typing import ClassVar, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -43,6 +43,8 @@ class Tokens(NamedTuple):
 @dataclasses.dataclass(frozen=True)
 class LMRunConfig(RunConfig):
     """A `RunConfig` plus the settings specific to language models."""
+
+    RESUMABLE: ClassVar[tuple[str, ...]] = (*RunConfig.RESUMABLE, "prompt", "max_new_tokens", "sampling")
 
     objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("lm"))
     """The objective and its arguments: lm, masked_diffusion (MDLM), or
