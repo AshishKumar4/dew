@@ -544,22 +544,16 @@ def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
         at = "/" + ci.record_key("3.12", ci.row("3.12", "tests/test_listless.py", ""), other)
         stored[at] = json.dumps({"key": None, "depends": [], "row": {}, "reads": [], "peak": 2 ** 30,
                                  "shares": 0, "pools": 0}).encode()
-    real_store = ci.store
+    listing = ci.r2.Store.keys
 
-    def unlisting(token):
-        found = real_store(token)
+    def refused(self, prefix):
+        raise ci.r2.Unavailable("listing refused")
+        yield
 
-        def refused(prefix):
-            raise ci.r2.Unavailable("listing refused")
-            yield
-
-        found.keys = refused
-        return found
-
-    monkeypatch.setattr(ci, "store", unlisting)
+    monkeypatch.setattr(ci.r2.Store, "keys", refused)
     assert ci.gpu_lane("3.12", ["tests/test_listless.py"], out, cache=False, processes=4, deadline=600.0) == 0
     assert [share for share, *_ in ran("test_listless")] == ["0.5"]
-    monkeypatch.setattr(ci, "store", real_store)
+    monkeypatch.setattr(ci.r2.Store, "keys", listing)
     # This class's own records now: the next lane reads them, the tight file alone as its own last run was.
     assert ci.gpu_lane("3.12", ["tests/test_tight.py"], out, cache=False, processes=4, deadline=600.0) == 0
     assert [share for share, *_ in ran("test_tight")][-1] != borrowed
