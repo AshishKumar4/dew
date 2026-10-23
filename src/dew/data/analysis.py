@@ -152,8 +152,11 @@ def _stated(source: Source, read: Read, measuring: Sequence[Measuring] = (),
             whole: Callable[[Source], Records] | None = None) -> tuple[Records | None, Mapping[str, object]]:
     """The records a memory read of `source` holds, then its metadata, with each fact `measuring`
     measures in place of any the store states, in a memory read: over the whole store's records,
-    below any holdout, so each part of it binds alike, as the stages before the measuring step make
-    them (`dew.data.lowering.prepared_rows`). `whole` reads the store once for every part of it."""
+    below any holdout (a generation's part's over the generation's rows for every input,
+    `SelectedGeneration.whole`), so each part of it binds alike, as the stages before the measuring
+    step make them (`dew.data.lowering.prepared_rows`). `whole` reads the store once for every part
+    of it."""
+    from dew.data.holdout import SelectedGeneration
     from dew.data.lowering import prepared_rows
 
     held = source.records(read) if read == "memory" else None
@@ -161,6 +164,8 @@ def _stated(source: Source, read: Read, measuring: Sequence[Measuring] = (),
     if held is None or not measuring:
         return held, metadata
     store = _store(source)
+    if isinstance(store, SelectedGeneration):
+        store = store.whole
     # A records holdout reads its part of the whole store's records, which it keeps.
     rows = (held if store is source else held.source if isinstance(held, SourceSlice)
             else whole(store) if whole is not None else store.records(read))
@@ -732,8 +737,18 @@ class _Lowering:
     order rather than in a memory read's eager pass, and `split` says whether
     any does, here or in a corpus it mixes; the plan takes the spans each
     keeps through this tree (`dew.data.lowering._split_spans`). `order` is the
-    canonical order a resume must find unchanged, and `endless` whether the
-    training order never runs out.
+    canonical order a resume must find unchanged. `parts_unending` says whether
+    its source never ends: a mix of parts whose orders never end (`unending`),
+    or a source a training read cut per share repeats at its root where its
+    order repeats nowhere (`_Build.shared`, `_Build.streamed`); `unending`
+    whether its order, its stages read in turn from there, never ends
+    (`reach`), so a part repeated at its root and then cut by a limit ends;
+    `records_unending` whether its records before its batch never end, and
+    `onward` whether they are read on without end anywhere on the way; and
+    `rooted` whether a training read repeats it at its root, as it does where
+    nothing in it repeats or ends it. A training stream is `endless` where its
+    order or that root repeat never ends. `stages` are its own stages, from
+    which a cut restates these (`_cut`).
     """
 
     per_share: bool
@@ -746,14 +761,46 @@ class _Lowering:
     epochs: int | None
     splits: tuple[int, ...]
     order: Mapping[str, object]
-    endless: bool
+    parts_unending: bool
+    unending: bool
+    records_unending: bool
+    onward: bool
+    rooted: bool
     one_to_one: bool
     """Whether the cache holds one record for each input (`_indexed_cache`), so a memory or indexed
     read reads it by index, in the order the uncached stages would make (`dew.data.lowering._Inputs`)."""
+    stages: tuple[Stage, ...]
 
     @property
     def split(self) -> bool:
         return bool(self.splits) or any(child.split for child in self.children)
+
+    @property
+    def endless(self) -> bool:
+        """Whether a training order never runs out: its own, or the repeat a training read adds at its
+        root (`rooted`)."""
+        return self.unending or self.rooted
+
+
+def ends(stage: Stage) -> bool:
+    """Whether `stage` ends the order it reads: a limit, or a slice with an end."""
+    return isinstance(stage, Limit) or (isinstance(stage, Slice) and stage.selection.stop is not None)
+
+
+def reach(stages: Sequence[Stage], unending: bool) -> tuple[bool, bool]:
+    """Whether an order read through `stages` in turn, from one that never ends where `unending`,
+    never ends, and whether it reads on without end anywhere on the way: a repeat without a count
+    makes it endless, and a stage that `ends` it ends it again, as a Grain transformation of its own
+    (`Native`) may, which nothing says it doesn't. The analysis's one reading of an order's
+    finiteness, which its lowering states (`_Lowering`)."""
+    onward = unending
+    for stage in stages:
+        if isinstance(stage, Repeat) and stage.epochs is None:
+            unending = True
+        elif ends(stage) or isinstance(stage, Native):
+            unending = False
+        onward = onward or unending
+    return unending, onward
 
 
 def _analyzed(
@@ -790,12 +837,11 @@ def _analyzed(
     if isinstance(source, Mixture) and source.tokens is not None:
         per_share = per_share or not all(_states_its_targets(child) for child in nested)
     per_share = per_share or any(child.per_share for child in lowered)
-    lowered = tuple(_cut(child, per_share) for child in lowered)
+    lowered = tuple(_cut(child, per_share, validation) for child in lowered)
     steps = (*ancestry, *stages)
     repeats = [stage.epochs for stage in steps if isinstance(stage, Repeat)]
-    endless = not any(isinstance(stage, Limit) for stage in steps) and (
-        not repeats or any(epochs is None for epochs in repeats)
-    )
+    parts_unending, unending, records_unending, onward = _finiteness(
+        stages, lowered, per_share and not validation and not repeats)
     written = next(((index, stage) for index, stage in enumerate(stages) if isinstance(stage, Repeat)), None)
     absorbed = (
         written
@@ -841,8 +887,13 @@ def _analyzed(
         epochs,
         tuple(at for at, stage in enumerate(stages) if at >= eager and isinstance(stage, TokenSplit)),
         order,
-        endless,
+        parts_unending,
+        unending,
+        records_unending,
+        onward,
+        not repeats and not any(ends(stage) for stage in steps),
         cache is not None and _indexed_cache(stages[:cache], read),
+        tuple(stages),
     )
     configured = any(isinstance(stage, Configured) for stage in steps)
     if per_share and lowering.split and not validation and not configured:
@@ -869,11 +920,29 @@ _KEEPS_TARGETS = (Shuffle, Repeat, Prefetch, Workers, Interleave, Artifact)
 arrive; a mixture's members are not batched, so these are all a member's stages may be."""
 
 
-def _cut(lowering: _Lowering, per_share: bool) -> _Lowering:
+def _finiteness(stages: Sequence[Stage], children: Sequence[_Lowering], repeated_at_root: bool
+                ) -> tuple[bool, bool, bool, bool]:
+    """An order's `parts_unending`, `unending`, `records_unending` and `onward` (`_Lowering`): read
+    through `stages` from a source that never ends where it is a mix or a run of phases none of whose
+    parts ends, or a source the read repeats at its root (`repeated_at_root`), as a training read cut
+    per share repeats one whose order repeats nowhere (`_Build.shared`, `_Build.streamed`)."""
+    parts_unending = all(child.unending for child in children) if children else repeated_at_root
+    unending, _ = reach(stages, parts_unending)
+    records_unending, onward = reach(stages[:_until(stages, (BatchStage, TokenBudget))], parts_unending)
+    return parts_unending, unending, records_unending, onward
+
+
+def _cut(lowering: _Lowering, per_share: bool, validation: bool = False) -> _Lowering:
     """A mixed corpus's analysis, cut where the order that mixes it is cut:
-    per share when that order is, so each corpus reads only its share."""
-    children = tuple(_cut(child, per_share) for child in lowering.children)
-    return dataclasses.replace(lowering, per_share=per_share, children=children)
+    per share when that order is, so each corpus reads only its share, and its
+    finiteness restated for that read, which repeats at its root a corpus whose
+    order repeats nowhere, and so every order that mixes it."""
+    children = tuple(_cut(child, per_share, validation) for child in lowering.children)
+    parts_unending, unending, records_unending, onward = _finiteness(
+        lowering.stages, children, per_share and not validation and not lowering.repeated)
+    return dataclasses.replace(lowering, per_share=per_share, children=children,
+                               parts_unending=parts_unending, unending=unending,
+                               records_unending=records_unending, onward=onward)
 
 
 def _checked(
