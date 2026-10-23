@@ -344,7 +344,8 @@ def _floating(dtype) -> bool:
 
 def _widened(value):
     """`value` with a float widened exactly to float64."""
-    return jnp.asarray(value, jnp.float64) if _floating(np.result_type(value)) else value
+    dtype = value.dtype if hasattr(value, "dtype") else np.result_type(value)
+    return jnp.asarray(value, jnp.float64) if _floating(dtype) else value
 
 
 def _replayed(graph, consts, arguments):
@@ -368,7 +369,12 @@ def _replayed_equation(equation, values):
     if name == "custom_vjp_call":
         return _replayed(params["call_jaxpr"].jaxpr, params["call_jaxpr"].consts, values)
     if name == "scan":
-        return _replayed_scan(params, values)
+        # The body, replayed in float64 for its operands' widened dtypes, as the scan's own.
+        body = params["jaxpr"]
+        widened = jax.make_jaxpr(lambda *operands: _replayed(body.jaxpr, body.consts, list(operands)))(
+            *(jax.ShapeDtypeStruct(variable.aval.shape, jnp.float64 if _floating(variable.aval.dtype)
+                                   else variable.aval.dtype) for variable in body.jaxpr.invars))
+        return equation.primitive.bind(*values, **{**params, "jaxpr": widened})
     if name in FORMATTED or not any(_floating(aval.dtype) for aval in avals if hasattr(aval, "dtype")):
         traced = [jnp.asarray(value).astype(variable.aval.dtype) if hasattr(variable.aval, "dtype")
                   and _floating(variable.aval.dtype) else value
@@ -382,22 +388,6 @@ def _replayed_equation(equation, values):
                and _floating(value) else value for key, value in params.items()}
     outputs = equation.primitive.bind(*values, **widened)
     return outputs if equation.primitive.multiple_results else [outputs]
-
-
-def _replayed_scan(params, values):
-    """A scan's body replayed step by step, its carry and stacked outputs in float64."""
-    body, constants, carried = params["jaxpr"], params["num_consts"], params["num_carry"]
-    consts, carry, sequences = values[:constants], values[constants:constants + carried], \
-        values[constants + carried:]
-    steps = range(params["length"])
-    stacked = []
-    for step in reversed(steps) if params["reverse"] else steps:
-        outputs = _replayed(body.jaxpr, body.consts, [*consts, *carry, *(xs[step] for xs in sequences)])
-        carry, ys = outputs[:carried], outputs[carried:]
-        stacked.append(ys)
-    if params["reverse"]:
-        stacked.reverse()
-    return [*carry, *(jnp.stack(column) for column in zip(*stacked, strict=True))]
 
 
 def equations(graph):
