@@ -821,10 +821,13 @@ def gpu_needs(recorded: dict | None, budget: float) -> tuple[float, float]:
 
 
 EXHAUSTED = re.compile(r"(?:[\w.]+\.)?(?:XlaRuntimeError|JaxRuntimeError|RuntimeError|OutOfMemoryError): "
-                       r"(?:RESOURCE_EXHAUSTED\b|CUDA_ERROR_OUT_OF_MEMORY\b|CUDA (?:error: )?out of memory)")
-"""An exception that is the GPU's memory running out, as pytest gives it: XLA's runtime error whose status
-is RESOURCE_EXHAUSTED, or the CUDA driver's out-of-memory error, raised as such; an assertion is never one,
-whatever its message says."""
+                       r"(?:RESOURCE_EXHAUSTED: (?:Out of memory|Failed to allocate)\b"
+                       r"|CUDA_ERROR_OUT_OF_MEMORY\b|CUDA (?:error: )?out of memory)")
+"""An exception that is the GPU's device memory running out, as pytest gives it: XLA's runtime error whose
+status is RESOURCE_EXHAUSTED for an allocation (out of memory, or a failed allocation), or the CUDA driver's
+out-of-memory error, raised as such. A block past the GPU's own resources (XLA's RESOURCE_EXHAUSTED for a
+shared memory size limit, as `dew.nn.kernels.tuning` reads it) is none, as no larger share helps it; nor is an
+assertion, whatever its message says."""
 
 
 def exhausted(failure: str | None) -> bool:
@@ -944,7 +947,8 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
     for name in borrowed:
         failures = [verdict.get("first_failure")
                     for verdict in json.loads(verdicts[name].read_text())["rows"] if verdict["exitCode"] != 0]
-        if failures and exhausted(failures[0]):
+        # Below the whole budget only: a file that already had it would run again as it ran.
+        if failures and exhausted(failures[0]) and shares[name] < budget:
             again[name] = (f"red under a share of {shares[name] / 2 ** 30:.1f} GiB borrowed from "
                            f"{borrowed[name][0]}'s measurement, out of memory ({failures[0]}); run again "
                            "alone with the lane's whole share")
