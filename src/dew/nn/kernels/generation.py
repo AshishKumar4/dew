@@ -125,6 +125,10 @@ class GpuTarget:
     """The bytes a second the L2 serves all multiprocessors' loads together, as a streaming probe measures
     it (programs re-reading a buffer the L2 holds; the kernel cost model's L2 term); None where no
     measurement states it, the L2 term then dropped."""
+    grid_step_seconds: float | None = None
+    """A TPU grid step's fixed cost, the seconds each program's step adds beside its work, as a least-squares
+    fit over a sweep of blocks measures it (the kernel cost model's step term); None on GPUs, whose
+    pipelined steps the model prices by their latency, the term then dropped."""
     scoped_vmem: int | None = None
     """A TPU's scoped VMEM limit in bytes at XLA's default, past which a Mosaic kernel refuses to compile
     (`dew.nn.attention.splash_block_sizes`); None where no measurement states it."""
@@ -271,7 +275,8 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}),
     GpuTarget('v4', 'TPU v4', dense_peaks={'TPU v4': {'bf16': 275e12}}),
     # Its scoped VMEM limit read from a Mosaic kernel's refusal on a v5e ("limit 16.00M").
-    GpuTarget('v5e', 'TPU v5 lite', dense_peaks={'TPU v5 lite': {'bf16': 197e12}}, scoped_vmem=16 * 2 ** 20),
+    GpuTarget('v5e', 'TPU v5 lite', dense_peaks={'TPU v5 lite': {'bf16': 197e12}}, scoped_vmem=16 * 2 ** 20,
+              grid_step_seconds=0.356e-6),
     GpuTarget('v5p', 'TPU v5', dense_peaks={'TPU v5': {'bf16': 459e12}, 'TPU v5p': {'bf16': 459e12}}),
     GpuTarget('v6e', 'TPU v6 lite', dense_peaks={'TPU v6 lite': {'bf16': 918e12}}),
 )}
