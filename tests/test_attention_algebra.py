@@ -705,7 +705,8 @@ def test_an_fp16_querys_gradient_over_equal_large_keys_whose_cotangents_cancel_i
     returns in the call's dtype; in both forms the gradient is finite, in both mainloops."""
     query = jnp.zeros((1, 1, 1, 16), jnp.float16)
     key = jnp.zeros((1, 3, 1, 16), jnp.float16).at[0, :, 0, 0].set(65504.0)
-    value = jnp.zeros((1, 3, 1, 16), jnp.float16).at[0, :, 0, 0].set(jnp.asarray([-65504.0, 16384.0, 65504.0]))
+    sizes = jnp.asarray([-65504.0, 16384.0, 65504.0])
+    value = jnp.zeros((1, 3, 1, 16), jnp.float16).at[0, :, 0, 0].set(sizes)
     dout = jnp.zeros((1, 1, 1, 16), jnp.float16).at[..., 0].set(1.0)
     spans = template.spans(1, 3, 1)
     tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
