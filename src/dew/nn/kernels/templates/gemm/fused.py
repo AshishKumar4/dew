@@ -313,10 +313,13 @@ def _prologue_axes(whole, arrays: list, shape: tuple) -> tuple | generation.Refu
 
 def _prologue_tile(whole, types: tuple, axes: tuple, tile, *side_tiles):
     """The producer's kernel stage on one loaded tile of its base and its side arrays' tiles beside it,
-    each side tile given back the dimensions of one the template squeezed (`_split`)."""
-    shaped = [side.reshape(tuple(1 if axis is None else tile.shape[PROLOGUE_AXES.index(axis)]
-                                 for axis in side_axes))
-              for side, side_axes in zip(side_tiles, axes, strict=True)]
+    each side tile given back the dimensions of one the template squeezed (`_split`), by a broadcast:
+    Mosaic GPU's layout inference finds a layout for a broadcast's dimension of one, and none for a
+    reshape's (FUSEDNORM-h100)."""
+    shaped = [jax.lax.broadcast_in_dim(
+        side, tuple(1 if axis is None else tile.shape[PROLOGUE_AXES.index(axis)] for axis in side_axes),
+        tuple(index for index, axis in enumerate(side_axes) if axis is not None))
+        for side, side_axes in zip(side_tiles, axes, strict=True)]
     tiled, _, _ = fuser.pull_block_spec(whole, pl.BlockSpec(tile.shape, lambda row, depth: (row, depth)),
                                         grid_len=2)(*types)
     return tiled((jnp.int32(0), jnp.int32(0)), (), tile, *shaped)

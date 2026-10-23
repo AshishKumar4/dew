@@ -5,6 +5,15 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- `dew.nn.moe.expert_projection` with `'pallas'` or `'auto'` runs its grouped
+  matmuls through Dew's GEMM template and differentiates at every order:
+  forward mode and higher-order derivatives no longer need `'xla'`. The old
+  first-order-only path, `dew.nn.kernels.grouped_projection`, and
+  `dew.nn.moe.grouped_matmul_kernel` are removed.
+- The grouped GEMM's kernel gradient on Hopper streams its operand stages
+  across a persistent tile loop, so the next tile's loads overlap this one's
+  stores; it runs as fast as CUTLASS's grouped kernel gradient at the MoE
+  shapes measured. A fused RMS norm's Mosaic GPU forward now lowers on Hopper.
 - `dew.figures` draws SVG figures for notebooks and docs. Their colors follow
   the page's light or dark theme (dewml.dev, Colab, JupyterLab, VS Code, and
   the system setting elsewhere), and their animations are CSS, so they play

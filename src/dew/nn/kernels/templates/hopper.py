@@ -9,13 +9,24 @@ producer never loads a next tile's stage over one an MMA still reads, and meet (
 writes to shared memory are the other's operand. Each consumer's accumulator lives for one output tile
 (`finished`), and a tile's rows reach global memory through `store_rows`, whose stores have static extents
 however many rows a tile holds.
+
+A mainloop that drives its own loads (the GEMM's kernel gradient, its stages streaming across tiles)
+streams each operand through a `Ring` whose counter runs across tiles, and takes each warpgroup's role
+(`roles`).
 """
 
+import dataclasses
 import functools
 import math
 
+from jax import lax, numpy as jnp
+from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
+
+Ref = state_types.AbstractRef | state_types.TransformedRef
+"""A scoped allocation a primitive takes: shared memory, transformed (tiled and swizzled) or not, or
+barriers."""
 
 
 def compiler_params() -> plgpu.CompilerParams:
@@ -128,3 +139,78 @@ def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int) -> N
                                     o_gmem.at[pl.ds(row_start + start, rung), pl.ds(column, o_smem.shape[1])])
 
         start = start + (stored & rung)
+
+
+@dataclasses.dataclass(frozen=True)
+class Ring:
+    """A ring of `stages` shared-memory slots one operand streams through: a producer loads step `counter`
+    into slot `counter % stages` (`load`), a consumer waits for it (`acquire`) and gives it back
+    (`release`). The counter runs across a persistent kernel's tiles, so a tile's first loads reuse the
+    slots the last tile left, and each tile may take its own number of steps (a causal tile's trip range):
+    a slot is free for its first fill and, after, once every consumer released it; the producer drains the
+    ring after its last load (`drain`). Allocated with `ring`, its slot count the allocation's own."""
+    smem: Ref
+    full: state_types.AbstractRef
+    consumed: state_types.AbstractRef
+
+    @property
+    def stages(self) -> int:
+        """The ring's slots: its allocation's leading dimension."""
+        return int(self.smem.shape[0])
+
+    def slot(self, counter):
+        """The slot step `counter` uses."""
+        return lax.rem(counter, jnp.asarray(self.stages, counter.dtype))
+
+    def load(self, counter, view) -> None:
+        """The producer's load of step `counter` from `view`, once its slot is free."""
+        slot = self.slot(counter)
+        pl.when(counter >= self.stages)(lambda: plgpu.barrier_wait(self.consumed.at[slot]))
+        plgpu.copy_gmem_to_smem(view, self.smem.at[slot], self.full.at[slot])
+
+    def acquire(self, counter):
+        """A consumer's wait for step `counter`'s load: its slot."""
+        slot = self.slot(counter)
+        plgpu.barrier_wait(self.full.at[slot])
+        return self.smem.at[slot]
+
+    def release(self, counter) -> None:
+        """A consumer's release of step `counter`'s slot, whose reads (and MMAs) are done."""
+        plgpu.barrier_arrive(self.consumed.at[self.slot(counter)])
+
+    def drain(self, end) -> None:
+        """The producer's wait, after its last load (step `end - 1`), for the consumers' release of each slot
+        it filled last, so no slot is freed (or reallocated) while a consumer still reads it, and every
+        release is seen."""
+        for back in range(self.stages):
+            step = end - 1 - back
+            pl.when(step >= 0)(lambda step=step: plgpu.barrier_wait(self.consumed.at[self.slot(step)]))
+
+
+def ring(block: tuple, dtype, stages: int, *, consumers: int = 1) -> dict:
+    """A `Ring`'s allocations for `pl.run_scoped`: `stages` slots of `block` in `dtype`, a load barrier
+    each, and a release barrier each that `consumers` arrive at. `Ring(**allocated)` once scoped."""
+    return {'smem': plgpu.SMEM((stages, *block), dtype),
+            'full': plgpu.Barrier(num_barriers=stages),
+            'consumed': plgpu.Barrier(num_arrivals=consumers, num_barriers=stages)}
+
+
+CONSUMER_REGISTERS, PRODUCER_REGISTERS = 232, 40
+"""The registers a thread holds in a cooperative block's two consumer warpgroups and its producer: the
+producer only issues loads, and JAX's warp-specialized pipeline gives the consumers the rest of the
+multiprocessor's (`pipeline._compute_registers(40, 2)`)."""
+
+
+def roles(wg, consumers: int, consumer, producer) -> None:
+    """Each warpgroup's role in a cooperative block: the `consumers` first run `consumer(wg)` with their
+    register budget raised to `CONSUMER_REGISTERS`, the last runs `producer()` with its lowered to
+    `PRODUCER_REGISTERS`."""
+    @pl.when(wg < consumers)
+    def _():
+        plgpu.set_max_registers(CONSUMER_REGISTERS, action="increase")
+        consumer(wg)
+
+    @pl.when(wg == consumers)
+    def _():
+        plgpu.set_max_registers(PRODUCER_REGISTERS, action="decrease")
+        producer()
