@@ -198,13 +198,14 @@ class GatedMLP(nn.Module):
         return self._down(gated_product(activation, axes=MLP_HIDDEN)(gate, up), train)
 
     def _ngpt_hidden(self, ngpt: NGPT, gate, up, activation):
-        """nGPT's hidden activations: the gate and up projections times their gains in fp32, back
-        in their dtype, their gated product in fp32, unit-normed in the activations' dtype
-        (dory.py:188-194)."""
+        """nGPT's hidden activations: the gate and up projections times their gains in at least fp32,
+        back in their dtype, their gated product in at least fp32, unit-normed in the activations'
+        dtype (dory.py:188-194)."""
         factor = ngpt.hidden(self.out_features)
-        gate = (gate.astype(jnp.float32) * gain(self.suv_gate, factor)).astype(gate.dtype)
-        up = (up.astype(jnp.float32) * gain(self.suv_up, factor)).astype(up.dtype)
-        hidden = gated_product(activation, axes=MLP_HIDDEN)(gate.astype(jnp.float32), up.astype(jnp.float32))
+        wide = at_least_fp32(jnp.result_type(gate, up))
+        gate = (gate.astype(wide) * gain(self.suv_gate, factor)).astype(gate.dtype)
+        up = (up.astype(wide) * gain(self.suv_up, factor)).astype(up.dtype)
+        hidden = gated_product(activation, axes=MLP_HIDDEN)(gate.astype(wide), up.astype(wide))
         return l2norm(hidden.astype(gate.dtype))
 
     def _down(self, hidden, train: bool):
