@@ -43,7 +43,8 @@ def transition_inputs(seed: int) -> dict[str, np.ndarray]:
     x = rng.normal(0, 0.2, (rows, 2)).astype(np.float32)
     velocity = rng.normal(0, 0.2, (rows, 2)).astype(np.float32)
     action = (x - 0.15 * velocity + rng.normal(0, 0.1, (rows, 2))).astype(np.float32)
-    return {"x": x, "velocity": velocity, "action": action}
+    # Each row's mean log density pulls back one, the cotangent both arms take from the draw.
+    return {"x": x, "velocity": velocity, "action": action, "density_cotangent": np.ones(rows, np.float32)}
 
 
 def fetched_reference():
@@ -66,6 +67,7 @@ def author_transition(reference, inputs: dict, dtype) -> dict[str, np.ndarray]:
     REFERENCE_SHIFT, by the names tests/test_flow_grpo.py reads."""
     import torch
     from diffusers import FlowMatchEulerDiscreteScheduler
+    from reference_error import torch_with_gradients
 
     scheduler = FlowMatchEulerDiscreteScheduler(shift=1.0)
     scheduler.set_timesteps(sigmas=list(SIGMAS))
@@ -74,11 +76,17 @@ def author_transition(reference, inputs: dict, dtype) -> dict[str, np.ndarray]:
     # NumPy, since the float64 run's `torch.tensor` is widened and would hold SIGMAS unrounded.
     scheduler.sigmas = torch.from_numpy(np.asarray((*SIGMAS, 0.0), np.float32)).to(dtype)
     timesteps = scheduler.timesteps.repeat(REPEATS)
-    v = torch.tensor(inputs["velocity"], dtype=dtype, requires_grad=True)
-    _, log_prob, mean, coefficient = reference.sde_step_with_logprob(
-        scheduler, v, timesteps, torch.tensor(inputs["x"], dtype=dtype), noise_level=NOISE_LEVEL,
-        prev_sample=torch.tensor(inputs["action"], dtype=dtype))
-    log_prob.sum().backward()
+    host = torch.empty(0, dtype=dtype).numpy().dtype
+
+    def stepped(v, x, action):
+        return reference.sde_step_with_logprob(scheduler, v, timesteps, x, noise_level=NOISE_LEVEL,
+                                               prev_sample=action)
+
+    operands = tuple(np.asarray(inputs[name], host) for name in ("velocity", "x", "action"))
+    _, log_prob, mean, coefficient = stepped(*(torch.as_tensor(operand) for operand in operands))
+    # The density's velocity gradient, the draw's cotangent pulled back through the gate's torch twin.
+    _, velocity_grad, _, _ = torch_with_gradients(lambda v, x, action: stepped(v, x, action)[1])(
+        *operands, inputs["density_cotangent"])
     t = scheduler.sigmas[:-1].repeat(REPEATS)
     s = scheduler.sigmas[1:].repeat(REPEATS)
     variance = coefficient[:, 0].square() * (t - s)
@@ -88,15 +96,15 @@ def author_transition(reference, inputs: dict, dtype) -> dict[str, np.ndarray]:
     frozen = torch.distributions.Independent(torch.distributions.Normal(shifted, std), 1)
     kl = torch.distributions.kl_divergence(policy, frozen)
     return {"mean": mean.detach().numpy(), "variance": variance.detach().numpy(),
-            "mean_log_prob": log_prob.detach().numpy(), "velocity_grad": v.grad.numpy(),
+            "mean_log_prob": log_prob.detach().numpy(), "velocity_grad": velocity_grad,
             "conditional_kl": kl.detach().numpy()}
 
 
 def dew_transition(inputs: dict) -> dict:
     """Dew's transition on a draw (`transition_inputs`), by `author_transition`'s names: the count the
     recording plans on, and tests/test_flow_grpo.py's arm and, in float64, its truth."""
-    import jax
     import jax.numpy as jnp
+    from reference_error import with_gradients
 
     from dew.sampling.flow import flow_transition
 
@@ -110,7 +118,9 @@ def dew_transition(inputs: dict) -> dict:
         return transition.log_prob(inputs["action"]) / dimensions
 
     transition = flow_transition(inputs["x"], inputs["velocity"], t, s, noise_level=NOISE_LEVEL)
-    gradient = jax.grad(lambda velocity: density(velocity).sum())(inputs["velocity"])
+    # The draw's cotangent on each row's density, through the gate's pullback.
+    cotangent = jnp.asarray(inputs["density_cotangent"], inputs["velocity"].dtype)
+    _, gradient = with_gradients(density)(inputs["velocity"], cotangent)
     shifted = transition.mean + jnp.asarray(REFERENCE_SHIFT, dtype)
     return {"mean": transition.mean, "variance": transition.variance,
             "mean_log_prob": density(inputs["velocity"]), "velocity_grad": gradient,
