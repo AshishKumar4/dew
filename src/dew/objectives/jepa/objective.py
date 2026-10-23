@@ -83,16 +83,20 @@ def representation_health(z) -> dict[str, jax.Array]:
     }
 
 
-def normalize_targets(x, epsilon: float = 1e-6):
-    """Layer-normalize `x` over its feature axis, with no learned affine.
+def normalize_targets(x: jax.Array, epsilon: float = 1e-6) -> jax.Array:
+    """Layer-normalize `x` over its feature axis, with no learned affine, through Flax's `LayerNorm`
+    at exact variance, whose statistics are float32 whatever `x`'s dtype, as I-JEPA's
+    `F.layer_norm` takes them.
 
     The objective applies it to the target encoder's output, so the
     prediction problem keeps a fixed scale as the encoder drifts, and
     shrinking the representation does not lower the loss.
     """
-    mean = jnp.mean(x, axis=-1, keepdims=True)
-    variance = jnp.var(x, axis=-1, keepdims=True)
-    return (x - mean) * jax.lax.rsqrt(variance + epsilon)
+    normalized = nn.LayerNorm(epsilon=epsilon, use_scale=False, use_bias=False,
+                              use_fast_variance=False).apply({}, x)
+    # `mutable` is unset, so apply returns the output alone, not a pair.
+    assert not isinstance(normalized, tuple)
+    return normalized
 
 
 @runtime_checkable
