@@ -2,7 +2,8 @@
 
 The torch generators run in a venv without Dew, the Dew generators in one
 without torch, so this module imports numpy and the standard library only,
-and `tools/trace_window.py`, which names and splits a profile's kernels the
+`tools/reference_source.py`, which loads Dew's host-only modules here, and
+`tools/trace_window.py`, which names and splits a profile's kernels the
 way `tools/benchmark_step.py` does. Every number the comparison reads is
 produced by one definition, so a difference between two records is a
 difference between the runs.
@@ -13,7 +14,6 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
-import importlib.util
 import json
 import math
 import os
@@ -27,24 +27,17 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from reference_source import loaded
 from trace_window import device_events, kernel_category, kernel_totals, window_totals
 
+SOURCE = Path(__file__).resolve().parents[2] / "src" / "dew"
 EVIDENCE = Path(os.environ.get(
     "REFERENCE_RUNS_DIR", Path.home() / ".cache/dew/verification-evidence/reference-runs"))
 
 
-def _native(name: str, source: str):
-    """Read Dew's host-only records and target table without its backend import policy."""
-    path = Path(__file__).resolve().parents[2] / "src/dew" / source
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-gpu_target = _native("dew_gpu_targets", "nn/kernels/generation.py").gpu_target
-WorkloadWork = _native("dew_workload", "telemetry/workload.py").WorkloadWork
+# Dew's host-only records and target table, read without its backend import policy.
+gpu_target = loaded("dew_gpu_targets", SOURCE / "nn/kernels/generation.py").gpu_target
+WorkloadWork = loaded("dew_workload", SOURCE / "telemetry/workload.py").WorkloadWork
 
 
 def peak_flops(device_kind: str) -> float | None:
@@ -204,13 +197,6 @@ def trim_trace(kernels: Sequence[tuple[str, int, int, int]], path: str | Path) -
     with gzip.open(path, "wt") as handle:
         json.dump(rows, handle)
     return path
-
-
-def git_head(path: str | Path) -> str:
-    """The commit a record was measured at; a record without one cannot be
-    traced, so a checkout git cannot read fails the run."""
-    return subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True,
-                          text=True, check=True).stdout.strip()
 
 
 def source_version(path: str | Path) -> str:
