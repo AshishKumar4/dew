@@ -323,6 +323,17 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
                     model_(input_ids=tokens, labels=tokens)
                 patterns[dtype] = [kept for _, kept in records]
             flips = [int(np.sum(a != b)) for a, b in zip(patterns[torch.float32], patterns[torch.float64], strict=True)]
+            hidden = {}
+            for dtype in (torch.float32, torch.float64):
+                model_ = references[dtype]
+                model_.load_state_dict(weights)
+                model_.train()
+                with float64() if dtype == torch.float64 else torch.no_grad(), torch.no_grad():
+                    out = model_(input_ids=tokens, labels=tokens, output_hidden_states=True)
+                hidden[dtype] = [h.double().numpy() for h in out.hidden_states] + [out.logits.double().numpy()]
+            relative = [float(np.sqrt(np.mean((a - b) ** 2)) / np.sqrt(np.mean(b ** 2)))
+                        for a, b in zip(hidden[torch.float32], hidden[torch.float64], strict=True)]
+            print("HIDDEN", seed, " ".join(f"{value:.1e}" for value in relative), flush=True)
             import flax.linen as fnn
             seen = {}
 
