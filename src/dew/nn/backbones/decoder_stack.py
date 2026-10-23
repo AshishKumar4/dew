@@ -528,10 +528,11 @@ class StackView:
     collection that entered it has `[stage, ...]` leaves, and one the loop
     created has `[iteration, stage, microbatch, ...]` leaves; a stage's real
     iterations are its microbatches, in order, and a leaf that holds rows
-    takes them back in the batch's order (`_whole`). A layer's own output
-    (what `capture_intermediates` keeps of its `__call__`) holds them at
-    `batch_axis`, where the stack's residual does, after AltUp's copies;
-    what its sublayers sow holds them first.
+    takes them back in the batch's order (`_whole`). `batch_axis` is where
+    the stack's residual holds its rows, after AltUp's copies: the pipeline
+    cuts the residual into microbatches there (`run_pipeline`), and a
+    layer's own output (what `capture_intermediates` keeps of its
+    `__call__`) holds them there too; what its sublayers sow holds them first.
     """
     groups: tuple[tuple[int, int], ...]
     stages: int = 1
@@ -720,9 +721,8 @@ def run_pipeline(model: nn.Module, view: StackView, x, *, train: bool, per_layer
     `model` is the decoder whose `_stacked` calls this; its `block` and
     `specs` build the stages.
     """
-    stages, count = view.stages, view.microbatches
+    stages, count, batch_axis = view.stages, view.microbatches, view.batch_axis
     per_stage = view.per_stage
-    batch_axis = 1 if model.altup is not None else 0
     micro = functools.partial(microbatched, count=count)
     x = micro(x, batch_axis)
     inputs = (
