@@ -233,7 +233,8 @@ def test_a_causal_backward_of_more_keys_than_queries_is_on_par_interpreted():
 @pytest.mark.parametrize("call", ["causal", "causal-documents-window"])
 def test_the_launches_lower_for_an_h100(call, accurate):
     """The forward and the backward's launches lower for an H100 on any host, as the GPU gate runs them: a
-    causal call, and a spans one of documents, whose programs read its block map and ids."""
+    causal call, and a spans one of documents, whose programs read its block map and ids; the forward under
+    every hook too, whose programs read each kind of parameter and the initial state."""
     if call == "causal":
         rows, tokens, heads, kv_heads = SHAPES["compiled"]
         spans = template.spans(tokens, tokens, rows, causal=True)
@@ -247,9 +248,11 @@ def test_the_launches_lower_for_an_h100(call, accurate):
     split = template.Split(others, rows_shape, rows_shape, rows_shape)
     residuals = (rows_shape, rows_shape, jax.ShapeDtypeStruct((rows, heads, tokens), jnp.int32), split)
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    hooks = hooks_for(HOOKS["all"], tokens, 128, gate_of(tokens, 128))
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-        jax.jit(functools.partial(attention_mosaic.forward, spans=spans)).trace(q, kv, kv).lower(
-            lowering_platforms=("cuda",))
+        for forward_hooks in (None, hooks):
+            jax.jit(functools.partial(attention_mosaic.forward, spans=spans, hooks=forward_hooks)).trace(
+                q, kv, kv).lower(lowering_platforms=("cuda",))
         jax.jit(lambda q, k, v, dout, residuals: attention_mosaic.backward(
             q, k, v, spans, None, dout, residuals=residuals, accurate=accurate)).trace(
             q, kv, kv, q, residuals).lower(lowering_platforms=("cuda",))
