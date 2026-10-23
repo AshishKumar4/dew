@@ -644,8 +644,9 @@ def _opened(raw: bytes, index: int) -> Image.Image:
 
 
 def _ordered(laid: Laid, logits: np.ndarray) -> np.ndarray:
-    """A question's logits in its own option order, from the slot order its row shows them in."""
-    ordered = np.empty(len(laid.order), np.float32)
+    """A question's logits in its own option order, from the slot order its row shows them in, at the
+    logits' own precision."""
+    ordered = np.empty(len(laid.order), np.asarray(logits).dtype)
     ordered[list(laid.order)] = logits[:len(laid.order)]
     return ordered
 
