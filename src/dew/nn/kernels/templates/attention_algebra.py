@@ -1026,6 +1026,29 @@ class DqSums(NamedTuple):
     keyed: jax.Array
 
 
+def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array, key: jax.Array,
+            prior: jax.Array, *, scale: float, kinds: tuple, summed: tuple,
+            dot: Callable[[jax.Array, jax.Array], jax.Array]) -> DqSums:
+    """A dQ pass's sums after a key tile (`DqSums`): its score cotangents pulled through the score hook
+    (`pulled`) and scaled, times the keys to fp32's accuracy (`cotangent_product`); the HEAD and QUERY
+    parameters' pullbacks of them (`summed` marks which `kinds` sum per row); and the weights' own
+    pullbacks and their product with the keys over the prior denominator, which take dQ to the refined D
+    (`dq_finish`), the weights' sums unnormalized."""
+    pulled_cotangents, pieces = pulled(cotangents, slopes, seen, kinds)
+    dq = sums.dq + cotangent_product(pulled_cotangents * scale, key, dot)
+    grads = tuple(grad + piece if row else grad for grad, row, piece in zip(sums.grads, summed, pieces,
+                                                                           strict=True))
+    pulled_weights, pieces = pulled(weights, slopes, seen, kinds)
+    over = expand(scale * inverse(prior), pulled_weights)
+    keyed = sums.keyed + weights_product(pulled_weights * over, key, dot)
+    weighed = sums.weighed
+    if any(summed):
+        weighed = tuple(total + piece if row else total
+                        for total, row, piece in zip(sums.weighed, summed, pieces, strict=True))
+    return DqSums(dq, sums.residual + cotangents.sum(axis=-1), sums.mass + weights.sum(axis=-1), grads,
+                  weighed, keyed)
+
+
 def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax.Array,
               shares: tuple[jax.Array, jax.Array], peak: jax.Array, anchor: jax.Array, delta: jax.Array):
     """A dQ pass's results from its sums, each taken to the pass's own denominator, the initial state's
