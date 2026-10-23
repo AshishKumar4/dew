@@ -22,6 +22,7 @@ from flax.nnx import bridge
 from dew.diffusion.process import DenoisingCondition
 from dew.inputs.encoders import CharTable, ConditionEncoder
 from dew.nn.dit import masked_mean
+from dew.nn.protocols import Lacks
 
 
 class TokenModel(nn.Module):
@@ -48,8 +49,8 @@ class TokenModel(nn.Module):
 
     def hidden_states(self, tokens, *, train=False, segment_ids=None, positions=None, **fields):
         if segment_ids is not None or positions is not None:
-            raise ValueError("this model reads one document a row; it takes no packed segment_ids "
-                             "or positions")
+            raise Lacks("packing", "this model reads one document a row; it takes no packed segment_ids "
+                                   "or positions")
         x = self.embed(tokens)
         mask = nn.make_causal_mask(tokens) if self.causal else None
         return self.norm(x + self.attention(x, mask=mask, deterministic=not train))
@@ -145,8 +146,8 @@ class NNXLanguageModel(nnx.Module):
 
     def hidden_states(self, tokens, *, train=False, segment_ids=None, positions=None, **fields):
         if segment_ids is not None or positions is not None:
-            raise ValueError("this model reads one document a row; it takes no packed segment_ids "
-                             "or positions")
+            raise Lacks("packing", "this model reads one document a row; it takes no packed segment_ids "
+                                   "or positions")
         x = jax.nn.gelu(self.mix(self.embed(tokens)))
         return jnp.cumsum(x, axis=1) / jnp.arange(1, tokens.shape[1] + 1)[None, :, None]
 
