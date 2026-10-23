@@ -1,26 +1,30 @@
 """A decision that reads a context beside its state, through gated cross-attention layers attached to a
 pretrained backbone: trained as an adapter, counted in its training work, and served."""
 
-import csv
-import json
+import itertools
 from pathlib import Path
 
 import jax
 import numpy as np
+import optax
 import pytest
+from decision_support import decision_rows
+from recording import RecordingTracker
 
-from dew.data import Files, Loading
-from dew.decision import Choice, Decide, decisions
-from dew.decision.config import DecisionRunConfig
+from dew.data.dataset import DataPartition
+from dew.data.text import ByteTokenizer
+from dew.decision import Choice, Decide, Example
+from dew.decision.layout import Specials
 from dew.decision.objective import DecisionObjective
 from dew.decision.questions import ChoiceAnswer
 from dew.interop import Pretrained
 from dew.nn.cross_attention import CrossAttention, crossing
 from dew.objectives.base import FROZEN
+from dew.training import Trainer
 
 pytestmark = pytest.mark.mesh
 
-QWEN = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
+LLAMA = Path(__file__).parent / "fixtures" / "hf" / "llama-tiny"
 
 TICKETS = [("charged twice for March", "billing", "a card holder since 2019"),
            ("the site is down", "technical", None),
@@ -32,70 +36,67 @@ TICKETS = [("charged twice for March", "billing", "a card holder since 2019"),
 for some."""
 
 
-def written(directory: Path) -> Path:
-    table = directory / "tickets.csv"
-    with table.open("w", newline="") as file:
-        writer = csv.writer(file)
-        writer.writerow(["text", "label", "notes"])
-        writer.writerows((text, label, "" if note is None else note) for text, label, note in TICKETS)
-    return table
+SPECIALS = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
+"""A byte tokenizer's specials, over the fixture's 256-token vocabulary."""
+
+QUESTION = {"team": Choice("Which team?", ["billing", "technical", "sales"])}
+
+
+def conditioned(length: int = 16, layers: tuple[int, ...] = (0, 1)) -> DecisionObjective:
+    """A decision over the tiny Llama with fresh cross-attention before `layers`, its context up to
+    `length` tokens, its rows laid out by bytes."""
+    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    return DecisionObjective(source.with_cross_attention(CrossAttention(layers, length), key=0),
+                             tokenizer=ByteTokenizer(), specials=SPECIALS)
+
+
+def examples() -> list[Example]:
+    return [Example(text, QUESTION, {"team": label}, context=note) for text, label, note in TICKETS]
 
 
 def test_a_backbone_with_fresh_context_layers_scores_every_row_as_its_source_does():
     """The cross-attention blocks start from zero gates, so a decision over the backbone with them
     scores a row, with its context or without, exactly as the backbone alone does; the blocks train
     and the source's weights are held frozen."""
-    source = Pretrained.load(QWEN, dtype="float32")
-    conditioned = source.with_cross_attention(CrossAttention((0,), 8), key=0)
-    plain, crossed = DecisionObjective(source), DecisionObjective(conditioned)
+    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    plain = DecisionObjective(source, tokenizer=ByteTokenizer(), specials=SPECIALS)
+    crossed = conditioned(8, (0,))
     assert crossed.context_length == 8 and plain.context_length is None
     assert crossed.variables is not None
     trained = jax.tree_util.tree_leaves_with_path(crossed.variables["params"]["backbone"])
     assert trained and all(crossing(tuple(entry.key for entry in path)) for path, _ in trained)
     assert FROZEN in crossed.variables
 
-    question = {"team": Choice("Which team?", ["billing", "technical", "sales"])}
     asked = Decide(plain.model, plain.init(jax.random.key(0)), plain.layout, plain.tokenizer, plain.specials)
-    head = asked.variables["params"]["head"]
     variables = crossed.init(jax.random.key(0))
-    variables = {**variables, "params": {**variables["params"], "head": head}}
+    variables = {**variables, "params": {**variables["params"], "head": asked.variables["params"]["head"]}}
     reading = Decide(crossed.model, variables, crossed.layout, crossed.tokenizer, crossed.specials)
-    alone = asked("charged twice for March", question)["team"].probabilities
+    alone = asked("charged twice for March", QUESTION)["team"]
     for context in (None, "a card holder since 2019"):
-        read = reading("charged twice for March", question, context=context)["team"].probabilities
-        np.testing.assert_array_equal(read, alone)
+        read = reading("charged twice for March", QUESTION, context=context)["team"]
+        assert isinstance(read, ChoiceAnswer) and isinstance(alone, ChoiceAnswer)
+        np.testing.assert_array_equal(read.probabilities, alone.probabilities)
 
 
-def test_a_decision_run_trains_its_context_layers_counts_their_work_and_serves_with_them(tmp_path):
-    """A table's context column trained through context layers: every logged step reports its
-    training work, the cross-attention's over each row's context counted in it (the objective's own
-    count, which holds the blocks' pass beside the frozen backbone's), and the run's task answers a
-    request with a context as it answers one without, the context read."""
-    train, held = Files(str(written(tmp_path)), format="csv").holdout(0.5)
+def test_a_conditioned_run_logs_its_training_work_and_serves_with_its_context():
+    """Examples with a context trained through context layers: every logged step reports its
+    training work, the objective's own count of its batch, the cross-attention's work over each row's
+    context in it (`test_the_context_layers_work_is_counted_in_a_conditioned_batch`), and the run's
+    task answers a request with its context."""
+    objective = conditioned()
+    data = decision_rows(examples(), 4, objective=objective.data())
+    counted = [objective.training_flops(None, batch)
+               for batch in itertools.islice(data.train(DataPartition()), 2)]
+    tracker = RecordingTracker()
+    trainer = Trainer(objective, optax.adam(1e-3), key=0, tracker=tracker)
+    state = trainer.fit(data, steps=2, log_every=1)
+    logged = [scalars["train/flops"] for _, scalars in tracker.scalars if "train/loss" in scalars]
+    assert logged == counted and all(work > 0 for work in counted)
 
-    def asked(rows):
-        return (rows.pipe(decisions, question="team", context="notes").read("memory").batch(4)
-                .loading(Loading(workers=0)))
-
-    config = DecisionRunConfig.cli([
-        "--pretrained", str(QWEN), "--context-layers", "0", "1", "--context-length", "16",
-        "--trainer.name", "context", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
-        "--trainer.steps", "2", "--trainer.eval-every", "2", "--trainer.checkpoint-every", "2",
-        "--trainer.log-every", "1", "--trainer.multi-host", "False",
-        "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32"],
-        default=DecisionRunConfig(data=asked(train), validation=asked(held)))
-    config.run()
-    run = tmp_path / "runs" / "context"
-    journal = (run / "tracking" / "scalars.jsonl").read_text().splitlines()
-    logged = [json.loads(row)["scalars"] for row in journal]
-    work = [scalars["train/flops"] for scalars in logged if "train/loss" in scalars]
-    assert len(work) == 2 and all(flops > 0 for flops in work)
-
-    decide = Decide.from_run(str(run))
-    question = {"team": Choice("Which team?", ["billing", "technical", "sales"])}
-    answer = decide("charged twice for March", question, context="a card holder since 2019")["team"]
+    task = objective.pipeline(state)
+    assert isinstance(task, Decide)
+    answer = task("charged twice for March", QUESTION, context="a card holder since 2019")["team"]
     assert isinstance(answer, ChoiceAnswer) and answer.choice in ("billing", "technical", "sales")
-    decide("charged twice for March", question)
 
 
 def test_the_context_layers_work_is_counted_in_a_conditioned_batch():
@@ -105,8 +106,7 @@ def test_the_context_layers_work_is_counted_in_a_conditioned_batch():
     cross-attention work."""
     from dew.nn.flops import counted_flops, frozen_training_flops, parameter_flops
 
-    source = Pretrained.load(QWEN, dtype="float32").with_cross_attention(CrossAttention((0,), 8), key=0)
-    objective = DecisionObjective(source)
+    objective = conditioned(8, (0,))
     lengths = np.asarray([5, 7])
     # Two windows of one row each, one question of three options a row.
     batch = {"segments": (np.arange(8) < lengths[:, None]).astype(np.int32),
