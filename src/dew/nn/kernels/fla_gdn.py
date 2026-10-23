@@ -474,15 +474,21 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
             slot = jnp.where(r > 0, base + n + 1, left)
             for i in range(slices):
                 dh_ref[slot, pl.ds(i * 64, 64), :] = grad[i].astype(dh_ref.dtype)
-            # The chunk's tokens last first (an exchange of rows, exact products): the readout's terms
-            # summed from the chunk's last token, the smallest first, as the portable math sums them
+            # The chunk's tokens last first (an exchange of rows, its products exact: one nonzero term
+            # a row, bf16x6's three parts of an fp32 value its 24 bits, which one product of IEEE
+            # fp32 would compile to FMA loops on sm80): the readout's terms summed from the chunk's
+            # last token, the smallest first, as the portable math sums them
             # (`recurrence_algebra.remembered`), where summed from the first the initial memory's
             # gradient sat 2.3 to 2.4 times its distance from float64 (tests/test_fla_kda.py).
             index = jnp.arange(chunk)
             exchange = (index[:, None] + index[None, :] == chunk - 1).astype(jnp.float32)
 
             def reversed_rows(x):
-                return _dot(exchange, x.astype(jnp.float32), exact=exact, ieee=True)
+                x = x.astype(jnp.float32)
+                if exact:
+                    return _dot(exchange, x, exact=True)
+                return jnp.dot(exchange, x, precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6,
+                               preferred_element_type=jnp.float32)
 
             out_grad = read(do_ref)
             dv = sum(_dot(read(k_ref, pl.ds(i * 64, 64)), grad[i].astype(k_ref.dtype), exact=exact)
