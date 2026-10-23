@@ -26,11 +26,10 @@ import jax.numpy as jnp
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig
 from dew.data.compile import fitted
 from dew.data.text import HFTokenizer, tokenizer_for
+from dew.objectives.lm.objective import Perplexity, Samples
 from dew.records import integer, text
 from dew.registry import DtypeName, objectives, resolve_dtype
 from dew.sampling.text import Sampling
-
-from .objective import Perplexity, Samples
 
 
 class Tokens(NamedTuple):
@@ -278,3 +277,6 @@ def same_vocabulary(written: str, loaded, name: str) -> bool:
         return written == name
     carried = HFTokenizer(str(loaded.source), local_files_only=True).tokenizer
     return HFTokenizer(written).tokenizer.get_vocab() == carried.get_vocab()
+
+
+__all__ = ["LMRunConfig"]

@@ -34,10 +34,12 @@ from dew.objectives.diffusion import (
     GuidanceDistillationObjective,
 )
 from dew.objectives.diffusion.block import BlockDiffusionObjective
-from dew.objectives.diffusion.config import DiffusionRunConfig, TextCondition
+from dew.config.diffusion import DiffusionRunConfig
+from dew.inputs import TextCondition
 from dew.objectives.diffusion.few_step import SMOOTH_TIME_SCALE
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
-from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, JepaRunConfig, MultiBlockMask
+from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, MultiBlockMask
+from dew.config.jepa import JepaRunConfig
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, PPOObjective, ValueHead
 from dew.objectives.rl.sessions import Call, Session, Status, pack

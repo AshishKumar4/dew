@@ -38,7 +38,8 @@ from dew.data import TFDS, Files, Loading, images, presets
 from dew.data.sources.codec import pack_dict_of_byte_arrays
 from dew.diffusion.presets import EDM
 from dew.nn.backbones import SimpleDiT
-from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
+from dew.config.diffusion import DiffusionRunConfig
+from dew.inputs import TextCondition
 from dew.optim import Cosine
 from dew.sampling import CFG
 from dew.sampling.solvers import Heun

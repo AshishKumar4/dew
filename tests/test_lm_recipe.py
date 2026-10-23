@@ -18,7 +18,8 @@ from dew.data.dataset import Loader
 from dew.data.pipeline import Dataset
 from dew.data.sources.tokens import TokenFiles
 from dew.inference import TextGeneration
-from dew.objectives.lm import LMObjective, LMRunConfig
+from dew.objectives.lm import LMObjective
+from dew.config.lm import LMRunConfig
 from dew.sampling import Sampling
 
 pytestmark = pytest.mark.mesh

@@ -15,8 +15,10 @@ every diffusion loss, sample, artifact and image metric uses, and
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -24,7 +26,9 @@ import numpy as np
 
 from dew import registry
 from dew.nn.inputs import ModelInputs
+from dew.nn.text_encoders import DEFAULT_MODEL
 from dew.objectives.base import Batch, Variables
+from dew.registry import DtypeName
 
 from .diffusion import DiffusionConditioner
 from .encoders import CharTable, CLIPText, ConditionEncoder, HFAudio, T5Text, rebuild
@@ -65,7 +69,8 @@ class Condition:
 
     def to_json(self) -> dict:
         return {
-            "encoder": {"class": registry.import_path(type(self.encoder)), "fields": self.encoder.to_json()},
+            "encoder": {"class": registry.recorded_name(type(self.encoder)),
+                        "fields": self.encoder.to_json()},
             "field": self.field,
             "unconditional": self.unconditional,
         }
@@ -212,7 +217,81 @@ class InputSpec:
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class TextCondition:
+    """Text conditioning: which registered encoder reads the batch's tokens, and from which checkpoint."""
+
+    encoder: str = "clip_text"
+    checkpoint: str = DEFAULT_MODEL
+    dtype: DtypeName | None = None
+    """The encoder's compute dtype; None follows the model's compute dtype."""
+    param_dtype: DtypeName = "float32"
+    """The storage dtype when loading source weights; supplied params keep theirs."""
+    field: str = "text"
+    """The batch field holding the tokenized text."""
+    unconditional: str = ""
+    """The prompt the unconditional branch is encoded from."""
+    max_length: int | None = None
+    """The token length every prompt is padded to.
+
+    None keeps the encoder's own default, which for CLIP is the checkpoint's
+    context length.
+    """
+    revision: str | None = None
+    """The checkpoint's git revision.
+
+    With it, a rerun conditions on the weights the run named, even after the
+    branch has moved on.
+    """
+
+    def build(self, *, params: Variables | None = None,
+              dtype: DtypeName | None = None) -> Condition:
+        """Build the encoder over supplied params, without loading source weights or casting storage.
+
+        `dtype` is the run's own compute dtype, which an unset `self.dtype` follows:
+        the tower runs next to the model it conditions in every step, so a checkpoint
+        stored in float32 is no reason to run it in float32.
+        """
+        fields = {name: value for name, value in
+                  (("max_length", self.max_length), ("revision", self.revision))
+                  if value is not None}
+        return Condition(
+            rebuild(self.encoder, {"checkpoint": self.checkpoint,
+                                   "dtype": dtype if self.dtype is None else self.dtype,
+                                   "param_dtype": self.param_dtype, **fields}, params=params),
+            field=self.field, unconditional=self.unconditional)
+
+
+@dataclasses.dataclass(frozen=True)
+class AudioCondition:
+    """Audio conditioning on each clip, through an audio tower.
+
+    `checkpoint` names the `hf_audio` tower, whose feature extractor encodes the
+    waveform in the batch's `audio` field on the host.
+    The dataset's clip length sets the waveform length used to encode every
+    clip and the silent unconditional input, so the two always agree.
+    """
+
+    encoder: ClassVar[str] = "hf_audio"
+    checkpoint: str = "facebook/wav2vec2-base-960h"
+    dtype: DtypeName | None = None
+    """The tower's compute dtype; None follows the model's compute dtype."""
+    param_dtype: DtypeName = "float32"
+    """The storage dtype when loading source weights; supplied params keep theirs."""
+
+    def build(self, seconds: float, *, params: Variables | None = None,
+              dtype: DtypeName | None = None) -> Condition:
+        """Build the tower over supplied params for waveforms of `seconds` (the clips' `audio_seconds`,
+        `Dataset.facts`), without loading source weights or casting storage."""
+        return Condition(
+            rebuild(self.encoder, {"checkpoint": self.checkpoint, "seconds": seconds,
+                                   "dtype": dtype if self.dtype is None else self.dtype,
+                                   "param_dtype": self.param_dtype}, params=params),
+            field="audio", unconditional=0.0)
+
+
 __all__ = [
+    "AudioCondition",
     "CLIPText",
     "CharTable",
     "Condition",
@@ -222,5 +301,6 @@ __all__ = [
     "HFAudio",
     "InputSpec",
     "T5Text",
+    "TextCondition",
     "unit_range",
 ]

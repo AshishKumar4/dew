@@ -76,7 +76,8 @@ With an autoencoder configured, training runs on latents instead of pixels. The 
 A DC-AE, Wan or RAE repository takes `revision="main"` or a commit; `bf16` and `flax` name the SD1-era Flax layouts:
 
 ```python
-from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder
+from dew.config.diffusion import DiffusionRunConfig
+from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
 
 config = DiffusionRunConfig(autoencoder=PretrainedAutoencoder(
     "mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers", revision="main"))

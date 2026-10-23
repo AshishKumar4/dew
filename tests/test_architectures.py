@@ -37,7 +37,8 @@ from dew.eval.images import DEFAULT_MODEL
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.attention import Stage
 from dew.objectives.base import VALID_ROWS, Step
-from dew.objectives.diffusion import DiffusionObjective, DiffusionRunConfig
+from dew.objectives.diffusion import DiffusionObjective
+from dew.config.diffusion import DiffusionRunConfig
 from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.registry import from_record, metrics, models, to_record

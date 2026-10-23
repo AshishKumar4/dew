@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     from _typeshed import DataclassInstance
     from flax import linen as nn
 
+    from dew.config import RunConfig
     from dew.diffusion.presets import Preset
     from dew.inputs.encoders import ConditionEncoder
     from dew.nn.mixers import MixerBase
@@ -113,6 +114,13 @@ def import_path(member: Importable) -> str:
         raise ValueError(f"{member!r} has no import path a record can name; define it at module level "
                          f"in an importable module to record it")
     return f"{module}:{name}"
+
+
+def recorded_name(member: type) -> str:
+    """The name a record writes for the class `member`: its alias, where a kind (`KINDS`) holds it, so
+    the record reads back wherever the class moves; else its import path (`import_path`)."""
+    path = import_path(member)
+    return next((alias for kind in KINDS for alias, held in kind.paths.items() if held == path), path)
 
 
 def imported(path: str) -> Callable[..., Configured]:
@@ -391,8 +399,9 @@ def to_record(value, annotation) -> JSON:
 
     The record is JSON: a dict, a list, or a scalar json.dump can write. A
     dataclass is the record of its fields where `annotation` names its class
-    exactly, and `{"class": <import path>, "fields": {...}}` where the field
-    declares a base, a union or nothing, so the reader knows what to build;
+    exactly, and `{"class": <its name>, "fields": {...}}` where the field
+    declares a base, a union or nothing, so the reader knows what to build,
+    the name its alias or its import path (`recorded_name`);
     a function is `{"function": <import path>}`. A Flax module held twice in
     one record, as `nn.Sequential([dense, dense])` holds its one shared layer,
     is written once as a class record with `"share": <n>`, and each later
@@ -418,7 +427,7 @@ def to_record(value, annotation) -> JSON:
                 return _referred(written, id(value))
             fields = record_fields(value, type(value))
             record = (fields if type(value) is _unwrapped(annotation)
-                      else {"class": import_path(type(value)), "fields": fields})
+                      else {"class": recorded_name(type(value)), "fields": fields})
             if isinstance(value, nn.Module):
                 written.modules[id(value)] = (value, record)
             return record
@@ -445,7 +454,7 @@ def to_record(value, annotation) -> JSON:
         # A plain class of Dew's or a trusted package's, rebuilt from its
         # constructor's parameters as `_built` builds one; it declares no
         # fields, so its record always names it.
-        return {"class": import_path(type(value)), "fields": _constructed(value)}
+        return {"class": recorded_name(type(value)), "fields": _constructed(value)}
     raise TypeError(
         f"{type(value).__name__} is not something a run record can carry; a "
         f"config field holds JSON scalars, sequences, mappings, dataclasses and "
@@ -1340,8 +1349,16 @@ schedules: Aliases[type[ScheduleBase], ScheduleBase] = Aliases("schedule", {
 }, base="dew.optim:ScheduleBase")
 
 
+runs: Aliases[type[RunConfig], RunConfig] = Aliases("run", {
+    "decision": "dew.decision.config:DecisionRunConfig",
+    "diffusion": "dew.config.diffusion:DiffusionRunConfig",
+    "jepa": "dew.config.jepa:JepaRunConfig",
+    "lm": "dew.config.lm:LMRunConfig",
+}, base="dew.config:RunConfig")
+
+
 KINDS: tuple[Aliases, ...] = (models, presets, solvers, encoders, metrics, objectives, mixers, towers,
-                              projectors, schedules)
+                              projectors, schedules, runs)
 """Every kind, which a record's alias is looked up across."""
 
 __all__ = [
@@ -1363,6 +1380,8 @@ __all__ = [
     "presets",
     "projectors",
     "record_fields",
+    "recorded_name",
+    "runs",
     "schedules",
     "solvers",
     "to_record",

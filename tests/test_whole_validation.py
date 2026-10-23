@@ -28,7 +28,9 @@ from dew.data.dataset import DataPartition, rows_of
 from dew.diffusion.presets import Flow
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.base import TEACHER, VALID_ROWS, Step
-from dew.objectives.diffusion import DiffusionRunConfig, GuidanceDistillationObjective, TextCondition
+from dew.objectives.diffusion import GuidanceDistillationObjective
+from dew.config.diffusion import DiffusionRunConfig
+from dew.inputs import TextCondition
 from dew.objectives.lm import LMObjective, Perplexity
 from dew.registry import objectives
 from dew.sampling import Euler
