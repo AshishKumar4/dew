@@ -147,3 +147,44 @@ def test_an_orbit_of_a_recorded_reference_or_of_one_order_is_refused():
         _drawn(_left_to_right, recorded, _cancelling_draw, range(2), orders=_swapped)
     with pytest.raises(ValueError):
         _drawn(_left_to_right, _outer_first, _cancelling_draw, range(2), orders=lambda inputs: [inputs])
+
+
+def _rows_of(width, wrong_by):
+    """A `[4096, width]` leaf's draw and arms: the reference off its truth by 2^-20 of every value, Dew
+    off by the same but `wrong_by` times it on the first row alone, too little of the leaf for the pooled
+    ratio to see at ten times."""
+    def draw(seed):
+        rng = np.random.default_rng([0x0D, seed])
+        return (rng.standard_normal((4096, width)).astype(np.float64),)
+
+    def reference(values):
+        return {"leaf": np.asarray(values, np.float64) * (1 + 2.0 ** -20)}
+
+    def dew(values):
+        moved = np.asarray(values, np.float64) * (1 + 2.0 ** -20)
+        moved[0] = np.asarray(values, np.float64)[0] * (1 + wrong_by * 2.0 ** -20)
+        return {"leaf": moved}
+
+    def truth(values):
+        return {"leaf": np.asarray(values, np.float64)}
+
+    return dew, reference, draw, truth
+
+
+def test_a_rows_factor_widens_at_one_or_two_values_alone():
+    """At one or two values a row the worst-row rule allows the factor at which two equally exact arms
+    part on one shared row (`row_factor`); at three or more, ROW_FACTOR. A first row ten times the
+    reference's error fails a leaf of eight-value rows and passes one of single values; one two thousand
+    times it fails both."""
+    from reference_error import ROW_FACTOR, row_factor
+
+    assert row_factor(8) == row_factor(3) == row_factor(0) == ROW_FACTOR
+    assert row_factor(1) > row_factor(2) > ROW_FACTOR
+    for width, wrong_by, fails in ((8, 10, True), (1, 10, False), (1, 2000, True)):
+        dew, reference, draw, truth = _rows_of(width, wrong_by)
+        if fails:
+            with pytest.raises(AssertionError) as raised:
+                assert_as_exact(dew, reference, draw, f"width {width}", seeds=8, truth_fn=truth)
+            assert raised.type is AssertionError
+        else:
+            assert_as_exact(dew, reference, draw, f"width {width}", seeds=8, truth_fn=truth)

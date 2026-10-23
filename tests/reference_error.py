@@ -458,17 +458,20 @@ class _Draws:
     """Each leaf's errors over a run of seeds: Dew's and the reference's mean squared error from
     float64 (seed by leaf), each seed's worst sized row over its size (Dew's, the reference's), each
     seed's count of rows of float64 zero where Dew is further from it than ROW_FACTOR times the
-    reference, and whether every value of the leaf was finite on every seed."""
+    reference, whether every value of the leaf was finite on every seed, and each leaf's row width (its
+    last axis's length, 0 for a leaf of no rows; `row_factor`)."""
     names: list[str]
     mine: np.ndarray
     theirs: np.ndarray
     worst: np.ndarray
     zero_rows: np.ndarray
     finite: np.ndarray
+    widths: tuple[int, ...]
 
     def joined(self, other: "_Draws") -> "_Draws":
         return _Draws(self.names, *(np.concatenate([getattr(self, field), getattr(other, field)])
-                                    for field in ("mine", "theirs", "worst", "zero_rows", "finite")))
+                                    for field in ("mine", "theirs", "worst", "zero_rows", "finite")),
+                      self.widths)
 
 
 SKETCH = 32
@@ -572,7 +575,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     its rows of float64 zero are the draw's own order's."""
     if orders is not None and getattr(reference_fn, "recorded", False):
         raise ValueError("a recorded reference holds its recorded draws alone, never another order of them")
-    mine, theirs, worst, zero_rows, finite, names = [], [], [], [], [], None
+    mine, theirs, worst, zero_rows, finite, names, widths = [], [], [], [], [], None, None
 
     def truth_of(inputs):
         with jax.enable_x64(new_val=True):
@@ -597,6 +600,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
             dew = dew_fn(*mine_at)
             names = names or [jax.tree_util.keystr(path)
                               for path, _ in jax.tree_util.tree_leaves_with_path(dew)]
+            widths = widths or tuple(int(np.shape(leaf)[-1]) if np.ndim(leaf) >= 2 else 0
+                                     for leaf in jax.tree.leaves(dew))
             evidence = _evidence(dew, reference_fn(*theirs_at), truth, their_truth)
             row = evidence if row is None else [
                 (first[0], first[1], float(np.fmax(first[2], other[2])), float(np.fmax(first[3], other[3])),
@@ -607,7 +612,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         zero_rows.append([entry[4] for entry in row])
         finite.append([entry[5] for entry in row])
     return _Draws(names, np.asarray(mine), np.asarray(theirs), np.asarray(worst).reshape(len(mine), -1, 2),
-                  np.asarray(zero_rows), np.asarray(finite))
+                  np.asarray(zero_rows), np.asarray(finite), widths)
 
 
 def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
@@ -704,13 +709,37 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
                 over.append(f"{leaf}: dew's RMS error from float64 is {ratio:.3f} times the reference's over "
                             f"{count} seeds, interval [{low:.3f}, {high:.3f}] (allowed {PARITY})")
         my_row, their_row = float(np.max(draws.worst[:, index, 0])), float(np.max(draws.worst[:, index, 1]))
-        if not within(my_row, ROW_FACTOR * their_row):
+        allowed = row_factor(draws.widths[index]) * their_row
+        if not within(my_row, allowed):
             over.append(f"{leaf}: the worst row over {count} seeds is {my_row:.3e} from float64 over its "
-                        f"size, the reference's {their_row:.3e}, allowed {ROW_FACTOR * their_row:.3e}")
+                        f"size, the reference's {their_row:.3e}, allowed {allowed:.3e}")
         if draws.zero_rows[:, index].any():
             over.append(f"{leaf}: {int(draws.zero_rows[:, index].sum())} rows of float64 zero over {count} "
                         f"seeds are further from it than ROW_FACTOR times the reference's own")
     return over, unresolved
+
+
+NARROW_WIDTHS = frozenset({1, 2})
+"""The row widths at which check 1's worst-row rule at ROW_FACTOR fails an equally exact Dew more often
+than LOWER_TAIL, as sites run it (both arms on one truth, two stages over 8 declared seeds, 256 rows a
+seed, standard normal truths and errors; tools/row_factor_rates.py, 28,000 runs a width on armada): 1.5e-2
+at one value a row, 1.5e-3 at two, 7e-5 at three (bound 4.0e-4) and none at four. A row of few values is
+sized by a few float64 values, which sit near zero far more often than a wide row's RMS does, so the
+worst row over a site's rows and seeds is the row whose truth is smallest, for both arms alike."""
+
+
+def row_factor(width: int) -> float:
+    """How many times the reference's worst row Dew's may be, for rows of `width` values: ROW_FACTOR, but
+    at NARROW_WIDTHS the factor at which two equally exact arms' errors on one shared row part with
+    probability LOWER_TAIL, their mean squares' ratio an F(width, width) where both are normal (1273 at
+    one value, 44.7 at two; at either, no red in 28,000 equally exact runs, a rate within 2.5e-4 at
+    99.9%). An error local to a value or two such rows hold is check 2's to catch, each element within
+    its operation's certified bound (tests/op_certificates.py)."""
+    if width not in NARROW_WIDTHS:
+        return ROW_FACTOR
+    from scipy import stats
+
+    return float(np.sqrt(stats.f.ppf(1 - LOWER_TAIL, width, width)))
 
 
 PREVIOUS_TAILS = (5e-4, 5e-4)

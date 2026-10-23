@@ -442,7 +442,7 @@ def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stag
         def drawn(start, stop, mine=mine, theirs=theirs, leaves=leaves, names=names):
             count = stop - start
             return _Draws(names, mine[start:stop], theirs[start:stop], np.zeros((count, leaves, 2)),
-                          np.zeros((count, leaves), int), np.ones((count, leaves), bool))
+                          np.zeros((count, leaves), int), np.ones((count, leaves), bool), (0,) * leaves)
 
         over, unresolved, stage = _staged(drawn, seeds, law, two_stage=two_stage)
         verdicts.append(("over" if over else "inconclusive" if unresolved else "pass", stage))
