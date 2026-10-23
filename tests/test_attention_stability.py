@@ -765,19 +765,32 @@ def test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edge
         _held_empty(family, differentiated(*draw(0)), label)
 
 
-@pytest.mark.parametrize("family", [family for family in TEMPLATE_FAMILIES if FAMILIES[family].folded])
-def test_the_default_form_is_finite_where_the_reference_is_at_fp32s_edges(family):
-    """Each template mainloop's output and query, key and value gradients in the default form, finite
-    wherever the reference's are (`assert_finite`) over the family's draws; a row that sees nothing, zero.
-    Its error here is no claim, and its ties the documented divergence (the module's docstring)."""
-    seeds, family = SEEDS[family], FAMILIES[family]
+def _default_is_finite(family_name: str, mainloop_name: str) -> None:
+    """A template mainloop's output and query, key and value gradients in the default form, finite wherever
+    the reference's are (`assert_finite`) over the family's draws; a row that sees nothing, zero. Its error
+    here is no claim, and its ties the documented divergence (the module's docstring)."""
+    seeds, family = SEEDS[family_name], FAMILIES[family_name]
     draw = _cast(family, family.draw)
     reference = jax.jit(with_gradients(_reference(family, anchored=False)))
-    for name, mainloop in _mainloops(family, {}).items():
-        label = f"{name} default {family.dtype}"
-        differentiated = jax.jit(with_gradients(mainloop))
-        assert_finite(differentiated, reference, draw, label, seeds=seeds)
-        _held_empty(family, differentiated(*draw(0)), label)
+    label = f"{mainloop_name} default {family.dtype}"
+    differentiated = jax.jit(with_gradients(_mainloops(family, {})[mainloop_name]))
+    assert_finite(differentiated, reference, draw, label, seeds=seeds)
+    _held_empty(family, differentiated(*draw(0)), label)
+
+
+@pytest.mark.parametrize("family", TEMPLATE_FAMILIES)
+def test_the_default_form_is_finite_where_the_reference_is_at_fp32s_edges(family):
+    """The plain-JAX mainloop, which walks under the default's guards (`algebra.walked`: its sums' headroom,
+    the fold's reach), finite in the default form over every family (`_default_is_finite`)."""
+    _default_is_finite(family, "portable")
+
+
+@pytest.mark.parametrize("family", [family for family in TEMPLATE_FAMILIES if FAMILIES[family].folded])
+def test_the_frozen_triton_mainloops_default_is_finite_where_the_reference_is_at_fp32s_edges(family):
+    """The Triton mainloop's default form finite over the families the fold holds (`_default_is_finite`):
+    frozen as a reference until its Mosaic mainloop replaces it, no production route, it walks without the
+    default's guards (Main's ruling, 2026-10-23), so the fold's divergences are not its."""
+    _default_is_finite(family, "triton")
 
 
 DECODED = [(family, form) for family, form in FAMILY_RUNS

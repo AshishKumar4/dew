@@ -42,8 +42,9 @@ class Forward:
     'spans', `KeySpans.form`), the call's key count `keys`, whether it packs documents (`ids`), the
     softmax `scale`, the score hook `score_mod(s, q_pos, k_pos, *params)` on natural logits, whether
     the call keeps its logits `natural` (`base2`), the accurate form, whether its weighted values can pass
-    fp32's largest, so a program's walk is `guarded` (`headroom`, the accurate form's alone), and whether
-    its softmax resumes from an `initial` state (`raw`)."""
+    fp32's largest, so a program's walk is `guarded` (`headroom`), whether its softmax resumes from an
+    `initial` state (`raw`), and whether natural logits stay `scaled` whatever the scale (`raw`; the fold's
+    rewalk, `unfolded`)."""
 
     form: str
     keys: int
@@ -53,6 +54,7 @@ class Forward:
     natural: bool = NATURAL
     headroom: bool = False
     initial: bool = False
+    scaled: bool = False
 
     @property
     def raw(self) -> bool:
@@ -64,7 +66,8 @@ class Forward:
         maximum is not the scaled one's), the logits are scaled, the largest's weight held to 1 by a select
         (`weights`). The backward recomputes in the same units (`below`)."""
         low, high = RAW_SCALES
-        return self.natural and self.score_mod is None and not self.initial and low <= self.scale <= high
+        return (self.natural and not self.scaled and self.score_mod is None and not self.initial
+                and low <= self.scale <= high)
 
     @property
     def base2(self) -> bool:
@@ -247,6 +250,47 @@ def guarded[C: (Partial, tuple)](plain: Callable[[], C], shifted: Callable[[jax.
         return (held, *rest) if rest else held
 
     return jax.lax.cond(jnp.max(live.astype(jnp.int32)) > 0, shifted, kept, live)
+
+
+FOLD_REACH = 2.0 ** 16
+"""The largest folded logit a program's rows take the fold at (`walked`): below it the fold's rounding of a
+logit, and of a row's maximum taken back to natural units for the backward, is under 2^-8 in its exponent,
+a weight moved by under 0.3%. Past it an ulp of a folded logit nears or passes 1, so two logits the
+reference keeps apart can tie and a row's maximum moves its weights by a factor (keys 1 to 4 ulps apart
+near 2^30 weigh 1 and 0 in the reference, 1/2 each folded, and a cotangent near 2^125 then overflows the
+backward's query gradient where the reference's is 0): such a program walks again in the natural form."""
+
+
+def unfolded(spec: Forward) -> Forward:
+    """The fold's rewalk form (`walked`): natural logits, scaled whatever the scale (`Forward.scaled`), so
+    the backward recomputes its rows' weights as it recomputes the fold's (`PLAIN`: both from the scaled
+    logits and a natural maximum)."""
+    return dataclasses.replace(spec, natural=True, scaled=True)
+
+
+def walked[C, O](spec: Forward, walk: Callable[[Forward, jax.Array | None], C],
+                 finished: Callable[[Forward, C], O], weighted: Callable[[C], jax.Array] | None = None) -> O:
+    """A program's walk and its outputs under the guards its form takes: `walk(form, live)` its walk in
+    `form`, plain where `live` is None, else those rows shifting (`guarded`), its carry a `Partial` or a
+    tuple whose first element is one, and `finished(form, carry)` its outputs. Under headroom the walk is
+    guarded (`guarded`, `weighted` as it reads it). Folded, a program one of whose rows' maximum passes
+    `FOLD_REACH` walks again in the natural form (`unfolded`), guarded as the call's form is, its outputs
+    that form's (its maximum natural, as the fold's are once finished). Ordinary inputs take the plain walk
+    alone, their bits and cost unchanged but for these checks."""
+    def guarded_walk(form: Forward, carry=None):
+        def plain():
+            return walk(form, None) if carry is None else carry
+
+        return guarded(plain, functools.partial(walk, form), weighted) if form.headroom else plain()
+
+    if not spec.base2:
+        return finished(spec, guarded_walk(spec))
+    carry = walk(spec, None)
+    state = carry if isinstance(carry, Partial) else carry[0]
+    reach = jnp.max(jnp.where(jnp.isfinite(state.m), jnp.abs(state.m), 0.0))
+    natural = unfolded(spec)
+    return jax.lax.cond(reach >= FOLD_REACH, lambda: finished(natural, guarded_walk(natural)),
+                        lambda: finished(spec, guarded_walk(spec, carry)))
 
 
 POWER2_REACH = 381.0
@@ -620,14 +664,22 @@ def normalized_pass(spec: Forward, carry: Carry, keys_at: Callable[[jax.Array], 
     anchor's weight and the other keys' weights, over the denominator; a weight below its dtype's least
     normal once normalized takes its product raised and in fp32, taken back after it (`SMALL_SHIFT`)."""
     split, arg, _, _ = carry
-    _, maximum, total = finish(spec, joined(carry, rows), initial=initial is not None)
+    state = joined(carry, rows)
+    _, maximum, total = finish(spec, state, initial=initial is not None)
+
+    def difference(logits):
+        # Each exponent in the walk's own units: folded logits against its base-2 maximum, natural ones
+        # against the natural maximum as the backward recomputes them.
+        if spec.base2:
+            return jnp.minimum(logits - expand(state.m, logits), 0.0)
+        return exponent(logits, maximum, recompute(spec))
 
     def walk(index, sums):
         keys = keys_at(index)
         value = keys.load()
-        rest, own_tile, small = normalized_terms(keys.logits, maximum, total,
+        rest, own_tile, small = normalized_terms(difference(keys.logits), total,
                                                  keys.coords.k_pos == arg.key[:, None], value.dtype,
-                                                 recompute(spec))
+                                                 jnp.exp2 if spec.base2 else jnp.exp)
         lowered = jnp.float32(-SMALL_SHIFT)
         product = keys.dot(rest, value) + power2(keys.dot(small, value.astype(jnp.float32)), lowered)
         others = rest.astype(jnp.float32).sum(axis=-1) + power2(small.sum(axis=-1), lowered)
@@ -692,10 +744,12 @@ of fp32's largest (`2^49` of fp16's), so a sum of them stays finite over any key
 it is a normal fp32 down to `2^-189`."""
 
 
-def normalized_terms(logits: jax.Array, maximum: jax.Array, total: jax.Array, at_anchor: jax.Array,
-                     dtype, how: Recompute) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """A tile's normalized weights `exp(s - m) / T` at the walk's maximum and natural denominator (divided,
-    as the reference's softmax divides), the reference's probabilities, narrowed to the values' `dtype`:
+def normalized_terms(difference: jax.Array, total: jax.Array, at_anchor: jax.Array, dtype,
+                     power: Callable[[jax.Array], jax.Array]) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """A tile's normalized weights `power(s - m) / T` (`difference`, each logit's exponent against the walk's
+    maximum, at most 0, in the units `power` takes: `exp2` folded, `exp` natural) over the natural
+    denominator (divided, as the reference's softmax divides), the reference's probabilities, narrowed to
+    the values' `dtype`:
     zero at the anchor key (`at_anchor`) and where below the dtype's least normal, the left operand of the
     other keys' sum; the anchor's own, fp32; and the other keys' weights that normalizing takes below the
     least normal, raised by `2^SMALL_SHIFT` in fp32, `small`, whose product with the values the pass takes
@@ -704,15 +758,14 @@ def normalized_terms(logits: jax.Array, maximum: jax.Array, total: jax.Array, at
     is at most the values' largest), and a small weight on a large value keeps fp32's resolution of its
     share, so a column the reference resolves is resolved here, whatever another column's size or the
     denominator's."""
-    natural = exponent(logits, maximum, how)
-    seen = expand(total > 0, logits)
-    denominator = expand(jnp.where(total > 0, total, 1.0), logits)
-    p = jnp.where(seen, jnp.exp(natural) / denominator, 0.0)
+    seen = expand(total > 0, difference)
+    denominator = expand(jnp.where(total > 0, total, 1.0), difference)
+    p = jnp.where(seen, power(difference) / denominator, 0.0)
     tiny = (p < float(jnp.finfo(dtype).tiny)) & jnp.logical_not(at_anchor)
     rounded = p.astype(dtype)
     zero = jnp.zeros_like(rounded)
     rest = jnp.where(at_anchor | tiny, zero, rounded)
-    half = jnp.exp(natural / 2)
+    half = power(difference / 2)
     raised = jnp.where(seen, half * jnp.float32(2.0 ** SMALL_SHIFT) * half / denominator, 0.0)
     small = jnp.where(tiny, raised, 0.0)
     return rest, jnp.where(at_anchor, rounded, zero).astype(jnp.float32).sum(axis=-1), small
