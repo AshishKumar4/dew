@@ -49,8 +49,8 @@ import jax
 import numpy as np
 
 from dew.data.prompts import PromptRecord
+from dew.inference.engine import settled
 from dew.inference.rollouts import Draw, InfrastructureError, RolloutServer
-from dew.inference.serving import settled
 from dew.objectives.base import Batch
 
 from .episodes import (

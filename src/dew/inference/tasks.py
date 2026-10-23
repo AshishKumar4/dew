@@ -414,14 +414,20 @@ def resident(model: nn.Module, variables: Variables) -> Variables:
     weights are rather than moving them. A jax.Array stays where it is, a pinned-host bank's among
     them. A task's generations and a server's steps read their weights so, where a host leaf
     would be copied to the device again at each call."""
-    stored = decoding_storage(model, variables)
-    mesh = mesh_of(stored)
+    return held(decoding_storage(model, variables))
+
+
+def held(variables: Variables) -> Variables:
+    """`variables` placed on the device once (`resident`'s placement, its storage as given): each host
+    leaf replicated on the mesh the tree's arrays sit on, or committed to this process's default
+    device; a jax.Array stays where it is."""
+    mesh = mesh_of(variables)
     target = default_placement() if mesh is None else NamedSharding(mesh, P())
 
     def placed(leaf):
         return jax.device_put(leaf, target) if isinstance(leaf, (np.ndarray, np.generic)) else leaf
 
-    return jax.tree.map(placed, stored)
+    return jax.tree.map(placed, variables)
 
 
 class _NativeTextTask:
