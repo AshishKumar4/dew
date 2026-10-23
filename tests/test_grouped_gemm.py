@@ -69,14 +69,16 @@ def test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla(sizes
     # One warpgroup a tile at two row blocks, and two (CUTLASS's cooperative schedule; a pair of
     # multiprocessors the interpreter does not model, the GPU's tile gate runs).
     tiled = [mosaic_gpu.Tiles(64, 64, 64, 2, 1), mosaic_gpu.Tiles(128, 64, 64, 2, 1),
-             mosaic_gpu.Tiles(64, 128, 64, 2, 1, warpgroups=2)]
+             mosaic_gpu.Tiles(128, 64, 64, 2, 1, warpgroups=2),
+             mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2)]
     for tiles, transpose in itertools.product(tiled, (False, True)):
         matrix = jnp.swapaxes(arrays[1], 1, 2) if transpose else arrays[1]
         got = mosaic_gpu.gmm(arrays[0], matrix, group_sizes, tiles=tiles, transpose_rhs=transpose,
                              out_dtype=dtype, multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
         check(got, reference[0], truth[0], group, f"forward {tiles} transpose={transpose}")
     for tiles in (mosaic_gpu.Tiles(64, 64, 64, 2, 1), mosaic_gpu.Tiles(64, 64, 128, 2, 1),
-                  mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2)):
+                  mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2),
+                  mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2)):
         got = mosaic_gpu.tgmm(arrays[0], arrays[2], group_sizes, tiles=tiles, out_dtype=jnp.float32,
                               multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
         check(got, reference[2], truth[2], None, f"kernel gradient {tiles}")
@@ -93,23 +95,29 @@ def check(got, reference, truth, group, label):
 
 
 @INTERPRETS
-def test_the_kernel_gradient_keeps_a_neighbours_non_finite_rows_out():
-    """The rows of the next group and the unrouted tail hold NaN and inf; each group's kernel gradient
-    sums its own rows alone, every one finite and as exact as XLA's over clean rows."""
+@pytest.mark.parametrize("tiles", [mosaic_gpu.Tiles(64, 64, 64, 2, 1),
+                                   mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2)],
+                         ids=["one warpgroup", "cooperative"])
+def test_the_kernel_gradient_keeps_a_neighbours_non_finite_rows_out(tiles):
+    """For each group, every other row (its neighbours' and the unrouted tail) holds inf in the rows and
+    NaN in the cotangent: the group's kernel gradient sums its own rows alone, finite and as exact as
+    XLA's over clean rows, one warpgroup a tile or two zeroing the stage both read (boundaries fall in
+    the first and the last row blocks)."""
     sizes = [37, 100, 0, 40]
     x, w, dy, group = operands(sizes, jnp.bfloat16, seed=3)
     truth = oracle.kernel_gradient(x, dy, sizes)
     reference = xla_products(x, w, dy, sizes, jnp.bfloat16, jnp.float32)[2]
-    dirty_x, dirty_dy = x.copy(), dy.copy()
-    dirty_x[group < 0], dirty_dy[group < 0] = np.inf, np.nan
-    tiles = mosaic_gpu.Tiles(64, 64, 64, 2, 1)
-    interpret = grouped_matmul.INTERPRETED
-    got = mosaic_gpu.tgmm(jnp.asarray(dirty_x, jnp.bfloat16), jnp.asarray(dirty_dy, jnp.bfloat16),
-                          jnp.asarray(sizes, jnp.int32), tiles=tiles, out_dtype=jnp.float32,
-                          multiprocessors=1, interpret=interpret)
-    assert np.all(np.isfinite(np.asarray(got)))
-    assert_as_exact_as_the_reference(np.asarray(got, np.float64), np.asarray(reference, np.float64), truth,
-                                      "kernel gradient")
+    for kept, size in enumerate(sizes):
+        if not size:
+            continue
+        dirty_x, dirty_dy = x.copy(), dy.copy()
+        dirty_x[group != kept], dirty_dy[group != kept] = np.inf, np.nan
+        got = mosaic_gpu.tgmm(jnp.asarray(dirty_x, jnp.bfloat16), jnp.asarray(dirty_dy, jnp.bfloat16),
+                              jnp.asarray(sizes, jnp.int32), tiles=tiles, out_dtype=jnp.float32,
+                              multiprocessors=1, interpret=grouped_matmul.INTERPRETED)[kept]
+        assert np.all(np.isfinite(np.asarray(got))), f"group {kept}: a neighbour's row reached it"
+        assert_as_exact_as_the_reference(np.asarray(got, np.float64), np.asarray(reference[kept], np.float64),
+                                          truth[kept], f"kernel gradient of group {kept}")
 
 
 @lowers("sm90")
@@ -273,6 +281,24 @@ def test_the_kernels_write_each_product_in_its_own_dtype(generation_name):
             ((4, DEPTH, WIDTH), jnp.dtype(jnp.float32))} <= written
 
 
+def test_the_cost_model_charges_a_program_its_instructions_at_its_warps_issue_rate():
+    """A program its CUDA cores bound, not its tensor work, takes as long as its instructions take to issue:
+    twice the instructions twice the time, and twice the warps half of it until the multiprocessor's
+    schedulers each issue every clock; programs sharing a multiprocessor share its schedulers."""
+    target = generation.TARGETS["sm90"]
+
+    def seconds(issued, warps, resident=1):
+        work = cost.Cost(programs=target.multiprocessors * resident, device_bytes=0.0, program_flops=1.0,
+                         program_issued=issued, warps=warps, resident=resident)
+        return cost.seconds(work, target)
+
+    assert seconds(2e6, 4) == 2 * seconds(1e6, 4)
+    assert seconds(1e6, 8) == seconds(1e6, 4) / 2
+    assert seconds(1e6, 16) == seconds(1e6, 32)
+    assert seconds(1e6, 32, resident=2) == 2 * seconds(1e6, 32)
+    assert seconds(0.0, 4) < seconds(1e6, 4)
+
+
 def test_the_cost_model_charges_each_multiprocessor_its_programs_in_turn():
     """A multiprocessor does its programs' work one after another: a launch of one program per
     multiprocessor takes one program's time, one more program a second, and the device bytes bound it
@@ -330,6 +356,27 @@ def test_a_block_aligned_launch_counts_the_tiles_its_groups_take():
     assert grouped_matmul._block_tiles(100, 8, 64) == 2 + 7
 
 
+@pytest.mark.parametrize("block_m,block_n", [(64, 128), (128, 512)])
+def test_a_cooperative_tile_refuses_what_its_consumers_cannot_compute(block_m, block_n):
+    """A cooperative tile's two consumers each take half its rows in warpgroup MMAs (a multiple of 64
+    rows by at most 256 columns): a tile whose halves are not that refuses."""
+    with pytest.raises(ValueError):
+        mosaic_gpu.Tiles(block_m, block_n, 64, 2, 1, warpgroups=2)
+
+
+@INTERPRETS
+def test_a_cooperative_tile_refuses_a_width_it_cannot_stage_whole():
+    """A consumer stages its bf16 output 128 columns at a time: a 192-column cooperative tile refuses a
+    16-bit output rather than leaving its last 64 columns unwritten."""
+    x, w, _, _ = operands(SIZES["ragged"], jnp.bfloat16)
+    wide = np.tile(w, (1, 1, 2))[..., :192]
+    tiles = mosaic_gpu.Tiles(128, 192, 64, 2, 1, warpgroups=2)
+    with pytest.raises(ValueError):
+        mosaic_gpu.gmm(jnp.asarray(x, jnp.bfloat16), jnp.asarray(wide, jnp.bfloat16),
+                       jnp.asarray(SIZES["ragged"], jnp.int32), tiles=tiles, transpose_rhs=False,
+                       out_dtype=jnp.bfloat16, multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
+
+
 def test_the_cost_model_names_a_fact_its_target_lacks():
     """A GPU outside every instruction family (sm60, before Turing) states no tensor rate and gives no
     estimate, naming the fact; the grouped kernels are then not eligible there, so XLA's ragged dot runs
@@ -365,7 +412,7 @@ def test_a_cooperative_tile_stores_each_of_several_outputs():
     x, w = jnp.asarray(x, jnp.bfloat16), jnp.asarray(w, jnp.bfloat16)
     bias = jnp.asarray(np.linspace(-1, 1, WIDTH), jnp.float32)
     sizes = jnp.asarray(SIZES["ragged"], jnp.int32)
-    tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2)
+    tiles = mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2)
 
     def run(epilogue, out_dtypes=None):
         return mosaic_gpu.gmm(x, w, sizes, tiles=tiles, transpose_rhs=False, out_dtype=jnp.bfloat16,

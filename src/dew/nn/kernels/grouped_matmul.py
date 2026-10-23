@@ -389,12 +389,12 @@ class _Triton(_GroupedLaunch[Tile]):
     def contraction(tile: Tile) -> int:
         """The contraction one step of `tile` takes, the dot's K."""
 
-    def staged_bytes(self, ba, config: Tile) -> int:
+    def staged_bytes(self, ba, config: Tile, target) -> int:
         # Pallas Triton's pipeline holds `stages - 1` depth steps, and on Hopper `stages` where it
         # pipelines a wgmma, which reads one step while the next loads; an A100 and an H100 refuse
         # exactly those bytes, so a Hopper tile is sized for the larger. The prologue's side tiles load
         # in the same steps.
-        held = 0 if generation.gpu_target().wgmma else 1
+        held = 0 if generation.effective(target).wgmma else 1
         step = self.loaded(config) * jnp.dtype(ba.arguments['tokens'].dtype).itemsize + _side_tile_bytes(
             ba.arguments['prologue_operands'], ba.arguments['hooks'].prologue_axes, self.extents(config))
         return step * (config.stages - held)
@@ -411,7 +411,7 @@ class _Triton(_GroupedLaunch[Tile]):
         threads = 32 * config.warps
         # One MMA's k of 16 of each operand fragment, the warps' shares together.
         fragments = (rows + columns) * 16 // threads
-        return cost.resident(target, self.staged_bytes(ba, config), threads,
+        return cost.resident(target, self.staged_bytes(ba, config, target), threads,
                              rows * columns // threads + fragments)
 
     @staticmethod
@@ -631,7 +631,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             return False
         return _hooks_lower(ba, dtype, mosaic_gpu_lowering.mosaic_lowering_rules[plgpu_core.WGxWG_SEMANTICS])
 
-    def staged_bytes(self, ba, config: mosaic_gpu.Tiles) -> int:
+    def staged_bytes(self, ba, config: mosaic_gpu.Tiles, target) -> int:
         # The pipeline's stages of both operand blocks and the prologue's side tiles, the epilogue's side
         # tiles, and the output block each output stores from.
         size = jnp.dtype(ba.arguments['tokens'].dtype).itemsize
@@ -642,12 +642,12 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             ba.arguments['prologue_operands'], hooks.prologue_axes, extents)
         epilogue = _side_tile_bytes(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes, extents)
         # One warpgroup stages each output in turn; two hold every output's staging buffer at once, and
-        # each consumer its own copy of an epilogue side tile without columns (`mosaic.staging`; a
+        # each consumer its own copy of an epilogue side tile without rows (`mosaic.staging`; a
         # prologue side's per-consumer copies are within the stages' count of it).
         staged_outs = sum(outs) if config.warpgroups == 2 else max(outs)
         if config.warpgroups == 2:
             epilogue_sides = ba.arguments.get('epilogue_operands', ())
-            epilogue += _side_tile_bytes(*_uncut(epilogue_sides, hooks.epilogue_axes, 'columns'), extents)
+            epilogue += _side_tile_bytes(*_uncut(epilogue_sides, hooks.epilogue_axes), extents)
         return config.stages * step + epilogue + staged_outs * config.block_m * config.block_n
 
     @staticmethod
@@ -666,7 +666,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         lhs = (extents['rows'], extents['depth'])
         # Each step's blocks are written by TMA and read once by the warpgroup's MMA. A prologue reads
         # the stage of `lhs` and its side tiles and writes the stage back before the MMA may read it
-        # (a commit to shared memory, and the consumers' meet): serial with the MMAs, not beside them
+        # (a commit to shared memory): serial with the MMAs, not beside them
         # (GMMSB-h100-main: a gated prologue at 3.7x the Triton launch's time).
         step = 2 * (config.block_m + config.block_n) * config.block_k * size
         rewritten = 0.0
@@ -763,7 +763,7 @@ class MosaicTgmm(_Mosaic):
     def fitting(self, ba, target) -> tuple[mosaic_gpu.Tiles, ...]:
         """The tiles that fit `target` (`Template.fitting`), with `exact_sums` those whose two fp32
         accumulators, the running sum and a step's, stay in each consumer warpgroup's registers (a
-        warpgroup's 128 threads hold its share of the tile's columns)."""
+        warpgroup's 128 threads hold its half of the tile's rows)."""
         fits = super().fitting(ba, target)
         if not ba.arguments.get('exact_sums'):
             return fits
@@ -836,13 +836,13 @@ class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
             raise ValueError(f"{target.generation} states no scoped VMEM, which the TPU launches fit their "
                              "blocks to")
         space = self.space(ba)
-        fits = tuple(blocks for blocks in space if self.staged_bytes(ba, blocks) <= budget)
+        fits = tuple(blocks for blocks in space if self.staged_bytes(ba, blocks, target) <= budget)
         if not fits:
-            raise base.Unfitted(type(self).__name__, min((self.staged_bytes(ba, blocks) for blocks in space),
-                                                         default=None), budget, target.generation)
+            least = min((self.staged_bytes(ba, blocks, target) for blocks in space), default=None)
+            raise base.Unfitted(type(self).__name__, least, budget, target.generation)
         return fits
 
-    def staged_bytes(self, ba, config: mosaic_tpu.Blocks) -> int:
+    def staged_bytes(self, ba, config: mosaic_tpu.Blocks, target) -> int:
         # Pallas's pipeline holds two of each operand's and output's blocks (one in flight), beside the
         # fp32 accumulator.
         size = jnp.dtype(ba.arguments['tokens'].dtype).itemsize
@@ -1022,9 +1022,9 @@ def _side_arrays(sides: tuple, axes_of: tuple) -> tuple:
                   jnp.dtype(side.dtype).itemsize) for side, axes in zip(sides, axes_of, strict=True))
 
 
-def _uncut(sides: tuple, axes_of: tuple, halved: str) -> tuple[tuple, tuple]:
-    """The side operands, and their axes, without the launch axis a cooperative consumer's half cuts."""
-    kept = [(side, axes) for side, axes in zip(sides, axes_of, strict=True) if halved not in axes]
+def _uncut(sides: tuple, axes_of: tuple) -> tuple[tuple, tuple]:
+    """The side operands, and their axes, without the rows a cooperative consumer's half cuts."""
+    kept = [(side, axes) for side, axes in zip(sides, axes_of, strict=True) if 'rows' not in axes]
     return tuple(side for side, _ in kept), tuple(axes for _, axes in kept)
 
 
