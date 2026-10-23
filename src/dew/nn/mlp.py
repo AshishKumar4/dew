@@ -77,6 +77,9 @@ def _erfinv(value: float) -> float:
 @logical_axes({
     ("gate_proj",): ("embed", "mlp"),
     ("up_proj",): ("embed", "mlp"),
+    # The packed kernel's columns are both halves' hidden widths: a tensor axis splits them flat,
+    # which the product's [..., 2, H] (`PACKED_HIDDEN`) redistributes.
+    ("gate_up_proj",): ("embed", "mlp"),
     ("down_proj",): ("mlp", "embed"),
 })
 class GatedMLP(nn.Module):
@@ -95,7 +98,8 @@ class GatedMLP(nn.Module):
     capped from above, and the up projection on both sides. Both need a gated
     activation. `packed` keeps the gate and up projections in one
     `gate_up_proj` from init on, as DeepSeek-V4.1's vision tower stores them,
-    and `linear` is the projections' module (Gemma 4's vision tower clips
+    in `packed_order` (diffusers' GEGLU stores the up projection first), and
+    `linear` is the projections' module (Gemma 4's vision tower clips
     theirs). Where the generation's kernel row measured it faster
     ('gate_up': 'joined'), separate gate and up projections run as one GEMM
     over their kernels joined per call (`dew.nn.joined`). The product reads a
@@ -112,6 +116,7 @@ class GatedMLP(nn.Module):
     init_std: float | None = None  # gate/up normal std; None: lecun normal
     output_init_std: float | None = None  # down normal std; None follows init_std
     packed: bool = False
+    packed_order: tuple[str, str] = ('gate_proj', 'up_proj')
     linear: Callable[..., Dense] = functools.partial(Dense, dot_general=float32_dot_general)
     dropout_rate: float = 0.0
     ngpt: NGPT | None = None
@@ -186,8 +191,12 @@ class GatedMLP(nn.Module):
                 gate_up = checkpoint_name(checkpoint_name(constrain(gate_up, PACKED_HIDDEN), 'gate_proj'),
                                           'up_proj')
                 return self._down(packed_gated_product(activation, axes=MLP_HIDDEN)(gate_up), train)
-        gate, up = self._group().split(self.gate_up_proj(x)) if self._packed() else (
-            self.gate_proj(x), self.up_proj(x))
+        if self._packed():
+            group = self._group()
+            halves = dict(zip(group.members, group.split(self.gate_up_proj(x)), strict=True))
+            gate, up = halves['gate_proj'], halves['up_proj']
+        else:
+            gate, up = self.gate_proj(x), self.up_proj(x)
         gate = checkpoint_name(constrain(gate, MLP_HIDDEN), 'gate_proj')
         up = checkpoint_name(constrain(up, MLP_HIDDEN), 'up_proj')
         if self.ngpt is not None:
@@ -216,6 +225,10 @@ class GatedMLP(nn.Module):
         projection's, or both kernels joined per call where the generation
         measured that faster (`joins`), else None."""
         if self._packed():
+            # The product reads the gate first (`packed_gated_product`); an up-first projection is
+            # read apart, as its reference splits it.
+            if self.packed_order[0] != 'gate_proj':
+                return None
             return self.gate_up_proj(x).reshape(*x.shape[:-1], 2, self.hidden_features)
         if joins('gate_up', (self.gate_proj, self.up_proj)):
             return joined_dense(x, (self.gate_proj, self.up_proj), axis=-2)
@@ -238,8 +251,9 @@ class GatedMLP(nn.Module):
 
     def _group(self) -> ProjectionGroup:
         """A gated MLP's gate and up projections, packed as `gate_up_proj`."""
-        return ProjectionGroup.of(tuple(self.path), 'gate_up_proj', ('gate_proj', 'up_proj'),
-                                  self.projections())
+        if sorted(self.packed_order) != ['gate_proj', 'up_proj']:
+            raise ValueError(f"packed_order orders gate_proj and up_proj, not {self.packed_order}")
+        return ProjectionGroup.of(tuple(self.path), 'gate_up_proj', self.packed_order, self.projections())
 
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
         """Its group (`_group`) where it is gated and its variables hold it
@@ -250,4 +264,13 @@ class GatedMLP(nn.Module):
         return (group,) if group.held(self.variables.get('params', {})) else ()
 
 
-__all__ = ["GatedMLP"]
+def geglu_feed_forward(dim: int, *, approximate: bool = True, **fields) -> GatedMLP:
+    """diffusers' `FeedForward`: a GEGLU to four times `dim` and back, biased, its gate and up
+    projections packed as the checkpoint keeps them, the up projection first; `approximate` is the
+    gate's tanh form of GELU, else the erf form, and `fields` any other `GatedMLP` field."""
+    return GatedMLP(hidden_features=4 * dim, out_features=dim,
+                    activation='geglu' if approximate else 'geglu_exact', use_bias=True, packed=True,
+                    packed_order=('up_proj', 'gate_proj'), **fields)
+
+
+__all__ = ["GatedMLP", "geglu_feed_forward"]
