@@ -157,6 +157,7 @@
 "tests/test_attention_splash.py::test_the_tpu_kernels_lower_for_a_tpu_on_a_mesh_that_splits_rows_or_heads[splash-rows]": 0.183,
 "tests/test_attention_stability.py::test_a_guarded_rows_split_sums_keep_a_subnormal_share_element_wise[bfloat16]": 25.38,
 "tests/test_attention_stability.py::test_a_guarded_rows_split_sums_keep_a_subnormal_share_element_wise[float32]": 25.9,
+"tests/test_attention_stability.py::test_a_resumed_state_of_large_values_under_the_folds_guard_is_finite": 6.0,
 "tests/test_attention_stability.py::test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a column near fp32's least normal beside an overflowing one-natural]": 14.28,
 "tests/test_attention_stability.py::test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a column near fp32's least normal under a large cotangent-natural]": 12.69,
 "tests/test_attention_stability.py::test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a cotangent on a small column beside an overflowing one-natural]": 14.69,
