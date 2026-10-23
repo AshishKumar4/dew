@@ -23,10 +23,12 @@ import tempfile
 from pathlib import Path
 
 MEASURED = """
-import atexit, json, runpy, sys
+import atexit, json, os, runpy, sys
 import jax
 from dew.telemetry.instrumentation import Compiles, compilation_cache_counts, count_compilation_cache
 stage, out, *argv = sys.argv[1:]
+# The script's own directory first, as `python script.py` puts it, for the modules beside it.
+sys.path[0] = os.path.dirname(os.path.abspath(argv[0]))
 count_compilation_cache()
 needed = Compiles(None).__enter__()
 

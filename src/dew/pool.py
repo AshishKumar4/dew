@@ -58,6 +58,24 @@ def detected_cluster() -> Cluster | None:
     return None
 
 
+def pool_cluster(multi_host: bool | None) -> Cluster | None:
+    """The cluster a process joins a pool through (`detected_cluster`), unless the run asks for none
+    (multi_host=False) or `dew launch` declared the pool itself (PROCESS_COUNT)."""
+    return None if multi_host is False or PROCESS_COUNT in os.environ else detected_cluster()
+
+
+def joins_pool(multi_host: bool | None, cluster: Cluster | None) -> bool:
+    """Whether a process joins a pool, read before a backend opens: the run asks for one
+    (multi_host=True), or the environment declares one (`dew launch`, a coordinator, a cluster of
+    `cluster`). A Slurm step of one task forms none unless the run asks, nor any run asking for none."""
+    one_task = (multi_host is None and cluster is not None and cluster.name == "slurm"
+                and cluster.count == 1)
+    if multi_host is False or one_task:
+        return False
+    return multi_host is True or cluster is not None or any(
+        name in os.environ for name in (PROCESS_COUNT, COORDINATOR))
+
+
 
 def runs_on_gpu(env: Mapping[str, str]) -> bool:
     """Whether `env` leaves jax the GPUs: JAX_PLATFORMS unset or naming them,
