@@ -448,8 +448,8 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
     it leaves into, `dh`, at that memory's slot (`Sequences`), then
     `dv2 = dv + (k dh) exp2(g_last - g)` (dh cast to k's dtype), then
     `dh = dh exp2(g_last) + scale (q exp2(g))^T do - w^T dv2`: the gated queries fp32 as two parts
-    of `do`'s dtype (`_split_dot`), where fla takes one TF32 product at the same cost, and dv2 cast
-    to w's dtype for its product, as fla casts it.
+    of `do`'s dtype (`_split_dot`), where fla takes one TF32 product at the same cost, its terms summed
+    from the chunk's last token, and dv2 cast to w's dtype for its product, as fla casts it.
     `per_key` is fla's USE_GK branch: `g_ref` `[T, K]` decays the gradient's rows by `exp2(g_last)`,
     and neither `dv2` nor the queries, which carry their own decay, are gated; the query product
     stays in q's dtype. A row's last sequence starts from the final
@@ -474,16 +474,34 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
             slot = jnp.where(r > 0, base + n + 1, left)
             for i in range(slices):
                 dh_ref[slot, pl.ds(i * 64, 64), :] = grad[i].astype(dh_ref.dtype)
+            # The chunk's tokens last first (an exchange of rows, its products exact: one nonzero term
+            # a row, bf16x6's three parts of an fp32 value its 24 bits, which one product of IEEE
+            # fp32 would compile to FMA loops on sm80): the readout's terms summed from the chunk's
+            # last token, the smallest first, as the portable math sums them
+            # (`recurrence_algebra.remembered`), where summed from the first the initial memory's
+            # gradient sat 2.3 to 2.4 times its distance from float64 (tests/test_fla_kda.py).
+            index = jnp.arange(chunk)
+            exchange = (index[:, None] + index[None, :] == chunk - 1).astype(jnp.float32)
+
+            def reversed_rows(x):
+                x = x.astype(jnp.float32)
+                if exact:
+                    return _dot(exchange, x, exact=True)
+                return jnp.dot(exchange, x, precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6,
+                               preferred_element_type=jnp.float32)
+
             out_grad = read(do_ref)
             dv = sum(_dot(read(k_ref, pl.ds(i * 64, 64)), grad[i].astype(k_ref.dtype), exact=exact)
                      for i in range(slices))
             final = begin + taken - 1
             queries = [read(q_ref, pl.ds(i * 64, 64)) for i in range(slices)]
+            last_first = reversed_rows(out_grad)
             if per_key:
                 dv = dv + read(dv_ref).astype(jnp.float32)
                 kept = [jnp.exp2(g_ref[final, pl.ds(i * 64, 64)].astype(jnp.float32))[:, None]
                         for i in range(slices)]
-                read_out = [_dot(query.T, out_grad.astype(query.dtype), exact=exact) for query in queries]
+                read_out = [_dot(reversed_rows(query).astype(query.dtype).T, last_first.astype(query.dtype),
+                                 exact=exact) for query in queries]
             else:
                 gate = _gates(g_ref, begin, taken, chunk)
                 last = _row(g_ref, final)
@@ -491,7 +509,8 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
                       + read(dv_ref).astype(jnp.float32))
                 decay = jnp.exp2(gate)[:, None]
                 kept = [jnp.exp2(last)] * slices
-                read_out = [_split_dot((query.astype(jnp.float32) * decay).T, out_grad, exact=exact)
+                read_out = [_split_dot(reversed_rows(query.astype(jnp.float32) * decay).T,
+                                       last_first.astype(out_grad.dtype), exact=exact)
                             for query in queries]
             write_rows(_rows(dv2_ref, begin, chunk), taken, dv)
 
@@ -515,6 +534,7 @@ class ChunkBwdDhu(_Launch):
 
     NAME = "chunk_bwd_dhu"
     KEYS, VALUES = 'k', 'do'
+    revision: int = 2
     SPACES = _spaces(_tiles([(0, 32), (0, 64)], (2, 4), (1, 2, 3)),
                      _tiles([(0, 32), (0, 64)], (2, 4), (1, 2)))
     # Measured at Qwen3.5-0.8B's shape (8 x 3072, 16 heads of 128, bf16), CUPTI, 2026-10-13: 0/64/4/3
