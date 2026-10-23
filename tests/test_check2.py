@@ -84,7 +84,9 @@ def test_a_computation_is_certified_through_its_calls_and_a_primitive_without_a_
     x = np.float32(np.linspace(0.1, 3, 32))
     outputs, findings = oc.certified(computed, x, np.bool_(1))
     assert findings == []
-    np.testing.assert_allclose(outputs, np.log(x.astype(np.float64) ** 2 + 1) * 2, rtol=1e-5)
+    # The op-by-op run's outputs are the operations' own: x·x, + 1, log, · 2, each the lane's.
+    stepped = np.asarray(jnp.multiply(jnp.log(jnp.add(jnp.multiply(x, x), np.float32(1))), np.float32(2)))
+    np.testing.assert_array_equal(outputs, stepped)
     _, findings = oc.certified(lambda x: jnp.sin(x), x)
     assert len(findings) == 1 and "no contract for sin" in findings[0]
     with pytest.raises(AssertionError):
