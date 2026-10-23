@@ -32,7 +32,7 @@ from jax.sharding import PartitionSpec as P
 
 from dew.nn.attention import FORWARD_MODE, repeat_kv_heads
 from dew.nn.inputs import cu_seqlens
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import L2NORM_EPS, at_least_fp32
 from dew.nn.sharding import grouped_heads, manual_map, rows_like
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
@@ -283,7 +283,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     work = at_least_fp32(jnp.result_type(query, key, value))
     if hooks.l2norm:
         query, key = (x.astype(work) for x in (query, key))
-        query, key = (x * jax.lax.rsqrt(jnp.sum(x * x, axis=-1, keepdims=True) + recurrence.L2NORM_EPS)
+        query, key = (x * jax.lax.rsqrt(jnp.sum(x * x, axis=-1, keepdims=True) + L2NORM_EPS)
                       for x in (query, key))
     scale = (key.shape[-1] ** -0.5 if hooks.l2norm else 1.0) if hooks.scale is None else hooks.scale
     g, beta = recurrence.log_gates(hooks, given, work)

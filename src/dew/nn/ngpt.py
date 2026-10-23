@@ -13,9 +13,8 @@ import math
 import jax
 import jax.numpy as jnp
 
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, l2norm
 
-EPSILON = 1e-6
 """The floor under a unit norm's squared length (dory.py's EPS)."""
 
 
@@ -68,22 +67,15 @@ class NGPT:
         return 1 / self.std
 
 
-def unit(x: jax.Array) -> jax.Array:
-    """`x` over its L2 length along the last axis, reduced in at least fp32 (`at_least_fp32`, a float64
-    model's in float64) and returned in `x`'s dtype: `x * rsqrt(sum(x**2) + 1e-6)`, Dory's `justnorm`."""
-    wide = x.astype(at_least_fp32(x.dtype))
-    return (wide * jax.lax.rsqrt(jnp.sum(jnp.square(wide), axis=-1, keepdims=True) + EPSILON)).astype(x.dtype)
-
-
 def stepped(residual: jax.Array, branch: jax.Array, alpha: jax.Array, scale: float) -> jax.Array:
     """The residual after a sublayer's `branch` joins it: both ends unit-normed in the residual's
     dtype, a step of `|alpha * scale|` from the residual toward the branch in at least fp32, and the
     result unit-normed back to the residual's dtype (Dory's `slerp_alpha`)."""
     wide = at_least_fp32(residual.dtype)
-    start = unit(residual).astype(wide)
-    end = unit(branch).astype(wide)
+    start = l2norm(residual).astype(wide)
+    end = l2norm(branch).astype(wide)
     rate = jnp.abs(alpha.astype(wide) * scale)
-    return unit(start + rate * (end - start)).astype(residual.dtype)
+    return l2norm(start + rate * (end - start)).astype(residual.dtype)
 
 
 def gain(scale: jax.Array, factor: float) -> jax.Array:
