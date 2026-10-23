@@ -116,6 +116,15 @@ def products_dtype(*operands) -> jnp.dtype | None:
     return jnp.result_type(*dtypes)
 
 
+def float64_sum(product: Callable[..., jax.Array], *operands, dtype: DTypeLike) -> jax.Array:
+    """`product(*operands)`, a sum of products, taken in float64 from its operands widened exactly and
+    rounded once to `dtype`, under `jax.enable_x64` for its own trace: the sum `accumulated` takes on a
+    CPU, with no platform of its own to choose."""
+    with jax.enable_x64(new_val=True):
+        wide = product(*(operand.astype(jnp.float64) for operand in operands), preferred_element_type=None)
+        return wide.astype(dtype)
+
+
 def accumulated(product: Callable[..., jax.Array], *operands,
                 preferred_element_type: DTypeLike | None = None) -> jax.Array:
     """`product(*operands, preferred_element_type=...)`, a sum of products of `operands` (a dot, an
@@ -143,12 +152,8 @@ def accumulated(product: Callable[..., jax.Array], *operands,
         return narrow(*operands)
     dtype = jax.eval_shape(narrow, *operands).dtype
 
-    def widened(*operands):
-        return tuple(operand.astype(jnp.float64) for operand in operands)
-
     def summed(*operands):
-        with jax.enable_x64(new_val=True):
-            return product(*widened(*operands), preferred_element_type=None).astype(dtype)
+        return float64_sum(product, *operands, dtype=dtype)
 
     def pulled(saved, operands, cotangent):
         """The operands' cotangents, each the float64 sum of its products rounded once: JAX
@@ -156,7 +161,7 @@ def accumulated(product: Callable[..., jax.Array], *operands,
         is formed in that scope here."""
         with jax.enable_x64(new_val=True):
             _, pullback = jax.vjp(lambda *wide: product(*wide, preferred_element_type=None),
-                                  *widened(*operands))
+                                  *(operand.astype(jnp.float64) for operand in operands))
             return tuple(gradient.astype(operand.dtype)
                          for gradient, operand in zip(pullback(cotangent.astype(jnp.float64)), operands,
                                                       strict=True))

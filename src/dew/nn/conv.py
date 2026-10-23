@@ -163,8 +163,12 @@ def _shifted_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax
     the convolution."""
     height, width = lhs.shape[1:3]
     padded = jnp.pad(lhs, ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0))).astype(jnp.float32)
-    windows = jnp.stack([padded[:, row * dilation:row * dilation + height, column * dilation:column * dilation
-                                + width, :] for row in range(3) for column in range(3)])
+    def window(row: int, column: int) -> jax.Array:
+        rows = slice(row * dilation, row * dilation + height)
+        columns = slice(column * dilation, column * dilation + width)
+        return padded[:, rows, columns, :]
+
+    windows = jnp.stack([window(row, column) for row in range(3) for column in range(3)])
     taps = rhs.astype(jnp.float32).reshape(9, rhs.shape[-1])
     return float32_einsum('tbhwc,tc->bhwc', windows, taps).astype(lhs.dtype)
 
