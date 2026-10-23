@@ -47,7 +47,7 @@ from dew.nn.gemma4_moe import Gemma4Experts
 from dew.nn.gpt_oss import GptOssMLP
 from dew.nn.inputs import ModelInputs
 from dew.nn.kda import KimiDeltaAttention
-from dew.nn.kernels.generation import assumed
+from dew.nn.kernels.generation import assumed, gpu_target
 from dew.nn.kernels.recurrence_chunk import recurrent_delta_rule
 from dew.nn.linear import GatedDeltaNet, recurrent_gated_delta_rule
 from dew.nn.mixer_base import MixerContext
@@ -633,10 +633,11 @@ def test_accumulation_two_logs_the_real_tokens_of_both_microbatches():
 
 
 def test_a_run_on_a_device_without_a_known_peak_still_reports_its_training_flops():
-    """train/flops, the step's analytical training work over the mesh, needs no device peak: a run on
-    the CPU, which has none and so reports no train/mfu, logs every step's count, the objective's own
-    for its batch. The counts are sums of float32 per-row shares, exact below 2**21 (a share is the
-    count over eight rows, three more bits), so they compare exactly."""
+    """train/flops, the step's analytical training work over the mesh, needs no device peak: a run
+    logs every step's count, the objective's own for its batch, on any device, and train/mfu only
+    where the device's peak is known, so on the CPU lane, whose devices have none, the count alone.
+    The counts are sums of float32 per-row shares, exact below 2**21 (a share is the count over
+    eight rows, three more bits), so they compare exactly."""
     import optax
 
     from dew.training import Trainer
@@ -651,7 +652,8 @@ def test_a_run_on_a_device_without_a_known_peak_still_reports_its_training_flops
                 log_every=1)
     logged = [scalars for _, scalars in tracker.scalars if "train/loss" in scalars]
     assert [scalars["train/flops"] for scalars in logged] == [work, work]
-    assert not any("train/mfu" in scalars for scalars in logged)
+    peak = gpu_target(jax.devices()[0].device_kind).bf16_peak
+    assert all(("train/mfu" in scalars) == (peak is not None) for scalars in logged)
 
 
 def test_s5_write_read_matches_the_native_scanned_path():
