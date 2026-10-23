@@ -14,7 +14,6 @@ and site/scripts/digest.py reads; `--check` writes nothing and fails where eithe
 import argparse
 import hashlib
 import json
-from collections.abc import Callable
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -46,13 +45,13 @@ def training_example(source: str) -> str:
     return before + after
 
 
-def programs(read: Callable[[str], str] = lambda path: (SITE / path).read_text()) -> dict[str, str]:
-    """Every program the page shows, as `read` (a path under site/ to its text) has their sources: each cell
-    of cells.json, the hero's cell and its script, and the live text and sampler."""
-    framework, hero = read("snippets/framework.py"), read("src/data/hero.py")
-    return {**{name: cell(name, framework) for name in [*CELLS["pool"], *CELLS["colab"]]},
+def programs() -> dict[str, str]:
+    """Every program the page shows: each cell of cells.json, the hero's cell and its script, and the live
+    text and sampler."""
+    hero = (SITE / "src/data/hero.py").read_text()
+    return {**{name: cell(name) for name in [*CELLS["pool"], *CELLS["colab"]]},
             "hero": training_example(hero), "hero.py": hero,
-            "text": read("src/data/text.py"), "sampler": read("src/data/sampler.py")}
+            "text": (SITE / "src/data/text.py").read_text(), "sampler": (SITE / "src/data/sampler.py").read_text()}
 
 
 def recordings() -> dict[str, list[str]]:
