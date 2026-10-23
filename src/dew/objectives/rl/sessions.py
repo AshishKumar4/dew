@@ -271,10 +271,11 @@ class Collector(Protocol):
     the proximal policy. A failure that is not the drawn sessions' own (a
     broken environment) raises on every process, and an infrastructure
     failure of a session's reward or environment is that session's
-    INFRA_ERROR. `scored` False is a data share's later reader, which enters
-    the draw but neither scores nor returns it: the share trains on its first
-    reader's sessions. `width` is the packed row's ids and
-    `rows(tasks, samples)` the rows a call of that many sessions packs into.
+    INFRA_ERROR. On a data share's later reader it enters the draw but
+    neither scores nor returns it, an empty list: the share trains on its
+    first reader's sessions (`first_reader_batch`). `width` is the packed
+    row's ids and `rows(tasks, samples)` the rows a call of that many
+    sessions packs into.
     """
 
     @property
@@ -282,8 +283,8 @@ class Collector(Protocol):
 
     def rows(self, tasks: int, samples: int) -> int: ...
 
-    def collect(self, snapshot: Snapshot, tasks: Sequence[Task], samples: int, *,
-                scored: bool = True) -> Sequence[Sequence[Session]]: ...
+    def collect(self, snapshot: Snapshot, tasks: Sequence[Task],
+                samples: int) -> Sequence[Sequence[Session]]: ...
 
 
 class SessionSource(Protocol):
