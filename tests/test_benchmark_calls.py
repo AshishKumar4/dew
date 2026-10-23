@@ -64,6 +64,7 @@ def test_pair_labels_lay_out_as_rows_by_columns_in_one_unit():
 NEIGHBOURED = """
 import ctypes
 import json
+import mmap
 
 import numpy as np
 
@@ -75,17 +76,21 @@ ctypes.CDLL(None).mallopt(-3, 1 << 30)
 held = np.ones(64 * 2**20, np.uint8)
 guard = np.ones(2**20, np.uint8)
 del held
-before = resident_memory()
-block = np.ones(64 * 2**20, np.uint8)
-after = resident_memory()
-print(json.dumps({"before": before, "after": after, "size": block.nbytes}))
+# A new private mapping is pages no allocator held: the kernel hands each in as it is written.
+with mmap.mmap(-1, 64 * 2**20, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS) as pages:
+    before = resident_memory()
+    for offset in range(0, len(pages), mmap.PAGESIZE):
+        pages[offset] = 1
+    after = resident_memory()
+    print(json.dumps({"before": before, "after": after, "size": len(pages)}))
 """
 
 
 def test_resident_memory_reads_the_kernel_fields_in_bytes_and_sees_an_allocation():
-    """Each of the kernel's memory fields in bytes under its own name: 64 MiB written through raises
-    the anonymous resident memory by more than half its size, which a field read in the kernel's KiB
-    would not show, in a process whose allocator holds a freed block of that size resident."""
+    """Each of the kernel's memory fields in bytes under its own name: 64 MiB of new pages written
+    through raises the anonymous resident memory by more than half its size, which a field read in
+    the kernel's KiB would not show, even in a process whose allocator holds a freed block of that
+    size resident, which an array of that size would be served from without a new page."""
     import json
     import subprocess
     import sys
