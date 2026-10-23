@@ -562,12 +562,12 @@ def _class_fills(name):
 
 
 def _translated(config):
-    """The decoder a config translates to, or None where the translation refuses it or finds a field
-    it requires missing."""
+    """The decoder a config translates to, or the refusal's kind where the translation refuses it or
+    finds a field it requires missing."""
     try:
         return translate_config(config)
-    except (ValueError, KeyError):
-        return None
+    except (ValueError, KeyError) as refused:
+        return type(refused)
 
 
 @pytest.mark.parametrize("name", CLASS_DEFAULTED)
@@ -582,7 +582,7 @@ def test_a_field_left_out_reads_as_its_config_class_fills_it(name):
     differing = []
     for field, filled in _class_fills(name).items():
         left = _translated(_without(field)(config))
-        if left is not None and left != _translated({**config, field: filled}):
+        if not isinstance(left, type) and left != _translated({**config, field: filled}):
             differing.append(field)
     assert not differing, f"{name} reads {differing} otherwise than its class where they are left out"
 
