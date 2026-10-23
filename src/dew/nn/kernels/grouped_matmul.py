@@ -666,7 +666,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         lhs = (extents['rows'], extents['depth'])
         # Each step's blocks are written by TMA and read once by the warpgroup's MMA. A prologue reads
         # the stage of `lhs` and its side tiles and writes the stage back before the MMA may read it
-        # (a commit to shared memory, and the consumers' meet): serial with the MMAs, not beside them
+        # (a commit to shared memory): serial with the MMAs, not beside them
         # (GMMSB-h100-main: a gated prologue at 3.7x the Triton launch's time).
         step = 2 * (config.block_m + config.block_n) * config.block_k * size
         rewritten = 0.0
@@ -763,7 +763,7 @@ class MosaicTgmm(_Mosaic):
     def fitting(self, ba, target) -> tuple[mosaic_gpu.Tiles, ...]:
         """The tiles that fit `target` (`Template.fitting`), with `exact_sums` those whose two fp32
         accumulators, the running sum and a step's, stay in each consumer warpgroup's registers (a
-        warpgroup's 128 threads hold its share of the tile's columns)."""
+        warpgroup's 128 threads hold its half of the tile's rows)."""
         fits = super().fitting(ba, target)
         if not ba.arguments.get('exact_sums'):
             return fits
