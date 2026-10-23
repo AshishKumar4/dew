@@ -163,8 +163,9 @@ def nhwc(array):
     return np.asarray(array).transpose(0, 2, 3, 1)
 
 
-VAE_SEEDS = {"vae": 16, "small_decoder": 16, "published": 16}
-"""Check 1's declared seeds for each autoencoder (to size)."""
+VAE_SEEDS = {"vae": 8, "small_decoder": 16, "published": 16}
+"""Check 1's declared seeds for each autoencoder, sized by `seeds_for` (the published one on a GPU, its
+download a network test's)."""
 
 
 def source_autoencoder_walk(model):
