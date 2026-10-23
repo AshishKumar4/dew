@@ -1279,9 +1279,9 @@ class RunConfig:
         return str(target)
 
     def record(self) -> dict[str, JSON]:
-        """The run's class record: its class's name, its alias where `dew.registry.runs` holds it, and
-        its fields (`to_dict`)."""
-        return {"class": registry.recorded_name(type(self)), "fields": self.to_dict()}
+        """The run's class record: its class by its alias in `dew.registry.runs`, or by its import path
+        where the table holds none, and its fields (`to_dict`)."""
+        return {"class": registry.runs.name_of(type(self)), "fields": self.to_dict()}
 
     @classmethod
     def cli(cls, args: Sequence[str] | None = None, *, default: Self | None = None) -> Self:
