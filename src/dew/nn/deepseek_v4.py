@@ -68,6 +68,7 @@ from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import YarnScaling, rotary_freqs, rotate
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import candidate_pool, index_scores, selection_mask, top_k_keys, top_k_selection
+from dew.nn.visibility import visible
 
 COMPRESSORS = ('csa', 'hca', 'csa2')
 CANDIDATES = ('source', 'restrict')
@@ -410,8 +411,8 @@ class Compressor(CompressedEntries):
         entries = self.entries(x, valid) if cache is None else self.cached_entries(x, *cache)[0]
         if self.index_topk is not None:
             return entries, self.indexer.select(x, q_resid, positions, cos, sin, cache, valid)
-        visible = entries_visible(positions, entries.shape[1], self.rate)
-        return entries, jnp.broadcast_to(visible, (x.shape[0], *visible.shape[1:]))
+        seen = entries_visible(positions, entries.shape[1], self.rate)
+        return entries, jnp.broadcast_to(seen, (x.shape[0], *seen.shape[1:]))
 
 
 class Csa2Indexer(IndexerFront, FakeQuantizing):
@@ -645,8 +646,8 @@ class DeepseekV4Attention(FakeQuantizing):
             if allocated:
                 held.value = write_cache(held.value, fresh, windows)
             keys = held.value
-        visible = entries_visible(positions, entries.shape[1], rate)
-        visible = jnp.broadcast_to(visible, (x.shape[0], *visible.shape[1:]))
+        seen = entries_visible(positions, entries.shape[1], rate)
+        seen = jnp.broadcast_to(seen, (x.shape[0], *seen.shape[1:]))
         if self.candidates == 'restrict':
             # A Reindex layer scores the pool's entries alone, their keys
             # gathered per query (section 2.3.2): O(pool), not O(entries).
@@ -654,7 +655,7 @@ class DeepseekV4Attention(FakeQuantizing):
             held = jnp.maximum(pool, 0)
             scores = self.indexer.scores(x, q_resid, keys[jnp.arange(x.shape[0])[:, None, None], held],
                                          cos, sin)
-            picks = top_k_selection(scores, (pool >= 0) & jnp.take_along_axis(visible, held, -1), top_k)
+            picks = top_k_selection(scores, (pool >= 0) & jnp.take_along_axis(seen, held, -1), top_k)
             chosen = jnp.where(picks >= 0, jnp.take_along_axis(pool, jnp.maximum(picks, 0), -1), -1)
             selected = selection_mask(chosen, entries.shape[1])
         else:
@@ -662,8 +663,8 @@ class DeepseekV4Attention(FakeQuantizing):
             if (self.candidates == 'source' and self.candidate_blocks and self.candidate_block_size
                     and kv_store is not None):
                 kv_store[_CSA2_CANDIDATES] = candidate_pool(
-                    scores, visible, self.candidate_blocks, self.candidate_block_size)
-            selected = top_k_keys(scores, visible, top_k)
+                    scores, seen, self.candidate_blocks, self.candidate_block_size)
+            selected = top_k_keys(scores, seen, top_k)
         if kv_store is not None:
             if not self.reindex:
                 kv_store[_CSA2_ENTRIES] = entries
@@ -711,8 +712,7 @@ class DeepseekV4Attention(FakeQuantizing):
         # The sliding window over the row's own positions: key j at or before
         # query i and within the window, its own position included
         # (masking_utils sliding_window_overlay, modeling_deepseek_v4.py:205).
-        query_pos, key_pos = rows[:, None], rows[None, :]
-        allowed = (key_pos <= query_pos) & (key_pos > query_pos - self.sliding_window)
+        allowed = visible(rows[:, None], rows[None, :], causal=True, window=self.sliding_window)
         allowed = jnp.broadcast_to(allowed, (batch, length, length))
         if cache is not None and cached_key is not None:
             slots, _, allocated = cache
@@ -840,7 +840,7 @@ class DSparkAttention(DeepseekV4Attention):
                                 dtype=at_least_fp32(x.dtype))
         place = down_projection(x, self.q_lora_rank + self.head_dim)
         query, _ = self._queries(x, cos, sin, place)
-        window = (places <= last[:, None]) & (places > last[:, None] - self.sliding_window)
+        window = visible(last[:, None], places, causal=True, window=self.sliding_window)
         if real is not None:
             window = window & real
         allowed = jnp.concatenate([

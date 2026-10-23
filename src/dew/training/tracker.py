@@ -38,6 +38,7 @@ from dew.artifacts import (
     VideoGrid,
     uint8_pixels,
 )
+from dew.cleanup import attempted
 from dew.records import integer, record
 from dew.telemetry.records import RECORD_TYPES, FitEnded, Record, RunRecord, json_value, reported_number
 
@@ -383,24 +384,19 @@ class LocalTracker(_OwnedTracker):
     def close(self) -> None:
         if self._closed:
             return
-        error = None
+
+        def plotted() -> None:
+            self.plot_files()
+
+        def closed() -> None:
+            self._closed = True
+
         try:
-            if self.plots:
-                self.plot_files()
-        except BaseException as failure:
-            error = failure
-        self._closed = True
-        for handle in self._files.values():
-            try:
-                handle.close()
-            except BaseException as failure:
-                if error is None:
-                    error = failure
-                else:
-                    error.add_note(f'Journal close also failed: {failure!r}')
-        self._files.clear()
-        if error is not None:
-            raise error
+            plots = [("Journal plots", plotted)] if self.plots else []
+            attempted([*plots, ("Journal state", closed),
+                       *((f"Journal close of {name}", handle.close) for name, handle in self._files.items())])
+        finally:
+            self._files.clear()
 
 
 def _curves(history: Mapping[str, list[tuple[int, float]]], metrics: tuple[str, ...], *, smooth: int = 1,
@@ -751,17 +747,8 @@ class Trackers(_OwnedTracker):
     def _each(self, operation) -> None:
         if self._closed:
             raise RuntimeError('Trackers is closed')
-        error = None
-        for tracker in self.trackers:
-            try:
-                operation(tracker)
-            except BaseException as failure:
-                if error is None:
-                    error = failure
-                else:
-                    error.add_note(f'{type(tracker).__name__} also failed: {failure!r}')
-        if error is not None:
-            raise error
+        attempted([(type(tracker).__name__, functools.partial(operation, tracker))
+                   for tracker in self.trackers])
 
     def log(self, scalars: Mapping[str, float], step: int) -> None:
         self._each(lambda tracker: tracker.log(scalars, step))
