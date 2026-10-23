@@ -33,19 +33,9 @@ from jax.experimental import checkify
 from jax.typing import ArrayLike
 from typing_extensions import TypeVar
 
+from dew.batch import Variables, real_slots, token_positions, valid_order, with_validity
 from dew.interop.weights import decoding_storage
-from dew.nn.inputs import (
-    ModelInputs,
-    PredictionPhase,
-    Request,
-    local_rows,
-    mesh_of,
-    next_position,
-    real_slots,
-    token_positions,
-    valid_order,
-    with_validity,
-)
+from dew.nn.inputs import ModelInputs, PredictionPhase, Request, local_rows, mesh_of, next_position
 from dew.nn.kernels.options import compiler_options
 from dew.nn.kv_cache import gather_cache_rows, refuse_unassigned, write_cache
 from dew.nn.protocols import (
@@ -61,7 +51,6 @@ from dew.nn.protocols import (
     Selective,
     Serving,
 )
-from dew.objectives.base import Variables
 from dew.sampling import decoding, strategies
 from dew.sampling.decoding import (
     EndOfSequence,

@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
+from dew.batch import Variables
 from dew.diffusion.process import DenoisingCondition
 from dew.inputs.encoders import ConditionEncoder, ConditionWork
 from dew.nn.blocks import torch_nearest_resize
@@ -22,7 +23,6 @@ from dew.nn.flops import counted_flops, projection_flops
 from dew.nn.protocols import LayerStates
 from dew.nn.safety import CLIPSafetyHead
 from dew.nn.text_encoders import CLIPTextTransformer, CLIPTowerOutput, T5EncoderTransformer
-from dew.objectives.base import Variables
 from dew.registry import dtype_name
 
 if TYPE_CHECKING:

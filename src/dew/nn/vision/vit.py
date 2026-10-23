@@ -26,12 +26,13 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.batch import coordinates
 from dew.interop.weights import ParamTree, checkpoint_array, insert, placed
 from dew.nn.activations import activation as named_activation
 from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.backbones.decoder_block import DecoderBlock
 from dew.nn.dense import Dense
-from dew.nn.inputs import AttentionMetadata, coordinates
+from dew.nn.inputs import AttentionMetadata
 from dew.nn.precision import float32_dot_general
 from dew.nn.text_encoders import clip_layer
 

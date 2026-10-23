@@ -25,9 +25,9 @@ from flax import linen as nn
 from flax.core import FrozenDict, freeze, unfreeze
 from jax.sharding import SingleDeviceSharding
 
+from dew.batch import Variables
 from dew.nn.kernels.options import QuantizedClass
 from dew.nn.protocols import ProjectionGroup, Serving
-from dew.objectives.base import Variables
 from dew.quantization import QUANTIZATION
 
 

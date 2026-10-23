@@ -25,6 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
+from dew.batch import Batch, Variables
 from dew.coordination import agreed, broadcast_from_process_zero, collective_host
 from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
@@ -32,7 +33,7 @@ from dew.diffusion.schedules.source import SourceGrid
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.precision import at_least_fp32
-from dew.objectives.base import OMITTED, Aux, Batch, Omitted, Ratio, Shown, Step, Variables
+from dew.objectives.base import OMITTED, Aux, Omitted, Ratio, Shown, Step
 from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.rl.advantage import group_normalised
 from dew.rl.surrogate import clipped_surrogate_terms

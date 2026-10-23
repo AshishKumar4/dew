@@ -34,13 +34,13 @@ import numpy as np
 import tyro
 
 import dew
+from dew.batch import VALID_ROWS
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, RunConfig, TrainerConfig
 from dew.data import ByteTokenizer, Concatenate, Dataset, Files, Hub, Loading, Source, images, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader
 from dew.interop.diffusion_gemma import build
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import VALID_ROWS
 from dew.objectives.lm import Perplexity
 from dew.records import record as read_record, strings
 from dew.training import MeshSpec, prepare_process

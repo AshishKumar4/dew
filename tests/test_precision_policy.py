@@ -10,11 +10,12 @@ import pytest
 from flax import linen as nn
 from reference_error import assert_fp32_reduction_bound, equations
 
+from dew.batch import coordinates
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import soft_embeddings
 from dew.nn.dsa_kpool import KPoolSparseAttention
-from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
+from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.llama4 import Llama4Mixer
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerContext

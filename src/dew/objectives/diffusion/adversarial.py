@@ -27,6 +27,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from dew.batch import Batch, Variables
 from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
 from dew.diffusion.transforms import broadcast_rates
@@ -35,7 +36,7 @@ from dew.nn.attention import l2_normalized
 from dew.nn.blocks import sinusoidal_time
 from dew.nn.dit import TextContext, masked_mean
 from dew.nn.sharding import rows_taken
-from dew.objectives.base import TEACHER, Aux, Batch, Objective, Step, Variables
+from dew.objectives.base import TEACHER, Aux, Objective, Step
 
 from .objective import DISCRIMINATOR, SPECTRAL, FlowDistillationObjective
 

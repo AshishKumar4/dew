@@ -18,12 +18,13 @@ A parameter that no declaration names (a convolution, a state matrix, a
 projection with no side worth naming) gets the shape heuristic, which
 places it on its largest divisible axis.
 
-This module also defines the mesh axis names and the functions that read
-the mesh in context: `pipeline_stages` for the decoder's stage count,
-`microbatches` for the schedule the trainer sets in context around its
-compiled step, `sequence_shards` for how many ways attention and the Mamba-2
-mixer split a sequence, `row_axes` for the axes their `shard_map`s split
-rows over, and `manual_map` for those maps.
+This module also defines the functions that read the mesh in context:
+`pipeline_stages` for the decoder's stage count, `microbatches` for the
+schedule the trainer sets in context around its compiled step,
+`sequence_shards` for how many ways attention and the Mamba-2 mixer split a
+sequence, and `manual_map` for their `shard_map`s, whose rows split over the
+axes `dew.mesh.row_axes` names. The mesh's axis names and the rule entries
+that place a batch's rows are `dew.mesh`'s, below the models and the data.
 
 `DEFAULT_RULES` maps the logical names onto the mesh, for parameters and
 activations alike. `logical_spec` reads it (or the rules a layout sets in
@@ -46,41 +47,23 @@ import numpy as np
 from flax import linen as nn
 from flax.linen import spmd
 
+from dew.mesh import (
+    BATCH_AXES,
+    BATCH_RULES,
+    EXPERT_AXIS,
+    FSDP_AXIS,
+    SEQUENCE_AXIS,
+    STAGE_AXIS,
+    TENSOR_AXIS,
+    LogicalAxisRules,
+    MeshAxes,
+    mesh_axes,
+    row_axes,
+)
+
 type LogicalAxes = tuple[str | None, ...]
 type Suffix = tuple[str, ...]
 
-DATA_AXIS = 'data'
-EXPERT_AXIS = 'expert'
-FSDP_AXIS = 'fsdp'
-TENSOR_AXIS = 'tensor'
-SEQUENCE_AXIS = 'sequence'
-STAGE_AXIS = 'stage'
-"""The axes of a mesh `MeshSpec.build` builds, plus the stage axis a
-pipeline mesh adds. They are named here because the attention seam and the
-decoder read them off the mesh in context: the sequence axis attention splits
-its queries over, and the tensor and stage axes, which hold a width and a
-pipeline stage and never a row."""
-
-MESH_AXES = (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS, SEQUENCE_AXIS, STAGE_AXIS)
-"""Every mesh's axes, in the order `MeshSpec.build` lays them out."""
-
-BATCH_AXES = (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS)
-"""The mesh axes a batch's rows split over, in mesh order. Sequence holds a
-slice of the positions, stage the pipeline's stages that hand one batch's
-microbatches along, and tensor the widths of Megatron's split, so every
-tensor shard computes its share of the width for every row."""
-
-
-class LayoutRefused(ValueError):
-    """Raised for a mesh layout that a model, an objective or a device set does not run, by design.
-
-    The message names the axis, says why it cannot hold what it would split,
-    and gives a layout that runs. Any other error on a layout is a defect.
-    It is a ValueError, so a caller that catches ValueError catches it too.
-    """
-
-type MeshAxes = str | tuple[str, ...] | None
-type LogicalAxisRules = tuple[tuple[str, MeshAxes], ...]
 
 # Rule order is precedence when two logical dimensions target the one mesh
 # axis. A name written twice is an ordered pair of choices, the form flax
@@ -149,7 +132,7 @@ DEFAULT_RULES: LogicalAxisRules = (
     # itself rather than fall back to replication.
     ("heads", TENSOR_AXIS),
     ("kv", TENSOR_AXIS),
-    ("activation_batch", BATCH_AXES),
+    BATCH_RULES[0],
     ("activation_length", SEQUENCE_AXIS),
     # The positions of a stretch of per-token work that splits no width the
     # tensor axis splits, which every tensor shard would otherwise compute
@@ -166,8 +149,7 @@ DEFAULT_RULES: LogicalAxisRules = (
     # one part of the pool per group of rows (`dew.inference.serving`).
     ("pages", BATCH_AXES),
     # Rows too few for every batch axis split over the first ones.
-    ("activation_batch", (DATA_AXIS, EXPERT_AXIS)),
-    ("activation_batch", DATA_AXIS),
+    *BATCH_RULES[1:],
 )
 
 RESIDUAL: LogicalAxes = ("activation_batch", "activation_length", "activation_embed")
@@ -417,17 +399,6 @@ def split_positions(x: jax.Array, head_shape: tuple[int, int],
     return jax.tree.map(lambda out: out[:, :length], project(padded))
 
 
-def row_axes(batch: int, *, mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh | None = None
-             ) -> tuple[str, ...]:
-    """The mesh axes a `shard_map` over the sequence axis splits `batch` rows
-    over: the ones `activation_batch` takes for `batch` rows on `mesh`, the
-    mesh in context by default (`logical_spec`). A batch too small for them is
-    computed alike on those axes' shards, the way GSPMD replicates a dimension
-    it cannot split."""
-    spec = logical_spec(("activation_batch",), (batch,), mesh=mesh)
-    return mesh_axes(spec[0]) if spec else ()
-
-
 def manual_map[**Arguments, Result](local: Callable[Arguments, Result], in_specs,
                                      out_specs) -> Callable[Arguments, Result]:
     """`local` in a `shard_map` over every axis the context leaves automatic.
@@ -456,19 +427,6 @@ def manual_map[**Arguments, Result](local: Callable[Arguments, Result], in_specs
         return local
     return jax.shard_map(local, in_specs=in_specs, out_specs=out_specs, axis_names=manual,
                          check_vma=False)
-
-
-def batch_axes(mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh) -> tuple[str, ...]:
-    """The axes of `mesh` a batch's rows split over: every axis
-    `activation_batch` takes, each of which divides `mesh.size` rows."""
-    return row_axes(mesh.size, mesh=mesh)
-
-
-def mesh_axes(assignment: MeshAxes) -> tuple[str, ...]:
-    """Read one entry of a spec or a rule as the mesh axes it names."""
-    if assignment is None:
-        return ()
-    return (assignment,) if isinstance(assignment, str) else tuple(assignment)
 
 
 def axis_rules() -> LogicalAxisRules:
@@ -815,5 +773,4 @@ def declared_axes(path, ndim: int, declared: Mapping[Suffix, LogicalAxes]) -> Lo
     return axes[len(axes) - ndim:]
 
 
-__all__ = ["ADAPTER_RANK", "DATA_AXIS", "FSDP_AXIS", "RESIDUAL", "LayoutRefused", "Link", "LogicalAxes",
-           "LogicalAxisRules", "Schedule", "logical_axes", "logical_spec"]
+__all__ = ["ADAPTER_RANK", "RESIDUAL", "Link", "LogicalAxes", "Schedule", "logical_axes", "logical_spec"]

@@ -23,8 +23,8 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew import registry
+from dew.batch import Batch, Variables
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import Batch, Variables
 
 from .diffusion import DiffusionConditioner
 from .encoders import CharTable, CLIPText, ConditionEncoder, HFAudio, T5Text, rebuild

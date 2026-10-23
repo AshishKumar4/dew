@@ -4,13 +4,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.batch import merge
 from dew.inference.banks import LayerBanks, at_namespace, entry_tree, in_namespace, narrowed
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import MultimodalTransformer, VisionConditioner
 from dew.nn.vision import GemmaProjector, SiglipVision
-from dew.objectives.base import merge
 from dew.training import Layout
 
 

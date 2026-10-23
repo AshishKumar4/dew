@@ -32,6 +32,7 @@ import optax
 from flax import linen as nn
 
 from dew.artifacts import Representations
+from dew.batch import Variables
 from dew.inputs import Field, InputSpec, unit_range
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import explicit_spec, whole_spec
@@ -43,7 +44,6 @@ from dew.objectives.base import (
     Ratio,
     Shown,
     Step,
-    Variables,
     joined,
     model_rngs,
     part,

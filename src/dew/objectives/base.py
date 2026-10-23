@@ -22,7 +22,6 @@ from collections.abc import Callable, Collection, Hashable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import (
     TYPE_CHECKING,
-    Any,
     ClassVar,
     Generic,
     Literal,
@@ -43,6 +42,7 @@ from jax.tree_util import Partial
 from typing_extensions import TypeIs, TypeVar
 
 from dew.artifacts import Artifact, Artifacts, TokenScores
+from dew.batch import FROZEN, VALID_ROWS, Batch, Variables, merge
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import compensated_sum
 from dew.nn.protocols import HiddenStates, ProjectsParameters
@@ -68,19 +68,7 @@ if TYPE_CHECKING:
 
     type Task = TextGeneration | BlockGeneration | MaskedGeneration | TextToImage
 
-type Variables = Mapping[str, Any]
-"""A Flax variables dict: the `params` collection plus any other collection
-the modules keep (`moe`, `batch_stats`, an objective's frozen encoders)."""
 
-type Batch = Mapping[str, Any]
-"""One batch of training examples, as the trainer and every objective read it.
-
-It is declared here and imported by `dew.data.dataset`, so a field added on
-one side has the same type on the other. The values are not all arrays.
-Besides the arrays a step consumes, a batch can hold the prepared text inputs
-of a language run, the file paths a video corpus loads lazily, the integer
-row counts a packer keeps and the record lists a mixture reads. A narrower
-value type would be wrong about what `dew.data` already builds."""
 type Path = tuple[str, ...]
 type PathFilter = Callable[[Path], bool]
 """A function that selects leaves of a variables tree by the tuple of dict keys above them.
@@ -532,17 +520,6 @@ def select(tree: Variables, keep: PathFilter) -> Variables:
     return selected
 
 
-def merge(tree: Variables, overlay: Variables) -> Variables:
-    """Return a copy of `tree` with every leaf in `overlay` written over it."""
-    merged = dict(tree)
-    for name, child in overlay.items():
-        held = tree.get(name)
-        merged[name] = (merge(held, child)
-                        if isinstance(held, Mapping) and isinstance(child, Mapping)
-                        else child)
-    return merged
-
-
 TEACHER = "teacher"
 """The collection of a distilling objective's frozen teacher variables."""
 
@@ -565,37 +542,17 @@ def without(tree: Variables, paths: Sequence[Sequence[str]]) -> Variables:
                 del kept[name]
     return kept
 
-FROZEN = "frozen"
-"""The name of the collection where a partially trained run keeps its frozen weights.
-
-The optimizer updates the `params` collection and nothing else, so the
-leaves that `freeze` keeps in `params` are the ones that train. The frozen
-leaves stay in this collection as part of the state, and `thaw` merges the
-two before the model reads them."""
 
 PARAMETER_ROOTS = (("params",), (FROZEN,))
 """The collections of a variables tree that hold a model's parameters, which a run's loaders read
 and a storage dtype casts: the trained ones and the frozen."""
 
 
-VALID_ROWS = "valid_rows"
-
 EXAMPLE_ROWS = "example_rows"
 """A training batch's column of each row's place among its step's records, int32: the order the
 records' stream holds them in, whatever process read a row (`dew.training.distributed.marked`). The
 trainer's transaction reads it for the examples' draws (`Step.example_index`) and takes it out of the
 batch the objective sees."""
-"""The field every evaluation batch holds: one bool per row, True for a real record and False for a repeat.
-
-A split's last batch is padded to full size with repeats of its own rows, and
-a process whose share runs out before the others' scores a copy of its last
-batch in which every row is a repeat. That way a pass is whole batches on
-every process and counts each record once. A loss weights its rows by this
-field, and its batch-wide terms are taken over the real rows only. Training
-batches never have it.
-"""
-
-
 def freeze(variables: Variables, trainable: PathFilter) -> Variables:
     """Move the `params` leaves that `trainable` rejects into the `FROZEN` collection.
 
@@ -751,7 +708,6 @@ def _ruled_jvp(primals, tangents):
     moved_value, _, moved = tangents
     return value, moved_value + sum(jnp.vdot(leaf, change) for leaf, change in
                                     zip(jax.tree.leaves(rule), jax.tree.leaves(moved), strict=True))
-
 
 
 class Objective(ABC, Generic[Loss, Effects]):
@@ -1604,7 +1560,6 @@ def mean_of_totals(accumulated: tuple[float, float]) -> float:
     return accumulated[0] / accumulated[1]
 
 
-
 def token_log_probs(logits: jax.Array, tokens: jax.Array) -> jax.Array:
     """`log_softmax(logits)[..., tokens]`, reduced in fp32 whatever `logits` holds.
 
@@ -1617,36 +1572,7 @@ def token_log_probs(logits: jax.Array, tokens: jax.Array) -> jax.Array:
     """
     return -optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), tokens)
 
-__all__ = [
-    "FROZEN",
-    "OMITTED",
-    "VALID_ROWS",
-    "Aux",
-    "Batch",
-    "EMASpec",
-    "Metric",
-    "Objective",
-    "Omitted",
-    "Path",
-    "PathFilter",
-    "Prediction",
-    "ProgramModule",
-    "Ratio",
-    "SavedTask",
-    "Shown",
-    "Source",
-    "Step",
-    "TrainingScalar",
-    "TrainingScalars",
-    "Variables",
-    "everything",
-    "freeze",
-    "joined",
-    "merge",
-    "model_rngs",
-    "part",
-    "select",
-    "thaw",
-    "training_rngs",
-    "under",
-]
+__all__ = ["OMITTED", "Aux", "EMASpec", "Metric", "Objective", "Omitted", "Path", "PathFilter",
+           "Prediction", "ProgramModule", "Ratio", "SavedTask", "Shown", "Source", "Step",
+           "TrainingScalar", "TrainingScalars", "everything", "freeze", "joined", "model_rngs", "part",
+           "select", "thaw", "training_rngs", "under"]

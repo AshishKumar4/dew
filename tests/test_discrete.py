@@ -339,7 +339,7 @@ def test_a_masked_response_continues_the_prompts_fields_and_keeps_its_media():
 
 def test_a_packed_prompt_continues_its_last_document_as_if_alone():
     """A packed prompt numbers its documents from 1 and its padding 0
-    (`dew.nn.inputs.real_slots`), and its tokens sit at their places in their
+    (`dew.batch.real_slots`), and its tokens sit at their places in their
     documents (`Coordinates.places`): a row of two documents and a row padded
     by segment 0 each continue their last document's positions, reading back
     what that document alone does."""

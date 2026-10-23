@@ -21,11 +21,11 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import AbstractMesh, Mesh
 
+from dew.batch import Batch, LayoutRefused
 from dew.coordination import from_every_process
 from dew.data.dataset import rows_of
 from dew.nn.kernels.options import compiler_options
-from dew.nn.sharding import LayoutRefused
-from dew.objectives.base import RECORD, Batch, Objective
+from dew.objectives.base import RECORD, Objective
 from dew.records import JSON
 from dew.training.distributed import Placement, batch_divisor
 from dew.training.host import snapshot

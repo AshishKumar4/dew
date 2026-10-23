@@ -18,6 +18,7 @@ import numpy as np
 from jax.sharding import Mesh
 
 from dew.artifacts import Artifact, Artifacts
+from dew.batch import VALID_ROWS, Batch, Variables
 from dew.coordination import (
     agree_process_phase,
     agreed,
@@ -28,18 +29,7 @@ from dew.coordination import (
 )
 from dew.data.dataset import Closeable, DataPartition, Reader, rows_of
 from dew.data.pipeline import Dataset
-from dew.objectives.base import (
-    VALID_ROWS,
-    Batch,
-    Effects,
-    Loss,
-    Metric,
-    Objective,
-    Step,
-    TrainingScalar,
-    Variables,
-    recorded_name,
-)
+from dew.objectives.base import Effects, Loss, Metric, Objective, Step, TrainingScalar, recorded_name
 
 from .distributed import MeshSpec, shard_batch, split_fields, with_host
 

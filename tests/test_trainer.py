@@ -31,11 +31,12 @@ from token_support import write_token_corpus
 
 from dew import position
 from dew.artifacts import Representations
+from dew.batch import merge
 from dew.checkpoints import Ranking
 from dew.config import OptimConfig
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader, replayed
-from dew.objectives.base import Aux, EMASpec, Objective, merge, under
+from dew.objectives.base import Aux, EMASpec, Objective, under
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainState, ema_update
 from dew.training.evaluation import WARM_BATCHES
 from dew.training.model_flops import _TokenCount

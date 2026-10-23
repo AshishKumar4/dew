@@ -19,13 +19,14 @@ from jax.typing import ArrayLike, DTypeLike
 from typing_extensions import TypeVar
 
 from dew.artifacts import uint8_pixels
+from dew.batch import Variables
 from dew.coordination import agreed
 from dew.diffusion.process import Conditioning, Process
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, local_rows, mesh_of, request_key
 from dew.nn.kernels.options import compiler_options
-from dew.objectives.base import Variables, thaw
+from dew.objectives.base import thaw
 from dew.records import JSON
 from dew.registry import dtype_name, resolve_dtype
 from dew.sampling.guidance import CFG, Guidance, guidance_modules

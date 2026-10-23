@@ -23,6 +23,7 @@ from steady_state import steady_state
 import dew
 import dew.nn.backbones  # registers the models
 from dew.artifacts import VideoGrid
+from dew.batch import merge
 from dew.config import MetricConfig, ModelConfig, ObjectiveConfig, TrainerConfig
 from dew.data import ByteTokenizer, presets
 from dew.data.dataset import Loader
@@ -31,7 +32,6 @@ from dew.data.sources.files import Files
 from dew.diffusion.presets import EDM, Flow
 from dew.inference import RunProcessor, TextGeneration
 from dew.inputs import Field, unit_range
-from dew.objectives.base import merge
 from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
 from dew.sampling import CFG, DPMSolverSDE, Euler, Heun, TextToImage
 from dew.sampling.pipelines import Images
@@ -853,8 +853,8 @@ def test_saved_decoder_compute_and_storage_overrides_generate_from_the_same_weig
 ):
     import jax.numpy as jnp
 
+    from dew.batch import FROZEN
     from dew.inference import TextGeneration
-    from dew.objectives.base import FROZEN
 
     objective, state = make_lm_run(tmp_path)
     baseline = dew.pipeline(str(tmp_path))

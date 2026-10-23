@@ -18,6 +18,7 @@ import jax
 import numpy as np
 import tyro
 
+from dew.batch import Variables, merge
 from dew.config import MetricConfig, ModelConfig, ObjectiveConfig, Prepared, RunConfig, media_field
 from dew.data.compile import fitted
 from dew.data.dataset import record_argument
@@ -27,7 +28,6 @@ from dew.inputs import Condition, Field, InputSpec, rebuild
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.protocols import IntervalModel, TimeScaled
 from dew.nn.text_encoders import DEFAULT_MODEL
-from dew.objectives.base import Variables, merge
 from dew.records import number, record
 from dew.registry import (
     Configured,

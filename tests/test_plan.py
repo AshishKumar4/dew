@@ -15,13 +15,13 @@ import pytest
 from token_support import write_token_corpus
 
 from dew import cache
+from dew.batch import LayoutRefused
 from dew.checkpoints import Checkpoints
 from dew.data import Loading, presets
 from dew.data.compile import compile
 from dew.data.sources.tokens import TokenFiles
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
-from dew.nn.sharding import LayoutRefused
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_tile
 from dew.registry import mixers

@@ -1074,8 +1074,8 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
     import benchmark_models as bench
     import jax
 
+    from dew.batch import LayoutRefused
     from dew.coordination import agreed
-    from dew.nn.sharding import LayoutRefused
 
     rows = []
     for model in models:

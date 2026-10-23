@@ -41,6 +41,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
+from dew.mesh import mesh_axes
 from dew.nn.kernels.generation import gpu_target
 from dew.nn.precision import (
     at_least_fp32,
@@ -56,7 +57,7 @@ from dew.nn.precision import (
     scaled_logits,
 )
 from dew.nn.protocols import AffineHead, HiddenStates, Logits, LogitsFromHidden, OutputTable
-from dew.nn.sharding import logical_spec, mesh_axes
+from dew.nn.sharding import logical_spec
 
 
 def tile_columns(vocab_size: int, chunks: int, columns: int) -> int:

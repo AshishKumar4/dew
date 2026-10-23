@@ -35,7 +35,7 @@ import numpy as np
 from flax import struct
 from jax import lax
 
-from dew.nn.inputs import valid_order
+from dew.batch import valid_order
 from dew.nn.scatter import DROPPED
 from dew.sampling.vocabulary import (
     Referencing,

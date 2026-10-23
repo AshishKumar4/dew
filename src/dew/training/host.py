@@ -19,7 +19,7 @@ import numpy as np
 from jax.experimental.layout import Format
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, Sharding, SingleDeviceSharding
 
-from dew.objectives.base import Variables
+from dew.batch import Variables
 from dew.training.distributed import Placement
 
 

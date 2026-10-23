@@ -52,6 +52,7 @@ from flax.linen.dtypes import promote_dtype
 from flax.linen.module import Interceptor
 from flax.nnx import bridge
 
+from dew.batch import FROZEN, Variables, merge as overlay
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_plan import group_layers
@@ -82,7 +83,7 @@ from dew.nn.protocols import (
     CountedVideo,
 )
 from dew.nn.sharding import LOW_RANK_FACTORS
-from dew.objectives.base import FROZEN, Path, Variables, freeze, merge as overlay, select, thaw
+from dew.objectives.base import Path, freeze, select, thaw
 from dew.quantization import (
     FROZEN_FP8,
     QUANTIZATION,

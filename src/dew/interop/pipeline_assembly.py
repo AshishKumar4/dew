@@ -24,6 +24,7 @@ import numpy as np
 from flax import linen as nn
 
 from dew import records
+from dew.batch import Variables
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import Origin, SourceGrid, SourceSchedule
 from dew.inference.pipeline import place
@@ -45,7 +46,6 @@ from dew.interop.streaming import LazyTree, WeightLayout
 from dew.interop.weights import AUTO, ParamTree, source_alias
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import Variables
 from dew.registry import dtype_name, from_record, resolve_dtype
 from dew.sampling.guidance import CFG
 

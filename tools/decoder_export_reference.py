@@ -34,8 +34,8 @@ import optax
 import torch
 from torch.overrides import TorchFunctionMode
 
+from dew.batch import Variables
 from dew.interop.pretrained import Pretrained
-from dew.objectives.base import Variables
 from dew.objectives.lm import LMObjective
 from dew.training import TrainState
 

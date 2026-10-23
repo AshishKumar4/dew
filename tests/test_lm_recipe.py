@@ -344,9 +344,9 @@ def test_a_pretrained_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
     leave the base bitwise, and `Pretrained.from_run` rebuilds the adapter
     from the run's own record, so its `adapter.save` writes the files the
     in-process adapter writes, byte for byte."""
+    from dew.batch import FROZEN
     from dew.interop import Pretrained
     from dew.lora import LoRA
-    from dew.objectives.base import FROZEN
 
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
@@ -382,8 +382,8 @@ def test_a_scratch_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
     the files an adapter bound the same way in process writes, byte for
     byte. (A model with no exported family, as this one, has no
     `Pretrained` bundle; the adapter needs none.)"""
+    from dew.batch import FROZEN
     from dew.lora import Adapter
-    from dew.objectives.base import FROZEN
 
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     config = run_config(tokens, "--trainer.steps", "2", "--max-new-tokens", "0", "--trainer.name",

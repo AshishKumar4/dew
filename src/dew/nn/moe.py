@@ -31,6 +31,8 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import SymbolicZero
 from jax.sharding import PartitionSpec as P
 
+from dew.batch import LayoutRefused
+from dew.mesh import EXPERT_AXIS, STAGE_AXIS, batch_axes, mesh_axes
 from dew.nn.dense import Dense
 
 from .activations import GatedActivation, gated_product, relu2, swiglu_clamped
@@ -48,17 +50,7 @@ from .precision import (
     rounded_operand,
 )
 from .protocols import ProjectionGroup, Routes, declared_groups
-from .sharding import (
-    EXPERT_AXIS,
-    STAGE_AXIS,
-    LayoutRefused,
-    LogicalAxes,
-    batch_axes,
-    logical_axes,
-    logical_spec,
-    mesh_axes,
-    seen_whole,
-)
+from .sharding import LogicalAxes, logical_axes, logical_spec, seen_whole
 
 # 'softmax' normalizes a token's affinities over the experts (Mixtral,
 # Qwen3.5); 'sigmoid' scores each expert on its own (DeepSeek V3, GLM, Kimi,

@@ -28,6 +28,7 @@ from jax.typing import DTypeLike
 
 from dew import records
 from dew._model_types import QWEN35_TYPES
+from dew.batch import Variables
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
@@ -66,7 +67,6 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import MultimodalTransformer
-from dew.objectives.base import Variables
 from dew.registry import dtype_name, from_record, projectors, rebuilt, resolve_dtype, towers
 from dew.sampling.pipelines import TextToImage
 from dew.sampling.text import Sampling

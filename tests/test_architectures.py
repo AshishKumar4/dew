@@ -30,13 +30,14 @@ from recording import RecordingTracker
 from reference_error import assert_leaves_as_exact, float64_terms
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
+from dew.batch import VALID_ROWS
 from dew.config import MetricConfig, ModelConfig, ObjectiveConfig
 from dew.data.dataset import Loader
 from dew.diffusion import presets
 from dew.eval.images import DEFAULT_MODEL
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.attention import Stage
-from dew.objectives.base import VALID_ROWS, Step
+from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective, DiffusionRunConfig
 from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective

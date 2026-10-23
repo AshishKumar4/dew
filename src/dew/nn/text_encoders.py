@@ -39,6 +39,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
+from dew.batch import coordinates
 from dew.interop.components import bind_component, component_source
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.weights import ParamTree, translate_parameters
@@ -48,7 +49,7 @@ from dew.nn.blocks import TokenEmbedding
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
 from dew.nn.flops import matching_lengths, patch_lengths
-from dew.nn.inputs import AttentionMetadata, coordinates
+from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mlp import GatedMLP

@@ -99,12 +99,11 @@ from forked import forked_map
 ROOT = Path(__file__).resolve().parent.parent
 
 # The two sanctioned open-mapping aliases: one variables tree, one batch, both
-# declared in dew.objectives.base, which is the layer both the trainer and the
-# data pipeline already depend on. Every other open dictionary in a contract is
-# SLOP002, and a second declaration of either name is an import that was not
-# written.
-SANCTIONED_ALIASES = {"Variables": "src/dew/objectives/base.py",
-                      "Batch": "src/dew/objectives/base.py"}
+# declared in dew.batch, the batch contract below every layer that reads them.
+# Every other open dictionary in a contract is SLOP002, and a second
+# declaration of either name is an import that was not written.
+SANCTIONED_ALIASES = {"Variables": "src/dew/batch.py",
+                      "Batch": "src/dew/batch.py"}
 MAPPINGS = {"dict", "Dict", "Mapping", "MutableMapping", "defaultdict", "OrderedDict"}
 OPEN_VALUES = {("dict", "Any"), ("Dict", "Any"), ("Mapping", "Any"), ("MutableMapping", "Any"),
                ("defaultdict", "Any"), ("OrderedDict", "Any"), ("dict", "object"),

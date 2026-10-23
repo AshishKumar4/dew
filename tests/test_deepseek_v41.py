@@ -39,11 +39,12 @@ import pytest
 from flax.traverse_util import flatten_dict, unflatten_dict
 from reference_error import FACTOR, distance
 
+from dew.batch import coordinates
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import families, translate_config, translate_wrapper_config
 from dew.nn.engram import Engram
 from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS, fake_quant_fp4, fake_quant_fp8
-from dew.nn.inputs import ModelInputs, coordinates
+from dew.nn.inputs import ModelInputs
 from dew.registry import models
 from dew.sampling import Sample, Sampling, Speculative, generate
 from tools.deepseek_v41_numerics import QUANTIZERS, unquantized, vision_bundle, vision_run

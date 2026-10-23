@@ -7,11 +7,12 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype
 
+from dew.batch import Variables
 from dew.decision.head import Head
 from dew.decision.layout import DecisionInputs
 from dew.nn.inputs import ModelInputs
 from dew.nn.protocols import HiddenStates, VocabularyRows
-from dew.objectives.base import Variables, part, thaw
+from dew.objectives.base import part, thaw
 
 
 @dataclass(frozen=True)

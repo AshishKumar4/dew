@@ -48,10 +48,10 @@ from uuid import uuid4
 import jax
 import numpy as np
 
+from dew.batch import Batch
 from dew.data.prompts import PromptRecord
 from dew.inference.rollouts import Draw, InfrastructureError, RolloutServer
 from dew.inference.serving import settled
-from dew.objectives.base import Batch
 
 from .episodes import (
     Action,

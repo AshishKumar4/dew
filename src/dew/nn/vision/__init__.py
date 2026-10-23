@@ -51,8 +51,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from dew.batch import Variables
 from dew.interop.weights import placed
-from dew.objectives.base import Variables
 
 from .common import (
     ProjectorBase as ProjectorBase,

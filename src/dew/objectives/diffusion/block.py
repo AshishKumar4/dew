@@ -23,16 +23,15 @@ import jax.numpy as jnp
 from flax import linen as nn, struct
 
 from dew.artifacts import TokenScores
+from dew.batch import FROZEN, Batch, Variables, token_layout
 from dew.inference.tasks import BlockGeneration, BlockSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
-from dew.nn.inputs import ModelInputs, token_layout
+from dew.nn.inputs import ModelInputs
 from dew.nn.protocols import BlockDenoiser, CacheCapacity, LayerScalars
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
-    FROZEN,
     OMITTED,
     Aux,
-    Batch,
     EMASpec,
     Objective,
     Omitted,
@@ -40,7 +39,6 @@ from dew.objectives.base import (
     Ratio,
     Source,
     Step,
-    Variables,
     model_rngs,
     thaw,
 )

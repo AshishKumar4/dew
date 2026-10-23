@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
 
+from dew.batch import Variables
 from dew.coordination import agreed, from_every_process
 from dew.inference.tasks import Processor, TextGeneration, TextSettings
 from dew.nn.dense import Dense
@@ -24,7 +25,6 @@ from dew.objectives.base import (
     Ratio,
     Shown,
     Step,
-    Variables,
     joined,
     part,
     projected_draw,

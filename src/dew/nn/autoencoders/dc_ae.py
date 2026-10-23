@@ -25,10 +25,10 @@ import jax.numpy as jnp
 from flax.typing import Dtype
 
 from dew import records
+from dew.batch import Variables
 from dew.interop.components import bind_component
 from dew.interop.weights import indexed_path
 from dew.nn.dense import Dense
-from dew.objectives.base import Variables
 
 from ..activations import gated_product
 from ..attention import rms_normalized

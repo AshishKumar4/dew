@@ -31,10 +31,10 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.artifacts import TokenScores
+from dew.batch import Variables, real_slots
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.inference.tasks import MaskedGeneration, MaskedSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
-from dew.nn.inputs import real_slots
 from dew.nn.protocols import TokenModel
 from dew.objectives.base import (
     OMITTED,
@@ -46,7 +46,6 @@ from dew.objectives.base import (
     Shown,
     Source,
     Step,
-    Variables,
     model_rngs,
     thaw,
 )
@@ -64,7 +63,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
     """Trains a masked diffusion model on the MDLM negative ELBO.
 
     A batch holds `[B, seq_len]` token ids under `batch["text"]`, and packed
-    windows also their `text_coordinates` (`dew.nn.inputs.Coordinates`).
+    windows also their `text_coordinates` (`dew.batch.Coordinates`).
     """
 
     saved_task = MaskedGeneration

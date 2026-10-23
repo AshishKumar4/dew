@@ -21,6 +21,7 @@ import numpy as np
 from flax import linen as nn, struct
 from typing_extensions import TypeVar, get_protocol_members
 
+from dew.batch import Variables, real_slots
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import (
     ModelInputs,
@@ -30,11 +31,9 @@ from dew.nn.inputs import (
     mesh_of,
     next_position,
     prompt_major,
-    real_slots,
 )
 from dew.nn.kernels.options import compiler_options
 from dew.nn.protocols import BlockDenoiser
-from dew.objectives.base import Variables
 
 ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
 

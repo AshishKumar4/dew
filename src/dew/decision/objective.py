@@ -13,6 +13,7 @@ import numpy as np
 from flax import linen as nn
 
 from dew.artifacts import Decisions
+from dew.batch import Batch, Variables
 from dew.data.pipeline import Configured, ObjectiveData, Pack, Rejected
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Temperatures
@@ -44,14 +45,12 @@ from dew.nn.protocols import CountedDecisions, CountedTraining, TokenModel
 from dew.objectives.base import (
     OMITTED,
     Aux,
-    Batch,
     Objective,
     Omitted,
     ProgramModule,
     Ratio,
     Source,
     Step,
-    Variables,
     joined,
     model_rngs,
     part,

@@ -4,9 +4,10 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from dew.batch import LayoutRefused
+from dew.mesh import SEQUENCE_AXIS
 from dew.nn.inputs import MixerCall
 from dew.nn.mla import MultiHeadLatentAttention
-from dew.nn.sharding import SEQUENCE_AXIS, LayoutRefused
 
 
 @pytest.mark.mesh

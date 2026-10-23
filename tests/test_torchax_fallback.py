@@ -174,8 +174,9 @@ def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placemen
     tensor's axes, and the one placement keeps the frozen tensors whole over fsdp, split over the
     tensor axis as the table splits them, while the trained ones, their moments and one step's
     update lie as the split layout lays them."""
-    from dew.nn.sharding import mesh_axes
-    from dew.objectives.base import FROZEN, freeze
+    from dew.batch import FROZEN
+    from dew.mesh import mesh_axes
+    from dew.objectives.base import freeze
     from dew.training.distributed import shard_batch
 
     variables = freeze(loaded.variables, lambda path: ".layers.1." in path[1])

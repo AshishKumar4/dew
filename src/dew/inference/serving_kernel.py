@@ -20,6 +20,7 @@ from jax.experimental import checkify
 from jax.experimental.layout import Format, Layout
 from jax.sharding import Mesh, NamedSharding
 
+from dew.batch import Variables
 from dew.inference.tasks import cache_sized
 from dew.nn.inputs import Admitted, ModelInputs
 from dew.nn.kernels.options import compiler_options
@@ -28,7 +29,6 @@ from dew.nn.kv_cache import POOLED, ROW_CURSORS, TABLE, as_words, from_words, gr
 from dew.nn.protocols import Serving
 from dew.nn.scatter import DROPPED
 from dew.nn.sharding import logical_spec
-from dew.objectives.base import Variables
 from dew.sampling import decoding
 from dew.sampling.decoding import LogitsTransform, StepState
 from dew.sampling.guided import Grammar

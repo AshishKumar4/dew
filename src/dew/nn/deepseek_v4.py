@@ -49,6 +49,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
+from dew.batch import valid_order
 from dew.nn.attention import (
     RMSNorm,
     cache_positions,
@@ -60,7 +61,7 @@ from dew.nn.attention import (
 from dew.nn.dense import Dense, DenseGeneral
 from dew.nn.documents import document_mask
 from dew.nn.fake_quant import FakeQuantizing
-from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, valid_order
+from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kv_cache import KVCache, write_cache
 from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
 from dew.nn.mla import IndexerFront

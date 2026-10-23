@@ -22,10 +22,11 @@ import jax
 import jax.numpy as jnp
 
 from dew.artifacts import TokenScores
+from dew.batch import Variables
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.inputs import Field, InputSpec
 from dew.nn.precision import at_least_fp32
-from dew.objectives.base import Aux, EMASpec, Ratio, Shown, Variables, thaw
+from dew.objectives.base import Aux, EMASpec, Ratio, Shown, thaw
 from dew.objectives.lm.chunked import final_read, head_cross_entropy
 from dew.rl import behavior_importance_weights, k3_kl, masked_mean, sequence_log_ratio, token_log_ratio
 from dew.rl.surrogate import (

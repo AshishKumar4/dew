@@ -46,9 +46,9 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import SingleDeviceSharding
 
+from dew.batch import Variables
 from dew.coordination import agreed, byte_groups, collective_host
 from dew.nn.inputs import mesh_of
-from dew.objectives.base import Variables
 from dew.records import JSON
 from dew.telemetry.devices import primary_context
 

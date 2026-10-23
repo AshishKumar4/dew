@@ -54,10 +54,10 @@ def test_public_pipeline_source_storage_and_saved_block_compute_are_independent(
     import optax
 
     import dew
+    from dew.batch import FROZEN
     from dew.inference import BlockGeneration
     from dew.inference.pipeline import place
     from dew.nn.diffusion_gemma import DiffusionGemma
-    from dew.objectives.base import FROZEN
     from dew.objectives.diffusion.block import BlockDiffusionObjective
     from dew.training import Checkpoints, Trainer
 

@@ -20,8 +20,9 @@ import jax.numpy as jnp
 import optax
 
 from dew.artifacts import Artifact, Representations
+from dew.batch import Batch
 from dew.eval.common import metric_device
-from dew.objectives.base import Batch, Objective, Shown, mean_of_totals, merge_totals
+from dew.objectives.base import Objective, Shown, mean_of_totals, merge_totals
 
 
 class ProbeParams(NamedTuple):

@@ -119,6 +119,7 @@ def build(args: argparse.Namespace) -> Run:
 
     from work import measure
 
+    from dew.batch import coordinates
     from dew.config import OptimConfig
     from dew.interop import Pretrained
     from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -127,8 +128,6 @@ def build(args: argparse.Namespace) -> Run:
     from dew.training import MeshSpec, Trainer
     from dew.training.distributed import batch_shardings
     from dew.training.optim import Cosine, ParamGroup
-
-    from dew.nn.inputs import coordinates
 
     data = np.load(args.data)
     windows, order = data["windows"], data["order"]

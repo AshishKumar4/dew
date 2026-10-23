@@ -12,7 +12,7 @@ from pathlib import Path
 import jax
 import numpy as np
 
-from dew.objectives.base import Variables
+from dew.batch import Variables
 
 from .episodes import Action, Episode, EpisodeId
 from .records import action_record, episode_from_record

@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.batch import Batch, Variables, token_id
 from dew.coordination import (
     PeerFailure,
     agree_process_phase,
@@ -31,8 +32,7 @@ from dew.coordination import (
 )
 from dew.data.dataset import DataPartition
 from dew.inference.rollouts import check_ending
-from dew.nn.inputs import ModelInputs, mesh_of, pad_token_rows, token_id
-from dew.objectives.base import Batch, Variables
+from dew.nn.inputs import ModelInputs, mesh_of, pad_token_rows
 from dew.sampling.text import Generation, Sampling
 from dew.training.state import TrainState
 

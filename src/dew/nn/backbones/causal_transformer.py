@@ -35,8 +35,9 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.batch import Coordinates, LayoutRefused, coordinates as build_coordinates, merge
+from dew.mesh import row_axes
 from dew.nn.dense import Dense
-from dew.objectives.base import merge
 from dew.records import JSON
 from dew.registry import from_record, read_arguments
 
@@ -59,15 +60,7 @@ from ..hyper_connections import (
     expand_streams,
     first_stream,
 )
-from ..inputs import (
-    AttentionMetadata,
-    Coordinates,
-    LayerInputs,
-    PredictionPhase,
-    coordinates as build_coordinates,
-    coordinates_of,
-    numbered_blocks,
-)
+from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase, coordinates_of, numbered_blocks
 from ..kv_cache import KVCache
 from ..mixer_base import MLP_RESIDUALS, RESIDUALS
 from ..mixers import AttentionMixer, MixerBase, MixerContext
@@ -87,15 +80,7 @@ from ..precision import (
 )
 from ..protocols import OutputTable, ProjectionGroup, QuantizesInputs, declared_groups
 from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
-from ..sharding import (
-    RESIDUAL,
-    LayoutRefused,
-    constrain,
-    logical_axes,
-    microbatches,
-    pipeline_stages,
-    row_axes,
-)
+from ..sharding import RESIDUAL, constrain, logical_axes, microbatches, pipeline_stages
 from .decoder_block import (
     DECODER_REMAT,
     NORM_SITES,
@@ -1742,7 +1727,7 @@ class CausalTransformer(nn.Module):
           states are the masked call's, the padding's are unspecified, and a
           causal layer runs as an unpadded call does.
         - `coordinates` are the tokens' documents, validity and positions as
-          the batch's builder made them (`dew.nn.inputs.coordinates`, with the
+          the batch's builder made them (`dew.batch.coordinates`, with the
           packer's `max_segments`); where None they are built here from
           `segment_ids`, `attention_mask`, `positions` and `right_padded`.
         """

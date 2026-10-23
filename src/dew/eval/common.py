@@ -10,7 +10,8 @@ import numpy as np
 from jax.typing import ArrayLike
 
 from dew.artifacts import Artifact, ImageGrid, VideoGrid
-from dew.objectives.base import Batch, Shown, mean_of_totals, merge_totals
+from dew.batch import Batch
+from dew.objectives.base import Shown, mean_of_totals, merge_totals
 
 
 @dataclass(frozen=True, eq=False)
