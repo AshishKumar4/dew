@@ -17,9 +17,9 @@ import sys
 MONTHS = ("January|February|March|April|May|June|July|August|September|October|November|December|"
           "Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec")
 DATE = re.compile(rf"\b(?:19|20)\d\d-[01]\d-[0-3]\d\b|\b(?:{MONTHS})\.? [0-3]?\d(?:st|nd|rd|th)?\b"
-                  rf"|\b[0-3]?\d(?:st|nd|rd|th)? (?:{MONTHS})\.? (?:19|20)\d\d\b")
-"""A calendar date: ISO (2026-10-22), a month and its day (October 22, Oct. 22nd), a day, month and
-year (22nd Oct. 2026)."""
+                  rf"|\b[0-3]?\d(?:st|nd|rd|th)? (?:of )?(?:{MONTHS})\b")
+"""A calendar date: ISO (2026-10-22), a month and its day (October 22, Oct. 22nd), a day and its month,
+with or without a year (22 October, the 22nd of Oct. 2026)."""
 PROSE = ("*.md", "*.mdx")
 DATA = (":(exclude)site/public", ":(exclude)tests/fixtures")
 
