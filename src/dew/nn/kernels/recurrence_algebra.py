@@ -524,9 +524,11 @@ def key_decayed_row(query, weighted_key, gate, low, earlier: Load, place, chunk:
     def column(j, sums):
         gate_j, low_j, key_j = earlier(j)
         gated = key_j * raised(gate - gate_j, low - low_j)
-        here = (index == j)[None, :]
-        return (jnp.where(here, (jnp.sum(query * gated, axis=1) * scale)[:, None], sums[0]),
-                jnp.where(here & (j < place), jnp.sum(weighted_key * gated, axis=1)[:, None], sums[1]))
+        here = index == j
+        # The earlier columns as a vector's mask: Mosaic GPU's layouts take no scalar condition over a tile.
+        return (jnp.where(here[None, :], (jnp.sum(query * gated, axis=1) * scale)[:, None], sums[0]),
+                jnp.where((here & (index < place))[None, :], jnp.sum(weighted_key * gated, axis=1)[:, None],
+                          sums[1]))
 
     empty = jnp.zeros((query.shape[0], chunk), jnp.float32)
     return jax.lax.fori_loop(0, place + 1, column, (empty, empty))
@@ -551,6 +553,6 @@ def key_decayed_output(queries: Load, gates: Load, entered: Load, columns: int, 
         gated = (query * raised(*gates(c))).astype(query.dtype)
         out = out + issue("memory", gated, entered(c).astype(gated.dtype))
     out = out * scale
-    index = jnp.arange(scores.shape[0])
-    local = jnp.where(index[:, None] >= index[None, :], scores, 0.0).astype(value.dtype)
+    rows, cols = _grid(scores.shape)
+    local = jnp.where(rows >= cols, scores, 0.0).astype(value.dtype)
     return out + issue("local", local, value)

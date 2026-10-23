@@ -5,6 +5,9 @@ Hopper), each product a synchronous warp-level MMA of 16-bit operands loaded fro
 operand layouts (ldmatrix) and accumulated in registers. A register operand reaches a product through shared
 memory (`stage`): Mosaic GPU's layout inference finds no cast from an accumulator's layout to an operand's."""
 
+import contextlib
+import contextvars
+
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -19,6 +22,20 @@ def swizzled(rows: int, columns: int, dtype) -> tuple:
     its rows' bytes allow, swizzled, as Mosaic GPU's MMA operand loads (ldmatrix) read them."""
     swizzle = plgpu.find_swizzle(columns * jnp.dtype(dtype).itemsize * 8)
     return plgpu.TilingTransform((8, swizzle // jnp.dtype(dtype).itemsize)), plgpu.SwizzleTransform(swizzle)
+
+
+_INTERPRETED = contextvars.ContextVar("interpreted", default=False)
+"""Whether the kernel being traced runs in Mosaic GPU's interpreter, which lowers no mma.sync and no cp.async:
+its products are then the dots they compute, and its loads plain copies."""
+
+
+@contextlib.contextmanager
+def _interpreted(interpret: bool):
+    token = _INTERPRETED.set(interpret)
+    try:
+        yield
+    finally:
+        _INTERPRETED.reset(token)
 
 
 class _Stream:
@@ -58,11 +75,16 @@ class MmaSync(mosaic.Family):
     rows = 64
     layout = plgpu.Layout.MMA_ACC(jnp.bfloat16)
     row = layout.reduce(1)
+    column = layout.reduce(0)
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int, interpret: bool):
         if consumers != 1:
             raise NotImplementedError("mma.sync's programs are one warpgroup")
-        return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
+        def traced(*refs):
+            with _interpreted(interpret):
+                entry(*refs)
+
+        return plgpu.kernel(traced, out_type=out_type, grid=grid, grid_names=grid_names,
                             compiler_params=mosaic.compiler_params(),
                             interpret=plgpu.InterpretGPUParams() if interpret else None)
 
@@ -95,6 +117,9 @@ class MmaSync(mosaic.Family):
         def copy(index, slot):
             views = next(iter(streams.values())).views(index)
             for name in names:
+                if _INTERPRETED.get():
+                    streams[name].smem.at[slot][...] = views[name][...]
+                    continue
                 plgpu.copy_gmem_to_smem(views[name], streams[name].smem.at[slot], None,
                                         oob_mode=plgpu.OOBFillMode.PROMISE_IN_BOUNDS)
 
@@ -112,7 +137,8 @@ class MmaSync(mosaic.Family):
                     self.settled()
                     copy(index, 0)
                 # The wait's barrier also ends every warp's reads of the slot the next copy refills.
-                plgpu.wait_gmem_to_smem(ahead * len(names))
+                if not _INTERPRETED.get():
+                    plgpu.wait_gmem_to_smem(ahead * len(names))
                 if ahead:
                     copy(jnp.minimum(index + ahead, hi - 1), lax.rem(index + ahead - first, stages))
                 return step(index, _Slots(streams, lax.rem(index - first, stages)), *both)
@@ -131,7 +157,10 @@ class MmaSync(mosaic.Family):
         return plgpu.load(ref, layout=layout(ref.dtype))
 
     def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
-        out = plgpu.mma(self.zeros(shape), self.operand(lhs, "lhs"), self.operand(rhs, "rhs"))
+        if _INTERPRETED.get():
+            out = jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
+        else:
+            out = plgpu.mma(self.zeros(shape), self.operand(lhs, "lhs"), self.operand(rhs, "rhs"))
         if then is not None:
             then()
         return out
@@ -183,6 +212,12 @@ class MmaSync(mosaic.Family):
 
     def rows_of(self, ref) -> jax.Array:
         return plgpu.load(ref, layout=self.row, optimized=False)
+
+    def columns_of(self, ref) -> jax.Array:
+        """A column vector read from `ref` (`[columns]`) in a column's layout. Two loads of one view in a
+        row's and a column's layouts are one load to Mosaic GPU's layout inference, which then finds none for
+        it."""
+        return plgpu.load(ref, layout=self.column, optimized=False)
 
     def as_row(self, vector: jax.Array) -> jax.Array:
         return plgpu.layout_cast(vector, self.row)

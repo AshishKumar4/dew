@@ -281,8 +281,9 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     (`starts`, at most `max_segments` a row) each compute as they would alone. A conv runs before the
     op: it takes the conv's output. The operands the hooks read are checked as the decode step's
     (`recurrence.read`), and a rated decay is taken on its declared domain, a contraction. `mainloop`
-    'mosaic' runs a decay a head or none, with or without the delta rule, on the recurrence template's Mosaic
-    GPU mainloop (`mosaic_rule`), a route no target's row takes yet: only a caller naming it runs it."""
+    'mosaic' runs a decay a head or none, with or without the delta rule, and one a key dimension under it,
+    on the recurrence template's Mosaic GPU mainloop (`mosaic_rule`), a route no target's row takes yet: only
+    a caller naming it runs it."""
     if hooks.conv is not None:
         raise ValueError("the chunked op takes the conv's output: its queries, keys and values")
     given = recurrence.read(hooks, operands, optional=('state',))
@@ -305,9 +306,9 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     state, starts = operands.state, operands.starts
     epilogue = hooks.skip or hooks.output is not None
     if mainloop is not None:
-        if mainloop != 'mosaic' or hooks.decay == 'vector':
+        if mainloop != 'mosaic' or (hooks.decay == 'vector' and not hooks.delta):
             raise ValueError(f"the {mainloop!r} mainloop does not take {hooks}: the 'mosaic' one runs a "
-                             "decay a head or none")
+                             "decay a head or none, and one a key dimension under the delta rule")
         out, final = mosaic_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
                                  scale=scale, delta=hooks.delta, wide=True)
         out = recurrence.skipped(hooks, out, value, given, work)
@@ -429,16 +430,19 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
 
 def mosaic_rule(query, key, value, g, beta, state=None, *, starts=None, max_segments: int | None = None,
                 scale: float | None = None, delta: bool = True, wide: bool = False):
-    """A decay a head's chunked rule, with or without the `delta` rule, on the recurrence template's Mosaic
-    GPU mainloop (`templates.recurrence.mainloop.forward`, its forward alone): `fla_rule`'s operands and
-    results, the operands in their common dtype and beta with them, the decay and the memory fp32, on one
-    device."""
+    """The chunked rule, a decay a head (`g` `[B, S, Hv]`) or a key dimension (`[B, S, Hv, Dk]`), with or
+    without the `delta` rule, on the recurrence template's Mosaic GPU mainloop
+    (`templates.recurrence.mainloop.forward`, its forward alone): `fla_rule`'s operands and results, the
+    operands in their common dtype and beta with them, the decay and the memory fp32, on one device,
+    interpreted off a GPU of the instruction family its bundle claims (Mosaic GPU's interpreter)."""
     from .templates.recurrence import mainloop
 
     dtype = jnp.result_type(query, key, value)
     query, key, value, beta = (x.astype(dtype) for x in (query, key, value, beta))
+    interpret = generation.family(generation.device_generation()) != mainloop.FAMILY.name
     return mainloop.forward(query, key, value, g.astype(jnp.float32), beta, state, starts=starts,
-                            max_segments=max_segments, scale=scale, delta=delta, wide=wide)
+                            max_segments=max_segments, scale=scale, delta=delta, wide=wide,
+                            interpret=interpret)
 
 
 RECOMPUTED: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar("recomputed", default=())
