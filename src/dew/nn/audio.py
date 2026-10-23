@@ -23,10 +23,10 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import records
 from dew.interop.weights import ParamTree, placed
-from dew.nn.blocks import sinusoid_frequencies, sinusoids
 from dew.nn.dense import Dense
 from dew.nn.inputs import sequence_blocks
 from dew.nn.precision import float32_dot_general, float32_products, products_dtype
+from dew.nn.rope import sinusoid_frequencies, sinusoids
 from dew.registry import from_record
 
 from .activations import activation
@@ -250,7 +250,8 @@ def _block_context(x, chunk: int, left: int, right: int):
 def _position_signal(width: int, positions, dtype):
     """Embed each relative position as `width` sinusoids, sines then cosines."""
     half = width // 2
-    inv = jnp.asarray(sinusoid_frequencies(half, max(half - 1, 1)))
+    # `exp(-ln(10000) i / (half - 1))`, which is `10000 ** (-i / (half - 1))`, rounded once from float64.
+    inv = jnp.asarray(sinusoid_frequencies(half, max(half - 1, 1), dtype=np.float32))
     return sinusoids(positions.astype(jnp.float32)[:, None] * inv[None, :]).astype(dtype)
 
 
