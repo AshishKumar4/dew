@@ -1328,21 +1328,16 @@ def normalized(logits: jax.Array, peak: jax.Array, total: jax.Array, how: Recomp
 
 
 def grad_scores(exponentials: jax.Array, products: jax.Array, anchor: jax.Array, delta: jax.Array,
-                seen: jax.Array | None, at_anchor: jax.Array | None, inverse_total: jax.Array, *,
-                anchored: bool) -> jax.Array:
-    """The score cotangents `p (dP - D)` of a tile, zero where unseen (`where_seen`). `anchored`, the
-    reference's own order, as JAX differentiates `exp(s - m) / T`: each query's `(dP - c) - (D - c)` about
-    its anchor c (`off_anchor_delta`) over its denominator (`inverse_total`), then times the unnormalized
-    weights `exp(s - m)`, so every intermediate lies where the reference's does (a weight below fp32's range
-    keeps its share beside a large product, and none overflows that the reference keeps); the anchor key's
-    own `dP - c` is 0 by definition where `at_anchor` names it, whatever its product's rounding, so a query
-    that sees one key has no cotangent, as the reference's. Else FlashAttention's order,
-    `exp(s - m) ((dP - D) / T)`, D summed once, no anchor test: the dK/dV launch's in the fast form, whose
-    refined D (`refinement`) takes up what the anchor test would (dQ without it is check 1's breach at a
-    query of one key: its gradient, exactly 0, comes out of `dP - D`'s rounding)."""
-    if not anchored:
-        centred = (products - expand(anchor + delta, products)) * expand(inverse_total, products)
-        return where_seen(seen, exponentials * centred, 0.0)
+                seen: jax.Array | None, at_anchor: jax.Array | None, inverse_total: jax.Array) -> jax.Array:
+    """The score cotangents `p (dP - D)` of a tile in the reference's own order, as JAX differentiates
+    `exp(s - m) / T`: each query's `(dP - c) - (D - c)` about its anchor c (`off_anchor_delta`) over its
+    denominator (`inverse_total`), then times the unnormalized weights `exp(s - m)`, so every intermediate
+    lies where the reference's does (a weight below fp32's range keeps its share beside a large product, and
+    none overflows that the reference keeps); zero where unseen (`where_seen`). The anchor key's own
+    `dP - c` is 0 by definition where `at_anchor` names it, whatever its product's rounding, so a query that
+    sees one key has no cotangent, as the reference's: FlashAttention's order, `(dP - D) / T` with no anchor
+    test, fails check 1 there in both dQ and dK (a query of one key, the stability suite's ordinary "one
+    key" and causal windows' first queries: rows whose float64 gradient is exactly 0)."""
     relative = products - expand(anchor, products)
     if at_anchor is not None:
         relative = jnp.where(at_anchor, 0.0, relative)

@@ -272,22 +272,19 @@ class _Tile(NamedTuple):
     keys: int
 
 
-def _scores(tile: _Tile, s, dp, peak, total, anchor, delta, chosen, *, how: algebra.Recompute, scale: float,
-            anchored: bool):
-    """A backward tile's weights unnormalized and over `total`, its score cotangents, `anchored` or not
-    (`algebra.grad_scores`), its entries' derivatives and its mask from its products `s` and `dp` and its
-    queries' statistics: positions only where it takes a mask or the anchor test."""
-    k_pos = tile.k_first + mosaic_sm90.iota(tile.shape, 1) if tile.masked or anchored else None
+def _scores(tile: _Tile, s, dp, peak, total, anchor, delta, chosen, *, how: algebra.Recompute, scale: float):
+    """A backward tile's weights unnormalized and over `total`, its score cotangents (`algebra.grad_scores`),
+    its entries' derivatives and its mask from its products `s` and `dp` and its queries' statistics."""
+    k_pos = tile.k_first + mosaic_sm90.iota(tile.shape, 1)
     seen = None
-    if tile.masked and k_pos is not None:
+    if tile.masked:
         q_pos = tile.q_first + mosaic_sm90.iota(tile.shape, 0)
         seen = (k_pos <= q_pos if tile.causal else k_pos >= 0) & (k_pos < tile.keys)
     logits, slopes = algebra.tile_logits(None, s, seen, None, None, (),
                                          scale=scale if how.factor is None else 1.0, slopes=True)
     exponentials, weights = algebra.normalized(logits, peak, total, how)
-    at_anchor = None if k_pos is None or not anchored else k_pos == algebra.expand(chosen, k_pos)
-    cotangents = algebra.grad_scores(exponentials, dp, anchor, delta, seen, at_anchor, algebra.inverse(total),
-                                     anchored=anchored)
+    at_anchor = k_pos == algebra.expand(chosen, k_pos)
+    cotangents = algebra.grad_scores(exponentials, dp, anchor, delta, seen, at_anchor, algebra.inverse(total))
     return exponentials, weights, cotangents, slopes, seen
 
 
@@ -349,8 +346,7 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, *
                     # a hook nothing past the cotangents reads the mask (`algebra.pulled`).
                     tile = _Tile(first, index * block_k, shape, masked, causal, keys_count)
                     exponentials, _, cotangents, _, _ = _scores(tile, s, dp, peak, prior, anchor, delta,
-                                                                chosen, how=how, scale=scale,
-                                                                anchored=True)
+                                                                chosen, how=how, scale=scale)
                     return exponentials, cotangents
 
                 # One walk, its tiles' masks chosen a tile at a time: a walk of two loops into one warpgroup
@@ -505,8 +501,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
                     # a hook nothing past the cotangents reads the mask (`algebra.pulled`).
                     tile = _Tile(q_first, k_first, shape, masked, causal, keys_count)
                     exponentials, weights, cotangents, _, _ = _scores(
-                        tile, s, dp, peak, denominator, centre, rest, chosen, how=how, scale=scale,
-                        anchored=accurate)
+                        tile, s, dp, peak, denominator, centre, rest, chosen, how=how, scale=scale)
                     return exponentials, weights, cotangents
 
                 # One walk, its tiles' masks chosen a tile at a time (`_dq_launch`'s walk).
