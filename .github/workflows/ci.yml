@@ -194,14 +194,23 @@ jobs:
     # MODELS, so every case runs in one. A commit proven on another push is not run
     # again. One run's armada jobs at a time (`armada`, queued in order): two
     # runs' suites fill the deployment's fleet, and the gangs, which need
-    # four containers at once, then wait out their deadline (armada#49). A
-    # base/<producer> promote (ci/base-*) that reruns what its change reaches
-    # from the producer's tip, and no gangs, which main's trains run, takes a
-    # group of its own, so a train never waits on it; one that falls back to
-    # the whole suite takes `armada`, as two whole suites cannot share the
-    # fleet (Main).
+    # four containers at once, then wait out their deadline (armada#49). Runs
+    # that rerun only what their change reaches share the fleet, each in a
+    # group of its own (owner, 2026-10-23): a land-queue train's by its slot
+    # (ci/batch-<worker>-slotN-*, ci/fix-<worker>-slotN), up to three at once,
+    # and a base/<producer> promote's (ci/base-*). The whole suite on main,
+    # every fifth publish, runs in the background (ci/full-whole-*), in its
+    # own group and with no gangs, which every train runs, so no train waits
+    # on it. Any other run, and a base promote that falls back to the whole
+    # suite, takes `armada`.
     concurrency:
-      group: ${{ startsWith(github.ref_name, 'ci/base-') && needs.scope.outputs.policy != 'off' && 'armada-base' || 'armada' }}
+      group: >-
+        ${{ (startsWith(github.ref_name, 'ci/full-whole-') && 'armada-whole')
+        || (needs.scope.outputs.policy != 'off' && startsWith(github.ref_name, 'ci/base-') && 'armada-base')
+        || (needs.scope.outputs.policy != 'off' && contains(github.ref_name, '-slot1') && 'armada-slot1')
+        || (needs.scope.outputs.policy != 'off' && contains(github.ref_name, '-slot2') && 'armada-slot2')
+        || (needs.scope.outputs.policy != 'off' && contains(github.ref_name, '-slot3') && 'armada-slot3')
+        || 'armada' }}
       cancel-in-progress: false
       queue: max
     timeout-minutes: 60
@@ -230,8 +239,9 @@ jobs:
         # Each client runs in a session of its own, so the interrupt a cancelled run sends this shell
         # reaches it and it cancels its armada job; the shell waits on them, where a trap runs.
         trap 'for group in ${gangs:-} ${suite:-}; do kill -INT -- "-$group" 2>/dev/null || true; done' INT TERM
-        # A base/<producer> promote runs no gangs: main's trains run them.
-        if [ -z "$PROVEN" ] && [ "${GITHUB_REF_NAME#ci/base-}" = "$GITHUB_REF_NAME" ]; then
+        # A base/<producer> promote and the background whole suite run no gangs: main's trains run them.
+        case "$GITHUB_REF_NAME" in ci/base-*|ci/full-whole-*) gangless=1 ;; *) gangless= ;; esac
+        if [ -z "$PROVEN" ] && [ -z "$gangless" ]; then
           # A gang member lost before the start fails it within 300 s (armada#22).
           items=$(python3 tools/armada/ci.py gangs)
           echo "$items" | setsid $armada map --commit=${{ github.sha }} --items=- --size=medium \
