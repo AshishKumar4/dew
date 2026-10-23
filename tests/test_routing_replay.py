@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, with_gradients
 
 from dew.inference.banks import HeldBanks
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -176,9 +176,13 @@ def test_the_gate_keeps_its_gradient_under_replay():
         routed = jax.random.randint(jax.random.fold_in(jax.random.key(2), seed), (2, SEQ_LEN + 1, LAYERS, 1),
                                     0, EXPERTS)
         pair = jnp.concatenate([routed, (routed + 1) % EXPERTS], axis=-1)
-        return params, tokens_of(2, seed=1000 + seed), pair
+        # The loss's cotangent, one, held in the draw as the gate takes it.
+        return params, tokens_of(2, seed=1000 + seed), pair, jnp.float32(1)
 
-    def forward(loss):
+    def backward_of(loss, one):
+        return lambda kernel: with_gradients(loss)(kernel, one)[1]
+
+    def forward(loss, one):
         # A directional derivative a kernel entry at a time, looped: the experts' ragged product has
         # no batching rule past its first dimension.
         def run(kernel):
@@ -188,16 +192,16 @@ def test_the_gate_keeps_its_gradient_under_replay():
         return run
 
     def gradient(obj, differentiate):
-        def run(params, tokens, routed):
+        def run(params, tokens, routed, one):
             def loss(kernel):
                 layer = params['params']['layers_1']
                 tree = {**params, 'params': {**params['params'], 'layers_1': {
                     **layer, 'mlp': {**layer['mlp'], 'gate': {'kernel': kernel}}}}}
                 return -jnp.sum(obj.token_scores(tree, tokens, routes=(routed, None), logits=True).losses)
-            return differentiate(loss)(params['params']['layers_1']['mlp']['gate']['kernel'])
+            return differentiate(loss, one)(params['params']['layers_1']['mlp']['gate']['kernel'])
         return jax.jit(run)
 
-    backward = gradient(obj, jax.grad)
+    backward = gradient(obj, backward_of)
     assert float(jnp.abs(backward(*draw(0))).sum()) > 0
     assert_as_exact(backward, gradient(obj, forward), draw, "gate gradient", seeds=SEEDS['gate'],
                     truth_fn=gradient(wide, forward))
