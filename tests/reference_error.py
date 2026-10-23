@@ -76,7 +76,7 @@ FACTOR = 2.0
 
 ROW_FACTOR = 4.0
 """How far Dew's worst row may sit from float64 against the reference's worst
-row (`rows_over`). An RMS over every entry averages a few wrong rows into a
+row (`rows_over`; check 1's at rows of one or two values is NARROW_FACTORS'). An RMS over every entry averages a few wrong rows into a
 large tensor, so each comparison also holds Dew's worst row to the
 reference's. The worst of many rows is an extreme value, not an average,
 and parts further by chance: over the suite's 3,660 comparisons whose rows
@@ -712,7 +712,8 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
         factor = NARROW_FACTORS.get(draws.widths[index], ROW_FACTOR)
         if not within(my_row, factor * their_row):
             over.append(f"{leaf}: the worst row over {count} seeds is {my_row:.3e} from float64 over its "
-                        f"size, the reference's {their_row:.3e}, allowed {factor} times it")
+                        f"size, the reference's {their_row:.3e}, allowed {factor * their_row:.3e} ({factor} "
+                        f"times it)")
         if draws.zero_rows[:, index].any():
             over.append(f"{leaf}: {int(draws.zero_rows[:, index].sum())} rows of float64 zero over {count} "
                         f"seeds are further from it than ROW_FACTOR times the reference's own")
@@ -724,20 +725,22 @@ NARROW_FACTORS = {1: 90.0, 2: 11.0}
 ROW_FACTOR fails an equally exact Dew far more often than LOWER_TAIL as sites run check 1 (1.5e-2 of
 runs at one value a row, 1.5e-3 at two): a row of few values is sized by a few float64 values, which sit
 near zero far more often than a wide row's RMS does, and the worst row over a site's rows and seeds is
-the row whose truth is smallest. Each factor is at least the 1 - 1e-4 quantile, at every layout measured,
-of the factor that would fail equally exact pairs at both stages, both arms on one truth
-(`tools/gate_null_runs.py --rows`, its `row_controls`, through `_staged` itself): the largest empirical
-quantile over 16, 256 and 2048 rows a draw and 8 and 64 declared seeds at 20,000 runs each, rounded up;
-larger runs put the quantile at 40 to 53 at one value up to 4,096 rows and 512 seeds. 28,000 fresh runs
-at the layouts the largest quantiles came from certify the rate within LOWER_TAIL at 99.9% (at most
-4.7e-4). Rows of three values keep ROW_FACTOR at a measured rate of at most 2.9e-4 over those layouts,
-not certified; of four and more, none in 20,000.
+the row whose truth is smallest. Each factor sits above the 1 - 1e-4 quantile of the factor that would
+fail equally exact pairs at both stages, both arms on one truth (`tools/gate_null_runs.py --rows`, its
+`row_controls`, through `_staged` itself), at every layout measured, 16 to 4,096 rows a draw and 8 to 512
+declared seeds: that quantile is 40 to 53 at one value and 7 to 8 at two (10,000 to 600,000 runs a
+layout), so 90 and 11 stand about 1.7 and 1.4 times above it, at measured rates near 2e-5 and at most
+3.3e-5; 28,000 fresh runs at the 16-row and 256-row layouts bound them within LOWER_TAIL at 99.9% (at
+most 4.7e-4). Rows of three values keep ROW_FACTOR at a measured rate of at most 2.9e-4 over 16 to 2,048
+rows, a point rate, bounded within LOWER_TAIL at 256 rows and 8 seeds (80,000 runs) and not at 2,048. The
+rate is a leaf's: a site of L narrow leaves may fail an equally exact Dew L times as often.
 
 The power this gives up is local: a narrow row whose error is between ROW_FACTOR and these factors
 times the reference's worst no longer fails by its row (the pooled ratio and the leaf's other rows still
 judge it), and a narrow false alarm no longer draws the second stage for the site's other leaves, which
-that stage exists to judge on real findings. An error local to a value or two is check 2's to catch once
-it gates, each element within its operation's certified bound (tests/op_certificates.py, the target)."""
+that stage exists to judge on real findings. Until check 2 gates, such an error passes check 1 wherever the
+pooled ratio does not see it; once it gates, each element is within its operation's certified bound
+(tests/op_certificates.py, the target)."""
 
 
 PREVIOUS_TAILS = (5e-4, 5e-4)
