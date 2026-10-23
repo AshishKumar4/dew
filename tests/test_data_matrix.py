@@ -37,16 +37,18 @@ pytestmark = [pytest.mark.mesh, pytest.mark.distributed]
 
 STEPS = 3
 ROWS = [
-    # Every pair of settings meets in one of these nine.
-    ("memory,nocache,all,rows", 1, 2),
-    ("memory,nocache,rejecting,packed", 2, 1),
-    ("memory,cache,rejecting,rows", 4, 2),
-    ("indexed,cache,all,rows", 2, 1),
-    ("indexed,nocache,rejecting,packed", 1, 4),
-    ("indexed,nocache,rejecting,packed", 4, 2),
-    ("streamed,cache,all,rows", 1, 4),
-    ("streamed,cache,rejecting,packed", 2, 4),
-    ("streamed,nocache,all,packed", 4, 1),
+    # Every pair of settings meets in one of these ten: read mode, cache, filter, packing, the count
+    # that saves and the other count the save resumes on or is refused.
+    ("memory,cache,all,rows", 2, 1),
+    ("memory,cache,rejecting,rows", 1, 4),
+    ("memory,nocache,all,packed", 4, 1),
+    ("memory,nocache,rejecting,rows", 1, 2),
+    ("indexed,cache,all,rows", 1, 4),
+    ("indexed,cache,rejecting,packed", 4, 2),
+    ("indexed,nocache,rejecting,packed", 2, 1),
+    ("streamed,cache,all,packed", 1, 2),
+    ("streamed,nocache,all,packed", 2, 4),
+    ("streamed,nocache,rejecting,rows", 4, 1),
     # The indexed read's global order, elastic, and each single step that makes it per-share.
     ("indexed,nocache,all,rows", 2, 4),
     ("indexed,nocache,all,rows", 4, 1),
