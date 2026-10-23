@@ -7,7 +7,7 @@ nothing but JAX's `jit` or custom derivatives, is called on canonical draws: eve
 float32 at each scale of `SCALES` and bfloat16 at the first, the same draw in every argument position.
 Where its outputs are floats it is differentiated too, along a drawn tangent (`jax.jvp`). Two
 functions match when, on every draw both run on, covering at least two shapes, their outputs land on
-the same points of the draw's grid (`_grid`), and their derivatives do wherever both have one.
+alike (`_alike`), and their derivatives are wherever both have one.
 
 A match ranks a candidate for a reader; it proves no equivalence and authorizes no dedupe by itself:
 equal draws miss what they do not reach (other ranks, dtypes, regimes, arguments not drawn alike), and
@@ -63,8 +63,9 @@ SCALES = (1.0, 1e-4, 30.0)
 """The draws' scales: unit normals, values near zero, and values large enough to leave a function's
 linear regime (a saturating activation, an exponential)."""
 STEP = {"float32": 2e-3, "bfloat16": 3e-2}
-"""A draw's grid step, relative to its outputs' largest magnitude: coarse enough that two orders of one
-sum land on the same points, fine enough that another epsilon's floor or another constant does not."""
+"""A draw's grid step (`_alike`), relative to the two outputs' largest magnitude: coarse enough that two
+orders of one sum, or two roundings of one formula, are alike, fine enough that another epsilon's floor
+or another constant is not."""
 MOST_ARGUMENTS = 4
 
 
@@ -77,8 +78,8 @@ class Candidate:
     """Every name its body reads, a callee's or a table entry's: what delegation is read from."""
     source: str
     draws: dict = field(default_factory=dict)
-    """Each draw's key, (shape, dtype, scale), to its outputs' grid (`_grid`), its derivative's (None
-    without one), its inputs' grids and its outputs as host arrays."""
+    """Each draw's key, (shape, dtype, scale), to its outputs, its derivative's (None without one) and
+    its inputs, as float64 host arrays."""
     refusals: dict = field(default_factory=dict)
     """Each shape it did not run on to the exception its first draw raised."""
     underived: str | None = None
@@ -152,14 +153,20 @@ def _host(tree) -> list[np.ndarray] | None:
     return leaves or None
 
 
-def _grid(leaves: list[np.ndarray], dtype: str) -> tuple:
-    """`leaves` on a grid: their largest magnitude's power of two, and each leaf's shape and values in
-    steps of STEP[dtype] of that power, as integers. Two computations alike to the step land on the same
-    points, but where a value sits at a step's edge or the largest magnitude at a power of two."""
-    largest = max(np.max(np.abs(leaf), initial=0.0) for leaf in leaves)
-    power = int(np.ceil(np.log2(largest))) if largest > 0 else None
-    step = STEP[dtype] * 2.0 ** (power or 0)
-    return power, tuple((leaf.shape, np.rint(leaf / step).astype(np.int64).tobytes()) for leaf in leaves)
+def _alike(first: list[np.ndarray], second: list[np.ndarray], dtype: str) -> bool:
+    """Whether two outputs are alike on a draw of `dtype`: leaf for leaf of one shape, each element of
+    one in the same cell as the other's on one of two grids of step STEP[dtype] times their largest
+    magnitude, the second offset by half a step. Elements under half a step apart share a cell of one
+    grid, wherever the grids' edges fall; elements over a step apart share none."""
+    if len(first) != len(second) or any(a.shape != b.shape for a, b in zip(first, second, strict=True)):
+        return False
+    largest = max((np.max(np.abs(leaf), initial=0.0) for leaf in (*first, *second)), default=0.0)
+    if largest == 0:
+        return True
+    step = STEP[dtype] * largest
+    return all(np.all((np.floor(a / step) == np.floor(b / step))
+                      | (np.floor(a / step + 0.5) == np.floor(b / step + 0.5)))
+               for a, b in zip(first, second, strict=True))
 
 
 def fingerprint(candidate: Candidate, draws) -> None:
@@ -189,23 +196,20 @@ def fingerprint(candidate: Candidate, draws) -> None:
         if outputs is None:
             candidate.refusals[key[0]] = "no finite numeric output"
             continue
-        inputs = [_grid([np.asarray(value, np.float64)], key[1]) for value in given]
-        candidate.draws[key] = (_grid(outputs, key[1]), derivative and _grid(derivative, key[1]), inputs,
-                                outputs)
+        candidate.draws[key] = (outputs, derivative, [np.asarray(value, np.float64) for value in given])
 
 
 def _trivial(candidate: Candidate) -> bool:
     """Whether `candidate` returns an input as it is (or cast) on every draw, or the same outputs at
     every scale of a shape: no computation of its own to compare."""
-    passes = all(any((grid[0], (leaf,)) in inputs for leaf in grid[1])
-                 for grid, _, inputs, _ in candidate.draws.values())
+    passes = all(any(_alike([leaf], [value], key[1]) for leaf in outputs for value in given)
+                 for key, (outputs, _, given) in candidate.draws.items())
     by_shape: dict = {}
-    for (shape, dtype, _), (_, _, _, outputs) in candidate.draws.items():
+    for (shape, dtype, _), (outputs, _, _) in candidate.draws.items():
         if dtype == "float32":
             by_shape.setdefault(shape, []).append(outputs)
-    constant = any(len(runs) > 1 and all(len(run) == len(runs[0]) and all(
-        np.array_equal(a, b) for a, b in zip(run, runs[0], strict=True)) for run in runs[1:])
-        for runs in by_shape.values())
+    constant = any(len(runs) > 1 and all(_alike(run, runs[0], "float32") for run in runs[1:])
+                   for runs in by_shape.values())
     return passes or constant
 
 
@@ -217,12 +221,12 @@ def match(first: Candidate, second: Candidate) -> str | None:
         return None
     derived = True
     for key in shared:
-        (outputs, derivative, _, _), (theirs, their_derivative, _, _) = first.draws[key], second.draws[key]
-        if outputs != theirs:
+        (outputs, derivative, _), (theirs, their_derivative, _) = first.draws[key], second.draws[key]
+        if not _alike(outputs, theirs, key[1]):
             return None
         if derivative is None or their_derivative is None:
             derived = False
-        elif derivative != their_derivative:
+        elif not _alike(derivative, their_derivative, key[1]):
             return None
     shapes = ", ".join(str(shape) for shape in sorted({key[0] for key in shared}, key=str))
     dtypes = ", ".join(sorted({key[1] for key in shared}))
