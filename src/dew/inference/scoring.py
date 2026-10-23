@@ -60,8 +60,10 @@ class Scoring[Request, Payload, Answer](Protocol):
 
 
 class _Request[Payload, Answer]:
-    def __init__(self, scored: Scored[Payload]) -> None:
+    def __init__(self, scored: Scored[Payload], served: tuple[Scoring, Variables]) -> None:
         self.scored = scored
+        self.served = served
+        """The task that laid the request out, and its weights: the pair that scores it."""
         self.future: Timed[Answer] = Timed()
 
 
@@ -69,7 +71,8 @@ class ScoringServer[Request, Payload, Answer]:
     """Answers scoring requests in batches through one task's pass.
 
     A batch takes the waiting requests oldest first, at most `rows` of them and, past its first, as
-    many as `tokens` holds. Build one with `from_task`.
+    many as `tokens` holds, all laid out by one task: a request admitted before a reload is scored
+    by the task and weights that admitted it. Build one with `from_task`.
     """
 
     def __init__(self, task: Scoring[Request, Payload, Answer], variables: Variables, *, tokens: int,
@@ -119,8 +122,9 @@ class ScoringServer[Request, Payload, Answer]:
     def submit(self, request: Request) -> Timed[Answer]:
         """Queue one request and return its future answer. The task lays it out here, so a request it
         refuses raises its ValueError here, and the others go on."""
-        # Laid out by the task served now; a reload's task lays out what arrives after it.
-        waiting: _Request[Payload, Answer] = _Request(self.task.admit(request))
+        # Laid out by the task served now, which scores it with its weights, whatever reloads meanwhile.
+        served = self._served
+        waiting: _Request[Payload, Answer] = _Request(served[0].admit(request), served)
         with self._ingress:
             if self._failed is not None:
                 raise RuntimeError("the server stopped after a step failed") from self._failed
@@ -133,12 +137,15 @@ class ScoringServer[Request, Payload, Answer]:
         if self._failed is not None:
             raise RuntimeError("the server stopped after a step failed") from self._failed
         batch: list[_Request[Payload, Answer]] = []
-        held = 0
-        while self._queue and len(batch) < self.rows:
+        held = taken = 0
+        # A cancelled request counts against the bound too, so one step never drains an unbounded queue.
+        while self._queue and taken < self.rows:
             waiting = self._queue[0]
-            if batch and held + waiting.scored.tokens > self.tokens:
+            over = held + waiting.scored.tokens > self.tokens
+            if batch and (over or waiting.served is not batch[0].served):
                 break
             self._queue.popleft()
+            taken += 1
             if not waiting.future.set_running_or_notify_cancel():
                 continue
             batch.append(waiting)
@@ -148,16 +155,18 @@ class ScoringServer[Request, Payload, Answer]:
         now = time.perf_counter()
         for waiting in batch:
             waiting.future.admitted = now
-        task, variables = self._served
+        task, variables = batch[0].served
+        payloads = [waiting.scored.payload for waiting in batch]
         with self._context():
             try:
-                answers = task.score(variables, [waiting.scored.payload for waiting in batch])
+                answered = list(zip(batch, task.score(variables, payloads), strict=True))
             except BaseException as failure:
-                # The batch's requests and every waiting one learn why; the step's caller does too.
+                # The batch's requests and every waiting one learn why, as for an answer too few or too
+                # many; the step's caller does too.
                 self.fail(failure, batch)
                 raise
         now = time.perf_counter()
-        for waiting, answer in zip(batch, answers, strict=True):
+        for waiting, answer in answered:
             waiting.future.finished = now
             settled(waiting.future, answer)
 
@@ -167,11 +176,11 @@ class ScoringServer[Request, Payload, Answer]:
             self.step()
 
     def reload(self, task: Scoring[Request, Payload, Answer], variables: Variables) -> None:
-        """Serve `task` with `variables` from the next batch on, in place of the current pair, both
-        at once: a batch reads the pair it starts with, so its answers pair one task with its own
-        weights, as a task's calibration is fitted to the weights it came with. The tree must match
-        the served one (`dew.inference.engine.normalized`), and its leaves are copied onto the served
-        placement before the swap. Safe against a `step` on another thread."""
+        """Serve `task` with `variables` in place of the current pair, both at once, for every request
+        submitted after: a request is scored by the pair that laid it out, so its answer pairs one
+        task with its own weights, as a task's calibration is fitted to the weights it came with.
+        The tree must match the served one (`dew.inference.engine.normalized`), and its leaves are
+        copied onto the served placement before the swap. Safe against a `step` on another thread."""
         self._served = (task, reloaded(normalized(variables, self._source_shapes), self.variables))
 
     def _context(self) -> contextlib.AbstractContextManager[None]:

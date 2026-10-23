@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.coordination import stop_at_exit
 from dew.objectives.base import Variables
 
 
@@ -112,17 +113,25 @@ class Engine:
     """Serves `kinds` from one thread of its own between `start` and `close`: each turn, every busy
     kind takes one step, so a kind's long queue never starves another's; with none busy the thread
     waits for a submission. A step that fails stops every kind, each request settled with the
-    failure, as one device's failure is every kind's."""
+    failure, as one device's failure is every kind's.
 
-    def __init__(self, *kinds: Kind) -> None:
+    A request's callback runs on the serving thread, inside its kind's step, and may `reload` or
+    `close` from there. A program that ends without `close` stops the thread after the step in
+    progress (`dew.coordination.stop_at_exit`)."""
+
+    def __init__(self, *kinds: Kind, name: str = "serving-engine") -> None:
         if not kinds:
             raise ValueError("an engine serves one kind or more")
         self.kinds = kinds
+        self.name = name
         self._arrived = threading.Event()
-        self._stepping = threading.Lock()
+        # Reentrant, so a request's callback may reload from inside its kind's step.
+        self._stepping = threading.RLock()
         """Held for each step and each `reload`, which a kind serializes with its steps."""
         self._closed = False
+        self._stopped = False
         self._thread: threading.Thread | None = None
+        self._withdraw: Callable[[], None] | None = None
         self.failure: BaseException | None = None
         for kind in kinds:
             kind.arrived = self._arrived.set
@@ -130,35 +139,59 @@ class Engine:
     def start(self) -> None:
         if self._thread is not None:
             raise RuntimeError("the engine is serving already")
-        self._closed = False
-        self._thread = threading.Thread(target=self._serve, name="serving-engine")
+        self._closed = self._stopped = False
+        self._thread = threading.Thread(target=self._serve, name=self.name, daemon=True)
         self._thread.start()
+        # A step under way at exit runs to its end inside jaxlib, so exit waits for the thread rather
+        # than finalizing under it.
+        self._withdraw = stop_at_exit(self._thread, self._halt, timeout=None)
 
     def close(self) -> None:
         """Stop serving once what waits is answered."""
         self._closed = True
-        self._arrived.set()
-        if self._thread is not None:
-            self._thread.join()
-            self._thread = None
+        self._ended()
+
+    def stop(self) -> None:
+        """Stop serving after the step in progress; what waits is left to its kind's owner."""
+        self._halt()
+        self._ended()
 
     def reload(self, reloading: Callable[[], None]) -> None:
         """Run `reloading`, a kind's reload, between two steps."""
         with self._stepping:
             reloading()
 
+    def _halt(self) -> None:
+        self._stopped = True
+        self._arrived.set()
+
+    def _ended(self) -> None:
+        """Wake the thread and wait for it to end, unless this is the thread, whose own callback
+        closed it: it ends once its turn returns."""
+        self._arrived.set()
+        thread, withdraw = self._thread, self._withdraw
+        if thread is None or thread is threading.current_thread() or withdraw is None:
+            return
+        thread.join()
+        withdraw()
+        self._thread = self._withdraw = None
+
     def _serve(self) -> None:
         try:
             while True:
-                # Cleared before the look, so a submission after it wakes the wait.
+                # Cleared before the look, so a submission after it wakes the wait; and closing is
+                # read before it, so a request that waits once closing is seen is seen too.
                 self._arrived.clear()
+                closed = self._closed
                 busy = [kind for kind in self.kinds if kind.busy]
                 for kind in busy:
+                    if self._stopped:
+                        return
                     with self._stepping:
                         kind.step()
+                if self._stopped or (closed and not busy):
+                    return
                 if not busy:
-                    if self._closed:
-                        return
                     self._arrived.wait()
         except BaseException as failure:
             # One device serves every kind: a failed step stops them all, each request told why.

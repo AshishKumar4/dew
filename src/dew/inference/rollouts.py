@@ -36,7 +36,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.coordination import agreed, collective_host, stop_at_exit
+from dew.coordination import agreed, collective_host
 from dew.nn.inputs import key_seed, request_key, token_id
 from dew.objectives.base import Variables, thaw
 from dew.records import JSON
@@ -51,7 +51,7 @@ from .clients import (
     matched_stop,
     reported_log_probs,
 )
-from .engine import settled
+from .engine import Engine, settled
 from .serving import Server
 
 if TYPE_CHECKING:
@@ -210,16 +210,16 @@ def _native_draw(prompt: tuple[int, ...], generation: Generation[np.ndarray], ve
 
 
 class NativeRolloutServer:
-    """Serves rollouts from Dew's `Server`, stepping it on a background thread.
+    """Serves rollouts from Dew's `Server`, stepped by an `Engine` of its own.
 
-    One lock orders weight loads with the server's steps, so a load happens
+    The engine orders weight loads with the server's steps, so a load happens
     between two steps. A submission waits for a load in progress but not for a
     step. The server takes it while a step runs and seats it at the next one.
     The server's own sampling policy and transforms decide the draws, and a
     draw keeps both the raw and the behavior likelihoods the server records.
-    The stepping thread starts at the first submission, so constructing the
-    server starts nothing. If the program ends without `close`, an exit hook
-    stops the stepping after the step in progress.
+    The engine's thread starts at the first submission, so constructing the
+    server starts nothing. If the program ends without `close`, the engine
+    stops after the step in progress.
 
     A draw ends on one of the policy's EOS ids or on the id completing one of
     its stop strings, and `Draw.terminated` tells those from a draw cut at its
@@ -241,16 +241,12 @@ class NativeRolloutServer:
                              "draw's policy names")
         self._server = server
         self._version = version
-        # Reentrant, so a draw's callback may load weights from inside a step.
-        self._lock = threading.RLock()
+        self._engine = Engine(server, name="dew-rollout-server")
         self._loading = threading.Lock()
         self._futures = threading.Lock()
-        self._arrived = threading.Event()
         self._outstanding: set[Future[Draw]] = set()
         self._closed = False
-        self._failure: BaseException | None = None
-        self._thread: threading.Thread | None = None
-        self._withdraw: Callable[[], None] | None = None
+        self._started = False
 
     @property
     def sampling(self) -> Sampling:
@@ -270,17 +266,13 @@ class NativeRolloutServer:
         ids, budget = _prompt(prompt), _budget(max_new_tokens)
         future: Future[Draw] = Future()
         with self._futures:
-            if self._failure is not None:
-                raise RuntimeError("the rollout server stopped") from self._failure
+            if self._engine.failure is not None:
+                raise RuntimeError("the rollout server stopped") from self._engine.failure
             if self._closed:
                 raise RuntimeError("the rollout server is closed")
-            if self._thread is None:
-                self._thread = threading.Thread(target=self._run, name="dew-rollout-server", daemon=True)
-                self._thread.start()
-                # A step under way at exit runs to its end inside jaxlib, so the bound is a step's, not a
-                # poll's. The stepping thread stops after the step in progress, which may be a long first
-                # compile; it holds no external call, so exit waits for it rather than finalizing under it.
-                self._withdraw = stop_at_exit(self._thread, self._stop, timeout=None)
+            if not self._started:
+                self._engine.start()
+                self._started = True
             self._outstanding.add(future)
         try:
             with self._loading:
@@ -291,7 +283,7 @@ class NativeRolloutServer:
             raise
 
         def resolve(done: Future[Generation[np.ndarray]]) -> None:
-            if not self._claimed(future):  # failed with the stepping thread or by `close`
+            if not self._claimed(future):  # settled by `close`
                 return
             try:
                 draw = _native_draw(ids, done.result(), version).checked(self.sampling)
@@ -303,7 +295,6 @@ class NativeRolloutServer:
             settled(future, draw)
 
         ticket.add_done_callback(resolve)
-        self._arrived.set()
         return future
 
     def _claimed(self, future: Future[Draw]) -> bool:
@@ -315,51 +306,24 @@ class NativeRolloutServer:
             self._outstanding.remove(future)
             return True
 
-    def _detached(self, failure: BaseException | None = None) -> list[Future[Draw]]:
-        """Take every outstanding draw, recording `failure` as the server's."""
-        with self._futures:
-            if failure is not None:
-                self._failure = failure
-            detached = list(self._outstanding)
-            self._outstanding.clear()
-        return detached
-
     def load(self, variables: Variables, version: int) -> None:
-        with self._lock, self._loading:
-            self._server.reload(thaw(variables))
-            self._version = version
+        def loading() -> None:
+            with self._loading:
+                self._server.reload(thaw(variables))
+                self._version = version
 
-    def _run(self) -> None:
-        try:
-            while True:
-                # Cleared before the look, so a submission after it wakes the wait.
-                self._arrived.clear()
-                with self._lock:
-                    if self._closed:
-                        return
-                    busy = bool(self._server.occupancy or self._server.queued)
-                    if busy:
-                        self._server.step()
-                if not busy:
-                    self._arrived.wait()
-        except BaseException as failure:
-            for future in self._detached(failure):
-                settled(future, failure)
-
-    def _stop(self) -> None:
-        with self._futures:
-            self._closed = True
-        self._arrived.set()
+        self._engine.reload(loading)
 
     def close(self) -> None:
-        self._stop()
+        """Stop after the step in progress; every draw still outstanding fails."""
         with self._futures:
-            thread, withdraw = self._thread, self._withdraw
-        if thread is not None and withdraw is not None:
-            thread.join()
-            withdraw()
+            self._closed = True
+        self._engine.stop()
+        with self._futures:
+            detached = list(self._outstanding)
+            self._outstanding.clear()
         cancelled = RuntimeError("the rollout server closed before this draw finished")
-        for future in self._detached():
+        for future in detached:
             settled(future, cancelled)
 
 
