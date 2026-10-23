@@ -1698,8 +1698,7 @@ def _order_records(train: Pipeline, build: _Build) -> int | None:
     alone; None where it never ends or its read counts none ahead. The batches' sizes are what the
     stages place, so no record is read."""
     stage = next((stage for stage in train.stages if isinstance(stage, BatchStage)), None)
-    order = dataclasses.replace(train, stages=train.stages[: _until(train.stages, (BatchStage, TokenBudget))])
-    if not build.global_order or build.lowering.endless or _unending(order) or stage is None:
+    if not build.global_order or build.lowering.endless or build.lowering.records_unending or stage is None:
         return None
     length = _order_length(train, build)
     if length is None:
