@@ -7,6 +7,7 @@ random weights. Everything runs at fp32 on CPU, and each parity test states
 its tolerance and the largest difference observed.
 """
 
+import os
 from pathlib import Path
 from statistics import NormalDist
 
@@ -292,6 +293,8 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
                 reference(input_ids=tokens)
             stored = {name: leaf.detach().numpy() for name, leaf in held.items()}
             _, gradients = torch_with_gradients(loss)(stored, one)
+            if os.environ.get("GRADIENTS_ONLY"):
+                return {name: gradients[name] for name in held if name in names}
             for name, leaf in held.items():
                 leaf.grad = torch.from_numpy(gradients[name])
             solver.step()
