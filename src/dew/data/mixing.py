@@ -16,7 +16,7 @@ from typing import Protocol, TypeGuard, overload, runtime_checkable
 import grain.experimental as gx
 import grain.python as pygrain
 
-from dew.data.dataset import Batch
+from dew.data.dataset import LONG_RUN, Batch, logged_run
 from dew.data.pipeline import Record, Rejected
 from dew.records import boolean, integer, record, text
 
@@ -89,12 +89,6 @@ _WARN_OVER = 0.01
 """The share of a corpus's attempted records it may reject before a run warns, once: a filter that
 drops more than one record in a hundred is worth a look."""
 
-_FIRST_LOGGED_RUN = 1024
-"""The run of rejections in a row a read first logs, then again at each doubling: longer than an
-ordinary filter's runs, so a filter that keeps nothing is named from the first line. An endless
-read reads on through any run; none proves the corpus holds nothing to keep."""
-
-
 class _KeepAccepted:
     def __init__(self, counts: CorpusCounts, tokens: Callable[[Batch], int] | None):
         self.counts, self.tokens = counts, tokens
@@ -122,7 +116,7 @@ class _KeepAccepted:
             _log.warning("corpus %s rejected more than %.1f%% of attempted records (%s)",
                          self.counts.label, _WARN_OVER * 100, reason)
             self.warned = True
-        if self.consecutive >= _FIRST_LOGGED_RUN and not self.consecutive & (self.consecutive - 1):
+        if logged_run(self.consecutive, LONG_RUN):
             reasons = ", ".join(f"{name} {count}" for name, count in self.counts.rejected.most_common(3))
             _log.warning("corpus %s rejected its last %d records and has kept %d; the read goes on until "
                          "one is kept (most rejected: %s)", self.counts.label, self.consecutive,
