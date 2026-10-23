@@ -1,7 +1,8 @@
 """An API rename keeps the landing page's recordings: site/scripts/redigest.py, on a copy of the site in a git
-repository of its own, writes the renamed programs' digests and leaves every other byte of their recordings as
-it was, and writes nothing when a change is more than a renaming or a recording was already of other code. The
-edits are found in the copied programs by parsing them, so the tests follow whatever API the page uses."""
+repository of its own, writes the renamed programs' digests and leaves every other byte of their recordings
+as it was, and writes nothing when a change is more than a declared rename of Dew's API or a recording was
+already of other code. The edits are found in the copied programs by parsing them, so the tests follow
+whatever API the page uses."""
 
 import ast
 import hashlib
@@ -13,7 +14,9 @@ import sys
 from pathlib import Path
 
 import pytest
-from tool_support import git
+from tool_support import git, load
+
+scopes = load("lint_scopes")
 
 REPO = Path(__file__).resolve().parents[1]
 COPIED = ("site/scripts/redigest.py", "site/scripts/gen_api.py", "tools/lint_scopes.py",
@@ -46,21 +49,50 @@ def redigest(root: Path, *renames: str) -> subprocess.CompletedProcess:
 
 
 def api_renamed(root: Path, owner: str, old: str, new: str | None, beside: tuple[str, ...] = ()) -> str:
-    """Dew's API at the base holds `owner.old`, a constructor's parameter, and the change renames it
-    `owner.new` (None: keeps it), the classes `beside` keeping a parameter `old` of their own; committed:
-    `recorded` the base, `change` the head. The rename to declare."""
-    package = root / "src" / "dew"  # the scratch commit's own Dew, which the tool reads at each commit
-    package.mkdir(parents=True, exist_ok=True)
-    (package / "__init__.py").write_text("")
+    """Dew's API at the base holds `owner.old` (owner a dotted class, dew.api.Config), a constructor's
+    parameter, and the change renames it `owner.new` (None: keeps it), the classes `beside` in its module
+    keeping a parameter `old` of their own; committed: `recorded` the base, `change` the head. The rename to
+    declare."""
+    module, _, name = owner.rpartition(".")
+    parts = module.split(".")
+    # The scratch commit's own Dew, which the tool reads at each commit: the module, in its packages.
+    for depth in range(1, len(parts) + 1):
+        (root / "src" / Path(*parts[:depth])).mkdir(parents=True, exist_ok=True)
+        (root / "src" / Path(*parts[:depth], "__init__.py")).touch()
+    path = root / "src" / Path(*parts, "__init__.py")
     api = "class {0}:\n    def __init__(self, {1}):\n        self.{1} = {1}\n"
     kept = "".join(api.format(other, old) for other in beside)
-    (package / "api.py").write_text(api.format(owner, old) + kept)
+    path.write_text(api.format(name, old) + kept)
     git(root, "add", "src")
     git(root, "commit", "-qm", "Dew's API")
     git(root, "checkout", "-q", "-b", "change")
-    (package / "api.py").write_text(api.format(owner, new or old) + kept)
+    path.write_text(api.format(name, new or old) + kept)
     git(root, "commit", "-qam", "Dew's API renamed", "--allow-empty")
-    return f"dew.api.{owner}.{old}=dew.api.{owner}.{new or old}"
+    return f"{owner}.{old}={owner}.{new or old}"
+
+
+def api_keywords(source: str) -> list[tuple[str, str]]:
+    """Each keyword the program passes a class of Dew's (dew.Trainer, dew.config.OptimConfig) it reaches
+    through an import in the call's scope: (the class's dotted path, the keyword), in order."""
+    tree = ast.parse(source)
+    called = [(scopes.resolved(node.func, table), keyword.arg)
+              for node, table in scopes.scoped(tree.body, {}, ()) if isinstance(node, ast.Call)
+              for keyword in node.keywords if keyword.arg]
+    return list(dict.fromkeys((owner, name) for owner, name in called
+                              if owner.startswith("dew.") and owner.rpartition(".")[2][:1].isupper()
+                              and not owner.rpartition(".")[0].rpartition(".")[2][:1].isupper()))
+
+
+def renamed_api_keyword(root: Path, relative: str, owner: str, name: str, new: str) -> None:
+    """Keyword `name` renamed `new` in every call of the program's that reaches `owner` through an import."""
+    source = (root / relative).read_text()
+    tree = ast.parse(source)
+    spans = [(keyword, f"{new}={ast.get_source_segment(source, keyword.value)}")
+             for node, table in scopes.scoped(tree.body, {}, ())
+             if isinstance(node, ast.Call) and scopes.resolved(node.func, table) == owner
+             for keyword in node.keywords if keyword.arg == name]
+    assert spans
+    rewrite(root, relative, spans)
 
 
 def recordings(root: Path) -> dict[str, bytes]:
@@ -117,13 +149,16 @@ def rewrite(root: Path, relative: str, spans: list[tuple[ast.AST, str]]) -> None
 
 
 def test_a_rename_rewrites_the_digests_of_the_programs_it_reaches_and_keeps_every_other_byte(site):
-    """A variable renamed in the lm cell's file and the hero: every capture naming their programs takes the
-    new digest, and nothing else of it changes, byte for byte."""
-    before = recordings(site)
+    """A keyword of Dew's that both the lm cell and the hero pass, renamed as declared in their files: every
+    capture naming their programs takes the new digest, and nothing else of it changes, byte for byte."""
     shown = programs(site)
-    for relative, program in ((FRAMEWORK, "lm"), (HERO, "hero.py")):
-        renamed_everywhere(site, relative, (variables(shown[program])[0],), "renamed_variable")
-    assert redigest(site).returncode == 0
+    owner, name = next(pair for pair in api_keywords(shown["lm"]) if pair in api_keywords(shown["hero.py"]))
+    declared = api_renamed(site, owner, name, f"{name}_renamed")
+    before = recordings(site)
+    for relative in (FRAMEWORK, HERO):
+        renamed_api_keyword(site, relative, owner, name, f"{name}_renamed")
+    assert redigest(site).returncode == 1 and recordings(site) == before, "a rename not declared"
+    assert redigest(site, declared).returncode == 0
     after = recordings(site)
     changed = {path for path in before if before[path] != after[path]}
     assert {"site/src/data/capture.json", "site/public/examples/framework/lm/capture.json"} <= changed
@@ -136,7 +171,7 @@ def test_a_rename_rewrites_the_digests_of_the_programs_it_reaches_and_keeps_ever
     assert (hero["cell_sha256"], hero["script_sha256"]) == (program_digest(site, "hero"),
                                                             program_digest(site, "hero.py"))
     # Run again, it finds every recording of the program the page shows.
-    assert redigest(site).returncode == 0 and recordings(site) == after
+    assert redigest(site, declared).returncode == 0 and recordings(site) == after
 
 
 def test_a_rename_of_dews_api_keeps_a_recording_only_as_declared_and_where_it_holds(site):
@@ -146,7 +181,7 @@ def test_a_rename_of_dews_api_keeps_a_recording_only_as_declared_and_where_it_ho
     and keeps no recording."""
     program = "from dew.api import Config, Trainer\nprint(Config({}=3), Trainer({}=3), dict({}=3))\n"
     recorded(site, program.format("steps", "steps", "steps"))
-    declared = api_renamed(site, "Config", "steps", "num_steps", beside=("Trainer",))
+    declared = api_renamed(site, "dew.api.Config", "steps", "num_steps", beside=("Trainer",))
     before = recordings(site)
     for spelled, declaring, kept in ((("steps", "steps"), (), False),
                                      (("num_steps", "steps"), (declared,), False),
@@ -170,7 +205,7 @@ def test_a_program_that_runs_another_operation_keeps_no_recording(site):
     does not show: refused, with no --rename, with a --rename naming no API of Dew's, and with one Dew's API
     holds but the change does not make, and nothing written."""
     before = recordings(site)
-    unchanged = api_renamed(site, "Config", "steps", None)
+    unchanged = api_renamed(site, "dew.api.Config", "steps", None)
     source = (site / HERO).read_text()
     node, other = an_operation(source)
     rewrite(site, HERO, [(node, f"{ast.get_source_segment(source, node.value)}.{other}")])
@@ -197,45 +232,15 @@ def argument_added(root: Path) -> None:
     rewrite(root, FRAMEWORK, [(keyword, f"{ast.get_source_segment(source, keyword)}, added=1")])
 
 
-def one_use(source: str, name: str) -> ast.Name:
-    """The last place the program reads variable `name`."""
-    return [node for node in ast.walk(ast.parse(source))
-            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id == name][-1]
+def variable_renamed(root: Path) -> None:
+    """The hero's first variable renamed everywhere the program binds or reads it."""
+    name = variables((root / HERO).read_text())[0]
+    rewrite(root, HERO, [(node, "renamed_variable") for node in ast.walk(ast.parse((root / HERO).read_text()))
+                         if isinstance(node, ast.Name) and node.id == name])
 
 
-def renamed_in_one_place(root: Path) -> None:
-    source = (root / HERO).read_text()
-    rewrite(root, HERO, [(one_use(source, variables(source)[0]), "fresh_name")])
-
-
-def renamed_to_anothers_name(root: Path) -> None:
-    source = (root / HERO).read_text()
-    first, other = variables(source)[:2]
-    rewrite(root, HERO, [(one_use(source, first), other)])
-
-
-def renamed_everywhere(root: Path, relative: str, names: tuple[str, ...], new: str) -> None:
-    """Variables `names` renamed `new` everywhere the program binds or reads them."""
-    tree = ast.parse((root / relative).read_text())
-    rewrite(root, relative, [(node, new) for node in ast.walk(tree)
-                             if isinstance(node, ast.Name) and node.id in names])
-
-
-def not_compiling(root: Path) -> None:
-    renamed_everywhere(root, TEXT, (variables((root / TEXT).read_text())[0],), "__debug__")
-
-
-def two_made_one(root: Path) -> None:
-    """Two of the hero's variables become one fresh name: a name neither had, which now means one where it
-    meant two."""
-    renamed_everywhere(root, HERO, tuple(variables((root / HERO).read_text())[:2]), "merged")
-
-
-@pytest.mark.parametrize("change", [value_changed, argument_added, renamed_in_one_place,
-                                    renamed_to_anothers_name, not_compiling, two_made_one],
-                         ids=["a value", "an argument", "a variable renamed in one place",
-                              "a variable renamed to another's name", "a rename that does not compile",
-                              "two variables made one fresh name"])
+@pytest.mark.parametrize("change", [value_changed, argument_added, variable_renamed],
+                         ids=["a value", "an argument", "a variable renamed everywhere"])
 def test_a_change_that_is_more_than_a_renaming_writes_nothing(site, change):
     before = recordings(site)
     change(site)
@@ -253,55 +258,62 @@ def recorded(root: Path, source: str) -> None:
     git(root, "commit", "-qam", "a text program recorded")
 
 
+API = "from dew.api import Config\n"
+
+
 @pytest.mark.parametrize(("before", "after", "kept"), [
-    ("import math as math\nprint(math.pi)\n", "import math as m\nprint(m.pi)\n", True),
-    ("import math\nprint(math.pi)\n", "import math as m\nprint(m.pi)\n", True),
-    ("import math\nimport json\nprint(math.pi, json)\n",
-     "import math as json\nimport json\nprint(json.pi, json)\n", False),
-    ("from json import dumps\nprint(dumps(1))\n", "from json import dumps as d\nprint(d(1))\n", True),
+    (f"{API}print(Config(steps=3))\n", f"{API}print(Config(num_steps=3))\n", True),
+    ("from dew.api import Config as C\nprint(C(steps=3))\n",
+     "from dew.api import Config as C\nprint(C(num_steps=3))\n", True),
+    ("import dew.api\nprint(dew.api.Config(steps=3))\n",
+     "import dew.api\nprint(dew.api.Config(num_steps=3))\n", True),
+    (f"{API}print(Config.steps)\n", f"{API}print(Config.num_steps)\n", True),
+    (f"{API}print(Config(steps=3), Config(steps=4))\n", f"{API}print(Config(num_steps=3), Config(steps=4))\n",
+     False),
+    ("from dew.api import Config as C\ndef run(C):\n    return C(steps=3)\nprint(run(dict))\n",
+     "from dew.api import Config as C\ndef run(C):\n    return C(num_steps=3)\nprint(run(dict))\n", False),
+    ("from dew.api import Config as C\ndef run(C):\n    return C.steps\nprint(run(C))\n",
+     "from dew.api import Config as C\ndef run(C):\n    return C.num_steps\nprint(run(C))\n", False),
+    (f"{API}def swap():\n    global Config\n    Config = dict\nswap()\nprint(Config(steps=3))\n",
+     f"{API}def swap():\n    global Config\n    Config = dict\nswap()\nprint(Config(num_steps=3))\n", False),
+    (f"{API}print(getattr(Config(steps=3), 'steps'))\n",
+     f"{API}print(getattr(Config(num_steps=3), 'steps'))\n", False),
+    (f"{API}print(Config(steps=3), Config(**{{'steps': 4}}))\n",
+     f"{API}print(Config(num_steps=3), Config(**{{'steps': 4}}))\n", False),
+    ("print(1)\n", "repr(1)\n", False),
+    ("import math as math\nprint(math.pi)\n", "import math as m\nprint(m.pi)\n", False),
+    ("import math\nprint(math.pi)\n", "import math as m\nprint(m.pi)\n", False),
+    ("from json import dumps\nprint(dumps(1))\n", "from json import dumps as d\nprint(d(1))\n", False),
     ("import os.path\nprint(os.__name__)\n", "import os.path as m\nprint(m.__name__)\n", False),
-    ("import os.path as m\nprint(m.__name__)\n", "import os.path\nprint(os.__name__)\n", False),
-    ("a, b = 1, 2\nprint(a, b)\n", "b, a = 1, 2\nprint(b, a)\n", True),
-    ("value = 9\ndef f(unused=0):\n    return value\nprint(f())\n",
-     "value = 9\ndef f(value=0):\n    return value\nprint(f())\n", False),
+    ("a, b = 1, 2\nprint(a, b)\n", "b, a = 1, 2\nprint(b, a)\n", False),
     ("x = 1\nprint(f'{x!r}')\n", "x = 1\nprint(f'{x!s}')\n", False),
     ("x = 1\nprint(f'{x=}')\n", "x = 1\nprint(f'{ x = }')\n", False),
-    ("print(dict(steps=3))\nsteps = 1\n", "print(dict(num_steps=3))\nsteps = 1\n", False),
-    ("def f(x):\n    return x\nprint(f(x=1))\n", "def f(y):\n    return y\nprint(f(y=1))\n", True),
-    ("def f(x):\n    return x\nprint(f(x=1))\n", "def f(y):\n    return y\nprint(f(x=1))\n", False),
-    ("def f(x):\n    return x\nprint(f(x=1))\n", "def f(x):\n    return x\nprint(f(y=1))\n", False),
-    ("def f(**options):\n    return options['x']\nprint(f(x=1))\n",
-     "def f(**options):\n    return options['x']\nprint(f(y=1))\n", False),
+    ("print(dict(steps=3))\n", "print(dict(num_steps=3))\n", False),
+    ("def f(x):\n    return x\nprint(f(x=1))\n", "def f(y):\n    return y\nprint(f(y=1))\n", False),
+    ("def f(x):\n    return x\nf = dict\nprint(f(x=1))\n",
+     "def f(y):\n    return y\nf = dict\nprint(f(y=1))\n", False),
+    ("def f(x=0, **kw):\n    return x, kw\noptions = {'x': 1}\nprint(f(**options))\n",
+     "def f(y=0, **kw):\n    return y, kw\noptions = {'x': 1}\nprint(f(**options))\n", False),
     ("class C:\n    def __init__(self, x):\n        self.x = x\nprint(C(x=1).x)\n",
-     "class C:\n    def __init__(self, y):\n        self.x = y\nprint(C(y=1).x)\n", True),
-    ("f = lambda x: x\nprint(f(x=1))\n", "f = lambda y: y\nprint(f(x=1))\n", False),
-    ("class C:\n    def m(self, x):\n        return x\nprint(C().m(x=1))\n",
-     "class C:\n    def m(self, y):\n        return y\nprint(C().m(x=1))\n", False),
-    ("class C:\n    def m(self, x):\n        return x\nprint(C().m(x=1))\n",
-     "class C:\n    def m(self, y):\n        return y\nprint(C().m(y=1))\n", False),
-    ("def unused(x):\n    return x\nprint(dict(x=1))\n",
-     "def unused(y):\n    return y\nprint(dict(y=1))\n", False),
-    ("def f(x=0, **options):\n    return x, options['y']\nprint(f(y=1))\n",
-     "def f(y=0, **options):\n    return y, options['y']\nprint(f(y=1))\n", False),
-], ids=["an alias renamed", "an alias added", "an alias that takes another import's name",
-        "an imported name given an alias", "an alias added to a dotted import", "an alias taken from one",
-        "two variables swapped",
-        "a parameter renamed to another variable's name", "an f-string's conversion", "an f-string's label",
-        "a keyword to a builtin renamed beside a variable of its spelling",
-        "a function's parameter and its keyword renamed",
-        "a function's parameter renamed and not its keyword", "a keyword renamed and not its parameter",
-        "a key a **kwargs collects renamed", "a class's parameter and its keyword renamed",
-        "a lambda's parameter renamed and not its keyword",
-        "a method's parameter renamed and not its keyword",
-        "a method's parameter and its keyword renamed",
-        "another callable's keyword renamed beside a parameter",
-        "a key a **kwargs collected becomes a parameter"])
-def test_the_programs_parsed_roles_decide_what_is_a_rename(site, before, after, kept):
-    """A rename is read in the parsed program: an import's name and its binding apart, a parameter a
-    variable and the keyword a call to its function passes it, an f-string's conversion and literal text
-    what it prints, and an API's name renamed as Dew's rename declares it (Config.steps)."""
+     "class C:\n    def __init__(self, y):\n        self.x = y\nprint(C(y=1).x)\n", False),
+], ids=["a keyword Dew's class takes, renamed as declared", "through the import's alias",
+        "through its module",
+        "an attribute of Dew's class", "a declared rename left undone at one use",
+        "an import's name a parameter shadows", "an attribute through a parameter shadowing the import",
+        "an import's name a function rebinds through global", "a name reflection reads from a string",
+        "a mapping unpacked into Dew's class", "a builtin for another", "an alias renamed", "an alias added",
+        "an imported name given an alias", "an alias added to a dotted import", "two variables swapped",
+        "an f-string's conversion", "an f-string's label", "a keyword to a builtin",
+        "a function's parameter and its keyword renamed", "a keyword to a name rebound to another callable",
+        "a parameter renamed beside a mapping unpacked into it",
+        "a class's parameter and its keyword renamed"])
+def test_the_programs_parsed_names_decide_what_is_a_rename(site, before, after, kept):
+    """A rename is read in the parsed program: only Dew's names it reaches through an import in the scope
+    that uses it change, each as the declared rename gives it (dew.api.Config.steps to num_steps), and in
+    full; every other name, value and form stays as it was, and nothing reads a renamed name from a string
+    or a mapping."""
     recorded(site, before)
-    declared = api_renamed(site, "Config", "steps", "num_steps")
+    declared = api_renamed(site, "dew.api.Config", "steps", "num_steps")
     was = recordings(site)
     (site / TEXT).write_text(after)
     assert redigest(site, declared).returncode == (0 if kept else 1)
@@ -310,14 +322,18 @@ def test_the_programs_parsed_roles_decide_what_is_a_rename(site, before, after, 
 
 
 def a_good_rename_writes_nothing(site: Path, relative: str, broken: str) -> None:
-    """A variable `relative` defines renamed, a good rename, and the refusal the base's capture `broken` holds
-    writes nothing; with `broken` as it was before, the same rename is written."""
+    """A keyword of Dew's that `relative` passes, renamed as declared, a good rename, and the refusal the
+    base's capture `broken` holds writes nothing; with `broken` as the site recorded it, the same rename is
+    written."""
+    recorded_at = git(site, "rev-parse", "HEAD").strip()
+    owner, name = api_keywords((site / relative).read_text())[0]
+    declared = api_renamed(site, owner, name, f"{name}_renamed")
     before = recordings(site)
-    renamed_everywhere(site, relative, (variables((site / relative).read_text())[0],), "renamed_variable")
-    assert redigest(site).returncode == 1
+    renamed_api_keyword(site, relative, owner, name, f"{name}_renamed")
+    assert redigest(site, declared).returncode == 1
     assert recordings(site) == before
-    git(site, "checkout", "-q", "HEAD~1", "--", broken)
-    assert redigest(site).returncode == 0 and recordings(site) != before
+    git(site, "checkout", "-q", f"{recorded_at}~1", "--", broken)
+    assert redigest(site, declared).returncode == 0 and recordings(site) != before
 
 
 def test_a_refusal_found_after_a_good_rename_writes_nothing(site):

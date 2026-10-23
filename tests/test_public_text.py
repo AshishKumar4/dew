@@ -1,5 +1,6 @@
-"""No dates in Dew's prose: tools/public_text.py, in a git repository of its own, fails a change that adds a
-date to a doc or a commit's message, and passes one that adds none, or one whose date is a recording's or a
+"""No forecasts in Dew's prose: tools/public_text.py, in a git repository of its own, fails a change that adds
+to a doc or a commit's message a date after the one it was written on, and passes one that adds none, one
+whose date is on or before its own (a measurement's timestamp), or one whose date is a recording's or a
 fixture's data."""
 
 import shutil
@@ -11,7 +12,9 @@ import pytest
 from tool_support import git
 
 REPO = Path(__file__).resolve().parents[1]
-GUIDE = "# Guide\n\nMeasured on 2026-09-02, before this rule.\n"
+GUIDE = "# Guide\n\nMeasured on 2026-09-02.\n"
+WRITTEN = "2026-10-22T12:00:00"
+"""When each change in these tests is written: its commit's author date."""
 
 
 @pytest.fixture
@@ -29,29 +32,32 @@ def repository(tmp_path: Path) -> Path:
 
 
 def change(root: Path, files: dict[str, str], message: str) -> int:
-    """`files` written and committed as `message` on the head; the gate's exit status for it."""
+    """`files` written and committed as `message` on the head, at WRITTEN; the gate's exit status for it."""
     for relative, text in files.items():
         (root / relative).parent.mkdir(parents=True, exist_ok=True)
         (root / relative).write_text(text)
     git(root, "add", "-A")
-    git(root, "commit", "-qm", message)
+    git(root, "commit", "-qm", message, f"--date={WRITTEN}")
     return subprocess.run([sys.executable, "tools/public_text.py", "base"], cwd=root, capture_output=True,
                           timeout=60).returncode
 
 
 @pytest.mark.parametrize(("files", "message", "status"), [
     ({"docs/guide.md": f"{GUIDE}\nMore, measured at a commit.\n"}, "docs: a measurement at its commit", 0),
-    ({"docs/guide.md": f"{GUIDE}\nRerun on 2026-10-22.\n"}, "docs: a rerun", 1),
-    ({"README.md": "Released October 22nd.\n"}, "docs: a release", 1),
-    ({"README.md": "Released on the 22nd Oct. 2026.\n"}, "docs: a release", 1),
-    ({"README.md": "Released 22 October.\n"}, "docs: a release", 1),
-    ({"README.md": "A release.\n"}, "docs: released on the 22nd of Oct.", 1),
-    ({"docs/guide.md": f"{GUIDE}\n++ rerun 2026-10-22\n"}, "docs: a line that begins as a header", 1),
-    ({"docs/new.md": "A new page.\n"}, "docs: a page, landed 2026-10-22", 1),
-    ({"tests/fixtures/run.md": "recorded 2026-10-22\n", "site/public/a/capture.json": '"2026-10-22"'},
+    ({"docs/guide.md": f"{GUIDE}\nRerun on 2026-10-21.\n"}, "docs: a rerun", 0),
+    ({"docs/guide.md": f"{GUIDE}\nRerun on October 22nd.\n"}, "docs: a rerun, measured 2026-10-22", 0),
+    ({"docs/guide.md": f"{GUIDE}\nRerun on 2026-10-23.\n"}, "docs: a rerun", 1),
+    ({"README.md": "Released November 3rd.\n"}, "docs: a release", 1),
+    ({"README.md": "Released on the 3rd Nov. 2026.\n"}, "docs: a release", 1),
+    ({"README.md": "Released 3 November.\n"}, "docs: a release", 1),
+    ({"README.md": "A release.\n"}, "docs: released on the 3rd of Nov.", 1),
+    ({"docs/guide.md": f"{GUIDE}\n++ rerun 2026-11-03\n"}, "docs: a line that begins as a header", 1),
+    ({"docs/new.md": "A new page.\n"}, "docs: a page, landing 2026-11-03", 1),
+    ({"tests/fixtures/run.md": "recorded 2026-11-03\n", "site/public/a/capture.json": '"2026-11-03"'},
      "tests: a recording and a fixture", 0),
-], ids=["no date", "a doc's ISO date", "a month and its day", "an ordinal day and a dotted month",
-        "a day and its month, no year", "a commit message's ordinal day of a month",
-        "a line that begins as a header", "a commit message's date", "data's dates"])
-def test_a_change_that_adds_a_date_to_prose_fails(repository, files, message, status):
+], ids=["no date", "a measurement's ISO date before its commit", "a measurement's day, its commit's own",
+        "a doc's ISO date after its commit", "a month and its later day", "an ordinal day and a dotted month",
+        "a day and its month, no year", "a commit message's ordinal day of a later month",
+        "a line that begins as a header", "a commit message's later date", "data's dates"])
+def test_a_change_that_adds_a_forecast_to_prose_fails(repository, files, message, status):
     assert change(repository, files, message) == status
