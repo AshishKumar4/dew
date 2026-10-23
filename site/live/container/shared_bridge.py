@@ -366,10 +366,9 @@ class Gateway:
         await self.settle(self.discard(context.channels, context.identifier))
 
     async def close(self, session):
-        """End `session`: its first context's creation, if one runs, cancelled to its end (`start` deletes
-        the kernel it made), then every context it holds."""
-        # The creation is cancelled, not awaited: `start` deletes the kernel it made once the gateway has made it
-        # (`settle`), which this close need not wait for.
+        """End `session`: its first context's creation, if one runs, cancelled, and every context it holds
+        closed. The creation is not awaited: `start` deletes the kernel it made once the gateway has made it
+        (`settle`), which this close need not wait for."""
         if task := self.creating.pop(session, None):
             task.cancel()
         for context in self.contexts.pop(session, {}).values():
