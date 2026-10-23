@@ -57,7 +57,6 @@ if TYPE_CHECKING:
     from _typeshed import DataclassInstance
     from flax import linen as nn
 
-    from dew.config import RunConfig
     from dew.diffusion.presets import Preset
     from dew.inputs.encoders import ConditionEncoder
     from dew.nn.mixers import MixerBase
@@ -1349,7 +1348,8 @@ schedules: Aliases[type[ScheduleBase], ScheduleBase] = Aliases("schedule", {
 }, base="dew.optim:ScheduleBase")
 
 
-runs: Aliases[type[RunConfig], RunConfig] = Aliases("run", {
+# A run config's own class sits above the registry, so the table's type names none.
+runs: Aliases[Callable[..., Any], Any] = Aliases("run", {
     "decision": "dew.decision.config:DecisionRunConfig",
     "diffusion": "dew.config.diffusion:DiffusionRunConfig",
     "jepa": "dew.config.jepa:JepaRunConfig",
