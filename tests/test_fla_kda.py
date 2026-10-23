@@ -82,7 +82,7 @@ def test_the_rule_on_the_port_is_as_exact_as_the_math(key_heads, value_heads, wi
     def run(rule):
         return lambda q, k, v, g, beta, h0, do, dht: through(rule, do, dht)(q, k, v, g, beta, h0)
 
-    assert_as_exact(jax.jit(run(fla_rule)), jax.jit(run(fla_math)), draw,
+    assert_as_exact(jax.jit(run(fla_rule)), jax.jit(run(recurrence)), draw,
                     f"fla_kda {(key_heads, value_heads, width, columns, length)}",
                     seeds=SEEDS[(key_heads, value_heads, width, columns, length)],
                     truth_fn=jax.jit(run(recurrence)))
