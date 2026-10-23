@@ -4,6 +4,7 @@ References run Diffusers 0.34.0 / Transformers 4.49.0 in isolation. Tests here
 run Dew-native models, preprocessing, Process and solvers on the current stack.
 Each worker process releases its JAX executable caches after the comparison.
 """
+import json
 import os
 import subprocess
 import sys
@@ -23,7 +24,7 @@ def saved_pipelines(tmp_path_factory):
                            tmp_path_factory.mktemp("saved-diffusion"))
 
 
-def run_check(*arguments):
+def run_check(*arguments) -> str:
     result = subprocess.run(
         [sys.executable, str(ROOT / "tools/check_native_diffusion.py"), *map(str, arguments)],
         cwd=ROOT,
@@ -40,20 +41,19 @@ def run_check(*arguments):
         },
     )
     assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout
+
+
+STREAMED = ("sd", "xl", "safety")
+"""The flows that also load their pipeline streamed onto a mesh a leaf at a time
+(tests/test_pipeline_streaming.py) and hold it to the source beside the whole load."""
 
 
 @pytest.mark.parametrize(
     "task", ["sd", "xl", "img2img", "inpaint", "xl-img2img", "xl-inpaint", "refiner", "safety"]
 )
 def test_native_bundle_trajectory_update_and_source_roundtrip(saved_pipelines, task):
-    run_check(saved_pipelines / task)
-
-
-@pytest.mark.parametrize("task", ["sd", "xl", "safety"])
-def test_a_streamed_bundle_matches_the_source(saved_pipelines, task):
-    """The same checks, on the pipeline streamed onto a mesh a leaf at a time
-    (tests/test_pipeline_streaming.py)."""
-    run_check(saved_pipelines / task, "--streamed")
+    run_check(saved_pipelines / task, *(["--streamed"] if task in STREAMED else []))
 
 
 SCHEDULER_GRIDS = ROOT / "tests/fixtures/diffusers_pipeline_schedulers.npz"
@@ -66,9 +66,17 @@ def grid_cases() -> list[str]:
         return sorted(name.removesuffix(".config") for name in grids.files if name.endswith(".config"))
 
 
+@pytest.fixture(scope="module")
+def walked_grids(saved_pipelines) -> dict:
+    """Every source grid walked by the saved SD pipeline, loaded once in one process, each case's
+    errors and, where it is off the source, its failure (`check_grids`)."""
+    printed = run_check(saved_pipelines / "sd", "--grids", SCHEDULER_GRIDS)
+    return json.loads(printed.strip().splitlines()[-1])["grids"]
+
+
 @pytest.mark.parametrize("solver", grid_cases())
-def test_native_solver_consumes_the_complete_source_grid(saved_pipelines, solver):
-    run_check(saved_pipelines / "sd", "--grids", SCHEDULER_GRIDS, "--case", solver)
+def test_native_solver_consumes_the_complete_source_grid(walked_grids, solver):
+    assert "failed" not in walked_grids[solver], walked_grids[solver]["failed"]
 
 
 @pytest.mark.parametrize("task", ["sd", "xl"])
