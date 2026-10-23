@@ -1,4 +1,5 @@
-"""The MoE grouped matmul: its kernels' launches and the custom VJP that trains through them.
+"""The grouped matmul's kernel launches, which the GEMM template (`templates.gemm.template`) runs and
+differentiates (`dew.nn.moe.expert_projection` through it), and XLA's portable projection.
 
 Three products, in MaxText's megablox shape: the forward `gmm`, the input gradient `gmm` against the
 transposed kernel, and the kernel gradient `tgmm`. Each is a template launch (`templates.base`) with
@@ -39,11 +40,11 @@ from jax.custom_derivatives import SymbolicZero
 from jax.experimental.pallas import mosaic_gpu as plgpu, tpu as pltpu
 from jax.extend import core as jax_core
 
-from ..precision import at_least_fp32, rounded_operand
+from ..precision import rounded_operand
 from . import generation
 from .templates import base, cost, hopper
 from .templates.gemm import mosaic_gpu, mosaic_tpu
-from .templates.product import declared, promoted
+from .templates.product import declared
 
 
 def ragged_dot_refusal(compute: Dtype, operands: tuple[Dtype, ...],
@@ -335,7 +336,7 @@ class _Triton(_GroupedLaunch[Tile]):
     config_cls: ClassVar[type[Tile]] = Tile
 
     def eligible(self, ba, target) -> bool:
-        # Every CUDA GPU the dispatcher sends the kernels to (`dew.nn.moe.grouped_matmul_kernel`), and
+        # Every CUDA GPU the template sends the kernels to (`templates.gemm.template`), and
         # a CPU, which interprets them, or traces the CUDA branch a GPU's lowering takes; never a TPU.
         cuda = generation.capability(generation.effective(target).generation) is not None
         return cuda and _rated(target, ba.arguments['tokens'].dtype)
@@ -1194,30 +1195,32 @@ def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     return jnp.where(grouped, out, 0)
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(3, 4))
+@functools.partial(jax.custom_jvp, nondiff_argnums=(3, 4, 5))
 def portable_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
-                dtype: Dtype | None, precision: PrecisionLike) -> jax.Array:
+                dtype: Dtype | None, precision: PrecisionLike, out_dtype: Dtype | None = None) -> jax.Array:
     """The grouped projection on `xla_ragged_dot`, in every differentiation mode: `x`'s rows `[rows, in]`
     through each group's matrix of `kernel` `[groups, in, out]`, both cast to `dtype` (flax's promotion
     where None), summed in at least fp32 and rounded once. Its tangent is `dx @ Q(kernel) + Q(x) @
     dkernel`, `Q` the rounded operands, summed over the widest of the compute, input and kernel dtypes,
-    so an input gradient keeps its input's dtype and a kernel gradient its master's. The one portable
-    projection: `dew.nn.moe.expert_projection`'s XLA route and the kernels' portable branches
-    (`grouped_projection`) run it."""
+    so an input gradient keeps its input's dtype and a kernel gradient its master's: the portable
+    projection `dew.nn.moe.expert_projection`'s XLA route and the GEMM template's portable branch run.
+    `out_dtype`, where given, is the dtype its sum rounds to in place of the products' (the template's
+    fp32 accumulator, which its epilogue reads)."""
     x, kernel = promote_dtype(x, kernel, dtype=dtype)
     accumulated = xla_ragged_dot(x, kernel, group_sizes, precision=precision,
                                  preferred_element_type=jnp.promote_types(x.dtype, jnp.float32))
-    return accumulated.astype(x.dtype)
+    return accumulated.astype(out_dtype or x.dtype)
 
 
-def _portable_projection_jvp(dtype: Dtype | None, precision: PrecisionLike,
+def _portable_projection_jvp(dtype: Dtype | None, precision: PrecisionLike, out_dtype: Dtype | None,
                     primals: tuple[jax.Array, jax.Array, jax.Array],
                     tangents: tuple[jax.Array, jax.Array, jax.Array]
                     ) -> tuple[jax.Array, jax.Array | SymbolicZero]:
     x, kernel, group_sizes = primals
     dx, dkernel, _ = tangents
-    output = jnp.asarray(portable_projection(x, kernel, group_sizes, dtype, precision))
+    output = jnp.asarray(portable_projection(x, kernel, group_sizes, dtype, precision, out_dtype))
     work = jnp.result_type(output.dtype, x.dtype, kernel.dtype, jnp.float32)
+    compute = jnp.dtype(dtype) if dtype is not None else jnp.result_type(x.dtype, kernel.dtype)
     # A symbolic zero tangent contributes no term. Only the others pass the
     # barrier: jax 0.11.2 cannot transpose one that holds a constant zero.
     live = [(name, tangent) for name, tangent in (('x', dx), ('kernel', dkernel))
@@ -1230,13 +1233,15 @@ def _portable_projection_jvp(dtype: Dtype | None, precision: PrecisionLike,
                     jax.lax.optimization_barrier(tuple(tangent for _, tangent in live)),
                     strict=True))
     terms = []
+    # Each rounded operand is held in the work dtype, which holds the rounding whatever the operand's own
+    # (an fp16 master's largest value rounds to bf16's 65536, which fp16 does not hold).
     if 'x' in held:
-        matrix = jnp.asarray(rounded_operand(kernel, output.dtype))
+        matrix = jnp.asarray(rounded_operand(kernel.astype(work), compute))
         terms.append(xla_ragged_dot(
             held['x'].astype(work), matrix.astype(work), group_sizes, precision=precision,
             preferred_element_type=work))
     if 'kernel' in held:
-        inputs = jnp.asarray(rounded_operand(x, output.dtype))
+        inputs = jnp.asarray(rounded_operand(x.astype(work), compute))
         terms.append(xla_ragged_dot(
             inputs.astype(work), held['kernel'].astype(work), group_sizes, precision=precision,
             preferred_element_type=work))
@@ -1248,74 +1253,3 @@ def _portable_projection_jvp(dtype: Dtype | None, precision: PrecisionLike,
 portable_projection.defjvp(_portable_projection_jvp, symbolic_zeros=True)
 
 
-def _forward(inputs, matrix, sizes, out_dtype, interpret_on_cpu):
-    def kernel(inputs, matrix, sizes, *, interpret):
-        return launched_gmm(inputs, matrix, sizes, out_dtype=out_dtype, trans_rhs=False, interpret=interpret)
-
-    def fallback(inputs, matrix, sizes):
-        return portable_projection(inputs, matrix, sizes, out_dtype, None)
-
-    branches, default = _on_platform(kernel, fallback, interpret_on_cpu)
-    return jax.lax.platform_dependent(inputs, matrix, sizes, default=default, **branches)
-
-
-def _backward(inputs, matrix, sizes, cotangent, input_dtype, kernel_dtype, interpret_on_cpu, exact):
-    def kernel(inputs, matrix, sizes, cotangent, *, interpret):
-        return (launched_gmm(cotangent, matrix, sizes, out_dtype=input_dtype, trans_rhs=True,
-                             interpret=interpret, promoted=promoted(above=exact, outputs=(input_dtype,))),
-                launched_tgmm(inputs, cotangent, sizes, out_dtype=kernel_dtype, interpret=interpret,
-                              promoted=promoted(above=exact, outputs=(kernel_dtype,))))
-
-    def fallback(inputs, matrix, sizes, cotangent):
-        # The portable projection's derivative on the rounded operands widened to the work dtype, which
-        # holds them whatever their own dtypes (an fp16 master cannot hold every rounded bf16 value), each
-        # gradient then rounded once to its operand's dtype.
-        work = jnp.result_type(at_least_fp32(input_dtype), at_least_fp32(kernel_dtype))
-        _, pullback = jax.vjp(lambda x, kernel: portable_projection(x, kernel, sizes, inputs.dtype, None),
-                              inputs.astype(work), matrix.astype(work))
-        d_inputs, d_matrix = pullback(cotangent)
-        return d_inputs.astype(input_dtype), d_matrix.astype(kernel_dtype)
-
-    branches, default = _on_platform(kernel, fallback, interpret_on_cpu)
-    return jax.lax.platform_dependent(inputs, matrix, sizes, cotangent, default=default,
-                                      **branches)
-
-
-@functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5))
-def grouped_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
-                       compute: Dtype, interpret_on_cpu: bool, exact: bool = False) -> jax.Array:
-    """Compute `dew.nn.moe.expert_projection` with the kernels, differentiable in first-order reverse mode.
-
-    The operands are cast to `compute`, and the product accumulates in fp32
-    and is rounded once to `compute`. The input gradient takes `x`'s dtype
-    and the kernel gradient takes the kernel's. Each is summed in fp32 from
-    the compute-dtype cotangent and the rounded operands, which with 16-bit
-    compute means exact products, and the kernels write each in its own
-    dtype, one rounding with no pass after. Only a CUDA lowering runs the
-    kernels (`interpret_on_cpu` adds the CPU's interpreter). Every other
-    lowering runs `jax.lax.ragged_dot` under the same contract. `exact` (a
-    precision above the default) gives an fp32 gradient IEEE sums
-    (`ragged_dot_refusal`).
-    """
-    return _projection_fwd(x, kernel, group_sizes, compute, interpret_on_cpu, exact)[0]
-
-
-def _projection_fwd(x, kernel, group_sizes, compute, interpret_on_cpu, exact):
-    inputs, matrix = x.astype(compute), kernel.astype(compute)
-    sizes = group_sizes.astype(jnp.int32)
-    output = _forward(inputs, matrix, sizes, jnp.dtype(compute), interpret_on_cpu)
-    # The residuals are the rounded operands, the values the forward
-    # multiplied; the dtypes of the originals are what the gradients take.
-    residuals = (inputs, matrix, sizes, jnp.zeros((0,), x.dtype), jnp.zeros((0,), kernel.dtype))
-    return output, residuals
-
-
-def _projection_bwd(compute, interpret_on_cpu, exact, residuals, cotangent):
-    del compute
-    inputs, matrix, sizes, x_like, kernel_like = residuals
-    d_inputs, d_matrix = _backward(inputs, matrix, sizes, cotangent.astype(inputs.dtype), x_like.dtype,
-                                   kernel_like.dtype, interpret_on_cpu, exact)
-    return d_inputs, d_matrix, np.zeros(sizes.shape, jax.dtypes.float0)
-
-
-grouped_projection.defvjp(_projection_fwd, _projection_bwd)
