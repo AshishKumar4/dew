@@ -407,16 +407,25 @@ def _grid(shape) -> tuple[jax.Array, jax.Array]:
 
 def tril_inverse(diagonal, index, across: Across | None = None):
     """`(I + D)^-1` of a strictly lower square block `D`, row by row: forward substitution. `index` is
-    the block's `arange` of columns; `across` lays each row found as the next one's weights (`Across`)."""
+    the block's `arange` of columns; `across` lays each row found as the next one's weights (`Across`). A
+    block past `SUB` rows substitutes in a loop, where its rows unrolled took Mosaic GPU 110 s to compile at
+    64 (an A100's whole forward)."""
     sub = diagonal.shape[0]
     rows, columns = _grid(diagonal.shape)
-    inverse = -diagonal
-    for i in range(2, sub):
+
+    def substituted(i, inverse):
         row = jnp.sum(jnp.where(rows == i, -diagonal, 0.0), axis=0)
         row = jnp.where(index < i, row, 0.0)
         weights = row if across is None else across(row)
         row = row + jnp.sum(weights[:, None] * inverse, axis=0)
-        inverse = jnp.where(rows == i, row[None, :], inverse)
+        return jnp.where(rows == i, row[None, :], inverse)
+
+    inverse = -diagonal
+    if sub > SUB:
+        inverse = jax.lax.fori_loop(2, sub, substituted, inverse)
+    else:
+        for i in range(2, sub):
+            inverse = substituted(i, inverse)
     return inverse + jnp.where(rows == columns, 1.0, 0.0)
 
 
