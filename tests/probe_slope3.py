@@ -22,3 +22,20 @@ with jax.disable_jit():
 print("eager", np.asarray(eager.query)[0, 0, 0, :2], [np.asarray(p).ravel()[:2] for p in jax.tree.leaves(eager.score_params)] if hasattr(eager, "score_params") else "")
 jitted = jax.jit(lambda q, k, v, d: run(q, k, v, dout=d))(query, key, value, dout)
 print("jit", np.asarray(jitted.query)[0, 0, 0, :2])
+
+
+def reference(q, k, v):
+    return template.reference(q, k, v, spans, hooks, scale=4.0)
+
+
+out, pull = jax.vjp(jax.jit(reference), query, key, value)
+print("reference jit dq", np.asarray(pull(dout)[0])[0, 0, 0, :2])
+with jax.disable_jit():
+    out, pull = jax.vjp(reference, query, key, value)
+    print("reference eager dq", np.asarray(pull(dout)[0])[0, 0, 0, :2])
+with jax.enable_x64(True):
+    wide = [jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value, dout)]
+    hooks64 = template.Hooks(score_mod=lambda s, q_pos, k_pos, slope: slope * s,
+                             score_params=(template.Param(jnp.full((1,), 2e38, jnp.float64), template.Kind.HEAD),))
+    out, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, hooks64, scale=4.0), *wide[:3])
+    print("float64 dq", np.asarray(pull(wide[3])[0])[0, 0, 0, :2])
