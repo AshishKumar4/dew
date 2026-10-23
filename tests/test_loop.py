@@ -28,7 +28,7 @@ def tokens(rng, length=12, rows=2):
     return jax.random.randint(rng, (rows, length), 0, VOCAB)
 
 
-SEEDS = {'decode': 64, 'scanned': 64, 'checkpointed': 256, 'block decode': 32}
+SEEDS = {'decode': 64, 'scanned': 64, 'checkpointed': 512, 'block decode': 32}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada):
 the most any of a site's cases took."""
 
@@ -142,7 +142,7 @@ def test_checkpointed_passes_preserve_logits_and_gradients(backprop_steps, scan_
     assert_as_exact(result(checkpointed), result(plain), draw,
                     f'{scan_layers} {backprop_steps} checkpointed', seeds=SEEDS['checkpointed'],
                     truth_fn=result(plain.clone(dtype=jnp.float64)))
-    gradients = result(checkpointed)(*drawn(plain)(0))['gradients']['params']
+    gradients = result(checkpointed)(*draw(0))['gradients']['params']
     assert bool(jnp.any(gradients['embed_tokens']['embedding'])) == (backprop_steps is None)
     assert bool(jnp.any(gradients['layers_1']['mlp']['down_proj']['kernel']))
 
