@@ -102,6 +102,27 @@ def byte_level_tokenizer(directory: Path):
     return AutoTokenizer.from_pretrained(directory, local_files_only=True)
 
 
+def wordpiece_tokenizer(directory: Path):
+    """A BERT-style WordPiece tokenizer over the lowercase letters and their continuations, saved
+    in `directory` and read back through transformers: [CLS] and [SEP] around each encoding, and a
+    decoder that joins a continuation to the word before it and spaces the words."""
+    from string import ascii_lowercase
+
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, processors
+    from transformers import AutoTokenizer, PreTrainedTokenizerFast
+
+    specials = ["[PAD]", "[UNK]", "[CLS]", "[SEP]"]
+    pieces = [*specials, *ascii_lowercase, *(f"##{letter}" for letter in ascii_lowercase)]
+    vocabulary = {piece: index for index, piece in enumerate(pieces)}
+    backend = Tokenizer(models.WordPiece(vocabulary, unk_token="[UNK]"))
+    backend.pre_tokenizer = pre_tokenizers.BertPreTokenizer()
+    backend.decoder = decoders.WordPiece()
+    backend.post_processor = processors.BertProcessing(("[SEP]", 3), ("[CLS]", 2))
+    PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]", cls_token="[CLS]",
+                            sep_token="[SEP]", pad_token="[PAD]").save_pretrained(directory)
+    return AutoTokenizer.from_pretrained(directory, local_files_only=True)
+
+
 def export_byte_tokens(root: Path, documents: Iterable[str], *flags: str) -> Path:
     """`documents` written as records under `root` and exported by `dew data export` as byte tokens,
     each document ended by its EOS, into `root/tokens`, with the export's further `flags`."""

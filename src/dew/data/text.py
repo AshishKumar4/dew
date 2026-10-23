@@ -235,6 +235,12 @@ class ByteTokenizer:
     def decode(self, ids: ArrayLike | Sequence[int]) -> str:
         return bytes(_token_row(ids)).decode("utf-8", errors="replace")
 
+    def document(self, text: str, *, eos: bool) -> list[int]:
+        """`text` as one document's ids, its utf-8 bytes, ended by the EOS with `eos` where it holds
+        any."""
+        ids = self.encode(text)
+        return [*ids, self.eos_id] if eos and ids else ids
+
     def __repr__(self):
         return self.__class__.__name__ + "()"
 
@@ -304,6 +310,23 @@ class HFTokenizer:
     def decode(self, ids: ArrayLike | Sequence[int]) -> str:
         # batch_decode of one row is decode's text, typed as one str.
         return self.tokenizer.batch_decode([_token_row(ids)])[0]
+
+    @functools.cached_property
+    def appends_eos(self) -> bool:
+        """Whether the tokenizer's own special tokens end every encoding with its EOS, as T5's and an
+        EOS-inserting Llama's do."""
+        eos, probe = self.eos_id, "a"
+        return (eos is not None and self.encode(probe)[-1:] == [eos]
+                and self.encode(probe, add_special_tokens=False)[-1:] != [eos])
+
+    def document(self, text: str, *, eos: bool) -> list[int]:
+        """`text` as one document's ids, by the tokenizer's own special tokens (its BOS where it adds
+        one), ended by its EOS exactly once with `eos` where it holds any, and by none without, whether
+        or not the tokenizer appends its own (`appends_eos`)."""
+        ids = self.encode(text)
+        if self.appends_eos and ids[-1:] == [self.eos_id]:
+            ids = ids[:-1]
+        return [*ids, self.eos_id] if eos and ids else ids
 
     def save_pretrained(self, directory) -> None:
         """Write this tokenizer's own files into an export directory.
@@ -398,11 +421,10 @@ class Tokenize(grain.MapTransform):
         if not isinstance(value, str):
             raise ValueError(f"Tokenize field {self.field!r} must contain text")
         tokenizer = self.vocabulary
-        ids = tokenizer.encode(value)
-        if (self.eos or (self.eos is None and tokenizer.eos_id is not None)) and ids:
-            if tokenizer.eos_id is None:
-                raise ValueError(f"tokenizer {self.tokenizer} has no EOS id")
-            ids.append(tokenizer.eos_id)
+        ended = bool(self.eos) or (self.eos is None and tokenizer.eos_id is not None)
+        if ended and tokenizer.eos_id is None:
+            raise ValueError(f"tokenizer {self.tokenizer} has no EOS id")
+        ids = tokenizer.document(value, eos=ended)
         kept = {key: value for key, value in element.items() if key != self.field}
         return {**kept, "text": np.asarray(ids, np.int32), "_dew_length": len(ids)}
 

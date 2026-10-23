@@ -18,6 +18,13 @@ head) take it.
 
 JSON schemas compile through `outlines_core.json_schema.build_regex_from_schema`,
 which is the schema-to-regex translation outlines and vLLM use.
+
+The automaton reads each piece as the tokenizer's decoder spells it mid-text,
+so it holds the decoded text to the pattern only where every piece spells
+alike at the start of a text: byte-level BPE (GPT-2, Llama 3, Qwen) does. A
+decoder that spells a piece otherwise at the start, as SentencePiece's
+Metaspace and a byte-fallback Llama's drop the leading space and WordPiece
+one between words, is refused (`context_free_pieces`).
 """
 
 from __future__ import annotations
@@ -115,8 +122,8 @@ def regex(tokenizer: Vocabulary | Referencing | Tokenizing, pattern: str, eos_to
     if not stops:
         raise ValueError("guided decoding needs an EOS id to end a row on")
     source = vocabulary_of(tokenizer, "guided decoding")
-    pieces, ids = vocabulary_pieces(source, matching_mode(source))
     special = set(source.all_special_ids) if isinstance(source, Special) else set()
+    pieces, ids = context_free_pieces(source, special)
     spelled: dict[str | bytes, list[int]] = {}
     for piece, index in zip(pieces, ids, strict=True):
         if index not in special and index not in stops and piece:
@@ -125,6 +132,29 @@ def regex(tokenizer: Vocabulary | Referencing | Tokenizing, pattern: str, eos_to
     width = max(max(ids) + 1, vocab_size or 0)
     return _tables(index.get_transitions(), index.get_initial_state(), index.get_final_states(),
                    stops, width)
+
+
+def context_free_pieces(source: Vocabulary, special: set[int]) -> tuple[list[str | bytes], list[int]]:
+    """Each vocabulary entry's text mid-text and its id (`vocabulary_pieces`), for a tokenizer whose
+    decoder spells every piece but `special` alike at the start of a text. Refuses one that spells
+    some piece otherwise there: the decoded row would then not be the text the automaton held to
+    the pattern."""
+    pieces, ids = vocabulary_pieces(source, matching_mode(source))
+    probe = source("abcdef", add_special_tokens=False)["input_ids"]
+    before = [source.convert_ids_to_tokens(token) for token in probe]
+    opening = source.convert_tokens_to_string(before)
+    for token, index in zip(source.get_vocab(), ids, strict=True):
+        if index in special:
+            continue
+        alone = source.convert_tokens_to_string([token])
+        within = source.convert_tokens_to_string([*before, token])
+        if within != opening + alone:
+            raise ValueError(
+                f"guided decoding reads each token as its tokenizer spells it mid-text, and "
+                f"{type(source).__name__}'s decoder spells {token!r} as {alone!r} at the start of a text: "
+                "a constrained row could decode to text outside the pattern. Guide a byte-level BPE "
+                "tokenizer's model (GPT-2, Llama 3, Qwen)")
+    return pieces, ids
 
 
 def json_schema(tokenizer: Vocabulary | Referencing | Tokenizing, schema: str | Mapping[str, JSON],

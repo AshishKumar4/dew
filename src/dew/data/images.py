@@ -590,19 +590,26 @@ class AugmentationKey(grain.RandomMapTransform):
 
 @dataclasses.dataclass(frozen=True)
 class EncodeCaptions:
+    """Each batch's captions as the fields `reader` encodes from them, none without one; with `keep`
+    the captions stay beside them, host text a metric reads in the words they were written in (an
+    evaluation batch's, `CLIPScore`'s)."""
+
     reader: Callable[[Sequence[str]], Batch] | None = dataclasses.field(default=None, repr=False)
+    keep: bool = False
 
     @property
     def identity(self) -> str:
+        kept = ":kept" if self.keep else ""
         if self.reader is None:
-            return "dew.drop-captions@1"
-        return f"dew.encode-captions:{callable_name(self.reader)}"
+            return f"dew.drop-captions@1{kept}"
+        return f"dew.encode-captions:{callable_name(self.reader)}{kept}"
 
     def __call__(self, batch: Batch) -> Batch:
         held = dict(batch)
         if "caption" not in held:
             return held
-        captions = [str(value) for value in held.pop("caption")]
+        written = held["caption"] if self.keep else held.pop("caption")
+        captions = [str(value) for value in written]
         return held if self.reader is None else {**held, **self.reader(captions)}
 
 
