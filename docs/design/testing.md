@@ -79,7 +79,7 @@ The module's older assertions hold the comparisons not yet converted to check 1,
 
 A failure is a defect in Dew, the reference arm or the gate's derivation. Find which one. Never widen a tolerance, change the reference to one Dew already matches, drop failing positions or gradients, or compare only argmax when logits disagree.
 
-A CPU's float32 products follow Dew's accumulation policy, which `dew.nn.precision` states with its boundary: the dot family sums in float64, convolutions keep XLA's fp32 sum.
+A CPU's float32 products follow Dew's accumulation policy, which `dew.nn.precision` states with its boundary: the dot family sums in float64, convolutions keep XLA's fp32 sum. A program that wants a CPU's fp32 sums, a CPU-hosted sampler or server trading accuracy for speed, runs under `jax.default_matmul_precision("F32_F32_F32")` (`FP32_SUMS`), which takes the fp32 product.
 
 The committed generator uses the reference's public interface. Kernel qualification records forward, backward and forward-mode behavior where the consuming objective needs it.
 
