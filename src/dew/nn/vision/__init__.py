@@ -46,13 +46,12 @@ its class's layout (`tower_variables`, `projector_variables`).
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 from dew.objectives.base import Variables
-from dew.registry import projectors
 
 from .common import (
     ProjectorBase as ProjectorBase,
@@ -106,28 +105,6 @@ from .vit import (
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
-
-
-class _Prefixes(Mapping[str, str | tuple[str, ...]]):
-    """Each projector kind's checkpoint prefix (`ProjectorLayout.prefix`), read off the classes
-    `dew.registry.projectors` names."""
-
-    def __getitem__(self, kind: str) -> str | tuple[str, ...]:
-        layout = projectors[kind].checkpoint if kind in projectors else None
-        if layout is None:
-            raise KeyError(kind)
-        return layout.prefix
-
-    def __iter__(self) -> Iterator[str]:
-        return (kind for kind in projectors if projectors[kind].checkpoint is not None)
-
-    def __len__(self) -> int:
-        return sum(1 for _ in self)
-
-
-PROJECTOR_PREFIX = _Prefixes()
-"""Where each projector kind's tensors sit: one prefix, or several whose tensors each keep the name
-past their own."""
 
 
 def tower_variables(kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str

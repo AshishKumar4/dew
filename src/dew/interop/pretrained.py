@@ -1360,11 +1360,11 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
             model = diffusion_gemma.build(
                 config, dtype=dtype, attention_impl=attention_impl, max_seq_len=max_seq_len
             )
-            variables = diffusion_gemma.translate_weights(tensors, config, param_dtype=param_dtype,
-                                                          checked=checked)
-            record, layouts, retained = config, (), {}
+            variables, layouts = diffusion_gemma.translate_weights(tensors, config, param_dtype=param_dtype,
+                                                                   checked=checked)
+            record, retained = config, {}
             built = {**config, "dtype": dtype, "attention_impl": attention_impl}
-            export_adapter = diffusion_gemma.export_weights
+            export_adapter = partial(diffusion_gemma.export_weights, vision=layouts)
         case WrapperRoute(wrapper=wrapper):
             model, variables, record, built, layouts, retained, export_adapter = _wrapper_source(
                 config, wrapper, tensors, directory, dtype=dtype, attention_impl=attention_impl,
