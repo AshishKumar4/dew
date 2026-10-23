@@ -76,6 +76,10 @@ def scaled(acc, scale):
     return acc * scale[None, :]
 
 
+def scaled_rows(acc, scale):
+    return acc * scale[:, None]
+
+
 def doubled(acc):
     return acc, acc * 2
 
@@ -102,6 +106,9 @@ CASES = {
                            biased_row, lambda x, w, ms, nw, b, u, s: ((b[None, :], (None, "columns")),)),
     "scaled": Case(epilogue=scaled, epilogue_operands=lambda x, w, ms, nw, b, u, s: ((s, ("columns",)),),
                    out_dtypes=(jnp.float32,)),
+    # Each row its own scale (routing weights'): a cooperative consumer reads its half's rows of it.
+    "row scaled": Case(epilogue=scaled_rows,
+                       epilogue_operands=lambda x, w, ms, nw, b, u, s: ((ms, ("rows",)),)),
     "two outputs": Case(epilogue=doubled, out_dtypes=(jnp.bfloat16, jnp.float32)),
     "wide output": Case(out_dtypes=(jnp.float32,)),
     "dense": Case(out_dtypes=(jnp.float32,), dense=True),
@@ -197,11 +204,11 @@ def _kernels(taken) -> set:
 
 
 @runs("sm90")
-@pytest.mark.parametrize("case", ["norm and bias", "gated prologue", "cast prologue"])
+@pytest.mark.parametrize("case", ["norm and bias", "gated prologue", "cast prologue", "row scaled"])
 def test_a_cooperative_tile_holds_check_1_with_its_hooks(case):
-    """The Hopper launches pinned to a cooperative tile, interpreted: each consumer rewrites half the stage
-    both read and computes half the columns' epilogue, as exact as the plain program from float64 truth;
-    the Mosaic kernels ran."""
+    """The Hopper launches pinned to a cooperative tile, interpreted: each consumer rewrites and multiplies
+    its half of the stage's rows and computes their epilogue, as exact as the plain program from float64
+    truth; the Mosaic kernels ran."""
     spec = CASES[case]
     pinned = {grouped_matmul.MosaicGmm: COOPERATIVE, grouped_matmul.MosaicTgmm: COOPERATIVE}
     with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"), tuning.pinned(pinned),
