@@ -50,9 +50,8 @@ FLOOR = 0.02
 """The smallest band a row is gated by, as a fraction of the base's median."""
 COMPILE_FLOOR = 0.25
 """The least growth of a step's compile time the gate fails a head for: not a noise allowance (the rounds'
-spread still widens the band as for any row) but the materiality the project's rule names, "a head that
-grows it materially needs a reason" (BIBLE, compile time is performance), set at a quarter with the owner
-on 2026-10-19."""
+spread still widens the band as for any row) but the materiality of the project's rule that compile time is
+performance and a head that grows it materially gives the reason: a quarter."""
 
 # FLUX.2 and Wan 2.1 1.3B at their head width over a few of their blocks: the
 # rotary, the joint attention and the modulated feed-forwards of the hot path.
