@@ -5,8 +5,9 @@ live in float32 and, as the truth, in float64 with its float32 pins widened (che
 tests/reference_error.py): its output, and the gradients into the residual, the context and every
 parameter, the gates drawn away from zero. What zero gates and an empty context leave of the
 residual is exact. The decoder carries the blocks through its forward, its decode cache and its
-scanned stack, each on par with the plain forward from float64. A loaded bundle trains the blocks
-beside a LoRA adapter's factors with the source frozen.
+scanned stack, each on par with the plain forward from float64, and in every form of residual it
+carries. A loaded bundle trains the blocks beside a LoRA adapter's factors with the source frozen,
+and its run's checkpoint restores them.
 """
 
 import contextlib
@@ -23,12 +24,16 @@ import torch
 from model_support import TINY_DECODER, flat_tree
 from reference_error import assert_as_exact, torch_with_gradients, with_gradients
 
+from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
 from dew.interop.pretrained import Pretrained
 from dew.lora import LoRA
+from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import decoder_norm
 from dew.nn.cross_attention import CROSS_LENGTHS, CrossAttention, GatedCrossAttention, crossing
+from dew.nn.gemma3n import AltUp
+from dew.nn.hyper_connections import HyperConnections
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CrossContext, ModelInputs
 from dew.nn.mlp import GatedMLP
 from dew.nn.ngpt import NGPT
@@ -50,7 +55,16 @@ CROSS = CrossAttention(layer_ids=(0, 2), context_length=6, context_features=24)
 MODEL = CausalTransformer(**{"vocab_size": VOCAB, **TINY_DECODER, "num_layers": 3, "num_kv_heads": 2,
                              "cross_attention": CROSS})
 
-SEEDS = {"block": 64, "base": 16, "decode": 16, "scan": 16}
+FORMS = {
+    "altup": {"altup": AltUp(num_inputs=2)},
+    "mhc": {"hyper_connections": HyperConnections(hc_mult=2)},
+    "single-pass mhc": {"hyper_connections": HyperConnections(hc_mult=2, head="carried", single_pass=True)},
+    "depth": {"attention_residuals": AttentionResiduals(block_size=2)},
+    "ngpt": {"ngpt": NGPT(std=0.02, alpha=0.05), "pre_norms": False},
+}
+"""Each residual a decoder carries beside the plain stream, which the blocks read and join in its form."""
+
+SEEDS = {"block": 64, "base": 16, "decode": 16, "scan": 16, **{f"fresh {form}": 16 for form in FORMS}}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` on armada."""
 
 
@@ -179,17 +193,42 @@ def float64(model):
     return model.clone(dtype=jnp.float64, attention_impl="reference")
 
 
-def test_a_fresh_block_computes_the_decoder_it_was_attached_to():
-    """Drawn at zero gates, the decoder with its blocks computes the decoder without them, on par
-    with its float32 from the float64 decoder (check 1): the same function in two programs."""
-    base = dataclasses.replace(MODEL, cross_attention=None)
+def fresh_against_base(model: CausalTransformer, label: str):
+    """Check 1: `model` drawn at zero gates, reading a context, on par with the decoder without its
+    blocks from that decoder's float64: the same function in two programs."""
+    base = dataclasses.replace(model, cross_attention=None)
 
     def base_logits(model):
         run = jax.jit(lambda variables, ids: model.apply(variables, ids))
         return lambda variables, ids, context, lengths: run(_without_blocks(variables), ids)
 
-    assert_as_exact(logits(MODEL), base_logits(base), model_draw(MODEL, gated=False), "fresh blocks",
-                    seeds=SEEDS["base"], truth_fn=base_logits(float64(base)))
+    assert_as_exact(logits(model), base_logits(base), model_draw(model, gated=False), label,
+                    seeds=SEEDS[label], truth_fn=base_logits(float64(base)))
+
+
+def test_a_fresh_block_computes_the_decoder_it_was_attached_to():
+    """Drawn at zero gates, the decoder with its blocks computes the decoder without them (check 1)."""
+    fresh_against_base(MODEL, "base")
+
+
+@pytest.mark.parametrize("form", FORMS)
+def test_every_residual_form_takes_the_blocks(form):
+    """AltUp's active copy, mHC's streams (Single-Pass's too), the depth state's partial block and
+    nGPT's unit stream each take the blocks: fresh, the decoder computes itself (check 1); gated, its
+    logits move, and every gate takes a finite gradient that moves it."""
+    model = MODEL.clone(**FORMS[form])
+    fresh_against_base(model, f"fresh {form}")
+    variables, ids, context, lengths = model_draw(model)(1)
+    conditioning = {CONTEXT: context, CONTEXT_LENGTHS: lengths}
+    base = dataclasses.replace(model, cross_attention=None)
+    moved = np.asarray(model.apply(variables, ids, conditioning=conditioning))
+    assert not np.array_equal(moved[lengths > 0], np.asarray(base.apply(_without_blocks(variables), ids))[
+        lengths > 0])
+    gradients = jax.grad(lambda params: jnp.sum(model.apply({**variables, "params": params}, ids,
+                                                            conditioning=conditioning)))(variables["params"])
+    gates = [np.asarray(leaf) for path, leaf in flat_tree(gradients).items() if "alpha_" in path]
+    assert len(gates) == 2 * len(CROSS.layer_ids)
+    assert all(np.isfinite(gate).all() and np.all(gate != 0) for gate in gates)
 
 
 def _without_blocks(variables):
@@ -264,10 +303,6 @@ def test_a_decoder_refuses_what_its_blocks_cannot_read():
             CrossAttention(**{"layer_ids": (0,), "context_length": 4, **fields})
     with pytest.raises(ValueError):
         MODEL.clone(cross_attention=CrossAttention((3,), 4)).init(jax.random.key(0), ids)
-    normalized = base.clone(ngpt=NGPT(std=0.02, alpha=0.05))
-    normalized.init(jax.random.key(0), ids)
-    with pytest.raises(ValueError):
-        normalized.clone(cross_attention=CROSS).init(jax.random.key(0), ids)
 
 
 def test_cross_flops_count_the_blocks_over_the_context():
@@ -292,8 +327,9 @@ def source():
 def test_the_blocks_train_beside_an_adapter_with_the_source_frozen(source, tmp_path):
     """Attached to a loaded source, the blocks train and the source stays frozen; attached beside a
     LoRA adapter in either order, the blocks and the factors train together. An objective over the
-    bundle reads the batch's context and moves the gates off zero, every frozen leaf as it was; the
-    source's format holds no blocks, so the bundle refuses to export."""
+    bundle reads the batch's context and moves the gates off zero, every frozen leaf as it was, and
+    the run's checkpoint restores the model with its blocks; the source's own format holds no
+    blocks, so the bundle refuses to export to it."""
     cross = CrossAttention(layer_ids=(1,), context_length=3, context_features=8)
     attached = source.with_cross_attention(cross, key=0)
     assert all(crossing(path) for path in flat_tree(attached.variables["params"]))
@@ -312,11 +348,13 @@ def test_the_blocks_train_beside_an_adapter_with_the_source_frozen(source, tmp_p
     inputs = ModelInputs(jnp.asarray(rng.integers(0, 256, (rows, 8)), jnp.int32), conditioning={
         CONTEXT: jnp.asarray(rng.standard_normal((rows, 3, 8)), jnp.float32),
         CONTEXT_LENGTHS: jnp.asarray(rng.integers(1, 4, rows), jnp.int32)})
+    checkpoints = Checkpoints(str(tmp_path / "run"))
     trainer = Trainer(LMObjective(before, 7), optax.sgd(0.1), key=jax.random.key(3), mesh=MeshSpec(),
-                      layout=Layout(min_shard=2**30))
+                      layout=Layout(min_shard=2**30), checkpoints=checkpoints)
     initial = trainer.initial_state()
     state = trainer.fit(Loader(train=lambda partition: iter([{"text": inputs}] * 2), val=None, records=rows,
-                               batch=rows), steps=2, log_every=2)
+                               batch=rows), steps=2, log_every=2, checkpoint_every=2)
+    checkpoints.wait()
     for before_leaf, after_leaf in zip(jax.tree.leaves(initial.variables[FROZEN]),
                                        jax.tree.leaves(state.variables[FROZEN]), strict=True):
         np.testing.assert_array_equal(np.asarray(before_leaf), np.asarray(after_leaf))
@@ -324,3 +362,8 @@ def test_the_blocks_train_beside_an_adapter_with_the_source_frozen(source, tmp_p
              if "alpha_" in path}
     assert gates and all(np.all(gate != 0) for gate in gates.values())
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(state.variables["params"]))
+    restored = Pretrained.from_run(tmp_path / "run")
+    assert restored.model.cross_attention == cross
+    kept = flat_tree(thaw(restored.variables))
+    for path, leaf in flat_tree(thaw(state.variables)).items():
+        np.testing.assert_array_equal(np.asarray(kept[path]), np.asarray(leaf), err_msg=path)

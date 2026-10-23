@@ -880,19 +880,14 @@ class CausalTransformer(nn.Module):
                 "model trained on plain next-token prediction")
 
     def refuse_unbuildable_cross_attention(self):
-        """Raise `ValueError` where `cross_attention` names a layer this model lacks, a residual
-        it does not add to, or a layer with no feed-forward width to take."""
+        """Raise `ValueError` where `cross_attention` names a layer this model lacks, or a layer
+        with no feed-forward width to take."""
         cross = self.cross_attention
         if cross is None:
             return
         outside = sorted(set(cross.layer_ids) - set(range(self.num_layers)))
         if outside:
             raise ValueError(f"cross-attention layers {outside} are outside the {self.num_layers} layers")
-        carried = [name for name in ("altup", "hyper_connections", "attention_residuals", "ngpt")
-                   if getattr(self, name) is not None]
-        if carried:
-            raise ValueError(f"cross-attention adds to the one plain residual stream, and {carried} "
-                             "carry another")
         unsized = sorted(index for index in cross.layer_ids if not self.mlp_widths[index])
         if cross.intermediate_size is None and unsized:
             raise ValueError(f"layers {unsized} have no feed-forward whose width the cross-attention "
@@ -1311,15 +1306,16 @@ class CausalTransformer(nn.Module):
 
     @nn.nowrap
     def _cross_layer(self, index: int, gated_mlp) -> Callable[..., GatedCrossAttention]:
-        """Layer `index`'s gated cross-attention factory: the model's norms, its gated MLP at the
-        block's width, its attention's heads, kernel and dtypes."""
+        """Layer `index`'s gated cross-attention factory: the model's norms, none under nGPT, its
+        gated MLP at the block's width, its attention's heads, kernel and dtypes."""
         cross = self.cross_attention
         assert cross is not None
         return functools.partial(
             GatedCrossAttention,
-            norm=decoder_norm(self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
-                              scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                              dtype=self.dtype, specs=self.norms),
+            norm=None if self.ngpt is not None else decoder_norm(
+                self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias, scale_offset=self.scale_offset,
+                scale_after_cast=self.scale_after_cast, dtype=self.dtype, specs=self.norms),
+            ngpt=self.ngpt is not None,
             feedforward=functools.partial(
                 gated_mlp, hidden_features=cross.intermediate_size or self.mlp_widths[index]),
             emb_features=self.emb_features,
