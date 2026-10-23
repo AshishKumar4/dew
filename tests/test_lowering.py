@@ -213,9 +213,9 @@ def test_an_expert_layer_lowers_for_the_gpu_with_the_grouped_matmul_its_generati
     """'auto' runs the grouped matmul's kernels on every GPU generation, each forward and backward
     launch of each projection the implementation its cost model picks there (its route says which):
     Triton's on a GPU without warpgroup MMA, whose two kernels lower, and on Hopper Triton's only where
-    a launch runs it, Mosaic GPU's lowering as no Triton kernel. The experts' SiLU product takes the
-    fused SwiGLU where the row names it, forward and backward, as every fused kernel is differentiated
-    through its portable arithmetic (`generation.linear_tangent`)."""
+    a launch runs it, Mosaic GPU's lowering as no Triton kernel. The experts' SiLU product runs in the
+    paired gate and up projection's epilogue (`moe.gated_projections`), forward and backward, so no
+    SwiGLU kernel of its own lowers."""
     with routes() as taken:
         lowered = _experts_lowered(generation, 'auto')
     # The layer's own launches, as traced for `generation`; its initialization runs on the CPU.
@@ -227,8 +227,7 @@ def test_an_expert_layer_lowers_for_the_gpu_with_the_grouped_matmul_its_generati
     if not gpu_target(generation).wgmma:
         assert kernels == {'triton'} and lowered_grouped == grouped
     assert bool(lowered_grouped) == ('triton' in kernels)
-    swiglu = set().union(*(FAMILIES[key][1] for key in chosen(generation, "step") if key[0] == 'swiglu'))
-    assert set(triton_kernels(lowered)) - grouped == swiglu
+    assert not set(triton_kernels(lowered)) - grouped
 
 
 def _mamba2_lowered(generation: str):
