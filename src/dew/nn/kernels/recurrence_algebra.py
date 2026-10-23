@@ -156,8 +156,17 @@ def raised(whole, part):
     pair of tokens at -30 a token), a decay's relative 1.3e-6, which put the port's decay gradient under
     decays near zero 7 to 10 times the token-by-token recurrence's distance from float64; and exp2 of a
     whole exponent, which a CPU takes as `exp(x ln 2)`, rounds its product with ln 2 the same way."""
-    n = jnp.floor(whole)
+    n = _floor(whole)
     return jnp.exp2((whole - n) + part) * _power_of_two(n)
+
+
+def _floor(x):
+    """`floor(x)` of fp32 `x` from its truncation toward zero, which Mosaic GPU lowers (it lowers no floor),
+    the same value (a zero's sign aside): every fp32 of magnitude 2^23 or more is an integer, and infinities
+    and NaNs are their own floor."""
+    truncated = jnp.clip(x, -2.0 ** 23, 2.0 ** 23).astype(jnp.int32).astype(x.dtype)
+    floor = jnp.where(truncated > x, truncated - 1.0, truncated)
+    return jnp.where(jnp.abs(x) < 2.0 ** 23, floor, x)
 
 
 def _power_of_two(n):
@@ -385,45 +394,62 @@ def apart(rows, rows_lo, columns, columns_lo):
     return (rows[:, None] - columns[None, :]) + (rows_lo[:, None] - columns_lo[None, :])
 
 
-def tril_inverse(diagonal, index):
+Across = Callable[[jax.Array], jax.Array]
+"""A column's vector `[C]` laid as a row's: a mainloop whose layouts keep the two apart (Mosaic GPU's, whose
+vectors are a row's or a column's of the accumulator's layout and never both) takes one to the other; where
+None, the vector itself serves as either."""
+
+
+def _grid(shape) -> tuple[jax.Array, jax.Array]:
+    """A tile's row and column indices `[R, C]` each, two iotas, so a mainloop lays each as its tile."""
+    return jax.lax.broadcasted_iota(jnp.int32, shape, 0), jax.lax.broadcasted_iota(jnp.int32, shape, 1)
+
+
+def tril_inverse(diagonal, index, across: Across | None = None):
     """`(I + D)^-1` of a strictly lower square block `D`, row by row: forward substitution. `index` is
-    the block's `arange` of rows, which the caller's other masks share."""
+    the block's `arange` of columns; `across` lays each row found as the next one's weights (`Across`)."""
     sub = diagonal.shape[0]
+    rows, columns = _grid(diagonal.shape)
     inverse = -diagonal
     for i in range(2, sub):
-        row = jnp.sum(jnp.where((index == i)[:, None], -diagonal, 0.0), axis=0)
+        row = jnp.sum(jnp.where(rows == i, -diagonal, 0.0), axis=0)
         row = jnp.where(index < i, row, 0.0)
-        row = row + jnp.sum(row[:, None] * inverse, axis=0)
-        inverse = jnp.where((index == i)[:, None], row[None, :], inverse)
-    return inverse + (index[:, None] == index[None, :])
+        weights = row if across is None else across(row)
+        row = row + jnp.sum(weights[:, None] * inverse, axis=0)
+        inverse = jnp.where(rows == i, row[None, :], inverse)
+    return inverse + jnp.where(rows == columns, 1.0, 0.0)
 
 
-def solved(keys: Load, gates, lows, betas, columns: int, issue: Issue) -> dict:
+def solved(keys: Load, gates, lows, betas, columns: int, issue: Issue, *, laid: tuple | None = None,
+           across: Across | None = None) -> dict:
     """`(I + A)^-1`'s blocks `{(i, j): [SUB, SUB]}` for `j <= i` of one chunk's `A = tril(beta_s (k_s .
     k_t) exp2(g_s - g_t), -1)`, a decay a head: `keys(i, c)` sub-chunk `i`'s key column block `c` of
-    `columns`, `gates`, `lows` and `betas` each sub-chunk's prefix halves and write gates, fp32. Every
-    block of `k k^T` sums its column blocks' products ('intra'), and the blocks invert (`inverted`)."""
+    `columns`, `gates`, `lows` and `betas` each sub-chunk's prefix halves and write gates, fp32, and `laid`
+    the halves `(gates, lows)` as a column's vectors where a mainloop's layouts keep them apart from a row's
+    (`Across`, which `across` crosses). Every block of `k k^T` sums its column blocks' products ('intra'),
+    and the blocks invert (`inverted`)."""
     count = len(gates)
-    index = jnp.arange(gates[0].shape[0])
-    strict = index[:, None] > index[None, :]
+    column_gates, column_lows = (gates, lows) if laid is None else laid
 
     def block(i, j):
         product = sum(issue("intra", keys(i, c), keys(j, c).T) for c in range(columns))
-        decay = decayed(gates[i], lows[i], gates[j], lows[j])
-        product = product * (jnp.where(strict, decay, 0.0) if i == j else decay)
-        return product * betas[i][:, None]
+        decay = decayed(gates[i], lows[i], column_gates[j], column_lows[j])
+        if i == j:
+            rows, cols = _grid(decay.shape)
+            decay = jnp.where(rows > cols, decay, 0.0)
+        return product * decay * betas[i][:, None]
 
-    return inverted({(i, j): block(i, j) for i in range(count) for j in range(i + 1)}, issue)
+    return inverted({(i, j): block(i, j) for i in range(count) for j in range(i + 1)}, issue, across=across)
 
 
-def inverted(blocks: dict, issue: Issue) -> dict:
+def inverted(blocks: dict, issue: Issue, *, across: Across | None = None) -> dict:
     """`(I + A)^-1`'s blocks `{(i, j): [SUB, SUB]}` for `j <= i` from `A`'s strictly lower blocks
     `blocks` (the diagonal ones strictly lower themselves): forward substitution inverts each diagonal
-    block (`tril_inverse`), and neighbouring inverses merge as `X_ij = -X_ii sum_m A_im X_mj` ('merge'),
-    nearest the diagonal first."""
+    block (`tril_inverse`, its rows laid by `across`), and neighbouring inverses merge as `X_ij = -X_ii
+    sum_m A_im X_mj` ('merge'), nearest the diagonal first."""
     count = max(i for i, _ in blocks) + 1
     index = jnp.arange(blocks[0, 0].shape[0])
-    inverse = {(i, i): tril_inverse(blocks[i, i], index) for i in range(count)}
+    inverse = {(i, i): tril_inverse(blocks[i, i], index, across) for i in range(count)}
     for distance in range(1, count):
         for i in range(distance, count):
             j = i - distance
@@ -462,10 +488,12 @@ def scalar_write(corrected_values, last, gate, last_lo, gate_lo):
 
 
 def chunk_output(queries: Load, entered: Load, keys: Load, columns: int, gate, low, value, scale: float,
-                 issue: Issue):
+                 issue: Issue, *, laid: tuple | None = None):
     """A chunk's output `[C, BV]`, fp32, a decay a head: `scale ((q S) exp2(g) + tril((q k^T) exp2(g_s -
     g_t)) v)`, the key column blocks `queries(c)`, `entered(c)` (the memory the chunk entered) and
-    `keys(c)` summed into fp32 ('memory', 'scores'), the scores cast to the values' dtype for 'local'."""
+    `keys(c)` summed into fp32 ('memory', 'scores'), the scores cast to the values' dtype for 'local'.
+    `laid` is the prefix's halves `(gate, low)` as a column's vectors where a mainloop's layouts keep them
+    apart from a row's (`Across`)."""
     out = jnp.zeros((gate.shape[0], value.shape[-1]), jnp.float32)
     scores = jnp.zeros((gate.shape[0], gate.shape[0]), jnp.float32)
     for c in range(columns):
@@ -473,9 +501,9 @@ def chunk_output(queries: Load, entered: Load, keys: Load, columns: int, gate, l
         out += issue("memory", query, entered(c))
         scores += issue("scores", query, keys(c).T)
     out = out * raised(gate, low)[:, None]
-    scores = scores * decayed(gate, low, gate, low)
-    index = jnp.arange(gate.shape[0])
-    scores = jnp.where(index[:, None] >= index[None, :], scores, 0.0)
+    scores = scores * decayed(gate, low, *((gate, low) if laid is None else laid))
+    rows, cols = _grid(scores.shape)
+    scores = jnp.where(rows >= cols, scores, 0.0)
     return out * scale + issue("local", scores.astype(value.dtype), value) * scale
 
 
