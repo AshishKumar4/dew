@@ -135,3 +135,34 @@ def test_a_mixed_list_with_a_backbone_that_reads_no_images_refuses_the_images_al
     assert isinstance(answered[1], dict)
     assert discrete(answered[1]) == discrete(decide.systemone(CASES["structured"]))
 
+
+
+def test_one_engine_serves_generation_and_scoring_from_one_thread(decide):
+    """A generation server and a scoring server under one engine (`dew.inference.engine.Engine`), their
+    requests submitted together from the caller's thread: each generation draws what it draws alone,
+    and each scoring answer is its lone answer, the two kinds stepped in turn."""
+    from model_support import serving_task
+
+    from dew.inference.engine import Engine
+    from dew.inference.scoring import ScoringServer
+    from dew.inference.serving import Server
+
+    bound = serving_task()
+    prompts, budgets = ["12", "5", "1234567"], [3, 5, 2]
+    alone = [bound(prompt, budget, key=index) for index, (prompt, budget) in enumerate(zip(prompts, budgets,
+                                                                                          strict=True))]
+    generating = Server.from_task(bound, slots=2, capacity=64, admission=2)
+    scoring = ScoringServer.from_task(*decide.scoring(), rows=2)
+    engine = Engine(generating, scoring)
+    engine.start()
+    try:
+        drawn = [generating.submit(prompt, budget, key=index)
+                 for index, (prompt, budget) in enumerate(zip(prompts, budgets, strict=True))]
+        answered = [scoring.submit(body) for body in CASES.values()]
+        generations = [ticket.result(timeout=300) for ticket in drawn]
+        answers = [future.result(timeout=300) for future in answered]
+    finally:
+        engine.close()
+    assert [generation.text for generation in generations] == [generation.text for generation in alone]
+    for body, answer in zip(CASES.values(), answers, strict=True):
+        assert discrete(answer) == discrete(decide.systemone(body))

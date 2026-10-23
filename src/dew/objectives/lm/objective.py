@@ -44,8 +44,11 @@ from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
 from dew.inference.tasks import Processor, TextSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
-from dew.nn.flops import MissingFlopsCount, counted_flops
+from dew.nn.cross_attention import crossing
+from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import (
+    CONTEXT,
+    CONTEXT_LENGTHS,
     COORDINATES_FIELD,
     Coordinates,
     ModelInputs,
@@ -62,6 +65,7 @@ from dew.nn.protocols import (
     CountedLogitsTraining,
     CountedPredictions,
     CountedPredictionTraining,
+    CrossAttending,
     DecoderTraining,
     Lacks,
     LayerStates,
@@ -70,6 +74,7 @@ from dew.nn.protocols import (
 )
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
+    FROZEN,
     OMITTED,
     VALID_ROWS,
     Aux,
@@ -709,9 +714,9 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         missing = self._missing_flops(model)
         if missing is not None:
             raise MissingFlopsCount(missing)
-        self._check_flop_geometry(batch)
+        crossed = self._context_flops(model, batch)
         lengths = self._prediction_lengths(batch)
-        count = counted_flops(model, self.real_lengths(batch)) + model.logits_flops(lengths)
+        count = counted_flops(model, self.real_lengths(batch)) + model.logits_flops(lengths) + crossed
         return count + (model.prediction_flops(self.real_lengths(batch),
                                                prediction_lengths=self._prediction_rows(model, batch))
                         if self.mtp_weight else 0)
@@ -722,12 +727,20 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         missing = self._missing_flops(model)
         if missing is not None:
             raise MissingFlopsCount(missing)
-        self._check_flop_geometry(batch)
-        if not isinstance(model, CountedLogitsTraining):
-            return super().training_flops(model, batch)
+        crossed = self._context_flops(model, batch)
         targets = self._prediction_lengths(batch)
         lengths = self.real_lengths(batch)
-        count = model.training_flops(lengths) + model.logits_training_flops(targets)
+        if self._trains_cross_attention_alone(model):
+            if self.mtp_weight:
+                raise MissingFlopsCount("a frozen trunk's prediction depths have no frozen training count")
+            # Every trunk and head matrix frozen: its forward and its input's gradient, no weight's.
+            trunk, head = counted_flops(model, lengths), model.logits_flops(targets)
+            return (frozen_training_flops(trunk, parameter_flops(model, lengths))
+                    + frozen_training_flops(head, head) + 3 * crossed)
+        if not isinstance(model, CountedLogitsTraining):
+            return super().training_flops(model, batch)
+        # Every cross-attention matrix trains: its forward, its input's gradient and its own.
+        count = model.training_flops(lengths) + model.logits_training_flops(targets) + 3 * crossed
         if self.mtp_weight:
             if not isinstance(model, CountedPredictionTraining):
                 raise MissingFlopsCount(f"{type(model).__name__} has no prediction_training_flops "
@@ -760,11 +773,35 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
             depth_rows.append((self._row_lengths(admitted, segments), self._row_lengths(scored, segments)))
         return depth_rows
 
-    def _check_flop_geometry(self, batch: Batch) -> None:
-        """Media needs its own FLOP count, but does not prevent counting token lengths."""
+    def _trains_cross_attention_alone(self, model) -> bool:
+        """Whether this objective trains a decoder's cross-attention blocks and nothing else: its
+        variables split (`FROZEN`) with every trained leaf a block's (`dew.nn.cross_attention`), as
+        `Pretrained.with_cross_attention` splits a source."""
+        held = self.variables
+        if held is None or FROZEN not in held or not isinstance(model, CrossAttending) or (
+                model.cross_attention is None):
+            return False
+        return all(crossing(("params", *(entry.key for entry in path)))
+                   for path, _ in jax.tree_util.tree_leaves_with_path(held["params"]))
+
+    def _context_flops(self, model, batch: Batch) -> float:
+        """The forward work of the cross-attention blocks over the batch's context
+        (`CrossAttending.cross_flops`), each row's real tokens reading its context's;
+        none without conditioning. Media needs its own count, which raises
+        `MissingFlopsCount`."""
         raw = batch[TEXT_KEY]
-        if isinstance(raw, ModelInputs) and raw.conditioning:
+        conditioning = raw.conditioning if isinstance(raw, ModelInputs) else {}
+        if not conditioning:
+            return 0.0
+        if (set(conditioning) - {CONTEXT, CONTEXT_LENGTHS} or not isinstance(model, CrossAttending)
+                or model.cross_attention is None):
             raise MissingFlopsCount("LMObjective needs its conditioning tower's multi-sequence geometry")
+        valid, _ = self._counted_tokens(batch)
+        context = np.asarray(conditioning[CONTEXT])
+        lengths = conditioning.get(CONTEXT_LENGTHS)
+        lengths = (np.full(context.shape[:1], context.shape[1]) if lengths is None
+                   else np.asarray(lengths)).astype(np.int64)
+        return float(model.cross_flops(np.sum(valid[:, :-1], axis=-1, dtype=np.int64), lengths))
 
     def _prediction_lengths(self, batch: Batch, depth: int = 0) -> np.ndarray:
         """Each row's targets the loss scores at `depth` (`scored_targets`)."""

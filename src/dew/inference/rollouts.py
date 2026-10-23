@@ -51,7 +51,8 @@ from .clients import (
     matched_stop,
     reported_log_probs,
 )
-from .serving import Server, settled
+from .engine import settled
+from .serving import Server
 
 if TYPE_CHECKING:
     import httpx
