@@ -19,6 +19,7 @@ from reference_error import (
     assert_as_exact_as_the_reference,
     assert_computes_the_oracle,
     assert_rounds_where_the_reference_does,
+    chain_roundings,
 )
 from tool_support import load as load_tool
 
@@ -310,22 +311,16 @@ def test_a_float64_model_computes_in_float64():
 
         logits = np.asarray(model.apply(variables, ids))
         written = loaded.export({'params': jax.grad(loss)(variables['params'])})
+        forward = chain_roundings(jax.make_jaxpr(lambda variables: model.apply(variables, ids))(variables))
+        backward = chain_roundings(jax.make_jaxpr(jax.grad(loss))(variables['params']))
     reference = TOOL.DoryReference(loaded.config, tensors, TOOL.torch.float64)
     expected = reference.forward(ids)
     gradients = reference.gradients(np.array(ids), np.array(cotangent), TOOL.GRADIENTS)
     assert logits.dtype == np.float64
-    # Each layer pass reduces over the width (the projections), a head (the logits), the keys (the
-    # weights) and the heads' and the feed-forward's widths; the backward runs every pass again.
-    config = loaded.config
-    passes = (config['n_input_layers'] + config['n_recurrent_loops'] * config['n_recurrent_layers']
-              + config['n_output_layers'])
-    layer = (3 * config['hidden_size'] + config['head_dim'] + ids.shape[1]
-             + config['num_attention_heads'] * config['head_dim'] + config['intermediate_size'])
-    roundings = 2 * (passes * layer + config['hidden_size'])
-    assert_computes_the_oracle(logits, expected, 'float64 logits', roundings=roundings)
+    assert_computes_the_oracle(logits, expected, 'float64 logits', roundings=forward)
     for tensor in TOOL.GRADIENTS:
         assert_computes_the_oracle(np.asarray(written[tensor]), gradients[tensor], f'float64 {tensor}',
-                                   roundings=roundings)
+                                   roundings=backward)
 
 
 def test_a_cut_loop_trains_the_layers_before_it_through_the_input_every_pass_reads():
