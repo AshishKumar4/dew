@@ -1102,9 +1102,10 @@ def configured(value: object) -> Configured:
     raise ValueError(f"{value!r} is not a value a member field carries")
 
 
-DtypeName = Literal["float32", "bfloat16", "float16"]
+DtypeName = Literal["float32", "bfloat16", "float16", "float64"]
 _DTYPES: dict[DtypeName, DTypeLike] = {name: getattr(jnp, name) for name in get_args(DtypeName)}
-"""Each storage dtype a config names, by its name: `DtypeName`'s, the one declaration."""
+"""Each storage dtype a config names, by its name: `DtypeName`'s, the one declaration. float64 is
+a model's own dtype where it computes in float64 end to end (Dory, nGPT)."""
 
 
 def resolve_dtype(value: object) -> DTypeLike | None:
@@ -1145,7 +1146,7 @@ def dtype_name(value: DTypeLike | None) -> DtypeName | None:
 
 def storage_name(value: DTypeLike) -> DtypeName | None:
     """The name of the storage dtype `value` is (`DtypeName`), or None for any other dtype: a
-    checkpoint's float64 or integer tensors are not storage a config names."""
+    checkpoint's integer or float8 tensors are not storage a config names."""
     return next((name for name, dtype in _DTYPES.items() if jnp.dtype(value) == jnp.dtype(dtype)), None)
 
 
