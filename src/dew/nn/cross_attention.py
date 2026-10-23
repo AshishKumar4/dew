@@ -191,10 +191,15 @@ class GatedCrossAttention(nn.Module):
     def _join(self, stream: jax.Array, branch: jax.Array, gate: jax.Array) -> jax.Array:
         """`stream` with `branch` joined through `gate`: added, broadcast over any
         axis the stream has beside the states', or under nGPT a step of `gate`
-        from the unit stream toward the unit branch, unit-normed back."""
+        from the unit stream toward the unit branch, unit-normed back and scaled
+        to the stream's own length. That is nGPT's step on the unit sphere its
+        layers' outputs lie on, and still the stream at a zero gate before a
+        first layer, whose input embeddings are not unit."""
         if self.ngpt:
-            start, end = unit(stream).astype(jnp.float32), unit(branch).astype(jnp.float32)
-            return unit(start + _gated(end - start, gate, self.precision)).astype(stream.dtype)
+            wide = stream.astype(jnp.float32)
+            start, end = unit(wide), unit(branch).astype(jnp.float32)
+            length = jnp.sqrt(jnp.sum(jnp.square(wide), axis=-1, keepdims=True))
+            return (length * unit(start + _gated(end - start, gate, self.precision))).astype(stream.dtype)
         widened = branch.reshape(branch.shape[:2] + (1,) * (stream.ndim - branch.ndim) + branch.shape[2:])
         return stream + _gated(widened, gate, self.precision).astype(stream.dtype)
 
