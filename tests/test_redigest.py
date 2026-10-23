@@ -237,17 +237,23 @@ def test_the_programs_parsed_roles_decide_what_is_a_rename(site, before, after, 
     assert changed == ({"site/public/examples/text/capture.json"} if kept else set())
 
 
+def a_good_rename_writes_nothing(site: Path, relative: str) -> None:
+    """The first keyword `relative` passes renamed, a good rename, and the refusal the base's recordings
+    hold writes nothing."""
+    before = recordings(site)
+    name = passed((site / relative).read_text())[0].arg
+    renamed_keyword(site, relative, name, f"{name}_renamed")
+    assert redigest(site).returncode == 1
+    assert recordings(site) == before
+
+
 def test_a_refusal_found_after_a_good_rename_writes_nothing(site):
     """The hero's cell digest written otherwise than the tool would write it: the rename of its script and
     cell is found good, the cell's digest cannot be placed, and neither digest is written."""
     capture = site / "site/src/data/capture.json"
     capture.write_bytes(capture.read_bytes().replace(b'"cell_sha256": "', b'"cell_sha256":"'))
     git(site, "commit", "-qam", "a capture written by hand")
-    before = recordings(site)
-    name = passed((site / HERO).read_text())[0].arg
-    renamed_keyword(site, HERO, name, f"{name}_renamed")
-    assert redigest(site).returncode == 1
-    assert recordings(site) == before
+    a_good_rename_writes_nothing(site, HERO)
 
 
 def test_a_recording_already_of_other_code_writes_nothing(site):
@@ -255,8 +261,4 @@ def test_a_recording_already_of_other_code_writes_nothing(site):
     capture = json.loads(stale.read_text())
     stale.write_text(stale.read_text().replace(capture["script_sha256"], "0" * 64))
     git(site, "commit", "-qam", "a stale recording")
-    before = recordings(site)
-    name = passed((site / FRAMEWORK).read_text())[0].arg
-    renamed_keyword(site, FRAMEWORK, name, f"{name}_renamed")
-    assert redigest(site).returncode == 1
-    assert recordings(site) == before
+    a_good_rename_writes_nothing(site, FRAMEWORK)
