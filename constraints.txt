@@ -18,13 +18,17 @@
 # erf_inv, through float32 and correctly rounded, which a GEMM template prologue
 # dividing in bfloat16 needs on CUDA; and a custom_vjp call (and Mosaic GPU's
 # custom_jvp call) lowered in a Pallas Triton or Mosaic GPU kernel as its primal
-# function, which a template's score hook through a jax.custom_vjp needs. Every
-# CI and development install takes this one build. Return to a release once one
-# ships the fixes.
+# function, which a template's score hook through a jax.custom_vjp needs; and
+# Mosaic GPU's MMA accumulator relaid out to a 16-bit MMA's left operand in
+# registers, and an abstract device's compute capability, which Mosaic GPU
+# lowers for, which the templates' Mosaic kernels need on sm80; and the
+# persistent compilation cache keyed by jax's own build, so two builds over one
+# jaxlib never read each other's programs. Every CI and development install
+# takes this one build. Return to a release once one ships the fixes.
 # BEGIN package index (site/scripts/gen_install.py)
 --extra-index-url https://pypi.dewml.dev/simple
 # END package index
-jax==0.11.2.post12
+jax==0.11.2.post15
 
 # The CA bundle requests, httpx and the Hub verify TLS with: 2026.10.19 dropped emSign ECC Root CA - G3,
 # whose intermediates' private keys were compromised in October 2026 (tests/test_trust_store.py).

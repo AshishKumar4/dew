@@ -42,12 +42,13 @@ import tyro
 import dew
 from dew.artifacts import uint8_pixels
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
+from dew.config.lm import LMRunConfig
 from dew.data import ByteTokenizer, Loading, Memory, presets, text
 from dew.data.sources import TokenFiles
 from dew.eval import FID, CLIPScore
 from dew.inference import RunProcessor, TextGeneration, TextToImage
 from dew.nn.backbones import CausalTransformer
-from dew.objectives.lm import LMObjective, LMRunConfig, Perplexity
+from dew.objectives.lm import LMObjective, Perplexity
 from dew.sampling import Sampling
 from dew.training import Evaluation
 
@@ -117,7 +118,7 @@ def smoke_run(out: Path) -> tuple[Path, Path]:
             presets.lm, "byte", seq_len=32, batch=4, pack=None, eos=False).loading(loading),
         validation=TokenFiles(str(held)).pipe(presets.token_windows, seq_len=32, batch=4).loading(loading),
         max_new_tokens=8,
-        optim=OptimConfig(learning_rate=1e-3),
+        optim=OptimConfig(rate=1e-3),
         trainer=TrainerConfig(checkpoint_dir=str(out / "checkpoints"), steps=2,
                               log_every=1, eval_every=None, checkpoint_every=2,
                               multi_host=False, compilation_cache_dir=None))

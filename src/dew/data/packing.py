@@ -21,7 +21,7 @@ from dew.data.dataset import Batch, Records
 from dew.data.generation import Generation
 from dew.data.pipeline import ExpandStep, Pack
 from dew.data.plan import fingerprint
-from dew.data.sources.base import Read, ShardManifest, Source, _consumed, _indexed_manifest
+from dew.data.sources.base import Read, Rows, ShardManifest, Source, View, _consumed, _indexed_manifest
 from dew.data.tokens import chunk_lengths, chunk_table, first_fit, packed_window
 from dew.records import record
 
@@ -222,15 +222,16 @@ class _PackedRows:
 
 
 @dataclasses.dataclass(frozen=True)
-class PackedSource:
+class PackedSource(View[Source]):
     """A source's documents packed first-fit into windows by a plan of their
     lengths (`plan_windows`): the plan a published generation stores
     (`published`), or the one made from the lengths a source states when it
     is first read (`planned`). Either way the windows are read by index in
-    one global order. It reads windows, not its documents' records, so it
-    names them `documents` rather than wrapping them as a source."""
+    one global order. Its rows are windows of its documents (`source`), not
+    their records (`View.rows`)."""
 
-    documents: Source
+    rows: ClassVar[Rows] = "derived"
+    source: Source
     plan: _Published | _Held
 
     @classmethod
@@ -253,32 +254,29 @@ class PackedSource:
             plan.refuse_cuts()
         return cls(source, plan)
 
-    def label(self) -> str:
-        return self.documents.label()
-
     def describe(self) -> str:
-        return f"{self.documents.describe()} {self.plan.kind} packing={self.plan.pack!r}"
+        return f"{self.source.describe()} {self.plan.kind} packing={self.plan.pack!r}"
 
     def consumed(self, read: Read) -> PackedSource:
-        documents = _consumed(self.documents, "indexed" if read == "streamed" else read)
+        documents = _consumed(self.source, "indexed" if read == "streamed" else read)
         plan = dataclasses.replace(self.plan, source=documents) if isinstance(self.plan, _Held) else self.plan
-        return dataclasses.replace(self, documents=documents, plan=plan)
+        return dataclasses.replace(self, source=documents, plan=plan)
 
     def fingerprint(self) -> Mapping[str, object]:
-        return {"source": self.documents.fingerprint(), "packing": self.order_fingerprints()}
+        return {"source": self.source.fingerprint(), "packing": self.order_fingerprints()}
 
     def order_fingerprints(self) -> Mapping[str, str]:
         return self.plan.fingerprints()
 
     def supports(self, read: Read) -> bool:
-        return self.documents.supports("indexed" if read == "streamed" else read)
+        return self.source.supports("indexed" if read == "streamed" else read)
 
     def records(self, read: Read) -> _PackedRows:
-        return _PackedRows(self.documents.records(read), self.plan)
+        return _PackedRows(self.source.records(read), self.plan)
 
     def metadata(self) -> Mapping[str, object]:
         return {
-            **self.documents.metadata(),
+            **super().metadata(),
             "rows": len(self.plan),
             "valid_targets": self.plan.at("totals", 0),
             "zero_target_windows": 0,

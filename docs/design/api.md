@@ -36,7 +36,7 @@ The seams named in `CONTRIBUTING.md:9` are crossed in these places, all confirme
 | The trainer publishes and deletes | `save()` pushes to the W&B registry, ranks the run against the W&B API and removes the local checkpoint (`objective_trainer.py:531-565, 388-529`). |
 | Constructors have effects | `SimpleTrainer.__init__` enables the compile cache, builds the mesh, opens W&B, downloads an artifact, creates the Orbax manager and restores state (`trainer.py:89-217`). `ConditionalInputConfig.__post_init__` runs the encoder (`inputs/__init__.py:26-31`). |
 | Data is a dict protocol | Six loaders return `{"train", "train_len", "val", "val_len", "local_batch_size", "global_batch_size"}`; `fit` reads them by name (`trainer.py:599-604`). |
-| Sharding is a string table | `DEFAULT_LOGICAL_PARAM_AXES` keyed on trailing module names (`training/distributed.py:63-91`), read again by Muon grouping (`training/optim.py:95`). A rename in a model file changes both, silently. |
+| Sharding is a string table | `DEFAULT_LOGICAL_PARAM_AXES` keyed on trailing module names (`training/distributed.py:63-91`), read again by Muon grouping (`optim.py:95`). A rename in a model file changes both, silently. |
 | One fact, two owners | The training schedule holds the transform for min-SNR (`schedules/common.py:22,58`) while the objective receives the transform again; presets return a 3-tuple (`transforms.py:157`). Gradient accumulation lives in `OptimConfig`, `optax.MultiSteps` and the trainer. |
 | Randomness is an object | `RandomMarkovState` (`random_state.py`) appears in schedules, every sampler, the objective and the trainer state, and is checkpointed. |
 
@@ -152,7 +152,7 @@ state = trainer.fit(data, steps=100_000, log_every=100, eval_every=2_000,
                     checkpoint_every=5_000, metrics=(metrics["fid"](), metrics["clip_score"]()))
 ```
 
-The trainer keeps what `CONTRIBUTING.md:9` gives it: mesh, compiled step, EMA, checkpoints, logging. The compiled step is `objective_trainer.py:237-299` with `Step` in place of positional `ema_params` and `rng`, plus the `Aux.variables` write-back. `fit` is step-based; `steps = epochs * data.steps_per_epoch` is a recipe's line. Publishing becomes `dew.io.publish(checkpoints.latest(), ...)`, called by a recipe after `fit`. Validation exceptions propagate (fixed in `6b747dc`).
+The trainer keeps what `CONTRIBUTING.md:9` gives it: mesh, compiled step, EMA, checkpoints, logging. The compiled step is `objective_trainer.py:237-299` with `Step` in place of positional `ema_params` and `rng`, plus the `Aux.variables` write-back. `fit` is step-based; `steps = data.epoch_steps(epochs)` is a recipe's line, counting the step an epoch's short last batch takes where its order reads on (`Loader.tail`). Publishing becomes `dew.io.publish(checkpoints.latest(), ...)`, called by a recipe after `fit`. Validation exceptions propagate (fixed in `6b747dc`).
 
 ```python
 class Tracker(Protocol):

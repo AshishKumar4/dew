@@ -17,7 +17,7 @@ from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
-from dew.nn.kernels.templates import hopper, product
+from dew.nn.kernels.templates import mosaic, product
 from dew.nn.kernels.templates.gemm import fused, mosaic_gpu, template, triton_dense
 
 pytestmark = pytest.mark.kernel
@@ -637,6 +637,21 @@ def test_a_fused_norm_lowers_for_an_h100(producer):
     assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
 
 
+def _three_gemms(sizes):
+    """A fused producer's product three ways: under `fuser.fuse`, unfused, and its float64 truth."""
+    def fused_gemm(operand, w):
+        return fused.fusible_gemm(operand, w, sizes, interpret_on_cpu=True)
+
+    def plain_gemm(operand, w):
+        return template.gemm(operand, w, sizes, out_dtype=jnp.float32)
+
+    def truth_gemm(operand, w):
+        matrix = w.astype(jnp.bfloat16).astype(operand.dtype)
+        return jax.lax.ragged_dot(operand, matrix, sizes, preferred_element_type=operand.dtype)
+
+    return fused_gemm, plain_gemm, truth_gemm
+
+
 @pytest.mark.parametrize("producer", [rms_norm, dew_rms_norm, relu], ids=lambda producer: producer.__name__)
 def test_a_fused_producers_gradients_are_its_own(producer):
     """Every input's gradient through a producer fused into the prologue is the unfused program's: the
@@ -657,20 +672,83 @@ def test_a_fused_producers_gradients_are_its_own(producer):
             return _wide(out)  # fp32, or the truth's float64, as the drawn cotangent is widened
         return with_gradients(transform(value))
 
-    def fused_gemm(operand, w):
-        return fused.fusible_gemm(operand, w, sizes, interpret_on_cpu=True)
-
-    def plain_gemm(operand, w):
-        return template.gemm(operand, w, sizes, out_dtype=jnp.float32)
-
-    def truth_gemm(operand, w):
-        matrix = w.astype(jnp.bfloat16).astype(operand.dtype)
-        return jax.lax.ragged_dot(operand, matrix, sizes, preferred_element_type=operand.dtype)
+    fused_gemm, plain_gemm, truth_gemm = _three_gemms(sizes)
 
     with generation.assumed("sm80"), generation.routes() as taken:
         assert_as_exact(jax.jit(loss(fused_gemm, fuser.fuse)), jax.jit(loss(plain_gemm)), draw,
                         f"{producer.__name__} gradients", seeds=SEEDS, truth_fn=loss(truth_gemm))
     assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
+
+
+@pytest.mark.parametrize("composition", ["jvp", "radial_jvp", "jvp_of_grad"])
+def test_a_fused_producers_forward_and_higher_derivatives_are_its_own(composition):
+    """Forward mode and a higher order through a norm fused into the prologue differentiate the whole
+    producer, its row statistic included, as exact as the unfused program's from float64: along the
+    radial tangent (the operand itself), where an RMS norm is constant, the product's tangent is the
+    epsilon's alone, not the normalized operand's projection a held statistic would give."""
+    sizes = jnp.asarray(SIZES)
+
+    def draw(seed):
+        x, w, _, nw, *_ = _draw(seed)
+        rng = np.random.default_rng(seed + 2000)
+        direction = x if composition == "radial_jvp" else jnp.asarray(rng.normal(size=x.shape), jnp.float32)
+        cotangent = jnp.asarray(rng.normal(size=(ROWS, WIDTH)), jnp.float32)
+        return x, w, nw, direction, cotangent
+
+    def derivative(gemm, transform=lambda value: value):
+        program = transform(lambda x, w, weight: _wide(gemm(rms_norm(x, weight), w)))
+
+        def run(x, w, weight, direction, cotangent):
+            def scored(x):
+                out = program(x, w, weight)
+                return jnp.sum(out * cotangent.astype(out.dtype))
+
+            along = (direction.astype(x.dtype),)
+            if composition == "jvp_of_grad":
+                return jax.jvp(jax.grad(scored), (x,), along)[1]
+            return jax.jvp(lambda x: program(x, w, weight), (x,), along)[1]
+        return run
+
+    fused_gemm, plain_gemm, truth_gemm = _three_gemms(sizes)
+
+    with generation.assumed("sm80"), generation.routes() as taken:
+        assert_as_exact(jax.jit(derivative(fused_gemm, fuser.fuse)), jax.jit(derivative(plain_gemm)), draw,
+                        f"normed operand {composition}", seeds=SEEDS, truth_fn=derivative(truth_gemm))
+    assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
+
+
+def test_chosen_routes_each_fused_stage_through_xla_or_insists_on_the_kernels():
+    """`generation.chosen(gemm_epilogue='xla', gemm_prologue='xla')` runs both stages in XLA beside the
+    product (each route says so) with the fused program's value, as exact as the unfused program from
+    float64; `gemm_epilogue='fused'` raises for a consumer the kernels cannot take rather than run XLA."""
+    sizes = jnp.asarray(SIZES)
+
+    def draw(seed):
+        x, w, _, nw, b, *_ = _draw(seed)
+        return x, w, nw, b
+
+    def fusing(x, w, weight, b):
+        return bias_cast(fused.fusible_gemm(rms_norm(x, weight), w, sizes, interpret_on_cpu=True), b, None)
+
+    def unfused(x, w, weight, b):
+        return bias_cast(template.gemm(rms_norm(x, weight), w, sizes, out_dtype=jnp.float32), b, None)
+
+    def truth(x, w, weight, b):
+        return _normed_truth(sizes, x, w, weight) + b[None, :]
+
+    with (generation.assumed("sm80"), generation.chosen(gemm_epilogue="xla", gemm_prologue="xla"),
+          generation.routes() as taken):
+        assert_as_exact(jax.jit(fuser.fuse(fusing)), jax.jit(unfused), draw, "both stages in XLA",
+                        seeds=SEEDS, truth_fn=truth)
+    assert {(route.choice, route.kernel) for route in taken if route.choice.startswith('gemm_')} == {
+        ('gemm_epilogue', 'xla'), ('gemm_prologue', 'xla')}
+    x, w, _, _, b, u, *_ = _draw(0)
+
+    def positioned(x, w, b, r):
+        return positional(fused.fusible_gemm(x, w, sizes, interpret_on_cpu=True), b, r)
+
+    with generation.assumed("sm80"), generation.chosen(gemm_epilogue="fused"), pytest.raises(ValueError):
+        jax.jit(fuser.fuse(positioned)).trace(x, w, b, u[:, :WIDTH])
 
 
 def test_a_one_row_normed_operand_fuses():
@@ -1050,7 +1128,7 @@ def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():
         assert mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2) in kept  # 128 registers a thread
         assert mosaic_gpu.Tiles(128, 256, 64, 3, 1, warpgroups=2) not in kept  # 256
         assert kept and all(2 * tile.block_m * tile.block_n // (128 * tile.warpgroups)
-                            < (hopper.CONSUMER_REGISTERS if tile.warpgroups == 2 else 255)
+                            < (mosaic.CONSUMER_REGISTERS if tile.warpgroups == 2 else 255)
                             for tile in kept)
         assert set(kept) < set(launch.fitting(plain, target))
         # Triton's kernel gradient with exact sums takes at most EXACT_STEP rows a step.

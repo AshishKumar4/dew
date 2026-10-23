@@ -9,13 +9,13 @@ from functools import cached_property
 
 import numpy as np
 
-from dew.data.dataset import Batch, Records
+from dew.data.dataset import Batch, Ranges, Records
 from dew.data.pipeline import Dataset
 from dew.data.storage import Store, local
 
 from .base import Read, ShardManifest, _indexed_manifest, url_label
 from .files import Files, export_content
-from .index import ArrayIndex, Ranges
+from .index import ArrayIndex
 
 _SPLIT = "train"
 """The split a token export's description, fingerprint, shards and document index have always named

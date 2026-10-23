@@ -1,5 +1,5 @@
 """A run's setup stops a process whose JAX opened on the CPU beside an NVIDIA
-GPU, with the install that fixes it (`dew.telemetry.devices`), and `import dew`
+GPU, with the install that fixes it (`dew.devices`), and `import dew`
 does not. The GPU is nvidia-smi's answer, so a stand-in nvidia-smi plays every
 machine on a host without one."""
 
@@ -9,8 +9,8 @@ import sys
 
 import pytest
 
-from dew.telemetry.builds import newest_build
-from dew.telemetry.devices import cpu_only_refusal, nvidia_gpus
+from dew.builds import newest_build
+from dew.devices import cpu_only_refusal, nvidia_gpus
 
 
 def stand_in(directory, printed: str, status: int = 0):
@@ -51,7 +51,7 @@ def run():
     fit_one_step()
 
 
-from dew.telemetry.devices import CPUOnlyJax
+from dew.devices import CPUOnlyJax
 
 try:
     run()
