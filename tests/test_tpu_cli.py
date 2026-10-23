@@ -335,6 +335,29 @@ def test_launch_on_several_tpus_joins_them_as_one_multislice_pool(fake):
 # ------------------------------------------------------------------------- setup
 
 
+def on_a_worker(tmp_path: Path, script: str, scripts: dict[str, str]) -> list[list[str]]:
+    """`script` run as a worker runs it, under bash, with stand-ins on PATH for its package manager and
+    privileged commands, each recording being called, and `scripts` (a name to its body after the line
+    that records the call); the calls, each its command and arguments."""
+    home, binaries, calls = tmp_path / "home", tmp_path / "bin", tmp_path / "calls"
+    home.mkdir()
+    binaries.mkdir()
+    for name in ("sudo", "curl", "gcsfuse", "rsync", "lsb_release", *scripts):
+        body = scripts.get(name, "")
+        (binaries / name).write_text(f'#!/bin/sh\necho "$(basename "$0") $*" >> {calls}\n{body}\n')
+        (binaries / name).chmod(0o755)
+    done = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60, env={
+        "HOME": str(home), "PATH": f"{binaries}:/usr/bin:/bin", "STAND_INS": str(tmp_path)})
+    assert done.returncode == 0, done.stderr
+    return [line.split() for line in calls.read_text().splitlines()]
+
+
+UV = ('[ "$1" = --version ] && echo "uv @RELEASE@"; if [ "$1" = venv ]; then mkdir -p "$4/bin"; '
+      'printf \'#!/bin/sh\\necho 3.12\\n\' > "$4/bin/python"; chmod +x "$4/bin/python"; fi')
+"""uv: it names release @RELEASE@, and makes the venv it is asked for, whose interpreter answers its
+version."""
+
+
 @pytest.mark.parametrize("source, version", [("", "1.2.3"), ("dew", "")], ids=["release", "editable"])
 def test_a_worker_installs_dew_with_its_tpu_extra_in_one_resolution(tmp_path, source, version):
     """The setup script a worker runs installs Dew once, a release or the synced source, with the tpu
@@ -344,27 +367,31 @@ def test_a_worker_installs_dew_with_its_tpu_extra_in_one_resolution(tmp_path, so
     package manager and privileged commands stand-ins that record being called."""
     spec, editable = tpu_setup.package_spec(source, "wandb", version)
     script = tpu_setup.render(python_version="3.12", package_spec=spec, editable=editable)
-    home, binaries = tmp_path / "home", tmp_path / "bin"
-    home.mkdir()
-    binaries.mkdir()
-    calls = tmp_path / "calls"
-    stub = f'#!/bin/sh\necho "$(basename "$0") $*" >> {calls}\n'
-    for name in ("sudo", "curl", "gcsfuse", "rsync", "lsb_release"):
-        (binaries / name).write_text(stub)
-    # uv makes the venv it is asked for, whose interpreter answers its version.
-    (binaries / "uv").write_text(stub + 'if [ "$1" = venv ]; then mkdir -p "$4/bin"; '
-                                        'printf \'#!/bin/sh\\necho 3.12\\n\' > "$4/bin/python"; '
-                                        'chmod +x "$4/bin/python"; fi\n')
-    for path in binaries.iterdir():
-        path.chmod(0o755)
-    done = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
-                          env={"HOME": str(home), "PATH": f"{binaries}:/usr/bin:/bin"})
-    assert done.returncode == 0, done.stderr
-    installs = [line.split()[1:] for line in calls.read_text().splitlines()
-                if line.startswith("uv pip install")]
-    target = f"{home}/dew[tpu,wandb]" if editable else "dewml[tpu,wandb]==1.2.3"
-    assert installs == [["pip", "install", "--quiet", "--python", f"{home}/dew-venv/bin/python",
+    calls = on_a_worker(tmp_path, script, {"uv": UV.replace("@RELEASE@", "99.0.0")})
+    installs = [call[1:] for call in calls if call[:3] == ["uv", "pip", "install"]]
+    target = f"{tmp_path}/home/dew[tpu,wandb]" if editable else "dewml[tpu,wandb]==1.2.3"
+    assert installs == [["pip", "install", "--quiet", "--python", f"{tmp_path}/home/dew-venv/bin/python",
                          "--extra-index-url", PACKAGE_INDEX, *(["-e"] if editable else []), target]]
+
+
+def test_a_fresh_worker_installs_the_least_uv_first_and_dew_with_it(tmp_path):
+    """A worker with no uv runs astral's installer for the least uv (pyproject.toml's [tool.uv]
+    required-version) under the script's own `set -euo pipefail`, and the uv it installed then installs
+    Dew. curl stands in for astral's installer, putting a uv of the release its URL names in ~/.local/bin,
+    which records its calls under that release's name."""
+    spec, editable = tpu_setup.package_spec("", "wandb", "1.2.3")
+    script = tpu_setup.render(python_version="3.12", package_spec=spec, editable=editable)
+    (tmp_path / "uv.template").write_text(
+        f'#!/bin/sh\necho "uv-@RELEASE@ $*" >> {tmp_path}/calls\n{UV}\n')
+    curl = ('for url; do :; done; release=${url#*/uv/}; release=${release%/install.sh}; '
+            'printf \'mkdir -p "$HOME/.local/bin"; sed "s/@RELEASE@/%s/g" "$STAND_INS/uv.template" '
+            '> "$HOME/.local/bin/uv"; chmod +x "$HOME/.local/bin/uv"\\n\' "$release"')
+    calls = on_a_worker(tmp_path, script, {"curl": curl})
+    [fetched] = [call[-1] for call in calls
+                 if call[0] == "curl" and call[-1].startswith("https://astral.sh/uv/")]
+    release = fetched.removeprefix("https://astral.sh/uv/").removesuffix("/install.sh")
+    installs = [call[:3] for call in calls if call[1:3] == ["pip", "install"]]
+    assert installs == [[f"uv-{release}", "pip", "install"]]
 
 
 # ----------------------------------------------------------------------- dry run
