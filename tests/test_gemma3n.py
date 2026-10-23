@@ -325,7 +325,7 @@ def test_the_dense_decoders_gradient_is_the_references():
         """Rows of ids drawn uniformly from the vocabulary but the pad id, and the loss's cotangent, one.
         The reference's embeddings are `nn.Embedding(padding_idx=pad)`, whose pad row takes no gradient
         whatever reads it, where Dew's takes its own: a padding convention, apart from the arithmetic
-        held here, which the ledger tracks."""
+        held here, which ledger row 1372 tracks."""
         ids = np.setdiff1d(np.arange(int(dense.vocab_size)), [] if pad is None else [pad])
         rows = ids[np.random.default_rng([0xDE, seed]).integers(0, len(ids), (DENSE_ROWS, STEP_LENGTH))]
         return rows.astype(np.int32), np.float32(1)
