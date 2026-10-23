@@ -9,6 +9,8 @@ ruff	"$PYTHON" -m ruff check $ruff_inputs
 slop	JAX_PLATFORMS=cpu "$PYTHON" tools/lint_slop.py
 # The ratchet reads the inventory's whole history, which a shallow checkout fetches first.
 ratchet	sh tools/base_history.sh && "$PYTHON" tools/lint_slop.py --ratchet --base="$BASE"
+# No forecasts in the prose and messages a change adds (the bible).
+public-text	sh tools/base_history.sh && "$PYTHON" tools/public_text.py "$BASE"
 fixtures	"$PYTHON" tools/fetched_fixtures.py check
 complexity	"$PYTHON" tools/complexity.py src/dew tools/lint_slop.py tools/lint_scopes.py examples recipes > complexity.json
 api-pages	uv run --no-project --with-requirements site/scripts/requirements.txt python site/scripts/gen_api.py --check
