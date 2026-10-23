@@ -50,7 +50,7 @@ def test_four_trials_train_their_own_points_and_reach_the_callers_tracker(tmp_pa
                 for rate in (0.1, 0.01) for clip in (0.0, 1.0)})
     trained = [json.loads((tmp_path / 'runs' / trial.name / 'run.json').read_text())['fields']
                for trial in trials]
-    assert [run['optim']['learning_rate'] for run in trained] == [0.1, 0.1, 0.01, 0.01]
+    assert [run['optim']['rate'] for run in trained] == [0.1, 0.1, 0.01, 0.01]
     assert [run['optim']['clip_grads'] for run in trained] == [0.0, 1.0, 0.0, 1.0]
     # The swept rate reached the optimizer, not just the record.
     assert trials[0].value != trials[2].value
