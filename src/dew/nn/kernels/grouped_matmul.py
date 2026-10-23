@@ -641,14 +641,18 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         step = (config.block_m + config.block_n) * config.block_k * size + _side_tile_bytes(
             ba.arguments['prologue_operands'], hooks.prologue_axes, extents)
         epilogue = _side_tile_bytes(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes, extents)
-        # One warpgroup stages each output in turn; two hold every output's staging buffer at once, and
-        # each consumer its own copy of an epilogue side tile without rows (`mosaic.staging`; a
-        # prologue side's per-consumer copies are within the stages' count of it).
-        staged_outs = sum(outs) if config.warpgroups == 2 else max(outs)
+        # One warpgroup stages each output in turn, whole; two hold every output's buffer at once, each
+        # consumer one chunk of its half (`mosaic_gpu._staged_columns`), and each its own copy of an
+        # epilogue side tile without rows (`mosaic.staging`; a prologue side's per-consumer copies are
+        # within the stages' count of it).
         if config.warpgroups == 2:
+            columns = min(config.block_n, mosaic_gpu.STAGED_BYTES // max(outs))
+            staged = sum(outs) * config.block_m * columns
             epilogue_sides = ba.arguments.get('epilogue_operands', ())
             epilogue += _side_tile_bytes(*_uncut(epilogue_sides, hooks.epilogue_axes), extents)
-        return config.stages * step + epilogue + staged_outs * config.block_m * config.block_n
+        else:
+            staged = max(outs) * config.block_m * config.block_n
+        return config.stages * step + epilogue + staged
 
     @staticmethod
     @abc.abstractmethod
