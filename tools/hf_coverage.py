@@ -62,7 +62,13 @@ def _route(config: dict, verified) -> tuple[str, str]:
     (`dew.interop.pretrained.source_route`), and for a refusal, the refusal's own words. `verified`
     checks an unregistered model_type against transformers, once per type (`classify`)."""
     from dew.interop import decoder_parts
-    from dew.interop.pretrained import source_route
+    from dew.interop.pretrained import (
+        DecoderRoute,
+        DiffusionGemmaRoute,
+        VerifiedRoute,
+        WrapperRoute,
+        source_route,
+    )
 
     if set(config) <= {"model_type", "architectures"}:
         # A GGUF repo's stub config.json (MaziyarPanahi/Qwen3-0.6B-GGUF): the loader reads its config
@@ -76,14 +82,20 @@ def _route(config: dict, verified) -> tuple[str, str]:
         return "remote code", "transformers has no class for it"
     except (KeyError, ValueError, TypeError) as error:
         return "refused", f"{type(error).__name__}: {error}"[:300]
-    if route.verified is None:
-        return "tier 1", f"registered {route.kind}"
-    try:
-        # The census reads the config only; a verified mapping reads the tensors' names beside it.
-        route.verified.translate(config, ())
-    except ValueError as error:
-        return "refused", str(error)[:300]
-    return "tier 2", f"{route.verified.family} {route.verified.error:.2e} <= {route.verified.bound:.2e}"
+    match route:
+        case DecoderRoute():
+            return "tier 1", "registered decoder"
+        case WrapperRoute():
+            return "tier 1", "registered wrapper"
+        case DiffusionGemmaRoute():
+            return "tier 1", "registered diffusion_gemma"
+        case VerifiedRoute(verified=verified):
+            try:
+                # The census reads the config only; a verified mapping reads the tensors' names beside it.
+                verified.translate(config, ())
+            except ValueError as error:
+                return "refused", str(error)[:300]
+            return "tier 2", f"{verified.family} {verified.error:.2e} <= {verified.bound:.2e}"
 
 
 def classify(out: Path) -> None:
