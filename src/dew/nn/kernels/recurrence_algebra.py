@@ -33,6 +33,7 @@ caller's `issue(name, left, right)`, the mainloop's, by its name in `PRODUCTS`, 
 multiplies; the portable math's issuer is XLA's (`portable`), a kernel's its own dot.
 """
 
+import functools
 from collections.abc import Callable
 
 import jax
@@ -276,10 +277,39 @@ def carry(state, step, issue: Issue = portable):
 
 
 def readout(query, entering, entered, key, pairs, corrected, issue: Issue = portable):
-    """A chunk's output `[..., C, Dv]`: the memory it entered read through the decayed queries, and the
-    chunk's own pairs over its corrected values (the inclusive lower `pairs` read the token itself)."""
-    return (issue("memory", query * entering, entered)
+    """A chunk's output `[..., C, Dv]`: the memory it entered read through the decayed queries
+    (`remembered`), and the chunk's own pairs over its corrected values (the inclusive lower `pairs` read
+    the token itself)."""
+    return (remembered(query * entering, entered, issue)
             + issue("local", paired("scores", query, key, pairs, issue), corrected))
+
+
+@functools.partial(jax.custom_jvp, nondiff_argnums=(2,))
+def remembered(decayed, entered, issue: Issue = portable):
+    """The memory a chunk entered read through its decayed queries, `decayed @ entered` ('memory'), whose
+    gradient in the memory sums the chunk's tokens from its last (`_remembered_transpose`): `decayed` falls
+    along the chunk with its decay, so the smallest terms add first, as the recurrence a token at a time
+    adds them. Summed from the first, the memory's gradient sat 1.76 to 1.89 times the token-by-token
+    recurrence's distance from float64 under every delta family (the carry widened to float64 changed
+    nothing, this product's sum widened took it to 0.85-1.16); from the last, 0.97-1.22
+    (tests/test_recurrence_stability.py)."""
+    return issue("memory", decayed, entered)
+
+
+def _remembered_transpose(decayed, cotangent, issue: Issue):
+    """`decayed^T @ cotangent`, the chunk's tokens summed from its last."""
+    return issue("memory", jnp.swapaxes(jnp.flip(decayed, -2), -1, -2), jnp.flip(cotangent, -2))
+
+
+@remembered.defjvp
+def _remembered_tangent(issue, primals, tangents):
+    """The product's tangent, its memory side linear in the memory with the transpose
+    `_remembered_transpose`, in forward and reverse mode alike."""
+    decayed, entered = primals
+    d_decayed, d_entered = tangents
+    read = linear_call(lambda decayed, entered: issue("memory", decayed, entered),
+                       functools.partial(_remembered_transpose, issue=issue), decayed, d_entered)
+    return remembered(decayed, entered, issue), issue("memory", d_decayed, entered) + read
 
 
 def compose(first, second, issue: Issue = portable):

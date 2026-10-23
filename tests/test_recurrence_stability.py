@@ -150,57 +150,58 @@ REGIMES = {
 """Each regime's transform of a draw's operands and its tokens (the draw's own where None)."""
 
 GRADIENT_SEEDS = {
-    ('scalar delta', 'decays near zero'): 512,
-    ('vector delta', 'decays near zero'): 512,
-    ('scalar write', 'decays near zero'): 512,
-    ('gated', 'decays near zero'): 512,
-    ('rated', 'decays near zero'): 512,
-    ('scalar delta', 'decays near one'): 32,
-    ('scalar delta', 'the decay bound'): 8,
-    ('scalar delta', 'aligned keys'): 128,
+    ('scalar delta', 'decays near one'): 8,
+    ('scalar delta', 'decays near zero'): 64,
+    ('scalar delta', 'the decay bound'): 16,
+    ('scalar delta', 'aligned keys'): 8,
     ('scalar delta', 'resets on chunk edges'): 8,
-    ('scalar delta', 'saturated gates'): 16,
-    ('scalar delta', 'spread gates'): 16,
+    ('scalar delta', 'saturated gates'): 8,
+    ('scalar delta', 'spread gates'): 8,
     ('scalar delta', 'a long sequence'): 8,
     ('scalar delta', 'a fading memory'): 8,
     ('scalar delta', 'steep then mild'): 8,
     ('vector delta', 'decays near one'): 8,
-    ('vector delta', 'the decay bound'): 8,
-    ('vector delta', 'aligned keys'): 16,
+    ('vector delta', 'decays near zero'): 64,
+    ('vector delta', 'the decay bound'): 16,
+    ('vector delta', 'aligned keys'): 8,
     ('vector delta', 'resets on chunk edges'): 8,
     ('vector delta', 'saturated gates'): 8,
     ('vector delta', 'spread gates'): 8,
     ('vector delta', 'a long sequence'): 8,
     ('vector delta', 'a fading memory'): 8,
     ('vector delta', 'steep then mild'): 8,
-    ('scalar write', 'decays near one'): 32,
+    ('scalar write', 'decays near one'): 8,
+    ('scalar write', 'decays near zero'): 64,
     ('scalar write', 'the decay bound'): 8,
-    ('scalar write', 'aligned keys'): 16,
+    ('scalar write', 'aligned keys'): 8,
     ('scalar write', 'resets on chunk edges'): 8,
-    ('scalar write', 'saturated gates'): 16,
-    ('scalar write', 'spread gates'): 16,
-    ('scalar write', 'a long sequence'): 16,
+    ('scalar write', 'saturated gates'): 8,
+    ('scalar write', 'spread gates'): 8,
+    ('scalar write', 'a long sequence'): 8,
     ('scalar write', 'a fading memory'): 8,
     ('scalar write', 'steep then mild'): 8,
     ('gated', 'decays near one'): 32,
+    ('gated', 'decays near zero'): 512,
     ('gated', 'the decay bound'): 64,
-    ('gated', 'aligned keys'): 256,
-    ('gated', 'resets on chunk edges'): 128,
+    ('gated', 'aligned keys'): 64,
+    ('gated', 'resets on chunk edges'): 64,
     ('gated', 'saturated gates'): 128,
-    ('gated', 'spread gates'): 512,
-    ('gated', 'a long sequence'): 8,
-    ('gated', 'a fading memory'): 8,
+    ('gated', 'spread gates'): 128,
+    ('gated', 'a long sequence'): 32,
+    ('gated', 'a fading memory'): 64,
     ('gated', 'steep then mild'): 64,
-    ('rated', 'decays near one'): 128,
-    ('rated', 'the decay bound'): 128,
-    ('rated', 'aligned keys'): 64,
+    ('rated', 'decays near one'): 32,
+    ('rated', 'decays near zero'): 0,
+    ('rated', 'the decay bound'): 0,
+    ('rated', 'aligned keys'): 0,
     ('rated', 'resets on chunk edges'): 128,
-    ('rated', 'saturated gates'): 8,
-    ('rated', 'spread gates'): 256,
-    ('rated', 'a long sequence'): 128,
-    ('rated', 'a fading memory'): 128,
-    ('rated', 'steep then mild'): 128,
+    ('rated', 'saturated gates'): 32,
+    ('rated', 'spread gates'): 512,
+    ('rated', 'a long sequence'): 64,
+    ('rated', 'a fading memory'): 512,
+    ('rated', 'steep then mild'): 0,
 }
+
 """Each site's declared seeds for its gradient's check 1, sized by `seeds_for`."""
 
 SEEDS = {
@@ -289,7 +290,7 @@ def cotangents(hooks, regime: str, seed: int) -> tuple[Chunk, tuple[jax.Array, j
     puts them back: they are not differentiable), and fp32 cotangents of their output `[B, S, Hv, Dv]`
     and final memory `[B, Hv, Dk, Dv]` from the seed's own key, which the float64 truth takes as they
     are."""
-    (operands,) = stressed(hooks, regime, seed, value_heads=GRADIENT_HEADS)
+    (operands,) = stressed(hooks, regime, seed, value_heads=RATED_HEADS if hooks.rated else GRADIENT_HEADS)
     batch, length, heads, width = operands.value.shape
     keys = jax.random.split(jax.random.fold_in(jax.random.key(seed), 101))
     return dataclasses.replace(operands, starts=None), (
@@ -298,8 +299,13 @@ def cotangents(hooks, regime: str, seed: int) -> tuple[Chunk, tuple[jax.Array, j
 
 
 GRADIENT_HEADS = 16
-"""The gradient arms' value heads: a head's own parameters (the gates' `log_a` and `bias`, a rated decay's
-rate) are a leaf of a head each, which two heads do not resolve within 512 seeds."""
+"""The gradient arms' value heads: a head's own parameters (the gates' `log_a` and `bias`) are a leaf of a
+head each, which two heads do not resolve within 512 seeds."""
+
+RATED_HEADS = 64
+"""A rated decay's gradient arms' value heads: its rate, a head's one factor of every token's decay, did not
+resolve within 512 seeds at 16 heads under aligned keys, decays near zero, the decay bound and steep then
+mild."""
 
 
 def restarting(fn, regime: str):
