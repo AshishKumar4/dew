@@ -265,9 +265,11 @@ Mosaic lowers and compiles in 0.9–2.9 s against Pallas Triton's 0.4–0.8 s. T
 A second copy of the algebra written in triton.language is not an acceptable answer.
 
 **Boundary tests.**
-1. **Bitwise across mainloops** (a semantics-drift guard): Mosaic GPU interpret mode and Triton interpret mode, at the same tiles, the same key order and the same algebra options. Where product shapes must differ, it falls back to check 1.
-2. **Check 1 per mainloop on GPU,** plus a same-schedule reproducibility test.
-3. **Zero cost, per scoreboard row:** with no hooks, at a given configuration, the template runs within noise of its named comparator:
+Two measures decide whether a mainloop lands and whether it replaces a route: the accuracy gate (check 1 against float64, and the stability suite), and performance, compute time and peak memory, on the operator rows and the model step. No code-equality or bitwise agreement between implementations is a gate; a bitwise comparison of two mainloops in interpret mode may stay as a cheap debugging aid, never blocking.
+
+1. **Check 1 per mainloop**, in interpret mode on a CPU and compiled on a GPU, and the stability suite.
+2. **A same-schedule reproducibility test**: one mainloop, one schedule, the same bits run to run (determinism, not a comparison of implementations).
+3. **Zero cost, per scoreboard row,** in compute time and peak memory: with no hooks, at a given configuration, the template runs within noise of its named comparator:
    - sm80: jax mha, then FA2;
    - sm90: Tokamax Mosaic, then FA3.
 
@@ -316,7 +318,7 @@ A second copy of the algebra written in triton.language is not an acceptable ans
 
 ## 9. One owner per math, and the deletions
 
-- **The portable CPU and TPU path is the algebra, run by a plain-JAX reference mainloop,** not a second implementation. Each template exposes it as one public `xla_mainloop(config)`, bitwise with the Triton and Mosaic interpret modes at the same configuration (§6, test 1). Check 2's certificate interprets this mainloop and witnesses each kernel's native output against it, so the algebra is certified once. Tests hold every template to independent oracles:
+- **The portable CPU and TPU path is the algebra, run by a plain-JAX reference mainloop,** not a second implementation. Each template exposes it as one public `xla_mainloop(config)`, held to check 1 as every mainloop is (§6). Check 2's certificate interprets this mainloop and witnesses each kernel's native output against it, so the algebra is certified once. Tests hold every template to independent oracles:
   - naive softmax attention;
   - the token-by-token recurrence update;
   - `jnp.dot` at float64;
@@ -340,13 +342,13 @@ A second copy of the algebra written in triton.language is not an acceptable ans
 
 ## 11. How it gets built
 
-Built in parallel. Each piece lands when it meets its gates: bitwise, zero cost, check 1, and the scoreboard.
+Built in parallel. Each piece lands when it meets its gates: the accuracy gate (check 1 and the stability suite), and its scoreboard rows' compute time and peak memory against the named comparators.
 
 **Risks retired first, as measurements:**
 1. sm80 attention backward against FA2. Today no Pallas Triton backward is within 2× of FA2 (10.0 vs 4.3 ms). Profile jax's Pallas backward against FA2 at the same tiles.
 2. Traced hooks on Mosaic GPU, forward and backward (§4).
 3. The D candidates, (a), (b) and (b′), on A100 and H100.
-4. The bitwise interpret harness, on today's two forward forms.
+4. The interpret-mode check 1 harness for every mainloop, on today's two forward forms.
 
 **Then the rungs:**
 - **Toolkit and attention:** sm90 attention reaching Tokamax Mosaic, then FA3; the decode mainloop; the fused ticket backward.
