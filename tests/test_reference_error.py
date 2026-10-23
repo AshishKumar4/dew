@@ -391,6 +391,65 @@ def test_check_one_passes_an_equally_exact_sum_over_the_seeds_its_own_reference_
     assert_as_exact(_reordered, _product, _draw, "reordered", seeds=seeds)
 
 
+def _cancelling_draw(seed):
+    """Sums of three terms, `[64, 4, 3]`, standard normal but for the first row's, which cancel: 1, half
+    an fp32 unit of it, and -1, scaled by a power of two the seed picks. In the order 1, -1, half its
+    exact sum survives; in 1, half, -1 the half is lost to the first rounding and the row is all error."""
+    rng = np.random.default_rng([0x0B, seed])
+    terms = rng.normal(size=(64, 4, 3))
+    scale = 2.0 ** int(rng.integers(-8, 8))
+    terms[0] = np.array([1.0, 2.0 ** -25, -1.0]) * scale
+    return (terms.astype(np.float32),)
+
+
+@jax.jit
+def _left_to_right(terms):
+    return {"sum": (terms[..., 0] + terms[..., 1]) + terms[..., 2]}
+
+
+@jax.jit
+def _outer_first(terms):
+    """The same sums with the last two terms swapped: the first row's comes out exact."""
+    return {"sum": (terms[..., 0] + terms[..., 2]) + terms[..., 1]}
+
+
+def _swapped(inputs):
+    """The orbit of a sum's last two terms: the draw, and its terms with those two swapped."""
+    (terms,) = inputs
+    return [inputs, (terms[..., [0, 2, 1]],)]
+
+
+def test_an_orbit_judges_each_arms_worst_row_over_the_same_orders():
+    """A row whose sum cancels rounds worst in one order and exactly in another: a reference whose own
+    order is the exact one fails an equally exact Dew by the worst row alone. Over the orbit of the two
+    orders both arms run at each, both worst rows are the lost half, and the site passes; at a single
+    order each arm's worst row, ratio and values are that order's alone."""
+    seeds = seeds_for(_outer_first, _cancelling_draw, "cancelling sums")
+    with pytest.raises(AssertionError, match="worst row"):
+        assert_as_exact(_left_to_right, _outer_first, _cancelling_draw, "cancelling sums", seeds=seeds)
+    assert_as_exact(_left_to_right, _outer_first, _cancelling_draw, "cancelling sums", seeds=seeds,
+                    orbit=_swapped)
+    from reference_error import _drawn
+
+    over = _drawn(_left_to_right, _outer_first, _cancelling_draw, range(8), orbit=_swapped)
+    orders = [_drawn(_left_to_right, _outer_first, lambda seed, k=k: _swapped(_cancelling_draw(seed))[k],
+                     range(8)) for k in range(2)]
+    np.testing.assert_array_equal(over.worst, np.maximum(orders[0].worst, orders[1].worst))
+    np.testing.assert_array_equal(over.mine, orders[0].mine)
+    np.testing.assert_array_equal(over.theirs, orders[0].theirs)
+
+
+def test_an_orbit_still_fails_a_sum_that_differs():
+    """A lost term fails over the orbit as at one order: the orbit moves rows' rounding, never a sum."""
+    @jax.jit
+    def lost(terms):
+        return {"sum": terms[..., 0] + terms[..., 1]}
+
+    with pytest.raises(AssertionError):
+        assert_as_exact(lost, _outer_first, _cancelling_draw, "lost term",
+                        seeds=seeds_for(_outer_first, _cancelling_draw, "cancelling sums"), orbit=_swapped)
+
+
 def test_a_committed_fixture_is_its_references_output_within_twice_a_fresh_runs_error():
     """An artifact check, not a parity (`assert_same_artifact`): a committed fixture whose largest error
     from float64 is up to twice a fresh run's is the reference's output; one further is not, even where
