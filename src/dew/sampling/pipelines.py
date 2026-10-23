@@ -19,7 +19,7 @@ from typing_extensions import TypeVar
 
 from dew.artifacts import uint8_pixels
 from dew.coordination import agreed
-from dew.diffusion.process import Conditioning, Process
+from dew.diffusion.process import Conditioning, Denoiser, Process
 from dew.inputs import InputSpec, encode_conditions, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, local_rows, mesh_of, request_key
@@ -846,14 +846,13 @@ def sampling_modules(model: nn.Module, guidance: Guidance | None,
     return (model, *guidance_modules(guidance), *(() if autoencoder is None else (autoencoder.model,)))
 
 
-def walk_and_decode(model: nn.Module, process: Process, autoencoder: AutoEncoder | None, variables, params,
-                    given, null, x_T: jax.Array, *, solver: Solver, guidance: Guidance | None, key: jax.Array,
-                    times, final_denoise: bool, initial=None, decode: bool = True) -> Images:
-    """`model`'s reverse walk of `process` from `x_T`, over its own `variables`, and with `decode` the
-    latents it reaches decoded by `autoencoder` (its weights `params["autoencoder"]`) and clipped to
-    [-1, 1]: the one sampling program a task (`TextToImage`) and an objective's evaluation
-    (`DiffusionObjective.sample`) run. `null` is the unconditional branch, read only under guidance."""
-    denoise = process.denoiser(model, variables, given, None if guidance is None else null)
+def walk_and_decode(denoise: Denoiser, autoencoder: AutoEncoder | None, params, x_T: jax.Array, *,
+                    solver: Solver, guidance: Guidance | None, key: jax.Array, times, final_denoise: bool,
+                    initial=None, decode: bool = True) -> Images:
+    """`denoise`'s reverse walk from `x_T`, and with `decode` the latents it reaches decoded by
+    `autoencoder` (its weights `params["autoencoder"]`) and clipped to [-1, 1]: the one sampling
+    program a task (`TextToImage`) and an objective's evaluation and preview
+    (`DiffusionObjective.evaluate`) run."""
     latents = sample(denoise, x_T, solver=solver, guidance=guidance, key=key, times=times,
                      initial=initial, final_denoise=final_denoise)
     if not decode:
@@ -875,9 +874,9 @@ def _run(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool
     def run(model, process, autoencoder, finish, final_denoise, decode,
             solver, guidance, times, initial, params, given, null, x_T, key):
         variables = {name: value for name, value in params.items() if name not in ("encoders", "autoencoder")}
-        walked = walk_and_decode(model, process, autoencoder, variables, params, given, null, x_T,
-                                 solver=solver, guidance=guidance, key=key, times=times,
-                                 final_denoise=final_denoise, initial=initial, decode=decode)
+        denoise = process.denoiser(model, variables, given, None if guidance is None else null)
+        walked = walk_and_decode(denoise, autoencoder, params, x_T, solver=solver, guidance=guidance, key=key,
+                                 times=times, final_denoise=final_denoise, initial=initial, decode=decode)
         if finish is None or walked.images is None:
             return walked
         return Images(finish(params, walked.images), latents=walked.latents)

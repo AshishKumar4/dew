@@ -877,10 +877,11 @@ class DiffusionObjective(Objective[Ratio]):
         process, times = sampling_grid(self.process, self.steps, self.grid)
         noise_key, sample_key = jax.random.split(key)
         x_T = process.noise(noise_key, (count, *self.latent_shape))
+        denoise = self.denoiser(params, given, unconditional, process)
         autoencoder, published = self.published_autoencoder(params)
-        walked = walk_and_decode(self.model, process, autoencoder, self.model_variables(params), published,
-                                 given, unconditional, x_T, solver=self.solver, guidance=self.guidance,
-                                 key=sample_key, times=np.asarray(times), final_denoise=self.final_denoise)
+        walked = walk_and_decode(denoise, autoencoder, published, x_T, solver=self.solver,
+                                 guidance=self.guidance, key=sample_key, times=np.asarray(times),
+                                 final_denoise=self.final_denoise)
         return walked.images
 
     def _rows(self, batch) -> int:

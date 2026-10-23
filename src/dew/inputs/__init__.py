@@ -4,8 +4,9 @@
 conditions it is given, keyed by the model's own keyword arguments. A
 `Condition` holds an encoder, the batch field it reads and the raw datum that
 stands for "no condition", which classifier-free guidance and conditioning
-dropout substitute. Nothing here runs a model. The spec only describes the
-inputs, and the objective does the encoding.
+dropout substitute. The spec only describes the inputs; `encode_conditions`
+runs its encoders over their weights, the one encoding a training step and a
+sampling task share.
 
 Image and video batches arrive as uint8 pixels in [0, 255], as the data
 workers write them. `unit_range` is the one conversion to [-1, 1], the range
