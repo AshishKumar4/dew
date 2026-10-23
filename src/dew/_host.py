@@ -6,6 +6,8 @@ from pathlib import Path
 
 _X86 = ("vendor_id", "cpu family", "model")
 _ARM = ("CPU implementer", "CPU architecture", "CPU part")
+CPUINFO = Path("/proc/cpuinfo")
+"""Linux's description of the host's processors."""
 
 
 def cpu_class(cpuinfo: str | None = None) -> str:
@@ -16,8 +18,7 @@ def cpu_class(cpuinfo: str | None = None) -> str:
     or run on another; and hardware estimate instructions (vrsqrtps) differ between classes, so
     float32 results, and thus numerical verdicts, belong to the class that produced them."""
     if cpuinfo is None:
-        info = Path("/proc/cpuinfo")
-        cpuinfo = info.read_text() if info.is_file() else ""
+        cpuinfo = CPUINFO.read_text() if CPUINFO.is_file() else ""
     fields: dict[str, str] = {}
     for line in cpuinfo.splitlines():
         key, _, value = line.partition(":")
