@@ -266,6 +266,20 @@ def record_key(python: str, row_name: str, held: str, inputs: str | None = None)
     return f"{at}/{held}/{name}/" + ("-of-".join(split.split("/")) if split else "whole")
 
 
+def key_parts(key: str) -> tuple[str, str, str]:
+    """A record's key under its Python's prefix (`record_key`'s `<class>/<test file>/<group>`) as its class,
+    its test file and its group (`whole`, or a split's `<index>-of-<count>`)."""
+    held, rest = key.split("/", 1)
+    name, group = rest.rsplit("/", 1)
+    return held, name, group
+
+
+def recorded(key: str, token: str) -> dict | None:
+    """The record at `key`, read (`record_of`), or None where there is none or the Worker did not give it."""
+    found = record_of(key, token)
+    return None if found is None else json.loads(found)
+
+
 def record_of(key: str, token: str) -> bytes | None:
     """The record at `key`, or None where there is none and where the Worker did not give it, which it
     reports and which costs only a rerun."""
@@ -284,9 +298,8 @@ def reused(python: str, name: str, split: str, common: str) -> dict | None:
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
-    record = record_of(record_key(python, row(python, name, split), device_class(), common), token)
-    recorded = None if record is None else json.loads(record)
-    return recorded["row"] if recorded is not None and fresh(recorded, name, common) else None
+    found = recorded(record_key(python, row(python, name, split), device_class(), common), token)
+    return found["row"] if found is not None and fresh(found, name, common) else None
 
 
 def fresh(recorded: dict, name: str, common: str) -> bool:
@@ -746,12 +759,11 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
     prefix = f"{CACHE_PREFIX}/{python}/"
 
     def evidence_of(key: str) -> tuple[str, list[str]]:
-        name = key.split("/", 1)[1].rsplit("/", 1)[0]  # <class>/<test file>/<group>
-        record = record_of(f"{prefix}{key}", token)
-        if record is None:
+        _, name, _ = key_parts(key)
+        found = recorded(f"{prefix}{key}", token)
+        if found is None:
             return name, ["unrecorded"]
-        recorded = json.loads(record)
-        return name, recorded["reads"] or ([] if fresh(recorded, name, common) else ["changed"])
+        return name, found["reads"] or ([] if fresh(found, name, common) else ["changed"])
 
     evidence: dict[str, set[str]] = {}
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
@@ -812,20 +824,18 @@ def borrowed_records(names: list[str], python: str, held: str, token: str) -> di
     prefix = f"{CACHE_PREFIX}/{python}/"
     wanted = set(names)
     keys = [key for key in listed(prefix, token)
-            if key.split("/", 1)[0] != held and key.endswith("/whole")
-            and key.split("/", 1)[1].rsplit("/", 1)[0] in wanted]
+            if key_parts(key)[0] != held and key_parts(key)[2] == "whole" and key_parts(key)[1] in wanted]
 
-    def recorded(key: str) -> tuple[str, str, dict | None]:
-        found = record_of(f"{prefix}{key}", token)
-        kind, rest = key.split("/", 1)
-        return rest.rsplit("/", 1)[0], kind, json.loads(found) if found else None
+    def read(key: str) -> tuple[str, str, dict | None]:
+        kind, name, _ = key_parts(key)
+        return name, kind, recorded(f"{prefix}{key}", token)
 
     def holds(found: dict) -> float:
         return gpu_needs(found, float("inf"))[1]
 
     borrowed: dict[str, tuple[str, dict]] = {}
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
-        for name, kind, found in pool.map(recorded, keys):
+        for name, kind, found in pool.map(read, keys):
             if found is None or found.get("depends") is None or found.get("peak") is None:
                 continue
             if name not in borrowed or holds(found) > holds(borrowed[name][1]):
@@ -861,12 +871,8 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
     budget = float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) * total
     held = device_class()
 
-    def recorded(key: str) -> dict | None:
-        found = record_of(key, token)
-        return json.loads(found) if found else None
-
     def needs(name: str) -> dict | None:
-        return recorded(record_key(python, row(python, name, ""), held))
+        return recorded(record_key(python, row(python, name, ""), held), token)
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
         records = dict(zip(tests, pool.map(needs, tests), strict=True))
