@@ -612,7 +612,8 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
                       prologue_axes: tuple, exact_sums: bool) -> jax.Array:
     """Dew: `tgmm`'s product at a tile two consumer warpgroups compute, each a half of its depth by all its
     columns, one MMA a step, beside a producer warpgroup issuing the loads (CUTLASS's cooperative sm90
-    schedule), the operand stages streaming across the persistent loop's tiles (`mosaic.Ring`): the
+    schedule), on the wgmma family's bundle (`FAMILY`), its rings streaming across the persistent loop's
+    tiles: the
     producer loads the next tile's first row blocks while the consumers store this one, which a group's
     few rows, a tile's few steps, make most of the time. Each warpgroup reads its depth half of the rows'
     stage, which it prepares (the prologue, the neighbouring groups' rows zeroed), and the whole
@@ -651,20 +652,12 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
 
         blocks = [((block_k, block_m), lhs_gmem), ((block_k, block_n), rhs_gmem),
                   *((tuple(extent[axis] for axis in prologue_axes[i]), side_gmems[i]) for i in stepped)]
-        rings = {f'ring_{i}': mosaic.ring(block, gmem.dtype, tiles.stages, consumers=2)
-                 for i, (block, gmem) in enumerate(blocks)}
+        fixed_staging = mosaic.staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]),
+                                                  side_gmems[i]) for i in fixed])
 
-        @functools.partial(
-            pl.run_scoped,
-            o_smem=plgpu.SMEM((2, block_n // staged, depth_half, staged), out_dtype),
-            **mosaic.staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]), side_gmems[i])
-                                 for i in fixed]),
-            halves=plgpu.Barrier(num_arrivals=2, num_barriers=2),
-            collective_axes="wg",
-            **rings,
-        )
-        def scope(o_smem, fixed_smems, fixed_barriers, halves, **rings):
-            streams = [mosaic.Ring(**rings[f'ring_{i}']) for i in range(len(rings))]
+        def scope(o_smem, fixed_smems, fixed_barriers, halves, *, streams):
+            rings = FAMILY.opened(streams)
+            streams = list(rings.values())
 
             def producer():
                 @plgpu.nd_loop((g, grid[0] * grid[1]), collective_axes="cluster_grid",
@@ -700,29 +693,32 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
 
                 hook = None if prologue is None else (prologue, prologue_axes, stepped, fixed, fixed_refs)
 
-                def release(counter):
-                    for ring in streams:
-                        ring.release(counter)
-
                 @plgpu.nd_loop((g, grid[0] * grid[1]), collective_axes="cluster_grid",
                                init_carry=jnp.int32(0))
                 def _(loop: plgpu.NDLoopInfo, carry):
                     g_i, depth, columns, _, steps = tile(loop)
-                    start, end = starts_gmem[g_i], ends_gmem[g_i]
+                    group = (starts_gmem[g_i], ends_gmem[g_i], steps, block_k)
                     fixed_views = [side_gmems[i].at[tuple(depth for _ in prologue_axes[i])] for i in fixed]
-                    # An empty group's tile reads none (`_streamed_gradient` stores its zeros).
+                    # An empty group's tile reads none and stores zeros.
                     pl.when(steps > 0)(lambda: mosaic.load_fixed(fixed_views, fixed_refs, fixed_barriers, wg))
-                    _streamed_gradient(
-                        lambda counter, step: _staged_halves(
-                            [ring.acquire(counter) for ring in streams], (step, start, end, steps, block_k),
-                            (mine_depth, mine_columns), hook, halves),
-                        release, steps, carry, part, exact_sums,
-                        lambda acc: store(acc, g_i, depth, columns))
+
+                    def staged_at(index, slots):
+                        return _staged_halves([slots[name] for name in rings], (index - carry, *group),
+                                              (mine_depth, mine_columns), hook, halves)
+
+                    store(_walked_gradient(rings, staged_at, carry, steps, part, exact_sums, bool(interpret)),
+                          g_i, depth, columns)
                     return carry + steps
 
                 plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
-            mosaic.roles(lax.axis_index("wg"), 2, consumer, producer)
+            FAMILY.roles(2, consumer, producer)
+
+        FAMILY.scoped(scope, plgpu.SMEM((2, block_n // staged, depth_half, staged), out_dtype),
+                      fixed_staging['fixed_smems'], fixed_staging['fixed_barriers'],
+                      plgpu.Barrier(num_arrivals=2, num_barriers=2),
+                      streams=FAMILY.streams({f'ring_{i}': (block, gmem.dtype)
+                                              for i, (block, gmem) in enumerate(blocks)}, tiles.stages, 2))
 
     kernel = mosaic.cooperative(body, jax.ShapeDtypeStruct((g, m, n), out_dtype), consumers=2, cluster=1,
                                 multiprocessors=multiprocessors, interpret=interpret)
@@ -751,52 +747,31 @@ def _staged_halves(stages: list, group: tuple, mine: tuple, hook, halves) -> tup
     return rows_stage.at[:, mine_depth].transpose((1, 0)), cotangent_stage
 
 
-def _streamed_gradient(staged, release, steps, first, shape: tuple, exact_sums: bool, store) -> None:
-    """Dew: a streamed kernel gradient tile's `steps` steps (`staged(counter, step)` their operands at the
-    ring's turn, `release(counter)` their stages back), summed into an fp32 tile of `shape` and stored: as
-    the tensor cores add, an MMA in flight, or with `exact_sums` each step's product summed apart and
-    added into the running sum by an IEEE add (a tensor core's accumulation truncates each add). An empty
-    group's tile, no steps, is zero."""
-    zeros = plgpu.layout_cast(jnp.zeros(shape, jnp.float32), plgpu.Layout.WGMMA)
+def _walked_gradient(rings: dict, staged, first, steps, shape: tuple, exact_sums: bool, interpret: bool):
+    """Dew: a streamed kernel gradient tile's `steps` steps from ring turn `first` (`staged(index, slots)`
+    their operands), summed into an fp32 tile of `shape` (`FAMILY.walk`): as the tensor cores add, an MMA
+    in flight, or with `exact_sums` each step's product summed apart and added into the running sum by an
+    IEEE add (a tensor core's accumulation truncates each add). An empty group's tile, no steps, is
+    zero."""
     if exact_sums:
-        def exact_step(step, running):
-            rows_operand, cotangent_operand = staged(first + step, step)
+        def exact_step(index, slots, running, accumulators):
+            lhs, rhs = staged(index, slots)
+            # Interpreted, the in-place product's own arithmetic, so the two sums add alike.
+            fresh = (FAMILY.products(FAMILY.zeros(shape), lhs, rhs, interpret=True) if interpret
+                     else FAMILY.product(lhs, rhs, shape))
+            return running + fresh, accumulators
 
-            def step_scope(step_ref):
-                plgpu.wgmma(step_ref, rows_operand, cotangent_operand)
-                plgpu.wgmma_wait(0)
-                return step_ref[...]
+        running, _ = FAMILY.walk(rings, ((exact_step, first, first + steps),), FAMILY.zeros(shape), (),
+                                 interpret)
+        return running
 
-            product = pl.run_scoped(step_scope, plgpu.WGMMAAccumulatorRef(shape))
-            release(first + step)
-            return running + product
+    def step(index, slots, nothing, accumulators):
+        (acc,) = accumulators
+        return nothing, (FAMILY.products(acc, *staged(index, slots), interpret),)
 
-        store(lax.fori_loop(0, steps, exact_step, zeros))
-        return
-
-    @pl.when(steps > 0)
-    def _():
-        @functools.partial(pl.run_scoped, acc_ref=plgpu.WGMMAAccumulatorRef(shape))
-        def _(acc_ref):
-            _summed(acc_ref, staged, release, steps, first)
-            store(acc_ref[...])
-
-    pl.when(steps == 0)(lambda: store(zeros))
-
-
-def _summed(acc_ref, staged, release, steps, first) -> None:
-    """Dew: `steps` steps' products into `acc_ref` as the tensor cores add them, an MMA in flight:
-    `staged(counter, step)` a step's operands at the ring's turn, `release(counter)` its stages back once
-    the products have read them."""
-    @pl.loop(0, steps)
-    def _(step):
-        plgpu.wgmma(acc_ref, *staged(first + step, step))
-        # One MMA in flight: the step before's stages are read.
-        plgpu.wgmma_wait(_IN_FLIGHT)
-        pl.when(step > 0)(lambda: release(first + step - 1))
-
-    plgpu.wgmma_wait(0)
-    release(first + steps - 1)
+    _, (summed,) = FAMILY.walk(rings, ((step, first, first + steps),), None, (shape,), interpret,
+                               in_flight=_IN_FLIGHT)
+    return summed
 
 
 def _zero_neighbours_of(refs: tuple, step, start, end, steps, block_k: int):
