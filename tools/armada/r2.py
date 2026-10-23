@@ -84,7 +84,8 @@ class Body:
         self.left -= len(data)
         if self.owed is not None:
             self.owed -= len(data)
-            if not data and wanted and self.owed > 0:
+            # A read that came back short ended at the connection's end: the body stopped before its length.
+            if self.owed > 0 and len(data) < wanted:
                 raise Unavailable(f"{self.what} ended {self.owed} bytes before its announced length")
         return data
 
@@ -98,7 +99,8 @@ class Body:
 
 @dataclass(frozen=True)
 class Reply:
-    """An answer: its status (2xx, 304 or 404), its headers, and its body as it arrives."""
+    """An answer: its status (2xx, 304 or 404), its headers, and its body as it arrives: None for a 304, a
+    404 and a HEAD, whose Content-Length is the object's."""
 
     status: int
     headers: Mapping[str, str]
@@ -147,7 +149,7 @@ class Store:
         except (OSError, http.client.HTTPException) as error:  # URLError, a timeout, a connection cut short
             raise Unavailable(f"{what} did not complete: {error}") from error
         with response:
-            answer = Body(response, limit, f"the answer to {what}")
+            answer = None if method == "HEAD" else Body(response, limit, f"the answer to {what}")
             yield Reply(response.status, dict(response.headers), answer)
 
     def get(self, key: str, limit: int = MAX_BYTES) -> bytes | None:
