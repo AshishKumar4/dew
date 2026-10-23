@@ -26,8 +26,7 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures" / "gemma3n"
 HIDDEN, COPIES = 32, 4
 ALTUP_SEEDS, PADDED_SEEDS = 128, 256
 SPARSITY_SEEDS = {0.9: 8, 0.95: 8, 0.99: 32}
-"""Each site's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` (2026-10-21, on
-armada)."""
+"""Each site's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` (on armada)."""
 
 
 def fixture() -> dict:
