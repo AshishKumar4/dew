@@ -17,7 +17,8 @@ from typing import ClassVar
 
 import numpy as np
 
-from dew.data.dataset import Batch, Records
+from dew.batch import Batch
+from dew.data.dataset import Records
 from dew.data.generation import Generation
 from dew.data.pipeline import ExpandStep, Pack
 from dew.data.plan import fingerprint

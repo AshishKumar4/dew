@@ -148,7 +148,7 @@ class Status(Enum):
 
 
 def _token_ids(name: str, ids: object) -> tuple[int, ...]:
-    """`ids`, a tuple, each read by `dew.nn.inputs.token_id`'s law."""
+    """`ids`, a tuple, each read by `dew.batch.token_id`'s law."""
     if not isinstance(ids, tuple):
         raise ValueError(f"{name} must be a tuple of token ids, got {type(ids).__name__}")
     return tuple(token_id(token, where=name) for token in ids)

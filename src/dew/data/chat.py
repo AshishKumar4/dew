@@ -48,7 +48,7 @@ from dew.data.text import HFTokenizer, SavedTokenizer, tokenizer_name
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
-    from dew.data.dataset import Batch
+    from dew.batch import Batch
     from dew.data.steps.text import LengthPolicy
 
 ROLES_KEY = "text_roles"

@@ -14,7 +14,8 @@ from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, run
 import grain.python as pygrain
 import numpy as np
 
-from dew.data.dataset import WORKER_BUFFER, Batch, Records, phase_ends
+from dew.batch import Batch
+from dew.data.dataset import WORKER_BUFFER, Records, phase_ends
 
 if TYPE_CHECKING:
     import jax

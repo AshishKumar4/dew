@@ -35,9 +35,6 @@ import tyro
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew import position
-
-# `Batch` lives in dew.objectives.base. The data layer imports it from here
-# so a dataset module needs one import for the value and its shape.
 from dew.batch import VALID_ROWS, Batch, LayoutRefused, padded_rows
 from dew.mesh import batch_axes
 

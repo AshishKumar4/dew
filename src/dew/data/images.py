@@ -14,7 +14,7 @@ import grain.python as grain
 import numpy as np
 from numpy.typing import ArrayLike
 
-from dew.data.dataset import Batch
+from dew.batch import Batch
 from dew.data.facts import resized, shaped, unshaped
 from dew.data.image_augmentation import JITTER
 from dew.data.image_codec import as_rgb, decode_image

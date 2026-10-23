@@ -9,7 +9,7 @@ import grain.python as grain
 import jax
 import numpy as np
 
-from dew.data.dataset import Batch
+from dew.batch import Batch
 from dew.records import record
 
 

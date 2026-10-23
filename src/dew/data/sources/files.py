@@ -25,7 +25,8 @@ from fsspec.utils import infer_compression
 from gcsfs import GCSFileSystem
 from s3fs import S3FileSystem
 
-from dew.data.dataset import Batch, Ranges, Records
+from dew.batch import Batch
+from dew.data.dataset import Ranges, Records
 from dew.data.pipeline import Dataset
 from dew.data.steps.generic import Fields
 from dew.data.storage import Readable, Store, commit_export, content_version, in_memory, local, on_gcs
