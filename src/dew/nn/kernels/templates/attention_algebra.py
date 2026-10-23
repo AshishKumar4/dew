@@ -1087,6 +1087,20 @@ def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, see
     grads = tuple(grad + piece if row else grad for grad, row, piece in zip(sums.grads, summed, pieces,
                                                                            strict=True))
     pulled_weights, pieces = pulled(weights, slopes, seen, kinds)
+    weighed = sums.weighed
+    if any(summed):
+        weighed = tuple(total + piece if row else total
+                        for total, row, piece in zip(sums.weighed, summed, pieces, strict=True))
+    residual, mass = sums.residual + cotangents.sum(axis=-1), sums.mass + weights.sum(axis=-1)
+    if slopes is None:
+        # Without a score hook each coefficient is the scale times a weight over the prior denominator,
+        # which holds every weight at its maximum: the weights over it sum to at most one, so their product
+        # with the keys is a mean of them, finite wherever they are, and the scale is the mass's, its
+        # mantissa and exponent apart (`dq_finish`). One product, no exponent a row.
+        scale_mantissa, scale_exponent = _split(jnp.float32(scale))
+        keyed = sums.keyed + weights_product(weights * expand(inverse(prior), weights), key, dot)
+        return DqSums(dq, residual, mass, grads, weighed, keyed,
+                      jnp.full_like(sums.keyed_mass, scale_mantissa), jnp.full_like(sums.keyed_shift, scale_exponent))
     # The tile's coefficients against the keys, `pulled weight · scale / prior`, joined into the running
     # mean as a softmax's sums are joined under a running maximum. Each is held at its row's power of two,
     # never formed whole where it would overflow (a hook's slope near fp32's largest): the row's largest
@@ -1106,12 +1120,7 @@ def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, see
     over = inverse(keyed_mass)
     keyed = (expand(before * over, sums.keyed) * sums.keyed
              + weights_product(coefficients * expand(over, coefficients), key, dot))
-    weighed = sums.weighed
-    if any(summed):
-        weighed = tuple(total + piece if row else total
-                        for total, row, piece in zip(sums.weighed, summed, pieces, strict=True))
-    return DqSums(dq, sums.residual + cotangents.sum(axis=-1), sums.mass + weights.sum(axis=-1), grads,
-                  weighed, keyed, keyed_mass, keyed_shift)
+    return DqSums(dq, residual, mass, grads, weighed, keyed, keyed_mass, keyed_shift)
 
 
 def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax.Array,
