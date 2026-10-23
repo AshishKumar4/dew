@@ -165,6 +165,35 @@ def test_named_profile_resolves_secrets_lazily(monkeypatch):
     assert fs.cat_file(path) == b"present"
 
 
+def test_a_profile_over_this_hosts_disk_exports_provisions_and_reads_as_the_disk_does(tmp_path):
+    """A storage profile whose base is this host's disk, by either of its names, is that disk: an
+    export to it commits there, and its ArrayRecord shards, a line file's offset index and a Parquet
+    file read there by their own readers."""
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from dew.data.sinks import export
+    from dew.data.sources import Memory
+
+    rows = [{"id": np.int64(index)} for index in range(5)]
+    for base in ("file", "local"):
+        name = f"disk{base}"
+        _profile(name, base, {})
+        root = tmp_path / base
+        root.mkdir()
+        export(Memory(rows), f"{name}://{root}/records", format="array_record", rows_per_shard=2)
+        records = Files(f"{name}://{root}/records").records("indexed")
+        assert [int(records[index]["id"]) for index in range(len(records))] == list(range(5))
+        (root / "rows.jsonl").write_text("".join(json.dumps({"id": index}) + "\n" for index in range(5)))
+        lines = Files(f"{name}://{root}/rows.jsonl")
+        lines.provision()
+        assert [lines.records("indexed")[index]["id"] for index in (4, 0)] == [4, 0]
+        pq.write_table(pa.table({"id": list(range(5))}), root / "rows.parquet")
+        table = Files(f"{name}://{root}/rows.parquet").records("memory")
+        assert [int(table[index]["id"]) for index in range(5)] == list(range(5))
+
+
 def test_local_content_versions_are_shared_and_refreshed_after_writes(tmp_path, monkeypatch):
     """Independent readers share one complete checksum per local file version."""
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))

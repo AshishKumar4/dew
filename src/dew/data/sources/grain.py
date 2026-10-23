@@ -50,7 +50,9 @@ class Grain(Dataset):
     def manifest(self) -> ShardManifest:
         if isinstance(self.dataset, grain.MapDataset):
             rows = len(self.dataset)
-            return ShardManifest((Shard(self.describe(), self.describe(), 0, rows, rows),), self._read_shard)
+            # One shard, the MapDataset's records in their index order.
+            return ShardManifest((Shard(self.describe(), self.describe(), 0, rows, rows),), self._read_shard,
+                                 index_ordered=True)
         return ShardManifest((Shard(self.describe(), self.describe()),), self._read_shard)
 
     def _read_shard(self, shard: Shard) -> grain.IterDataset:

@@ -12,7 +12,7 @@ from flax import linen as nn
 
 from dew.artifacts import Representations
 from dew.data.dataset import Loader
-from dew.objectives.base import Aux, EMASpec, Objective
+from dew.objectives.base import Aux, EMASpec, Objective, mean_of_totals, merge_totals
 from dew.training import Checkpoints, Layout, Trainer
 
 BATCH = 8
@@ -156,8 +156,5 @@ class Spread:
         self.seen.append((np.asarray(artifact.features).shape, np.asarray(batch["x"]).shape))
         return float(jnp.std(artifact.features)), 1
 
-    def merge(self, accumulated, contribution):
-        return accumulated[0] + contribution[0], accumulated[1] + contribution[1]
-
-    def finalize(self, accumulated):
-        return accumulated[0] / accumulated[1]
+    merge = staticmethod(merge_totals)
+    finalize = staticmethod(mean_of_totals)
