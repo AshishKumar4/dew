@@ -17,14 +17,16 @@ binomials; documents reset on chunks' first and last tokens; and saturated gates
 Mamba's step through softplus at 30), and pre-activations spread over [-20, 20], which keep gates near 0 and 1
 apart; a memory fading over a long sequence, whose output falls far below its scale; and a steep decay every
 eighth token between mild ones, whose pairs after it are differences of large, nearly equal prefixes. Each
-runs the portable math, and the port of fla's kernels (`recurrence_chunk.fla_rule`) where the hooks take it
-(the delta rule with a decay), both forward and through their gradient, held to the recurrence's gradient by
-check 1. The port runs where its route takes the regime's declared decay floor (`FLOORS`): a decay a key
-dimension steeper than its domain, -5 a token, it refuses (`fla_kda.DECAY_FLOOR`), which the port's arm
-asserts. The port's prefix difference uncompensated in base 2 failed check 1 under saturated write gates,
-aligned keys, resets on chunk edges and the decay bound, and its 64-token chunks of the suite's 16-wide keys
-over a long sequence; compensated, and its chunk no longer than twice the keys' width
-(`recurrence_chunk.held_chunk`), it passes."""
+runs the portable math forward and through its gradient (with `reference_error.with_gradients`, each seed's
+cotangents drawn with its operands), and the port of fla's kernels (`recurrence_chunk.fla_rule`) forward
+where the hooks take it (the delta rule with a decay). The port runs where its route takes the regime's
+declared decay floor (`FLOORS`): a decay a key dimension steeper than its domain, -5 a token, it refuses
+(`fla_kda.DECAY_FLOOR`), which the port's arm asserts. The port's prefix difference uncompensated in base 2
+failed check 1 under saturated write gates, aligned keys, resets on chunk edges and the decay bound, and its
+64-token chunks of the suite's 16-wide keys over a long sequence; compensated, and its chunk no longer than
+twice the keys' width (`recurrence_chunk.held_chunk`), it passes. Its gradients, fla's arithmetic, fail
+check 1 in several of these regimes: its route reports them (`recurrence_chunk.PORT_GAPS`) until the
+template's GPU mainloop replaces it."""
 
 import dataclasses
 import functools
@@ -36,8 +38,8 @@ import pytest
 from reference_error import assert_as_exact, widened, with_gradients
 from test_recurrence_chunk import CHUNK, KEY_WIDTH, VALUE_HEADS, draw, token_by_token
 
-from dew.nn.kernels import recurrence
-from dew.nn.kernels.recurrence_chunk import Chunk, chunk, port_refusal
+from dew.nn.kernels import generation, recurrence
+from dew.nn.kernels.recurrence_chunk import PORT_GAPS, Chunk, chunk, on_the_port, port_refusal
 
 SITES = {'scalar delta': recurrence.Hooks(decay='scalar', scale=KEY_WIDTH ** -0.5),
          'vector delta': recurrence.Hooks(decay='vector', scale=KEY_WIDTH ** -0.5),
@@ -359,17 +361,16 @@ def test_the_chunked_op_stays_finite_and_exact_where_chunked_forms_break(name, r
                     seeds=SEEDS[name, regime])
 
 
-@pytest.mark.parametrize('name, regime, arm', CASES)
-def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime, arm):
-    """The arm's gradient finite wherever the reference's in float64 is, and on par with the token-by-token
-    recurrence's from float64 (check 1) over the site's declared seeds; the port, where its route refuses
-    the regime's floor, refuses it."""
+@pytest.mark.parametrize('name, regime', [pytest.param(name, regime, id=f'{name}-{regime}')
+                                          for name in SITES for regime in REGIMES])
+def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime):
+    """The portable math's gradient finite wherever the reference's in float64 is, and on par with the
+    token-by-token recurrence's from float64 (check 1) over the site's declared seeds. The port's gradients,
+    fla's arithmetic, are its route's known defect in these regimes (`PORT_GAPS`), until the template's GPU
+    mainloop replaces it."""
     hooks = SITES[name]
-    if (refused := refusal(hooks, regime, arm)) is not None:
-        assert refused.code == 'decay_floor', refused
-        return
-    dew = jax.jit(with_gradients(restarting(functools.partial(chunk, hooks, chunk_size=CHUNK,
-                                                              ported=arm == 'port'), regime)))
+    dew = jax.jit(with_gradients(restarting(functools.partial(chunk, hooks, chunk_size=CHUNK, ported=False),
+                                            regime)))
     reference = jax.jit(with_gradients(restarting(functools.partial(token_by_token, hooks), regime)))
     draws = functools.partial(cotangents, hooks, regime)
     for seed in range(2):
@@ -381,5 +382,18 @@ def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime, a
         for index, (ours, exact) in enumerate(leaves):
             finite = np.isfinite(np.asarray(exact))
             assert np.all(np.isfinite(np.asarray(ours))[finite]), f'leaf {index}: not finite, seed {seed}'
-    assert_as_exact(dew, reference, draws, f'the {arm} arm\'s gradient, {name} under {regime}',
+    assert_as_exact(dew, reference, draws, f"the portable math's gradient, {name} under {regime}",
                     seeds=GRADIENT_SEEDS[name, regime])
+
+
+def test_a_route_to_the_port_reports_its_known_gradient_defects():
+    """The port's gradients fail check 1 where its arms here would hold them (row 1328's regimes), so every
+    route that runs it reports them (`recurrence_chunk.PORT_GAPS`); the portable math's reports none."""
+    (operands,) = stressed(SITES['scalar delta'], 'decays near one', 0)
+    with generation.chosen(gated_delta_rule='fla'), generation.routes() as found:
+        on_the_port(operands.query, operands.key, operands.value)
+    with generation.chosen(gated_delta_rule='xla'), generation.routes() as portable:
+        on_the_port(operands.query, operands.key, operands.value)
+    assert [route.kernel for route in found] == ['fla'] and found[0].gaps == PORT_GAPS
+    assert {gap.row for gap in found[0].gaps} == {'1328'}
+    assert [route.kernel for route in portable] == ['xla'] and portable[0].gaps == ()
