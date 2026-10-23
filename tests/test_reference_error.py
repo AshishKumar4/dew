@@ -776,7 +776,7 @@ def test_null_runs_judge_the_reference_against_itself_on_draws_no_other_run_take
         return _draw(seed)
 
     verdicts = null_runs(_product, draw, "null", seeds=8, runs=3)
-    assert [verdict for verdict, _ in verdicts] == ["pass"] * 3
+    assert [verdict for verdict, _, _ in verdicts] == ["pass"] * 3
 
     # Draws of one truth (an orbit's) pair their rows of float64 zero: Dew's residue on a row the
     # reference holds at zero is no pass for drawing the reference elsewhere.
@@ -794,7 +794,7 @@ def test_null_runs_judge_the_reference_against_itself_on_draws_no_other_run_take
 
     with pytest.raises(AssertionError):
         assert_as_exact(residue, exact, one_truth, "orbit", seeds=8, truth_fn=truth)
-    [(verdict, _)] = null_runs(exact, one_truth, "orbit", seeds=8, runs=1, truth_fn=truth, dew_fn=residue)
+    [(verdict, _, _)] = null_runs(exact, one_truth, "orbit", seeds=8, runs=1, truth_fn=truth, dew_fn=residue)
     assert verdict == "over"
     assert len(taken) == len(set(taken))
     assert null_rate_bound(0, 1400) == pytest.approx(1 - 0.001 ** (1 / 1400), rel=1e-9)
@@ -886,7 +886,7 @@ def test_the_procedure_before_the_two_stages_draws_again_as_it_did():
         def drawn(start, stop):
             count = stop - start
             return _Draws(["leaf"], np.full((count, 1), dew), np.ones((count, 1)), np.zeros((count, 1, 2)),
-                          np.zeros((count, 1), int), np.full((count, 1), np.isfinite(dew)))
+                          np.zeros((count, 1), int), np.full((count, 1), np.isfinite(dew)), (0,))
         return drawn
 
     with np.errstate(invalid="ignore"):
