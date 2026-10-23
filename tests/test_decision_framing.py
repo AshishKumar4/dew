@@ -86,7 +86,8 @@ def test_a_tokenizer_without_a_template_frames_a_row_as_plain_text():
 @pytest.mark.parametrize("name", sorted(LOCAL))
 def test_an_image_stands_as_its_processors_own_image_part(name):
     """A row's image is the text its processor's own chat template writes for an image part, which
-    holds the processor's own image token, and which the processor expands to the image's tokens."""
+    holds the processor's own image token, and which the processor expands to the image's tokens: the
+    processed row is longer than the written text's own tokens."""
     from transformers import AutoProcessor
 
     from dew.data.chat import image_text
@@ -96,7 +97,8 @@ def test_an_image_stands_as_its_processors_own_image_part(name):
     assert processor.image_token in written
     picture = Image.fromarray(np.random.default_rng(0).integers(0, 256, (64, 64, 3), dtype=np.uint8))
     expanded = processor(text=[written], images=[picture])
-    assert int((np.asarray(expanded["input_ids"]) == processor.image_token_id).sum()) > 1
+    own = processor.tokenizer(written, add_special_tokens=False)["input_ids"]
+    assert np.asarray(expanded["input_ids"]).shape[-1] > len(own)
 
 
 def test_a_framing_reads_a_chat_template_of_its_own_and_its_variables_and_its_record_reloads_them():
@@ -134,11 +136,24 @@ def test_a_framing_refuses_what_it_would_otherwise_leave_unread():
     with pytest.raises(ValueError):
         Framing(options={"chat_template": "{{ messages }}"})
     with pytest.raises(ValueError):
+        Framing(options={"tokenizer_kwargs": {}})
+    with pytest.raises(ValueError):
         Framing(chat_template="{{ messages }}", template=False)
     with pytest.raises(ValueError):
         Framing(chat_template="{{ messages }}").around(ByteTokenizer())
     walked = ("{% for message in messages %}{{ message.content }}{% endfor %}"
               "{% for key, value in labels.items() %}<{{ key }}>{% endfor %}")
+    from dew.data.chat import CONTENT, framed
+
     templated = HFTokenizer(str(LOCAL["qwen3.5"]), local_files_only=True)
-    _, after = Framing(chat_template=walked, options={"labels": {"z": 1, "a": 2}}).around(templated)
-    assert after.startswith("<z><a>")
+    with pytest.raises(ValueError):
+        framed(templated.tokenizer, JOINT_SYSTEM, where="direct", options={"tokenizer_kwargs": {}})
+    rendered = []
+    for labels in ({"z": 1, "a": 2}, {"a": 2, "z": 1}):
+        before, after = Framing(chat_template=walked, options={"labels": labels}).around(templated)
+        direct = templated.tokenizer.apply_chat_template(
+            [{"role": "system", "content": JOINT_SYSTEM}, {"role": "user", "content": CONTENT}],
+            chat_template=walked, labels=labels, tokenize=False, add_generation_prompt=True)
+        assert isinstance(direct, str) and before + CONTENT + after == direct + JOINT_PREFILL
+        rendered.append(after)
+    assert rendered[0] != rendered[1]
