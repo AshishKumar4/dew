@@ -189,7 +189,10 @@ def test_a_packed_delta_net_lowers_onto_the_port_whatever_documents_its_rows_dec
 
 
 def _experts_lowered(generation: str, implementation: str):
-    """An expert layer's bf16 forward and backward, as a MoE step runs them, lowered for `generation`."""
+    """An expert layer's bf16 forward and backward, as a MoE step runs them, lowered for `generation` after
+    its launches are settled as the trainer settles a step's (`tuning.tune`, which stores each launch's
+    description, its hooks named)."""
+    from dew.nn.kernels import tuning
     from dew.nn.moe import ExpertMLP
 
     experts = ExpertMLP(num_experts=8, hidden_features=128, out_features=64, implementation=implementation,
@@ -204,8 +207,11 @@ def _experts_lowered(generation: str, implementation: str):
         return experts.apply(variables, x, weights, indices).astype(jnp.float32).sum()
 
     mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation)
-    with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
+    def lower():
         return jax.jit(jax.value_and_grad(loss)).trace(variables, x).lower(lowering_platforms=('cuda',))
+
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
+        return tuning.tune(lower)[0]
 
 
 @pytest.mark.parametrize("generation", GPUS)

@@ -18,6 +18,7 @@ embed, mlp]` and `mlp/experts/down_proj/kernel` `[exp, mlp, embed]`, the
 layout `jax.lax.ragged_dot` takes and the `expert` mesh axis shards.
 """
 
+import dataclasses
 import functools
 import math
 from collections.abc import Callable, Mapping, Sequence
@@ -479,6 +480,18 @@ def _placed(implementation: str) -> bool:
     return triton_runs() or (implementation == 'pallas' and backend() == 'cpu')
 
 
+@dataclasses.dataclass(frozen=True)
+class GatedEpilogue:
+    """A gated MLP's product of its two clamped projections (`swiglu_clamped`) as a paired projection's
+    epilogue computes it on the two fp32 accumulators (`gated_arithmetic`): a value, so a launch's stored
+    picks name it (`tuning`)."""
+    activation: GatedActivation
+    limit: float | None
+
+    def __call__(self, gate: jax.Array, up: jax.Array) -> jax.Array:
+        return gated_arithmetic(self.activation)(*swiglu_clamped(gate, up, self.limit))
+
+
 def gated_projections(x: jax.Array, gate_kernel: jax.Array, up_kernel: jax.Array, group_sizes: jax.Array,
                       dtype: Dtype | None, implementation: str, precision: PrecisionLike,
                       activation: GatedActivation, limit: float | None) -> jax.Array:
@@ -493,10 +506,8 @@ def gated_projections(x: jax.Array, gate_kernel: jax.Array, up_kernel: jax.Array
                  and all(seen_whole(array) for array in (x, gate_kernel, up_kernel)))
     if templated:
         compute = canonicalize_dtype(x, gate_kernel, up_kernel, dtype=dtype)
-        arithmetic = gated_arithmetic(activation)
         return template.gemm(x, gate_kernel, group_sizes, paired=up_kernel,
-                             epilogue=lambda gate, up: arithmetic(*swiglu_clamped(gate, up, limit)),
-                             compute=compute, out_dtype=compute,
+                             epilogue=GatedEpilogue(activation, limit), compute=compute, out_dtype=compute,
                              precision=float32_products(compute, precision),
                              interpret_on_cpu=implementation == 'pallas')
     # The same residual names as the dense MLP's, so one remat policy covers both (mixer_base.RESIDUALS).
