@@ -62,7 +62,7 @@ def test_without_ynn_takes_a_callers_compiler_options_over_its_own():
 
 def test_windows_stack_a_sites_own_draws_and_its_arms_take_them_all():
     """`windows(draw, count)`'s seed `s` is the site's draws of seeds `s * count` on, stacked, and an arm
-    over them (`over_windows`, compiled or looped) gives each window's own output, stacked."""
+    over them, batched or looped, gives each window's own output, stacked, as host arrays."""
     from reference_error import over_windows, windows
 
     def draw(seed):
@@ -79,84 +79,122 @@ def test_windows_stack_a_sites_own_draws_and_its_arms_take_them_all():
     looped = over_windows(lambda x, seed: jax.tree.map(np.asarray, arm(x, seed)), looped=True)
     for wrapped in (over_windows(arm), looped):
         found = wrapped(*stacked)
+        assert all(type(leaf) is np.ndarray for leaf in jax.tree.leaves(found))
         for index in range(5):
             wanted = jax.tree.leaves(arm(*draw(10 + index)))
             for got, want in zip(jax.tree.leaves(found), wanted, strict=True):
-                np.testing.assert_array_equal(np.asarray(got[index]), np.asarray(want))
+                np.testing.assert_array_equal(got[index], np.asarray(want))
 
 
-def test_windows_keep_a_draws_dtypes_and_weak_types_and_a_host_arms_outputs():
-    """A window keeps what one draw holds: a host array its dtype, a weak JAX scalar its weak type, so a
-    float16 arm computes in float16 over windows as over one draw; a looped NumPy reference's float64
-    outputs stay float64."""
+def test_windows_keep_a_host_draws_dtypes():
+    """A host array of a window keeps its dtype, float16 and int64 alike, as one draw holds it."""
+    from reference_error import windows
+
+    stacked = windows(lambda seed: (np.array([1 / 3], np.float16), np.int64(2**40 + seed)), 2)(0)
+    assert stacked[0].dtype == np.float16 and stacked[1].dtype == np.int64
+    assert stacked[1][1] == 2**40 + 1
+
+
+def test_windows_keep_a_weak_scalars_weak_type():
+    """A weak JAX scalar stays weak, so a float16 arm computes in float16 over windows as over one draw."""
     from reference_error import over_windows, windows
 
-    def draw(seed):
-        return np.array([1 / 3], np.float16), jnp.asarray(1.5), np.int64(2**40 + seed)
-
-    stacked = windows(draw, 2)(0)
-    assert stacked[0].dtype == np.float16 and stacked[2].dtype == np.int64
+    draw = windows(lambda seed: (np.array([1 / 3], np.float16), jnp.asarray(1.5)), 2)
+    stacked = draw(0)
     assert jax.typeof(stacked[1]).weak_type
-    found = over_windows(lambda x, scale, big: x * scale)(*stacked)
+    found = over_windows(lambda x, scale: x * scale)(*stacked)
     assert found.dtype == np.float16
-    np.testing.assert_array_equal(found[0], draw(0)[0] * draw(0)[1])
-    reference = over_windows(lambda x, scale, big: np.asarray(x, np.float64) * 1.1, looped=True)(*stacked)
-    assert reference.dtype == np.float64
+    np.testing.assert_array_equal(found[0], np.asarray(jnp.asarray(stacked[0][0]) * 1.5))
 
 
-def test_windows_of_no_draws_are_refused():
-    """A seed of no windows is no draw."""
-    from reference_error import windows
+def test_a_looped_host_arm_keeps_its_outputs_dtypes():
+    """A looped NumPy reference's float64 outputs stay float64."""
+    from reference_error import over_windows
+
+    found = over_windows(lambda x: np.asarray(x, np.float64) * 1.1, looped=True)(np.ones((2, 3), np.float16))
+    assert found.dtype == np.float64
+
+
+def test_no_windows_are_refused():
+    """A seed of no windows, or an arm given none, is no draw."""
+    from reference_error import over_windows, windows
 
     with pytest.raises(ValueError):
         windows(lambda seed: (np.zeros(2),), 0)
+    for arm in (over_windows(lambda x: x), over_windows(lambda x: x, looped=True)):
+        with pytest.raises(ValueError):
+            arm(np.zeros((0, 2), np.float32))
 
 
-def test_a_batched_arm_that_computes_otherwise_than_one_draws_is_refused():
-    """`over_windows` refuses a batched arm whose windows differ, by a bit, from one draw's compiled
-    arm window by window: here a batching rule that adds one, where a fusion or a route would move a
-    rounding."""
-    from reference_error import over_windows
-
+def moved_when(condition):
+    """An identity whose batching rule adds one where `condition(axis_size, x)` holds: a batch axis that
+    moves a rounding, as a fusion or a kernel's route may."""
     @jax.custom_batching.custom_vmap
     def arm(x):
         return x
 
     @arm.def_vmap
     def batched(axis_size, in_batched, x):
-        return x + 1, in_batched[0]
+        return (x + 1 if condition(axis_size, x) else x), in_batched[0]
+    return arm
 
-    with pytest.raises(AssertionError):
-        over_windows(arm)(np.zeros((3, 2), np.float32))
-    # The check runs at each signature: a reference's float32 program and its float64 truth's are two,
-    # and a batching that moves only the float64 one is refused there.
-    @jax.custom_batching.custom_vmap
-    def wide_only(x):
-        return x
 
-    @wide_only.def_vmap
-    def moved(axis_size, in_batched, x):
-        return (x + 1 if x.dtype == jnp.float64 else x), in_batched[0]
+def test_a_batched_arm_that_computes_otherwise_than_one_draws_is_refused():
+    """`over_windows` refuses a batched arm whose windows differ, by a bit, from one draw's compiled
+    arm window by window, on every call, and the looped arm takes it."""
+    from reference_error import over_windows
 
-    both = over_windows(wide_only)
-    both(np.zeros((3, 2), np.float32))
-    with jax.enable_x64(new_val=True), pytest.raises(AssertionError):
-        both(np.zeros((3, 2), np.float64))
-    # So are another tree of arguments and another narrow format of the same width.
-    @jax.custom_batching.custom_vmap
-    def fnuz_only(x):
-        return x
+    arm = over_windows(moved_when(lambda size, x: True))
+    for _ in range(2):
+        with pytest.raises(AssertionError):
+            arm(np.zeros((3, 2), np.float32))
+    np.testing.assert_array_equal(over_windows(moved_when(lambda size, x: True), looped=True)(
+        np.zeros((3, 2), np.float32)), np.zeros((3, 2), np.float32))
 
-    @fnuz_only.def_vmap
-    def shifted(axis_size, in_batched, x):
-        return (x + 1 if x.dtype == jnp.float8_e4m3fnuz else x), in_batched[0]
 
-    formats = over_windows(fnuz_only)
-    formats(np.zeros((3, 2), jnp.float8_e4m3fn))
-    with pytest.raises(AssertionError):
-        formats(np.zeros((3, 2), jnp.float8_e4m3fnuz))
-    np.testing.assert_array_equal(over_windows(lambda x: arm(x), looped=True)(np.zeros((3, 2), np.float32)),
-                                  np.zeros((3, 2), np.float32))
+@pytest.mark.parametrize("change", ["x64", "windows", "tree", "format", "precision"])
+def test_the_bit_check_runs_again_at_each_new_signature(change):
+    """A signature the first call did not hold is checked again: x64's setting at the same float32 avals,
+    another count of windows, another tree of the same leaves, another narrow format of the same width,
+    and another default matmul precision."""
+    from reference_error import over_windows
+
+    x = np.zeros((3, 2), np.float32)
+    if change == "x64":
+        arm = over_windows(moved_when(lambda size, x: jax.config.jax_enable_x64))
+        arm(x)
+        with jax.enable_x64(new_val=True), pytest.raises(AssertionError):
+            arm(x)
+    elif change == "windows":
+        arm = over_windows(moved_when(lambda size, x: size == 5))
+        arm(x)
+        with pytest.raises(AssertionError):
+            arm(np.zeros((5, 2), np.float32))
+    elif change == "tree":
+        rule = moved_when(lambda size, x: True)
+        arm = over_windows(lambda tree: rule(tree["b"]) if "b" in tree else tree["a"])
+        arm({"a": x})
+        with pytest.raises(AssertionError):
+            arm({"b": x})
+    elif change == "format":
+        arm = over_windows(moved_when(lambda size, x: x.dtype == jnp.float8_e4m3fnuz))
+        arm(np.zeros((3, 2), jnp.float8_e4m3fn))
+        with pytest.raises(AssertionError):
+            arm(np.zeros((3, 2), jnp.float8_e4m3fnuz))
+    else:
+        highest = moved_when(lambda size, x: str(jax.config.jax_default_matmul_precision) == "highest")
+        arm = over_windows(highest)
+        arm(x)
+        with jax.default_matmul_precision("highest"), pytest.raises(AssertionError):
+            arm(x)
+
+
+def test_a_without_ynn_arm_takes_the_looped_form():
+    """A `without_ynn` arm's compiler options refuse the batched program, and it runs looped."""
+    from reference_error import over_windows, without_ynn
+
+    x = np.ones((3, 2), np.float32)
+    np.testing.assert_array_equal(over_windows(without_ynn(lambda x: x * 2), looped=True)(x), x * 2)
 
 
 def test_a_small_row_beside_large_ones_is_held_to_its_own_size():
