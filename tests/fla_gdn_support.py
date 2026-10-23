@@ -10,22 +10,12 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+from gdn_cases import CASES
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, recurrence, short_conv, tuning
 
-COMPILED_SHAPES = {
-    "0.8b": {"batch": 8, "length": 3072, "key_heads": 16, "value_heads": 16,
-             "width": 128, "columns": 128, "chunk": 64},
-    "9b": {"batch": 4, "length": 3072, "key_heads": 16, "value_heads": 32,
-           "width": 128, "columns": 128, "chunk": 64},
-    "27b": {"batch": 1, "length": 4096, "key_heads": 16, "value_heads": 48,
-            "width": 128, "columns": 128, "chunk": 64},
-    "wide keys": {"batch": 1, "length": 512, "key_heads": 2, "value_heads": 4,
-                  "width": 256, "columns": 128, "chunk": 64},
-}
-"""The shapes every declared config compiles at: the training shapes, whose heads are `fla_gdn.WIDEST`
-wide, three value heads a key head among them (no power of two), and the widest keys the port takes
-in 16 bits (`fla_gdn.WIDEST_KEYS`)."""
+COMPILED_SHAPES = {name: CASES[name] for name in ("0.8b", "9b", "27b", "wide keys")}
+"""The shapes every declared config compiles at (`gdn_cases`): the training shapes and the widest keys."""
 
 
 class KernelCase(NamedTuple):

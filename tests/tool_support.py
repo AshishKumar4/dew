@@ -1,6 +1,8 @@
-"""Source-file loading for tools exercised by several test suites."""
+"""Source-file loading for tools exercised by several test suites, and git in a test's scratch repository."""
 
 import importlib.util
+import os
+import subprocess
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -33,3 +35,11 @@ def run_from(name: str, directory: str) -> Iterator[ModuleType]:
         yield load(name, directory)
     finally:
         sys.path.remove(path)
+
+
+def git(root: Path, *arguments: str) -> str:
+    """Git in the scratch repository `root`, its author and committer named, its output returned; a
+    failure raises."""
+    return subprocess.run(["git", "-C", str(root), *arguments], check=True, capture_output=True, text=True,
+                          env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}).stdout
