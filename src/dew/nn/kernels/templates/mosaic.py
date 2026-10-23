@@ -23,7 +23,8 @@ import math
 from collections.abc import Callable
 
 import jax
-from jax import lax, numpy as jnp
+import jax.numpy as jnp
+from jax import lax
 from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
@@ -404,8 +405,8 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         """fp32 zeros in the accumulator's layout (two-dimensional) or a row's (one-dimensional)."""
 
     @abc.abstractmethod
-    def full(self, shape: tuple[int, ...], value: float) -> jax.Array:
-        """fp32 `value` in the accumulator's layout or a row's (`zeros`)."""
+    def full(self, shape: tuple[int, ...], value: float, dtype=jnp.float32) -> jax.Array:
+        """`value` in `dtype` (fp32 unless given) in the accumulator's layout or a row's (`zeros`)."""
 
     @abc.abstractmethod
     def iota(self, shape: tuple[int, int], dimension: int) -> jax.Array:

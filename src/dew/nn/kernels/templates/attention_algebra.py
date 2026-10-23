@@ -432,6 +432,13 @@ def tile(state: Partial, alpha: jax.Array, p: jax.Array, value: jax.Array
     return held.weights, alpha, held
 
 
+def denominator_after(total: jax.Array, factor: jax.Array, p: jax.Array, held: Room | None = None
+                      ) -> jax.Array:
+    """A row's denominator after a tile: the state's taken by `factor` (`carry_factor`) and the tile's
+    weights `p` added at the row's shift (`beyond_weights`)."""
+    return carry_factor(total, factor, held) + beyond_weights(p.sum(axis=-1), held)
+
+
 def stepped(state: Partial, m: jax.Array, factor: jax.Array, p: jax.Array, product: jax.Array,
             held: Room | None, times: Callable[[jax.Array], jax.Array]) -> Partial:
     """The state after a tile: its sums taken by `factor` (`carry_factor`) and the tile's `product` of its
@@ -439,7 +446,7 @@ def stepped(state: Partial, m: jax.Array, factor: jax.Array, p: jax.Array, produ
     unshifted weights' product, which the mainloop issues as `times` of them (their product with the
     tile's values), kept unshifted (`Guard.plain`); the plain walk's arithmetic where `held` is None,
     which issues no other product."""
-    denominator = carry_factor(state.total, factor, held) + beyond_weights(p.sum(axis=-1), held)
+    denominator = denominator_after(state.total, factor, p, held)
     acc = carry_factor(state.acc, factor, held) + beyond_weights(product, held)
     if held is None:
         return Partial(acc, m, denominator)
@@ -813,14 +820,30 @@ def split_accumulate(others: jax.Array, own: jax.Array, others_total: jax.Array,
     keys add their `product` and their narrowed weights `rest`. So neither is summed with a key's weight
     cancelled out of it. On the guarded walk the tile's product, sum and own weight take the row's shift
     past its weights' (`beyond_weights`)."""
+    taken = split_taken(others, own, alpha, moved, old_value, held)
+    own, total = split_rows(own, others_total, alpha, moved, rest, own_tile, held)
+    return taken + beyond_weights(product, held), own, total
+
+
+def split_taken(others: jax.Array, own: jax.Array, alpha: jax.Array, moved: jax.Array, old_value: jax.Array,
+                held: Room | None = None) -> jax.Array:
+    """`split_accumulate`'s split sums before the tile's product joins them: where the anchor moved, the
+    old anchor's term (its weight `own` before the tile, times its value row `old_value`) joined, then taken
+    to the new maximum by `alpha`; a mainloop that accumulates the product in place applies this to its
+    accumulator first."""
     old = old_value.astype(jnp.float32)
     joined = jnp.where(expand(moved, old), expand(own, old) * old, 0.0)
+    return carry_factor(others + joined, alpha, held)
+
+
+def split_rows(own: jax.Array, others_total: jax.Array, alpha: jax.Array, moved: jax.Array, rest: jax.Array,
+               own_tile: jax.Array, held: Room | None = None) -> tuple[jax.Array, jax.Array]:
+    """`split_accumulate`'s row sums after a tile: the anchor's own weight, the tile's where the anchor
+    moved to it, and the other keys' weights' sum, the old anchor's weight joining it where it moved."""
     total = (carry_factor(others_total + jnp.where(moved, own, 0.0), alpha, held)
              + beyond_weights(rest.astype(jnp.float32).sum(axis=-1), held))
     own_tile = beyond_weights(own_tile.astype(jnp.float32), held)
-    product = beyond_weights(product, held)
-    return (carry_factor(others + joined, alpha, held) + product,
-            jnp.where(moved, own_tile, carry_factor(own, alpha, held)), total)
+    return jnp.where(moved, own_tile, carry_factor(own, alpha, held)), total
 
 
 SMALL_SHIFT = 63
@@ -828,6 +851,7 @@ SMALL_SHIFT = 63
 by, half fp32's least normal's exponent: raised, such a weight on a value of any dtype is below `2^-63`
 of fp32's largest (`2^49` of fp16's), so a sum of them stays finite over any key count a call holds, and
 it is a normal fp32 down to `2^-189`."""
+
 
 
 def normalized_terms(difference: jax.Array, total: jax.Array, at_anchor: jax.Array, dtype,

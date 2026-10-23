@@ -99,9 +99,9 @@ class Wgmma(mosaic.RingFamily):
     def zeros(self, shape: tuple[int, ...]) -> jax.Array:
         return self.full(shape, 0.0)
 
-    def full(self, shape: tuple[int, ...], value: float) -> jax.Array:
+    def full(self, shape: tuple[int, ...], value: float, dtype=jnp.float32) -> jax.Array:
         layout = self.layout if len(shape) == 2 else self.row
-        return plgpu.layout_cast(jnp.full(shape, value, jnp.float32), layout)
+        return plgpu.layout_cast(jnp.full(shape, value, dtype), layout)
 
     def iota(self, shape: tuple[int, int], dimension: int) -> jax.Array:
         return plgpu.broadcasted_iota(jnp.int32, shape, dimension, layout=self.layout)

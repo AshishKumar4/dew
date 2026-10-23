@@ -78,6 +78,30 @@ def _check_forward(call: str, dtype, shape, *, natural: bool, interpret: bool):
                     f"mosaic forward {call} {jnp.dtype(dtype).name} natural {natural}", seeds=SEEDS)
 
 
+def _check_training(call: str, shape, *, accurate: bool, interpret: bool):
+    """The training forward's output and its residuals, the maxima and denominators the reference keeps
+    (check 1), and the backward from its residuals in the form `accurate` names (check 1 against the
+    reference's gradients): the whole of a training step on this mainloop."""
+    spans = template.spans(shape[1], shape[1], shape[0], **CALLS[call])
+    draw = _drawn(shape, jnp.bfloat16)
+    family = _family(interpret)
+
+    def ours(query, key, value, dout):
+        out, maximum, total, anchors, split = attention_mosaic.training(query, key, value, spans,
+                                                                        interpret=interpret, family=family)
+        grads = attention_mosaic.backward(query, key, value, spans, None, dout,
+                                          residuals=(maximum, total, anchors, split), accurate=accurate,
+                                          interpret=interpret, family=family)
+        return out, grads.query, grads.key, grads.value
+
+    def reference(query, key, value, dout):
+        out, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans), query, key, value)
+        return out, *pull(dout)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
+                    f"mosaic training {call} accurate {accurate}", seeds=SEEDS)
+
+
 def _check_backward(call: str, shape, *, accurate: bool, interpret: bool, keys: int | None = None):
     keys = shape[1] if keys is None else keys
     spans = template.spans(shape[1], keys, shape[0], **CALLS[call])
@@ -123,6 +147,14 @@ def test_the_backward_is_on_par_interpreted(call, accurate):
 
 
 @INTERPRETS
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
+@pytest.mark.parametrize("call", CALLS)
+def test_a_training_step_is_on_par_interpreted(call, accurate):
+    """The training forward (its split sums, `attention_mosaic.training`) and the backward from them."""
+    _check_training(call, SHAPES["interpreted"], accurate=accurate, interpret=True)
+
+
+@INTERPRETS
 def test_a_causal_backward_of_more_keys_than_queries_is_on_par_interpreted():
     """A causal call of 64 queries over 256 keys, whose last key tiles no query sees: the fast form's two
     consumers each take a key block, one wholly past the queries' diagonal, and walk no query tile, the
@@ -165,6 +197,15 @@ def test_the_forward_is_on_par_on_an_h100(call, dtype):
 def test_the_natural_forward_is_on_par_on_an_h100(call):
     """The forward with natural logits, fp16's, compiled on an H100."""
     _check_forward(call, jnp.float16, SHAPES["compiled"], natural=True, interpret=False)
+
+
+@ON_HOPPER
+@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
+@pytest.mark.parametrize("call", CALLS)
+def test_a_training_step_is_on_par_on_an_h100(call, accurate):
+    """The training forward and the backward from its residuals, compiled (the interpreted test's)."""
+    _check_training(call, SHAPES["compiled"], accurate=accurate, interpret=False)
 
 
 @ON_HOPPER
