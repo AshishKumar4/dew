@@ -324,7 +324,7 @@ def test_a_matrix_declared_with_no_axis_named_is_orthogonalized_as_one_matrix():
     reference = optax.contrib.muon(LR)
     one = {'kernel': at(grads, path)}
     expected, _ = reference.update(one, reference.init(one), one)
-    np.testing.assert_allclose(np.asarray(at(updates, path)), np.asarray(expected['kernel']), atol=1e-8)
+    np.testing.assert_array_equal(np.asarray(at(updates, path)), np.asarray(expected['kernel']))
 
 
 def test_the_router_gate_takes_the_adamw_update():
