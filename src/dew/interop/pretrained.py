@@ -518,7 +518,7 @@ class Pretrained:
         """
         from dew.nn.cross_attention import crossing
         from dew.nn.inputs import request_key
-        from dew.nn.protocols import CrossAttending
+        from dew.nn.protocols import CrossAttending, Predicting
         from dew.objectives.base import freeze, merge, select, thaw
 
         if not isinstance(self.model, CrossAttending):
@@ -526,10 +526,12 @@ class Pretrained:
         if self.model.cross_attention is not None:
             raise ValueError("this bundle already reads a context; attach cross-attention to the source")
         model = self.model.with_cross_attention(cross)
+        # A token more than the prediction depths a source carries, which each read one further on.
+        length = 1 + (model.num_nextn_predict_layers if isinstance(model, Predicting) else 0)
 
         def drawn(draw: jax.Array) -> Variables:
             # Only the blocks leave the program, so the source's own draws are dead code to XLA.
-            return select(thaw(model.init(draw, jnp.zeros((1, 1), jnp.int32))),
+            return select(thaw(model.init(draw, jnp.zeros((1, length), jnp.int32))),
                           lambda path: path[0] == "params" and crossing(path))
 
         variables = freeze(merge(self.variables, jax.jit(drawn)(request_key(key))), crossing)
