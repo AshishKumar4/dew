@@ -144,7 +144,7 @@ def loaded(copies) -> None:
         plgpu.barrier_wait(barrier)
 
 
-def stored(parts, smem, views) -> None:
+def stored(parts, views, *, smem) -> None:
     """Each of `parts` written whole to its view of `views` through the shared buffer `smem`, in turn, the
     buffer reused once its copy is done."""
     for part, view in zip(parts, views, strict=True):

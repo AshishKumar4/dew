@@ -381,8 +381,9 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, *
                 ((block_q, width), (block_q, width)), walk.interpret)
             # The tiles a block whose diagonal ends first leaves its partner.
             mosaic.passed(rings, walked, most)
-            mosaic.stored((dq, keyed) if walk.accurate else (dq,), out_smem.at[wg],
-                          (dq_ref.at[rows], keyed_ref.at[rows]))
+            # The keyed sums the accurate form's alone (`algebra.dq_terms`).
+            written = ((dq, dq_ref.at[rows]), (keyed, keyed_ref.at[rows]))[:2 if walk.accurate else 1]
+            mosaic.stored(*zip(*written, strict=True), smem=out_smem.at[wg])
             for place, part in enumerate(sums):
                 # A row's layout whatever the sum's (the keyed mass of a call without a hook is a constant).
                 row_smem.at[wg, place][...] = plgpu.layout_cast(part, mosaic_sm90.ROW)
@@ -511,7 +512,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
                                                       ((block_k, width), (block_k, value_width)),
                                                       walk.interpret)
             out = (row, pl.ds(k_first, block_k), head)
-            mosaic.stored((dk, dv), out_smem.at[wg], (dk_ref.at[out], dv_ref.at[out]))
+            mosaic.stored((dk, dv), (dk_ref.at[out], dv_ref.at[out]), smem=out_smem.at[wg])
 
         def producer():
             mosaic.streamed(rings, _tiles_of((q_ref, do_ref), row, head, block_q), least, q_steps)
