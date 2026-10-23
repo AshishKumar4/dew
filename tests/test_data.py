@@ -26,7 +26,15 @@ from reader_support import assert_resumes_where_it_stopped
 
 from dew.data import Loading, Memory, images, presets
 from dew.data.compile import compile, held, validation
-from dew.data.dataset import Checkpointable, DataPartition, Records as IndexedRows, SourceSlice, describe
+from dew.data.dataset import (
+    Checkpointable,
+    DataPartition,
+    Records as IndexedRows,
+    SourceSlice,
+    describe,
+    take_batch,
+    take_rows,
+)
 from dew.data.image_codec import decode_image
 from dew.data.images import EncodeCaptions
 from dew.data.pipeline import Pipeline
@@ -89,6 +97,18 @@ def _bounded(iterator, limit):
     """
     taken = list(itertools.islice(iterator, limit))
     return taken, next(iterator, None) is None
+
+
+def test_rows_are_taken_from_arrays_and_from_per_row_records_kept_in_their_own_type():
+    """`take_rows` takes a list's or a tuple's records in its own type and an array's leading axis;
+    `take_batch` maps it over a batch, a list of opaque records taken as one column."""
+    indices = np.asarray([2, 0])
+    assert take_rows(("a", "b", "c"), indices) == ("c", "a")
+    assert take_rows([{"id": 0}, {"id": 1}, {"id": 2}], indices) == [{"id": 2}, {"id": 0}]
+    batch = {"tokens": np.arange(6).reshape(3, 2), "records": [{"id": 0}, {"id": 1}, {"id": 2}]}
+    taken = take_batch(batch, indices)
+    np.testing.assert_array_equal(taken["tokens"], [[4, 5], [0, 1]])
+    assert taken["records"] == [{"id": 2}, {"id": 0}]
 
 
 @pytest.mark.parametrize("workers", [0, 2])
@@ -1205,17 +1225,16 @@ def test_records_whose_field_lengths_differ_are_refused_with_the_remedy():
     stream.close()
 
 
-def test_an_epoch_of_records_too_few_for_one_batch_is_refused():
-    """Three records repeat to fill a batch of four, as a run counted in steps reads them, but an
-    epoch of them is zero steps long, so a run counted in epochs is refused."""
+def test_an_epoch_of_records_too_few_for_one_batch_is_one_step():
+    """Three records repeat to fill a batch of four, as a run counted in steps reads them, and an
+    epoch of them is that one step, which holds the next epoch's first record."""
     data = _records(_columns(3))
     stream = data.train(DataPartition())
     try:
         assert len(next(stream)["index"]) == 4
     finally:
         stream.close()
-    with pytest.raises(ValueError):
-        data.epoch_steps(1)
+    assert data.epoch_steps(1) == 1
 
 
 def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(tmp_path):

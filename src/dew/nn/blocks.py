@@ -1,6 +1,5 @@
 """The convolutional and embedding pieces the UNets and the DiT sandwich share."""
 
-import math
 from collections.abc import Callable
 from functools import partial
 
@@ -17,6 +16,7 @@ from .attention import GroupNorm, RMSNorm
 from .conv import Conv
 from .flops import projection_flops
 from .precision import at_least_fp32, float32_dot_general
+from .rope import sinusoid_frequencies, sinusoids
 from .sharding import constrain, explicit_spec, rows_taken, whole_spec
 
 
@@ -174,31 +174,7 @@ class FourierEmbedding(nn.Module):
         # into whatever scalar the caller scaled `x` by (EDM's 1/4) and the
         # sin/cos arguments round differently.
         angular = jax.lax.optimization_barrier(2 * jnp.pi * self.frequencies.value)
-        emb = x[:, None] * angular[None, :]
-        return jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=-1)
-
-
-def sinusoid_frequencies(count: int, divisor: float, *, dtype: DTypeLike = np.float32,
-                         base: float = 10000.0) -> np.ndarray:
-    """The `count` frequencies `base ** (-i / divisor)` every sinusoidal position or time signal in Dew
-    rotates by, as a host array of `dtype`.
-
-    The whole exponent `i * -ln(base)` is formed in `dtype` before it is divided, as the published
-    diffusion models form it (the other order moves a timestep embedding's sine by 1e-5 near timestep
-    1000), and its exp is taken on the host in float64 and rounded once, so the table does not vary
-    with the backend.
-    """
-    width = np.dtype(dtype).type
-    exponent = np.arange(count, dtype=width) * width(-math.log(base)) / width(divisor)
-    return np.exp(exponent.astype(np.float64)).astype(width)
-
-
-def sinusoids(angles, *, cosine_first: bool = False, xp=jnp):
-    """Each angle's sine and cosine side by side, `[..., n]` to `[..., 2n]`: the sines first, or the
-    cosines where `cosine_first`. `xp` is the array module it computes with: `numpy` for a host table
-    built while a model traces, which JAX would otherwise stage into the trace."""
-    first, second = (xp.cos(angles), xp.sin(angles)) if cosine_first else (xp.sin(angles), xp.cos(angles))
-    return xp.concatenate([first, second], axis=-1)
+        return sinusoids(x[:, None] * angular[None, :])
 
 
 def sinusoidal_time(time, features: int, *, dtype: DTypeLike, shift: float = 0, cosine_first: bool = True):
@@ -212,7 +188,7 @@ def sinusoidal_time(time, features: int, *, dtype: DTypeLike, shift: float = 0, 
     half = features // 2
     if features % 2 or half <= shift:
         raise ValueError("Time embedding width must be even and exceed twice the frequency shift")
-    frequencies = jnp.asarray(sinusoid_frequencies(half, half - shift, dtype=dtype))
+    frequencies = jnp.asarray(sinusoid_frequencies(half, half - shift, dtype=dtype, exponential=True))
     return sinusoids(jnp.asarray(time, dtype).reshape(-1, 1) * frequencies[None], cosine_first=cosine_first)
 
 
@@ -286,6 +262,13 @@ def _torch_bicubic_weights(size_in: int, size_out: int, antialias: bool) -> np.n
         ):
             matrix[i, min(max(tap, 0), size_in - 1)] += weight
     return matrix.astype(np.float32)
+
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+"""The ImageNet pixel statistics, per RGB channel, that encoders trained on ImageNet read their
+inputs under: transformers' `IMAGENET_DEFAULT_MEAN` and `IMAGENET_DEFAULT_STD`, which a test holds
+these equal to (Dew imports no transformers at module level)."""
 
 
 def torch_bicubic_resize(x, height: int, width: int, *, antialias: bool = False):

@@ -958,13 +958,13 @@ def trial(run: RunConfig) -> float:
 
 
 with LocalTracker("runs/sweep/tracking") as tracker:
-    trials = config.sweep({"optim.learning_rate": [0.01, 0.003]}, train=trial, trials=2,
+    trials = config.sweep({"optim.rate": [0.01, 0.003]}, train=trial, trials=2,
                           ledger="runs/sweep/ledger.json", tracker=tracker, search=GridSearch())
 best = min(trials, key=lambda trial: trial.value)
 print(best.overrides, round(best.value, 4))
 ```
 
-This prints `{'optim.learning_rate': 0.01} 1.0024`; the slower rate reaches 1.015. Each trial is a real run under `runs/sweep/lm-rate/trial-<index>`, with its own `run.json`, checkpoints and tracking journal. A finished trial is written to the ledger before it is reported, so calling `sweep` again continues an interrupted sweep without retraining the finished trials. `RandomSearch` and `GridSearch` are built in; `OptunaSearch` needs `dewml[hpo]`.
+This prints `{'optim.rate': 0.01} 1.0024`; the slower rate reaches 1.015. Each trial is a real run under `runs/sweep/lm-rate/trial-<index>`, with its own `run.json`, checkpoints and tracking journal. A finished trial is written to the ledger before it is reported, so calling `sweep` again continues an interrupted sweep without retraining the finished trials. `RandomSearch` and `GridSearch` are built in; `OptunaSearch` needs `dewml[hpo]`.
 
 ## Diffusion and sampling
 
@@ -1056,7 +1056,7 @@ from dew.data import TFDS, presets
 from dew.diffusion.presets import EDM
 from dew.inference import TextToImage
 from dew.nn.backbones import SimpleDiT
-from dew.objectives.diffusion import DiffusionRunConfig
+from dew.config.diffusion import DiffusionRunConfig
 from dew.sampling import Heun
 
 run = Path("runs/flowers-run")
@@ -1429,17 +1429,19 @@ curl -LsSf https://dewml.dev/install.sh | sh
 The script finds the hardware and the build it runs (an NVIDIA GPU and the CUDA version its driver supports, a TPU VM, or the CPU), asks where to install, installs [uv](https://docs.astral.sh/uv/) if it is missing, and installs Dew there.
 
 <!-- BEGIN least Python (site/scripts/gen_install.py) -->
-Dew needs Python 3.12 or newer.
+Dew needs Python 3.12 or newer, and CI tests 3.12 and 3.14.
 <!-- END least Python -->
 
-I recommend 3.14, and CI tests both. To install it yourself, choose the extra for your hardware; each installs the accelerator build of the JAX version Dew requires:
+I recommend the newest of them. To install it yourself, choose the extra for your hardware; each installs the accelerator build of the JAX version Dew requires:
 
+<!-- BEGIN install commands (site/scripts/gen_install.py) -->
 | Hardware | uv | pip |
 |---|---|---|
 | CPU | `uv pip install dewml --extra-index-url https://pypi.dewml.dev/simple` | `pip install dewml --extra-index-url https://pypi.dewml.dev/simple` |
-| NVIDIA GPU, driver 580+ | `uv pip install "dewml[cuda13]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[cuda13]" --extra-index-url https://pypi.dewml.dev/simple` |
-| NVIDIA GPU, driver 525+ | `uv pip install "dewml[cuda12]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[cuda12]" --extra-index-url https://pypi.dewml.dev/simple` |
+| NVIDIA GPU, driver 580+ (CUDA 13) | `uv pip install "dewml[cuda13]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[cuda13]" --extra-index-url https://pypi.dewml.dev/simple` |
+| NVIDIA GPU, driver 525+ (CUDA 12) | `uv pip install "dewml[cuda12]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[cuda12]" --extra-index-url https://pypi.dewml.dev/simple` |
 | Google TPU VM | `uv pip install "dewml[tpu]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[tpu]" --extra-index-url https://pypi.dewml.dev/simple` |
+<!-- END install commands -->
 
 <!-- BEGIN pip (site/scripts/gen_install.py) -->
 Use pip 26.2.2 or newer and uv 0.13.4 or newer: older ones trust the roots of eMudhra's compromised certificate authorities (October 2026). Update pip from its wheel by hash, so the update holds whatever the older pip trusts, and uv through the system's certificates once they are updated:
@@ -1450,7 +1452,7 @@ UV_SYSTEM_CERTS=true uv self update
 ```
 <!-- END pip -->
 
-Dew runs on its own build of JAX 0.11.2, which only its package index serves; without `--extra-index-url https://pypi.dewml.dev/simple` the install stops at resolving jax ([installation guide](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#dews-jax-build)).
+Dew runs on its own build of JAX, which only its package index serves; without `--extra-index-url https://pypi.dewml.dev/simple` the install stops at resolving jax ([installation guide](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#dews-jax-build)).
 
 CUDA 13 also needs a GPU of compute capability 7.5 or later ([which CUDA build](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#which-cuda-build)).
 
@@ -1464,7 +1466,7 @@ source .venv/bin/activate
 uv pip install -e ".[cuda12]" --extra-index-url https://pypi.dewml.dev/simple
 ```
 
-To install the main branch without cloning it, run `uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew" --extra-index-url https://pypi.dewml.dev/simple`. The extras install the accelerator build of jaxlib 0.11.2 under Dew's JAX build. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on.
+To install the main branch without cloning it, run `uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew" --extra-index-url https://pypi.dewml.dev/simple`. The extras install the accelerator build of jaxlib that matches Dew's JAX build. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on.
 
 `pyproject.toml` lists every optional extra, and the installation guide's [Optional extras](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#optional-extras) says what each adds. `interop` reads and writes safetensors, `vision` provides the host image processors that the multimodal checkpoints call, and `inference-clients` installs the Ollama and OpenAI SDKs used in the serving section. The sections above name the extra each feature needs. The [installation guide](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md) covers development dependencies and dataset preparation.
 

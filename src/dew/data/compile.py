@@ -18,7 +18,7 @@ import functools
 import threading
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from typing import Literal, Protocol, runtime_checkable
+from typing import ClassVar, Literal, Protocol, runtime_checkable
 
 import grain.python as pygrain
 import numpy as np
@@ -41,7 +41,6 @@ from dew.data.analysis import (
     _name,
     _preferred_read,
     _promoted,
-    _Ran,
     _stated,
     _steps,
     _until,
@@ -61,7 +60,17 @@ from dew.data.dataset import (
     Records,
 )
 from dew.data.facts import merge_facts
-from dew.data.lowering import _as_iter, _Build, _epoch_records, _Locality, _split_spans, _weights, _workers
+from dew.data.lowering import (
+    _as_iter,
+    _Build,
+    _epoch_records,
+    _Locality,
+    _order_records,
+    _split_spans,
+    _tail,
+    _weights,
+    _workers,
+)
 from dew.data.materialize import _materialize, _Memory
 from dew.data.mixing import CorpusCounts, Proportions
 from dew.data.pipeline import (
@@ -103,7 +112,16 @@ from dew.data.pipeline import (
 )
 from dew.data.plan import Plan, StepIdentity, fingerprint, unplaced
 from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
-from dew.data.sources.base import Read, ShardManifest, Source, _consumed, tokenizer_contract
+from dew.data.sources.base import (
+    Read,
+    Rows,
+    Source,
+    View,
+    _consumed,
+    beneath,
+    materialized,
+    tokenizer_contract,
+)
 from dew.data.steps.generic import Coordinated
 from dew.records import JSON, integer, json_value
 
@@ -122,8 +140,8 @@ def _cache_references(pipeline: Pipeline, read: Read) -> tuple[str, ...]:
     references = []
     for leaf, source in _leaves(pipeline):
         stages, written = _written(source, leaf.stages), source
-        while isinstance(written, _Memory):
-            written = written.original
+        while materialized(written):
+            written = written.source
         references += [stage.cache.reference(_cache_manifest(written, stages[:index], read))
                        for index, stage in enumerate(stages) if isinstance(stage, Artifact)]
     return tuple(references)
@@ -139,7 +157,11 @@ class _PinnedRead:
 
 
 @dataclasses.dataclass(frozen=True)
-class _Facts:
+class _Facts(View[Source]):
+    """`source` as the compile's read of it took it (`_pin_sources`): its name, identity and facts
+    as they were then, and the memory read pinning took, which its memory reads reuse."""
+
+    rows: ClassVar[Rows] = "read"
     source: Source
     read: Read
     stated_snapshot: Mapping[str, object]
@@ -154,9 +176,6 @@ class _Facts:
     def label(self) -> str:
         return self.stated_label
 
-    def describe(self) -> str:
-        return self.source.describe()
-
     def fingerprint(self) -> Mapping[str, object]:
         return self.stated_snapshot
 
@@ -169,9 +188,6 @@ class _Facts:
     def records(self, read: Read) -> Records:
         held = None if self.held is None else self.held.records
         return held if read == "memory" and held is not None else self.source.records(read)
-
-    def manifest(self) -> ShardManifest:
-        return self.source.manifest()
 
     @functools.cached_property
     def _lengths(self) -> np.ndarray | None:
@@ -191,16 +207,12 @@ class _Facts:
 
 def _released(pipelines: Sequence[Pipeline]) -> None:
     """Let go of the memory reads pinning took for `pipelines` (`_PinnedRead`), once every branch
-    of their preparation is materialized: under each source a memory read made (`_Ran`), its
-    preparation's included, down to the pinned one."""
-    for _, source in (leaf for pipeline in pipelines for leaf in _leaves(pipeline)):
-        while isinstance(source, (_Facts, _Ran)):
-            if isinstance(source, _Facts):
-                if source.held is not None:
-                    source.held.records = None
-                source = source.source
-            else:
-                source = source.original
+    of their preparation is materialized: under each source a memory read made (`materialized`),
+    its preparation's included, down to the pinned one."""
+    for _, leaf in (leaf for pipeline in pipelines for leaf in _leaves(pipeline)):
+        for source in beneath(leaf, ("read", "materialized")):
+            if isinstance(source, _Facts) and source.held is not None:
+                source.held.records = None
 
 
 def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, ...]:
@@ -328,8 +340,8 @@ def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]) 
         return {}
 
     def read_of(read: Source) -> Source:
-        while isinstance(read, _Memory):
-            read = read.original
+        while materialized(read):
+            read = read.source
         return read
 
     def steps(identities: Sequence[StepIdentity]) -> JSON:
@@ -449,6 +461,27 @@ def _prepared(
     return branches
 
 
+def _made(prepared: Sequence[Pipeline], read: Read, counts: Sequence[dict[str, CorpusCounts]], *,
+          training: bool) -> tuple[Pipeline, ...]:
+    """Prepared branches as a memory read makes them, the first training where `training`: their
+    first stages run and their rows held (`_materialize`), counted into `counts`, then the memory
+    reads pinning took let go (`_released`); another read's as they are."""
+    if read != "memory":
+        return tuple(prepared)
+    made = tuple(_materialize(branch, count, training=training and not index)
+                 for index, (branch, count) in enumerate(zip(prepared, counts, strict=True)))
+    _released(prepared)
+    return made
+
+
+def _build(branch: Pipeline, read: Read, loading: Loading, *, batch: int, training: bool, seed: int = 0,
+           lowering: _Lowering | None = None) -> _Build:
+    """The build a reader of a prepared `branch` reads it by, in batches of `batch`: training's, or a
+    scored or published pass's, by the lowering its analysis gives unless `lowering` says otherwise."""
+    lowered = _analyzed(branch, read, validation=not training) if lowering is None else lowering
+    return _Build(read, loading, seed, batch, lowered, training=training)
+
+
 def compile(
     train: Pipeline,
     *,
@@ -527,20 +560,15 @@ def _staged(
         objective=objective,
         counts=(counts,) if validation is None else (counts, validation_counts),
     )
-    train, validation = branches[0], (None if validation is None else branches[1])
-    if not any(isinstance(stage, BatchStage) for stage in train.stages):
+    original = branches[0]
+    if not any(isinstance(stage, BatchStage) for stage in original.stages):
         raise ValueError("compile needs one batch(global_size) stage on the training pipeline")
-    batch = _output_batch(train)
-    original = train
-    if read == "memory":
-        train = _materialize(train, counts)
-        validation = (
-            None if validation is None else _materialize(validation, validation_counts, training=False)
-        )
-        if validation_counts and not any(count.accepted for count in validation_counts.values()):
-            validation = None
-        _released(branches)
-    build = _Build(read, loading, seed, batch, _analyzed(train, read), training=True)
+    train, *scored = _made(branches, read, (counts, validation_counts)[: len(branches)], training=True)
+    validation = scored[0] if scored else None
+    # A memory read that kept none of the scored records scores none.
+    if validation_counts and not any(count.accepted for count in validation_counts.values()):
+        validation = None
+    build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed)
     return _Staged(train, validation, original, build, counts, validation_counts, batch_tokens)
 
 
@@ -631,6 +659,8 @@ def _compiled(
         statistics=statistics,
         batch_tokens=staged.batch_tokens,
         device=device,
+        tail=_tail(train, build),
+        order_records=_order_records(train, build),
     )
 
 
@@ -681,8 +711,7 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
             if isinstance(stage, Pack):
                 declare(stage, stage.segments if documents is None else documents)
                 packed = True
-        while isinstance(source, (_Facts, _Ran)):
-            source = source.source if isinstance(source, _Facts) else source.original
+        *_, source = beneath(source, ("read", "materialized"))
         if isinstance(source, PackedSource):
             declare(source.plan.pack, source.plan.most_documents)
             packed = True
@@ -704,7 +733,7 @@ def _held_coordinated(validation: Pipeline, training: tuple[Coordinated, ...]) -
 
 def _packed_documents(source: Source) -> int | None:
     """The most documents a window of a memory read's packed windows holds, None where it packed none."""
-    return source.documents if isinstance(source, _Memory) else None
+    return source.segments if isinstance(source, _Memory) else None
 
 
 def _held_steps(pipeline: Pipeline) -> tuple[HostStep, ...]:
@@ -775,7 +804,8 @@ def _compile_phases(
         phases = [(functools.partial(global_reader, loaded.train), end) for loaded, end in built]
         return PhasedStream(phases, loading.stop_seconds)
 
-    return dataclasses.replace(built[0][0], train=training)
+    # Only the last phase's order can end, so its batch decides what an epoch's short batch does.
+    return dataclasses.replace(built[0][0], train=training, tail=built[-1][0].tail, order_records=None)
 
 
 def _continued(pipeline: Pipeline, consumed: Mapping[str, int]) -> Pipeline:
@@ -967,12 +997,10 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
         pipeline = dataclasses.replace(pipeline, stages=tuple(
             dataclasses.replace(stage, drop_remainder=False) if isinstance(stage, TokenBudget) else stage
             for stage in pipeline.stages))
-    (pinned,) = _prepared((pipeline,), read, provision=True, training=True,
-                          counts=(counts,) if records is None else None)
-    pipeline = pinned
-    if read == "memory" and records is None:
-        pipeline = _materialize(pinned, counts)
-        _released((pinned,))
+    prepared = _prepared((pipeline,), read, provision=True, training=True,
+                         counts=(counts,) if records is None else None)
+    # A bounded pass reads lazily: nothing runs ahead of it in memory.
+    (pipeline,) = prepared if records is not None else _made(prepared, read, (counts,), training=True)
     packed = _coordinated(pipeline)
     lowering = _analyzed(pipeline, read)
     if records is not None:
@@ -980,14 +1008,15 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
     if finite:
         lowering = _finite(lowering)
     # A token budget is fixed-length rows by now (`_budgeted`).
-    batch = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
-    build = _Build(read, loading, 0, batch, lowering, training=True).tuned(pipeline).pooled(pipeline)
+    build = _build(pipeline, read, loading, batch=_output_batch(pipeline), training=True,
+                   lowering=lowering).tuned(pipeline).pooled(pipeline)
     return _Host(build.batches(pipeline, DataPartition()), packed + _batch_steps(pipeline)[0])
 
 
 def _finite(lowering: _Lowering) -> _Lowering:
     """A non-repeated diagnostic pass without training's implicit root repeats."""
-    return dataclasses.replace(lowering, endless=False, repeated=True, epochs=1,
+    return dataclasses.replace(lowering, parts_unending=False, unending=False, records_unending=False,
+                               onward=False, rooted=False, repeated=True, epochs=1,
                                children=tuple(_finite(child) for child in lowering.children))
 
 
@@ -1003,13 +1032,10 @@ def iterate(
         isinstance(stage, (RandomMap, BatchStage, MapBatch, Workers, Repeat)) for stage in _steps(pipeline)
     ):
         raise ValueError("publication needs deterministic, unbatched pipelines without repeat")
-    (pinned,) = _prepared((pipeline,), read, provision=provision, counts=({},))
-    pipeline = pinned
-    if read == "memory":
-        pipeline = _materialize(pinned, {}, training=False)
-        _released((pinned,))
-    lowering = _analyzed(pipeline, read, validation=True)
-    build = _Build(read, loading, 0, 1, lowering, training=False)
+    (pipeline,) = _made(_prepared((pipeline,), read, provision=provision, counts=({},)), read, ({},),
+                        training=False)
+    # Publication reads records, unbatched.
+    build = _build(pipeline, read, loading, batch=1, training=False)
     rows = build.records(pipeline, DataPartition())
     return _as_iter(rows, loading)
 
@@ -1086,16 +1112,11 @@ def validation(
     read = read or _preferred_read((pipeline,), provision=provision)
     if not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in pipeline.stages):
         pipeline = pipeline.batch(batch, drop_remainder=False)
-    (pinned,) = _prepared((pipeline,), read, provision=provision, objective=objective, counts=({},))
-    # A token budget is fixed-length rows by now (`_budgeted`).
-    batch = _output_batch(pinned)
-    pipeline = pinned
-    if read == "memory":
-        pipeline = _materialize(pinned, {}, training=False)
-        _released((pinned,))
+    prepared = _prepared((pipeline,), read, provision=provision, objective=objective, counts=({},))
+    (pipeline,) = _made(prepared, read, ({},), training=False)
     packed = _coordinated(pipeline)
-    lowering = _analyzed(pipeline, read, validation=True)
-    build = _Build(read, loading, seed, batch, lowering, training=False)
+    # A token budget is fixed-length rows by now (`_budgeted`).
+    build = _build(pipeline, read, loading, batch=_output_batch(prepared[0]), training=False, seed=seed)
     return functools.partial(_validation_reader, pipeline=pipeline, build=build.tuned(pipeline),
                              host=packed + _held_steps(pipeline) + host)
 

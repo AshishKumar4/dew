@@ -874,6 +874,29 @@ def test_the_reference_path_is_flax_attention_op_for_op(dtype, forced, dropout_r
     np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 
 
+@pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the routing is a CPU's")
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
+@pytest.mark.parametrize("implementation", ["auto", "xla"])
+def test_a_cpu_attention_over_one_key_moves_no_query_or_key(implementation, dtype):
+    """A query that reads one key attends it whatever the scores, so its query's and its key's
+    gradients are exactly zero, as the softmax's own derivative gives them: on a CPU 'auto' and 'xla'
+    take the reference path in every dtype, where jax.nn's backward, through rowsum(dO * O), left
+    each a rounding's worth."""
+    keys = jax.random.split(jax.random.key(3), 4)
+    query = jax.random.normal(keys[0], (2, 5, 4, 8), dtype)
+    key, value = (jax.random.normal(drawn, (2, 7, 4, 8), dtype) for drawn in keys[1:3])
+    cotangent = jax.random.normal(keys[3], (2, 5, 4, 8), dtype)
+    one = jnp.ones((2,), jnp.int32)
+
+    def attend(query, key, value):
+        return scaled_dot_product_attention(query, key, value, implementation=implementation,
+                                            key_value_seq_lengths=one)
+
+    _, into_query, into_key, _ = jax.jit(with_gradients(attend))(query, key, value, cotangent)
+    assert not np.any(np.asarray(into_query, np.float32))
+    assert not np.any(np.asarray(into_key, np.float32))
+
+
 @pytest.mark.parametrize("implementation", ["reference", "xla"])
 def test_normal_attention_ends_each_rows_keys_at_its_length_as_a_prefix_mask_does(implementation):
     """Key lengths keep each row's first keys, as the prefix mask of those lengths
@@ -1021,17 +1044,22 @@ def test_narrow_heads_take_the_kernel_their_target_measured_fastest(generation_n
     assert "row" not in refused
 
 
-def test_a_splash_call_refused_for_its_arithmetic_is_reported_as_that():
-    """On a TPU, a call splash would tile but whose arithmetic only the reference path computes (a
-    HIGHEST matmul precision) is refused by splash for its arithmetic, not for its tiling: the case
-    builder forms the tiling fact from the requirements before it, whatever a later one says."""
+@pytest.mark.parametrize("call, refused", [
+    ({"precision": jax.lax.Precision.HIGHEST}, ["arithmetic"]),
+    ({"key_value_seq_lengths": jnp.array([512])}, ["key_lengths"]),
+    ({"bias": jnp.zeros((1, 4, 512, 512), jnp.bfloat16)}, ["bias"]),
+], ids=["arithmetic", "key lengths", "bias"])
+def test_a_splash_call_tiled_but_refused_otherwise_is_reported_by_its_own_requirement(call, refused):
+    """On a TPU, a call splash's blocking tiles but another of its requirements turns down is refused
+    by that requirement alone, not for its tiling: the case builder forms the mask-descriptor fact
+    under a name that may choose splash on a TPU (`TPU_BACKEND`) whatever else the call asks, and
+    `tiles` reads the lengths from the case."""
     from dew.nn.attention import attention_case
     from dew.nn.attention_kernels import ATTENTION, kernel_refusals
     from dew.nn.kernels import generation
 
     query = jnp.zeros((1, 512, 4, 64), jnp.bfloat16)
     with generation.assumed("v5e"):
-        case = attention_case(query, query, causal=True, precision=jax.lax.Precision.HIGHEST)
-        refused = [refusal.code for refusal in kernel_refusals(ATTENTION, "tpu", case)]
-    assert case.splash and refused == ["arithmetic"]
-
+        case = attention_case(query, query, causal=True, **call)
+        found = [refusal.code for refusal in kernel_refusals(ATTENTION, "tpu", case)]
+    assert case.splash_mask and found == refused

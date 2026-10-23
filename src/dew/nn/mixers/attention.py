@@ -50,12 +50,12 @@ from dew.nn.kernels.selection import select
 from dew.nn.kv_cache import PAGED, PLACES, TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import QKV_RESIDUALS, MixerBase, MixerContext
-from dew.nn.ngpt import NGPT, gain, unit
-from dew.nn.precision import at_least_fp32, float32_dot_general, rounded_to, scaled
+from dew.nn.ngpt import NGPT, gain
+from dew.nn.precision import at_least_fp32, float32_dot_general, l2norm, rounded_to, scaled
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, mrope_tables, rotary_freqs, rotate
 from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
-from dew.nn.visibility import windowed
+from dew.nn.visibility import visible, windowed
 
 
 def temperature_scale(positions, floor_scale: float, attn_scale: float, *, dtype: DTypeLike):
@@ -168,7 +168,7 @@ class CausalSelfAttention(nn.Module):
     index. causal=False is full attention, which a masked diffusion model reads
     its corrupted sequence with and an encoder reads its input with; with
     `bidirectional_window` a window keeps the keys within window - 1 positions
-    on either side (`dew.nn.attention.window_sides`). Decoding attends a bidirectional canvas
+    on either side (`dew.nn.visibility.window_sides`). Decoding attends a bidirectional canvas
     over the frozen prefix a causal prefill cached, and writes nothing back.
     kv_shared marks a layer without K/V projections (Gemma 3n/4 cross-layer
     sharing): it reads the keys, values and places its provider stashed in
@@ -297,11 +297,11 @@ class CausalSelfAttention(nn.Module):
 
     def _ngpt_rotated(self, ngpt: NGPT, query, key):
         """The rotated query and key heads on the unit sphere, the query times the square of its
-        learned gain, in fp32 and back to its dtype (dory.py:139-149)."""
+        learned gain, in at least fp32 and back to its dtype (dory.py:139-149)."""
         heads = gain(self.sqk, ngpt.query(self.ctx.head_dim))
         heads = heads.reshape(self.ctx.num_heads, self.ctx.head_dim)
-        query = (jnp.square(heads) * unit(query).astype(jnp.float32)).astype(query.dtype)
-        return query, unit(key)
+        query = (jnp.square(heads) * l2norm(query).astype(at_least_fp32(query.dtype))).astype(query.dtype)
+        return query, l2norm(key)
 
     @property
     def reads_train(self) -> bool:
@@ -788,7 +788,8 @@ class CausalSelfAttention(nn.Module):
                 mask, causal = causal_attention_mask(positions, kv_len, self.ctx.sliding_window), False
             else:
                 last = jnp.max(jnp.asarray(positions).reshape(B, S), axis=-1, keepdims=True)
-                documents, causal, window = self._cached_call(positions, jnp.arange(kv_len)[None, :] <= last)
+                documents, causal, window = self._cached_call(
+                    positions, visible(last, jnp.arange(kv_len)[None, :], causal=True))
             key_places = held_places
             # A quantized provider stashed its keys in the cache's rotation.
             rotation = self.ctx.kv_cache.key_rotation(self.ctx.head_dim)
@@ -872,8 +873,8 @@ class CausalSelfAttention(nn.Module):
                 raise ValueError("attention_key_positions must be [B, keys]")
             if self.ctx.sliding_window is not None:
                 query_positions = jnp.broadcast_to(jnp.asarray(rotary_positions), (B, S))
-                distance = query_positions[:, :, None] - key_positions[:, None, :]
-                mask = mask & (jnp.abs(distance) < self.ctx.sliding_window)[:, None]
+                mask = mask & windowed(query_positions[:, :, None], key_positions[:, None, :],
+                                       self.ctx.sliding_window, causal=False)[:, None]
         return mask, key_positions
 
     @property
@@ -1103,12 +1104,12 @@ class CausalSelfAttention(nn.Module):
         if self.exclusive_self_attention:
             attention = exclusive_self_attention(attention, own_value)
         if gate is not None and self.ctx.ngpt is not None:
-            # nGPT scales the gate's logits by the square of their learned gain, gates in fp32 and
-            # unit-norms the gated heads together (dory.py:154-157).
+            # nGPT scales the gate's logits by the square of their learned gain, gates in at least
+            # fp32 and unit-norms the gated heads together (dory.py:154-157).
+            wide = at_least_fp32(jnp.result_type(gate, attention))
             scale = gain(self.s_gate, self.ctx.ngpt.gate(self.ctx.emb_features))
-            logits = gate.astype(jnp.float32) * jnp.square(scale).reshape(self.ctx.num_heads,
-                                                                           self.ctx.head_dim)
-            attention = (attention.astype(jnp.float32) * jax.nn.sigmoid(logits)).astype(attention.dtype)
+            logits = gate.astype(wide) * jnp.square(scale).reshape(self.ctx.num_heads, self.ctx.head_dim)
+            attention = (attention.astype(wide) * jax.nn.sigmoid(logits)).astype(attention.dtype)
         elif gate is not None:
             # The branch multiplies by the sigmoid of its gate, then projects
             # (modeling_qwen3_5.py:701, and modeling_qwen4_exp.py:836 the same).
@@ -1116,7 +1117,7 @@ class CausalSelfAttention(nn.Module):
         attention = constrain(attention, HEADS)
         joined = attention.reshape(batch, length, self.ctx.num_heads * self.value_dim)
         if self.ctx.ngpt is not None:
-            joined = unit(joined)
+            joined = l2norm(joined)
         return checkpoint_name(self.o_proj(joined), 'o_proj')
 
 

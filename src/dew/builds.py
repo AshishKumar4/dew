@@ -2,7 +2,7 @@
 
 The standard library alone and no Dew import: tools/environments.py loads this
 file by its path to choose a checkout's lock before any environment exists to
-import Dew from, and `dew.telemetry.devices` asks it at `import dew`.
+import Dew from, and `dew.devices` asks it at `import dew`.
 """
 
 import re

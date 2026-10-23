@@ -69,12 +69,13 @@ from orbax.checkpoint.checkpoint_manager import AsyncOptions, MultiprocessingOpt
 from orbax.checkpoint.checkpoint_managers import preservation_policy as preservation
 
 from dew import position, records
+from dew.cleanup import attempted
 from dew.coordination import broadcast_from_process_zero, from_every_process
 from dew.files import write_atomically
 from dew.hashing import fmix32
 from dew.nn import sharding
 from dew.nn.sharding import LogicalAxes
-from dew.objectives.base import Variables
+from dew.objectives.base import PARAMETER_ROOTS, Variables
 from dew.records import JSON, duration, json_value
 from dew.telemetry.profile import region
 
@@ -119,7 +120,7 @@ PYTHON_RUN: dict[str, JSON] = {
 def _is_profiles(node) -> bool:
     """Whether `node` is a `PowerProfilesState`, or the mapping of its fields
     a restore without a template reads it as."""
-    from dew.training.optim import PowerProfilesState
+    from dew.optim import PowerProfilesState
     return isinstance(node, PowerProfilesState) or (
         isinstance(node, Mapping) and set(node) == set(PowerProfilesState._fields))
 
@@ -194,22 +195,12 @@ def location(directory: str) -> epath.Path:
     return path if is_uri(directory) else path.resolve()
 
 
-def _attempted(steps: Sequence[tuple[str, Callable[[], None]]], *,
-               primary: BaseException | None = None) -> None:
-    """Run every step, even after one fails. Each failure is noted on `primary`, the error its
-    caller is already raising, which stays the one raised; without one the first failure is raised
-    with the later ones noted on it."""
-    error = primary
-    for label, step in steps:
-        try:
-            step()
-        except BaseException as failure:
-            if error is None:
-                error = failure
-            else:
-                error.add_note(f"{label} failed: {failure!r}")
-    if primary is None and error is not None:
-        raise error
+def _step_record(deltas: list[str], control: dict | None, rung: JSON, artifact: JSON,
+                 boxed: Mapping[tuple[str, ...], LogicalAxes] | None) -> dict:
+    """What a persistent and a local save both record of a step: its EMA deltas, its control
+    state, its rung, its inference artifact and its boxed axes."""
+    return {"ema_deltas": deltas, "control": copy.deepcopy(control or {}), "rung": rung, "artifact": artifact,
+            "boxed": _boxed_record(boxed)}
 
 
 def _processes(count: int) -> str:
@@ -321,6 +312,20 @@ _SEEDS = (0x9E3779B9, 0x7F4A7C15)
 """The two multipliers `_marks` mixes a word's flat index by."""
 
 
+def _word_type(width: int) -> type:
+    """The unsigned type `_marks` reads `width`-byte elements as: their own width up to 2 bytes,
+    32-bit words past it (an 8-byte element is two)."""
+    return {1: np.uint8, 2: np.uint16}.get(width, np.uint32)
+
+
+def _mixed(module, words, index):
+    """The two marks of 32-bit `words` at their flat positions `index`, in `module` (NumPy on the
+    host, jax.numpy on the devices): each word mixed with its index times a seed (`fmix32`) and the
+    words summed, wrapping."""
+    return module.stack([module.sum(fmix32(words ^ (index * module.uint32(seed))), dtype=module.uint32)
+                         for seed in _SEEDS])
+
+
 @jax.jit
 def _marks(leaves: list[jax.Array]) -> jax.Array:
     """Two 32-bit marks of each leaf's stored bits at their positions, `[leaves, 2]`.
@@ -338,33 +343,30 @@ def _marks(leaves: list[jax.Array]) -> jax.Array:
 
 def _leaf_marks(leaf: jax.Array) -> jax.Array:
     bits = leaf.astype(jnp.uint8) if leaf.dtype == jnp.bool_ else leaf
-    width = np.dtype(bits.dtype).itemsize
     # An 8-byte element becomes a trailing pair of 32-bit words.
-    unsigned = {1: jnp.uint8, 2: jnp.uint16}.get(width, jnp.uint32)
-    bits = jax.lax.bitcast_convert_type(bits, unsigned).astype(jnp.uint32)
+    bits = jax.lax.bitcast_convert_type(bits, _word_type(np.dtype(bits.dtype).itemsize)).astype(jnp.uint32)
     index = jnp.zeros(bits.shape, jnp.uint32)
     stride = 1
     for axis in reversed(range(bits.ndim)):
         index = index + jax.lax.broadcasted_iota(jnp.uint32, bits.shape, axis) * jnp.uint32(stride)
         stride = stride * bits.shape[axis] % 2 ** 32
-    return jnp.stack([jnp.sum(fmix32(bits ^ (index * jnp.uint32(seed))), dtype=jnp.uint32)
-                      for seed in _SEEDS])
+    return _mixed(jnp, bits, index)
 
 
 def _host_marks(leaf: np.ndarray, chunk: int = 1 << 24) -> np.ndarray:
-    """`_marks` of a host array, from its stored bytes, `chunk` words at a time."""
+    """`_marks` of a host array, from its stored bytes, `chunk` words at a time: the same mixing
+    (`_mixed`) on the host, so a leaf JAX does not hold as stored (float64 with x64 off) is marked
+    from its bytes, and no more than a chunk's words are widened at once."""
     array = np.ascontiguousarray(leaf)
     if array.dtype == np.bool_:
         array = array.astype(np.uint8)
-    width = array.dtype.itemsize
-    words = array.reshape(-1).view({1: np.uint8, 2: np.uint16}.get(width, np.uint32))
+    words = array.reshape(-1).view(_word_type(array.dtype.itemsize))
     marks = np.zeros(2, np.uint32)
     with np.errstate(over="ignore"):
         for start in range(0, words.size, chunk):
             bits = words[start:start + chunk].astype(np.uint32)
             index = (np.arange(start, start + bits.size, dtype=np.uint64) & 0xFFFFFFFF).astype(np.uint32)
-            for slot, seed in enumerate(_SEEDS):
-                marks[slot] += np.sum(fmix32(bits ^ (index * np.uint32(seed))), dtype=np.uint32)
+            marks += _mixed(np, bits, index)
     return marks
 
 
@@ -910,7 +912,7 @@ class Checkpoints:
     restores onto any mesh.
     """
 
-    def __init__(self, directory: str, *, keep: int | Keep = 2,
+    def __init__(self, directory: str, *, keep: int | Keep = Keep.latest,
                  local_directory: str | None = None, local_every: int | None = None):
         if (local_directory is None) != (local_every is None):
             raise ValueError(
@@ -923,8 +925,10 @@ class Checkpoints:
         self._rank_limits: dict[str, int] = {}
         self._rank_modes: dict[str, str] = {}
         self._pending: tuple[int, dict[str, float]] | None = None
-        self._step_cache: dict[int, Kept] = {}
-        self._custom_cache: dict[int, dict] = {}
+        # Each committed step's record, read once: its metrics and custom metadata, which `Kept`
+        # views are derived from. A save in flight stages its metadata apart, until it commits.
+        self._committed: dict[int, tuple[Mapping[str, float], dict]] = {}
+        self._staged: dict[int, dict] = {}
         self.local_directory = None if local_directory is None else str(location(local_directory))
         self.local_every = local_every
         self._manager = None
@@ -959,37 +963,35 @@ class Checkpoints:
         """Return whether an evaluation would enter the best-K set of any of its trackers."""
         return bool(self._candidates((ranking,) if isinstance(ranking, Ranking) else ranking))
 
-    def _cache_step(self, step: int, metadata) -> Kept:
-        custom = metadata.custom_metadata or {}
-        checkpoint = _kept(step, metadata.metrics or {}, custom)
-        self._step_cache[step] = checkpoint
-        self._custom_cache[step] = copy.deepcopy(custom)
-        return checkpoint
+    def _cache_step(self, step: int, metadata) -> None:
+        """Record `step`'s committed metadata, which its staged save, if any, became."""
+        self._committed[step] = (dict(metadata.metrics or {}), copy.deepcopy(metadata.custom_metadata or {}))
+        self._staged.pop(step, None)
 
     def _custom(self, step: int) -> dict:
-        """The custom metadata `step` was saved with, as this process cached
-        it or from its committed metadata, which Orbax reads opening no manager."""
-        if step in self._custom_cache:
-            return self._custom_cache[step]
+        """The custom metadata `step` was saved with: a save in flight's as staged, a committed step's
+        as this process read it, or else from its committed metadata, which Orbax reads opening no
+        manager."""
+        if step in self._staged:
+            return self._staged[step]
+        if step in self._committed:
+            return self._committed[step][1]
         return ocp.metadata.get_step_metadata(self.path(step)).custom_metadata or {}
 
     def kept(self) -> list[Kept]:
         """Return the committed retained steps, oldest first; their immutable metadata is cached."""
         persistent = self._open()
         active = set(persistent.all_steps())
-        for step in set(self._step_cache) - active:
-            del self._step_cache[step]
-            self._custom_cache.pop(step, None)
+        for step in set(self._committed) - active:
+            del self._committed[step]
         retained = []
         for step in sorted(active):
-            checkpoint = self._step_cache.get(step)
-            if checkpoint is None:
+            if step not in self._committed:
                 if not self._complete(step):
                     continue
-                checkpoint = self._cache_step(step, persistent.metadata(step))
-            # Callers own the returned nested rules; changing them must not
-            # mutate the committed metadata cached for later queries.
-            retained.append(dataclasses.replace(checkpoint, rankings=copy.deepcopy(checkpoint.rankings)))
+                self._cache_step(step, persistent.metadata(step))
+            # A view of the committed record; `_kept` copies the nested rules callers may change.
+            retained.append(_kept(step, *self._committed[step]))
         return retained
 
     def _identify_run(self) -> None:
@@ -1021,7 +1023,7 @@ class Checkpoints:
         retained = self.kept()
         if name is None:
             for checkpoint in reversed(retained):
-                custom = self._custom_cache[checkpoint.step]
+                custom = self._custom(checkpoint.step)
                 if custom.get('primary'):
                     name = custom['primary']
                     break
@@ -1150,7 +1152,7 @@ class Checkpoints:
         return steps[0] if None not in steps and len(set(steps)) == 1 else None
 
     def _complete(self, step: int) -> bool:
-        if step in self._step_cache:
+        if step in self._committed:
             return step in self._open().all_steps()
         path = epath.Path(self.path(step))
         return path.exists() and ocp.utils.is_checkpoint_finalized(path)
@@ -1273,31 +1275,25 @@ class Checkpoints:
                 scores[f'checkpoint/rank/{rank.metric}'] = rank.score
                 rules[rank.metric] = dataclasses.asdict(rank)
         custom = {
-            "ema_deltas": deltas,
+            **_step_record(deltas, control, rung, artifact, boxed),
             "profiles": profile_metadata,
             "rankings": rules,
             "primary": primary or (rankings[0].metric if rankings else None),
-            "control": copy.deepcopy(control or {}),
             "weights_only": weights_only,
-            "rung": rung,
-            "artifact": artifact,
-            "boxed": _boxed_record(boxed),
             "frozen": frozen,
             "tree": mapping,
         }
-        # The retention policy reads this step's record without waiting for its
-        # metadata to commit; a save Orbax refuses leaves the step's record as it was.
-        committed = self._custom_cache.pop(step, None)
-        self._custom_cache[step] = copy.deepcopy(custom)
+        # The retention policy reads this step's record without waiting for its metadata to commit;
+        # a save Orbax refuses leaves the step's committed record as it was, and one it takes replaces it.
+        self._staged[step] = copy.deepcopy(custom)
         try:
             with region("checkpoint.submit"):
                 persistent.save(step, args=ocp.args.PyTreeSave(state_tree), metrics=scores, force=True,
                                 custom_metadata=custom)
         except BaseException:
-            self._custom_cache.pop(step)
-            if committed is not None:
-                self._custom_cache[step] = committed
+            self._staged.pop(step)
             raise
+        self._committed.pop(step, None)
         self._pending = (step, scores)
         self._frozen_pending = {digest for held in frozen.values() for digest in held.values()}
         # Pinned-host state is written before returning; the docstring says why.
@@ -1330,7 +1326,7 @@ class Checkpoints:
         if jax.process_index() == 0 and root.exists():
             referenced = {*recorded, *self._frozen_pending}
             for kept in self.kept():
-                for values in ((self._custom_cache.get(kept.step) or {}).get('frozen') or {}).values():
+                for values in (self._custom(kept.step).get('frozen') or {}).values():
                     referenced.update(values.values())
             for path in root.iterdir():
                 if path.name not in referenced and ocp.utils.is_checkpoint_finalized(path):
@@ -1517,13 +1513,9 @@ class Checkpoints:
                 args=ocp.args.PyTreeSave(state_tree),
                 force=True,
                 custom_metadata={
+                    **_step_record(deltas, control, rung, artifact, boxed),
                     "processes": jax.process_count(),
                     "placement": written,
-                    "ema_deltas": deltas,
-                    "control": copy.deepcopy(control or {}),
-                    "rung": rung,
-                    "artifact": artifact,
-                    "boxed": _boxed_record(boxed),
                 },
             )
         if _written_in_place(state_tree):
@@ -1574,7 +1566,7 @@ class Checkpoints:
 
     def variables(self, *, step: int | str | None = None, ema: bool | None = None,
                   mesh=None, layout=None, param_dtype: jax.typing.DTypeLike | None = None,
-                  parameter_roots: tuple[tuple[str, ...], ...] = (("params",), ("frozen",)),
+                  parameter_roots: tuple[tuple[str, ...], ...] = PARAMETER_ROOTS,
                   unread: tuple[tuple[str, ...], ...] = ()) -> Variables:
         """Read the selected step's live or averaged variables onto the requested layout.
 
@@ -1860,7 +1852,7 @@ class Checkpoints:
         asynchronous write once, from the wait, and its close still releases the manager. The first
         failure is raised with the rest noted on it. A closed `Checkpoints` reopens its managers on
         its next use."""
-        _attempted(self._closing())
+        attempted(self._closing())
 
     def __enter__(self) -> Checkpoints:
         return self
@@ -1868,7 +1860,7 @@ class Checkpoints:
     def __exit__(self, kind: type[BaseException] | None, raised: BaseException | None,
                  traceback: TracebackType | None) -> None:
         """`close`, with a failure noted on the error the body raised, which stays the one raised."""
-        _attempted(self._closing(), primary=raised)
+        attempted(self._closing(), primary=raised)
 
     def _closing(self) -> list[tuple[str, Callable[[], None]]]:
         """The steps that close the open managers, which this forgets: each one's wait, then each
@@ -1885,6 +1877,6 @@ class Checkpoints:
         anything that reads a checkpoint back has to call this first.
         """
         with region("checkpoint.wait"):
-            _attempted([("Checkpoint wait", writer.wait_until_finished)
+            attempted([("Checkpoint wait", writer.wait_until_finished)
                         for writer in (self._manager, self._local_manager) if writer is not None])
             self._pending = None
