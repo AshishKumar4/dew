@@ -1633,7 +1633,7 @@ class CausalTransformer(nn.Module):
         if context is not None:
             # The context enters in the dtype a server holds it in (`context_dtype`), so a served and
             # a standalone call, and a cached and a full one, project the same values.
-            context = context.replace(embeddings=context.embeddings.astype(self.context_dtype))
+            context = CrossContext(context.embeddings.astype(self.context_dtype), context.lengths)
         # A layer whose mixer reads no pairwise mask refuses one (`MixerCall`).
         if key_positions is not None and pairwise_mask is None:
             raise ValueError("attention_key_positions requires attention_pairwise_mask")
