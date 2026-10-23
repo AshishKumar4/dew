@@ -615,10 +615,10 @@ def _walked_gradient(rings: dict, staged, first, steps, shape: tuple, exact_sums
     if exact_sums:
         def exact_step(index, slots, running, accumulators):
             lhs, rhs = staged(index, slots)
-            # Interpreted, the in-place product's own arithmetic, so the two sums add alike.
-            fresh = (FAMILY.products(FAMILY.zeros(shape), lhs, rhs, interpret=True) if interpret
-                     else FAMILY.product(lhs, rhs, shape))
-            return running + fresh, accumulators
+            if interpret:
+                # The in-place product's own arithmetic: the CPU's dots sum in IEEE fp32 either way.
+                return FAMILY.products(running, lhs, rhs, interpret=True), accumulators
+            return running + FAMILY.product(lhs, rhs, shape), accumulators
 
         running, _ = FAMILY.walk(rings, ((exact_step, first, first + steps),), FAMILY.zeros(shape), (),
                                  interpret)
@@ -626,7 +626,8 @@ def _walked_gradient(rings: dict, staged, first, steps, shape: tuple, exact_sums
 
     def step(index, slots, nothing, accumulators):
         (acc,) = accumulators
-        return nothing, (FAMILY.products(acc, *staged(index, slots), interpret),)
+        lhs, rhs = staged(index, slots)
+        return nothing, (FAMILY.products(acc, lhs, rhs, interpret),)
 
     _, (summed,) = FAMILY.walk(rings, ((step, first, first + steps),), None, (shape,), interpret,
                                in_flight=_IN_FLIGHT)
