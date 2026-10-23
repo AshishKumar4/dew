@@ -1014,14 +1014,16 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
 class DqSums(NamedTuple):
     """A dQ pass's sums over its keys: dQ `[bq, D]` and the score cotangents' row sums and the HEAD and
     QUERY hook parameters' pullbacks of them (`grads`), each cotangent taken over a `prior` denominator
-    (the forward's, or the first pass's; `grad_scores`); and the unnormalized weights' row sums and the
-    hook parameters' pullbacks of them (`weighed`), fp32."""
+    (the forward's, or the first pass's; `grad_scores`); and the unnormalized weights' row sums, the hook
+    parameters' pullbacks of them (`weighed`) and their product with the keys as dQ's (`keyed`, `[bq, D]`),
+    fp32."""
 
     dq: jax.Array
     residual: jax.Array
     mass: jax.Array
     grads: tuple[jax.Array, ...]
     weighed: tuple[jax.Array, ...]
+    keyed: jax.Array
 
 
 def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax.Array,
@@ -1029,9 +1031,11 @@ def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax
     """A dQ pass's results from its sums, each taken to the pass's own denominator, the initial state's
     `state_total` and its keys' weights, so the weights it differentiates sum to one over its own logits
     whichever pass gave D: the cotangents' sums from the prior by their ratio (one division, about 1),
-    the weights' over it. D is then refined once from its own sums (`refinement`), and the HEAD and
-    QUERY gradients with it. Returns dQ, the refined `D - c`, the denominator, the keys' share of the
-    weights, and the hook gradients."""
+    the weights' over it. D is then refined once from its own sums (`refinement`), and dQ and the HEAD
+    and QUERY gradients with it, each less the refinement times its weights' own product (`keyed`,
+    `weighed`): a query's dQ cancels across its keys exactly as its cotangents sum to 0, so the D it takes
+    must be the one whose cotangents do, not the first pass's. Returns dQ, the refined `D - c`, the
+    denominator, the keys' share of the weights, and the hook gradients."""
     total = state_total + sums.mass
     ratio = jnp.where(total > 0, prior / jnp.where(total > 0, total, 1.0), 0.0)
     over = inverse(total)
@@ -1039,7 +1043,8 @@ def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax
     refined = refinement(residual, mass, peak0, shares, peak, total, anchor, delta)
     grads = tuple(grad * ratio - refined * (weighed * over)
                   for grad, weighed in zip(sums.grads, sums.weighed, strict=True))
-    return sums.dq * expand(ratio, sums.dq), delta + refined, total, mass, grads
+    dq = sums.dq * expand(ratio, sums.dq) - expand(refined * over, sums.keyed) * sums.keyed
+    return dq, delta + refined, total, mass, grads
 
 
 def below(logits: jax.Array, peak: jax.Array, how: Recompute = PLAIN) -> jax.Array:
