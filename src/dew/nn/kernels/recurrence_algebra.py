@@ -147,13 +147,34 @@ def decays(g, documents=None):
     return grown_from(hi, lo, jnp.exp), jnp.where(inclusive, jnp.exp(diff), 0.0)
 
 
-def raised(hi, lo):
-    """`exp2(hi + lo)` of a compensated base-2 exponent as `exp2(hi) exp2(lo)`: a decay from a chunk's start,
-    whose exponent's rounded half alone carries its whole sum's rounding (a relative 3e-6 at the prefix
-    -43 a single token at -30 a token reaches). `exp2(lo)`, near one, keeps `lo` to fp32's resolution
-    there, and a product of the two rounds the same in any program a compiler fuses it into, where a
-    first-order correction's multiply-add may contract to one rounding or not."""
-    return jnp.exp2(hi) * jnp.exp2(lo)
+def raised(whole, part):
+    """`exp2(whole + part)` of a compensated base-2 exponent to fp32's resolution at any size: its integer
+    `n = floor(whole)` an exact power of two (`_power_of_two`) and its fraction `(whole - n) + part`, near
+    [0, 1), through exp2. The exponent rounded to one fp32 lost up to half its ulp, 1.9e-6 near -43 (a
+    pair of tokens at -30 a token), a decay's relative 1.3e-6, which put the port's decay gradient under
+    decays near zero 7 to 10 times the token-by-token recurrence's distance from float64; and exp2 of a
+    whole exponent, which a CPU takes as `exp(x ln 2)`, rounds its product with ln 2 the same way."""
+    n = jnp.floor(whole)
+    return jnp.exp2((whole - n) + part) * _power_of_two(n)
+
+
+def _power_of_two(n):
+    """`2^n` of an integral fp32 `n`, exactly: two halves' fp32 bits built from their exponents, whose
+    product reaches fp32's subnormals and rounds past them to zero, and past fp32's range to inf."""
+    n = jnp.clip(n, -300.0, 300.0).astype(jnp.int32)
+    half = jax.lax.shift_right_arithmetic(n, jnp.int32(1))
+
+    def bits(exponent):
+        biased = jnp.clip(exponent, -127, 128) + 127
+        return jax.lax.bitcast_convert_type(jax.lax.shift_left(biased, jnp.int32(23)), jnp.float32)
+
+    return bits(half) * bits(n - half)
+
+
+def decayed(rows, rows_lo, columns, columns_lo):
+    """`exp2(rows - columns)` `[R, C]` of a compensated prefix's halves (`apart`) to fp32's resolution
+    (`raised`)."""
+    return raised(rows[:, None] - columns[None, :], rows_lo[:, None] - columns_lo[None, :])
 
 
 def grown_from(hi, lo, exp, unit: float = 1.0):
@@ -385,7 +406,7 @@ def solved(keys: Load, gates, lows, betas, columns: int, issue: Issue) -> dict:
 
     def block(i, j):
         product = sum(issue("intra", keys(i, c), keys(j, c).T) for c in range(columns))
-        decay = jnp.exp2(apart(gates[i], lows[i], gates[j], lows[j]))
+        decay = decayed(gates[i], lows[i], gates[j], lows[j])
         product = product * (jnp.where(strict, decay, 0.0) if i == j else decay)
         return product * betas[i][:, None]
 
@@ -432,7 +453,7 @@ def carried(state, keys: Load, values, decay, dtype, issue: Issue) -> list:
 def scalar_write(corrected_values, last, gate, last_lo, gate_lo):
     """A decay a head's write: the corrected values gated by `exp2(g_last - g)` over both halves, and the
     memory's decay `exp2(g_last)`."""
-    gated = corrected_values * jnp.exp2((last - gate) + (last_lo - gate_lo))[:, None]
+    gated = corrected_values * raised(last - gate, last_lo - gate_lo)[:, None]
     return gated, raised(last, last_lo)
 
 
@@ -448,7 +469,7 @@ def chunk_output(queries: Load, entered: Load, keys: Load, columns: int, gate, l
         out += issue("memory", query, entered(c))
         scores += issue("scores", query, keys(c).T)
     out = out * raised(gate, low)[:, None]
-    scores = scores * jnp.exp2(apart(gate, low, gate, low))
+    scores = scores * decayed(gate, low, gate, low)
     index = jnp.arange(gate.shape[0])
     scores = jnp.where(index[:, None] >= index[None, :], scores, 0.0)
     return out * scale + issue("local", scores.astype(value.dtype), value) * scale
@@ -464,7 +485,7 @@ def key_decayed_row(query, weighted_key, gate, low, earlier: Load, place, chunk:
 
     def column(j, sums):
         gate_j, low_j, key_j = earlier(j)
-        gated = key_j * jnp.exp2((gate - gate_j) + (low - low_j))
+        gated = key_j * raised(gate - gate_j, low - low_j)
         here = (index == j)[None, :]
         return (jnp.where(here, (jnp.sum(query * gated, axis=1) * scale)[:, None], sums[0]),
                 jnp.where(here & (j < place), jnp.sum(weighted_key * gated, axis=1)[:, None], sums[1]))
@@ -476,7 +497,7 @@ def key_decayed_row(query, weighted_key, gate, low, earlier: Load, place, chunk:
 def key_decayed_write(key, gate, low, last, last_low):
     """A chunk's keys gated to its end under a decay a key dimension, `k exp2(g_last - g)` over both
     prefix halves, in the keys' arithmetic: the write the memory takes (`carried`)."""
-    return key * jnp.exp2((last - gate) + (last_low - low))
+    return key * raised(last - gate, last_low - low)
 
 
 def key_decayed_output(queries: Load, gates: Load, entered: Load, columns: int, scores, value, scale: float,

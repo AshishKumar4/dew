@@ -281,7 +281,7 @@ class RecomputeWU(_Launch):
 
     NAME = "recompute_w_u"
     KEYS, VALUES = "k", "v"
-    revision: int = 3
+    revision: int = 4
     SPACES = _spaces(_tiles([(64, 64)], (2, 4), (2, 3, 4)))
     PICKS = _picks(Tiles(64, 64, 4, 2))
 
@@ -364,7 +364,7 @@ class ChunkFwdO(_Launch):
 
     NAME = "chunk_fwd_o"
     KEYS, VALUES = "q", "v"
-    revision: int = 2
+    revision: int = 3
     SPACES = _spaces(_tiles([(32, 64), (64, 64), (32, 128), (64, 128)], (2, 4, 8), (2, 3, 4)),
                      _tiles([(32, 64), (64, 64)], (2, 4, 8), (2,)))
     # Measured on an A100-40GB at Kimi Linear's 1 x 4096 x 32 x 128 bf16: 0.25 -> 0.23 ms.
@@ -550,7 +550,7 @@ def _wy_dqkg_kernel(chunk_ref, q_ref, k_ref, v_ref, vn_ref, g_ref, gl_ref, beta_
             gate_exp = algebra.raised(gate, low)
             decay_grad = decay_grad * algebra.raised(final, final_low)
             dq = dq * gate_exp * scale
-            dk = dk * jnp.exp2((final[None, :] - gate) + (final_low[None, :] - low))
+            dk = dk * algebra.raised(final[None, :] - gate, final_low[None, :] - low)
             gated_key = key * gate_exp
             dw = -dw.astype(transposed.dtype)
             scores = scores + _dot(dw, gated_key.T.astype(transposed.dtype), exact=exact)
@@ -579,7 +579,7 @@ class BwdWyDqkg(_Launch):
     """`bwd_wy_dqkg`'s launch (tuning.KernelOp)."""
 
     NAME = "bwd_wy_dqkg"
-    revision: int = 4
+    revision: int = 5
     KEYS, VALUES = "k", "v"
     SPACES = _spaces(_tiles([(32, 32), (32, 64)], (2, 4), (1,)), _tiles([(32, 32)], (2, 4), (1,)))
     PICKS = _picks(Tiles(32, 64, 4, 1), small=Tiles(32, 32, 4, 1))
@@ -669,8 +669,8 @@ def _bwd_intra_kernel(chunk_ref, q_ref, k_ref, g_ref, gl_ref, beta_ref, daqk_ref
             """The chunk's token `j` as the column of every row `s >= j`: its pairs' decays, the rows' and
             the column's gradients, and the ranges `(t, j - 1]` closed before it."""
             dq2, dk2, dkt, running, behind, dr = carry
-            apart = (gate - _row(g_ref, start + j)[None, :]) + (low - _row(gl_ref, start + j)[None, :])
-            decay = jnp.exp2(apart)
+            decay = algebra.raised(gate - _row(g_ref, start + j)[None, :],
+                                   low - _row(gl_ref, start + j)[None, :])
             decay = jnp.where((rows >= j)[:, None] & live, decay, 0.0)
             at = pl.ds(j, 1)
             qk = read_rows(_rows(daqk_ref, start, chunk, at), taken).astype(jnp.float32)
@@ -698,7 +698,7 @@ class BwdIntra(_Launch):
     """`bwd_intra`'s launch (tuning.KernelOp)."""
 
     NAME = "bwd_intra"
-    revision: int = 4
+    revision: int = 5
     KEYS, VALUES = "k", None
     SPACES = _spaces(_tiles([(32, 0), (64, 0)], (2, 4, 8), (1,)))
     # Measured on an A100-40GB at Kimi Linear's 1 x 4096 x 32 x 128 bf16: 2.49 -> 1.98 ms.

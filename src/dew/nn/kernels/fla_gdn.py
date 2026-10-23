@@ -182,7 +182,7 @@ class KktSolve(_Launch):
 
     NAME = "kkt_solve"
     KEYS, VALUES = 'k', None
-    revision: int = 2
+    revision: int = 3
     SPACES = _spaces(_tiles([(32, 0), (64, 0)], (1, 2, 4), (2, 3, 4)))
     PICKS = _picks(Tiles(64, 0, 1, 3))
 
@@ -258,7 +258,7 @@ class RecomputeWU(_Launch):
 
     NAME = "recompute_w_u"
     KEYS, VALUES = 'k', 'v'
-    revision: int = 2
+    revision: int = 3
     SPACES = _spaces(_tiles([(64, 64)], (2, 4, 8), (2, 3, 4)))
     PICKS = _picks(Tiles(64, 64, 2, 4))
 
@@ -373,7 +373,7 @@ class ChunkFwdH(_Launch):
 
     NAME = "chunk_fwd_h"
     KEYS, VALUES = 'k', 'u'
-    revision: int = 3
+    revision: int = 4
     SPACES = _spaces(_tiles([(0, 32), (0, 64)], (2, 4), (2, 3, 4)),
                      _tiles([(0, 32), (0, 64)], (2, 4), (1, 2)))
     # fla's stages for devices under an A100's shared memory (chunk_delta_h.py:43-44), with two warps.
@@ -501,8 +501,8 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, gl_ref, dht_ref, do_ref, d
             else:
                 gate = _gates(g_ref, begin, taken, chunk)
                 last = _row(g_ref, final)
-                apart = (last - gate) + (_row(gl_ref, final) - _gates(gl_ref, begin, taken, chunk))
-                dv = (dv * jnp.exp2(apart)[:, None]
+                apart = algebra.raised(last - gate, _row(gl_ref, final) - _gates(gl_ref, begin, taken, chunk))
+                dv = (dv * apart[:, None]
                       + read(dv_ref).astype(jnp.float32))
                 kept = [algebra.raised(last, _row(gl_ref, final))] * slices
 
@@ -535,7 +535,7 @@ class ChunkBwdDhu(_Launch):
 
     NAME = "chunk_bwd_dhu"
     KEYS, VALUES = 'k', 'do'
-    revision: int = 4
+    revision: int = 5
     SPACES = _spaces(_tiles([(0, 32), (0, 64)], (2, 4), (1, 2, 3)),
                      _tiles([(0, 32), (0, 64)], (2, 4), (1, 2)))
     # Measured at Qwen3.5-0.8B's shape (8 x 3072, 16 heads of 128, bf16), CUPTI, 2026-10-13: 0/64/4/3
@@ -634,7 +634,7 @@ def _dv_local_kernel(chunk_ref, q_ref, k_ref, g_ref, gl_ref, do_ref, dv_ref, *, 
             columns = pl.ds(block * bk, bk)
             scores += _dot(read(k_ref, columns), read(q_ref, columns).T, exact=exact) * scale
         gate, low = _gates(g_ref, start, taken, chunk), _gates(gl_ref, start, taken, chunk)
-        scores = scores * jnp.exp2(-algebra.apart(gate, low, gate, low))
+        scores = scores * algebra.decayed(-gate, -low, -gate, -low)
         index = jnp.arange(chunk)
         scores = jnp.where(index[:, None] <= index[None, :], scores, 0.0).astype(do_ref.dtype)
         for block in range(do_ref.shape[-1] // bv):
@@ -649,7 +649,7 @@ class ChunkBwdDvLocal(_Launch):
 
     NAME = "chunk_bwd_dv_local"
     KEYS, VALUES = 'k', 'do'
-    revision: int = 2
+    revision: int = 3
     SPACES = _spaces(_tiles([(64, 64), (128, 128)], (2, 4, 8), (2, 3, 4)))
     PICKS = _picks(Tiles(64, 64, 2, 3))
 
@@ -772,8 +772,8 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, gl_ref, h_ref, do_ref, 
             last = _row(g_ref, (start + taken - 1, head))
             last_low = _row(gl_ref, (start + taken - 1, head))
             dq = dq * algebra.raised(gate, low)[:, None] * scale
-            dk = dk * jnp.exp2((last - gate) + (last_low - low))[:, None]
-            ds = jnp.where(causal, ds * jnp.exp2(algebra.apart(gate, low, gate, low)), 0.0) * scale
+            dk = dk * algebra.raised(last - gate, last_low - low)[:, None]
+            ds = jnp.where(causal, ds * algebra.decayed(gate, low, gate, low), 0.0) * scale
             # The keys' writes into the memory the chunk leaves run through (s, end]: the last row's pairs.
             leaving = jnp.sum(dk * keys.astype(jnp.float32), axis=1)
             pairs = (jnp.where(strict, ds * scores, 0.0)
@@ -800,7 +800,7 @@ class ChunkBwdDqkwg(_Launch):
 
     NAME = "chunk_bwd_dqkwg"
     KEYS, VALUES = 'k', 'v'
-    revision: int = 4
+    revision: int = 5
     SPACES = _spaces(_tiles([(64, 64), (64, 128), (128, 64), (128, 128)], (2, 4, 8), (1, 2)),
                      _tiles([(64, 64), (64, 128), (128, 64), (128, 128)], (2, 4, 8), (1,)))
     # One stage elsewhere: its loop over a key head's value heads holds every block of a head, and a
@@ -948,7 +948,7 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, gl_ref, a_ref, dw_r
         d_x = _dot(d_x.astype(inverse_t.dtype), inverse_t, exact=exact)
         d_x = _dot(inverse_t, d_x.astype(inverse_t.dtype), exact=exact)
         low = _gates(gl_ref, start, taken, chunk)
-        d_x = d_x * jnp.exp2(algebra.apart(gate, low, gate, low))
+        d_x = d_x * algebra.decayed(gate, low, gate, low)
         d_l = jnp.where(strict, -d_x, 0.0).astype(k_ref.dtype)
         def keys_grad(block, carry):
             products, d_beta = carry
@@ -981,7 +981,7 @@ class PrepareWyReprBwd(_Launch):
 
     NAME = "prepare_wy_repr_bwd"
     KEYS, VALUES = 'k', 'v'
-    revision: int = 4
+    revision: int = 5
     SPACES = _spaces(_tiles([(32, 32), (64, 64)], (2, 4, 8), (1, 2, 3)))
     # Eight warps for fp32 on every GPU: at TF32x3 four took ptxas 40 s on sm80 and 66 s on sm89, eight
     # 17 s; one stage on a 99 KB block, whose looped blocks stage the next one, 102,400 bytes at two
@@ -1085,7 +1085,7 @@ class ChunkFwdO(_Launch):
 
     NAME = "chunk_fwd_o"
     KEYS, VALUES = 'k', 'v'
-    revision: int = 3
+    revision: int = 4
     SPACES = _spaces(frozenset({Tiles(128, 128, 8, 3), Tiles(64, 64, 4, 3), Tiles(32, 32, 2, 3)}))
     PICKS = _picks(Tiles(128, 128, 8, 3))
 
