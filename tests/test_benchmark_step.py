@@ -51,29 +51,40 @@ def test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer(architectur
     assert row["training_flops"] == counted
 
 
-def peak_row(tmp_path, platform: str) -> dict:
+def peak_row(tmp_path, platform: str, *arguments: str) -> dict:
     """The causal_transformer smoke case's row, the tool run as a person runs it on one device of
-    `platform`, its peak measured in a process of the case's own."""
+    `platform` with `arguments`, its peak measured in a process of the case's own."""
     out = tmp_path / "rows.json"
     environment = {name: value for name, value in os.environ.items() if name != "XLA_FLAGS"}
     subprocess.run([sys.executable, str(REPO_ROOT / "tools/benchmark_step.py"), "--preset", "cpu-smoke",
                     "--architectures", "causal_transformer", "--warmup", "1", "--steps", "2",
-                    "--dtype", "float32", "--mesh", "{}", "--json-out", str(out)],
-                   env={**environment, "JAX_PLATFORMS": platform}, check=True, capture_output=True,
-                   timeout=900)
+                    "--dtype", "float32", "--mesh", "{}", "--json-out", str(out), *arguments],
+                   env={**environment, "JAX_PLATFORMS": platform, "PYTHONPATH": str(tmp_path)}, check=True,
+                   capture_output=True, timeout=900)
     (row,) = json.loads(out.read_text())
     return row
 
 
-def test_a_cases_peak_is_read_in_a_process_of_its_own_one_high_water_a_device(tmp_path):
+def test_a_cases_peak_is_read_in_a_process_of_its_own_with_all_the_case_runs(tmp_path):
     """The tool's peak memory comes from a process of the case's own that loaded every program from a cache
-    and compiled nothing (a compile there refuses the run), one high-water a device; the bytes XLA planned
-    stand beside it."""
-    row = peak_row(tmp_path, "cpu")
+    and compiled nothing (a compile there refuses the run), one high-water a device, the bytes XLA planned
+    beside it; that process runs all the case does: inside the context a diagnostic names (`--within`), and
+    through the profiled steps, whose traces it keeps apart."""
+    (tmp_path / "marking.py").write_text(
+        "import contextlib, os\n"
+        "@contextlib.contextmanager\n"
+        "def marked():\n"
+        f"    with open({str(tmp_path / 'entered')!r}, 'a') as file: file.write(f'{{os.getpid()}}\\n')\n"
+        "    yield\n")
+    row = peak_row(tmp_path, "cpu", "--within", "marking:marked", "--profile-dir", str(tmp_path / "traces"),
+                   "--profile-steps", "1")
     assert row["devices"] == 1 and len(row["peak_bytes_by_device"]) == 1 and row["planned_device_bytes"] > 0
+    assert len(set((tmp_path / "entered").read_text().split())) == 3, "this process and both peak processes"
+    assert any((tmp_path / "traces/peak-run").rglob("*.xplane.pb"))
 
 
 @pytest.mark.gpu(reason="a GPU's allocator keeps the high-water the measured peak reads")
+@pytest.mark.mesh(devices=1)
 def test_a_cases_measured_peak_holds_at_least_the_bytes_xla_planned(tmp_path):
     """On a GPU the measured peak is each device's allocator high-water over the case's run, its native
     workspaces included: at least what XLA planned for the step."""

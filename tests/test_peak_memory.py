@@ -38,3 +38,10 @@ def test_a_program_that_fails_is_refused_with_its_error(tmp_path):
     with pytest.raises(peak_memory.subprocess.CalledProcessError) as raised:
         peak_memory.measured([str(program)])
     assert raised.value.returncode == 3 and sys.executable in raised.value.cmd
+
+
+def test_a_program_imports_the_modules_beside_it_as_it_would_alone(tmp_path):
+    (tmp_path / "beside.py").write_text("VALUE = 1\n")
+    program = tmp_path / "program.py"
+    program.write_text("import beside\n" + PROGRAM.format(setup="assert beside.VALUE == 1"))
+    assert len(peak_memory.measured([str(program)])) == len(jax.local_devices())
