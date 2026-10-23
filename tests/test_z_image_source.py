@@ -24,7 +24,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import assert_transformer_exports, extract_fixture, fixture_arrays, source_transformer
+from interop_support import (
+    assert_transformer_exports,
+    drawn_prompts,
+    extract_fixture,
+    fixture_arrays,
+    source_transformer,
+)
 from reference_error import assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.diffusion.process import DenoisingCondition
@@ -199,9 +205,6 @@ def streamed(source):
 PIPELINE_SEEDS = {"prompts": 8, "walk": 8}
 """Check 1's declared seeds for the pipeline's prompt encoding and its walk, sized by `seeds_for` on
 armada."""
-WORDS = ("a", "red", "cat", "on", "mat", "tiny", "photo", "of", "the", "blue", "sea", "under", "light")
-
-
 def source_pipelines(source):
     """Diffusers' own `ZImagePipeline` the fixture saved, loaded in float32 and widened to float64,
     the scheduler's tables and float32 pins widened with it (`float64_scheduler`)."""
@@ -243,9 +246,7 @@ def test_prompt_encoding_matches_the_source_pipeline(pipeline, source, record):
     narrow, wide = source_pipelines(source)
 
     def prompts_of(seed) -> tuple[str, ...]:
-        """Two prompts of one to eight words drawn from `seed`, and the empty one."""
-        rng = np.random.default_rng([7, int(seed)])
-        return (*(" ".join(rng.choice(WORDS, size=rng.integers(1, 9))) for _ in range(2)), "")
+        return (*drawn_prompts(7, seed), "")
 
     def draw(seed):
         # The arms draw their prompts from the seed, a leaf the gate widens as it is.

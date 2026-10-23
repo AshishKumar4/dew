@@ -67,10 +67,9 @@ def pulled(fn, count: int = 2, *, has_aux: bool = False):
     def run(*arguments):
         *arguments, cotangent = arguments
         held = arguments[count:]
-        if not has_aux:
-            return with_gradients(lambda *taken: fn(*taken, *held))(*arguments[:count], cotangent)
-        differentiated = with_gradients(lambda *taken: fn(*taken, *held)[0])(*arguments[:count], cotangent)
-        return differentiated, fn(*arguments)[1]
+        pulled_back = with_gradients(lambda *taken: fn(*taken, *held), has_aux=has_aux)(
+            *arguments[:count], cotangent)
+        return (pulled_back[:-1], pulled_back[-1]) if has_aux else pulled_back
     return run
 
 

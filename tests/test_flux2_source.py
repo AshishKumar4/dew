@@ -23,7 +23,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import tool_support
-from interop_support import assert_transformer_exports, extract_fixture, fixture_arrays, source_transformer
+from interop_support import (
+    assert_transformer_exports,
+    drawn_prompts,
+    extract_fixture,
+    fixture_arrays,
+    source_transformer,
+)
 from reference_error import assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.diffusion.process import DenoisingCondition
@@ -259,10 +265,11 @@ def test_the_autoencoder_folds_and_normalizes_as_the_pipeline_does(source, array
 @pytest.mark.network
 def test_the_published_autoencoder_matches_the_source(monkeypatch):
     """FLUX.2's VAE as `FLUX.2-klein-4B` publishes it (the one FLUX.2 [dev]
-    ships), downloaded, on a smooth 128x192 image, against the source run in
-    float32 and float64 (`flux2_published.npz`): the pipeline's folded,
-    normalized latent and a corner of its decode, each as near float64 as the
-    source's float32."""
+    ships), downloaded, against the source loaded beside it in float32 and
+    float64: over drawn noisy versions of a smooth 128x192 image, codes and
+    cotangents, the pipeline's folded, normalized latent, its whole decode and
+    both their input gradients on par with the source's float32 (check 1,
+    `autoencoder_check`)."""
     import copy
 
     from diffusers import AutoencoderKLFlux2
@@ -302,9 +309,6 @@ def klein(source):
 PIPELINE_SEEDS = {"prompts": 8, "walk": 8, "mistral3": 8}
 """Check 1's declared seeds for the pipeline's prompt encoding, its walk and FLUX.2 [dev]'s Mistral-3
 encoding, sized by `seeds_for` on armada."""
-WORDS = ("a", "red", "cat", "on", "mat", "tiny", "photo", "of", "the", "blue", "sea", "under", "light")
-
-
 def klein_pipelines(source):
     """Diffusers' own `Flux2KleinPipeline` the fixture saved, in float32 and widened to float64."""
     import copy
@@ -344,9 +348,7 @@ def test_klein_prompt_encoding_matches_the_source_pipeline(klein, source, record
     assert condition.guidance is None
 
     def prompts_of(seed) -> tuple[str, ...]:
-        """Two prompts of one to eight words drawn from `seed`, and the empty one."""
-        rng = np.random.default_rng([11, int(seed)])
-        return (*(" ".join(rng.choice(WORDS, size=rng.integers(1, 9))) for _ in range(2)), "")
+        return (*drawn_prompts(11, seed), "")
 
     def source_encoded(pipe, prompts):
         with torch.no_grad():
@@ -435,9 +437,7 @@ def test_a_mistral3_encoder_reads_as_flux2_dev_reads_it(source, record):
     tokenizer = AutoTokenizer.from_pretrained(directory / "tokenizer")
 
     def prompts_of(seed) -> tuple[str, ...]:
-        """Two prompts of one to eight words drawn from `seed`."""
-        rng = np.random.default_rng([13, int(seed)])
-        return tuple(" ".join(rng.choice(WORDS, size=rng.integers(1, 9))) for _ in range(2))
+        return drawn_prompts(13, seed)
 
     def source_encoded(model, prompts, dtype):
         with torch.no_grad():
