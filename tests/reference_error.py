@@ -972,8 +972,15 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     that shares its upstream rounding, the same inputs through the same upstream arithmetic, has errors
     whose sizes vary across draws together: their ratio resolves where each alone, heavy-tailed across
     draws, does not, and the verdict judges that same paired ratio. The width asked of it is PARITY
-    either way. Fails past `most`, where the site needs larger inputs or fewer shared factors, not more
-    seeds."""
+    either way. Paired sizing holds out its draws only where `draw` keys an independent stream by the
+    whole seed: a draw that enumerates finitely or by a modulus (`(arange(n) + seed) % vocab`) repeats a
+    verdict's inputs at SIZING_FROM and needs a pilot stream of its own first, and a recorded reference
+    (`indexed_recording`), which holds its recorded seeds alone, is refused: its site keeps its
+    recorded count. Fails past `most`, where the site needs larger inputs or fewer shared factors, not
+    more seeds."""
+    if dew_fn is not None and getattr(reference_fn, "recorded", False):
+        raise ValueError(f"{label}: a recorded reference holds its recorded seeds alone, never a paired "
+                         f"sizing's from SIZING_FROM; its site keeps its recorded count")
     count = max(start, FEWEST_SEEDS)
     while count <= most:
         if dew_fn is None:

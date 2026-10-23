@@ -7,13 +7,13 @@ import pytest
 from reference_error import assert_as_exact, seeds_for
 
 
-def _draw(seed):
-    """Sums' terms scaled per draw by a heavy-tailed factor (a Pareto of index one, plus one), the
-    null runs' heavy-sums class's law (tools/gate_null_runs.py) at a smaller size."""
+@pytest.fixture(scope="module")
+def heavy():
+    """Sums' terms scaled per draw by a heavy-tailed factor (a Pareto of index one, plus one), the null
+    runs' heavy-sums class's draw (tools/gate_null_runs.py) at a smaller size, loaded once."""
     from tool_support import load
 
-    _, heavy, _, _ = load("gate_null_runs").heavy_sums(rows=32, terms=128)
-    return heavy(seed)
+    return load("gate_null_runs").heavy_sums(rows=32, terms=128)[1]
 
 
 def _summed(order):
@@ -28,26 +28,39 @@ def _truth(x):
     return {"sum": np.sum(np.asarray(x, np.float64), axis=1)}
 
 
-def test_a_shared_heavy_tail_resolves_paired_and_not_against_itself():
+def test_a_shared_heavy_tail_resolves_paired_and_not_against_itself(heavy):
     reference, twin = _summed(0), _summed(1)
-    seeds = seeds_for(reference, _draw, "heavy sums", truth_fn=_truth, dew_fn=twin)
+    seeds = seeds_for(reference, heavy, "heavy sums", truth_fn=_truth, dew_fn=twin)
     with pytest.raises(AssertionError) as raised:
-        seeds_for(reference, _draw, "heavy sums", truth_fn=_truth, most=seeds)
+        seeds_for(reference, heavy, "heavy sums", truth_fn=_truth, most=seeds)
     assert raised.type is AssertionError
-    assert_as_exact(twin, reference, _draw, "heavy sums", seeds=seeds, truth_fn=_truth)
+    assert_as_exact(twin, reference, heavy, "heavy sums", seeds=seeds, truth_fn=_truth)
 
 
-def test_a_fault_fails_at_the_paired_count():
+def test_a_fault_fails_at_the_paired_count(heavy):
     """A sum in float32 whose every term is first rounded to bfloat16's precision fails at the count the
     equally exact pair declares."""
     import ml_dtypes
 
     reference, twin = _summed(0), _summed(1)
-    seeds = seeds_for(reference, _draw, "heavy sums", truth_fn=_truth, dew_fn=twin)
+    seeds = seeds_for(reference, heavy, "heavy sums", truth_fn=_truth, dew_fn=twin)
 
     def coarse(x):
         return twin(np.asarray(x).astype(ml_dtypes.bfloat16).astype(np.float32))
 
     with pytest.raises(AssertionError) as raised:
-        assert_as_exact(coarse, reference, _draw, "heavy sums", seeds=seeds, truth_fn=_truth)
+        assert_as_exact(coarse, reference, heavy, "heavy sums", seeds=seeds, truth_fn=_truth)
     assert raised.type is AssertionError
+
+
+def test_a_recorded_reference_is_refused_a_paired_sizing(heavy):
+    """A recorded reference holds its recorded seeds alone (`indexed_recording` marks it `recorded`),
+    so a paired sizing, whose draws start at SIZING_FROM, refuses it."""
+    reference = _summed(0)
+
+    def recorded(x):
+        return reference(x)
+    recorded.recorded = True
+
+    with pytest.raises(ValueError):
+        seeds_for(recorded, heavy, "recorded sums", truth_fn=_truth, dew_fn=_summed(1))
