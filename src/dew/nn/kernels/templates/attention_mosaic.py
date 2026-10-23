@@ -296,8 +296,11 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, *
             whole = program.whole(first, walked)
             q_pos, columns = first + mosaic_sm90.iota(shape, 0), mosaic_sm90.iota(shape, 1)
             nothing = mosaic_sm90.zeros((block_q,))
-            # The row sums carried; dQ and the keyed sums accumulate in place (`mosaic_sm90.accumulating`).
-            start = algebra.DqSums(None, nothing, nothing, (), (), None, nothing, nothing + algebra.NO_SHIFT)
+            # The row sums carried, dQ's and the keyed sums' places empty: they accumulate in place
+            # (`mosaic_sm90.accumulating`).
+            empty = jnp.zeros((), jnp.float32)
+            start = algebra.DqSums(empty, nothing, nothing, (), (), empty, nothing,
+                                   nothing + algebra.NO_SHIFT)
             parts = staged.at[wg]
 
             def step(index, sums, dq_acc, keyed_acc):
@@ -468,7 +471,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
                                                  columns == algebra.expand(chosen, columns),
                                                  algebra.inverse(denominator))
                 pulled, _ = algebra.pulled(cotangents, slopes, seen, ())
-                narrowed, _ = algebra.value_operands(exponentials, weights, do_slot, denominator)
+                narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype)
                 cotangent_parts = algebra.cotangent_parts(pulled * scale, q_slot.dtype, accurate=accurate)
                 buffers = staged.at[wg]
                 # Each staged part's transpose the left operand (`algebra.cotangent_product`'s `aᵀ @ b`).
@@ -545,14 +548,13 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
         raise NotImplementedError(f"the sm90 backward takes full and causal calls, not {spans.form!r} ones")
     if jnp.dtype(query.dtype) != jnp.dtype(jnp.bfloat16):
         raise NotImplementedError(f"the sm90 backward takes bf16 operands, not {jnp.dtype(query.dtype)}")
-    width = query.shape[3]
-    scale = width ** -0.5 if scale is None else scale
-    how = algebra.recompute(algebra.Forward("full", 0, ids=False, scale=scale, natural=natural))
+    factor = query.shape[3] ** -0.5 if scale is None else scale
+    how = algebra.recompute(algebra.Forward("full", 0, ids=False, scale=factor, natural=natural))
     launch = functools.partial(_launch_backward, how=how, causal=spans.form == "causal",
                                keys_count=spans.keys, accurate=accurate, tiles=tiles, consumers=consumers,
                                interpret=interpret)
     block = max(consumers * tiles.block_q, consumers * tiles.block_k)
-    return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=block, scale=scale)
+    return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=block, scale=factor)
 
 
 def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maximum, key_index, anchor_value,
@@ -564,22 +566,23 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     finish (`algebra.dq_finish`) and the dK/dV program under its refined D, each query's anchor key as the
     first pass chose it."""
     del start, end, query_ids, key_ids, score_params, score_mod, score_kinds, score_dtypes
-    width = query.shape[-1]
-    # The family's swizzled tiles hold whole rows of `FAMILY.rows` 16-bit entries.
-    padded = [jnp.pad(array, ((0, 0),) * 3 + ((0, -array.shape[3] % FAMILY.rows),))
-              for array in (query, key, value, dout)]
-    _, state_total = algebra.off_anchor_start(peak0, total0, maximum, value.shape[-1], shift)
+    width, value_width = query.shape[-1], value.shape[-1]
+    _, state_total = algebra.off_anchor_start(peak0, total0, maximum, value_width, shift)
     cotangent = jnp.swapaxes(dout, 1, 2).astype(jnp.float32)
     anchor, delta, chosen = algebra.split_delta(others, own, others_total, forward_total, state_total,
                                                 jnp.swapaxes(anchor_value, 1, 2), cotangent, key_index, shift)
+    # The family's swizzled tiles hold whole rows of `FAMILY.rows` 16-bit entries.
+    query, key, value, dout = (jnp.pad(array, ((0, 0),) * 3 + ((0, -array.shape[3] % FAMILY.rows),))
+                               for array in (query, key, value, dout))
     shared = {"how": how, "scale": scale, "causal": causal, "keys_count": keys_count, "tiles": tiles,
               "accurate": accurate, "consumers": consumers, "interpret": interpret}
-    dq_sum, keyed, rows = _dq_launch(*padded, maximum, forward_total, anchor, delta, chosen, **shared)
+    dq_sum, keyed, rows = _dq_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
+                                     **shared)
     sums = algebra.DqSums(jnp.swapaxes(dq_sum, 1, 2), rows[0], rows[1], (), (), jnp.swapaxes(keyed, 1, 2),
                           rows[2], rows[3])
     dq, refined, denominator, mass, _ = algebra.dq_finish(sums, forward_total, state_total, peak0,
                                                           (total0, initial_term), maximum, anchor, delta,
                                                           accurate=accurate)
-    dk, dv = _dkv_launch(*padded, maximum, denominator, anchor, refined, chosen, **shared)
+    dk, dv = _dkv_launch(query, key, value, dout, maximum, denominator, anchor, refined, chosen, **shared)
     return (jnp.swapaxes(dq, 1, 2)[..., :width], refined, anchor, maximum, denominator, mass, chosen,
-            dk[..., :width], dv[..., :value.shape[-1]])
+            dk[..., :width], dv[..., :value_width])

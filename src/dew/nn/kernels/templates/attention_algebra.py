@@ -1401,11 +1401,14 @@ def summed_products(parts: tuple[tuple[jax.Array, jax.Array | None], ...], opera
                     dot: Callable[[jax.Array, jax.Array], jax.Array]) -> jax.Array:
     """The sum of `parts`' products with `operand` by `dot` (`cotangent_parts`, `weights_parts`), each taken
     back by its power of two, in order."""
-    total = None
-    for part, exponent in parts:
+    def taken(part: jax.Array, exponent: jax.Array | None) -> jax.Array:
         product = dot(part, operand)
-        product = product if exponent is None else power2(product, exponent)
-        total = product if total is None else total + product
+        return product if exponent is None else power2(product, exponent)
+
+    (first, first_exponent), *rest = parts
+    total = taken(first, first_exponent)
+    for part, exponent in rest:
+        total = total + taken(part, exponent)
     return total
 
 
@@ -1435,6 +1438,14 @@ def value_operands(exponentials: jax.Array, weights: jax.Array, dout: jax.Array,
     query's cotangents that cancel across a key still cancel, and a normalized weight below bf16's least
     subnormal (about 9e-41) is dropped, which only a cotangent past about 1e28 would make count."""
     if dout.dtype == jnp.bfloat16:
-        return weights.astype(dout.dtype), dout
+        return value_weights(exponentials, weights, dout.dtype), dout
     scaled = dout.astype(jnp.float32) * expand(inverse(total), dout)
-    return exponentials.astype(dout.dtype).astype(jnp.float32), scaled
+    return value_weights(exponentials, weights, dout.dtype), scaled
+
+
+def value_weights(exponentials: jax.Array, weights: jax.Array, dtype) -> jax.Array:
+    """`value_operands`' left operand for an output cotangent of `dtype`: bf16's normalized weights narrowed,
+    else the unnormalized ones narrowed to `dtype` and held in fp32."""
+    if dtype == jnp.bfloat16:
+        return weights.astype(dtype)
+    return exponentials.astype(dtype).astype(jnp.float32)
