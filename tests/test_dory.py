@@ -298,16 +298,18 @@ def test_a_float64_model_computes_in_float64():
     included: each within float64's rounding of the torch reference's own float64 run, an
     independent implementation of the same tensors (`assert_computes_the_oracle`), where one fp32
     rounding point on the path would sit many orders further."""
+    loaded = load()
+    tensors = {key: np.array(value, copy=True) for key, value in loaded.export().items()}
     with jax.enable_x64(new_val=True):
-        loaded = Pretrained.load(TINY, dtype='float64', param_dtype='float64', attention_impl='xla')
-        tensors = {key: np.array(value, copy=True) for key, value in loaded.export().items()}
+        model = loaded.model.clone(dtype=jnp.float64)
+        variables = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), loaded.variables)
         ids, cotangent = REFERENCE['input_ids'], REFERENCE['cotangent'].astype(np.float64)
 
         def loss(params):
-            return jnp.sum(loaded.model.apply({**loaded.variables, 'params': params}, ids) * cotangent)
+            return jnp.sum(model.apply({**variables, 'params': params}, ids) * cotangent)
 
-        logits = np.asarray(loaded.model.apply(loaded.variables, ids))
-        written = loaded.export({'params': jax.grad(loss)(loaded.variables['params'])})
+        logits = np.asarray(model.apply(variables, ids))
+        written = loaded.export({'params': jax.grad(loss)(variables['params'])})
     reference = TOOL.DoryReference(loaded.config, tensors, TOOL.torch.float64)
     expected = reference.forward(ids)
     gradients = reference.gradients(np.array(ids), np.array(cotangent), TOOL.GRADIENTS)
