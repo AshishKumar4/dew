@@ -2023,6 +2023,20 @@ def projected_output(attended, name: str, features: int, *, flat: bool, bias: bo
                         name=name, dot_general=float32_dot_general)(attended)
 
 
+@dataclasses.dataclass(frozen=True)
+class QKNorm:
+    """How an attention RMS-normalizes its queries and keys: the norms' module `names`, their
+    `epsilon`, whether over each head's channels or, `across_heads`, each token's whole projection
+    before it splits (Wan's `rms_norm_across_heads`: another function, not another order), and
+    whether the normalized row rounds to the weight's dtype before it scales (`scale_after_cast`,
+    diffusers' `RMSNorm`)."""
+
+    names: tuple[str, str] = ("q_norm", "k_norm")
+    epsilon: float = 1e-6
+    across_heads: bool = False
+    scale_after_cast: bool = False
+
+
 @logical_axes({
     ("to_q",): ("embed", "heads", "head_dim"),
     ("to_k",): ("embed", "heads", "head_dim"),
@@ -2037,6 +2051,13 @@ class NormalAttention(nn.Module):
     `use_bias` is the projections' bias; `qkv_bias`, when given, the
     query, key and value projections' alone, as timm's ViT attention
     (U-ViT's) has them without one and its output projection with one.
+    `flat` stores each projection as the published attentions do,
+    `[C, heads * head_dim]`, rather than Dew's headed `[C, heads, head_dim]`
+    (`projected_heads`), under `names` (query, key, value, output): Wan's
+    are the defaults, the AutoencoderKL mid-block's `query/key/value/
+    proj_attn`. `qk_norm` normalizes the queries and keys (`QKNorm`), and
+    `rotary_pairs` names the channels each angle of `freqs_cis` turns
+    (`dew.nn.rope.rotate`).
     `mask`, boolean and broadcasting to `[B, H, S, S_context]`, keeps the keys
     each query may read. `key_value_seq_lengths` `[B]` ends each row's keys
     instead, for a right-padded context, which a fused kernel skips rather
@@ -2053,15 +2074,19 @@ class NormalAttention(nn.Module):
     use_bias: bool = True
     qkv_bias: bool | None = None
     force_fp32_for_softmax: bool = True
-    qk_norm: bool = False  # RMSNorm on q/k per head (SD3-style bf16 logit safety)
+    qk_norm: QKNorm | None = None
     attention_impl: str = "auto"  # an AttentionImpl
+    flat: bool = False
+    names: tuple[str, str, str, str] = ("to_q", "to_k", "to_v", "to_out_0")
+    rotary_pairs: Literal["half", "adjacent"] = "half"
 
     @nn.nowrap
     def projections(self, context_features: int | None = None) -> dict[str, tuple[int, int]]:
         inner = self.heads * self.dim_head
         context = self.query_dim if context_features is None else context_features
-        return {'to_q': (self.query_dim, inner), 'to_k': (context, inner), 'to_v': (context, inner),
-                'to_out_0': (inner, self.query_dim)}
+        query, key, value, output = self.names
+        return {query: (self.query_dim, inner), key: (context, inner), value: (context, inner),
+                output: (inner, self.query_dim)}
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
@@ -2072,16 +2097,19 @@ class NormalAttention(nn.Module):
     def cross_flops(self, lengths, context_lengths, context_features: int) -> float:
         """Cross-attention with the context geometry supplied by its owner."""
         maps = self.projections(context_features)
-        return (sum(projection_flops(lengths, *maps[name]) for name in ('to_q', 'to_out_0'))
-                + sum(projection_flops(context_lengths, *maps[name]) for name in ('to_k', 'to_v'))
+        query, key, value, output = self.names
+        return (sum(projection_flops(lengths, *maps[name]) for name in (query, output))
+                + sum(projection_flops(context_lengths, *maps[name]) for name in (key, value))
                 + cross_attention_flops(lengths, context_lengths, self.heads, self.dim_head, self.dim_head))
 
     def _heads(self, name: str, x, norm: str | None = None):
+        normed = self.qk_norm if norm is not None else None
+        rms = None if normed is None else RMSNorm(
+            epsilon=normed.epsilon, scale_after_cast=normed.scale_after_cast, dtype=self.dtype, name=norm)
         projected = projected_heads(
-            x, name, self.heads, self.dim_head, flat=False,
+            x, name, self.heads, self.dim_head, flat=self.flat,
             bias=self.use_bias if self.qkv_bias is None else self.qkv_bias, dtype=self.dtype,
-            precision=self.precision,
-            norm=RMSNorm(epsilon=1e-6, dtype=self.dtype, name=norm) if norm and self.qk_norm else None)
+            precision=self.precision, across_heads=normed is not None and normed.across_heads, norm=rms)
         return constrain(projected, HEADS)
 
     @nn.compact
@@ -2097,14 +2125,14 @@ class NormalAttention(nn.Module):
         # [B, S, heads, head_dim], column-parallel under a tensor axis; a
         # context's positions split over a sequence axis where its link pays
         # for it (`split_positions`).
-        query = self._heads("to_q", x, "q_norm")
+        q_name, k_name, v_name, out_name = self.names
+        q_norm, k_norm = self.qk_norm.names if self.qk_norm is not None else (None, None)
+        query = self._heads(q_name, x, q_norm)
         key, value = split_positions(context, (self.heads, self.dim_head),
-                                     lambda tokens: (self._heads("to_k", tokens, "k_norm"),
-                                                     self._heads("to_v", tokens)))
+                                     lambda tokens: (self._heads(k_name, tokens, k_norm),
+                                                     self._heads(v_name, tokens)))
         if freqs_cis is not None:
-            freqs_cos, freqs_sin = freqs_cis
-            query = rotate(query, freqs_cos, freqs_sin)
-            key = rotate(key, freqs_cos, freqs_sin)
+            query, key = (rotate(part, *freqs_cis, pairs=self.rotary_pairs) for part in (query, key))
 
         hidden_states = scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,
@@ -2112,7 +2140,7 @@ class NormalAttention(nn.Module):
             implementation=self.attention_impl, mask=mask, key_value_seq_lengths=key_value_seq_lengths,
             segment_ids=segment_ids, key_segment_ids=key_segment_ids, max_segments=max_segments,
         )
-        proj = projected_output(constrain(hidden_states, HEADS), "to_out_0", self.query_dim, flat=False,
+        proj = projected_output(constrain(hidden_states, HEADS), out_name, self.query_dim, flat=self.flat,
                                 bias=self.use_bias, dtype=self.dtype, precision=self.precision)
         return proj.reshape(orig_x_shape)
 
