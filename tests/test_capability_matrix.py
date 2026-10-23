@@ -447,9 +447,11 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
     its step, and evaluation scores `evaluated` (the batch by default) to
     finite artifacts, or, for an objective that scores no tokens (`scores`
     False), to none; a second evaluation runs the programs the first
-    compiled, tracing nothing. `data` replaces the batch stream with the method's own;
-    a method that trains on what its `rollout` samples from the batch, not
-    on the batch (`sampled` False), has no sample field to check.
+    compiled, tracing nothing. The run resumes from its checkpoint onto the
+    run that never stopped (`assert_resumes`). `data` replaces the batch stream
+    with the method's own; a method that trains on what its `rollout` samples
+    from the batch, not on the batch (`sampled` False), has no sample field to
+    check.
     """
     if objective.inputs is not None and sampled:
         objective.inputs.check(batch)
@@ -483,7 +485,38 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
     assert (artifact is not None and finite(artifact)) if scores else artifact is None, artifact
     with steady_state(allow=("host_to_device", "device_to_host")):
         objective.evaluate(variables, batch if evaluated is None else evaluated, trained.step)
+    assert_resumes(objective, data, directory, rollout)
     return trained
+
+
+def assert_resumes(objective, data, directory: Path, rollout) -> None:
+    """A new trainer resumed from the run's first checkpoint ends its second step on every leaf of
+    a run of two steps that never stopped, bit for bit, keys as their raw bits, and its step reads
+    the restored state as that run's read its fresh one: the same avals, shardings and formats, so
+    it runs the program the persistent cache holds for the step. It resumes from a copy of the
+    checkpoint's directory, so the checkpoint the cell reloads stays the first step's."""
+    copied = directory.with_name(f"{directory.name}-resumed")
+    shutil.copytree(directory, copied)
+    resumed = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=Checkpoints(str(copied)),
+                      rollout=rollout)
+    after = resumed.fit(data, steps=2, log_every=1, checkpoint_final=False)
+    whole = Trainer(objective, optax.adam(1e-3), key=0, rollout=rollout)
+    uninterrupted = whole.fit(data, steps=2, log_every=1)
+    assert int(after.step) == int(uninterrupted.step) == 2
+
+    def bits(tree):
+        return [(jax.tree_util.keystr(path), np.asarray(jax.random.key_data(leaf)
+                 if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf))
+                for path, leaf in jax.tree_util.tree_leaves_with_path(tree)]
+
+    assert jax.tree.structure(after) == jax.tree.structure(uninterrupted)
+    for (path, got), (_, want) in zip(bits(after), bits(uninterrupted), strict=True):
+        assert got.dtype == want.dtype, path
+        np.testing.assert_array_equal(got, want, err_msg=path)
+    read, fresh = resumed.executable, whole.executable
+    assert read.in_avals == fresh.in_avals
+    assert read.input_shardings == fresh.input_shardings
+    assert read.input_formats == fresh.input_formats
 
 
 def token_batch(width: int, seed: int = 0) -> np.ndarray:
