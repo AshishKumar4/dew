@@ -188,38 +188,34 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
 def _paired(lhs, rhs, paired, group_sizes, *, epilogue, dtypes: tuple, several: bool, compute, straight: bool,
             plain: dict):
     """`gemm` of a paired product on grouped operands: each output tile `epilogue(acc, paired_acc)` of one
-    `lhs` tile's two products. Its reverse mode is one paired launch that recomputes both accumulators and
-    whose epilogue is `epilogue`'s VJP of the outputs' cotangents (side tiles), giving each accumulator's
-    cotangent rounded once to `compute`, as the two unfused projections' outputs' cotangents are, so each
-    matrix's products of it run on the kernels as theirs did; the activation's backward reads and writes
-    nothing of its own. The gate holds the product as exact as the unfused program it replaces (two
-    projections rounded to `compute`, then the activation), forward and reverse."""
+    `lhs` tile's two products. The launch also writes the two accumulators rounded to `compute`, the two
+    unfused projections' outputs, which its reverse mode reads as theirs did (`_PairedSaved`): the
+    epilogue's VJP there, in XLA, gives each accumulator's cotangent, then each matrix's products of it
+    run on the kernels. Nothing is read back between the products and the epilogue. The gate holds the
+    product as exact as the unfused program it replaces (two projections rounded to `compute`, then the
+    activation), forward and reverse."""
     transpose_rhs, interpret_on_cpu, precision, dense = (plain[key] for key in
                                                           ('transpose_rhs', 'interpret_on_cpu', 'precision',
                                                            'dense'))
-
-    def value(lhs, rhs, paired, group_sizes):
-        return _gemm(lhs.astype(compute), rhs, group_sizes, None, (), (), epilogue, (), (), dtypes,
-                     several=several, paired=paired, **plain)
+    count = len(dtypes)
 
     def portable(lhs, rhs, paired, group_sizes):
         return _portable_gemm(lhs if straight else lhs.astype(compute), rhs, group_sizes, None, (), epilogue,
                               (), dtypes, several, transpose_rhs, precision, compute if straight else None,
                               paired=paired)
 
-    def forward(*operands):
-        return value(*operands), ()
+    def forward(lhs, rhs, paired, group_sizes):
+        outs = _gemm(lhs.astype(compute), rhs, group_sizes, None, (), (), _PairedSaved(epilogue), (), (),
+                     (*dtypes, compute, compute), several=True, paired=paired, **plain)
+        return (outs[:count] if several else outs[0]), outs[count:]
 
     def backward(saved, operands, cotangent):
-        del saved
         lhs, rhs, paired, group_sizes = operands
-        cotangents = cotangent if several else (cotangent,)
-
         work = jnp.promote_types(compute, jnp.float32)
-        d_accs = _gemm(lhs.astype(compute), rhs, group_sizes, None, (), (), _PairedPullback(epilogue),
-                       cotangents,
-                       (('rows', 'columns'),) * len(cotangents), (compute, compute), several=True,
-                       paired=paired, **plain)
+        outs, pull = jax.vjp(lambda *accs: _tupled(epilogue, *accs), *(acc.astype(work) for acc in saved))
+        cotangents = cotangent if several else (cotangent,)
+        d_accs = tuple(d_acc.astype(compute) for d_acc in pull(
+            tuple(c.astype(out.dtype) for c, out in zip(cotangents, outs, strict=True))))
         matrices = (rhs, paired)
         transposed = {'transpose_rhs': not transpose_rhs, 'interpret_on_cpu': interpret_on_cpu,
                       'precision': precision, 'dense': dense}
@@ -240,16 +236,15 @@ def _paired(lhs, rhs, paired, group_sizes, *, epilogue, dtypes: tuple, several: 
     differentiable = generation.linear_tangent(forward, backward, portable)
     return differentiable(lhs, rhs, paired, group_sizes)
 
+
 @dataclasses.dataclass(frozen=True)
-class _PairedPullback:
-    """A paired product's backward epilogue: `epilogue`'s VJP at the two accumulators of the outputs'
-    cotangents (side tiles), each accumulator's cotangent. A value, so a launch's stored picks name it
-    (`tuning`), as they name `epilogue`."""
+class _PairedSaved:
+    """A paired product's epilogue with its two accumulators beside its outputs, which its reverse mode
+    reads. A value, so a launch's stored picks name it (`tuning`), as they name `epilogue`."""
     epilogue: Callable
 
-    def __call__(self, acc, paired_acc, *cotangents):
-        outs, pull = jax.vjp(lambda *accs: _tupled(self.epilogue, *accs), acc, paired_acc)
-        return pull(tuple(c.astype(out.dtype) for c, out in zip(cotangents, outs, strict=True)))
+    def __call__(self, acc, paired_acc):
+        return (*_tupled(self.epilogue, acc, paired_acc), acc, paired_acc)
 
 
 def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
