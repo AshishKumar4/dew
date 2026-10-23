@@ -399,49 +399,6 @@ def read_rope_theta(entry: Mapping[str, object] | None, field: str) -> float | N
     return rope.theta
 
 
-def partial_rope(hf_config: Mapping[str, object], *, default_factor: float, default_theta: float = 10000.0,
-                 factor_field: str = 'partial_rotary_factor',
-                 theta_field: str = 'rope_theta') -> tuple[float, float, Mapping[str, object]]:
-    """(rope_theta, partial_rotary_factor, the rest of the rotary's entry) of a config: the
-    `rope_parameters` entry's values, else the flat fields under the family's spellings (GPT-NeoX's
-    `rotary_emb_base` and `rotary_pct`), else the defaults. The rest is the entry without its
-    factor, which a family whose rotary may scale hands `base_config`'s rope reader."""
-    entry = records.record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
-    theta = records.number(entry.get('rope_theta', hf_config.get(theta_field, default_theta)), theta_field)
-    factor = records.number(entry.get('partial_rotary_factor', hf_config.get(factor_field, default_factor)),
-                            factor_field)
-    return theta, factor, {key: value for key, value in entry.items() if key != 'partial_rotary_factor'}
-
-
-def plain_partial_rope(hf_config: Mapping[str, object], *, default_factor: float, reference: str,
-                       layout: tuple[str, ...] = (), default_theta: float = 10000.0) -> tuple[float, float]:
-    """(rope_theta, partial_rotary_factor) of a config whose rotary is plain (`partial_rope`), with
-    `layout` the entry's fields that place the rotated pairs. A scaled type or any other field
-    refuses, naming `reference`'s rotary."""
-    theta, factor, rest = partial_rope(hf_config, default_factor=default_factor, default_theta=default_theta)
-    rope_type = rest.get('rope_type', rest.get('type', 'default'))
-    if rope_type not in ('default', 'none'):
-        refuse(f"rope_parameters (rope_type {rope_type!r})", f"{reference} is the plain rotary")
-    scaling = sorted(set(rest) - {'rope_type', 'type', 'rope_theta', *layout})
-    if scaling:
-        refuse(f"rope_parameters scaling fields {scaling}", f"{reference} is the plain rotary")
-    return theta, factor
-
-
-@dataclass(frozen=True)
-class Ropes:
-    """Holds what the shared rope readers hand a family: the model's base and
-    ramp, and the sliding kind's own where a config states one.
-    `full_only` marks a nested config whose sliding entry names no ramp
-    while the full one does, so the ramp is the full kind's alone."""
-
-    theta: float
-    scaling: Ramp | None = None
-    local_theta: float | None = None
-    local_scaling: Ramp | None = None
-    full_only: bool = False
-
-
 @dataclass(frozen=True)
 class RopeSpelling:
     """How a family's config class turns the stored rope fields into its
@@ -466,6 +423,50 @@ class RopeSpelling:
 
 PLAIN_SPELLING = RopeSpelling()
 """The mixin's own spelling, which most config classes keep: one record, at 10000 when unnamed."""
+
+
+def partial_rope(hf_config: Mapping[str, object], spelling: RopeSpelling, *, default_factor: float,
+                 factor_field: str = 'partial_rotary_factor',
+                 theta_field: str = 'rope_theta') -> tuple[float, float, Mapping[str, object]]:
+    """(rope_theta, partial_rotary_factor, the rest of the rotary's entry) of a config: the
+    `rope_parameters` entry's values, else the flat fields under the family's spellings (GPT-NeoX's
+    `rotary_emb_base` and `rotary_pct`), else the config class's defaults: its `spelling`'s base, as
+    `rope_records` reads it, and `default_factor`. The rest is the entry without its factor, which a
+    family whose rotary may scale hands `base_config`'s rope reader."""
+    entry = records.record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
+    theta = records.number(entry.get('rope_theta', hf_config.get(theta_field, spelling.theta)), theta_field)
+    factor = records.number(entry.get('partial_rotary_factor', hf_config.get(factor_field, default_factor)),
+                            factor_field)
+    return theta, factor, {key: value for key, value in entry.items() if key != 'partial_rotary_factor'}
+
+
+def plain_partial_rope(hf_config: Mapping[str, object], spelling: RopeSpelling, *, default_factor: float,
+                       reference: str, layout: tuple[str, ...] = ()) -> tuple[float, float]:
+    """(rope_theta, partial_rotary_factor) of a config whose rotary is plain (`partial_rope`), with
+    `layout` the entry's fields that place the rotated pairs. A scaled type or any other field
+    refuses, naming `reference`'s rotary."""
+    theta, factor, rest = partial_rope(hf_config, spelling, default_factor=default_factor)
+    rope_type = rest.get('rope_type', rest.get('type', 'default'))
+    if rope_type not in ('default', 'none'):
+        refuse(f"rope_parameters (rope_type {rope_type!r})", f"{reference} is the plain rotary")
+    scaling = sorted(set(rest) - {'rope_type', 'type', 'rope_theta', *layout})
+    if scaling:
+        refuse(f"rope_parameters scaling fields {scaling}", f"{reference} is the plain rotary")
+    return theta, factor
+
+
+@dataclass(frozen=True)
+class Ropes:
+    """Holds what the shared rope readers hand a family: the model's base and
+    ramp, and the sliding kind's own where a config states one.
+    `full_only` marks a nested config whose sliding entry names no ramp
+    while the full one does, so the ramp is the full kind's alone."""
+
+    theta: float
+    scaling: Ramp | None = None
+    local_theta: float | None = None
+    local_scaling: Ramp | None = None
+    full_only: bool = False
 
 
 def rope_records(hf_config: Mapping[str, object], spelling: RopeSpelling

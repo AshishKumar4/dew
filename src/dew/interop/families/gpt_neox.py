@@ -8,6 +8,7 @@ import numpy as np
 from dew import records
 from dew.interop.decoder_parts import (
     MEGATRON_MLP,
+    PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
     Renames,
@@ -26,7 +27,7 @@ from dew.nn.rope import inverse_frequencies
 
 
 def _gpt_neox_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
-    theta, partial, rope = partial_rope(hf, default_factor=.25, factor_field='rotary_pct',
+    theta, partial, rope = partial_rope(hf, PLAIN_SPELLING, default_factor=.25, factor_field='rotary_pct',
                                         theta_field='rotary_emb_base')
     activation = records.text(hf.get('hidden_act', 'gelu'), 'hidden_act')
     mlp = ungated_mlp(activation, ('gelu', 'gelu_new', 'gelu_pytorch_tanh', 'relu'), 'hidden_act', 'GPT-NeoX')

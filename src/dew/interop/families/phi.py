@@ -5,6 +5,7 @@ from functools import partial
 
 from dew import records
 from dew.interop.decoder_parts import (
+    PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
     Renames,
@@ -21,7 +22,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
 def _phi_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
-    theta, partial, rope = partial_rope(hf, default_factor=.5)
+    theta, partial, rope = partial_rope(hf, PLAIN_SPELLING, default_factor=.5)
     activation = records.text(hf.get('hidden_act', 'gelu_new'), 'hidden_act')
     mlp = ungated_mlp(activation, ('gelu_new', 'gelu_pytorch_tanh', 'gelu', 'relu'), 'hidden_act', 'Phi')
     if hf.get('qk_layernorm', False):
