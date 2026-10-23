@@ -777,6 +777,22 @@ class TritonBackward(Template[BackwardTiles]):
         return _hook_program(name, value, self.score_kinds, self.score_dtypes, differentiated=True)
 
 
+def _backward_registers(ba: tokamax.BoundArguments, config: BackwardTiles, *, dq: bool) -> int:
+    """The fp32 words a thread of a backward launch's program holds live across its walk, the program's
+    spread over its threads: its gradient accumulators (dQ's `[block_q, D]`, or dK's and dV's) and three
+    `block_q` by `block_k` tiles of the walk (the logits' weights, dP and dS)."""
+    width, value_width = ba.arguments["query"].shape[-1], ba.arguments["value"].shape[-1]
+    tile = 3 * config.block_q * config.block_k
+    if dq:
+        return (config.block_q * width + tile) // (32 * config.dq_warps)
+    return (config.block_k * (width + value_width) + tile) // (32 * config.dkv_warps)
+
+
+def _backward_staged(ba: tokamax.BoundArguments, config: BackwardTiles) -> int:
+    """`TritonBackward.staged_bytes`, the larger launch's shared memory."""
+    return TritonBackward().staged_bytes(ba, config)
+
+
 def _launch_cost(ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget,
                  kinds: tuple[Kind, ...], *, dq: bool) -> float:
     """One backward launch's seconds: its programs, each staging the tiles it walks once a visit and
@@ -811,13 +827,20 @@ def _launch_cost(ba: tokamax.BoundArguments, config: BackwardTiles, target: gene
     if not dq and query.dtype == jnp.float16:
         # fp16's dV product runs in fp32 (`algebra.value_operands`), after the launch's 16-bit work.
         products, wide = products - value_width, value_width
+    warps, stages = (config.dq_warps, config.dq_stages) if dq else (config.dkv_warps, config.dkv_stages)
+    staged = float(tiles * walked * size)
     seconds = costs.seconds(costs.Cost(
         programs=programs,
         device_bytes=read + written,
         program_flops=tiles * 2.0 * config.block_q * config.block_k * products,
-        program_staged=float(tiles * walked * size),
+        program_staged=staged,
         program_exponentials=float(tiles * config.block_q * config.block_k * exponentials),
-        mode=_mode(query.dtype)), target)
+        mode=_mode(query.dtype), steps=tiles, stages=stages,
+        resident=costs.resident(target, _backward_staged(ba, config), 32 * warps,
+                                _backward_registers(ba, config, dq=dq)),
+        # Every program stages each tile it walks from the L2: a smaller tile of the other axis, more
+        # programs re-reading the same operands.
+        l2_bytes=programs * staged), target)
     if wide:
         seconds += costs.seconds(costs.Cost(
             programs=programs, device_bytes=0,
