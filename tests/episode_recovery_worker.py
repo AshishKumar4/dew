@@ -8,7 +8,7 @@ from pathlib import Path
 
 import jax
 import numpy as np
-from episode_support import build, scheduled
+from episode_support import build, episode_scheduler
 
 from dew.data.dataset import Loader
 from dew.objectives.rl import EpisodeJournal
@@ -26,7 +26,7 @@ def main() -> None:
     trainer, collector = build(
         environment, journal=EpisodeJournal(str(directory / "journal")), record=records.append
     )
-    trainer.rollout = scheduled(collector)
+    trainer.rollout = episode_scheduler(collector)
     data = Loader(
         train=lambda partition: itertools.repeat({"task_id": np.arange(jax.device_count(), dtype=np.int32)}),
         val=None,

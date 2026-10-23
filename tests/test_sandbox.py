@@ -21,7 +21,7 @@ from episode_support import (
     action,
     build,
     environment,
-    trained,
+    trained_batch,
     verify,
 )
 
@@ -85,7 +85,7 @@ def test_episodes_collect_through_subprocess_workers():
     episodes = []
     trainer, collector = build(harness, record=episodes.append)
     state = trainer.initial_state()
-    batch = trained(collector, state)
+    batch = trained_batch(collector, state)
     assert len(episodes) == GROUPS
     assert {episode.status for episode in episodes} <= {EpisodeStatus.COMPLETED, EpisodeStatus.TRUNCATED}
     assert {verify(episode) for episode in episodes} <= {-1., 0., 1.}
