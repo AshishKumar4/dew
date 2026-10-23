@@ -1770,7 +1770,7 @@ calls it before its first JAX call, or sets `XLA_FLAGS` in the environment.
 
 Separately, `import dew` sets `--xla_allow_excess_precision=false` unless
 `XLA_FLAGS` already names that flag
-(`dew.telemetry.devices.keep_roundings`). With XLA's default, a fusion may
+(`dew.devices.keep_roundings`). With XLA's default, a fusion may
 skip a bf16 rounding the program states, and which roundings it skips
 depends on the layout, so one device and four devices computed different
 bf16 forwards of the same model. XLA reads its flags when a backend opens,
