@@ -254,3 +254,26 @@ def test_a_source_trained_from_keeps_its_arrays_after_the_step_donates_the_state
         jax.block_until_ready(stepped)
         for leaf, held in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(before), strict=True):
             np.testing.assert_array_equal(np.asarray(leaf), held)
+
+
+def test_a_host_owned_state_takes_its_held_tree_over_leaf_by_leaf():
+    """A state held on the host is placed from the objective's own arrays one leaf at a time, each
+    handed over as it lands (`host.stream`): its step is not donated, so the state takes no copy of
+    the held tree first, and the objective's held tree then holds the state's placed arrays, one copy
+    between the two."""
+    from pathlib import Path
+
+    import optax
+
+    from dew.interop import Pretrained
+    from dew.objectives.lm import LMObjective
+    from dew.training import Layout, Trainer
+
+    fixture = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
+    objective = LMObjective(Pretrained.load(fixture, dtype="float32", attention_impl="reference"), 8,
+                            ema_decay=None)
+    trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(5), layout=Layout(host=("variables",)))
+    state, _, _ = trainer.place()
+    placed = {id(leaf) for leaf in jax.tree.leaves(state.variables)}
+    held = jax.tree.leaves(objective.held_variables())
+    assert held and all(id(leaf) in placed for leaf in held)
