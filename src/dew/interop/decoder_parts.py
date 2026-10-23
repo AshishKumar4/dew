@@ -825,14 +825,30 @@ NO_AUDIO: AudioFields = {"audio": None, "audio_projector": None,
                           "audio_token_id": None, "audio_soft_tokens": None}
 
 
-def record_int(record: Mapping[str, object], field: str, default: int | None = None) -> int:
-    """Read an int field out of a record by name. A None default makes it required."""
-    return records.integer(record[field] if default is None else record.get(field, default), field)
+def _recorded(record: Mapping[str, object], field: str, default: object, used: set[str] | None) -> object:
+    """`field`'s value in `record`, or `default`; a None default makes it required. `used`, when
+    given, takes the field as read (the set `translate_family_config` checks the rest against)."""
+    if used is not None:
+        used.add(field)
+    return record[field] if default is None else record.get(field, default)
 
 
-def record_float(record: Mapping[str, object], field: str, default: float | None = None) -> float:
-    """Read a real field out of a record by name. A None default makes it required."""
-    return records.number(record[field] if default is None else record.get(field, default), field)
+def record_int(record: Mapping[str, object], field: str, default: int | None = None, *,
+               used: set[str] | None = None) -> int:
+    """Read an int field out of a record by name (`_recorded`)."""
+    return records.integer(_recorded(record, field, default, used), field)
+
+
+def record_float(record: Mapping[str, object], field: str, default: float | None = None, *,
+                 used: set[str] | None = None) -> float:
+    """Read a real field out of a record by name (`_recorded`)."""
+    return records.number(_recorded(record, field, default, used), field)
+
+
+def record_bool(record: Mapping[str, object], field: str, default: bool | None = None, *,
+                used: set[str] | None = None) -> bool:
+    """Read a boolean field out of a record by name (`_recorded`)."""
+    return records.boolean(_recorded(record, field, default, used), field)
 
 
 # Where a layer's norms sit in the two trees: without the sandwich the names

@@ -41,9 +41,8 @@ from dew.interop.decoder_parts import (
     renamed_name,
     renamed_path,
 )
-from dew.interop.families.deepseek import deepseek_layout
+from dew.interop.families.deepseek import deepseek_layout, deepseek_mixture
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 
 _KINDS = ('full_attention', 'sliding_attention')
@@ -146,18 +145,12 @@ def _mixture(hf: Mapping[str, object], count: int, used: set[str],
     reference does; its expert fields are read all the same."""
     if hf.get('n_routed_experts') is None and not sparse:
         return None
-    layout = deepseek_layout({**hf, 'routed_scaling_factor': hf.get('routed_scaling_factor') or 1.0},
-                             count, used, sparse_layers=sparse)
+    # A null scaling is the reference's 1.0.
+    stated = {**hf, 'routed_scaling_factor': hf.get('routed_scaling_factor') or 1.0}
     if not sparse:
+        deepseek_layout(stated, count, used, sparse_layers=sparse)
         return None
-    if hf.get('norm_topk_prob', True) is not True:
-        refuse('norm_topk_prob', 'DeepseekV3TopkRouter renormalizes the top-k weights')
-    return NativeFields(Mixture, {
-        **layout,
-        'score_function': 'sigmoid', 'bias': True,
-        'groups': records.integer(hf.get('n_group') or 1, 'n_group'),
-        'groups_per_token': records.integer(hf.get('topk_group') or 1, 'topk_group'),
-    })
+    return deepseek_mixture(stated, count, used, sparse_layers=sparse)
 
 
 def _mimo_v2_flash_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:

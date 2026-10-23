@@ -121,14 +121,17 @@ _MINIMAX_M2_NAMES = (
 )
 
 
-def deepseek_mixture(hf_config: Mapping[str, object], layers: int,
-                      used: set) -> MixtureFields:
+def deepseek_mixture(hf_config: Mapping[str, object], layers: int, used: set, *,
+                     sparse_layers: tuple[int, ...] | None = None,
+                     reads_norm_topk: bool = False) -> MixtureFields:
     """Read a DeepSeek V3 MoE config into the mixture record.
 
     The reference selects on the biased sigmoid scores inside the best
     groups, each scored by its two best experts, and renormalises.
     `norm_topk_prob: false` would leave the weights unnormalised, which the
-    V3 reference never does, so it refuses naming the field.
+    V3 reference never does, so it refuses naming the field; a router that
+    reads the flag (GLM-5's) passes `reads_norm_topk`. `sparse_layers` is a
+    family's own schedule (`deepseek_layout`).
     """
     used.update(('norm_topk_prob', 'topk_method', 'scoring_func'))
     scoring = hf_config.get('scoring_func', 'sigmoid')
@@ -136,7 +139,10 @@ def deepseek_mixture(hf_config: Mapping[str, object], layers: int,
         refuse(f"scoring_func {scoring!r}",
                 "dew's router scores softmax, sigmoid or sqrtsoftplus, and "
                 "this family's reference scores sigmoid")
-    if hf_config.get('norm_topk_prob', True) is not True:
+    norm_topk = hf_config.get('norm_topk_prob', True)
+    if not isinstance(norm_topk, bool):
+        refuse('norm_topk_prob', 'expected a boolean')
+    if not (norm_topk or reads_norm_topk):
         refuse("norm_topk_prob=False",
                 "DeepseekV3TopkRouter always renormalises the top-k weights")
     method = hf_config.get('topk_method')
@@ -145,8 +151,9 @@ def deepseek_mixture(hf_config: Mapping[str, object], layers: int,
                 "the reference selects with the bias and the group limit, "
                 "which is what noaux_tc names")
     return NativeFields(Mixture, {
-        **deepseek_layout(hf_config, layers, used),
+        **deepseek_layout(hf_config, layers, used, sparse_layers=sparse_layers),
         'score_function': 'sigmoid',
+        **({'norm_topk_prob': norm_topk} if reads_norm_topk else {}),
         'groups': records.integer(hf_config.get('n_group') or 1, 'n_group'),
         'groups_per_token': records.integer(hf_config.get('topk_group') or 1, 'topk_group'),
         'bias': True,
@@ -188,7 +195,7 @@ def _deepseek_v2_mixture(hf_config: Mapping[str, object], layers: int,
     })
 
 
-_LAYOUT_FIELDS = ('n_routed_experts', 'num_local_experts', 'num_experts_per_tok', 'routed_scaling_factor',
+LAYOUT_FIELDS = ('n_routed_experts', 'num_local_experts', 'num_experts_per_tok', 'routed_scaling_factor',
                   'n_group', 'topk_group', 'n_shared_experts', 'moe_intermediate_size',
                   'first_k_dense_replace', 'moe_layer_freq', 'mlp_layer_types', 'aux_loss_alpha', 'seq_aux')
 """The fields every DeepSeek mixture reads (`deepseek_layout`)."""
@@ -232,7 +239,7 @@ def deepseek_layout(hf_config: Mapping[str, object], layers: int,
     `seq_aux` compute V2's balance loss. A family with an explicit per-layer
     schedule supplies sparse_layers and reuses only the expert geometry.
     """
-    used.update(_LAYOUT_FIELDS)
+    used.update(LAYOUT_FIELDS)
     experts = hf_config.get('n_routed_experts',
                             hf_config.get('num_local_experts'))
     if experts is None:
@@ -280,7 +287,7 @@ def deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
     # mixture's fields describe nothing it computes.
     routed = deepseek_routed(hf_config, layers, used)
     if not routed:
-        used.update((*_LAYOUT_FIELDS, 'norm_topk_prob', 'topk_method', 'scoring_func'))
+        used.update((*LAYOUT_FIELDS, 'norm_topk_prob', 'topk_method', 'scoring_func'))
     sparse_name = ('deepseek_sparse_attention'
                    if sparse else 'full_attention')
     if hf_config.get('layer_types') is None:
