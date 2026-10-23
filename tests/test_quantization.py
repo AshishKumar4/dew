@@ -35,7 +35,7 @@ from dew.nn.sharding import pipeline_microbatches
 from dew.nn.ssm import diagonal_recurrence
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
-from dew.quantization import UNQUANTIZED, Quantization, quantize_for_serving
+from dew.quantization import UNQUANTIZED, Quantization, quantize_for_serving, quantize_with
 from dew.registry import models
 from dew.training.distributed import Layout, MeshSpec, shard_batch
 
@@ -67,7 +67,7 @@ def quantized_forward(spec, **overrides):
 
 @pytest.mark.parametrize("scan_layers", [False, True])
 def test_the_wrapped_forward_matches_qwixs_own_call(scan_layers):
-    """Dew's wrapping against the provider built by hand, over the layer
+    """Dew's wrapping against the provider built by hand (`quantize_with`), over the layer
     loop and over the scanned stack: identical compiled logits, and both
     away from the fp32 forward. The gap is the assertion: rules that never
     reached a matmul would leave the fp32 numerics bitwise, so any bit moved
@@ -78,7 +78,7 @@ def test_the_wrapped_forward_matches_qwixs_own_call(scan_layers):
     model, qmodel, variables, ids = quantized_forward(Quantization(), scan_layers=scan_layers)
     rules = [qwix.QtRule(module_path=".*", weight_qtype=jnp.int8,
                          act_qtype=jnp.int8)]
-    reference = qwix.quantize_model(model, qwix.QtProvider(rules))
+    reference = quantize_with(model, qwix.QtProvider(rules))
     plain = jax.jit(model.apply)(variables, ids)
     wrapped = jax.jit(qmodel.apply)(variables, ids)
     manual = jax.jit(reference.apply)(variables, ids)
@@ -180,7 +180,7 @@ def ungrouped_reference(qwix, settings: dict, group_width: int):
     from dew.nn.conv import Conv
 
     features = settings["features"]
-    ungrouped = qwix.quantize_model(Conv(**settings), qwix.QtProvider(
+    ungrouped = quantize_with(Conv(**settings), qwix.QtProvider(
         [qwix.QtRule(module_path=".*", weight_qtype=jnp.int8, act_qtype=jnp.int8)]))
     # Output channel o reads input channel i as its group's j-th: block[j, o, i].
     block = (jnp.arange(features)[None, None, :]
@@ -414,7 +414,7 @@ import numpy as np
 import qwix
 
 from dew.nn.conv import Conv
-from dew.quantization import Quantization
+from dew.quantization import Quantization, quantize_with
 
 dtype = sys.argv[1]
 # Without the bias, which the quantization leaves alone and a bf16
@@ -425,7 +425,7 @@ x = jax.random.normal(jax.random.key(0), (8, 16, 16, 4), jnp.bfloat16)
 variables = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), conv.init(jax.random.key(1), x))
 cotangent = jax.random.normal(jax.random.key(2), (8, 8, 8, 128), jnp.bfloat16)
 qtype = jnp.int8 if dtype == "int8" else jnp.float8_e4m3fn
-reference = qwix.quantize_model(Conv(**settings), qwix.QtProvider(
+reference = quantize_with(Conv(**settings), qwix.QtProvider(
     [qwix.QtRule(module_path=".*", weight_qtype=qtype, act_qtype=qtype)]))
 
 
@@ -489,7 +489,7 @@ def test_a_bf16_convolution_under_weight_only_quantization_trains_as_qwix_does()
     x = jax.random.normal(jax.random.key(0), (8, 16, 16, 4), jnp.bfloat16)
     variables = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), conv.init(jax.random.key(1), x))
     cotangent = jax.random.normal(jax.random.key(2), (8, 8, 8, 128), jnp.bfloat16)
-    reference = qwix.quantize_model(conv, qwix.QtProvider([qwix.QtRule(
+    reference = quantize_with(conv, qwix.QtProvider([qwix.QtRule(
         module_path=".*", weight_qtype=jnp.int8, op_names=("dot_general", "einsum", "dot"))]))
 
     def value_and_gradients(module):
@@ -534,7 +534,7 @@ def test_a_convolution_no_rule_quantizes_computes_as_unwrapped_and_as_qwix_does(
     cotangent = jax.random.normal(jax.random.key(3), x.shape)
     pattern = "^(?!.*spatial_fusion).*"
     spec = Quantization(patterns=(pattern,))
-    direct = qwix.quantize_model(block, qwix.QtProvider(
+    direct = quantize_with(block, qwix.QtProvider(
         [qwix.QtRule(module_path=pattern, weight_qtype=jnp.int8, act_qtype=jnp.int8)]))
 
     def value_and_gradients(module, variables):
@@ -610,7 +610,7 @@ def test_a_quantized_text_task_matches_qwix_direct_logits_and_generation(dtype, 
     fields = {"op_names": ("dot_general", "einsum", "dot")} if weight_only else {}
     rules = [qwix.QuantizationRule(module_path=".*_proj", weight_qtype=qtype,
                                   act_qtype=None if weight_only else qtype, **fields)]
-    reference = qwix.quantize_model(model, qwix.PtqProvider(rules),
+    reference = quantize_with(model, qwix.PtqProvider(rules),
                                     methods=entry_methods(model))
     abstract = jax.eval_shape(functools.partial(reference.init, jax.random.key(0),
                                                jnp.zeros((1, 1), jnp.int32)))
@@ -685,7 +685,7 @@ def test_a_quantized_image_task_matches_qwix_direct_prediction_and_samples(flux_
     fields = {"op_names": ("dot_general", "einsum", "dot")} if weight_only else {}
     rules = [qwix.QuantizationRule(module_path=FLUX_BLOCKS[0], weight_qtype=qtype,
                                   act_qtype=None if weight_only else qtype, **fields)]
-    reference = qwix.quantize_model(task.model, qwix.PtqProvider(rules),
+    reference = quantize_with(task.model, qwix.PtqProvider(rules),
                                     methods=entry_methods(task.model))
     example = task.prepare("", key=0, steps=1)
     own = {name: tree for name, tree in task.variables.items() if name not in ("encoders", "autoencoder")}
@@ -731,7 +731,7 @@ def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix():
     task = TextGeneration(model, host, sampling=Sampling(temperature=0))
     served = task.quantized(spec)
     assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(served.variables))
-    reference = qwix.quantize_model(model, qwix.PtqProvider([
+    reference = quantize_with(model, qwix.PtqProvider([
         qwix.QuantizationRule(module_path=".*_proj", weight_qtype=jnp.int8,
                               op_names=("dot_general", "einsum", "dot"))]),
         methods=entry_methods(model))
@@ -924,7 +924,7 @@ def test_quantized_training_differentiates_through_complex_matmuls_in_float():
     model = Rotated()
     x = jax.random.normal(jax.random.key(0), (4, 16))
     variables = model.init(jax.random.key(1), x)
-    reference = qwix.quantize_model(model, qwix.QtProvider(
+    reference = quantize_with(model, qwix.QtProvider(
         [qwix.QtRule(module_path="proj", weight_qtype=jnp.int8, act_qtype=jnp.int8)]))
 
     def value_and_gradients(module):
@@ -963,7 +963,7 @@ def test_serving_leaves_complex_matmuls_in_float():
     x = jax.random.normal(jax.random.key(0), (4, 16))
     variables = model.init(jax.random.key(1), x)
     served, served_variables = quantize_for_serving(model, variables, Quantization(), x)
-    reference = qwix.quantize_model(model, qwix.PtqProvider([qwix.QuantizationRule(
+    reference = quantize_with(model, qwix.PtqProvider([qwix.QuantizationRule(
         module_path="Dense_0", weight_qtype=jnp.int8, act_qtype=jnp.int8)]), methods=entry_methods(model))
     abstract = jax.eval_shape(functools.partial(reference.init, jax.random.key(1), x))
     expected = {**variables, "params": qwix.quantize_params(variables["params"], abstract["params"])}
