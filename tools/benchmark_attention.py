@@ -32,7 +32,9 @@ Usage:
 
 import contextlib
 import json
+import os
 import statistics
+import sys
 from dataclasses import dataclass
 from typing import Optional
 
@@ -43,6 +45,9 @@ import tyro
 
 from dew.nn.attention_kernels import ATTENTION
 from dew.telemetry.benchmark import largest_difference, samples
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import peak_memory
 
 IMPLEMENTATIONS = (*(kernel.name for kernel in ATTENTION.kernels), 'jax_cudnn', 'tokamax_triton')
 """Dew's attention kernels as the selector names them, each through the production entry, then two
@@ -89,6 +94,8 @@ class BenchmarkConfig:
     warmup: int = 3
     steps: int = 20
     json_out: Optional[str] = None
+    peak_run: Optional[int] = None
+    """Run row N of the sweep alone, for its measured peak (tools/peak_memory.py), writing nothing."""
 
 
 def attention_fn(implementation: str, config: BenchmarkConfig, causal: bool, sinks=None, dtype=None):
@@ -243,10 +250,19 @@ def format_table(rows: list[dict]) -> str:
 
 
 def main(config: BenchmarkConfig) -> list[dict]:
+    if config.peak_run is not None:
+        measure(cases(config)[config.peak_run], config)
+        return []
+    # Each row's measured peak, before this process opens a backend, which would hold the device each
+    # row's peak process needs.
+    peaks = [peak_memory.measured([os.path.abspath(__file__), *sys.argv[1:], "--peak-run", str(index)])
+             for index in range(len(cases(config)))]
     print(f"Devices: {jax.device_count()} x {jax.devices()[0].device_kind}")
     rows = []
-    for case in cases(config):
+    for case, peak in zip(cases(config), peaks, strict=True):
         row = measure(case, config)
+        # A row its kernel did not serve has no program's peak.
+        row["peak_device_bytes"] = None if not row.get("served") or None in peak else max(peak)
         rows.append(row)
         label = (f"{row['implementation']} S={row['sequence_length']} "
                  f"D={row['head_dim']} causal={row['causal']}")

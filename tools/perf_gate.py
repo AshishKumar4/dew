@@ -78,9 +78,14 @@ SLOTS = (32, 128)
 ATTENTION = ("cudnn", "xla")
 """The attention rows' implementations."""
 
-# A checkpoint of lm-dense's whole training state, saved and then restored onto its shardings.
+# A checkpoint of lm-dense's whole training state, saved and then restored onto its shardings, and the
+# measured peak of a save and restore in a process of their own (tools/peak_memory.py), taken before this
+# one opens a backend.
 CHECKPOINT = """
-import json, sys, tempfile, time
+import json, os, sys, tempfile, time
+if sys.argv[2:] != ["--peak-run"]:
+    import peak_memory
+    peaks = peak_memory.measured([os.path.abspath(__file__), sys.argv[1], "--peak-run"])
 import jax
 from benchmark_cases import Case
 from benchmark_models import build_trainer
@@ -105,7 +110,9 @@ for _ in range(3):
         started = time.perf_counter()
         jax.block_until_ready(checkpoints.restore(template, step)[0])
         restores.append(time.perf_counter() - started)
-print(json.dumps({"save_ms": 1e3 * sorted(saves)[1], "restore_ms": 1e3 * sorted(restores)[1]}))
+if sys.argv[2:] != ["--peak-run"]:
+    print(json.dumps({"save_ms": 1e3 * sorted(saves)[1], "restore_ms": 1e3 * sorted(restores)[1],
+                      "peak_device_bytes": None if None in peaks else max(peaks)}))
 """
 
 
@@ -113,7 +120,7 @@ print(json.dumps({"save_ms": 1e3 * sorted(saves)[1], "restore_ms": 1e3 * sorted(
 class Row:
     name: str
     unit: str
-    """'ms' or 's', lower is better, or 'items/s', higher is better."""
+    """'ms', 's' or 'GiB' (a measured peak), lower is better, or 'items/s', higher is better."""
     tool: str
     """The tools/ file the row runs, or '' for a script of this file's."""
     gated: bool = True
@@ -147,26 +154,45 @@ class Probe:
         return self.rows[0].tool
 
 
+GIB = 2 ** 30
+
+
+def peak(record: dict) -> float | None:
+    """A tool's record's measured peak device memory in GiB (`peak_device_bytes`, tools/peak_memory.py), or
+    None where it measured none: a tree whose tool predates it, or a device whose allocator keeps no
+    high-water, which the gate shows unmeasured, never as zero."""
+    measured = record.get("peak_device_bytes")
+    return None if measured is None else measured / GIB
+
+
 def _stepped(out: Path) -> tuple:
-    """A step's time and the time its program took to compile."""
+    """A step's time, the time its program took to compile, and its measured peak."""
     [step] = json.loads(out.read_text())
-    return step["ms_per_step"], step["compile_seconds"]
+    return step["ms_per_step"], step["compile_seconds"], peak(step)
+
+
+def _forwarded(out: Path, name: str) -> tuple:
+    """A forward's time and its measured peak; a tree whose tool predates the peak wrote the time alone."""
+    entry = json.loads(out.read_text())[name]
+    return (entry, None) if isinstance(entry, float) else (entry["ms"], peak(entry))
 
 
 def _served(out: Path) -> tuple:
-    """Each slot count's best repeat, then its median repeat. A host-bound
+    """Each slot count's best repeat, then its median repeat, then its measured peak. A host-bound
     row's noise only ever slows it (32 slots spread 33% by median)."""
-    repeats = {entry["slots"]: [repeat["output_tokens_per_second"] for repeat in entry["repeats"]]
-               for entry in json.loads(out.read_text())["sweep"]}
+    sweep = {entry["slots"]: entry for entry in json.loads(out.read_text())["sweep"]}
+    repeats = {slots: [repeat["output_tokens_per_second"] for repeat in entry["repeats"]]
+               for slots, entry in sweep.items()}
     return (*[max(repeats[slots]) for slots in SLOTS],
-            *[statistics.median(repeats[slots]) for slots in SLOTS])
+            *[statistics.median(repeats[slots]) for slots in SLOTS],
+            *[peak(sweep[slots]) for slots in SLOTS])
 
 
 def _attended(out: Path) -> tuple:
-    """Each implementation's forward and backward time."""
-    timed = {row["implementation"]: row["forward_backward_ms"]
-             for row in json.loads(out.read_text()) if "forward_backward_ms" in row}
-    return tuple(timed[implementation] for implementation in ATTENTION)
+    """Each implementation's forward and backward time, then each one's measured peak."""
+    rows = {row["implementation"]: row for row in json.loads(out.read_text()) if "forward_backward_ms" in row}
+    return (*(rows[implementation]["forward_backward_ms"] for implementation in ATTENTION),
+            *(peak(rows[implementation]) for implementation in ATTENTION))
 
 
 def _qwen35_comparison(out: Path) -> tuple:
@@ -182,20 +208,23 @@ PROBES = [
     # Each step's time, and the time its program took to compile in that process (`COMPILE_FLOOR`).
     *[Probe((Row(name, "ms", "benchmark_step.py"),
              Row(f"compile {name.removeprefix('step ')}", "s", "benchmark_step.py", floor=COMPILE_FLOOR,
-                 first_round=True)),
+                 first_round=True),
+             Row(f"peak {name}", "GiB", "benchmark_step.py")),
             lambda _, out, case=case: ["--cases", json.dumps([case]), "--warmup", "10", "--steps", "30",
                                        "--json-out", str(out)],
             lambda _, out: _stepped(out))
       for name, case in STEP_CASES.items()],
     # A process for each forward, so a module one tree lacks costs that row alone.
-    *[Probe((Row(name, "ms", "benchmark_forward.py"),),
+    *[Probe((Row(name, "ms", "benchmark_forward.py"), Row(f"peak {name}", "GiB", "benchmark_forward.py")),
             lambda _, out, name=name: ["--cases", name, "--json-out", str(out)],
-            lambda _, out, name=name: (json.loads(out.read_text())[name],))
+            lambda _, out, name=name: _forwarded(out, name))
       for name in FORWARD],
     Probe((*[Row(f"serve qwen3-0.6b {slots} slots", "items/s", "benchmark_lm_serving.py") for slots in SLOTS],
            # The median of the same repeats: the stalls best-of-five hides (a recompile, a pause), shown.
            *[Row(f"serve qwen3-0.6b {slots} slots, median repeat", "items/s", "benchmark_lm_serving.py",
-                 gated=False) for slots in SLOTS]),
+                 gated=False) for slots in SLOTS],
+           *[Row(f"peak serve qwen3-0.6b {slots} slots", "GiB", "benchmark_lm_serving.py")
+             for slots in SLOTS]),
           lambda args, out: ["--backend", "dew", "--model", args.model, "--slots", ",".join(map(str, SLOTS)),
                              "--repeats", "5", "--out", str(out)],
           lambda _, out: _served(out)),
@@ -213,28 +242,41 @@ PROBES = [
           lambda _, out: (lambda record: (record["construction_seconds"],
                                           *record["by_admission_width"].values(),
                                           record["warm_seconds"]))(json.loads(out.read_text()))),
-    Probe(tuple(Row(f"attention {implementation} S=2048 D=128 causal fwd+bwd", "ms", "benchmark_attention.py")
-                for implementation in ATTENTION),
+    Probe((*(Row(f"attention {implementation} S=2048 D=128 causal fwd+bwd", "ms", "benchmark_attention.py")
+             for implementation in ATTENTION),
+           *(Row(f"peak attention {implementation} S=2048 D=128 causal fwd+bwd", "GiB",
+                 "benchmark_attention.py") for implementation in ATTENTION)),
           lambda _, out: ["--implementations", *ATTENTION, "--sequence-lengths", "2048", "--head-dims", "128",
                           "--causal", "True", "--json-out", str(out)],
           lambda _, out: _attended(out)),
     Probe((Row("image pipeline flowers 128px, device crop+flip+jitter", "items/s",
-               "benchmark_image_pipeline.py"),),
+               "benchmark_image_pipeline.py"),
+           Row("peak image pipeline flowers 128px, device crop+flip+jitter", "GiB",
+               "benchmark_image_pipeline.py")),
           lambda args, out: ["--flowers", args.flowers, "--images", "512", "--repeats", "3", "--no-training",
                              "--out", str(out)],
-          lambda _, out: (json.loads(out.read_text())["pipeline"]["device_crop_flip_jitter"]
-                          ["images_per_second"],)),
-    Probe((Row("checkpoint lm-dense save", "ms", ""), Row("checkpoint lm-dense restore", "ms", "")),
-          lambda _, out: ["-c", CHECKPOINT,
+          lambda _, out: (lambda pipeline: (pipeline["images_per_second"], peak(pipeline)))(
+              json.loads(out.read_text())["pipeline"]["device_crop_flip_jitter"])),
+    Probe((Row("checkpoint lm-dense save", "ms", ""), Row("checkpoint lm-dense restore", "ms", ""),
+           Row("peak checkpoint lm-dense save and restore", "GiB", "")),
+          lambda _, out: [str(_script(out, CHECKPOINT)),
                           json.dumps({**STEP_CASES["step lm-dense 4x1024"], "batch_size": 1})],
-          lambda printed, _: tuple(json.loads(printed.strip().splitlines()[-1])[f"{kind}_ms"]
-                                   for kind in ("save", "restore"))),
+          lambda printed, _: (lambda record: (record["save_ms"], record["restore_ms"], peak(record)))(
+              json.loads(printed.strip().splitlines()[-1]))),
     Probe((Row("reference qwen3.5-0.8b 8x3072 vs torch", "items/s", "reference_runs/qwen35_pair.py",
                hardware="A100-SXM4-80GB", head_only=True),),
           lambda args, out: ["--torch-python", args.torch_python, "--out", str(out), "--claim"],
           lambda _, out: _qwen35_comparison(out)),
 ]
 BATTERY = [row for probe in PROBES for row in probe.rows]
+
+
+def _script(out: Path, source: str) -> Path:
+    """`source` as a file beside the probe's output, which a measured peak runs again in a process of its own
+    (`python <file>`, as tools/peak_memory.py runs a program)."""
+    script = out.with_suffix(".py")
+    script.write_text(source)
+    return script
 
 
 def _tools(tree: Path, tool: str, newer: Path) -> Path:
