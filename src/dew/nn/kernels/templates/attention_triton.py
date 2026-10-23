@@ -762,6 +762,10 @@ class TritonBackward(Template[BackwardTiles]):
                    config.block_k + (config.dkv_stages - 1) * config.block_q)
         return (rows * (width + value_width) + 2 * config.block_q * config.block_k) * size
 
+    def registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int:
+        """The larger of its two launches' registers a thread (`_backward_registers`)."""
+        return max(_backward_registers(ba, config, dq=True), _backward_registers(ba, config, dq=False))
+
     def cost(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget) -> float:
         """Both launches' (`_launch_cost`): every tile of the call (a bound: the spans are traced, so a
         sparse call visits fewer)."""
