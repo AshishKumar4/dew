@@ -27,6 +27,7 @@ import optax
 from flax import linen as nn
 
 from dew.inputs import InputSpec
+from dew.nn.protocols import Lacks
 from dew.objectives.base import FROZEN, Aux, Batch, Objective, Ratio, Source, Step, Variables, model_rngs
 
 type Outputs = jax.Array | tuple[Outputs, ...] | list[Outputs] | Mapping[str, Outputs]
@@ -111,7 +112,7 @@ def selected(outputs: Outputs, output: tuple[int | str, ...]) -> jax.Array:
             continue
         raise TypeError(f"output {output} indexes the model's {type(outputs).__name__} with {step!r}")
     if not isinstance(outputs, jax.Array):
-        raise TypeError(f"output {output} selects a {type(outputs).__name__}, not the logits; name "
+        raise Lacks("logits", f"output {output} selects a {type(outputs).__name__}, not the logits; name "
                         "the path to them")
     return outputs
 
