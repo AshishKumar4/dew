@@ -78,6 +78,22 @@ class PromptRecord:
         a missing one is empty, and any other value travels as its JSON (`_text`)."""
         return cls(_text(data_source), _text(ground_truth), _text(extra_info))
 
+    @classmethod
+    def from_row(cls, row: Mapping[str, object]) -> PromptRecord:
+        """The record of a prompt row (verl's columns): its data source, its reference answer,
+        top-level or in `reward_model`, and its extra info with its `ability` folded in. Measuring
+        the reward width (`RewardWidth`) and rendering a row (`RenderPrompt`) read it alike."""
+        return cls.of(json_value(row.get("data_source"), "prompt data_source"), _ground_truth(row, "prompt"),
+                      _extra_info(row))
+
+    def columns(self) -> Mapping[str, str]:
+        """Its three values under the batch keys a prompt batch stores them by."""
+        return {SOURCE_KEY: self.data_source, TRUTH_KEY: self.ground_truth, INFO_KEY: self.extra_info}
+
+    def width(self) -> int:
+        """The bytes its widest value takes in UTF-8."""
+        return max(len(text.encode("utf-8")) for text in self.columns().values())
+
 
 def _extra_info(element: Mapping[str, object]) -> JSON:
     """A prompt row's `extra_info`, its `ability` (a verl row's task family) folded in as a field of
@@ -206,8 +222,6 @@ class RewardWidth:
     fact = "reward_bytes"
 
     def __call__(self, records: Records, /) -> int:
-        widths = (len(text.encode("utf-8")) for index in range(len(records)) for row in (records[index],)
-                  if isinstance(row, Mapping)
-                  for text in (_text(row.get("data_source")), _ground_truth(row, "prompt"),
-                               _text(_extra_info(row))))
+        widths = (PromptRecord.from_row(row).width() for index in range(len(records))
+                  for row in (records[index],) if isinstance(row, Mapping))
         return max(1, max(widths, default=1))
