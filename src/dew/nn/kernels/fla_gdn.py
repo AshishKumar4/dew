@@ -442,8 +442,10 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, gl_ref, dht_ref, do_ref, d
     it leaves into, `dh`, at that memory's slot (`Sequences`), then
     `dv2 = dv + (k dh) exp2(g_last - g)` (dh cast to k's dtype), then
     `dh = dh exp2(g_last) + scale (q exp2(g))^T do - w^T dv2`: the gated queries fp32 as two parts
-    of `do`'s dtype (`_split_dot`), where fla takes one TF32 product at the same cost, and dv2 cast
-    to w's dtype for its product, as fla casts it.
+    of `do`'s dtype (`_split_dot`), where fla takes one TF32 product at the same cost, the readout's
+    products summed a sub-chunk at a time from the chunk's last, the smallest first (the memory's
+    gradient sat 2.5 times the token-by-token recurrence's error from float64 summed from the first,
+    `recurrence_algebra.remembered`), and dv2 cast to w's dtype for its product, as fla casts it.
     `per_key` is fla's USE_GK branch: `g_ref` `[T, K]` decays the gradient's rows by `exp2(g_last)`,
     and neither `dv2` nor the queries, which carry their own decay, are gated; the query product
     stays in q's dtype. A row's last sequence starts from the final
@@ -468,26 +470,40 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, gl_ref, dht_ref, do_ref, d
             slot = jnp.where(r > 0, base + n + 1, left)
             for i in range(slices):
                 dh_ref[slot, pl.ds(i * 64, 64), :] = grad[i].astype(dh_ref.dtype)
-            out_grad = read(do_ref)
             dv = sum(_dot(read(k_ref, pl.ds(i * 64, 64)), grad[i].astype(k_ref.dtype), exact=exact)
                      for i in range(slices))
             final = begin + taken - 1
-            queries = [read(q_ref, pl.ds(i * 64, 64)) for i in range(slices)]
+
+            def block(ref, b, *rest):
+                at = b * algebra.SUB
+                return read_rows(_rows(ref, begin + at, algebra.SUB, *rest), taken - at)
+
+            def read_out_of(i, term):
+                """The memory's gradient from the chunk's reads of it, key slice `i`: the readout's terms
+                summed a sub-chunk at a time from the chunk's last (`recurrence_algebra.remembered`)."""
+                return sum(term(block(q_ref, b, pl.ds(i * 64, 64)), block(do_ref, b), b)
+                           for b in reversed(range(chunk // algebra.SUB)))
+
             if per_key:
                 dv = dv + read(dv_ref).astype(jnp.float32)
                 kept = [jnp.exp2(g_ref[final, pl.ds(i * 64, 64)].astype(jnp.float32))[:, None]
                         for i in range(slices)]
-                read_out = [_dot(query.T, out_grad.astype(query.dtype), exact=exact) for query in queries]
+                read_out = [read_out_of(i, lambda query, out, b: _dot(query.T, out.astype(query.dtype),
+                                                                      exact=exact))
+                            for i in range(slices)]
             else:
                 gate = _gates(g_ref, begin, taken, chunk)
                 last = _row(g_ref, final)
                 apart = (last - gate) + (_row(gl_ref, final) - _gates(gl_ref, begin, taken, chunk))
                 dv = (dv * jnp.exp2(apart)[:, None]
                       + read(dv_ref).astype(jnp.float32))
-                decay = jnp.exp2(gate)[:, None]
                 kept = [jnp.exp2(last)] * slices
-                read_out = [_split_dot((query.astype(jnp.float32) * decay).T, out_grad, exact=exact)
-                            for query in queries]
+
+                def decayed(query, out, b):
+                    decay = jnp.exp2(_gates(g_ref, begin, taken, algebra.SUB, b * algebra.SUB))[:, None]
+                    return _split_dot((query.astype(jnp.float32) * decay).T, out, exact=exact)
+
+                read_out = [read_out_of(i, decayed) for i in range(slices)]
             write_rows(_rows(dv2_ref, begin, chunk), taken, dv)
 
             def moved(i):
@@ -510,7 +526,7 @@ class ChunkBwdDhu(_Launch):
 
     NAME = "chunk_bwd_dhu"
     KEYS, VALUES = 'k', 'do'
-    revision: int = 2
+    revision: int = 3
     SPACES = _spaces(_tiles([(0, 32), (0, 64)], (2, 4), (1, 2, 3)),
                      _tiles([(0, 32), (0, 64)], (2, 4), (1, 2)))
     # Measured at Qwen3.5-0.8B's shape (8 x 3072, 16 heads of 128, bf16), CUPTI, 2026-10-13: 0/64/4/3
