@@ -728,10 +728,11 @@ class RolloutScheduler:
                   ) -> tuple[list[Session], list[float], int, _Tally, float]:
         """This process's admitted rollouts for the call's entry, their latencies, the group count,
         the tally and the wait, the entries ahead of it opened as well."""
+        # The wait counts a synchronous collection, which opening its entry runs.
+        began = time.perf_counter()
         for pending in entries:
             self.acquisition.open(pending, self.groups + self.oversample)
         tally = _Tally()
-        began = time.perf_counter()
         admitted = self._admit(entries[0], updates, tally)
         waited = time.perf_counter() - began
         return ([rollout for group in admitted for rollout in group.done[:self.groups]],

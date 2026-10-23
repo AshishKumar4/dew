@@ -3,6 +3,8 @@
 import functools
 from collections.abc import Mapping
 
+import numpy as np
+
 from dew.inference.rollouts import Draw
 from dew.records import finite, integer, integers, listed, record as section, text
 from dew.sampling.text import Sampling
@@ -27,14 +29,18 @@ messages = functools.partial(listed, read=section, what="a list of chat messages
 
 
 def draw_record(value: Mapping[str, object], sampling: Sampling) -> Draw:
-    """Read a draw `asdict` wrote, checked to end as `sampling`, its episode's policy, ends one.
-    An episode's draws carry no engine records (routing, supports), so none is read."""
+    """Read a draw `asdict` wrote, checked to end as `sampling`, its episode's policy, ends one,
+    with the engine records it carries (routing as nested lists of expert ids, kept ids per
+    sampled id)."""
     record = section(value, "draw")
-    raw = record["raw_log_probs"]
+    raw, routed, support = record["raw_log_probs"], record["routed_experts"], record["support"]
     return Draw(integers(record["prompt"], "prompt"), integers(record["tokens"], "tokens"),
                 reals(record["behavior_log_probs"], "behavior_log_probs"),
                 text(record["finish_reason"], "finish_reason"), integer(record["version"], "version"),
-                None if raw is None else reals(raw, "raw_log_probs")).checked(sampling)
+                None if raw is None else reals(raw, "raw_log_probs"),
+                None if routed is None else np.asarray(routed),
+                None if support is None else listed(support, "support", read=integers,
+                                                    what="a list of token-id lists")).checked(sampling)
 
 
 def sampling_record(value: Mapping[str, object]) -> Sampling:
