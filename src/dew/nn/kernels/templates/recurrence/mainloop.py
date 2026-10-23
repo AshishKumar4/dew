@@ -303,8 +303,7 @@ def _views(block: int | None = None, **parted) -> dict:
 
 def _staging(operand: _Operand, *shapes) -> tuple:
     """A product site's staging tiles, a part of `operand`'s form each, for each of `shapes`."""
-    return tuple(tuple(plgpu.SMEM(shape, operand.stored)
-                       for _ in range(operand.parts)) for shape in shapes)
+    return tuple(tuple(plgpu.SMEM(shape, operand.stored) for _ in range(operand.parts)) for shape in shapes)
 
 
 MERGED = 2
@@ -318,8 +317,7 @@ def _merges(call: _Call) -> tuple:
     products."""
     parts = PARTS if call.held.parts > 1 else MERGED
     tile = (CHUNK, CHUNK)
-    return tuple(tuple(plgpu.SMEM(tile, jnp.bfloat16)
-                       for _ in range(parts)) for _ in range(3))
+    return tuple(tuple(plgpu.SMEM(tile, jnp.bfloat16) for _ in range(parts)) for _ in range(3))
 
 
 def _merging(staging, call: _Call) -> _Issuer:
@@ -327,11 +325,18 @@ def _merging(staging, call: _Call) -> _Issuer:
     return _Issuer(call, {"merge": list(staging)}, {"merge": len(staging[0])})
 
 
-def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, stages: int,
+def _taken(index: int):
+    """A chunk's program's liveness (`_kernel`'s `live`): its chunk, the `index`-th input's entry (`taken`),
+    holds tokens."""
+    return lambda refs: refs[index][lax.axis_index("chunks")] > 0
+
+
+def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, stages: int, live,
             staging: tuple = (), once: dict | None = None):
-    """`program(*refs, streams, staging)` as a kernel over `grid`: its streams' allocations (of `blocks`,
-    `stages` deep, and of `once`'s blocks, loaded once, one deep; `Family.opened` takes them with their
-    views) and its staging tiles scoped, named for its launch (`recurrence_solve`, ...)."""
+    """`program(*refs, streams, staging)` as a kernel over `grid`, run where `live(refs)` holds (a laid
+    call's chunks and sequences are as many as its worst case, most of them empty): its streams' allocations
+    (of `blocks`, `stages` deep, and of `once`'s blocks, loaded once, one deep; `Family.opened` takes them
+    with their views) and its staging tiles scoped, named for its launch (`recurrence_solve`, ...)."""
     family = call.family
     streams = {**family.streams(blocks, stages, 1), **family.streams(once or {}, 1, 1)}
 
@@ -339,7 +344,8 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
         def scoped(staged, *, streams):
             program(*arrays, streams=streams, staging=staged)
 
-        family.scoped(scoped, staging, streams=streams)
+        # An empty program scopes nothing (Mosaic GPU's interpreter takes a scope's allocations in turn).
+        pl.when(live(arrays))(lambda: family.scoped(scoped, staging, streams=streams))
 
     entry.__name__ = f"recurrence{program.__qualname__.split('.')[0]}"
 
@@ -382,13 +388,11 @@ def _solve(k, hi, lo, beta, taken, call: _Call):
             held.store(a_ref, algebra.doubled(-block, _merging(staging, call)), row, CHUNK, h * CHUNK, CHUNK)
             return carry, accumulators
 
-        @pl.when(taken_ref[n] > 0)
-        def _():
-            _walk(streams, views, step, call)
+        _walk(streams, views, step, call)
 
     return _kernel(program, call, out_type=held.shape(call.heads * CHUNK), grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=_streamed(keys=((CHUNK, width), call.given)),
-                   stages=1, staging=_merges(call))(k, hi, lo, beta, taken)
+                   stages=1, live=_taken(4), staging=_merges(call))(k, hi, lo, beta, taken)
 
 
 def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
@@ -432,15 +436,13 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
             held.store(outs[-1], jnp.where(rows >= cols, scores, 0.0), row, CHUNK, h * CHUNK, CHUNK)
             return carry, accumulators
 
-        @pl.when(taken_ref[n] > 0)
-        def _():
-            _walk(streams, views, step, call)
+        _walk(streams, views, step, call)
 
     blocks = _streamed(queries=((CHUNK, width), call.given), keys=((CHUNK, width), call.given),
                        gates=((CHUNK, width), gates), lows=((CHUNK, width), gates))
     out_type = (held.shape(call.heads * CHUNK),) * (1 + call.delta)
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
-                   grid_names=("chunks", "heads"), blocks=blocks, stages=1,
+                   grid_names=("chunks", "heads"), blocks=blocks, stages=1, live=_taken(5),
                    staging=_merges(call) if call.delta else ())(q, k, hi, lo, beta, taken)
 
 
@@ -496,9 +498,7 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
                     held.store(outs[0], w, row, CHUNK, h * width + c * BLOCK, BLOCK)
             return carry, accumulators
 
-        @pl.when(taken_ref[n] > 0)
-        def _():
-            _walk(streams, views, step, call)
+        _walk(streams, views, step, call)
 
     given = {"keys": ((CHUNK, width), call.given)}
     if call.per_key:
@@ -509,7 +509,7 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
                 + (held.shape(call.heads * width),) * call.per_key)
     # Without the delta rule the inverse's place takes the keys, an operand no step reads.
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
-                   grid_names=("chunks", "heads"), blocks=_streamed(**given), stages=1,
+                   grid_names=("chunks", "heads"), blocks=_streamed(**given), stages=1, live=_taken(6),
                    staging=_staging(held, (CHUNK, BLOCK)) if call.delta else ())(
         k, v, k if a is None else a, hi, lo, beta, taken)
 
@@ -606,7 +606,7 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
             family.stream(entering, initial_views, 0, 1)
             family.stream(chunks, views, first, first + count)
 
-        pl.when(count > 0)(lambda: family.roles(1, consumer, producer))
+        family.roles(1, consumer, producer)
 
     out_type = (memories.shape(value_width), held.shape(call.heads * value_width),
                 jax.ShapeDtypeStruct((batch * call.heads * width, value_width), jnp.float32))
@@ -615,6 +615,7 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
     initials = _streamed(**{f"initial{i}": ((BLOCK, bv), initial) for i in range(slices)})
     return _kernel(program, call, out_type=out_type, grid=(value_width // bv, sequences.shape[0], call.heads),
                    grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=tiles.stages,
+                   live=lambda refs: refs[7][lax.axis_index("sequences"), 1] > 0,
                    staging=_staging(held, (BLOCK, bv)), once=initials)(
         k, k if w is None else w, u, hi, lo, beta, h0, sequences)
 
@@ -667,9 +668,7 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
             o_ref.at[span, pl.ds(h * value_width + j * bv, bv)][...] = out.astype(o_ref.dtype)
             return carry, accumulators
 
-        @pl.when(taken_ref[n] > 0)
-        def _():
-            _walk(streams, views, step, call)
+        _walk(streams, views, step, call)
 
     if call.per_key:
         given = {"gates": ((CHUNK, width), gates), "lows": ((CHUNK, width), gates),
@@ -680,7 +679,7 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
                        values=((CHUNK, bv), held), **given)
     out_type = jax.ShapeDtypeStruct((call.rows, call.heads * value_width), out_dtype)
     return _kernel(program, call, out_type=out_type, grid=(value_width // bv, call.chunks, call.heads),
-                   grid_names=("blocks", "chunks", "heads"), blocks=blocks, stages=1,
+                   grid_names=("blocks", "chunks", "heads"), blocks=blocks, stages=1, live=_taken(6),
                    staging=_staging(held, (CHUNK, BLOCK)))(q, k if scores is None else scores, h, corrected,
                                                            hi, lo, taken)
 
