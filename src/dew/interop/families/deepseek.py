@@ -33,6 +33,7 @@ from dew.interop.decoder_parts import (
     base_config,
     dew_path,
     layer_depth_path,
+    plain_partial_rope,
     prediction_path,
     read_rope,
     record_float,
@@ -85,21 +86,17 @@ def _minimax_m2_config(hf_config: Mapping[str, object], used: set[str]) -> Decod
     used.update(('use_mtp', 'num_mtp_modules', 'mtp_transformer_layers',
                  'mlp_intermediate_size', 'shared_moe_mode',
                  'output_router_logits', 'router_aux_loss_coef'))
-    entry = records.record(hf_config.get('rope_scaling') or hf_config.get('rope_parameters') or {},
-                           'rope_parameters')
-    extra = set(entry) - {'rope_type', 'type', 'rope_theta', 'partial_rotary_factor'}
-    if extra or entry.get('rope_type', entry.get('type', 'default')) != 'default':
-        refuse('rope_parameters', 'MiniMax-M2 currently reads plain partial rotary positions')
     head_dim = records.integer(hf_config.get('head_dim', 128), 'head_dim')
     rotary_dim = records.integer(hf_config.get('rotary_dim', head_dim), 'rotary_dim')
-    factor = records.number(entry.get('partial_rotary_factor', hf_config.get(
-        'partial_rotary_factor', rotary_dim / head_dim)), 'partial_rotary_factor')
+    # The release states its rotary under rope_scaling, which transformers reads as rope_parameters.
+    theta, factor = plain_partial_rope(
+        {**hf_config, 'rope_parameters': hf_config.get('rope_scaling') or hf_config.get('rope_parameters')},
+        default_factor=rotary_dim / head_dim, default_theta=5000000.0, reference='MiniMax-M2')
     if 'rotary_dim' in hf_config and factor * head_dim != rotary_dim:
         refuse('rotary_dim', 'it disagrees with partial_rotary_factor * head_dim')
     if not 0 < factor <= 1 or int(head_dim * factor) % 2:
         refuse('rotary_dim', 'partial rotary must rotate a positive even head slice')
     used.update(('rotary_dim', 'partial_rotary_factor', 'rope_parameters', 'rope_scaling', 'rope_theta'))
-    theta = records.number(entry.get('rope_theta', hf_config.get('rope_theta', 5000000.0)), 'rope_theta')
     config = base_config({**hf_config, 'head_dim': head_dim}, used, qk_norm=True,
                           rope=Ropes(theta), reads=frozenset())
     config.update(qk_norm_scope='projection', partial_rotary_factor=factor,

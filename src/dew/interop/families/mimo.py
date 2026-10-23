@@ -31,6 +31,7 @@ from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
+    KindFields,
     Renames,
     Ropes,
     base_config,
@@ -126,11 +127,21 @@ def _mimo_v2_flash_config(hf: Mapping[str, object], used: set[str]) -> DecoderFi
         # and gives it the sinks (modeling_mimo_v2_flash.py:348, 363).
         kinds['sliding_attention'].update(num_kv_heads=2 * kv_heads, sinks=True,
                                           partial_rotary_factor=local_factor)
-    scale = hf.get('attention_value_scale', 0.707)
+    return _attention_and_experts(
+        config, hf, used, kinds, value_dim=records.integer(hf.get('v_head_dim', 128), 'v_head_dim'),
+        scale=hf.get('attention_value_scale', 0.707), factor=full_factor, count=count, sparse=sparse)
+
+
+def _attention_and_experts(config: DecoderFields, hf: Mapping[str, object], used: set[str],
+                           kinds: Mapping[str, KindFields], *, value_dim: int, scale: object, factor: float,
+                           count: int, sparse: tuple[int, ...]) -> DecoderFields:
+    """`config` with what both MiMo-V2 readers set alike: the layer kinds, the value heads' width
+    and scale, the unbiased output projection, the 'default' partial rotary of the full layers,
+    attention dropout and the routed experts (`_mixture`)."""
     config.update(
-        kinds=kinds, value_head_dim=records.integer(hf.get('v_head_dim', 128), 'v_head_dim'),
+        kinds=kinds, value_head_dim=value_dim,
         value_scale=None if scale is None else records.number(scale, 'attention_value_scale'),
-        o_proj_bias=False, partial_rotary_factor=None if full_factor == 1.0 else full_factor,
+        o_proj_bias=False, partial_rotary_factor=None if factor == 1.0 else factor,
         partial_rotary_type='default',
         attention_dropout_rate=records.number(hf.get('attention_dropout', 0.), 'attention_dropout'),
         mixture=_mixture(hf, count, used, sparse))
@@ -295,15 +306,9 @@ def _mimo_v2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         # A windowed kind rotates whole heads unless it states its own
         # factor (`LayerKind`); MiMoV2Attention turns the same third of both.
         kinds['sliding_attention'].update(num_kv_heads=swa_kv_heads, partial_rotary_factor=factor)
-    scale = hf.get('attention_value_scale')
-    config.update(
-        kinds=kinds, value_head_dim=value_dim,
-        value_scale=None if scale is None else records.number(scale, 'attention_value_scale'),
-        o_proj_bias=False, partial_rotary_factor=None if factor == 1.0 else factor,
-        partial_rotary_type='default',
-        attention_dropout_rate=records.number(hf.get('attention_dropout', 0.), 'attention_dropout'),
-        mixture=_mixture(hf, count, used, sparse))
-    return config
+    return _attention_and_experts(config, hf, used, kinds, value_dim=value_dim,
+                                  scale=hf.get('attention_value_scale'), factor=factor, count=count,
+                                  sparse=sparse)
 
 
 _FUSED_QKV = grouped_qkv('.self_attn.qkv_proj')

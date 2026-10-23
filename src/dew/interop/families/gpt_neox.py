@@ -16,6 +16,7 @@ from dew.interop.decoder_parts import (
     fixed_attention_buffer,
     grouped_qkv,
     hf_ungated,
+    partial_rope,
     renamed_name,
     renamed_path,
     ungated_mlp,
@@ -25,12 +26,10 @@ from dew.nn.rope import inverse_frequencies
 
 
 def _gpt_neox_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
-    parameters = records.record(hf.get('rope_parameters') or {}, 'rope_parameters')
-    partial = records.number(parameters.get('partial_rotary_factor', hf.get('rotary_pct', .25)), 'rotary_pct')
-    theta = records.number(parameters.get('rope_theta', hf.get('rotary_emb_base', 10000.)), 'rotary_emb_base')
+    theta, partial, rope = partial_rope(hf, default_factor=.25, factor_field='rotary_pct',
+                                        theta_field='rotary_emb_base')
     activation = records.text(hf.get('hidden_act', 'gelu'), 'hidden_act')
     mlp = ungated_mlp(activation, ('gelu', 'gelu_new', 'gelu_pytorch_tanh', 'relu'), 'hidden_act', 'GPT-NeoX')
-    rope = {key: value for key, value in parameters.items() if key != 'partial_rotary_factor'}
     config = base_config({**hf, 'hidden_act': 'gelu', 'rope_theta': theta,
                            'rope_parameters': rope or None}, used, reads=frozenset({'attention_bias'}))
     used.update(('rotary_pct', 'rotary_emb_base', 'use_parallel_residual', 'layer_norm_eps',

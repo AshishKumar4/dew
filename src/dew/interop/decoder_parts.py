@@ -43,11 +43,19 @@ DEFAULT_MAX_SEQ_LEN = 8192
 # 'gelu' is torch's erf gelu (ACT2FN['gelu']), which Gemma's released config
 # names, and 'gelu_pytorch_tanh' the approximation the later Gemmas name.
 ACTIVATIONS = {'silu': 'swiglu', 'gelu_pytorch_tanh': 'geglu', 'gelu': 'geglu_exact'}
-_HF_ACTIVATIONS = {ours: theirs for theirs, ours in ACTIVATIONS.items()}
+_UNGATED: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ('gelu_exact', 'gelu', ()), ('gelu', 'gelu_new', ('gelu_fast', 'gelu_pytorch_tanh')),
+    ('relu', 'relu', ()))
+"""The ungated activations the classic families' configs name for an MLP or a head: Dew's name,
+the spelling an export writes and the other spellings a config may use. transformers' erf GELU is
+Dew's exact one, its tanh approximations Dew's 'gelu'."""
+UNGATED_ACTIVATIONS = {spelling: ours for ours, written, others in _UNGATED
+                       for spelling in (written, *others)}
+"""The ungated activations by every spelling a classic family's config may use, as Dew's (`_UNGATED`)."""
 # GPT OSS names its clamped experts 'silu' too; the family's own dial is
 # the mlp value, so the export vocabulary maps it back to the reference's.
-_HF_ACTIVATIONS['swigluoai'] = 'silu'
-_HF_ACTIVATIONS.update({'gelu': 'gelu_new', 'gelu_exact': 'gelu', 'relu': 'relu'})
+_HF_ACTIVATIONS = {**{ours: theirs for theirs, ours in ACTIVATIONS.items()}, 'swigluoai': 'silu',
+                   **{ours: written for ours, written, _ in _UNGATED}}
 
 
 def hf_activation(activation: GatedActivation) -> str:
@@ -56,12 +64,6 @@ def hf_activation(activation: GatedActivation) -> str:
     if isinstance(activation, Situ):
         refuse('mlp', "SiTU is named only by Kimi K3's own config fields")
     return _HF_ACTIVATIONS[activation]
-
-
-UNGATED_ACTIVATIONS = {'gelu': 'gelu_exact', 'gelu_new': 'gelu', 'gelu_fast': 'gelu',
-                       'gelu_pytorch_tanh': 'gelu', 'relu': 'relu'}
-"""The ungated activations the classic families' configs name for an MLP or
-a head, as Dew's: transformers' erf GELU, its tanh approximations and ReLU."""
 
 
 def ungated_mlp(activation: str, accepted: Collection[str], field: str, family: str) -> str:
@@ -95,7 +97,7 @@ def fixed_attention_buffer(name: str, tensor: np.ndarray, attention: str,
 def hf_ungated(mlp: GatedActivation | None, family: str, tanh: str = 'gelu_new') -> str:
     """The activation a classic `family`'s config names Dew's ungated `mlp`
     by, its tanh GELU spelled `tanh`; any other `mlp` is refused."""
-    if isinstance(mlp, str) and mlp in ('gelu', 'gelu_exact', 'relu'):
+    if isinstance(mlp, str) and mlp in {ours for ours, _, _ in _UNGATED}:
         return tanh if mlp == 'gelu' else _HF_ACTIVATIONS[mlp]
     return refuse('mlp', f'{family} writes only an ungated GELU or ReLU')
 
@@ -397,24 +399,32 @@ def read_rope_theta(entry: Mapping[str, object] | None, field: str) -> float | N
     return rope.theta
 
 
-def plain_partial_rope(hf_config: Mapping[str, object], *, default_factor: float, reference: str,
-                       layout: tuple[str, ...] = ()) -> tuple[float, float]:
-    """(rope_theta, partial_rotary_factor) of a config whose rotary is plain:
-    `rope_parameters` or the flat fields, the entry's value winning, and
-    `layout` the entry's fields that place the rotated pairs. A scaled type
-    or any other field refuses, naming `reference`'s rotary."""
+def partial_rope(hf_config: Mapping[str, object], *, default_factor: float, default_theta: float = 10000.0,
+                 factor_field: str = 'partial_rotary_factor',
+                 theta_field: str = 'rope_theta') -> tuple[float, float, dict[str, object]]:
+    """(rope_theta, partial_rotary_factor, the rest of the rotary's entry) of a config: the
+    `rope_parameters` entry's values, else the flat fields under the family's spellings (GPT-NeoX's
+    `rotary_emb_base` and `rotary_pct`), else the defaults. The rest is the entry without its
+    factor, which a family whose rotary may scale hands `base_config`'s rope reader."""
     entry = records.record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
-    rope_type = entry.get('rope_type', entry.get('type', 'default'))
+    theta = records.number(entry.get('rope_theta', hf_config.get(theta_field, default_theta)), theta_field)
+    factor = records.number(entry.get('partial_rotary_factor', hf_config.get(factor_field, default_factor)),
+                            factor_field)
+    return theta, factor, {key: value for key, value in entry.items() if key != 'partial_rotary_factor'}
+
+
+def plain_partial_rope(hf_config: Mapping[str, object], *, default_factor: float, reference: str,
+                       layout: tuple[str, ...] = (), default_theta: float = 10000.0) -> tuple[float, float]:
+    """(rope_theta, partial_rotary_factor) of a config whose rotary is plain (`partial_rope`), with
+    `layout` the entry's fields that place the rotated pairs. A scaled type or any other field
+    refuses, naming `reference`'s rotary."""
+    theta, factor, rest = partial_rope(hf_config, default_factor=default_factor, default_theta=default_theta)
+    rope_type = rest.get('rope_type', rest.get('type', 'default'))
     if rope_type not in ('default', 'none'):
         refuse(f"rope_parameters (rope_type {rope_type!r})", f"{reference} is the plain rotary")
-    scaling = sorted(set(entry) - {'rope_type', 'type', 'rope_theta', 'partial_rotary_factor', *layout})
+    scaling = sorted(set(rest) - {'rope_type', 'type', 'rope_theta', *layout})
     if scaling:
         refuse(f"rope_parameters scaling fields {scaling}", f"{reference} is the plain rotary")
-    theta = records.number(entry.get('rope_theta', hf_config.get('rope_theta', 10000.0)),
-                           'rope_parameters rope_theta')
-    factor = records.number(entry.get('partial_rotary_factor',
-                                      hf_config.get('partial_rotary_factor', default_factor)),
-                            'rope_parameters partial_rotary_factor')
     return theta, factor
 
 
