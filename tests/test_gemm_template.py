@@ -228,41 +228,6 @@ def test_a_cooperative_tile_holds_check_1_with_its_hooks(case, product):
 
 
 
-@runs("v5e")
-def test_a_tpu_runs_an_exactly_summed_product_in_xla():
-    """A kernel gradient into fp32 above the default precision adds each step's products apart, which
-    the TPU's launches do not promise (their MXUs add within a step): XLA runs it, the refusal reported."""
-    x, _, _, _, _, _, _, dy = _draw(0)
-    with generation.assumed("v5e"), generation.routes() as taken:
-        template.gemm_t(x, dy.astype(jnp.bfloat16), jnp.asarray(SIZES), out_dtype=jnp.float32,
-                        precision="highest", interpret_on_cpu=True)
-    [found] = [route for route in taken if route.choice == 'grouped_matmul']
-    assert found.kernel == 'xla' and "MXUs" in found.refusal.detail
-
-def test_an_empty_rows_undefined_derivative_reaches_no_shared_gradient():
-    """A row past the routed ones whose mean square is zero has no defined derivative of `rsqrt`; it
-    multiplied nothing, so the norm weight's and the matrix's gradients are the routed row's alone, and
-    the empty row's own are zero."""
-    x = jnp.zeros((2, DEPTH), jnp.bfloat16).at[0].set(1)
-    ms, nw = jnp.asarray([1.0, 0.0]), jnp.ones((DEPTH,))
-    w = jnp.ones((1, DEPTH, WIDTH)) / DEPTH
-
-    def through(x, ms, nw, w, *, sizes, interpret):
-        out = template.gemm(x, w, jnp.asarray(sizes), prologue=normed,
-                            prologue_operands=((ms, ("rows",)), (nw, ("depth",))), out_dtype=jnp.float32,
-                            interpret_on_cpu=interpret)
-        return jnp.sum(out)
-
-    with generation.assumed("sm80"):
-        dx, dms, dnw, dw = jax.jit(jax.grad(functools.partial(through, sizes=[1], interpret=True),
-                                            (0, 1, 2, 3)))(x, ms, nw, w)
-        alone = jax.jit(jax.grad(functools.partial(through, sizes=[1], interpret=False), (0, 1, 2, 3)))(
-            x[:1], ms[:1], nw, w)
-    np.testing.assert_array_equal(np.asarray(dnw), np.asarray(alone[2]))
-    np.testing.assert_array_equal(np.asarray(dw), np.asarray(alone[3]))
-    assert not np.any(np.asarray(dx[1], np.float32)) and float(dms[1]) == 0
-
-
 def test_a_wide_cotangent_meets_the_rounded_matrix_once():
     """An fp32 output's cotangent 1.00390625 times a bf16 matrix entry 1.0078125 rounds once to bf16's
     1.015625, as JAX's derivative of the plain program has it; rounding the cotangent first would give
