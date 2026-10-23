@@ -654,6 +654,26 @@ def test_a_querys_gradient_with_a_large_refinement_at_a_small_scale_is_finite():
     assert_same_bits(triton.query, portable.query, "a large refinement at a small scale")
 
 
+def test_a_querys_gradient_at_a_subnormal_scale_is_finite():
+    """The accurate form at a scale of 2^-128, below fp32's least normal: a query of zeros over two equal keys
+    and values of 1 under a cotangent of 1, whose score cotangents, dQ and the reference's are all 0. The
+    keyed sums carry the scale as a mantissa and an exponent (`algebra.dq_terms`), taken apart in Python's
+    double, where 2^128 is no overflow; an infinite mantissa would make dQ's correction 0 · inf, NaN. dQ is
+    finite and 0 in both mainloops."""
+    query = jnp.zeros((1, 1, 1, 16), jnp.float32)
+    key = jnp.ones((1, 2, 1, 16), jnp.float32)
+    value = jnp.ones((1, 2, 1, 16), jnp.float32)
+    dout = jnp.ones((1, 1, 1, 16), jnp.float32)
+    spans = template.spans(1, 2, 1)
+    tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
+    options = {"scale": 2.0 ** -128, "natural": True, "accurate": True}
+    with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
+        triton = attention_triton.backward(query, key, value, spans, None, dout, interpret=True, **options)
+    portable = attention_portable.backward(query, key, value, spans, None, dout, **options, **tiles)
+    for name, grads in (("triton", triton), ("portable", portable)):
+        np.testing.assert_array_equal(np.asarray(grads.query), 0.0, err_msg=name)
+
+
 def test_a_querys_gradient_from_a_state_of_a_small_denominator_at_a_large_scale_is_finite():
     """One key resumed from a state of denominator 2^-40 at maximum 40, at a scale of 2^100: the key's
     probability is about 4.7e-6 and dQ about 5.9e24, finite, though the scale over the denominator, 2^140,

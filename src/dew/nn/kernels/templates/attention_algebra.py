@@ -1166,7 +1166,8 @@ def _static_split(x: float) -> tuple[np.float32, np.float32]:
     if value == 0:
         return value, np.float32(0.0)
     exponent = math.ceil(math.log2(abs(float(value))))
-    return np.float32(value * np.float32(2.0) ** -exponent), np.float32(exponent)
+    # In Python's double, where 2^-exponent of a subnormal scale is no fp32 overflow.
+    return np.float32(math.ldexp(float(value), -exponent)), np.float32(exponent)
 
 
 def exponent_product(mantissa: jax.Array, exponent: jax.Array) -> jax.Array:
