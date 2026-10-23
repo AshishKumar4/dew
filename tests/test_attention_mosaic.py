@@ -51,9 +51,8 @@ output gate, and all at once; each `(score hooks, gate)`. The hook indexed off t
 column forms a unit axis, which the mainloop refuses (`attention_mosaic.unlowered`, ledger row 1428):
 `test_a_hook_that_forms_a_unit_axis_is_refused`."""
 HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False),
-              "float16-natural": (jnp.float16, True)}
-"""The hooked forward's dtypes and forms: the fold over both 16-bit dtypes, and fp16's natural form (bf16's
-takes a headroom guard the mainloop has not yet)."""
+              "bfloat16-natural": (jnp.bfloat16, True), "float16-natural": (jnp.float16, True)}
+"""The hooked forward's dtypes and forms: the fold and natural logits over both 16-bit dtypes."""
 FORM_TILES = attention_mosaic.Tiles(64, 64, 2)
 """The call forms' tiles: the template core's 100 queries over 96 keys (`test_attention_template.CASES`) in a
 pair of query blocks over two key tiles, so a block's spans begin and end within the keys it streams."""
@@ -192,11 +191,12 @@ def test_the_forward_is_on_par_interpreted(call, dtype):
 
 
 @INTERPRETS
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
 @pytest.mark.parametrize("call", CALLS)
-def test_the_natural_forward_is_on_par_interpreted(call):
-    """The forward with natural logits, fp16's (bf16's takes a headroom guard the mainloop has not yet), under
-    the interpreter."""
-    _check_forward(call, jnp.float16, SHAPES["interpreted"], natural=True, interpret=True)
+def test_the_natural_forward_is_on_par_interpreted(call, dtype):
+    """The forward with natural logits under the interpreter, bf16's under its headroom guard
+    (`algebra.walked_launches`)."""
+    _check_forward(call, dtype, SHAPES["interpreted"], natural=True, interpret=True)
 
 
 @INTERPRETS
@@ -211,8 +211,7 @@ def test_the_forward_is_on_par_over_every_call_form_interpreted(form):
 @pytest.mark.parametrize("hooks", FORWARD_HOOKS)
 def test_the_forward_is_on_par_under_every_hook_interpreted(hooks, dtype, natural):
     """The forward under each hook (`FORWARD_HOOKS`) over causal packed documents under a window, under the
-    interpreter: the fold over both 16-bit dtypes, and fp16's natural form (bf16's takes a headroom guard the
-    mainloop has not yet)."""
+    interpreter, in each of `HOOK_FORMS`."""
     _check_hooks(hooks, dtype, natural, interpret=True)
 
 
@@ -315,10 +314,11 @@ def test_the_forward_is_on_par_on_an_h100(call, dtype):
 
 @ON_HOPPER
 @pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
 @pytest.mark.parametrize("call", CALLS)
-def test_the_natural_forward_is_on_par_on_an_h100(call):
-    """The forward with natural logits, fp16's, compiled on an H100."""
-    _check_forward(call, jnp.float16, SHAPES["compiled"], natural=True, interpret=False)
+def test_the_natural_forward_is_on_par_on_an_h100(call, dtype):
+    """The forward with natural logits compiled on an H100."""
+    _check_forward(call, dtype, SHAPES["compiled"], natural=True, interpret=False)
 
 
 @ON_HOPPER

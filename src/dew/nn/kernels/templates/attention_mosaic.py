@@ -15,8 +15,10 @@ call's from its places, a spans call's from its block map, `attention.block_map`
 does not see whole (`algebra.seen`); a consumer keeps releasing the slots its partner alone reads.
 
 The forward over every call form of 16-bit operands under every hook (`Hooks`: the score hook and its
-parameters on each tile, the softmax's initial state in the walk's start, the output hook on its output),
-the base-2 fold and the natural form without headroom (fp16 values, which cannot overflow it)."""
+parameters on each tile, the softmax's initial state in the walk's start, the output hook on its output), the
+base-2 fold and natural logits, under the default's guards over whole launches (`algebra.walked_launches`: a
+program walks its keys once, so the call walks again in the natural form where some row's logits pass the
+fold's reach, and its overflowed rows again shifting under headroom). Its legality rule is `refused`."""
 
 import dataclasses
 import functools
@@ -90,11 +92,9 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     family = family_of(query.dtype) if family is None else family
     tiles = DEFAULTS[family.name] if tiles is None else tiles
     hooks = Hooks() if hooks is None else hooks
-    if jnp.dtype(query.dtype) not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
-        raise NotImplementedError(f"the Mosaic mainloop takes 16-bit operands, not {jnp.dtype(query.dtype)}")
     width, value_width = query.shape[3], value.shape[3]
-    if width != value_width:
-        raise NotImplementedError("the Mosaic mainloop's output reuses the query's stage: equal head widths")
+    if reason := refused(query.dtype, width, value_width, hooks, backward=False):
+        raise NotImplementedError(reason)
     block = max(family.consumers * tiles.block_q, tiles.block_k)
     call = padded_call(query, key, value, spans, hooks, block)
     # Every form guards its sums where its values can overflow them (`algebra.Forward.headroom`), and the
@@ -103,8 +103,6 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                            scale=width ** -0.5 if scale is None else scale, score_mod=hooks.score_mod,
                            natural=natural, headroom=algebra.headroom(value.dtype),
                            initial=hooks.initial is not None)
-    if refusal := unlowered(hooks, (tiles.block_q, tiles.block_k), call.value.shape[-1]):
-        raise NotImplementedError(refusal)
     query, key, value = (_columns(array) for array in (call.query, call.key, call.value))
     spans_of, hooked = _spans_of(spec, call, tiles.block_q, tiles.block_k), _hooked_of(hooks, call)
 
@@ -127,6 +125,24 @@ def _columns(array: jax.Array) -> jax.Array:
     """`array` with its last axis padded to whole rows of `COLUMNS` 16-bit entries, as the family's swizzled
     tiles hold them."""
     return jnp.pad(array, ((0, 0),) * (array.ndim - 1) + ((0, -array.shape[-1] % COLUMNS),))
+
+
+def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backward: bool) -> str | None:
+    """Why this mainloop takes no call of `dtype` operands, head widths `width` and `value_width` and `hooks`
+    (its forward, or with `backward` its backward), or None: its legality rule, which `forward` and
+    `backward` refuse by and the route's chooser and the stability suite read."""
+    hooks = Hooks() if hooks is None else hooks
+    sixteen = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
+    if backward and hooks != Hooks():
+        return "the Mosaic backward takes no hooks yet"
+    if backward and jnp.dtype(dtype) != jnp.dtype(jnp.bfloat16):
+        return f"the Mosaic backward takes bf16 operands, not {jnp.dtype(dtype)}"
+    if jnp.dtype(dtype) not in sixteen:
+        return f"the Mosaic mainloop takes 16-bit operands, not {jnp.dtype(dtype)}"
+    if width != value_width:
+        return ("the Mosaic mainloop's output reuses the query's stage, and its backward stages dK and dV "
+                "through one buffer: equal head widths")
+    return unlowered(hooks, (COLUMNS, COLUMNS), COLUMNS)
 
 
 def unlowered(hooks: Hooks, tile: tuple[int, int], value_width: int) -> str | None:
@@ -873,13 +889,8 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     operands, no hooks."""
     family = family_of(query.dtype) if family is None else family
     tiles = BACKWARD_DEFAULTS[family.name] if tiles is None else tiles
-    if hooks is not None and hooks != Hooks():
-        raise NotImplementedError("the Mosaic backward takes no hooks yet")
-    if jnp.dtype(query.dtype) != jnp.dtype(jnp.bfloat16):
-        raise NotImplementedError(f"the Mosaic backward takes bf16 operands, not {jnp.dtype(query.dtype)}")
-    if query.shape[3] != value.shape[3]:
-        raise NotImplementedError("the Mosaic backward stages dK and dV through one buffer: equal head "
-                                  "widths, as the forward takes")
+    if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=True):
+        raise NotImplementedError(reason)
     count = min(BACKWARD_CONSUMERS[accurate], family.consumers) if consumers is None else consumers
     factor = query.shape[3] ** -0.5 if scale is None else scale
     spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=factor,
