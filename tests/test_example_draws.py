@@ -58,9 +58,10 @@ def test_a_record_draws_alike_however_many_processes_read_its_step():
 NORMAL_SEEDS = 8
 """The normal-draw sites' declared draws (`seeds_for`): each draw is the step's key from its seed.
 Each draws WIDTH values a row of each example: float32's erf_inv is up to 63 ulps from float64 near
-|u| = 1, so a leaf of a few values pools a heavy tail and resolves no ratio."""
+|u| = 1, so a leaf of a few hundred values pools a heavy tail and resolved no ratio within 512 seeds
+(at WIDTH 64)."""
 
-WIDTH = 64
+WIDTH = 2048
 """The values a check-1 draw adds to each draw shape, as a last axis (`NORMAL_SEEDS`)."""
 
 LOW = float(np.nextafter(np.float32(-1.0), np.float32(0.0)))
