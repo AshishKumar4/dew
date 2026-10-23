@@ -56,11 +56,12 @@ def peak_row(tmp_path, platform: str, *arguments: str) -> dict:
     `platform` with `arguments`, its peak measured in a process of the case's own."""
     out = tmp_path / "rows.json"
     environment = {name: value for name, value in os.environ.items() if name != "XLA_FLAGS"}
-    subprocess.run([sys.executable, str(REPO_ROOT / "tools/benchmark_step.py"), "--preset", "cpu-smoke",
-                    "--architectures", "causal_transformer", "--warmup", "1", "--steps", "2",
-                    "--dtype", "float32", "--mesh", "{}", "--json-out", str(out), *arguments],
-                   env={**environment, "JAX_PLATFORMS": platform, "PYTHONPATH": str(tmp_path)}, check=True,
-                   capture_output=True, timeout=900)
+    done = subprocess.run([sys.executable, str(REPO_ROOT / "tools/benchmark_step.py"), "--preset", "cpu-smoke",
+                           "--architectures", "causal_transformer", "--warmup", "1", "--steps", "2",
+                           "--dtype", "float32", "--mesh", "{}", "--json-out", str(out), *arguments],
+                          env={**environment, "JAX_PLATFORMS": platform, "PYTHONPATH": str(tmp_path)},
+                          capture_output=True, text=True, timeout=900)
+    assert done.returncode == 0, done.stderr[-4000:]
     (row,) = json.loads(out.read_text())
     return row
 
