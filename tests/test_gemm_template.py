@@ -17,7 +17,7 @@ from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
-from dew.nn.kernels.templates import hopper, product
+from dew.nn.kernels.templates import mosaic, product
 from dew.nn.kernels.templates.gemm import fused, mosaic_gpu, template, triton_dense
 
 pytestmark = pytest.mark.kernel
@@ -1050,7 +1050,7 @@ def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():
         assert mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2) in kept  # 128 registers a thread
         assert mosaic_gpu.Tiles(128, 256, 64, 3, 1, warpgroups=2) not in kept  # 256
         assert kept and all(2 * tile.block_m * tile.block_n // (128 * tile.warpgroups)
-                            < (hopper.CONSUMER_REGISTERS if tile.warpgroups == 2 else 255)
+                            < (mosaic.CONSUMER_REGISTERS if tile.warpgroups == 2 else 255)
                             for tile in kept)
         assert set(kept) < set(launch.fitting(plain, target))
         # Triton's kernel gradient with exact sums takes at most EXACT_STEP rows a step.
