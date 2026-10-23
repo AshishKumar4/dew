@@ -398,6 +398,44 @@ def test_a_gpu_lane_fetches_the_pinned_fixtures_before_any_file_and_stops_where_
     assert fetched.is_file() and not (tmp_path / "read").exists()
 
 
+LANE_TEST = ("import os, subprocess, sys, time\n"
+             "from pathlib import Path\n"
+             "def test_runs():\n"
+             "    began = time.monotonic()\n"
+             "    time.sleep(1)\n"
+             "    share = os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION']\n"
+             "    grown = os.environ.get('XLA_PYTHON_CLIENT_PREALLOCATE', 'true')\n"
+             "    ran = Path(f'ran-{Path(__file__).stem}-{os.getpid()}')\n"
+             "    ran.write_text(f'{share} {began} {time.monotonic()} {grown}')\n")
+"""A GPU lane's test file standing in: it records the share it was given, when it ran and whether its pool
+grows."""
+
+
+def gpu_lane_at(root: Path, monkeypatch, url: str, files: int) -> list[str]:
+    """A GPU lane's machine at `root`: the test cache at `url`, half of one 80 GiB GPU, and `files` test files
+    of `LANE_TEST`. Their names."""
+    cached(monkeypatch, url)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
+    gpu_driver(root, monkeypatch)
+    names = [f"tests/test_file_{index}.py" for index in range(files)]
+    for name in names:
+        (root / name).write_text(LANE_TEST)
+    return names
+
+
+def lane_runs(root: Path, stem: str) -> list[list[str]]:
+    """Each run of `stem`'s `LANE_TEST`, oldest first: its share, start, end and growth."""
+    return [path.read_text().split() for path in sorted(root.glob(f"ran-{stem}-*"),
+                                                        key=lambda path: path.stat().st_mtime)]
+
+
+def overlapping(runs: list[list[str]]) -> int:
+    """The most of `runs` (`lane_runs`) that ran at one moment."""
+    spans = [(float(began), float(ended)) for _, began, ended, _ in runs]
+    return max(sum(began <= moment < ended for began, ended in spans) for moment, _ in spans)
+
+
 def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_share(
         ci, tmp_path, monkeypatch, cache_worker):
     """The GPU lane runs each file once, in a process of its own. A file no
@@ -409,22 +447,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     row stays red: nothing is run again. The rows join one verdict, each
     recorded as a task's are, and a later lane reuses the green ones."""
     url, stored, _ = cache_worker
-    cached(monkeypatch, url)
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
-    monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
-    gpu_driver(tmp_path, monkeypatch)
-    source = ("import os, subprocess, sys, time\n"
-              "from pathlib import Path\n"
-              "def test_runs():\n"
-              "    began = time.monotonic()\n"
-              "    time.sleep(1)\n"
-              "    share = os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION']\n"
-              "    grown = os.environ.get('XLA_PYTHON_CLIENT_PREALLOCATE', 'true')\n"
-              "    ran = Path(f'ran-{Path(__file__).stem}-{os.getpid()}')\n"
-              "    ran.write_text(f'{share} {began} {time.monotonic()} {grown}')\n")
-    names = [f"tests/test_file_{index}.py" for index in range(5)]
-    for name in names:
-        (tmp_path / name).write_text(source)
+    names, source = gpu_lane_at(tmp_path, monkeypatch, url, 5), LANE_TEST
     # One that fails on any share, and one that starts a process.
     (tmp_path / "tests/test_red.py").write_text(source + "    assert share == 'all of it'\n")
     (tmp_path / "tests/test_spawner.py").write_text(
@@ -434,12 +457,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     fetcher(tmp_path)
 
     def ran(stem: str) -> list[list[str]]:
-        return [path.read_text().split() for path in sorted(tmp_path.glob(f"ran-{stem}-*"),
-                                                            key=lambda path: path.stat().st_mtime)]
-
-    def overlapping(runs: list[list[str]]) -> int:
-        spans = [(float(began), float(ended)) for _, began, ended, _ in runs]
-        return max(sum(began <= moment < ended for began, ended in spans) for moment, _ in spans)
+        return lane_runs(tmp_path, stem)
 
     out = tmp_path / "verdict.json"
     assert ci.gpu_lane("3.12", every, out, cache=True, processes=4, deadline=600.0) == 0
@@ -479,6 +497,91 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     assert len(ran("test_red")) == 2, "a red row is never reused"
     assert ci.gpu_lane("3.12", names, out, cache=True, processes=4, deadline=600.0) == 0
     assert all(len(ran(Path(name).stem)) == 2 for name in names), "the third lane reused the green rows"
+
+
+def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A lane on a class no run has measured borrows each file's share from another GPU class's last
+    measured peak (the largest any class holds), so its files run side by side as a measured lane's do,
+    not each alone. A file red under a borrowed share because its memory ran out runs once more, alone,
+    with the lane's whole share, and its row says so (interference) with that first failure; one whose
+    first failure is its own (an assertion, whatever its message names) stays red, run once. The lane
+    records this class's own measurement, so the next lane on it reads its own, not the borrowed one. A
+    file no class measured runs alone, as every unmeasured one does where the Worker does not list its
+    records."""
+    url, stored, _ = cache_worker
+    names, source = gpu_lane_at(tmp_path, monkeypatch, url, 4), LANE_TEST
+    # Out of memory on any share but the whole: run again alone, its second row green, the first failure kept
+    # in its row. And one whose first failure is its own (an assertion): red, run once, whatever share.
+    (tmp_path / "tests/test_tight.py").write_text(
+        source + "    if share != '0.5':\n"
+                 "        raise RuntimeError('RESOURCE_EXHAUSTED: Out of memory allocating 9.0GiB')\n")
+    (tmp_path / "tests/test_wrong.py").write_text(
+        source + "    assert share == '0.5', 'an accuracy miss, not RESOURCE_EXHAUSTED: out of memory'\n")
+    # A block past the GPU's shared memory is no device memory a larger share gives: red, run once. And one
+    # out of memory whose borrowed measurement already reached the whole share: red, run once, as it ran.
+    (tmp_path / "tests/test_shared.py").write_text(
+        source + "    raise RuntimeError('RESOURCE_EXHAUSTED: Shared memory size limit exceeded: 300000')\n")
+    (tmp_path / "tests/test_whole.py").write_text(
+        source + "    raise RuntimeError('RESOURCE_EXHAUSTED: Out of memory allocating 90.0GiB')\n")
+    (tmp_path / "tests/test_new.py").write_text(source)
+    every = [*names, "tests/test_tight.py", "tests/test_wrong.py", "tests/test_shared.py",
+             "tests/test_whole.py", "tests/test_new.py"]
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    # Another class measured 4 GiB for each file but the new one; a third, smaller peaks for some.
+    for other, peak in (("NVIDIA-H100-80GB-HBM3-x86", 4), ("NVIDIA-A10-x86", 2)):
+        for name in [*names, "tests/test_tight.py", "tests/test_wrong.py", "tests/test_shared.py",
+                     "tests/test_whole.py"]:
+            at = "/" + ci.record_key("3.12", ci.row("3.12", name, ""), other)
+            whole = 64 if name == "tests/test_whole.py" else peak
+            stored[at] = json.dumps({"key": None, "depends": [name], "row": {}, "reads": [],
+                                     "peak": whole * 2 ** 30, "shares": 0, "pools": 0}).encode()
+
+    def ran(stem: str) -> list[list[str]]:
+        return lane_runs(tmp_path, stem)
+
+    out = tmp_path / "verdict.json"
+    assert ci.gpu_lane("3.12", every, out, cache=True, processes=4, deadline=600.0) == 0
+    rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
+    borrowed = str(6 * 2 ** 30 / (81920 * 2 ** 20))
+    first = [ran(Path(name).stem)[0] for name in names]
+    assert [share for share, *_ in first] == [borrowed] * len(names), "the largest class's 4 GiB and headroom"
+    assert overlapping(first) >= 2, "borrowed shares pack as measured ones do"
+    assert [share for share, *_ in ran("test_new")] == ["0.5"], "measured on no class: alone, the whole share"
+    assert [share for share, *_ in ran("test_tight")] == [borrowed, "0.5"]
+    tight = rows["3.12:tests/test_tight.py"]
+    assert tight["exitCode"] == 0 and "borrowed from NVIDIA-H100-80GB-HBM3-x86" in tight["interference"]
+    assert "RESOURCE_EXHAUSTED" in tight["interference"]
+    wrong = rows["3.12:tests/test_wrong.py"]
+    assert wrong["exitCode"] == 1 and "an accuracy miss" in wrong["output"] and "interference" not in wrong
+    assert [share for share, *_ in ran("test_wrong")] == [borrowed], "its own failure: red, run once"
+    for stem in ("test_shared", "test_whole"):
+        found = rows[f"3.12:tests/{stem}.py"]
+        assert found["exitCode"] == 1 and len(ran(stem)) == 1, f"{stem}: red, run once"
+        assert "interference" not in found
+    assert ran("test_whole")[0][0] == "0.5", "its borrowed measurement already reached the whole share"
+    assert all("interference" not in row for name, row in rows.items() if name != "3.12:tests/test_tight.py")
+    # A Worker that does not list its records: nothing is borrowed, and an unmeasured file runs alone.
+    (tmp_path / "tests/test_listless.py").write_text(source)
+    for other in ("NVIDIA-H100-80GB-HBM3-x86",):
+        at = "/" + ci.record_key("3.12", ci.row("3.12", "tests/test_listless.py", ""), other)
+        stored[at] = json.dumps({"key": None, "depends": [], "row": {}, "reads": [], "peak": 2 ** 30,
+                                 "shares": 0, "pools": 0}).encode()
+    listing = ci.r2.Store.keys
+
+    def refused(self, prefix):
+        raise ci.r2.Unavailable("listing refused")
+        yield
+
+    monkeypatch.setattr(ci.r2.Store, "keys", refused)
+    assert ci.gpu_lane("3.12", ["tests/test_listless.py"], out, cache=False, processes=4, deadline=600.0) == 0
+    assert [share for share, *_ in ran("test_listless")] == ["0.5"]
+    monkeypatch.setattr(ci.r2.Store, "keys", listing)
+    # This class's own records now: the next lane reads them, the tight file alone as its own last run was.
+    assert ci.gpu_lane("3.12", ["tests/test_tight.py"], out, cache=False, processes=4, deadline=600.0) == 0
+    assert [share for share, *_ in ran("test_tight")][-1] != borrowed
+    assert "interference" not in json.loads(out.read_text())["rows"][0]
 
 
 def test_a_files_children_hold_what_they_held_at_once_and_each_start_must_leave_its_record(tmp_path):
