@@ -1,6 +1,7 @@
 """Tokenizers for language-model data, utf-8 bytes or any HF tokenizer, and
 the text record steps: tokenizing, chunking, dropping, normalizing and
-filtering text.
+filtering text, and curating it through DataTrove's filters (`Language`,
+`Quality`, `Classifier`, `Decontaminated`; the `curation` extra).
 
 `import dew.data` stays cheap. Nothing here imports `transformers` at module
 scope, and ByteTokenizer needs nothing but numpy. HFTokenizer loads its
@@ -10,24 +11,27 @@ tokenizer on first use, so a host without the hub cache still imports
 
 from __future__ import annotations
 
+import abc
 import dataclasses
 import functools
 import hashlib
 import json
+import tempfile
 import threading
 import unicodedata
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 
 import grain.python as grain
 import numpy as np
 from filelock import FileLock
 
-from dew.data.pipeline import TOKEN_FIELDS
+from dew.data.pipeline import TOKEN_FIELDS, Rejected
 from dew.data.tokens import chunk_table
 
 if TYPE_CHECKING:
+    from datatrove.pipeline.filters.base_filter import BaseFilter
     from jax.typing import ArrayLike
     from transformers import PreTrainedConfig, PreTrainedTokenizerBase
 
@@ -485,6 +489,147 @@ class MinChars:
 
     def __call__(self, element: Batch) -> bool:
         return len(str(element[self.field])) >= self.count
+
+
+class Curated(abc.ABC):
+    """A record step over one of DataTrove's document filters: the record where the filter keeps the
+    text in `field`, else `Rejected` with the reason the filter names, or the step's own. The filter
+    is built once a process (`curator`), never pickled with the step, and the step's identity
+    records DataTrove's release, which pins the filter's rules and the models it names."""
+
+    field: str
+    reason: ClassVar[str]
+    rejects: ClassVar[bool] = True
+
+    @abc.abstractmethod
+    def curator(self) -> BaseFilter:
+        """The DataTrove filter the step runs."""
+
+    def __call__(self, element: Batch) -> Batch | Rejected:
+        from datatrove.data import Document
+
+        text = element[self.field]
+        text = text.decode("utf-8") if isinstance(text, bytes) else str(text)
+        kept = _curator(self).filter(Document(text=text, id=""))
+        # DataTrove's filters keep with True and drop with False or with False and their reason.
+        if kept is True:
+            return element
+        return Rejected(kept[1] if isinstance(kept, tuple) else self.reason)
+
+    def dependencies(self) -> Mapping[str, object]:
+        from importlib.metadata import version
+
+        return {"datatrove": version("datatrove")}
+
+
+@functools.cache
+def _curator(step: Curated) -> BaseFilter:
+    """`step`'s DataTrove filter, one a process."""
+    return step.curator()
+
+
+@dataclasses.dataclass(frozen=True)
+class Language(Curated):
+    """The text in `field` kept where DataTrove's language identification scores it above
+    `min_score` in one of `languages` (DataTrove's codes; any language when none is named), over
+    fastText's lid.176 (`backend="ft176"`) or GlotLID (`"glotlid"`), which DataTrove downloads on
+    first use into its asset cache."""
+
+    languages: tuple[str, ...] = ()
+    min_score: float = 0.65
+    backend: Literal["ft176", "glotlid"] = "ft176"
+    field: str = "text"
+    reason = "language"
+
+    def curator(self) -> BaseFilter:
+        from datatrove.pipeline.filters import LanguageFilter
+
+        return LanguageFilter(languages=list(self.languages) or None, language_threshold=self.min_score,
+                              backend=self.backend)
+
+
+QUALITY_RULES = ("gopher", "c4", "fineweb")
+"""The heuristic quality rules `Quality` runs: Gopher's (Rae et al. 2021), C4's (Raffel et al.
+2020) and FineWeb's (Penedo et al. 2024), as DataTrove implements them."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Quality(Curated):
+    """The text in `field` kept where DataTrove's `rule` passes it: Gopher's, C4's or FineWeb's
+    quality filter at DataTrove's own thresholds, any of which `settings` replaces as
+    `(parameter, value)` pairs of the filter's constructor. A rejected record is counted under the
+    rule's reason (`gopher_short_doc`, `too_few_sentences`, `line_punct_ratio`, ...)."""
+
+    rule: Literal["gopher", "c4", "fineweb"]
+    settings: tuple[tuple[str, object], ...] = ()
+    field: str = "text"
+    reason = "quality"
+
+    def curator(self) -> BaseFilter:
+        from datatrove.pipeline.filters import C4QualityFilter, FineWebQualityFilter, GopherQualityFilter
+
+        rules = dict(zip(QUALITY_RULES, (GopherQualityFilter, C4QualityFilter, FineWebQualityFilter),
+                         strict=True))
+        return rules[self.rule](**dict(self.settings))
+
+
+@dataclasses.dataclass(frozen=True)
+class Classifier(Curated):
+    """The text in `field` kept by a fastText classifier, DataTrove's fastText filter over the model at
+    `model` (a path or a URL, which DataTrove downloads on first use): where one of `keep`'s
+    `(label, score)` pairs scores at least its score, or where none of `remove`'s does. The step's
+    identity records the model's SHA-256."""
+
+    model: str
+    keep: tuple[tuple[str, float], ...] = ()
+    remove: tuple[tuple[str, float], ...] = ()
+    field: str = "text"
+    reason = "classifier"
+
+    def curator(self) -> BaseFilter:
+        from datatrove.pipeline.filters import FastTextClassifierFilter
+
+        return FastTextClassifierFilter(self.model, keep_labels=list(self.keep) or None,
+                                        remove_labels=list(self.remove) or None)
+
+    def dependencies(self) -> Mapping[str, object]:
+        from datatrove.io import cached_asset_path_or_download
+
+        path = cached_asset_path_or_download(self.model, namespace="filters", subfolder="fasttext")
+        return {**super().dependencies(), "model": hashlib.sha256(Path(path).read_bytes()).hexdigest()}
+
+
+@dataclasses.dataclass(frozen=True)
+class Decontaminated(Curated):
+    """The text in `field` kept unless it shares an `n`-gram with one of the evaluation texts
+    `against`, by DataTrove's n-gram decontamination: both normalized, split into words and hashed
+    as its filter reads documents, and a record with a shared n-gram `Rejected("contaminated")`.
+    The evaluation texts are indexed once, with no evaluation harness, under the system's
+    temporary directory by what they hold."""
+
+    against: tuple[str, ...]
+    n: int = 12
+    field: str = "text"
+    reason = "contaminated"
+
+    def curator(self) -> BaseFilter:
+        from datatrove.pipeline.decont import NGramsDecontConfig, NGramsDecontFilter
+        from datatrove.utils.text import ngrams, simplify_text
+
+        from dew.files import write_atomically
+
+        config = NGramsDecontConfig(n_grams=self.n)
+        held = hashlib.sha256(json.dumps([self.n, self.against]).encode()).hexdigest()
+        folder = Path(tempfile.gettempdir()) / "dew-decontamination" / held
+        decontaminate = NGramsDecontFilter(str(folder), config=config)
+        # The index the filter reads, each n-gram split, joined and hashed as its own filter reads a document.
+        words = [decontaminate.tokenizer.word_tokenize(simplify_text(text, config.norm_config))
+                 for text in self.against]
+        hashes = {decontaminate.hash_func(" ".join(gram)) for row in words for gram in ngrams(row, self.n)}
+        folder.mkdir(parents=True, exist_ok=True)
+        write_atomically(folder / "against.index.hashes",
+                         np.array(sorted(hashes), dtype=config.hash_config.np_descr).tobytes())
+        return decontaminate
 
 
 def export_tokens(dataset: Dataset, url: str, tokenizer: str, *, field: str = "text", eos: bool = True,
