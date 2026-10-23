@@ -24,8 +24,8 @@ from `jax._src` imports to their public equivalents, with lines of logic
 changed and marked `# Dew:`: the prologue and epilogue hooks with their side
 operands (`_side_tile`), tgmm's output cast, and gmm's zeroing when every
 group is empty. The file's `ragged_dot_general`
-adapter is left out: Dew calls the kernels itself, through
-`dew.nn.moe.expert_projection`'s custom VJP, the way MaxText calls megablox.
+adapter is left out: Dew calls the kernels itself, through the GEMM template
+(`templates.gemm.template`), which differentiates them, the way MaxText calls megablox.
 
 Every global load and store is masked on every dimension, rows included, and
 each output past the routed rows is the epilogue of a zero accumulator, zero
