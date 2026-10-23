@@ -26,6 +26,21 @@ def programs(directory: Path) -> dict[str, bytes]:
             for path in directory.glob(f"*{remote_cache.SUFFIX}")}
 
 
+def test_a_cpu_bundle_is_its_host_class_s_alone(monkeypatch):
+    """On the CPU, whose device kind is "cpu" on every host, a bundle is its host class's
+    (`dew._host.cpu_class`): XLA:CPU compiles for the host that compiles, and armada's hosts span classes,
+    so a program from another class need not link here ("Failed to materialize symbols"), after which the
+    process compiles nothing more."""
+    import dew._host
+
+    prefixes = {}
+    for named in ("AuthenticAMD-25-17", "AuthenticAMD-25-1"):
+        monkeypatch.setattr(dew._host, "cpu_class", lambda named=named: named)
+        prefixes[named] = remote_cache.prefix()
+    assert len(set(prefixes.values())) == 2
+    assert all(prefix.endswith(f"/cpu/{named}") for named, prefix in prefixes.items())
+
+
 def test_an_unreachable_remote_only_slows_a_task_by_its_first_failed_requests(monkeypatch, tmp_path):
     """No Worker at the URL: each file's bundle fails to arrive or leave until
     `FAILURES` requests have, the remote is then left alone, every program stays
