@@ -11,6 +11,8 @@ from abc import ABC, abstractmethod
 import jax
 import jax.numpy as jnp
 
+from dew.nn.precision import correctly_rounded_divide
+
 
 def expand(coefficient, x):
     """Return a per-example coefficient `[B]` reshaped to broadcast against `x` `[B, ...]`."""
@@ -25,23 +27,14 @@ def ancestral_variance(sigma, following):
 
 
 def divided(numerator, rate):
-    """`numerator / rate`, rounded once, as a source written in PyTorch divides a state by a rate.
-
-    A workaround for openxla/xla#51148: on CPU, XLA's algebraic simplifier rewrites a division by
-    a broadcast, a per-row rate against a `[B, ...]` state among them, into a multiplication by its
-    reciprocal without fast math (`HandleDivide`, behind `executing_on_cpu` and
-    `enable_sink_broadcast`, which no option turns off), two roundings where the division makes
-    one: 29% of float32 quotients come out an ulp off. The divisor here is the rate plus the
-    numerator times zero, a full-shape operand that no simplification folds back to the broadcast
-    (folding would change an infinite numerator's NaN), so the division stays one, inside the
-    fusion around it and with no buffer of its own. A finite numerator leaves the rate exact.
-    Other backends keep the division as written (the rewrite is the CPU compiler's alone), so
-    there it is the plain one, at the plain one's cost. Remove this once XLA keeps such
-    divisions IEEE.
-    """
-    return jax.lax.platform_dependent(numerator, rate, cpu=lambda value, by: value / (by + value * 0),
-                                      default=lambda value, by: value / by)
-
+    """`numerator / rate`, rounded once, as a source written in PyTorch divides a state by a rate:
+    IEEE division (`dew.nn.precision.correctly_rounded_divide`) on every backend, where XLA's own
+    division rounds twice on a CPU and approximately on a GPU. A float64 run's division is IEEE
+    already."""
+    numerator, rate = jnp.asarray(numerator), jnp.asarray(rate)
+    if jnp.result_type(numerator, rate) != jnp.float32:
+        return numerator / rate
+    return correctly_rounded_divide(numerator, rate)
 
 
 def times(t) -> jax.Array:
