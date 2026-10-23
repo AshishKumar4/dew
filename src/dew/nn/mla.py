@@ -50,7 +50,7 @@ from dew.nn.precision import (
     compensated_add,
     compensated_sum,
     float32_dot_general,
-    float32_products,
+    float32_einsum,
 )
 from dew.nn.rope import YarnScaling, deinterleaved, rotary_freqs, rotate, yarn_query_scale
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
@@ -116,7 +116,7 @@ def indexer_kl(scores, query, key, keep, scale: float):
 
     def head(summed, projections):
         q, k = projections
-        product = jnp.einsum('bsd,btd->bst', q, k, precision=float32_products(q.dtype))
+        product = float32_einsum('bsd,btd->bst', q, k)
         probabilities = jax.nn.softmax(jnp.where(keep, product, masked), axis=-1)
         return compensated_add(summed, (probabilities, jnp.zeros_like(probabilities))), None
 

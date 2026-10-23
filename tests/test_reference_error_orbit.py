@@ -153,13 +153,13 @@ def test_narrow_rows_take_their_narrow_factor_and_wider_rows_row_factor():
     """The worst-row rule judged alone (`_judgement` on a leaf whose pooled ratio is one): Dew's worst
     row just inside its width's factor times the reference's passes and just past it fails, at one and
     two values a row (NARROW_FACTORS) and at three and eight (ROW_FACTOR)."""
-    from reference_error import NARROW_FACTORS, ROW_FACTOR, _Draws, _judgement
+    from reference_error import NARROW_FACTORS, NO_ZERO_ROWS, ROW_FACTOR, _Draws, _judgement
 
     for width in (1, 2, 3, 8):
         factor = NARROW_FACTORS.get(width, ROW_FACTOR)
         for worst, fails in ((0.99 * factor, False), (1.01 * factor, True)):
             draws = _Draws(["leaf"], np.ones((8, 1)), np.ones((8, 1)), np.tile([[[worst, 1.0]]], (8, 1, 1)),
-                           np.zeros((8, 1), int), np.ones((8, 1), bool), (width,))
+                           [[NO_ZERO_ROWS]] * 8, np.ones((8, 1), bool), (width,))
             over, _ = _judgement(draws, "leaf")
             assert bool(over) == fails, (width, worst)
 
