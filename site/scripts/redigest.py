@@ -67,12 +67,11 @@ class Renaming:
     """The renamings between two parsed programs: each variable to its one new name, injectively, and each
     API name where it is used."""
 
-    def __init__(self, defined: dict[str, set[str]]):
+    def __init__(self, before: Callables, after: Callables):
         self.variables: dict[str, str] = {}
         self.members: dict[str, set[str]] = {}
-        self.defined = defined
-        """The functions and classes the program defines, each with the parameters a keyword binds: a call's
-        keyword names one of them, and any other is a key a **kwargs collects."""
+        self.before, self.after = before, after
+        """What each program defines that a call's keyword can bind."""
 
     def name(self, role: str, was: str | None, now: str | None, line: int) -> None:
         if (was is None) != (now is None):
@@ -96,19 +95,15 @@ class Renaming:
                 raise ValueError(f"line {line}: {len(was)} items became {len(now)}")
             for before, after in zip(was, now, strict=True):
                 self.compare(before, after, line)
-        elif isinstance(was, ast.Call) and isinstance(was.func, ast.Name) and was.func.id in self.defined:
-            # A keyword to a function the program defines names its parameter, a variable, which renames
-            # with it.
+        elif isinstance(was, ast.Call):
             line = was.lineno
             self.compare([was.func, was.args], [now.func, now.args], line)
             if len(was.keywords) != len(now.keywords):
                 raise ValueError(f"line {line}: {len(was.keywords)} keywords became {len(now.keywords)}")
+            callees = (was.func.id if isinstance(was.func, ast.Name) else None,
+                       now.func.id if isinstance(now.func, ast.Name) else None)
             for one, other in zip(was.keywords, now.keywords, strict=True):
-                if one.arg in self.defined[was.func.id]:
-                    self.name(VARIABLE, one.arg, other.arg, line)
-                elif one.arg != other.arg:
-                    raise ValueError(f"line {line}: the key {one.arg!r} a **kwargs collects became "
-                                     f"{other.arg!r}")
+                self.keyword(one.arg, other.arg, callees, line)
                 self.compare(one.value, other.value, line)
         elif isinstance(was, ast.AST):
             line = getattr(was, "lineno", line)
@@ -135,6 +130,31 @@ class Renaming:
         elif was != now:
             raise ValueError(f"line {line}: {was!r} became {now!r}, not a rename")
 
+    def keyword(self, was: str | None, now: str | None, callees: tuple[str | None, str | None],
+                line: int) -> None:
+        """A call's keyword, on each side: a parameter it binds (a variable, which renames with the
+        parameter), a key a **kwargs collects (kept as it is), or an API's name. A callable the program
+        defines and calls by its name binds its own parameters; one it calls otherwise (a method, an alias)
+        may bind any parameter it defines. A keyword binds on both sides or on neither."""
+        if was is None or now is None:  # a mapping unpacked into the call: **options
+            self.name(MEMBER, was, now, line)
+            return
+        callee, renamed = callees
+        if callee in self.before.signatures:
+            bound = (was in self.before.signatures[callee], now in self.after.signatures.get(renamed, set()))
+        else:
+            bound = (was in self.before.parameters, now in self.after.parameters)
+            if not any(bound):
+                self.name(MEMBER, was, now, line)
+                return
+        if bound[0] != bound[1]:
+            raise ValueError(f"line {line}: the keyword {was!r} became {now!r}, which binds a parameter "
+                             "on one side only")
+        if bound[0]:
+            self.name(VARIABLE, was, now, line)
+        elif was != now:
+            raise ValueError(f"line {line}: the key {was!r} a **kwargs collects became {now!r}")
+
     def alias(self, was: ast.alias, now: ast.alias, line: int) -> None:
         """An import: its name an API name, and the variable it binds (its `as`, else its name's first
         part)."""
@@ -160,22 +180,32 @@ class Renaming:
         return ", ".join(sorted(names))
 
 
-def defined(program: ast.Module) -> dict[str, set[str]]:
-    """Each function and class `program` defines, with the parameters a keyword binds: a function's own, but
-    those only by position; a class's __init__'s, but its first; a class with no __init__ of its own, none.
-    A name defined twice keeps the parameters both definitions share."""
-    found: dict[str, set[str]] = {}
-    for node in ast.walk(program):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            named = set(keywords(node, bound=False))
-        elif isinstance(node, ast.ClassDef):
-            init = next((item for item in node.body if isinstance(item, ast.FunctionDef)
-                         and item.name == "__init__"), None)
-            named = set() if init is None else set(keywords(init, bound=True))
-        else:
-            continue
-        found[node.name] = found[node.name] & named if node.name in found else named
-    return found
+class Callables:
+    """What a program defines that a call's keyword can bind: each function, class and lambda it names, with
+    the parameters a keyword binds (`signatures`: a function's own, but those only by position; a class's
+    __init__'s, but its first; a class with no __init__ of its own, none; a name defined twice, those both
+    definitions share), and every parameter of every callable it defines (`parameters`)."""
+
+    def __init__(self, program: ast.Module):
+        self.signatures: dict[str, set[str]] = {}
+        for node in ast.walk(program):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                named, names = node.name, set(keywords(node.args, bound=False))
+            elif isinstance(node, ast.ClassDef):
+                init = next((item for item in node.body if isinstance(item, ast.FunctionDef)
+                             and item.name == "__init__"), None)
+                named, names = node.name, set() if init is None else set(keywords(init.args, bound=True))
+            elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Lambda):
+                for target in assigned(node):
+                    self.define(target, set(keywords(node.value.args, bound=False)))
+                continue
+            else:
+                continue
+            self.define(named, names)
+        self.parameters = {node.arg for node in ast.walk(program) if isinstance(node, ast.arg)}
+
+    def define(self, name: str, names: set[str]) -> None:
+        self.signatures[name] = self.signatures[name] & names if name in self.signatures else names
 
 
 def api(revision: str) -> set[str]:
@@ -195,13 +225,15 @@ def api(revision: str) -> set[str]:
         names |= {target for node in tree.body for target in assigned(node)}
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                names |= {node.name, *(f"{node.name}.{name}" for name in keywords(node, bound=False))}
+                names |= {node.name, *(f"{node.name}.{name}" for name in keywords(node.args, bound=False))}
             elif isinstance(node, ast.ClassDef):
                 names.add(node.name)
                 for item in node.body:
                     held = assigned(item)
                     if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        held = [item.name, *(keywords(item, bound=True) if item.name == "__init__" else [])]
+                        held = [item.name]
+                        if item.name == "__init__":
+                            held += keywords(item.args, bound=True)
                     names |= {f"{node.name}.{name}" for name in held}
     return names
 
@@ -213,10 +245,10 @@ def assigned(node: ast.stmt) -> list[str]:
     return [target.id for target in targets if isinstance(target, ast.Name)]
 
 
-def keywords(function: ast.FunctionDef | ast.AsyncFunctionDef, bound: bool) -> list[str]:
-    """The parameters a keyword passes `function`, its first left out where it is `bound` (self)."""
-    positional = function.args.args[1:] if bound else function.args.args
-    return [arg.arg for arg in (*positional, *function.args.kwonlyargs)]
+def keywords(arguments: ast.arguments, bound: bool) -> list[str]:
+    """The parameters a keyword passes a callable of `arguments`, its first left out where it is `bound`."""
+    positional = arguments.args[1:] if bound else arguments.args
+    return [arg.arg for arg in (*positional, *arguments.kwonlyargs)]
 
 
 def declared(renames: list[str], base: str, head: str) -> dict[str, str]:
@@ -244,7 +276,7 @@ def renamed(before: str, after: str, renames: dict[str, str]) -> Renaming:
     otherwise."""
     try:
         was, now = ast.parse(before), ast.parse(after)
-        renaming = Renaming(defined(was))
+        renaming = Renaming(Callables(was), Callables(now))
         renaming.compare(was, now)
         renaming.check(after, renames)
     except SyntaxError as error:
