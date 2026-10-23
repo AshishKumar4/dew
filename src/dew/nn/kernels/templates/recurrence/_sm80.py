@@ -133,8 +133,10 @@ class MmaSync(mosaic.Family):
 
             def stepped(index, both, step=step, hi=hi):
                 if not ahead:
-                    # One slot: the last step's reads done before its next load.
-                    self.settled()
+                    # One slot: the last step's reads done (the wait's barrier, no copy in flight) before
+                    # its next load.
+                    if not _INTERPRETED.get():
+                        plgpu.wait_gmem_to_smem(0)
                     copy(index, 0)
                 # The wait's barrier also ends every warp's reads of the slot the next copy refills.
                 if not _INTERPRETED.get():
@@ -189,16 +191,16 @@ class MmaSync(mosaic.Family):
         return acc
 
     def stage(self, value, buffer):
-        """`value` in the shared-memory tile `buffer`, in its dtype, once every warp's reads of `buffer` are
-        done, for a product to read: a register operand's way to an MMA."""
-        self.settled()
+        """`value` in the shared-memory tile `buffer`, in its dtype, for a product to read: a register
+        operand's way to an MMA. Mosaic GPU brackets a store with the warpgroup's barriers (its automatic
+        barriers), so every warp's reads of `buffer` are done before it and its writes seen after; sm80 has no
+        async proxy to fence (`commit_smem`'s fence.proxy.async does not select there)."""
         buffer[...] = value.astype(buffer.dtype)
-        plgpu.commit_smem()
         return buffer
 
     def settled(self) -> None:
-        # The products are synchronous; the warpgroup's reads of shared memory are done at its barrier.
-        plgpu.commit_smem()
+        # The products are synchronous: each has read its operands when it returns.
+        pass
 
     def zeros(self, shape: tuple[int, ...]) -> jax.Array:
         return self.full(shape, 0.0)
