@@ -163,16 +163,13 @@ def _shifted_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax
     """The depthwise convolution's taps (`_taps`), each product rounded to fp32 before it is added, the
     sum from the first, rounded once to the input's dtype.
 
-    For more than 16 features that is XLA:CPU's library convolution's
-    arithmetic (YNNPACK, jax 0.11.2), bit for bit in fp32 and bf16, which on
-    the hybrid DiT's 2 x 16 x 16 x 768 maps takes 6.4 ms a call against 1.4
-    here; it sums 16 features or fewer otherwise, so those keep the
-    convolution. If a jax or YNNPACK release changes that summation,
-    tests/test_depthwise_conv.py's
-    test_cpu_depthwise_is_the_library_convolution_bit_for_bit fails. An
-    output whose nine taps are all negative zero is the sum's negative zero
-    here, where the library gives a zero of either sign by its kernel and
-    the host it runs on."""
+    XLA:CPU runs a depthwise convolution of more than 16 features this way,
+    as exact as its library convolution (tests/test_depthwise_conv.py holds
+    it to check 1), which on the hybrid DiT's 2 x 16 x 16 x 768 maps takes
+    6.4 ms a call against 1.4 here; 16 features or fewer keep the
+    convolution. An output whose nine taps are all negative zero is the
+    sum's negative zero here, where the library gives a zero of either sign
+    by its kernel and the host it runs on."""
     height, width = lhs.shape[1:3]
     padded = jnp.pad(lhs, ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0))).astype(jnp.float32)
     products = jax.lax.optimization_barrier(_taps(padded, rhs.astype(jnp.float32), dilation, height, width))
