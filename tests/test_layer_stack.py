@@ -17,7 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import largest_difference
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened
+from reference_error import assert_as_exact, widened, without_ynn
 from sharded import assert_sharded
 from token_support import token_rows
 
@@ -404,39 +404,61 @@ def layer_states(model, variables, ids):
     return [model.layer_state(kept, index) for index in range(model.num_layers)]
 
 
-def layer_states_on(spec, model, variables, ids, microbatches=None):
-    """`layer_states` on `spec`'s mesh, the weights and the rows placed as a step places them, with
-    the pipeline's schedule of `microbatches` in context."""
+def layer_states_on(spec, model, variables, microbatches=None):
+    """`layer_states` on `spec`'s mesh as a function of token rows, the weights and the rows placed as
+    a step places them, with the pipeline's schedule of `microbatches` in context, compiled once
+    (`without_ynn`)."""
     mesh = spec.build()
     placed = jax.device_put(variables, Layout(min_shard=TINY_SHARD).shardings(mesh, variables))
-    rows = shard_batch(mesh, {"ids": ids})["ids"]
-    with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
-        states = jax.jit(lambda tree, rows: layer_states(model, tree, rows))(placed, rows)
-    return [np.asarray(state) for state in states]
+    compiled = without_ynn(lambda tree, rows: layer_states(model, tree, rows))
+
+    def states(ids):
+        rows = shard_batch(mesh, {"ids": ids})["ids"]
+        with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
+            return [np.asarray(state) for state in compiled(placed, rows)]
+    return states
 
 
-def float64_layer_states(model, variables, ids):
+def float64_layer_states(model, variables):
     """`layer_states` of the model computing in float64 over its weights widened, on the CPU, which
-    every lane keeps for float64: the truth."""
-    with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
-        return [np.asarray(state) for state in layer_states(model.clone(dtype=jnp.float64),
-                                                            widened(variables), np.asarray(ids))]
+    every lane keeps for float64, as a function of token rows: the truth."""
+    wide, held = model.clone(dtype=jnp.float64), widened(variables)
+
+    def states(ids):
+        with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
+            return [np.asarray(state) for state in layer_states(wide, held, np.asarray(ids))]
+    return states
+
+
+def token_draw(rows):
+    """Seed `seed`'s `rows` token rows, `SEQ_LEN` long."""
+    return lambda seed: (token_rows(VOCAB, rows, SEQ_LEN, seed=seed)["text"],)
+
+
+PIPELINED_STATES_SEEDS = 0
+"""The pipelined layer states' check-1 seeds, sized by `seeds_for` on armada."""
+FETCHED_STATES_SEEDS = 0
+"""The host-fetched layer states' check-1 seeds, sized by `seeds_for` on armada."""
+
+
+def pipelined_layer_states():
+    """The pipelined (dew) and fsdp (reference) layer-state functions of one model's weights and its
+    float64 truth: two stages over four microbatches, microbatch m holding rows m, m + 4, ..."""
+    model = tiny()
+    variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
+    return (layer_states_on(MeshSpec(fsdp=2, stage=2), model, variables, microbatches=4),
+            layer_states_on(MeshSpec(fsdp=4), model, variables), float64_layer_states(model, variables))
 
 
 @mesh_lane
 def test_a_pipelines_layer_states_hold_the_batchs_rows():
     """Two stages over four microbatches, microbatch m holding rows m, m + 4, ... (`microbatched`):
-    every layer's output a reader of layer states keeps comes back in the batch's rows, as exact as
-    the same forward's on the fsdp mesh, both measured from float64. Laid out microbatch by
-    microbatch, rows 1 to 3 would hold rows 4, 8 and 12."""
-    model = tiny()
-    ids = token_batch(PIPELINED_ROWS)["text"][:, :SEQ_LEN]
-    variables = model.init(jax.random.key(0), ids[:1])
-    plain = layer_states_on(MeshSpec(fsdp=4), model, variables, ids)
-    piped = layer_states_on(MeshSpec(fsdp=2, stage=2), model, variables, ids, microbatches=4)
-    truth = float64_layer_states(model, variables, ids)
-    for index, (ours, theirs, wide) in enumerate(zip(piped, plain, truth, strict=True)):
-        assert_as_exact_as_the_reference(ours, theirs, wide, f"pipelined layer {index}")
+    every layer's output a reader of layer states keeps comes back in the batch's rows, on par with
+    the same forward's on the fsdp mesh, both measured from float64 (check 1). Laid out microbatch
+    by microbatch, rows 1 to 3 would hold rows 4, 8 and 12."""
+    piped, plain, truth = pipelined_layer_states()
+    assert_as_exact(piped, plain, token_draw(PIPELINED_ROWS), "pipelined layer states",
+                    seeds=PIPELINED_STATES_SEEDS, truth_fn=truth)
 
 
 @mesh_lane
@@ -567,24 +589,29 @@ def test_a_scanned_glm5_next_computes_its_unrolled_forward():
         assert np.abs(got - unrolled).max() <= 1e-4 * np.abs(unrolled).max()
 
 
-def test_a_host_resident_stacks_layer_states_are_a_resident_ones():
-    """A stack whose layers sit in host memory runs each fetched layer in a scope of its own
-    (`decoder_stack._applied`): every layer's output a reader of layer states keeps is there, as
-    exact as the resident stack's, both measured from float64, where the fetched scope once kept
-    none of it."""
+def fetched_layer_states():
+    """The host-fetched (dew) and resident (reference) layer-state functions of one scanned model's
+    weights and its float64 truth, each arm compiled once (`without_ynn`)."""
     model = tiny(scan_layers=True, attention_impl="reference")
-    ids = token_batch(2)["text"][:, :SEQ_LEN]
-    variables = model.init(jax.random.key(0), ids)
+    variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
     assert any(count > 1 for _, count in model.bind(variables).groups)
     host = jax.sharding.SingleDeviceSharding(jax.devices()[0], memory_kind="pinned_host")
     layers = {name: jax.device_put(tree, host) for name, tree in variables["params"].items()
               if name.startswith("layers_")}
     on_host = {**variables, "params": {**variables["params"], **layers}}
-    states = jax.jit(lambda tree: layer_states(model, tree, ids))
-    hosted, resident = states(on_host), states(variables)
-    truth = float64_layer_states(model, variables, ids)
-    for index, (ours, theirs, wide) in enumerate(zip(hosted, resident, truth, strict=True)):
-        assert_as_exact_as_the_reference(np.asarray(ours), np.asarray(theirs), wide, f"fetched layer {index}")
+    compiled = without_ynn(lambda tree, ids: layer_states(model, tree, ids))
+    return (lambda ids: compiled(on_host, ids)), (lambda ids: compiled(variables, ids)), float64_layer_states(
+        model, variables)
+
+
+def test_a_host_resident_stacks_layer_states_are_a_resident_ones():
+    """A stack whose layers sit in host memory runs each fetched layer in a scope of its own
+    (`decoder_stack._applied`): every layer's output a reader of layer states keeps is there, on
+    par with the resident stack's, both measured from float64 (check 1), where the fetched scope
+    once kept none of it."""
+    hosted, resident, truth = fetched_layer_states()
+    assert_as_exact(hosted, resident, token_draw(2), "host-fetched layer states",
+                    seeds=FETCHED_STATES_SEEDS, truth_fn=truth)
 
 
 def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_resident_one():
