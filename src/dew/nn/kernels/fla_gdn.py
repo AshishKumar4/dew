@@ -94,14 +94,15 @@ def _dot(a, b, *, exact: bool, ieee: bool = False, solve: jnp.dtype | None = Non
     kernel (the suite's 'highest' made every fp32 product IEEE):
     - bf16 or fp16: exact products summed in fp32 (fla's `tl.dot` of narrow operands); no precision.
     - fp32 with `ieee`: IEEE products, fla's `allow_tf32=False` dots (`recompute_w_u`'s `A @ v`).
-    - fp32 otherwise: TF32x3 (`DotAlgorithmPreset.TF32_TF32_F32_X3`), three TF32 products near IEEE
-      accuracy where fla's own dots take one TF32 (Triton's default `input_precision` for fp32, and
-      `SOLVE_TRIL_DOT_PRECISION`, chunk_fwd.py:21). jax 0.11's Pallas lowers `Precision.HIGH` as
-      plain TF32 (pallas/triton/lowering.py `_TF32_PRECISIONS`), so the preset is named. IEEE there
-      lowers on sm80 to FMA loops ptxas took 3.5 to over 15 minutes to compile for the WY backward;
-      TF32x3 compiles in seconds.
+    - fp32 otherwise: bf16x6 (`DotAlgorithmPreset.BF16_BF16_F32_X6`), six bf16 products, an fp32
+      product's accuracy on tensor cores, where fla's own dots take one TF32 (Triton's default
+      `input_precision` for fp32, and `SOLVE_TRIL_DOT_PRECISION`, chunk_fwd.py:21). TF32x3, two
+      bits short of fp32's product, put the port's final memory 1.5 to 2.6 times the token-by-token
+      recurrence's distance from float64 and its gradients up to 3.5 times on an A100, across the
+      stability suite's regimes; bf16x6 took its port arms' 40 failures of 60 to 12. IEEE lowers on
+      sm80 to FMA loops ptxas took 3.5 to over 15 minutes to compile for the WY backward.
     - fp32 with `solve`, the call's dtype, at the solves' products of fp32 intermediates (the kkt and
-      KDA sub-chunk merges and products, fla's SOLVE_TRIL_DOT_PRECISION): TF32x3 in an fp32 call,
+      KDA sub-chunk merges and products, fla's SOLVE_TRIL_DOT_PRECISION): bf16x6 in an fp32 call,
       where one TF32 put a Kimi linear layer's logits 100 times the reference's distance from
       float64 on an H100; one TF32, fla's, in a 16-bit call, whose operands' rounding it stays under
       and where TF32x3 cost Kimi Linear's bf16 layer 17% on an H100 and 19% on an A100.
