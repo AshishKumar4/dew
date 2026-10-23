@@ -124,13 +124,21 @@ def products_dtype(*operands) -> jnp.dtype | None:
     return jnp.result_type(*dtypes)
 
 
-_JAX_PRODUCTS = (jax.lax.dot_general, jnp.einsum, jnp.matmul)
+def _jax_products() -> tuple:
+    """JAX's products as they stand, each with its code object where it is a Python function: a
+    library may swap one by its module attribute or by its code (Qwix does both)."""
+    return tuple((product, getattr(product, "__code__", None))
+                 for product in (jax.lax.dot_general, jnp.einsum, jnp.matmul))
+
+
+_JAX_PRODUCTS = _jax_products()
 """JAX's own products, as this module found them."""
 
 
 def _intercepted() -> bool:
     """Whether a library has swapped one of JAX's products for its own (`_JAX_PRODUCTS`)."""
-    return (jax.lax.dot_general, jnp.einsum, jnp.matmul) != _JAX_PRODUCTS
+    return any(now is not was or code is not original
+               for (now, code), (was, original) in zip(_jax_products(), _JAX_PRODUCTS, strict=True))
 
 
 FP32_SUMS = "F32_F32_F32"
