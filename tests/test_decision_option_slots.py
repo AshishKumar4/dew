@@ -18,7 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from decision_support import decision_rows
-from reference_error import assert_as_exact, widened, with_gradients
+from reference_error import seeds_for, assert_as_exact, widened, with_gradients
 from safetensors.numpy import load_file
 
 from dew.data.dataset import DataPartition
@@ -275,6 +275,11 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
         raise AssertionError(f"no candidate of seed {seed} has its scorer gap above {SCORER_MARGIN}")
 
     grid = stepped(objective, compact=False)
+    import time
+    began = time.perf_counter()
+    print("SIZED paired", seeds_for(grid, draw, "slots paired", truth_fn=lambda *inputs: zeroed(grid(*inputs)),
+                                    dew_fn=stepped(objective, compact=True)), f"{time.perf_counter() - began:.0f}s",
+          flush=True)
     # The truth of the algebraic zeros is exactly zero, which each of their rows is held to.
     assert_as_exact(stepped(objective, compact=True), grid, draw, "compacted options logits and gradient",
                     seeds=SLOT_SEEDS, truth_fn=lambda *inputs: zeroed(grid(*inputs)))
