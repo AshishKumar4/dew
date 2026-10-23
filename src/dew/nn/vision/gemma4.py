@@ -16,6 +16,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
+from dew._model_types import SANDWICH_NORMS
 from dew.interop.weights import native_layouts, placed
 from dew.nn.attention import RMSNorm
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
@@ -262,11 +263,6 @@ _GEMMA4_VISION_TENSORS = {
 }
 _GEMMA4_VISION_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj")
 _GEMMA4_VISION_MLP = ("gate_proj", "up_proj", "down_proj")
-# The sandwich's four norms as the decoder block names them.
-_GEMMA4_VISION_NORMS = {"input_layernorm": "input_layernorm",
-                        "post_attention_layernorm": "attention_output_norm",
-                        "pre_feedforward_layernorm": "post_attention_layernorm",
-                        "post_feedforward_layernorm": "mlp_output_norm"}
 
 
 def _gemma4_vision_layer_path(parts) -> tuple[str, ...] | None:
@@ -274,8 +270,8 @@ def _gemma4_vision_layer_path(parts) -> tuple[str, ...] | None:
     if len(parts) < 5 or parts[:2] != ["encoder", "layers"] or not parts[2].isdigit():
         return None
     layer = f"layers_{parts[2]}"
-    if len(parts) == 5 and parts[3] in _GEMMA4_VISION_NORMS and parts[4] == "weight":
-        return (layer, _GEMMA4_VISION_NORMS[parts[3]], "scale")
+    if len(parts) == 5 and parts[3] in SANDWICH_NORMS and parts[4] == "weight":
+        return (layer, SANDWICH_NORMS[parts[3]], "scale")
     if len(parts) == 7 and parts[5] == "linear" and parts[6] == "weight":
         if parts[3] == "self_attn" and parts[4] in _GEMMA4_VISION_PROJECTIONS:
             return (layer, "self_attn", parts[4], "kernel")
@@ -325,7 +321,7 @@ def gemma4_vision_name(path: tuple[str, ...]) -> str:
     layer, *rest = trunk
     if not layer.startswith("layers_"):
         raise ValueError(f"unknown vision parameter {path!r}")
-    norms = {native: name for name, native in _GEMMA4_VISION_NORMS.items()}
+    norms = {native: name for name, native in SANDWICH_NORMS.items()}
     if len(rest) == 2 and rest[0] in norms:
         rest = [norms[rest[0]], "weight"]
     elif rest[-1] == "kernel":

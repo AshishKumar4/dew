@@ -35,9 +35,7 @@ def _gpt_oss_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
     top_k = hf_config['num_experts_per_tok']
     if not isinstance(layers, int) or not isinstance(experts, int) or not isinstance(top_k, int):
         refuse('num_hidden_layers/num_local_experts/num_experts_per_tok', 'integer counts are required')
-    pattern = tuple('sliding_attention' if index % 2 == 0 else 'full_attention'
-                    for index in range(layers))
-    config = base_config(hf_config, used, layer_types=pattern,
+    config = base_config(hf_config, used, layer_types=('sliding_attention', 'full_attention'),
                           rope=ropes, scale_after_cast=False)
     config.update(mlp='swigluoai', attention_sinks=True,
                   mixture=native_fields(Mixture)(experts=experts, top_k=top_k))

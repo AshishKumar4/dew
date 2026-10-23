@@ -141,7 +141,7 @@ def _qwen3_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
     windowed = (hf_config.get('use_sliding_window', False)
                 and hf_config.get('sliding_window') is not None)
     layer_types = specified_layer_types(hf_config, used, (
-        'sliding_attention' if windowed else 'full_attention',) * layers)
+        'sliding_attention' if windowed else 'full_attention',))
     config = base_config(hf_config, used, qk_norm=True, layer_types=layer_types)
     used.update(('num_experts', 'num_local_experts'))
     sparse = _sparse_step_layers(hf_config, layers, used)
@@ -164,16 +164,22 @@ def _dense(config: DecoderFields, used: set[str]) -> DecoderFields:
     return config
 
 
-def _qwen_moe_mixture(hf_config: Mapping[str, object], used: set[str],
-                      sparse: tuple[int, ...], experts: int) -> MixtureFields:
-    """The expert width and softmax normalization Qwen2-MoE and Qwen3-MoE share."""
+def _qwen_moe_mixture(hf_config: Mapping[str, object], used: set[str], sparse: tuple[int, ...],
+                      experts: int, *, normalized: bool = False, shared: bool = False) -> MixtureFields:
+    """The routed experts Qwen2-MoE, Qwen3-MoE and Qwen3-Next share: their width and softmax top-k,
+    renormalized where `norm_topk_prob` says, whose default is `normalized` (Qwen3-Next's reference
+    renormalizes unless told not to), and, where `shared`, the sigmoid-gated shared expert Qwen2-MoE
+    and Qwen3-Next add."""
     used.update(('norm_topk_prob', 'moe_intermediate_size'))
-    norm_topk = bool(hf_config.get('norm_topk_prob', False))
-    expert_width = records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size')
-    return native_fields(Mixture)(
+    mixture = native_fields(Mixture)(
         top_k=softmax_top_k(hf_config, used), experts=experts, layers=sparse,
-        norm_topk_prob=norm_topk,
-        expert_features=expert_width)
+        norm_topk_prob=bool(hf_config.get('norm_topk_prob', normalized)),
+        expert_features=records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size'))
+    if shared:
+        used.add('shared_expert_intermediate_size')
+        mixture.update(shared_features=record_int(hf_config, 'shared_expert_intermediate_size'),
+                       shared_gate=True)
+    return mixture
 
 
 def _qwen2_moe_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -201,10 +207,7 @@ def _qwen2_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
     sparse = _sparse_step_layers(hf_config, layers, used)
     if not (experts > 0 and sparse):
         return _dense(config, used)
-    mixture = _qwen_moe_mixture(hf_config, used, sparse, experts)
-    mixture.update(shared_features=record_int(hf_config, 'shared_expert_intermediate_size'),
-                   shared_gate=True)
-    config['mixture'] = mixture
+    config['mixture'] = _qwen_moe_mixture(hf_config, used, sparse, experts, shared=True)
     return config
 
 
@@ -218,9 +221,8 @@ def _qwen_hybrid_config(hf_config: Mapping[str, object], used: set[str], *,
     geometry read from the config.
     """
     interval = records.integer(hf_config.get('full_attention_interval', 4), 'full_attention_interval')
-    layer_types = specified_layer_types(hf_config, used, tuple(
-        'full_attention' if (index + 1) % interval == 0 else 'linear_attention'
-        for index in range(records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers'))))
+    layer_types = specified_layer_types(hf_config, used,
+                                        ('linear_attention',) * (interval - 1) + ('full_attention',))
     config = base_config(hf_config, used, qk_norm=True, scale_after_cast=False,
                           layer_types=layer_types, rope=Ropes(10000.0))
     used.add('full_attention_interval')
@@ -308,14 +310,7 @@ def _qwen3_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decod
     )
     # `num_experts > 0` gates the routed block too (modeling_qwen3_next.py:814).
     if sparse and experts > 0:
-        norm_topk = bool(hf_config.get('norm_topk_prob', True))
-        expert_width = record_int(hf_config, 'moe_intermediate_size')
-        shared_width = record_int(hf_config, 'shared_expert_intermediate_size')
-        config['mixture'] = native_fields(Mixture)(
-            top_k=softmax_top_k(hf_config, used), experts=experts, layers=sparse,
-            norm_topk_prob=norm_topk,
-            expert_features=expert_width, shared_features=shared_width,
-            shared_gate=True)
+        config['mixture'] = _qwen_moe_mixture(hf_config, used, sparse, experts, normalized=True, shared=True)
     config['num_nextn_predict_layers'] = single_prediction_depth(hf_config, used, 'num_nextn_predict_layers')
     return config
 

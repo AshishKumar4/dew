@@ -75,6 +75,7 @@ from dew.interop.decoder_parts import (
     MixtureFields,
     Renames,
     SituFields,
+    context_lengths,
     dew_path,
     record_float,
     record_int,
@@ -309,10 +310,9 @@ def _kimi_k3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
         refuse(f'linear_attn_config fields {extra}', 'KimiDeltaAttention reads no such field')
     tied = records.boolean(hf_config.get('tie_word_embeddings', False), 'tie_word_embeddings')
     used.update(_K3_WRAPPER_FIELDS)
-    # KimiLinearConfig's own default (configuration_kimi_k3.py:55), capped
-    # at the context every family builds by default.
-    context = min(record_int(text, 'max_position_embeddings', 4096), DEFAULT_MAX_SEQ_LEN)
-    return _decoder(text, tied, context)
+    # KimiLinearConfig's own default (configuration_kimi_k3.py:55).
+    capacity, _ = context_lengths(text, 4096)
+    return _decoder(text, tied, capacity)
 
 
 _KIMI_NAMES: Renames = (('block_sparse_moe', 'mlp'), ('w1', 'gate_proj'), ('w3', 'up_proj'),

@@ -414,8 +414,7 @@ def _kimi_k25_config(hf_config: Mapping[str, object], used: set[str]) -> Decoder
                  'use_unified_vision_chunk', 'video_placeholder', 'ignore_index'))
     nested = {key: value for key, value in text.items()
               if key not in SERIALIZED_TEXT_FIELDS and key not in SERIALIZED_ENCODER_FIELDS}
-    text_family = {'kimi_k2': KIMI_K2, 'deepseek_v3': DEEPSEEK_V3}[model_type]
-    config = translated({**nested, 'model_type': model_type, 'tie_word_embeddings': tied}, text_family)
+    config = translated({**nested, 'model_type': model_type, 'tie_word_embeddings': tied}, DEEPSEEK_V3)
     placeholders = []
     for key, default in (('image_token_id', 163605), ('video_token_id', 163840)):
         value = hf_config.get(key, default)
@@ -447,17 +446,18 @@ def _kimi_k25_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] |
     raise ValueError(f"unknown tensor name {name!r}")
 
 
-# DeepSeek V4's three attention kinds, onto the compressor each one runs
-# (COMPRESSOR_CLASSES, modeling_deepseek_v4.py:788-790): the sliding kind
-# runs none, and the two compressed kinds name theirs.
-_V4_KINDS = {'sliding_attention': None,
-             'compressed_sparse_attention': 'csa',
-             'heavily_compressed_attention': 'hca'}
-# The legacy per-layer compression rate, onto the kind it names, and the
-# rates a kind pools by (configuration_deepseek_v4.py:28-32, :156).
-_V4_RATIOS = {0: 'sliding_attention', 4: 'compressed_sparse_attention',
-              128: 'heavily_compressed_attention'}
-_V4_RATES = {'compressed_sparse_attention': 4, 'heavily_compressed_attention': 128}
+# DeepSeek V4's three attention kinds, each with the compressor it runs
+# (COMPRESSOR_CLASSES, modeling_deepseek_v4.py:788-790) and the rate it pools
+# by, which is also the legacy per-layer rate that names it
+# (configuration_deepseek_v4.py:28-32, :156): the sliding kind runs none, at 0.
+_V4_KINDS: dict[str, tuple[str | None, int]] = {
+    'sliding_attention': (None, 0),
+    'compressed_sparse_attention': ('csa', 4),
+    'heavily_compressed_attention': ('hca', 128),
+}
+_V4_COMPRESSORS = {kind: compressor for kind, (compressor, _) in _V4_KINDS.items()}
+_V4_RATIOS = {rate: kind for kind, (_, rate) in _V4_KINDS.items()}
+_V4_RATES = {kind: rate for kind, (compressor, rate) in _V4_KINDS.items() if compressor is not None}
 _V4_MLP_KINDS = ('hash_moe', 'moe')
 # The activations ACT2FN holds for `scoring_func` (modeling_deepseek_v4.py:1031).
 V4_SCORES = ('softmax', 'sigmoid', 'sqrtsoftplus')
@@ -645,8 +645,8 @@ def _v4_compress_rates(hf_config: Mapping[str, object], layer_types: tuple[str, 
         if not isinstance(supplied, Mapping):
             refuse('compress_rates', 'expected a rate per compressed attention kind')
         rates.update(supplied)
-    for legacy, kind in (('compress_rate_csa', 'compressed_sparse_attention'),
-                         ('compress_rate_hca', 'heavily_compressed_attention')):
+    for kind in _V4_RATES:
+        legacy = f"compress_rate_{_V4_COMPRESSORS[kind]}"
         if hf_config.get(legacy) is not None:
             rates[kind] = hf_config[legacy]
     unknown = sorted(set(rates) - set(_V4_KINDS))
@@ -655,7 +655,7 @@ def _v4_compress_rates(hf_config: Mapping[str, object], layer_types: tuple[str, 
                 f"a rate belongs to a kind, one of {sorted(_V4_KINDS)}")
     resolved: dict[str, int] = {}
     for kind in dict.fromkeys(layer_types):
-        if _V4_KINDS[kind] is None:
+        if _V4_COMPRESSORS[kind] is None:
             continue
         rate = rates.get(kind)
         if isinstance(rate, bool) or not isinstance(rate, int) or rate < 1:
@@ -889,7 +889,7 @@ def _v4_attention_kinds(hf_config: Mapping[str, object], used: set[str],
     kinds: dict[str, KindFields] = {}
     for kind in dict.fromkeys(layer_types):
         record: KindFields = native_fields(LayerKind)(window=window)
-        compressor = _V4_KINDS[kind]
+        compressor = _V4_COMPRESSORS[kind]
         if compressor is not None:
             layer_mixer = {**mixer, 'compressor': compressor,
                            'compress_rate': rates[kind]}
@@ -942,10 +942,15 @@ _DEEPSEEK_V4_NAMES = (
 # conversion_mapping.py:489-493 rewrite on load and, being anchored, leave
 # alone on save: a released checkpoint carries the left column and one
 # transformers wrote the right one, so both spellings are read here.
-_DEEPSEEK_V4_TRUNK = {
+# The trunk names V4's reference code gives the embedding, final norm and head,
+# which V4.1's shares.
+V4_TRUNK = {
     'embed.weight': 'model.embed_tokens.weight',
     'norm.weight': 'model.norm.weight',
     'head.weight': 'lm_head.weight',
+}
+_DEEPSEEK_V4_TRUNK = {
+    **V4_TRUNK,
     'hc_head_fn': 'model.hc_head.hc_fn',
     'hc_head_base': 'model.hc_head.hc_base',
     'hc_head_scale': 'model.hc_head.hc_scale',
@@ -1144,20 +1149,6 @@ DEEPSEEK_V2 = DecoderFamily(
 )
 
 
-# Kimi and DeepSeek V3 share a computation; only source provenance names Kimi.
-# Derived-model export therefore never selects Kimi via `matches`.
-KIMI_K2 = DecoderFamily(
-    ('kimi_k2',),
-    deepseek_config,
-    lambda fields: False,
-    'deepseek_v3',
-    'DeepseekV3ForCausalLM',
-    lambda model: {},
-    weight_path=layer_depth_path,
-    preserve_source_layout=True,
-)
-
-
 # Kimi K2.5 wraps that same computation in a vision repo, so it is
 # provenance-only too, and its own tensor names are the wrapper's.
 KIMI_K25 = DecoderFamily(
@@ -1172,8 +1163,10 @@ KIMI_K25 = DecoderFamily(
     tied_head_names=('language_model.lm_head.weight', 'language_model.model.embed_tokens.weight'),
 )
 
+# Kimi K2 is DeepSeek V3's computation under another name; a derived model
+# exports as DeepSeek V3, the name `export_model_type` gives either source.
 DEEPSEEK_V3 = DecoderFamily(
-    ('deepseek_v3',),
+    ('deepseek_v3', 'kimi_k2'),
     deepseek_config,
     lambda fields: isinstance(fields.mixer, MLAMixer),
     'deepseek_v3',
