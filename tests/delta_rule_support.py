@@ -1,6 +1,5 @@
-"""The float64 oracle the delta rules' tests share: the gated delta rule token by token (`rule_math`), a chunk
-at a time for a real shape's gradient (`checkpointed`), grouped value heads and packed documents over it
-(`recurrence`), the gradient harness every rule
+"""The float64 oracle the delta rules' tests share: the gated delta rule token by token (`rule_math`),
+grouped value heads and packed documents over it (`recurrence`), the gradient harness every rule
 is run through (`through`), fla's own outputs and gradients, the ports' reference (`fla_side`), the
 float64 terms of the decay gradient Kimi's port sums (`fla_decay_terms`), the portable math and its
 float64 terms (`math`, `float64_truth`), and the port's plain decay prefix (`plain_prefix`)."""
@@ -40,25 +39,6 @@ def rule_math(q, k, v, g, beta, h0):
 
     final, out = jax.lax.scan(step, h0, tuple(jnp.moveaxis(x, 1, 0) for x in (q, k, v, g, beta)))
     return jnp.moveaxis(out, 0, 1), final
-
-
-def checkpointed(chunk: int):
-    """`rule_math`, its tokens scanned a `chunk` at a time with each chunk's scan recomputed on the way back,
-    so its gradient keeps one memory a chunk rather than one a token: the float64 oracle at a model's real
-    shape (`gdn_cases`), whose memory a token would not fit a GPU. Its values are `rule_math`'s."""
-    def rule(q, k, v, g, beta, h0):
-        def blocked(x):
-            return jnp.moveaxis(x.reshape(x.shape[0], x.shape[1] // chunk, chunk, *x.shape[2:]), 1, 0)
-
-        @jax.checkpoint
-        def block(state, inputs):
-            out, state = rule_math(*inputs, state)
-            return state, out
-
-        final, out = jax.lax.scan(block, h0, tuple(blocked(x) for x in (q, k, v, g, beta)))
-        return jnp.moveaxis(out, 0, 1).reshape(v.shape), final
-
-    return rule
 
 
 def recurrence(q, k, v, g, beta, h0, cuts=None, rule=rule_math):
