@@ -1,7 +1,8 @@
 """Tokenizers for language-model data, utf-8 bytes or any HF tokenizer, and
 the text record steps: tokenizing, chunking, dropping, normalizing and
 filtering text, and curating it through DataTrove's filters (`Language`,
-`Quality`, `Classifier`, `Decontaminated`; the `curation` extra).
+`Quality`, `Classifier`, `Decontaminated`) and its MinHash deduplication
+(`deduplicated`; the `curation` extra).
 
 `import dew.data` stays cheap. Nothing here imports `transformers` at module
 scope, and ByteTokenizer needs nothing but numpy. HFTokenizer loads its
@@ -632,6 +633,77 @@ class Decontaminated(Curated):
         write_atomically(folder / "against.index.hashes",
                          np.array(sorted(hashes), dtype=config.hash_config.np_descr).tobytes())
         return decontaminate
+
+
+@dataclasses.dataclass(frozen=True)
+class NearDuplicates:
+    """MinHash's near-duplicate rule, as DataTrove applies it (Broder 1997; FineWeb's defaults): a
+    record's text in `field` is shingled into `n`-word n-grams, `buckets` bands of `hashes` minhashes
+    each sign it, and two records whose signatures agree in a whole band are near-duplicates, which
+    for Jaccard similarity s happens with probability 1 - (1 - s^hashes)^buckets: about 0.72 at
+    half odds by default."""
+
+    n: int = 5
+    buckets: int = 14
+    hashes: int = 8
+    field: str = "text"
+
+
+def deduplicated(dataset: Dataset, url: str, near: NearDuplicates | None = None, *,
+                 format: Literal["array_record", "parquet"] = "array_record",
+                 rows_per_shard: int = 100_000) -> Mapping[str, object]:
+    """Seal `dataset`'s records at `url` as `Dataset.snapshot` does, each group of near-duplicates
+    (`near`, FineWeb's rule by default) kept as one record, by DataTrove's four MinHash stages:
+    signatures over one pass of the records, band matches bucket by bucket, their clusters, and a
+    second pass that writes every record no cluster removes. The two passes read one order, so a
+    removed index names one record.
+    The manifest, which `Files(url)` reads back, records the rule, DataTrove's release and the
+    records removed. Returns it."""
+    from importlib.metadata import version
+
+    from datatrove.data import Document
+    from datatrove.pipeline.dedup.minhash import (
+        MinhashConfig,
+        MinhashDedupBuckets,
+        MinhashDedupCluster,
+        MinhashDedupSignature,
+    )
+
+    from dew.data.sinks import export, passed
+
+    near = NearDuplicates() if near is None else near
+
+    def documents() -> Iterator[Document]:
+        records = passed(dataset)
+        try:
+            for index, record in enumerate(records):
+                text = record[near.field]
+                text = text.decode("utf-8") if isinstance(text, bytes) else str(text)
+                yield Document(text=text, id=str(index))
+        finally:
+            records.close()
+
+    config = MinhashConfig(n_grams=near.n, num_buckets=near.buckets, hashes_per_bucket=near.hashes)
+    with tempfile.TemporaryDirectory(prefix="dew-minhash-") as work:
+        MinhashDedupSignature(f"{work}/signatures", config=config).run(documents(), rank=0, world_size=1)
+        banded = MinhashDedupBuckets(f"{work}/signatures", f"{work}/bands", config=config)
+        for bucket in range(near.buckets):
+            banded.run(None, rank=bucket, world_size=near.buckets)
+        MinhashDedupCluster(f"{work}/bands", f"{work}/clusters", config=config).run(None, 0, 1)
+        # The one signing pass is DataTrove's rank 0, whose removed indices this file holds.
+        listed = Path(work) / "clusters" / "000000.remove"
+        removed = frozenset(np.fromfile(listed, "<u4").tolist() if listed.exists() else ())
+
+    def kept() -> Iterator[Batch]:
+        records = passed(dataset)
+        try:
+            yield from (record for index, record in enumerate(records) if index not in removed)
+        finally:
+            records.close()
+
+    rule = {**dataclasses.asdict(near), "datatrove": version("datatrove"), "removed": len(removed)}
+    return export(kept(), url, format=format, rows_per_shard=rows_per_shard,
+                  metadata={"near_duplicates": rule})
 
 
 def export_tokens(dataset: Dataset, url: str, tokenizer: str, *, field: str = "text", eos: bool = True,
