@@ -267,6 +267,7 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
     return product, rounded(tail - lost if subtract else lost + tail)
 
 
+@jax.custom_jvp
 def correctly_rounded_divide(numerator: jax.typing.ArrayLike, denominator: jax.typing.ArrayLike) -> jax.Array:
     """The correctly rounded fp32 quotient, IEEE division's, on XLA's approximate
     dividers too: XLA:CPU rewrites a division by a broadcast into a multiplication
@@ -284,6 +285,7 @@ def correctly_rounded_divide(numerator: jax.typing.ArrayLike, denominator: jax.t
     of two. The quantizer's observed scales and quotients keep these
     intermediates normal; dense and midpoint checks hold the result to
     NumPy's IEEE divide without enabling x64. Dense keeps its own precision.
+    Its derivative is the division's, as JAX differentiates `a / b`.
     """
     quotient = numerator / denominator
     product, error = two_product(quotient, denominator, bit_split=True, subtract=True)
@@ -301,6 +303,12 @@ def correctly_rounded_divide(numerator: jax.typing.ArrayLike, denominator: jax.t
     up = (high > upper) | ((high == upper) & ((low > 0) | ((low == 0) & odd)))
     down = (high < -lower) | ((high == -lower) & ((low < 0) | ((low == 0) & odd)))
     return jnp.where(up, above, jnp.where(down, below, quotient))
+
+
+@correctly_rounded_divide.defjvp
+def _divide_jvp(primals, tangents):
+    """The rounding is a selection among neighbours, so the quotient's tangent is the division's."""
+    return correctly_rounded_divide(*primals), jax.jvp(jnp.divide, primals, tangents)[1]
 
 
 def compensated_add(left, right):
