@@ -389,7 +389,9 @@ def _fp16_beside_a_large_state(seed):
     value[..., 1:] = _uniform(seed + 4, -1.0, 1.0, (RESUMED, 2, 1, 15))
     key, dout = _normal(seed + 5, (RESUMED, 2, 1, 16), (RESUMED, 1, 1, 16))
     state = (np.zeros((RESUMED, 1, 1), np.float32), total.astype(np.float32), acc)
-    return np.zeros((RESUMED, 1, 1, 16), np.float32), key, value, state, dout
+    # The cotangent drawn times 2^-4, so its product with the values, which the reference's backward holds
+    # in fp16 as it holds the probabilities (row 1362), stays within fp16's largest.
+    return np.zeros((RESUMED, 1, 1, 16), np.float32), key, value, state, dout * np.float32(2.0 ** -4)
 
 
 def _near_keys(dtype: str):
