@@ -90,7 +90,7 @@ SEEDS = {"ties at scale 1": 64, "ties at scale 1, cotangents near 2**125": 64, "
          "two finite slices whose merge overflows": 8, "a resumed state of a large denominator": 64,
          "a resumed state beside an overflowing column": 32,
          "a resumed state of a denominator near fp32's largest beside an overflowing column": 8,
-         "fp16 values near their largest beside a state near fp32's largest": 8,
+         "fp16 values near their largest beside a state near fp32's largest": 32,
          "keys an ulp apart, float32": 32, "keys an ulp apart, bfloat16": 32,
          "keys near fp32's largest at equal logits": 32, "a far maximum in a later key tile": 8,
          "a decode step's sink and one key": 8, "a decode step's sink near fp32's largest and one key": 8,
