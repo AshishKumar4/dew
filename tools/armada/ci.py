@@ -802,6 +802,37 @@ def gpu_needs(recorded: dict | None, budget: float) -> tuple[float, float]:
     return share, min(share * (1 + recorded.get("shares", 0)) + recorded.get("pools", 0), budget)
 
 
+def borrowed_records(names: list[str], python: str, held: str, token: str) -> dict[str, tuple[str, dict]]:
+    """For each of `names`, test files no run on class `held` measured, the class and last record of
+    the whole file on another class whose run measured its GPU peak, the one that holds the most
+    (`gpu_needs`): what a file has taken on a GPU, which a first lane on a class takes as its share.
+    One no class measured is absent. Its run on `held` records its own, which every later lane reads."""
+    if not names:
+        return {}
+    prefix = f"{CACHE_PREFIX}/{python}/"
+    wanted = set(names)
+    keys = [key for key in listed(prefix, token)
+            if key.split("/", 1)[0] != held and key.endswith("/whole")
+            and key.split("/", 1)[1].rsplit("/", 1)[0] in wanted]
+
+    def recorded(key: str) -> tuple[str, str, dict | None]:
+        found = record_of(f"{prefix}{key}", token)
+        kind, rest = key.split("/", 1)
+        return rest.rsplit("/", 1)[0], kind, json.loads(found) if found else None
+
+    def holds(found: dict) -> float:
+        return gpu_needs(found, float("inf"))[1]
+
+    borrowed: dict[str, tuple[str, dict]] = {}
+    with concurrent.futures.ThreadPoolExecutor(32) as pool:
+        for name, kind, found in pool.map(recorded, keys):
+            if found is None or found.get("depends") is None or found.get("peak") is None:
+                continue
+            if name not in borrowed or holds(found) > holds(borrowed[name][1]):
+                borrowed[name] = (kind, found)
+    return borrowed
+
+
 def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes: int,
              deadline: float) -> int:
     """Run `tests` on this process's share of the one GPU it sees, each file once, as a task of its
@@ -811,11 +842,15 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
     and files start heaviest first while what they hold with their children (`gpu_needs`) fits
     the share this process was given (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at
     most `processes` at once. A file that runs out of a measured share is red: it took more than
-    its last run, whose peak its next run is given. A file given the lane's whole share (unmeasured,
-    measured that large, or with a child the lane did not follow, as the fla reference's in another
-    environment's Python) grows its pool as it uses it rather than taking the share at its first GPU
-    op (`XLA_PYTHON_CLIENT_PREALLOCATE`), so such a child has what the file has not yet taken; a file
-    that grows to the whole share still leaves its child none.
+    its last run, whose peak its next run is given. A file no run on this class measured borrows its
+    share from the largest any other GPU class's last run measured (`borrowed`), so a first lane on
+    a class packs its files as a measured one does; one red under a borrowed share runs once more,
+    alone, with the lane's whole share, as another class's peak is no verdict of this one's. A file
+    given the lane's whole share (measured on no class, measured that large, or with a child the lane
+    did not follow, as the fla reference's in another environment's Python) grows its pool as it uses
+    it rather than taking the share at its first GPU op (`XLA_PYTHON_CLIENT_PREALLOCATE`), so such a
+    child has what the file has not yet taken; a file that grows to the whole share still leaves its
+    child none.
 
     First the pinned fixtures the tests read offline are fetched while the Hub is reachable
     (tools/fetched_fixtures.py): a store file already whole is kept, and a pin whose upload is due stops
@@ -826,34 +861,59 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
     budget = float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) * total
     held = device_class()
 
-    def needs(name: str) -> tuple[float, float]:
-        record = record_of(record_key(python, row(python, name, ""), held), token)
-        return gpu_needs(json.loads(record) if record else None, budget)
+    def recorded(key: str) -> dict | None:
+        found = record_of(key, token)
+        return json.loads(found) if found else None
+
+    def needs(name: str) -> dict | None:
+        return recorded(record_key(python, row(python, name, ""), held))
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
-        needed = dict(zip(tests, pool.map(needs, tests), strict=True))
+        records = dict(zip(tests, pool.map(needs, tests), strict=True))
+    borrowed = borrowed_records([name for name, found in records.items() if found is None], python, held,
+                                token)
+    needed = {name: gpu_needs(records[name] or (borrowed[name][1] if name in borrowed else None), budget)
+              for name in tests}
     shares = {name: share for name, (share, _) in needed.items()}
     holds = {name: held for name, (_, held) in needed.items()}
     # Before any test writes under tests/, the inputs every file's key hashes.
     common = shared(python)
-    waiting = sorted(tests, key=lambda name: -holds[name])
     verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(tests)}
-    running: dict[concurrent.futures.Future, str] = {}
-    with concurrent.futures.ThreadPoolExecutor(processes) as pool:
-        while waiting or running:
-            free = budget - sum(holds[name] for name in running.values())
-            fits = next((name for name in waiting if holds[name] <= free), None)
-            if fits is not None and len(running) < processes:
-                waiting.remove(fits)
-                environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total),
-                           **({"XLA_PYTHON_CLIENT_PREALLOCATE": "false"} if shares[fits] >= budget else {})}
-                running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache, 60.0, common,
-                                    environ)] = fits
-                continue
-            done, _ = concurrent.futures.wait(running, return_when=concurrent.futures.FIRST_COMPLETED)
-            for future in done:
-                future.result()
-                del running[future]
+
+    def run(names: list[str]) -> None:
+        waiting = sorted(names, key=lambda name: -holds[name])
+        running: dict[concurrent.futures.Future, str] = {}
+        with concurrent.futures.ThreadPoolExecutor(processes) as pool:
+            while waiting or running:
+                free = budget - sum(holds[name] for name in running.values())
+                fits = next((name for name in waiting if holds[name] <= free), None)
+                if fits is not None and len(running) < processes:
+                    waiting.remove(fits)
+                    environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total),
+                               **({"XLA_PYTHON_CLIENT_PREALLOCATE": "false"} if shares[fits] >= budget
+                                  else {})}
+                    running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache, 60.0,
+                                        common, environ)] = fits
+                    continue
+                done, _ = concurrent.futures.wait(running, return_when=concurrent.futures.FIRST_COMPLETED)
+                for future in done:
+                    future.result()
+                    del running[future]
+
+    run(tests)
+    # Red under a share another class measured: its verdict is this class's, alone with the whole share,
+    # and its row says so, as packed work run again alone is interference.
+    again = {name: shares[name] for name in borrowed if any(
+        verdict["exitCode"] != 0 for verdict in json.loads(verdicts[name].read_text())["rows"])}
+    for name in again:
+        shares[name] = holds[name] = budget
+    run(list(again))
+    for name, share in again.items():
+        rows = json.loads(verdicts[name].read_text())["rows"]
+        interference = (f"red under a share of {share / 2 ** 30:.1f} GiB borrowed from {borrowed[name][0]}'s "
+                        "measurement, run again alone with the lane's whole share")
+        verdicts[name].write_text(json.dumps({"rows": [{**verdict, "interference": interference}
+                                                       for verdict in rows]}))
     rows = [verdict for name in tests for verdict in json.loads(verdicts[name].read_text())["rows"]]
     out.write_text(json.dumps({"rows": rows}))
     return 0

@@ -481,6 +481,68 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     assert all(len(ran(Path(name).stem)) == 2 for name in names), "the third lane reused the green rows"
 
 
+def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A lane on a class no run has measured borrows each file's share from another GPU class's last
+    measured peak (the largest any class holds), so its files run side by side as a measured lane's do,
+    not each alone; a file red under a borrowed share runs once more, alone, with the lane's whole share,
+    and its row says so (interference); and the lane records this class's own measurement, so the next
+    lane on it reads its own, not the borrowed one. A file no class measured runs alone."""
+    url, stored, _ = cache_worker
+    cached(monkeypatch, url)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
+    gpu_driver(tmp_path, monkeypatch)
+    source = ("import os, time\n"
+              "from pathlib import Path\n"
+              "def test_runs():\n"
+              "    began = time.monotonic()\n"
+              "    time.sleep(1)\n"
+              "    share = os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION']\n"
+              "    ran = Path(f'ran-{Path(__file__).stem}-{os.getpid()}')\n"
+              "    ran.write_text(f'{share} {began} {time.monotonic()}')\n")
+    names = [f"tests/test_file_{index}.py" for index in range(4)]
+    for name in names:
+        (tmp_path / name).write_text(source)
+    # Red on any share but the whole: run again alone, its second row green.
+    (tmp_path / "tests/test_tight.py").write_text(source + "    assert share == '0.5'\n")
+    (tmp_path / "tests/test_new.py").write_text(source)
+    every = [*names, "tests/test_tight.py", "tests/test_new.py"]
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    # Another class measured 4 GiB for each file but the new one; a third, smaller peaks for some.
+    for other, peak in (("NVIDIA-H100-80GB-HBM3-x86", 4), ("NVIDIA-A10-x86", 2)):
+        for name in [*names, "tests/test_tight.py"]:
+            at = "/" + ci.record_key("3.12", ci.row("3.12", name, ""), other)
+            stored[at] = json.dumps({"key": None, "depends": [name], "row": {}, "reads": [],
+                                     "peak": peak * 2 ** 30, "shares": 0, "pools": 0}).encode()
+
+    def ran(stem: str) -> list[list[str]]:
+        return [path.read_text().split() for path in sorted(tmp_path.glob(f"ran-{stem}-*"),
+                                                            key=lambda path: path.stat().st_mtime)]
+
+    def overlapping(runs: list[list[str]]) -> int:
+        spans = [(float(began), float(ended)) for _, began, ended in runs]
+        return max(sum(began <= moment < ended for began, ended in spans) for moment, _ in spans)
+
+    out = tmp_path / "verdict.json"
+    assert ci.gpu_lane("3.12", every, out, cache=True, processes=4, deadline=600.0) == 0
+    rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
+    borrowed = str(6 * 2 ** 30 / (81920 * 2 ** 20))
+    first = [ran(Path(name).stem)[0] for name in names]
+    assert [share for share, *_ in first] == [borrowed] * len(names), "the largest class's 4 GiB and headroom"
+    assert overlapping(first) >= 2, "borrowed shares pack as measured ones do"
+    assert [share for share, *_ in ran("test_new")] == ["0.5"], "measured on no class: alone, the whole share"
+    assert [share for share, *_ in ran("test_tight")] == [borrowed, "0.5"]
+    tight = rows["3.12:tests/test_tight.py"]
+    assert tight["exitCode"] == 0 and "borrowed from NVIDIA-H100-80GB-HBM3-x86" in tight["interference"]
+    assert all("interference" not in row for name, row in rows.items() if name != "3.12:tests/test_tight.py")
+    # This class's own records now: the next lane reads them, the tight file alone as its own last run was.
+    assert ci.gpu_lane("3.12", ["tests/test_tight.py"], out, cache=False, processes=4, deadline=600.0) == 0
+    assert [share for share, *_ in ran("test_tight")][-1] != borrowed
+    assert "interference" not in json.loads(out.read_text())["rows"][0]
+
+
 def test_a_files_children_hold_what_they_held_at_once_and_each_start_must_leave_its_record(tmp_path):
     """The children's records join the file that started them (`followed.gathered`): their files,
     and the GPU they held, the most a child that took the parent's fraction used, those children as
