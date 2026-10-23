@@ -25,7 +25,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from dew.nn.precision import L2NORM_EPS, compensated_add
+from dew.nn.precision import L2NORM_EPS, compensated_add, l2norm
 
 from . import chunked_launch, norm_swiglu, short_conv, tuning
 from .generation import triton_runs
@@ -263,8 +263,7 @@ def _prologue(hooks: Hooks, given: dict, work):
     else:
         query, key, value = (given[name].astype(work) for name in ('query', 'key', 'value'))
     if hooks.l2norm:
-        query, key = (x * jax.lax.rsqrt(jnp.sum(x * x, axis=-1, keepdims=True) + L2NORM_EPS)
-                      for x in (query, key))
+        query, key = (l2norm(x) for x in (query, key))
         query = query * (key_width ** -0.5 if hooks.scale is None else hooks.scale)
     elif hooks.scale is not None:
         query = query * hooks.scale
