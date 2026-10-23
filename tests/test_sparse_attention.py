@@ -16,7 +16,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, widened, with_gradients
+import reference_error as _gate
+from reference_error import widened, with_gradients
+
+
+def assert_as_exact(dew_fn, reference_fn, draw, label, *, seeds, truth_fn=None, **options):
+    count = _gate.seeds_for(reference_fn, draw, label, truth_fn=truth_fn)
+    print(f"SIZED {label!r} {count}", flush=True)
+    _gate.assert_as_exact(dew_fn, reference_fn, draw, label, seeds=count, truth_fn=truth_fn, **options)
+    print(f"PASSED {label!r}", flush=True)
 
 from dew.lora import LoRA
 from dew.nn.attention import scaled_dot_product_attention
