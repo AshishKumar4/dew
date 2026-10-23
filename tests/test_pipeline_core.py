@@ -23,7 +23,7 @@ from dew import position
 from dew.data.cache import Cache
 from dew.data.compile import compile, iterate, validation
 from dew.data.dataset import DataPartition, Loading
-from dew.data.mixing import Members, TokenDeficit, token_weights
+from dew.data.mixing import TokenDeficit, token_weights
 from dew.data.pipeline import Configured, Pipeline, Rejected, mix
 from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
 from dew.data.sources import Files, Memory
@@ -747,7 +747,7 @@ def test_a_validation_pass_starts_at_most_one_worker_per_batch(monkeypatch):
 def test_token_deficit_mix_counts_targets_and_restores_delivered_counts():
     corpora = [grain.MapDataset.source([{"id": tag, "targets": targets}]).repeat().to_iter_dataset()
                for tag, targets in [(0, 2), (1, 7)]]
-    mix = TokenDeficit(corpora, Members((1, 3), ("short", "long")), tokens=Targets(), names=["short", "long"],
+    mix = TokenDeficit(corpora, (1, 3), ("short", "long"), tokens=Targets(), names=["short", "long"],
                        labels=["short", "long"])
     reader = iter(mix)
     delivered = [0, 0]
@@ -1610,7 +1610,7 @@ def test_token_mixer_probes_an_unselected_tiny_share_before_emitting_a_row():
     and its first row lets it."""
     parents = [grain.MapDataset.source([{"targets": 3}]).repeat().to_iter_dataset(),
                grain.MapDataset.source([{"targets": 1}]).repeat().to_iter_dataset()]
-    reader = iter(TokenDeficit(parents, Members((1, 1e-9), ("normal", "tiny")), tokens=Targets(),
+    reader = iter(TokenDeficit(parents, (1, 1e-9), ("normal", "tiny"), tokens=Targets(),
                                names=["normal", "tiny"], labels=["normal", "tiny"]))
     try:
         assert next(reader) == {"targets": 3}

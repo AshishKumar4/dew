@@ -72,7 +72,6 @@ from dew.data.mixing import (
     Accepted,
     Chunked,
     CorpusCounts,
-    Members,
     PrimedMix,
     ProportionalSelection,
     Proportions,
@@ -1131,17 +1130,17 @@ class _Build:
         ]
         # A streamed mix saves each member's position under its key, so a member that joins starts
         # and one that left is dropped while the others resume (`Plan.check`).
-        members = Members(tuple(source.weights),
-                          tuple(_member_keys(strings(self.lowering.order["members"], "mixture members"))))
+        keys = _member_keys(strings(self.lowering.order["members"], "mixture members"))
         if source.tokens is not None:
             return TokenDeficit(
                 streams,
-                members,
+                source.weights,
+                keys,
                 tokens=source.tokens,
                 names=[_name(child) for child in source.pipelines],
                 labels=[_label(child) for child in source.pipelines],
             )
-        return PrimedMix(streams, members)
+        return PrimedMix(streams, source.weights, keys)
 
     def indexed(
         self, pipeline: Pipeline, source: Source, partition: DataPartition, last: int, *, marked: bool = False
