@@ -721,6 +721,37 @@ def test_an_fp16_querys_gradient_over_equal_large_keys_whose_cotangents_cancel_i
         assert np.isfinite(np.asarray(grads.query, np.float32)).all(), name
 
 
+def test_a_resumed_state_of_large_values_under_the_folds_guard_is_finite():
+    """fp32, the default form: one query over one key of logit m0 = 24576.005859375 (folded below the fold's
+    reach, `algebra.FOLD_REACH`, and naturalized back an ulp below m0), resumed from a state of maximum m0,
+    denominator 1 and values 1023 * 2^118, the key's value the same: the plain walk's weighted values
+    overflow, so the guarded walk's live row takes its split sums from the normalized pass, whose share of
+    the state is taken at the walk's own maximum, at most 1 (`normalized_pass`); at the naturalized one it
+    passed 1 and overflowed the share. The plain-JAX mainloop's output and gradients are finite, as the
+    reference's are."""
+    m0 = 24576.005859375
+    size = 1023.0 * 2.0 ** 118
+    query = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(4.0)
+    key = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(m0)
+    value = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(size)
+    dout = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(2.0 ** -8)
+    initial = template.Initial(jnp.full((1, 1, 1), m0, jnp.float32), jnp.ones((1, 1, 1), jnp.float32),
+                               jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(size))
+    spans = template.spans(1, 1, 1)
+    hooks = template.Hooks(initial=initial)
+    tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
+
+    out = attention_portable.attend(query, key, value, spans, hooks, **tiles)
+    def attend(query, key, value, initial):
+        return template.reference(query, key, value, spans, template.Hooks(initial=initial))
+
+    reference, pull = jax.vjp(attend, query, key, value, initial)
+    grads = attention_portable.backward(query, key, value, spans, hooks, dout, **tiles)
+    for name, leaf in (("reference", (reference, pull(dout))), ("output", out),
+                       ("gradients", (grads.query, grads.key, grads.value, grads.initial))):
+        assert all(np.isfinite(np.asarray(array, np.float32)).all() for array in jax.tree.leaves(leaf)), name
+
+
 def test_a_querys_gradient_from_a_state_near_fp32s_largest_over_a_tiny_weight_at_a_small_scale_is_finite():
     """One key at logit -83 (a weight near 2^-120) resumed from a state of denominator 2^127 at maximum 0,
     at a scale of 2^-40: the key's coefficient against its key, weight times scale over the denominator, is
