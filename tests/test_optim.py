@@ -735,7 +735,8 @@ def test_rates_of_one_schedule_lower_to_one_update(optimizer, form):
             ParamGroup("kernels", ("*kernel",), learning_rate_multiplier=rate * 100,
                        schedule=Linear(peak=rate * 2, warmup_steps=1, end=rate / 8)),
             ParamGroup("rest", ("*",)))
-        return OptimConfig(optimizer=optimizer, rate=schedule, param_groups=groups)
+        return OptimConfig(optimizer=optimizer, rate=rate if schedule is None else schedule,
+                           param_groups=groups)
 
     programs, updates = [], []
     for rate in (1e-3, 4e-3):
@@ -770,7 +771,8 @@ def test_a_configured_optimizer_is_optaxs_own_at_the_rate_its_state_holds(optimi
     params = decoder_params()["params"]
     adam = optimizer in ("adam", "adamw", "lamb")
     betas, opts = ({"b1": 0.8, "b2": 0.95}, {"eps": 1e-5, "eps_root": 1e-9}) if adam else ({}, {})
-    config = OptimConfig(optimizer=optimizer, **betas, optimizer_opts=opts, rate=schedule, clip_grads=0.5)
+    config = OptimConfig(optimizer=optimizer, **betas, optimizer_opts=opts,
+                         rate=3e-3 if schedule is None else schedule, clip_grads=0.5)
     solver = config.build(10)
     scale, shape = scaled(config.rate)
     ratio = (lambda count: 1.0) if shape is None else shape.schedule(10)
