@@ -17,7 +17,29 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from interop_support import fixture_arrays
-from reference_error import assert_as_exact, torch_with_gradients, with_gradients
+import reference_error as _gate
+from reference_error import torch_with_gradients, with_gradients
+
+
+def assert_as_exact(dew_fn, reference_fn, draw, label, *, seeds, truth_fn=None, **options):
+    import os
+    block = os.environ.get("SEED_BLOCK")
+    if block is None or "dense" not in label:
+        return _gate.assert_as_exact(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, **options)
+    first, last = (int(value) for value in block.split(":"))
+    leaf = "model.layers.2.altup.correction_coefs.weight"
+    for seed in range(first, last):
+        inputs = draw(seed)
+        mine, theirs = dew_fn(*inputs)[leaf], reference_fn(*inputs)[leaf]
+        with jax.enable_x64(True):
+            truth = np.asarray(truth_fn(*_gate.widened(inputs))[leaf], np.float64)
+        def rows(value):
+            error = np.asarray(value, np.float64) - truth
+            size = np.sqrt(np.mean(truth ** 2, axis=-1))
+            return np.sqrt(np.mean(error ** 2, axis=-1)) / np.maximum(size, 1e-300)
+        a, b = rows(mine), rows(theirs)
+        print("ROWS", seed, f"{a.max():.3e}", f"{b.max():.3e}", int(np.argmax(a)), int(np.argmax(b)),
+              f"rms {np.sqrt(np.mean((np.asarray(mine, np.float64) - truth) ** 2)):.3e} {np.sqrt(np.mean((np.asarray(theirs, np.float64) - truth) ** 2)):.3e}", flush=True)
 
 from dew.nn.gemma3n import AltUp, AltUpLayer, LaurelBlock
 from dew.nn.mlp import GatedMLP, gaussian_topk
