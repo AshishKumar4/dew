@@ -15,7 +15,6 @@ from dew.telemetry import builds
 
 REPO = Path(__file__).resolve().parents[1]
 READ = ("pyproject.toml", "constraints.txt", "README.md", "docs/installation.md", "tools/pip.txt",
-        "site/scripts/gen_install.py", "site/scripts/uv_bootstrap.sh", "site/scripts/colab-notebooks.mjs",
         "site/package.json", "site/public/install.sh")
 
 
@@ -26,8 +25,10 @@ def scratch(root: Path) -> Path:
         shutil.copy(REPO / name, root / name)
     shutil.copytree(REPO / "src", root / "src", ignore=lambda _, names: [
         name for name in names if name.endswith(".py") and name not in ("builds.py", "tpu_setup.py")])
-    # The tested Pythons, which tools/armada/ci.py reads from pyproject.toml's classifiers.
-    shutil.copytree(REPO / "tools/armada", root / "tools/armada")
+    # The generator and what it reads beside it, and the tested Pythons, which tools/armada/ci.py reads from
+    # pyproject.toml's classifiers.
+    for directory in ("site/scripts", "tools/armada"):
+        shutil.copytree(REPO / directory, root / directory, ignore=shutil.ignore_patterns("__pycache__"))
     return root
 
 
