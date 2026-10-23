@@ -331,6 +331,30 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
                 with float64() if dtype == torch.float64 else torch.no_grad(), torch.no_grad():
                     out = model_(input_ids=tokens, labels=tokens, output_hidden_states=True)
                 hidden[dtype] = [h.double().numpy() for h in out.hidden_states] + [out.logits.double().numpy()]
+            outputs = {}
+            for dtype in (torch.float32, torch.float64):
+                model_ = references[dtype]
+                hooks = []
+                for name, module in model_.named_modules():
+                    if ".layers.1." in name or ".layers.0." in name:
+                        def hook(module, args, out, name=name, dtype=dtype):
+                            first = out[0] if isinstance(out, tuple) else out
+                            if torch.is_tensor(first) and first.is_floating_point():
+                                outputs.setdefault(name, {})[dtype] = first.detach().double().numpy()
+                        hooks.append(module.register_forward_hook(hook))
+                model_.load_state_dict(weights)
+                with float64() if dtype == torch.float64 else torch.no_grad(), torch.no_grad():
+                    model_(input_ids=tokens, labels=tokens)
+                for handle in hooks:
+                    handle.remove()
+            errors = []
+            for name, pair in outputs.items():
+                if len(pair) == 2 and pair[torch.float32].shape == pair[torch.float64].shape:
+                    a, b = pair[torch.float32], pair[torch.float64]
+                    size = np.sqrt(np.mean(b ** 2))
+                    if size > 0:
+                        errors.append((float(np.sqrt(np.mean((a - b) ** 2)) / size), name))
+            print("MODULES", seed, [f"{name.split('layers.')[-1]} {value:.1e}" for value, name in sorted(errors)[::-1][:8]], flush=True)
             relative = [float(np.sqrt(np.mean((a - b) ** 2)) / np.sqrt(np.mean(b ** 2)))
                         for a, b in zip(hidden[torch.float32], hidden[torch.float64], strict=True)]
             print("HIDDEN", seed, " ".join(f"{value:.1e}" for value in relative), flush=True)
