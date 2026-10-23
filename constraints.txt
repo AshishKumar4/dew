@@ -23,12 +23,14 @@
 # registers, and an abstract device's compute capability, which Mosaic GPU
 # lowers for, which the templates' Mosaic kernels need on sm80; and the
 # persistent compilation cache keyed by jax's own build, so two builds over one
-# jaxlib never read each other's programs. Every CI and development install
-# takes this one build. Return to a release once one ships the fixes.
+# jaxlib never read each other's programs; and ceil and floor lowered in Mosaic
+# GPU and Pallas Mosaic GPU, which a template's Mosaic kernel rounding a value
+# needs on an H100. Every CI and development install takes this one build.
+# Return to a release once one ships the fixes.
 # BEGIN package index (site/scripts/gen_install.py)
 --extra-index-url https://pypi.dewml.dev/simple
 # END package index
-jax==0.11.2.post15
+jax==0.11.2.post16
 
 # The CA bundle requests, httpx and the Hub verify TLS with: 2026.10.19 dropped emSign ECC Root CA - G3,
 # whose intermediates' private keys were compromised in October 2026 (tests/test_trust_store.py).
