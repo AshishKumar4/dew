@@ -80,16 +80,14 @@ Dew's outputs and gradients are measured from float64 truth: the same computatio
 **Fast and accurate forms.** A kernel with a fast default and an accurate form one option away (attention's base-2 fold and fast backward, against `natural=True, accurate=True`; [kernel templates](kernel-templates.md#0-the-vision)) holds each to its own contract, by `tests/test_attention_stability.py`'s families of adversarial inputs:
 
 - **The accurate form** holds check 1 on drawn inputs and on every family, and keeps apart every pair of values the reference keeps apart: it merges no ties.
-- **The default form** holds check 1 on drawn inputs. On every family it holds two things only: it is finite wherever the reference is finite, and it is exactly zero wherever the reference is (a row of no keys). Where the fold diverges at extreme inputs, those are its permitted ties, the families the suite marks `folded=False`:
-  - logits a ulp apart near 2^30 at scales below 1, which the fold can round into one (ties at scales 1/2 and 1/4, with and without cotangents near 2^125);
-  - a logit near fp32's largest, alone, with a sink or at scale 1/4, whose contracted weight is 0 or infinite, and one key, whose weight is 1 only within an ulp of its exponent;
-  - values near fp32's largest, over equal keys, beside a small, least-normal or subnormal column, or in a resumed state, whose weighted sum overflows where the reference's normalized one does not, and a sink near fp32's largest;
-  - in fp32, one weight carrying a row's output over values near fp32's largest, where the fold's rounding of its logit is the row's error;
-  - logits near 1e30, where the backward's base-2 maximum moves the anchor's weight away from 1;
-  - two finite slices whose merge overflows, and a row that overflows beside one that does not.
+- **The default form** holds check 1 on drawn inputs. On every family it holds two things only: it is finite wherever the reference is finite, and it is exactly zero wherever the reference is (a row of no keys). Its error at the families' inputs is no claim, and where it ties values the reference keeps apart, those are its permitted ties, measured over 16 seeds of the plain-JAX mainloop as groups of a leaf's entries returned equal whose reference values spread past twice the reference's own error and two ulps more:
+  - the output's, by the fold: at logits near 1e4 (1 group, 374 ulps), keys an ulp apart in bf16 (3, 8 ulps), and a sink and one key (1, 5 ulps);
+  - dQ's, by FlashAttention's one bf16 product at the first D: at keys an ulp apart in bf16 (278 groups, 379 ulps);
+  - dK's: at a small weight on a large value in bf16 (12, 8 ulps);
+  - dV's, by the fold's recomputed weights: at keys an ulp apart in fp32 (100, 16 ulps).
 - **Decode** holds the default's two claims on the families of a decode step.
 
-A mainloop that composes the guards (the plain-JAX one, the Mosaic ones) holds the default's claims on every family; one that walks without them (the frozen Triton mainloop) on all but the permitted ties. A tie is permitted only where this list names it. The list changes with the suite's families, in the same change.
+A mainloop that composes the guards (the plain-JAX one, the Mosaic ones) holds the default's claims on every family. One that walks without them (the frozen Triton mainloop) holds them on every family but the fold's divergences at extreme inputs, the families the suite marks `folded=False`, which the accurate form alone runs: logits a ulp apart near 2^30 at scales below 1; a logit near fp32's largest, alone, with a sink or at scale 1/4, and one key; values near fp32's largest, over equal keys, beside a small, least-normal or subnormal column, or in a resumed state, and a sink near fp32's largest; in fp32, one weight carrying a row's output over values near fp32's largest; logits near 1e30; and two finite slices whose merge overflows, or a row that overflows beside one that does not. A tie is permitted only where the list above names it, and either list changes with the suite's families and measurements, in the same change.
 
 The module's older assertions hold the comparisons not yet converted to check 1, and go once their last site moves.
 
