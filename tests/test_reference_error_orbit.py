@@ -85,6 +85,27 @@ def test_an_orbit_fails_a_dew_wrong_only_at_another_order():
     assert raised.type is AssertionError
 
 
+def test_an_orbit_judges_the_rows_of_a_leaf_the_reference_holds_exactly():
+    """A leaf the reference holds exactly on every seed has no ratio to judge, and its rows still are
+    over the orbit: sums of 1, 0 and 1, which a Dew dropping its middle term gets exactly at the draw's
+    own order and halves at the order swapping the last two."""
+    def draw(seed):
+        return (np.tile(np.float32([1, 0, 1]), (2, 1, 1)),)
+
+    @jax.jit
+    def whole(terms):
+        return {"sum": jnp.sum(terms, axis=-1)}
+
+    @jax.jit
+    def middle_dropped(terms):
+        return {"sum": terms[..., 0] + terms[..., 2]}
+
+    assert_as_exact(middle_dropped, whole, draw, "exact leaf", seeds=8)
+    with pytest.raises(AssertionError) as raised:
+        assert_as_exact(middle_dropped, whole, draw, "exact leaf", seeds=8, orders=_swapped)
+    assert raised.type is AssertionError
+
+
 def test_an_orbit_fails_a_value_not_finite_at_another_order():
     """A Dew that turns NaN only at the other order (where the cancelling row's middle term is its
     negative one) passes at the draw's own order and fails over the orbit."""
