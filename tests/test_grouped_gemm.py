@@ -212,7 +212,7 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
 def test_cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
     """Where the installed dew-cutlass holds this GPU's kernels, the projection's forward and both
     gradients through CUTLASS's launches, chosen by name, are as exact as XLA's ragged dot from float64,
-    unrouted rows and empty groups included, and the launches that ran them are CUTLASS's."""
+    unrouted rows and empty groups included, and the CUDA branch's launches are CUTLASS's."""
     pytest.importorskip("dew_cutlass")
     here = generation.effective(generation.gpu_target()).generation
     if here not in grouped_matmul.cutlass_architectures():
@@ -234,7 +234,9 @@ def test_cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
         assert_as_exact(jax.jit(through_cutlass), jax.jit(with_gradients(projection("xla"))), draw,
                         f"cutlass {sizes}", seeds=SEEDS,
                         truth_fn=with_gradients(projection("xla", jnp.float64)))
-    assert {type(launch).__name__ for launch, _ in launches} == {"CutlassGmm", "CutlassTgmm"}
+    # The CUDA branch's launches; the CPU branch beside it interprets Triton's.
+    ran = {type(launch).__name__ for launch, ba in launches if not ba.arguments["interpret"]}
+    assert ran == {"CutlassGmm", "CutlassTgmm"}
 
 
 def test_the_kernels_forward_mode_keeps_the_projections_law():

@@ -821,8 +821,8 @@ def cutlass_architectures() -> tuple[str, ...]:
 @functools.cache
 def _cutlass_registered() -> None:
     """dew_cutlass's FFI targets, registered with jax once, at the first launch that runs one."""
-    for target, handler in importlib.import_module('dew_cutlass').targets().items():
-        jax.ffi.register_ffi_target(target, handler, platform="CUDA")
+    for target, capsule in importlib.import_module('dew_cutlass').targets().items():
+        jax.ffi.register_ffi_target(target, capsule, platform="CUDA")
 
 
 class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
@@ -837,10 +837,12 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
     config_cls: ClassVar[type[mosaic_gpu.Tiles]] = mosaic_gpu.Tiles
     TILE: ClassVar[mosaic_gpu.Tiles]
     COSTED_AS: ClassVar[_Mosaic]
-    MEASURED: ClassVar[dict[str, float]]
-    """By generation, the geometric mean over the scoreboard's rows of the launch's measured seconds over
-    the model's at `TILE`, as a share of the same ratio of the template's Mosaic launch at its own pick:
-    its time on the scale of the model's estimates of the template's launches."""
+    MEASURED: ClassVar[dict[tuple[str, bool], float]]
+    """By generation and whether the call is dense (one group, which the template's launch runs without a
+    group's bookkeeping and CUTLASS's does not), the geometric mean over the scoreboard's rows of the
+    launch's measured seconds over the model's at `TILE`, as a share of the same ratio of the template's
+    Mosaic launch at its own pick: its time on the scale of the model's estimates of the template's
+    launches."""
 
     def eligible(self, ba, target) -> bool:
         operands = [value for name, value in ba.arguments.items()
@@ -849,7 +851,7 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
         # need: every extent a multiple of 8 elements.
         extents = {extent for operand in operands for extent in operand.shape[1:]}
         built = generation.effective(target).generation
-        return (built in self.MEASURED and built in cutlass_architectures()
+        return ((built, bool(ba.arguments.get('dense'))) in self.MEASURED and built in cutlass_architectures()
                 and all(operand.dtype == jnp.bfloat16 for operand in operands)
                 and jnp.dtype(ba.arguments['out_dtype']) in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32))
                 and ba.arguments['sizes'].dtype == jnp.int32 and all(extent % 8 == 0 for extent in extents)
@@ -867,7 +869,8 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
         return self.COSTED_AS.costed(ba, config, target)
 
     def cost(self, ba, config: mosaic_gpu.Tiles, target) -> float:
-        return super().cost(ba, config, target) * self.MEASURED[generation.effective(target).generation]
+        measured = self.MEASURED[generation.effective(target).generation, bool(ba.arguments.get('dense'))]
+        return super().cost(ba, config, target) * measured
 
 
 @dataclasses.dataclass(frozen=True)
@@ -877,8 +880,8 @@ class CutlassGmm(_Cutlass):
     ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
     TILE: ClassVar[mosaic_gpu.Tiles] = mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2)
     COSTED_AS: ClassVar[_Mosaic] = MosaicGmm()
-    # CUTLASS-4: forward and input gradient of the scoreboard's grouped rows, bf16 out.
-    MEASURED: ClassVar[dict[str, float]] = {'sm90': 0.72}
+    # ROUTE-2 on an H100: the scoreboard's 14 grouped and 4 dense rows of the forward and input gradient.
+    MEASURED: ClassVar[dict[tuple[str, bool], float]] = {('sm90', False): 0.71, ('sm90', True): 1.06}
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
@@ -903,8 +906,8 @@ class CutlassTgmm(_Cutlass):
     ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
     TILE: ClassVar[mosaic_gpu.Tiles] = mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2)
     COSTED_AS: ClassVar[_Mosaic] = MosaicTgmm()
-    # CUTLASS-4: the kernel gradient of the scoreboard's grouped rows, bf16 out.
-    MEASURED: ClassVar[dict[str, float]] = {'sm90': 1.16}
+    # ROUTE-2 on an H100: the scoreboard's 13 grouped and 4 dense rows of the kernel gradient, bf16 and fp32.
+    MEASURED: ClassVar[dict[tuple[str, bool], float]] = {('sm90', False): 0.84, ('sm90', True): 0.85}
 
     def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,
