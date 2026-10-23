@@ -1,7 +1,9 @@
 """tools/gen_exports.py writes a lazy package's TYPE_CHECKING imports and `__all__` from its `_EXPORTS`, the
 one place the surface is declared: on a scratch package, one whose three lists disagree fails the check and
-is rewritten so that each consumer reads the same surface: the lazy lookup, `from package import *`, and a
-type checker's imports, run here by importing the package with TYPE_CHECKING on; and ruff's gate passes it."""
+is rewritten so that each consumer reads the same surface: a program's lazy lookup, which binds nothing at
+import, `from package import *`, and the imports a type checker reads, run here with TYPE_CHECKING on, each
+binding its name to the object its module defines; and ruff's gate passes it. (The suite's environment holds
+no type checker; the pyright gate reads src/dew's own packages.)"""
 
 import json
 import subprocess
@@ -38,12 +40,15 @@ __all__ = [
 ]
 '''
 
-CONSUMERS = '''import json, typing
-typing.TYPE_CHECKING = True  # the package's TYPE_CHECKING imports run, as a type checker reads them
+CONSUMERS = '''import importlib, json, sys, typing
+typing.TYPE_CHECKING = sys.argv[1] == "static"  # on: the imports a type checker reads run, binding each name
 import sparx
+exports = sparx._EXPORTS
+bound = {name: value is getattr(importlib.import_module(exports[name]), name)
+         for name, value in vars(sparx).items() if name in exports}
 namespace = {}
 exec("from sparx import *", namespace)
-print(json.dumps({"star": sorted(name for name in namespace if name != "__builtins__"),
+print(json.dumps({"bound": bound, "star": sorted(name for name in namespace if name != "__builtins__"),
                   "area": sparx.area(1.0), "shapes": [sparx.Model2.__name__, sparx.Model10.__name__]}))
 '''
 
@@ -64,10 +69,13 @@ def generate(root: Path, *arguments: str) -> int:
                           text=True, timeout=120).returncode
 
 
-def consumed(root: Path) -> dict:
-    """What each consumer of the package reads."""
-    done = subprocess.run([sys.executable, "-c", CONSUMERS], cwd=root, env={"PYTHONPATH": str(root)},
-                          capture_output=True, text=True, check=True)
+def consumed(root: Path, reading: str) -> dict:
+    """What the package's consumers read, imported as a program does (`runtime`: each name is bound only
+    when the lazy lookup reads it) or with its TYPE_CHECKING imports run (`static`: as a type checker reads
+    them, each bound by its own import, the lazy lookup aside): the names it binds, each whether it is the
+    object its module defines, `from sparx import *`, and the exports called."""
+    done = subprocess.run([sys.executable, "-c", CONSUMERS, reading], cwd=root,
+                          env={"PYTHONPATH": str(root)}, capture_output=True, text=True, check=True)
     return json.loads(done.stdout)
 
 
@@ -76,8 +84,10 @@ def test_a_package_whose_lists_disagree_is_rewritten_for_every_consumer(tmp_path
     assert generate(root, "--check") == 1
     assert generate(root) == 0
     assert generate(root, "--check") == 0
-    assert consumed(root) == {"star": ["Circle", "Model10", "Model2", "PI", "__version__", "area"],
-                              "area": 3.0, "shapes": ["Model2", "Model10"]}
+    star, shapes = ["Circle", "Model10", "Model2", "PI", "__version__", "area"], ["Model2", "Model10"]
+    assert consumed(root, "runtime") == {"bound": {}, "star": star, "area": 3.0, "shapes": shapes}
+    bound = dict.fromkeys(["Circle", "Model10", "Model2", "PI", "area"], True)
+    assert consumed(root, "static") == {"bound": bound, "star": star, "area": 3.0, "shapes": shapes}
     ruff = subprocess.run([sys.executable, "-m", "ruff", "check", "--config", str(REPO / "pyproject.toml"),
                            "--select=I001,RUF022,F401,F811", str(root / "sparx" / "__init__.py")],
                           capture_output=True, text=True)
@@ -94,4 +104,5 @@ def test_an_export_moved_to_another_module_is_read_from_there(tmp_path):
     package.write_text(package.read_text().replace('"area": "sparx.measures"', '"area": "sparx.shapes"'))
     assert generate(root, "--check") == 1
     assert generate(root) == 0
-    assert consumed(root)["area"] == 3.0
+    assert consumed(root, "runtime")["area"] == 3.0
+    assert consumed(root, "static")["bound"]["area"]
