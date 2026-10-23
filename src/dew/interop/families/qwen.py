@@ -441,6 +441,8 @@ QWEN3_MOE = DecoderFamily(
     'Qwen3MoeForCausalLM',
     _qwen3_export,
     preserve_source_layout=True,
+    # Qwen3MoeConfig's defaults for the fields its decoder reads.
+    defaults={'max_position_embeddings': 32768},
 )
 
 QWEN3 = DecoderFamily(
@@ -451,6 +453,8 @@ QWEN3 = DecoderFamily(
     'Qwen3ForCausalLM',
     _qwen3_export,
     preserve_source_layout=False,
+    # Qwen3Config's defaults for the fields its decoder reads.
+    defaults={'num_key_value_heads': 32, 'head_dim': 128, 'max_position_embeddings': 32768},
 )
 
 QWEN2_MOE = DecoderFamily(
@@ -464,6 +468,8 @@ QWEN2_MOE = DecoderFamily(
     weight_path=qwen35_moe_path,
     packed=FUSED_EXPERTS,
     preserve_source_layout=True,
+    # Qwen2MoeConfig's defaults for the fields its decoder reads.
+    defaults={'num_key_value_heads': 16, 'max_position_embeddings': 32768},
 )
 
 QWEN2 = DecoderFamily(
@@ -474,4 +480,6 @@ QWEN2 = DecoderFamily(
     'Qwen2ForCausalLM',
     _qwen3_export,
     preserve_source_layout=False,
+    # Qwen2Config's defaults for the fields its decoder reads.
+    defaults={'num_key_value_heads': 32, 'max_position_embeddings': 32768},
 )
