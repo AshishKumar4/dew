@@ -2146,11 +2146,18 @@ class NormalAttention(nn.Module):
 
 
 class BasicTransformerBlock(nn.Module):
-    """Run self-attention, cross-attention over `context`, then feed-forward.
+    """Run a first attention, cross-attention over `context`, then feed-forward.
 
-    Each is pre-normed with a residual. `use_cross_only` drops the
-    self-attention. `only_pure_attention` runs the cross-attention alone,
-    with no norm and no residual, which the UNets' stages do by default.
+    Each is pre-normed (`norm`, RMS or affine layer norm, at `norm_epsilon`)
+    with a residual. `first_attention` names what the first attention reads:
+    the tokens themselves (`self`), the `context` too (`context`, the SD
+    checkpoints with no self-attention), or nothing, when the block has none
+    (`none`). `only_pure_attention` runs the cross-attention alone, with no
+    norm and no residual, which the UNets' stages do by default.
+    `qkv_bias` is the attentions' (`NormalAttention`). `dropout_rate` drops
+    each attention's output, inside the feed-forward and the block's output,
+    as diffusers' `BasicTransformerBlock` does in training; `approximate_gelu`
+    is the feed-forward's GELU (`geglu_feed_forward`).
     """
     query_dim: int
     heads: int = 4
@@ -2158,10 +2165,14 @@ class BasicTransformerBlock(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     use_bias: bool = True
-    use_cross_only:bool = False
+    qkv_bias: bool | None = None
+    first_attention: Literal["self", "context", "none"] = "self"
     only_pure_attention:bool = False
     force_fp32_for_softmax: bool = True
+    norm: Literal["rms", "layer"] = "rms"
     norm_epsilon: float = 1e-4
+    dropout_rate: float = 0.0
+    approximate_gelu: bool = True
     attention_impl: str = "auto"  # an AttentionImpl
 
     @nn.nowrap
@@ -2170,10 +2181,11 @@ class BasicTransformerBlock(nn.Module):
         from .mlp import geglu_feed_forward  # mlp's blocks import this module's norms
 
         attention = NormalAttention(self.query_dim, self.heads, self.dim_head, parent=None)
-        count = attention.cross_flops(lengths, context_lengths, context_features)
+        crossed = attention.cross_flops(lengths, context_lengths, context_features)
+        count = crossed
         if not self.only_pure_attention:
-            if not self.use_cross_only:
-                count += attention.model_flops(lengths)
+            first = {"self": attention.model_flops(lengths), "context": crossed, "none": 0}
+            count += first[self.first_attention]
             count += geglu_feed_forward(self.query_dim, parent=None).model_flops(lengths)
         return count
 
@@ -2185,6 +2197,7 @@ class BasicTransformerBlock(nn.Module):
             dim_head=self.dim_head,
             precision=self.precision,
             use_bias=self.use_bias,
+            qkv_bias=self.qkv_bias,
             dtype=self.dtype,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             attention_impl=self.attention_impl,
@@ -2194,19 +2207,25 @@ class BasicTransformerBlock(nn.Module):
 
         from .mlp import geglu_feed_forward  # mlp's blocks import this module's norms
 
-        self.ff = geglu_feed_forward(self.query_dim, dtype=self.dtype, precision=self.precision)
-        self.norm1 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
-        self.norm2 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
-        self.norm3 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
+        self.ff = geglu_feed_forward(self.query_dim, approximate=self.approximate_gelu, dtype=self.dtype,
+                                     precision=self.precision, dropout_rate=self.dropout_rate)
+        norm = RMSNorm if self.norm == "rms" else LayerNorm
+        self.norm1, self.norm2, self.norm3 = (norm(epsilon=self.norm_epsilon, dtype=self.dtype)
+                                              for _ in range(3))
 
-    def __call__(self, hidden_states, context=None):
+    def _dropped(self, x, train: bool):
+        return nn.Dropout(self.dropout_rate)(x, deterministic=not train) if self.dropout_rate else x
+
+    def __call__(self, x, context=None, *, train: bool = False):
         if self.only_pure_attention:
-            return self.attention2(hidden_states, context)
+            return self.attention2(x, context)
 
-        if not self.use_cross_only:
-            hidden_states = hidden_states + self.attention1(self.norm1(hidden_states))
-        hidden_states = hidden_states + self.attention2(self.norm2(hidden_states), context)
-        return hidden_states + self.ff(self.norm3(hidden_states))
+        if self.first_attention != "none":
+            first = context if self.first_attention == "context" else None
+            x = x + self._dropped(self.attention1(self.norm1(x), first), train)
+        x = x + self._dropped(self.attention2(self.norm2(x), context), train)
+        x = x + self.ff(self.norm3(x), train=train)
+        return self._dropped(x, train)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2281,7 +2300,7 @@ class TransformerBlock(nn.Module):
         context_lengths = lengths if context_lengths is None else context_lengths
         context_features = inner if context_features is None else context_features
         block = BasicTransformerBlock(inner, self.heads, self.dim_head,
-                                       use_cross_only=not self.use_self_and_cross,
+                                       first_attention="self" if self.use_self_and_cross else "none",
                                        only_pure_attention=self.only_pure_attention, parent=None)
         count = block.cross_flops(lengths, context_lengths, context_features)
         return count + (2 * projection_flops(lengths, input_features, inner) if self.use_projection else 0)
@@ -2309,7 +2328,7 @@ class TransformerBlock(nn.Module):
             precision=self.precision,
             use_bias=False,
             dtype=self.dtype,
-            use_cross_only=(not self.use_self_and_cross),
+            first_attention="self" if self.use_self_and_cross else "none",
             only_pure_attention=self.only_pure_attention,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             attention_impl=self.attention_impl,
