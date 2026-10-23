@@ -81,9 +81,10 @@ def test_both_mainloops_compute_the_same_bits_under_every_hook(hooks, dtype, nat
 
 
 def both_backward(case: dict, names: tuple, dtype, tiles: attention_triton.Tiles,
-                  natural: bool = template.NATURAL):
+                  natural: bool = template.NATURAL, accurate: bool = template.ACCURATE):
     """The Triton mainloop's and the plain-JAX mainloop's gradients over `case` and the score hooks
-    `names` at `tiles` (both launches'), seed 0, the exponent `natural` or the fold."""
+    `names` at `tiles` (both launches'), seed 0, the exponent `natural` or the fold, the backward
+    `accurate` or the fast form."""
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     score_mod, kinds, draw_hooks = score_hooks(names, queries, keys, 32)
@@ -97,9 +98,10 @@ def both_backward(case: dict, names: tuple, dtype, tiles: attention_triton.Tiles
     # Both mainloops' forwards at the same tiles, whose sums the backwards read (`Split`).
     with tuning.pinned({attention_triton.TritonBackward: config, attention_triton.TritonForward: tiles}):
         triton = attention_triton.backward(query, key, value, spans, hooks, dout, natural=natural,
-                                           interpret=True)
+                                           accurate=accurate, interpret=True)
     portable = attention_portable.backward(query, key, value, spans, hooks, dout, block_q=tiles.block_q,
-                                           block_k=tiles.block_k, pad=attention_triton.BLOCK, natural=natural)
+                                           block_k=tiles.block_k, pad=attention_triton.BLOCK, natural=natural,
+                                           accurate=accurate)
     return triton, portable
 
 
@@ -118,15 +120,16 @@ def test_both_mainloops_compute_the_same_gradients_over_every_call_form(form, ti
     assert_same_bits(triton, portable, form)
 
 
-@pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["float32", "bfloat16"])
 @pytest.mark.parametrize("hooks", SCORE_HOOKS)
-def test_both_mainloops_compute_the_same_gradients_under_every_score_hook(hooks, dtype, natural):
+def test_both_mainloops_compute_the_same_gradients_under_every_score_hook(hooks, dtype, accurate):
     """Each score hook's gradients (its parameters' and the initial state's too) over a windowed causal
-    call of packed documents, in both dtypes and both forms of the exponent."""
+    call of packed documents, in both dtypes and both forms: the default, and the accurate (natural logits
+    and the backward's accurate form)."""
     triton, portable = both_backward(CASES["causal-documents-window"], SCORE_HOOKS[hooks], dtype, TILES[1],
-                                     natural)
-    assert_same_bits(triton, portable, f"{hooks} {jnp.dtype(dtype).name} natural {natural}")
+                                     natural=accurate, accurate=accurate)
+    assert_same_bits(triton, portable, f"{hooks} {jnp.dtype(dtype).name} accurate {accurate}")
 
 
 @pytest.mark.parametrize("hooks", ["none", "sinks", "softcap"])
