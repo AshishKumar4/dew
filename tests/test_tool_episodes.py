@@ -26,9 +26,9 @@ from episode_support import (
     ToolPolicy,
     build,
     collect,
+    episode_scheduler,
     per_call,
-    scheduled,
-    trained,
+    trained_batch,
     transition_logits,
     verify,
 )
@@ -46,7 +46,7 @@ def test_multiturn_actions_keep_cached_likelihoods_and_observations_out_of_targe
     trainer, collector = build(harness, record=episodes.append)
     state = trainer.initial_state()
 
-    batch = trained(collector, state)
+    batch = trained_batch(collector, state)
 
     assert Counter(harness.opened) == Counter(harness.closed)
     assert len(harness.calls) == GROUPS
@@ -100,7 +100,7 @@ def test_grpo_gradient_matches_action_only_categorical_reference():
     episodes = []
     trainer, collector = build(record=episodes.append)
     state = trainer.initial_state()
-    batch = {name: jnp.asarray(value) for name, value in trained(collector, state).items()}
+    batch = {name: jnp.asarray(value) for name, value in trained_batch(collector, state).items()}
     info = Step(state.microstep, jax.random.key(1), state.ema)
 
     def loss(table):
@@ -206,7 +206,7 @@ class Tasks:
 
 def run(directory, steps, records, accumulation=1):
     trainer, collector = build(record=records.append, accumulation=accumulation)
-    trainer.rollout = scheduled(collector)
+    trainer.rollout = episode_scheduler(collector)
     trainer.checkpoints = Checkpoints(str(directory))
     data = Loader(train=lambda partition: Tasks(), val=None, records=None, batch=jax.device_count())
     return trainer.fit(data, steps=steps, log_every=1)
@@ -267,7 +267,7 @@ def test_aborted_episode_leaves_the_previous_trainer_checkpoint_intact(tmp_path,
     expected = np.asarray(first.variables["params"]["table"]).copy()
     records = []
     trainer, collector = build(Harness(failure), record=records.append)
-    trainer.rollout = scheduled(collector)
+    trainer.rollout = episode_scheduler(collector)
     trainer.checkpoints = Checkpoints(str(directory))
     data = Loader(train=lambda partition: Tasks(), val=None, records=None, batch=jax.device_count())
     exception = EpisodeFailure if failure == "tool" else EpisodeCancelled

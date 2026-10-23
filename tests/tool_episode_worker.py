@@ -17,7 +17,7 @@ def main() -> None:
     if processes > 1:
         jax.distributed.initialize(coordinator_address=coordinator, num_processes=processes,
                                    process_id=rank, local_device_ids=[0], initialization_timeout=30)
-    from episode_support import Harness, SquareSession, build, scheduled
+    from episode_support import Harness, SquareSession, build, episode_scheduler
 
     from dew.coordination import collective_host
     from dew.data.dataset import Loader
@@ -46,7 +46,7 @@ def main() -> None:
     trainer, collector = build(environment=environment, record=records.append)
     if mode == "mismatch" and rank == 1:
         collector = replace(collector, max_turns=collector.max_turns + 1)
-    scheduler, trained = scheduled(collector), []
+    scheduler, trained = episode_scheduler(collector), []
 
     def rollout(state, batch, key):
         """The scheduler's call, keeping the batch it hands the step."""

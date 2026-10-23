@@ -169,23 +169,23 @@ def build(harness=None, *, record=None, accumulation=1, **changes):
     return trainer, replace(collector, **changes)
 
 
-def scheduled(collector, **changes) -> RolloutScheduler:
+def episode_scheduler(collector, **changes) -> RolloutScheduler:
     """The trainer's rollout over `collector`: `GROUPS` episodes of each task, collected at each call."""
     return RolloutScheduler(Synchronous(collector), groups=GROUPS, **changes)
 
 
-def snapshot(state, key=23) -> Snapshot:
+def cohort_snapshot(state, key=23) -> Snapshot:
     return Snapshot(state.variables, int(state.step), int(state.updates), jax.random.key(key))
 
 
-def trained(collector, state, key=23, tasks=(31,)):
+def trained_batch(collector, state, key=23, tasks=(31,)):
     """The batch the trainer's scheduler (`scheduled`) packs from one cohort of `tasks`' episodes."""
-    return scheduled(collector)(state, {"task_id": np.asarray(tasks, np.int32)}, jax.random.key(key))
+    return episode_scheduler(collector)(state, {"task_id": np.asarray(tasks, np.int32)}, jax.random.key(key))
 
 
 def collect(collector, state, key=23, tasks=(31,)):
     """One cohort of `GROUPS` episodes of each of `tasks` under `state`, as the scheduler collects it."""
-    return collector.episodes(snapshot(state, key), [Task(str(task)) for task in tasks], GROUPS)
+    return collector.episodes(cohort_snapshot(state, key), [Task(str(task)) for task in tasks], GROUPS)
 
 
 def per_call(batch, name, episodes):
