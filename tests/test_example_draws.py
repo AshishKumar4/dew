@@ -8,6 +8,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+import scipy.special
+from reference_error import assert_as_exact
 
 from dew.data.dataset import DataPartition
 from dew.diffusion import presets
@@ -53,35 +55,96 @@ def test_a_record_draws_alike_however_many_processes_read_its_step():
                                   [9, 11, 13, 15])
 
 
-def test_each_example_draws_its_own_values_under_any_key_implementation():
-    """A mapped draw under an RBG key would take every example's values from its first key: the
-    examples draw from a counter-based stream of the key's bits, each its own."""
-    for impl in ("threefry2x32", "rbg"):
-        key = jax.random.key(5, impl=impl)
-        step = Step(jnp.asarray(0), key, None)
-        values = np.asarray(step.sample("noise", jax.random.normal, (3,), dtype=jnp.float32, rows=4))
-        assert len({tuple(row) for row in values}) == 4
-        base = jax.random.fold_in(example_stream(key), stream("noise"))
-        third = jax.random.normal(jax.random.fold_in(base, 2), (3,))
-        np.testing.assert_array_equal(values[2], np.asarray(third))
+NORMAL_SEEDS = 8
+"""The normal-draw sites' declared draws (`seeds_for`): each draw is the step's key from its seed."""
+
+LOW = float(np.nextafter(np.float32(-1.0), np.float32(0.0)))
+"""The least uniform `jax.random.normal` draws: the float32 just above -1."""
 
 
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-def test_an_examples_normal_draw_is_its_own_whatever_batch_it_is_drawn_in(dtype):
-    """An example's normal draw is the same bits drawn alone, among 3, 4, 7 or 16 rows, or at a draw
-    shape of a row, a grid or a volume: no lane of a batch's fused program rounds it otherwise
-    (XLA:CPU's AVX-512 loop did, scaling erf_inv, on jax 0.12 before the fork's `_normal_real` ended
-    the inverse error function before its scale)."""
-    key = jax.random.key(11)
+def normal_truth(bits):
+    """`jax.random.normal`'s float32 draw from `bits` in float64: its uniform, exact in float64 (23 bits
+    of the word times the span's 24), then sqrt(2) times the inverse error function."""
+    floats = (np.asarray(bits, np.uint64) >> np.uint64(9)).astype(np.float64) * 2.0 ** -23
+    uniform = np.maximum(LOW, floats * float(np.float32(1.0) - np.float32(LOW)) + LOW)
+    return np.sqrt(2.0) * scipy.special.erfinv(uniform)
+
+
+def example_bits(key, examples, shape):
+    """Each example's raw bits as its own stream draws them alone (`Step.sample`'s counter stream)."""
     base = jax.random.fold_in(example_stream(key), stream("noise"))
-    for shape in ((3,), (5, 7), (2, 3, 4)):
-        alone = [np.asarray(jax.random.normal(jax.random.fold_in(base, example), shape, dtype))
-                 for example in range(16)]
-        for rows in (1, 3, 4, 7, 16):
-            step = Step(jnp.asarray(0), key, None)
-            values = np.asarray(step.sample("noise", jax.random.normal, shape, dtype=dtype, rows=rows))
-            for example in range(rows):
-                np.testing.assert_array_equal(values[example], alone[example])
+    return [np.asarray(jax.random.bits(jax.random.fold_in(base, example), shape)) for example in examples]
+
+
+@pytest.mark.parametrize("impl", ["threefry2x32", "rbg"])
+def test_each_example_draws_its_own_bits_under_any_key_implementation(impl):
+    """A mapped draw under an RBG key would take every example's values from its first key: the
+    examples draw from a counter-based stream of the key's bits, each its own. The bits are exact
+    (`example_bits`); the normal draws over them are on par with each example's alone by check 1
+    against their float64 truth (`normal_truth`), since a batch's fused program may round a lane's
+    floats otherwise (XLA:CPU on AVX-512, jax 0.12)."""
+    key = jax.random.key(5, impl=impl)
+    step = Step(jnp.asarray(0), key, None)
+    bits = np.asarray(step.sample("noise", jax.random.bits, (3,), rows=4))
+    assert len({tuple(row) for row in bits}) == 4
+    np.testing.assert_array_equal(bits, np.stack(example_bits(key, range(4), (3,))))
+
+    def keyed(data):
+        return jax.random.wrap_key_data(data, impl=impl)
+
+    @jax.jit
+    def batched(data):
+        return Step(jnp.asarray(0), keyed(data), None).sample("noise", jax.random.normal, (3,),
+                                                               dtype=jnp.float32, rows=4)
+
+    @jax.jit
+    def alone(data):
+        base = jax.random.fold_in(example_stream(keyed(data)), stream("noise"))
+        return jnp.stack([jax.random.normal(jax.random.fold_in(base, example), (3,))
+                          for example in range(4)])
+
+    def truth(data):
+        return np.stack([normal_truth(bits) for bits in example_bits(keyed(data), range(4), (3,))])
+
+    assert_as_exact(batched, alone, lambda seed: (jax.random.key_data(jax.random.key(seed, impl=impl)),),
+                    f"{impl} normal draws", seeds=NORMAL_SEEDS, truth_fn=truth)
+
+
+LAYOUTS = [(rows, shape) for shape in ((3,), (5, 7), (2, 3, 4)) for rows in (1, 3, 4, 7, 16)]
+"""A batch of each row count at each draw shape: a row, a grid and a volume."""
+
+
+def test_an_examples_draw_is_its_own_whatever_batch_it_is_drawn_in():
+    """An example's bits are the same drawn alone, among 3, 4, 7 or 16 rows, or at a draw shape of a
+    row, a grid or a volume, exactly; its normal draw over them is on par with its own alone by check 1
+    against their float64 truth, since a batch's fused program may round a lane's floats otherwise
+    (XLA:CPU's AVX-512 loop contracts some lanes' mul-adds, jax 0.12)."""
+    key = jax.random.key(11)
+    for rows, shape in LAYOUTS:
+        step = Step(jnp.asarray(0), key, None)
+        bits = np.asarray(step.sample("noise", jax.random.bits, shape, rows=rows))
+        np.testing.assert_array_equal(bits, np.stack(example_bits(key, range(rows), shape)))
+
+    @jax.jit
+    def batched(data):
+        step = Step(jnp.asarray(0), jax.random.wrap_key_data(data), None)
+        return {f"{rows}x{shape}": step.sample("noise", jax.random.normal, shape, dtype=jnp.float32,
+                                               rows=rows) for rows, shape in LAYOUTS}
+
+    @jax.jit
+    def alone(data):
+        base = jax.random.fold_in(example_stream(jax.random.wrap_key_data(data)), stream("noise"))
+        return {f"{rows}x{shape}": jnp.stack([jax.random.normal(jax.random.fold_in(base, example), shape)
+                                               for example in range(rows)]) for rows, shape in LAYOUTS}
+
+    def truth(data):
+        drawn = jax.random.wrap_key_data(data)
+        return {f"{rows}x{shape}": np.stack([normal_truth(bits)
+                                             for bits in example_bits(drawn, range(rows), shape)])
+                for rows, shape in LAYOUTS}
+
+    assert_as_exact(batched, alone, lambda seed: (jax.random.key_data(jax.random.key(seed)),),
+                    "normal draws across batches", seeds=NORMAL_SEEDS, truth_fn=truth)
 
 
 def test_a_recorder_and_a_tape_hold_each_example_once_and_whole():
