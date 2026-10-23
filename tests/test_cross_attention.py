@@ -577,7 +577,7 @@ def test_a_frozen_trunk_counts_the_weight_gradients_of_its_blocks_alone():
     trained = LMObjective(attached.model, 7)
     rows, targets = frozen.real_lengths(batch), np.full(2, 7, np.int64)
     weights = attached.model.parameter_flops(rows) + attached.model.logits_flops(targets)
-    assert trained.training_flops(None, batch) - frozen.training_flops(None, batch) == pytest.approx(weights)
+    assert trained.training_flops(None, batch) - frozen.training_flops(None, batch) == weights
 
 
 def test_zero_gates_leave_a_pretrained_ngpt_decoder_bit_for_bit():
