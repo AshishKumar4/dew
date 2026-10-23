@@ -26,16 +26,15 @@ def programs(directory: Path) -> dict[str, bytes]:
             for path in directory.glob(f"*{remote_cache.SUFFIX}")}
 
 
-def test_a_cpu_bundle_is_its_host_class_s_alone():
-    """On the CPU, whose device kind is "cpu" on every host, a bundle is its host class's
-    (`dew._host.cpu_class`): XLA:CPU compiles for the host that compiles, and armada's hosts span classes,
-    so a program from another class need not link here ("Failed to materialize symbols"), after which the
-    process compiles nothing more."""
+def test_a_bundle_is_its_host_class_s_alone_on_every_backend():
+    """A bundle is its host class's (`dew._host.cpu_class`) whatever the backend: XLA:CPU compiles for the host
+    that compiles, and a GPU lane's programs hold CPU executables too (its host-side computations), so a program
+    from another class need not link here ("Failed to materialize symbols"), after which the process compiles
+    nothing more. On the CPU, whose device kind is "cpu" on every host, and on a GPU lane's backend alike."""
     import os
     import subprocess
     import sys
 
-    # On the CPU backend, whatever this lane's: a CUDA or TPU lane's prefix is its device kind's.
     script = """
 import dew._host
 import remote_cache
@@ -44,12 +43,13 @@ for named in ("AuthenticAMD-25-17", "AuthenticAMD-25-1"):
     print(remote_cache.prefix())
 """
     path = os.pathsep.join([os.path.dirname(__file__), os.environ.get("PYTHONPATH", "")])
-    env = {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": path}
-    done = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True,
-                          timeout=300)
-    assert done.returncode == 0, done.stderr[-2000:]
-    zen4, zen3 = done.stdout.split()
-    assert zen4.endswith("/cpu/AuthenticAMD-25-17") and zen3.endswith("/cpu/AuthenticAMD-25-1")
+    for platforms in ({"JAX_PLATFORMS": "cpu"}, {}):
+        env = {**os.environ, "PYTHONPATH": path, **platforms}
+        done = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True,
+                              timeout=300)
+        assert done.returncode == 0, done.stderr[-2000:]
+        zen4, zen3 = done.stdout.split()
+        assert zen4.endswith("/AuthenticAMD-25-17") and zen3.endswith("/AuthenticAMD-25-1"), (platforms, zen4)
 
 
 def test_an_unreachable_remote_only_slows_a_task_by_its_first_failed_requests(monkeypatch, tmp_path):
