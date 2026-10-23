@@ -315,7 +315,8 @@ class PromptSource:
             future.cancel()
 
     def close(self) -> None:
-        """Stop the reward threads. The caller closes the server; this method does not."""
+        """Stop the reward threads: a reward running finishes, and a rollout whose reward has not
+        started is cancelled. The caller closes the server; this method does not."""
         self._scorers.shutdown(wait=True, cancel_futures=True)
 
     def _rollout(self, task: Task, prompt: _Prompt, version: int, drawn: Future[Draw]) -> Session:
@@ -348,9 +349,13 @@ class PromptSource:
 
         def chained(_: Future[Draw]) -> None:
             try:
-                self._scorers.submit(score)
+                job = self._scorers.submit(score)
             except RuntimeError as closed:
                 settled(scored, closed)
+                return
+            # A close cancels the scorers' queued work (`close`); the rollout its job would have
+            # settled is cancelled with it, so no one waits on it.
+            job.add_done_callback(lambda job: scored.cancel() if job.cancelled() else None)
 
         drawn.add_done_callback(chained)
         return scored
