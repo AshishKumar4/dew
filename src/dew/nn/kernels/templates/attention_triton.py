@@ -642,9 +642,8 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
             interpret=interpret)
         logits, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
         dv = dv + kernel_dot(*algebra.value_operands(exponentials, weights, dout, total_ref[rows]), interpret)
-        # Its product with the queries to fp32's accuracy (`algebra.cotangent_product`), the scale after
-        # it, which XLA cannot then fold into a hook's slope (`algebra.dq_step`).
-        dk = dk + algebra.cotangent_product(logits, query, product, transposed=True) * scale
+        # Scaled before it meets the queries, to fp32's accuracy (`algebra.cotangent_product`).
+        dk = dk + algebra.cotangent_product(logits * scale, query, product, transposed=True)
         for place, (kind, piece) in enumerate(zip(score_kinds, pieces, strict=True)):
             if kind == Kind.TILE:
                 # A tile parameter's entries, under the refined D (`algebra.refinement`).
