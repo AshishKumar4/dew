@@ -52,8 +52,9 @@ LOSS = 1e-6
 GRADIENT = 1.7e-6
 """Twice the worst leaf's max |Δgrad| over its max |grad| measured on CPU,
 8.3e-7 at the first layer's post-attention norm bias."""
-HEAD_SEEDS, BF16_SEEDS = 256, 256
-"""Each site's check-1 seeds, sized by `seeds_for` on 2026-10-20 on armada."""
+HEAD_SEEDS, BF16_SEEDS = 512, 512
+"""Each site's check-1 seeds, sized by `seeds_for` on armada: the most any of its cases took (the
+softcap head's and GPT-NeoX's)."""
 
 
 @pytest.fixture(scope="module")
