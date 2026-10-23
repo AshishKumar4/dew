@@ -705,13 +705,15 @@ def listed(prefix: str, token: str) -> list[str]:
     return list(store(token).keys(prefix))
 
 
-def file_records(python: str) -> dict[str, list[tuple[str, str, dict | None]]]:
-    """Every record of each test file under `python`, the last run's on each class and group (`record_key`):
-    (its class, its group, the record, or None where the Worker did not give it)."""
+def file_records(python: str, inputs: str | None = None) -> dict[str, list[tuple[str, str, dict | None]]]:
+    """Every record of each test file under `python` on each class and group (`record_key`): the last
+    run's, or with `inputs` the last of the runs on those shared inputs. Each is (its class, its group, the
+    record, or None where the Worker did not give it)."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         raise SystemExit("the GPU tier is chosen from the test cache's records, which need its URL and token")
-    prefix = f"{CACHE_PREFIX}/{python}/"
+    at = CACHE_PREFIX if inputs is None else f"{CACHE_PREFIX}-inputs/{inputs[:16]}"
+    prefix = f"{at}/{python}/"
     try:
         keys = listed(prefix, token)
     # The tier is chosen from the records: none listed, none is chosen.
@@ -760,10 +762,14 @@ def marked(python: str) -> dict[str, list[str]]:
     """Each test file of this checkout with tests marked one of `session.MARKS`, with its evidence: what a
     batch's GPU run holds. The marks are those a CPU task's run recorded (executed.py records each test's
     marks as it runs, a test skipped on the CPU included), where a fresh record of every group of one run
-    of the file on one class (`fresh`, its whole row or each of its split's) shows them; a file no such run
-    covers is collected here on the CPU, under the marks' selection, and counted."""
+    of the file on one class (`fresh`, its whole row or each of its split's) shows them, among the runs on
+    these very inputs (a CPU task's or a GPU lane's, `record_key`'s `inputs`): a file no such run covers is
+    collected here on the CPU, under the marks' selection within CI's, and counted."""
     inputs = (shared(python), lane_inputs(python))
-    records = file_records(python)
+    records: dict[str, list[tuple[str, str, dict | None]]] = {}
+    for common in inputs:
+        for name, found in file_records(python, common).items():
+            records.setdefault(name, []).extend(found)
 
     def recorded_marks(name: str) -> set[str] | None:
         """The marks of a complete, fresh run of `name` on one class, or None where no class holds one."""
@@ -790,8 +796,10 @@ def marked(python: str) -> dict[str, list[str]]:
         elif marks:
             found[name] = sorted(marks)
     if unknown:
+        # The marks' tests CI's selection keeps (`session.SELECTION`): a record holds only tests a task ran.
+        selected = f"({' or '.join(session.MARKS)}) and ({session.SELECTION[1]})"
         done = subprocess.run([f".venv-{python}/bin/python", "-m", "pytest", "--collect-only", "-q",
-                               "-m", " or ".join(session.MARKS), *unknown],
+                               "-m", selected, *unknown],
                               capture_output=True, text=True, env={**os.environ, "JAX_PLATFORMS": "cpu"})
         if done.returncode not in (0, 5):
             raise SystemExit(f"collecting the marked tests exited {done.returncode}\n"
