@@ -6,9 +6,13 @@ keys and values under the selection folded into a `[B, S, T]` mask, which
 `tests/test_mla.py` holds against transformers 5.16.1 (the V3.2 fixture's
 seven tokens exceed its top-k of four, so that parity test runs this path).
 The selection is on par with it from the reference in float64 over drawn
-inputs (check 1, tests/reference_error.py), and a call that keeps the masked
-kernel with the masked kernel's call: two programs, which XLA holds to no
-common bits.
+inputs (check 1, tests/reference_error.py), and a dropped-out adapter's call,
+which keeps the masked kernel, with the masked kernel's call: two programs,
+which XLA holds to no common bits. A quantized kv_b_proj's call is still held
+to the masked kernel's bit for bit: its FP8 roundings of the latents (and of
+the frozen product's cotangents) part float32 from float64 at a few seeds in
+a thousand, so check 1's control does not resolve without a margin on them
+in the draw.
 """
 
 from functools import partial
@@ -27,8 +31,7 @@ from dew.nn.sparse_selection import selection_mask, sparse_latent_attention, top
 from dew.quantization import QUANTIZATION, InputQuantization
 
 HEADS, RANK, NOPE, ROPE, VALUE = 4, 24, 16, 8, 12
-SEEDS = {'selection': 8, 'packed selection': 8, 'sparse layer': 8, 'dropped-out adapter': 8,
-         'input quantized kv_b_proj': 8, 'frozen quantized kv_b_proj': 8}
+SEEDS = {'selection': 8, 'packed selection': 8, 'sparse layer': 8, 'dropped-out adapter': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 
 
@@ -174,13 +177,13 @@ def test_a_quantized_kv_b_proj_keeps_the_masked_kernel(quantized):
     there, rounds the latents themselves. The absorbed path applies kv_b_proj
     to the identity, where the rounding would land on the identity instead,
     so such a call runs the masked kernel: its output and every gradient are
-    on par (check 1) with the same call's with `qk` open, its truth that call
-    in float64 on the same quantization."""
+    the same call's with `qk` open."""
     layer = MultiHeadLatentAttention(
         emb_features=32, num_heads=HEADS, max_seq_len=64, q_lora_rank=16, kv_lora_rank=RANK,
         qk_nope_head_dim=NOPE, qk_rope_head_dim=ROPE, v_head_dim=VALUE,
         index_topk=5, index_n_heads=2, index_head_dim=16, attention_impl="reference")
-    variables = layer.init(jax.random.key(3), jnp.zeros((2, 21, 32)))
+    hidden = jax.random.normal(jax.random.key(2), (2, 21, 32))
+    variables = layer.init(jax.random.key(3), hidden)
     if quantized == "input":
         record = InputQuantization(sites=(("kv_b_proj", "fp8"),))
         held = {"kv_b_proj": {"fp8_input_scale": jnp.asarray(0.01, jnp.float32)}}
@@ -188,23 +191,19 @@ def test_a_quantized_kv_b_proj_keeps_the_masked_kernel(quantized):
         record = InputQuantization(frozen_fp8=("kv_b_proj",), measured_on=device_generation())
         held = record.packed(variables["params"])
     model = record.apply(layer)
+    cotangent = jax.random.normal(jax.random.key(4), hidden.shape)
 
-    def run(params, *, qk: bool):
-        # The output and the parameters' and hidden states' gradients under the drawn readout.
-        def call(params, x):
+    def run(*, qk: bool):
+        def loss(params, x):
             tree = {"params": params, QUANTIZATION: held}
-            return model.apply(tree, x, mutable=["qk"])[0] if qk else model.apply(tree, x)
+            output = model.apply(tree, x, mutable=["qk"])[0] if qk else model.apply(tree, x)
+            return jnp.sum(output * cotangent), output
 
-        return lambda hidden, cotangent: with_gradients(call)(params, hidden, cotangent)
+        (_, output), gradients = jax.value_and_grad(loss, (0, 1), has_aux=True)(variables["params"], hidden)
+        return output, gradients
 
-    def draw(seed):
-        (hidden,) = hidden_draw(seed)
-        return hidden, jax.random.normal(jax.random.fold_in(jax.random.key(4), seed), hidden.shape)
-
-    params = variables["params"]
-    label = f'{quantized} quantized kv_b_proj'
-    assert_as_exact(jax.jit(run(params, qk=False)), jax.jit(run(params, qk=True)), draw, label,
-                    seeds=SEEDS[label], truth_fn=run(widened(params), qk=True))
+    for sparse, masked in zip(jax.tree.leaves(run(qk=False)), jax.tree.leaves(run(qk=True)), strict=True):
+        np.testing.assert_array_equal(np.asarray(sparse), np.asarray(masked))
 
 
 def test_memory_follows_the_selection_not_the_sequence():
