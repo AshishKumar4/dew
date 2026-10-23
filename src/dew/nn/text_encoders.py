@@ -57,6 +57,7 @@ from dew.nn.sharding import logical_axes
 from dew.registry import resolve_dtype
 
 DEFAULT_MODEL = "openai/clip-vit-large-patch14"
+"""The CLIP checkpoint the native port follows and loads by default."""
 
 
 class CLIPTowerOutput(NamedTuple):
