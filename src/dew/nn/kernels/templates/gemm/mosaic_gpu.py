@@ -279,7 +279,7 @@ def _gmm_cooperative(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_r
     block_m, block_n, block_k, pair = tiles.block_m, tiles.block_n, tiles.block_k, tiles.cluster
     rows_half = block_m // 2
     part = (rows_half, block_n)
-    staged = _staged_columns(block_n, dtypes)
+    staged = staged_columns(block_n, dtypes)
     side_shapes = [tuple({'rows': part[0], 'columns': part[1]}[axis] for axis in axes)
                    for axes in epilogue_axes]
     # A pipeline's operands each follow its steps: a prologue side operand without depth is loaded once a
@@ -448,7 +448,7 @@ written to shared memory as one 512-byte row conflicted on its banks 195 times a
 slower)."""
 
 
-def _staged_columns(block_n: int, dtypes) -> int:
+def staged_columns(block_n: int, dtypes) -> int:
     """The columns of each chunk a consumer stages its output tile in: `STAGED_BYTES` of the widest
     output, or the whole tile where that is narrower; the tile must divide into them."""
     columns = min(block_n, STAGED_BYTES // max(jnp.dtype(dtype).itemsize for dtype in dtypes))
@@ -608,7 +608,7 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     half, depth_half = block_n // 2, block_m // 2
     part = (depth_half, block_n)
-    staged = _staged_columns(block_n, (out_dtype,))
+    staged = staged_columns(block_n, (out_dtype,))
     grid = (m // block_m, n // block_n)
     stepped = tuple(i for i, axes in enumerate(prologue_axes) if 'rows' in axes)
     fixed = tuple(i for i, axes in enumerate(prologue_axes) if 'rows' not in axes)
@@ -671,7 +671,7 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
                 fixed_refs = [smem.at[wg] for smem in fixed_smems]
 
                 def store(acc, g_i, depth, columns):
-                    # One `_staged_columns` chunk at a time through one buffer, as `_finish_half` stores.
+                    # One `staged_columns` chunk at a time through one buffer, as `_finish_half` stores.
                     mine = pl.ds(depth.start + wg * depth_half, depth_half)
                     for chunk in range(block_n // staged):
                         plgpu.wait_smem_to_gmem(0, wait_read_only=True)

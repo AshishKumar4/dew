@@ -62,6 +62,7 @@ def _facts(costed: cost.Cost, facts: generation.GpuTarget) -> dict[str, float | 
     return {'multiprocessors': facts.multiprocessors, 'clock_hz': facts.clock_hz,
             'memory_bandwidth': facts.memory_bandwidth, 'tensor_rate_per_clock': rate,
             'shared_limit': facts.shared_limit, 'load_latency_clocks': facts.load_latency,
+            'stage_latency_clocks': facts.stage_latency, 'l2_bandwidth': facts.l2_bandwidth,
             'warpgroup_mma': facts.wgmma}
 
 

@@ -655,12 +655,12 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             ba.arguments['prologue_operands'], hooks.prologue_axes, extents)
         epilogue = _side_tile_bytes(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes, extents)
         # One warpgroup stages each output in turn, whole; two hold every output's buffer at once, each
-        # consumer one chunk of its half (`mosaic_gpu._staged_columns`), and each its own copy of an
+        # consumer one chunk of its half (`mosaic_gpu.staged_columns`), and each its own copy of an
         # epilogue side tile without rows (`hopper.staging`; a prologue side's per-consumer copies are
         # within the stages' count of it).
         if config.warpgroups == 2:
-            columns = min(config.block_n, mosaic_gpu.STAGED_BYTES // max(outs))
-            staged = sum(outs) * config.block_m * columns
+            dtypes = hooks.out_dtypes or (ba.arguments['out_dtype'],)
+            staged = sum(outs) * config.block_m * mosaic_gpu.staged_columns(config.block_n, dtypes)
             epilogue_sides = ba.arguments.get('epilogue_operands', ())
             epilogue += _side_tile_bytes(*_uncut(epilogue_sides, hooks.epilogue_axes), extents)
         else:
@@ -737,6 +737,7 @@ class MosaicGmm(_Mosaic):
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
     CONTRACTED: ClassVar[str] = 'depth'
+    revision: int = 2  # the cooperative output staged one chunk at a time
 
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         kernel = ba.arguments['kernel']
@@ -791,6 +792,7 @@ class MosaicTgmm(_Mosaic):
     EXACT_SUMS: ClassVar[bool] = True
     CONTRACTED: ClassVar[str] = 'rows'
     STREAMS: ClassVar[bool] = True
+    revision: int = 2  # the cooperative output staged one chunk at a time
 
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         depth, width = ba.arguments['tokens'].shape[1], ba.arguments['cotangent'].shape[1]
