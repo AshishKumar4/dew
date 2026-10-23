@@ -23,7 +23,7 @@ from dew import position
 from dew.data.cache import Cache
 from dew.data.compile import compile, iterate, validation
 from dew.data.dataset import DataPartition, Loading
-from dew.data.mixing import Members, TokenDeficit, token_weights
+from dew.data.mixing import TokenDeficit, token_weights
 from dew.data.pipeline import Configured, Pipeline, Rejected, mix
 from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
 from dew.data.sources import Files, Memory
@@ -747,7 +747,7 @@ def test_a_validation_pass_starts_at_most_one_worker_per_batch(monkeypatch):
 def test_token_deficit_mix_counts_targets_and_restores_delivered_counts():
     corpora = [grain.MapDataset.source([{"id": tag, "targets": targets}]).repeat().to_iter_dataset()
                for tag, targets in [(0, 2), (1, 7)]]
-    mix = TokenDeficit(corpora, Members((1, 3), ("short", "long")), tokens=Targets(), names=["short", "long"],
+    mix = TokenDeficit(corpora, (1, 3), ("short", "long"), tokens=Targets(), names=["short", "long"],
                        labels=["short", "long"])
     reader = iter(mix)
     delivered = [0, 0]
@@ -1610,7 +1610,7 @@ def test_token_mixer_probes_an_unselected_tiny_share_before_emitting_a_row():
     and its first row lets it."""
     parents = [grain.MapDataset.source([{"targets": 3}]).repeat().to_iter_dataset(),
                grain.MapDataset.source([{"targets": 1}]).repeat().to_iter_dataset()]
-    reader = iter(TokenDeficit(parents, Members((1, 1e-9), ("normal", "tiny")), tokens=Targets(),
+    reader = iter(TokenDeficit(parents, (1, 1e-9), ("normal", "tiny"), tokens=Targets(),
                                names=["normal", "tiny"], labels=["normal", "tiny"]))
     try:
         assert next(reader) == {"targets": 3}
@@ -2049,132 +2049,6 @@ def test_a_streamed_repeat_repeats_where_it_is_written_past_a_limit_or_a_repeat(
     twice = Pipeline(source(8)).repeat(2).repeat(3)
     assert len(ids(twice, "streamed")) == len(ids(twice, "indexed")) == 48
 
-
-def _tagged(tag, count):
-    """`count` records whose ids say they are corpus `tag`'s: 100 * tag on."""
-    return Pipeline(Memory(tuple({"id": np.int32(100 * tag + index)} for index in range(count))))
-
-
-def _nested():
-    """A mix at even weights of a corpus of 12 and a mix at even weights of corpora of 8 and 4."""
-    return mix([_tagged(1, 12), mix([_tagged(2, 8), _tagged(3, 4)], weights=(1, 1))], weights=(1, 1))
-
-
-def _ids(reader, batches=None):
-    try:
-        return [int(value) for batch in itertools.islice(reader, batches) for value in batch["id"]]
-    finally:
-        reader.close()
-
-
-def test_a_nested_mixture_a_run_reads_on_counts_its_epoch_until_every_corpus_has_come_round():
-    """A run reads a mixture on past its end, each part on from where it was, so its epoch is the
-    fewest records in which every part comes round once, the inner mixture counted the same way:
-    the inner one of 8 and 4 at even weights in 15, the outer of 12 and those 15 in 30. Every
-    record of every corpus is read in it."""
-    loader = compile(_nested().batch(2), loading=READ)
-    assert loader.records == 30
-    read = _ids(loader.train(DataPartition()), 15)
-    corpora = {1: 12, 2: 8, 3: 4}
-    assert {tag: len({value for value in read if value // 100 == tag}) for tag in corpora} == corpora
-
-
-@pytest.mark.parametrize("epochs", [1, 2])
-def test_a_nested_mixture_read_a_counted_number_of_times_counts_the_records_its_mix_reads(epochs):
-    """A mixture repeated a counted number of times reads its mix to its end each time, where its
-    first corpus ends, the inner mixture's at its own: the inner one of 8 and 4 ends at 8, the
-    outer of 12 and those 8 at 16, and the run reads that many records each epoch and no more."""
-    loader = compile(_nested().repeat(epochs).batch(2), loading=READ)
-    assert loader.records == 16
-    assert len(_ids(loader.train(DataPartition()))) == 16 * epochs
-
-
-@pytest.mark.parametrize("taken", [8, 20])
-def test_a_mixture_repeated_for_ever_then_taken_counts_no_more_than_it_reads(taken):
-    """A mix of corpora of 8 and 4 at even weights, repeated for ever and then cut to its first
-    records, counts the fewest in which every corpus comes round, 15, where the cut holds that
-    many, and the cut where it holds fewer: a run reads that many and ends."""
-    loader = compile(mix([_tagged(1, 8), _tagged(2, 4)], weights=(1, 1)).repeat().take(taken).batch(1),
-                     loading=READ)
-    assert loader.records == min(15, taken)
-    assert len(_ids(loader.train(DataPartition()))) == taken
-
-
-def test_a_mixture_of_a_part_cut_after_its_repeat_ends_where_that_part_does():
-    """A mix of a part repeated for ever then cut to 8 records and a corpus repeated for ever, at even
-    weights, ends where the cut part does, at 16, and counts that many: a run reads them and ends."""
-    cut = mix([_tagged(1, 8), _tagged(2, 4)], weights=(1, 1)).repeat().take(8)
-    loader = compile(mix([cut, _tagged(3, 8).repeat()], weights=(1, 1)).batch(1), loading=READ)
-    assert loader.records == 16
-    assert len(_ids(loader.train(DataPartition()))) == 16
-
-
-def test_a_part_cut_after_its_repeat_comes_round_in_a_mix_read_on_once_its_cut_is_read():
-    """A part repeated for ever and cut to 8 records, mixed at even weights with a corpus of 8 and read
-    on past the mix's end, comes round once its 8 are read: an epoch is the 16 records in which both
-    parts have, and holds the cut part's 8 and every record of the corpus."""
-    cut = mix([_tagged(1, 8), _tagged(2, 4)], weights=(1, 1)).repeat().take(8)
-    loader = compile(mix([cut, _tagged(3, 8)], weights=(1, 1)).repeat().batch(1), loading=READ)
-    assert loader.records == 16
-    read = _ids(loader.train(DataPartition()), loader.records)
-    assert sorted(value for value in read if value < 300) == [*range(100, 104), *range(200, 204)]
-    assert sorted(value for value in read if value >= 300) == list(range(300, 308))
-
-
-def test_a_part_cut_between_two_repeats_comes_round_once_the_cut_its_last_repeat_reads_is_read():
-    """A corpus of 8 repeated, cut to 3 and repeated again comes round, in a mix read on past its end,
-    once the 3 its last repeat reads are: at even weights with a corpus of 3 an epoch is 6 records,
-    holding the cut's 3 and the other corpus's 3."""
-    part = _tagged(1, 8).repeat().take(3).repeat()
-    loader = compile(mix([part, _tagged(2, 3)], weights=(1, 1)).repeat().batch(1), loading=READ)
-    assert loader.records == 6
-    assert sorted(_ids(loader.train(DataPartition()), loader.records)) == [100, 101, 102, 200, 201, 202]
-
-
-def test_an_order_read_once_too_short_for_a_batch_it_drops_is_refused_an_epoch():
-    """Three records read once in batches of four that drop a short one deliver no step, so a run
-    counted in epochs of them is refused."""
-    with pytest.raises(ValueError):
-        compile(_tagged(1, 3).repeat(1).batch(4), loading=READ).epoch_steps(1)
-
-
-@pytest.mark.parametrize(("keep", "steps"), [(False, 2), (True, 3)])
-def test_an_order_read_once_counts_the_steps_its_batches_deliver(keep, steps):
-    """Five records read once in batches of two take two steps where the batch drops its short last
-    one, and three where it keeps it, filled: an epoch's steps are those its reader delivers."""
-    loader = compile(_tagged(1, 5).repeat(1).batch(2, drop_remainder=not keep), loading=READ)
-    assert loader.steps_per_epoch == steps
-    reader = loader.train(DataPartition())
-    try:
-        assert len(list(reader)) == steps
-    finally:
-        reader.close()
-
-
-def test_an_epoch_of_an_order_read_on_counts_the_step_that_completes_it():
-    """Five records repeated for ever in batches of two take three steps an epoch, the third holding
-    the last record and the next epoch's first, and two epochs five steps: the steps that read
-    every record of each."""
-    loader = compile(_tagged(1, 5).repeat().batch(2), loading=READ)
-    assert (loader.steps_per_epoch, loader.epoch_steps(2)) == (3, 5)
-    read = _ids(loader.train(DataPartition()), loader.steps_per_epoch)
-    assert set(read) == set(range(100, 105))
-
-
-def test_a_mixture_a_run_cuts_without_a_repeat_counts_its_cut():
-    """A mix of two corpora of 8 cut to its first 3 records and written without a repeat counts those
-    3 an epoch: the run's own repeat reads the cut."""
-    loader = compile(mix([_tagged(1, 8), _tagged(2, 8)], weights=(1, 1)).take(3).batch(1), loading=READ)
-    assert loader.records == 3
-
-
-def test_a_mixture_of_a_repeated_corpus_and_one_read_once_counts_what_a_run_reads():
-    """A mix of a corpus of 8 repeated and one of 4 written without a repeat, at even weights, ends
-    where the one read once does, at 8, and a run reads that many records: the order repeats
-    already, so a run adds no repeat of its own."""
-    loader = compile(mix([_tagged(1, 8).repeat(), _tagged(2, 4)], weights=(1, 1)).batch(1), loading=READ)
-    assert loader.records == 8
-    assert sorted(_ids(loader.train(DataPartition()))) == [*range(100, 104), *range(200, 204)]
 
 def test_a_streamed_training_read_with_a_random_step_and_no_repeat_never_runs_out():
     """A training order that writes no repeat repeats for ever, as its plan

@@ -299,6 +299,13 @@ class SelectedGeneration(View[Source]):
     def stated(self) -> Mapping[str, object]:
         return _uncounted(stated(self.source))
 
+    @functools.cached_property
+    def whole(self) -> Source:
+        """The generation's rows for every input: the whole store this part's measured facts are
+        measured over (`dew.data.analysis._stated`), as uncached they are over the store below its
+        selections."""
+        return self.generation.source()
+
     def order_fingerprints(self) -> Mapping[str, str]:
         """Which of the generation's rows this part reads, in their order."""
         return {"selected": hashlib.sha256(np.ascontiguousarray(self._dense, np.int64).tobytes()).hexdigest()}
