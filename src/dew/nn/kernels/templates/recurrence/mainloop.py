@@ -170,8 +170,11 @@ class _Issuer:
         count = max(len(left), len(right))
         terms = sorted(((i, j) for i in range(len(left)) for j in range(len(right)) if i + j < count),
                        key=lambda term: -sum(term))
-        return functools.reduce(lambda acc, term: FAMILY.issue(acc, left[term[0]], right[term[1]]), terms,
-                                FAMILY.zeros(shape))
+        if len(terms) == 1:
+            return FAMILY.product(left[0], right[0], shape)
+        # Each part's product on its own, summed in fp32 smallest first: a tensor core's accumulation truncates
+        # (mma.sync's), so a part accumulated onto a larger one loses its last bit where a sum rounds it.
+        return functools.reduce(jnp.add, (FAMILY.product(left[i], right[j], shape) for i, j in terms))
 
 
 def _diagonal(size: int) -> jax.Array:
