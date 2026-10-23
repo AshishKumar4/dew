@@ -8,7 +8,7 @@ import jax.numpy as jnp
 
 from dew.artifacts import ImageGrid
 
-from .common import ImageMetric, paired
+from .common import PairedImageMetric
 
 
 def frame_batch(images: jnp.ndarray) -> jnp.ndarray:
@@ -45,7 +45,7 @@ def peak_signal_noise_ratio(
     return scores if per_example else jnp.mean(scores)
 
 
-class PSNR(ImageMetric):
+class PSNR(PairedImageMetric):
     """Measures the mean PSNR in dB between the sampled frames and the batch's; higher is better.
 
     The sampled artifact is in [-1, 1]. The batch's uint8 pixels, read from
@@ -55,8 +55,4 @@ class PSNR(ImageMetric):
     """
 
     def __init__(self, data_range: float = 2.0, field: str = "image", reads: type = ImageGrid):
-        def measure(artifact, batch):
-            samples, targets = paired(artifact, batch, field)
-            return peak_signal_noise_ratio(samples, targets, data_range, per_example=True)
-
-        super().__init__(name="psnr", measure=measure, reads=reads)
+        super().__init__("psnr", peak_signal_noise_ratio, data_range, field, reads)
