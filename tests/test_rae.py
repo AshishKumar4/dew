@@ -180,4 +180,3 @@ def test_the_published_dinov2_matches_transformers(monkeypatch):
     bound = max(FORWARD, 2 * float(reference["dinov2_plain.tokens.float32_gap"]))
     print(f"published DINOv2 gap {gap:.3g}, bound {bound:.3g}")
     assert gap < bound
-
