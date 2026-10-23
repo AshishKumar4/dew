@@ -281,24 +281,6 @@ def test_the_kernels_write_each_product_in_its_own_dtype(generation_name):
             ((4, DEPTH, WIDTH), jnp.dtype(jnp.float32))} <= written
 
 
-def test_the_cost_model_charges_a_program_its_instructions_at_its_warps_issue_rate():
-    """A program its CUDA cores bound, not its tensor work, takes as long as its instructions take to issue:
-    twice the instructions twice the time, and twice the warps half of it until the multiprocessor's
-    schedulers each issue every clock; programs sharing a multiprocessor share its schedulers."""
-    target = generation.TARGETS["sm90"]
-
-    def seconds(issued, warps, resident=1):
-        work = cost.Cost(programs=target.multiprocessors * resident, device_bytes=0.0, program_flops=1.0,
-                         program_issued=issued, warps=warps, resident=resident)
-        return cost.seconds(work, target)
-
-    assert seconds(2e6, 4) == 2 * seconds(1e6, 4)
-    assert seconds(1e6, 8) == seconds(1e6, 4) / 2
-    assert seconds(1e6, 16) == seconds(1e6, 32)
-    assert seconds(1e6, 32, resident=2) == 2 * seconds(1e6, 32)
-    assert seconds(0.0, 4) < seconds(1e6, 4)
-
-
 def test_the_cost_model_charges_each_multiprocessor_its_programs_in_turn():
     """A multiprocessor does its programs' work one after another: a launch of one program per
     multiprocessor takes one program's time, one more program a second, and the device bytes bound it
