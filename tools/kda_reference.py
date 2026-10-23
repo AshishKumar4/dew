@@ -150,17 +150,22 @@ def torch_rule(reference: dict, rule: str, inputs: dict, dtype) -> dict:
     """The published `rule` on `inputs` in torch at `dtype`: its output, final state and the six
     operand gradients, by name."""
     import torch
+    from reference_error import torch_with_gradients
 
-    operands = [torch.tensor(inputs[name], dtype=dtype, requires_grad=True) for name in INPUTS]
     options = {"chunk_size": 4} if rule == "chunk" else {}
-    out, state = reference[f"{rule}_kimi_delta_attention"](
-        *operands[:5], initial_state=operands[5], output_final_state=True, use_qk_l2norm_in_kernel=True,
-        **options)
-    loss = (out * torch.tensor(inputs["output_cotangent"], dtype=dtype)).sum()
-    loss = loss + (state * torch.tensor(inputs["state_cotangent"], dtype=dtype)).sum()
-    gradients = torch.autograd.grad(loss, operands)
-    return {"output": out.detach().numpy(), "state": state.detach().numpy()} | {
-        f"grad/{name}": grad.numpy() for name, grad in zip(INPUTS, gradients, strict=True)}
+
+    def published(*operands):
+        return reference[f"{rule}_kimi_delta_attention"](
+            *operands[:5], initial_state=operands[5], output_final_state=True, use_qk_l2norm_in_kernel=True,
+            **options)
+
+    # The draw's cotangents, pulled back through the gate's torch twin as the JAX arms pull them back.
+    host = torch.empty(0, dtype=dtype).numpy().dtype
+    (out, state), *gradients = torch_with_gradients(published)(
+        *(np.asarray(inputs[name], host) for name in INPUTS),
+        (inputs["output_cotangent"], inputs["state_cotangent"]))
+    return {"output": out, "state": state} | {
+        f"grad/{name}": grad for name, grad in zip(INPUTS, gradients, strict=True)}
 
 
 def main(destination: Path) -> None:
