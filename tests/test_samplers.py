@@ -916,3 +916,40 @@ def test_rk4s_update_divides_by_six_as_ieee_division_does():
     dt = np.asarray(sigma_s, np.float32) - np.asarray(sigma_t, np.float32)
     expected = x + (6 * eps * dt) / np.float32(6)
     np.testing.assert_array_equal(np.asarray(stepped).view(np.uint32), expected.view(np.uint32))
+
+
+def test_pndms_runge_kutta_weighs_a_low_precision_stage_in_fp32_as_diffusers_step_prk_does():
+    """PNDM's Runge-Kutta warmup weighs each stage as Diffusers' step_prk does, the product with 1/6 or
+    1/3 in fp32 and rounded once to the stage's dtype, as torch's `bf16_tensor * python_float` does
+    (`dew.nn.precision.scaled`): a bf16 stage of 7 weighs to 1.1640625, where rounding the sixth to
+    bf16 first gives 1.171875. With the later stages zero and the state zero, the step is the
+    transfer of the first stage's weight alone, `_get_prev_sample`'s, bit for bit."""
+    import ml_dtypes
+
+    process, _ = vp_process()
+    rng = np.random.default_rng(7)
+    eps = rng.standard_normal((4096, 1)).astype(ml_dtypes.bfloat16)
+    eps[0, 0] = 7
+    x = jnp.zeros((4096, 1), jnp.float32)
+    times = process.times(12)
+    t, t_next = jnp.full((4096,), times[0]), jnp.full((4096,), times[1])
+
+    def denoise(at, time):
+        return at, jnp.zeros((4096, 1), jnp.bfloat16)
+
+    solver = PNDM()
+    state = solver.init(x, times, process, key=jax.random.key(0))
+    stepped, _ = jax.jit(lambda x, eps: solver.step(x, t, t_next, x, eps, state, jax.random.key(0), process,
+                                                    denoise))(x, jnp.asarray(eps))
+    weighed = (eps.astype(np.float32) * np.float32(1 / 6)).astype(ml_dtypes.bfloat16)
+    assert weighed[0, 0] == 1.1640625
+
+    @jax.jit
+    def transfer(x, weighed):
+        alpha2_t, sigma2_t = process.variances(t, like=x)
+        alpha2_s, sigma2_s = process.variances(t_next, like=x)
+        denominator = alpha2_t * sigma2_s ** 0.5 + (alpha2_t * sigma2_t) ** 0.5 * alpha2_s ** 0.5
+        return (alpha2_s / alpha2_t) ** 0.5 * x - (alpha2_s - alpha2_t) * weighed / denominator
+
+    expected = np.asarray(transfer(x, jnp.asarray(weighed)))
+    np.testing.assert_array_equal(np.asarray(stepped).view(np.uint32), expected.view(np.uint32))
