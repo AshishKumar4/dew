@@ -11,7 +11,7 @@ from test_attention_template import CASES, ROWS, SINKS, SOFTCAP, arguments, geom
 
 from dew.nn.attention import alibi_bias
 from dew.nn.kernels import tuning
-from dew.nn.kernels.templates import attention as template, attention_triton
+from dew.nn.kernels.templates import attention as template, attention_algebra as algebra, attention_triton
 
 ON_GPU = jax.default_backend() == "gpu"
 SEEDS = 8
@@ -100,13 +100,20 @@ def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, *
     hooks = hooks_for(names, queries, value_width, gate_of(queries, value_width))
     pin = tuning.pinned({attention_triton.TritonForward: config})
 
+    # The maxima are in the logits' own units, raw products in the raw form (`algebra.Forward.raw`), taken
+    # to the reference's natural ones as the algebra takes them (`algebra.Forward.naturalized`).
+    spec = algebra.Forward(spans.form, keys, ids=spans.query_ids is not None, scale=width ** -0.5,
+                           score_mod=hooks.score_mod, natural=natural, initial=hooks.initial is not None)
+
     def ours(query, key, value):
         with pin:
             out = attention_triton.forward(query, key, value, spans, hooks, residuals=residuals,
                                            natural=natural, interpret=not ON_GPU)
         # The maxima and denominators the reference keeps too; the anchor keys only the backward reads,
         # held to its gradients (`check_backward`).
-        return out[:3] if residuals else out
+        if not residuals:
+            return out
+        return out[0], spec.naturalized(out[1]) if spec.raw else out[1], out[2]
 
     def xla(query, key, value):
         return template.reference(query, key, value, spans, hooks, residuals=residuals)

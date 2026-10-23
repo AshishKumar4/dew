@@ -617,9 +617,13 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
         nothing = jnp.zeros((batch, heads, queries), jnp.float32)
         starts = nothing - jnp.inf, nothing, nothing
     else:
-        # The softmax's initial state: its maximum, denominator and share of D's numerator, in fp32.
-        starts = (state.m.astype(jnp.float32), state.total.astype(jnp.float32),
-                  jnp.sum(state.acc.astype(jnp.float32) * cotangent, axis=-1))
+        # The softmax's initial state: its maximum, denominator and its values' mean's product with the
+        # cotangent, in fp32 (`attention_algebra.off_anchor_start`): `acc0 · dO` itself overflows where the
+        # state's sums are near fp32's largest; its mean does not.
+        total0 = state.total.astype(jnp.float32)
+        over = jnp.where(total0 > 0, 1.0 / jnp.where(total0 > 0, total0, 1.0), 0.0)
+        mean0 = state.acc.astype(jnp.float32) * over[..., None]
+        starts = state.m.astype(jnp.float32), total0, jnp.sum(mean0 * cotangent, axis=-1)
     call = padded_call(query, key, value, spans, hooks, block)
     padded_dout = jnp.pad(dout, ((0, 0), (0, call.query.shape[1] - queries), (0, 0),
                                  (0, call.value.shape[-1] - value_width)))
@@ -674,9 +678,9 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
         inverse = jnp.where(total > 0, 1.0 / jnp.where(total > 0, total, 1.0), 0.0)
         # Its maximum's cotangent, that term's score cotangent, taken whole as the reference's derivative
         # takes it; exactly 0 for a query that read only its state, whose output its maximum leaves unmoved.
-        moved = (jnp.sum(state.acc.astype(jnp.float32) * cotangent, axis=-1)
-                 - state.total.astype(jnp.float32) * delta) * inverse
-        initial = Initial(m=jnp.where(mass > 0, moved * factor, 0.0).astype(state.m.dtype),
+        # Its weight before any product, as the launch takes it (`attention_algebra.refinement`).
+        moved = (starts[2] - delta) * ((starts[1] * factor) * inverse)
+        initial = Initial(m=jnp.where(mass > 0, moved, 0.0).astype(state.m.dtype),
                           total=(-(delta * inverse) * factor).astype(state.total.dtype),
                           acc=((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
     return Gradients(dq[:, :queries, :, :width].astype(query.dtype),

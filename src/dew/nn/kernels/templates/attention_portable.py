@@ -238,7 +238,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
         kv_head = head // group
         q = jax.lax.dynamic_slice_in_dim(query[row, :, head], i * block_q, block_q)
         do = jax.lax.dynamic_slice_in_dim(dout[row, :, head], i * block_q, block_q)
-        peak0, total0, term0 = peak[row, head, rows], total[row, head, rows], initial_term[row, head, rows]
+        peak0, total0, mean0 = peak[row, head, rows], total[row, head, rows], initial_term[row, head, rows]
         maxima, chosen = maximum[row, head, rows], key_index[row, head, rows]
         shifts = shift[row, head, rows]
         anchor_rows = jax.lax.dynamic_slice_in_dim(anchor_value[row, :, head], i * block_q, block_q)
@@ -252,7 +252,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             v_tile = jax.lax.dynamic_slice_in_dim(value[row, :, kv_head], j * block_k, block_k)
             return columns, _seen(spans, row, rows, columns), params, k_tile, v_tile
 
-        before, state_total, state_share = algebra.off_anchor_start(peak0, total0, term0, maxima,
+        before, state_total, state_share = algebra.off_anchor_start(peak0, total0, mean0, maxima,
                                                                     value.shape[-1], shifts)
         if sums is None:
             # D without the forward's split sums: the dQ launch's own pass over the keys.
@@ -303,7 +303,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
         found = algebra.DqSums(*jax.lax.fori_loop(
             lo, hi, step, (jnp.zeros((block_q, width), jnp.float32), nothing, nothing, rows_sums, rows_sums)))
         dq, delta, denominator, mass, grads = algebra.dq_finish(found, prior, state_total, peak0,
-                                                                (total0, term0), m, anchor, delta)
+                                                                (total0, mean0), m, anchor, delta)
         return dq, (delta, anchor, m, denominator, mass), chosen, _written(grads, score_kinds)
 
     dq, rows_out, chosen, written = jax.lax.map(program, jnp.arange(blocks * batch * heads))
