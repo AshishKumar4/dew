@@ -683,6 +683,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         # Python's apart.
         ran.append({"name": row(python, name, split), "exitCode": 1 if red else 0, "seconds": seconds,
                      "output": "\n".join(red + ([shown(output)] if red else [])),
+                     # Its first failed test's exception as pytest gave it ("RuntimeError: ..."), which
+                     # `exhausted` reads.
+                     **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
                      "tests": {node_of(case): float(case.get("time") or 0) for case in own},
                      "timings": {row(python, name, ""): seconds}, **cause})
     out.write_text(json.dumps({"rows": rows + ran}))
@@ -817,15 +820,17 @@ def gpu_needs(recorded: dict | None, budget: float) -> tuple[float, float]:
     return share, min(share * (1 + recorded.get("shares", 0)) + recorded.get("pools", 0), budget)
 
 
-EXHAUSTED = re.compile(r"RESOURCE_EXHAUSTED|[Oo]ut of memory|CUDA_ERROR_OUT_OF_MEMORY|"
-                       r"cudaErrorMemoryAllocation|failed to allocate")
-"""A failure that is the GPU's memory running out: XLA's and the CUDA driver's words for it."""
+EXHAUSTED = re.compile(r"(?:[\w.]+\.)?(?:XlaRuntimeError|JaxRuntimeError|RuntimeError|OutOfMemoryError): "
+                       r"(?:RESOURCE_EXHAUSTED\b|CUDA_ERROR_OUT_OF_MEMORY\b|CUDA (?:error: )?out of memory)")
+"""An exception that is the GPU's memory running out, as pytest gives it: XLA's runtime error whose status
+is RESOURCE_EXHAUSTED, or the CUDA driver's out-of-memory error, raised as such; an assertion is never one,
+whatever its message says."""
 
 
-def exhausted(failure: str) -> bool:
-    """Whether a red row's first failure (its output's first line) is the GPU's memory running out
-    (`EXHAUSTED`), which a smaller share than the file needs causes, rather than the file's own failure."""
-    return bool(EXHAUSTED.search(failure))
+def exhausted(failure: str | None) -> bool:
+    """Whether a red row's first failed test raised the GPU's memory running out (`EXHAUSTED`, its exception's
+    start), which a smaller share than the file needs causes, rather than failed on its own."""
+    return failure is not None and EXHAUSTED.match(failure) is not None
 
 
 def borrowed_records(names: list[str], python: str, held: str, token: str) -> dict[str, tuple[str, dict]]:
@@ -937,7 +942,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
     # failure (an assertion, an accuracy miss, an illegal address) is the file's: its red stands, run once.
     again: dict[str, str] = {}
     for name in borrowed:
-        failures = [verdict["output"].split("\n", 1)[0]
+        failures = [verdict.get("first_failure")
                     for verdict in json.loads(verdicts[name].read_text())["rows"] if verdict["exitCode"] != 0]
         if failures and exhausted(failures[0]):
             again[name] = (f"red under a share of {shares[name] / 2 ** 30:.1f} GiB borrowed from "
