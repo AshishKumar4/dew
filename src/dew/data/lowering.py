@@ -46,6 +46,7 @@ from dew.data.analysis import (
     _steps,
     _until,
     _volatile,
+    ends,
 )
 from dew.data.cache import _Mapped
 from dew.data.concurrent import Concurrently
@@ -70,7 +71,6 @@ from dew.data.mixing import (
     Accepted,
     Chunked,
     CorpusCounts,
-    Members,
     PrimedMix,
     ProportionalSelection,
     Proportions,
@@ -1129,17 +1129,17 @@ class _Build:
         ]
         # A streamed mix saves each member's position under its key, so a member that joins starts
         # and one that left is dropped while the others resume (`Plan.check`).
-        members = Members(tuple(source.weights),
-                          tuple(_member_keys(strings(self.lowering.order["members"], "mixture members"))))
+        keys = _member_keys(strings(self.lowering.order["members"], "mixture members"))
         if source.tokens is not None:
             return TokenDeficit(
                 streams,
-                members,
+                source.weights,
+                keys,
                 tokens=source.tokens,
                 names=[_name(child) for child in source.pipelines],
                 labels=[_label(child) for child in source.pipelines],
             )
-        return PrimedMix(streams, members)
+        return PrimedMix(streams, source.weights, keys)
 
     def indexed(
         self, pipeline: Pipeline, source: Source, partition: DataPartition, last: int, *, marked: bool = False
@@ -1533,9 +1533,9 @@ class _Build:
                 filled = _FillShare(partition, batch_stage.size) if canonical else FilledBatch(size)
                 stream = stream.map(filled)
             return stream, after
-        if self.training and self.lowering.endless and not self.lowering.repeated:
+        if self.training and self.lowering.rooted:
             rows = _repeated(rows, None, _name(pipeline), self.loading)
-        elif self.training and not self.lowering.endless and drop:
+        elif self.training and not (self.lowering.records_unending or self.lowering.rooted) and drop:
             rows = rows[: len(rows) // batch_stage.size * batch_stage.size]
         whole = rows
         # The records after a resume's count go to the shares in turn from the first of them on
@@ -1632,7 +1632,7 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
         """Where the first repeat after the last slice or limit of `pipeline` reads the view they
         bound, past its stages where none follows; None where nothing bounds it."""
         stages = pipeline.stages
-        bounds = [at for at, stage in enumerate(stages) if _bounds(stage)]
+        bounds = [at for at, stage in enumerate(stages) if ends(stage)]
         if not bounds:
             return None
         return next((at for at, stage in enumerate(stages) if at > bounds[-1] and isinstance(stage, Repeat)),
@@ -1661,12 +1661,11 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
 
     repeated, batched = _until(train.stages, (Repeat,)), _until(train.stages, (BatchStage, TokenBudget))
     order = dataclasses.replace(train, stages=train.stages[:batched])
-    # Read on past its end: by a repeat without a count, or as a mix of parts that never end.
-    source = train.source
-    onward = any(isinstance(stage, Repeat) and stage.epochs is None for stage in order.stages) or (
-        isinstance(source, Mixture) and all(_unending(child) for child in source.pipelines))
+    # Whether its records never end, and whether they are read on past an end on the way: by a repeat
+    # without a count, or as a mix of parts that never end.
+    unending, onward = build.lowering.records_unending, build.lowering.onward
     # A training order that repeats nowhere repeats for ever at its root (`_Build.batched`).
-    rooted = build.training and build.lowering.endless and not build.lowering.repeated
+    rooted = build.training and build.lowering.rooted
     if onward or rooted:
         # A view the order's repeat reads is its epoch, the read's own root repeat reading the whole
         # order; a bound after its last written repeat ends the order.
@@ -1676,7 +1675,7 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
                  else held(dataclasses.replace(order, stages=order.stages[:at]), build))
     else:
         count = passed(train, build)
-    if count is None or rooted or _unending(order) or (not onward and repeated >= batched):
+    if count is None or rooted or unending or (not onward and repeated >= batched):
         return count
     # An order that ends holds no more than it reads before its batch, whatever bounds it after its repeat.
     length = _order_length(train, build)
@@ -1699,8 +1698,7 @@ def _order_records(train: Pipeline, build: _Build) -> int | None:
     alone; None where it never ends or its read counts none ahead. The batches' sizes are what the
     stages place, so no record is read."""
     stage = next((stage for stage in train.stages if isinstance(stage, BatchStage)), None)
-    order = dataclasses.replace(train, stages=train.stages[: _until(train.stages, (BatchStage, TokenBudget))])
-    if not build.global_order or build.lowering.endless or _unending(order) or stage is None:
+    if not build.global_order or build.lowering.endless or build.lowering.records_unending or stage is None:
         return None
     length = _order_length(train, build)
     if length is None:
@@ -1720,33 +1718,12 @@ def _order_records(train: Pipeline, build: _Build) -> int | None:
 
 def _tail(train: Pipeline, build: _Build) -> Tail:
     """What a training read of `train` does with the records an epoch leaves short of a batch: reads
-    them, where its order never ends (`_unending`) or the read repeats it at its root
+    them, where its records never end (`_Lowering.records_unending`) or the read repeats them at its root
     (`_Build.batched`), so they lead the next epoch's batch, or where its batch keeps a short one;
     drops them where its order ends and its batch drops it."""
-    batched = _until(train.stages, (BatchStage, TokenBudget))
-    order = dataclasses.replace(train, stages=train.stages[:batched])
-    rooted = build.training and build.lowering.endless and not build.lowering.repeated
     drops = next((stage.drop_remainder for stage in train.stages if isinstance(stage, BatchStage)), True)
-    return "read" if _unending(order) or rooted or not drops else "dropped"
-
-
-def _bounds(stage: Stage) -> bool:
-    """Whether `stage` ends the order it reads: a limit, or a slice with an end."""
-    return isinstance(stage, Limit) or (isinstance(stage, Slice) and stage.selection.stop is not None)
-
-
-def _unending(pipeline: Pipeline) -> bool:
-    """Whether `pipeline`'s order never ends, its stages read in turn: a repeat without a count makes
-    it endless and a limit or a slice with an end ends it again, from a mixture whose parts' orders
-    each never end, whose mix never does, or a source that ends."""
-    source = pipeline.source
-    endless = isinstance(source, Mixture) and all(_unending(child) for child in source.pipelines)
-    for stage in pipeline.stages:
-        if isinstance(stage, Repeat) and stage.epochs is None:
-            endless = True
-        elif _bounds(stage):
-            endless = False
-    return endless
+    rooted = build.training and build.lowering.rooted
+    return "read" if build.lowering.records_unending or rooted or not drops else "dropped"
 
 
 def _split_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, int, int]]]:
