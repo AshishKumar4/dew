@@ -1699,15 +1699,19 @@ def _order_records(train: Pipeline, build: _Build) -> int | None:
     alone; None where it never ends or its read counts none ahead. The batches' sizes are what the
     stages place, so no record is read."""
     stage = next((stage for stage in train.stages if isinstance(stage, BatchStage)), None)
-    if not build.global_order or build.lowering.endless or stage is None:
+    order = dataclasses.replace(train, stages=train.stages[: _until(train.stages, (BatchStage, TokenBudget))])
+    if not build.global_order or build.lowering.endless or _unending(order) or stage is None:
         return None
     length = _order_length(train, build)
     if length is None:
         return None
     whole, short = divmod(length, stage.size)
-    kept = [short] if short and not stage.drop_remainder else []
+    count = whole + (1 if short and not stage.drop_remainder else 0)
+    if not count:
+        # No batch to place: the read refuses an order of none, as it reads.
+        return 0
     after = tuple(range(train.stages.index(stage) + 1, len(train.stages)))
-    sizes = pygrain.MapDataset.source([stage.size] * whole + kept)
+    sizes = pygrain.MapDataset.range(count).map(lambda index: stage.size if index < whole else short)
     placed = build.placed(sizes, train, DataPartition(), after)
     if not len(placed):
         return 0
