@@ -519,7 +519,7 @@ class Pretrained:
         from dew.nn.cross_attention import crossing
         from dew.nn.inputs import request_key
         from dew.nn.protocols import CrossAttending
-        from dew.objectives.base import freeze, merge, select, thaw, training
+        from dew.objectives.base import freeze, merge, select, thaw
 
         if not isinstance(self.model, CrossAttending):
             raise TypeError(f"a {type(self.model).__name__} takes no cross-attention layers")
@@ -532,9 +532,7 @@ class Pretrained:
             return select(thaw(model.init(draw, jnp.zeros((1, 1), jnp.int32))),
                           lambda path: path[0] == "params" and crossing(path))
 
-        trained = training(self.variables)
-        variables = freeze(merge(thaw(self.variables), jax.jit(drawn)(request_key(key))),
-                           lambda path: crossing(path) or path in trained)
+        variables = freeze(merge(self.variables, jax.jit(drawn)(request_key(key))), crossing)
         return replace(self, model=model, variables=variables)
 
     def export(self, variables: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:

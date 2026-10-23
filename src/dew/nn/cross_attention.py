@@ -46,11 +46,12 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from .activations import GatedActivation
 from .attention import projected_heads, projected_output, scaled_dot_product_attention
 from .flops import counted_flops, cross_attention_flops, projection_flops
 from .inputs import CrossContext
 from .ngpt import unit
-from .precision import float32_dot_general
+from .precision import at_least_fp32, float32_dot_general, sqrt_or_zero
 from .sharding import HEADS, KV_HEADS, constrain
 
 NAME = "cross_attention"
@@ -77,14 +78,17 @@ class CrossAttention:
     cache keeps the keys and values of. `context_features` is the width of
     the context's tokens; None reads the decoder's own width. `intermediate_size`
     is the block's feed-forward width; None takes the width of the layer's own
-    dense feed-forward. The attention has the decoder's heads, key-value heads
-    and head width, and reads the context without positions.
+    dense feed-forward. `activation` is the feed-forward's gated activation,
+    IDEFICS's SiLU unless named, whatever the decoder's own feed-forward runs.
+    The attention has the decoder's heads, key-value heads and head width, and
+    reads the context without positions.
     """
 
     layer_ids: tuple[int, ...]
     context_length: int
     context_features: int | None = None
     intermediate_size: int | None = None
+    activation: GatedActivation = "swiglu"
 
     def __post_init__(self):
         object.__setattr__(self, "layer_ids", tuple(int(layer) for layer in self.layer_ids))
@@ -178,7 +182,7 @@ class GatedCrossAttention(nn.Module):
         dropout = nn.Dropout(rate=self.dropout_rate)
 
         def joined(stream: jax.Array, name: str, branch: jax.Array) -> jax.Array:
-            gate = jnp.tanh(self.param(name, nn.initializers.zeros, (1,), jnp.float32))
+            gate = jnp.tanh(self.param(name, nn.initializers.zeros, (1,), jnp.float32).astype(jnp.float32))
             branch = dropout(branch, deterministic=not train)
             return jnp.where(present, self._join(stream, branch, gate), stream)
 
@@ -190,19 +194,22 @@ class GatedCrossAttention(nn.Module):
         return x if self.norm is None else self.norm(name=name)(x)
 
     def _join(self, stream: jax.Array, branch: jax.Array, gate: jax.Array) -> jax.Array:
-        """`stream` with `branch` joined through `gate`: added, broadcast over any
-        axis the stream has beside the states', or under nGPT a step of `gate`
-        from the unit stream toward the unit branch, unit-normed back and scaled
-        to the stream's own length. That is nGPT's step on the unit sphere its
-        layers' outputs lie on, and still the stream at a zero gate before a
-        first layer, whose input embeddings are not unit."""
+        """`stream` with `branch` joined through `gate`, in at least float32 and
+        rounded once to the stream's dtype: added, broadcast over any axis the
+        stream has beside the states', or under nGPT moved by the step of
+        `gate` from the unit stream toward the unit branch, nGPT's step on the
+        unit sphere, at the stream's own length. The move is the stepped
+        point less the unstepped one, so a zero gate leaves the stream as it
+        is, whatever its length: before a first layer the input embeddings
+        are not unit."""
+        wide = stream.astype(at_least_fp32(stream.dtype))
         if self.ngpt:
-            wide = stream.astype(jnp.float32)
-            start, end = unit(wide), unit(branch).astype(jnp.float32)
-            length = jnp.sqrt(jnp.sum(jnp.square(wide), axis=-1, keepdims=True))
-            return (length * unit(start + _gated(end - start, gate, self.precision))).astype(stream.dtype)
+            start, end = unit(wide), unit(branch).astype(wide.dtype)
+            length = sqrt_or_zero(jnp.sum(jnp.square(wide), axis=-1, keepdims=True))
+            moved = unit(start + _gated(end - start, gate, self.precision)) - unit(start)
+            return (wide + length * moved).astype(stream.dtype)
         widened = branch.reshape(branch.shape[:2] + (1,) * (stream.ndim - branch.ndim) + branch.shape[2:])
-        return stream + _gated(widened, gate, self.precision).astype(stream.dtype)
+        return (wide + _gated(widened, gate, self.precision)).astype(stream.dtype)
 
     def _keys_values(self, embeddings: jax.Array) -> tuple[jax.Array, jax.Array]:
         """The context's keys and values, `[B, C, kv_heads, head_dim]` each."""
@@ -235,23 +242,25 @@ class GatedCrossAttention(nn.Module):
         if width > self.context_length:
             raise ValueError(f"a cached call keeps at most {self.context_length} context tokens a row "
                              f"(CrossAttention.context_length), got {width}")
-        key, value = self._keys_values(context.embeddings)
+        # The prefill reads the keys and values as the cache keeps them, so its steps read the same.
+        key, value = (projected.astype(dtype) for projected in self._keys_values(context.embeddings))
         if allocated:
             padding = ((0, 0), (0, self.context_length - width), (0, 0), (0, 0))
-            keys.value = jnp.pad(key.astype(dtype), padding)
-            values.value = jnp.pad(value.astype(dtype), padding)
+            keys.value = jnp.pad(key, padding)
+            values.value = jnp.pad(value, padding)
             lengths.value = context.lengths
         return key, value, context.lengths
 
 
 def _gated(branch: jax.Array, gate: jax.Array, precision: PrecisionLike) -> jax.Array:
-    """`branch` times the one-element `gate`, as their outer product, whose
-    transpose gives the gate a dot (the module docstring)."""
-    product = float32_dot_general(branch, gate.astype(branch.dtype), (((), ()), ((), ())),
+    """`branch` times the one-element `gate`, both in at least float32, as
+    their outer product, whose transpose gives the gate a dot (the module
+    docstring)."""
+    wide = jnp.promote_types(at_least_fp32(branch.dtype), gate.dtype)
+    product = float32_dot_general(branch.astype(wide), gate.astype(wide), (((), ()), ((), ())),
                                   precision=precision)
     return product[..., 0]
 
 
 __all__ = ["CROSS_CACHE", "CROSS_KEY", "CROSS_LENGTHS", "CROSS_VALUE", "NAME", "CrossAttention",
-           "GatedCrossAttention",
-           "crossing"]
+           "GatedCrossAttention", "crossing"]

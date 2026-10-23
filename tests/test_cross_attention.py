@@ -51,7 +51,7 @@ LLAMA = ROOT / "tests" / "fixtures" / "hf" / "llama-tiny"
 
 B, S, D, H, C, FEATURES, WIDTH, EPS = 4, 5, 32, 4, 7, 48, 40, 1e-6
 BLOCK = GatedCrossAttention(
-    norm=decoder_norm("rms", epsilon=EPS, bias=False, scale_offset=False, scale_after_cast=False, dtype=None),
+    norm=decoder_norm("rms", epsilon=EPS, bias=False, scale_offset=False, scale_after_cast=True, dtype=None),
     feedforward=functools.partial(GatedMLP, hidden_features=WIDTH, out_features=D),
     emb_features=D, context_features=FEATURES, context_length=C, heads=H, kv_heads=H, head_dim=D // H)
 
@@ -69,14 +69,14 @@ FORMS = {
 }
 """Each residual a decoder carries beside the plain stream, which the blocks read and join in its form."""
 
-SEEDS = {"block": 64, "base": 16, "decode": 16, "scan": 16, "fresh altup": 16, "fresh mhc": 32,
-         "fresh single-pass-mhc": 16, "fresh depth": 16, "fresh ngpt": 8}
+SEEDS = {"block float32": 64, "block bfloat16": 64, "base": 16, "decode": 16, "scan": 16, "fresh altup": 16,
+         "fresh mhc": 32, "fresh single-pass-mhc": 16, "fresh depth": 16, "fresh ngpt": 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` on armada."""
 
 
-def block_draw(seed):
+def block_draw(seed, dtype=np.float32):
     """The residual, a context, each row's real context tokens (one or more), the block's parameters
-    with its gates away from zero, and a cotangent on its output, drawn from `seed` in float32."""
+    with its gates away from zero, and a cotangent on its output, drawn from `seed` in `dtype`."""
     rng = np.random.default_rng(seed)
     shapes = jax.eval_shape(BLOCK.init, jax.random.key(0), jnp.zeros((B, S, D)),
                             CrossContext(jnp.zeros((B, C, FEATURES)), jnp.ones((B,), jnp.int32)))["params"]
@@ -92,7 +92,7 @@ def block_draw(seed):
     params = jax.tree_util.tree_map_with_path(leaf, shapes)
     drawn = (rng.standard_normal((B, S, D)), rng.standard_normal((B, C, FEATURES)), params,
              rng.standard_normal((B, S, D)))
-    x, context, params, cotangent = jax.tree.map(lambda value: np.asarray(value, np.float32), drawn)
+    x, context, params, cotangent = jax.tree.map(lambda value: np.asarray(value, dtype), drawn)
     return x, context, params, rng.integers(1, C + 1, B).astype(np.int32), cotangent
 
 
@@ -116,8 +116,8 @@ def idefics_block(wide: bool):
     def forward(x, context, params, *, lengths):
         with float64() if wide else contextlib.nullcontext():
             config = IdeficsConfig(hidden_size=D, num_attention_heads=H, intermediate_size=WIDTH,
-                                   rms_norm_eps=EPS, hidden_act="silu", vision_config={"embed_dim": FEATURES})
-            config._attn_implementation = "eager"
+                                   rms_norm_eps=EPS, hidden_act="silu", vision_config={"embed_dim": FEATURES},
+                                   attn_implementation="eager")
             layer = IdeficsGatedCrossAttentionLayer(config).to(x.dtype)
             mlp = params["mlp"]
             weights = {
@@ -140,11 +140,14 @@ def idefics_block(wide: bool):
     return run
 
 
-def test_the_block_computes_and_differentiates_as_idefics():
+@pytest.mark.parametrize("dtype", [np.float32, jnp.bfloat16], ids=["float32", "bfloat16"])
+def test_the_block_computes_and_differentiates_as_idefics(dtype):
     """Through both gated branches, the output and the gradients into the residual, the context and
-    every parameter on par with IDEFICS's float32 (check 1), over contexts of every length."""
-    assert_as_exact(dew_block, idefics_block(wide=False), block_draw, "gated cross-attention",
-                    seeds=SEEDS["block"], truth_fn=idefics_block(wide=True))
+    every parameter on par with IDEFICS's in float32 and in bfloat16 (check 1), over contexts of
+    every length; the gates' products are at least float32."""
+    label = f"block {np.dtype(dtype).name}"
+    assert_as_exact(dew_block, idefics_block(wide=False), functools.partial(block_draw, dtype=dtype), label,
+                    seeds=SEEDS[label], truth_fn=idefics_block(wide=True))
 
 
 def test_zero_gates_and_an_empty_context_leave_the_residual_as_it_is():
@@ -435,16 +438,94 @@ def test_a_served_request_reads_its_own_context(options):
 
 
 def test_a_server_refuses_a_context_its_layers_cannot_read():
-    """A context wider than the layers read, or longer than they keep, is refused at submit; a decoder
-    without cross-attention takes none."""
+    """A context wider than the layers read, longer than they keep, or counting tokens it does not
+    hold, is refused at submit; a decoder without cross-attention takes none."""
     server = Server.from_task(served_task(), slots=2, capacity=128)
     wide = request(0)
     with pytest.raises(ValueError):
         server.submit(dataclasses.replace(wide, conditioning={CONTEXT: jnp.zeros((1, 4, 7))}), 2)
     with pytest.raises(ValueError):
         server.submit(dataclasses.replace(wide, conditioning={CONTEXT: jnp.zeros((1, 5, 6))}), 2)
+    for length in (-1, 3):
+        with pytest.raises(ValueError):
+            server.submit(dataclasses.replace(wide, conditioning={
+                CONTEXT: jnp.zeros((1, 2, 6)), CONTEXT_LENGTHS: jnp.asarray([length], jnp.int32)}), 2)
     model = decoder().clone(max_seq_len=128)
     plain = TextGeneration(model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)),
                            RunProcessor(Digits()), sampling=Sampling(temperature=0))
     with pytest.raises(ValueError):
         Server.from_task(plain, slots=2, capacity=128).submit(request(0), 2)
+
+
+def test_a_zero_gate_leaves_an_ngpt_stream_whatever_its_length():
+    """Under nGPT a zero gate moves the stream by nothing, a tiny one and a zero row included, which
+    a step normed back to the stream's length would shrink or lose; the zero row's gradients stay
+    finite."""
+    block = BLOCK.clone(norm=None, ngpt=True)
+    x, context, params, lengths, cotangent = block_draw(2)
+    x = x * np.asarray([1e-4, 1.0, 30.0, 0.0], np.float32)[:, None, None]
+    shut = {**params, "alpha_cross_attn": np.zeros(1, np.float32), "alpha_dense": np.zeros(1, np.float32)}
+
+    @jax.jit
+    def run(x, params):
+        def block_out(x, params):
+            return block.apply({"params": params}, x, CrossContext(context, lengths))
+        return with_gradients(block_out)(x, params, cotangent)
+
+    out, into_x, gradients = run(x, shut)
+    np.testing.assert_array_equal(np.asarray(out), x)
+    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves((into_x, gradients)))
+
+
+def test_freeze_keeps_what_a_split_tree_trains():
+    """`freeze` over a tree already split keeps its trained leaves training beside those it is asked
+    to, and its frozen ones frozen; over an unsplit tree it splits by the filter alone, and freezing
+    a split tree by the filter it was split by changes nothing."""
+    from dew.objectives.base import freeze
+
+    tree = {"params": {"a": np.ones(2), "b": np.ones(3), "c": np.ones(4)}, "constants": {"k": np.ones(1)}}
+    first = freeze(tree, lambda path: path[-1] == "a")
+    assert set(first["params"]) == {"a"} and set(first[FROZEN]) == {"b", "c"}
+    second = freeze(first, lambda path: path[-1] == "b")
+    assert set(second["params"]) == {"a", "b"} and set(second[FROZEN]) == {"c"}
+    assert second["constants"] is tree["constants"]
+    again = freeze(first, lambda path: path[-1] == "a")
+    assert jax.tree.structure(again) == jax.tree.structure(first)
+    with pytest.raises(ValueError):
+        freeze(first, lambda path: True)
+
+
+def test_an_objective_with_prediction_depths_scores_and_counts_a_conditioned_batch():
+    """An LM objective over a decoder with blocks and a prediction depth scores a batch that carries a
+    context, the depth reading the conditioned trunk's states, and counts the blocks' work over the
+    context beside the trunk's (`cross_flops`); conditioning of another kind has no count."""
+    from dew.nn.flops import MissingFlopsCount
+    from dew.objectives.base import Step
+
+    model = MODEL.clone(num_nextn_predict_layers=1)
+    variables, ids, context, lengths = model_draw(model)(4)
+    objective = LMObjective(model, SEQ - 1, mtp_weight=0.3)
+    inputs = ModelInputs(jnp.asarray(ids), conditioning={CONTEXT: jnp.asarray(context),
+                                                         CONTEXT_LENGTHS: jnp.asarray(lengths)})
+    loss, _ = objective.scalar_loss(variables, {"text": inputs},
+                                    Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None))
+    assert np.isfinite(float(loss))
+    plain = objective.model_flops(None, {"text": ModelInputs(jnp.asarray(ids))})
+    rows = np.full(B, SEQ - 1, np.int64)
+    crossed = model.cross_flops(rows, lengths.astype(np.int64))
+    assert objective.model_flops(None, {"text": inputs}) == plain + crossed
+    with pytest.raises(MissingFlopsCount):
+        media = dataclasses.replace(inputs, conditioning={"pixel_values": context})
+        objective.model_flops(None, {"text": media})
+
+
+def test_the_blocks_attach_to_a_decoder_whose_own_feed_forward_they_do_not_run():
+    """GPT OSS's feed-forward is its experts' clamped SwiGLU, which no dense block runs; its blocks
+    run their own activation, attach and read a context."""
+    source = Pretrained.load(ROOT / "tests" / "fixtures" / "hf" / "gpt-oss-tiny", dtype="float32",
+                             attention_impl="reference")
+    attached = source.with_cross_attention(CrossAttention((0,), context_length=2, context_features=4), key=0)
+    conditioning = {CONTEXT: jnp.ones((1, 2, 4)), CONTEXT_LENGTHS: jnp.asarray([2], jnp.int32)}
+    logits = attached.model.apply(thaw(attached.variables), jnp.asarray([[1, 2, 3]]),
+                                  conditioning=conditioning)
+    assert np.isfinite(np.asarray(logits)).all()

@@ -481,11 +481,11 @@ class Server:
             raise ValueError(f"slots ({slots}) and admission ({admission}) must divide by the "
                              f"{self.groups} groups the mesh splits rows into")
         self.model = model
-        crossing = isinstance(model, CrossAttending) and model.cross_attention is not None
-        self.cross: tuple[CrossAttention, int] | None = (
-            (model.cross_attention, model.context_width) if crossing else None)
-        """The model's cross-attention layers and its context's width, where a request may carry a
-        context beside its prompt."""
+        self.cross: tuple[CrossAttention, int, np.dtype] | None = None
+        """The model's cross-attention layers and its context's width and dtype, where a request may
+        carry a context beside its prompt."""
+        if isinstance(model, CrossAttending) and model.cross_attention is not None:
+            self.cross = (model.cross_attention, model.context_width, np.dtype(model.context_dtype))
         self.variables = variables
         self._weight_groups: list[ProjectionGroup] = []
         self.processor = processor
@@ -800,16 +800,19 @@ class Server:
                     salt=salt)
 
     def _request_context(self, embeddings: ArrayLike, lengths: ArrayLike | None) -> np.ndarray:
-        """A request's context as its real tokens on the host, `[length, features]`, in float32,
-        refused where it is not one row of the model's width or holds more tokens than the
+        """A request's context as its real tokens on the host, `[length, features]`, in the dtype
+        the model reads a context in (`CrossAttending.context_dtype`), refused where it is not one
+        row of the model's width, counts tokens it does not hold, or holds more than the
         cross-attention layers cache (`CrossAttention.context_length`)."""
         assert self.cross is not None
-        cross, features = self.cross
+        cross, features, dtype = self.cross
         given = CrossContext.from_conditioning({CONTEXT: jnp.asarray(embeddings), **(
             {} if lengths is None else {CONTEXT_LENGTHS: jnp.asarray(lengths)})})
-        tokens, length = np.asarray(given.embeddings, np.float32), int(np.asarray(given.lengths)[0])
+        tokens, length = np.asarray(given.embeddings, dtype), int(np.asarray(given.lengths)[0])
         if tokens.shape[0] != 1 or tokens.shape[-1] != features:
             raise ValueError(f"a request's context is one row of {features}-wide tokens, got {tokens.shape}")
+        if not 0 <= length <= tokens.shape[1]:
+            raise ValueError(f"a request's context counts {length} real tokens of its {tokens.shape[1]}")
         if length > cross.context_length:
             raise ValueError(f"the cross-attention layers keep at most {cross.context_length} context "
                              f"tokens a row, got {length}")
@@ -915,11 +918,12 @@ class Server:
         history = np.zeros((count, capacity), np.int32)
         history_valid = np.zeros((count, capacity), bool)
         cross = self.cross
-        if cross is not None:
-            # Every piece carries its row's context, so a row continuing over a former occupant's
-            # slot, or after shared prefix pages, reads its own; a row without one reads none.
-            contexts = np.zeros((count, cross[0].context_length, cross[1]), np.float32)
-            lengths = np.zeros((count,), np.int32)
+        # Every piece carries its row's context, so a row continuing over a former occupant's slot,
+        # or after shared prefix pages, reads its own; a row without one reads none.
+        context_length, width, dtype = (0, 0, np.float32) if cross is None else (
+            cross[0].context_length, cross[1], cross[2])
+        contexts = np.zeros((count, context_length, width), dtype)
+        lengths = np.zeros((count,), np.int32)
         for index, slot, row in chosen:
             piece = row.prompt[row.prefilled:row.prefilled + width]
             tokens[index, width - len(piece):] = piece
