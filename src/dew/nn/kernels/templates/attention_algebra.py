@@ -1083,7 +1083,10 @@ def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, see
     pullbacks and their product with the keys over the prior denominator, which take dQ to the refined D
     (`dq_finish`), the weights' sums unnormalized."""
     pulled_cotangents, pieces = pulled(cotangents, slopes, seen, kinds)
-    dq = sums.dq + cotangent_product(pulled_cotangents * scale, key, dot)
+    # The scale taken after the product: XLA folds a constant scale into a hook's constant slope before it
+    # (`a * s * c -> a * (s c)`), which overflows where the slope is near fp32's largest though the
+    # cotangents are 0; a product between them it cannot fold across.
+    dq = sums.dq + cotangent_product(pulled_cotangents, key, dot) * scale
     grads = tuple(grad + piece if row else grad for grad, row, piece in zip(sums.grads, summed, pieces,
                                                                            strict=True))
     pulled_weights, pieces = pulled(weights, slopes, seen, kinds)
