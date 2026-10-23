@@ -238,7 +238,11 @@ def sft_tokens(marker, targets, *, empty_rows=0):
 @pytest.mark.parametrize("empty_rows", [0, 32])
 @pytest.mark.parametrize("projected", [False, True])
 def test_sft_token_mixture_weighs_final_assistant_targets_and_resumes(weights, empty_rows, projected):
-    """One versus seven assistant targets per packed row get the requested scored-token shares."""
+    """One versus seven assistant targets per packed row get the requested scored-token shares,
+    exactly over 640 rows, a whole number of the mix's cycles at either weighting (8 rows at even
+    weights, 10 at a quarter to three quarters)."""
+    from fractions import Fraction
+
     model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2,
                               mlp_features=16, max_seq_len=8)
     policy = LMObjective(model, seq_len=8, loss_role=Role.ASSISTANT).data()
@@ -253,7 +257,7 @@ def test_sft_token_mixture_weighs_final_assistant_targets_and_resumes(weights, e
     targets = ValidTargets(field=field, role=int(Role.ASSISTANT), measured=False)
     delivered = {1: 0, 2: 0}
     try:
-        for _ in range(64):
+        for _ in range(80):
             batch = next(reader)
             for index, marker in enumerate(batch[field][:, 0]):
                 row = jax.tree.map(lambda values, index=index: values[index], batch)
@@ -262,8 +266,9 @@ def test_sft_token_mixture_weighs_final_assistant_targets_and_resumes(weights, e
         remaining = [next(reader)[field].tolist() for _ in range(3)]
     finally:
         reader.close()
-    assert [delivered[marker] / sum(delivered.values()) for marker in (1, 2)] == pytest.approx(weights,
-                                                                                          abs=0.01)
+    total = sum(delivered.values())
+    shares = [Fraction(delivered[marker], total) for marker in (1, 2)]
+    assert shares == [Fraction(weight) for weight in weights]
     assert data.counts["sft-1"].accepted == 64 - empty_rows
     assert data.counts["sft-1"].rejected["zero_targets"] == empty_rows
     resumed = compile(train.batch(8), objective=policy, read="memory",
