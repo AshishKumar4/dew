@@ -35,7 +35,7 @@ class Named:
         return [(row, weight) for row in rows][:len(rows) - self.short]
 
     def answer(self, payload: str, outputs):
-        return self.name, payload, "".join(row for row, _ in outputs), outputs[0][1]
+        return self.name, payload, "".join(row for row, _ in outputs), *(outputs[0][1:] if outputs else ())
 
 
 def weights(value: float):
@@ -203,3 +203,18 @@ def test_an_engine_closed_from_its_own_thread_ends_free_to_start_again():
     engine.start()
     engine.close()
     assert kind.failure is None
+
+
+def test_a_request_of_no_rows_is_answered_as_it_is_admitted_and_shuts_down_cleanly():
+    """A request its task lays out as no rows needs no pass: its future is answered at submission,
+    the queue holds nothing of it, and a server's run and an engine's close both finish."""
+    server = ScoringServer.from_task(Named("a"), weights(1.0))
+    empty = server.submit("")
+    assert empty.done() and server.queued == 0
+    assert empty.result()[:3] == ("a", "a", "")
+    server.run()
+    engine = Engine(server)
+    engine.start()
+    after = server.submit("x")
+    assert after.result() == ("a", "a", "x", 1.0)
+    engine.close()
