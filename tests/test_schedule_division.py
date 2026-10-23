@@ -23,13 +23,33 @@ DIVISION_SEEDS = 16
 
 def draw(seed):
     """Latents, a clean prediction, a noise prediction and each row's signal and noise rates, the
-    rates in (0.01, 1) as a schedule's are, uniform in log: a quotient's error scales with one over
-    its rate, so rates uniform in value leave each draw's error to its smallest few, a tail no
-    count of seeds resolves."""
+    rates uniform in log over (0.01, 1), 64 rows of them: a quotient's error scales with one over
+    its rate, so every draw spans the magnitudes rather than leaving its error to its few smallest
+    rates."""
     rng = np.random.default_rng([23, seed])
     states = [rng.standard_normal(SHAPE).astype(np.float32) for _ in range(3)]
     rates = [np.exp(rng.uniform(np.log(0.01), 0.0, (SHAPE[0], 1, 1, 1))).astype(np.float32) for _ in range(2)]
     return (*states, *rates)
+
+
+def test_a_schedules_division_keeps_zeros_infinities_and_mixed_operands():
+    """A signed zero, a zero divisor and an overflowing quotient are IEEE's, bit for bit, as is a
+    float32 state over a float16 rate or a Python float; a float64 state over a broadcast rate is
+    float64's correctly rounded quotient, which XLA:CPU's reciprocal would round twice."""
+    numerator = np.asarray([-0.0, 0.0, 1.0, 2.0 ** 127, 3.0, -2.0, np.inf], np.float32)
+    rate = np.asarray([1.0, -1.0, 0.0, 0.25, np.inf, 0.0, 2.0], np.float32)
+    got = np.asarray(jax.jit(divided)(numerator, rate))
+    with np.errstate(divide="ignore", over="ignore"):
+        np.testing.assert_array_equal(got.view(np.uint32), (numerator / rate).view(np.uint32))
+    states, _, _, rates, _ = draw(1)
+    half = np.asarray(rates, np.float16)
+    np.testing.assert_array_equal(np.asarray(jax.jit(divided)(states, half)).view(np.uint32),
+                                  (states / half.astype(np.float32)).view(np.uint32))
+    np.testing.assert_array_equal(np.asarray(divided(states, 0.3)).view(np.uint32),
+                                  (states / np.float32(0.3)).view(np.uint32))
+    with jax.enable_x64(new_val=True):
+        wide, by = np.full((4, 3), 3.0), np.full((4, 1), 5.0)
+        np.testing.assert_array_equal(np.asarray(jax.jit(divided)(wide, by)), wide / by)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])

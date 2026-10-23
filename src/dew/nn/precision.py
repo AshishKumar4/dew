@@ -285,9 +285,13 @@ def correctly_rounded_divide(numerator: jax.typing.ArrayLike, denominator: jax.t
     of two. The quantizer's observed scales and quotients keep these
     intermediates normal; dense and midpoint checks hold the result to
     NumPy's IEEE divide without enabling x64. Dense keeps its own precision.
-    Its derivative is the division's, as JAX differentiates `a / b`.
+    A zero or non-finite quotient (a zero divisor, an overflow, a signed
+    zero) is the division's, which leaves no residual to correct. Its
+    derivative is the division's, as JAX differentiates `a / b`.
     """
     quotient = numerator / denominator
+    special = (quotient == 0) | ~jnp.isfinite(quotient)
+    plain = quotient
     product, error = two_product(quotient, denominator, bit_split=True, subtract=True)
     residual = (numerator - product) - error
     quotient = quotient + residual / denominator
@@ -302,7 +306,7 @@ def correctly_rounded_divide(numerator: jax.typing.ArrayLike, denominator: jax.t
     odd = (jax.lax.bitcast_convert_type(quotient, jnp.uint32) & 1) != 0
     up = (high > upper) | ((high == upper) & ((low > 0) | ((low == 0) & odd)))
     down = (high < -lower) | ((high == -lower) & ((low < 0) | ((low == 0) & odd)))
-    return jnp.where(up, above, jnp.where(down, below, quotient))
+    return jnp.where(special, plain, jnp.where(up, above, jnp.where(down, below, quotient)))
 
 
 @correctly_rounded_divide.defjvp

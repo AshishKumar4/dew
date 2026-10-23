@@ -20,15 +20,20 @@ def expand(coefficient, x):
 
 
 def divided(numerator, rate):
-    """`numerator / rate` as a source written in PyTorch divides a state by a rate: IEEE division
-    (`dew.nn.precision.correctly_rounded_divide`) on every backend, where XLA's own division rounds
-    twice on a CPU and approximately on a GPU. A bfloat16 or float16 quotient is the float32 one
-    rounded to its dtype, as PyTorch's float32 opmath gives it; a float64 run's division is IEEE
-    already."""
+    """`numerator / rate` as a source written in PyTorch divides a state by a rate: IEEE division,
+    whatever the backend's own division does. A float32, bfloat16 or float16 quotient is
+    `dew.nn.precision.correctly_rounded_divide`'s of the operands widened to float32, rounded to its
+    dtype, as PyTorch's float32 opmath gives it, under any compiler flags. A float64 one is the
+    division by a full-shape divisor, the rate plus the numerator times zero: XLA:CPU rewrites a
+    division by a broadcast into a multiplication by its reciprocal, two roundings where the
+    division makes one (openxla/xla#51148), and no simplification folds that divisor back to the
+    broadcast (folding would change an infinite numerator's NaN)."""
     numerator, rate = jnp.asarray(numerator), jnp.asarray(rate)
     dtype = jnp.result_type(numerator, rate)
-    if dtype == jnp.float64 or not jnp.issubdtype(dtype, jnp.floating):
+    if not jnp.issubdtype(dtype, jnp.floating):
         return numerator / rate
+    if dtype == jnp.float64:
+        return numerator / (rate + numerator * 0)
     return correctly_rounded_divide(numerator.astype(jnp.float32), rate.astype(jnp.float32)).astype(dtype)
 
 
