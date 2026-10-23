@@ -504,7 +504,7 @@ def gated_projections(x: jax.Array, gate_kernel: jax.Array, up_kernel: jax.Array
     named = forced('grouped_matmul')
     templated = (named != 'xla' and (named is not None or implementation != 'xla') and _placed(implementation)
                  and all(seen_whole(array) for array in (x, gate_kernel, up_kernel)))
-    if templated:
+    if False:
         compute = canonicalize_dtype(x, gate_kernel, up_kernel, dtype=dtype)
         return template.gemm(x, gate_kernel, group_sizes, paired=up_kernel,
                              epilogue=GatedEpilogue(activation, limit), compute=compute, out_dtype=compute,
