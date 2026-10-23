@@ -398,6 +398,31 @@ def test_a_gpu_lane_fetches_the_pinned_fixtures_before_any_file_and_stops_where_
     assert fetched.is_file() and not (tmp_path / "read").exists()
 
 
+LANE_TEST = ("import os, subprocess, sys, time\n"
+             "from pathlib import Path\n"
+             "def test_runs():\n"
+             "    began = time.monotonic()\n"
+             "    time.sleep(1)\n"
+             "    share = os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION']\n"
+             "    grown = os.environ.get('XLA_PYTHON_CLIENT_PREALLOCATE', 'true')\n"
+             "    ran = Path(f'ran-{Path(__file__).stem}-{os.getpid()}')\n"
+             "    ran.write_text(f'{share} {began} {time.monotonic()} {grown}')\n")
+"""A GPU lane's test file standing in: it records the share it was given, when it ran and whether its pool
+grows."""
+
+
+def lane_runs(root: Path, stem: str) -> list[list[str]]:
+    """Each run of `stem`'s `LANE_TEST`, oldest first: its share, start, end and growth."""
+    return [path.read_text().split() for path in sorted(root.glob(f"ran-{stem}-*"),
+                                                        key=lambda path: path.stat().st_mtime)]
+
+
+def overlapping(runs: list[list[str]]) -> int:
+    """The most of `runs` (`lane_runs`) that ran at one moment."""
+    spans = [(float(began), float(ended)) for _, began, ended, _ in runs]
+    return max(sum(began <= moment < ended for began, ended in spans) for moment, _ in spans)
+
+
 def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_share(
         ci, tmp_path, monkeypatch, cache_worker):
     """The GPU lane runs each file once, in a process of its own. A file no
@@ -413,15 +438,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
     monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
     gpu_driver(tmp_path, monkeypatch)
-    source = ("import os, subprocess, sys, time\n"
-              "from pathlib import Path\n"
-              "def test_runs():\n"
-              "    began = time.monotonic()\n"
-              "    time.sleep(1)\n"
-              "    share = os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION']\n"
-              "    grown = os.environ.get('XLA_PYTHON_CLIENT_PREALLOCATE', 'true')\n"
-              "    ran = Path(f'ran-{Path(__file__).stem}-{os.getpid()}')\n"
-              "    ran.write_text(f'{share} {began} {time.monotonic()} {grown}')\n")
+    source = LANE_TEST
     names = [f"tests/test_file_{index}.py" for index in range(5)]
     for name in names:
         (tmp_path / name).write_text(source)
@@ -434,12 +451,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     fetcher(tmp_path)
 
     def ran(stem: str) -> list[list[str]]:
-        return [path.read_text().split() for path in sorted(tmp_path.glob(f"ran-{stem}-*"),
-                                                            key=lambda path: path.stat().st_mtime)]
-
-    def overlapping(runs: list[list[str]]) -> int:
-        spans = [(float(began), float(ended)) for _, began, ended, _ in runs]
-        return max(sum(began <= moment < ended for began, ended in spans) for moment, _ in spans)
+        return lane_runs(tmp_path, stem)
 
     out = tmp_path / "verdict.json"
     assert ci.gpu_lane("3.12", every, out, cache=True, processes=4, deadline=600.0) == 0
@@ -494,14 +506,7 @@ def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
     monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
     gpu_driver(tmp_path, monkeypatch)
-    source = ("import os, time\n"
-              "from pathlib import Path\n"
-              "def test_runs():\n"
-              "    began = time.monotonic()\n"
-              "    time.sleep(1)\n"
-              "    share = os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION']\n"
-              "    ran = Path(f'ran-{Path(__file__).stem}-{os.getpid()}')\n"
-              "    ran.write_text(f'{share} {began} {time.monotonic()}')\n")
+    source = LANE_TEST
     names = [f"tests/test_file_{index}.py" for index in range(4)]
     for name in names:
         (tmp_path / name).write_text(source)
@@ -519,12 +524,7 @@ def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
                                      "peak": peak * 2 ** 30, "shares": 0, "pools": 0}).encode()
 
     def ran(stem: str) -> list[list[str]]:
-        return [path.read_text().split() for path in sorted(tmp_path.glob(f"ran-{stem}-*"),
-                                                            key=lambda path: path.stat().st_mtime)]
-
-    def overlapping(runs: list[list[str]]) -> int:
-        spans = [(float(began), float(ended)) for _, began, ended in runs]
-        return max(sum(began <= moment < ended for began, ended in spans) for moment, _ in spans)
+        return lane_runs(tmp_path, stem)
 
     out = tmp_path / "verdict.json"
     assert ci.gpu_lane("3.12", every, out, cache=True, processes=4, deadline=600.0) == 0
