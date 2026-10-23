@@ -359,14 +359,15 @@ class DiffusionRunConfig(RunConfig):
         if not issubclass(kind, FlowDistillationObjective | GuidanceDistillationObjective):
             raise ValueError(f"teacher_run names a distillation's teacher, and {self.objective.name} "
                              f"distills none")
-        given: dict[str, object] = {}
+        published: Variables | None = None
         if variables is None or TEACHER not in variables:
             # A resumed student holds its teacher, so only a fresh one reads the teacher's run.
             with Checkpoints(self.teacher_run) as checkpoints:
-                given["teacher_variables"] = checkpoints.variables(ema=None, step=None, mesh=None,
-                                                                   layout=None, param_dtype=None)
+                published = checkpoints.variables(ema=None, step=None, mesh=None, layout=None,
+                                                  param_dtype=None)
+        given: dict[str, object] = {} if published is None else {"teacher_variables": published}
         if issubclass(kind, GuidanceDistillationObjective):
-            held = teacher_weights(variables, given.get("teacher_variables"), whole=True)
+            held = teacher_weights(variables, published, whole=True)
             given["teacher"] = DiffusionRunConfig.load(self.teacher_run).build(variables=held)
         return given
 
