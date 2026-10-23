@@ -258,7 +258,7 @@ CASES = [
 ]
 import dataclasses as _dataclasses
 import os as _os
-_DROP = {k.split("=")[0]: k.split("=")[1] if "=" in k else None for k in _os.environ.get("G3N_DROP", "").split(",") if k}
+_DROP = {k.split("=")[0]: k.split("=")[1] if "=" in k else None for k in _os.environ.get("G3N_DROP", "").split(";") if k}
 if _DROP:
     _gemma = next(c for c in CASES if c.label == "gemma3n")
     _config = {k: v for k, v in _gemma.config.items() if k not in _DROP or _DROP[k] is not None}
