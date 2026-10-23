@@ -55,13 +55,15 @@ A GPU-touching change lands by its row:
 
 | Destination | Change | Before it lands |
 |---|---|---|
-| `base/kernels` | kernel and template pieces | the hardware-free gates: interpret-mode check 1 and the stability suite, the bitwise boundary test, the deviceless compile with its resource gate |
+| `base/kernels` | kernel and template pieces | the hardware-free gates: interpret-mode check 1 and the stability suite, the deviceless compile with its resource gate |
 | `main`, from `base/kernels` | the composed kernel base | the GPU gate green on `base/kernels`' tip on every gating type (A100, H100, A10, L4, TPU v5e), with its tiers and scoreboards |
 | `main` | a dependency or environment change (JAX, locks) | the whole suite natively once, on an A100, and the marked native tier on every other gating type |
 | `main` | a Hopper-only path | its real H100 run |
 | `main` | any other GPU-touching or performance-critical change | the CPU CI; the next native wave validates it, and a red is fixed at once |
 
 The native tier is the suite on a type's own backend: on a GPU (`JAX_PLATFORMS=cuda`) the `gpu`- and `kernel`-marked tests, on a TPU (`JAX_PLATFORMS=tpu`) the `tpu`- and `kernel`-marked tests, each `-m "... and not network"`. A dependency or environment change runs the whole suite natively once, on an A100, beside that tier on every other gating type. The GPU gate runs that tier, the kernels' scoreboard rows ([kernel templates](kernel-templates.md)) and the performance gate (`tools/perf_gate.py`) on every gating type. A native wave runs the tier on every gating type; a change that lands on the CPU CI is validated by the next one. The GPU tier uses real checkpoints and representative shapes on each type it gates. Sharding and communication also run on multiple physical GPUs. A compile-only result does not establish runtime correctness. Target-specific FP8 and newer-device paths require the relevant hardware. TPU kernels need real TPU execution for their runtime claims.
+
+**Two measures decide.** A change lands, and one implementation replaces another (a kernel, a template, a composition, a model path), by two measures and nothing else: the accuracy gate ([below](#numerical-accuracy)) and performance, its compute time and its peak memory, on the operator rows it changes and on the model step (`tools/benchmark_step.py`). No equality of code or bitwise agreement between two implementations decides either: two programs that compute a float are held by check 1, not bit for bit. A replacement passes the gate, and its time and peak memory are no worse, within their measured noise, on the rows and the step it claims.
 
 ## Numerical accuracy
 
