@@ -63,6 +63,7 @@ from dew.nn.protocols import (
     CountedPredictions,
     CountedPredictionTraining,
     DecoderTraining,
+    Lacks,
     LayerStates,
     OutputTable,
     TokenModel,
@@ -155,7 +156,7 @@ def _check_reads(model: nn.Module) -> None:
     logits a model gives from its tokens (`Logits`).
     """
     if isinstance(model, TokenModel) and not model.causal:
-        raise ValueError("LMObjective requires a causal model for next-token likelihoods")
+        raise Lacks("causal", "LMObjective requires a causal model for next-token likelihoods")
     refuse_without_logits(model, "LMObjective")
 
 
