@@ -113,13 +113,16 @@ class _Prefixes(Mapping[str, str | tuple[str, ...]]):
     `dew.registry.projectors` names."""
 
     def __getitem__(self, kind: str) -> str | tuple[str, ...]:
-        return projector_layout(kind).prefix
+        layout = projectors[kind].checkpoint if kind in projectors else None
+        if layout is None:
+            raise KeyError(kind)
+        return layout.prefix
 
     def __iter__(self) -> Iterator[str]:
-        return iter(projectors)
+        return (kind for kind in projectors if projectors[kind].checkpoint is not None)
 
     def __len__(self) -> int:
-        return len(projectors)
+        return sum(1 for _ in self)
 
 
 PROJECTOR_PREFIX = _Prefixes()
