@@ -20,6 +20,23 @@ def test_an_object_round_trips_a_miss_is_none_and_a_listing_pages_to_its_end(cac
         r2.Store(url, "another", "dew-test", timeout=10).get("records/a")
 
 
+def test_a_callers_own_sender_carries_every_request_with_the_workers_protocol(cache_worker):
+    """A caller's sender (dew-ops' pooled one) sends what the Store builds: each request with the token and
+    the caller's User-Agent, its answers read as the standard library's are."""
+    url, _, _ = cache_worker
+    sent = []
+
+    def recording(method, address, headers, body, timeout):
+        sent.append((method, headers["Authorization"], headers["User-Agent"]))
+        return r2.urllib_send(method, address, headers, body, timeout)
+
+    store = r2.Store(url, "token", "dew-pooled", timeout=10, send=recording)
+    store.put("records/a", b"a")
+    assert store.get("records/a") == b"a" and store.get("records/b") is None
+    assert list(store.keys("records/")) == ["a"]
+    assert sent == [(method, "Bearer token", "dew-pooled") for method in ("PUT", "GET", "GET", "GET")]
+
+
 def test_what_the_contract_refuses_never_reaches_the_worker(cache_worker):
     url, stored, seen = cache_worker
     store = r2.Store(url, "token", "dew-test", timeout=10)
