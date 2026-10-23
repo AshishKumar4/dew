@@ -591,19 +591,18 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable) ->
     `portable(*operands)` gives the output.
 
     The output's derivative is one custom JVP whose tangent is `portable`'s, evaluated as a
-    `linear_call` that transposes to `backward`: forward mode (`jax.jvp`, `jax.linearize`) takes
-    the portable tangent however a jit or a scan staged the call, and reverse mode runs the
-    backward kernel. The forward and the backward are custom JVPs of their own whose tangents are
+    linear map that transposes to `backward` (`linear_map`): forward mode (`jax.jvp`,
+    `jax.linearize`) takes the portable tangent however a jit or a scan staged the call, and reverse
+    mode runs the backward kernel, through a vjp or through a jvp that a shard_map or a scan then
+    transposes. The forward and the backward are custom JVPs of their own whose tangents are
     `portable`'s and its pullback's, so a higher order (`jax.jvp` of `jax.grad`, `jax.grad` of
     `jax.jvp`) differentiates through XLA while each level's value comes from the kernels; what
     `saved` holds is a function of the operands, whose tangents carry it. This composes with
-    `jax.vmap` of a gradient and with forward over reverse on Dew's jax build (0.11.2.post5 on),
-    whose `linear_call` batches and carries its residual tangents; a stock jax raises its own
-    error for either."""
+    `jax.vmap` of a gradient and with forward over reverse."""
     import jax
     import jax.numpy as jnp
     import numpy as np
-    from jax.custom_derivatives import SymbolicZero, linear_call
+    from jax.custom_derivatives import SymbolicZero
 
     @jax.custom_jvp
     def produced(*operands):
@@ -658,11 +657,78 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable) ->
             return [pulled_back[index] for index in live]
 
         moving = [directions[index] for index in live]
-        return output, linear_call(tangent, transposed, (primals, saved), moving)
+        return output, linear_map(tangent, transposed, (primals, saved), moving)
 
     bounded.defjvp(bounded_jvp, symbolic_zeros=True)
     return bounded
 
+
+def linear_map(apply: Callable, transpose: Callable, residuals, moving):
+    """`apply(residuals, moving)`, linear in `moving`, whose transpose is `transpose(residuals, cotangent)`
+    (the cotangents of `moving`, a tree like it): one `jax.experimental.hijax.HiPrim`, so reverse mode
+    runs `transpose` whether it reaches the map through a vjp or through a jvp that a shard_map, a scan
+    or `jax.linearize` transposes. Its tangent is the map of the moving tangents plus `apply`'s own
+    derivative in `residuals` (a higher order's), and it maps over a batch (`jax.vmap`) as `apply`
+    does. What `jax.custom_derivatives.linear_call` did, which jax deprecates for hijax."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax._src import ad_util
+    from jax.experimental import hijax
+
+    def zero(leaf) -> bool:
+        return isinstance(leaf, (ad_util.Zero, ad_util.SymbolicZero))
+
+    def instantiated(tangents, like):
+        """`tangents` with each symbolic zero an array of `like`'s: float0's for an integer leaf."""
+        def one(tangent, primal):
+            if not zero(tangent):
+                return tangent
+            if jnp.issubdtype(primal.dtype, jnp.inexact):
+                return jnp.zeros(primal.shape, primal.dtype)
+            return np.zeros(primal.shape, jax.dtypes.float0)
+        return jax.tree.map(one, tangents, like, is_leaf=zero)
+
+    class Linear(hijax.HiPrim):
+        def __init__(self, in_avals, out_aval):
+            self.in_avals, self.out_aval = in_avals, out_aval
+            self.params = {"map": (apply, transpose)}
+            super().__init__()
+
+        def expand(self, residuals, moving):
+            return apply(residuals, moving)
+
+        def transpose(self, cotangent, residuals, moving):
+            if all(zero(leaf) for leaf in jax.tree.leaves(cotangent, is_leaf=zero)):
+                return
+            pulled = transpose(residuals, instantiated(cotangent, self.out_aval))
+            jax.tree.map(lambda accum, value: isinstance(accum, hijax.GradAccum) and accum.accum(value),
+                         moving, pulled, is_leaf=lambda leaf: isinstance(leaf, hijax.GradAccum))
+            return
+
+        def jvp(self, primals, tangents):
+            residuals, moving = primals
+            d_residuals, d_moving = tangents
+            terms = []
+            if not all(zero(leaf) for leaf in jax.tree.leaves(d_moving, is_leaf=zero)):
+                terms.append(self(residuals, instantiated(d_moving, moving)))
+            if not all(zero(leaf) for leaf in jax.tree.leaves(d_residuals, is_leaf=zero)):
+                terms.append(jax.jvp(lambda held: apply(held, moving), (residuals,),
+                                     (instantiated(d_residuals, residuals),))[1])
+            if not terms:
+                return self(residuals, moving), jax.tree.map(
+                    lambda aval: ad_util.Zero(aval.to_tangent_aval()), self.out_aval)
+            return self(residuals, moving), jax.tree.map(lambda *parts: sum(parts), *terms)
+
+        lin, linearized = hijax.linearize_from_jvp
+        vjp_fwd, vjp_bwd_retval = hijax.vjp_from_jvp
+
+        def batch_dim_rule(self, axis_data, dims):
+            batched = any(dim is not None for dim in jax.tree.leaves(dims, is_leaf=lambda leaf: leaf is None))
+            return jax.tree.map(lambda _: 0 if batched else None, self.out_aval)
+
+    out_aval = jax.tree.map(jax.typeof, jax.eval_shape(apply, residuals, moving))
+    return Linear(jax.tree.map(jax.typeof, (residuals, moving)), out_aval)(residuals, moving)
 
 def first_refusal(*checks: tuple[bool, str]) -> str | None:
     """The reason beside the first of `checks` that does not hold, or None where all hold: how a
