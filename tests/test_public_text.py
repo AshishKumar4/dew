@@ -3,7 +3,6 @@ to a doc or a commit's message a date after the one it was written on, and passe
 whose date is on or before its own (a measurement's timestamp), or one whose date is a recording's or a
 fixture's data."""
 
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -20,8 +19,6 @@ WRITTEN = "2026-10-22T12:00:00"
 @pytest.fixture
 def repository(tmp_path: Path) -> Path:
     """A repository whose `base` branch holds a doc that already names a date, which a change may keep."""
-    (tmp_path / "tools").mkdir()
-    shutil.copyfile(REPO / "tools/public_text.py", tmp_path / "tools/public_text.py")
     (tmp_path / "docs").mkdir()
     (tmp_path / "docs/guide.md").write_text(GUIDE)
     git(tmp_path, "init", "-q", "-b", "base")
@@ -32,14 +29,15 @@ def repository(tmp_path: Path) -> Path:
 
 
 def change(root: Path, files: dict[str, str], message: str) -> int:
-    """`files` written and committed as `message` on the head, at WRITTEN; the gate's exit status for it."""
+    """`files` written and committed as `message` on the head, at WRITTEN; the gate's exit status for it, run
+    in the repository as check.sh runs it in Dew's."""
     for relative, text in files.items():
         (root / relative).parent.mkdir(parents=True, exist_ok=True)
         (root / relative).write_text(text)
     git(root, "add", "-A")
     git(root, "commit", "-qm", message, f"--date={WRITTEN}")
-    return subprocess.run([sys.executable, "tools/public_text.py", "base"], cwd=root, capture_output=True,
-                          timeout=60).returncode
+    return subprocess.run([sys.executable, str(REPO / "tools/public_text.py"), "base"], cwd=root,
+                          capture_output=True, timeout=60).returncode
 
 
 @pytest.mark.parametrize(("files", "message", "status"), [
