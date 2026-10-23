@@ -9,10 +9,11 @@ The selection is on par with it from the reference in float64 over drawn
 inputs (check 1, tests/reference_error.py), and a dropped-out adapter's call,
 which keeps the masked kernel, with the masked kernel's call: two programs,
 which XLA holds to no common bits. A quantized kv_b_proj's call is still held
-to the masked kernel's bit for bit: its FP8 roundings of the latents (and of
-the frozen product's cotangents) part float32 from float64 at a few seeds in
-a thousand, so check 1's control does not resolve without a margin on them
-in the draw.
+to the masked kernel's bit for bit: its FP8 rounding of the latents parts
+float32 from float64 at 7 seeds of 1024 (the input scale's, on armada), a
+whole FP8 step at an element, so check 1's control did not resolve within
+512 seeds; its draw needs a margin on those roundings, the frozen product's
+cotangents' too, first.
 """
 
 from functools import partial
