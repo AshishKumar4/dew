@@ -172,10 +172,13 @@ STEP_ROWS, STEP_LENGTH = 4, 32
 """A training step's draw: rows a device and ids a row, within the checkpoint's 64 positions."""
 UPDATE_SEEDS = {0.0: 8, 0.1: 8}
 """Each decay's declared seeds for the update's check 1, sized by `seeds_for` (on armada)."""
-DENSE_ROWS, DENSE_SEEDS = 16, 8
-"""The dense decoder's gradient draw's rows, and its check 1's declared seeds, sized by `seeds_for` (on
-armada): at STEP_ROWS AltUp's output scale in its third layer, a leaf of 32 values each summed over a
-draw's tokens, did not resolve within 512 seeds."""
+DENSE_ROWS, DENSE_ORBIT, DENSE_SEEDS = 16, 8, 512
+"""The dense decoder's gradient draw: its rows, the orders of them each drawn set is taken in (an orbit
+of the mean loss's exact symmetry), and check 1's declared seeds, sized by `seeds_for` (on armada). At
+STEP_ROWS AltUp's output scale in its third layer, a leaf of 32 values each summed over a draw's tokens,
+did not resolve within 512 seeds. Over one set's orders the worst row of AltUp's correction gradient in
+its third layer, a sum that nearly cancels, ranges tenfold for the reference alone (2.2e-3 to 2.0e-2
+of its size at one set, on armada): one order is no measure of it."""
 
 
 def clipped_gemma3n():
@@ -322,12 +325,15 @@ def test_the_dense_decoders_gradient_is_the_references():
     pad = references[torch.float32].config.pad_token_id
 
     def draw(seed):
-        """Rows of ids drawn uniformly from the vocabulary but the pad id, and the loss's cotangent, one.
-        The reference's embeddings are `nn.Embedding(padding_idx=pad)`, whose pad row takes no gradient
+        """Rows of ids drawn uniformly from the vocabulary but the pad id, taken in the order the seed
+        picks of DENSE_ORBIT (the set `seed // DENSE_ORBIT` draws), and the loss's cotangent, one. The
+        reference's embeddings are `nn.Embedding(padding_idx=pad)`, whose pad row takes no gradient
         whatever reads it, where Dew's takes its own: a padding convention, apart from the arithmetic
         held here, which ledger row 1372 tracks."""
         ids = np.setdiff1d(np.arange(int(dense.vocab_size)), [] if pad is None else [pad])
-        rows = ids[np.random.default_rng([0xDE, seed]).integers(0, len(ids), (DENSE_ROWS, STEP_LENGTH))]
+        drawn, order = divmod(seed, DENSE_ORBIT)
+        rows = ids[np.random.default_rng([0xDE, drawn]).integers(0, len(ids), (DENSE_ROWS, STEP_LENGTH))]
+        rows = rows[np.random.default_rng([0x0D, order]).permutation(DENSE_ROWS)] if order else rows
         return rows.astype(np.int32), np.float32(1)
 
     def loss(params, rows):
