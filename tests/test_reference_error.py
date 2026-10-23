@@ -127,24 +127,28 @@ def test_no_windows_are_refused():
 
 
 def test_each_window_runs_one_draws_program_compiled_once():
-    """Each window calls the program one draw compiles, traced once for all of them, and never a batched
-    one: an arm whose batching rule computes otherwise gives each window one draw's output."""
-    from reference_error import over_windows
+    """Each window calls the program one draw compiles, traced once for all of them over host and JAX
+    leaves alike, and never a batched one: an arm whose batching rule computes otherwise gives each
+    window one draw's output."""
+    from reference_error import over_windows, windows
 
     traces = []
 
     @jax.custom_batching.custom_vmap
-    def arm(x):
-        traces.append(x.shape)
-        return x
+    def arm(x, y):
+        traces.append((x.shape, y.shape))
+        return x + y
 
     @arm.def_vmap
-    def batched(axis_size, in_batched, x):
-        return x + 1, in_batched[0]
+    def batched(axis_size, in_batched, x, y):
+        return x + y + 1, in_batched[0]
 
-    x = np.arange(10, dtype=np.float32).reshape(5, 2)
-    np.testing.assert_array_equal(over_windows(jax.jit(arm))(x), x)
-    assert traces == [(2,)]
+    def draw(seed):
+        return np.full(2, seed, np.float32), jnp.full(2, seed, jnp.float32)
+
+    found = over_windows(jax.jit(arm))(*windows(draw, 5)(1))
+    np.testing.assert_array_equal(found, np.repeat(2 * np.arange(5, 10, dtype=np.float32)[:, None], 2, 1))
+    assert traces == [((2,), (2,))]
 
 
 def test_a_without_ynn_arm_runs_over_windows():
