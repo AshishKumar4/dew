@@ -20,14 +20,16 @@ def expand(coefficient, x):
 
 
 def divided(numerator, rate):
-    """`numerator / rate`, rounded once, as a source written in PyTorch divides a state by a rate:
-    IEEE division (`dew.nn.precision.correctly_rounded_divide`) on every backend, where XLA's own
-    division rounds twice on a CPU and approximately on a GPU. A float64 run's division is IEEE
+    """`numerator / rate` as a source written in PyTorch divides a state by a rate: IEEE division
+    (`dew.nn.precision.correctly_rounded_divide`) on every backend, where XLA's own division rounds
+    twice on a CPU and approximately on a GPU. A bfloat16 or float16 quotient is the float32 one
+    rounded to its dtype, as PyTorch's float32 opmath gives it; a float64 run's division is IEEE
     already."""
     numerator, rate = jnp.asarray(numerator), jnp.asarray(rate)
-    if jnp.result_type(numerator, rate) != jnp.float32:
+    dtype = jnp.result_type(numerator, rate)
+    if dtype == jnp.float64 or not jnp.issubdtype(dtype, jnp.floating):
         return numerator / rate
-    return correctly_rounded_divide(numerator, rate)
+    return correctly_rounded_divide(numerator.astype(jnp.float32), rate.astype(jnp.float32)).astype(dtype)
 
 
 def times(t) -> jax.Array:
