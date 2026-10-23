@@ -20,6 +20,7 @@ from dew import records
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
+    MOE_NAMES,
     SERIALIZED_ENCODER_FIELDS,
     SERIALIZED_TEXT_FIELDS,
     DecoderFamily,
@@ -111,10 +112,12 @@ def _minimax_m2_config(hf_config: Mapping[str, object], used: set[str]) -> Decod
     return config
 
 
+# MiniMax's balancing bias, under either of its spellings, ahead of Mixtral's
+# MoE names, which would otherwise take its block's part first.
 _MINIMAX_M2_NAMES = (
     ('block_sparse_moe.e_score_correction_bias', 'mlp.gate.e_score_correction_bias'),
     ('mlp.e_score_correction_bias', 'mlp.gate.e_score_correction_bias'),
-    ('block_sparse_moe', 'mlp'), ('w1', 'gate_proj'), ('w2', 'down_proj'), ('w3', 'up_proj'),
+    *MOE_NAMES,
 )
 
 

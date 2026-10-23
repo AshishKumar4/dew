@@ -163,9 +163,6 @@ def _modernbert_path(name: str, config: Mapping[str, object]) -> tuple[str, ...]
     name = _nested(name)
     if name in _HEAD:
         return ('params', *_HEAD[name])
-    # Alias inspection sees the raw names before preparation splits them.
-    if name.endswith(('.attn.Wqkv.weight', '.mlp.Wi.weight', '.mlp.Wi.bias')):
-        return None
     return renamed_path(_MODERNBERT_NAMES, name, config)
 
 

@@ -317,12 +317,9 @@ _FUSED_QKV = grouped_qkv('.self_attn.qkv_proj')
 
 
 def _mimo_v2_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """The shared map under the family's names. The fused qkv is read through
-    its parts (`_FUSED_QKV`); the prediction layers, which the reference skips
+    """The shared map under the family's names; the prediction layers, which the reference skips
     on load, and the towers, which the text decoder never runs, have no place."""
     if name.startswith(('model.mtp.', 'visual.', 'audio_encoder.', 'speech_embeddings.')):
-        return None
-    if name.endswith(tuple(packing.name for packing in _FUSED_QKV)):
         return None
     return renamed_path(_NAMES, name, config)
 
