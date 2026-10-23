@@ -35,7 +35,7 @@ from dew.batch import Variables, real_slots
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.inference.tasks import MaskedGeneration, MaskedSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
-from dew.nn.protocols import TokenModel
+from dew.nn.protocols import Lacks, TokenModel
 from dew.objectives.base import (
     OMITTED,
     Aux,
@@ -102,9 +102,9 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         (`Objective.bind_model`)."""
         model = self.bind_model(model, variables=variables, processor=processor)
         if not isinstance(model, TokenModel) or model.causal:
-            raise ValueError(
-                "a masked diffusion model reads the whole corrupted row, so its states attend "
-                "both ways (TokenModel with causal False), as CausalTransformer(causal=False)'s do")
+            raise Lacks("bidirectional",
+                        "a masked diffusion model reads the whole corrupted row, so its states attend "
+                        "both ways (TokenModel with causal False), as CausalTransformer(causal=False)'s do")
         refuse_without_logits(model, "masked diffusion")
         self.model = model
         self.process = process

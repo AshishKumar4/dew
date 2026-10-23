@@ -45,6 +45,7 @@ from dew.nn.protocols import (
     Decoding,
     Exposing,
     Generating,
+    Lacks,
     Layered,
     Predicting,
     ProjectionGroup,
@@ -634,11 +635,11 @@ def check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray
     `max_seq_len` where None.
     """
     if isinstance(model, BlockDenoiser):
-        raise TypeError(f"{type(model).__name__}'s cache commits whole canvases (BlockDenoiser), not a "
-                        "token at a time; generate with BlockGeneration")
+        raise Lacks("cache", f"{type(model).__name__}'s cache commits whole canvases (BlockDenoiser), not "
+                             "a token at a time; generate with BlockGeneration")
     if not isinstance(model, Decoding):
-        raise TypeError(f"{type(model).__name__} opens no decode cache (Decoding.init_cache), so it cannot "
-                        "continue a prompt token by token")
+        raise Lacks("cache", f"{type(model).__name__} opens no decode cache (Decoding.init_cache), so it "
+                             "cannot continue a prompt token by token")
     if ids.ndim != 2 or min(ids.shape) < 1 or not np.issubdtype(ids.dtype, np.integer):
         raise ValueError("inputs must contain non-empty [B, P] integer token ids")
     if type(max_new_tokens) is not int or max_new_tokens < 0:
