@@ -610,7 +610,13 @@ class EpisodeCollector:
             agreed("episode verification", lambda: self._verify(slots, policy_step, binding_id, run))
 
     def collect(self, snapshot: Snapshot, tasks: Sequence[Task], samples: int) -> list[list[Session]]:
-        """Collect `samples` episodes of each task under `snapshot`, as sessions by task (`session_of`).
+        """`samples` episodes of each task under `snapshot` (`episodes`), as sessions by task
+        (`session_of`)."""
+        sessions = [session_of(episode, group="") for episode in self.episodes(snapshot, tasks, samples)]
+        return [sessions[index * samples:(index + 1) * samples] for index in range(len(tasks))]
+
+    def episodes(self, snapshot: Snapshot, tasks: Sequence[Task], samples: int) -> tuple[Episode, ...]:
+        """Collect `samples` episodes of each task under `snapshot`, task by task.
 
         The cohorts have fixed shapes, and every process agrees on each host
         phase before each generation. `record`, when set, receives every
@@ -658,8 +664,7 @@ class EpisodeCollector:
                 for episode in records:
                     self.record(episode)
         agreed("episode recording", record)
-        sessions = [session_of(episode, group="") for episode in records]
-        return [sessions[index * samples:(index + 1) * samples] for index in range(len(tasks))]
+        return records
 
 
 def session_of(episode: Episode, *, group: str) -> Session:

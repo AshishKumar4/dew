@@ -1549,7 +1549,7 @@ def mode_rollout(args) -> dict:
 
     from dew.data.dataset import Loader
     from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.objectives.rl import GRPOObjective, SampledRollout
+    from dew.objectives.rl import GRPOObjective, RolloutScheduler
     from dew.sampling import Sampling, generate
     from dew.training import Layout, MeshSpec, Trainer
 
@@ -1569,8 +1569,8 @@ def mode_rollout(args) -> dict:
     eos = int(np.asarray(greedy.tokens)[0, 4])
     sampling = Sampling(temperature=0, eos_token_ids=eos, pad_token_id=12)
     objective = GRPOObjective(model, seq_len=7, variables=params)
-    rollout = SampledRollout(objective, lambda text, record: float(len(text)),
-                             groups=2, max_new_tokens=4, sampling=sampling)
+    rollout = RolloutScheduler.sampled(objective, lambda text, record: float(len(text)),
+                                       groups=2, max_new_tokens=4, sampling=sampling)
     trainer = Trainer(objective, optax.sgd(0.01), key=jax.random.key(5),
                       mesh=MeshSpec(fsdp=args.fsdp_size), layout=Layout(min_shard=TINY),
                       rollout=rollout)
@@ -1827,8 +1827,8 @@ def mixed_token_lengths() -> np.ndarray:
 def mixed_validity_inputs(prompts: np.ndarray, lengths: np.ndarray, *, explicit: bool):
     """What a host producer hands generation for these left-padded rows.
 
-    A producer that padded nothing omits validity, the way `SampledRollout`
-    does from the lengths it already holds. `explicit` spells the field out
+    A producer that padded nothing omits validity, the way `PolicyCollector`
+    does (`pad_token_rows`). `explicit` spells the field out
     on every row instead, which is the reference a pool has to reproduce.
     """
     import jax.numpy as jnp

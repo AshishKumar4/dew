@@ -411,7 +411,7 @@ def test_a_trial_past_its_timeout_is_interrupted_and_the_scheduler_retries_it(tm
 
     from dew.data.dataset import Loader
     from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.objectives.rl import GRPOObjective, RolloutScheduler
+    from dew.objectives.rl import Asynchronous, GRPOObjective, RolloutScheduler
     from dew.objectives.rl.scheduler import task_ids
     from dew.training import Layout, Trainer
 
@@ -430,9 +430,9 @@ def test_a_trial_past_its_timeout_is_interrupted_and_the_scheduler_retries_it(tm
     objective = GRPOObjective(model, seq_len=7)
     tasks, records = jax.device_count(), []
     scheduler = RolloutScheduler(
-        objective, source, Publisher(), width=8, rows=2 * tasks, groups=2, max_lag=0, ahead=0,
+        Asynchronous(source, Publisher(), objective, width=8, rows=2 * tasks, max_lag=0, ahead=0),
         tasks=lambda batch: [Task(task.id, {HARBOR_KEY: str(hanging)}) for task in task_ids(batch)],
-        log=records.append)
+        groups=2, log=records.append)
     data = scheduler.tasks(Loader(train=lambda partition: iter(
         lambda: {"task_id": np.arange(tasks, dtype=np.int32)}, None), val=None, records=None, batch=tasks))
     try:

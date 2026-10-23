@@ -58,6 +58,7 @@ class _DewCall(TypedDict):
     count: int
     finish_reason: str
     version: int
+    raw_log_probs: list[float] | None
     support: list[list[int]] | None
     reward: float | None
     transcript: dict[str, object] | None
@@ -120,6 +121,7 @@ def to_verl(trajectories: Sequence[Session | VerlTrajectory]) -> list[VerlRow]:
                         "count": count,
                         "finish_reason": call.finish_reason,
                         "version": call.version,
+                        "raw_log_probs": None if call.raw_log_probs is None else list(call.raw_log_probs),
                         "support": None if call.support is None else [list(kept) for kept in call.support],
                         "reward": call.reward,
                         "transcript": None if call.transcript is None else {
@@ -245,6 +247,8 @@ def _calls(row: Mapping[str, object], version: int | None,
                     "finish_reason",
                 ),
                 version=integer(stated, "version"),
+                raw_log_probs=None if meta.get("raw_log_probs") is None
+                else reals(meta["raw_log_probs"], "raw_log_probs"),
                 routed_experts=None if record is None else record[:forwarded],
                 support=None if support is None else listed(
                     support, "support", read=integers, what="a list of token-id lists"),

@@ -167,7 +167,8 @@ def test_a_native_draw_ends_on_the_stop_string_it_completes(pieces):
     remote engines do; a policy whose string the draw never spells ends on its EOS id, and one with
     neither runs to its budget."""
     from dew.inference.pipeline import RunProcessor
-    from dew.objectives.rl.sources import PromptSource, prompt_tasks
+    from dew.objectives.rl.rollout import prompt_tasks
+    from dew.objectives.rl.sources import PromptSource
 
     ids = {piece: pieces.convert_tokens_to_ids(piece) for piece in ("<eos>", "st", "op", "a", "yy")}
     order = [ids["a"], ids["st"], ids["op"], ids["yy"], ids["<eos>"]]
@@ -237,7 +238,7 @@ def test_a_native_draw_ends_on_the_stop_string_it_completes(pieces):
 
         def step(self, action):
             self.steps += 1
-            self.context = (*action.context, *action.tokens, ids["a"])
+            self.context = (*action.prompt, *action.tokens, ids["a"])
             if self.steps == 2:
                 return Observation((), EpisodeStatus.COMPLETED, "two turns")
             return Observation(self.context)
