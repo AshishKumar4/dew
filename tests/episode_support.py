@@ -152,7 +152,7 @@ def verify(episode):
 
 
 def build(harness=None, *, record=None, accumulation=1, **changes):
-    """A trainer and the episode collector its scheduler (`scheduled`) draws through."""
+    """A trainer and the episode collector its scheduler (`episode_scheduler`) draws through."""
     model = ToolPolicy()
     objective = GRPOObjective(model, PROMPT + RESPONSE - 1, beta=.05)
     trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(19), accumulation=accumulation)
@@ -179,7 +179,7 @@ def cohort_snapshot(state, key=23) -> Snapshot:
 
 
 def trained_batch(collector, state, key=23, tasks=(31,)):
-    """The batch the trainer's scheduler (`scheduled`) packs from one cohort of `tasks`' episodes."""
+    """The batch the trainer's scheduler (`episode_scheduler`) packs from one cohort of `tasks`' episodes."""
     return episode_scheduler(collector)(state, {"task_id": np.asarray(tasks, np.int32)}, jax.random.key(key))
 
 
