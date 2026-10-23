@@ -293,38 +293,28 @@ def test_a_context_ended_while_it_starts_leaves_no_kernel(bridge, monkeypatch, p
 
 
 def test_a_session_closed_while_its_first_context_starts_leaves_no_kernel(bridge, monkeypatch):
-    """The Worker's close of a session while the gateway still creates its first context, as the container's
-    RPCs ask them, ends that creation: the create answers that it was closed, the kernel the gateway then
-    makes is deleted, and the session can start again."""
-    import urllib.request
-
+    """The Worker's close of a session while the gateway still creates its first context (the container's
+    create and close RPCs, `Gateway.create` and `Gateway.close`) ends that creation: the create says the
+    session was closed, the kernel the gateway then makes is deleted, and the session can start again."""
     monkeypatch.setattr(bridge, "available", lambda: 1 << 40)
-
-    def rpc(port, path):
-        request = urllib.request.Request(f"http://127.0.0.1:{port}/contexts/{path}",
-                                         headers={"Authorization": "Bearer " + SECRET})
-        try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                return response.status
-        except urllib.error.HTTPError as error:
-            return error.code
 
     async def scenario():
         kernels = Kernels()
-        gateway, server, runner, port = await serving(bridge, kernels)
+        gateway, server, runner, _ = await serving(bridge, kernels)
         try:
             session = str(uuid.uuid4())
             kernels.held.add("create")
-            created = asyncio.ensure_future(asyncio.to_thread(rpc, port, session))
+            created = asyncio.ensure_future(gateway.create(session))
             await asyncio.wait_for(kernels.entered["create"].wait(), 30)
-            closed = await asyncio.to_thread(rpc, port, f"{session}/close")
+            await gateway.close(session)
             kernels.held.clear()
             kernels.release["create"].set()
-            assert (closed, await created) == (200, 503)
+            with pytest.raises(RuntimeError, match="closed"):
+                await created
             await settled(kernels)
             assert kernels.live == set() and session not in gateway.contexts
-            assert await asyncio.to_thread(rpc, port, session) == 200
-            assert await asyncio.to_thread(rpc, port, f"{session}/close") == 200
+            assert None in await gateway.create(session)
+            await gateway.close(session)
             await settled(kernels)
             assert kernels.live == set()
         finally:
