@@ -332,13 +332,14 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
                     x = np.asarray(args[0], np.float64)
                     rms = np.sqrt(np.mean(x * x, axis=-1))
                     name = "/".join(str(part) for part in module.scope.path[-3:])
-                    if np.median(rms) > 0:
-                        seen[name] = min(seen.get(name, np.inf), float(rms.min() / np.median(rms)))
+                    live = rms[rms > 0]
+                    if live.size:
+                        seen[name] = min(seen.get(name, np.inf), float(live.min() / np.median(live)))
                 return next_fun(*args, **kwargs)
 
             with fnn.intercept_methods(record):
                 model.apply(loaded.variables, jnp.asarray(rows[:, :-1]), train=True)
-            worst = sorted((value, name) for name, value in seen.items())[:4]
+            worst = sorted((value, name) for name, value in seen.items())[:3]
             print("FLIPS", seed, "gate_margin", gate_margin(model, loaded.variables, rows[:, :-1], train=True), "per call", flips,
                   "norms", [f"{name} {value:.1e}" for value, name in worst], flush=True)
         Gemma3nTextMLP._gaussian_topk = original
