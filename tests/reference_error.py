@@ -150,19 +150,23 @@ def with_gradients(fn):
 
 
 def _host_tensor(value):
-    """A torch copy of a host array, its own shape and dtype. A narrow float NumPy holds as ml_dtypes'
-    (bfloat16, the float8 formats) goes through the float32 that holds it exactly to torch's format of
-    its name. A copy, so autograd never writes an array JAX holds."""
+    """A torch copy of a host array, of its own shape and dtype. NumPy holds bfloat16, the float8
+    formats and the 4-bit integers as ml_dtypes' types: a float of those goes through float32, which
+    holds it exactly, to torch's format of the same name, and an integer enters as int32, which holds
+    its values. A copy, so autograd never writes an array JAX holds."""
     import torch
 
     value = np.array(value)
-    if value.dtype.kind == "V" or value.dtype.type.__module__.startswith("ml_dtypes"):
-        return torch.as_tensor(value.astype(np.float32)).to(getattr(torch, value.dtype.name))
+    if value.dtype.type.__module__.startswith("ml_dtypes"):
+        if jnp.issubdtype(value.dtype, jnp.floating):
+            return torch.as_tensor(value.astype(np.float32)).to(getattr(torch, value.dtype.name))
+        return torch.as_tensor(value.astype(np.int32))
     return torch.as_tensor(value)
 
 
 def _host_array(value):
-    """A tensor as a host array, a narrow float NumPy has no format for as the float32 that holds it."""
+    """A tensor as a host array. A format NumPy lacks, such as bfloat16, comes back as float32, which holds
+    its values exactly."""
     import torch
 
     value = value.detach()

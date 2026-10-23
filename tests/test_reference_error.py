@@ -144,24 +144,45 @@ def test_a_torch_arm_pairs_each_cotangent_with_its_own_output():
 
     _, gradient = torch_with_gradients(lambda v: (v * 1, v * 2))(
         np.ones(2, np.float32), (np.full(2, 10, np.float32), np.full(2, 100, np.float32)))
+    assert gradient.dtype == np.float32
     np.testing.assert_array_equal(gradient, np.full(2, 210, np.float32))
 
 
 def test_a_torch_arms_narrow_floats_go_in_through_float32():
-    """A bfloat16 or float8 input and cotangent, as JAX holds them on the host, go in through the float32
-    that holds them exactly, and come out in float32."""
+    """A bfloat16 input and cotangent, as JAX holds them on the host, and a float8 input reach the arm
+    in torch's format of their name, through the float32 that holds them exactly, and come out in
+    float32."""
     from reference_error import torch_with_gradients
 
-    out, gradient = torch_with_gradients(lambda x: x * 2)(np.array([2.0, 3.0], jnp.bfloat16),
-                                                          np.ones(2, jnp.bfloat16))
+    def doubled(x):
+        assert x.dtype == torch.bfloat16
+        return x * 2
+
+    halves = np.array([2.0, 3.0], jnp.bfloat16)
+    out, gradient = torch_with_gradients(doubled)(halves, np.ones(2, jnp.bfloat16))
     assert out.dtype == gradient.dtype == np.float32
     np.testing.assert_array_equal(out, np.array([4.0, 6.0], np.float32))
     np.testing.assert_array_equal(gradient, np.full(2, 2, np.float32))
     # Torch computes no float8 on the CPU, so a float8 input is widened inside, as a quantized arm's is.
-    out, gradient = torch_with_gradients(lambda x: x.float() * 2)(np.array([2.0, 3.0], jnp.float8_e4m3fn),
-                                                                  np.ones(2, np.float32))
+    def widened_inside(x):
+        assert x.dtype == torch.float8_e4m3fn
+        return x.float() * 2
+
+    out, gradient = torch_with_gradients(widened_inside)(np.array([2.0, 3.0], jnp.float8_e4m3fn),
+                                                         np.ones(2, np.float32))
     assert gradient.dtype == np.float32
     np.testing.assert_array_equal(gradient, np.full(2, 2, np.float32))
+
+
+def test_a_torch_arms_narrow_integer_input_has_no_gradient():
+    """An int4 input, which NumPy holds as ml_dtypes' too, is no float: it enters as int32, its values
+    kept, and takes no gradient."""
+    from reference_error import torch_with_gradients
+
+    out, gradient = torch_with_gradients(lambda i: i.float() * 2)(np.array([1, -2], jnp.int4),
+                                                                   np.ones(2, np.float32))
+    assert gradient is None
+    np.testing.assert_array_equal(out, np.array([2.0, -4.0], np.float32))
 
 
 def test_a_torch_arms_bfloat16_output_comes_out_through_float32():
