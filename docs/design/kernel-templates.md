@@ -206,6 +206,25 @@ Rule 0 applies: use Splash's MaskInfo, with its empty/partial/full classes and p
 - **Machine primitives, only where JAX has none:** layout-aware coordinates and row vectors; the promoted, scaled `mma`.
 - **The cost features (§7).**
 
+**One mainloop per overlap structure, one bundle per family (the owner's ruling, 2026-10-23).** CUTLASS and FA3 share the pipeline, scheduler and warp roles and keep a collective mainloop per kind and architecture, because the overlap structures differ. Here everything per architecture that is not an overlap structure is a `Family` bundle in the toolkit, a mainloop holds no math and no pipeline machinery, only the order of the bundle's steps around the algebra, and a template has one mainloop for every family whose overlap structure is the same, a separate thin one only where it is not.
+
+*The bundle* (`templates/mosaic.py` declares `Family`; `mosaic_sm80.py`, `mosaic_sm90.py`, `mosaic_sm100.py` and `mosaic_tpu.py` each give one) holds only what the hardware decides:
+- **Facts:** the MMA's row unit (sm80 16, sm90 64, sm100 128, TPU 8 by 128 lanes), the shared-memory (VMEM) budget, the register budget per role, the MMAs a role may have in flight, and the stages and consumers its loader and roles allow.
+- **Roles** (`roles(consumers, consumer, producer)`): sm90 a producer warpgroup and one or two consumers at `setmaxnreg` budgets; sm100 an issuing warpgroup (a load warp and an MMA warp) beside the compute warpgroups; sm80 and TPU one role, its loads its pipeline's.
+- **The walk** (`walk(streams, segments, step, carry, accumulators)`): streams each operand's blocks through the family's loader (sm90 and sm100 TMA into mbarrier rings, multicast across a cluster; sm80 `emit_pipeline`'s cp.async stages; TPU `emit_pipeline`'s DMA), calls the mainloop's `step(index, slots, carry, accumulators)` over each `(lo, hi)` segment (a runtime count; the counters run on across a persistent loop's tiles), releases a step's slots once its MMAs have read them, drains, and returns the carry and the accumulators' values. Every ring count, phase and wait is the bundle's; a mainloop never touches a barrier.
+- **The accumulator's home** (`accumulators(shapes)` within the walk): a wgmma accumulator ref on sm90, a register carry on sm80, tensor memory on sm100, VMEM scratch on TPU.
+- **The issuer** (`issue(acc, lhs, rhs, *, transpose_lhs, transpose_rhs)`): mma.sync, wgmma, tcgen05, the MXU's dot, in place into a home; `product(lhs, rhs, shape)` the same into a fresh one, its value returned (attention's S and dP).
+- **Operand movement:** `relayout(value, dtype)`, an accumulator's value as the next product's left operand in registers where the family can (wgmma's register A; sm80 with the relayout patch), else None; `stage(value, buffer)`, registers to operand memory otherwise (shared memory, or tensor memory for sm100's P).
+- **Vectors and stores:** the accumulator's layout and a row's and a column's in it (`zeros`, `iota`, row and column broadcasts, masks), whole loads (`loaded`) and stores (`stored`: the TMA rung ladder on sm90 and sm100, register rungs on sm80, a BlockSpec out on TPU), a ragged tile's predicated load and row-count store.
+
+*The mainloops by overlap structure.*
+- **Attention: sm80, sm90 and TPU share one** (`attention_mosaic.py`). Their compute role issues its own products, holds the output accumulator where the algebra's step updates it (registers, VMEM), and takes P from registers or a staged tile: a step is `product(Q, Kᵀ)`, the algebra, then `issue(O, P, V)`; whether loads come from a producer warpgroup's TMA ring or a cp.async pipeline is the walk's. **sm100 has its own thin one** (`attention_sm100.py`): FA4's structure differs in kind, not in instruction. One thread of an MMA warp issues every tcgen05 product into tensor memory a step ahead of the softmax, which never issues one; the output accumulator lives in tensor memory, where the algebra's step cannot rescale it, so a correction role rescales it between products. Its compute role reads S and writes P through tensor memory and signals the MMA warp. It shares the algebra, the bundle and the program grid with the other.
+- **GEMM: one for every family** (`gemm/mosaic_gpu.py`): stream A and B, issue into the accumulator's home, finish into the epilogue; sm100's MMA-warp issue is the bundle's roles and issuer, its tensor-memory accumulator the bundle's home, the epilogue reading it back through the bundle.
+- **Recurrence: one** (`recurrence/mainloop.py`): its chunk's product DAG through `issue`, the carried state in the bundle's home.
+- The duplicate gates run on every mainloop and bundle: no mainloop repeats toolkit code.
+
+*Gotchas the bundles own* (measured): a ring's load is waited for once, a second wait taking the barrier's next phase (sm90); a walk of two loops into one wgmma accumulator, the first empty, faults on an H100 under jax 0.11.2, so a skeleton's masked and whole tiles are one walk chosen a tile at a time; an sm80 zero store needs an MMA-laid zero, and sub-8-row register loads have no layout; Mosaic's warpgroup lowering takes no `is_finite` (the algebra's `finite` is `|x| < inf`).
+
 **Mainloop, per template per generation.** It is built from the toolkit and the algebra, and its parameters are configuration:
 - consumers;
 - cooperative (split M, so register-A prologues need no duplication) or ping-pong (the epilogue overlaps the next tile);
@@ -358,7 +377,7 @@ Built in parallel. Each piece lands when it meets its gates: the accuracy gate (
 4. The interpret-mode check 1 harness for every mainloop, on today's two forward forms.
 
 **Then the rungs:**
-- **Toolkit and attention:** sm90 attention reaching Tokamax Mosaic, then FA3; the decode mainloop; the fused ticket backward.
+- **Toolkit and attention:** sm90 attention reaching Tokamax Mosaic, then FA3; the decode mainloop; the fused ticket backward. The sm90 mainloop (`attention_mosaic.py`) holds the forward (full and causal calls, 16-bit operands, the fold and fp16's natural form, no hooks yet) and the backward in both forms (bf16, from the Triton training forward's split sums), both on par by check 1, interpreted and on an H100; on an H100 at llama-d128, causal bf16, 2 × 4096, its backward takes 2.63 ms in the fast form and 4.81 in the accurate one, against the Triton mainloop's 2.96 and 5.06 in the same session. It runs on no route yet: its forward's guards, hooks, the remaining call forms and its training forward come next.
 - **Recurrence:** the one chunk algebra absorbing the four ports, then FlashQLA's fused launch DAG and `compose`.
 - **GEMM and the choice layer:** the M-split, register-A cooperative mainloop and the reduce pass before norm and SwiGLU fusion, then split-K for dW, then CUTLASS's rungs; the analytic features, the logging and the ranker.
 

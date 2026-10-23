@@ -1,0 +1,442 @@
+"""The templates' Pallas Mosaic GPU toolkit (design §6), every instruction family's: the launch,
+warpgroup roles, barriers, shared-memory staging, operand streams and stores every Mosaic mainloop builds on.
+The math is each template's algebra, written once; what an instruction family adds is its issue and its
+layout facts alone (`Family`: mosaic_sm90's wgmma; mma.sync's and tcgen05's to come). Each template keeps
+its own mainloop, product dependencies and launch DAG; only these primitives are shared.
+
+A cooperative launch (`cooperative`) runs a producer warpgroup issuing the loads beside consumer warpgroups
+computing, persistent over the multiprocessors, a pair of them a cluster where it shares one operand's blocks
+(multicast, `multicast_axes`). The consumers report a tile drained (`drained`, `drain`) so a persistent
+producer never loads a next tile's stage over one an MMA still reads, and meet (`meet`) where one consumer's
+writes to shared memory are the other's operand. Each consumer's accumulator lives for one output tile
+(`finished`), and a tile's rows reach global memory through `store_rows`, whose stores have static extents
+however many rows a tile holds.
+
+A mainloop that drives its own loads (the GEMM's kernel gradient, its stages streaming across tiles)
+streams each operand through a `Ring` whose counter runs across tiles, and takes each warpgroup's role
+(`roles`).
+"""
+
+import abc
+import dataclasses
+import math
+from collections.abc import Callable
+
+import jax
+from jax import lax, numpy as jnp
+from jax._src.state import types as state_types
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import mosaic_gpu as plgpu
+
+Ref = state_types.AbstractRef | state_types.TransformedRef
+"""A scoped allocation a primitive takes: shared memory, transformed (tiled and swizzled) or not, or
+barriers."""
+
+
+def compiler_params(*, approx_math: bool = False) -> plgpu.CompilerParams:
+    """A mainloop's compiler parameters: Mosaic GPU's warpgroup lowering, whose arrays are a warpgroup's,
+    and with `approx_math` the hardware's approximate exponential and reciprocal (ex2.approx, as Triton's
+    exp2 and FlashAttention's are)."""
+    return plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup, approx_math=approx_math)
+
+
+def cooperative(body, out_type, *, consumers: int, cluster: int, multiprocessors: int, interpret):
+    """A cooperative launch of `body`: `consumers` consumer warpgroups and a producer a block (warpgroup
+    `consumers`, `drain`), persistent over `multiprocessors` ('cluster_grid'), a pair of them a cluster where
+    `cluster` is 2 ('cluster')."""
+    if multiprocessors < cluster:
+        raise ValueError(f"a cluster of {cluster} pairs multiprocessors, and the launch has "
+                         f"{multiprocessors} (an interpreter's one block does not model a cluster)")
+    return plgpu.kernel(
+        body,
+        out_type=out_type,
+        grid=(multiprocessors // cluster,),
+        grid_names=("cluster_grid",),
+        cluster=(cluster,),
+        cluster_names=("cluster",),
+        num_threads=consumers + 1,
+        thread_name="wg",
+        compiler_params=compiler_params(),
+        interpret=interpret,
+    )
+
+
+def multicast_axes(cluster: int) -> tuple[str, ...]:
+    """The axes a block a pair shares is loaded over, multicast: the cluster's, for a pair."""
+    return ("cluster",) if cluster == 2 else ()
+
+
+def stage_spec(axes: tuple, extent: dict, stepped: str, in_flight: int) -> plgpu.BlockSpec:
+    """An operand's block in a pipeline's shared-memory stage: its tile at `extent` per launch axis, advancing
+    along `stepped` (the pipeline's axis) and fixed along the others, held `in_flight` steps longer for the
+    MMAs in flight."""
+    return plgpu.BlockSpec(tuple(extent[axis] for axis in axes),
+                           lambda step: tuple(step if axis == stepped else 0 for axis in axes),
+                           memory_space=plgpu.SMEM, delay_release=in_flight)
+
+
+def ignore(*_, **__) -> None:
+    """A pipeline body or compute context that does nothing: the allocations a pipeline takes do not depend
+    on them (`hopper_matmul_mgpu`'s `ignore`)."""
+
+
+def drained(cluster: int):
+    """The barrier two consumers report a tile drained at: both multiprocessors' of a pair (each producer's
+    next loads are multicast into both), a block's own otherwise."""
+    if cluster == 2:
+        return plgpu.ClusterBarrier(collective_axes=("cluster",), num_arrivals=2)
+    return plgpu.Barrier(num_arrivals=2)
+
+
+def drain(barrier, wg, producer: int = 2) -> None:
+    """The producer warpgroup (`producer`) waits until the consumers have finished the tile's MMAs (each
+    arrives at `barrier` after its last wait; a pair's four, `drained`) before its next tile's loads reuse
+    the pipeline's stages."""
+    pl.when(wg == producer)(lambda: plgpu.barrier_wait(barrier))
+
+
+def meet(halves) -> None:
+    """The two consumer warpgroups wait for each other at `halves`, two barriers of two arrivals, in turn:
+    neither arrives at a barrier's next phase before the other has seen its last, however the meets fall
+    (the interpreter's invariant, and the hardware's parity waits)."""
+    for barrier in (halves.at[0], halves.at[1]):
+        plgpu.barrier_arrive(barrier)
+        plgpu.barrier_wait(barrier)
+
+
+def staging(name: str, shaped) -> dict:
+    """Each consumer warpgroup's staging buffer for each operand a tile reads (`shaped`: its tile's shape and
+    its operand) and a barrier for each, as `{name}_smems` and `{name}_barriers`."""
+    shaped = list(shaped)
+    return {f'{name}_smems': [plgpu.SMEM((2, *shape), gmem.dtype) for shape, gmem in shaped],
+            f'{name}_barriers': [plgpu.Barrier(num_barriers=2) for _ in shaped]}
+
+
+def streamed(rings: tuple, views, lo, hi) -> None:
+    """A producer's loads of steps `lo` to `hi` into `rings`, each ring's step counted from `lo` and loaded
+    from its view of `views(step)`, then each ring drained."""
+    @pl.loop(lo, hi)
+    def _(index):
+        for ring, view in zip(rings, views(index), strict=True):
+            ring.load(index - lo, view)
+
+    for ring in rings:
+        ring.drain(hi - lo)
+
+
+def passed(rings: tuple, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
+    """A consumer's steps `lo` to `hi` of `rings` it reads none of (another consumer's), each ring's load
+    awaited and its slot released as a reading consumer's are (counted from `first`): a wait takes its
+    barrier's next phase, so every consumer waits on every load; `between()` after each step."""
+    @pl.loop(lo, hi)
+    def _(index):
+        for ring in rings:
+            ring.acquire(index - first)
+            ring.release(index - first)
+        if between is not None:
+            between()
+
+
+def loaded(copies) -> None:
+    """Each `(view, ref, barrier)` copied whole into shared memory, every copy issued before any is
+    awaited."""
+    for view, ref, barrier in copies:
+        plgpu.copy_gmem_to_smem(view, ref, barrier)
+    for _, _, barrier in copies:
+        plgpu.barrier_wait(barrier)
+
+
+def stored(parts, views, *, smem) -> None:
+    """Each of `parts` written whole to its view of `views` through the shared buffer `smem`, in turn, the
+    buffer reused once its copy is done."""
+    for part, view in zip(parts, views, strict=True):
+        smem[...] = part.astype(smem.dtype)
+        plgpu.commit_smem()
+        plgpu.copy_smem_to_gmem(smem, view)
+        plgpu.wait_smem_to_gmem(0)
+
+
+def load_fixed(views: list, refs: list, barriers: list, wg) -> None:
+    """Each operand a tile reads whole (`views`) into this warpgroup's `refs` (`staging`), awaited."""
+    for view, ref, barrier in zip(views, refs, barriers, strict=True):
+        plgpu.copy_gmem_to_smem(view, ref, barrier.at[wg])
+        plgpu.barrier_wait(barrier.at[wg])
+
+
+def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int) -> None:
+    """Rows `first` to `first + stored` of `o_smem` to `o_gmem` at row `row_start + first` and `column`, in a
+    power-of-two ladder of TMA stores (a descriptor's extents are static), the largest `most` rows'."""
+    start, size = first, most
+    while size:
+        rung = 1 << int(math.log2(size))
+        size //= 2
+
+        @pl.when(stored & rung != 0)
+        def _(start=start, rung=rung):
+            plgpu.copy_smem_to_gmem(o_smem.at[pl.ds(start, rung)],
+                                    o_gmem.at[pl.ds(row_start + start, rung), pl.ds(column, o_smem.shape[1])])
+
+        start = start + (stored & rung)
+
+
+@dataclasses.dataclass(frozen=True)
+class Ring:
+    """A ring of `stages` shared-memory slots one operand streams through: a producer loads step `counter`
+    into slot `counter % stages` (`load`), a consumer waits for it (`acquire`) and gives it back
+    (`release`). The counter runs across a persistent kernel's tiles, so a tile's first loads reuse the
+    slots the last tile left, and each tile may take its own number of steps (a causal tile's trip range):
+    a slot is free for its first fill and, after, once every consumer released it; the producer drains the
+    ring after its last load (`drain`). Allocated with `ring`, its slot count the allocation's own."""
+    smem: Ref
+    full: state_types.AbstractRef
+    consumed: state_types.AbstractRef
+
+    @property
+    def stages(self) -> int:
+        """The ring's slots: its allocation's leading dimension."""
+        return int(self.smem.shape[0])
+
+    def slot(self, counter):
+        """The slot step `counter` uses."""
+        return lax.rem(counter, jnp.asarray(self.stages, counter.dtype))
+
+    def load(self, counter, view) -> None:
+        """The producer's load of step `counter` from `view`, once its slot is free."""
+        slot = self.slot(counter)
+        pl.when(counter >= self.stages)(lambda: plgpu.barrier_wait(self.consumed.at[slot]))
+        plgpu.copy_gmem_to_smem(view, self.smem.at[slot], self.full.at[slot])
+
+    def acquire(self, counter):
+        """A consumer's wait for step `counter`'s load: its slot. Each load is waited for once (a wait takes
+        the barrier's next phase)."""
+        slot = self.slot(counter)
+        plgpu.barrier_wait(self.full.at[slot])
+        return self.smem.at[slot]
+
+    def at(self, counter):
+        """Step `counter`'s slot, its load waited for already (`acquire`, issued under an earlier step's
+        products)."""
+        return self.smem.at[self.slot(counter)]
+
+    def release(self, counter) -> None:
+        """A consumer's release of step `counter`'s slot, whose reads (and MMAs) are done."""
+        plgpu.barrier_arrive(self.consumed.at[self.slot(counter)])
+
+    def drain(self, end) -> None:
+        """The producer's wait, after its last load (step `end - 1`), for the consumers' release of each slot
+        it filled last, so no slot is freed (or reallocated) while a consumer still reads it, and every
+        release is seen."""
+        for back in range(self.stages):
+            step = end - 1 - back
+            pl.when(step >= 0)(lambda step=step: plgpu.barrier_wait(self.consumed.at[self.slot(step)]))
+
+
+def ring(block: tuple, dtype, stages: int, *, consumers: int = 1) -> dict:
+    """A `Ring`'s allocations for `pl.run_scoped`: `stages` slots of `block` in `dtype`, a load barrier
+    each, and a release barrier each that `consumers` arrive at. `Ring(**allocated)` once scoped."""
+    return {'smem': plgpu.SMEM((stages, *block), dtype),
+            'full': plgpu.Barrier(num_barriers=stages),
+            'consumed': plgpu.Barrier(num_arrivals=consumers, num_barriers=stages)}
+
+
+PRODUCER_REGISTERS = 40
+"""The registers a thread of a cooperative block's producer warpgroup holds: it only issues loads."""
+
+
+def consumer_registers(consumers: int) -> int:
+    """The registers a thread of each of `consumers` consumer warpgroups holds: the multiprocessor's 64K less
+    the producer's, shared among them in setmaxnreg's steps of 8 and at most its 256 (two consumers' 232,
+    JAX's warp-specialized pipeline's `_compute_registers(40, 2)`)."""
+    share = (64 * 1024 // 128 - PRODUCER_REGISTERS) // consumers
+    return min(256, share // 8 * 8)
+
+
+CONSUMER_REGISTERS = consumer_registers(2)
+"""Two consumer warpgroups' registers a thread (`consumer_registers`)."""
+
+
+def roles(wg, consumers: int, consumer, producer) -> None:
+    """Each warpgroup's role in a cooperative block: the `consumers` first run `consumer(wg)` with their
+    register budget raised to their share (`consumer_registers`), the last runs `producer()` with its
+    lowered to `PRODUCER_REGISTERS`."""
+    @pl.when(wg < consumers)
+    def _():
+        plgpu.set_max_registers(consumer_registers(consumers), action="increase")
+        consumer(wg)
+
+    @pl.when(wg == consumers)
+    def _():
+        plgpu.set_max_registers(PRODUCER_REGISTERS, action="decrease")
+        producer()
+
+
+class Slots:
+    """A walk step's operand slots (`Family.walk`), by stream name: each acquired when the step first reads
+    it (`slots[name]`) and released at the step's end, once its MMAs are done, unless the step `release`s it
+    sooner (a slot its last product has read)."""
+
+    def __init__(self, rings: dict[str, "Ring"], counter):
+        self._rings, self._counter = rings, counter
+        self._held: dict[str, Ref] = {}
+        self._released: set[str] = set()
+
+    def __getitem__(self, name: str):
+        if name not in self._held:
+            self._held[name] = self._rings[name].acquire(self._counter)
+        return self._held[name]
+
+    def release(self, name: str) -> None:
+        """Stream `name`'s slot given back now, its reads done (acquired first if the step read none)."""
+        self[name]
+        self._rings[name].release(self._counter)
+        self._released.add(name)
+
+    def done(self) -> None:
+        """Every slot the step has not given back given back: each consumer waits on every load (a wait
+        takes its barrier's next phase), so a slot it never read is still acquired before it is released."""
+        for name in self._rings:
+            if name not in self._released:
+                self.release(name)
+
+
+class Family(abc.ABC):
+    """An instruction family's bundle (design §6, one mainloop per overlap structure): everything a Mosaic
+    mainloop issues that the hardware decides, so a mainloop holds no instruction, layout or barrier of its
+    own. Its facts (`name`, the MMA's row unit `rows`), its launch and roles (`kernel`, `roles`), its operand
+    streams (`streams`, `opened`, `stream` the producer's, `walk` and `passed` the consumer's), its products
+    (`product` into a fresh accumulator, `register_products` and `staged_products` in place, `settled`), and
+    its accumulator's layouts (`zeros`, `full`, `iota`, `rows_of`, `as_row`)."""
+
+    name: str
+    rows: int
+
+    @abc.abstractmethod
+    def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
+               interpret: bool) -> Callable:
+        """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own."""
+
+    @abc.abstractmethod
+    def roles(self, wg, consumers: int, consumer, producer) -> None:
+        """Each role of a program: `consumer(index)` the compute roles', `producer()` the loads' where the
+        family streams from a role of its own."""
+
+    @abc.abstractmethod
+    def streams(self, blocks: dict, stages: int, consumers: int) -> dict:
+        """The scoped allocations of a stream of each `blocks[name]` `(shape, dtype)` in `stages` slots read
+        by `consumers` (`opened` once scoped)."""
+
+    @abc.abstractmethod
+    def opened(self, allocated: dict) -> dict:
+        """The streams of `streams`' allocations, scoped, by name."""
+
+    @abc.abstractmethod
+    def stream(self, streams: dict, views, lo, hi) -> None:
+        """The producer's loads of steps `lo` to `hi`, `views(step)` each stream's view, by name."""
+
+    @abc.abstractmethod
+    def walk[C](self, streams: dict, segments, start: C, shapes: tuple, interpret: bool, *,
+                first: jax.Array | int = 0) -> tuple[C, tuple[jax.Array, ...]]:
+        """A consumer's walk of `segments`, each `(step, lo, hi)`, `step(index, slots, carry, accumulators)
+        -> (carry, accumulators)` given each stream's slots (`Slots`, the streams' steps counted from
+        `first`), from `start`, with fp32 accumulators of `shapes` (zero) its products issue into in place.
+        Returns the carry and the accumulators' values."""
+
+    @abc.abstractmethod
+    def passed(self, streams: dict, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
+        """A consumer's steps `lo` to `hi` it reads none of, each load awaited and released as a reading
+        consumer's (counted from `first`); `between()` after each step."""
+
+    @abc.abstractmethod
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
+        """`lhs @ rhs` into a fresh fp32 accumulator of `shape`, its value, with `then` issued while the
+        product runs."""
+
+    @abc.abstractmethod
+    def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
+        """`lhs @ rhs` into a fresh fp32 accumulator, `lhs` in registers (16-bit), its value."""
+
+    @abc.abstractmethod
+    def register_products(self, acc, parts, rhs, interpret: bool):
+        """`acc` with `parts`' products with `rhs` issued into it in place, each part's left operand in
+        registers."""
+
+    @abc.abstractmethod
+    def staged_products(self, acc, parts, rhs, buffers, interpret: bool, *, transposed: bool = False):
+        """`register_products` of `parts` each staged in `buffers` first (its transpose the left operand
+        where `transposed`)."""
+
+    @abc.abstractmethod
+    def settled(self) -> None:
+        """Every product issued so far done."""
+
+    @abc.abstractmethod
+    def zeros(self, shape: tuple[int, ...]) -> jax.Array:
+        """fp32 zeros in the accumulator's layout (two-dimensional) or a row's (one-dimensional)."""
+
+    @abc.abstractmethod
+    def full(self, shape: tuple[int, ...], value: float) -> jax.Array:
+        """fp32 `value` in the accumulator's layout or a row's (`zeros`)."""
+
+    @abc.abstractmethod
+    def iota(self, shape: tuple[int, int], dimension: int) -> jax.Array:
+        """Indices along `dimension` of a tile in the accumulator's layout."""
+
+    @abc.abstractmethod
+    def rows_of(self, ref) -> jax.Array:
+        """A row vector read from `ref` (`[rows]`) in a row's layout."""
+
+    @abc.abstractmethod
+    def as_row(self, vector: jax.Array) -> jax.Array:
+        """`vector` `[rows]` in a row's layout, whatever its own."""
+
+
+class RingFamily(Family):
+    """A family whose loads a producer warpgroup issues by TMA into `Ring`s, beside one or two consumer
+    warpgroups at `setmaxnreg` budgets (`roles`): sm90's and sm100's. Its walk acquires each step's slots as
+    the step reads them and releases them once its products are done (`Slots`)."""
+
+    def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
+               interpret: bool) -> Callable:
+        return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
+                            num_threads=consumers + 1, thread_name="wg",
+                            compiler_params=compiler_params(approx_math=True),
+                            interpret=plgpu.InterpretGPUParams() if interpret else None)
+
+    def roles(self, wg, consumers: int, consumer, producer) -> None:
+        roles(wg, consumers, consumer, producer)
+
+    def streams(self, blocks: dict, stages: int, consumers: int) -> dict:
+        return {name: ring(shape, dtype, stages, consumers=consumers)
+                for name, (shape, dtype) in blocks.items()}
+
+    def opened(self, allocated: dict) -> dict:
+        return {name: Ring(**scoped) for name, scoped in allocated.items()}
+
+    def stream(self, streams: dict, views, lo, hi) -> None:
+        names = tuple(streams)
+        streamed(tuple(streams.values()), lambda index: tuple(views(index)[name] for name in names), lo, hi)
+
+    def walk[C](self, streams: dict, segments, start: C, shapes: tuple, interpret: bool, *,
+                first: jax.Array | int = 0) -> tuple[C, tuple[jax.Array, ...]]:
+        def slotted(step):
+            def run(index, carry, accumulators):
+                slots = Slots(streams, index - first)
+                carry, accumulators = step(index, slots, carry, accumulators)
+                # The step's products done before its slots are given back.
+                self.settled()
+                slots.done()
+                return carry, accumulators
+
+            return run
+
+        return self.accumulated(tuple((slotted(step), lo, hi) for step, lo, hi in segments), start, shapes,
+                                interpret)
+
+    @abc.abstractmethod
+    def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool
+                       ) -> tuple[C, tuple[jax.Array, ...]]:
+        """A walk of `segments`, `step(index, carry, accumulators)`, with the family's accumulators of
+        `shapes` held across it (`walk`)."""
+
+    def passed(self, streams: dict, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
+        passed(tuple(streams.values()), lo, hi, first=first, between=between)
