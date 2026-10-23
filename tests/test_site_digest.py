@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
-COPIED = ("site/scripts/digest.py", "site/snippets/cells.py", "site/snippets/cells.json",
+COPIED = ("site/snippets/cells.py", "site/snippets/cells.json",
           "site/snippets/framework.py", "site/src/data/hero.py", "site/src/data/text.py",
           "site/src/data/sampler.py", "site/src/data/capture.json")
 DIGEST = re.compile(rb"[0-9a-f]{64}")
@@ -29,6 +29,9 @@ def site(tmp_path: Path) -> Path:
 
 
 def digest(root: Path, *names: str) -> subprocess.CompletedProcess:
+    """site/scripts/digest.py run on the copy, as its own: it reads and writes the site beside it."""
+    (root / "site/scripts").mkdir(exist_ok=True)
+    shutil.copyfile(REPO / "site/scripts/digest.py", root / "site/scripts/digest.py")
     return subprocess.run([sys.executable, str(root / "site/scripts/digest.py"), *names], capture_output=True,
                           text=True, timeout=60)
 
