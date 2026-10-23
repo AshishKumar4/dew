@@ -100,8 +100,8 @@ def test_a_batchs_probabilities_are_each_bodys_alone(decide):
                  for index in range(4)],)
 
     from reference_error import seeds_for
-    print("SIZED batched", seeds_for(lambda bodies: scored(decide, bodies, together=False), draw, "batched sizing",
-                                     truth_fn=truth, dew_fn=lambda bodies: scored(decide, bodies, together=True)),
+    print("SIZED batched", seeds_for(lambda seed: scored(decide, seed, together=False), draw, "batched sizing",
+                                     truth_fn=truth, dew_fn=lambda seed: scored(decide, seed, together=True)),
           flush=True)
     assert_as_exact(lambda bodies: scored(decide, bodies, together=True),
                     lambda bodies: scored(decide, bodies, together=False), draw,
