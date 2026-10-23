@@ -156,6 +156,12 @@ def kernel_picks_path(device_kind: str) -> str:
     return os.path.join(autotune_dir(default_compilation_cache_dir()), 'kernels', f"{name}.json")
 
 
+def device_facts_path(device_kind: str) -> str:
+    """The file of a GPU's calibrated facts (`dew.nn.kernels.tuning.calibration`) for `device_kind`,
+    beside its kernel picks."""
+    return kernel_picks_path(device_kind).removesuffix('.json') + '.facts.json'
+
+
 KERNEL_TUNES = jax.make_user_context(0)
 """How many times this process's kernel picks changed (`dew.nn.kernels.tuning.tune`):
 a context JAX keys its trace and compile caches on, so a program lowered

@@ -77,6 +77,96 @@ lab verifies on the GPU. 'flash' and 'cudnn' name CUDA libraries."""
 
 
 @dataclasses.dataclass(frozen=True)
+class Architecture:
+    """The facts every device of one instruction family shares, from its compute capability (a TPU's
+    generation): the family a template's mainloop claims (`family`), its dense tensor-core FLOPs per
+    clock per multiprocessor by arithmetic mode ('16bit': fp16 or bf16 operands summed in fp32; 'tf32';
+    'fp32': IEEE fp32 on the CUDA cores, the rate a dot at Precision.HIGHEST takes), Hopper's warpgroup
+    MMA, Blackwell's tensor memory columns (PTX ISA, tcgen05.alloc), and the model values of what only a
+    measurement states, which the opt-in calibration replaces on a device (`GpuTarget.calibration`): the
+    global-memory load latency in multiprocessor clocks and the bytes the L2 serves a multiprocessor a
+    clock; on a TPU the scoped VMEM limit at XLA's default, the VMEM a kernel may raise its limit to
+    (`vmem_bytes`), and a grid step's fixed seconds."""
+
+    family: str
+    tensor_rates: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    wgmma: bool = False
+    tmem_columns: int | None = None
+    load_latency: float | None = None
+    l2_bytes_per_clock: float | None = None
+    scoped_vmem: int | None = None
+    vmem_bytes: int | None = None
+    grid_step_seconds: float | None = None
+
+
+# Tensor FLOPs per clock per multiprocessor are a datasheet's dense peak over SMs x boost clock: A100 312 TF
+# bf16 -> 2048, TF32 156 -> 1024; A10 125/62.5 -> 1024/512; L4 121/60 -> 1024/512; H100 SXM 989/495 ->
+# 4096/2048; RTX PRO 6000 Blackwell Server 500/250 -> 1024/512; B200 2250/1125 over 148 SMs at its
+# sustained 1.86 GHz -> 8192/4096, Hopper's doubled (the Blackwell whitepaper). IEEE fp32 runs an FMA a
+# CUDA-core lane a clock: 64 lanes an SM on GA100 -> 128 (A100 19.5 TF over 108 SMs x 1410 MHz), 128 on
+# TU10x, GA10x, AD10x, GH100 and GB10x/GB20x -> 256. GeForce parts of sm86 and sm89 sum 16-bit products in
+# fp32 at half the rate (the GA102 and Ada whitepapers), which their catalogued peaks give
+# (`GpuTarget.tensor_rate`). Global-memory load latency in clocks, a pointer chase's (Luo et al.,
+# "Benchmarking and Dissecting the Nvidia Hopper GPU Architecture", IPDPS 2024, arXiv 2402.13499, Table
+# IV): A100 466.3, H800 478.8, RTX 4090 541.5. L2 bytes a multiprocessor a clock, Dew's streaming probe
+# (L2PROBE, probe_l2.py) over SMs x clock: A100 5.43 TB/s -> 35.7, A10 4.74 -> 38.8, H100 SXM 13.2 -> 54.6.
+# A family no device of which was measured takes its nearest measured family's model values, said so
+# below; the opt-in calibration measures the device's own.
+_AMPERE = Architecture('mma.sync', {'16bit': 2048, 'tf32': 1024, 'fp32': 128}, load_latency=466.3,
+                       l2_bytes_per_clock=35.7)
+_AMPERE_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256}, load_latency=541.5,
+                                l2_bytes_per_clock=38.8)
+_TURING = Architecture('mma.sync', {'16bit': 1024, 'fp32': 128}, load_latency=541.5, l2_bytes_per_clock=38.8)
+_HOPPER = Architecture('wgmma', {'16bit': 4096, 'tf32': 2048, 'fp32': 256}, wgmma=True, load_latency=478.8,
+                       l2_bytes_per_clock=54.6)
+# Blackwell's tcgen05 family: no member measured, its latency and L2 Hopper's.
+_BLACKWELL = Architecture('tcgen05', {'16bit': 8192, 'tf32': 4096, 'fp32': 256}, tmem_columns=512,
+                          load_latency=478.8, l2_bytes_per_clock=54.6)
+# Consumer Blackwell (RTX 50, RTX PRO 6000) runs sm80's mma.sync forms: Ada's rates and model values.
+_BLACKWELL_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256}, load_latency=541.5,
+                                   l2_bytes_per_clock=38.8)
+# A TPU's: its MXU's FLOPs a clock (v5e 197 TF over 1.5 GHz -> 131072), the scoped VMEM limit at XLA's
+# default (v5e 16 MiB, read from a Mosaic kernel's refusal: "limit 16.00M"; v6e's pending GEMMTPU-VMEM's),
+# and a grid step's fixed seconds, the slope of time over 1 to 65536 Pallas grid steps each issuing one
+# small DMA (GEMMTPU-GRIDSTEP: v5e 0.1785 us, v6e 0.2835 us). v6e: two 256x256 MXUs, 918 TF over its
+# clock -> 524288. T4: 65 TF fp16 summed in fp32 and 8.1 TF fp32
+# over 40 SMs at 1590 MHz -> 1024 and 128.
+# VMEM capacity: v6e 128 MiB from an allocation refusal ("would exceed memory (size=134217728)",
+# GEMMTPU-GRIDSTEP@v6e1); v5e 128 MiB by Google's specification, pending GEMMTPU-VMEM@v5e1's refusal.
+_TPUS = {'v5e': Architecture('tpu', {'16bit': 131072}, scoped_vmem=16 * 2 ** 20, vmem_bytes=128 * 2 ** 20,
+                             grid_step_seconds=1.785e-7),
+         'v6e': Architecture('tpu', {'16bit': 524288}, vmem_bytes=128 * 2 ** 20, grid_step_seconds=2.835e-7)}
+
+
+def architecture(generation: str) -> Architecture | None:
+    """The instruction family `generation` belongs to, from its compute capability alone, one rule a
+    capability (a TPU's generation), so a device no row names (B300, sm103) takes its family's facts;
+    None outside every family Dew knows (a GPU before Turing, a TPU no rule states, a CPU)."""
+    found = capability(generation)
+    if found is None:
+        return _TPUS.get(generation)
+    major, minor = found
+    if (major, minor) == (7, 5):
+        return _TURING
+    if major == 8:
+        return _AMPERE if minor == 0 else _AMPERE_CONSUMER
+    if (major, minor) == (9, 0):
+        return _HOPPER
+    if major in (10, 11):
+        return _BLACKWELL
+    if major == 12:
+        return _BLACKWELL_CONSUMER
+    return None
+
+
+def family(generation: str) -> str | None:
+    """The instruction family a template's mainloop claims `generation` by ('mma.sync', 'wgmma',
+    'tcgen05', 'tpu'), seen or unseen: a claim is a family, never a list of devices."""
+    found = architecture(generation)
+    return None if found is None else found.family
+
+
+@dataclasses.dataclass(frozen=True)
 class GpuTarget:
     """One generation's device prefixes, dense peaks, block memory and measured kernel row.
 
@@ -87,22 +177,22 @@ class GpuTarget:
     also be read by a Torch reference's environment without importing JAX.
 
     `head_tile` is the chunked LM head's `(tokens, columns)` tile where one was
-    measured to beat the default (`dew.objectives.lm.chunked.chunked_tile`), and
-    `wgmma` whether the GPU's matmuls run Hopper's warpgroup MMA, which Pallas
-    Triton pipelines by holding every stage of a tile in shared memory
-    (`dew.nn.kernels.grouped_matmul`). `multiprocessors` is the canonical
-    device's streaming multiprocessors, a real device's own where it reports
-    them (`gpu_target`), which a launch sizes its programs by
-    (`dew.nn.kernels.decode_attention`). `clock_hz` and `memory_bandwidth` are the
-    canonical device's boost clock and device-memory bytes per second, and
-    `tensor_rates` the generation's dense tensor-core FLOPs per clock per
-    multiprocessor by arithmetic mode ('16bit': fp16 or bf16 operands summed in
-    fp32; 'tf32'; 'fp32': IEEE fp32 on the CUDA cores, the rate a dot at
-    Precision.HIGHEST takes), which a kernel's cost model reads
-    (`dew.nn.kernels.templates.cost`). This table is the one place a choice is
-    keyed on the hardware generation; any other code reads its facts, a library's
-    support rule the compute capability (`capability`), and a launch config the
-    autotuner (`dew.nn.kernels.tuning`), as tools/lint_slop.py's SLOP016 holds.
+    measured to beat the default (`dew.objectives.lm.chunked.chunked_tile`).
+    `multiprocessors` is the canonical device's streaming multiprocessors, a real
+    device's own where it reports them (`gpu_target`), which a launch sizes its
+    programs by (`dew.nn.kernels.decode_attention`). `clock_hz` and
+    `memory_bandwidth` are the canonical device's boost clock and device-memory
+    bytes per second, a real device's own likewise. Every other fact a kernel's
+    cost model reads (`dew.nn.kernels.templates.cost`) is its instruction
+    family's (`architecture`): its tensor rates, warpgroup MMA, tensor memory, and
+    the model values of its load latency and L2 bandwidth, which a device's
+    opt-in calibration replaces (`calibration`, `dew.nn.kernels.tuning`). A row
+    states a device's datasheet alone: its peaks, which MFU reads, and what a
+    compile-only target of it needs. This table and `architecture` are the one
+    place a choice is keyed on the hardware; any other code reads their facts, a
+    library's support rule the compute capability (`capability`), and a launch
+    config the autotuner (`dew.nn.kernels.tuning`), as tools/lint_slop.py's
+    SLOP016 holds.
     """
 
     generation: str
@@ -112,33 +202,74 @@ class GpuTarget:
     dense_peaks: Mapping[str, Mapping[str, float]] = dataclasses.field(default_factory=dict)
     aliases: tuple[str, ...] = ()
     head_tile: tuple[int, int] | None = None
-    wgmma: bool = False
     multiprocessors: int | None = None
     clock_hz: float | None = None
     memory_bandwidth: float | None = None
-    tensor_rates: Mapping[str, int] = dataclasses.field(default_factory=dict)
-    load_latency: float | None = None
-    """The generation's global-memory load latency in multiprocessor clocks, as a pointer chase measures
-    it (the kernel cost model's waiting term, `dew.nn.kernels.templates.cost`); None where no
-    measurement states it."""
-    l2_bandwidth: float | None = None
-    """The bytes a second the L2 serves all multiprocessors' loads together, as a streaming probe measures
-    it (programs re-reading a buffer the L2 holds; the kernel cost model's L2 term); None where no
-    measurement states it, the L2 term then dropped."""
-    grid_step_seconds: float | None = None
-    """A TPU grid step's fixed cost, the seconds each program's step adds beside its work, as a least-squares
-    fit over a sweep of blocks measures it (the kernel cost model's step term); None on GPUs, whose
-    pipelined steps the model prices by their latency, the term then dropped."""
-    scoped_vmem: int | None = None
-    """A TPU's scoped VMEM limit in bytes at XLA's default, past which a Mosaic kernel refuses to compile
-    (`dew.nn.attention.splash_block_sizes`); None where no measurement states it."""
-    tmem_columns: int | None = None
-    """A Blackwell multiprocessor's tensor memory columns (PTX ISA, tcgen05.alloc), the bound a kernel's
-    tensor memory takes (tests/kernel_compile.py); None on a GPU without it."""
+    calibration: Mapping[str, float] = dataclasses.field(default_factory=dict)
+    """The device's own measurements of what its family states a model value of ('load_latency',
+    'l2_bandwidth'), which the opt-in calibration takes (`dew.nn.kernels.tuning`) and caches per device
+    kind; empty, the family's values hold. Nothing measures silently."""
     int8_triton_gemm: bool = False
     """Whether XLA's Triton GEMM fusion computes int8 dots right on this GPU: on none measured, an
     A100 and an RTX PRO 6000 Blackwell, at jaxlib 0.11.2 (openxla/xla#51016;
     `dew.nn.kernels.options.compiler_options`)."""
+
+    @property
+    def architecture(self) -> Architecture:
+        """The target's instruction family's facts (`architecture`), none where it belongs to none."""
+        return architecture(self.generation) or Architecture('')
+
+    @property
+    def tensor_rates(self) -> Mapping[str, int]:
+        return self.architecture.tensor_rates
+
+    @property
+    def wgmma(self) -> bool:
+        """Whether the GPU's matmuls run Hopper's warpgroup MMA, which Pallas Triton pipelines by holding
+        every stage of a tile in shared memory (`dew.nn.kernels.grouped_matmul`)."""
+        return self.architecture.wgmma
+
+    @property
+    def tmem_columns(self) -> int | None:
+        """A Blackwell multiprocessor's tensor memory columns, the bound a kernel's tensor memory takes
+        (tests/kernel_compile.py); None on a GPU without it."""
+        return self.architecture.tmem_columns
+
+    @property
+    def scoped_vmem(self) -> int | None:
+        """A TPU's scoped VMEM limit in bytes at XLA's default, past which a Mosaic kernel refuses to
+        compile (`dew.nn.attention.splash_block_sizes`); None where no rule states it."""
+        return self.architecture.scoped_vmem
+
+    @property
+    def vmem_bytes(self) -> int | None:
+        """A TPU's VMEM capacity in bytes, the most a Mosaic kernel may raise its scoped limit to
+        (`vmem_limit_bytes`); None on GPUs and where no rule states it."""
+        return self.architecture.vmem_bytes
+
+    @property
+    def grid_step_seconds(self) -> float | None:
+        """A TPU grid step's fixed seconds beside its work (the cost model's step term); None on GPUs,
+        whose pipelined steps the model prices by their latency."""
+        return self.architecture.grid_step_seconds
+
+    @property
+    def load_latency(self) -> float | None:
+        """The global-memory load latency in multiprocessor clocks (the cost model's waiting term): the
+        device's calibrated one, else its family's model value."""
+        return self.calibration.get('load_latency', self.architecture.load_latency)
+
+    @property
+    def l2_bandwidth(self) -> float | None:
+        """The bytes a second the L2 serves all multiprocessors' loads together (the cost model's L2
+        term): the device's calibrated one, else its family's bytes a multiprocessor a clock over its
+        multiprocessors and clock; None where neither states it, the term then dropped."""
+        if 'l2_bandwidth' in self.calibration:
+            return self.calibration['l2_bandwidth']
+        rate = self.architecture.l2_bytes_per_clock
+        if rate is None or self.multiprocessors is None or self.clock_hz is None:
+            return None
+        return rate * self.multiprocessors * self.clock_hz
 
     @property
     def device_kind_prefixes(self) -> tuple[str, ...]:
@@ -188,17 +319,7 @@ class GpuTarget:
 # RTX PRO 6000 Blackwell Server 188, from NVIDIA's architecture whitepapers and datasheets.
 # Boost clock (MHz) and memory bandwidth (GB/s) of each canonical device, from the same datasheets:
 # A100 SXM4 80GB 1410/2039, A10 1695/600, L4 2040/300, H100 SXM 1830/3350, RTX PRO 6000 Blackwell
-# Server 2617/1792. Tensor FLOPs per clock per multiprocessor are a datasheet's dense peak over SMs x
-# boost clock: A100 312 TF bf16 -> 2048, TF32 156 -> 1024; A10 125/62.5 -> 1024/512; L4 121/60 ->
-# 1024/512; H100 SXM 989/495 -> 4096/2048; RTX PRO 6000 Blackwell Server 500/250 -> 1024/512.
-# GeForce parts of sm86 and sm89 sum 16-bit products in fp32 at half that rate (the GA102 and Ada
-# whitepapers); their generation's row states the data-center rate. IEEE fp32 runs an FMA a CUDA-core
-# lane a clock: 64 lanes an SM on GA100 -> 128 (A100 19.5 TF over 108 SMs x 1410 MHz), 128 on GA10x,
-# AD10x, GH100 and GB20x -> 256 (A10 31.2 TF over 72 x 1695 MHz, L4 30.3 TF over 58 x 2040 MHz; the
-# GH100 and Blackwell whitepapers' 128 fp32 lanes an SM).
-# Global-memory load latency in clocks, a pointer chase's (Luo et al., "Benchmarking and Dissecting the
-# Nvidia Hopper GPU Architecture", IPDPS 2024, arXiv 2402.13499, Table IV): A100 466.3, H800 478.8,
-# RTX 4090 541.5; sm86 and the Blackwell generations are unmeasured there.
+# Server 2617/1792. The rates, latencies and L2 a family shares are `architecture`'s.
 # Opted-in shared memory per block, in KiB: Turing64, A100163, Ampere/Ada/RTX
 # Blackwell99, Hopper227. The SM reservation is already excluded:
 # https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html
@@ -223,11 +344,9 @@ class GpuTarget:
 # by 0.7 to 18%, 0.56 ms against 0.47 at 16 rows of 8192); Qwen3.5-0.8B's 8/2 heads of 256,
 # which cuDNN does not take on sm80, the decode kernel at 1.04x the fastest in geometric mean.
 TARGETS = {target.generation: target for target in (
-    # T4: 40 SMs at a 1590 MHz boost, 320 GB/s; 65 TF fp16 summed in fp32 and 8.1 TF fp32 (the T4
-    # datasheet) -> 1024 and 128 an SM a clock.
+    # T4: 40 SMs at a 1590 MHz boost, 320 GB/s (the T4 datasheet).
     GpuTarget('sm75', 'Tesla T4', 64 * 1024, dense_peaks={'Tesla T4': {}, 'NVIDIA Tesla T4': {}},
-              aliases=('gpu:t4', 't4'), multiprocessors=40, clock_hz=1590e6, memory_bandwidth=320e9,
-              tensor_rates={'16bit': 1024, 'fp32': 128}),
+              aliases=('gpu:t4', 't4'), multiprocessors=40, clock_hz=1590e6, memory_bandwidth=320e9),
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'attention': 'flash', 'attention_narrow': 'flash', 'attention_window': 'flash',
                'attention_sinks': 'flash',
@@ -235,19 +354,16 @@ TARGETS = {target.generation: target for target in (
                'rms_norm': 'pallas', 'swiglu': 'pallas', 'gate_up': 'joined', 'delta_gates': 'joined',
                'gated_delta_rule': 'fla', 'ssd': 'pallas'},
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), head_tile=(4096, 8192),
-              multiprocessors=108, clock_hz=1410e6, memory_bandwidth=2039e9,
-              tensor_rates={'16bit': 2048, 'tf32': 1024, 'fp32': 128}, load_latency=466.3),
+              multiprocessors=108, clock_hz=1410e6, memory_bandwidth=2039e9),
     GpuTarget('sm86', 'NVIDIA A10', 99 * 1024, {'attention_narrow': 'flash'},
               {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}, multiprocessors=72,
-              clock_hz=1695e6, memory_bandwidth=600e9,
-              tensor_rates={'16bit': 1024, 'tf32': 512, 'fp32': 256}, l2_bandwidth=4.74e12),
+              clock_hz=1695e6, memory_bandwidth=600e9),
     GpuTarget('sm89', 'NVIDIA L4', 99 * 1024,
               {'attention': 'flash', 'attention_window': 'flash', 'attention_sinks': 'flash',
                'xla_triton_gemm': 'off', 'gated_delta_rule': 'fla'},
               {'NVIDIA L4': {'bf16': 121e12, 'fp8': 242.5e12},
                'NVIDIA GeForce RTX 4080': {'bf16': 97.5e12}}, ('gpu:l4', 'l4'), head_tile=(4096, 8192),
-              multiprocessors=58, clock_hz=2040e6, memory_bandwidth=300e9,
-              tensor_rates={'16bit': 1024, 'tf32': 512, 'fp32': 256}, load_latency=541.5),
+              multiprocessors=58, clock_hz=2040e6, memory_bandwidth=300e9),
     GpuTarget('sm90', 'NVIDIA H100 80GB HBM3', 227 * 1024,
               {'attention': 'flash', 'attention_narrow': 'flash', 'attention_window': 'flash',
                'attention_sinks': 'flash', 'attention_packed': 'flash', 'xla_triton_gemm': 'off',
@@ -257,30 +373,32 @@ TARGETS = {target.generation: target for target in (
         'NVIDIA H100 PCIe': {'bf16': 756e12, 'fp8': 1513e12},
         'NVIDIA H100 NVL': {'bf16': 835e12, 'fp8': 1670.5e12},
         'NVIDIA H200': {'bf16': 989e12, 'fp8': 1979e12},
-        'NVIDIA H200 NVL': {'bf16': 835e12, 'fp8': 1670.5e12}}, wgmma=True, multiprocessors=132,
-              clock_hz=1830e6, memory_bandwidth=3350e9,
-              tensor_rates={'16bit': 4096, 'tf32': 2048, 'fp32': 256}, load_latency=478.8,
-              l2_bandwidth=13.2e12),
+        'NVIDIA H200 NVL': {'bf16': 835e12, 'fp8': 1670.5e12}}, multiprocessors=132,
+              clock_hz=1830e6, memory_bandwidth=3350e9),
     # Datasheet facts alone, no routes: what a compile-only sm100 device needs (`tests/kernel_compile.py`),
     # its peaks the scoreboard's MFU; a B200 run states its own clock and bandwidth (`runtime_facts`).
     GpuTarget('sm100', 'NVIDIA B200', 227 * 1024,
               dense_peaks={'NVIDIA B200': {'bf16': 2.25e15, 'fp8': 4.5e15}}, multiprocessors=148,
-              clock_hz=1965e6, memory_bandwidth=8e12, tmem_columns=512),
+              clock_hz=1965e6, memory_bandwidth=8e12),
+    # Blackwell Ultra, datasheet alone and unmeasured, a compile-only sm103 device's facts: 160 SMs and
+    # 8 TB/s (NVIDIA, "Inside NVIDIA Blackwell Ultra"), HGX B300's 2.25/4.5 PF dense bf16/fp8 a GPU (the
+    # HGX table's sparse figures halved over 8 GPUs). No source states its clock: B200's, which steers
+    # only XLA's own fusions in a compile-only target; a B300 run reads its own (`runtime_facts`).
+    GpuTarget('sm103', 'NVIDIA B300', 227 * 1024,
+              dense_peaks={'NVIDIA B300': {'bf16': 2.25e15, 'fp8': 4.5e15}}, multiprocessors=160,
+              clock_hz=1965e6, memory_bandwidth=8e12),
     GpuTarget('sm120', 'NVIDIA RTX PRO 6000 Blackwell Server Edition', 99 * 1024,
               {'attention': 'flash', 'gated_delta_rule': 'fla'},
               dense_peaks={'NVIDIA RTX PRO 6000 Blackwell': {'bf16': 500e12, 'fp8': 1000e12}},
-              aliases=('gpu:g4', 'g4'), multiprocessors=188, clock_hz=2617e6, memory_bandwidth=1792e9,
-              tensor_rates={'16bit': 1024, 'tf32': 512, 'fp32': 256}),
+              aliases=('gpu:g4', 'g4'), multiprocessors=188, clock_hz=2617e6, memory_bandwidth=1792e9),
     GpuTarget('v2', 'TPU v2', dense_peaks={'TPU v2': {'bf16': 22.5e12}}),
     GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}),
     GpuTarget('v4', 'TPU v4', dense_peaks={'TPU v4': {'bf16': 275e12}}),
-    # Its scoped VMEM limit read from a Mosaic kernel's refusal on a v5e ("limit 16.00M"). One
-    # TensorCore a chip, of four 128 x 128 MXUs, each 16K multiply-adds a cycle, and 800 GiB/s of HBM
-    # (cloud.google.com/tpu/docs/v5e, /tpu/docs/system-architecture-tpu-vm); the clock is 197e12 / 131072,
-    # derived from the peak, no stated clock.
-    GpuTarget('v5e', 'TPU v5 lite', dense_peaks={'TPU v5 lite': {'bf16': 197e12}}, scoped_vmem=16 * 2 ** 20,
-              multiprocessors=1, clock_hz=197e12 / 131072, memory_bandwidth=800 * 2 ** 30,
-              tensor_rates={'16bit': 131072}, grid_step_seconds=0.356e-6),
+    # One TensorCore a chip, of four 128 x 128 MXUs, and 800 GiB/s of HBM (cloud.google.com/tpu/docs/v5e,
+    # /tpu/docs/system-architecture-tpu-vm); the clock is 197e12 / 131072, derived from the peak, no stated
+    # clock. Its MXU rate, scoped VMEM and grid step are its architecture's (`_TPUS`).
+    GpuTarget('v5e', 'TPU v5 lite', dense_peaks={'TPU v5 lite': {'bf16': 197e12}}, multiprocessors=1,
+              clock_hz=197e12 / 131072, memory_bandwidth=800 * 2 ** 30),
     GpuTarget('v5p', 'TPU v5', dense_peaks={'TPU v5': {'bf16': 459e12}, 'TPU v5p': {'bf16': 459e12}}),
     GpuTarget('v6e', 'TPU v6 lite', dense_peaks={'TPU v6 lite': {'bf16': 918e12}}),
 )}
@@ -400,16 +518,39 @@ def _one_kind(devices) -> None:
                          "be of one kind")
 
 
+CALIBRATED = frozenset({'load_latency', 'l2_bandwidth'})
+"""The facts a device's opt-in calibration measures in place of its family's model values
+(`Architecture`, `dew.nn.kernels.tuning.store_calibration`)."""
+
+
+def calibration(device_kind: str) -> dict[str, float]:
+    """The facts calibrated for GPUs of `device_kind` (`CALIBRATED`), read from the file the opt-in
+    calibration writes beside the kernel picks (`dew.cache.device_facts_path`): none where none was
+    written or the process keeps no picks (`dew.cache.keeps_picks`), its family's model values then
+    holding. Reading measures nothing: a process starts with no probe."""
+    import json
+    import os
+
+    from dew import cache
+
+    path = cache.device_facts_path(device_kind)
+    if not cache.keeps_picks() or not os.path.exists(path):
+        return {}
+    with open(path) as handle:
+        facts = json.load(handle)
+    return {name: float(facts[name]) for name in CALIBRATED if name in facts}
+
+
 def runtime_facts(target: GpuTarget, device) -> GpuTarget:
     """`target` with the facts a real CUDA `device` reports of itself in place of the table's: its
-    multiprocessors, its block's shared memory, its clock and memory bandwidth (`_clocks`), and
-    Hopper's warpgroup MMA, which capability 9.0 alone has. A GPU the table does not name so keeps
-    every resource a kernel's requirements and cost read."""
-    capability = _compute_capability(device)
+    multiprocessors, its block's shared memory, its clock and memory bandwidth (`_clocks`), read free at
+    runtime, its family's facts its capability's (`architecture`), and the opt-in calibration cached for
+    its kind (`calibration`). A GPU the table does not name so keeps every resource a kernel's
+    requirements and cost read."""
     facts = {'multiprocessors': _multiprocessors(device), 'shared_limit': _shared_memory(device),
              **dict(_clocks(device.local_hardware_id))}
     return dataclasses.replace(target, **{name: value for name, value in facts.items() if value is not None},
-                               wgmma=capability == '9.0' if capability else target.wgmma)
+                               calibration=calibration(device.device_kind))
 
 
 SHARED_BUDGET = 99 * 1024

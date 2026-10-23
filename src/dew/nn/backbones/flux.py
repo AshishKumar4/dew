@@ -163,10 +163,9 @@ class FluxTransformer(TextStream, nn.Module):
         time = embedding_flops(rows, TIME_FEATURES, self.features)
         count += (1 + self.guidance_embeds) * time
         count += embedding_flops(rows, pooled_features, self.features)
-        block = DoubleStreamBlock(self.features, self.heads, self.head_dim, parent=None)
-        count += self.num_layers * block.multisequence_flops(lengths, context_lengths)
-        single = FluxSingleBlock(self.features, self.heads, self.head_dim, parent=None)
-        count += self.num_single_layers * single.model_flops((image + context).astype(np.int64))
+        count += self.num_layers * self._double(parent=None).multisequence_flops(lengths, context_lengths)
+        joined = (image + context).astype(np.int64)
+        count += self.num_single_layers * self._single(parent=None).model_flops(joined)
         return (count + self._output_modulation().model_flops(rows)
                 + projection_flops(lengths, self.features, self.patch_size**2 * self.out_channels))
 
@@ -188,6 +187,20 @@ class FluxTransformer(TextStream, nn.Module):
 
         return (guided_time(embed, time, guidance, guidance_embeds=self.guidance_embeds)
                 + embedding(pooled, self.features, "text_embedder", **dense))
+
+    @nn.nowrap
+    def _double(self, **where) -> DoubleStreamBlock:
+        """A joint block as the model runs it, named by `where` (or unbound, `parent=None`, where a FLOP
+        count reads it): one factory, so the count and the execution build the same block."""
+        return DoubleStreamBlock(self.features, self.heads, self.head_dim, context_first=True,
+                                 attention_impl=self.attention_impl, dtype=self.dtype,
+                                 precision=self.precision, **where)
+
+    @nn.nowrap
+    def _single(self, **where) -> FluxSingleBlock:
+        """A single-stream block as the model runs it (`_double`)."""
+        return FluxSingleBlock(self.features, self.heads, self.head_dim, attention_impl=self.attention_impl,
+                               dtype=self.dtype, precision=self.precision, **where)
 
     @nn.nowrap
     def _output_modulation(self):
@@ -220,16 +233,12 @@ class FluxTransformer(TextStream, nn.Module):
         tables = axis_tables(flux_positions(rows, columns, context.shape[1]), self.axes_dims_rope, 10000.0,
                              dtype=np.float64)
         rotation = tuple(jnp.asarray(table[None], at_least_fp32(image.dtype)) for table in tables)
-        block = {"attention_impl": self.attention_impl, **dense}
         for index in range(self.num_layers):
-            image, context = DoubleStreamBlock(
-                self.features, self.heads, self.head_dim, context_first=True,
-                name=f"transformer_blocks_{index}", **block)(image, context, conditioned, rotation)
+            image, context = self._double(name=f"transformer_blocks_{index}")(image, context, conditioned,
+                                                                              rotation)
         joined = jnp.concatenate([context, image], axis=1)
         for index in range(self.num_single_layers):
-            joined = FluxSingleBlock(self.features, self.heads, self.head_dim,
-                                     name=f"single_transformer_blocks_{index}", **block)(
-                joined, conditioned, rotation)
+            joined = self._single(name=f"single_transformer_blocks_{index}")(joined, conditioned, rotation)
         image = joined[:, context.shape[1]:]
         scale, shift = self._output_modulation()(conditioned)
         image = modulate(layer_norm(self.dtype)(image), shift, scale)

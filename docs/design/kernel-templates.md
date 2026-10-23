@@ -14,7 +14,7 @@ There are three templates: attention, linear recurrence and GEMM. Each one meets
 2. **It is the most general:** it covers every row of its coverage table (§12). Any row marked a non-goal needs the owner's sign-off.
 3. **It is one algorithm:** the math is written once (§3). A backend contributes a mainloop built from a shared toolkit, with no math of its own (§6).
 4. **There is no duplication:** every hand kernel and external route it replaces is deleted once its scoreboard row is met. One owner exists per math (§9).
-5. **It meets the gate, both checks, as bible §7 states them:** check 1 (parity against independent float64 truth) and check 2 (every element within its certified bound), for every form, hook and gradient on every target. Check 2 is required wherever the zero-element certificate covers the operations, and its coverage grows with the template rather than waiting. The reference is never changed to match an implementation (§7's ban).
+5. **It meets the gate, both checks, as `tests/reference_error.py` states them ([Numerical accuracy](testing.md#numerical-accuracy)):** check 1 (parity against independent float64 truth) and check 2 (every element within its certified bound), for every form, hook and gradient on every target. Check 2 is required wherever the zero-element certificate covers the operations, and its coverage grows with the template rather than waiting. The reference is never changed to match an implementation ([testing](testing.md#numerical-accuracy)'s ban).
 
 **One consequence needs the owner** (§13, question 1). FlashAttention's backward computes D = rowsum(dO·O), which fails check 1 on peaked rows: 5–50× in fp32, up to 1,400× in bf16. Every D form that passes costs products FA skips; the anchored pass adds +1.03 ms on the H100, 79% of FA3's whole backward. The gate stands. The speed bar stands too, until the owner changes it: the attention backward must beat FA2/FA3 while passing both checks. The +1.03 ms is one measured form, not a lower bound on every accurate one. Candidate (b′), a masked-column P·V, could make an accurate D nearly free; it is the first measurement. The FA2/FA3 routes stay until the template beats them, and §13 question 1 asks the owner what happens if no accurate form can.
 
@@ -194,7 +194,7 @@ Rule 0 applies: use Splash's MaskInfo, with its empty/partial/full classes and p
 
 **Toolkit, per generation, shared by every template.** It reuses JAX's machinery directly, with no wrapper that renames a native API:
 - **Pipelines:**
-  - sm80, sm86, sm89 and sm120: the Pallas Triton loop, `num_stages` and `num_warps`;
+  - sm80, sm86, sm89 and sm120: Mosaic GPU's pipeline, and beside it the Pallas Triton loop (`num_stages` and `num_warps`) while that measures faster (the decision below);
   - sm90/100: Mosaic GPU's `emit_pipeline_warp_specialized`, its rings, barriers, register reallocation, TMA and clusters;
   - TPU: Mosaic TPU's pipeline and DMA.
 - **One tile scheduler:** persistent grid, LPT, rasterization and swizzle, and split-K, stream-K and split-KV work lists.
@@ -210,18 +210,20 @@ Rule 0 applies: use Splash's MaskInfo, with its empty/partial/full classes and p
 - the epilogue overlap;
 - for recurrence, its launch DAG: a fused or split solve (FlashQLA's fused prologue and fused scan against fla's four launches), and sequential or parallel state passing, chosen by B·H. Its sm90 shape includes a compute-producer warpgroup role, like FA4's correction warpgroup.
 
-**Every accelerator.** The templates target every accelerator Dew runs on, on par with the best framework on each. Each mainloop claims the generations below. A claim holds only with a measured scoreboard row on one GPU of that generation (booked through the GPU lane), in one session against the best kernel there. Until a generation has its measured row, its calls stay on today's routes (the interim selector, §7) or XLA, never on an unmeasured mainloop; a generation the template never claims runs XLA by a fixed capability rule.
+**Every accelerator.** The templates target every accelerator Dew runs on, on par with the best framework on each. A mainloop claims an instruction family, never a list of devices: on any GPU of a family it has a mainloop for, seen or unseen (a B300, sm103, is in sm100's tcgen05 family), the template compiles a kernel tailored to that device's facts and the cost model, and runs it by default. The family is the compute capability's (`generation.family`), and the facts are the device's own attributes, read free at runtime, with its family's (`generation.architecture`: tensor rates, warpgroup MMA, tensor memory, and model values of what only a measurement states, which the opt-in calibration replaces per device kind). Correctness on a new member comes from the hardware-free gates for that exact target: its deviceless compile and resource checks, and the interpret checks. The scoreboard GPUs validate the family and the cost model, one measured row per family. Only a GPU outside every claimed family runs XLA. While the interim selector stands (§7), an external route keeps a family's calls only where its measured row beats the template there, by the owner's deletion rule.
 
-| Mainloop | Backend | Claims | Instructions it relies on | One GPU per claim |
+| Mainloop | Backend | Claims (family) | Instructions it relies on | Scoreboard GPU of the family |
 |---|---|---|---|---|
-| Triton | Pallas Triton | sm80, sm86, sm89, sm120 | mma.sync, cp.async, ldmatrix | A100; A10 or RTX 3090; L4 or RTX 4090; RTX 5090 or RTX PRO 6000 |
-| Hopper | Mosaic GPU | sm90 | wgmma, TMA, warp specialization, clusters | H100 |
-| Blackwell | Mosaic GPU | sm100 | tcgen05, TMEM, 2-CTA | B200 |
+| Triton | Pallas Triton | mma.sync (sm80, sm86, sm89, sm120 and every 8.x/12.x) | mma.sync, cp.async, ldmatrix | A100; A10 or RTX 3090; L4 or RTX 4090; RTX 5090 or RTX PRO 6000 |
+| Hopper | Mosaic GPU | wgmma (9.0) | wgmma, TMA, warp specialization, clusters | H100 |
+| Blackwell | Mosaic GPU | tcgen05 (10.x/11.x: B200, B300, ...) | tcgen05, TMEM, 2-CTA | B200 |
 | TPU | Mosaic TPU | v5e, v6e and later | MXU, DMA pipeline | one chip per generation |
 
-- **sm120 (consumer Blackwell: RTX 50, RTX PRO 6000) has no tcgen05 and no TMEM.** Its tensor cores take sm80's mma.sync forms (with FP8/FP4 additions), so it runs the Triton mainloop, not the Blackwell one.
-- **sm86/sm89/sm120 differ from sm80 in shared memory per SM** (99–100 KB a block against the A100's 163 KB) and in SM count. So their tile spaces and picks are their own TARGETS rows (`generation.shared_budget`), and their scoreboard rows are measured, not inferred from the A100.
-- **sm75 (T4) and older** have no bf16 tensor cores, and Pallas Triton doesn't compile there (`generation.py`, the sm75 row of TARGETS). They run XLA.
+Mosaic GPU takes each of the Triton row's claims when its scoreboard row there meets Triton's (the decision below); until then that row holds them.
+
+- **sm120 (consumer Blackwell: RTX 50, RTX PRO 6000) has no tcgen05 and no TMEM.** Its tensor cores take sm80's mma.sync forms (with FP8/FP4 additions), so it is in the mma.sync family and runs that family's mainloop (Triton's until Mosaic's measures at or under it there), not the tcgen05 one.
+- **sm86/sm89/sm120 differ from sm80 in shared memory per SM** (99–100 KB a block against the A100's 163 KB) and in SM count. So their tile spaces and picks follow the device's own shared memory and SMs (`generation.shared_budget`, `runtime_facts`), and their family's scoreboard rows are measured, not inferred from the A100.
+- **sm75 (T4) and older** are outside every claimed family: no bf16 tensor cores, and Pallas Triton doesn't compile there (`generation.triton_runs`). They run XLA.
 
 Each mainloop's shape comes from the fastest known kernel on its hardware, built rung by rung against it:
 
@@ -256,7 +258,7 @@ Mosaic lowers and compiles in 0.9–2.9 s against Pallas Triton's 0.4–0.8 s. T
 2. One warpgroup a CTA. A two-warpgroup kernel fails because emit_pipeline's SMEM isn't a thread-collective allocation, and pre-Hopper emit_pipeline takes inputs only, so no larger CTA tile shares its B operand.
 3. A GEMM at equal tile and warps runs 1.35× Pallas Triton (128×128×32, 4 warps, 3 stages). The schedule within a K-step (synchronous mma.sync, ldmatrix interleaving, cp.async waits) is the likely cause; unconfirmed without ncu.
 
-**Decision:** sm80 stays on Pallas Triton under the pin. Mosaic sm80 is a rung re-measured at each jax bump.
+**Decision:** every NVIDIA generation's mainloop is Mosaic GPU, sm80 included. A Pallas Triton arm stays beside it only while it measures faster and the pinned jaxlib still runs it: on sm80 that is today, by the table above, and each jax bump measures it again (jax 0.12.0.1 among them).
 
 **Fallbacks, if Pallas Triton's removal forces the move:**
 - Mosaic GPU's layout inference and `emit_pipeline` are Python (`jax/experimental/mosaic/gpu`, `jax/_src/pallas/mosaic_gpu`), so causes 1 and 2 are fixable in Dew's Python-only JAX fork.
@@ -280,7 +282,7 @@ A second copy of the algebra written in triton.language is not an acceptable ans
 **No kernel tables and, in the end, no selector.** The end state is one implementation per operation, the template. What stays is the config chooser inside each template: legality, then a model over device facts that picks tiles and formulations (§3), like any kernel's heuristics, with no per-GPU entries. Measured tuning is opt-in, cached per device kind, and the user's choice. Scoreboards are evidence, never routing data: no runtime table of measured routes is built.
 
 - **Interim:** today's typed selector (`selection`, `generation.route`) keeps serving the hand-kernel and external routes until each is deleted (§9). It isn't extended, and it goes with the last route.
-- **A generation the template doesn't claim** (§6) runs XLA by a fixed capability rule, not a measured choice. Where XLA beats the template on a claimed generation, that's a template defect to fix (§6, "debug where XLA wins"), not a route.
+- **A GPU outside every family the template claims** (§6) runs XLA by a fixed capability rule, not a measured choice. Where XLA beats the template on a claimed family's GPU, that's a template defect to fix (§6, "debug where XLA wins"), not a route.
 - **Legality prunes; predictions rank.** Only hard constraints remove a configuration: it fits shared memory, registers and TMEM, and respects layout and instruction rules. Residency, predicted spills and roofline estimates are predictions, so they rank the legal space and never prune it. Today's analytic model ties all 36 attention configurations and ties the dense pick with the best tile; pruning on it would keep an arbitrary subset.
 - **Rank with complete analytic features**, one schema for all templates:
   - work per pipe and bytes per memory level;
@@ -330,13 +332,13 @@ A second copy of the algebra written in triton.language is not an acceptable ans
   - `fla_gdn.py`, `fla_kda.py`, `mamba_ssd.py`, `ssd.py`, and the portable chunk math as a separate algebra;
   - `ragged_dot.py`, `triton_dense.py`, `norm_swiglu.py` (once its callers outside GEMM move), and the per-template cost formulas;
   - `KeySpans`, when MaskInfo takes over;
-  - each external route when its row is met, and with the last of them the typed selector itself: one implementation per operation remains, the template, with XLA by a fixed capability rule on a generation it doesn't claim (§7).
+  - each external route when its row is met, and with the last of them the typed selector itself: one implementation per operation remains, the template, with XLA by a fixed capability rule on a GPU outside every family it claims (§7).
 
 ## 10. Sharding, remat and compile
 
 - **Sharding.** Kernels run per shard inside `shard_map` (`tests/sharded.py`'s contract). Context parallelism is attention's `merge` and recurrence's `compose`. Expert parallelism is GEMM's group metadata per shard.
 - **Remat.** Which residuals are saved and in what dtype belongs to the algebra (lse, D, w, u, h). The saved-or-recomputed choice for recurrence's w, u and h is a choice-layer bit. Fusion changes which named residuals exist (`decoder_block.MLP_RESIDUALS`: 'gate_proj', 'up_proj', 'down_proj'), so each fused path declares the names it saves, and the remat policies read them, not today's fixed list.
-- **Compile.** Hooks are keyed by their traced programs. Every static form, hook and configuration is a compile, so the choice layer limits configurations to buckets. Compile seconds are recorded beside step time (bible §6).
+- **Compile.** Hooks are keyed by their traced programs. Every static form, hook and configuration is a compile, so the choice layer limits configurations to buckets. Compile seconds are recorded beside step time.
 
 ## 11. How it gets built
 

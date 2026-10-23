@@ -14,6 +14,14 @@ A hook is a plain JAX callable the kernel's body traces, pointwise in the score 
 decay), with each parameter loaded as its kind says (`Param`); the softmax starts from an initial state
 (`Initial`: sinks, a resumed partial); `output_mod(o, *params)` on the normalized output tile. Absent,
 a hook adds no op.
+
+Precision, every implementation's contract: the products of the inputs accumulate in fp32, the logits'
+scale, hooks and softmax run in fp32, and the probabilities round to the values' dtype for each product
+they enter, the output's `P V` and the backward's `P^T dO`, as jax's own attention does
+(`jax.nn.dot_product_attention`'s xla path, jax/_src/nn/functions.py: `probs =
+softmax(...).astype(key.dtype)`) and FlashAttention 2's forward (csrc/flash_attn/src/flash_fwd_kernel.h:
+"Convert acc_s from fp32 to fp16/bf16" before the P V product); the output normalizes in fp32 before it
+rounds to the query's dtype (`reference`).
 """
 
 import dataclasses
@@ -45,14 +53,22 @@ class KeySpans:
     form: str = dataclasses.field(default="spans", metadata={"static": True})
 
 
+def within(keys: jax.Array, start: jax.Array, end: jax.Array,
+           ids: tuple[jax.Array, jax.Array] | None = None) -> jax.Array:
+    """Whether each key index of `keys` lies in its query's interval `start` to `end` and, with `ids`
+    (the queries' and the keys', broadcasting alike), is of its document: the keys a call's spans let a
+    query see, which the reference (`visible`) and every mainloop (`attention_algebra.modify`, the
+    backward's tiles) mask by."""
+    seen = (keys >= start) & (keys < end)
+    return seen if ids is None else seen & (ids[0] == ids[1])
+
+
 def visible(spans: KeySpans, row: jax.Array | int, queries: jax.Array, keys: jax.Array) -> jax.Array:
     """Whether each of `keys` (key indices, broadcasting) is visible to each of `queries` (query
-    indices) in batch row `row`: inside the query's interval and, with ids, of its document."""
-    start, end = spans.start[row][queries], spans.end[row][queries]
-    seen = (keys >= start) & (keys < end)
-    if spans.query_ids is not None and spans.key_ids is not None:
-        seen &= spans.query_ids[row][queries] == spans.key_ids[row][keys]
-    return seen
+    indices) in batch row `row` (`within`)."""
+    ids = (None if spans.query_ids is None or spans.key_ids is None
+           else (spans.query_ids[row][queries], spans.key_ids[row][keys]))
+    return within(keys, spans.start[row][queries], spans.end[row][queries], ids)
 
 
 def dense(spans: KeySpans) -> jax.Array:
@@ -117,8 +133,8 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     document's keys, under causality or a window a cross call's queries aligned to their document's last
     keys (`aligned_places`); `lengths` `[B]` end each row's keys and `starts` `[B]` begin them.
     Lengths and starts are int32 token coordinates; places and ids keep their own dtypes."""
-    from dew.nn.attention import window_sides
     from dew.nn.documents import CrossDocuments, aligned_places, document_ids
+    from dew.nn.visibility import window_sides
 
     index = jnp.broadcast_to(jnp.arange(queries, dtype=jnp.int32)[None, :], (batch, queries))
     place = index
@@ -601,9 +617,13 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
         nothing = jnp.zeros((batch, heads, queries), jnp.float32)
         starts = nothing - jnp.inf, nothing, nothing
     else:
-        # The softmax's initial state: its maximum, denominator and share of D's numerator, in fp32.
-        starts = (state.m.astype(jnp.float32), state.total.astype(jnp.float32),
-                  jnp.sum(state.acc.astype(jnp.float32) * cotangent, axis=-1))
+        # The softmax's initial state: its maximum, denominator and its values' mean's product with the
+        # cotangent, in fp32 (`attention_algebra.off_anchor_start`): `acc0 · dO` itself overflows where the
+        # state's sums are near fp32's largest; its mean does not.
+        total0 = state.total.astype(jnp.float32)
+        over = jnp.where(total0 > 0, 1.0 / jnp.where(total0 > 0, total0, 1.0), 0.0)
+        mean0 = state.acc.astype(jnp.float32) * over[..., None]
+        starts = state.m.astype(jnp.float32), total0, jnp.sum(mean0 * cotangent, axis=-1)
     call = padded_call(query, key, value, spans, hooks, block)
     padded_dout = jnp.pad(dout, ((0, 0), (0, call.query.shape[1] - queries), (0, 0),
                                  (0, call.value.shape[-1] - value_width)))
@@ -658,9 +678,9 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
         inverse = jnp.where(total > 0, 1.0 / jnp.where(total > 0, total, 1.0), 0.0)
         # Its maximum's cotangent, that term's score cotangent, taken whole as the reference's derivative
         # takes it; exactly 0 for a query that read only its state, whose output its maximum leaves unmoved.
-        moved = (jnp.sum(state.acc.astype(jnp.float32) * cotangent, axis=-1)
-                 - state.total.astype(jnp.float32) * delta) * inverse
-        initial = Initial(m=jnp.where(mass > 0, moved * factor, 0.0).astype(state.m.dtype),
+        # Its weight before any product, as the launch takes it (`attention_algebra.refinement`).
+        moved = (starts[2] - delta) * ((starts[1] * factor) * inverse)
+        initial = Initial(m=jnp.where(mass > 0, moved, 0.0).astype(state.m.dtype),
                           total=(-(delta * inverse) * factor).astype(state.total.dtype),
                           acc=((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
     return Gradients(dq[:, :queries, :, :width].astype(query.dtype),
