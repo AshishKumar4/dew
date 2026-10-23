@@ -23,15 +23,18 @@ def _cancelling_draw(seed):
     return (terms.astype(np.float32),)
 
 
-@jax.jit
-def _left_to_right(terms):
-    return {"sum": (terms[..., 0] + terms[..., 1]) + terms[..., 2]}
+def _in_order(*order):
+    """The sums of three terms added in `order`, the first two first."""
+    @jax.jit
+    def summed(terms):
+        first, second, third = (terms[..., index] for index in order)
+        return {"sum": (first + second) + third}
+    return summed
 
 
-@jax.jit
-def _outer_first(terms):
-    """The same sums with the last two terms swapped: the first row's comes out exact."""
-    return {"sum": (terms[..., 0] + terms[..., 2]) + terms[..., 1]}
+_left_to_right = _in_order(0, 1, 2)
+_outer_first = _in_order(0, 2, 1)
+"""The same sums with the last two terms swapped: the first row's comes out exact."""
 
 
 @jax.jit
