@@ -180,16 +180,17 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
         for looked, request in enumerate(list(self._queue)):
             if looked == self.rows or (chosen and request.served is not chosen[0][0].served):
                 break
-            if request.taken == 0:
-                if not request.future.set_running_or_notify_cancel():
-                    self._queue.remove(request)
-                    continue
-                request.future.admitted = now
             task = request.served[0]
             while request.taken < len(request.scored.rows):
                 rows = [kept.scored.rows[index] for kept, index in chosen]
                 if chosen and not task.fits([*rows, request.scored.rows[request.taken]]):
                     return chosen
+                # A request runs from its first row's pass on; one cancelled before it leaves the queue.
+                if request.taken == 0:
+                    if not request.future.set_running_or_notify_cancel():
+                        self._queue.remove(request)
+                        break
+                    request.future.admitted = now
                 chosen.append((request, request.taken))
                 request.taken += 1
         return chosen
