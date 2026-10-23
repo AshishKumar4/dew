@@ -1,7 +1,9 @@
 """An API rename keeps the landing page's recordings: site/scripts/redigest.py, on a copy of the site in a git
 repository of its own, writes the renamed programs' digests and leaves every other byte of their recordings as
-it was, and writes nothing when a change is more than a renaming or a recording was already of other code."""
+it was, and writes nothing when a change is more than a renaming or a recording was already of other code. The
+edits are found in the copied programs by parsing them, so the tests follow whatever API the page uses."""
 
+import ast
 import hashlib
 import json
 import os
@@ -60,18 +62,62 @@ def program_digest(root: Path, name: str) -> str:
                           text=True).stdout.strip()
 
 
-def edit(root: Path, relative: str, old: str, new: str, count: int = -1) -> None:
-    text = (root / relative).read_text()
-    assert old in text
-    (root / relative).write_text(text.replace(old, new, count))
+FRAMEWORK, HERO, TEXT = "site/snippets/framework.py", "site/src/data/hero.py", "site/src/data/text.py"
+
+
+def programs(root: Path) -> dict[str, str]:
+    """The page's programs, from the copy's own cells.py."""
+    code = ("import json, sys; sys.path.insert(0, 'site/snippets'); import cells; "
+            "print(json.dumps(cells.programs()))")
+    return json.loads(subprocess.run([sys.executable, "-c", code], cwd=root, check=True, capture_output=True,
+                                     text=True).stdout)
+
+
+def passed(source: str) -> list[ast.keyword]:
+    """The keyword arguments the program passes to its calls, in order."""
+    return [keyword for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Call)
+            for keyword in node.keywords if keyword.arg]
+
+
+def variables(source: str) -> list[str]:
+    """The names the program assigns at its top level, in order, each with a later use."""
+    tree = ast.parse(source)
+    used = [node.id for node in ast.walk(tree)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)]
+    assigned = [target.id for statement in tree.body if isinstance(statement, ast.Assign)
+                for target in statement.targets if isinstance(target, ast.Name)]
+    return [name for name in dict.fromkeys(assigned) if name in used]
+
+
+def rewrite(root: Path, relative: str, spans: list[tuple[ast.AST, str]]) -> None:
+    """Each node's source in `relative` replaced by its text: the spans the parse gives, back to front."""
+    lines = (root / relative).read_bytes().splitlines(keepends=True)
+    starts = [0]
+    for line in lines:
+        starts.append(starts[-1] + len(line))
+    text = b"".join(lines)
+    for node, new in sorted(spans, key=lambda span: (span[0].lineno, span[0].col_offset), reverse=True):
+        begin = starts[node.lineno - 1] + node.col_offset
+        text = text[:begin] + new.encode() + text[starts[node.end_lineno - 1] + node.end_col_offset:]
+    (root / relative).write_bytes(text)
+
+
+def renamed_keyword(root: Path, relative: str, name: str, new: str) -> None:
+    """Keyword `name` renamed `new` everywhere the program passes it."""
+    source = (root / relative).read_text()
+    spans = [(keyword, f"{new}={ast.get_source_segment(source, keyword.value)}")
+             for keyword in passed(source) if keyword.arg == name]
+    assert spans
+    rewrite(root, relative, spans)
 
 
 def test_a_rename_rewrites_the_digests_of_the_programs_it_reaches_and_keeps_every_other_byte(site):
     before = recordings(site)
-    edit(site, "site/snippets/framework.py", "OptimConfig(learning_rate=", "OptimConfig(rate=")
-    edit(site, "site/src/data/hero.py", "OptimConfig(schedule=", "OptimConfig(rate=")
-    # An API's keyword renamed while the variable of the same spelling keeps its name.
-    edit(site, "site/src/data/hero.py", "steps=steps,", "num_steps=steps,")
+    shown = programs(site)
+    shared = sorted({keyword.arg for keyword in passed(shown["lm"])} &
+                    {keyword.arg for keyword in passed(shown["hero.py"])})
+    for relative in (FRAMEWORK, HERO):
+        renamed_keyword(site, relative, shared[0], f"{shared[0]}_renamed")
     assert redigest(site).returncode == 0
     after = recordings(site)
     changed = {path for path in before if before[path] != after[path]}
@@ -88,39 +134,72 @@ def test_a_rename_rewrites_the_digests_of_the_programs_it_reaches_and_keeps_ever
     assert redigest(site).returncode == 0 and recordings(site) == after
 
 
-FRAMEWORK, TRAINS = "site/snippets/framework.py", "trainer = Trainer(LMObjective("
+def numbered(source: str) -> ast.keyword:
+    """The first keyword the program passes a number."""
+    return next(keyword for keyword in passed(source)
+                if isinstance(keyword.value, ast.Constant) and type(keyword.value.value) in (int, float))
 
 
-@pytest.mark.parametrize(("path", "old", "new"), [
-    (FRAMEWORK, "OptimConfig(learning_rate=1e-3)", "OptimConfig(learning_rate=2e-3)"),
-    (FRAMEWORK, "OptimConfig(learning_rate=1e-3)", "OptimConfig(learning_rate=1e-3, clip=1.0)"),
-    (FRAMEWORK, f"{TRAINS}model,", f"{TRAINS}net,"),
-    (FRAMEWORK, f"{TRAINS}model,", f"{TRAINS}data,"),
-    ("site/src/data/text.py", "model", "__debug__"),
-], ids=["a value", "an argument", "a variable renamed in one place", "a variable renamed to another's name",
-        "a rename that does not compile"])
-def test_a_change_that_is_more_than_a_renaming_writes_nothing(site, path, old, new):
+def value_changed(root: Path) -> None:
+    keyword = numbered((root / FRAMEWORK).read_text())
+    rewrite(root, FRAMEWORK, [(keyword.value, repr(keyword.value.value * 2 + 1))])
+
+
+def argument_added(root: Path) -> None:
+    source = (root / FRAMEWORK).read_text()
+    keyword = numbered(source)
+    rewrite(root, FRAMEWORK, [(keyword, f"{ast.get_source_segment(source, keyword)}, added=1")])
+
+
+def one_use(source: str, name: str) -> ast.Name:
+    """The last place the program reads variable `name`."""
+    return [node for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id == name][-1]
+
+
+def renamed_in_one_place(root: Path) -> None:
+    source = (root / HERO).read_text()
+    rewrite(root, HERO, [(one_use(source, variables(source)[0]), "fresh_name")])
+
+
+def renamed_to_anothers_name(root: Path) -> None:
+    source = (root / HERO).read_text()
+    first, other = variables(source)[:2]
+    rewrite(root, HERO, [(one_use(source, first), other)])
+
+
+def renamed_everywhere(root: Path, relative: str, names: tuple[str, ...], new: str) -> None:
+    """Variables `names` renamed `new` everywhere the program binds or reads them."""
+    tree = ast.parse((root / relative).read_text())
+    rewrite(root, relative, [(node, new) for node in ast.walk(tree)
+                             if isinstance(node, ast.Name) and node.id in names])
+
+
+def not_compiling(root: Path) -> None:
+    renamed_everywhere(root, TEXT, (variables((root / TEXT).read_text())[0],), "__debug__")
+
+
+def two_made_one(root: Path) -> None:
+    """Two of the hero's variables become one fresh name: a name neither had, which now means one where it
+    meant two."""
+    renamed_everywhere(root, HERO, tuple(variables((root / HERO).read_text())[:2]), "merged")
+
+
+@pytest.mark.parametrize("change", [value_changed, argument_added, renamed_in_one_place,
+                                    renamed_to_anothers_name, not_compiling, two_made_one],
+                         ids=["a value", "an argument", "a variable renamed in one place",
+                              "a variable renamed to another's name", "a rename that does not compile",
+                              "two variables made one fresh name"])
+def test_a_change_that_is_more_than_a_renaming_writes_nothing(site, change):
     before = recordings(site)
-    edit(site, path, old, new, -1 if path.endswith("text.py") else 1)
-    assert redigest(site).returncode == 1
-    assert recordings(site) == before
-
-
-def test_two_variables_renamed_to_one_fresh_name_writes_nothing(site):
-    """The hero's training and held-out pipelines both become `batches`: a name neither had, which now means
-    one where it meant two."""
-    before = recordings(site)
-    hero = "site/src/data/hero.py"
-    edit(site, hero, "data = train.", "batches = train.")
-    edit(site, hero, "held = val.", "batches = val.")
-    edit(site, hero, "fit(data, validation=held,", "fit(batches, validation=batches,")
+    change(site)
     assert redigest(site).returncode == 1
     assert recordings(site) == before
 
 
 def recorded(root: Path, source: str) -> None:
     """`source` as the text program the base recorded: text.py, its capture naming its digest."""
-    (root / "site/src/data/text.py").write_text(source)
+    (root / TEXT).write_text(source)
     capture = root / "site/public/examples/text/capture.json"
     named = json.loads(capture.read_bytes())["script_sha256"]
     capture.write_bytes(capture.read_bytes().replace(named.encode(),
@@ -152,7 +231,7 @@ def test_the_programs_parsed_roles_decide_what_is_a_rename(site, before, after, 
     variable, an f-string's conversion and literal text what it prints."""
     recorded(site, before)
     was = recordings(site)
-    (site / "site/src/data/text.py").write_text(after)
+    (site / TEXT).write_text(after)
     assert redigest(site).returncode == (0 if kept else 1)
     changed = {path for path in was if was[path] != recordings(site)[path]}
     assert changed == ({"site/public/examples/text/capture.json"} if kept else set())
@@ -165,7 +244,8 @@ def test_a_refusal_found_after_a_good_rename_writes_nothing(site):
     capture.write_bytes(capture.read_bytes().replace(b'"cell_sha256": "', b'"cell_sha256":"'))
     git(site, "commit", "-qam", "a capture written by hand")
     before = recordings(site)
-    edit(site, "site/src/data/hero.py", "OptimConfig(schedule=", "OptimConfig(rate=")
+    name = passed((site / HERO).read_text())[0].arg
+    renamed_keyword(site, HERO, name, f"{name}_renamed")
     assert redigest(site).returncode == 1
     assert recordings(site) == before
 
@@ -176,6 +256,7 @@ def test_a_recording_already_of_other_code_writes_nothing(site):
     stale.write_text(stale.read_text().replace(capture["script_sha256"], "0" * 64))
     git(site, "commit", "-qam", "a stale recording")
     before = recordings(site)
-    edit(site, "site/snippets/framework.py", "OptimConfig(learning_rate=", "OptimConfig(rate=")
+    name = passed((site / FRAMEWORK).read_text())[0].arg
+    renamed_keyword(site, FRAMEWORK, name, f"{name}_renamed")
     assert redigest(site).returncode == 1
     assert recordings(site) == before
