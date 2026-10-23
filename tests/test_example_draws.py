@@ -71,9 +71,11 @@ def normal_truth(bits):
 
 
 def example_bits(key, examples, shape):
-    """Each example's raw bits as its own stream draws them alone (`Step.sample`'s counter stream)."""
+    """Each example's raw 32-bit words as its own stream draws them alone (`Step.sample`'s counter
+    stream); a float32 normal reads one word an element, under a float64 truth too."""
     base = jax.random.fold_in(example_stream(key), stream("noise"))
-    return [np.asarray(jax.random.bits(jax.random.fold_in(base, example), shape)) for example in examples]
+    return [np.asarray(jax.random.bits(jax.random.fold_in(base, example), shape, jnp.uint32))
+            for example in examples]
 
 
 @pytest.mark.parametrize("impl", ["threefry2x32", "rbg"])
