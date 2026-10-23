@@ -413,7 +413,6 @@ def test_the_ported_rule_and_its_gradients_follow_the_recurrence(dtype, bound):
         assert relative(mine, theirs) < bound, name
 
 
-@pytest.mark.parametrize("per_key", [False, True])
 def test_the_oracle_a_chunk_at_a_time_is_the_token_recurrence_to_the_bit():
     """The float64 oracle at a model's real shape keeps one memory a chunk on the way back (`checkpointed`):
     its outputs and gradients are the token recurrence's to the bit, as it recomputes the same scan, at the
@@ -438,6 +437,7 @@ def test_the_oracle_a_chunk_at_a_time_is_the_token_recurrence_to_the_bit():
             np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs), err_msg=name)
 
 
+@pytest.mark.parametrize("per_key", [False, True])
 def test_a_sequences_first_decay_gradient_is_exactly_zero_from_no_memory(per_key):
     """The decay of a sequence's first token scales the memory before it alone, so its gradient is
     exactly zero where that memory is: a row's first sequence from a zero initial memory and any
