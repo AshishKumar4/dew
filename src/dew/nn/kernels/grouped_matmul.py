@@ -497,7 +497,8 @@ class Gmm(_Triton):
             resident=self._resident(ba, config, target))
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
-             prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
+             prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
+             *, out_dtype: str,
              trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
              dense: bool = False, config: Tile, return_residuals: bool = False):
         # Imported at first use: the kernels need jax's Pallas Triton backend,
@@ -510,14 +511,15 @@ class Gmm(_Triton):
                                     out_dtypes=tuple(jnp.dtype(d) for d in (options.pop('out_dtypes')
                                                                             or (out_dtype,))),
                                     interpret=interpret, prologue_operands=prologue_operands,
-                                    epilogue_operands=epilogue_operands, exact_sums=exact_sums, **options)
+                                    epilogue_operands=epilogue_operands, exact_sums=exact_sums, paired=paired,
+                                    **options)
             return (outs if hooks.out_dtypes else outs[0]), None
         from . import ragged_dot
         return ragged_dot.gmm(tokens, kernel, sizes, block_m=config.block_m, block_k=config.block_k,
                               block_n=config.block_n, num_warps=config.warps, num_stages=config.stages,
                               trans_rhs=trans_rhs, interpret=interpret, compute_dtype=tokens.dtype,
                               out_dtype=jnp.dtype(out_dtype), prologue_operands=prologue_operands,
-                              epilogue_operands=epilogue_operands, exact_sums=exact_sums,
+                              epilogue_operands=epilogue_operands, exact_sums=exact_sums, paired=paired,
                               **hooks.kernel_options()), None
 
 
@@ -733,7 +735,8 @@ class MosaicGmm(_Mosaic):
         return self._cost(ba, config, tiles * columns, depth / config.block_k, moved)
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
-             prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
+             prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
+             *, out_dtype: str,
              trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
              dense: bool = False, config: mosaic_gpu.Tiles, return_residuals: bool = False):
         # Never set: the launch is not eligible for exact sums; a dense call is one group, as any.
@@ -742,7 +745,7 @@ class MosaicGmm(_Mosaic):
                               out_dtype=out_dtype, multiprocessors=self._multiprocessors(interpret),
                               interpret=INTERPRETED if interpret else False,
                               prologue_operands=prologue_operands, epilogue_operands=epilogue_operands,
-                              **hooks.kernel_options()), None
+                              paired=paired, **hooks.kernel_options()), None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -940,7 +943,8 @@ class MosaicTpuGmm(_MosaicTpu):
                           2 * config.block_m * config.block_n * depth, moved, tokens.dtype)
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
-             prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
+             prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
+             *, out_dtype: str,
              trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
              dense: bool = False, config: mosaic_tpu.Blocks, return_residuals: bool = False):
         # Never set: the launch is not eligible for exact sums; a dense call is one group, as any.
@@ -948,7 +952,7 @@ class MosaicTpuGmm(_MosaicTpu):
         return mosaic_tpu.gmm(tokens, kernel, sizes, blocks=config, transpose_rhs=trans_rhs,
                               out_dtype=out_dtype, interpret=TPU_INTERPRETED if interpret else False,
                               prologue_operands=prologue_operands, epilogue_operands=epilogue_operands,
-                              **hooks.kernel_options()), None
+                              paired=paired, **hooks.kernel_options()), None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1069,32 +1073,34 @@ _GMMS = (MosaicGmm(), MosaicTpuGmm(), Gmm())
 _TGMMS = (MosaicTgmm(), MosaicTpuTgmm(), Tgmm())
 
 
-def launched_gmm(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_operands: tuple = (), *,
-                 out_dtype, trans_rhs: bool, hooks: Hooks = NO_HOOKS, interpret: bool, promoted: bool = False,
-                 dense: bool = False):
+def launched_gmm(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_operands: tuple = (),
+                 paired=None, *, out_dtype, trans_rhs: bool, hooks: Hooks = NO_HOOKS, interpret: bool,
+                 promoted: bool = False, dense: bool = False):
     """Each group's rows of `tokens` times its matrix of `kernel`, rounded to `tokens`'s dtype, through
     the launch that runs it (`_launch`), with the template's hooks (`templates.gemm.template.gemm`).
     `promoted`, the declared product's (`templates.product.Product`), adds each depth step's partial
     apart (`exact_sums`); `dense`, one group of every row (a dense product), the plain tiled kernel where
-    Triton runs it."""
+    Triton runs it. `paired`, a second matrix, makes each tile two products the epilogue combines
+    (`mosaic_gpu.gmm`'s)."""
     launches, arguments, options = _gmm_call(tokens, kernel, sizes, prologue_operands, epilogue_operands,
-                                             out_dtype=out_dtype, trans_rhs=trans_rhs, hooks=hooks,
+                                             paired, out_dtype=out_dtype, trans_rhs=trans_rhs, hooks=hooks,
                                              interpret=interpret, promoted=promoted, dense=dense)
     return _launch(launches, arguments, options)(*arguments, **options)
 
 
 def gmm_refusal(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_operands: tuple = (),
-                **options) -> str | None:
+                paired=None, **options) -> str | None:
     """Why no launch takes a `launched_gmm` call (`launch_refusal`), or None where one does."""
-    return launch_refusal(*_gmm_call(tokens, kernel, sizes, prologue_operands, epilogue_operands, **options))
+    return launch_refusal(*_gmm_call(tokens, kernel, sizes, prologue_operands, epilogue_operands, paired,
+                                     **options))
 
 
-def _gmm_call(tokens, kernel, sizes, prologue_operands: tuple, epilogue_operands: tuple, *, out_dtype,
+def _gmm_call(tokens, kernel, sizes, prologue_operands: tuple, epilogue_operands: tuple, paired, *, out_dtype,
               trans_rhs: bool, hooks: Hooks = NO_HOOKS, interpret: bool, promoted: bool = False,
               dense: bool = False) -> tuple:
     """`launched_gmm`'s launches, arguments and options."""
     arguments = (tokens, kernel.astype(tokens.dtype), sizes, tuple(prologue_operands),
-                 tuple(epilogue_operands))
+                 tuple(epilogue_operands), None if paired is None else paired.astype(tokens.dtype))
     options = {'out_dtype': jnp.dtype(out_dtype).name, 'trans_rhs': trans_rhs, 'hooks': hooks,
                'interpret': interpret, 'exact_sums': promoted, 'dense': dense}
     return _GMMS, arguments, options
