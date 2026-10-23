@@ -233,11 +233,22 @@ def _quantized(model: nn.Module, provider: QuantizationProvider, spec: Quantizat
     """`model` with the matmuls of its `entry_methods` under Qwix's `provider`, in the class Qwix
     makes for the call, a `QuantizedClass` of `spec`,
     each method tracing what it calls under the key `QUANTIZED_TRACE` gives the provider."""
-    methods = entry_methods(model)
+    quantized = quantize_with(model, provider, methods=entry_methods(model),
+                              key=(type(provider).__name__, spec))
+    type(quantized)._dew_quantization = spec
+    return quantized
+
+
+def quantize_with(model: nn.Module, provider: QuantizationProvider, *,
+                  methods: Sequence[str] = ("__call__",), key: Hashable | None = None) -> nn.Module:
+    """Qwix's `quantize_model(model, provider, methods=methods)`, each of `methods` tracing what it
+    calls under `key` in `QUANTIZED_TRACE` (by default the provider's kind and the provider): the
+    way Dew runs a model Qwix quantizes with a provider of its own, so Qwix owns the products the
+    thread tracing it forms (`dew.nn.precision.accumulated`) and no other thread's, and its traces
+    stay apart from the plain model's."""
     quantized = _qwix().quantize_model(model, provider, methods=methods)
     layer = type(quantized)
-    layer._dew_quantization = spec
-    key = (type(provider).__name__, spec)
+    key = (type(provider).__name__, provider) if key is None else key
     for name in methods:
         setattr(layer, name, _keyed(getattr(layer, name), key))
     return quantized
@@ -1389,4 +1400,4 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     return served, {**variables, "params": parameters}
 
 
-__all__ = ["InputQuantization", "Quantization", "split_columns"]
+__all__ = ["InputQuantization", "Quantization", "quantize_with", "split_columns"]

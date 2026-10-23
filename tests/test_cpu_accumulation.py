@@ -189,12 +189,17 @@ def test_a_product_that_names_its_precision_still_sums_in_float64(precision):
 def test_a_mixed_product_converts_its_operands_as_the_product_does():
     """An int32 operand multiplies a float32 one as float32, as JAX converts it: 2**24 + 1 becomes
     2**24, so the terms cancel to 0 exactly, which the float64 sum keeps; the float operand's gradient
-    is the converted integers, the integer held fixed."""
+    is the converted integers, the integer held fixed. Asked for a float64 result, the product
+    converts both to float64 and keeps the 1, as JAX's does."""
     ints = np.asarray([2 ** 24 + 1, -(2 ** 24)], np.int32)
     floats = np.ones(2, np.float32)
     assert float(jax.jit(lambda ints, floats: float32_einsum("i,i->", ints, floats))(ints, floats)) == 0.0
     gradient = jax.jit(jax.grad(lambda floats: float32_einsum("i,i->", ints, floats)))(floats)
     assert np.asarray(gradient).tolist() == [2.0 ** 24, -(2.0 ** 24)]
+    with jax.enable_x64(new_val=True):
+        wide = jax.jit(lambda ints, floats: float32_einsum("i,i->", ints, floats,
+                                                         preferred_element_type=jnp.float64))(ints, floats)
+        assert wide.dtype == jnp.float64 and float(wide) == 1.0
 
 
 def test_a_portable_recurrence_product_sums_in_float64():
