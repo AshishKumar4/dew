@@ -672,9 +672,11 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
         layouts = [run_case(case, tmp_path, fsdp=fsdp, state=copied(), steps=steps)[1] for fsdp in (1, 4)]
         drawn = {name: drawn_steps(case, tmp_path, fsdp, devices, initial, steps) for name, fsdp, devices
                  in (("one device", 1, 1), ("8x1 data", 1, None), ("2x4 fsdp", 4, None))}
-        # The drawn steps are fit's own on its batch, bit for bit, so what check 1 judges is the run's.
+        # The drawn steps are fit's own on its batch, bit for bit, so what check 1 judges is the run's:
+        # the cell's own batch in its own order, whatever selection margin a draw then asks.
+        own = (next(batches(case, encoder)()), np.arange(width))
         for fitted, stepped in zip((alone, *layouts), drawn.values(), strict=True):
-            ours = stepped(*draw(0))
+            ours = stepped(*own)
             for name, tree in ours.items():
                 held = jax.device_get(getattr(fitted, name))
                 assert jax.tree.structure(tree) == jax.tree.structure(held), name
