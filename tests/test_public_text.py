@@ -2,22 +2,16 @@
 date to a doc or a commit's message, and passes one that adds none, or one whose date is a recording's or a
 fixture's data."""
 
-import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+from tool_support import git
 
 REPO = Path(__file__).resolve().parents[1]
 GUIDE = "# Guide\n\nMeasured on 2026-09-02, before this rule.\n"
-
-
-def git(root: Path, *arguments: str) -> None:
-    subprocess.run(["git", "-C", str(root), *arguments], check=True, capture_output=True,
-                   env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
-                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
 
 
 @pytest.fixture
