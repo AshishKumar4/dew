@@ -35,6 +35,7 @@ class ProcessorCall(TypedDict, total=False):
     padding: bool
     truncation: bool
     return_tensors: str | None
+    add_special_tokens: bool
     audio: Media
     videos: Media
     video_metadata: Sequence[Mapping[str, object]]
@@ -224,6 +225,14 @@ class Processor:
         options = {"backend": "pil"} if self.config.get("model_type") == "gemma3" else {}
         return AutoProcessor.from_pretrained(str(self.directory), local_files_only=True, **options)
 
+    def host_media(self, text: str | Sequence[str], *, images: Media) -> dict[str, np.ndarray]:
+        """The source's fields for `text` and `images` as host arrays in their own dtypes, before Dew
+        aligns them to model rows: asked of the processor in the tensor type it computes in
+        (`_media_tensors`), and read as `_from_arrays` reads them, a bfloat16 field widened to
+        float32."""
+        return self._host_arrays(self.media(text=text if isinstance(text, str) else list(text), images=images,
+                                            return_tensors=self._media_tensors))
+
     def media(self, *, images: Media | None = None,
               **kwargs: Unpack[ProcessorCall]) -> Mapping[str, object]:
         """Return the source's media fields before Dew aligns them to model rows."""
@@ -298,6 +307,10 @@ class Processor:
         return "pt" if any(isinstance(part, TorchvisionBackend) for part in parts) else "np"
 
     def _from_arrays(self, values: Mapping[str, object]) -> ModelInputs:
+        """A media processor's fields as model inputs, read on the host (`_host_arrays`)."""
+        return self.from_hf(self._host_arrays(values))
+
+    def _host_arrays(self, values: Mapping[str, object]) -> dict[str, np.ndarray]:
         """A media processor's fields on the host, in their own dtypes: NumPy arrays as they are, and
         the tensors of a processor that computes in PyTorch (`_media_tensors`) read by PyTorch, which
         that processor installs, a bfloat16 one (Llama 4's pixels) widened to float32, which is exact.
@@ -316,7 +329,7 @@ class Processor:
                 raise TypeError(f"{type(self._media_reference).__name__} returned {name!r} as "
                                 f"{type(value).__name__}, which is no tensor")
             arrays[name] = (value.float() if value.dtype == torch.bfloat16 else value).numpy()
-        return self.from_hf(arrays)
+        return arrays
 
     def from_hf(self, values: Mapping[str, object]) -> ModelInputs:
         """Check a processor's raw outputs and turn them into `ModelInputs` for the device.
@@ -640,6 +653,14 @@ class Processor:
     def bos_id(self) -> int | None:
         """The id the source's tokenizer starts a sequence with, or None."""
         return _row_start(self.reference)
+
+    def encode(self, text: str, *, specials: bool) -> list[int]:
+        """`text`'s ids from the source's tokenizer: with the special tokens its encoding adds around
+        a sequence where `specials` (a BOS it opens with, an EOS it closes with, as T5's does), and
+        none otherwise."""
+        values = self.reference(text=[text], add_special_tokens=specials, padding=False, truncation=False,
+                                return_tensors=None)
+        return [int(token) for token in values["input_ids"][0]]
 
     def save_pretrained(self, directory: str | Path) -> None:
         """Save the tokenizer and the source's unchanged media processor files."""
