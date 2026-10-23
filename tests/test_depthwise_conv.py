@@ -7,7 +7,15 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact, assert_fp32_reduction_bound
+import reference_error as _gate
+from reference_error import assert_fp32_reduction_bound
+
+
+def assert_as_exact(dew_fn, reference_fn, draw, label, *, seeds, truth_fn=None):
+    count = _gate.seeds_for(reference_fn, draw, label, truth_fn=truth_fn)
+    print(f"SIZED {label!r} {count}", flush=True)
+    _gate.assert_as_exact(dew_fn, reference_fn, draw, label, seeds=count, truth_fn=truth_fn)
+    print(f"PASSED {label!r}", flush=True)
 
 from dew.nn.conv import (
     Conv,
