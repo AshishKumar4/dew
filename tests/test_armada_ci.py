@@ -195,11 +195,13 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
 def test_a_file_pytest_reports_nothing_of_is_red_unless_its_collection_shows_every_test_deselected(
         ci, tmp_path):
     """Every requested file is accounted for by its tests' rows, or by its collection: one whose every
-    test the selection deselected (`-m "not network"`) is green. A file whose tests vanish from the run
-    with no word (a hook dropping them unreported) is red, and so is every file of a run that wrote no
-    report at all, though pytest exits 0: CI never goes green on tests that did not run."""
+    test the selection deselected (`-m "not network"`) is green, though another file of its task fails. A
+    file whose tests vanish from the run with no word (a hook dropping them unreported) is red, and so is
+    every file of a run that wrote no report at all, though pytest exits 0: CI never goes green on tests
+    that did not run."""
     files = {
         "test_pass.py": "def test_ok(): pass\n",
+        "test_fails.py": "def test_no(): assert False\n",
         "test_online.py": "import pytest\n@pytest.mark.network\ndef test_fetch(): pass\n",
         "test_dropped.py": "def test_one(): pass\ndef test_two(): pass\n",
     }
@@ -211,9 +213,10 @@ def test_a_file_pytest_reports_nothing_of_is_red_unless_its_collection_shows_eve
     out = tmp_path / "verdict.json"
     ci.task("3.12", [f"tests/{name}" for name in files], "", out, 600.0)
     rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
-    assert {name: (row["exitCode"], row.get("kind")) for name, row in rows.items()} == {
-        "3.12:tests/test_pass.py": (0, None), "3.12:tests/test_online.py": (0, None),
-        "3.12:tests/test_dropped.py": (1, "whole")}
+    assert {name: row["exitCode"] for name, row in rows.items()} == {
+        "3.12:tests/test_pass.py": 0, "3.12:tests/test_fails.py": 1, "3.12:tests/test_online.py": 0,
+        "3.12:tests/test_dropped.py": 1}
+    assert rows["3.12:tests/test_dropped.py"].get("kind") == "whole"
     # A run that writes no report: pytest exits 0, and no file of it is green.
     (tmp_path / "tests" / "conftest.py").write_text(
         "def pytest_configure(config):\n    config.option.xmlpath = None\n")

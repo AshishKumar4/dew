@@ -663,12 +663,15 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                    f"{node.get('message')}" for case in own for node in case.iter("skipped")
                    if "could not import" in f"{node.get('message')} {node.text}"]
         # pytest exits 1 for failed tests and 5 for none collected; any other exit (a crash, a signal,
-        # an internal error) leaves even a written report untrustworthy, so every row it holds is red.
-        exited = ([f"pytest exited {done.returncode}" + ("" if own else f" with no report of {name}")]
-                  if done.returncode not in (0, 1, 5) or (not own and done.returncode == 1) else [])
+        # an internal error) leaves even a written report untrustworthy, so every row it holds is red. A file
+        # whose every test the selection set aside has no report however pytest exits, another file's failure
+        # among the task's included.
         counted = counts.get(name, {})
-        unaccounted = ([] if exited or (report.is_file() and (own or (counted and counted["collected"]
-                                                                      == counted["deselected"])))
+        deselected = bool(counted) and counted["collected"] == counted["deselected"]
+        exited = ([f"pytest exited {done.returncode}" + ("" if own else f" with no report of {name}")]
+                  if done.returncode not in (0, 1, 5) or (not own and not deselected and done.returncode == 1)
+                  else [])
+        unaccounted = ([] if exited or (report.is_file() and (own or deselected))
                        else [f"no evidence {name} ran: " + ("pytest wrote no report" if not report.is_file()
                                                             else "pytest reported none of its tests, and its "
                                                                  "collection shows them not all deselected")])
