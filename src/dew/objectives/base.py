@@ -886,9 +886,14 @@ class Objective(ABC, Generic[Loss, Effects]):
         return self.variables
 
     counts_tokens: bool = False
-    """Whether the objective supplies real token lengths (`real_lengths`), for throughput telemetry
-    and a run whose length is its tokens (`Trainer.fit(tokens=)`); an objective over another's
-    batches, a distillation's, counts as that one does."""
+    """Whether the objective counts the targets its loss scores (`scored_tokens`), for a run whose
+    length is its tokens (`Trainer.fit(tokens=)`) and its tokens a second; an objective over
+    another's batches, a distillation's, counts as that one does."""
+
+    def scored_tokens(self, batch: Batch) -> np.ndarray:
+        """Each row's targets the loss scores, read before device placement: what a token budget
+        commits. The FLOP count reads the inputs instead (`real_lengths`)."""
+        raise TypeError(f"{type(self).__name__} counts no tokens (counts_tokens)")
 
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """Real row (or packed-segment) lengths, read before device placement.

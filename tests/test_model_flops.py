@@ -612,7 +612,9 @@ def test_active_expert_products_match_the_executed_forward(kind):
     assert model.model_flops(lengths) == forward_products(model.apply, variables, *operands) + scalar_mix
 
 
-def test_accumulation_two_logs_the_real_tokens_of_both_microbatches():
+def test_accumulation_two_logs_the_scored_targets_of_both_microbatches():
+    """Rows of 3 and 5 real tokens score 2 and 4 targets each: an update of both microbatches
+    commits their targets, not their inputs."""
     import optax
 
     from dew.training import Trainer
@@ -628,8 +630,26 @@ def test_accumulation_two_logs_the_real_tokens_of_both_microbatches():
     trainer.fit(Loader(batches, None, batch=8, records=16), steps=2, log_every=2)
     ticks = [scalars for _, scalars in tracker.scalars if "train/tokens" in scalars]
     assert len(ticks) == 1
-    assert ticks[0]["train/tokens"] * 2 == 8 * (3 + 5)
+    assert ticks[0]["train/tokens"] * 2 == 8 * (2 + 4)
     assert ticks[0]["train/tokens_per_s"] > 0
+
+
+def test_a_token_budget_runs_until_the_targets_its_loss_scored_reach_it():
+    """Eight padded rows of 3 real tokens hold 24 inputs and score 16 targets a step, so a budget of
+    40 tokens ends at the step whose targets pass it, the third, not the second, where the inputs
+    would pass it."""
+    import optax
+
+    from dew.training import Trainer
+
+    def batches(partition):
+        while True:
+            yield {"text": np.broadcast_to((np.arange(7) < 3).astype(np.int32), (8, 7))}
+
+    objective = LMObjective(decoder().clone(num_layers=1), seq_len=6, pad_id=0)
+    state = Trainer(objective, optax.sgd(0.01), key=0).fit(Loader(batches, None, batch=8, records=None),
+                                                           tokens=40, log_every=1)
+    assert int(state.step) == 3
 
 
 def test_a_run_on_a_device_without_a_known_peak_still_reports_its_training_flops():

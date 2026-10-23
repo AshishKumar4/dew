@@ -62,7 +62,8 @@ class JepaRunConfig(RunConfig):
         if video != (models[self.model.name] is models["jepa_video_encoder"]):
             raise ValueError("a video dataset and --model jepa_video_encoder go together")
         encoder = self.model.build()
-        grid = (sample.shape[-2] // encoder.patch_size,) * 2
+        # A frame is [height, width, channels], an image's or each of a clip's.
+        grid = (sample.shape[-3] // encoder.patch_size, sample.shape[-2] // encoder.patch_size)
         fields = self.model.fields
         predictor = ModelConfig("jepa_predictor", {
             **{key: value for key, value in fields.items() if key in SHARED_MODEL_KEYS}, **self.predictor,
@@ -71,7 +72,7 @@ class JepaRunConfig(RunConfig):
         mask = MultiBlockMask.for_grid(grid, num_targets=self.num_target_blocks, scale=self.target_scale,
                                        aspect=self.target_aspect, scan_order=encoder.scan_order)
         ramp = ({} if "momentum_steps" in self.objective.fields
-                else {"momentum_steps": self.trainer.total_steps(dataset)})
+                else {"momentum_steps": self.trainer.total_updates(dataset)})
         objective = self.objective.build(encoder=encoder, predictor=predictor, mask=mask, sample=sample,
                                          **ramp)
         probes = () if not self.probe_classes else (
