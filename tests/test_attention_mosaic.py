@@ -42,11 +42,14 @@ SEEDS = 8
 against the reference's own."""
 ALL_HOOKS_SEEDS = 32
 """The draws of a site with every hook at once (`test_attention_triton.ALL_HOOKS_SEEDS`)."""
-FORWARD_HOOKS = {**{name: (names, False) for name, names in SCORE_HOOKS.items()}, "gate": ((), True),
-                 "all": (("softcap", "sinks", "alibi", "temperature", "key", "tile", "indexed"), True)}
+FORWARD_HOOKS = {**{name: (names, False) for name, names in SCORE_HOOKS.items() if name != "row-indexed"},
+                 "gate": ((), True),
+                 "all": (("softcap", "custom", "sinks", "alibi", "temperature", "key", "tile"), True)}
 """The forward's hooks: each score hook the backward differentiates (`test_attention_triton.SCORE_HOOKS`:
-every kind of parameter, the initial state as sinks or a resumed partial, a hook through a custom VJP and
-one indexed off the query's coordinates), an output gate, and all at once; each `(score hooks, gate)`."""
+every kind of parameter, the initial state as sinks or a resumed partial, a hook through a custom VJP), an
+output gate, and all at once; each `(score hooks, gate)`. The hook indexed off the query's coordinates'
+column forms a unit axis, which the mainloop refuses (`attention_mosaic.unlowered`, ledger row 1428):
+`test_a_hook_that_forms_a_unit_axis_is_refused`."""
 HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False),
               "float16-natural": (jnp.float16, True)}
 """The hooked forward's dtypes and forms: the fold over both 16-bit dtypes, and fp16's natural form (bf16's
@@ -211,6 +214,25 @@ def test_the_forward_is_on_par_under_every_hook_interpreted(hooks, dtype, natura
     interpreter: the fold over both 16-bit dtypes, and fp16's natural form (bf16's takes a headroom guard the
     mainloop has not yet)."""
     _check_hooks(hooks, dtype, natural, interpret=True)
+
+
+def test_a_hook_that_forms_a_unit_axis_is_refused():
+    """The hook indexed off the query's coordinates' column (`q_pos[:, :1]`) forms a `[bq, 1]` array, which
+    Mosaic GPU's layout inference takes no operation on: the mainloop refuses it before any launch, the
+    legality rule the route's chooser reads (ledger row 1428), where a pointwise hook lowers."""
+    queries, keys = core_geometry(CASES["causal"])
+    spans = template.spans(queries, keys, ROWS, causal=True)
+    query, key, value, _ = _drawn((ROWS, queries, 4, 2), jnp.bfloat16, width=64, keys=keys)(0)
+    for names, refused in ((("indexed",), True), (("softcap", "alibi"), False)):
+        score_mod, kinds, draw_hooks = score_hooks(names, queries, keys, 64)
+        params, initial = draw_hooks(0)
+        hooks = template.Hooks(score_mod, tuple(template.Param(param, kind)
+                                                for param, kind in zip(params, kinds, strict=True)), initial)
+        assert (attention_mosaic.unlowered(hooks, (64, 64), 64) is not None) == refused, names
+    with pytest.raises(NotImplementedError, match="unit axis"):
+        attention_mosaic.forward(query, key, value, spans,
+                                 template.Hooks(score_hooks(("indexed",), queries, keys, 64)[0]),
+                                 interpret=True, family=mosaic_sm90.WGMMA)
 
 
 @INTERPRETS

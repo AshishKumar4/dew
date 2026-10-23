@@ -23,6 +23,7 @@ import functools
 from typing import NamedTuple
 
 import jax
+import jax.extend.core as jax_core
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
@@ -41,6 +42,7 @@ from dew.nn.kernels.templates.attention import (
     Split,
     block_map,
     gradients,
+    kept_dtype,
     padded_call,
 )
 
@@ -100,6 +102,8 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                            natural=natural, initial=hooks.initial is not None)
     if spec.natural and algebra.headroom(value.dtype):
         raise NotImplementedError("the Mosaic mainloop's natural form takes no headroom guard yet")
+    if refusal := unlowered(hooks, (tiles.block_q, tiles.block_k), call.value.shape[-1]):
+        raise NotImplementedError(refusal)
     query, key, value = (_columns(array) for array in (call.query, call.key, call.value))
     out = _launch(query, key, value, _spans_of(spec, call, tiles.block_q, tiles.block_k),
                   _hooked_of(hooks, call), spec=spec, hooks=hooks, tiles=tiles, family=family,
@@ -111,6 +115,46 @@ def _columns(array: jax.Array) -> jax.Array:
     """`array` with its last axis padded to whole rows of `COLUMNS` 16-bit entries, as the family's swizzled
     tiles hold them."""
     return jnp.pad(array, ((0, 0),) * (array.ndim - 1) + ((0, -array.shape[-1] % COLUMNS),))
+
+
+def unlowered(hooks: Hooks, tile: tuple[int, int], value_width: int) -> str | None:
+    """Why Mosaic GPU cannot lower `hooks` on this mainloop's tiles (`tile`, its outputs `value_width` wide),
+    or None: a hook that forms an array of a unit axis beside a longer one (`q_pos[:, :1]`, a reshape), whose
+    every operation jax 0.11.2's Mosaic GPU layout inference finds no layout for. A legality rule, which
+    the route's chooser reads to send such a call to another route, until the fork's layout inference
+    takes unit axes (ledger row 1428)."""
+    rows, columns = tile
+
+    def entries(kind: Kind, dtype, width: int) -> jax.ShapeDtypeStruct:
+        # A parameter as `_param` gives it: a head's scalar, else the tile's entries.
+        return jax.ShapeDtypeStruct(() if kind == Kind.HEAD else (rows, width), kept_dtype(dtype))
+
+    traced = []
+    if hooks.score_mod is not None:
+        positions = jax.ShapeDtypeStruct(tile, jnp.int32)
+        traced.append(jax.make_jaxpr(hooks.score_mod)(
+            jax.ShapeDtypeStruct(tile, jnp.float32), positions, positions,
+            *(entries(param.kind, param.value.dtype, columns) for param in hooks.score_params)).jaxpr)
+    if hooks.output_mod is not None:
+        traced.append(jax.make_jaxpr(hooks.output_mod)(
+            jax.ShapeDtypeStruct((rows, value_width), jnp.float32),
+            *(entries(param.kind, param.value.dtype, value_width) for param in hooks.output_params)).jaxpr)
+    if any(_unit_axis(jaxpr) for jaxpr in traced):
+        return ("the Mosaic mainloop takes no hook that forms a unit axis beside a longer one (Mosaic GPU's "
+                "layout inference finds no layout for it)")
+    return None
+
+
+def _unit_axis(jaxpr: jax_core.Jaxpr) -> bool:
+    """Whether any operation of `jaxpr`, or of a jaxpr inside it, gives a two-dimensional array of a unit
+    axis beside a longer one."""
+    for eqn in jaxpr.eqns:
+        shapes = [getattr(var.aval, "shape", ()) for var in eqn.outvars]
+        if any(len(shape) == 2 and 1 in shape and max(shape) > 1 for shape in shapes):
+            return True
+        if any(_unit_axis(inner) for inner in jax_core.jaxprs_in_params(eqn.params)):
+            return True
+    return False
 
 
 class _Hooked(NamedTuple):
