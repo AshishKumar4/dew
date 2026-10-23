@@ -151,4 +151,7 @@ LLAMA4_TEXT = DecoderFamily(
     weight_path=partial(renamed_path, _LLAMA4_NAMES, layer_leaves=_LLAMA4_EXPERTS),
     packed=_LLAMA4_PACKED,
     preserve_source_layout=True,
+    # Llama4TextConfig's defaults for the fields its decoder reads.
+    defaults={'rms_norm_eps': 1e-5, 'num_experts_per_tok': 1, 'use_qk_norm': True,
+              'attn_temperature_tuning': True, 'floor_scale': 8192, 'attn_scale': 0.1},
 )

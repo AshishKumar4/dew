@@ -485,8 +485,6 @@ _YARN_SOURCES = (
     ("nemotron-h-tiny", lambda config: {**_without("head_dim")(config),
                                         "attention_head_dim": config["head_dim"]}),
     ("llada-tiny", _without("n_kv_heads", "head_dim")),
-    # LLaDA's ModelConfig rotates at 10000 (the release states its own 500000).
-    ("llada-tiny", lambda config: {**_without("rope_theta")(config), "rope_theta": 10000.0}),
     # Glm4MoeConfig fills an absent factor with half the head, the fixture's own.
     ("glm4-moe-tiny", lambda config: {**_without("partial_rotary_factor")(config),
                                       "rope_parameters": _without("partial_rotary_factor")(
@@ -520,6 +518,16 @@ def test_a_config_whose_class_names_no_value_for_an_unstated_field_is_refused(na
         fp32_decoder(_respelled(name, tmp_path, edit))
 
 
+def test_a_dense_llada_config_without_a_base_rotates_at_its_classs_10000(tmp_path):
+    """LLaDA's ModelConfig, which its config class starts from, rotates at 10000; the release states
+    its own 500000. Without a base the fixture computes what it computes at 10000."""
+    ids = np.load(FIXTURES / "llada-tiny" / "input_ids.npy")
+    unstated, stated = (fp32_decoder(_respelled("llada-tiny", tmp_path / where, edit)) for where, edit in (
+        ("unstated", _without("rope_theta")), ("stated", lambda config: {**config, "rope_theta": 10000.0})))
+    np.testing.assert_array_equal(np.asarray(unstated[0].apply(unstated[1], ids)),
+                                  np.asarray(stated[0].apply(stated[1], ids)))
+
+
 CLASS_DEFAULTED = ("deepseek-v2-tiny", "deepseek-v3-tiny", "gpt-oss-tiny", "mistral-tiny", "mixtral-tiny",
                    "llama4-tiny", "modernbert-tiny", "qwen2-tiny", "qwen2-moe-tiny", "qwen3-tiny",
                    "qwen3-moe-tiny")
@@ -530,7 +538,8 @@ _IDENTITY = frozenset({"model_type", "architectures", "transformers_version", "d
 
 def _defaulted_edits(name):
     """Each way to leave one of the fixture's fields to its config class: every field whose stated
-    value is the one the class fills, removed alone, a flat rope record's entries among them."""
+    value is the one the class fills, removed alone, and a flat rope record's base where it is the
+    class's `default_theta`, which is what the class fills a record's missing base with."""
     from transformers import CONFIG_MAPPING
 
     config = fixture_config(name)
@@ -538,11 +547,10 @@ def _defaulted_edits(name):
     edits = {field: _without(field) for field, value in config.items()
              if field not in _IDENTITY and field != "rope_parameters"
              and getattr(made, field, _IDENTITY) == value}
-    stated, default = config.get("rope_parameters"), getattr(made, "rope_parameters", None)
-    if isinstance(stated, dict) and isinstance(default, dict):
-        edits |= {f"rope_parameters.{key}": (lambda key: lambda config: {
-                      **config, "rope_parameters": _without(key)(config["rope_parameters"])})(key)
-                  for key, value in stated.items() if default.get(key, _IDENTITY) == value}
+    record = config.get("rope_parameters")
+    if isinstance(record, dict) and record.get("rope_theta") == getattr(type(made), "default_theta", None):
+        edits["rope_parameters.rope_theta"] = lambda config: {
+            **config, "rope_parameters": _without("rope_theta")(config["rope_parameters"])}
     return edits
 
 
