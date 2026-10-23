@@ -817,6 +817,17 @@ def gpu_needs(recorded: dict | None, budget: float) -> tuple[float, float]:
     return share, min(share * (1 + recorded.get("shares", 0)) + recorded.get("pools", 0), budget)
 
 
+EXHAUSTED = re.compile(r"RESOURCE_EXHAUSTED|[Oo]ut of memory|CUDA_ERROR_OUT_OF_MEMORY|"
+                       r"cudaErrorMemoryAllocation|failed to allocate")
+"""A failure that is the GPU's memory running out: XLA's and the CUDA driver's words for it."""
+
+
+def exhausted(failure: str) -> bool:
+    """Whether a red row's first failure (its output's first line) is the GPU's memory running out
+    (`EXHAUSTED`), which a smaller share than the file needs causes, rather than the file's own failure."""
+    return bool(EXHAUSTED.search(failure))
+
+
 def borrowed_records(names: list[str], python: str, held: str, token: str) -> dict[str, tuple[str, dict]]:
     """For each of `names`, test files no run on class `held` measured, the class and last record of
     the whole file on another class whose run measured its GPU peak, the one that holds the most
@@ -866,8 +877,9 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
     most `processes` at once. A file that runs out of a measured share is red: it took more than
     its last run, whose peak its next run is given. A file no run on this class measured borrows its
     share from the largest any other GPU class's last run measured (`borrowed`), so a first lane on
-    a class packs its files as a measured one does; one red under a borrowed share runs once more,
-    alone, with the lane's whole share, as another class's peak is no verdict of this one's. A file
+    a class packs its files as a measured one does; one red under a borrowed share whose first failure is
+    its memory running out (`exhausted`) runs once more, alone, with the lane's whole share, as that red is
+    the borrowed share's; one whose first failure is any other is red, run once. A file
     given the lane's whole share (measured on no class, measured that large, or with a child the lane
     did not follow, as the fla reference's in another environment's Python) grows its pool as it uses
     it rather than taking the share at its first GPU op (`XLA_PYTHON_CLIENT_PREALLOCATE`), so such a
@@ -919,17 +931,23 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
                     del running[future]
 
     run(tests)
-    # Red under a share another class measured: its verdict is this class's, alone with the whole share,
-    # and its row says so, as packed work run again alone is interference.
-    again = {name: shares[name] for name in borrowed if any(
-        verdict["exitCode"] != 0 for verdict in json.loads(verdicts[name].read_text())["rows"])}
+    # Red under a share another class measured, its first failure an allocation's (`exhausted`): that red is
+    # the borrowed share's, not the file's, and the file runs again alone with the lane's whole share, its row
+    # saying so with the first failure, as packed work run again alone is interference. Any other first
+    # failure (an assertion, an accuracy miss, an illegal address) is the file's: its red stands, run once.
+    again: dict[str, str] = {}
+    for name in borrowed:
+        failures = [verdict["output"].split("\n", 1)[0]
+                    for verdict in json.loads(verdicts[name].read_text())["rows"] if verdict["exitCode"] != 0]
+        if failures and exhausted(failures[0]):
+            again[name] = (f"red under a share of {shares[name] / 2 ** 30:.1f} GiB borrowed from "
+                           f"{borrowed[name][0]}'s measurement, out of memory ({failures[0]}); run again "
+                           "alone with the lane's whole share")
     for name in again:
         shares[name] = holds[name] = budget
     run(list(again))
-    for name, share in again.items():
+    for name, interference in again.items():
         rows = json.loads(verdicts[name].read_text())["rows"]
-        interference = (f"red under a share of {share / 2 ** 30:.1f} GiB borrowed from {borrowed[name][0]}'s "
-                        "measurement, run again alone with the lane's whole share")
         verdicts[name].write_text(json.dumps({"rows": [{**verdict, "interference": interference}
                                                        for verdict in rows]}))
     rows = [verdict for name in tests for verdict in json.loads(verdicts[name].read_text())["rows"]]
