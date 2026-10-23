@@ -14,16 +14,18 @@ from dew.eval import CLIPDistance, CLIPScore
 CLIP_TINY = Path(__file__).resolve().parent / "fixtures" / "clip" / "tiny"
 
 
-def clip_fixture():
+def clip_fixture(conditions=None):
     """The reference's inputs and embeddings, and the sampler-shaped batch
-    that carries them: images in [-1, 1] and the tokenized captions."""
+    that carries them: images in [-1, 1] and the captions as text, beside
+    the fields a run's `conditions` tokenized them into."""
     reference = np.load(CLIP_TINY / "reference.npz")
-    recipe = json.loads((CLIP_TINY / "prompts.json").read_text())["images"]
+    fixture = json.loads((CLIP_TINY / "prompts.json").read_text())
+    recipe = fixture["images"]
     images = np.random.RandomState(recipe["seed"]).randint(
         0, 256, tuple(recipe["shape"]), dtype=np.uint8)
     generated = jnp.asarray(images, jnp.float32) / 127.5 - 1.0
-    batch = {"text": {"input_ids": reference["input_ids"],
-                      "attention_mask": reference["attention_mask"]}}
+    batch = {"caption": np.asarray(fixture["prompts"], object),
+             **({} if conditions is None else {"text": conditions(fixture["prompts"])})}
     image = reference["image_embeds"].astype(np.float64)
     text = reference["text_embeds"].astype(np.float64)
     cosine = ((image * text).sum(-1)
@@ -53,6 +55,24 @@ def test_clip_metric_scores_the_reference_cosine():
 
     expected = np.mean(1.0 - cosine)
     assert abs(score - expected) < CLIP_TOLERANCE, f"{score} against {expected}"
+
+
+@pytest.mark.parametrize("conditions", ["t5/tiny", "tokenizers/gpt2"])
+def test_a_validation_pass_scores_its_captions_in_clips_own_words(conditions):
+    """A run whose conditions read the captions through another tokenizer (T5's SentencePiece, GPT-2's
+    byte-level BPE) holds them in that tokenizer's ids; the CLIP metrics score the captions
+    themselves, as `CLIPScore.score` does a set of prompts, so the condition's ids never reach
+    CLIP."""
+    from dew.data.text import load_tokenizer
+
+    tokenizer = load_tokenizer(str(Path(__file__).resolve().parent / "fixtures" / conditions))
+    generated, batch, _ = clip_fixture(
+        lambda prompts: dict(tokenizer(prompts, padding=True, return_tensors="np")))
+    metric = CLIPScore(str(CLIP_TINY))
+    pooled = metric.finalize(metric(ImageGrid(generated), batch))
+    prompts = json.loads((CLIP_TINY / "prompts.json").read_text())["prompts"]
+    images = np.load(CLIP_TINY / "reference.npz")["images"]
+    assert pooled == pytest.approx(metric.score(images, prompts), abs=1e-9)
 
 
 def test_clip_score_over_images_and_prompts_is_the_metric_number():
