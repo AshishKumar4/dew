@@ -109,6 +109,9 @@ class Wgmma(mosaic.RingFamily):
     def rows_of(self, ref) -> jax.Array:
         return plgpu.load(ref, layout=self.row, optimized=False)
 
+    def columns_of(self, ref) -> jax.Array:
+        return plgpu.load(ref, layout=self.column, optimized=False)
+
     def as_row(self, vector: jax.Array) -> jax.Array:
         return plgpu.layout_cast(vector, self.row)
 

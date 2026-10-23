@@ -34,7 +34,9 @@ from dew.nn.kernels.templates.attention import (
     Gradients,
     Hooks,
     KeySpans,
+    PaddedCall,
     Split,
+    block_map,
     gradients,
     padded_call,
 )
@@ -84,8 +86,6 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     tiles = DEFAULTS[family.name] if tiles is None else tiles
     if hooks is not None and hooks != Hooks():
         raise NotImplementedError("the Mosaic mainloop takes no hooks yet")
-    if spans.form not in ("full", "causal"):
-        raise NotImplementedError(f"the Mosaic mainloop takes full and causal calls, not {spans.form!r} ones")
     if jnp.dtype(query.dtype) not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
         raise NotImplementedError(f"the Mosaic mainloop takes 16-bit operands, not {jnp.dtype(query.dtype)}")
     width, value_width = query.shape[3], value.shape[3]
@@ -93,15 +93,48 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
         raise NotImplementedError("the Mosaic mainloop's output reuses the query's stage: equal head widths")
     block = max(family.consumers * tiles.block_q, tiles.block_k)
     call = padded_call(query, key, value, spans, Hooks(), block)
-    spec = algebra.Forward(spans.form, spans.keys, ids=False, scale=width ** -0.5 if scale is None else scale,
-                           natural=natural)
+    spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None,
+                           scale=width ** -0.5 if scale is None else scale, natural=natural)
     if spec.natural and algebra.headroom(value.dtype):
         raise NotImplementedError("the Mosaic mainloop's natural form takes no headroom guard yet")
     # The family's swizzled tiles hold whole rows of `COLUMNS` 16-bit entries.
     query, key, value = (jnp.pad(array, ((0, 0),) * 3 + ((0, -array.shape[3] % COLUMNS),))
                          for array in (call.query, call.key, call.value))
-    out = _launch(query, key, value, spec=spec, tiles=tiles, family=family, interpret=interpret)
+    out = _launch(query, key, value, _spans_of(spec, call, tiles.block_q, tiles.block_k), spec=spec,
+                  tiles=tiles, family=family, interpret=interpret)
     return out[:, :call.queries, :, :value_width]
+
+
+class _Spans(NamedTuple):
+    """A spans call's arrays as its programs read them: each query's interval `start`, `end` `[B, Qp]`, and
+    its block map at the launch's tiles (`attention.block_map`): the key tiles each query block reads, `lo`,
+    `hi`, and sees whole, `full_lo`, `full_hi` (`[B, Qp // block_q]`), and the query tiles reading each key
+    block, `q_lo`, `q_hi` (`[B, Kp // block_k]`); with documents, the queries' and keys' ids (`[B, Qp]`,
+    `[B, Kp]`) and the blocks' uniform ones (`query_doc`, `key_doc`)."""
+
+    start: jax.Array
+    end: jax.Array
+    lo: jax.Array
+    hi: jax.Array
+    full_lo: jax.Array
+    full_hi: jax.Array
+    q_lo: jax.Array
+    q_hi: jax.Array
+    query_ids: jax.Array | None = None
+    key_ids: jax.Array | None = None
+    query_doc: jax.Array | None = None
+    key_doc: jax.Array | None = None
+
+
+def _spans_of(spec: algebra.Forward, call: PaddedCall, block_q: int, block_k: int) -> _Spans | None:
+    """A spans call's `_Spans` at `block_q` by `block_k` tiles over its padded keys (None for a full or
+    causal call, whose programs take their tiles from their places)."""
+    if spec.form != "spans":
+        return None
+    blocks = block_map(KeySpans(call.start, call.end, call.query_ids, call.key_ids, call.key.shape[1]),
+                       block_q, block_k)
+    return _Spans(call.start, call.end, blocks.lo, blocks.hi, blocks.full_lo, blocks.full_hi, blocks.q_lo,
+                  blocks.q_hi, call.query_ids, call.key_ids, blocks.query_doc, blocks.key_doc)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -142,15 +175,53 @@ class _Program:
             whole = jnp.minimum(lax.div(first, self.tiles.block_k), whole)
         return jnp.minimum(jnp.maximum(whole, 0), walked)
 
+    def reach(self, first, spans: _Spans | None, row):
+        """The key tiles a query block from `first` reads, `[lo, hi)`, and whether it sees tile `index` whole
+        (`whole(index)`, a tile that takes no mask): a full or causal call's from its places (`walked`,
+        `whole`), a spans call's from its block map (`spans`, batch row `row`), whole where the ids of
+        both blocks agree too."""
+        if spans is None:
+            walked = self.walked(first)
+            count = self.whole(first, walked)
+            return jnp.int32(0), walked, lambda index: index < count
+        block = lax.div(first, self.tiles.block_q)
+        full_lo, full_hi = spans.full_lo[row, block], spans.full_hi[row, block]
+
+        def whole(index):
+            inside = (index >= full_lo) & (index < full_hi)
+            if spans.query_doc is None or spans.key_doc is None:
+                return inside
+            doc = spans.query_doc[row, block]
+            return inside & (doc != 0) & (doc == spans.key_doc[row, index])
+
+        return spans.lo[row, block], spans.hi[row, block], whole
+
+
+def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, shape: tuple[int, int],
+            q_pos, columns) -> algebra.Coords:
+    """A tile's coordinates (`algebra.Coords`): its queries' and keys' places from `first` and `k_first`
+    (`q_pos` the query places, `columns` the tile's key offsets, in the accumulator's layout), and a spans
+    call's queries' intervals and, with documents, both blocks' ids."""
+    k_pos = k_first + columns
+    if spans is None:
+        return algebra.Coords(q_pos, k_pos)
+    rows = (row, pl.ds(first, shape[0]))
+    bounds = family.rows_of(spans.start.at[rows]), family.rows_of(spans.end.at[rows])
+    ids = None
+    if spans.query_ids is not None and spans.key_ids is not None:
+        ids = (family.rows_of(spans.query_ids.at[rows]),
+               family.columns_of(spans.key_ids.at[row, pl.ds(k_first, shape[1])]))
+    return algebra.Coords(q_pos, k_pos, bounds, ids)
+
 
 def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_view, q_smem, q_loaded, streams,
-              turn, schedule, most, first, *, interpret: bool):
-    """A consumer's query block: its walk of the key tiles through the family's streams (`algebra.plain_step`
-    a step), then its output stored through its query stage."""
+              turn, streamed: tuple, first, spans: _Spans | None, row, *, interpret: bool):
+    """A consumer's query block: its walk of the key tiles it reads through the family's streams
+    (`algebra.plain_step` a step), passing those of the program's `streamed` range its partner alone reads,
+    then its output stored through its query stage."""
     family, tiles = program.family, program.tiles
     shape = (tiles.block_q, tiles.block_k)
-    walked = program.walked(first)
-    whole = program.whole(first, walked)
+    lo, hi, whole = program.reach(first, spans, row)
     family.loaded(((q_view, q_smem, q_loaded),))
     q = family.held(q_smem)
     q_pos, columns = first + family.iota(shape, 0), family.iota(shape, 1)
@@ -160,14 +231,16 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     # (`algebra.Keys.accumulate`), a constant no loop may carry.
     rows = (family.full((tiles.block_q,), -jnp.inf), family.zeros((tiles.block_q,)))
     pl.when(consumer == 1)(turn)
+    # The slots before this block's first tile its partner reads, the turns it would have taken.
+    family.passed(streams, streamed[0], lo, first=streamed[0], between=lambda: (turn(), turn()))
 
     def step(index, slots, rows, accumulators):
         s = family.product(q, slots["keys"].transpose((1, 0)), shape, turn)
         slots.release("keys")
-        coords = algebra.Coords(q_pos, index * tiles.block_k + columns)
+        coords = _coords(family, spans, row, first, index * tiles.block_k, shape, q_pos, columns)
         # A tile every query sees whole takes no mask: one walk, the choice a tile's (a walk of each, these
         # rings' waits and arrivals in two loops, faulted on an H100 under jax 0.11.2's lowering).
-        logits, products = algebra.logits_of(spec, s, coords, masked=index >= whole)
+        logits, products = algebra.logits_of(spec, s, coords, masked=jnp.logical_not(whole(index)))
 
         def load():
             # The value slot, once the partner's products are issued: its turn on the tensor cores is over
@@ -189,17 +262,18 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         state = algebra.plain_step(spec, state, algebra.Keys(coords, logits, load, dot, accumulate, products))
         return (state.m, state.total), tuple(held)
 
-    rows, (acc,) = family.walk(streams, ((step, 0, walked),), rows, ((tiles.block_q, width),), interpret)
+    rows, (acc,) = family.walk(streams, ((step, lo, hi),), rows, ((tiles.block_q, width),), interpret,
+                               first=streamed[0])
     state = algebra.Partial(acc, *rows)
-    # The slots a consumer whose diagonal ends first leaves its partner, the turns it would have taken.
-    family.passed(streams, walked, most, between=lambda: (turn(), turn()))
+    # The slots past this block's last tile (a causal block whose diagonal ends first) its partner reads.
+    family.passed(streams, hi, streamed[1], first=streamed[0], between=lambda: (turn(), turn()))
     pl.when(consumer == 0)(turn)
     out, _, _ = algebra.finish(spec, state, initial=False)
     family.stored((out,), (out_view,), smem=q_smem)
 
 
-def _launch(query, key, value, *, spec: algebra.Forward, tiles: Tiles, family: mosaic.Family,
-            interpret: bool):
+def _launch(query, key, value, spans: _Spans | None, *, spec: algebra.Forward, tiles: Tiles,
+            family: mosaic.Family, interpret: bool):
     batch, queries, heads, width = query.shape
     keys_count, kv_heads = key.shape[1], key.shape[2]
     group, consumers = heads // kv_heads, family.consumers
@@ -209,12 +283,18 @@ def _launch(query, key, value, *, spec: algebra.Forward, tiles: Tiles, family: m
     # No more stages than key tiles: a slot past them would load past the keys.
     program = _Program(family, tiles, steps, min(tiles.stages, steps), spec.keys, spec.form == "causal")
 
-    def body(q_ref, k_ref, v_ref, out_ref, q_smem, q_loaded, schedule, *, streams):
+    def body(q_ref, k_ref, v_ref, *refs, streams):
+        spans_refs, (out_ref, q_smem, q_loaded, schedule) = refs[:len(leaves)], refs[len(leaves):]
+        spans_of = None if spans is None else treedef.unflatten(spans_refs)
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
         views = _views_of({"keys": k_ref, "values": v_ref}, row, lax.div(head, group), block_k)
         streams = family.opened(streams, views)
         pair_first = program.query_tile(queries // pair) * pair
-        most = program.walked(pair_first + pair - block_q)
+        # The key tiles the program streams: those any of its consumers' blocks reads.
+        reaches = [program.reach(pair_first + index * block_q, spans_of, row)[:2]
+                   for index in range(consumers)]
+        streamed = (functools.reduce(jnp.minimum, [lo for lo, _ in reaches]),
+                    functools.reduce(jnp.maximum, [hi for _, hi in reaches]))
 
         def turn(*, arrive: bool = True, wait: bool = True):
             # The consumers' turns on the tensor cores, where a program has two (a schedule barrier).
@@ -227,18 +307,19 @@ def _launch(query, key, value, *, spec: algebra.Forward, tiles: Tiles, family: m
             first = pair_first + index * block_q
             rows = (row, pl.ds(first, block_q), head)
             _consumer(program, spec, index, q_ref.at[rows], out_ref.at[rows], q_smem.at[index],
-                      q_loaded.at[index], streams, turn, schedule, most, first, interpret=interpret)
+                      q_loaded.at[index], streams, turn, streamed, first, spans_of, row, interpret=interpret)
 
         def producer():
-            family.stream(streams, views, 0, most)
+            family.stream(streams, views, *streamed)
 
         family.roles(consumers, consumer, producer)
 
     blocks = {"keys": ((block_k, width), key.dtype), "values": ((block_k, value.shape[-1]), value.dtype)}
+    leaves, treedef = jax.tree.flatten(spans)
 
-    def entry(q_ref, k_ref, v_ref, out_ref):
+    def entry(*refs):
         family.scoped(
-            functools.partial(body, q_ref, k_ref, v_ref, out_ref),
+            functools.partial(body, *refs),
             plgpu.SMEM((consumers, block_q, width), query.dtype),
             plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_arrivals=consumers),
             streams=family.streams(blocks, program.stages, consumers))
@@ -246,7 +327,7 @@ def _launch(query, key, value, *, spec: algebra.Forward, tiles: Tiles, family: m
     return family.kernel(entry, out_type=jax.ShapeDtypeStruct((batch, queries, heads, value.shape[-1]),
                                                               query.dtype),
                          grid=(heads, queries // pair, batch), grid_names=("heads", "q_tiles", "batch"),
-                         consumers=consumers, interpret=interpret)(query, key, value)
+                         consumers=consumers, interpret=interpret)(query, key, value, *leaves)
 
 
 BACKWARD_DEFAULTS = {"wgmma": Tiles(64, 64, 2)}
