@@ -37,14 +37,22 @@ Decision Index requires of an engine:
     python -m decision_index pipeline --edition 0.2.1 --engine http \\
         --option base_url=http://127.0.0.1:8000 --out runs/di-encoder
 
-Requests are answered one at a time, each in one forward pass per budget's worth of
-question rows; `GET /health` answers once the model is loaded.
+Concurrent requests are answered together: those that arrive within
+`--batch-window` seconds of the first, up to `--max-batch`, go through one
+`systemone` call, which scores their rows in one forward pass per budget's
+worth of them and answers each as it would alone; a request Jev would refuse
+gets its own 422 and the others their answers. `GET /health` answers once the
+model is loaded.
 """
 
+import contextlib
 import hmac
 import json
 import os
+import queue
 import threading
+import time
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 
 import tyro
@@ -57,14 +65,91 @@ from starlette.routing import Route
 from dew.decision import Decide
 
 
-def app(decide: Decide, *, api_key: str | None = None, details: bool = False,
-        strict: bool = False, whole: bool = False) -> Starlette:
-    """A Starlette app answering `POST /v1/systemone` with `decide`."""
-    one_at_a_time = threading.Lock()
+class Batches:
+    """Requests answered together: a worker thread takes the first request waiting, those that
+    arrive within `window` seconds of it, up to `most`, and answers them through one `systemone`
+    call, each request's own response or refusal through its own future. The worker runs between
+    `start` and `stop`, the app's lifespan."""
 
-    def answer(body: dict) -> dict:
-        with one_at_a_time:
-            return decide.systemone(body, details=details, strict=strict, whole=whole)
+    def __init__(self, decide: Decide, *, window: float, most: int, **answering: bool):
+        if window < 0 or most < 1:
+            raise ValueError(f"a batch waits a window of 0 s or more for 1 request or more, not "
+                             f"{window} s and {most}")
+        self.decide, self.window, self.most, self.answering = decide, window, most, answering
+        self.waiting: queue.Queue[tuple[dict, Future] | None] = queue.Queue()
+        self.worker: threading.Thread | None = None
+        self.runner: ThreadPoolExecutor | None = None
+
+    def start(self) -> None:
+        self.runner = ThreadPoolExecutor(1, thread_name_prefix="decision-batch")
+        self.worker = threading.Thread(target=self._serve, name="decision-batches")
+        self.worker.start()
+
+    def stop(self) -> None:
+        assert self.worker is not None and self.runner is not None
+        self.waiting.put(None)
+        self.worker.join()
+        self.runner.shutdown()
+        self.worker = self.runner = None
+
+    def answer(self, body: dict) -> dict:
+        """`body`'s response, from the batch it joins; its refusal raised as a ValueError."""
+        if self.worker is None:
+            raise RuntimeError("the app answers within its lifespan, which starts its batches")
+        answered: Future = Future()
+        self.waiting.put((body, answered))
+        return answered.result()
+
+    def _serve(self) -> None:
+        while (first := self.waiting.get()) is not None:
+            batch, closing = [first], False
+            deadline = time.monotonic() + self.window
+            while len(batch) < self.most and (left := deadline - time.monotonic()) > 0:
+                try:
+                    more = self.waiting.get(timeout=left)
+                except queue.Empty:
+                    break
+                if more is None:
+                    closing = True
+                    break
+                batch.append(more)
+            self._answer(batch)
+            if closing:
+                return
+
+    def _answer(self, batch: list[tuple[dict, Future]]) -> None:
+        # The call runs on the runner, whose future carries what it raised: a batch that fails whole
+        # tells every request of it why.
+        assert self.runner is not None
+        called = self.runner.submit(self.decide.systemone, [body for body, _ in batch], **self.answering)
+        wait([called])
+        failed = called.exception()
+        if failed is not None:
+            for _, answered in batch:
+                answered.set_exception(failed)
+            return
+        for (_, answered), response in zip(batch, called.result(), strict=True):
+            if isinstance(response, ValueError):
+                answered.set_exception(response)
+            else:
+                answered.set_result(response)
+
+
+def app(decide: Decide, *, api_key: str | None = None, details: bool = False,
+        strict: bool = False, whole: bool = False, batch_window: float = 0.005,
+        max_batch: int = 32) -> Starlette:
+    """A Starlette app answering `POST /v1/systemone` with `decide`, concurrent requests together
+    (`Batches`)."""
+    batches = Batches(decide, window=batch_window, most=max_batch, details=details, strict=strict,
+                      whole=whole)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_):
+        batches.start()
+        try:
+            yield
+        finally:
+            batches.stop()
 
     async def systemone(request: Request) -> JSONResponse:
         given = request.headers.get("authorization", "")
@@ -74,7 +159,7 @@ def app(decide: Decide, *, api_key: str | None = None, details: bool = False,
             body = json.loads(await request.body())
             if not isinstance(body, dict):
                 raise ValueError("the request body is a JSON object with state and questions")
-            return JSONResponse(await run_in_threadpool(answer, body))
+            return JSONResponse(await run_in_threadpool(batches.answer, body))
         except ValueError as refused:
             return JSONResponse({"error": str(refused)}, status_code=422)
 
@@ -82,7 +167,7 @@ def app(decide: Decide, *, api_key: str | None = None, details: bool = False,
         return JSONResponse({"model": decide.name})
 
     return Starlette(routes=[Route("/v1/systemone", systemone, methods=["POST"]),
-                             Route("/health", health, methods=["GET"])])
+                             Route("/health", health, methods=["GET"])], lifespan=lifespan)
 
 
 @dataclass(frozen=True)
@@ -106,6 +191,10 @@ class Options:
     """For a layout of one row per question: the tokens its instructions and options share."""
     option_tokens: int | None = None
     """For a layout of one row per question: the most tokens one option keeps."""
+    batch_window: float = 0.005
+    """Seconds a batch waits, after its first request, for more to answer with it."""
+    max_batch: int = 32
+    """The most requests one batch answers."""
 
 
 def main(options: Options) -> None:
@@ -121,7 +210,7 @@ def main(options: Options) -> None:
     if widened:
         decide = replace(decide, layout=replace(decide.layout, **widened))
     served = app(decide, api_key=options.api_key, details=options.details, strict=options.strict,
-                 whole=options.whole)
+                 whole=options.whole, batch_window=options.batch_window, max_batch=options.max_batch)
     uvicorn.run(served, host=options.host, port=options.port)
 
 
