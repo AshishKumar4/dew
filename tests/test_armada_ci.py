@@ -192,11 +192,12 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
         "3.12:tests/test_pass.py": (1, "whole"), "3.12:tests/test_dies.py": (1, "whole")}
 
 
-def test_a_file_pytest_reports_nothing_of_is_red_unless_its_collection_shows_every_test_deselected(ci, tmp_path):
-    """Every requested file is accounted for by its tests' rows, or by its collection: one whose every test the
-    selection deselected (`-m "not network"`) is green. A file whose tests vanish from the run with no word
-    (a hook dropping them unreported) is red, and so is every file of a run that wrote no report at all,
-    though pytest exits 0: CI never goes green on tests that did not run."""
+def test_a_file_pytest_reports_nothing_of_is_red_unless_its_collection_shows_every_test_deselected(
+        ci, tmp_path):
+    """Every requested file is accounted for by its tests' rows, or by its collection: one whose every
+    test the selection deselected (`-m "not network"`) is green. A file whose tests vanish from the run
+    with no word (a hook dropping them unreported) is red, and so is every file of a run that wrote no
+    report at all, though pytest exits 0: CI never goes green on tests that did not run."""
     files = {
         "test_pass.py": "def test_ok(): pass\n",
         "test_online.py": "import pytest\n@pytest.mark.network\ndef test_fetch(): pass\n",

@@ -168,15 +168,20 @@ def pytest_collectreport(report):
         collected.setdefault(report.nodeid, 0)
 
 
+def tally(counts: dict[str, int], items) -> None:
+    """Each item's test file counted once more in `counts`."""
+    for item in items:
+        name = item.nodeid.split("::")[0]
+        counts[name] = counts.get(name, 0) + 1
+
+
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(items):
-    for item in items:
-        collected[item.nodeid.split("::")[0]] = collected.get(item.nodeid.split("::")[0], 0) + 1
+    tally(collected, items)
 
 
 def pytest_deselected(items):
-    for item in items:
-        deselected[item.nodeid.split("::")[0]] = deselected.get(item.nodeid.split("::")[0], 0) + 1
+    tally(deselected, items)
 
 
 @pytest.hookimpl(hookwrapper=True)
