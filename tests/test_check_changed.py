@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from tool_support import git
+
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
 GATE = ("check.sh", "check_gates", "lint_inputs.sh", "base_history.sh", "lint_slop.py", "lint_scopes.py",
         "lint_tolerances.py", "duplicates.py", "forked.py")
@@ -20,11 +22,6 @@ HELD = {"tests/test_close.py": {"comparisons": 1, "lane": "Data", "by": "2099-01
 
 def inventory(files: dict) -> str:
     return json.dumps({"about": "SLOP020's held comparisons", "empty_by": "2099-01-01", "files": files})
-
-
-def git(root: Path, *arguments: str) -> None:
-    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *arguments], cwd=root, check=True,
-                   capture_output=True)
 
 
 def checkout(tmp_path: Path) -> Path:

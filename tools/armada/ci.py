@@ -13,7 +13,7 @@
 The plan prints a task matrix for each Python CI proves. Whole test files are
 packed heaviest first into the lightest of the tasks, each near `target`
 seconds, so a task imports only its own modules. A file heavier than that runs
-as groups of its tests (`groups`, tools/armada/split.py): runs of consecutive
+as groups of its tests (`session.groups`, tools/armada/split.py): runs of consecutive
 tests in node-id order, each as light as that many runs let it be, a heavier
 test alone. Each group also pays the file's setup (its module's fixtures,
 imports and compiles), which is what armada measured the file at beyond its
@@ -106,10 +106,12 @@ def _beside(name: str):
 
 
 child_groups = _beside("child_groups")
+session = _beside("session")
 r2 = _beside("r2")
 SETTLE = 30.0
 """Seconds a task's process group has, after SIGKILL, to be reaped and gone: inside armada's own timeout
-with the default deadline and grace (1680 + 60 + 30 + the reader's 10 < .armada.json's 1800)."""
+with the default deadline and grace (session.DEADLINE + session.GRACE + 30 + the reader's 10 < .armada.json's
+1800)."""
 
 REPO = Path(__file__).resolve().parents[2]
 _CLASSIFIERS = tomllib.loads((REPO / "pyproject.toml").read_text())["project"]["classifiers"]
@@ -154,13 +156,14 @@ COLLECT_TASKS = 4
 SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 """CI runs the first in the lint job, under the griffe it pins, and the second in the multihost job,
 across the containers of an armada gang."""
-DURATIONS = Path("tests/test_durations.json")
-SHARED = ("pyproject.toml", "constraints.txt", ".armada.json", "tools/armada/ci.py",
+SHARED = ("pyproject.toml", "constraints.txt", ".armada.json", "tools/armada/session.py",
           "tools/armada/child_groups.py", "tools/armada/split.py", "tools/armada/executed.py",
-          "tools/armada/followed.py", str(DURATIONS))
-"""The files every test file's key covers whole, beside tests/ and src/, every lock (a GPU node
+          "tools/armada/followed.py", str(session.DURATIONS))
+"""The files every test file's key covers whole, beside tests/ and src/'s data, every lock (a GPU node
 builds its environment from its CUDA lock) and the environment's own inputs, which .armada.json
-names (`environment_files`)."""
+names (`environment_files`): what every test process runs or reads, the session it runs in, the
+process group it runs as and the plugins loaded into it among them. The plan's own code (this file)
+runs outside the tests, so a change to it reruns none of them."""
 
 
 def environment_files() -> list[str]:
@@ -174,17 +177,21 @@ def environment_files() -> list[str]:
                    for name in (environment.get("setup"), environment.get("install"),
                                 *environment.get("key", ()))
                    if name})
-RECORDERS = ("ci.py", "executed.py", "followed.py")
-"""The tools that write and read the records, beside each other."""
-CACHE_PREFIX = "testcache/" + hashlib.sha256(
-    b"".join(Path(__file__).with_name(name).read_bytes() for name in RECORDERS)).hexdigest()[:16]
-"""Where records live: one namespace per version of the tools that write and read them, so a branch
-grading with a changed record format never overwrites or breaks main's records."""
+RECORD_FORMAT = 2
+"""The version of a record's form, what `record` writes and `reused` reads: a change to its fields or
+their meaning takes the next, so a branch grading with it never breaks main's records. A change to
+what a record holds (executed.py, followed.py) needs none: they are `SHARED`, so every key moves with
+them."""
+CACHE_PREFIX = f"testcache/format-{RECORD_FORMAT}"
+"""Where records live: one namespace per `RECORD_FORMAT`."""
 
 
 def shared(python: str) -> str:
     """The hash of what every test file's run shares: `python`, the `SHARED` files, every lock, every
-    non-Python file under tests/ and src/, and the names of every Python file there."""
+    non-Python file under tests/ and src/ (a fixture, a package's data), and the names of every Python
+    file there, whose arrival can change what an import finds (a conftest.py, a package's __init__.py, a
+    module that shadows another, a test module among them) or what a scanner lists, neither of which a
+    record sees."""
     digest = hashlib.sha256(python.encode())
     for top in ("tests", "src"):
         for path in sorted(Path(top).rglob("*")):
@@ -196,6 +203,13 @@ def shared(python: str) -> str:
     for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files()}):
         digest.update(name.encode() + contents(name))
     return digest.hexdigest()
+
+
+def lane_inputs(python: str) -> str:
+    """The hash of what a GPU lane's file shares (`gpu_lane`): what every test file's run shares (`shared`),
+    and this file, which sets the environment, share and deadline each file runs under on a GPU, where a
+    CPU task's are the session's."""
+    return hashlib.sha256((shared(python) + contents(__file__).hex()).encode()).hexdigest()
 
 
 def contents(name: str) -> bytes:
@@ -315,8 +329,8 @@ RECORD_TRIES = 4
 def recorded_tests() -> dict[str, list[float]]:
     """Each file's tests' times in tests/test_durations.json, in node-id order."""
     tests: dict[str, list[float]] = {}
-    if DURATIONS.is_file():
-        for node, seconds in sorted(json.loads(DURATIONS.read_text()).items()):
+    if session.DURATIONS.is_file():
+        for node, seconds in sorted(json.loads(session.DURATIONS.read_text()).items()):
             tests.setdefault(node.split("::")[0], []).append(seconds)
     return tests
 
@@ -353,42 +367,11 @@ def parsed_row(row_name: str) -> tuple[str, str, str]:
     return python, name, split
 
 
-def starts(weights: list[int], capacity: int) -> list[int]:
-    """Where each run of consecutive `weights` begins, each run filled up to `capacity`, a heavier
-    weight alone."""
-    begins, held = [0], 0
-    for index, weight in enumerate(weights):
-        if held and held + weight > capacity:
-            begins.append(index)
-            held = 0
-        held += weight
-    return begins
-
-
-def milliseconds(seconds: list[float]) -> list[int]:
-    return [round(max(value, 0.0) * 1000) for value in seconds]
-
-
-def groups(seconds: list[float], count: int) -> list[range]:
-    """`count` runs of consecutive `seconds`, each filled up to the least capacity that needs no more
-    runs, a heavier test alone: how every task of a file split `count` ways cuts the file's tests
-    (split.py), in whole milliseconds, so each container cuts them alike. The runs beside a test
-    heavier than the rest are no heavier than they must be. A run past the last test is empty."""
-    weights = milliseconds(seconds)
-    low, high = 0, sum(weights)
-    while low < high:
-        middle = (low + high) // 2
-        low, high = (low, middle) if len(starts(weights, middle)) <= count else (middle + 1, high)
-    bounds = [*starts(weights, low), len(weights)]
-    bounds += [len(weights)] * (count + 1 - len(bounds))
-    return [range(bounds[index], bounds[index + 1]) for index in range(count)]
-
-
 def split(tests: list[float], seconds: float, target: float, cut: int = 1) -> list[float]:
     """The weights of the groups a file that took `seconds` as `cut` groups runs as. Of those
     seconds, what its recorded `tests`' times leave is what each group paid besides its tests (its
     module's fixtures, imports and compiles, which a test's least recorded time does not hold), so
-    each group weighs its tests plus that setup. The file is cut (`groups`) into the fewest runs
+    each group weighs its tests plus that setup. The file is cut (`session.groups`) into the fewest runs
     whose tests fit what the setup leaves of `target`, at least half of it, so a file whose setup
     is most of a group is not cut into slivers that each pay it again; a heavier test runs alone.
     Counting the setup once a group, rather than scaling every test by the file's total, keeps a
@@ -403,12 +386,13 @@ def split(tests: list[float], seconds: float, target: float, cut: int = 1) -> li
         count = math.ceil(seconds / target)
         return [seconds / count] * count
     setup = max(seconds - sum(tests), 0.0) / cut
-    if cut > 1 and max(sum(tests[run.start:run.stop]) for run in groups(tests, cut)) + setup <= KEPT * target:
+    heaviest = max(sum(tests[run.start:run.stop]) for run in session.groups(tests, cut)) if cut > 1 else None
+    if heaviest is not None and heaviest + setup <= KEPT * target:
         count = cut
     else:
         room = max(target - setup, target / 2)
-        count = len(starts(milliseconds(tests), round(room * 1000)))
-    return [sum(tests[run.start:run.stop]) + setup for run in groups(tests, count) if run]
+        count = len(session.starts(session.milliseconds(tests), round(room * 1000)))
+    return [sum(tests[run.start:run.stop]) + setup for run in session.groups(tests, count) if run]
 
 
 KEPT = 1.5
@@ -548,38 +532,12 @@ def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
     return 0
 
 
-SELECTION = ("-m", "not network")
-"""Which tests CI runs: every one but those marked network, which reach the Hub (`CLOSED_HUB`)."""
-
-CLOSED_HUB = {"HF_HUB_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
-              "HF_ENDPOINT": "http://127.0.0.1:9"}
-"""What a task's tests see of the Hugging Face Hub, which none of them may reach (`SELECTION`): the
-libraries offline, and the Hub's address a closed port for any that would ask it regardless. A test
-that needs the Hub is marked network; one that reads a model or dataset otherwise brings it."""
-
-
-def pytest_run(python: str, report: Path, *measured: str) -> list[str]:
-    """CI's pytest under `python`, as every task runs it: CI's `SELECTION`, failures and errors summarized
-    with short tracebacks, a file that does not collect beside those that do, every thread's stack
-    printed when a test runs ten minutes, unbuffered (-u) so the output holds every test that finished
-    when a run is cut short, and pytest's JUnit report written to `report`."""
-    return [f".venv-{python}/bin/python", "-u", *measured, "-m", "pytest", "-q", *SELECTION, "-rfE",
-            "--tb=short", "--continue-on-collection-errors", "-o", "faulthandler_timeout=600",
-            f"--junitxml={report}"]
-
-
-def pytest_environment(environ: Mapping[str, str]) -> dict[str, str]:
-    """What CI's pytest runs under: this process's environment, `environ` over it, the Hub closed, and
-    tools/armada on the path, where the plugins a task loads (split.py, executed.py) import from."""
-    path = os.pathsep.join(filter(None, [str(Path(__file__).resolve().parent), os.environ.get("PYTHONPATH")]))
-    return {**os.environ, **environ, **CLOSED_HUB, "PYTHONPATH": path}
-
-
 def targeted(python: str, arguments: list[str], report: Path) -> int:
     """pytest's exit status on `arguments` (files, node ids and options) run as a CI task runs its files
-    (`pytest_run`): a lane's targeted run (tmp/run_tests.py) and the gangs select as CI does, and an
+    (`session.pytest_run`): a lane's targeted run (tmp/run_tests.py) and the gangs select as CI does, and an
     option of their own (a `-m` after CI's) chooses instead."""
-    return subprocess.run([*pytest_run(python, report), *arguments], env=pytest_environment({}),
+    return subprocess.run([*session.pytest_run(python, report), *arguments],
+                          env=session.pytest_environment({}),
                           check=False).returncode
 
 
@@ -592,7 +550,7 @@ def apportioned(own_seconds: Mapping[str, float], wall: float, rows: int) -> dic
 
 
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: bool = True,
-         grace: float = 60.0, coverage: Path | None = None) -> int:
+         grace: float = session.GRACE, coverage: Path | None = None) -> int:
     """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds, killing
     their process group `grace` seconds after that, and giving it `SETTLE` seconds to be gone.
 
@@ -625,13 +583,14 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # its data where COVERAGE_FILE says.
     measured = [] if coverage is None else ["-m", "coverage", "run"]
     environ = environ if coverage is None else {**environ, "COVERAGE_FILE": str(coverage / ".coverage")}
-    command = [*pytest_run(python, report, *measured), "-p", "executed", *tests, *grouping]
+    command = [*session.pytest_run(python, report, *measured), "-p", "executed", *tests, *grouping]
     # pytest leads a process group of its own, so what its tests start ends with it. Its output is
     # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
     # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
     lines: list[str] = []
+    environment = session.pytest_environment({**environ, "DEW_EXECUTED": str(executed_report)})
     done = child_groups.start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                              env=pytest_environment({**environ, "DEW_EXECUTED": str(executed_report)}))
+                              env=environment)
 
     def read() -> None:
         for line in done.stdout or ():
@@ -748,15 +707,16 @@ def listed(prefix: str, token: str) -> list[str]:
 
 def gpu_tier(python: str) -> dict[str, list[str]]:
     """The test files that take another path on a GPU, each with its evidence: where its tests read
-    the backend and its marks of `MARKS`, over every record of its rows,
+    the backend and its marks of `session.MARKS`, over every record of its rows,
     on every class, a split file's under each count of groups it was planned as. A file is out
-    only where every record is of these inputs (`fresh`) and says neither, so a file whose inputs
-    changed since it ran is in as "changed", and one without a record, or with one the Worker did not
-    return, as "unrecorded": a new file, or one no green run of these tools has recorded."""
+    only where every record is of these inputs (`fresh`), a CPU task's (`shared`) or a GPU lane's
+    (`lane_inputs`), and says neither, so a file whose inputs changed since it ran is in as "changed",
+    and one without a record, or with one the Worker did not return, as "unrecorded": a new file, or one
+    no green run of these tools has recorded."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         raise SystemExit("the GPU tier is chosen from the test cache's records, which need its URL and token")
-    common = shared(python)
+    inputs = (shared(python), lane_inputs(python))
     prefix = f"{CACHE_PREFIX}/{python}/"
 
     def evidence_of(key: str) -> tuple[str, list[str]]:
@@ -764,7 +724,8 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
         found = recorded(f"{prefix}{key}", token)
         if found is None:
             return name, ["unrecorded"]
-        return name, found["reads"] or ([] if fresh(found, name, common) else ["changed"])
+        current = any(fresh(found, name, common) for common in inputs)
+        return name, found["reads"] or ([] if current else ["changed"])
 
     try:
         keys = listed(prefix, token)
@@ -780,16 +741,12 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
     return {name: sorted(evidence[name]) for name in every if evidence.get(name)} | unrecorded
 
 
-MARKS = ("gpu", "kernel")
-"""The marks of tests a GPU runs otherwise: those only a GPU runs, and a kernel's, which a CPU interprets."""
-
-
 def marked(python: str) -> dict[str, int]:
-    """Each test file of this checkout with tests marked one of `MARKS`, and how many, as pytest
+    """Each test file of this checkout with tests marked one of `session.MARKS`, and how many, as pytest
     collects it on the CPU: what a batch's GPU run holds, whatever the records say."""
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
     done = subprocess.run([f".venv-{python}/bin/python", "-m", "pytest", "--collect-only", "-q",
-                           "-m", " or ".join(MARKS), *every],
+                           "-m", " or ".join(session.MARKS), *every],
                           capture_output=True, text=True, env={**os.environ, "JAX_PLATFORMS": "cpu"})
     if done.returncode not in (0, 5):
         raise SystemExit(f"collecting the marked tests exited {done.returncode}\n"
@@ -915,7 +872,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
     shares = {name: share for name, (share, _) in needed.items()}
     holds = {name: held for name, (_, held) in needed.items()}
     # Before any test writes under tests/, the inputs every file's key hashes.
-    common = shared(python)
+    common = lane_inputs(python)
     verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(tests)}
 
     def run(names: list[str]) -> None:
@@ -1095,7 +1052,7 @@ def main() -> int:
     running.add_argument(
         "--cache", choices=("on", "off"), required=True,
         help="whether a file that ran green on these inputs is reused (the plan's DEW_TEST_CACHE)")
-    running.add_argument("--deadline", type=float, default=1680.0,
+    running.add_argument("--deadline", type=float, default=session.DEADLINE,
                          help="seconds before armada's own task timeout (.armada.json) to interrupt at")
     running.add_argument("--coverage", type=Path, default=None,
                          help="run the files under coverage.py, its data file in this directory")
@@ -1138,8 +1095,8 @@ def main() -> int:
         return 0
     if args.operation == "durations":
         recorded = durations([json.loads(path.read_text()) for path in args.verdicts])
-        DURATIONS.write_text(json.dumps(dict(sorted(recorded.items())), indent=0) + "\n")
-        print(f"{len(recorded)} tests, {sum(recorded.values()):.0f} s, in {DURATIONS}")
+        session.DURATIONS.write_text(json.dumps(dict(sorted(recorded.items())), indent=0) + "\n")
+        print(f"{len(recorded)} tests, {sum(recorded.values()):.0f} s, in {session.DURATIONS}")
         return 0
     if args.operation == "gpu-tier":
         tier = ({name: [f"{count} marked"] for name, count in marked(PYTHONS[0]).items()} if args.marked
