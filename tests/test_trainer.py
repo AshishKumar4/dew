@@ -297,12 +297,12 @@ def test_closed_checkpoints_leave_no_writer_running_across_trials(tmp_path):
 
     try:
         trial(0)
-        settled = threading.active_count()
+        settled = set(threading.enumerate())
         release.set()
         neighbour.join()
         for index in (1, 2):
             reopened = trial(index)
-            assert threading.active_count() == settled
+            assert set(threading.enumerate()) <= settled
     finally:
         release.set()
         neighbour.join()
