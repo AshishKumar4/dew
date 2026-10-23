@@ -24,11 +24,12 @@ from jax.sharding import AbstractMesh, Mesh
 from dew.batch import Batch, LayoutRefused
 from dew.coordination import from_every_process
 from dew.data.dataset import rows_of
+from dew.distributed import Placement, batch_divisor
+from dew.host_memory import snapshot
 from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import RECORD, Objective
 from dew.records import JSON
-from dew.training.distributed import Placement, batch_divisor
-from dew.training.host import snapshot
+from dew.train_state import TrainState
 from dew.training.memory import (
     compiled_if_it_fits,
     head_fused_of,
@@ -41,7 +42,6 @@ from dew.training.memory import (
     step_fits,
     temporaries_factor,
 )
-from dew.training.state import TrainState
 
 _log = logging.getLogger(__name__)
 

@@ -23,7 +23,7 @@ The Dew seams referred to throughout:
 | --- | --- |
 | objective | `dew.objectives`, run by `dew.training.Trainer` (compiled step, EMA, orbax, tracker) |
 | optimizer | `dew.training.optim.build_optimizer` and `OPTIMIZER_MAP` (adam/adamw/lamb, warmup-cosine, grad accum, clip) |
-| sharding | `dew.training.distributed`, a two-axis `(data, fsdp)` mesh |
+| sharding | `dew.distributed`, a two-axis `(data, fsdp)` mesh |
 | block / mixer / MoE | `dew.nn.backbones.causal_transformer` - `CausalTransformer` with `layer_types`, `sliding_window`, `qk_norm`, `final_logit_softcap`, per-block `mixer` slot; HF-style parameter names; no MoE yet |
 | attention kernel path | `dew.nn.attention`, one shared entry with implementation selection |
 | data pipeline | `dew.data`, grain sources |

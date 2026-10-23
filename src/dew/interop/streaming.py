@@ -7,7 +7,7 @@ one leaf: the stored tensors it comes from (memory-mapped views), whether
 their trailing pair of axes swaps (torch Linear `[out, in]` to Dense
 `[in, out]`), whether they stack onto a leading expert axis, and the dtype
 the leaf is kept in. `read(index)` builds only the part a device asks for,
-and `dew.training.host.place_leaf` puts each part on its device before it
+and `dew.host_memory.place_leaf` puts each part on its device before it
 reads the next, so a process holds one device shard of one leaf at a time.
 
 `WeightLayout` is the way back: which leaves one source tensor is built
@@ -23,8 +23,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.host_memory import evict
 from dew.interop.weights import swapped
-from dew.training.host import evict
 
 
 @dataclass(frozen=True, eq=False)

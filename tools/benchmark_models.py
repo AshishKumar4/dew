@@ -30,6 +30,7 @@ from dew.data.dataset import DataPartition
 from dew.diffusion import presets
 from dew.diffusion.discrete import MDLM
 from dew.diffusion.process import DenoisingCondition
+from dew.distributed import DevicePrefetchIterator
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.inputs.encoders import ConditionEncoder
 from dew.nn.attention import AttentionImpl
@@ -51,9 +52,8 @@ from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, sessions
 from dew.registry import models, projectors, resolve_dtype, towers
+from dew.train_state import TrainState
 from dew.training import Layout, MeshSpec, Trainer
-from dew.training.distributed import DevicePrefetchIterator
-from dew.training.state import TrainState
 
 Batch = dict[str, np.ndarray | Mapping[str, np.ndarray] | ModelInputs]
 

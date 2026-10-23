@@ -47,7 +47,7 @@ _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from dew.config import Wandb
-    from dew.training.distributed import Layout
+    from dew.distributed import Layout
 
 
 EXECUTION_TIMEOUT = "30m"
@@ -103,8 +103,8 @@ def prepare_process(wandb: Wandb | None = None,
     _join_process_pool(multi_host)
     ready_process()
     if layout is not None and "variables" in layout.host:
-        from dew.training.distributed import MeshSpec
-        from dew.training.host import companion_mesh
+        from dew.distributed import MeshSpec
+        from dew.host_memory import companion_mesh
         companion_mesh(MeshSpec().build())
     _log.info("Number of devices: %s", jax.device_count())
 

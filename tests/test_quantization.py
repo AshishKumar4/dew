@@ -25,6 +25,7 @@ from reference_error import assert_as_exact, assert_as_exact_as_the_reference, a
 from token_support import token_rows
 
 from dew.config import ObjectiveConfig, OptimConfig
+from dew.distributed import Layout, MeshSpec, shard_batch
 from dew.lora import _updated as lora_update
 from dew.nn.attention_residuals import depth_mixed
 from dew.nn.blocks import torch_bicubic_resize
@@ -36,7 +37,6 @@ from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.quantization import UNQUANTIZED, Quantization, quantize_for_serving
 from dew.registry import models
-from dew.training.distributed import Layout, MeshSpec, shard_batch
 
 import_module("dew.nn.backbones")  # registers the fixture kind
 

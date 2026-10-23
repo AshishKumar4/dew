@@ -28,8 +28,8 @@ import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec
 from reference_error import assert_as_exact
 
+from dew.distributed import parameter_axes
 from dew.telemetry.instrumentation import collective, custom_call_kind, hlo_instructions
-from dew.training.distributed import parameter_axes
 
 
 def split_axes(tree) -> set[str]:

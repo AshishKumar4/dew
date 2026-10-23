@@ -74,8 +74,8 @@ from dew.sampling.text import Sampling
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
+    from dew.distributed import Layout, MeshSpec
     from dew.lora import Adapter, LoRA
-    from dew.training.distributed import Layout, MeshSpec
 
 
 
@@ -166,8 +166,8 @@ def on_default_device(variables: Variables) -> Variables:
     """`variables` with each host leaf on JAX's default device as a `jnp` array is, uncommitted, so a
     jitted call reads it where it is and a placement moves it, one leaf at a time: a leaf's transfer
     completes before the next starts, and its host copy is released (a memory-mapped one's pages
-    evicted, `dew.training.host.evict`) once its device copy is written back in its place."""
-    from dew.training.host import evict
+    evicted, `dew.host_memory.evict`) once its device copy is written back in its place."""
+    from dew.host_memory import evict
 
     def placed(node):
         if not isinstance(node, Mapping):

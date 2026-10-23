@@ -35,7 +35,7 @@ from dew.sampling.pipelines import TextToImage
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
-    from dew.training.distributed import Layout, MeshSpec
+    from dew.distributed import Layout, MeshSpec
 
 
 def pipeline(
@@ -128,6 +128,7 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout 
 def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
                  dtype: str | None, param_dtype: str | None,
                  revision: str | None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
+    from dew.distributed import MeshSpec as DefaultMesh
     from dew.inference.projections import packed_owned
     from dew.interop import (
         Pretrained,
@@ -136,7 +137,6 @@ def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | 
         PretrainedMaskedDecoder,
         PretrainedPipeline,
     )
-    from dew.training.distributed import MeshSpec as DefaultMesh
 
     storage = "auto" if param_dtype is None else param_dtype
     placement = DefaultMesh() if mesh is None else mesh
@@ -162,13 +162,13 @@ def place(variables: Variables, mesh: MeshSpec | Mesh | None, layout: Layout | N
     describes, one leaf at a time.
 
     The sharding is the one the trainer gives a train state's parameters under
-    `layout`; `dew.training.host.stream` places the leaves, updating the
+    `layout`; `dew.host_memory.stream` places the leaves, updating the
     dict nodes of `variables` in place. A task holds its variables frozen, and
     a frozen node can't be updated, so frozen nodes are first rebuilt as
     dicts over the same leaves.
     """
-    from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh, device_mesh
-    from dew.training.host import stream
+    from dew.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh, device_mesh
+    from dew.host_memory import stream
 
     variables = _updatable(variables)
     placed_on = device_mesh(DefaultMesh() if mesh is None else mesh)

@@ -46,7 +46,7 @@ from dew.nn.backbones.layer_plan import group_layers, layer_index
 from dew.nn.hyper_connections import Carried
 
 if TYPE_CHECKING:
-    from dew.training.distributed import Layout, MeshSpec, Placement
+    from dew.distributed import Layout, MeshSpec, Placement
 
 
 class LayerBanks(Protocol):
@@ -368,7 +368,7 @@ class SafetensorsBanks(LayerBanks):
 
     @staticmethod
     def _placed(variables: Variables, placement: Placement) -> Variables:
-        from dew.training.host import place_leaf
+        from dew.host_memory import place_leaf
 
         return jax.tree.map(place_leaf, variables, placement)
 
@@ -463,8 +463,8 @@ class SafetensorsBanks(LayerBanks):
             raise RuntimeError("the safetensors bank source is closed")
 
     def _read(self, key: tuple[tuple[str, ...], int]) -> Variables:
+        from dew.host_memory import evict
         from dew.interop.streaming import SourceLeaf
-        from dew.training.host import evict
 
         with self._lock:
             if key in self._cache:
@@ -761,11 +761,7 @@ def _check_shapes(shapes: Variables, site: DecoderBank) -> None:
 def _bank_plan(model: BankedModel, source: LayerBanks, mesh: MeshSpec | Mesh | None,
                layout: Layout | None):
     """Validate canonical ownership and placement before either loader reads a value."""
-    from dew.training.distributed import (
-        Layout as DefaultLayout,
-        MeshSpec as DefaultMesh,
-        device_mesh as resolve_mesh,
-    )
+    from dew.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh, device_mesh as resolve_mesh
 
     sites = bank_sites(model)
     shapes = source.shapes()

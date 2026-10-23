@@ -67,7 +67,7 @@ batches never have it.
 
 EXAMPLE_ROWS = "example_rows"
 """A training batch's column of each row's place among its step's records, int32: the order the
-records' stream holds them in, whatever process read a row (`dew.training.distributed.marked`). The
+records' stream holds them in, whatever process read a row (`dew.distributed.marked`). The
 trainer's transaction reads it for the examples' draws (`Step.example_index`) and takes it out of the
 batch the objective sees."""
 

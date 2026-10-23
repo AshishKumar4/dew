@@ -122,7 +122,7 @@ def test_a_host_source_is_placed_holding_one_device_shard_at_a_time():
 
     from jax.sharding import NamedSharding, PartitionSpec
 
-    from dew.training.host import place_leaf
+    from dew.host_memory import place_leaf
 
     class Recorded:
         def __init__(self, value: np.ndarray):
@@ -180,7 +180,7 @@ def test_a_format_placement_lands_a_source_whole_and_releases_it_whether_or_not_
     from jax.experimental.layout import Format, Layout as DeviceLayout
     from jax.sharding import SingleDeviceSharding
 
-    from dew.training.host import place_leaf
+    from dew.host_memory import place_leaf
 
     target = Format(DeviceLayout(major_to_minor=(0, 1)), SingleDeviceSharding(jax.devices()[0]))
     source = Whole(np.arange(12, dtype=np.float32).reshape(3, 4))

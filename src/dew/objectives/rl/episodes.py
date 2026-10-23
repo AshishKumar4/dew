@@ -34,7 +34,7 @@ from dew.data.dataset import DataPartition
 from dew.inference.rollouts import check_ending
 from dew.nn.inputs import ModelInputs, mesh_of, pad_token_rows
 from dew.sampling.text import Generation, Sampling
-from dew.training.state import TrainState
+from dew.train_state import TrainState
 
 from .sessions import (
     OLD_LOG_PROBS_KEY,

@@ -54,6 +54,7 @@ from dew.data import records
 from dew.data.compile import fitted
 from dew.data.dataset import Loader, Ramp, Reader, ramped, record_argument
 from dew.data.pipeline import Dataset
+from dew.distributed import Layout, MeshSpec
 from dew.files import write_atomically
 from dew.inputs import Field
 from dew.lora import AdapterRecord, LoRA
@@ -75,8 +76,8 @@ from dew.registry import (
     wants_tuple,
 )
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
+from dew.train_state import TrainState
 from dew.training.display import TrainingDisplay
-from dew.training.distributed import Layout, MeshSpec
 from dew.training.optim import (
     BF16_STATE_OPTIMIZERS,
     OPTIMIZER_MAP,
@@ -92,7 +93,6 @@ from dew.training.optim import (
 from dew.training.profiling import ProfileWindow
 from dew.training.quantization import quantize_trunk
 from dew.training.selection import Best
-from dew.training.state import TrainState
 from dew.training.tracker import LocalTracker, Tracker, Trackers, WandbTracker
 from dew.training.trainer import Rollout, Trainer
 

@@ -29,9 +29,8 @@ from dew.coordination import (
 )
 from dew.data.dataset import Closeable, DataPartition, Reader, rows_of
 from dew.data.pipeline import Dataset
+from dew.distributed import MeshSpec, shard_batch, split_fields, with_host
 from dew.objectives.base import Effects, Loss, Metric, Objective, Step, TrainingScalar, recorded_name
-
-from .distributed import MeshSpec, shard_batch, split_fields, with_host
 
 
 @dataclass(frozen=True)

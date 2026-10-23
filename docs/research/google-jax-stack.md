@@ -25,7 +25,7 @@ The Dew seams referred to throughout:
 | kernel path | `dew.nn.attention.scaled_dot_product_attention(implementation=...)` |
 | checkpointer | `dew.training.trainer`, an `ocp.CheckpointManager` |
 | optimizer | `dew.training.optim.build_optimizer` and `OPTIMIZER_MAP` |
-| sharding | `dew.training.distributed`, a `(data, fsdp)` mesh |
+| sharding | `dew.distributed`, a `(data, fsdp)` mesh |
 | objective | `dew.objectives` |
 | post-training interop | `dew.interop`, safetensors |
 | telemetry | `dew.telemetry` |
@@ -34,7 +34,7 @@ The Dew seams referred to throughout:
 
 The Dew side of this note describes the source on 2026-09-02, and several of the ranked items in section 12 have since landed. Checked against the current source:
 
-- Item 1 and item 8: a `Layout` maps the logical axes the modules declare onto mesh axes (`src/dew/training/distributed.py:299-302`), with a `tolerance` of 0.02 for unsharded parameters (`src/dew/training/distributed.py:338`). The mesh has six named axes, all `AxisType.Auto` (`src/dew/nn/sharding.py:43-48`; `src/dew/training/distributed.py:201`). The two-axis `(data, fsdp)` mesh and the shape-inferred `parameter_spec` this note describes are gone.
+- Item 1 and item 8: a `Layout` maps the logical axes the modules declare onto mesh axes (`src/dew/distributed.py:299-302`), with a `tolerance` of 0.02 for unsharded parameters (`src/dew/distributed.py:338`). The mesh has six named axes, all `AxisType.Auto` (`src/dew/nn/sharding.py:43-48`; `src/dew/distributed.py:201`). The two-axis `(data, fsdp)` mesh and the shape-inferred `parameter_spec` this note describes are gone.
 - Item 2: token windows carry `<field>_segment_ids` for packed documents (`src/dew/data/tokens.py:254`).
 - Item 3: `OPTIMIZER_MAP` has `muon` and `muonclip` entries built on `optax.contrib.muon` (`src/dew/training/optim.py:13,306-312`). Schedule-free AdamW is not in the map.
 - Item 4: the LM head scores the vocabulary in chunks (`src/dew/objectives/lm/chunked.py`; see [lm-head.md](lm-head.md)).
@@ -88,7 +88,7 @@ The model says "this axis is `heads`". The config decides whether `heads` is sha
 
 One guardrail is worth copying on its own: `sharding_tolerance: 0.02`, described as "the allowed percentage of non-sharded parameters" (`base.yml:672-673`). The run fails if too much of the model ended up replicated.
 
-One more flag matters because Dew has made the same choice implicitly: `shard_mode: "auto"`, "can be either auto or explicit" (`base.yml:547`). Auto means GSPMD infers the collectives from the annotations, explicit means JAX's explicit axis types make them visible in the type. Dew builds its mesh with `axis_types=(AxisType.Auto, AxisType.Auto)` (`src/dew/training/distributed.py:38`) and says why in the docstring, that GSPMD should infer the collectives rather than Dew writing them by hand (`:27-28`). That is the right default, and it is worth knowing that the reference codebase treats it as a switch, not a fixed rule, with `custom_mesh_and_rule` to swap the mesh and rules wholesale (`base.yml:548`).
+One more flag matters because Dew has made the same choice implicitly: `shard_mode: "auto"`, "can be either auto or explicit" (`base.yml:547`). Auto means GSPMD infers the collectives from the annotations, explicit means JAX's explicit axis types make them visible in the type. Dew builds its mesh with `axis_types=(AxisType.Auto, AxisType.Auto)` (`src/dew/distributed.py:38`) and says why in the docstring, that GSPMD should infer the collectives rather than Dew writing them by hand (`:27-28`). That is the right default, and it is worth knowing that the reference codebase treats it as a switch, not a fixed rule, with `custom_mesh_and_rule` to swap the mesh and rules wholesale (`base.yml:548`).
 
 ### Rematerialisation
 
@@ -161,11 +161,11 @@ Gemma 4, DeepSeek 4 and Qwen 3.5 are all present, so this codebase tracks releas
 
 ### What Dew should do about it
 
-Dew's mesh is `(data, fsdp)` with `AxisType.Auto`, and sharding is inferred from shape: shard the largest evenly divisible axis, replicate anything under 65536 elements (`src/dew/training/distributed.py:22-58`). That is a good default and a hard ceiling. Inferring rather than declaring costs two things. First, the heuristic cannot express any axis other than FSDP, so tensor, context and expert parallelism are unreachable, which by section 10's arithmetic pins Dew to a per-device batch of roughly 850 tokens on v5p-class hardware. Second, when no axis divides evenly the parameter is silently replicated and nothing says so.
+Dew's mesh is `(data, fsdp)` with `AxisType.Auto`, and sharding is inferred from shape: shard the largest evenly divisible axis, replicate anything under 65536 elements (`src/dew/distributed.py:22-58`). That is a good default and a hard ceiling. Inferring rather than declaring costs two things. First, the heuristic cannot express any axis other than FSDP, so tensor, context and expert parallelism are unreachable, which by section 10's arithmetic pins Dew to a per-device batch of roughly 850 tokens on v5p-class hardware. Second, when no axis divides evenly the parameter is silently replicated and nothing says so.
 
 The order of work: name logical axes in the model modules, add a rules table from logical names to physical axes, keep `(data, fsdp)` as the default rules so nothing changes today, then add axes one at a time.
 
-[borrow: reimplement the idea] Logical axis rules, and `sharding_tolerance` as a startup assertion. Seam: `dew.training.distributed`, plus logical annotations in `dew.nn`.
+[borrow: reimplement the idea] Logical axis rules, and `sharding_tolerance` as a startup assertion. Seam: `dew.distributed`, plus logical annotations in `dew.nn`.
 [borrow: reimplement the idea] A named `remat_policy` instead of all-or-nothing `jax.checkpoint`. Seam: `dew.training.objective_trainer`.
 [borrow: reimplement the idea] Vocabulary tiling for the LM head: `num_vocab_tiling` chunks the cross-entropy along batch-sequence and is "highly recommended for models with large vocabularies (e.g. Gemma)", with `vocab_tiling_ag_once` to gather the head once for the backward (`base.yml:720-729`). Seam: the LM objective.
 [borrow: reimplement the idea] Goodput accounting. Seam: `dew.telemetry`.
@@ -413,7 +413,7 @@ Two of the three reasons to move are things Dew's LM path needs.
 | --- | --- | --- |
 | Sequence packing with segment ids | `grain.experimental.FirstFitPackIterDataset`, `BestFitPackIterDataset`, `ConcatThenSplitIterDataset` | none. `dew/data/sources/text.py:24-63` reads fixed `seq_len + 1` windows from a flat memmap at stride `seq_len` |
 | Dataset mixing with weights | `MapDataset.mix` and `IterDataset.mix` (`dataset.py:250,960`), `MixedMapDataset` (`transformations/mix.py:87`) | none |
-| Iterator state inside the Orbax checkpoint | `grain.checkpoint.CheckpointHandler`, with `CheckpointSave` and `CheckpointRestore` as `ocp.args.CheckpointArgs` (`checkpoint/handler.py:33,197,241`) | hand-rolled: `DevicePrefetchIterator.source_state` threaded into the trainer's pytree (`dew/training/distributed.py:96-104`, `dew/training/trainer.py:285-288`) |
+| Iterator state inside the Orbax checkpoint | `grain.checkpoint.CheckpointHandler`, with `CheckpointSave` and `CheckpointRestore` as `ocp.args.CheckpointArgs` (`checkpoint/handler.py:33,197,241`) | hand-rolled: `DevicePrefetchIterator.source_state` threaded into the trainer's pytree (`dew/distributed.py:96-104`, `dew/training/trainer.py:285-288`) |
 | Elastic iterators across a changing host count | `ElasticIterDatasetIterator` with `get_shard_states()`, saved as `shard_state_<idx>.json` (`checkpoint/elastic_checkpoint.py`) | none |
 | Sharding by process | `ShardByJaxProcess` sets `shard_index=process_index`, `shard_count=process_count` (`core/sharding.py:57-66`) | used already (`dew/data/dataloaders.py:190`) |
 
@@ -465,7 +465,7 @@ Two consequences for Dew. There is no learning-rate decay, so it pairs with warm
 | `split_real_and_imaginary` | complex parameters (`contrib/_complex_valued.py:87`) | later |
 | `sophia`, `sam`, `dog`, `dowg`, `dadapt_adamw`, `prodigy`, `momo`, `madgrad`, `cocob`, `adopt`, `acprop`, `dpsgd`, `reduce_on_plateau` | research optimizers and wrappers | skip today |
 
-Optax provides no wrap-to-shard helper. What it provides is a tested guarantee: `contrib/_sharding_test.py:54-75` and `_src/sharding_test.py:71-121` verify that every optimizer's state carries the input `NamedSharding` through `init` and `update` under an explicit mesh. For Dew that is the right news, because Dew derives optimizer-state sharding from parameter shapes already: `parameter_spec` is applied to every leaf of the train state, and the docstring says why, that moments and EMA copies have the same shapes as the parameters they track (`src/dew/training/distributed.py:44-52`).
+Optax provides no wrap-to-shard helper. What it provides is a tested guarantee: `contrib/_sharding_test.py:54-75` and `_src/sharding_test.py:71-121` verify that every optimizer's state carries the input `NamedSharding` through `init` and `update` under an explicit mesh. For Dew that is the right news, because Dew derives optimizer-state sharding from parameter shapes already: `parameter_spec` is applied to every leaf of the train state, and the docstring says why, that moments and EMA copies have the same shapes as the parameters they track (`src/dew/distributed.py:44-52`).
 
 ### What Dew should do about it
 
@@ -548,7 +548,7 @@ Two things not to do. Do not write a quantization branch into Dew's modules; tha
 
 A book by Jacob Austin, Sholto Douglas, Roy Frostig, Anselm Levskaya, Charlie Chen, Sharad Vikram, Federico Lebron, Peter Choy, Vinay Ramasesh, Albert Webson and Reiner Pope, published by Google DeepMind on 2025-02-04 at <https://jax-ml.github.io/scaling-book/>. Twelve chapters. Chapter 12, on NVIDIA GPUs, is dated 2025-08-18. Not a library: it is the arithmetic that decides which parallelism to use.
 
-Dew's mesh has two axes and one rule: shard the largest evenly divisible axis over `fsdp`, replicate below 65536 elements (`src/dew/training/distributed.py:44-58`). Nothing in Dew's docs tells a user when that rule stops working. This book gives the thresholds.
+Dew's mesh has two axes and one rule: shard the largest evenly divisible axis over `fsdp`, replicate below 65536 elements (`src/dew/distributed.py:44-58`). Nothing in Dew's docs tells a user when that rule stops working. This book gives the thresholds.
 
 ### The chip numbers
 
@@ -624,7 +624,7 @@ Note two things. The sequence dimension of a DiT is sharded over a `context` axi
 
 Model coverage, from `src/maxdiffusion/configs/`: Stable Diffusion 1.4, 1.5, 2.1 and XL, XL Lightning, Flux dev and schnell, Flux 2 Klein including a 9B config, Wan 1.3B, 14B, 27B, image-to-video and Animate, and Z-Image with a turbo variant. `src/maxdiffusion/models/` also holds `ltx_video`, `ltx2`, `qwen3_flax`, `controlnet_flax`, `lora.py`, `lora_nnx.py` and `quantizations.py`.
 
-[borrow: reimplement the idea] the DiT and UNet logical axis rules above, as the concrete target for Dew's diffusion objective once logical axes exist. It is the closest published analogue to what Dew already trains. Seams: `dew.training.distributed`, `dew.nn.dit`.
+[borrow: reimplement the idea] the DiT and UNet logical axis rules above, as the concrete target for Dew's diffusion objective once logical axes exist. It is the closest published analogue to what Dew already trains. Seams: `dew.distributed`, `dew.nn.dit`.
 
 ### Levanter and Haliax
 
@@ -647,11 +647,11 @@ This is the same idea as MaxText's logical axis rules, taken further. MaxText ke
 
 Google's single-controller runtime, the one used internally to train Gemini, exposed on Cloud through GKE. Primary docs: <https://docs.cloud.google.com/ai-hypercomputer/docs/workloads/pathways-on-cloud/pathways-intro>. "Pathways simplifies large-scale machine learning computations by enabling a single JAX client to orchestrate workloads across multiple large TPU slices, potentially spanning thousands of TPU chips."
 
-The difference that matters to Dew's code is the programming model, not the deployment. Under Pathways, `jax.process_index()` is always 0, and `jax.devices()` and `jax.local_devices()` return every device in the job (porting guide, "Process index"). Dew's data path assumes the opposite: `ShardByJaxProcess` shards by `process_index` and `process_count` (`grain/_src/core/sharding.py:57-66`, used at `dew/data/dataloaders.py:190`), and `shard_batch` calls `jax.make_array_from_process_local_data` (`dew/training/distributed.py:73-77`), which is a multi-controller idiom. Neither is wrong, but neither survives a move to Pathways unchanged.
+The difference that matters to Dew's code is the programming model, not the deployment. Under Pathways, `jax.process_index()` is always 0, and `jax.devices()` and `jax.local_devices()` return every device in the job (porting guide, "Process index"). Dew's data path assumes the opposite: `ShardByJaxProcess` shards by `process_index` and `process_count` (`grain/_src/core/sharding.py:57-66`, used at `dew/data/dataloaders.py:190`), and `shard_batch` calls `jax.make_array_from_process_local_data` (`dew/distributed.py:73-77`), which is a multi-controller idiom. Neither is wrong, but neither survives a move to Pathways unchanged.
 
 The rest of the picture, from the same docs. `pathwaysutils` (<https://github.com/AI-Hypercomputer/pathways-utils>) provides a proxy JAX backend selected with `JAX_PLATFORMS=proxy`, profiling that covers the Pathways components as well as the user program, a custom Orbax `ArrayHandler` registered by `import pathwaysutils; pathwaysutils.initialize()` with `ENABLE_PATHWAYS_PERSISTENCE=1` so existing Orbax code keeps working, and elastic training primitives. Elastic training is configured with `max_elastic_down_event_count` and `max_reshard_retry_count`; a slice loss surfaces as a `jax.errors.JaxRuntimeError`, and the program is expected to rebuild its computation for the new device count (resilient-training guide). Data loading runs on a CPU VM rather than a TPU VM, which adds latency, and the recommended fix at scale is to run the input pipeline on the accelerator hosts with colocated Python; MaxText's `multihost_dataloading.py` `RemoteIterator` is named as the reference implementation. There is a persistent compilation cache in GCS, enabled by default through `--gcs_scratch_location`.
 
-[later] Pathways, triggered by a multi-slice run. The preparatory work in Dew is small and worth knowing about now: keep process-count assumptions in one place, which today means `dew.data.dataloaders` and `dew.training.distributed`, so that switching to a single-controller runtime is a change in two files rather than everywhere.
+[later] Pathways, triggered by a multi-slice run. The preparatory work in Dew is small and worth knowing about now: keep process-count assumptions in one place, which today means `dew.data.dataloaders` and `dew.distributed`, so that switching to a single-controller runtime is a change in two files rather than everywhere.
 
 ### Flax NNX against Linen in 2026
 
@@ -686,7 +686,7 @@ While reading gemma's dependencies I found `hackable-diffusion @ git+https://git
 
 Ordered by expected value at scale, not by effort. Each line says why it matters with the evidence behind it.
 
-1. Logical axis rules instead of shape inference. [borrow] Seam: `dew.training.distributed` plus annotations in `dew.nn`.
+1. Logical axis rules instead of shape inference. [borrow] Seam: `dew.distributed` plus annotations in `dew.nn`.
 Evidence: MaxText expresses twelve physical axes through a 109-line rules table (`base.yml:549-658`), and MaxDiffusion applies the identical pattern to DiTs and UNets with four axes (`base_flux_dev.yml:151-178`). Dew's `parameter_spec` can only ever produce FSDP, so by section 10's arithmetic Dew is capped near a per-device batch of 850 tokens on v5p, where FSDP plus tensor parallelism reaches about 100. This one change is the precondition for tensor, context and expert parallelism, and therefore for training anything Dew cannot already train.
 
 2. Sequence packing with segment ids. [adopt] Seam: data source in `dew.data`.
@@ -707,7 +707,7 @@ Evidence: `use_replica_parallel` with its size and replica caps (`orbax .../v1/_
 7. tokamax as the TPU kernel path, and `ragged_dot` for MoE. [adopt, optional extra] Seam: `dew.nn.attention`, future `dew.nn.moe`.
 Evidence: Dew's `tpu` implementation imports `jax.experimental.pallas.ops.tpu.flash_attention` (`dew/nn/attention.py:177-182`), while MaxText has moved to a vendored tokamax splash kernel and exposes `use_tokamax_splash` and `use_tokamax_gmm` (`base.yml:286,1350`). tokamax's signature is a superset of the one Dew already calls, and it supports all eighteen MoE tile configs against six for megablox and JAX ragged dot (`base.yml:261-262`). My own test (appendix A) shows the fast paths do not reach consumer Ada, so this is a TPU and H100-and-newer item, which is exactly where it matters.
 
-8. `sharding_tolerance` as a startup assertion. [borrow] Seam: `dew.training.distributed`.
+8. `sharding_tolerance` as a startup assertion. [borrow] Seam: `dew.distributed`.
 Evidence: MaxText fails a run when more than 2 percent of parameters are unsharded (`base.yml:672-673`). Dew's `parameter_spec` silently returns `P()` when no axis divides evenly by `fsdp_size` (`distributed.py:56-58`), so a model whose dimensions do not match the device count trains at full replication and reports nothing. This is a dozen lines that turn a silent memory blow-up into an error, which is why it ranks above larger items.
 
 9. The scaling rules written into Dew's docs. [borrow] Seam: `docs/concepts/`.

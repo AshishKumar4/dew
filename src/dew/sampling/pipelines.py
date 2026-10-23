@@ -40,9 +40,9 @@ if TYPE_CHECKING:
     from jax.sharding import Mesh
     from PIL.Image import Image as PILImage
 
+    from dew.distributed import Layout, MeshSpec
     from dew.objectives.diffusion import DiffusionObjective
     from dew.quantization import Quantization
-    from dew.training.distributed import Layout, MeshSpec
 
 class _Default(Enum):
     """The sentinel that tells `guidance=None` from an omitted `guidance=`.

@@ -64,7 +64,7 @@ from dew.nn.sharding import (
 )
 from dew.records import JSON, number, record
 from dew.telemetry.profile import region
-from dew.training.state import VARIABLE_FIELDS
+from dew.train_state import VARIABLE_FIELDS
 
 # The role axes no parameter splits over: data holds a batch's replicas, and
 # stage the pipeline's stages of the layer stack, which the decoder places

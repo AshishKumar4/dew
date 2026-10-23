@@ -52,6 +52,37 @@ from dew.data.dataset import (
     stream_identity,
 )
 from dew.data.pipeline import Dataset, DeviceStep
+from dew.distributed import (
+    PREFETCH_DEPTH,
+    DevicePrefetchIterator,
+    Layout,
+    MeshSpec,
+    Placement,
+    Signature,
+    batch_layout,
+    batch_shardings,
+    batch_signature,
+    check_batch,
+    check_stream,
+    device_mesh,
+    explicit_axes,
+    link_bandwidth,
+    link_figures,
+    link_topology,
+    marked,
+    microbatch,
+    microbatch_shapes,
+    placed_bytes,
+    placed_held,
+    prefetched_bytes,
+    resumed_link_figures,
+    ruled,
+    shard_batch,
+    split_fields,
+    stage_microbatches,
+    step_reads,
+    taking_over,
+)
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, batch_axes
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels import tuning
@@ -97,39 +128,9 @@ from dew.telemetry.records import (
     Record,
     StepCompiled,
 )
+from dew.train_state import MODEL_STATE, Accumulation, TrainState, kept_window
 from dew.training._lowering import Lowered
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
-from dew.training.distributed import (
-    PREFETCH_DEPTH,
-    DevicePrefetchIterator,
-    Layout,
-    MeshSpec,
-    Placement,
-    Signature,
-    batch_layout,
-    batch_shardings,
-    batch_signature,
-    check_batch,
-    check_stream,
-    device_mesh,
-    explicit_axes,
-    link_bandwidth,
-    link_figures,
-    link_topology,
-    marked,
-    microbatch,
-    microbatch_shapes,
-    placed_bytes,
-    placed_held,
-    prefetched_bytes,
-    resumed_link_figures,
-    ruled,
-    shard_batch,
-    split_fields,
-    stage_microbatches,
-    step_reads,
-    taking_over,
-)
 from dew.training.evaluation import EvalSuite, Evaluation
 from dew.training.interval import Interval, Taken, held
 from dew.training.memory import (
@@ -161,7 +162,6 @@ from dew.training.profiling import ProfileWindow, owned_capture, start_capture, 
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best, HeldBest, rankings
-from dew.training.state import MODEL_STATE, Accumulation, TrainState, kept_window
 from dew.training.tracker import Tracker
 from dew.training.transaction import Committed, Transaction, compact_qk, outcome, window_dropped, with_ema
 
@@ -586,7 +586,7 @@ class Trainer(Generic[Loss, Effects]):
     def state_mesh(self) -> Mesh:
         if not self.host_master:
             return self.device_mesh
-        from dew.training.host import companion_mesh
+        from dew.host_memory import companion_mesh
         return companion_mesh(self.device_mesh)
 
     def _boxed_init(self, initialized: Variables, params: Variables) -> optax.OptState:
@@ -684,7 +684,7 @@ class Trainer(Generic[Loss, Effects]):
         # overridable method, and the objective is asked for what it holds exactly once.
         initializer, key = self.objective.initializer, self.key
         if self.host_master:
-            from dew.training.host import transfer
+            from dew.host_memory import transfer
             key = transfer(key, NamedSharding(self.state_mesh, P()))
         abstract = jax.eval_shape(self.initial_state, initializer, key)
         refuse_wide_floats(abstract, self.device_mesh)
@@ -861,8 +861,8 @@ class Trainer(Generic[Loss, Effects]):
         transient is one leaf, not the tree, and one JIT could not have
         returned to the two device sets anyway.
         """
+        from dew.host_memory import evict, place_leaf, stream, transfer
         from dew.training.execution import bank_bytes, check_bank_pool
-        from dew.training.host import evict, place_leaf, stream, transfer
         held = self.objective.held_variables()
         with jax.default_device(self.state_mesh.local_devices[0]):
             state = self.initial_state(initializer, key)
@@ -1297,8 +1297,8 @@ class Trainer(Generic[Loss, Effects]):
                 f"stage would compute the whole step; give those devices to the data or fsdp axis")
 
     def _compile_host(self, state: TrainState, batch: Batch) -> CompiledStep:
+        from dew.host_memory import transfer
         from dew.training.execution import HostExecution
-        from dew.training.host import transfer
         cpu = self.state_mesh
         execution = HostExecution(self.objective, self.layout, self.device_mesh, cpu, device=self._device)
         cpu_batch = transfer(batch, batch_shardings(cpu, batch))

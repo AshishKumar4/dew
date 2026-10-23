@@ -39,7 +39,7 @@ from dew.decision.task import Decide
 from dew.nn.backbones.decoder_block import remat_policy
 from dew.nn.protocols import RematChoosing
 from dew.records import number, record
-from dew.training.state import TrainState
+from dew.train_state import TrainState
 
 if TYPE_CHECKING:
     from dew.interop import Pretrained

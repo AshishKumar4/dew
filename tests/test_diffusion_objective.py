@@ -354,8 +354,8 @@ def test_each_example_draws_its_own_times_noise_and_dropout_on_every_layout():
     example the same times, noise and dropped condition, and so the same noised input, target and
     loss weight, bitwise, as the transaction places each microbatch's rows among the update's
     examples (`example_places`). The model's dropout stays the attempt's (`Step.key`)."""
+    from dew.distributed import microbatch
     from dew.objectives.base import Recorder, example_stream, stream
-    from dew.training.distributed import microbatch
     from dew.training.transaction import example_places
 
     objective = make_objective(unconditional_prob=0.5)

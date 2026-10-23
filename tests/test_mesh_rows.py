@@ -9,8 +9,8 @@ import numpy as np
 import pytest
 from flax import linen as nn
 
+from dew.distributed import Layout, MeshSpec, shard_batch
 from dew.nn.sharding import RESIDUAL, constrain
-from dew.training.distributed import Layout, MeshSpec, shard_batch
 
 pytestmark = pytest.mark.mesh(devices=8)
 

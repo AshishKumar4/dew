@@ -30,8 +30,8 @@ if TYPE_CHECKING:
     from transformers import CLIPTokenizer, PreTrainedTokenizerBase
 
     from dew.data.text import PinnedTokenizer
+    from dew.distributed import Layout, MeshSpec
     from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.training.distributed import Layout, MeshSpec
 
 
 def _prompt(record: Mapping[str, object], key: str, default: str) -> str:

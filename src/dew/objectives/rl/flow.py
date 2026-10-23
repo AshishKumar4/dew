@@ -47,7 +47,7 @@ REWARDS_KEY = "rewards"
 """The batch field that holds each image's reward, the score its trajectory got."""
 
 if TYPE_CHECKING:
-    from dew.training.state import TrainState
+    from dew.train_state import TrainState
 
 Predictor = Callable[[jax.Array, jax.Array], tuple[jax.Array, jax.Array]]
 

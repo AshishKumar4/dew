@@ -239,7 +239,7 @@ def test_two_files_evaluating_alike_fail(tmp_path):
 
 def test_two_files_closing_alike_on_exit_fail(tmp_path):
     """Two context managers whose exits close the same way, the error noted on the one in flight: a small
-    function (21 nodes, training/distributed.py's and tracker.py's), written twice."""
+    function (21 nodes, distributed.py's and tracker.py's), written twice."""
     exit_ = ("class {0}:\n    def close(self):\n        self.closed = True\n\n"
              "    def __exit__(self, kind, {1}, traceback):\n        try:\n            self.close()\n"
              "        except BaseException as {2}:\n            if {1} is None:\n                raise\n"

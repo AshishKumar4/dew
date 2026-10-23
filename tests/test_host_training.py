@@ -20,6 +20,7 @@ from dew.checkpoints import Checkpoints
 from dew.data import Loading, Memory
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import DeviceStep
+from dew.host_memory import companion_mesh, transfer
 from dew.inference.banks import spread
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
@@ -28,7 +29,6 @@ from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Aux, EMASpec, Objective, Ratio, freeze
 from dew.objectives.lm import LMObjective
 from dew.training import Layout, Trainer
-from dew.training.host import companion_mesh, transfer
 
 HOST = Layout(host=("variables",), min_shard=1, tolerance=1.)
 DEVICE = Layout(min_shard=1, tolerance=1.)

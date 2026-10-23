@@ -37,12 +37,12 @@ from dew.config import OptimConfig
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader, replayed
 from dew.objectives.base import Aux, EMASpec, Objective, under
+from dew.train_state import CHECKPOINTED
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainState, ema_update
 from dew.training.evaluation import WARM_BATCHES
 from dew.training.model_flops import _TokenCount
 from dew.training.optim import Cosine, Power
 from dew.training.runtime import Preempted
-from dew.training.state import CHECKPOINTED
 
 
 def endless():
@@ -1461,7 +1461,7 @@ def test_only_the_held_arrays_an_output_takes_over_are_donated():
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     from jax.tree_util import Partial
 
-    from dew.training.distributed import placed_held, taking_over
+    from dew.distributed import placed_held, taking_over
 
     mesh = Mesh(np.array(jax.devices()), ("fsdp",))
     rows = 8 * jax.device_count()

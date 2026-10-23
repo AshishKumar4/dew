@@ -58,7 +58,7 @@ from dew.objectives.base import (
 from dew.records import integer, record
 
 if TYPE_CHECKING:
-    from dew.training.state import TrainState
+    from dew.train_state import TrainState
 
 NONE_OF_THE_ABOVE = "none of the above"
 

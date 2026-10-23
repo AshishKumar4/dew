@@ -19,8 +19,8 @@ from dew.objectives.diffusion import DiffusionObjective, MaskedDiffusionObjectiv
 from dew.objectives.lm import LMObjective, Samples
 from dew.objectives.rl import GRPOObjective
 from dew.sampling import Sampling
+from dew.train_state import TrainState
 from dew.training import Trainer
-from dew.training.state import TrainState
 
 
 class Denoiser(nn.Module):

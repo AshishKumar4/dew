@@ -19,7 +19,7 @@ Design record, 2026-09-03. The code blocks are design sketches, not runnable cod
 | 9 | Discrete diffusion gets its own small algebra in `dew.diffusion.discrete`, shaped like the Gaussian one. It is not a special case of it. | 6.1 |
 | 10 | The objective's loss returns an `Aux` that can carry updated non-parameter collections. That is the one channel for MoE balancing, batch statistics and sown values. | 3.3, 6.2 |
 | 11 | A custom compiled step is the one escape hatch (`Trainer(step=...)`). There is no second trainer. | 6.5 |
-| 12 | Sharding is declared on the module that owns the parameters, with a decorator, and merged into a `Layout`. The table in `training/distributed.py` moves out of the training package. | 3.8 |
+| 12 | Sharding is declared on the module that owns the parameters, with a decorator, and merged into a `Layout`. The table in `distributed.py` moves out of the training package. | 3.8 |
 
 ## 1. What is wrong today
 
@@ -36,7 +36,7 @@ The seams named in `CONTRIBUTING.md:9` are crossed in these places, all confirme
 | The trainer publishes and deletes | `save()` pushes to the W&B registry, ranks the run against the W&B API and removes the local checkpoint (`objective_trainer.py:531-565, 388-529`). |
 | Constructors have effects | `SimpleTrainer.__init__` enables the compile cache, builds the mesh, opens W&B, downloads an artifact, creates the Orbax manager and restores state (`trainer.py:89-217`). `ConditionalInputConfig.__post_init__` runs the encoder (`inputs/__init__.py:26-31`). |
 | Data is a dict protocol | Six loaders return `{"train", "train_len", "val", "val_len", "local_batch_size", "global_batch_size"}`; `fit` reads them by name (`trainer.py:599-604`). |
-| Sharding is a string table | `DEFAULT_LOGICAL_PARAM_AXES` keyed on trailing module names (`training/distributed.py:63-91`), read again by Muon grouping (`training/optim.py:95`). A rename in a model file changes both, silently. |
+| Sharding is a string table | `DEFAULT_LOGICAL_PARAM_AXES` keyed on trailing module names (`distributed.py:63-91`), read again by Muon grouping (`training/optim.py:95`). A rename in a model file changes both, silently. |
 | One fact, two owners | The training schedule holds the transform for min-SNR (`schedules/common.py:22,58`) while the objective receives the transform again; presets return a 3-tuple (`transforms.py:157`). Gradient accumulation lives in `OptimConfig`, `optax.MultiSteps` and the trainer. |
 | Randomness is an object | `RandomMarkovState` (`random_state.py`) appears in schedules, every sampler, the objective and the trainer state, and is checkpointed. |
 
@@ -260,7 +260,7 @@ The chain replaces `datasetMap`, `onlineDatasetMap` and `mediaDatasetMap`: a sto
 class CausalTransformer(nn.Module): ...
 ```
 
-Same table and the same `logical_axes` and `_mesh_spec` machinery (`training/distributed.py:115-217`), declared on the module it names. Each class keeps its own declarations, and a suffix has one set of axes across the process: a second class that declares it otherwise is refused at the decorator, both named, and a class outside Dew qualifies a one-name suffix with its holder's name (`("head", "readout")`), so it places no other model's `readout`. `Layout` merges the declarations of the modules in the tree; Muon reads them through the same function. Models stay plain Flax modules with no partitioning metadata in `init`, which is the reason the table exists (`distributed.py:57-62`). A test asserts that every parameter of every registered model is declared or explicitly heuristic.
+Same table and the same `logical_axes` and `_mesh_spec` machinery (`distributed.py:115-217`), declared on the module it names. Each class keeps its own declarations, and a suffix has one set of axes across the process: a second class that declares it otherwise is refused at the decorator, both named, and a class outside Dew qualifies a one-name suffix with its holder's name (`("head", "readout")`), so it places no other model's `readout`. `Layout` merges the declarations of the modules in the tree; Muon reads them through the same function. Models stay plain Flax modules with no partitioning metadata in `init`, which is the reason the table exists (`distributed.py:57-62`). A test asserts that every parameter of every registered model is declared or explicitly heuristic.
 
 ### 3.9 Config and CLI
 

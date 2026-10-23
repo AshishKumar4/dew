@@ -25,8 +25,8 @@ import numpy as np
 import pytest
 from lane_environment import outside_any_cluster
 
+from dew.distributed import parameter_axes
 from dew.training import MeshSpec
-from dew.training.distributed import parameter_axes
 
 # Needs the eight simulated CPU devices conftest configures, except the tests
 # that name fewer: those of stand-in devices need none, and a four-GPU run
@@ -624,7 +624,7 @@ def test_every_process_of_a_pool_takes_the_same_link_bandwidth(tmp_path):
                f"runtime.prepare_process(compilation_cache_dir={str(tmp_path / 'cache')!r})\n"
                "import jax\n"
                "from dew.training import MeshSpec\n"
-               "from dew.training.distributed import link_bandwidth\n"
+               "from dew.distributed import link_bandwidth\n"
                "mesh = MeshSpec(tensor=jax.device_count()).build()\n"
                "print('measured', jax.process_index(), repr(link_bandwidth(mesh, 'tensor')), flush=True)\n")
     pools = []
@@ -651,10 +651,10 @@ def test_a_link_figure_is_kept_for_its_placement_and_carried_by_a_checkpoint(tmp
     import optax
     from jax.sharding import Mesh
 
+    from dew.distributed import link_bandwidth, link_topology
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
     from dew.training import Trainer
-    from dew.training.distributed import link_bandwidth, link_topology
 
     devices = np.asarray(jax.devices()[:4])
     paired = Mesh(devices.reshape(2, 2), ("data", "tensor"))

@@ -61,7 +61,7 @@ SIMILARITY = {"min_lines": 6, "ignore_comments": True, "ignore_docstrings": True
 FUNCTION_NODES = 20
 """The fewest syntax nodes a function's body has for its copies to count: below it, a body says too little
 (a property, a one-line delegation) for two to be one logic. The smallest copy found that shares knowledge,
-two context managers' cleanup (training/distributed.py's and tracker.py's), has 21; two constructors that
+two context managers' cleanup (distributed.py's and tracker.py's), has 21; two constructors that
 only store their fields (ledger 934) are declarations, not logic."""
 WINDOW = 6
 """Consecutive statements a window holds, as pylint's six lines."""

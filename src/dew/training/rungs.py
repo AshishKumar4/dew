@@ -37,7 +37,7 @@ from dew.telemetry.instrumentation import StepFlops, step_flops
 
 if TYPE_CHECKING:
     from dew.batch import Batch
-    from dew.training.state import TrainState
+    from dew.train_state import TrainState
     from dew.training.trainer import StepFn
 
 

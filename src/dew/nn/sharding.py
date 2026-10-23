@@ -238,7 +238,7 @@ class Link:
     """A mesh axis's interconnect, one device's dense bf16 peak, and whether a projection split over the axis.
 
     The trainer measures the interconnect when it places a step
-    (`dew.training.distributed.link_bandwidth`). `down_projection` and
+    (`dew.distributed.link_bandwidth`). `down_projection` and
     `split_positions` set `spread` when they decide to split a projection in
     the step over the axis.
     """

@@ -110,10 +110,10 @@ import numpy as np
 from dew.batch import Variables
 from dew.coordination import agreed
 from dew.data.dataset import Batch, DataPartition, Loader, tapped
+from dew.distributed import first_reader_batch, shard_batch
 from dew.nn.inputs import local_rows, mesh_of
 from dew.objectives.base import Shown
-from dew.training.distributed import first_reader_batch, shard_batch
-from dew.training.state import TrainState
+from dew.train_state import TrainState
 
 from .grpo import GRPOObjective
 from .sessions import (

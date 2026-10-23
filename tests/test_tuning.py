@@ -302,7 +302,7 @@ from dew import cache
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import Trainer
-from dew.training.distributed import shard_batch
+from dew.distributed import shard_batch
 
 seq = int(sys.argv[1])
 model = models.build("causal_transformer", vocab_size=4096, emb_features=1024, num_layers=2, num_heads=8,

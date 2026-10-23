@@ -1,5 +1,5 @@
 """Each example's draws are its own (`dew.objectives.base.Step.sample`): keyed by its place among the
-update's examples, which the trainer's batches carry (`dew.training.distributed.marked`), so a record
+update's examples, which the trainer's batches carry (`dew.distributed.marked`), so a record
 draws alike however the update is split, pooled or read by several processes, and roles the update
 gives a count of its examples go by place too."""
 
@@ -12,11 +12,11 @@ import pytest
 from dew.batch import EXAMPLE_ROWS
 from dew.data.dataset import DataPartition
 from dew.diffusion import presets
+from dew.distributed import marked
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import EXAMPLE_STREAM, Aux, Objective, Ratio, Recorder, Step, example_stream, stream
 from dew.objectives.diffusion.few_step import MeanFlowObjective, ShortcutObjective
-from dew.training.distributed import marked
 from dew.training.transaction import example_places
 
 UPDATE = jax.random.key(11)

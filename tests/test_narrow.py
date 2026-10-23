@@ -265,7 +265,7 @@ def test_the_fit_check_counts_the_copies_the_first_step_builds(monkeypatch):
     them before its first call, so their bytes count beside the step with the
     prefetched batches: the headroom the check leaves is the step's own,
     `step_headroom` of the devices' free bytes, less the bytes held beside it."""
-    from dew.training.distributed import placed_bytes
+    from dew.distributed import placed_bytes
     from dew.training.memory import step_headroom
 
     limit = 2 ** 40
@@ -289,7 +289,7 @@ def test_the_fit_check_counts_the_copies_the_first_step_builds(monkeypatch):
 def test_a_restored_state_drops_its_templates_copies():
     """The copies are of the template's own parameters; a restored state
     starts without and the step rebuilds them from what was restored."""
-    from dew.training.state import TrainState
+    from dew.train_state import TrainState
 
     zero, one = jnp.zeros((), jnp.int32), jnp.ones((), jnp.int32)
     template = TrainState(step=zero, microstep=zero, updates=zero, variables={"params": {"w": jnp.ones(2)}},
