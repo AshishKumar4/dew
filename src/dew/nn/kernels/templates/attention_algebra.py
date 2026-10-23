@@ -1243,13 +1243,11 @@ def cotangent_product(cotangents: jax.Array, operand: jax.Array,
     if operand.dtype == jnp.float32:
         return dot(oriented(cotangents), operand)
     if operand.dtype == jnp.bfloat16:
-        out, rest = None, cotangents
-        for _ in range(3):
-            piece = rest.astype(jnp.bfloat16)
-            rest = rest - piece.astype(jnp.float32)
-            term = dot(oriented(piece), operand)
-            out = term if out is None else out + term
-        return out
+        high = cotangents.astype(jnp.bfloat16)
+        rest = cotangents - high.astype(jnp.float32)
+        middle = rest.astype(jnp.bfloat16)
+        low = (rest - middle.astype(jnp.float32)).astype(jnp.bfloat16)
+        return (dot(oriented(high), operand) + dot(oriented(middle), operand)) + dot(oriented(low), operand)
     scaled, high_exponent = _scaled(cotangents)
     high = scaled.astype(operand.dtype)
     low, low_exponent = _fp16_scaled(scaled - high.astype(jnp.float32))
