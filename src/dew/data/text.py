@@ -2,7 +2,7 @@
 the text record steps: tokenizing, chunking, dropping, normalizing and
 filtering text, and curating it through DataTrove's filters (`Language`,
 `Quality`, `Classifier`, `Decontaminated`) and its MinHash deduplication
-(`deduplicated`; the `curation` extra).
+(`NearDuplicates`, which `Dataset.snapshot` applies; the `curation` extra).
 
 `import dew.data` stays cheap. Nothing here imports `transformers` at module
 scope, and ByteTokenizer needs nothing but numpy. HFTokenizer loads its
@@ -20,9 +20,9 @@ import json
 import tempfile
 import threading
 import unicodedata
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 
 import grain.python as grain
 import numpy as np
@@ -511,7 +511,10 @@ class Curated(abc.ABC):
 
         text = element[self.field]
         text = text.decode("utf-8") if isinstance(text, bytes) else str(text)
-        kept = _curator(self).filter(Document(text=text, id=""))
+        # DataTrove's filters and the spaCy pipeline they share build and mutate state as they read
+        # (an index filled in place, a tokenizer's length bound), so a process's readers take turns.
+        with _CURATING:
+            kept = _curator(self).filter(Document(text=text, id=""))
         # DataTrove's filters keep with True and drop with False or with False and their reason.
         if kept is True:
             return element
@@ -521,6 +524,11 @@ class Curated(abc.ABC):
         from importlib.metadata import version
 
         return {"datatrove": version("datatrove")}
+
+
+_CURATING = threading.Lock()
+"""Held while a DataTrove filter is built or reads a record: their state is shared and not
+thread-safe."""
 
 
 @functools.cache
@@ -562,7 +570,8 @@ class Quality(Curated):
     rule's reason (`gopher_short_doc`, `too_few_sentences`, `line_punct_ratio`, ...)."""
 
     rule: Literal["gopher", "c4", "fineweb"]
-    settings: tuple[tuple[str, Any], ...] = ()  # the filter's constructor arguments, as its own types
+    settings: tuple[tuple[str, float | int | bool | str | tuple[str, ...] | None], ...] = ()
+    """The filter's constructor arguments, a sequence (Gopher's `stop_words`) as a tuple."""
     field: str = "text"
     reason = "quality"
 
@@ -571,7 +580,8 @@ class Quality(Curated):
 
         rules = dict(zip(QUALITY_RULES, (GopherQualityFilter, C4QualityFilter, FineWebQualityFilter),
                          strict=True))
-        return rules[self.rule](**dict(self.settings))
+        return rules[self.rule](**{name: list(value) if isinstance(value, tuple) else value
+                                   for name, value in self.settings})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -649,64 +659,44 @@ class NearDuplicates:
     field: str = "text"
 
 
-def deduplicated(dataset: Dataset, url: str, near: NearDuplicates | None = None, *,
-                 format: Literal["array_record", "parquet"] = "array_record",
-                 rows_per_shard: int = 100_000) -> Mapping[str, object]:
-    """Seal `dataset`'s records at `url` as `Dataset.snapshot` does, each group of near-duplicates
-    (`near`, FineWeb's rule by default) kept as one record, by DataTrove's four MinHash stages:
-    signatures over one pass of the records, band matches bucket by bucket, their clusters, and a
-    second pass that writes every record no cluster removes. The two passes read one order, so a
-    removed index names one record.
-    The manifest, which `Files(url)` reads back, records the rule, DataTrove's release and the
-    records removed. Returns it."""
-    from importlib.metadata import version
-
+def near_duplicates_removed(records: Iterable[Batch], near: NearDuplicates) -> tuple[Iterator[Batch], int]:
+    """`records`, one pass of a sealed snapshot, each group of near-duplicates (`near`) kept as one
+    record by DataTrove's four MinHash stages: signatures, band matches bucket by bucket, their
+    clusters, and the filter that drops every record a cluster removes, over the same records in the
+    same order. Returns the records kept, lazily, and how many the clusters remove."""
     from datatrove.data import Document
     from datatrove.pipeline.dedup.minhash import (
         MinhashConfig,
         MinhashDedupBuckets,
         MinhashDedupCluster,
+        MinhashDedupFilter,
         MinhashDedupSignature,
     )
 
-    from dew.data.dataset import Closeable
-    from dew.data.sinks import export, passed
-
-    near = NearDuplicates() if near is None else near
+    rows = list(records)
 
     def documents() -> Iterator[Document]:
-        records = passed(dataset)
-        try:
-            for index, record in enumerate(records):
-                text = record[near.field]
-                text = text.decode("utf-8") if isinstance(text, bytes) else str(text)
-                yield Document(text=text, id=str(index))
-        finally:
-            if isinstance(records, Closeable):
-                records.close()
+        for index, record in enumerate(rows):
+            text = record[near.field]
+            text = text.decode("utf-8") if isinstance(text, bytes) else str(text)
+            yield Document(text=text, id=str(index))
 
     config = MinhashConfig(n_grams=near.n, num_buckets=near.buckets, hashes_per_bucket=near.hashes)
-    with tempfile.TemporaryDirectory(prefix="dew-minhash-") as work:
-        MinhashDedupSignature(f"{work}/signatures", config=config).run(documents(), rank=0, world_size=1)
-        banded = MinhashDedupBuckets(f"{work}/signatures", f"{work}/bands", config=config)
-        for bucket in range(near.buckets):
-            banded.run(None, rank=bucket, world_size=near.buckets)
-        MinhashDedupCluster(f"{work}/bands", f"{work}/clusters", config=config).run(None, 0, 1)
-        # The one signing pass is DataTrove's rank 0, whose removed indices this file holds.
-        listed = Path(work) / "clusters" / "000000.remove"
-        removed = frozenset(np.fromfile(listed, "<u4").tolist() if listed.exists() else ())
+    work = tempfile.TemporaryDirectory(prefix="dew-minhash-")
+    MinhashDedupSignature(f"{work.name}/signatures", config=config).run(documents(), rank=0, world_size=1)
+    banded = MinhashDedupBuckets(f"{work.name}/signatures", f"{work.name}/bands", config=config)
+    for bucket in range(near.buckets):
+        banded.run(None, rank=bucket, world_size=near.buckets)
+    clusters = MinhashDedupCluster(f"{work.name}/bands", f"{work.name}/clusters", config=config)
+    clusters.run(None, 0, 1)
+    removed = int(clusters.stats["to_remove"].total)
 
     def kept() -> Iterator[Batch]:
-        records = passed(dataset)
-        try:
-            yield from (record for index, record in enumerate(records) if index not in removed)
-        finally:
-            if isinstance(records, Closeable):
-                records.close()
+        with work:
+            survivors = MinhashDedupFilter(f"{work.name}/clusters").run(documents(), rank=0, world_size=1)
+            yield from (rows[int(document.id)] for document in survivors)
 
-    rule = {**dataclasses.asdict(near), "datatrove": version("datatrove"), "removed": len(removed)}
-    return export(kept(), url, format=format, rows_per_shard=rows_per_shard,
-                  metadata={"near_duplicates": rule})
+    return kept(), removed
 
 
 def export_tokens(dataset: Dataset, url: str, tokenizer: str, *, field: str = "text", eos: bool = True,
