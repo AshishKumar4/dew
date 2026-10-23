@@ -407,6 +407,7 @@ LAYOUT_SEEDS: dict[str, int] = {
     "causal_transformer+gpt_oss": 256, "causal_transformer+deepseek_v2": 64,
     "causal_transformer+glm4_moe": 256, "causal_transformer+llama4": 32,
     "causal_transformer+gemma4_moe": 128, "causal_transformer+gemma3n": 64,
+    "causal_transformer+mla": 64,
 }
 """Each cell's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada, paired
 with the layout's arm where the cell's arms share their upstream rounding (the language cells): the
