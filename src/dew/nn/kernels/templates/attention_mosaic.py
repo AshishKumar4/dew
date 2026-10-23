@@ -170,8 +170,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         coords = algebra.Coords(q_pos, index * tiles.block_k + columns)
         # A tile every query sees whole takes no mask: one walk, the choice a tile's (a walk of each, these
         # rings' waits and arrivals in two loops, faulted on an H100 under jax 0.11.2's lowering).
-        logits = lax.cond(index < whole, lambda: algebra.modify(spec, s, coords, masked=False),
-                          lambda: algebra.modify(spec, s, coords, masked=True))
+        logits = algebra.modify(spec, s, coords, masked=index >= whole)
 
         def load():
             # The value slot, once the partner's products are issued: its turn on the tensor cores is over
