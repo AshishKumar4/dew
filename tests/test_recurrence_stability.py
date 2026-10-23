@@ -33,7 +33,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, widened, with_gradients
+from reference_error import assert_as_exact, widened, with_gradients, without_ynn
 from test_recurrence_chunk import CHUNK, KEY_WIDTH, VALUE_HEADS, draw, token_by_token
 
 from dew.nn.kernels import recurrence
@@ -308,6 +308,13 @@ resolve within 512 seeds at 16 heads under aligned keys, decays near zero, the d
 mild."""
 
 
+def compiler(arm: str):
+    """How an arm and its reference compile: the portable math as Dew's users run it (`jax.jit`), the port,
+    a GPU kernel a CPU interprets, and its reference without XLA:CPU's YNNPACK fusions
+    (`reference_error.without_ynn`), so the two run the same kind of code on any host."""
+    return without_ynn if arm == 'port' else jax.jit
+
+
 def restarting(fn, regime: str):
     """`fn` on operands whose documents start as the regime's do, a constant of their shape (`_reset`),
     which `cotangents` takes out of the draw."""
@@ -343,8 +350,9 @@ def test_the_chunked_op_stays_finite_and_exact_where_chunked_forms_break(name, r
     if (refused := refusal(hooks, regime, arm)) is not None:
         assert refused.code == 'decay_floor', refused
         return
-    dew = jax.jit(functools.partial(chunk, hooks, chunk_size=CHUNK, ported=arm == 'port'))
-    reference = jax.jit(functools.partial(token_by_token, hooks))
+    compiled = compiler(arm)
+    dew = compiled(functools.partial(chunk, hooks, chunk_size=CHUNK, ported=arm == 'port'))
+    reference = compiled(functools.partial(token_by_token, hooks))
     draws = functools.partial(stressed, hooks, regime)
     for seed in range(SEEDS[name, regime]):
         operands = draws(seed)
@@ -368,9 +376,10 @@ def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime, a
     if (refused := refusal(hooks, regime, arm)) is not None:
         assert refused.code == 'decay_floor', refused
         return
-    dew = jax.jit(with_gradients(restarting(functools.partial(chunk, hooks, chunk_size=CHUNK,
+    compiled = compiler(arm)
+    dew = compiled(with_gradients(restarting(functools.partial(chunk, hooks, chunk_size=CHUNK,
                                                               ported=arm == 'port'), regime)))
-    reference = jax.jit(with_gradients(restarting(functools.partial(token_by_token, hooks), regime)))
+    reference = compiled(with_gradients(restarting(functools.partial(token_by_token, hooks), regime)))
     draws = functools.partial(cotangents, hooks, regime)
     for seed in range(2):
         drawn = draws(seed)
