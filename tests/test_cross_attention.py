@@ -446,7 +446,8 @@ def test_a_served_request_reads_its_own_context(options):
 
 def test_a_server_refuses_a_context_its_layers_cannot_read():
     """A context wider than the layers read, longer than they keep, or counting tokens it does not
-    hold, is refused at submit; a decoder without cross-attention takes none."""
+    hold, an int64 count the cache's int32 would wrap among them, is refused at submit; a decoder
+    without cross-attention takes none."""
     server = Server.from_task(served_task(), slots=2, capacity=128)
     wide = request(0)
     with pytest.raises(ValueError):
@@ -462,6 +463,11 @@ def test_a_server_refuses_a_context_its_layers_cannot_read():
                            RunProcessor(Digits()), sampling=Sampling(temperature=0))
     with pytest.raises(ValueError):
         Server.from_task(plain, slots=2, capacity=128).submit(request(0), 2)
+    with jax.enable_x64(new_val=True):
+        wrapped = np.asarray([2 ** 32 + 1], np.int64)
+        with pytest.raises(ValueError):
+            server.submit(dataclasses.replace(wide, conditioning={
+                CONTEXT: jnp.zeros((1, 2, 6)), CONTEXT_LENGTHS: wrapped}), 2)
 
 
 def test_a_zero_gate_leaves_an_ngpt_stream_whatever_its_length():
@@ -509,8 +515,9 @@ def test_freeze_keeps_what_a_split_tree_trains():
 
 def test_an_objective_with_prediction_depths_scores_and_counts_a_conditioned_batch():
     """An LM objective over a decoder with blocks and a prediction depth scores a batch that carries a
-    context, the depth reading the conditioned trunk's states, and counts the blocks' work over the
-    context beside the trunk's (`cross_flops`); conditioning of another kind has no count."""
+    context, the depth reading the conditioned trunk's states, through the model's own scoring
+    methods too, and counts the blocks' work over the context beside the trunk's (`cross_flops`);
+    conditioning of another kind has no count."""
     from dew.nn.flops import MissingFlopsCount
     from dew.objectives.base import Step
 
@@ -522,6 +529,11 @@ def test_an_objective_with_prediction_depths_scores_and_counts_a_conditioned_bat
     loss, _ = objective.scalar_loss(variables, {"text": inputs},
                                     Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None))
     assert np.isfinite(float(loss))
+    hidden = model.apply(variables, jnp.asarray(ids), method="hidden_states",
+                         conditioning=inputs.conditioning)
+    depths = model.apply(variables, hidden, jnp.asarray(ids), method="mtp_logits",
+                         conditioning=inputs.conditioning)
+    assert len(depths) == 1 and np.isfinite(np.asarray(depths[0])).all()
     plain = objective.model_flops(None, {"text": ModelInputs(jnp.asarray(ids))})
     rows = np.full(B, SEQ - 1, np.int64)
     crossed = model.cross_flops(rows, lengths.astype(np.int64))
@@ -541,3 +553,43 @@ def test_the_blocks_attach_to_a_decoder_whose_own_feed_forward_they_do_not_run()
     logits = attached.model.apply(thaw(attached.variables), jnp.asarray([[1, 2, 3]]),
                                   conditioning=conditioning)
     assert np.isfinite(np.asarray(logits)).all()
+
+
+def test_a_wider_context_enters_in_the_decoders_context_dtype():
+    """With x64 on, a float64 context enters a float32 decoder as float32 (`context_dtype`), as a
+    server holds it: no product of the call, the cross-attention's key and value maps included, takes
+    a float64 operand, and the cached keys and values are float32."""
+    from reference_error import equations
+
+    variables, ids, context, lengths = model_draw(MODEL)(5)
+    with jax.enable_x64(new_val=True):
+        conditioning = {CONTEXT: np.asarray(context, np.float64), CONTEXT_LENGTHS: lengths}
+        traced = jax.make_jaxpr(lambda variables: MODEL.apply(variables, ids, conditioning=conditioning))(
+            variables)
+        wide = [equation for equation in equations(traced) if equation.primitive.name == "dot_general"
+                and any(variable.aval.dtype == np.float64 for variable in equation.invars)]
+        assert not wide
+        _, made = MODEL.apply(variables, B, method=CausalTransformer.init_cache, mutable=["cache"])
+        _, held = MODEL.apply({**variables, **made}, ids[:, :PROMPT], decode=True, mutable=["cache"],
+                              conditioning=conditioning)
+    kept = [leaf for path, leaf in flat_tree(held["cache"]).items()
+            if path.endswith(("cross_key", "cross_value"))]
+    assert kept and all(leaf.dtype == np.float32 for leaf in kept)
+
+
+def test_a_frozen_trunk_counts_the_weight_gradients_of_its_blocks_alone():
+    """A source with blocks attached trains the blocks alone: its training count is a fully trained
+    decoder's less every trunk and head matrix's weight gradient (`parameter_flops`, `logits_flops`),
+    the blocks' three passes kept."""
+    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    cross = CrossAttention(layer_ids=(1,), context_length=3, context_features=8)
+    attached = source.with_cross_attention(cross, key=0)
+    rng = np.random.default_rng(0)
+    batch = {"text": ModelInputs(jnp.asarray(rng.integers(0, 256, (2, 8)), jnp.int32), conditioning={
+        CONTEXT: jnp.asarray(rng.standard_normal((2, 3, 8)), jnp.float32),
+        CONTEXT_LENGTHS: jnp.asarray([3, 1], jnp.int32)})}
+    frozen = LMObjective(attached, 7)
+    trained = LMObjective(attached.model, 7)
+    rows, targets = frozen.real_lengths(batch), np.full(2, 7, np.int64)
+    weights = attached.model.parameter_flops(rows) + attached.model.logits_flops(targets)
+    assert trained.training_flops(None, batch) - frozen.training_flops(None, batch) == pytest.approx(weights)
