@@ -19,7 +19,7 @@ multiprocessor's `resident` programs (`resident`) wait together (Little's law). 
     compute  = ceil(programs / (multiprocessors · resident)) · max(resident · program, waiting)
     memory   = device_bytes / memory bandwidth
     l2       = l2_bytes / L2 bandwidth
-    seconds  = max(compute, memory, l2)
+    seconds  = max(compute, memory, l2) + programs * steps * grid step seconds (TPU's)
 
 `l2_bytes` are the bytes all programs stage from the L2 together: a tile every program re-reads (the
 keys and values each query block of attention walks, the operand bands each output tile of a GEMM
@@ -99,7 +99,9 @@ def seconds(cost: Cost, target: generation.GpuTarget) -> float:
     waiting = 0.0 if latency is None else waiting_seconds(cost, latency, clock)
     waves = math.ceil(cost.programs / (multiprocessors * cost.resident))
     l2 = 0.0 if facts.l2_bandwidth is None else cost.l2_bytes / facts.l2_bandwidth
-    return max(waves * max(cost.resident * program, waiting), cost.device_bytes / bandwidth, l2)
+    step = facts.grid_step_seconds
+    stepping = 0.0 if step is None else cost.programs * cost.steps * step
+    return max(waves * max(cost.resident * program, waiting), cost.device_bytes / bandwidth, l2) + stepping
 
 
 def program_seconds(cost: Cost, rate: float, clock: float) -> float:
