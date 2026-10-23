@@ -56,16 +56,17 @@ def test_a_request_admitted_before_a_reload_is_scored_by_the_task_that_laid_it_o
 
 def test_a_request_whose_rows_outrun_a_pass_carries_them_to_the_next_step():
     """A step is one pass: a request of five rows, two a pass, is answered at its third step, each
-    step scoring the next of its rows, and the request behind it waits its turn."""
+    step scoring the next of its rows; the request behind it fills the third pass's room and carries
+    its own last row to a fourth."""
     server = ScoringServer.from_task(Named("a", width=2), weights(1.0))
-    long, behind = server.submit("abcde"), server.submit("f")
+    long, behind = server.submit("abcde"), server.submit("fg")
     for _ in range(2):
         server.step()
-        assert not long.done() and server.queued == 2
+        assert not long.done() and not behind.running() and server.queued == 2
     server.step()
-    assert long.result() == ("a", "a", "abcde", 1.0) and not behind.done()
+    assert long.result() == ("a", "a", "abcde", 1.0) and behind.running() and not behind.done()
     server.step()
-    assert behind.result() == ("a", "a", "f", 1.0)
+    assert behind.result() == ("a", "a", "fg", 1.0) and server.queued == 0
 
 
 def test_an_output_too_few_fails_the_whole_pass():
