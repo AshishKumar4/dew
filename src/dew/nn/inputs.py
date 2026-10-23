@@ -499,6 +499,48 @@ def document_starts(segments, valid, *, xp=jnp):
     return valid & xp.take_along_axis(changed, xp.maximum(rank, 0), axis=1)
 
 
+CONTEXT = "context"
+"""The `ModelInputs.conditioning` entry a decoder's cross-attention layers read,
+`[B, C, features]` (`dew.nn.cross_attention`)."""
+CONTEXT_LENGTHS = "context_lengths"
+"""The `ModelInputs.conditioning` entry counting each row's real context tokens, `[B]`
+integers; a row's padding comes after them. Without it every context token is real."""
+
+
+@struct.dataclass
+class CrossContext:
+    """The sequence a call's cross-attention layers read: `embeddings` `[B, C, features]`
+    and each row's count of real tokens, `lengths` `[B]` int32, its padding after them."""
+
+    embeddings: jax.Array
+    lengths: jax.Array
+
+    @classmethod
+    def from_conditioning(cls, conditioning: Mapping[str, jax.Array]) -> CrossContext:
+        """The context a call's `conditioning` carries under `CONTEXT` and `CONTEXT_LENGTHS`.
+
+        Raises ValueError for any other entry, for a context that is not
+        `[B, C, features]` floats, and for lengths that are not one integer
+        per row.
+        """
+        unknown = sorted(set(conditioning) - {CONTEXT, CONTEXT_LENGTHS})
+        if unknown or CONTEXT not in conditioning:
+            raise ValueError(f"a decoder's conditioning is {CONTEXT!r} and optionally {CONTEXT_LENGTHS!r}, "
+                             f"got {sorted(conditioning)}")
+        embeddings = jnp.asarray(conditioning[CONTEXT])
+        if embeddings.ndim != 3 or not jnp.issubdtype(embeddings.dtype, jnp.floating):
+            raise ValueError(f"a context is [B, C, features] floats, got "
+                             f"{embeddings.dtype}{embeddings.shape}")
+        lengths = conditioning.get(CONTEXT_LENGTHS)
+        if lengths is None:
+            lengths = jnp.full(embeddings.shape[:1], embeddings.shape[1], jnp.int32)
+        lengths = jnp.asarray(lengths)
+        if lengths.shape != embeddings.shape[:1] or not jnp.issubdtype(lengths.dtype, jnp.integer):
+            raise ValueError(f"context lengths are one integer per row, [{embeddings.shape[0]}], "
+                             f"got {lengths.dtype}{lengths.shape}")
+        return cls(embeddings, lengths.astype(jnp.int32))
+
+
 @struct.dataclass
 class AttentionMetadata:
     """Per-token data the layers read alongside their inputs, independent of physical cache-slot addresses.
@@ -516,6 +558,7 @@ class AttentionMetadata:
     encoder computes once for its layers. `blocks` `[B, S]` number each row's
     routing blocks of `routing_block` places for a block router
     (`numbered_blocks`), which the model computes once for its layers.
+    `context` is the sequence its cross-attention layers read (`CrossContext`).
 
     `coordinates` are the tokens' documents, validity, positions and cache
     slots (`Coordinates`). Their `right_padded` says each row's real tokens
@@ -538,6 +581,7 @@ class AttentionMetadata:
     admitted: Admitted | None = None
     position_bias: jax.Array | None = None
     blocks: jax.Array | None = None
+    context: CrossContext | None = None
     routing_block: int | None = struct.field(pytree_node=False, default=None)
 
     @property

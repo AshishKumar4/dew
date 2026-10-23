@@ -613,6 +613,16 @@ def freeze(variables: Variables, trainable: PathFilter) -> Variables:
     return {**variables, "params": moving["params"], FROZEN: frozen["params"]}
 
 
+def training(variables: Variables) -> frozenset[Path]:
+    """The full paths of the `params` leaves a split tree trains (`freeze`), or none for a tree
+    with no `FROZEN` collection, which was never split. An adapter attached over a split tree
+    keeps these training beside its own leaves."""
+    if FROZEN not in variables:
+        return frozenset()
+    return frozenset(("params", *(entry.key for entry in path))
+                     for path, _ in jax.tree_util.tree_leaves_with_path(variables["params"]))
+
+
 def thaw(variables: Variables) -> Variables:
     """Undo `freeze`, merging the frozen leaves back into one `params` collection.
 
