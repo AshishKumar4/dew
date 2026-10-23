@@ -1,4 +1,5 @@
-"""The grouped GEMM template (bible §6's third): one grouped matmul with a prologue and an epilogue.
+"""The grouped GEMM template (docs/design/kernel-templates.md): one grouped matmul with a prologue and an
+epilogue.
 
 `gemm(lhs, rhs, group_sizes)` multiplies each group's rows of `lhs` `[rows, depth]` by its matrix of
 `rhs` `[groups, depth, width]` (or `[groups, width, depth]` with `transpose_rhs`), a dense product

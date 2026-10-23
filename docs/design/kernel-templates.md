@@ -14,7 +14,7 @@ There are three templates: attention, linear recurrence and GEMM. Each one meets
 2. **It is the most general:** it covers every row of its coverage table (§12). Any row marked a non-goal needs the owner's sign-off.
 3. **It is one algorithm:** the math is written once (§3). A backend contributes a mainloop built from a shared toolkit, with no math of its own (§6).
 4. **There is no duplication:** every hand kernel and external route it replaces is deleted once its scoreboard row is met. One owner exists per math (§9).
-5. **It meets the gate, both checks, as bible §7 states them:** check 1 (parity against independent float64 truth) and check 2 (every element within its certified bound), for every form, hook and gradient on every target. Check 2 is required wherever the zero-element certificate covers the operations, and its coverage grows with the template rather than waiting. The reference is never changed to match an implementation (§7's ban).
+5. **It meets the gate, both checks, as `tests/reference_error.py` states them ([Numerical accuracy](testing.md#numerical-accuracy)):** check 1 (parity against independent float64 truth) and check 2 (every element within its certified bound), for every form, hook and gradient on every target. Check 2 is required wherever the zero-element certificate covers the operations, and its coverage grows with the template rather than waiting. The reference is never changed to match an implementation ([testing](testing.md#numerical-accuracy)'s ban).
 
 **One consequence needs the owner** (§13, question 1). FlashAttention's backward computes D = rowsum(dO·O), which fails check 1 on peaked rows: 5–50× in fp32, up to 1,400× in bf16. Every D form that passes costs products FA skips; the anchored pass adds +1.03 ms on the H100, 79% of FA3's whole backward. The gate stands. The speed bar stands too, until the owner changes it: the attention backward must beat FA2/FA3 while passing both checks. The +1.03 ms is one measured form, not a lower bound on every accurate one. Candidate (b′), a masked-column P·V, could make an accurate D nearly free; it is the first measurement. The FA2/FA3 routes stay until the template beats them, and §13 question 1 asks the owner what happens if no accurate form can.
 
@@ -194,7 +194,7 @@ Rule 0 applies: use Splash's MaskInfo, with its empty/partial/full classes and p
 
 **Toolkit, per generation, shared by every template.** It reuses JAX's machinery directly, with no wrapper that renames a native API:
 - **Pipelines:**
-  - sm80, sm86, sm89 and sm120: the Pallas Triton loop, `num_stages` and `num_warps`;
+  - sm80, sm86, sm89 and sm120: Mosaic GPU's pipeline, and beside it the Pallas Triton loop (`num_stages` and `num_warps`) while that measures faster (the decision below);
   - sm90/100: Mosaic GPU's `emit_pipeline_warp_specialized`, its rings, barriers, register reallocation, TMA and clusters;
   - TPU: Mosaic TPU's pipeline and DMA.
 - **One tile scheduler:** persistent grid, LPT, rasterization and swizzle, and split-K, stream-K and split-KV work lists.
@@ -219,7 +219,9 @@ Rule 0 applies: use Splash's MaskInfo, with its empty/partial/full classes and p
 | Blackwell | Mosaic GPU | sm100 | tcgen05, TMEM, 2-CTA | B200 |
 | TPU | Mosaic TPU | v5e, v6e and later | MXU, DMA pipeline | one chip per generation |
 
-- **sm120 (consumer Blackwell: RTX 50, RTX PRO 6000) has no tcgen05 and no TMEM.** Its tensor cores take sm80's mma.sync forms (with FP8/FP4 additions), so it runs the Triton mainloop, not the Blackwell one.
+Mosaic GPU takes each of the Triton row's claims when its scoreboard row there meets Triton's (the decision below); until then that row holds them.
+
+- **sm120 (consumer Blackwell: RTX 50, RTX PRO 6000) has no tcgen05 and no TMEM.** Its tensor cores take sm80's mma.sync forms (with FP8/FP4 additions), so it runs the mma.sync mainloop (Triton's until Mosaic's measures at or under it there), not the tcgen05 one.
 - **sm86/sm89/sm120 differ from sm80 in shared memory per SM** (99–100 KB a block against the A100's 163 KB) and in SM count. So their tile spaces and picks are their own TARGETS rows (`generation.shared_budget`), and their scoreboard rows are measured, not inferred from the A100.
 - **sm75 (T4) and older** have no bf16 tensor cores, and Pallas Triton doesn't compile there (`generation.py`, the sm75 row of TARGETS). They run XLA.
 
@@ -256,7 +258,7 @@ Mosaic lowers and compiles in 0.9–2.9 s against Pallas Triton's 0.4–0.8 s. T
 2. One warpgroup a CTA. A two-warpgroup kernel fails because emit_pipeline's SMEM isn't a thread-collective allocation, and pre-Hopper emit_pipeline takes inputs only, so no larger CTA tile shares its B operand.
 3. A GEMM at equal tile and warps runs 1.35× Pallas Triton (128×128×32, 4 warps, 3 stages). The schedule within a K-step (synchronous mma.sync, ldmatrix interleaving, cp.async waits) is the likely cause; unconfirmed without ncu.
 
-**Decision:** sm80 stays on Pallas Triton under the pin. Mosaic sm80 is a rung re-measured at each jax bump.
+**Decision:** every NVIDIA generation's mainloop is Mosaic GPU, sm80 included. A Pallas Triton arm stays beside it only while it measures faster and the pinned jaxlib still runs it: on sm80 that is today, by the table above, and each jax bump measures it again (jax 0.12.0.1 among them).
 
 **Fallbacks, if Pallas Triton's removal forces the move:**
 - Mosaic GPU's layout inference and `emit_pipeline` are Python (`jax/experimental/mosaic/gpu`, `jax/_src/pallas/mosaic_gpu`), so causes 1 and 2 are fixable in Dew's Python-only JAX fork.
@@ -338,7 +340,7 @@ Two measures decide whether a mainloop lands and whether it replaces a route: th
 
 - **Sharding.** Kernels run per shard inside `shard_map` (`tests/sharded.py`'s contract). Context parallelism is attention's `merge` and recurrence's `compose`. Expert parallelism is GEMM's group metadata per shard.
 - **Remat.** Which residuals are saved and in what dtype belongs to the algebra (lse, D, w, u, h). The saved-or-recomputed choice for recurrence's w, u and h is a choice-layer bit. Fusion changes which named residuals exist (`decoder_block.MLP_RESIDUALS`: 'gate_proj', 'up_proj', 'down_proj'), so each fused path declares the names it saves, and the remat policies read them, not today's fixed list.
-- **Compile.** Hooks are keyed by their traced programs. Every static form, hook and configuration is a compile, so the choice layer limits configurations to buckets. Compile seconds are recorded beside step time (bible §6).
+- **Compile.** Hooks are keyed by their traced programs. Every static form, hook and configuration is a compile, so the choice layer limits configurations to buckets. Compile seconds are recorded beside step time.
 
 ## 11. How it gets built
 
