@@ -3,6 +3,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+from reference_error import with_gradients
 from tool_support import load
 
 from dew.nn.mixers.mamba2 import chunk_ssd, recurrent_ssd
@@ -82,12 +83,10 @@ def mamba2_run(site, arrays):
 
 
 def ssd_value_and_grad(scan, operands, dy, dfinal):
-    """A scan's output, final state and all seven operand gradients under both cotangents."""
-    def loss(*args):
-        out, final = scan(*args)
-        return jnp.sum(out * dy) + jnp.sum(final * dfinal), (out, final)
-
-    (_, (out, final)), grads = jax.value_and_grad(loss, argnums=range(7), has_aux=True)(*operands)
+    """A scan's output, final state and all seven operand gradients under both cotangents, each cast to
+    its output's dtype, pulled back through the gate (`reference_error.with_gradients`)."""
+    out, final = jax.eval_shape(scan, *operands)
+    (out, final), *grads = with_gradients(scan)(*operands, (dy.astype(out.dtype), dfinal.astype(final.dtype)))
     return {"y": out, "final": final, **dict(zip(("x", "dt", "A", "B", "C", "D", "h0"),
                                                grads, strict=True))}
 
