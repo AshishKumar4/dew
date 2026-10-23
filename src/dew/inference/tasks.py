@@ -623,8 +623,9 @@ class TextGeneration(_NativeTextTask):
                  trust: Sequence[str] = ()) -> TextGeneration:
         """Load the causal language-model run in `directory` as a task.
 
-        The task rebuilds the model that the run's `run.json` records, the
-        way the recipe built it, over the weights of the latest checkpoint
+        The task rebuilds the model that the checkpoint's inference record
+        (`Checkpoints.artifact`) declares, the way the recipe built it, over
+        the weights of the latest checkpoint
         (or of `step`), and decodes text through the run's own tokenizer.
         The run's preview budget and sampling policy become the task's
         defaults, and a PPO run loads only its policy weights.
@@ -710,8 +711,8 @@ class BlockGeneration(_NativeTextTask):
                  trust: Sequence[str] = ()) -> BlockGeneration:
         """Load the block-diffusion run in `directory` as a task.
 
-        The task rebuilds the block denoiser that the run's `run.json`
-        records, over the weights of the latest checkpoint (or of `step`),
+        The task rebuilds the block denoiser that the checkpoint's inference
+        record declares, over the weights of the latest checkpoint (or of `step`),
         and samples with the run's saved `BlockProcess` over the canvas the
         model declares. The run's preview budget becomes the task's
         `max_new_tokens`, and its pad id the task's `pad_token_id`. A run
@@ -787,8 +788,8 @@ class MaskedGeneration(_NativeTextTask):
                  trust: Sequence[str] = ()) -> MaskedGeneration:
         """Load the masked-diffusion run in `directory` as a task.
 
-        The task rebuilds the bidirectional model that the run's `run.json`
-        records, over the weights of the latest checkpoint (or of `step`),
+        The task rebuilds the bidirectional model that the checkpoint's inference
+        record declares, over the weights of the latest checkpoint (or of `step`),
         and refines responses with MDLM over the run's own mask token, using
         the solver and step count the run saved. The model must score the
         whole row with every position reading the others (`Logits`, and

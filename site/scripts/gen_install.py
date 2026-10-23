@@ -1,5 +1,5 @@
 """Generate the install facts other files repeat from their owners: the CUDA builds' minima
-(dew.telemetry.builds.CUDA_BUILDS), Dew's package index (dew.telemetry.builds.PACKAGE_INDEX), Dew's least
+(dew.builds.CUDA_BUILDS), Dew's package index (dew.builds.PACKAGE_INDEX), Dew's least
 Python (pyproject.toml's requires-python), the JAX it requires (its dependencies), the pip every pip install
 takes first (tools/pip.txt) and the least uv (pyproject.toml's [tool.uv] required-version), with the
 bootstrap that installs it (site/scripts/uv_bootstrap.sh), into the standalone installer, armada's setup, dew
@@ -36,7 +36,7 @@ EXTRAS = ("<!-- BEGIN extras (site/scripts/gen_install.py checks them against py
 def facts() -> tuple[list[tuple[str, int, tuple[int, int]]], str, str]:
     """The CUDA builds, the package index and the least Python, read as literals so the installer
     stays independent of Dew's runtime imports."""
-    source = ast.parse((REPO / "src/dew/telemetry/builds.py").read_text())
+    source = ast.parse((REPO / "src/dew/builds.py").read_text())
 
     def literal(name: str):
         return next(ast.literal_eval(node.value) for node in source.body if isinstance(node, ast.Assign)
