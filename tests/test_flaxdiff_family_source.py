@@ -61,6 +61,8 @@ UDIT_MOVED = {"time_embed": ("conditioning", "time_embed"),
               "final_norm": ("output", "final_norm"), "final_proj": ("output", "final_proj")}
 DIT_POOLING = {"text_pooling": "all"}
 PROJECTIONS = {"project_in_conv": "project_in", "project_out_conv": "project_out"}
+FEED_FORWARD = {("net_0", "proj"): ("gate_up_proj",), ("net_2",): ("down_proj",)}
+"""FlaxDiff's GEGLU feed-forward, diffusers', under `GatedMLP`'s names (`geglu_feed_forward`)."""
 # A scan order's patch projection lands on Dew's patch convolution (`scan_projection`).
 SCAN_PROJECTED = ("patch_embed", "Conv_0")
 MMDITS = ("SimpleMMDiT", "HierarchicalMMDiT")
@@ -122,6 +124,10 @@ def dew_path(cls: str, name: str) -> tuple[str, ...]:
         at = path.index("mlp") + 1
         path = (*path[:at], MMDIT_LAYERS.get(path[at], path[at]), *path[at + 1:])
     if cls in UNETS:
+        if "ff" in path:
+            at = path.index("ff") + 1
+            moved = next(names for names in FEED_FORWARD if path[at:at + len(names)] == names)
+            path = (*path[:at], *FEED_FORWARD[moved], *path[at + len(moved):])
         # FlaxDiff's ConvLayer wraps the convolution Dew's Conv is, and its
         # middle stage projects with a 1x1 convolution where Dew's is dense.
         return tuple(PROJECTIONS.get(part, part.replace("ConvLayer_", "Conv_")) for part in path

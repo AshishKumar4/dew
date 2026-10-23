@@ -14,6 +14,8 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   across a persistent tile loop, so the next tile's loads overlap this one's
   stores; it runs as fast as CUTLASS's grouped kernel gradient at the MoE
   shapes measured. A fused RMS norm's Mosaic GPU forward now lowers on Hopper.
+- `train/flops`, a step's analytical training work, is logged on every device,
+  CPU and TPU included; `train/mfu` still needs a device with a known peak.
 - `dew.figures` draws SVG figures for notebooks and docs. Their colors follow
   the page's light or dark theme (dewml.dev, Colab, JupyterLab, VS Code, and
   the system setting elsewhere), and their animations are CSS, so they play

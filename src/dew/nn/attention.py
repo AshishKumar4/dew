@@ -26,7 +26,6 @@ from jax.sharding import PartitionSpec as P
 
 from dew.nn.dense import Dense, DenseGeneral
 
-from .activations import gated_product
 from .attention_kernels import (
     ATTENTION,
     DECODE,
@@ -2117,78 +2116,6 @@ class NormalAttention(nn.Module):
         return proj.reshape(orig_x_shape)
 
 
-class FlaxGEGLU(nn.Module):
-    """Project to twice the hidden width, then gate one half by the other.
-
-    The gate is GELU, the gated linear unit of Shazeer 2020
-    (https://arxiv.org/abs/2002.05202), whose product a gated MLP takes
-    (`dew.nn.activations.gated_product`); diffusers stores the up half first. The
-    hidden width is four times `dim`.
-    """
-
-    dim: int
-    dtype: Dtype | None = jnp.float32
-    precision: PrecisionLike = jax.lax.Precision.DEFAULT
-    approximate: bool = True
-
-    @nn.nowrap
-    def projections(self) -> dict[str, tuple[int, int]]:
-        return {"proj": (self.dim, self.dim * 4 * 2)}
-
-    @nn.nowrap
-    def model_flops(self, lengths) -> float:
-        return projection_flops(lengths, *self.projections()["proj"])
-
-    def setup(self):
-        self.proj = Dense(self.projections()["proj"][1], dtype=self.dtype, precision=self.precision,
-                          dot_general=float32_dot_general)
-
-    def __call__(self, hidden_states):
-        hidden_states = self.proj(hidden_states)
-        hidden_linear, hidden_gelu = jnp.split(hidden_states, 2, axis=-1)
-        return gated_product('geglu' if self.approximate else 'geglu_exact')(hidden_gelu, hidden_linear)
-
-
-@logical_axes({("net_0", "proj"): ("embed", "mlp"), ("net_2",): ("mlp", "embed")})
-class FlaxFeedForward(nn.Module):
-    """Run GEGLU then a linear layer back to `dim`, as diffusers does.
-
-    The checkpoint keys `net_0` and `net_2` are the indices the reference's
-    Sequential gives the two layers.
-    """
-
-    dim: int
-    dtype: Dtype | None = jnp.float32
-    precision: PrecisionLike = jax.lax.Precision.DEFAULT
-    dropout: float = 0.0
-    approximate_gelu: bool = True
-
-    @nn.nowrap
-    def model_flops(self, lengths) -> float:
-        """GEGLU's gate/up and down projections, with its fourfold hidden width."""
-        return (FlaxGEGLU(self.dim, parent=None).model_flops(lengths)
-                + projection_flops(lengths, *self.projections()["net_2"]))
-
-    @nn.nowrap
-    def projections(self) -> dict[str, tuple[int, int]]:
-        inner = FlaxGEGLU(self.dim, parent=None).projections()["proj"][1] // 2
-        return {"net_2": (inner, self.dim)}
-
-    def setup(self):
-        self.net_0 = FlaxGEGLU(
-            self.dim, dtype=self.dtype, precision=self.precision, approximate=self.approximate_gelu
-        )
-        self.net_2 = Dense(self.projections()["net_2"][1], dtype=self.dtype, precision=self.precision,
-                           dot_general=float32_dot_general)
-        self.dropout_layer = nn.Dropout(self.dropout)
-
-    def __call__(self, hidden_states, *, train: bool = False):
-        hidden_states = self.net_0(hidden_states)
-        if self.dropout:
-            hidden_states = self.dropout_layer(hidden_states, deterministic=not train)
-        return self.net_2(hidden_states)
-
-
 class BasicTransformerBlock(nn.Module):
     """Run self-attention, cross-attention over `context`, then feed-forward.
 
@@ -2211,12 +2138,14 @@ class BasicTransformerBlock(nn.Module):
     @nn.nowrap
     def cross_flops(self, lengths, context_lengths, context_features: int) -> float:
         """The configured attention branches and optional GEGLU maps."""
+        from .mlp import geglu_feed_forward  # mlp's blocks import this module's norms
+
         attention = NormalAttention(self.query_dim, self.heads, self.dim_head, parent=None)
         count = attention.cross_flops(lengths, context_lengths, context_features)
         if not self.only_pure_attention:
             if not self.use_cross_only:
                 count += attention.model_flops(lengths)
-            count += FlaxFeedForward(self.query_dim, parent=None).model_flops(lengths)
+            count += geglu_feed_forward(self.query_dim, parent=None).model_flops(lengths)
         return count
 
     def setup(self):
@@ -2234,7 +2163,9 @@ class BasicTransformerBlock(nn.Module):
         self.attention1 = attention(name='Attention1')
         self.attention2 = attention(name='Attention2')
 
-        self.ff = FlaxFeedForward(dim=self.query_dim, dtype=self.dtype, precision=self.precision)
+        from .mlp import geglu_feed_forward  # mlp's blocks import this module's norms
+
+        self.ff = geglu_feed_forward(self.query_dim, dtype=self.dtype, precision=self.precision)
         self.norm1 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
         self.norm2 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
         self.norm3 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
