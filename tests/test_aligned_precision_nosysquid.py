@@ -27,3 +27,18 @@ def test_precision(variant, width, size, name, seeds, monkeypatch):
     install(VARIANTS[variant])
     print("VARIANT", variant, flush=True)
     measure(width, size, name, seeds, monkeypatch)
+
+
+@pytest.mark.parametrize("variant", ["chunk-adjoint", "chunk-adjoint-fast"])
+@pytest.mark.parametrize("width,size", [pytest.param(16, 16, id="small"),
+                                       pytest.param(128, 64, id="production")])
+@pytest.mark.parametrize("name,seeds", [pytest.param("scalar delta", 40, id="scalar"),
+                                       pytest.param("vector delta", 40, id="vector"),
+                                       pytest.param("gated", 320, id="gated")])
+def test_adjoint_ratios(variant, width, size, name, seeds, monkeypatch):
+    from dew.nn.kernels import recurrence_chunk as c
+    from probe_aligned_chunk_adjoint_nosysquid import chunk_adjoint, chunk_adjoint_wy_source
+    monkeypatch.setattr(c, "chunk_delta_rule", {"chunk-adjoint": chunk_adjoint,
+                                              "chunk-adjoint-fast": chunk_adjoint_wy_source}[variant])
+    print("VARIANT", variant, flush=True)
+    measure(width, size, name, seeds, monkeypatch)

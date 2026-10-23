@@ -43,11 +43,12 @@ def run(mode, name, seed):
     if "DEW_PROBE_CHUNK" in os.environ:
         st.CHUNK = int(os.environ["DEW_PROBE_CHUNK"])
         c.held_chunk = lambda size, width: size
+    regime = os.environ.get("DEW_PROBE_REGIME", "aligned keys")
     with jax.enable_x64(False):
-        drawn = st.cotangents(st.SITES[name], "aligned keys", seed)
+        drawn = st.cotangents(st.SITES[name], regime, seed)
     jax.config.update("jax_enable_x64", True)
     hooks = st.SITES[name]
-    ref = jax.jit(with_gradients(functools.partial(token_by_token, hooks)))
+    ref = jax.jit(with_gradients(st.restarting(functools.partial(token_by_token, hooks), regime)))
     ref32 = ref(*drawn)
     with jax.enable_x64(True):
         truth = ref(*widened(drawn))
@@ -103,7 +104,8 @@ def run(mode, name, seed):
             if piece != "base":
                 target = c if piece == "l2norm" else c.recurrence if piece == "gated" else a
                 setattr(target, piece, wide(getattr(target, piece)))
-    mine = jax.jit(with_gradients(functools.partial(chunk, hooks, chunk_size=st.CHUNK, ported=False)))(*drawn)
+    mine = jax.jit(with_gradients(st.restarting(
+        functools.partial(chunk, hooks, chunk_size=st.CHUNK, ported=False), regime)))(*drawn)
     leaves = jax.tree_util.tree_flatten_with_path(mine)[0]
     refs, exacts = jax.tree.leaves(ref32), jax.tree.leaves(truth)
     for (path, ours), refleaf, exact in zip(leaves, refs, exacts, strict=True):
