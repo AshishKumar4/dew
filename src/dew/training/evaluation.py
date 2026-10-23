@@ -432,12 +432,12 @@ def _cut(leaf, keep: np.ndarray):
     """`leaf` without the rows `keep` marks as repeats, when its leading axis
     is the batch's rows: an array, a per-row tuple of captions or texts, or a
     per-row list of opaque records (`dew.data.dataset.take_rows`)."""
-    if isinstance(leaf, np.ndarray | jax.Array):
-        leaf = np.asarray(leaf)
-        per_row = leaf.ndim and leaf.shape[0] == keep.size
-    else:
-        per_row = isinstance(leaf, list | tuple) and len(leaf) == keep.size
-    return take_rows(leaf, np.flatnonzero(keep)) if per_row else leaf
+    if isinstance(leaf, list | tuple):
+        return take_rows(leaf, np.flatnonzero(keep)) if len(leaf) == keep.size else leaf
+    array = np.asarray(leaf) if isinstance(leaf, np.ndarray | jax.Array) else None
+    if array is None or not array.ndim or array.shape[0] != keep.size:
+        return leaf
+    return take_rows(array, np.flatnonzero(keep))
 
 
 def _real_artifact[A: Artifact](artifact: A, keep: np.ndarray) -> A:

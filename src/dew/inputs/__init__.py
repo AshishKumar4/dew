@@ -121,6 +121,12 @@ class InputSpec:
             if condition.encoder.reads_captions
         }
 
+    @property
+    def encoders(self) -> tuple[tuple[str, ConditionEncoder], ...]:
+        """Each condition's encoder by the keyword it is passed under, a hashable value a compiled
+        encoding takes as a static argument (`encode_conditions`)."""
+        return tuple((keyword, condition.encoder) for keyword, condition in self.conditions.items())
+
     def dependencies(self) -> Mapping[str, object]:
         """What `tokenize` and `encode_fields` make of a batch depends on: each condition's field
         and its encoder's own (`ConditionEncoder.dependencies`)."""
@@ -210,6 +216,14 @@ class InputSpec:
             if "mask" in record
             else None,
         )
+
+
+def encode_conditions(encoders: Sequence[tuple[str, ConditionEncoder]], weights: Mapping[str, Variables],
+                      tokens: Mapping[str, object]) -> dict:
+    """Each of `encoders` (`InputSpec.encoders`) over the tokens under its keyword, with the weights
+    under its keyword: the conditions a model is passed, by keyword. The one encoding a training
+    step (`DiffusionObjective.encode`) and a sampling task (`TextToImage`) run."""
+    return {keyword: encoder.encode(weights[keyword], tokens[keyword]) for keyword, encoder in encoders}
 
 
 __all__ = [
