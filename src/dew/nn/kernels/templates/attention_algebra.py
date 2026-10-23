@@ -1242,9 +1242,12 @@ def cotangent_product(cotangents: jax.Array, operand: jax.Array,
                       transposed: bool = False) -> jax.Array:
     """A tile's score cotangents `[bq, bk]` (fp32, scaled) times the call's queries or keys `operand` (its
     transpose's product where `transposed`: dK's `dSᵀ Q`, else dQ's `dS K`), fp32. An fp32 operand takes the
-    fp32 product. The fast form (`accurate` False) narrows the cotangents to a 16-bit operand's dtype for
-    one product, FlashAttention's: fp16's at the power of two that puts their largest at 2^14, so none
-    leaves its range. The accurate form takes them to fp32's accuracy, as the reference differentiates (its
+    fp32 product. The fast form (`accurate` False) narrows bf16's cotangents to bf16 for one product,
+    FlashAttention's. fp16's take the accurate form's two products in both forms: one fp16 product of
+    cotangents that cancel against equal keys near fp16's largest leaves a gradient past it once it returns
+    in fp16 (three keys of 65504, values -65504, 16384 and 65504: 131008 where the exact one is 0 and the
+    reference's finite), the stability rule's breach. The accurate form takes them to fp32's accuracy, as
+    the reference differentiates (its
     score cotangents are fp32), so a key's or a query's gradient whose cotangents cancel across the other
     axis loses no more than the reference's fp32 product does, where one 16-bit product loses every bit the
     cancellation exposes (bf16 small weights on large values: dK's worst row 3700x the reference's). A bf16
@@ -1258,11 +1261,8 @@ def cotangent_product(cotangents: jax.Array, operand: jax.Array,
 
     if operand.dtype == jnp.float32:
         return dot(oriented(cotangents), operand)
-    if not accurate:
-        if operand.dtype == jnp.bfloat16:
-            return dot(oriented(cotangents.astype(jnp.bfloat16)), operand)
-        narrow, exponent = _fp16_scaled(cotangents)
-        return power2(dot(oriented(narrow), operand), exponent)
+    if operand.dtype == jnp.bfloat16 and not accurate:
+        return dot(oriented(cotangents.astype(jnp.bfloat16)), operand)
     if operand.dtype == jnp.bfloat16:
         high = cotangents.astype(jnp.bfloat16)
         rest = cotangents - high.astype(jnp.float32)
