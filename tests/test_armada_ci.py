@@ -12,7 +12,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from tool_support import load
+from tool_support import git, load
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -868,20 +868,63 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
 
 def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
     """The checkout's one 3.12 task, run green on one CPU class against the shared test cache as armada
-    starts it (`armada_task`), its verdict written beside the checkout's entries, not among them (the
-    checkout's own directory is an input): each call, how many times its test has run, which it counts
-    in `runs`."""
+    starts it (`armada_task`) under the cache's policy, its verdict written beside the checkout's entries,
+    not among them (the checkout's own directory is an input): each call, how many times its test has run,
+    which it counts in `runs`."""
     interpreter(root, "3.12")
     url, _, _ = cache_worker
     monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
     cached(monkeypatch, url)
     (root / ".verdict").mkdir()
 
-    def run() -> int:
-        assert armada_task(ci, monkeypatch, root / ".verdict/verdict.json")["exitCode"] == 0
+    def run(policy: str = "on") -> int:
+        assert armada_task(ci, monkeypatch, root / ".verdict/verdict.json", policy)["exitCode"] == 0
         return len((root / "runs").read_text())
 
     return run
+
+
+@pytest.mark.parametrize(("changed", "policy"), [
+    ({"src/pkg/mod.py": "VALUE = 2\n"}, "on"), ({"docs/page.md": "page\n"}, "on"),
+    ({"tutorials/notes.ipynb": "{}\n"}, "on"), ({"tools/tool.py": "VALUE = 2\n"}, "stale:tools/"),
+    ({"pyproject.toml": "[project]\nname = 'changed'\n"}, "off"), ({"locks/cpu.txt": "jax==9\n"}, "off"),
+    ({"tools/armada/session.py": "# the session\n"}, "off"), ({".github/workflows/ci.yml": "on: []\n"}, "off"),
+    ({"Makefile": "all:\n"}, "off"),
+], ids=["a source module", "a docs page", "a notebook", "a tool", "the project", "a lock",
+        "the test session", "a workflow", "a file no record places"])
+def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_place_it(ci, tmp_path, changed,
+                                                                                        policy):
+    """CI's test cache policy for a change from main: each file's own inputs decide ('on') where the records
+    place what changed, every file that read a tool runs again where a tool changed, and every file runs
+    ('off') for a change to what every test process runs or reads, or to a file the records do not place."""
+    for name, text in {"src/pkg/mod.py": "VALUE = 1\n", "pyproject.toml": "[project]\nname = 'x'\n",
+                       "locks/cpu.txt": "jax==1\n"}.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    git(tmp_path, "init", "-q", "-b", "main")
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-qm", "base")
+    for name, text in changed.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-qm", "change")
+    assert ci.policy("HEAD~1") == policy
+
+
+def test_a_stale_policy_reruns_every_file_whose_run_read_a_tool(ci, tmp_path, monkeypatch, cache_worker):
+    """Under 'stale:tools/' a green row whose test ran a file under tools/ runs again, though that file is
+    unchanged, and under 'on' it is reused."""
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools/helper.py").write_text("VALUE = 1\n")
+    (tmp_path / "tests/test_tool.py").write_text(
+        "import runpy\n"
+        "from pathlib import Path\n"
+        "def test_tool():\n"
+        "    with Path('runs').open('a') as runs: runs.write('x')\n"
+        "    assert runpy.run_path('tools/helper.py')['VALUE'] == 1\n")
+    run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
+    assert [run(), run(), run("stale:tools/"), run()] == [1, 1, 2, 2]
 
 
 def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_changes(
