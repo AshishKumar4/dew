@@ -74,3 +74,16 @@ def test_a_float32_product_returns_the_dtype_asked():
     dims = (((1,), (0,)), ((), ()))
     result = jax.jit(lambda: float32_dot_general(lhs, rhs, dims, preferred_element_type=jnp.float32))()
     assert result.dtype == jnp.float32 and float(result[0, 0]) == 1.0
+
+
+def test_a_trace_for_an_assumed_gpu_target_keeps_its_fp32_sum():
+    """A step traced for an assumed GPU target (`generation.assumed`) on a CPU forms the target's
+    product, summed in fp32, with no float64 in its program: the policy is real CPU execution's."""
+    from dew.nn.kernels.generation import assumed
+
+    lhs, rhs = CANCELLING[None], np.ones((3, 1), np.float32)
+    dims = (((1,), (0,)), ((), ()))
+    with assumed("sm80"):
+        text = jax.jit(lambda: float32_dot_general(lhs, rhs, dims)).lower().as_text()
+    assert "f64" not in text
+
