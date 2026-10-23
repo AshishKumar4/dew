@@ -365,6 +365,7 @@ def grain_reader(config: Worker, objective, loading: Loading):
 
     from dew.data import images
     from dew.data.images import EncodeCaptions
+    from dew.data.steps.generic import Coordinated
 
     read_options = grain.ReadOptions(loading.threads, loading.read_buffer)
     if config.workload == "image":
@@ -390,8 +391,9 @@ def grain_reader(config: Worker, objective, loading: Loading):
         # A produced packing order is repeated and shuffled by both Dew loaders.
         stored = list(packed)
         rows = grain.MapDataset.source(stored).shuffle(seed=measured.seed).repeat()
-        stream = grain_options(rows.batch(measured.batch, drop_remainder=True).to_iter_dataset(read_options),
-                               config)
+        # Grain's packed columns as the objective and the trainer read them, as Dew's read lays them.
+        rows = rows.batch(measured.batch, drop_remainder=True).map(Coordinated(("text",), None))
+        stream = grain_options(rows.to_iter_dataset(read_options), config)
     else:
         from dew.data.packing import PackedSource
         from dew.data.pipeline import Pack
@@ -403,23 +405,11 @@ def grain_reader(config: Worker, objective, loading: Loading):
         rows = grain.MapDataset.source(windows).map(
             lambda row: {name: value for name, value in row.items() if not name.startswith("_dew_")})
         rows = rows.shuffle(seed=measured.seed).repeat().batch(measured.batch, drop_remainder=True)
-        stream = grain_options(rows.to_iter_dataset(read_options), config)
+        stream = grain_options(rows.map(Coordinated(("text",), None)).to_iter_dataset(read_options), config)
     reference = ("prepacked in-memory native-Grain first-fit list" if config.engine == "grain_prepacked" else
                  "planned first-fit windows read from token store" if config.workload == "text" else
                  "native Grain transforms")
     return lambda: iter(stream), {"read": "indexed", "batch_policy": "fixed rows", "reference": reference}
-
-
-def objective_batch(batch) -> dict:
-    """`batch` as the objective reads it: a native Grain packing's `text_segment_ids` become the
-    token field its layout reads (`dew.nn.inputs.token_layout`), as Dew's packing's coordinates are."""
-    if "text_segment_ids" not in batch:
-        return batch
-    from dew.nn.inputs import ModelInputs
-
-    rest = {name: value for name, value in batch.items() if name != "text_segment_ids"}
-    segments = {"segment_ids": batch["text_segment_ids"]}
-    return {**rest, "text": ModelInputs(batch["text"], token_fields=segments)}
 
 
 def batch_counts(batch, objective) -> dict:
@@ -430,7 +420,7 @@ def batch_counts(batch, objective) -> dict:
 
     rows = len(next(iter(batch.values())))
     if objective.counts_tokens:
-        tokens = int(np.sum(objective.real_lengths(objective_batch(batch))))
+        tokens = int(np.sum(objective.real_lengths(batch)))
         return {"rows": rows, "tokens": tokens, "padded_tokens": int(np.size(batch["text"][:, :-1]))}
     valid = np.asarray(batch["valid"]) if "valid" in batch else np.ones(rows, bool)
     return {"rows": rows, "tokens": int(np.sum(valid)), "padded_tokens": int(np.size(valid))}
@@ -515,8 +505,9 @@ class Counted(Forwarding):
     def __next__(self):
         batch = next(self._source)
         counts = batch_counts(batch, self.objective)
-        counts["model_flops"] = (None if counts["tokens"] == 0 else
-                                 self.objective.training_flops(None, objective_batch(batch)))
+        # An objective that counts no tokens, an image's, declares no FLOP count for its rows.
+        counts["model_flops"] = (self.objective.training_flops(None, batch)
+                                 if self.objective.counts_tokens and counts["tokens"] else None)
         self.counts.put(counts)
         return batch
 

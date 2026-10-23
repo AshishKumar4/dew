@@ -679,22 +679,25 @@ def test_an_epoch_under_a_ramp_counts_the_step_that_completes_it(records, steps)
     assert data.epoch_steps(1) == steps
 
 
-def test_a_ramp_over_an_order_read_once_delivers_its_short_last_step_filled():
-    """Five records read once in batches of six that keep a short one, under a ramp of four-record
-    steps, take two steps: the second holds the fifth record, filled out and marked real alone, as
-    the epoch's count says."""
-    data = ramped(compile(Pipeline(Memory(Indexed(1, 5))).repeat(1).batch(6, drop_remainder=False),
-                          loading=READ), Ramp(start=4, increment=2, samples=100))
-    assert data.epoch_steps(1) == 2
+@pytest.mark.parametrize(("records", "keep", "real"), [(6, False, [4]), (7, True, [4, 3]), (5, True, [4, 1])])
+def test_a_ramp_over_an_order_read_once_ends_where_its_records_do(records, keep, real):
+    """An order read once under a ramp of four-record steps takes the steps its tail policy counts and
+    no more: six records in batches of six that drop a short one take one whole step, the other two
+    dropped; seven or five in batches that keep one take the steps that hold them all, the last
+    holding the order's last records real and the rest filled, never a step of padding alone."""
+    order = Pipeline(Memory(Indexed(1, records))).repeat(1).batch(6, drop_remainder=not keep)
+    data = ramped(compile(order, loading=READ), Ramp(start=4, increment=2, samples=100))
+    assert data.epoch_steps(1) == len(real)
     stream = data.train(DataPartition())
     try:
         steps = list(stream)
     finally:
         stream.close()
-    assert len(steps) == 2
-    real = [int(value) for step in steps
-            for value in np.asarray(step["id"])[np.asarray(step[VALID_ROWS], bool)]]
-    assert sorted(real) == [1000 + index for index in range(5)]
+    held = [np.asarray(step[VALID_ROWS], bool) if VALID_ROWS in step else np.ones(4, bool) for step in steps]
+    assert [int(np.count_nonzero(valid)) for valid in held] == real
+    ids = sorted(int(value) for step, valid in zip(steps, held, strict=True)
+                 for value in np.asarray(step["id"])[valid])
+    assert ids == [1000 + index for index in range(sum(real))]
 
 
 def indexed_data(records: int, batch: int, seed: int = 0) -> Loader:

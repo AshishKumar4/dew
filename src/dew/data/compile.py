@@ -65,6 +65,7 @@ from dew.data.lowering import (
     _Build,
     _epoch_records,
     _Locality,
+    _order_records,
     _split_spans,
     _tail,
     _weights,
@@ -659,6 +660,7 @@ def _compiled(
         batch_tokens=staged.batch_tokens,
         device=device,
         tail=_tail(train, build),
+        order_records=_order_records(train, build),
     )
 
 
@@ -803,7 +805,7 @@ def _compile_phases(
         return PhasedStream(phases, loading.stop_seconds)
 
     # Only the last phase's order can end, so its batch decides what an epoch's short batch does.
-    return dataclasses.replace(built[0][0], train=training, tail=built[-1][0].tail)
+    return dataclasses.replace(built[0][0], train=training, tail=built[-1][0].tail, order_records=None)
 
 
 def _continued(pipeline: Pipeline, consumed: Mapping[str, int]) -> Pipeline:
