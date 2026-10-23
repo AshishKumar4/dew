@@ -45,6 +45,7 @@ _MASKED_LM = 'ModernBertForMaskedLM'
 
 
 _MODERNBERT_SPELLING = RopeSpelling(theta=160000.0, per_kind=True, local_theta=10000.0,
+                                    legacy_kinds=('full_attention', 'sliding_attention'),
                                     local_field='local_rope_theta')
 """ModernBertConfig's rope: a record per layer type, at 160000 on the full layers and 10000 on the
 sliding ones where the file names no base (its `default_theta`)."""

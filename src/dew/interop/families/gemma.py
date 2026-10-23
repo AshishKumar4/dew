@@ -579,7 +579,9 @@ GEMMA3N_TEXT = DecoderFamily(
     sandwich_norms=True,
     weight_path=_gemma3n_path,
     preserve_source_layout=True,
-    defaults={'hidden_activation': 'gelu_pytorch_tanh', 'final_logit_softcapping': 30.0},
+    # Gemma3nTextConfig's window, which an omitted sliding_window means.
+    defaults={'hidden_activation': 'gelu_pytorch_tanh', 'final_logit_softcapping': 30.0,
+              'sliding_window': 512},
 )
 
 GEMMA4_TEXT = DecoderFamily(
@@ -610,7 +612,9 @@ GEMMA3_TEXT = DecoderFamily(
     _gemma3_export,
     sandwich_norms=True,
     preserve_source_layout=False,
-    defaults={'hidden_activation': 'gelu_pytorch_tanh', 'query_pre_attn_scalar': 256},
+    # Gemma3TextConfig's window, which an omitted sliding_window means.
+    defaults={'hidden_activation': 'gelu_pytorch_tanh', 'query_pre_attn_scalar': 256,
+              'sliding_window': 4096},
 )
 
 GEMMA2 = DecoderFamily(
@@ -622,8 +626,9 @@ GEMMA2 = DecoderFamily(
     _gemma2_export,
     sandwich_norms=True,
     preserve_source_layout=False,
+    # Gemma2Config's window, which an omitted sliding_window means.
     defaults={'hidden_activation': 'gelu_pytorch_tanh', 'query_pre_attn_scalar': 256,
-              'final_logit_softcapping': 30.0, 'attn_logit_softcapping': 50.0},
+              'final_logit_softcapping': 30.0, 'attn_logit_softcapping': 50.0, 'sliding_window': 4096},
 )
 
 GEMMA = DecoderFamily(

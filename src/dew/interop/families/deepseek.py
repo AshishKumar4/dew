@@ -216,8 +216,10 @@ def deepseek_routed(hf_config: Mapping[str, object], layers: int, used: set) -> 
         refuse(f"moe_layer_freq {freq!r}",
                 "transformers builds every layer past the dense ones as MoE, "
                 "whatever this field says")
-    first_k = records.integer(hf_config.get('first_k_dense_replace', 0) or 0, 'first_k_dense_replace')
-    if not 0 <= first_k <= layers:
+    # A dense prefix past the stack leaves every layer dense, as DeepseekV3DecoderLayer builds them.
+    first_k = min(records.integer(hf_config.get('first_k_dense_replace', 0) or 0, 'first_k_dense_replace'),
+                  layers)
+    if first_k < 0:
         refuse(f"first_k_dense_replace {first_k!r}",
                 f"it names dense layers of a {layers}-layer model")
     pattern = hf_config.get('mlp_layer_types')
@@ -1158,6 +1160,7 @@ DEEPSEEK_V2 = DecoderFamily(
     lambda model: {},
     weight_path=layer_depth_path,
     preserve_source_layout=True,
+    aliases={'num_experts': 'n_routed_experts'},
     # DeepseekV2Config's defaults for the fields its routing reads.
     defaults={'n_shared_experts': 2, 'n_routed_experts': 64, 'routed_scaling_factor': 1.0,
               'topk_method': 'greedy', 'norm_topk_prob': False, 'first_k_dense_replace': 0},
@@ -1189,6 +1192,7 @@ DEEPSEEK_V3 = DecoderFamily(
     lambda model: {},
     weight_path=layer_depth_path,
     preserve_source_layout=True,
+    aliases={'num_local_experts': 'n_routed_experts', 'num_mtp_layers': 'num_nextn_predict_layers'},
     # DeepseekV3Config's defaults for the fields its routing reads: its routed weights scale by 2.5.
     defaults={'n_shared_experts': 1, 'n_routed_experts': 256, 'num_experts_per_tok': 8,
               'routed_scaling_factor': 2.5, 'n_group': 8, 'topk_group': 4, 'norm_topk_prob': True,

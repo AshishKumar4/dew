@@ -529,50 +529,44 @@ def test_a_dense_llada_config_without_a_base_rotates_at_its_classs_10000(tmp_pat
 
 
 CLASS_DEFAULTED = ("deepseek-v2-tiny", "deepseek-v3-tiny", "gpt-oss-tiny", "mistral-tiny", "mixtral-tiny",
-                   "llama4-tiny", "modernbert-tiny", "qwen2-tiny", "qwen2-moe-tiny", "qwen3-tiny",
-                   "qwen3-moe-tiny")
+                   "ministral-tiny", "llama4-tiny", "modernbert-tiny", "qwen2-tiny", "qwen2-moe-tiny",
+                   "qwen3-tiny", "qwen3-moe-tiny", "gemma2-tiny", "gemma3-tiny", "olmo3-tiny", "phi3-tiny",
+                   "glm4-moe-tiny", "muse-glimmer-text-tiny")
 """Fixtures of families whose transformers config class states their defaults."""
 _IDENTITY = frozenset({"model_type", "architectures", "transformers_version", "dtype", "torch_dtype",
                        "auto_map", "_name_or_path"})
 
 
-def _defaulted_edits(name):
-    """Each way to leave one of the fixture's fields to its config class: every field whose stated
-    value is the one the class fills, removed alone, and a flat rope record's base where it is the
-    class's `default_theta`, which is what the class fills a record's missing base with."""
+def _class_defaults(name):
+    """The fields of the fixture's transformers config class, at its defaults, that a JSON file can
+    state: each is what the class reads where the file leaves the field out."""
     from transformers import CONFIG_MAPPING
 
-    config = fixture_config(name)
-    made = CONFIG_MAPPING[config["model_type"]]()
-    edits = {field: _without(field) for field, value in config.items()
-             if field not in _IDENTITY and field != "rope_parameters"
-             and getattr(made, field, _IDENTITY) == value}
-    record = config.get("rope_parameters")
-    if isinstance(record, dict) and record.get("rope_theta") == getattr(type(made), "default_theta", None):
-        edits["rope_parameters.rope_theta"] = lambda config: {
-            **config, "rope_parameters": _without("rope_theta")(config["rope_parameters"])}
-    return edits
+    made = CONFIG_MAPPING[fixture_config(name)["model_type"]]()
+    return {field: value for field, value in made.to_dict().items()
+            if field not in _IDENTITY and not field.startswith("_")
+            and json.loads(json.dumps(value, default=lambda value: None)) == value}
+
+
+def _translated(config):
+    """The decoder a config translates to, or None where the translation refuses it."""
+    try:
+        return translate_config(config)
+    except ValueError:
+        return None
 
 
 @pytest.mark.parametrize("name", CLASS_DEFAULTED)
-def test_a_field_left_to_its_config_class_computes_what_stating_it_does(name, tmp_path):
-    """Every field the fixture states at its config class's default, removed one at a time: the
-    load computes the fully spelled fixture's logits, because the family fills it as its class does,
-    never at another family's default."""
-    ids = np.load(FIXTURES / name / "input_ids.npy")
-    model, variables = fp32_decoder(FIXTURES / name)
-    spelled = np.asarray(model.apply(variables, ids))
-    edits = _defaulted_edits(name)
-    assert edits, f"{name} states no field at its class's default"
-    differing = []
-    for field, edit in edits.items():
-        try:
-            model, variables = fp32_decoder(_respelled(name, tmp_path / field, edit))
-            if not np.array_equal(np.asarray(model.apply(variables, ids)), spelled):
-                differing.append(field)
-        except ValueError as refused:
-            differing.append(f"{field} (refused: {refused})")
-    assert not differing, f"{name} computes another model without {differing}"
+def test_a_field_left_out_reads_as_its_config_class_fills_it(name):
+    """Each field of the family's config class, once stated at the class's default and once left
+    out of the fixture's config: both translate to one decoder, or both are refused, because the
+    family fills an omitted field as its class does, never at another family's default. Over the
+    fixture's own weights, one decoder computes one set of logits
+    (`test_a_source_spelled_another_way_computes_the_reference_logits`)."""
+    config = fixture_config(name)
+    differing = [field for field, default in _class_defaults(name).items()
+                 if _translated({**config, field: default}) != _translated(_without(field)(config))]
+    assert not differing, f"{name} reads {differing} otherwise than its class where they are left out"
 
 
 @pytest.mark.parametrize("name, theta", [

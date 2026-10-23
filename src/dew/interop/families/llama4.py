@@ -75,10 +75,10 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
                  'moe_layers', 'interleave_moe_layer_step', 'attention_chunk_size',
                  'use_qk_norm', 'attn_temperature_tuning', 'floor_scale', 'attn_scale'))
     rule = {
-        'use_qk_norm': bool(hf_config.get('use_qk_norm', True)),
-        'attn_temperature_tuning': bool(hf_config.get('attn_temperature_tuning', True)),
-        'floor_scale': records.number(hf_config.get('floor_scale', 8192), 'floor_scale'),
-        'attn_scale': records.number(hf_config.get('attn_scale', 0.1), 'attn_scale'),
+        'use_qk_norm': bool(hf_config['use_qk_norm']),
+        'attn_temperature_tuning': bool(hf_config['attn_temperature_tuning']),
+        'floor_scale': records.number(hf_config['floor_scale'], 'floor_scale'),
+        'attn_scale': records.number(hf_config['attn_scale'], 'attn_scale'),
     }
     chunk = hf_config.get('attention_chunk_size')
     full = native_fields(LayerKind)(mixer=None)
@@ -92,7 +92,7 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     step = records.integer(hf_config.get('interleave_moe_layer_step', 1), 'interleave_moe_layer_step')
     mixture: MixtureFields = native_fields(Mixture)(
         experts=records.integer(hf_config['num_local_experts'], 'num_local_experts'),
-        top_k=records.integer(hf_config.get('num_experts_per_tok', 1), 'num_experts_per_tok'),
+        top_k=records.integer(hf_config['num_experts_per_tok'], 'num_experts_per_tok'),
         score_function='sigmoid',
         norm_topk_prob=False,
         scale_inputs=True,
@@ -153,5 +153,8 @@ LLAMA4_TEXT = DecoderFamily(
     preserve_source_layout=True,
     # Llama4TextConfig's defaults for the fields its decoder reads.
     defaults={'rms_norm_eps': 1e-5, 'num_experts_per_tok': 1, 'use_qk_norm': True,
-              'attn_temperature_tuning': True, 'floor_scale': 8192, 'attn_scale': 0.1},
+              'attn_temperature_tuning': True, 'floor_scale': 8192, 'attn_scale': 0.1,
+              'attention_chunk_size': 8192},
+    # A model whose rotated layers attend every key says so, against the class's 8192.
+    export_nulls=('attention_chunk_size',),
 )

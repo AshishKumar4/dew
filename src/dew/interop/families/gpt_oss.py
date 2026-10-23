@@ -83,7 +83,10 @@ GPT_OSS = DecoderFamily(
     weight_path=partial(renamed_path, (), layer_leaves=_GPT_OSS_LEAVES),
     export_path=partial(renamed_name, (), layer_leaves=_GPT_OSS_LEAVES),
     preserve_source_layout=False,
-    # GptOssConfig's defaults: biased attention, its own norm epsilon and expert geometry, and a window.
+    # GptOssConfig's defaults: biased attention, its own norm epsilon and expert geometry, a window,
+    # and its YaRN record where a config states none.
     defaults={'attention_bias': True, 'rms_norm_eps': 1e-5, 'num_experts_per_tok': 4,
-              'num_local_experts': 128, 'sliding_window': 128},
+              'num_local_experts': 128, 'sliding_window': 128,
+              'rope_parameters': {'rope_type': 'yarn', 'factor': 32.0, 'beta_fast': 32.0, 'beta_slow': 1.0,
+                                  'truncate': False, 'original_max_position_embeddings': 4096}},
 )
