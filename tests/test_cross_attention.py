@@ -22,14 +22,7 @@ import optax
 import pytest
 import torch
 from model_support import TINY_DECODER, Digits, decoder, flat_tree
-from reference_error import (
-    assert_as_exact,
-    assert_computes_the_oracle,
-    chain_roundings,
-    torch_with_gradients,
-    widened,
-    with_gradients,
-)
+from reference_error import assert_as_exact, torch_with_gradients, with_gradients
 from test_serving import assert_same_generation
 
 from dew.checkpoints import Checkpoints
@@ -471,27 +464,19 @@ def test_a_server_refuses_a_context_its_layers_cannot_read():
 
 
 def test_a_zero_gate_leaves_an_ngpt_stream_whatever_its_length():
-    """Under nGPT a zero gate moves the stream by nothing, tiny, large and zero rows alike, where a step
-    normed back to the stream's length would shrink a tiny one: in float64 the block is the identity
-    within float64's rounding of its own chain (`assert_computes_the_oracle`), and a zero row comes
-    back bit for bit with finite gradients."""
+    """Under nGPT a zero gate moves the stream by nothing, tiny, large and zero rows alike, bit for
+    bit, where a step normed back to the stream's length would shrink a tiny one; the gradients stay
+    finite, a zero row's included."""
     block = BLOCK.clone(norm=None, ngpt=True)
     x, context, params, lengths, cotangent = block_draw(2)
     x = x * np.asarray([1e-4, 1.0, 30.0, 0.0], np.float32)[:, None, None]
     shut = {**params, "alpha_cross_attn": np.zeros(1, np.float32), "alpha_dense": np.zeros(1, np.float32)}
 
-    def block_out(x, params, context):
+    def block_out(x, params):
         return block.apply({"params": params}, x, CrossContext(context, lengths))
 
-    with jax.enable_x64(new_val=True):
-        wide = widened((x, shut, context))
-        run = functools.partial(block_out, context=wide[2])
-        roundings = chain_roundings(jax.make_jaxpr(run)(*wide[:2]))
-        assert_computes_the_oracle(np.asarray(run(*wide[:2])), wide[0], "a zero nGPT gate",
-                                   roundings=roundings)
-    out, into_x, gradients = jax.jit(with_gradients(functools.partial(block_out, context=context)))(
-        x, shut, cotangent)
-    np.testing.assert_array_equal(np.asarray(out)[3], x[3])
+    out, into_x, gradients = jax.jit(with_gradients(block_out))(x, shut, cotangent)
+    np.testing.assert_array_equal(np.asarray(out), x)
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves((into_x, gradients)))
 
 
@@ -593,3 +578,24 @@ def test_a_frozen_trunk_counts_the_weight_gradients_of_its_blocks_alone():
     rows, targets = frozen.real_lengths(batch), np.full(2, 7, np.int64)
     weights = attached.model.parameter_flops(rows) + attached.model.logits_flops(targets)
     assert trained.training_flops(None, batch) - frozen.training_flops(None, batch) == pytest.approx(weights)
+
+
+def test_zero_gates_leave_a_pretrained_ngpt_decoder_bit_for_bit():
+    """Blocks attached to a pretrained nGPT decoder (Dory, looped), their gates at zero, return its
+    logits bit for bit over a context; drawn away from zero, the gates move them."""
+    dory = Pretrained.load(ROOT / "tests" / "fixtures" / "hf" / "dory-tiny", dtype="float32",
+                           attention_impl="reference")
+    width = dory.model.emb_features
+    attached = dory.with_cross_attention(CrossAttention((0,), context_length=3), key=0)
+    rng = np.random.default_rng(6)
+    ids = jnp.asarray(rng.integers(0, dory.model.vocab_size, (2, 9)), jnp.int32)
+    conditioning = {CONTEXT: jnp.asarray(rng.standard_normal((2, 3, width)), jnp.float32),
+                    CONTEXT_LENGTHS: jnp.asarray([3, 2], jnp.int32)}
+    variables = thaw(attached.variables)
+    base = np.asarray(dory.model.apply(thaw(dory.variables), ids))
+    fresh = np.asarray(attached.model.apply(variables, ids, conditioning=conditioning))
+    np.testing.assert_array_equal(fresh, base)
+    gated = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: jnp.full_like(leaf, 0.5) if path[-1].key.startswith("alpha_") else leaf, variables)
+    moved = np.asarray(attached.model.apply(gated, ids, conditioning=conditioning))
+    assert np.isfinite(moved).all() and not np.array_equal(moved, base)

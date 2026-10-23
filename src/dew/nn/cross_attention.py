@@ -203,8 +203,9 @@ class GatedCrossAttention(nn.Module):
         unit sphere, at the stream's own length. The move is the stepped
         point less the unstepped one, so a zero gate leaves the stream as it
         is, whatever its length: before a first layer the input embeddings
-        are not unit."""
-        wide = stream.astype(at_least_fp32(stream.dtype))
+        are not unit. A zero gate's step is the same point, normed alike, so
+        the stream comes back bit for bit."""
+        wide = stream.astype(at_least_fp32(jnp.result_type(stream, branch, gate)))
         if self.ngpt:
             start, end = l2norm(wide), l2norm(branch).astype(wide.dtype)
             length = sqrt_or_zero(jnp.sum(jnp.square(wide), axis=-1, keepdims=True))
