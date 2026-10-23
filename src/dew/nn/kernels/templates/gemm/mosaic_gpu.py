@@ -301,7 +301,8 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
             allocations=pipeline(hopper.ignore, hopper.ignore).get_allocations(
                 lhs_gmem.at[pl.ds(0, block_m)], rhs_columns(rhs_gmem.at[0], 0),
                 *stepped_views(pl.ds(0, block_m))),
-            o_smems=[plgpu.SMEM((2, *part), gmem.dtype) for gmem in o_gmems],
+            o_smems=[plgpu.SMEM((2, part[1] // _STAGED_COLUMNS, part[0], _STAGED_COLUMNS), gmem.dtype)
+                     for gmem in o_gmems],
             **hopper.staging('side', zip(side_shapes, side_gmems, strict=True)),
             **hopper.staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]), prologue_gmems[i])
                                  for i in fixed]),
@@ -440,9 +441,19 @@ def _finish_half(acc, epilogue, sides: tuple, outs: tuple, place: tuple, wg) -> 
     values = values if isinstance(values, tuple) else (values,)
     for o_gmem, o_smem, value in zip(*outs, values, strict=True):
         plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-        o_smem[wg] = value.astype(o_smem.dtype)
+        for chunk in range(o_smem.shape[1]):
+            columns = slice(chunk * _STAGED_COLUMNS, (chunk + 1) * _STAGED_COLUMNS)
+            o_smem[wg, chunk] = value[:, columns].astype(o_smem.dtype)
         plgpu.commit_smem()
-        hopper.store_rows(o_smem.at[wg], o_gmem, row_start, first, stored, column, most)
+        for chunk in range(o_smem.shape[1]):
+            hopper.store_rows(o_smem.at[wg, chunk], o_gmem, row_start, first, stored,
+                              column + chunk * _STAGED_COLUMNS, most)
+
+
+_STAGED_COLUMNS = 128
+"""The columns a consumer stages its output in at a time: a row-split part's 256 columns written to shared
+memory as one 512-byte row conflicted on its banks 280 times as often as two 256-byte halves (ncu, Qwen3's
+down projection: 18.3M conflicts against 64.6K, its forward 11% slower than the column split's)."""
 
 
 _IN_FLIGHT = 1
