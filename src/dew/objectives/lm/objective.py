@@ -689,6 +689,10 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
             valid = valid & (tokens != self.pad_id)
         return valid, token_layout(fields, xp=np)[1]
 
+    def scored_tokens(self, batch: Batch) -> np.ndarray:
+        """Each row's targets the loss scores (`scored_targets`), its `loss_role`'s alone."""
+        return self._prediction_lengths(batch)
+
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """Real input lengths, each packed document its own attention square.
 

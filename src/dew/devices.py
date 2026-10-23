@@ -13,7 +13,7 @@ import shutil
 import sys
 from collections.abc import Mapping, Sequence
 
-from dew.builds import CUDA_BUILDS, QUERY, listed_gpus, newest_build, runs_on
+from dew.builds import CUDA_BUILDS, PACKAGE_INDEX, QUERY, listed_gpus, newest_build, runs_on
 from dew.pool import answered, runs_on_gpu
 
 _log = logging.getLogger(__name__)
@@ -236,7 +236,8 @@ def cpu_only_refusal(env: Mapping[str, str], gpus: tuple[str, tuple[int, int]] |
                           f"an older one with NVIDIA's cuda-compat) and SM {least[0]}.{least[1]}+"
                           for name, major, least, version in CUDA_BUILDS)
         return f"{found}: no CUDA build of JAX runs here ({needs}). Update the NVIDIA driver. {on_cpu}"
-    install = f'uv pip install "dewml[{build}]"'
+    # Dew's JAX build is served from its own index only, beside PyPI.
+    install = f'uv pip install --extra-index-url {PACKAGE_INDEX} "dewml[{build}]"'
     if not installed:
         return f"{found}: no CUDA build of JAX is installed. Install the one it runs: {install}. {on_cpu}"
     stale = " ".join(f"jax-{name}-plugin jax-{name}-pjrt" for name in installed)

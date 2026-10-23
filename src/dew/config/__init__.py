@@ -686,7 +686,8 @@ class TrainerConfig:
     epochs: int | None = None
     """The run length as passes over the data; `steps` sets it directly instead."""
     tokens: int | None = None
-    """Stop after this many real tokens across all microbatches, including before a resume.
+    """Stop after the loss has scored this many targets across all microbatches, including before a
+    resume.
 
     Uses the counter reported as `train/tokens`, without padding. The final
     microbatch may cross the budget. With `steps` or `epochs`, the first cap
@@ -859,6 +860,15 @@ class TrainerConfig:
         """Return the step cap from `steps` or `epochs`, None for a token-only run (`run_steps`, the
         one policy a direct fit applies too)."""
         return run_steps(dataset, self.steps, self.epochs, self.tokens, self.accumulation)
+
+    def total_updates(self, dataset: Loader) -> int | None:
+        """Return the optimizer updates the run takes over `dataset` as `RunConfig.train` finalizes it,
+        its token budget's accumulation and its batch ramp applied: what an average that moves once an
+        update ramps over. None for a token-only run."""
+        trainer = self.accumulating(dataset)
+        ramp = trainer.batch_ramp
+        steps = trainer.total_steps(dataset if ramp is None else ramped(dataset, ramp))
+        return None if steps is None else -(-steps // trainer.accumulation)
 
     def eval_interval(self, dataset: Loader) -> int | None:
         """Return the steps between validation passes over `data`, or None for never."""
@@ -1155,6 +1165,9 @@ class RunConfig:
     _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {"lora": "lora"}
     """The optional settings `cli` turns on by their own flags, each with the
     subcommand its flags imply."""
+    RESUMABLE: ClassVar[tuple[str, ...]] = ("trainer", "optim", "data", "validation", "data_seed")
+    """The fields a run resumed under its name may change: how it trains and optimizes, and what it
+    reads. Every other field says what it trains, which the resume must keep (`check_resume`)."""
 
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
     data: Annotated[Dataset | None, tyro.conf.Suppress] = None
@@ -1278,6 +1291,25 @@ class RunConfig:
         """The run's class record: its class by its alias in `dew.registry.runs`, or by its import path
         where the table holds none, and its fields (`to_dict`)."""
         return {"class": registry.runs.name_of(type(self)), "fields": self.to_dict()}
+
+    def check_resume(self, saved: Mapping[str, object]) -> None:
+        """Refuse to resume the run whose record is `saved` as this one where they train different
+        things: another class, or a field outside `RESUMABLE` that differs. A changed `rope_theta`
+        keeps every shape, so it would otherwise continue the old weights under new semantics. The
+        saved fields are read back as this class reads them (`from_dict`), so a field the record
+        predates takes its default."""
+        named = registry.class_record(saved)
+        if named is None or named[0] != registry.runs.name_of(type(self)):
+            raise ValueError(f"the run to resume is no {type(self).__name__}; resume it as the run it "
+                             "records, or train under another name")
+        before = type(self).from_dict({name: value for name, value in named[1].items()
+                                       if name not in _CHAINS})._fields_record()
+        now = self._fields_record()
+        changed = sorted(name for name in now.keys() | before.keys()
+                         if name not in self.RESUMABLE and now.get(name) != before.get(name))
+        if changed:
+            raise ValueError(f"the run to resume trained other {', '.join(changed)}; resume it as it "
+                             "recorded them, or train under another name")
 
     @classmethod
     def cli(cls, args: Sequence[str] | None = None, *, default: Self | None = None) -> Self:
@@ -1500,7 +1532,12 @@ class RunConfig:
             local = _local_tracker(checkpoints.directory, name)
             tracker = Trackers(local, *(() if wandb_tracker is None else (wandb_tracker,)))
             def record_run() -> None:
-                """Write the run's record and name where it is tracked, on rank zero."""
+                """Refuse a checkpoint of another run under the name, before its record is replaced or
+                its state restored; then write the run's record and name where it is tracked, on rank
+                zero."""
+                saved = epath.Path(checkpoints.directory) / RUN_FILE
+                if checkpoints.latest is not None and saved.exists():
+                    self.check_resume(json.loads(saved.read_text()))
                 if jax.process_index() == 0:
                     display = TrainingDisplay()
                     display.note(f"Experiment_Name: {name}")
