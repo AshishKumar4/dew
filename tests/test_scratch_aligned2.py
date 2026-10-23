@@ -54,7 +54,7 @@ def wide(fn):
 
 
 @jax.custom_jvp
-def wide_factor(a, issue=algebra.portable):
+def wide_factor(a):
     with jax.enable_x64(True):
         return ORIGINAL["factor"](a.astype(jnp.float64), lambda n, x, y: jnp.matmul(x, y, precision="highest")).astype(a.dtype)
 
