@@ -23,8 +23,7 @@ from reference_error import assert_as_exact_as_the_reference, equations
 from dew.config import OptimConfig
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
-from dew.training import MeshSpec
-from dew.training.optim import (
+from dew.optim import (
     OPTIMIZER_MAP,
     Cosine,
     Exponential,
@@ -41,6 +40,7 @@ from dew.training.optim import (
     scaled,
     weight_decay_mask,
 )
+from dew.training import MeshSpec
 from tools.muonclip_reference import clip_qk_kernel, clip_scale
 
 LR = 1e-3

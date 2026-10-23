@@ -13,8 +13,8 @@ from model_support import largest_difference
 from dew.checkpoints import Checkpoints, Ranking
 from dew.config import OptimConfig, RunConfig
 from dew.objectives.base import EMASpec
+from dew.optim import PowerProfilesState, power_profiles
 from dew.training import Layout, Trainer
-from dew.training.optim import PowerProfilesState, power_profiles
 from dew.training.posthoc import coefficients, exponent, power_decay
 
 # Outputs of NVlabs/edm2 training/phema.py (std_to_exp, power_function_beta,
