@@ -15,6 +15,7 @@ from PIL import Image
 from dew.data.text import ByteTokenizer, HFTokenizer
 from dew.decision import Choice, JointLayout, Noul
 from dew.decision.layout import JOINT_PREFILL, JOINT_SYSTEM, Framing, Specials
+from dew.records import JSON
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -149,7 +150,8 @@ def test_a_framing_refuses_what_it_would_otherwise_leave_unread():
     with pytest.raises(ValueError):
         framed(templated.tokenizer, JOINT_SYSTEM, where="direct", options={"tokenizer_kwargs": {}})
     rendered = []
-    for labels in ({"z": 1, "a": 2}, {"a": 2, "z": 1}):
+    orders: list[dict[str, JSON]] = [{"z": 1, "a": 2}, {"a": 2, "z": 1}]
+    for labels in orders:
         before, after = Framing(chat_template=walked, options={"labels": labels}).around(templated)
         direct = templated.tokenizer.apply_chat_template(
             [{"role": "system", "content": JOINT_SYSTEM}, {"role": "user", "content": CONTENT}],
