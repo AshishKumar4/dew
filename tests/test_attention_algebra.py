@@ -601,18 +601,20 @@ def test_the_accurate_forms_rescale_is_as_exact_as_its_exponent_rounded_once(raw
                     f"the accurate form's rescale, {'raw' if raw else 'scaled'}", seeds=8)
 
 
-@pytest.mark.parametrize("scale, slope, size", [(2.0, None, 2e38), (1.0, 2.0, 2e38), (4.0, 1e38, 0.25)],
-                         ids=["scale-2", "slope-2", "slope-1e38"])
+@pytest.mark.parametrize("scale, slope, size", [(2.0, None, 2e38), (1.0, 2.0, 2e38), (4.0, 1e38, 0.25),
+                                                (4.0, 2e38, 0.25)],
+                         ids=["scale-2", "slope-2", "slope-1e38", "slope-2e38"])
 def test_a_querys_gradient_over_keys_near_fp32s_largest_is_finite_at_any_scale_and_slope(scale, slope, size):
     """One query of zeros over two equal keys at equal logits (each weighs 1/2) under a scale and a score
     hook's slope: the query's gradient is the cotangents' difference times the keys, 0, and D's refinement 0,
     so dQ is exactly 0 in both mainloops (`algebra.DqSums.keyed`): keys near fp32's largest at a scale or a
-    slope of 2, whose sum under coefficients summing to 2 would overflow, and small keys at a slope of 1e38,
-    whose coefficients' magnitudes would (held as a mantissa and an exponent, `keyed_shift`)."""
+    slope of 2, whose sum under coefficients summing to 2 would overflow, and small keys at a slope of 1e38
+    or 2e38, whose coefficients' magnitudes, or at 2e38 each coefficient itself, would (held as mantissas and
+    exponents, `keyed_shift`)."""
     query = jnp.zeros((1, 1, 1, 16), jnp.float32)
     key = jnp.zeros((1, 2, 1, 16), jnp.float32).at[:, :, :, 0].set(size)
-    value = jnp.asarray([[[[1.0] * 16]], [[[2.0] * 16]]], jnp.float32).reshape(1, 2, 1, 16)
-    dout = jnp.ones((1, 1, 1, 16), jnp.float32)
+    value = jnp.zeros((1, 2, 1, 16), jnp.float32).at[..., 0].set(jnp.asarray([1.0, 2.0]).reshape(1, 2, 1))
+    dout = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
     spans = template.spans(1, 2, 1)
     hooks = template.Hooks(score_mod=None if slope is None else (lambda s, q_pos, k_pos: slope * s))
     tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
