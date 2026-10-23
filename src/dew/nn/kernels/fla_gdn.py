@@ -105,15 +105,16 @@ def _dot(a, b, *, exact: bool, ieee: bool = False, solve: jnp.dtype | None = Non
       where one TF32 put a Kimi linear layer's logits 100 times the reference's distance from
       float64 on an H100; one TF32, fla's, in a 16-bit call, whose operands' rounding it stays under
       and where TF32x3 cost Kimi Linear's bf16 layer 17% on an H100 and 19% on an A100.
-    - interpreted: each product exact in float64 and the sum rounded once to fp32."""
+    - interpreted: fp32 operands, the CPU's own fp32 dot."""
     if jnp.dtype(a.dtype) != jnp.dtype(b.dtype):
         raise TypeError(f"Pallas dot operands must have the same dtype, got {a.dtype} and {b.dtype}")
     wide = jnp.dtype(a.dtype) == jnp.float32
     if exact:
-        # Each product exact in float64 and the sum rounded once to fp32, as Dew's CPU products sum
-        # (`dew.nn.precision`), where a CPU's own fp32 dot picks its order and rounding by shape and ISA.
-        with jax.enable_x64(new_val=True):
-            return jnp.dot(a.astype(jnp.float64), b.astype(jnp.float64)).astype(jnp.float32)
+        # The GPU's fp32 accumulation, interpreted: a float64 sum rounded once made a document's rows
+        # depend on how many programs the interpreter ran beside it, and held the port to arithmetic
+        # its kernels do not run.
+        a, b = a.astype(jnp.float32), b.astype(jnp.float32)
+        precision = jax.lax.Precision.HIGHEST if ieee and wide else None
     elif wide:
         narrow_call = solve is not None and jnp.dtype(solve).itemsize < 4
         precision = (jax.lax.Precision.HIGHEST if ieee else jax.lax.Precision.DEFAULT if narrow_call
