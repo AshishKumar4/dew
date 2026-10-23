@@ -477,8 +477,9 @@ def main():
               for index in range(len(args.slots))] if args.backend == "dew" else None)
     engines = {"vllm": vllm_points, "vllm-engine": engine_points, "sglang-engine": sglang_points}
     hardware, points = dew_points(args) if args.backend == "dew" else asyncio.run(engines[args.backend](args))
-    for point, peak in zip(points, peaks or [], strict=True):
-        point["peak_device_bytes"] = None if None in peak else max(peak)
+    if peaks is not None:
+        for point, peak in zip(points, peaks, strict=True):
+            point["peak_device_bytes"] = None if None in peak else max(peak)
     record = {"backend": args.backend, "model": args.model, "hardware": hardware,
               "prompt": args.prompt, "output": args.output, "vocab_limit": args.vocab_limit,
               "sampling": {"temperature": 0, "ignore_eos": True}, "warm_output": args.output,
