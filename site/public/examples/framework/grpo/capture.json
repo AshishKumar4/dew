@@ -1,7 +1,7 @@
 {
 	"about": "The screen grpo.py left on a terminal, written by site/scripts/capture_snippets.py.",
 	"arguments": [],
-	"script_sha256": "3f3480385335c1161e46b9a606c8647885d78b3ac3d07214907cba162f0138e2",
+	"script_sha256": "011997854a78a6dd3bc2b0bb68604615b7cd226021a279d336ccb31fb06c5446",
 	"meta": {
 		"where": "a 4-vCPU Cloudflare container",
 		"python": "3.12.15",

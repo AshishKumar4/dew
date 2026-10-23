@@ -29,12 +29,13 @@ import jax.numpy as jnp
 import tyro
 
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
+from dew.config.lm import LMRunConfig
 from dew.data import HFTokenizer, Loading, presets
 from dew.data.chat import Role
 from dew.data.sources import Read, source as data_source
 from dew.inference import RunProcessor
 from dew.interop import PretrainedDecoder
-from dew.objectives.lm import LMObjective, LMRunConfig, Perplexity, Samples
+from dew.objectives.lm import LMObjective, Perplexity, Samples
 from dew.training import MeshSpec, TrainState, prepare_process
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
@@ -108,7 +109,7 @@ def run_config(config: Config, tokenizer: str, chat: str) -> LMRunConfig:
                     .read(config.data_read).loading(loading)),
         tokenizer=tokenizer,
         max_new_tokens=4 if smoke else 64,
-        optim=OptimConfig(learning_rate=config.learning_rate, weight_decay=0.0,
+        optim=OptimConfig(rate=config.learning_rate, weight_decay=0.0,
                           clip_grads=1.0),
         # A smoke run stays out of any process pool; a real run joins one
         # when a cluster started it and runs alone otherwise.

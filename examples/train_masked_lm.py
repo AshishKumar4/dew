@@ -33,12 +33,13 @@ import tyro
 
 import dew
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
+from dew.config.lm import LMRunConfig
 from dew.data import ByteTokenizer, Files, HFTokenizer, Hub, Loading, presets, text
 from dew.data.compile import iterate
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
-from dew.objectives.lm import LMRunConfig, Perplexity
+from dew.objectives.lm import Perplexity
+from dew.optim import Cosine
 from dew.training import Evaluation, MeshSpec
-from dew.training.optim import Cosine
 
 SMOKE_TEXT = (
     "The cat sat on the warm mat and watched the rain.\n",
@@ -124,7 +125,7 @@ def main(config: Config) -> Path:
         data=data, validation=validation, tokenizer=config.tokenizer,
         objective=ObjectiveConfig("masked_diffusion", {
             "steps": config.sample_steps, "ema_decay": 0.9 if config.smoke else 0.999}),
-        optim=OptimConfig(weight_decay=0.03, clip_grads=1.0, schedule=Cosine(
+        optim=OptimConfig(weight_decay=0.03, clip_grads=1.0, rate=Cosine(
             peak=config.learning_rate, warmup_steps=config.warmup_steps,
             end=config.learning_rate / 10)),
         trainer=replace(trainer, compilation_cache_dir=None) if config.smoke else trainer)

@@ -14,7 +14,7 @@ import numpy as np
 import optax
 
 from dew.config import OptimConfig
-from dew.training.optim import Cosine, Exponential, OneCycle, ParamGroup
+from dew.optim import Cosine, Exponential, OneCycle, ParamGroup
 
 TORCH = np.load(Path(__file__).resolve().parent / "fixtures" / "torch_optim" / "reference.npz")
 EPOCHS, PER_EPOCH = 6, 2
@@ -134,7 +134,7 @@ def test_grouped_adam_is_torchs_adam_with_param_groups_a_momentum_cycle_and_a_cl
 
 def test_a_bounded_group_clamps_its_parameters_and_no_others():
     params = {"delay": jnp.asarray([0.05, 2.95]), "kernel": jnp.asarray([0.05, 2.95])}
-    config = OptimConfig(optimizer="adam", learning_rate=0.5, param_groups=(
+    config = OptimConfig(optimizer="adam", rate=0.5, param_groups=(
         ParamGroup("delays", ("delay",), bounds=(0.0, 3.0)), ParamGroup("rest", ("*",))))
     solver = config.build(1)
     grads = {"delay": jnp.asarray([1.0, -1.0]), "kernel": jnp.asarray([1.0, -1.0])}
