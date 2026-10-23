@@ -586,7 +586,7 @@ def test_zero_gates_leave_a_pretrained_ngpt_decoder_bit_for_bit():
     dory = Pretrained.load(ROOT / "tests" / "fixtures" / "hf" / "dory-tiny", dtype="float32",
                            attention_impl="reference")
     width = dory.model.emb_features
-    attached = dory.with_cross_attention(CrossAttention((0,), context_length=3), key=0)
+    attached = dory.with_cross_attention(CrossAttention((0,), context_length=3, intermediate_size=32), key=0)
     rng = np.random.default_rng(6)
     ids = jnp.asarray(rng.integers(0, dory.model.vocab_size, (2, 9)), jnp.int32)
     conditioning = {CONTEXT: jnp.asarray(rng.standard_normal((2, 3, width)), jnp.float32),

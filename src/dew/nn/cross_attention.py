@@ -50,7 +50,7 @@ from .activations import GatedActivation
 from .attention import projected_heads, projected_output, scaled_dot_product_attention
 from .flops import counted_flops, cross_attention_flops, projection_flops
 from .inputs import CrossContext
-from .precision import at_least_fp32, float32_dot_general, l2norm, sqrt_or_zero
+from .precision import L2NORM_EPS, at_least_fp32, float32_dot_general, l2norm, sqrt_or_zero
 from .sharding import HEADS, KV_HEADS, constrain
 
 NAME = "cross_attention"
@@ -196,22 +196,19 @@ class GatedCrossAttention(nn.Module):
         return x if self.norm is None else self.norm(name=name)(x)
 
     def _join(self, stream: jax.Array, branch: jax.Array, gate: jax.Array) -> jax.Array:
-        """`stream` with `branch` joined through `gate`, in at least float32 and
-        rounded once to the stream's dtype: added, broadcast over any axis the
-        stream has beside the states', or under nGPT moved by the step of
-        `gate` from the unit stream toward the unit branch, nGPT's step on the
-        unit sphere, at the stream's own length. The move is the stepped
-        point less the unstepped one, so a zero gate leaves the stream as it
-        is, whatever its length: before a first layer the input embeddings
-        are not unit. A zero gate's step is the same point, normed alike, so
-        the stream comes back bit for bit."""
+        """`stream` with `branch` joined through `gate`, in at least float32 of
+        the three and rounded once to the stream's dtype: added, broadcast over
+        any axis the stream has beside the states', or under nGPT moved by the
+        step of `gate` from the unit stream toward the unit branch, nGPT's step
+        on the unit sphere, at the stream's own length (`_moved_on_the_sphere`),
+        so a zero gate leaves the stream bit for bit, whatever its length:
+        before a first layer the input embeddings are not unit."""
         wide = stream.astype(at_least_fp32(jnp.result_type(stream, branch, gate)))
         if self.ngpt:
             start, end = l2norm(wide), l2norm(branch).astype(wide.dtype)
             length = sqrt_or_zero(jnp.sum(jnp.square(wide), axis=-1, keepdims=True))
-            # One norm over both points, so a step of a zero gate, the same point, norms as it does.
-            normed = l2norm(jnp.stack([start, start + _gated(end - start, gate, self.precision)]))
-            return (wide + length * (normed[1] - normed[0])).astype(stream.dtype)
+            move = _moved_on_the_sphere(start, _gated(end - start, gate, self.precision))
+            return (wide + length * move).astype(stream.dtype)
         widened = branch.reshape(branch.shape[:2] + (1,) * (stream.ndim - branch.ndim) + branch.shape[2:])
         return (wide + _gated(widened, gate, self.precision)).astype(stream.dtype)
 
@@ -254,6 +251,19 @@ class GatedCrossAttention(nn.Module):
             values.value = jnp.pad(value, padding)
             lengths.value = context.lengths
         return key, value, context.lengths
+
+
+def _moved_on_the_sphere(start: jax.Array, step: jax.Array) -> jax.Array:
+    """`l2norm(start + step) - l2norm(start)` along the last axis, written so a zero step moves by
+    exactly zero: with N = |start|^2 + eps and M = N + 2<start, step> + |step|^2 the two points' squared
+    lengths (`L2NORM_EPS`), the difference is step / sqrt(M) less start times (M - N) / (sqrt(M)
+    sqrt(N) (sqrt(M) + sqrt(N))), and M - N is formed from the step alone."""
+    inner = jnp.sum(start * step, axis=-1, keepdims=True)
+    grown = 2 * inner + jnp.sum(jnp.square(step), axis=-1, keepdims=True)
+    before = jnp.sum(jnp.square(start), axis=-1, keepdims=True) + L2NORM_EPS
+    after = before + grown
+    root_before, root_after = jnp.sqrt(before), jnp.sqrt(after)
+    return step / root_after - start * grown / (root_after * root_before * (root_after + root_before))
 
 
 def _gated(branch: jax.Array, gate: jax.Array, precision: PrecisionLike) -> jax.Array:
