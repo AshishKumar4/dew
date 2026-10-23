@@ -367,7 +367,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
                                              algebra.inverse(denominator))
             pulled, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
             dv = dv + interpreted_dot(*algebra.value_operands(exponentials, weights, do, denominator))
-            dk = dk + algebra.cotangent_product(pulled, q, interpreted_dot, transposed=True) * scale
+            dk = dk + algebra.cotangent_product(pulled * scale, q, interpreted_dot, transposed=True)
             tiled = tuple(jax.lax.dynamic_update_slice_in_dim(entries, piece, i * block_q, axis=0)
                           for entries, piece in zip(tiled, (piece for kind, piece in zip(score_kinds, pieces,
                                                                                        strict=True)
