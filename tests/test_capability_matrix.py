@@ -510,13 +510,13 @@ def assert_resumes(objective, data, directory: Path, rollout) -> None:
                 for path, leaf in jax.tree_util.tree_leaves_with_path(tree)]
 
     assert jax.tree.structure(after) == jax.tree.structure(uninterrupted)
-    for (path, got), (_, want) in zip(bits(after), bits(uninterrupted), strict=True):
-        assert got.dtype == want.dtype, path
-        np.testing.assert_array_equal(got, want, err_msg=path)
     read, fresh = resumed.executable, whole.executable
-    assert read.in_avals == fresh.in_avals
-    assert read.input_shardings == fresh.input_shardings
-    assert read.input_formats == fresh.input_formats
+    programs = [name for name in ("in_avals", "input_shardings", "input_formats")
+                if getattr(read, name) != getattr(fresh, name)]
+    leaves = [path for (path, got), (_, want) in zip(bits(after), bits(uninterrupted), strict=True)
+              if got.dtype != want.dtype or not np.array_equal(got, want)]
+    assert not programs and not leaves, {"the step reads the restored state otherwise": programs,
+                                         "leaves off the run that never stopped": leaves}
 
 
 def token_batch(width: int, seed: int = 0) -> np.ndarray:
