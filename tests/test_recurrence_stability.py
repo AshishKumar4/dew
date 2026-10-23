@@ -1,6 +1,6 @@
-"""The recurrence template's stability (bible §6: accuracy, performance and stability together): the chunked
-op under the inputs that break chunked forms, each held to the same recurrence a token at a time
-(`test_recurrence_chunk.token_by_token`, the decode step's reference) two ways:
+"""The recurrence template's stability (docs/design/kernel-templates.md: accuracy, performance and stability
+together): the chunked op under the inputs that break chunked forms, each held to the same recurrence a
+token at a time (`test_recurrence_chunk.token_by_token`, the decode step's reference) two ways:
 
 - finite wherever the reference in float64 is finite: no NaN or inf of the chunked form's own, an
   exponent's overflow or an underflow's `0 * inf`;
