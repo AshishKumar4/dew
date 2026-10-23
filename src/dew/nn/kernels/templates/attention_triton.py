@@ -514,9 +514,9 @@ def _key_param(ref, kind: Kind, head, rows):
 
 
 def _tile_scores(score_mod, query, key, value, dout, peak, total, anchor, delta, seen, q_pos, k_pos, params,
-                 *, key_index, scale: float, how: algebra.Recompute, interpret: bool):
+                 *, key_index, scale: float, how: algebra.Recompute, accurate: bool, interpret: bool):
     """A tile's backward through its scores: its unnormalized weights `exp(s - m)` and its weights `p` over
-    `total` (zero where masked), the masked score cotangents `p * ((dP - c) - (D - c))`
+    `total` (zero where masked), the masked score cotangents `p (dP - D)` in the form `accurate` names
     (`algebra.grad_scores`), `dP = dO V^T`, `c` each query's `anchor` and `delta` its `D - c`, and the
     entries' derivatives through `score_mod` (`algebra.scored`), its weights recomputed as its forward
     computed them (`how`)."""
@@ -524,7 +524,7 @@ def _tile_scores(score_mod, query, key, value, dout, peak, total, anchor, delta,
                                          params, scale=scale if how.factor is None else 1.0, slopes=True)
     exponentials, weights = algebra.normalized(logits, peak, total, how)
     cotangents = algebra.grad_scores(exponentials, kernel_dot(dout, value.T, interpret), anchor, delta, seen,
-                                     k_pos == key_index[:, None], algebra.inverse(total))
+                                     k_pos == key_index[:, None], algebra.inverse(total), accurate=accurate)
     return exponentials, weights, cotangents, slopes
 
 
@@ -602,7 +602,8 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
         key, value = key_ref[keys, :], value_ref[keys, :]
         weights, _, cotangents, slopes = _tile_scores(score_mod, query, key, value, dout, peak, prior, anchor,
                                                    delta, seen, q_pos, k_pos, params, key_index=key_index,
-                                                   scale=scale, how=how, interpret=interpret)
+                                                   scale=scale, how=how, accurate=accurate,
+                                                   interpret=interpret)
         return algebra.dq_step(carry, weights, cotangents, slopes, seen, key, prior, scale=scale,
                                kinds=score_kinds, summed=summed, dot=product, accurate=accurate)
 
@@ -661,7 +662,7 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
         exponentials, weights, cotangents, slopes = _tile_scores(
             score_mod, query, key, value, dout, peak_ref[rows], total_ref[rows], anchor_ref[rows],
             delta_ref[rows], seen, q_pos, k_pos, params, key_index=index_ref[rows], scale=scale, how=how,
-            interpret=interpret)
+            accurate=accurate, interpret=interpret)
         logits, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
         dv = dv + transposed(*algebra.value_operands(exponentials, weights, dout, total_ref[rows]))
         # Scaled before it meets the queries, in the backward's form (`algebra.cotangent_product`).

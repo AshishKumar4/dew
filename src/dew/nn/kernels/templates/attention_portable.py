@@ -295,7 +295,8 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                                                  columns[None, :], params, scale=factor, slopes=True)
             weights = algebra.normalized(logits, m, jnp.ones_like(m), how)[0]
             cotangents = algebra.grad_scores(weights, interpreted_dot(do, v_tile.T), anchor, delta, seen,
-                                             columns[None, :] == chosen[:, None], algebra.inverse(prior))
+                                             columns[None, :] == chosen[:, None], algebra.inverse(prior),
+                                             accurate=accurate)
             return algebra.dq_step(carry, weights, cotangents, slopes, seen, k_tile, prior, scale=scale,
                                    kinds=score_kinds, summed=summed, dot=interpreted_dot, accurate=accurate)
 
@@ -379,7 +380,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
             cotangents = algebra.grad_scores(exponentials, interpreted_dot(do, v_tile.T),
                                              anchor[row, head, rows], delta[row, head, rows], seen,
                                              columns[None, :] == key_index[row, head, rows][:, None],
-                                             algebra.inverse(denominator))
+                                             algebra.inverse(denominator), accurate=accurate)
             pulled, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
             dv = dv + transposed_dot(*algebra.value_operands(exponentials, weights, do, denominator))
             dk = dk + algebra.cotangent_product(pulled * scale, q, transposed_dot, accurate=accurate)

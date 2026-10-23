@@ -933,12 +933,19 @@ def differentiable(score_mod: Callable, q_pos, k_pos, params, floating: list[int
     return hooked
 
 
-def tile_logits(score_mod, product: jax.Array, seen: jax.Array, q_pos, k_pos, params, *, scale: float,
+def tile_logits(score_mod, product: jax.Array, seen: jax.Array | None, q_pos, k_pos, params, *, scale: float,
                 slopes: bool = False):
     """A backward tile's logits from its product `Q·Kᵀ` taken by `scale`, under `score_mod`, -inf where
-    unseen (`seen`), and with `slopes` its entries' derivatives (`scored`)."""
+    unseen (`seen`; None, a tile every query sees whole), and with `slopes` its entries' derivatives
+    (`scored`)."""
     logits, derivatives = scored(score_mod, product * scale, q_pos, k_pos, params, slopes=slopes)
-    return jnp.where(seen, logits, -jnp.inf), derivatives
+    return where_seen(seen, logits, -jnp.inf), derivatives
+
+
+def where_seen(seen: jax.Array | None, entries: jax.Array, unseen: float) -> jax.Array:
+    """A tile's `entries` where `seen`, `unseen` elsewhere; every entry where `seen` is None (a tile every
+    query sees whole, which a mainloop gives no mask)."""
+    return entries if seen is None else jnp.where(seen, entries, unseen)
 
 
 def scored(score_mod, logits, q_pos, k_pos, params, *, slopes: bool):
@@ -976,10 +983,10 @@ def pulled(cotangents, slopes, seen, kinds: tuple[Kind, ...]):
     hook's derivative there is not finite. fp32."""
     if slopes is None:
         return cotangents, ()
-    logits = jnp.where(seen, cotangents * slopes[0], 0.0)
+    logits = where_seen(seen, cotangents * slopes[0], 0.0)
     pieces = []
     for slope, kind in zip(slopes[1:], kinds, strict=True):
-        entries = jnp.where(seen, cotangents * slope, 0.0)
+        entries = where_seen(seen, cotangents * slope, 0.0)
         pieces.append(entries.sum(axis=0) if kind == Kind.KEY else entries if kind == Kind.TILE
                       else entries.sum(axis=-1))
     return logits, tuple(pieces)
@@ -1166,7 +1173,7 @@ class DqProducts(NamedTuple):
     keyed: tuple[tuple[jax.Array, jax.Array | None], ...] | None
 
 
-def _dq_rows(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array, *,
+def _dq_rows(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array | None, *,
              kinds: tuple, summed: tuple) -> tuple[DqSums, jax.Array]:
     """A dQ tile's row sums (`dq_step`): the HEAD and QUERY parameters' pullbacks of the cotangents and of
     the weights, the cotangents' and the weights' sums; and the weights pulled through the score hook."""
@@ -1182,7 +1189,7 @@ def _dq_rows(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, se
     return sums._replace(residual=residual, mass=mass, grads=grads, weighed=weighed), pulled_weights
 
 
-def dq_terms(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array,
+def dq_terms(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array | None,
              prior: jax.Array, *, scale: float, kinds: tuple, summed: tuple, dtype,
              accurate: bool) -> tuple[DqSums, DqProducts]:
     """`dq_step` where its products add to dQ and the keyed sums unscaled (the fast form, or the accurate one
@@ -1310,18 +1317,25 @@ def normalized(logits: jax.Array, peak: jax.Array, total: jax.Array, how: Recomp
 
 
 def grad_scores(exponentials: jax.Array, products: jax.Array, anchor: jax.Array, delta: jax.Array,
-                seen: jax.Array, at_anchor: jax.Array | None, inverse_total: jax.Array) -> jax.Array:
-    """The score cotangents `p (dP - D)` of a tile in the reference's own order, as JAX differentiates
-    `exp(s - m) / T`: each query's `(dP - c) - (D - c)` about its anchor c (`off_anchor_delta`) over its
-    denominator (`inverse_total`), then times the unnormalized weights `exp(s - m)`, so every
-    intermediate lies where the reference's does (a weight below fp32's range keeps its share beside a
-    large product, and none overflows that the reference keeps); zero where unseen. The anchor key's
-    own `dP - c` is 0 by definition where `at_anchor` names it, whatever its product's rounding."""
+                seen: jax.Array | None, at_anchor: jax.Array | None, inverse_total: jax.Array, *,
+                accurate: bool) -> jax.Array:
+    """The score cotangents `p (dP - D)` of a tile, zero where unseen (`where_seen`). The fast form
+    (`accurate` False) takes FlashAttention's order, `exp(s - m) ((dP - D) / T)`, D each query's
+    `c + (D - c)` (`anchor`, `delta`) summed once, with no anchor test (`at_anchor` unread). The accurate
+    form takes the reference's own order, as JAX differentiates `exp(s - m) / T`: each query's
+    `(dP - c) - (D - c)` about its anchor c (`off_anchor_delta`) over its denominator (`inverse_total`),
+    then times the unnormalized weights `exp(s - m)`, so every intermediate lies where the reference's does
+    (a weight below fp32's range keeps its share beside a large product, and none overflows that the
+    reference keeps); the anchor key's own `dP - c` is 0 by definition where `at_anchor` names it, whatever
+    its product's rounding."""
+    if not accurate:
+        centred = (products - expand(anchor + delta, products)) * expand(inverse_total, products)
+        return where_seen(seen, exponentials * centred, 0.0)
     relative = products - expand(anchor, products)
     if at_anchor is not None:
         relative = jnp.where(at_anchor, 0.0, relative)
     centred = (relative - expand(delta, relative)) * expand(inverse_total, relative)
-    return jnp.where(seen, exponentials * centred, 0.0)
+    return where_seen(seen, exponentials * centred, 0.0)
 
 
 def refinement(residual: jax.Array, mass: jax.Array, peak0: jax.Array, shares: tuple[jax.Array, jax.Array],

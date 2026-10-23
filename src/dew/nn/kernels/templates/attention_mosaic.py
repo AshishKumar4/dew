@@ -16,6 +16,7 @@ headroom (fp16 values, which cannot overflow it), no hooks."""
 
 import dataclasses
 import functools
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -259,6 +260,38 @@ def _rows(ref, row, head, first, count: int):
     return plgpu.load(ref.at[row, head, pl.ds(first, count)], (), layout=mosaic_sm90.ROW, optimized=False)
 
 
+class _Tile(NamedTuple):
+    """A backward tile's place: its first query and key, its shape, whether it takes a mask (`masked`), and
+    the call's form (`causal`, its keys)."""
+
+    q_first: jax.Array
+    k_first: jax.Array
+    shape: tuple[int, int]
+    masked: bool
+    causal: bool
+    keys: int
+
+
+def _scores(tile: _Tile, s, dp, peak, total, anchor, delta, chosen, *, how: algebra.Recompute, scale: float,
+            accurate: bool):
+    """A backward tile's weights unnormalized and over `total`, its score cotangents in the form `accurate`
+    names (`algebra.grad_scores`), its entries' derivatives and its mask from its products `s` and `dp` and
+    its queries' statistics: positions only where it takes a mask or the accurate form's anchor test."""
+    k_pos = tile.k_first + mosaic_sm90.iota(tile.shape, 1) if tile.masked or accurate else None
+    seen = None
+    if tile.masked and k_pos is not None:
+        q_pos = tile.q_first + mosaic_sm90.iota(tile.shape, 0)
+        seen = (k_pos <= q_pos if tile.causal else k_pos >= 0) & (k_pos < tile.keys)
+    logits, slopes = algebra.tile_logits(None, s, seen, None, None, (),
+                                         scale=scale if how.factor is None else 1.0, slopes=True)
+    exponentials, weights = algebra.normalized(logits, peak, total, how)
+    # The anchor test is the accurate form's alone (`algebra.grad_scores`).
+    at_anchor = None if k_pos is None or not accurate else k_pos == algebra.expand(chosen, k_pos)
+    cotangents = algebra.grad_scores(exponentials, dp, anchor, delta, seen, at_anchor, algebra.inverse(total),
+                                     accurate=accurate)
+    return exponentials, weights, cotangents, slopes, seen
+
+
 def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, *, how: algebra.Recompute,
                scale: float, causal: bool, keys_count: int, tiles: Tiles, accurate: bool, consumers: int,
                interpret: bool):
@@ -296,7 +329,6 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, *
                                                               index_ref))
             walked = program.walked(first)
             whole = program.whole(first, walked)
-            q_pos, columns = first + mosaic_sm90.iota(shape, 0), mosaic_sm90.iota(shape, 1)
             nothing = mosaic_sm90.zeros((block_q,))
             # The row sums carried; dQ and the keyed sums accumulate in place (`mosaic_sm90.walked_products`),
             # their places in a step's sums empty (a constant the walk would forward, which no kernel's
@@ -311,15 +343,23 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, *
                 s = mosaic_sm90.product(q_smem.at[wg], k_slot.transpose((1, 0)), shape)
                 dp = mosaic_sm90.product(do_smem.at[wg], v_slot.transpose((1, 0)), shape)
                 values.release(index)
-                k_pos = index * block_k + columns
-                seen = lax.cond(index < whole, lambda: k_pos >= 0,
-                                lambda: (k_pos <= q_pos if causal else k_pos >= 0) & (k_pos < keys_count))
-                logits, slopes = algebra.tile_logits(None, s, seen, q_pos, k_pos, (),
-                                                     scale=scale if how.factor is None else 1.0, slopes=True)
-                exponentials, _ = algebra.normalized(logits, peak, prior, how)
-                at_anchor = k_pos == algebra.expand(chosen, k_pos)
-                cotangents = algebra.grad_scores(exponentials, dp, anchor, delta, seen, at_anchor,
-                                                 algebra.inverse(prior))
+
+
+                def scores(*, masked: bool):
+                    # A tile every query sees whole (`masked` False) takes no mask, so no positions. Without
+                    # a hook nothing past the cotangents reads the mask (`algebra.pulled`).
+                    tile = _Tile(first, index * block_k, shape, masked, causal, keys_count)
+                    exponentials, _, cotangents, _, _ = _scores(tile, s, dp, peak, prior, anchor, delta,
+                                                                chosen, how=how, scale=scale,
+                                                                accurate=accurate)
+                    return exponentials, cotangents
+
+                # One walk, its tiles' masks chosen a tile at a time: a walk of two loops into one warpgroup
+                # accumulator, the first empty, faults on an H100 under jax 0.11.2's Mosaic GPU lowering
+                # (a query block from 0's whole tiles, or a full call's diagonal ones).
+                exponentials, cotangents = lax.cond(index < whole, functools.partial(scores, masked=False),
+                                                    functools.partial(scores, masked=True))
+                slopes, seen = None, None
 
                 # The weights' sums unnormalized (`algebra.dq_finish` takes them to the pass's own
                 # denominator); each product's parts issued into one accumulator.
@@ -334,8 +374,9 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, *
                 keys.release(index)
                 return (sums.residual, sums.mass, sums.keyed_mass, sums.keyed_shift), (dq_acc, keyed_acc)
 
-            rows, (dq, keyed) = mosaic_sm90.walked_products(step, start, 0, walked,
-                                                            ((block_q, width), (block_q, width)), interpret)
+            segments = ((step, 0, walked),)
+            accumulators = ((block_q, width), (block_q, width))
+            rows, (dq, keyed) = mosaic_sm90.walked_products(segments, start, accumulators, interpret)
             sums = algebra.DqSums(dq, rows[0], rows[1], (), (), keyed, rows[2], rows[3])
 
             @pl.loop(walked, most)
@@ -436,8 +477,10 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
             plgpu.barrier_wait(k_loaded.at[wg])
             plgpu.barrier_wait(v_loaded.at[wg])
             mine = first_tile(k_first)
-            columns = k_first + mosaic_sm90.iota(shape, 1)
-            rows_iota = mosaic_sm90.iota(shape, 0)
+            # The query tiles from which every query sees the block whole: past its diagonal, and none if
+            # it holds padding.
+            whole = jnp.minimum(pl.cdiv(k_first + block_k - 1, block_q), q_steps) if causal else mine
+            whole = jnp.where(k_first + block_k > keys_count, q_steps, jnp.maximum(whole, mine))
 
 
             @pl.loop(least, mine)
@@ -458,15 +501,19 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
                                                                        delta_ref, index_ref))
                 s = mosaic_sm90.product(q_slot, k_smem.at[wg].transpose((1, 0)), shape)
                 dp = mosaic_sm90.product(do_slot, v_smem.at[wg].transpose((1, 0)), shape)
-                q_pos = q_first + rows_iota
-                seen = ((columns <= q_pos) if causal else columns >= 0) & (columns < keys_count)
-                logits, slopes = algebra.tile_logits(None, s, seen, q_pos, columns, (),
-                                                     scale=scale if how.factor is None else 1.0, slopes=True)
-                exponentials, weights = algebra.normalized(logits, peak, denominator, how)
-                cotangents = algebra.grad_scores(exponentials, dp, centre, rest, seen,
-                                                 columns == algebra.expand(chosen, columns),
-                                                 algebra.inverse(denominator))
-                pulled, _ = algebra.pulled(cotangents, slopes, seen, ())
+                def scores(*, masked: bool):
+                    # A tile every query sees whole (`masked` False) takes no mask, so no positions. Without
+                    # a hook nothing past the cotangents reads the mask (`algebra.pulled`).
+                    tile = _Tile(q_first, k_first, shape, masked, causal, keys_count)
+                    exponentials, weights, cotangents, _, _ = _scores(
+                        tile, s, dp, peak, denominator, centre, rest, chosen, how=how, scale=scale,
+                        accurate=accurate)
+                    return exponentials, weights, cotangents
+
+                # One walk, its tiles' masks chosen a tile at a time (`_dq_launch`'s walk).
+                exponentials, weights, pulled = lax.cond(index < whole,
+                                                         functools.partial(scores, masked=True),
+                                                         functools.partial(scores, masked=False))
                 narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype)
                 cotangent_parts = algebra.cotangent_parts(pulled * scale, q_slot.dtype, accurate=accurate)
                 buffers = staged.at[wg]
@@ -482,8 +529,10 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
                 douts.release(index - least)
                 return carry, (dk_acc, dv_acc)
 
-            _, (dk, dv) = mosaic_sm90.walked_products(step, None, mine, q_steps,
-                                                      ((block_k, width), (block_k, value_width)), interpret)
+            # The block's diagonal tiles masked, then the rest whole.
+            segments = ((step, mine, q_steps),)
+            accumulators = ((block_k, width), (block_k, value_width))
+            _, (dk, dv) = mosaic_sm90.walked_products(segments, None, accumulators, interpret)
             out = (row, pl.ds(k_first, block_k), head)
             for target, part in ((dk_ref, dk), (dv_ref, dv)):
                 out_smem.at[wg][...] = part
