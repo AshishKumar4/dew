@@ -484,7 +484,15 @@ _YARN_SOURCES = (
     # The Nemotron-H releases that carry their own remote code name the head width attention_head_dim.
     ("nemotron-h-tiny", lambda config: {**_without("head_dim")(config),
                                         "attention_head_dim": config["head_dim"]}),
-    ("llada-tiny", _without("n_kv_heads", "head_dim", "rope_theta")),
+    ("llada-tiny", _without("n_kv_heads", "head_dim")),
+    # LLaDA's ModelConfig rotates at 10000 (the release states its own 500000).
+    ("llada-tiny", lambda config: {**_without("rope_theta")(config), "rope_theta": 10000.0}),
+    # Glm4MoeConfig fills an absent factor with half the head, the fixture's own.
+    ("glm4-moe-tiny", lambda config: {**_without("partial_rotary_factor")(config),
+                                      "rope_parameters": _without("partial_rotary_factor")(
+                                          config["rope_parameters"])}),
+    # MiMoV2FlashConfig installs per-kind bases 5e6 and 1e4 at a factor of 0.334 for an absent record.
+    ("mimo-v2-flash-tiny", _without("rope_parameters")),
     ("llada-tiny", lambda config: {
         **_without("n_layers", "activation_type")(config),
         "num_layers": config["n_layers"], "hidden_activation": config["activation_type"]}),
@@ -495,6 +503,68 @@ def test_a_source_spelled_another_way_computes_the_reference_logits(name, edit, 
     spelled fixture is, and computes the reference's logits."""
     ours, theirs = _reference_logits(name, _respelled(name, tmp_path, edit))
     assert np.max(np.abs(ours - theirs)) < 1e-4
+
+
+@pytest.mark.parametrize("name, edit", [
+    # LLaDA-MoE's config classes default the rotary's base and factor to -1, which names no rotary.
+    *[(name, _without(field)) for name in ("llada-moe-tiny", "llada-moe-v2-tiny")
+      for field in ("rope_theta", "partial_rotary_factor")],
+    # MiMoV2FlashRotaryEmbedding indexes each per-kind record's base; its class fills none.
+    ("mimo-v2-flash-tiny", lambda config: {**config, "rope_parameters": {
+        kind: _without("rope_theta")(entry) for kind, entry in config["rope_parameters"].items()}}),
+])
+def test_a_config_whose_class_names_no_value_for_an_unstated_field_is_refused(name, edit, tmp_path):
+    """A field the config class has no working default for, left unstated, is refused rather than
+    read at another family's default."""
+    with pytest.raises(ValueError):
+        fp32_decoder(_respelled(name, tmp_path, edit))
+
+
+CLASS_DEFAULTED = ("deepseek-v2-tiny", "deepseek-v3-tiny", "gpt-oss-tiny", "mistral-tiny", "mixtral-tiny",
+                   "llama4-tiny", "modernbert-tiny", "qwen2-tiny", "qwen2-moe-tiny", "qwen3-tiny",
+                   "qwen3-moe-tiny")
+"""Fixtures of families whose transformers config class states their defaults."""
+_IDENTITY = frozenset({"model_type", "architectures", "transformers_version", "dtype", "torch_dtype",
+                       "auto_map", "_name_or_path"})
+
+
+def _defaulted_edits(name):
+    """Each way to leave one of the fixture's fields to its config class: every field whose stated
+    value is the one the class fills, removed alone, a flat rope record's entries among them."""
+    from transformers import CONFIG_MAPPING
+
+    config = fixture_config(name)
+    made = CONFIG_MAPPING[config["model_type"]]()
+    edits = {field: _without(field) for field, value in config.items()
+             if field not in _IDENTITY and field != "rope_parameters"
+             and getattr(made, field, _IDENTITY) == value}
+    stated, default = config.get("rope_parameters"), getattr(made, "rope_parameters", None)
+    if isinstance(stated, dict) and isinstance(default, dict):
+        edits |= {f"rope_parameters.{key}": (lambda key: lambda config: {
+                      **config, "rope_parameters": _without(key)(config["rope_parameters"])})(key)
+                  for key, value in stated.items() if default.get(key, _IDENTITY) == value}
+    return edits
+
+
+@pytest.mark.parametrize("name", CLASS_DEFAULTED)
+def test_a_field_left_to_its_config_class_computes_what_stating_it_does(name, tmp_path):
+    """Every field the fixture states at its config class's default, removed one at a time: the
+    load computes the fully spelled fixture's logits, because the family fills it as its class does,
+    never at another family's default."""
+    ids = np.load(FIXTURES / name / "input_ids.npy")
+    model, variables = fp32_decoder(FIXTURES / name)
+    spelled = np.asarray(model.apply(variables, ids))
+    edits = _defaulted_edits(name)
+    assert edits, f"{name} states no field at its class's default"
+    differing = []
+    for field, edit in edits.items():
+        try:
+            model, variables = fp32_decoder(_respelled(name, tmp_path / field, edit))
+            if not np.array_equal(np.asarray(model.apply(variables, ids)), spelled):
+                differing.append(field)
+        except ValueError as refused:
+            differing.append(f"{field} (refused: {refused})")
+    assert not differing, f"{name} computes another model without {differing}"
 
 
 @pytest.mark.parametrize("name, theta", [

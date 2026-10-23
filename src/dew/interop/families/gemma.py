@@ -338,6 +338,16 @@ def gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
         hf_config.get("hidden_size_per_layer_input", 0), "hidden_size_per_layer_input"
     )
     sharing = _trailing_sharers(hf_config, len(layer_types), 0)
+    kinds = decoder_kinds(
+        layer_types,
+        kinds_of(config).get("sliding_attention", native_fields(LayerKind)()).value.window,
+        rope_local_theta,
+        None,
+        None if full_dim == sliding_dim else full_dim,
+    )
+    if partial is not None and "sliding_attention" in kinds:
+        # Gemma 4's sliding layers turn whole heads; its partial factor is the full layers' alone.
+        kinds["sliding_attention"]["partial_rotary_factor"] = 1.0
     config.update(
         sandwich_norms=True,
         embedding_scale=True,
@@ -345,13 +355,7 @@ def gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
         v_norm=True,
         head_dim=sliding_dim,
         rope_theta=rope_theta,
-        kinds=decoder_kinds(
-            layer_types,
-            kinds_of(config).get("sliding_attention", native_fields(LayerKind)()).value.window,
-            rope_local_theta,
-            None,
-            None if full_dim == sliding_dim else full_dim,
-        ),
+        kinds=kinds,
         partial_rotary_factor=partial,
         # The reference widens only sharing layers. With none, this flag
         # changes neither the weights nor the forward operation.
