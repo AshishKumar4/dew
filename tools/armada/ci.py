@@ -90,9 +90,6 @@ import sys
 import threading
 import time
 import tomllib
-import urllib.error
-import urllib.parse
-import urllib.request
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from pathlib import Path
@@ -109,6 +106,7 @@ def _beside(name: str):
 
 
 child_groups = _beside("child_groups")
+r2 = _beside("r2")
 SETTLE = 30.0
 """Seconds a task's process group has, after SIGKILL, to be reaped and gone: inside armada's own timeout
 with the default deadline and grace (1680 + 60 + 30 + the reader's 10 < .armada.json's 1800)."""
@@ -253,36 +251,28 @@ def gpu_query(field: str) -> list[str]:
                           check=True).stdout.split("\n")[:-1]
 
 
-def worker() -> str:
-    """The URL of the Worker that holds the records."""
-    return os.environ["DEW_XLA_CACHE_URL"].rstrip("/")
+def store(token: str) -> r2.Store:
+    """The Worker that holds the records."""
+    return r2.Store(os.environ["DEW_XLA_CACHE_URL"], token, "dew-ci-test-cache", timeout=10)
 
 
-def cache_url(python: str, row_name: str, held: str, inputs: str | None = None) -> str:
+def record_key(python: str, row_name: str, held: str, inputs: str | None = None) -> str:
     """Where the record of `row_name` on class `held` (`device_class`) lives: the last run's, or with
     `inputs`, the last of the runs on those shared inputs (`shared`), apart from the last runs' list
     (`listed`). Any run of another commit replaces the last record, so a commit's retry reads its own
     under its inputs first (`reused`). The Worker's key alphabet has no colon or hash."""
     _, name, split = parsed_row(row_name)
     at = f"{CACHE_PREFIX}/{python}" if inputs is None else f"{CACHE_PREFIX}-inputs/{inputs[:16]}/{python}"
-    return f"{worker()}/{at}/{held}/{name}/" + ("-of-".join(split.split("/")) if split else "whole")
+    return f"{at}/{held}/{name}/" + ("-of-".join(split.split("/")) if split else "whole")
 
 
-def cache_request(url: str, token: str, data: bytes | None = None) -> bytes | None:
-    """GET (or with `data`, PUT) `url`: None on a miss, and on a failure, which it reports and which
-    costs only a rerun."""
-    headers = {"Authorization": f"Bearer {token}", "User-Agent": "dew-ci-test-cache"}
-    method = "PUT" if data is not None else "GET"
-    request = urllib.request.Request(url, data=data, method=method, headers=headers)
+def record_of(key: str, token: str) -> bytes | None:
+    """The record at `key`, or None where there is none and where the Worker did not give it, which it
+    reports and which costs only a rerun."""
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            return response.read()
-    except urllib.error.HTTPError as error:
-        if error.code != 404:
-            print(f"the test cache answered {error.code} to {method} {url}", file=sys.stderr)
-        return None
-    except (urllib.error.URLError, TimeoutError, OSError) as error:
-        print(f"the test cache is unreachable ({error}); {method} {url} skipped", file=sys.stderr)
+        return store(token).get(key)
+    except (r2.R2Error, ValueError) as error:
+        print(f"the test cache did not give {key}: {error}", file=sys.stderr)
         return None
 
 
@@ -294,7 +284,7 @@ def reused(python: str, name: str, split: str, common: str) -> dict | None:
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
-    record = cache_request(cache_url(python, row(python, name, split), device_class(), common), token)
+    record = record_of(record_key(python, row(python, name, split), device_class(), common), token)
     recorded = None if record is None else json.loads(record)
     return recorded["row"] if recorded is not None and fresh(recorded, name, common) else None
 
@@ -712,34 +702,34 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str) ->
                            "peak": ran["peak"], "shares": ran["shares"], "pools": ran["pools"]}).encode()
         # The record under these inputs, which `reused` reads, and the last run's, which the GPU tier and
         # lane read, only once the first is written, so it is never newer.
-        if written(cache_url(python, row_["name"], held, common), token, body):
-            written(cache_url(python, row_["name"], held), token, body)
+        if written(record_key(python, row_["name"], held, common), token, body):
+            written(record_key(python, row_["name"], held), token, body)
 
 
-def written(url: str, token: str, body: bytes) -> bool:
-    """Whether `body` was PUT at `url`, tried `RECORD_TRIES` times: a record not written leaves the
-    one before it, such as an older green row a red run should have replaced."""
+def written(key: str, token: str, body: bytes) -> bool:
+    """Whether `body` was PUT at `key`, tried `RECORD_TRIES` times while the Worker is unavailable: a
+    record not written leaves the one before it, such as an older green row a red run should have
+    replaced."""
     for attempt in range(RECORD_TRIES):
         if attempt:
             time.sleep(2 ** attempt)
-        if cache_request(url, token, body) is not None:
+        try:
+            store(token).put(key, body)
             return True
+        except r2.Unavailable as error:
+            print(f"the test cache did not take {key}: {error}", file=sys.stderr)
+        except (r2.R2Error, ValueError) as error:
+            print(f"the test cache refused {key}: {error}", file=sys.stderr)
+            return False
     return False
 
 
 def listed(prefix: str, token: str) -> list[str]:
     """The names of the Worker's records under `prefix`, without it, a page of a thousand at a time."""
-    names, cursor = [], None
-    while True:
-        fields = {"list": prefix} | ({"cursor": cursor} if cursor else {})
-        page = cache_request(f"{worker()}/?{urllib.parse.urlencode(fields)}", token)
-        if page is None:
-            raise SystemExit(f"the test cache did not list {prefix}")
-        listing = json.loads(page)
-        names += listing["keys"]
-        cursor = listing["cursor"]
-        if not cursor:
-            return names
+    try:
+        return list(store(token).keys(prefix))
+    except r2.R2Error as error:
+        raise SystemExit(f"the test cache did not list {prefix}: {error}") from error
 
 
 def gpu_tier(python: str) -> dict[str, list[str]]:
@@ -757,7 +747,7 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
 
     def evidence_of(key: str) -> tuple[str, list[str]]:
         name = key.split("/", 1)[1].rsplit("/", 1)[0]  # <class>/<test file>/<group>
-        record = cache_request(f"{worker()}/{prefix}{key}", token)
+        record = record_of(f"{prefix}{key}", token)
         if record is None:
             return name, ["unrecorded"]
         recorded = json.loads(record)
@@ -837,7 +827,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
     held = device_class()
 
     def needs(name: str) -> tuple[float, float]:
-        record = cache_request(cache_url(python, row(python, name, ""), held), token)
+        record = record_of(record_key(python, row(python, name, ""), held), token)
         return gpu_needs(json.loads(record) if record else None, budget)
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
