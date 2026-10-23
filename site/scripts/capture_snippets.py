@@ -3,7 +3,8 @@
 The page shows each cell beside the terminal it ran on, so a recording must come
 from running exactly that code. Run this after changing what a cell does, in an
 environment with Dew and pyte installed, and commit what it writes (a change that
-only renames keeps its recording: site/scripts/redigest.py):
+cannot alter what it shows keeps its recording and takes its new digest:
+site/scripts/digest.py):
 
     python site/scripts/capture_snippets.py --where "a 4-vCPU Cloudflare container" --cell lm
 

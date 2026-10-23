@@ -5,7 +5,7 @@ This is the one place the page's programs and their recordings are declared. Run
 site/src/data/programs.json, which the page and the Colab notebooks read, and
 site/src/data/recordings.json, each recorded program to the capture (under site/) that names its sha256
 and the key it is under there, which the page checks every recording against (src/data/recordings.mjs)
-and site/scripts/redigest.py reads; `--check` writes nothing and fails where either is stale
+and site/scripts/digest.py reads; `--check` writes nothing and fails where either is stale
 (tools/check_gates). The recorder and the live container call `cell` and `training_example` directly.
 
     python site/snippets/cells.py [--check]
