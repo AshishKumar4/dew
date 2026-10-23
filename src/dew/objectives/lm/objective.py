@@ -44,7 +44,8 @@ from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
 from dew.inference.tasks import Processor, TextSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
-from dew.nn.flops import MissingFlopsCount, counted_flops
+from dew.nn.cross_attention import crossing
+from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import (
     CONTEXT,
     CONTEXT_LENGTHS,
@@ -73,6 +74,7 @@ from dew.nn.protocols import (
 )
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
+    FROZEN,
     OMITTED,
     VALID_ROWS,
     Aux,
@@ -726,10 +728,17 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         if missing is not None:
             raise MissingFlopsCount(missing)
         crossed = self._context_flops(model, batch)
-        if not isinstance(model, CountedLogitsTraining):
-            return super().training_flops(model, batch)
         targets = self._prediction_lengths(batch)
         lengths = self.real_lengths(batch)
+        if self._trains_cross_attention_alone(model):
+            if self.mtp_weight:
+                raise MissingFlopsCount("a frozen trunk's prediction depths have no frozen training count")
+            # Every trunk and head matrix frozen: its forward and its input's gradient, no weight's.
+            trunk, head = counted_flops(model, lengths), model.logits_flops(targets)
+            return (frozen_training_flops(trunk, parameter_flops(model, lengths))
+                    + frozen_training_flops(head, head) + 3 * crossed)
+        if not isinstance(model, CountedLogitsTraining):
+            return super().training_flops(model, batch)
         # Every cross-attention matrix trains: its forward, its input's gradient and its own.
         count = model.training_flops(lengths) + model.logits_training_flops(targets) + 3 * crossed
         if self.mtp_weight:
@@ -763,6 +772,17 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
             scored = self._scored(np, tokens, mask, documents, self._batch_roles(batch, np), depth)
             depth_rows.append((self._row_lengths(admitted, segments), self._row_lengths(scored, segments)))
         return depth_rows
+
+    def _trains_cross_attention_alone(self, model) -> bool:
+        """Whether this objective trains a decoder's cross-attention blocks and nothing else: its
+        variables split (`FROZEN`) with every trained leaf a block's (`dew.nn.cross_attention`), as
+        `Pretrained.with_cross_attention` splits a source."""
+        held = self.variables
+        if held is None or FROZEN not in held or not isinstance(model, CrossAttending) or (
+                model.cross_attention is None):
+            return False
+        return all(crossing(("params", *(entry.key for entry in path)))
+                   for path, _ in jax.tree_util.tree_leaves_with_path(held["params"]))
 
     def _context_flops(self, model, batch: Batch) -> float:
         """The forward work of the cross-attention blocks over the batch's context

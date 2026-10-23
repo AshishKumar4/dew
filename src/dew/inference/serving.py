@@ -808,9 +808,12 @@ class Server:
         cross, features, dtype = self.cross
         given = CrossContext.from_conditioning({CONTEXT: jnp.asarray(embeddings), **(
             {} if lengths is None else {CONTEXT_LENGTHS: jnp.asarray(lengths)})})
-        tokens, length = np.asarray(given.embeddings, dtype), int(np.asarray(given.lengths)[0])
+        tokens = np.asarray(given.embeddings, dtype)
+        # The count as given, before the cache's int32 holds it, where a wider one would wrap.
+        counted = np.asarray(given.lengths if lengths is None else lengths)
         if tokens.shape[0] != 1 or tokens.shape[-1] != features:
             raise ValueError(f"a request's context is one row of {features}-wide tokens, got {tokens.shape}")
+        length = int(counted.reshape(-1)[0])
         if not 0 <= length <= tokens.shape[1]:
             raise ValueError(f"a request's context counts {length} real tokens of its {tokens.shape[1]}")
         if length > cross.context_length:
