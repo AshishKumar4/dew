@@ -10,7 +10,9 @@ dropout, EMA, two-micro-step accumulation, dynamic loss scaling and a clipped
 AdamW (tests/qualification_worker.py). One run goes uninterrupted. A second
 is SIGKILLed after step 7, holding the step-5 checkpoint, which sits between
 the two micro-steps of an update. A third resumes from it. The resumed run
-must end on every state leaf of the uninterrupted one, bit for bit. The
+must end on every state leaf of the uninterrupted one, bit for bit, and its
+process must find every program its fit runs (the steps and the validation)
+in the persistent cache the first two filled. The
 baseline's fp32 loss and source-tensor gradients must match transformers', and
 each run's export must give its trained logits when transformers reads it.
 The runs use XLA attention, the path the README's CUDA bitwise claim names.
@@ -151,6 +153,9 @@ def test_a_run_killed_mid_accumulation_resumes_onto_every_leaf_of_the_uninterrup
                                                                        worker.CHECKPOINT_STEP // 2)
     for field in ("position", "state_structure", "step", "microstep", "updates"):
         assert resumed[field] == baseline[field], field
+    # A restored leaf that entered the step in another layout or sharding would be another program.
+    assert baseline["cache_misses"] > 0 and resumed["cache_hits"] > 0 and resumed["cache_misses"] == 0, (
+        baseline, resumed)
     assert baseline["final_loss"] < baseline["initial_loss"], "training did not lower the probe's loss"
     with (np.load(qualified / "baseline" / "state.npz") as left,
           np.load(qualified / "restarted" / "state.npz") as right):
