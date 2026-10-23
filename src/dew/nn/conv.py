@@ -32,7 +32,6 @@ derivatives; other backends use lax, as does a convolution a Qwix rule
 quantizes (`dew.quantization`).
 """
 
-import functools
 import math
 from collections.abc import Callable, Sequence
 
@@ -48,7 +47,7 @@ from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 
 from .flops import conv_flops
-from .precision import accumulated, biased, float32_products, products_dtype
+from .precision import biased, float32_products, products_dtype
 from .sharding import SEQUENCE_AXIS, STAGE_AXIS, auto_part, logical_spec, mesh_axes
 
 # A linear boundary must survive in tangents and cotangents too: dropping it
@@ -152,32 +151,29 @@ def _taps(padded: jax.Array, kernel: jax.Array, dilation: int, height: int, widt
             * kernel[row, column, 0] for row in range(3) for column in range(3)]
 
 
+def _accumulated(total: jax.Array, products: Sequence[jax.Array]) -> jax.Array:
+    """`total` plus each of `products` in order, one fp32 add at a time: the depthwise schedules'
+    accumulation, each giving its own seed (the first product, or zeros)."""
+    for product in products:
+        total = total + product
+    return total
+
+
 def _shifted_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
-    """The depthwise convolution as its nine shifted windows against the taps, the sum of products
-    in float64 and rounded once to the input's dtype (`accumulated`, as a CPU sums every fp32
-    product): the windows stacked and contracted with the taps in one product.
+    """The depthwise convolution's taps (`_taps`), each product rounded to fp32 before it is added, the
+    sum from the first, rounded once to the input's dtype.
 
     XLA:CPU runs a depthwise convolution of more than 16 features this way,
-    which on the hybrid DiT's 2 x 16 x 16 x 768 maps took 6.4 ms a call in
-    the library convolution against 1.4 shifted; 16 features or fewer keep
-    the convolution."""
+    as exact as its library convolution (tests/test_depthwise_conv.py holds
+    it to check 1), which on the hybrid DiT's 2 x 16 x 16 x 768 maps takes
+    6.4 ms a call against 1.4 here; 16 features or fewer keep the
+    convolution. An output whose nine taps are all negative zero is the
+    sum's negative zero here, where the library gives a zero of either sign
+    by its kernel and the host it runs on."""
     height, width = lhs.shape[1:3]
     padded = jnp.pad(lhs, ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0))).astype(jnp.float32)
-    def window(row: int, column: int) -> jax.Array:
-        rows = slice(row * dilation, row * dilation + height)
-        columns = slice(column * dilation, column * dilation + width)
-        return padded[:, rows, columns, :]
-
-    windows = jnp.stack([window(row, column) for row in range(3) for column in range(3)])
-    taps = rhs.astype(jnp.float32).reshape(9, rhs.shape[-1])
-    return accumulated(_tapped, windows, taps).astype(lhs.dtype)
-
-
-def _tapped(windows: jax.Array, taps: jax.Array, preferred_element_type=None) -> jax.Array:
-    """The nine windows `[9, B, H, W, C]` against their taps `[9, C]`, summed: elementwise, so XLA
-    fuses it where a contraction over nine broadcast rows would not."""
-    del preferred_element_type  # the operands' own
-    return jnp.sum(windows * taps[:, None, None, None, :], axis=0)
+    products = jax.lax.optimization_barrier(_taps(padded, rhs.astype(jnp.float32), dilation, height, width))
+    return _accumulated(products[0], products[1:]).astype(lhs.dtype)
 
 
 def _materialized_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
@@ -204,10 +200,8 @@ def _materialized_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -
     # Onto a positive zero, as the form has summed: XLA:CPU keeps it, so an output whose nine taps
     # are all negative zero is positive zero there, and XLA:CUDA, where this form runs, drops it (A100
     # and H100), so the output is the sum's negative zero, as the shifted form's is.
-    total = jnp.zeros(lhs.shape, jnp.float32)
-    for product in _taps(padded, _barrier(rhs.astype(jnp.float32)), dilation, height, width):
-        total = total + product
-    return _barrier(total).astype(lhs.dtype)
+    products = _taps(padded, _barrier(rhs.astype(jnp.float32)), dilation, height, width)
+    return _barrier(_accumulated(jnp.zeros(lhs.shape, jnp.float32), products)).astype(lhs.dtype)
 
 
 def _conv_general_dilated(
@@ -226,13 +220,11 @@ def _conv_general_dilated(
     passes lax's own to time against it."""
 
     def convolve(x: jax.Array, w: jax.Array) -> jax.Array:
-        # A sum of products like a dot's, which a CPU sums in float64 (`accumulated`).
-        return accumulated(functools.partial(
-            jax.lax.conv_general_dilated, window_strides=window_strides, padding=padding,
-            lhs_dilation=lhs_dilation, rhs_dilation=rhs_dilation, dimension_numbers=dimension_numbers,
-            feature_group_count=feature_group_count, batch_group_count=batch_group_count,
-            precision=float32_products(products_dtype(x, w), precision), out_sharding=out_sharding),
-            x, w, preferred_element_type=preferred_element_type)
+        return jax.lax.conv_general_dilated(
+            x, w, window_strides, padding, lhs_dilation=lhs_dilation, rhs_dilation=rhs_dilation,
+            dimension_numbers=dimension_numbers, feature_group_count=feature_group_count,
+            batch_group_count=batch_group_count, precision=float32_products(products_dtype(x, w), precision),
+            preferred_element_type=preferred_element_type, out_sharding=out_sharding)
 
     dilation = (1, 1) if rhs_dilation is None else tuple(rhs_dilation)
     if (lhs.ndim == rhs.ndim == 4 and rhs.shape[:3] == (3, 3, 1)
