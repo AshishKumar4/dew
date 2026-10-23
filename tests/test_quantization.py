@@ -29,6 +29,7 @@ from dew.lora import _updated as lora_update
 from dew.nn.attention_residuals import depth_mixed
 from dew.nn.blocks import torch_bicubic_resize
 from dew.nn.kv_cache import hadamard, rotated
+from dew.nn.precision import FP32_SUMS
 from dew.nn.quantizers import nearest_codewords
 from dew.nn.sharding import pipeline_microbatches
 from dew.nn.ssm import diagonal_recurrence
@@ -124,14 +125,15 @@ def test_qwix_refuses_an_unknown_calibration_where_it_first_quantizes_a_weight()
 
 def test_a_pattern_that_matches_nothing_quantizes_nothing():
     """A narrowed pattern is selective: a regex no module path matches runs
-    the fp32 numerics bitwise. A pattern that matched everything would move
-    the logits here, so the equality fails it. Observed on CPU: bitwise
-    equal."""
+    the fp32 numerics bitwise, as the unquantized model sums them where Qwix
+    owns its products (`FP32_SUMS`). A pattern that matched everything would
+    move the logits here, so the equality fails it."""
     pytest.importorskip("qwix")
     model, qmodel, variables, ids = quantized_forward(
         Quantization(patterns=(".*does_not_exist.*",)))
-    assert float(jnp.max(jnp.abs(
-        qmodel.apply(variables, ids) - model.apply(variables, ids)))) == 0.0
+    with jax.default_matmul_precision(FP32_SUMS):
+        plain = model.apply(variables, ids)
+    assert float(jnp.max(jnp.abs(qmodel.apply(variables, ids) - plain))) == 0.0
 
 
 def test_an_int8_trunk_trains_down():
@@ -1223,8 +1225,9 @@ def zone_cases(dtype) -> dict[str, tuple[Callable[..., jax.Array], tuple, dict]]
 @pytest.mark.parametrize("name", sorted(UNQUANTIZED))
 def test_a_function_the_model_keeps_in_float_runs_unquantized(name, dtype):
     """Each function `UNQUANTIZED` names runs in a quantized model as in the unquantized one,
-    bitwise, in a float32 and a bfloat16 model, where a copy of its code under another name, which
-    the table does not reach, quantizes its products and moves."""
+    bitwise, in a float32 and a bfloat16 model, the unquantized one summing its products as Qwix's
+    do (`FP32_SUMS`), where a copy of its code under another name, which the table does not reach,
+    quantizes its products and moves."""
     function, operands, keywords = zone_cases(dtype)[name]
     copy = types.FunctionType(function.__code__, function.__globals__, f"{function.__name__}_copy",
                               function.__defaults__, function.__closure__)
@@ -1235,7 +1238,10 @@ def test_a_function_the_model_keeps_in_float_runs_unquantized(name, dtype):
         # Qwix quantizes a product as it is traced, and jnp.matmul is jitted, so each run traces
         # afresh: one that reused another's cached trace would take its products, quantized or not.
         jax.clear_caches()
-        return np.asarray((Quantization().apply(model) if quantize else model).apply({}, *operands))
+        if quantize:
+            return np.asarray(Quantization().apply(model).apply({}, *operands))
+        with jax.default_matmul_precision(FP32_SUMS):
+            return np.asarray(model.apply({}, *operands))
 
     plain = ran(function, quantize=False)
     np.testing.assert_array_equal(ran(function, quantize=True), plain)
@@ -1245,10 +1251,13 @@ def test_a_function_the_model_keeps_in_float_runs_unquantized(name, dtype):
 
 def test_an_einsum_of_three_operands_runs_as_the_unquantized_model_runs_it():
     """Qwix quantizes a two-operand einsum alone and raises on any other, so the provider runs one
-    of three operands, torch's bicubic resampling among them, as the unquantized model does."""
+    of three operands, torch's bicubic resampling among them, as the unquantized model does where
+    it sums as Qwix's products do (`FP32_SUMS`)."""
     x = jnp.asarray(np.random.default_rng(0).standard_normal((1, 4, 5, 3)), jnp.float32)
     model = Calls(functools.partial(torch_bicubic_resize, height=7, width=9))
-    np.testing.assert_array_equal(Quantization().apply(model).apply({}, x), model.apply({}, x))
+    with jax.default_matmul_precision(FP32_SUMS):
+        plain = model.apply({}, x)
+    np.testing.assert_array_equal(Quantization().apply(model).apply({}, x), plain)
 
 
 def assert_computed_as_on_the_host(run, label: str) -> None:
