@@ -9,6 +9,7 @@ shared loader calls it.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping
 
 import numpy as np
@@ -25,6 +26,7 @@ from dew.interop.hf_decoders import (
     translate_config,
     translate_denoiser_weights,
 )
+from dew.interop.streaming import WeightLayout
 from dew.interop.weights import nested
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import layer_scalar_mode
@@ -105,8 +107,10 @@ def translate_weights(
     *,
     param_dtype: str = "float32",
     checked: Checked = NOTHING_CHECKED,
-) -> Variables:
-    """Map a DiffusionGemma checkpoint's tensors into its variables tree.
+) -> tuple[Variables, tuple[WeightLayout, ...]]:
+    """Map a DiffusionGemma checkpoint's tensors into its variables tree, with the layouts its
+    vision readers placed the tower's and the embedder's tensors by, under their source names, which
+    `export_weights` writes them back through.
 
     Text weights route through the shared decoder map, vision and projection
     weights through their own. Each component casts its own leaves to
@@ -130,18 +134,25 @@ def translate_weights(
     for collection, tree in mapped["text"].items():
         if collection != "params":
             variables[collection] = {"text": tree}
+    layouts: tuple[WeightLayout, ...] = ()
     if config.get("vision_config") is not None:
         if not vision or not projection:
             raise ValueError("vision_config requires both vision_tower and embed_vision tensors")
-        tower_variables, _ = vision_variables("gemma4", vision, param_dtype)
-        params["conditioner"] = {
-            "tower": tower_variables["params"],
-            "projector": translate_gemma4_projector_weights(projection, param_dtype=param_dtype)[0]}
+        tower_variables, tower_layouts = vision_variables("gemma4", vision, param_dtype)
+        projector, projector_layouts = translate_gemma4_projector_weights(projection, param_dtype=param_dtype)
+        params["conditioner"] = {"tower": tower_variables["params"], "projector": projector}
         if "constants" in tower_variables:
             variables.setdefault("constants", {})["conditioner"] = {"tower": tower_variables["constants"]}
+        layouts = _named(VISION_PREFIX, nested(tower_layouts, 1, "conditioner", "tower")) + _named(
+            PROJECTION_PREFIX, nested(projector_layouts, 0, "params", "conditioner", "projector"))
     elif vision or projection:
         raise ValueError("vision weights require vision_config")
-    return variables
+    return variables, layouts
+
+
+def _named(prefix: str, layouts: tuple[WeightLayout, ...]) -> tuple[WeightLayout, ...]:
+    """`layouts` under the checkpoint names their component's tensors carry below `prefix`."""
+    return tuple(dataclasses.replace(layout, name=prefix + layout.name) for layout in layouts)
 
 
 def generation_process(config: Mapping[str, object], generation: Mapping[str, object]) -> BlockProcess:
@@ -271,12 +282,16 @@ def _refuse_unreadable(config: Mapping[str, object]) -> None:
 
 
 def export_weights(
-    model: DiffusionGemma, variables: Variables, config: Mapping[str, object]
+    model: DiffusionGemma, variables: Variables, config: Mapping[str, object],
+    vision: tuple[WeightLayout, ...] | None = None,
 ) -> dict[str, np.ndarray]:
     """Return the checkpoint tensors for a DiffusionGemma, keyed by source name.
 
     The decoder half goes through `export_decoder_weights` and is renamed under
-    the reference's `model.decoder.` and `model.encoder.` prefixes. A config
+    the reference's `model.decoder.` and `model.encoder.` prefixes. The tower
+    and the embedder go back through `vision`, the layouts their readers placed
+    a loaded checkpoint's tensors by (`translate_weights`); a model built in Dew
+    has none, and writes them through the layouts its own tree gives. A config
     the published implementation cannot build is refused (`_refuse_unreadable`).
     """
     from dew.interop.hf_decoders import export_decoder_weights
@@ -297,16 +312,15 @@ def export_weights(
         tensors[f"model.decoder.self_conditioning.{module}.weight"] = np.ascontiguousarray(
             np.asarray(leaf).T if kind == "kernel" else np.asarray(leaf))
     if "conditioner" in params:
-        # The tower and the embedder write back through the layouts their readers place by,
-        # rebuilt from the native tree, which a run trained from scratch has without a source.
-        tower = {collection: tree["conditioner"]["tower"] for collection, tree in variables.items()
-                 if "tower" in tree.get("conditioner", {})}
-        written = ((VISION_PREFIX, nested(gemma4_tower_layouts(tower), 1, "conditioner", "tower")),
-                   (PROJECTION_PREFIX, nested(gemma4_projector_layouts(params["conditioner"]["projector"]),
-                                              1, "conditioner", "projector")))
-        for prefix, layouts in written:
-            for layout in layouts:
-                tensors[prefix + layout.name] = layout.export(variables)
+        if vision is None:
+            tower = {collection: tree["conditioner"]["tower"] for collection, tree in variables.items()
+                     if "tower" in tree.get("conditioner", {})}
+            projector = params["conditioner"]["projector"]
+            vision = (_named(VISION_PREFIX, nested(gemma4_tower_layouts(tower), 1, "conditioner", "tower"))
+                      + _named(PROJECTION_PREFIX, nested(gemma4_projector_layouts(projector),
+                                                         1, "conditioner", "projector")))
+        for layout in vision:
+            tensors[layout.name] = layout.export(variables)
     return tensors
 
 
