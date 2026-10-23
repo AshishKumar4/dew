@@ -8,9 +8,12 @@ from reference_error import assert_as_exact, seeds_for
 
 
 def _draw(seed):
-    """Sums' terms scaled per draw by a heavy-tailed factor (a Pareto of index one, plus one)."""
-    rng = np.random.default_rng([0x5E, seed])
-    return ((rng.pareto(1.0) + 1) * rng.standard_normal((32, 128))).astype(np.float32),
+    """Sums' terms scaled per draw by a heavy-tailed factor (a Pareto of index one, plus one), the
+    null runs' heavy-sums class's law (tools/gate_null_runs.py) at a smaller size."""
+    from tool_support import load
+
+    _, heavy, _, _ = load("gate_null_runs").heavy_sums(rows=32, terms=128)
+    return heavy(seed)
 
 
 def _summed(order):
