@@ -67,8 +67,7 @@ Coordinates and row vectors come from the toolkit, because Mosaic GPU iotas need
 **The exponent's forms.** The default folds log2(e) into the scale (exp2 of `s·c − m`, which a compiler contracts to `fma(s, c, −m)`), FA2's and jax's mha arithmetic, and is the fast form; `natural=True` is the accurate form:
 - its logits stay raw products, each exponent their difference scaled after it is taken, `exp2((s − m)·c)` (`Forward.raw`): the largest logit's weight is 1 exactly and no multiply precedes the subtraction to contract into it. Under a score hook or an initial state its logits are scaled, the largest's weight held to 1 by a select;
 - the backward recomputes its weights in the forward's units from its raw maximum (`Recompute`);
-- its sums carry the headroom (above);
-- its backward takes the score cotangents' products with the keys and queries to fp32's accuracy, as the reference's fp32 cotangents are: a bf16 operand meets them as three exact bf16 parts (`cotangent_product`), and dQ takes D's refinement (`DqSums.keyed`, `dq_finish`). The default rounds the cotangents to the operands' dtype for one product and takes the first pass's D, FlashAttention's arithmetic.
+- its sums carry the headroom (above).
 
 Both pass check 1 on drawn inputs; the stability suite (tests/test_attention_stability.py) holds the accurate form to every family and the fold to all but its divergences at extreme inputs, which it runs in the accurate form alone:
 - logits a ulp apart near 2^30, at scales below 1: the fold rounds each logit at log2(e) times its size, so two the reference keeps apart can tie, and a large cotangent then overflows the backward;
@@ -76,10 +75,9 @@ Both pass check 1 on drawn inputs; the stability suite (tests/test_attention_sta
 - values near fp32's largest: the weighted values' sum overflows where the reference's normalized one does not (the headroom is the accurate form's), and so does a sink near fp32's largest;
 - in fp32, a row whose output one weight carries over values near fp32's largest (a weight of e^-12 to e^-26 on values of 2^120 to 2^126): the fold's extra rounding of that weight's logit is the row's error, 2.04 times the reference's; bf16 hides it in the weight's rounding to 16 bits;
 - a maximum that jumps far within a row (logits 50 above the keys before them): every earlier weight shares the one rounded exponent of the rescale, which doesn't average out over them as the reference's per-key exponents do, 9.8 times the reference's error over 32 keys; the accurate form compensates that exponent (TwoSum, and TwoProduct for the raw scale; `carried`), 0.28 times the reference's;
-- logits near 1e30 and beyond: the backward takes the base-2 maximum back to natural units, which moves the anchor's own weight away from 1;
-- a key's or a query's gradient whose score cotangents cancel across the other axis (bf16 small weights on large values, keys an ulp apart, keys near fp32's largest at equal logits): the default's one product in the operands' dtype keeps 8 bits of each cotangent, where the reference's fp32 keeps 24 (3700 times the reference's worst row on the bf16 small-weight family), and its dQ at the first pass's D keeps D's rounding (76 times on keys an ulp apart in bf16).
+- logits near 1e30 and beyond: the backward takes the base-2 maximum back to natural units, which moves the anchor's own weight away from 1.
 
-Measured on an H100 at qwen3-8b and gpt-oss-20b shapes, 4k and 32k tokens, the accurate form's raw arithmetic costs 1–5% of the forward and the headroom guard 2–6%. Its backward's fp32-accurate products and dQ's refinement cost 1.75 times the default's (llama-d128 causal bf16, 2 by 4096 tokens: 10.79 ms against 6.16; the three-part product alone 7.90). The fold needs `scale·log2(e) < 1` in fp32, so every folded logit is an ulp of fp32's largest below it, and an initial maximum (a sink) past fp32's largest in base 2 saturates exactly (`base2_maximum`).
+Measured on an H100 at qwen3-8b and gpt-oss-20b shapes, 4k and 32k tokens, the accurate form's raw arithmetic costs 1–5% of the forward and the headroom guard 2–6%; the training step's backward is within 2%. The fold needs `scale·log2(e) < 1` in fp32, so every folded logit is an ulp of fp32's largest below it, and an initial maximum (a sink) past fp32's largest in base 2 saturates exactly (`base2_maximum`).
 
 **Backward.**
 - Products: dP = dO·Vᵀ, dV += Pᵀ·dO, dK += dSᵀ·Q, dQ += dS·K, plus whatever D's form needs.
