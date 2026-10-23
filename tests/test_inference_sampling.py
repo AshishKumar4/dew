@@ -226,6 +226,17 @@ def test_a_call_policy_takes_the_tasks_eos_and_pad_ids(task):
     assert named.lengths.tolist() == [4] and not named.terminated.any()
 
 
+@pytest.mark.parametrize("changed", [{"temperature": True}, {"top_p": np.float32(0.9)},
+                                     {"repetition_penalty": np.float32(1.1)}, {"eos_token_ids": True}])
+def test_a_policy_refuses_as_it_is_built_a_value_its_controls_refuse(changed):
+    """A policy checks its settings with the controls' own rules, so a value the control it builds
+    would refuse at generation, or a flag where a rate goes, is refused when the policy is built."""
+    valid = {"temperature": 0.7, "top_p": 0.9, "repetition_penalty": 1.1, "eos_token_ids": 3}
+    Sampling(**valid)
+    with pytest.raises(ValueError):
+        Sampling(**{**valid, **changed})
+
+
 def test_source_total_length_and_explicit_continuation_budget_have_defined_precedence(task):
     from pathlib import Path
 

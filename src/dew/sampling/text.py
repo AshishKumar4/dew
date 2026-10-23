@@ -156,16 +156,14 @@ class Sampling:
     stop: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if not math.isfinite(self.temperature) or self.temperature < 0:
+        # Zero is greedy decoding, so the temperature is the one rate the controls' checks do not cover.
+        if isinstance(self.temperature, bool) or not math.isfinite(self.temperature) or self.temperature < 0:
             raise ValueError("temperature must be finite and non-negative")
-        if self.top_k is not None and (type(self.top_k) is not int or self.top_k < 1):
-            raise ValueError("top_k must be a positive integer or None")
+        if self.top_k is not None:
+            decoding.positive_size("top_k", self.top_k)
         for name, value in (("top_p", self.top_p), ("min_p", self.min_p), ("typical_p", self.typical_p)):
-            if isinstance(value, (bool, np.bool_)) or not math.isfinite(value) or not 0 <= value <= 1:
-                raise ValueError(f"{name} must be finite and between zero and one")
-        if isinstance(self.repetition_penalty, bool) or not (
-                math.isfinite(self.repetition_penalty) and self.repetition_penalty > 0):
-            raise ValueError("repetition_penalty must be finite and positive")
+            decoding.unit_interval(name, value)
+        decoding.positive("repetition_penalty", self.repetition_penalty)
         for name, value in (("presence_penalty", self.presence_penalty),
                             ("frequency_penalty", self.frequency_penalty)):
             if isinstance(value, bool) or not math.isfinite(value):
@@ -177,11 +175,7 @@ class Sampling:
         if self.pad_token_id is not None and (type(self.pad_token_id) is not int or self.pad_token_id < 0):
             raise ValueError("pad_token_id must be a non-negative token id")
         if self.eos_token_ids is not None:
-            eos = self.eos_token_ids
-            stops = (eos,) if isinstance(eos, int) else tuple(eos)
-            if not stops or any(type(token) is not int or token < 0 for token in stops):
-                raise ValueError("eos_token_ids must contain non-negative token ids")
-            object.__setattr__(self, "eos_token_ids", stops)
+            object.__setattr__(self, "eos_token_ids", decoding.token_ids("eos_token_ids", self.eos_token_ids))
         if isinstance(self.stop, str):
             raise ValueError(f"stop is a tuple of strings; write stop=({self.stop!r},)")
         if any(not isinstance(string, str) or not string for string in self.stop):
