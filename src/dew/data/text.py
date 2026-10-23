@@ -20,9 +20,9 @@ import json
 import tempfile
 import threading
 import unicodedata
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, runtime_checkable
 
 import grain.python as grain
 import numpy as np
@@ -615,6 +615,7 @@ class Decontaminated(Curated):
 
     def curator(self) -> BaseFilter:
         from datatrove.pipeline.decont import NGramsDecontConfig, NGramsDecontFilter
+        from datatrove.utils.hashing import create_hash_func
         from datatrove.utils.text import ngrams, simplify_text
 
         from dew.files import write_atomically
@@ -626,8 +627,8 @@ class Decontaminated(Curated):
         # The index the filter reads, each n-gram split, joined and hashed as its own filter reads a document.
         words = [decontaminate.tokenizer.word_tokenize(simplify_text(text, config.norm_config))
                  for text in self.against]
-        # DataTrove hashes the joined n-gram's text (its filter's own call), whatever its annotation says.
-        hashed = cast(Callable[[str], int], decontaminate.hash_func)
+        # The hash of a joined n-gram's text, as the filter builds its own from the same config.
+        hashed = create_hash_func(config.hash_config, str)
         hashes = {hashed(" ".join(gram)) for row in words for gram in ngrams(row, self.n)}
         folder.mkdir(parents=True, exist_ok=True)
         write_atomically(folder / "against.index.hashes",
@@ -669,6 +670,7 @@ def deduplicated(dataset: Dataset, url: str, near: NearDuplicates | None = None,
         MinhashDedupSignature,
     )
 
+    from dew.data.dataset import Closeable
     from dew.data.sinks import export, passed
 
     near = NearDuplicates() if near is None else near
@@ -681,7 +683,8 @@ def deduplicated(dataset: Dataset, url: str, near: NearDuplicates | None = None,
                 text = text.decode("utf-8") if isinstance(text, bytes) else str(text)
                 yield Document(text=text, id=str(index))
         finally:
-            records.close()
+            if isinstance(records, Closeable):
+                records.close()
 
     config = MinhashConfig(n_grams=near.n, num_buckets=near.buckets, hashes_per_bucket=near.hashes)
     with tempfile.TemporaryDirectory(prefix="dew-minhash-") as work:
@@ -699,7 +702,8 @@ def deduplicated(dataset: Dataset, url: str, near: NearDuplicates | None = None,
         try:
             yield from (record for index, record in enumerate(records) if index not in removed)
         finally:
-            records.close()
+            if isinstance(records, Closeable):
+                records.close()
 
     rule = {**dataclasses.asdict(near), "datatrove": version("datatrove"), "removed": len(removed)}
     return export(kept(), url, format=format, rows_per_shard=rows_per_shard,
