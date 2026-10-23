@@ -6,8 +6,9 @@ keys and values under the selection folded into a `[B, S, T]` mask, which
 `tests/test_mla.py` holds against transformers 5.16.1 (the V3.2 fixture's
 seven tokens exceed its top-k of four, so that parity test runs this path).
 The selection is on par with it from the reference in float64 over drawn
-inputs (check 1, tests/reference_error.py); a call that keeps the masked kernel
-is the masked kernel's call, to the bit.
+inputs (check 1, tests/reference_error.py), and a call that keeps the masked
+kernel with the masked kernel's call: two programs, which XLA holds to no
+common bits.
 """
 
 from functools import partial
@@ -34,7 +35,8 @@ from dew.nn.sparse_selection import selection_mask, sparse_latent_attention, top
 from dew.quantization import QUANTIZATION, InputQuantization
 
 HEADS, RANK, NOPE, ROPE, VALUE = 4, 24, 16, 8, 12
-SEEDS = {'selection': 8, 'packed selection': 8, 'sparse layer': 8}
+SEEDS = {'selection': 8, 'packed selection': 8, 'sparse layer': 8, 'dropped-out adapter': 8,
+         'input quantized kv_b_proj': 8, 'frozen quantized kv_b_proj': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 
 
@@ -139,32 +141,39 @@ def test_the_layer_runs_the_selection_and_matches_its_masked_kernel():
     def masked(variables, hidden):
         return layer.apply(variables, hidden, mutable=["qk"])[0]
 
-    def draw(seed):
-        return (jax.random.normal(jax.random.fold_in(jax.random.key(2), seed), (2, 21, 32)),)
+    assert_as_exact(jax.jit(partial(layer.apply, variables)), jax.jit(partial(masked, variables)),
+                    hidden_draw, 'sparse layer', seeds=SEEDS['sparse layer'],
+                    truth_fn=partial(masked, widened(variables)))
 
-    assert_as_exact(jax.jit(partial(layer.apply, variables)), jax.jit(partial(masked, variables)), draw,
-                    'sparse layer', seeds=SEEDS['sparse layer'], truth_fn=partial(masked, widened(variables)))
+
+def hidden_draw(seed):
+    """Check 1's draw of a layer's hidden states."""
+    return (jax.random.normal(jax.random.fold_in(jax.random.key(2), seed), (2, 21, 32)),)
 
 
 def test_an_adapter_dropping_out_kv_b_proj_keeps_the_masked_kernel():
     """LoRA dropout on kv_b_proj draws a mask per token and latent dimension.
     The absorbed path applies kv_b_proj to the identity, where the same draw
     would be one mask for every token, so such a training call runs the
-    masked kernel: it is the same call with `qk` open, rng for rng, to the bit."""
+    masked kernel: on par (check 1) with the same call with `qk` open, rng for
+    rng, its truth that call in float64 under the same mask."""
     layer = MultiHeadLatentAttention(
         emb_features=32, num_heads=HEADS, max_seq_len=64, q_lora_rank=16, kv_lora_rank=RANK,
         qk_nope_head_dim=NOPE, qk_rope_head_dim=ROPE, v_head_dim=VALUE,
         index_topk=5, index_n_heads=2, index_head_dim=16, attention_impl="reference")
-    hidden = jax.random.normal(jax.random.key(2), (2, 21, 32))
     adapter = LoRA(rank=4, modules=("kv_b_proj",), alpha=8.0, dropout=0.5).apply(
-        layer, layer.init(jax.random.key(3), hidden), key=3)
+        layer, layer.init(jax.random.key(3), jnp.zeros((2, 21, 32))), key=3)
     adapted, variables = adapter.model, adapter.variables
     factor = variables["params"]["kv_b_proj"]["lora_B"]
     variables["params"]["kv_b_proj"]["lora_B"] = jax.random.normal(jax.random.key(4), factor.shape)
     rngs = {"dropout": jax.random.key(5)}
-    trained = adapted.apply(variables, hidden, rngs=rngs)
-    masked, _ = adapted.apply(variables, hidden, rngs=rngs, mutable=["qk"])
-    np.testing.assert_array_equal(np.asarray(trained), np.asarray(masked))
+
+    def masked(variables, hidden):
+        return adapted.apply(variables, hidden, rngs=rngs, mutable=["qk"])[0]
+
+    assert_as_exact(jax.jit(lambda hidden: adapted.apply(variables, hidden, rngs=rngs)),
+                    jax.jit(partial(masked, variables)), hidden_draw, 'dropped-out adapter',
+                    seeds=SEEDS['dropped-out adapter'], truth_fn=partial(masked, widened(variables)))
 
 
 @pytest.mark.parametrize("quantized", ["input", "frozen"])
@@ -173,13 +182,13 @@ def test_a_quantized_kv_b_proj_keeps_the_masked_kernel(quantized):
     there, rounds the latents themselves. The absorbed path applies kv_b_proj
     to the identity, where the rounding would land on the identity instead,
     so such a call runs the masked kernel: its output and every gradient are
-    the same call's with `qk` open."""
+    on par (check 1) with the same call's with `qk` open, its truth that call
+    in float64 on the same quantization."""
     layer = MultiHeadLatentAttention(
         emb_features=32, num_heads=HEADS, max_seq_len=64, q_lora_rank=16, kv_lora_rank=RANK,
         qk_nope_head_dim=NOPE, qk_rope_head_dim=ROPE, v_head_dim=VALUE,
         index_topk=5, index_n_heads=2, index_head_dim=16, attention_impl="reference")
-    hidden = jax.random.normal(jax.random.key(2), (2, 21, 32))
-    variables = layer.init(jax.random.key(3), hidden)
+    variables = layer.init(jax.random.key(3), jnp.zeros((2, 21, 32)))
     if quantized == "input":
         record = InputQuantization(sites=(("kv_b_proj", "fp8"),))
         held = {"kv_b_proj": {"fp8_input_scale": jnp.asarray(0.01, jnp.float32)}}
@@ -187,19 +196,23 @@ def test_a_quantized_kv_b_proj_keeps_the_masked_kernel(quantized):
         record = InputQuantization(frozen_fp8=("kv_b_proj",), measured_on=device_generation())
         held = record.packed(variables["params"])
     model = record.apply(layer)
-    cotangent = jax.random.normal(jax.random.key(4), hidden.shape)
 
-    def run(*, qk: bool):
-        def loss(params, x):
+    def run(params, *, qk: bool):
+        # The output and the parameters' and hidden states' gradients under the drawn readout.
+        def call(params, x):
             tree = {"params": params, QUANTIZATION: held}
-            output = model.apply(tree, x, mutable=["qk"])[0] if qk else model.apply(tree, x)
-            return jnp.sum(output * cotangent), output
+            return model.apply(tree, x, mutable=["qk"])[0] if qk else model.apply(tree, x)
 
-        (_, output), gradients = jax.value_and_grad(loss, (0, 1), has_aux=True)(variables["params"], hidden)
-        return output, gradients
+        return lambda hidden, cotangent: with_gradients(call)(params, hidden, cotangent)
 
-    for sparse, masked in zip(jax.tree.leaves(run(qk=False)), jax.tree.leaves(run(qk=True)), strict=True):
-        np.testing.assert_array_equal(np.asarray(sparse), np.asarray(masked))
+    def draw(seed):
+        (hidden,) = hidden_draw(seed)
+        return hidden, jax.random.normal(jax.random.fold_in(jax.random.key(4), seed), hidden.shape)
+
+    params = variables["params"]
+    label = f'{quantized} quantized kv_b_proj'
+    assert_as_exact(jax.jit(run(params, qk=False)), jax.jit(run(params, qk=True)), draw, label,
+                    seeds=SEEDS[label], truth_fn=run(widened(params), qk=True))
 
 
 def test_memory_follows_the_selection_not_the_sequence():
