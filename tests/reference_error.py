@@ -956,24 +956,43 @@ def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth
         raise Inconclusive(found) if unresolved else AssertionError(found)
 
 
+SIZING_FROM = 1 << 20
+"""The first seed a paired sizing draws (`seeds_for` with `dew_fn`): past every site's verdict seeds
+and below every null run's (tools/gate_null_runs.py, from 2^16 runs of at least 80 seeds on), so the
+count a site declares is fixed by draws its verdict never sees."""
+
+
 def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = 512,
-              truth_fn=None) -> int:
-    """The seeds a site declares: the fewest, doubling from `start`, for which the reference compared
-    with itself (its errors on two disjoint seed sets, `_interval`'s control) resolves PARITY in every
-    leaf: the pooled ratio's interval no wider than PARITY. Fails past `most`, where the
-    site needs larger inputs or fewer shared factors, not more seeds."""
+              truth_fn=None, dew_fn=None) -> int:
+    """The seeds a site declares: the fewest, doubling from `start`, for which the pooled ratio's
+    interval is no wider than PARITY in every leaf. Of the reference compared with itself, its errors on
+    two disjoint seed sets resampled apart (`_interval`'s control), by default; with `dew_fn`, paired:
+    Dew's errors against the reference's on the same draws, the two resampled by the same seeds as the
+    verdict resamples them (`_interval`), on draws from SIZING_FROM on that no verdict takes. A pair
+    that shares its upstream rounding, the same inputs through the same upstream arithmetic, has errors
+    whose sizes vary across draws together: their ratio resolves where each alone, heavy-tailed across
+    draws, does not, and the verdict judges that same paired ratio. The width asked of it is PARITY
+    either way. Fails past `most`, where the site needs larger inputs or fewer shared factors, not more
+    seeds."""
     count = max(start, FEWEST_SEEDS)
     while count <= most:
-        first = _drawn(reference_fn, reference_fn, draw, range(count), truth_fn)
-        second = _drawn(reference_fn, reference_fn, draw, range(count, 2 * count), truth_fn)
-        wide = [name for index, name in enumerate(first.names)
-                if np.sum(first.theirs[:, index]) > 0 and np.sum(second.theirs[:, index]) > 0
-                and not _resolves(*_interval(first.theirs[:, index], control=second.theirs[:, index]))]
+        if dew_fn is None:
+            first = _drawn(reference_fn, reference_fn, draw, range(count), truth_fn)
+            second = _drawn(reference_fn, reference_fn, draw, range(count, 2 * count), truth_fn)
+            wide = [name for index, name in enumerate(first.names)
+                    if np.sum(first.theirs[:, index]) > 0 and np.sum(second.theirs[:, index]) > 0
+                    and not _resolves(*_interval(first.theirs[:, index], control=second.theirs[:, index]))]
+        else:
+            paired = _drawn(dew_fn, reference_fn, draw, range(SIZING_FROM, SIZING_FROM + count), truth_fn)
+            wide = [name for index, name in enumerate(paired.names)
+                    if np.sum(paired.theirs[:, index]) > 0
+                    and not _resolves(*_interval(paired.mine[:, index], paired.theirs[:, index]))]
         if not wide:
             return count
         count *= 2
-    raise AssertionError(f"{label}: the reference compared with itself does not resolve {PARITY} within "
-                         f"{most} seeds at {wide[:4]}; give the site larger inputs or fewer shared factors")
+    compared = "the reference compared with itself" if dew_fn is None else "Dew paired with the reference"
+    raise AssertionError(f"{label}: {compared} does not resolve {PARITY} within {most} seeds at {wide[:4]}; "
+                         f"give the site larger inputs or fewer shared factors")
 
 
 def recording(path) -> dict[str, np.ndarray]:
