@@ -19,9 +19,9 @@ import json
 import tempfile
 import threading
 import unicodedata
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, cast, runtime_checkable
 
 import grain.python as grain
 import numpy as np
@@ -625,7 +625,9 @@ class Decontaminated(Curated):
         # The index the filter reads, each n-gram split, joined and hashed as its own filter reads a document.
         words = [decontaminate.tokenizer.word_tokenize(simplify_text(text, config.norm_config))
                  for text in self.against]
-        hashes = {decontaminate.hash_func(" ".join(gram)) for row in words for gram in ngrams(row, self.n)}
+        # DataTrove hashes the joined n-gram's text (its filter's own call), whatever its annotation says.
+        hashed = cast(Callable[[str], int], decontaminate.hash_func)
+        hashes = {hashed(" ".join(gram)) for row in words for gram in ngrams(row, self.n)}
         folder.mkdir(parents=True, exist_ok=True)
         write_atomically(folder / "against.index.hashes",
                          np.array(sorted(hashes), dtype=config.hash_config.np_descr).tobytes())

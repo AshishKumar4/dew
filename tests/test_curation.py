@@ -74,8 +74,9 @@ def test_a_fasttext_classifier_keeps_the_label_it_is_asked_for_and_its_model_key
     lines += ["__label__spam click here buy now free offer win prize" for _ in range(60)]
     examples.write_text("\n".join(lines) + "\n")
     model = tmp_path / "model.bin"
-    fasttext.train_supervised(input=str(examples), epoch=25, minCount=1, seed=0, thread=1).save_model(
-        str(model))
+    trained = fasttext.train_supervised(input=str(examples), epoch=10, lr=0.05, dim=16, minCount=1, seed=0,
+                                        thread=1)
+    trained.save_model(str(model))
     classified = Pipeline(web_pages()).filter_map(text.Classifier(str(model), keep=(("prose", 0.5),)))
     kept, dropped = one_pass(classified)
     assert kept == [0, 1, 2, 11] and dropped == {"classifier": 1}
