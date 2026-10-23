@@ -55,7 +55,7 @@ from dew.nn.precision import (
     rounds_to_bf16,
     scaled_logits,
 )
-from dew.nn.protocols import AffineHead, HiddenStates, Logits, LogitsFromHidden, OutputTable
+from dew.nn.protocols import AffineHead, HiddenStates, Lacks, Logits, LogitsFromHidden, OutputTable
 from dew.nn.sharding import logical_spec, mesh_axes
 
 
@@ -118,9 +118,9 @@ def refuse_without_logits(model, objective: str) -> None:
     """Refuse a model `objective` reads no logits from: no head over its final
     states (`reads_states`) and no logits from its tokens (`Logits`)."""
     if not reads_states(model) and not isinstance(model, Logits):
-        raise TypeError(
-            f"{objective} scores a model's logits, and a {type(model).__name__} gives none: no head over "
-            f"its final states (HiddenStates with AffineHead or LogitsFromHidden) and no Logits")
+        raise Lacks("logits",
+                    f"{objective} scores a model's logits, and a {type(model).__name__} gives none: no head "
+                    f"over its final states (HiddenStates with AffineHead or LogitsFromHidden) and no Logits")
 
 
 def final_read(model, variables, *args, **kwargs):

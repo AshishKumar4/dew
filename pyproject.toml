@@ -18,13 +18,13 @@ dependencies = [
     "flax>=0.12.10,<0.13",
     # Dew's JAX build: 0.11.2 with the fixes no release has yet (constraints.txt
     # names them), which only Dew's package index serves, pypi.dewml.dev. The
-    # first build with every fix is post11; a release sorts below it, so an
+    # first build with every fix is post12; a release sorts below it, so an
     # install from PyPI alone stops at resolving jax rather than running on a
     # jax without them (docs/installation.md). The accelerator builds the
     # cuda12, cuda13 and tpu extras name are 0.11.2's. A bump runs the GPU
     # checks docs/installation.md lists under "Bumping JAX" first: CI is
     # CPU-only.
-    "jax>=0.11.2.post11,<0.11.3",
+    "jax>=0.11.2.post12,<0.11.3",
     "optax>=0.2.2",
     "orbax-checkpoint>=0.12.4",
     "numpy",
@@ -251,6 +251,13 @@ ci = ["dewml[test,av,tfds,metrics,inference-clients,serve,environments,vision,au
 tutorials = ["dewml[streaming,interop,notebooks]", "matplotlib"]
 # Execute notebooks through a Jupyter kernel of the selected interpreter.
 notebooks = ["nbclient", "nbformat", "ipykernel"]
+
+# The least uv: 0.13.4 is the first whose own CA store leaves out emSign's (GHSA-hq85-5cpj-mr62). uv refuses
+# to run older in this project, setup-uv installs a release at least this, and site/scripts/gen_install.py
+# writes it into the installers that bootstrap uv before any checkout (install.sh, tools/armada/setup.sh, dew
+# tpu setup's script) and into the installation advice.
+[tool.uv]
+required-version = ">=0.13.4"
 
 [tool.ruff]
 target-version = "py312"

@@ -8,10 +8,11 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from tool_support import load
+from tool_support import git, load
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -388,14 +389,52 @@ def test_a_gpu_lane_fetches_the_pinned_fixtures_before_any_file_and_stops_where_
         "def test_reads(): Path('read').write_text(str(time.monotonic()))\n")
     out = tmp_path / "verdict.json"
     fetched = fetcher(tmp_path)
-    assert ci.gpu_lane("3.12", ["tests/test_reads.py"], out, cache=True, processes=1, deadline=600.0) == 0
+    assert ci.gpu_lane("3.12", ["tests/test_reads.py"], out, cache="on", processes=1, deadline=600.0) == 0
     assert float(fetched.read_text()) < float((tmp_path / "read").read_text())
     fetched.unlink()
     (tmp_path / "read").unlink()
     fetcher(tmp_path, due=True)
     with pytest.raises(subprocess.CalledProcessError):
-        ci.gpu_lane("3.12", ["tests/test_reads.py"], out, cache=True, processes=1, deadline=600.0)
+        ci.gpu_lane("3.12", ["tests/test_reads.py"], out, cache="on", processes=1, deadline=600.0)
     assert fetched.is_file() and not (tmp_path / "read").exists()
+
+
+LANE_TEST = ("import os, subprocess, sys, time\n"
+             "from pathlib import Path\n"
+             "def test_runs():\n"
+             "    began = time.monotonic()\n"
+             "    time.sleep(1)\n"
+             "    share = os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION']\n"
+             "    grown = os.environ.get('XLA_PYTHON_CLIENT_PREALLOCATE', 'true')\n"
+             "    ran = Path(f'ran-{Path(__file__).stem}-{os.getpid()}')\n"
+             "    ran.write_text(f'{share} {began} {time.monotonic()} {grown}')\n")
+"""A GPU lane's test file standing in: it records the share it was given, when it ran and whether its pool
+grows."""
+
+
+def gpu_lane_at(root: Path, monkeypatch, url: str, files: int) -> list[str]:
+    """A GPU lane's machine at `root`: the test cache at `url`, half of one 80 GiB GPU, and `files` test files
+    of `LANE_TEST`. Their names."""
+    cached(monkeypatch, url)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
+    gpu_driver(root, monkeypatch)
+    names = [f"tests/test_file_{index}.py" for index in range(files)]
+    for name in names:
+        (root / name).write_text(LANE_TEST)
+    return names
+
+
+def lane_runs(root: Path, stem: str) -> list[list[str]]:
+    """Each run of `stem`'s `LANE_TEST`, oldest first: its share, start, end and growth."""
+    return [path.read_text().split() for path in sorted(root.glob(f"ran-{stem}-*"),
+                                                        key=lambda path: path.stat().st_mtime)]
+
+
+def overlapping(runs: list[list[str]]) -> int:
+    """The most of `runs` (`lane_runs`) that ran at one moment."""
+    spans = [(float(began), float(ended)) for _, began, ended, _ in runs]
+    return max(sum(began <= moment < ended for began, ended in spans) for moment, _ in spans)
 
 
 def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_share(
@@ -409,22 +448,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     row stays red: nothing is run again. The rows join one verdict, each
     recorded as a task's are, and a later lane reuses the green ones."""
     url, stored, _ = cache_worker
-    cached(monkeypatch, url)
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
-    monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
-    gpu_driver(tmp_path, monkeypatch)
-    source = ("import os, subprocess, sys, time\n"
-              "from pathlib import Path\n"
-              "def test_runs():\n"
-              "    began = time.monotonic()\n"
-              "    time.sleep(1)\n"
-              "    share = os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION']\n"
-              "    grown = os.environ.get('XLA_PYTHON_CLIENT_PREALLOCATE', 'true')\n"
-              "    ran = Path(f'ran-{Path(__file__).stem}-{os.getpid()}')\n"
-              "    ran.write_text(f'{share} {began} {time.monotonic()} {grown}')\n")
-    names = [f"tests/test_file_{index}.py" for index in range(5)]
-    for name in names:
-        (tmp_path / name).write_text(source)
+    names, source = gpu_lane_at(tmp_path, monkeypatch, url, 5), LANE_TEST
     # One that fails on any share, and one that starts a process.
     (tmp_path / "tests/test_red.py").write_text(source + "    assert share == 'all of it'\n")
     (tmp_path / "tests/test_spawner.py").write_text(
@@ -434,15 +458,10 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     fetcher(tmp_path)
 
     def ran(stem: str) -> list[list[str]]:
-        return [path.read_text().split() for path in sorted(tmp_path.glob(f"ran-{stem}-*"),
-                                                            key=lambda path: path.stat().st_mtime)]
-
-    def overlapping(runs: list[list[str]]) -> int:
-        spans = [(float(began), float(ended)) for _, began, ended, _ in runs]
-        return max(sum(began <= moment < ended for began, ended in spans) for moment, _ in spans)
+        return lane_runs(tmp_path, stem)
 
     out = tmp_path / "verdict.json"
-    assert ci.gpu_lane("3.12", every, out, cache=True, processes=4, deadline=600.0) == 0
+    assert ci.gpu_lane("3.12", every, out, cache="on", processes=4, deadline=600.0) == 0
     rows = json.loads(out.read_text())["rows"]
     assert [(row["name"], row["exitCode"]) for row in rows] == [
         (f"3.12:{name}", int(name == "tests/test_red.py")) for name in every]
@@ -456,12 +475,12 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     # Measured peaks of 4 GiB: each file then holds 6 GiB of the 40, and four run at once. Records without
     # a key, as a run on these inputs leaves to be run again, under the last run's and these inputs'.
     # The spawner's child took its fraction, so it holds two shares: 12 GiB beside the others' 24.
-    common = ci.shared("3.12")
+    common = ci.lane_inputs("3.12")
     for name, inputs in itertools.product([*names, "tests/test_spawner.py"], (None, common)):
         at = "/" + ci.record_key("3.12", ci.row("3.12", name, ""), ci.device_class(), inputs)
         stored[at] = json.dumps({"key": None, "depends": [name], "row": {}, "reads": [], "peak": 4 * 2 ** 30,
                                  "shares": int(name == "tests/test_spawner.py"), "pools": 0}).encode()
-    assert ci.gpu_lane("3.12", every, out, cache=True, processes=4, deadline=600.0) == 0
+    assert ci.gpu_lane("3.12", every, out, cache="on", processes=4, deadline=600.0) == 0
     rows = json.loads(out.read_text())["rows"]
     assert [row["exitCode"] for row in rows] == [int(name == "tests/test_red.py") for name in every]
     measured = [ran(Path(name).stem)[-1] for name in names]
@@ -474,11 +493,98 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     assert ci.gpu_needs({"depends": None, "peak": 4 * gib}, budget) == (budget, budget)
     held = {"depends": [], "peak": 4 * gib, "shares": 2, "pools": gib}
     assert ci.gpu_needs(held, budget) == (6 * gib, 19 * gib), "6 GiB, twice more for its children, and 1 GiB"
-    assert ci.gpu_lane("3.12", [], out, cache=True, processes=4, deadline=600.0) == 0
+    assert ci.gpu_lane("3.12", [], out, cache="on", processes=4, deadline=600.0) == 0
     assert json.loads(out.read_text()) == {"rows": []}, "an empty lane runs nothing"
     assert len(ran("test_red")) == 2, "a red row is never reused"
-    assert ci.gpu_lane("3.12", names, out, cache=True, processes=4, deadline=600.0) == 0
+    assert ci.gpu_lane("3.12", names, out, cache="on", processes=4, deadline=600.0) == 0
     assert all(len(ran(Path(name).stem)) == 2 for name in names), "the third lane reused the green rows"
+    # Their records, of these inputs as the lane keys them, read no backend: none is in the GPU tier.
+    assert not set(names) & set(ci.gpu_tier("3.12"))
+
+
+def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A lane on a class no run has measured borrows each file's share from another GPU class's last
+    measured peak (the largest any class holds), so its files run side by side as a measured lane's do,
+    not each alone. A file red under a borrowed share because its memory ran out runs once more, alone,
+    with the lane's whole share, and its row says so (interference) with that first failure; one whose
+    first failure is its own (an assertion, whatever its message names) stays red, run once. The lane
+    records this class's own measurement, so the next lane on it reads its own, not the borrowed one. A
+    file no class measured runs alone, as every unmeasured one does where the Worker does not list its
+    records."""
+    url, stored, _ = cache_worker
+    names, source = gpu_lane_at(tmp_path, monkeypatch, url, 4), LANE_TEST
+    # Out of memory on any share but the whole: run again alone, its second row green, the first failure kept
+    # in its row. And one whose first failure is its own (an assertion): red, run once, whatever share.
+    (tmp_path / "tests/test_tight.py").write_text(
+        source + "    if share != '0.5':\n"
+                 "        raise RuntimeError('RESOURCE_EXHAUSTED: Out of memory allocating 9.0GiB')\n")
+    (tmp_path / "tests/test_wrong.py").write_text(
+        source + "    assert share == '0.5', 'an accuracy miss, not RESOURCE_EXHAUSTED: out of memory'\n")
+    # A block past the GPU's shared memory is no device memory a larger share gives: red, run once. And one
+    # out of memory whose borrowed measurement already reached the whole share: red, run once, as it ran.
+    (tmp_path / "tests/test_shared.py").write_text(
+        source + "    raise RuntimeError('RESOURCE_EXHAUSTED: Shared memory size limit exceeded: 300000')\n")
+    (tmp_path / "tests/test_whole.py").write_text(
+        source + "    raise RuntimeError('RESOURCE_EXHAUSTED: Out of memory allocating 90.0GiB')\n")
+    (tmp_path / "tests/test_new.py").write_text(source)
+    every = [*names, "tests/test_tight.py", "tests/test_wrong.py", "tests/test_shared.py",
+             "tests/test_whole.py", "tests/test_new.py"]
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    # Another class measured 4 GiB for each file but the new one; a third, smaller peaks for some.
+    for other, peak in (("NVIDIA-H100-80GB-HBM3-x86", 4), ("NVIDIA-A10-x86", 2)):
+        for name in [*names, "tests/test_tight.py", "tests/test_wrong.py", "tests/test_shared.py",
+                     "tests/test_whole.py"]:
+            at = "/" + ci.record_key("3.12", ci.row("3.12", name, ""), other)
+            whole = 64 if name == "tests/test_whole.py" else peak
+            stored[at] = json.dumps({"key": None, "depends": [name], "row": {}, "reads": [],
+                                     "peak": whole * 2 ** 30, "shares": 0, "pools": 0}).encode()
+
+    def ran(stem: str) -> list[list[str]]:
+        return lane_runs(tmp_path, stem)
+
+    out = tmp_path / "verdict.json"
+    assert ci.gpu_lane("3.12", every, out, cache="on", processes=4, deadline=600.0) == 0
+    rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
+    borrowed = str(6 * 2 ** 30 / (81920 * 2 ** 20))
+    first = [ran(Path(name).stem)[0] for name in names]
+    assert [share for share, *_ in first] == [borrowed] * len(names), "the largest class's 4 GiB and headroom"
+    assert overlapping(first) >= 2, "borrowed shares pack as measured ones do"
+    assert [share for share, *_ in ran("test_new")] == ["0.5"], "measured on no class: alone, the whole share"
+    assert [share for share, *_ in ran("test_tight")] == [borrowed, "0.5"]
+    tight = rows["3.12:tests/test_tight.py"]
+    assert tight["exitCode"] == 0 and "borrowed from NVIDIA-H100-80GB-HBM3-x86" in tight["interference"]
+    assert "RESOURCE_EXHAUSTED" in tight["interference"]
+    wrong = rows["3.12:tests/test_wrong.py"]
+    assert wrong["exitCode"] == 1 and "an accuracy miss" in wrong["output"] and "interference" not in wrong
+    assert [share for share, *_ in ran("test_wrong")] == [borrowed], "its own failure: red, run once"
+    for stem in ("test_shared", "test_whole"):
+        found = rows[f"3.12:tests/{stem}.py"]
+        assert found["exitCode"] == 1 and len(ran(stem)) == 1, f"{stem}: red, run once"
+        assert "interference" not in found
+    assert ran("test_whole")[0][0] == "0.5", "its borrowed measurement already reached the whole share"
+    assert all("interference" not in row for name, row in rows.items() if name != "3.12:tests/test_tight.py")
+    # A Worker that does not list its records: nothing is borrowed, and an unmeasured file runs alone.
+    (tmp_path / "tests/test_listless.py").write_text(source)
+    for other in ("NVIDIA-H100-80GB-HBM3-x86",):
+        at = "/" + ci.record_key("3.12", ci.row("3.12", "tests/test_listless.py", ""), other)
+        stored[at] = json.dumps({"key": None, "depends": [], "row": {}, "reads": [], "peak": 2 ** 30,
+                                 "shares": 0, "pools": 0}).encode()
+    listing = ci.r2.Store.keys
+
+    def refused(self, prefix):
+        raise ci.r2.Unavailable("listing refused")
+        yield
+
+    monkeypatch.setattr(ci.r2.Store, "keys", refused)
+    assert ci.gpu_lane("3.12", ["tests/test_listless.py"], out, cache="off", processes=4, deadline=600.0) == 0
+    assert [share for share, *_ in ran("test_listless")] == ["0.5"]
+    monkeypatch.setattr(ci.r2.Store, "keys", listing)
+    # This class's own records now: the next lane reads them, the tight file alone as its own last run was.
+    assert ci.gpu_lane("3.12", ["tests/test_tight.py"], out, cache="off", processes=4, deadline=600.0) == 0
+    assert [share for share, *_ in ran("test_tight")][-1] != borrowed
+    assert "interference" not in json.loads(out.read_text())["rows"][0]
 
 
 def test_a_files_children_hold_what_they_held_at_once_and_each_start_must_leave_its_record(tmp_path):
@@ -543,7 +649,7 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
     for index, name in enumerate(("negative", "positive")):
         (tmp_path / "runs" / str(index)).mkdir(parents=True)
         ci.task("3.12", [f"tests/test_{name}.py"], "", tmp_path / "runs" / str(index) / "rows.json", 600.0,
-                cache=False, coverage=tmp_path / "runs" / str(index))
+                cache="off", coverage=tmp_path / "runs" / str(index))
     (tmp_path / "runs/logs").mkdir()
     assert ci.coverage_report(tmp_path / "runs") == 0
     files = {Path(name).name: measured for name, measured in
@@ -554,7 +660,7 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
     # A task interrupted at its deadline leaves its later tests' coverage out: the pass is refused.
     (tmp_path / "tests/test_slow.py").write_text("import time\ndef test_slow(): time.sleep(30)\n")
     (tmp_path / "runs/2").mkdir()
-    ci.task("3.12", ["tests/test_slow.py"], "", tmp_path / "runs/2/rows.json", 1.0, cache=False, grace=5.0,
+    ci.task("3.12", ["tests/test_slow.py"], "", tmp_path / "runs/2/rows.json", 1.0, cache="off", grace=5.0,
             coverage=tmp_path / "runs/2")
     assert ci.coverage_report(tmp_path / "runs") == 1
     [interrupted] = json.loads((tmp_path / "runs/2/rows.json").read_text())["rows"]
@@ -762,6 +868,96 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
 
 
 
+def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
+    """The checkout's one 3.12 task, run green on one CPU class against the shared test cache as armada
+    starts it (`armada_task`) under the cache's policy, its verdict written beside the checkout's entries,
+    not among them (the checkout's own directory is an input): each call, how many times its test has run,
+    which it counts in `runs`."""
+    interpreter(root, "3.12")
+    url, _, _ = cache_worker
+    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    cached(monkeypatch, url)
+    (root / ".verdict").mkdir()
+
+    def run(policy: str = "on") -> int:
+        assert armada_task(ci, monkeypatch, root / ".verdict/verdict.json", policy)["exitCode"] == 0
+        return len((root / "runs").read_text())
+
+    return run
+
+
+@pytest.mark.parametrize(("changed", "policy"), [
+    ({"src/pkg/mod.py": "VALUE = 2\n"}, "on"), ({"docs/page.md": "page\n"}, "on"),
+    ({"tutorials/notes.ipynb": "{}\n"}, "on"), ({"tools/tool.py": "VALUE = 2\n"}, "stale:tools/"),
+    ({"pyproject.toml": "[project]\nname = 'changed'\n"}, "off"), ({"locks/cpu.txt": "jax==9\n"}, "off"),
+    ({"tools/armada/session.py": "# the session\n"}, "off"),
+    ({".github/workflows/ci.yml": "on: []\n"}, "off"),
+    ({"Makefile": "all:\n"}, "off"),
+], ids=["a source module", "a docs page", "a notebook", "a tool", "the project", "a lock",
+        "the test session", "a workflow", "a file no record places"])
+def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_place_it(
+        ci, tmp_path, changed, policy):
+    """CI's test cache policy for a change from main: each file's own inputs decide ('on') where the records
+    place what changed, every file that read a tool runs again where a tool changed, and every file runs
+    ('off') for a change to what every test process runs or reads, or to a file the records do not place."""
+    for name, text in {"src/pkg/mod.py": "VALUE = 1\n", "pyproject.toml": "[project]\nname = 'x'\n",
+                       "locks/cpu.txt": "jax==1\n"}.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    git(tmp_path, "init", "-q", "-b", "main")
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-qm", "base")
+    for name, text in changed.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-qm", "change")
+    assert ci.policy("HEAD~1") == policy
+
+
+def test_a_stale_policy_reruns_every_file_whose_run_read_a_tool(ci, tmp_path, monkeypatch, cache_worker):
+    """Under 'stale:tools/' a green row whose test ran a file under tools/ runs again, though that file is
+    unchanged, and under 'on' it is reused."""
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools/helper.py").write_text("VALUE = 1\n")
+    (tmp_path / "tests/test_tool.py").write_text(
+        "import runpy\n"
+        "from pathlib import Path\n"
+        "def test_tool():\n"
+        "    with Path('runs').open('a') as runs: runs.write('x')\n"
+        "    assert runpy.run_path('tools/helper.py')['VALUE'] == 1\n")
+    run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
+    assert [run(), run(), run("stale:tools/"), run()] == [1, 1, 2, 2]
+
+
+def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_changes(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A file's green row is kept across a change its tests never meet, the plan's own code (ci.py, which
+    runs outside every test process); it runs again once what its test process runs or reads changes: a
+    plugin loaded into it, a fixture, a Python file added (a conftest.py, a package's __init__.py, a test
+    module), which can change what an import finds, or the process group it runs as."""
+    (tmp_path / "tests/test_kept.py").write_text(
+        "from pathlib import Path\n"
+        "def test_kept():\n"
+        "    with Path('runs').open('a') as runs: runs.write('x')\n")
+    armada = tmp_path / "tools/armada"
+    armada.mkdir(parents=True)
+    for tool in (ROOT / "tools/armada").glob("*.py"):
+        (armada / tool.name).write_text(tool.read_text())
+    run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
+    changes = [(None, "", 1), ("tools/armada/ci.py", "# the plan's own code\n", 1),
+               ("tools/armada/executed.py", "# a plugin loaded into it\n", 2),
+               ("tests/fixtures/data.json", "{}\n", 3), ("tests/conftest.py", "VALUE = 1\n", 4),
+               ("src/package/__init__.py", "", 5), ("tests/more/test_added.py", "VALUE = 2\n", 6),
+               ("tools/armada/child_groups.py", "# its process group\n", 7)]
+    for path, text, runs in changes:
+        if path:
+            (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+            with (tmp_path / path).open("a") as file:
+                file.write(text)
+        assert run() == runs, path
+
+
 def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_list_changes(
         ci, tmp_path, monkeypatch, cache_worker):
     """A test's inputs outside tests/ and src/ are its file's inputs too (executed.py): a documentation
@@ -788,18 +984,7 @@ def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_
         "        os.close(os.open('plan.md', os.O_RDONLY, dir_fd=folder))\n"
         "    finally:\n"
         "        os.close(folder)\n")
-    interpreter(tmp_path, "3.12")
-    url, _, _ = cache_worker
-    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
-    cached(monkeypatch, url)
-    # Beside the checkout's entries, not among them: the checkout's own directory is an input.
-    (tmp_path / ".verdict").mkdir()
-    out = tmp_path / ".verdict/verdict.json"
-
-    def run():
-        assert armada_task(ci, monkeypatch, out)["exitCode"] == 0
-        return len((tmp_path / "runs").read_text())
-
+    run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
     # Each page changed, added or listed anew runs the file again, and the run after reuses that row.
     # Python bytecode a run leaves beside a page (a directory, `None` here) is no change to the pages.
     changes = [(None, "", 1), ("docs/model.md", "width 8\n", 2), ("docs/serving.md", "serve\n", 3),

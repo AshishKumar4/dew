@@ -24,6 +24,7 @@ from dew.diffusion.schedules import NoiseScheduler, expand
 from dew.diffusion.transforms import PredictionTransform, broadcast_rates
 from dew.inputs import InputSpec
 from dew.lora import unadapted
+from dew.nn.protocols import Lacks
 from dew.objectives.base import TEACHER, Aux, ProgramModule, Step, Variables, model_rngs
 from dew.registry import to_record
 from dew.sampling.guidance import guide
@@ -122,7 +123,7 @@ class GuidanceDistillationObjective(DiffusionObjective):
         conditions, _ = self._conditions(variables, batch, drop_key, step)
         if not any(isinstance(value, DenoisingCondition) and value.guidance is not None
                    for value in conditions.values()):
-            raise ValueError("the student's conditioning carries no guidance input to distill into")
+            raise Lacks("guided", "the student's conditioning carries no guidance input to distill into")
         output = self.model.apply(self.model_variables(variables), noisy * c_in, schedule.model_time(t),
                                   **with_guidance(conditions, scale.astype(jnp.float32)), train=step.training,
                                   rngs=model_rngs(jax.random.fold_in(step.key, 1), training=step.training))

@@ -22,6 +22,13 @@ def token_mu(tokens: int, base_tokens: int, max_tokens: int, base_shift: float, 
     return tokens * slope + (base_shift - slope * base_tokens)
 
 
+def static_shift(shift, t):
+    """shift t / (1 + (shift - 1) t), Diffusers' static shift of a flow sigma, operation for
+    operation, on a number or an array of either library: the one map the flow scheduler, the
+    published flow grids and the consistency grid shift a time by."""
+    return shift * t / (1 + (shift - 1) * t)
+
+
 @partial(jax.custom_jvp, nondiff_argnums=(0,))
 def time_shift(shift: float, t: jax.Array) -> jax.Array:
     """shift / (shift + 1 / t - 1), Diffusers' `FlowMatchEulerDiscreteScheduler.time_shift` operation for
@@ -93,7 +100,7 @@ class FlowMatchingScheduler(ContinuousNoiseScheduler, RectifiedFlow):
         `FlowMatchEulerDiscreteScheduler.time_shift`, a static one as its static sigmas."""
         if self.dynamic:
             return time_shift(self.shift, t)
-        return self.shift * t / (1 + (self.shift - 1) * t)
+        return static_shift(self.shift, t)
 
     def sample_t(self, key, n):
         if self.density == "logit_normal":

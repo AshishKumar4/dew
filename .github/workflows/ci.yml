@@ -188,10 +188,19 @@ jobs:
       env:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
-        DEW_TEST_CACHE: ${{ github.event_name == 'schedule' && 'off' || 'on' }}
+        DEW_TEST_CACHE: ${{ (github.event_name == 'schedule' || startsWith(github.ref_name, 'ci/full-')) && 'off' || '' }}
         PROVEN: ${{ needs.proven.outputs.run }}
       run: |
         armada=armada
+        # The daily run and a land-queue train's full run (ci/full-*) run every file; any other run reruns what
+        # its change reaches (tools/armada/ci.py policy), and the whole suite where it cannot place it: from
+        # main, or for a fix on a train (ci/fix-*) from the train's tip it fixes, its first parent.
+        if [ -z "$DEW_TEST_CACHE" ]; then
+          case "$GITHUB_REF_NAME" in ci/fix-*) from=HEAD^1 ;; *) from=origin/main ;; esac
+          DEW_TEST_CACHE=$(python3 tools/armada/ci.py policy "$from")
+        fi
+        echo "the test cache's policy: $DEW_TEST_CACHE"
+        export DEW_TEST_CACHE
         # Each client runs in a session of its own, so the interrupt a cancelled run sends this shell
         # reaches it and it cancels its armada job; the shell waits on them, where a trap runs.
         trap 'for group in ${gangs:-} ${suite:-}; do kill -INT -- "-$group" 2>/dev/null || true; done' INT TERM
@@ -221,6 +230,21 @@ jobs:
           wait "$gangs" || failed=1
           echo "--- the multi-host gangs"
           cat "$RUNNER_TEMP/gangs.log"
+          # A red gang's logs, every rank's and attempt's with each one's relay (armada's GET
+          # /jobs/<id>/tasks/<i>/runs, and each run's log): the map's summary names no cause, and a gang's
+          # cause can sit on a rank other than the one that failed first.
+          job=$(grep -oE '\bjob [0-9]{14}-[0-9a-f]{8}' "$RUNNER_TEMP/gangs.log" | head -1 | cut -d' ' -f2)
+          # A task row: its index, then "exit <code>" or what else ended it (TIMEOUT, LOST, CANCELLED).
+          for task in $(awk '$1 ~ /^[0-9]+$/ && (($2 == "exit" && $3 != 0) || $2 ~ /^(TIMEOUT|LOST|CANCELLED)$/) { print $1 }' \
+                          "$RUNNER_TEMP/gangs.log"); do
+            runs=$(curl -sS --compressed --fail-with-body "${ARMADA_URL%/}/jobs/$job/tasks/$task/runs" \
+              -H "authorization: Bearer $ARMADA_TOKEN" -H "armada-protocol: 10") || runs='{"runs": []}'
+            for run in $(echo "$runs" | jq -r '.runs[] | "\(.vessel).\(.attempt):\(.rank)"'); do
+              echo "--- gang $task of job $job, rank ${run#*:} (${run%:*})"
+              curl -sS --compressed --fail-with-body "${ARMADA_URL%/}/jobs/$job/tasks/$task/runs/${run%:*}/log" \
+                -H "authorization: Bearer $ARMADA_TOKEN" -H "armada-protocol: 10" || echo "(armada stored no log for it)"
+            done
+          done
         fi
         exit $failed
     - name: Cancel the armada jobs of a cancelled run

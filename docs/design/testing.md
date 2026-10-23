@@ -1,6 +1,6 @@
 # Behavioral qualification in Dew
 
-Design record, consolidated 2026-10-19. Tests run real use cases through public interfaces. Kernel math is qualified at representative shapes against float64 truth; other behavior is exercised through end-to-end scenarios. The [roadmap](../roadmap.md#ci-and-tooling) holds coverage gaps and qualification work.
+Design record. Tests run real use cases through public interfaces. Kernel math is qualified at representative shapes against float64 truth; other behavior is exercised through end-to-end scenarios. The [roadmap](../roadmap.md#ci-and-tooling) holds coverage gaps and qualification work.
 
 ## Scenarios
 
@@ -49,15 +49,39 @@ Implementations come from their registries. A new implementation cannot opt out 
 
 **CPU tier (every CI run):** real architectures from their real configs, scaled down (layers, width), plus small real checkpoints that fit (for example SmolLM2-135M). Each scenario takes minutes. Multiprocess and multihost behavior uses real processes, readers and meshes. A single-process mesh simulation is useful evidence for that simulation only.
 
-**GPU validation** (owner, 2026-10-19): every GPU-touching or performance-critical change on main is validated on real GPUs: A100 and H100, plus multi-GPU where it shards or communicates.
+## GPU landing
 
-The GPU tier uses real checkpoints and representative shapes on each target a change names. A100 and H100 qualify GPU paths; sharding and communication also run on multiple physical GPUs. A compile-only result does not establish runtime correctness. Target-specific FP8 and newer-device paths require the relevant hardware. TPU kernels need real TPU execution for their runtime claims.
+A GPU-touching change lands by its row:
+
+| Destination | Change | Before it lands |
+|---|---|---|
+| `base/kernels` | kernel and template pieces | the hardware-free gates: interpret-mode check 1 and the stability suite, the bitwise boundary test, the deviceless compile with its resource gate |
+| `main`, from `base/kernels` | the composed kernel base | the GPU gate green on `base/kernels`' tip on every gating type (A100, H100, A10, L4, TPU v5e), with its tiers and scoreboards |
+| `main` | a dependency or environment change (JAX, locks) | the whole suite natively once, on an A100, and the marked native tier on every other gating type |
+| `main` | a Hopper-only path | its real H100 run |
+| `main` | any other GPU-touching or performance-critical change | the CPU CI; the next native wave validates it, and a red is fixed at once |
+
+The native tier is the suite on a type's own backend: on a GPU (`JAX_PLATFORMS=cuda`) the `gpu`- and `kernel`-marked tests, on a TPU (`JAX_PLATFORMS=tpu`) the `tpu`- and `kernel`-marked tests, each `-m "... and not network"`. A dependency or environment change runs the whole suite natively once, on an A100, beside that tier on every other gating type. The GPU gate runs that tier, the kernels' scoreboard rows ([kernel templates](kernel-templates.md)) and the performance gate (`tools/perf_gate.py`) on every gating type. A native wave runs the tier on every gating type; a change that lands on the CPU CI is validated by the next one. The GPU tier uses real checkpoints and representative shapes on each type it gates. Sharding and communication also run on multiple physical GPUs. A compile-only result does not establish runtime correctness. Target-specific FP8 and newer-device paths require the relevant hardware. TPU kernels need real TPU execution for their runtime claims.
 
 ## Numerical accuracy
 
-`tests/reference_error.py` owns the acceptance rule and states it: every comparison of Dew's outputs and gradients with float64 truth goes through its assertion, and nothing here restates the rule. A failure is a defect in Dew, the reference arm or the rule's derivation. Find which one. Never widen a tolerance, change the reference to one Dew already matches, drop failing positions or gradients, or compare only argmax when logits disagree.
+Dew's outputs and gradients are measured from float64 truth: the same computation run in float64 on the same inputs. One gate, `tests/reference_error.py`, holds them by two checks and nothing else. Tests carry no per-operation knowledge; the gate holds it.
+
+**Check 1, on par** (`assert_as_exact`; enforced at every converted site). Over a site's declared seeds of drawn inputs, each leaf's RMS error from float64, pooled over the seeds, is within 1.5 times the reference's on the same inputs (`PARITY`), with no floor of any kind. A leaf's rows run along its last axis, and its worst row is the largest row error over that row's own float64 RMS size, over every row and seed; Dew's is within 4 times the reference's (`ROW_FACTOR`), or, for rows of one or two values, the factor at which equally exact pairs fail at both stages with probability within 5e-4 as sites run check 1 (`NARROW_FACTORS`, 90 and 11, calibrated over 16 to 2048 rows and 8 to 64 seeds and certified by 28,000 runs): at ROW_FACTOR such rows failed equally exact pairs 1.5% and 0.15% of the time, rows of three at most 2.9e-4 as measured, and of four or more none. An error local to a value or two such rows hide is check 2's to catch once it gates. A row too small for float64 to resolve (at most `RESOLUTION` of its leaf's size) is held instead within 4 times the reference's error on that same row, unless a live reference measures it, its error below the row's own size. A leaf the reference holds exactly on every seed Dew must hold exactly, and every value is finite: a NaN or an infinity fails. The verdict on the ratio is a bootstrap interval over the seeds in two pre-declared stages: a pass certifies the ratio at most 1.5², and a failure by the ratio certifies it above one, each at a nominal 5e-4. A failure by a row, a zero row or a value not finite certifies no ratio. An interval too wide to decide is inconclusive, never a pass. A site declares its seeds, sized by `seeds_for` so that the reference compared with itself resolves the factor. Where a computation has an orbit of summation orders (an exact symmetry of its result, such as a permutation of a sum's terms or of a mean's rows), a site may declare it (`orders`): both arms run at the same K orders of each draw and each arm's worst row is its worst over them, compared alike, since one order is no measure of a row that nearly cancels; the pooled ratio, the zero rows and the sizing stay the draw's own order's.
+
+- The draw holds everything the claim varies: the inputs, the cotangents (gradients come through `with_gradients` and `torch_with_gradients`, which pull back the draw's cotangent), and a stated margin wherever a selection (a top-k cutoff, routing, an argmax) could flip between float32 and float64.
+- Values held or moved without arithmetic (a cache row kept, a gather, the same program on the same values) are compared bit for bit. A float that two different programs compute (a padded call against the unpadded one, a kernel against the composition it replaces) is held by check 1, not bit for bit, since XLA promises no common bits across programs; across layouts, which bits stay exact is the **Layout invariance** paragraph's below. The few sites still comparing such floats bit for bit move to check 1 once their draws take the margins it needs.
+- On the CPU, both arms of a check between two Dew paths compile without YNNPACK's fusions (`without_ynn`), whose microkernels the host's instruction set picks at run time. The programs still compile for the host, so their bits differ by host; the verdicts measured on hosts of two instruction sets agreed, which is evidence, not a guarantee for every host. CI pins its CPU.
+
+**Check 2, never wrong** (the target; `tests/op_certificates.py` prototypes its exact oracles and bound arithmetic, which the suite tests but does not yet use as a gate). Every element lies within a certified roundoff bound for its own operation, on the native inputs the kernel itself computed: faithful rounding for every pointwise step, and a bound from numerical analysis for each sum and dot product; an opaque kernel is probed natively. An IEEE operation (add, multiply, fused multiply-add, divide, square root, cast) is held to its correctly rounded result, which is faithful. A library primitive, a transcendental included, is held to faithful rounding as well, whatever error its vendor documents: one that misses it is a finding, never a wider bound. The exact results come from exact arithmetic, not from a float64 run. Check 2 never compares one element's error with another implementation's.
+
+The module's older assertions hold the comparisons not yet converted to check 1, and go once their last site moves.
+
+A failure is a defect in Dew, the reference arm or the gate's derivation. Find which one. Never widen a tolerance, change the reference to one Dew already matches, drop failing positions or gradients, or compare only argmax when logits disagree.
 
 The committed generator uses the reference's public interface. Kernel qualification records forward, backward and forward-mode behavior where the consuming objective needs it.
+
+**Layout invariance.** Raw random bits, and what exact operations alone derive from them (uniforms, bit-compare masks such as dropout's), are bit-identical on every layout. Floats derived through rounding chains (normals, Gumbel noise, initial weights) are held equal across layouts by check 1 of `tests/reference_error.py`. A discrete result taken from them, such as a categorical sample by the argmax of Gumbel noise plus logits, can flip near a tie, and its check says so. Every other exact contract stays exact: checkpoint and resume, caches, serialization, and the same program run twice. A bitwise claim across programs moves to check 1 only where it is shown invalid.
 
 ## Tests must catch a defect
 
