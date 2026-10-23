@@ -39,3 +39,21 @@ with jax.enable_x64(True):
                              score_params=(template.Param(jnp.full((1,), 2e38, jnp.float64), template.Kind.HEAD),))
     out, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, hooks64, scale=4.0), *wide[:3])
     print("float64 dq", np.asarray(pull(wide[3])[0])[0, 0, 0, :2])
+
+
+def traced(slope):
+    hooked = template.Hooks(score_mod=lambda s, q_pos, k_pos, slope: slope * s,
+                            score_params=(template.Param(slope, template.Kind.HEAD),))
+    return attention_portable.backward(query, key, value, spans, hooked, dout, scale=4.0, **tiles).query
+
+
+print("traced param jit dq", np.asarray(jax.jit(traced)(jnp.full((1,), 2e38, jnp.float32)))[0, 0, 0, :2])
+
+
+def traced_reference(slope):
+    hooked = template.Hooks(score_mod=lambda s, q_pos, k_pos, slope: slope * s,
+                            score_params=(template.Param(slope, template.Kind.HEAD),))
+    return jax.vjp(lambda q: template.reference(q, key, value, spans, hooked, scale=4.0), query)[1](dout)[0]
+
+
+print("traced param reference dq", np.asarray(jax.jit(traced_reference)(jnp.full((1,), 2e38, jnp.float32)))[0, 0, 0, :2])
