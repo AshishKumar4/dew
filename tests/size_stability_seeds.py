@@ -7,9 +7,9 @@ import jax
 import test_attention_stability as suite
 from reference_error import seeds_for, with_gradients
 
-name = list(suite.FAMILIES)[int(sys.argv[1])]
+name = sys.argv[1] if not sys.argv[1].isdigit() else list(suite.FAMILIES)[int(sys.argv[1])]
 family = suite.FAMILIES[name]
 draw = suite._cast(family, family.draw)
 count = seeds_for(jax.jit(with_gradients(suite._reference(family, anchored=False))), draw, name,
                   truth_fn=with_gradients(suite._reference(family, anchored=True)))
-print(json.dumps({"family": name, "declared": family.seeds, "sized": count}))
+print(json.dumps({"family": name, "declared": suite.SEEDS.get(name), "sized": count}))
