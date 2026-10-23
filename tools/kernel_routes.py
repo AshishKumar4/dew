@@ -295,8 +295,7 @@ def cells(names: Iterable[str], targets: Iterable[str] | None = None,
                 rows = {(r.choice, r.site, r.kernel, r.refusal.code if r.refusal else None): r for r in seen}
                 cell["routes"] = [{"choice": r.choice, "site": r.site, "kernel": r.kernel,
                                    "preferred": r.preferred, "ran": r.ran, "verdict": verdict(r),
-                                   "refusal": dataclasses.asdict(r.refusal) if r.refusal else None,
-                                   "gaps": [dataclasses.asdict(gap) for gap in r.gaps]}
+                                   "refusal": dataclasses.asdict(r.refusal) if r.refusal else None}
                                   for r in rows.values()]
                 yield cell
 
@@ -317,11 +316,6 @@ def report(records: list[dict]) -> str:
                 lines.append(f"| {cell['family']} | {cell['target']} | {cell['mode']} | {route['choice']} | "
                              f"`{route['site']}` | {route['kernel']} | {route['preferred']} | "
                              f"{route['verdict']} | {refusal.get('code', '')}: {refusal.get('detail', '')} |")
-    lines += ["", "## Known defects of the kernels run", "",
-              "| Family | Target | Mode | Choice | Ran | Gap | Row |", "|---|---|---|---|---|---|---|"]
-    lines += [f"| {cell['family']} | {cell['target']} | {cell['mode']} | {route['choice']} | "
-              f"{route['kernel']} | {gap['code']}: {gap['detail']} | {gap['row']} |"
-              for cell in records for route in cell.get("routes", ()) for gap in route.get("gaps", ())]
     lines += ["", "## Not traced", "", "| Family | Target | Mode | Why |", "|---|---|---|---|"]
     lines += [f"| {c['family']} | {c.get('target', '')} | {c.get('mode', '')} | "
               f"{c.get('error') or c.get('absent') or refused(c['refused'])} |"

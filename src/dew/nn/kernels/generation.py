@@ -465,16 +465,6 @@ class Refusal:
         return self.detail
 
 
-@dataclasses.dataclass(frozen=True)
-class Gap:
-    """A known defect of the kernel a route runs, which no refusal turns a call away for: a stable `code`,
-    the `detail` a report names, and the ledger `row` that tracks it (`Route.gaps`)."""
-
-    code: str
-    detail: str
-    row: str
-
-
 UNCLASSIFIED = 'unclassified'
 """The code of a refusal its site gives as text alone, which no kernel's `SUPPORTS` declares."""
 
@@ -495,8 +485,7 @@ class Route:
     runs for `choice` at `site` (module:function), `preferred` what it runs where nothing refuses (the
     generation's row, `chosen`, or the site's own best), `refusal` why `preferred` did not take the
     call, and `ran` what this host executed, `kernel` but where the host cannot run it (cuDNN within
-    `assumed` on a CPU). A route is generic exactly where `kernel != preferred`. `gaps` are the known
-    defects of `kernel` its site reports with it (`Gap`)."""
+    `assumed` on a CPU). A route is generic exactly where `kernel != preferred`."""
 
     choice: str
     kernel: str
@@ -505,7 +494,6 @@ class Route:
     ran: str
     target: str
     site: str
-    gaps: tuple[Gap, ...] = ()
 
 
 class _Routes:
@@ -542,13 +530,13 @@ _logged: set[tuple[str, str, str]] = set()
 
 
 def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Refusal | str | None = None,
-          ran: str | None = None, gaps: tuple[Gap, ...] = ()) -> Route:
+          ran: str | None = None) -> Route:
     """Report the dispatch of `choice` to `kernel`, the one call every dispatch site makes once it has
-    decided: `preferred` defaults to the kernel `chosen` or the generation's row names, else `kernel`; a
-    `refusal` given as text alone is `UNCLASSIFIED`; `ran` is what this host executes, `kernel` by
-    default; `gaps` are `kernel`'s known defects (`Gap`). Every `routes` block open records it. A call off
-    the measured kernel is the dispatch's own choice, logged once a process for each kernel and refusal at
-    INFO, naming both; one that runs the preferred kernel, or a choice no row names, logs nothing."""
+    decided: `preferred` defaults to the kernel `chosen` or the generation's row names, else `kernel`;
+    a `refusal` given as text alone is `UNCLASSIFIED`; `ran` is what this host executes, `kernel` by
+    default. Every `routes` block open records it. A call off the measured kernel is the dispatch's
+    own choice, logged once a process for each kernel and refusal at INFO, naming both; one that runs
+    the preferred kernel, or a choice no row names, logs nothing."""
     from dew import cache
 
     _named((choice,))
@@ -557,7 +545,7 @@ def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Re
     measured = preferred or picked or gpu_target(generation).kernels.get(choice)
     if isinstance(refusal, str):
         refusal = Refusal(UNCLASSIFIED, refusal)
-    found = Route(choice, kernel, measured or kernel, refusal, ran or kernel, generation, _site(), gaps)
+    found = Route(choice, kernel, measured or kernel, refusal, ran or kernel, generation, _site())
     for collected in cache.KERNEL_ROUTES.value:
         collected.found.append(found)
     detail = '' if refusal is None else refusal.detail

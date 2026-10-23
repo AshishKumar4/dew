@@ -36,7 +36,7 @@ from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import grouped_heads, manual_map, rows_like
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
-from .generation import Gap, Refusal, first_refusal, measured_kernel, ran_kernel, refused, route, triton_runs
+from .generation import Refusal, first_refusal, measured_kernel, ran_kernel, refused, route, triton_runs
 from .ssd import ssd_chunk_scan, ssd_kernel_platform
 
 CHUNK_SIZE = 64
@@ -364,28 +364,15 @@ def port_refusal(query, key, value, *, per_key: bool = False, floor: float | Non
     )
 
 
-PORT_GAPS = (Gap(
-    'stress_gradients',
-    "the port's gradients, fla's arithmetic, sit past check 1's factor of the token-by-token recurrence's "
-    "distance from float64 under decays near zero (the memory's 21 times), aligned keys (the decay's 2.6 "
-    "to 6), saturated and spread gates (the memory's 2.5, a decay a key dimension's 4), and a decay a key "
-    "dimension at its -5 floor (468): its decay gradient is each prefix's, summed back, which cancels over "
-    "a long prefix (tests/test_recurrence_stability.py)", '1328'),)
-"""The port's known defects, reported with every route that runs it (`generation.Route.gaps`), until the
-recurrence template's GPU mainloop replaces its arithmetic."""
-
-
 def on_the_port(query, key, value, *, per_key: bool = False, floor: float | None = None) -> bool:
     """Whether the rule runs on the port: where the target's row names it (`measured_kernel`, the table
     qualification reads) and the call has no refusal (`port_refusal`), reported as the target's route
     (`generation.route`), which logs a call the row's port turns down the first time. A decay per key
-    dimension (`per_key`) states its per-token `floor` (`port_refusal`). A route to the port reports its
-    known defects (`PORT_GAPS`)."""
+    dimension (`per_key`) states its per-token `floor` (`port_refusal`)."""
     preferred = measured_kernel('gated_delta_rule', 'xla')
     refusal = port_refusal(query, key, value, per_key=per_key, floor=floor) if preferred == 'fla' else None
     kernel = 'fla' if preferred == 'fla' and refusal is None else 'xla'
-    gaps = PORT_GAPS if kernel == 'fla' else ()
-    return route('gated_delta_rule', kernel=kernel, refusal=refusal, gaps=gaps).kernel == 'fla'
+    return route('gated_delta_rule', kernel=kernel, refusal=refusal).kernel == 'fla'
 
 
 def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segments: int | None = None,
