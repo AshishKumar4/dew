@@ -2,11 +2,14 @@
 repository of its own, writes the renamed programs' digests and leaves their outputs as they were, and writes
 nothing when a change is more than a renaming or a recording was already of other code."""
 
+import http.server
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -14,7 +17,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 COPIED = ("site/scripts/redigest.py", "site/snippets/cells.py", "site/snippets/cells.json",
           "site/snippets/framework.py", "site/src/data/hero.py", "site/src/data/text.py",
-          "site/src/data/sampler.py", "site/src/data/capture.json")
+          "site/src/data/sampler.py", "site/src/data/capture.json", "site/live/container/text-to-image")
 
 
 def git(root: Path, *arguments: str) -> None:
@@ -36,9 +39,9 @@ def site(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def redigest(root: Path) -> subprocess.CompletedProcess:
+def redigest(root: Path, hub: str = "http://127.0.0.1:9") -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, str(root / "site/scripts/redigest.py"), "--base", "recorded"],
-                          capture_output=True, text=True, timeout=60)
+                          capture_output=True, text=True, timeout=60, env={**os.environ, "HF_ENDPOINT": hub})
 
 
 def recordings(root: Path) -> dict[str, bytes]:
@@ -103,3 +106,51 @@ def test_a_recording_already_of_other_code_writes_nothing(site):
     rename(site, "site/snippets/framework.py", "OptimConfig(learning_rate=", "OptimConfig(rate=")
     assert redigest(site).returncode == 1
     assert recordings(site) == before
+
+
+@pytest.fixture
+def hub():
+    """The Hub's tree listing for the pinned model's revisions, as `trees` (a revision to its files) holds
+    them; its endpoint."""
+    trees: dict[str, list[dict]] = {}
+
+    class Tree(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            revision = self.path.split("/tree/", 1)[1].split("?", 1)[0]
+            body = json.dumps(trees[revision]).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Tree)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_address[1]}", trees
+    server.shutdown()
+
+
+def listing(weights: str, record: str) -> list[dict]:
+    """A revision's files: a weight object (an LFS file) and a run's record (a plain one)."""
+    return [{"type": "file", "path": "1350000/d/432fa0667", "oid": "a", "size": 9, "lfs": {"oid": weights}},
+            {"type": "file", "path": "run.json", "oid": record, "size": 10}]
+
+
+@pytest.mark.parametrize(("weights", "kept"), [("same", 0), ("other", 1)],
+                         ids=["same weights", "other weights"])
+def test_a_pin_moved_to_the_same_weights_keeps_the_sampler_and_to_other_weights_records_again(
+        site, hub, weights, kept):
+    endpoint, trees = hub
+    owner = site / "site/live/container/text-to-image"
+    repository, old = owner.read_text().strip().split("@")
+    new = "1" * 40
+    trees[old], trees[new] = listing("same", "record"), listing(weights, "rewritten record")
+    before = recordings(site)
+    owner.write_text(f"{repository}@{new}\n")
+    rename(site, "site/src/data/sampler.py", old, new)
+    assert redigest(site, endpoint).returncode == kept
+    after = recordings(site)
+    sampler = "site/public/examples/sampler/capture.json"
+    assert {path for path in before if before[path] != after[path]} == ({sampler} if kept == 0 else set())
