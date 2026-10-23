@@ -832,9 +832,9 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
     and query head takes each query's D about 0 or about the anchor key `key_index`'s `anchor_value · dO`,
     whichever is nearer, from the forward's split sums (`sums`, `algebra.split_delta`), or where None from
     a first walk of the key blocks the block map gives it, weighed at the forward's `maximum` from the
-    initial state's maximum, denominator and share of `D`'s numerator (`peak`, `total`, `initial_term`;
-    `algebra.off_anchor_delta`); then walks them for dQ under the weights `exp(s - m)`, normalized at the
-    end by their own sum `T`, refining `D - c` from its own sums. Returns dQ
+    initial state's maximum, denominator and its values' mean's term (`peak`, `total`, `initial_term`;
+    `algebra.off_anchor_start`, `algebra.off_anchor_delta`); then walks them for dQ under the weights
+    `exp(s - m)`, normalized at the end by their own sum `T`, refining `D - c` from its own sums. Returns dQ
     `[B, Qp, H, Dp]` fp32, `D - c`, `c`, `m`, `T` and the keys' mass `[B, H, Qp]`, the anchor key it took
     (-1 where about 0) `[B, H, Qp]` int32, and the gradients of the score hook's head (`[nQb, B, H, 1]`
     partials) and query (`[B, H, Qp]`) parameters."""

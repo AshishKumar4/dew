@@ -909,14 +909,17 @@ class OffAnchor(NamedTuple):
     own: jax.Array
 
 
-def off_anchor_start(peak0: jax.Array, total0: jax.Array, term0: jax.Array, maximum: jax.Array,
+def off_anchor_start(peak0: jax.Array, total0: jax.Array, mean0: jax.Array, maximum: jax.Array,
                      width: int, shift: jax.Array) -> tuple[OffAnchor, jax.Array, jax.Array]:
-    """The first pass from the softmax's initial state (its maximum, denominator and share of D's
-    numerator) weighed at the forward's `maximum`, its sums at each row's `2^-shift` (the forward's,
-    `room`), and that state's denominator and share there, unshifted."""
+    """The first pass from the softmax's initial state (its maximum, denominator and its values' mean's
+    product with the cotangent, `mean0`, `acc0 / total0 · dO`) weighed at the forward's `maximum`, its sums
+    at each row's `2^-shift` (the forward's, `room`), and that state's denominator and share of D's
+    numerator there, unshifted: the share is its weight times its mean's term, never `acc0 · dO`, which
+    overflows where the state's sums are near fp32's largest."""
     # The fold's maximum is the state's taken to base 2 and back, which may round it an ulp below.
     carried = jnp.where(peak0 == -jnp.inf, 0.0, jnp.exp(jnp.minimum(peak0 - maximum, 0.0)))
-    state_total, state_share = total0 * carried, term0 * carried
+    state_total = total0 * carried
+    state_share = state_total * mean0
     nothing = jnp.zeros_like(total0)
     first = OffAnchor(power2(state_total, -shift), jnp.zeros((total0.shape[0], width), jnp.float32),
                       nothing, nothing)
@@ -1084,13 +1087,15 @@ def grad_scores(exponentials: jax.Array, products: jax.Array, anchor: jax.Array,
 def refinement(residual: jax.Array, mass: jax.Array, peak0: jax.Array, shares: tuple[jax.Array, jax.Array],
                peak: jax.Array, total: jax.Array, anchor: jax.Array, delta: jax.Array) -> jax.Array:
     """D's one refinement from the main pass's own sums: the score cotangents of a query and of its
-    initial state (`shares`: its denominator and D's numerator at the state's maximum `peak0`) sum to 0
-    by the softmax's shift, and what they sum to here (`residual`, over the keys' weights `mass`) is D's
-    rounding. Moving D by it over the weights' total lets dK/dV, the initial state's gradients and the
-    head and query parameters' take the D whose cotangents do."""
-    carried = jnp.where(peak0 == -jnp.inf, 0.0, jnp.exp(jnp.minimum(peak0 - peak, 0.0))) * inverse(total)
-    whole_residual = residual + (shares[1] - shares[0] * (anchor + delta)) * carried
-    whole_mass = mass + shares[0] * carried
+    initial state (`shares`: its denominator and its values' mean's term at the state's maximum `peak0`,
+    `off_anchor_start`) sum to 0 by the softmax's shift, and what they sum to here (`residual`, over the
+    keys' weights `mass`) is D's rounding. Moving D by it over the weights' total lets dK/dV, the initial
+    state's gradients and the head and query parameters' take the D whose cotangents do. The state's
+    weight is taken whole before any product, so a state whose sums are near fp32's largest stays finite."""
+    carried = jnp.where(peak0 == -jnp.inf, 0.0, jnp.exp(jnp.minimum(peak0 - peak, 0.0)))
+    weight = (shares[0] * carried) * inverse(total)
+    whole_residual = residual + (shares[1] - (anchor + delta)) * weight
+    whole_mass = mass + weight
     return jnp.where(whole_mass > 0, whole_residual / jnp.where(whole_mass > 0, whole_mass, 1.0), 0.0)
 
 
