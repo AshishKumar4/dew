@@ -719,14 +719,15 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
     return over, unresolved
 
 
-NARROW_FACTORS = {1: 0.0, 2: 0.0}
+NARROW_FACTORS = {1: 21.0, 2: 6.0}
 """The worst-row rule's factor at rows of one or two values, in place of ROW_FACTOR: at either width
 ROW_FACTOR fails an equally exact Dew far more often than LOWER_TAIL as sites run check 1, since a row of
 few values is sized by a few float64 values, which sit near zero far more often than a wide row's RMS
 does, and the worst row over a site's rows and seeds is the row whose truth is smallest. Each is the 1 -
 LOWER_TAIL quantile of the factor that would fail equally exact pairs at both stages, both arms on one
-truth (`tools/gate_null_runs.py --rows`, its `row_controls`), over the layouts sites declare; measured,
-with its rate certified by the same controls. At ROW_FACTOR the controls fail such pairs 1.5e-2 of runs
+truth (`tools/gate_null_runs.py --rows`, its `row_controls`), the largest over 16, 256 and 2048 rows a
+draw and 8 and 64 declared seeds (20,000 runs each: 20.1 at one value, 6.0 at two), rounded up; its rate
+certified by the same controls at the layout that quantile came from. At ROW_FACTOR the controls fail such pairs 1.5e-2 of runs
 at one value a row and 1.5e-3 at two, and 7e-5 at three (bound 4.0e-4 at 99.9%) and none at four in
 28,000 runs. A local error a row of a value or two hides is check 2's to catch once it gates, each
 element within its operation's certified bound (tests/op_certificates.py, the target)."""
