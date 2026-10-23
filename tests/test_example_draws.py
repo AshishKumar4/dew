@@ -55,7 +55,7 @@ def test_a_record_draws_alike_however_many_processes_read_its_step():
                                   [9, 11, 13, 15])
 
 
-NORMAL_SEEDS = 8
+NORMAL_SEEDS = {"threefry2x32": 8, "rbg": 16, "layouts": 64}
 """The normal-draw sites' declared draws (`seeds_for`): each draw is the step's key from its seed.
 Each draws WIDTH values a row of each example: float32's erf_inv is up to 63 ulps from float64 near
 |u| = 1, so a leaf of a few hundred values pools a heavy tail and resolved no ratio within 512 seeds
@@ -115,7 +115,7 @@ def test_each_example_draws_its_own_bits_under_any_key_implementation(impl):
         return np.stack([normal_truth(bits) for bits in example_bits(keyed(data), range(4), (3, WIDTH))])
 
     assert_as_exact(batched, alone, lambda seed: (jax.random.key_data(jax.random.key(seed, impl=impl)),),
-                    f"{impl} normal draws", seeds=NORMAL_SEEDS, truth_fn=truth)
+                    f"{impl} normal draws", seeds=NORMAL_SEEDS[impl], truth_fn=truth)
 
 
 LAYOUTS = [(rows, shape) for shape in ((3,), (5, 7), (2, 3, 4)) for rows in (1, 3, 4, 7, 16)]
@@ -154,7 +154,7 @@ def test_an_examples_draw_is_its_own_whatever_batch_it_is_drawn_in():
                 for rows, shape in floats}
 
     assert_as_exact(batched, alone, lambda seed: (jax.random.key_data(jax.random.key(seed)),),
-                    "normal draws across batches", seeds=NORMAL_SEEDS, truth_fn=truth)
+                    "normal draws across batches", seeds=NORMAL_SEEDS["layouts"], truth_fn=truth)
 
 
 def test_a_recorder_and_a_tape_hold_each_example_once_and_whole():
