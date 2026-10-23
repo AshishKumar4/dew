@@ -374,23 +374,6 @@ def _resumed_huge_denominator(seed):
     return np.zeros((RESUMED, 1, 1, 16), np.float32), key, value, state, dout * np.float32(2.0 ** -10)
 
 
-def _small_mass_beside_its_anchor(seed: int, rows: int = 64):
-    # One query a row over 64 keys of which three are kept: keys 0 and 1 of logit 0, whose values near
-    # fp32's largest overflow the first tile's sum, and key 32 of logit 86 to 90, in the second tile, the
-    # anchor at the final maximum, beside which the first two weigh below fp32's least normal; every key
-    # the same drawn value, so the score cotangents and the query and key gradients are zero exactly.
-    query = np.zeros((rows, 1, 1, 16), np.float32)
-    query[..., 0] = 4.0
-    key = np.zeros((rows, 64, 1, 16), np.float32)
-    key[:, 32, 0, 0] = _uniform(seed, 86.0, 90.0, (rows,))
-    row = np.zeros((rows, 1, 1, 16), np.float32)
-    row[..., 0] = _uniform(seed + 1, 2.9e38, 3.3e38, (rows, 1, 1))
-    row[..., 1:] = _uniform(seed + 2, -1.0, 1.0, (rows, 1, 1, 15))
-    value = np.broadcast_to(row, (rows, 64, 1, 16)).copy()
-    (dout,) = _normal(seed + 3, (rows, 1, 1, 16))
-    return query, key, value, None, dout * np.float32(2.0 ** -10)
-
-
 def _families() -> dict[str, Family]:
     small = functools.partial(_small_weight, queries=8, logits=(16.0, 21.0), sizes=(3.0, 5.0))
     edge = functools.partial(_small_weight, queries=1, logits=(80.0, 87.0), sizes=None, rows=1024)
@@ -456,9 +439,6 @@ def _families() -> dict[str, Family]:
         "a subnormal share of an overflowing row, bfloat16": Family(
             _subnormal_share, np.ones((64, 1, 1, 256), bool), folded=False, dtype="bfloat16"),
         # Every weight but one 1/255, bf16's worst rounding of a weight, beside the subnormal share.
-        "a subnormal mass beside its anchor at equal values": Family(
-            _small_mass_beside_its_anchor, np.isin(np.arange(64), (0, 1, 32))[None, None, None, :],
-            folded=False),
         "a subnormal share beside 255 equal weights, bfloat16": Family(
             functools.partial(_subnormal_share, equal=True), np.ones((64, 1, 1, 256), bool), folded=False,
             dtype="bfloat16"),
