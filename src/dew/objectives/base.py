@@ -240,19 +240,6 @@ def stream(name: str) -> int:
     return fold
 
 
-def layout_normal(key: jax.Array, shape: Sequence[int] = (), dtype=float) -> jax.Array:
-    """`jax.random.normal`'s draw, its uniform's inverse error function ended before the scale fuses
-    onto it: on AVX-512, XLA:CPU's fused loop rounds the scaled erf_inv by lane (jax 0.12), so an
-    example's values would depend on the shape of the batch it is drawn in. A complex dtype is
-    `jax.random.normal`'s own."""
-    dtype = jax.dtypes.canonicalize_dtype(dtype)
-    if jnp.issubdtype(dtype, jnp.complexfloating):
-        return jax.random.normal(key, shape, dtype)
-    low = np.nextafter(np.array(-1.0, dtype), np.array(0.0, dtype), dtype=dtype)
-    uniform = jax.random.uniform(key, shape, dtype, minval=low, maxval=np.array(1.0, dtype))
-    return np.array(np.sqrt(2), dtype) * jax.lax.optimization_barrier(jax.lax.erf_inv(uniform))
-
-
 def example_stream(key: jax.Array) -> jax.Array:
     """A counter-based key (threefry2x32) of `key`'s bits, whatever `key`'s implementation: a mapped
     draw under it is each mapped key's own, where an RBG key maps every draw from its first key
@@ -361,8 +348,6 @@ class Step:
     def _drawn(self, name, draw, shape, dtype, examples) -> jax.Array:
         given = () if shape is None else (shape,)
         options = {} if dtype is None else {"dtype": dtype}
-        if draw is jax.random.normal:
-            draw = layout_normal
 
         def drawn(key):
             return draw(key, *given, **options)
