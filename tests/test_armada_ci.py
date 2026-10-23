@@ -277,7 +277,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
             f"3.12:{name}": 0 for name in tests}
     (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
     # A group of test_lost.py's the Worker lists and does not return.
-    stored[ci.cache_url("3.12", "3.12:tests/test_lost.py#2/2", ci.cpu_class())[len(url):]] = None
+    stored["/" + ci.record_key("3.12", "3.12:tests/test_lost.py#2/2", ci.cpu_class())] = None
     assert ci.gpu_tier("3.12") == {
         "tests/test_imported.py": ["tests/devices.py:placed"],
         "tests/test_imported_too.py": ["tests/devices.py:placed"],
@@ -458,7 +458,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     # The spawner's child took its fraction, so it holds two shares: 12 GiB beside the others' 24.
     common = ci.shared("3.12")
     for name, inputs in itertools.product([*names, "tests/test_spawner.py"], (None, common)):
-        at = ci.cache_url("3.12", ci.row("3.12", name, ""), ci.device_class(), inputs)[len(url):]
+        at = "/" + ci.record_key("3.12", ci.row("3.12", name, ""), ci.device_class(), inputs)
         stored[at] = json.dumps({"key": None, "depends": [name], "row": {}, "reads": [], "peak": 4 * 2 ** 30,
                                  "shares": int(name == "tests/test_spawner.py"), "pools": 0}).encode()
     assert ci.gpu_lane("3.12", every, out, cache=True, processes=4, deadline=600.0) == 0
