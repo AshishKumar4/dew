@@ -459,7 +459,7 @@ class _Draws:
     float64 (seed by leaf), each seed's worst sized row over its size (Dew's, the reference's), each
     seed's count of rows of float64 zero where Dew is further from it than ROW_FACTOR times the
     reference, whether every value of the leaf was finite on every seed, and each leaf's row width (its
-    last axis's length, 0 for a leaf of no rows; `row_factor`)."""
+    last axis's length, 0 for a leaf of no rows; NARROW_FACTORS)."""
     names: list[str]
     mine: np.ndarray
     theirs: np.ndarray
@@ -709,37 +709,27 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
                 over.append(f"{leaf}: dew's RMS error from float64 is {ratio:.3f} times the reference's over "
                             f"{count} seeds, interval [{low:.3f}, {high:.3f}] (allowed {PARITY})")
         my_row, their_row = float(np.max(draws.worst[:, index, 0])), float(np.max(draws.worst[:, index, 1]))
-        allowed = row_factor(draws.widths[index]) * their_row
-        if not within(my_row, allowed):
+        factor = NARROW_FACTORS.get(draws.widths[index], ROW_FACTOR)
+        if not within(my_row, factor * their_row):
             over.append(f"{leaf}: the worst row over {count} seeds is {my_row:.3e} from float64 over its "
-                        f"size, the reference's {their_row:.3e}, allowed {allowed:.3e}")
+                        f"size, the reference's {their_row:.3e}, allowed {factor} times it")
         if draws.zero_rows[:, index].any():
             over.append(f"{leaf}: {int(draws.zero_rows[:, index].sum())} rows of float64 zero over {count} "
                         f"seeds are further from it than ROW_FACTOR times the reference's own")
     return over, unresolved
 
 
-NARROW_WIDTHS = frozenset({1, 2})
-"""The row widths at which check 1's worst-row rule at ROW_FACTOR fails an equally exact Dew more often
-than LOWER_TAIL, as sites run it (both arms on one truth, two stages over 8 declared seeds, 256 rows a
-seed, standard normal truths and errors; tools/row_factor_rates.py, 28,000 runs a width on armada): 1.5e-2
-at one value a row, 1.5e-3 at two, 7e-5 at three (bound 4.0e-4) and none at four. A row of few values is
-sized by a few float64 values, which sit near zero far more often than a wide row's RMS does, so the
-worst row over a site's rows and seeds is the row whose truth is smallest, for both arms alike."""
-
-
-def row_factor(width: int) -> float:
-    """How many times the reference's worst row Dew's may be, for rows of `width` values: ROW_FACTOR, but
-    at NARROW_WIDTHS the factor at which two equally exact arms' errors on one shared row part with
-    probability LOWER_TAIL, their mean squares' ratio an F(width, width) where both are normal (1273 at
-    one value, 44.7 at two; at either, no red in 28,000 equally exact runs, a rate within 2.5e-4 at
-    99.9%). An error local to a value or two such rows hold is check 2's to catch, each element within
-    its operation's certified bound (tests/op_certificates.py)."""
-    if width not in NARROW_WIDTHS:
-        return ROW_FACTOR
-    from scipy import stats
-
-    return float(np.sqrt(stats.f.ppf(1 - LOWER_TAIL, width, width)))
+NARROW_FACTORS = {1: 0.0, 2: 0.0}
+"""The worst-row rule's factor at rows of one or two values, in place of ROW_FACTOR: at either width
+ROW_FACTOR fails an equally exact Dew far more often than LOWER_TAIL as sites run check 1, since a row of
+few values is sized by a few float64 values, which sit near zero far more often than a wide row's RMS
+does, and the worst row over a site's rows and seeds is the row whose truth is smallest. Each is the 1 -
+LOWER_TAIL quantile of the factor that would fail equally exact pairs at both stages, both arms on one
+truth (`tools/gate_null_runs.py --rows`, its `row_controls`), over the layouts sites declare; measured,
+with its rate certified by the same controls. At ROW_FACTOR the controls fail such pairs 1.5e-2 of runs
+at one value a row and 1.5e-3 at two, and 7e-5 at three (bound 4.0e-4 at 99.9%) and none at four in
+28,000 runs. A local error a row of a value or two hides is check 2's to catch once it gates, each
+element within its operation's certified bound (tests/op_certificates.py, the target)."""
 
 
 PREVIOUS_TAILS = (5e-4, 5e-4)
@@ -767,11 +757,11 @@ def _staged(drawn, seeds: int, label: str, *, two_stage: bool = True) -> tuple[l
 
 STAGES_LOG = "DEW_CHECK1_STAGES"
 """The environment variable naming a file each check-1 judgement appends its stage, its verdict and its
-leaves of NARROW_WIDTHS rows to, one JSON line (`_logged`): what a train reads every site's stage-two rate
-from, every attempt counted, and which sites' local errors rest on check 2."""
+leaves of narrow rows (NARROW_FACTORS) to, one JSON line (`_logged`): what a train reads every site's
+stage-two rate from, every attempt counted, and which sites' local errors rest on check 2."""
 
 
-def _logged(label: str, stage: int, verdict: str, narrow: tuple[str, ...] = ()) -> None:
+def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str]) -> None:
     import json
     import os
 
@@ -780,7 +770,7 @@ def _logged(label: str, stage: int, verdict: str, narrow: tuple[str, ...] = ()) 
         with open(path, "a", encoding="utf-8") as log:
             log.write(json.dumps({"site": os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0],
                                   "label": label, "stage": stage, "verdict": verdict,
-                                  "narrow": list(narrow)}) + "\n")
+                                  "narrow_leaves": narrow_leaves}) + "\n")
 
 
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None,
@@ -828,16 +818,16 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     if seeds < FEWEST_SEEDS:
         raise Inconclusive(f"{label}: {seeds} seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
                            f"(`seeds_for`)")
-    narrow: list[str] = []
+    narrow_leaves: list[str] = []
 
     def drawn(start, stop):
         draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders)
-        narrow[:] = [name for name, width in zip(draws.names, draws.widths, strict=True)
-                     if width in NARROW_WIDTHS]
+        narrow_leaves[:] = [name for name, width in zip(draws.names, draws.widths, strict=True)
+                            if width in NARROW_FACTORS]
         return draws
 
     over, unresolved, stage = _staged(drawn, seeds, label)
-    _logged(label, stage, _verdict(over, unresolved), tuple(narrow))
+    _logged(label, stage, _verdict(over, unresolved), narrow_leaves)
     if over:
         raise AssertionError("\n".join(over + unresolved))
     if unresolved:
