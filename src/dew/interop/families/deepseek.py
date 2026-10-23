@@ -30,6 +30,7 @@ from dew.interop.decoder_parts import (
     MixtureFields,
     Ramp,
     Ropes,
+    RopeSpelling,
     base_config,
     dew_path,
     layer_depth_path,
@@ -51,6 +52,9 @@ from dew.nn.deepseek_v4 import DeepseekV4Mixer
 from dew.nn.dspark import DSpark
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mla import MLAMixer
+
+# MiniMaxM2Config's default_theta (configuration_minimax_m2.py:74).
+_MINIMAX_M2_SPELLING = RopeSpelling(theta=5000000.0)
 
 
 def _minimax_m2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -91,7 +95,7 @@ def _minimax_m2_config(hf_config: Mapping[str, object], used: set[str]) -> Decod
     # The release states its rotary under rope_scaling, which transformers reads as rope_parameters.
     theta, factor = plain_partial_rope(
         {**hf_config, 'rope_parameters': hf_config.get('rope_scaling') or hf_config.get('rope_parameters')},
-        default_factor=rotary_dim / head_dim, default_theta=5000000.0, reference='MiniMax-M2')
+        _MINIMAX_M2_SPELLING, default_factor=rotary_dim / head_dim, reference='MiniMax-M2')
     if 'rotary_dim' in hf_config and factor * head_dim != rotary_dim:
         refuse('rotary_dim', 'it disagrees with partial_rotary_factor * head_dim')
     if not 0 < factor <= 1 or int(head_dim * factor) % 2:

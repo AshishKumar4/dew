@@ -18,6 +18,7 @@ from dew.interop.decoder_parts import (
     FUSED_EXPERTS,
     LINEAR_FIELDS,
     MOE_SHARED,
+    PLAIN_SPELLING,
     QWEN35,
     DecoderFamily,
     DecoderFields,
@@ -76,7 +77,8 @@ def _qwen35_rope(hf_config: Mapping[str, object]) -> tuple[float, float]:
     exactly. Wrapper loading keeps the three-axis layout on its attention mixer
     for visual inputs.
     """
-    return plain_partial_rope(hf_config, default_factor=0.25, reference='Qwen3_5TextRotaryEmbedding',
+    return plain_partial_rope(hf_config, PLAIN_SPELLING, default_factor=0.25,
+                              reference='Qwen3_5TextRotaryEmbedding',
                               layout=('mrope_section', 'mrope_interleaved'))
 
 
