@@ -19,10 +19,12 @@ tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
 def traced(slope):
     hooked = template.Hooks(score_mod=lambda s, q_pos, k_pos, slope: slope * s,
                             score_params=(template.Param(slope, template.Kind.HEAD),))
-    return attention_portable.backward(query, key, value, spans, hooked, dout, scale=4.0, **tiles).query
+    return attention_portable.backward(query, key, value, spans, hooked, dout, scale=4.0, natural=NATURAL,
+                                       **tiles).query
 
 
-print("traced param jit dq", np.asarray(jax.jit(traced)(jnp.full((1,), 2e38, jnp.float32)))[0, 0, 0, :2])
+for NATURAL in (False, True):
+    print("traced param jit dq natural", NATURAL, np.asarray(jax.jit(traced)(jnp.full((1,), 2e38, jnp.float32)))[0, 0, 0, :2])
 
 
 def traced_reference(slope):
