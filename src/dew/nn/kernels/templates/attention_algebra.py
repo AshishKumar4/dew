@@ -603,13 +603,16 @@ def started(spec: Forward, initial: tuple[jax.Array, jax.Array, jax.Array] | Non
 
 class Keys(NamedTuple):
     """A key tile as a mainloop gives it the algebra: its coordinates and (modified) logits `[bq, bk]`,
-    `load()` its values `[bk, Dv]`, which a step calls after the softmax (where jax's mha loads them), and
-    the mainloop's product `dot(a, b)`, `a @ b` in fp32."""
+    `load()` its values `[bk, Dv]`, which a step calls after the softmax (where jax's mha loads them), the
+    mainloop's product `dot(a, b)`, `a @ b` in fp32, and where the mainloop holds the running sums of the
+    weighted values itself (an MMA's accumulator), `accumulate(scale, p, value)`, which takes them by
+    `scale` and adds the narrowed weights' product with the values in place (the plain walk's step)."""
 
     coords: Coords
     logits: jax.Array
     load: Callable[[], jax.Array]
     dot: Callable[[jax.Array, jax.Array], jax.Array]
+    accumulate: Callable[[Callable[[jax.Array], jax.Array], jax.Array, jax.Array], None] | None = None
 
 
 Carry = tuple[Partial, Argmax, jax.Array, jax.Array]
@@ -633,8 +636,14 @@ def _softmax(spec: Forward, state: Partial, keys: Keys):
 
 
 def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
-    """The state after a tile `keys`: its softmax and the product of its weights with its values."""
+    """The state after a tile `keys`: its softmax and the product of its weights with its values, into the
+    mainloop's own running sums where it holds them (`Keys.accumulate`; the state's `acc` then is the
+    mainloop's to read, passed through)."""
     m, factor, p, value, held = _softmax(spec, state, keys)
+    if held is None and keys.accumulate is not None:
+        keys.accumulate(lambda acc: carry_factor(acc, factor, None), narrow(p, value.dtype), value)
+        denominator = carry_factor(state.total, factor, None) + beyond_weights(p.sum(axis=-1), None)
+        return Partial(state.acc, m, denominator)
     times = functools.partial(_times, keys.dot, value)
     return stepped(state, m, factor, p, times(p), held, times)
 

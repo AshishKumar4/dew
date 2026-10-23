@@ -63,6 +63,14 @@ class Wgmma(mosaic.RingFamily):
                 plgpu.wgmma(acc, lhs, rhs)
         return acc
 
+    def rescaled_products(self, acc, scale, parts, rhs, interpret: bool):
+        if interpret:
+            return self.register_products(scale(acc), parts, rhs, interpret)
+        # The accumulator's value read once its products are done, scaled, stored back.
+        plgpu.wgmma_wait(0)
+        acc[...] = scale(acc[...])
+        return self.register_products(acc, parts, rhs, interpret)
+
     def settled(self) -> None:
         plgpu.wgmma_wait(0)
 
