@@ -106,6 +106,21 @@ def test_the_waiting_share_reads_the_estimates_service_time():
     assert found.predictions['waiting_share'] == waiting / (waiting + program)
 
 
+def test_a_bulk_loaded_programs_waiting_share_follows_from_its_logged_facts():
+    """A Hopper program staging by bulk copies waits each stage's bulk-copy latency and its L2 transfer:
+    the waiting share reconstructs from the row's legacy inputs and the facts it logs."""
+    target = generation.TARGETS["sm90"]
+    legacy = cost.Cost(programs=132, device_bytes=1.0, program_flops=1.0, program_staged=1e9, steps=8,
+                       stages=3, l2_bytes=132 * 8 * 49152.0, bulk_loads=True)
+    found = features.features(_Costed(legacy), None, None, target)
+    facts = found.facts
+    clock, multiprocessors = facts['clock_hz'], facts['multiprocessors']
+    stage = facts['stage_latency_clocks'] + 49152.0 / (facts['l2_bandwidth'] / (multiprocessors * clock))
+    waiting = legacy.steps * stage / (legacy.stages - 1) / clock
+    program = legacy.program_staged / (cost.SHARED_BYTES_PER_CLOCK * clock)
+    assert found.predictions['waiting_share'] == pytest.approx(waiting / (waiting + program), rel=1e-12)
+
+
 def test_a_launch_without_a_costed_record_has_no_features():
     """A kernel op that is no template, and a template costing by an override of `cost`, have none."""
     class Uncosted(base.Template):
