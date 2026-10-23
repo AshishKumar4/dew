@@ -63,6 +63,7 @@ rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
 import dataclasses
+import functools
 import hashlib
 import math
 
@@ -113,6 +114,52 @@ def widened(tree):
     inputs of a float64 truth."""
     return jax.tree.map(lambda leaf: np.asarray(
         leaf, np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype), tree)
+
+
+def windows(draw, count: int):
+    """A check-1 draw of `count` windows a seed: seed `s` gives the site's own draws of seeds
+    `s * count` to `s * count + count - 1`, each leaf stacked on a new leading axis. A seed's evidence
+    then pools `count` independent draws, so a leaf whose error spreads far from one draw to the next
+    (a parameter's gradient, a short window's) resolves at fewer seeds; its arms take the windows
+    through `over_windows`."""
+    def drawn(seed):
+        arguments = [draw(seed * count + index) for index in range(count)]
+        return jax.tree.map(lambda *leaves: np.stack([np.asarray(leaf) for leaf in leaves]), *arguments)
+    return drawn
+
+
+def over_windows(fn, *, looped: bool = False):
+    """`fn`, an arm of one draw, over `windows`' stacked ones, its outputs stacked on their leading axis:
+    one compiled program over every window (`jax.vmap`) for a JAX arm, or `fn` window by window for one
+    that is not (a torch or NumPy reference, `looped`). A batch axis may change the program XLA
+    compiles (its fusions, a kernel's route), so the first call of a batched arm also runs it window by
+    window, compiled as one draw runs it, and fails unless every window's output is the same bit for
+    bit: then check 1 judges the program its users run, or the site takes `looped`."""
+    def each(*arguments, single):
+        count = len(jax.tree.leaves(arguments)[0])
+        found = [single(*jax.tree.map(lambda leaf, index=index: leaf[index], arguments))
+                 for index in range(count)]
+        return jax.tree.map(lambda *leaves: np.stack([np.asarray(leaf) for leaf in leaves]), *found)
+
+    if looped:
+        return functools.partial(each, single=fn)
+    batched, single, checked = jax.jit(jax.vmap(fn)), jax.jit(fn), []
+
+    def run(*arguments):
+        found = batched(*arguments)
+        if not checked:
+            expected = each(*arguments, single=single)
+            for (path, got), want in zip(jax.tree_util.tree_leaves_with_path(found),
+                                         jax.tree.leaves(expected), strict=True):
+                got = np.asarray(got)
+                if got.dtype != want.dtype or got.shape != want.shape or got.tobytes() != want.tobytes():
+                    raise AssertionError(
+                        f"{jax.tree_util.keystr(path)}: the batched arm over windows computes otherwise "
+                        "than one draw's compiled arm does, window by window; take "
+                        "`over_windows(fn, looped=True)`")
+            checked.append(True)
+        return found
+    return run
 
 
 WITHOUT_YNN = {"xla_cpu_experimental_ynn_fusion_type": ""}

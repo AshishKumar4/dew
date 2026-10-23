@@ -60,6 +60,51 @@ def test_without_ynn_takes_a_callers_compiler_options_over_its_own():
                                   jax.jit(jnp.dot)(x, w))
 
 
+def test_windows_stack_a_sites_own_draws_and_its_arms_take_them_all():
+    """`windows(draw, count)`'s seed `s` is the site's draws of seeds `s * count` on, stacked, and an arm
+    over them (`over_windows`, compiled or looped) gives each window's own output, stacked."""
+    from reference_error import over_windows, windows
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return rng.normal(size=(3, 4)).astype(np.float32), np.int32(seed)
+
+    def arm(x, seed):
+        return {"sum": jnp.sum(x, axis=-1) + seed, "x": x}
+
+    stacked = windows(draw, 5)(2)
+    for index in range(5):
+        for got, want in zip(jax.tree.leaves(stacked), jax.tree.leaves(draw(10 + index)), strict=True):
+            np.testing.assert_array_equal(got[index], want)
+    looped = over_windows(lambda x, seed: jax.tree.map(np.asarray, arm(x, seed)), looped=True)
+    for wrapped in (over_windows(arm), looped):
+        found = wrapped(*stacked)
+        for index in range(5):
+            wanted = jax.tree.leaves(arm(*draw(10 + index)))
+            for got, want in zip(jax.tree.leaves(found), wanted, strict=True):
+                np.testing.assert_array_equal(np.asarray(got[index]), np.asarray(want))
+
+
+def test_a_batched_arm_that_computes_otherwise_than_one_draws_is_refused():
+    """`over_windows` refuses a batched arm whose windows differ, by a bit, from one draw's compiled
+    arm window by window: here a batching rule that adds one, where a fusion or a route would move a
+    rounding."""
+    from reference_error import over_windows
+
+    @jax.custom_batching.custom_vmap
+    def arm(x):
+        return x
+
+    @arm.def_vmap
+    def batched(axis_size, in_batched, x):
+        return x + 1, in_batched[0]
+
+    with pytest.raises(AssertionError, match="looped=True"):
+        over_windows(arm)(np.zeros((3, 2), np.float32))
+    np.testing.assert_array_equal(over_windows(lambda x: arm(x), looped=True)(np.zeros((3, 2), np.float32)),
+                                  np.zeros((3, 2), np.float32))
+
+
 def test_a_small_row_beside_large_ones_is_held_to_its_own_size():
     """Dew doubles a row of 5s beside rows of 1e8 that the reference rounds by 8. Every
     tensor-wide distance passes it: its RMS error, 3.5, sits under twice the reference's, 5.7.
