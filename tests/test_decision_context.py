@@ -52,9 +52,9 @@ QUESTION = {"pick": Choice("Which one?", ["a", "b", "c"])}
 
 WORDS = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "note", "first"]
 
-CONTEXT_SEEDS = 32
+CONTEXT_SEEDS = 8
 """Check 1's declared seeds for the batched answers with their contexts, sized paired (`seeds_for`
-with the batch as `dew_fn`, 2026-10-23 on armada)."""
+with the batch as `dew_fn`, 2026-10-23 on armada, both arms without YNNPACK's fusions)."""
 
 
 def conditioned(length: int = 16, layers: tuple[int, ...] = (0, 1)) -> DecisionObjective:
