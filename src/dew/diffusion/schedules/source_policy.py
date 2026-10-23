@@ -6,7 +6,7 @@ import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Literal, NamedTuple, Protocol
+from typing import Literal, NamedTuple, Protocol, get_args
 
 import numpy as np
 
@@ -50,8 +50,8 @@ Spacing = Literal["leading", "linspace", "trailing"]
 Transform = Literal["none", "karras", "exponential", "beta"]
 Terminal = Literal["zero", "sigma_min"]
 
-_SPACINGS: tuple[Spacing, ...] = ("leading", "linspace", "trailing")
-_TERMINALS: tuple[Terminal, ...] = ("zero", "sigma_min")
+_SPACINGS: tuple[Spacing, ...] = get_args(Spacing)
+_TERMINALS: tuple[Terminal, ...] = get_args(Terminal)
 _SIGMA_SCHEDULES: tuple[Transform, ...] = ("karras", "exponential")
 # Each sigma transformation with the control that turns it on.
 _TRANSFORM_CONTROLS: tuple[tuple[Transform, str], ...] = (
@@ -102,7 +102,7 @@ _DISTILLED = _fields(_THRESHOLD, {"original_inference_steps": 50, "clip_sample":
 
 _ALL_PREDICTIONS = ("epsilon", "sample", "v_prediction")
 _NO_SAMPLE = ("epsilon", "v_prediction")
-_DPM_ALGORITHMS: tuple[Algorithm, ...] = ("dpmsolver++", "dpmsolver", "sde-dpmsolver++", "sde-dpmsolver")
+_DPM_ALGORITHMS: tuple[Algorithm, ...] = get_args(Algorithm)
 _SOLVER_TYPES = ("midpoint", "heun", "logrho", "bh1", "bh2")
 
 

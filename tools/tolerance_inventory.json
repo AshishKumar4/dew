@@ -842,7 +842,7 @@
    "lane": "Training"
   },
   "tools/layout_parity.py": {
-   "comparisons": 3,
+   "comparisons": 1,
    "lane": "Accuracy Gate"
   },
   "tools/lora_reference.py": {

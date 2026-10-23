@@ -62,6 +62,11 @@ def softmax(logits: np.ndarray, temperature: float) -> np.ndarray:
     return shifted / shifted.sum()
 
 
+TYPE_MINIMUM, BUCKET_MINIMUM = 10, 2000
+"""The answers a question type's and a bucket's temperatures need to be fitted: Laya's minimums
+(laya/calibrate.py MIN_TYPE_N and MIN_BUCKET_N)."""
+
+
 @dataclass(frozen=True)
 class Temperatures:
     """The temperature each question's logits are divided by.
@@ -95,14 +100,17 @@ class Temperatures:
         return min(self.highest, max(self.lowest, value))
 
     @classmethod
-    def fit(cls, scored: Sequence[Scored], *, type_minimum: int = 10, bucket_minimum: int = 2000,
-            lowest: float = 0.5, highest: float = 5.0) -> "Temperatures":
+    def fit(cls, scored: Sequence[Scored], *, type_minimum: int = TYPE_MINIMUM,
+            bucket_minimum: int = BUCKET_MINIMUM, lowest: float | None = None,
+            highest: float | None = None) -> "Temperatures":
         """Return the temperatures that minimize held-out log loss.
 
         There is one per question type with at least `type_minimum` answers, and one
-        per bucket with at least `bucket_minimum`; these are Laya's minimums
-        (laya/calibrate.py MIN_TYPE_N and MIN_BUCKET_N).
+        per bucket with at least `bucket_minimum` (`TYPE_MINIMUM`, `BUCKET_MINIMUM`), each held
+        within [`lowest`, `highest`], the class's own bounds where not given.
         """
+        lowest = cls.lowest if lowest is None else lowest
+        highest = cls.highest if highest is None else highest
         def fitted(group: list[Scored], minimum: int) -> float | None:
             return None if len(group) < minimum else _temperature(group)
 
