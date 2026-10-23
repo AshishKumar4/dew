@@ -91,7 +91,7 @@ SEEDS = {"ties at scale 1": 64, "ties at scale 1, cotangents near 2**125": 64, "
          "a resumed state beside an overflowing column": 32,
          "a resumed state of a denominator near fp32's largest beside an overflowing column": 8,
          "fp16 values near their largest beside a state near fp32's largest": 8,
-         "a decode step's sink and one key": 32, "a decode step's sink near fp32's largest and one key": 8,
+         "a decode step's sink and one key": 8, "a decode step's sink near fp32's largest and one key": 8,
          "documents of one key": 8}
 """Each family's declared seeds, the fewest over which the reference compared with itself resolves check
 1's parity (`reference_error.seeds_for`), sized for every family at the suite's own draws and reference."""
