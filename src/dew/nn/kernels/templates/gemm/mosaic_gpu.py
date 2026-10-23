@@ -277,6 +277,7 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
     # Each consumer's part of the tile: half its columns, or with `row_split` half its rows (CUTLASS's
     # cooperative split, one m64n256 MMA a step where the columns' halves take two m64n128s).
     part = (rows_half, block_n) if row_split else (block_m, half)
+    staged = min(part[1], _STAGED_COLUMNS)
     side_shapes = [tuple({'rows': part[0], 'columns': part[1]}[axis] for axis in axes)
                    for axes in epilogue_axes]
     # A pipeline's operands each follow its steps: a prologue side operand without depth is loaded once a
@@ -301,8 +302,7 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
             allocations=pipeline(hopper.ignore, hopper.ignore).get_allocations(
                 lhs_gmem.at[pl.ds(0, block_m)], rhs_columns(rhs_gmem.at[0], 0),
                 *stepped_views(pl.ds(0, block_m))),
-            o_smems=[plgpu.SMEM((2, part[1] // _STAGED_COLUMNS, part[0], _STAGED_COLUMNS), gmem.dtype)
-                     for gmem in o_gmems],
+            o_smems=[plgpu.SMEM((2, part[1] // staged, part[0], staged), gmem.dtype) for gmem in o_gmems],
             **hopper.staging('side', zip(side_shapes, side_gmems, strict=True)),
             **hopper.staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]), prologue_gmems[i])
                                  for i in fixed]),
@@ -441,17 +441,17 @@ def _finish_half(acc, epilogue, sides: tuple, outs: tuple, place: tuple, wg) -> 
     values = values if isinstance(values, tuple) else (values,)
     for o_gmem, o_smem, value in zip(*outs, values, strict=True):
         plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-        for chunk in range(o_smem.shape[1]):
-            columns = slice(chunk * _STAGED_COLUMNS, (chunk + 1) * _STAGED_COLUMNS)
-            o_smem[wg, chunk] = value[:, columns].astype(o_smem.dtype)
+        chunks, width = o_smem.shape[1], o_smem.shape[-1]
+        for chunk in range(chunks):
+            o_smem[wg, chunk] = value[:, chunk * width:(chunk + 1) * width].astype(o_smem.dtype)
         plgpu.commit_smem()
-        for chunk in range(o_smem.shape[1]):
-            hopper.store_rows(o_smem.at[wg, chunk], o_gmem, row_start, first, stored,
-                              column + chunk * _STAGED_COLUMNS, most)
+        for chunk in range(chunks):
+            hopper.store_rows(o_smem.at[wg, chunk], o_gmem, row_start, first, stored, column + chunk * width,
+                              most)
 
 
 _STAGED_COLUMNS = 128
-"""The columns a consumer stages its output in at a time: a row-split part's 256 columns written to shared
+"""The most columns a consumer stages its output in at a time: a row-split part's 256 columns written to shared
 memory as one 512-byte row conflicted on its banks 280 times as often as two 256-byte halves (ncu, Qwen3's
 down projection: 18.3M conflicts against 64.6K, its forward 11% slower than the column split's)."""
 
