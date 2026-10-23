@@ -618,6 +618,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     """Whether the kernel adds each depth step's product apart (`exact_sums`); one that does not is not
     eligible where the call asks for it."""
     CONTRACTED: ClassVar[str]
+    STREAMS: ClassVar[bool] = False
+    """Whether its cooperative kernel streams its stages across tiles (`hopper.Ring`), its pipeline
+    filling once a launch, not once a tile."""
     """The launch axis its steps walk."""
 
     def eligible(self, ba, target) -> bool:
@@ -695,8 +698,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # Every step's operand tiles come through the L2, rereads or not, a pair's multicast matrix tile
         # once for both; so do its prologue side tiles, but a cooperative tile's sides without the
         # contraction come once a consumer an output tile (`hopper.load_fixed`), as do its epilogue side
-        # tiles, a side without rows read by both consumers. The stages arrive by bulk copy (TMA), and
-        # each step spends `_STEP_CLOCKS` outside the overlapped work.
+        # tiles, a side without rows read by both consumers. The stages arrive by bulk copy (TMA), the
+        # pipeline fills anew each tile but where the cooperative kernel gradient streams its stages
+        # across tiles (`hopper.Ring`), and each step spends `_STEP_CLOCKS` outside the overlapped work.
         cooperative = config.warpgroups == 2
         loaded = (config.block_m + config.block_n / config.cluster) * config.block_k * size
         fixed = _side_tile_bytes(epilogue_sides, hooks.epilogue_axes, extents)
@@ -715,7 +719,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             program_exponentials=epilogue_exponentials, mode=_mode(tokens.dtype), steps=steps,
             stages=config.stages, serial_staged=rewritten, serial_exponentials=prologue_exponentials,
             l2_bytes=tiles * (steps * loaded + fixed), bulk_loads=True,
-            step_clocks=_STEP_CLOCKS[config.warpgroups])
+            fills=0.0 if self.STREAMS and config.warpgroups == 2 else 1.0, step_clocks=_STEP_CLOCKS)
 
     def _multiprocessors(self, interpret: bool) -> int:
         # The interpreter runs one block (jax/_src/pallas/mosaic_gpu/interpret).
@@ -786,6 +790,7 @@ class MosaicTgmm(_Mosaic):
     ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
     EXACT_SUMS: ClassVar[bool] = True
     CONTRACTED: ClassVar[str] = 'rows'
+    STREAMS: ClassVar[bool] = True
 
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         depth, width = ba.arguments['tokens'].shape[1], ba.arguments['cotangent'].shape[1]
@@ -1056,11 +1061,11 @@ def _side_arrays(sides: tuple, axes_of: tuple) -> tuple:
                   jnp.dtype(side.dtype).itemsize) for side, axes in zip(sides, axes_of, strict=True))
 
 
-_STEP_CLOCKS = {1: 120.0, 2: 240.0}
-"""Clocks a Hopper mainloop step spends outside its overlapped loads and MMAs, by the warpgroups
-computing a tile: one warpgroup issuing its MMAs and waiting on its stages, two consumers handing the
-producer each stage back. Fitted with `stage_latency` to a canonical 8192^3 bf16 product at every
-fitting tile (CALIB-mainloop, H100 SXM), not to the MoE sweeps the ranking test holds the model to."""
+_STEP_CLOCKS = 160.0
+"""Clocks a Hopper mainloop step spends outside its overlapped loads and MMAs (its issue and barrier
+handoffs). Fitted with `stage_latency` to a canonical 8192^3 bf16 product at every fitting tile, one
+warpgroup and cooperative (CALIB-mainloop, H100 SXM: times within 11% rms, pairwise order 214 of 231),
+not to the MoE sweeps the ranking test holds the model to."""
 
 
 def _uncut(sides: tuple, axes_of: tuple) -> tuple[tuple, tuple]:

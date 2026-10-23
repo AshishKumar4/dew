@@ -13,16 +13,19 @@ of `steps` pipeline steps, `stages` of them in flight, issues each step's loads 
 before it needs them, so each step waits at least its loads' latency (a bulk copy's where the program
 stages by bulk copies, `bulk_loads`, else a global load's) and their transfer, its share of
 `l2_bytes` at the multiprocessor's L2 rate, over `stages - 1`; a multiprocessor's `resident` programs
-(`resident`) wait together (Little's law). A step also spends `step_clocks` outside the overlapped work
-(its issue and barrier handoffs), which a template states for its mainloop. Per multiprocessor,
+(`resident`) wait together (Little's law). A program whose pipeline fills anew (`fills` times, a
+per-tile pipeline's once, a pipeline streaming across tiles' never) waits one stage's latency and
+transfer before its first step, and a step spends `step_clocks` outside the overlapped work (its
+issue and barrier handoffs), which a template states for its mainloop. Per multiprocessor,
 
     program  = max(program_flops / tensor rate, program_staged / shared-memory rate,
                    program_exponentials / special-function rate, program_issued / issue rate)
              + serial_staged / shared-memory rate + serial_exponentials / special-function rate
     issue rate = min(SCHEDULERS, resident · warps / ISSUE_INTERVAL)
-    waiting  = steps · (load latency + step's l2 bytes / L2 bytes a clock) / (stages - 1)
+    stage    = load latency + a step's l2 bytes / L2 bytes a clock
+    waiting  = steps · stage / (stages - 1)
     compute  = ceil(programs / (multiprocessors · resident))
-               · (max(resident · program, waiting) + resident · steps · step_clocks)
+               · (max(resident · program, waiting) + resident · (fills · stage + steps · step_clocks))
     memory   = device_bytes / memory bandwidth
     l2       = l2_bytes / L2 bandwidth
     seconds  = max(compute, memory, l2) + programs * steps * grid step seconds (TPU's)
@@ -105,6 +108,7 @@ class Cost:
     program_issued: float = 0.0
     warps: int = 4
     bulk_loads: bool = False
+    fills: float = 0.0
     step_clocks: float = 0.0
 
 
@@ -120,12 +124,14 @@ def seconds(cost: Cost, target: generation.GpuTarget) -> float:
                          f"{', '.join(name for name, value in named if value is None)}, "
                          "which the kernel cost model needs")
     program = program_seconds(cost, rate, clock)
-    waiting = program_waiting(cost, facts) or 0.0
+    stage = stage_clocks(cost, facts)
+    waiting = 0.0 if stage is None else waiting_seconds(cost, stage, clock)
+    fill = 0.0 if stage is None else cost.fills * stage / clock
     waves = math.ceil(cost.programs / (multiprocessors * cost.resident))
     l2 = 0.0 if facts.l2_bandwidth is None else cost.l2_bytes / facts.l2_bandwidth
     step = facts.grid_step_seconds
     stepping = 0.0 if step is None else cost.programs * cost.steps * step
-    serial = cost.resident * cost.steps * cost.step_clocks / clock
+    serial = cost.resident * (fill + cost.steps * cost.step_clocks / clock)
     return max(waves * (max(cost.resident * program, waiting) + serial), cost.device_bytes / bandwidth,
                l2) + stepping
 
@@ -144,25 +150,33 @@ def program_seconds(cost: Cost, rate: float, clock: float) -> float:
             + cost.serial_exponentials / (EXPONENTIALS_PER_CLOCK * clock))
 
 
-def program_waiting(cost: Cost, facts: generation.GpuTarget) -> float | None:
-    """`waiting_seconds` at `facts`' latency, a bulk copy's where the program stages by them, and its L2
-    rate; None where the target states no latency or clock."""
+def stage_clocks(cost: Cost, facts: generation.GpuTarget) -> float | None:
+    """The clocks one stage of `cost`'s program takes to arrive on `facts`: its loads' latency (a bulk
+    copy's where it stages by them) and their transfer, a step's share of `l2_bytes` at the
+    multiprocessor's L2 rate (none where that is unstated); None where the target states no latency."""
     latency = (facts.stage_latency if cost.bulk_loads else None) or facts.load_latency
-    if latency is None or facts.clock_hz is None or facts.multiprocessors is None:
+    if latency is None:
         return None
-    l2 = facts.l2_bandwidth
-    return waiting_seconds(cost, latency, facts.clock_hz,
-                           l2 / (facts.multiprocessors * facts.clock_hz) if l2 else None)
-
-
-def waiting_seconds(cost: Cost, latency: float, clock: float,
-                    l2_bytes_per_clock: float | None = None) -> float:
-    """The seconds a program's steps wait on loads `latency` clocks long and their transfer, a step's
-    share of `l2_bytes` at `l2_bytes_per_clock` (none where that is unstated), its stages in flight
-    hiding `stages - 1` steps of it (Little's law, the module's docstring)."""
     steps = cost.programs * cost.steps
-    transfer = cost.l2_bytes / steps / l2_bytes_per_clock if l2_bytes_per_clock and steps else 0.0
-    return cost.steps * (latency + transfer) / max(cost.stages - 1, 1) / clock
+    l2 = facts.l2_bandwidth
+    if not (l2 and steps and facts.multiprocessors and facts.clock_hz):
+        return latency
+    return latency + cost.l2_bytes / steps / (l2 / (facts.multiprocessors * facts.clock_hz))
+
+
+def program_waiting(cost: Cost, facts: generation.GpuTarget) -> float | None:
+    """`waiting_seconds` at `facts`' stage (`stage_clocks`); None where the target states no latency or
+    clock."""
+    stage = stage_clocks(cost, facts)
+    if stage is None or facts.clock_hz is None:
+        return None
+    return waiting_seconds(cost, stage, facts.clock_hz)
+
+
+def waiting_seconds(cost: Cost, latency: float, clock: float) -> float:
+    """The seconds a program's steps wait on stages `latency` clocks long, its stages in flight hiding
+    `stages - 1` steps of it (Little's law, the module's docstring)."""
+    return cost.steps * latency / max(cost.stages - 1, 1) / clock
 
 
 def resident(target: generation.GpuTarget, staged: int, threads: int, registers: int) -> int:
