@@ -21,7 +21,7 @@ import threading
 import unicodedata
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, runtime_checkable
 
 import grain.python as grain
 import numpy as np
@@ -561,7 +561,7 @@ class Quality(Curated):
     rule's reason (`gopher_short_doc`, `too_few_sentences`, `line_punct_ratio`, ...)."""
 
     rule: Literal["gopher", "c4", "fineweb"]
-    settings: tuple[tuple[str, object], ...] = ()
+    settings: tuple[tuple[str, Any], ...] = ()  # the filter's constructor arguments, as its own types
     field: str = "text"
     reason = "quality"
 

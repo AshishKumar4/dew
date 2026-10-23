@@ -29,7 +29,7 @@ EVALUATION = ("Which of these is the capital of France and has been since the la
               "according to the historians who study the early kingdoms of western Europe?")
 
 
-def read(chain: Pipeline) -> tuple[list[int], dict[str, float]]:
+def one_pass(chain: Pipeline) -> tuple[list[int], dict[str, float]]:
     """The ids one pass of a chain keeps, in order, and what a run counts it dropping, by reason."""
     kept = [int(record["id"]) for record in iterate(chain, read="memory")]
     dropped = {key.rsplit("/", 1)[1]: count for key, count in chain.stats(records=len(PROSE) + 2).items()
@@ -37,7 +37,7 @@ def read(chain: Pipeline) -> tuple[list[int], dict[str, float]]:
     return kept, dropped
 
 
-def corpus() -> Memory:
+def web_pages() -> Memory:
     """The prose, a fragment too short for any quality rule, and a page that quotes an evaluation
     question whole."""
     records = [{"id": index, "text": passage} for index, passage in enumerate(PROSE)]
@@ -47,16 +47,16 @@ def corpus() -> Memory:
 
 
 def test_a_curated_corpus_keeps_its_prose_and_counts_what_each_filter_drops():
-    curated = Pipeline(corpus()).filter_map(text.Quality("gopher"),
+    curated = Pipeline(web_pages()).filter_map(text.Quality("gopher"),
                                             text.Decontaminated(against=(EVALUATION,)))
-    kept, dropped = read(curated)
+    kept, dropped = one_pass(curated)
     assert kept == [0, 1, 2]
     assert dropped.pop("contaminated") == 1 and sum(dropped.values()) == 1, dropped
 
 
 def test_a_curation_steps_rules_key_the_plan_and_the_same_rules_key_it_alike():
     def plan(*steps):
-        return compile(Pipeline(corpus()).filter_map(*steps).batch(1), read="memory",
+        return compile(Pipeline(web_pages()).filter_map(*steps).batch(1), read="memory",
                        loading=Loading(workers=0, threads=1, read_buffer=1)).plan.identity()
 
     gopher = plan(text.Quality("gopher"))
@@ -74,9 +74,10 @@ def test_a_fasttext_classifier_keeps_the_label_it_is_asked_for_and_its_model_key
     lines += ["__label__spam click here buy now free offer win prize" for _ in range(60)]
     examples.write_text("\n".join(lines) + "\n")
     model = tmp_path / "model.bin"
-    fasttext.train_supervised(input=str(examples), epoch=25, lr=1.0, minCount=1, seed=0, thread=1).save_model(
+    fasttext.train_supervised(input=str(examples), epoch=25, minCount=1, seed=0, thread=1).save_model(
         str(model))
-    kept, dropped = read(Pipeline(corpus()).filter_map(text.Classifier(str(model), keep=(("prose", 0.5),))))
+    classified = Pipeline(web_pages()).filter_map(text.Classifier(str(model), keep=(("prose", 0.5),)))
+    kept, dropped = one_pass(classified)
     assert kept == [0, 1, 2, 11] and dropped == {"classifier": 1}
 
 
@@ -86,6 +87,6 @@ def test_language_identification_keeps_the_language_it_is_asked_for():
     french = ("Le fleuve passe devant le vieux moulin et traverse la ville, où les enfants attendent sur "
               "le pont pour regarder passer les bateaux le soir.")
     records.append({"id": 10, "text": french})
-    kept, dropped = read(Pipeline(Memory(records, shard_rows=len(records)))
+    kept, dropped = one_pass(Pipeline(Memory(records, shard_rows=len(records)))
                          .filter_map(text.Language(("en",))))
     assert kept == [0, 1, 2] and dropped == {"language": 1}
