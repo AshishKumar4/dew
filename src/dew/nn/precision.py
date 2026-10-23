@@ -465,6 +465,42 @@ def _compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
     return compensated_total((hi, lo), jnp.sum(wide, axes)).astype(values.dtype)
 
 
+def compensates_loops() -> bool:
+    """Whether a running sum of float32 products carried across a loop keeps what each addition
+    drops (`compensated_add`), so the loop's sum rounds once as one product's does: where a CPU sums
+    each product in float64 (`accumulated`). A carry's shape is fixed when its loop traces, so this
+    reads the platform a call's code is chosen for (`dew.nn.kernels.generation.backend`), as a CPU's
+    attention routing does; an accelerator's running sum is the plain one, as its products' sums are
+    float32's."""
+    from dew.nn.kernels.generation import backend
+
+    return backend() == "cpu" and jax.config.jax_default_matmul_precision != FP32_SUMS and not _intercepted()
+
+
+def running_sum(shape: tuple[int, ...], dtype: DTypeLike) -> jax.Array:
+    """An empty running sum of `shape` (`added_to`, `running_total`): `[3, *shape]`, a double-float
+    pair and the plain sum beside it, where loops compensate (`compensates_loops`), else `[1, *shape]`,
+    the plain sum alone. Its leading axis is the form's, so a loop slices and updates the sum's own
+    axes one past theirs."""
+    return jnp.zeros((3 if compensates_loops() else 1, *shape), dtype)
+
+
+def added_to(running: jax.Array, term: jax.Array) -> jax.Array:
+    """`running` (`running_sum`) with `term` added: through `compensated_add` where it is a pair."""
+    term = term.astype(running.dtype)
+    if running.shape[0] == 1:
+        return running + term[None]
+    pair = compensated_add((running[0], running[1]), (term, jnp.zeros_like(term)))
+    return jnp.stack((*pair, running[2] + term))
+
+
+def running_total(running: jax.Array) -> jax.Array:
+    """A running sum's value (`running_sum`): a pair's rounded once (`compensated_total`), else the sum."""
+    if running.shape[0] == 1:
+        return running[0]
+    return compensated_total((running[0], running[1]), running[2])
+
+
 def compensated_total(pair: tuple[jax.Array, jax.Array], plain: jax.Array) -> jax.Array:
     """A compensated sum's value, its `(hi, lo)` pair rounded once, or the `plain` sum of the same
     values where that reaches an infinity: +-inf or NaN as `jnp.sum`'s is, where every residual past
