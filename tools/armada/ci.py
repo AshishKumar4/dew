@@ -38,10 +38,14 @@ each test of the newest at its least time as the floor's Python ran it.
 
 The test cache reuses a file's row when its inputs are unchanged since it ran green. A
 green row records the checkout's Python files its tests executed
-(tools/armada/executed.py) and its key, a hash of those files, the file
-itself and what every file shares (`shared`: the environment's locks, the
-CI tools, every non-Python file under tests/ and src/, and the names of every
-Python file there, so a file a scanner would find changes every key). A task
+(tools/armada/executed.py) and its key, a hash of those files, the
+directories under src/ that hold them (so a module added beside one changes
+it), the file itself and what every file shares (`shared`: the environment's
+locks, the CI tools, every non-Python file under tests/ and src/, the names
+of the Python files under tests/ but the test modules, and src/'s entries).
+A test module, or a module in a package a file never imported, is no input
+of that file's: a train that loses a head reruns only the files the head's
+modules reached (the land queue's recompose after a pull). A task
 recomputes each of its files' keys from the record made on its own class
 (`device_class`: float32 results differ by CPU microarchitecture, and by GPU)
 and reports the recorded green row
@@ -188,19 +192,23 @@ CACHE_PREFIX = f"testcache/format-{RECORD_FORMAT}"
 
 def shared(python: str) -> str:
     """The hash of what every test file's run shares: `python`, the `SHARED` files, every lock, every
-    non-Python file under tests/ and src/ (a fixture, a package's data), and the names of every Python
-    file there, whose arrival can change what an import finds (a conftest.py, a package's __init__.py, a
-    module that shadows another, a test module among them) or what a scanner lists, neither of which a
-    record sees."""
+    non-Python file under tests/ and src/ (a fixture, a package's data), and the names of the Python
+    files under tests/ but its test modules and of src/'s own entries, whose arrival can change what an
+    import finds (a conftest.py, a helper or a top-level package that shadows another), which a record
+    does not see. A module within a package under src/ is its importers' input alone, with its
+    package's other modules (`inputs`), and a test module is no other file's: so a train that loses a
+    head runs again only what that head's modules reached."""
     digest = hashlib.sha256(python.encode())
     for top in ("tests", "src"):
         for path in sorted(Path(top).rglob("*")):
             if not path.is_file() or "__pycache__" in path.parts:
                 continue
+            if path.suffix == ".py" and (top == "src" or path.name.startswith("test_")):
+                continue
             digest.update(str(path).encode())
             if path.suffix != ".py":
                 digest.update(hashlib.sha256(path.read_bytes()).digest())
-    for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files()}):
+    for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), "src"}):
         digest.update(name.encode() + contents(name))
     return digest.hexdigest()
 
@@ -226,12 +234,21 @@ def contents(name: str) -> bytes:
 
 
 def cache_key(common: str, name: str, depends: list[str]) -> str:
-    """The key of test file `name` whose run executed or read `depends` (executed.py): those files'
-    contents, those directories' entries, and `common`."""
+    """The key of test file `name` whose run executed or read `depends` (executed.py): its `inputs`'
+    contents, its directories' entries, and `common`."""
     digest = hashlib.sha256(common.encode())
-    for path in sorted({name, *depends}):
+    for path in inputs(name, depends):
         digest.update(path.encode() + contents(path))
     return digest.hexdigest()
+
+
+def inputs(name: str, depends: list[str]) -> list[str]:
+    """What test file `name`'s key covers, given that its run executed or read `depends`: those, and the
+    directory of each module it executed under src/, whose entries name the modules an import there
+    finds: a module added beside one it imported (which shadows it, or which an import it tried now
+    finds) changes its key, and one added to a package it never imported does not."""
+    packages = {str(Path(path).parent) for path in depends if path.startswith("src/") and path.endswith(".py")}
+    return sorted({name, *depends, *packages})
 
 
 def cpu_class() -> str:
