@@ -626,9 +626,10 @@ GEMMA2 = DecoderFamily(
     _gemma2_export,
     sandwich_norms=True,
     preserve_source_layout=False,
-    # Gemma2Config's window, which an omitted sliding_window means.
+    # Gemma2Config's defaults for the fields its decoder reads.
     defaults={'hidden_activation': 'gelu_pytorch_tanh', 'query_pre_attn_scalar': 256,
-              'final_logit_softcapping': 30.0, 'attn_logit_softcapping': 50.0, 'sliding_window': 4096},
+              'final_logit_softcapping': 30.0, 'attn_logit_softcapping': 50.0, 'sliding_window': 4096,
+              'head_dim': 256, 'max_position_embeddings': 8192},
 )
 
 GEMMA = DecoderFamily(
