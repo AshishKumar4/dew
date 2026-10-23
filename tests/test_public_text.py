@@ -49,9 +49,12 @@ def change(root: Path, files: dict[str, str], message: str) -> int:
     ({"docs/guide.md": f"{GUIDE}\nMore, measured at a commit.\n"}, "docs: a measurement at its commit", 0),
     ({"docs/guide.md": f"{GUIDE}\nRerun on 2026-10-22.\n"}, "docs: a rerun", 1),
     ({"README.md": "Released October 22nd.\n"}, "docs: a release", 1),
+    ({"README.md": "Released on the 22nd Oct. 2026.\n"}, "docs: a release", 1),
+    ({"docs/guide.md": f"{GUIDE}\n++ rerun 2026-10-22\n"}, "docs: a line that begins as a header", 1),
     ({"docs/new.md": "A new page.\n"}, "docs: a page, landed 2026-10-22", 1),
     ({"tests/fixtures/run.md": "recorded 2026-10-22\n", "site/public/a/capture.json": '"2026-10-22"'},
      "tests: a recording and a fixture", 0),
-], ids=["no date", "a doc's ISO date", "a month and its day", "a commit message's date", "data's dates"])
+], ids=["no date", "a doc's ISO date", "a month and its day", "an ordinal day and a dotted month",
+        "a line that begins as a header", "a commit message's date", "data's dates"])
 def test_a_change_that_adds_a_date_to_prose_fails(repository, files, message, status):
     assert change(repository, files, message) == status
