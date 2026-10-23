@@ -37,10 +37,6 @@ from dew.nn.text_encoders import check_tree
 # checkpoint would allocate one of those whether the caller asked or not.
 DEFAULT_MAX_SEQ_LEN = 8192
 
-MASKED_MODEL_TYPES = frozenset({
-    'llada', 'llada_moe_v2', 'llada2_moe', 'dream', 'Dream', 'diffusion_gemma_text'})
-"""Bidirectional diffusion decoders, never an unknown causal LM's loading convention."""
-
 # hidden_act / hidden_activation values, onto the GatedMLP activations. These
 # are the three the covered families use; anything else raises a ValueError
 # naming the value.
@@ -809,17 +805,12 @@ def translated(hf_config: Mapping[str, object], family: "DecoderFamily") -> Deco
 def translate_family_config(hf_config: Mapping[str, object],
                             family: "DecoderFamily") -> tuple[DecoderFields, set[str]]:
     """Translate a config as `family` reads it, returning the fields nothing read."""
-    model_type = hf_config.get('model_type')
     # Gemma 4 spells the flag 'vision' for its image tokens alone, and the
     # text decoder is causal (configuration_gemma4.py, only 'all' clears
-    # is_causal). True and 'all' change what the decoder computes. The masked
-    # diffusion families are bidirectional by construction (LLaDA's
-    # bidirectional bias, Dream's hard-coded is_causal=False, DiffusionGemma's
-    # decoder), so their own translators own the direction and this check
-    # leaves them alone.
+    # is_causal). True and 'all' change what the decoder computes. A
+    # bidirectional family's own translator owns the direction.
     bidirectional = hf_config.get('use_bidirectional_attention', False)
-    if (model_type not in MASKED_MODEL_TYPES
-            and bidirectional and bidirectional != 'vision'):
+    if not family.bidirectional and bidirectional and bidirectional != 'vision':
         refuse(f"use_bidirectional_attention={bidirectional!r}", "the backbone is causal")
     used = {'model_type', 'use_bidirectional_attention', 'num_hidden_layers'}
     # An omitted field is the config class's default; an explicit null stays null.
@@ -1021,9 +1012,20 @@ def renamed_path(renames: Renames, name: str, config: Mapping[str, object], *, l
     return dew_path(spelled, config)
 
 
-def renamed_name(renames: Renames, dew_name: str, config: Mapping[str, object]) -> str | None:
-    """`hf_tensor_name` respelled in the family's own names: `renamed_path` backwards."""
-    name = hf_tensor_name(dew_name, config)
+def renamed_name(renames: Renames, dew_name: str, config: Mapping[str, object], *,
+                 leaves: Leaves | None = None, layer_leaves: Leaves | None = None,
+                 sandwich_norms: bool = False) -> str | None:
+    """`renamed_path` backwards: the source name of the leaf `dew_name` (its path past the
+    collection, dotted), a `leaves` or `layer_leaves` one's by its table, any other's
+    `hf_tensor_name`, respelled in the family's own names."""
+    path = tuple(dew_name.split('.'))
+    name = next((spelled for spelled, leaf in (leaves or {}).items() if leaf == path), None)
+    layer = path[0].removeprefix('layers_')
+    if name is None and layer_leaves is not None and layer != path[0] and layer.isdigit():
+        tail = next((spelled for spelled, leaf in layer_leaves.items() if leaf == path[1:]), None)
+        name = None if tail is None else f'model.layers.{layer}.{tail}'
+    if name is None:
+        name = hf_tensor_name(dew_name, config, sandwich_norms=sandwich_norms)
     return None if name is None else renamed(name, renames, export=True)
 
 
@@ -1656,6 +1658,11 @@ class DecoderFamily:
     omits them, which the shared readers would otherwise default for every
     family alike: Gemma's GELU, Gemma 2's caps and query scalar, OLMo 3's
     norm epsilon. Rope bases are the class's `RopeSpelling`."""
+    bidirectional: bool = False
+    """The family's decoder attends both ways by construction, as the masked diffusion families'
+    do (LLaDA's bidirectional bias, Dream's hard-coded is_causal=False, DiffusionGemma's decoder):
+    its own translator reads the direction, and no unregistered causal LM is tried as it
+    (`dew.interop.verify.CONVENTIONS`)."""
     export_nulls: tuple[str, ...] = ()
     """Config fields whose explicit null disables a component. Other null export fields remove
     a generic field the family does not read; these survive as JSON null instead of taking the
