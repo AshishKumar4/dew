@@ -743,12 +743,15 @@ def load(root: Path | None = None) -> griffe.Module:
 def canonical(package: griffe.Module, dotted: str) -> str | None:
     """Where the package defines the name `dotted` (an import's path and the attributes after it), aliases
     followed (`reached`): an object's own path, or a keyword its owner takes (`Class.name`) under the owner's;
-    None for a name the package does not hold, or another package's."""
-    found = reached(package, dotted)
+    None for a name the package does not hold, or another package's, an alias to one included."""
+    try:
+        found = reached(package, dotted)
+        path, _, name = dotted.rpartition(".")
+        owner = reached(package, path) if found is None and path else None
+    except Unresolved:  # an alias whose target is another package's, which this model does not load
+        return None
     if found is not None:
         return found.path
-    path, _, name = dotted.rpartition(".")
-    owner = reached(package, path) if path else None
     return f"{owner.path}.{name}" if owner is not None and name in keyword_names(owner) else None
 
 

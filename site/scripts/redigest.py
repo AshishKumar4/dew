@@ -17,16 +17,19 @@ the page's one declaration of both. For each recording whose program differs fro
 what its digest names, this checks two things. First, the recording is of `base`'s
 program: its digest matches that program. Second, the program is that one renamed,
 read as Python parses it:
-- every value, string, f-string conversion and literal text, operator and keyword
-  is unchanged;
-- an API's names (a call's keyword argument, an attribute, an imported name) may be
-  renamed where they are used, each only as the change declares it (`--rename`), a
-  rename of Dew's API that the two commits show: its old name defined in src/dew at
-  `base` and its new one at `head`;
-- a variable (a name, a parameter, a function or class it defines, an import's
-  binding) is renamed everywhere, each to its own name, which no other variable of
-  the program had, so every use still means what it meant;
-- the result compiles.
+- every name, value, string, f-string conversion and literal text, operator and
+  keyword is unchanged, but for Dew's names the program reaches through an import in
+  the scope that uses them (a call's keyword, an attribute, an imported name, a name
+  an import binds): a parameter, an assignment or a definition of the same name in
+  that scope, or a global or nonlocal declaration of it anywhere, stands for no
+  import;
+- each of those changes only as the change declares it (`--rename`), a rename of
+  Dew's API that the two commits show: its old name defined in src/dew at `base` and
+  its new one at `head`, or what holds it renamed so; and none is left as it was
+  where the head's Dew no longer defines it;
+- where any changes, nothing in the program reads a name from a string or a mapping,
+  which no rename follows: no reflective builtin (getattr, globals), no mapping
+  unpacked into a call, no string spelling a renamed name.
 It then prints each renaming and writes the new digest, and nothing else in the
 recording changes, byte for byte. Whether the library's rename keeps what the
 recording shows (a label, a value it prints) is the head's own claim. Its reviewer
@@ -45,6 +48,7 @@ import json
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 
 import griffe
@@ -58,52 +62,55 @@ import lint_scopes as scopes
 
 SITE = cells.SITE
 REPO = SITE.parent
-VARIABLE, MEMBER = "variable", "member"
-ROLES = {(ast.Name, "id"): VARIABLE, (ast.arg, "arg"): VARIABLE, (ast.FunctionDef, "name"): VARIABLE,
-         (ast.AsyncFunctionDef, "name"): VARIABLE, (ast.ClassDef, "name"): VARIABLE,
-         (ast.Global, "names"): VARIABLE, (ast.Nonlocal, "names"): VARIABLE,
-         (ast.ExceptHandler, "name"): VARIABLE, (ast.MatchAs, "name"): VARIABLE,
-         (ast.MatchStar, "name"): VARIABLE, (ast.MatchMapping, "rest"): VARIABLE,
-         (ast.MatchClass, "kwd_attrs"): MEMBER}
-"""Each identifier of the syntax, by node and field, and what it names: a variable of the program, or an API's
-name, which the program uses but does not bind. An attribute, an import and a call's keyword are read apart,
-each with what holds it."""
+REFLECTION = frozenset({"getattr", "setattr", "delattr", "hasattr", "vars", "globals", "locals", "exec",
+                        "eval", "__import__"})
+"""The builtins that read or bind a name spelled as a string, which no rename follows."""
+
+
+def tables(program: ast.Module) -> dict[int, Mapping[str, str]]:
+    """What each name imported in the scope of each node of `program` stands for (lint_scopes.scoped: a
+    parameter, an assignment or a definition there stands for no import), keyed by the node's identity. A
+    name the program declares global or nonlocal anywhere stands for none: the scope that rebinds it is
+    another's."""
+    rebound = {name for node in ast.walk(program) if isinstance(node, ast.Global | ast.Nonlocal)
+               for name in node.names}
+    return {id(node): {name: path for name, path in table.items() if name not in rebound}
+            for node, table in scopes.scoped(program.body, {}, ())}
 
 
 class Renaming:
-    """The renamings between two parsed programs: each variable to its one new name, injectively, and each
-    changed API name with what holds it on each side (`changes`), which a declared rename must account for."""
+    """How the program at the head renames base's: every name, value and form the same, but for the names of
+    Dew's API it uses, each reached through an import in the scope that uses it, which change only as a
+    declared rename gives them (`changes`), and in full."""
 
-    def __init__(self, before: ast.Module, after: ast.Module):
-        self.variables: dict[str, str] = {}
+    def __init__(self, before: ast.Module, after: ast.Module, declared: Declared):
+        self.declared = declared
+        self.tables = (tables(before), tables(after))
         self.changes: list[tuple[str, str, int]] = []
-        """Each API name the program changes, as the dotted path it reaches on each side ("" where the program
-        does not show what holds it), and its line."""
-        self.loose: list[tuple[str, int]] = []
-        """Each keyword passed to a callable the program does not show, kept as it was, and its line."""
-        self.before, self.after = Callables(before), Callables(after)
-        self.held = (scopes.imports(before, []), scopes.imports(after, []))
+        """Each name of Dew's API the program changes, as the dotted path it reaches on each side, and its
+        line."""
 
-    def name(self, role: str, was: str | None, now: str | None, line: int) -> None:
-        if (was is None) != (now is None):
-            raise ValueError(f"line {line}: {was!r} became {now!r}")
-        if was is None:
-            return
-        if role == MEMBER:
-            if was != now:
-                self.changes.append(("", "", line))
-            return
-        if self.variables.setdefault(was, now) != now:
-            raise ValueError(f"line {line}: the variable {was!r} became both {self.variables[was]!r} and "
-                             f"{now!r}")
+    def reached(self, was: ast.expr, now: ast.expr) -> tuple[str, str]:
+        """The dotted paths `was` and `now` reach through the imports of their scopes; "" for one reaching
+        none."""
+        return (scopes.resolved(was, self.tables[0].get(id(was), {})),
+                scopes.resolved(now, self.tables[1].get(id(now), {})))
 
-    def member(self, paths: tuple[str, str], spelled: tuple[str, str], line: int) -> None:
-        """An API name, spelled on each side as `spelled`, at the dotted path it reaches on each (`paths`)."""
-        if spelled[0] != spelled[1] or paths[0].rsplit(".", 1)[0] != paths[1].rsplit(".", 1)[0]:
+    def use(self, spelled: tuple[str, str], paths: tuple[str, str], line: int) -> None:
+        """One use of a name, spelled on each side as `spelled`, reaching the dotted paths `paths`: a changed
+        one is a name of Dew's API renamed as declared; an unchanged one is not a name of base's Dew that the
+        head's no longer defines."""
+        if spelled[0] != spelled[1] or paths[0] != paths[1]:
+            if not self.declared.accounts_for(*paths):
+                raise ValueError(f"line {line}: {paths[0] or spelled[0]} became {paths[1] or spelled[1]}, "
+                                 "which no --rename of Dew's API declares")
             self.changes.append((*paths, line))
+        elif self.declared.vanished(paths[0]):
+            raise ValueError(f"line {line}: {paths[0]} is left as it was, which the head's Dew no longer "
+                             "defines")
 
     def compare(self, was: object, now: object, line: int = 0) -> None:
-        """`now` is `was` up to the renamings; a ValueError at the first other difference."""
+        """`now` is `was` up to the declared renames; a ValueError at the first other difference."""
         if type(was) is not type(now):
             raise ValueError(f"line {line}: {type(was).__name__} became {type(now).__name__}")
         if isinstance(was, list):
@@ -111,142 +118,60 @@ class Renaming:
                 raise ValueError(f"line {line}: {len(was)} items became {len(now)}")
             for before, after in zip(was, now, strict=True):
                 self.compare(before, after, line)
+        elif isinstance(was, ast.Name):
+            line = was.lineno
+            self.compare(was.ctx, now.ctx, line)
+            self.use((was.id, now.id), self.reached(was, now), line)
+        elif isinstance(was, ast.Attribute):
+            line = was.lineno
+            self.compare([was.value, was.ctx], [now.value, now.ctx], line)
+            self.use((was.attr, now.attr), self.reached(was, now), line)
         elif isinstance(was, ast.Call):
             line = was.lineno
             self.compare([was.func, was.args], [now.func, now.args], line)
             if len(was.keywords) != len(now.keywords):
                 raise ValueError(f"line {line}: {len(was.keywords)} keywords became {len(now.keywords)}")
+            owners = self.reached(was.func, now.func)
             for one, other in zip(was.keywords, now.keywords, strict=True):
-                self.keyword(one.arg, other.arg, (was.func, now.func), line)
+                if (one.arg is None) != (other.arg is None):
+                    raise ValueError(f"line {line}: a keyword became a mapping unpacked, or one the other")
+                if one.arg is not None:
+                    paths = tuple(f"{owner}.{name}" if owner else ""
+                                  for owner, name in zip(owners, (one.arg, other.arg), strict=True))
+                    self.use((one.arg, other.arg), paths, line)
                 self.compare(one.value, other.value, line)
-        elif isinstance(was, ast.Attribute):
-            line = was.lineno
-            self.compare([was.value, was.ctx], [now.value, now.ctx], line)
-            self.member(self.reached(was, now), (was.attr, now.attr), line)
-        elif isinstance(was, (ast.Import, ast.ImportFrom)):
+        elif isinstance(was, ast.Import | ast.ImportFrom):
             line = was.lineno
             modules = (getattr(was, "module", None) or "", getattr(now, "module", None) or "")
             if getattr(was, "level", 0) != getattr(now, "level", 0) or len(was.names) != len(now.names):
                 raise ValueError(f"line {line}: an import became another")
             for one, other in zip(was.names, now.names, strict=True):
-                # `import a.b` binds the package a, `import a.b as m` the module a.b: an alias there is no
-                # rename.
-                if "." in one.name and (one.asname is None) != (other.asname is None):
-                    raise ValueError(f"line {line}: an alias on import {one.name} binds another module")
+                if one.asname != other.asname:
+                    raise ValueError(f"line {line}: the name an import binds became another")
                 paths = tuple(".".join(part for part in (module, alias.name) if part)
                               for module, alias in zip(modules, (one, other), strict=True))
-                self.member(paths, paths, line)
-                bound = (alias.asname or alias.name.split(".")[0] for alias in (one, other))
-                self.name(VARIABLE, *bound, line)
+                self.use((one.name, other.name), paths, line)
         elif isinstance(was, ast.AST):
             line = getattr(was, "lineno", line)
             for field, before in ast.iter_fields(was):
-                after = getattr(now, field, None)
-                role = ROLES.get((type(was), field))
-                if role is not None:
-                    names, renames = (item if isinstance(item, list) else [item] for item in (before, after))
-                    if len(names) != len(renames):
-                        raise ValueError(f"line {line}: {names} became {renames}")
-                    for one, other in zip(names, renames, strict=True):
-                        self.name(role, one, other, line)
-                else:
-                    self.compare(before, after, line)
+                self.compare(before, getattr(now, field, None), line)
         elif was != now:
             raise ValueError(f"line {line}: {was!r} became {now!r}, not a rename")
 
-    def reached(self, was: ast.expr, now: ast.expr) -> tuple[str, str]:
-        """The dotted paths `was` and `now` reach through the programs' imports; "" for one reaching none."""
-        return scopes.resolved(was, self.held[0]), scopes.resolved(now, self.held[1])
-
-    def keyword(self, was: str | None, now: str | None, callees: tuple[ast.expr, ast.expr],
-                line: int) -> None:
-        """A call's keyword, on each side. To a callable the program defines and calls by its name, a
-        parameter it binds (a variable, which renames with the parameter) or a key its **kwargs collects
-        (kept as it is), binding on both sides or on neither. To one an import reaches, an API's name, under
-        that callable. To any other (a method, an alias, a builtin), kept as it is: which parameter it binds
-        is not shown."""
-        if was is None or now is None:  # a mapping unpacked into the call: **options
-            self.name(MEMBER, was, now, line)
-            return
-        callee, renamed = (node.id if isinstance(node, ast.Name) else None for node in callees)
-        if callee in self.before.signatures and callee not in self.held[0]:
-            bound = (was in self.before.signatures[callee], now in self.after.signatures.get(renamed, set()))
-            if bound[0] != bound[1]:
-                raise ValueError(f"line {line}: the keyword {was!r} became {now!r}, which binds a parameter "
-                                 "on one side only")
-            if bound[0]:
-                self.name(VARIABLE, was, now, line)
-            elif was != now:
-                raise ValueError(f"line {line}: the key {was!r} a **kwargs collects became {now!r}")
-            return
-        owners = self.reached(*callees)
-        if all(owners):
-            self.member((f"{owners[0]}.{was}", f"{owners[1]}.{now}"), (was, now), line)
-        elif was != now:
-            raise ValueError(f"line {line}: the keyword {was!r} became {now!r}, to a callable the program "
-                             "does not show")
-        else:
-            self.loose.append((was, line))
-
-    def check(self, after: str, declared: Declared) -> None:
-        """Every variable renamed to a name of its own; every API name changed as a rename `declared` gives
-        it, at what holds it; no keyword left to an unshown callable spells a parameter the program renames;
-        the renamed program compiles."""
-        bound = list(self.variables.values())
-        if len(set(bound)) != len(bound):
-            twice = sorted({name for name in bound if bound.count(name) > 1})
-            raise ValueError(f"two variables became one: {', '.join(twice)}")
-        for was, now, line in self.changes:
-            if not declared.accounts_for(was, now):
-                raise ValueError(f"line {line}: {was or 'an API name'} became {now or 'another'}, which no "
-                                 "--rename of Dew's API declares")
-        renamed = {name for was, now in self.variables.items() if was != now and was in self.before.parameters
-                   for name in (was, now)}
-        for was, line in self.loose:
-            if was in renamed:
-                raise ValueError(f"line {line}: the keyword {was!r} to a callable the program does not show "
-                                 "spells a parameter it renames")
-        compile(after, "<program>", "exec")
+    def check(self, after: ast.Module) -> None:
+        """Where the program's names of Dew's change, nothing in it reads a name from a string, which no
+        rename follows: no reflective builtin, no mapping unpacked into a call, no string spelling a renamed
+        name."""
+        renamed = {was.rpartition(".")[2] for was, _, _ in self.changes}
+        for node in ast.walk(after) if self.changes else ():
+            if ((isinstance(node, ast.Name) and node.id in REFLECTION)
+                    or (isinstance(node, ast.keyword) and node.arg is None)
+                    or (isinstance(node, ast.Constant) and node.value in renamed)):
+                raise ValueError(f"line {node.lineno}: {ast.unparse(node)} reads a name from a string or a "
+                                 "mapping, which the rename does not follow")
 
     def printed(self) -> str:
-        names = {f"{was} -> {now}" for was, now in self.variables.items() if was != now}
-        names |= {f"{was} -> {now}" for was, now, _ in self.changes}
-        return ", ".join(sorted(names))
-
-
-class Callables:
-    """What a program defines that a call's keyword can bind: each function, class and lambda it names, with
-    the parameters a keyword binds (`signatures`: a function's own, but those only by position; a class's
-    __init__'s, but its first; a class with no __init__ of its own, none; a name defined twice, those both
-    definitions share), and every parameter of every callable it defines (`parameters`)."""
-
-    def __init__(self, program: ast.Module):
-        self.signatures: dict[str, set[str]] = {}
-        for node in ast.walk(program):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                named, names = node.name, set(keywords(node.args, bound=False))
-            elif isinstance(node, ast.ClassDef):
-                init = next((item for item in node.body if isinstance(item, ast.FunctionDef)
-                             and item.name == "__init__"), None)
-                named, names = node.name, set() if init is None else set(keywords(init.args, bound=True))
-            elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Lambda):
-                for target in node.targets:
-                    if isinstance(target, ast.Name):
-                        self.define(target.id, set(keywords(node.value.args, bound=False)))
-                continue
-            else:
-                continue
-            self.define(named, names)
-        self.parameters = {node.arg for node in ast.walk(program) if isinstance(node, ast.arg)}
-
-    def define(self, name: str, names: set[str]) -> None:
-        self.signatures[name] = self.signatures[name] & names if name in self.signatures else names
-
-
-def keywords(arguments: ast.arguments, bound: bool) -> list[str]:
-    """The parameters a keyword passes a callable of `arguments`, its first left out where it is `bound`."""
-    positional = arguments.args[1:] if bound else arguments.args
-    return [arg.arg for arg in (*positional, *arguments.kwonlyargs)]
+        return ", ".join(sorted({f"{was} -> {now}" for was, now, _ in self.changes}))
 
 
 class Declared:
@@ -272,7 +197,18 @@ class Declared:
         return gen_api.canonical(self.models[0], old), gen_api.canonical(self.models[1], new)
 
     def accounts_for(self, was: str, now: str) -> bool:
-        return bool(self.models) and bool(was) and bool(now) and self.at(was, now) in self.pairs
+        """Whether a use reaching `was` at the base and `now` at the head is a declared rename: of the name
+        itself, or of what holds it, the name kept (a renamed class's field)."""
+        if not (self.models and was and now) or None in (found := self.at(was, now)):
+            return False
+        held, _, name = was.rpartition(".")
+        holder, _, kept = now.rpartition(".")
+        return found in self.pairs or (name == kept and bool(held) and self.accounts_for(held, holder))
+
+    def vanished(self, path: str) -> bool:
+        """Whether `path`, a name of base's Dew, is no name of the head's."""
+        return bool(self.models and path) and gen_api.canonical(self.models[0], path) is not None and (
+            gen_api.canonical(self.models[1], path) is None)
 
 
 def api_model(revision: str) -> griffe.Module:
@@ -289,11 +225,11 @@ def renamed(before: str, after: str, declared: Declared) -> Renaming:
     otherwise."""
     try:
         was, now = ast.parse(before), ast.parse(after)
-        renaming = Renaming(was, now)
+        renaming = Renaming(was, now, declared)
         renaming.compare(was, now)
-        renaming.check(after, declared)
+        renaming.check(now)
     except SyntaxError as error:
-        raise ValueError(f"the renamed program does not compile: {error}") from error
+        raise ValueError(f"a program does not parse: {error}") from error
     return renaming
 
 
