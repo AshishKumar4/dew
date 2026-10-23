@@ -25,7 +25,7 @@ block, and that is where a linear-attention mixer goes.
 import dataclasses
 import functools
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import ClassVar, Literal, Self
 
 import flax.core
@@ -44,6 +44,7 @@ from ..activations import GatedActivation, Situ, ungated_activation
 from ..attention import RMSNorm
 from ..attention_residuals import AttentionResiduals, DepthAttention
 from ..blocks import TokenEmbedding, normal_kernel
+from ..cross_attention import CrossAttention, GatedCrossAttention
 from ..deepseek_v4 import DeepseekV4Mixer
 from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..dspark import DSpark, DSparkStage, draft as dspark_draft
@@ -62,6 +63,7 @@ from ..hyper_connections import (
 from ..inputs import (
     AttentionMetadata,
     Coordinates,
+    CrossContext,
     LayerInputs,
     PredictionPhase,
     coordinates as build_coordinates,
@@ -366,6 +368,10 @@ class CausalTransformer(nn.Module):
     the `constants` collection. A loaded checkpoint derives it from its
     tokenizer, and a fresh model fills it with each id modulo the compressed
     vocabulary's size."""
+    cross_attention: CrossAttention | None = None
+    """The layers that read a conditioning sequence through Flamingo's gated
+    cross-attention (`dew.nn.cross_attention`), before their own sublayers; None
+    for a model without them. A call passes the sequence as its `conditioning`."""
     dspark: DSpark | None = None
     """DeepSeek's block drafter (`dew.nn.dspark`, V4.1 and V4-Flash-0731), or
     None for a model without one. Its stages are decoder blocks that attend
@@ -862,6 +868,7 @@ class CausalTransformer(nn.Module):
                 "altup and hyper_connections each carry their own stack of residual "
                 "copies through the layers, so a model has one or the other")
         self.refuse_unbuildable_stream_fields()
+        self.refuse_unbuildable_cross_attention()
         if self.swiglu_limit is not None and self.swiglu_limit <= 0:
             raise ValueError(
                 f"swiglu_limit caps the gate and up projections, so it is positive, "
@@ -871,6 +878,25 @@ class CausalTransformer(nn.Module):
             raise ValueError(
                 f"mask_token_id names a vocabulary id, got {mask!r}; None is a "
                 "model trained on plain next-token prediction")
+
+    def refuse_unbuildable_cross_attention(self):
+        """Raise `ValueError` where `cross_attention` names a layer this model lacks, a residual
+        it does not add to, or a layer with no feed-forward width to take."""
+        cross = self.cross_attention
+        if cross is None:
+            return
+        outside = sorted(set(cross.layer_ids) - set(range(self.num_layers)))
+        if outside:
+            raise ValueError(f"cross-attention layers {outside} are outside the {self.num_layers} layers")
+        carried = [name for name in ("altup", "hyper_connections", "attention_residuals", "ngpt")
+                   if getattr(self, name) is not None]
+        if carried:
+            raise ValueError(f"cross-attention adds to the one plain residual stream, and {carried} "
+                             "carry another")
+        unsized = sorted(index for index in cross.layer_ids if not self.mlp_widths[index])
+        if cross.intermediate_size is None and unsized:
+            raise ValueError(f"layers {unsized} have no feed-forward whose width the cross-attention "
+                             "block takes; name its intermediate_size")
 
     def refuse_unbuildable_stream_fields(self):
         """Raise `ValueError` for settings on mHC's residual streams that cannot be
@@ -936,7 +962,8 @@ class CausalTransformer(nn.Module):
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
-        """Real-row hidden-state work, summing the same block factories as setup."""
+        """Real-row hidden-state work, summing the same block factories as setup. A context's
+        cross-attention work is `cross_flops`, which needs the context's lengths."""
         return (self._layer_flops(lengths, counted_flops)
                 + self._root_flops(lengths, DepthAttention.depth_flops))
 
@@ -1219,6 +1246,7 @@ class CausalTransformer(nn.Module):
                                else self.attention_residuals.site(index)),
                 engram=(None if self.engram is None or index not in self.engram.layer_ids
                         else self.engram.layer_ids.index(index)),
+                cross=self.cross_attention is not None and index in self.cross_attention.layer_ids,
                 prediction_target=(index if self.dspark is not None and index in self.dspark.target_layers
                                    else None),
                 attention_norm=index > 0 or self.first_attention_norm)
@@ -1256,6 +1284,7 @@ class CausalTransformer(nn.Module):
                 emb_features=self.emb_features, norm_eps=self.norm_eps,
                 dtype=self.dtype, precision=self.precision),
             engram_index=spec.engram,
+            cross=self._cross_layer(index, gated_mlp) if spec.cross else None,
             prediction_target=spec.prediction_target is not None,
             prediction_site='input' if self.dspark is None else self.dspark.reads,
             attention_norm=spec.attention_norm,
@@ -1279,6 +1308,38 @@ class CausalTransformer(nn.Module):
             dtype=self.dtype,
             precision=self.precision,
             name=name)
+
+    @nn.nowrap
+    def _cross_layer(self, index: int, gated_mlp) -> Callable[..., GatedCrossAttention]:
+        """Layer `index`'s gated cross-attention factory: the model's norms, its gated MLP at the
+        block's width, its attention's heads, kernel and dtypes."""
+        cross = self.cross_attention
+        assert cross is not None
+        return functools.partial(
+            GatedCrossAttention,
+            norm=decoder_norm(self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
+                              scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
+                              dtype=self.dtype, specs=self.norms),
+            feedforward=functools.partial(
+                gated_mlp, hidden_features=cross.intermediate_size or self.mlp_widths[index]),
+            emb_features=self.emb_features,
+            context_features=cross.context_features or self.emb_features,
+            context_length=cross.context_length, heads=self.num_heads, kv_heads=self.kv_heads,
+            head_dim=self.features_per_head, dropout_rate=self.dropout_rate,
+            attention_impl=self.attention_impl, force_fp32_for_softmax=self.force_fp32_for_softmax,
+            dtype=self.dtype, precision=self.precision)
+
+    @nn.nowrap
+    def cross_flops(self, lengths, context_lengths) -> float:
+        """The cross-attention blocks' work over rows of `lengths` tokens reading contexts of
+        `context_lengths` tokens (`GatedCrossAttention.cross_flops`), which `model_flops`
+        leaves out: a call without a context runs none of it."""
+        cross = self.cross_attention
+        if cross is None:
+            return 0.0
+        gated_mlp = self.feedforward_factories()[0]
+        return sum(self._cross_layer(index, gated_mlp)(parent=None).cross_flops(lengths, context_lengths)
+                   for index in cross.layer_ids)
 
     @nn.nowrap
     def _prediction_depths(self, types: Sequence[str], kinds: dict[str, ResolvedKind], mixer_spec,
@@ -1408,13 +1469,13 @@ class CausalTransformer(nn.Module):
                  input_embeddings=None,
                  attention_mask=None, image_groups=None, rotary_positions=None,
                  attention_pairwise_mask=None, attention_key_positions=None, right_padded: bool = False,
-                 coordinates: Coordinates | None = None):
+                 coordinates: Coordinates | None = None, conditioning: Mapping[str, jax.Array] | None = None):
         x, prediction = self.hidden_and_mtp_inputs(
             tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
             input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
             rotary_positions=rotary_positions, attention_pairwise_mask=attention_pairwise_mask,
             attention_key_positions=attention_key_positions, right_padded=right_padded,
-            coordinates=coordinates)
+            coordinates=coordinates, conditioning=conditioning)
         if self.is_initializing() and self.dspark is not None:
             self.reach_drafter(tokens, x.dtype)
         if self.is_initializing() and self.mtp:
@@ -1712,7 +1773,8 @@ class CausalTransformer(nn.Module):
                               attention_mask=None, image_groups=None, rotary_positions=None,
                               attention_pairwise_mask=None, attention_key_positions=None,
                               routed_experts=None, routed=None, media_mask=None, admitted=None,
-                              right_padded: bool = False, coordinates: Coordinates | None = None):
+                              right_padded: bool = False, coordinates: Coordinates | None = None,
+                              conditioning: Mapping[str, jax.Array] | None = None):
         """Return the final normalized states and the prediction depths' input.
 
         V4's depth reads the raw residual streams from before the collapse head
@@ -1745,11 +1807,15 @@ class CausalTransformer(nn.Module):
           the batch's builder made them (`dew.nn.inputs.coordinates`, with the
           packer's `max_segments`); where None they are built here from
           `segment_ids`, `attention_mask`, `positions` and `right_padded`.
+        - `conditioning` carries the sequence the `cross_attention` layers read
+          (`dew.nn.inputs.CONTEXT`) and its rows' lengths (`CONTEXT_LENGTHS`).
+          A cached call that carries it keeps its keys and values for the
+          calls after it. A model without cross-attention takes none.
         """
         attention_metadata = self._attention_metadata(
             tokens, decode, positions, segment_ids, attention_mask, image_groups, rotary_positions,
             attention_pairwise_mask, attention_key_positions, media_mask, admitted, right_padded,
-            coordinates)
+            coordinates, conditioning)
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.
@@ -1813,12 +1879,20 @@ class CausalTransformer(nn.Module):
                             rotary_positions, pairwise_mask, key_positions,
                             media_mask, admitted=None,
                             right_padded: bool = False,
-                            coordinates: Coordinates | None = None) -> AttentionMetadata | None:
+                            coordinates: Coordinates | None = None,
+                            conditioning: Mapping[str, jax.Array] | None = None) -> AttentionMetadata | None:
         """What the layers read beside the residual, None for a call that
         carries none of it: the masks and positions `hidden_and_mtp_inputs`
         takes, the token ids a hash router selects by, the engram layers'
-        bucket ids, and the media mask, which only a model with engram or a
-        router with a media bias reads."""
+        bucket ids, the media mask, which only a model with engram or a
+        router with a media bias reads, and the cross-attention's context."""
+        if conditioning and self.cross_attention is None:
+            raise TypeError(f"this decoder has no cross-attention to read the conditioning "
+                            f"{sorted(conditioning)}")
+        context = CrossContext.from_conditioning(conditioning) if conditioning else None
+        if context is not None and context.embeddings.shape[0] != tokens.shape[0]:
+            raise ValueError(f"a context row per token row, got {context.embeddings.shape[0]} for "
+                             f"{tokens.shape[0]}")
         # A layer whose mixer reads no pairwise mask refuses one (`MixerCall`).
         if key_positions is not None and pairwise_mask is None:
             raise ValueError("attention_key_positions requires attention_pairwise_mask")
@@ -1842,13 +1916,14 @@ class CausalTransformer(nn.Module):
             block)
         if (coordinates is None and image_groups is None and rotary_positions is None
                 and pairwise_mask is None and key_positions is None and not self.hash_layers
-                and engram_ids is None and media_mask is None and admitted is None and blocks is None):
+                and engram_ids is None and media_mask is None and admitted is None and blocks is None
+                and context is None):
             return None
         return AttentionMetadata(
             coordinates=coordinates, image_groups=image_groups, rotary_positions=rotary_positions,
             pairwise_mask=pairwise_mask, key_positions=key_positions,
             token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids, media=media_mask,
-            admitted=admitted, blocks=blocks, routing_block=block)
+            admitted=admitted, blocks=blocks, context=context, routing_block=block)
 
     def looped(self, x, **stack):
         """Run the layer stack over `x` once, or as `loop` says: the layers before
@@ -2325,6 +2400,10 @@ class CausalTransformer(nn.Module):
         return clamped_predictions(params, self.altup.coef_clip)
 
     @nn.nowrap
+    def with_cross_attention(self, cross: CrossAttention | None) -> Self:
+        """This decoder with `cross` as its cross-attention layers (`CrossAttending`), None for none."""
+        return self.clone(cross_attention=cross)
+
     def with_remat(self, policy: RematPolicy | None) -> Self:
         """Start at `policy`, including policies outside `DECODER_REMAT`.
 

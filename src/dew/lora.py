@@ -82,7 +82,7 @@ from dew.nn.protocols import (
     CountedVideo,
 )
 from dew.nn.sharding import LOW_RANK_FACTORS
-from dew.objectives.base import FROZEN, Path, Variables, freeze, merge as overlay, select, thaw
+from dew.objectives.base import FROZEN, Path, Variables, freeze, merge as overlay, select, thaw, training
 from dew.quantization import (
     FROZEN_FP8,
     QUANTIZATION,
@@ -191,6 +191,7 @@ class LoRA:
         _refuse_unadaptable(model)
         if fp8_base is not None:
             model = fp8_base.joined(model)
+        trained = training(variables)
         variables = thaw(variables)
         bound = _named(bound_layouts(model, variables, layouts or {}), self.modules)
         scaling = 2.0 * self.rank if self.alpha is None else float(self.alpha)
@@ -205,7 +206,7 @@ class LoRA:
                             INIT_B(factor_key, shape_b, FACTOR_DTYPE))
         bases = {} if base is None else dict.fromkeys(_components(bound) or {""}, base)
         return Adapter.bound(model, overlay(variables, leaves), targets, self.rslora, self.dropout, bound,
-                             bases)
+                             bases, trained)
 
     def fp8_base(self, model: nn.Module, variables: Variables, *, tokens: int,
                  modules: Sequence[str] | None = None,
@@ -237,6 +238,7 @@ class LoRA:
         and PEFT features this loader does not support are refused by name.
         """
         _refuse_unadaptable(model)
+        trained = training(variables)
         variables = thaw(variables)
         bound = bound_layouts(model, variables, layouts or {})
         path = FilePath(path)
@@ -245,13 +247,13 @@ class LoRA:
             config = _Config.read(json.loads(FilePath(where).read_text()), where)
             tensors, _ = read_file(path / PEFT_WEIGHTS)
             return _place(model, bound, variables, _entries(_components(bound), tensors, {"": config},
-                                                            PEFT_PREFIX))
+                                                            PEFT_PREFIX), trained)
         file = path if path.is_file() else path / DIFFUSERS_WEIGHTS
         if not file.is_file():
             raise FileNotFoundError(f"{path} holds neither {PEFT_WEIGHTS} nor {DIFFUSERS_WEIGHTS}")
         tensors, metadata = read_file(file)
         configs = _diffusers_configs(tensors, metadata.get(DIFFUSERS_METADATA), str(file))
-        return _place(model, bound, variables, _entries(_components(bound), tensors, configs, ""))
+        return _place(model, bound, variables, _entries(_components(bound), tensors, configs, ""), trained)
 
 
 @dataclass(frozen=True)
@@ -318,15 +320,19 @@ class Adapter:
     @classmethod
     def bound(cls, model: nn.Module, variables: Variables, targets: Mapping[Path, Target], rslora: bool,
               dropout: float, layouts: Mapping[str, WeightLayout],
-              bases: Mapping[str, AdapterBase] | None = None) -> Adapter:
+              bases: Mapping[str, AdapterBase] | None = None,
+              trained: frozenset[Path] = frozenset()) -> Adapter:
         """Adapt `model` to `targets` and split `variables` into factors and frozen weights.
 
-        The factors go under `params` and everything else under `FROZEN`. `bases` are the published
-        models its components were bound to (`Adapter.bases`).
+        The factors go under `params`, with the `trained` leaves the source
+        already trained (`training`), such as a cross-attention block's, and
+        everything else under `FROZEN`. `bases` are the published models its
+        components were bound to (`Adapter.bases`).
         """
         adapted = _adapted(model, _Bound(targets, rslora, dropout, layouts, dict(bases or {})))
         factors = {(*path, factor) for path in targets for factor in FACTORS}
-        return cls(adapted, _fp8_packed(model, freeze(thaw(variables), lambda path: path in factors)))
+        return cls(adapted, _fp8_packed(model, freeze(thaw(variables),
+                                                      lambda path: path in factors or path in trained)))
 
     @classmethod
     def from_run(cls, directory: str | FilePath, *, step: int | str | None = None,
@@ -1141,8 +1147,9 @@ def _entries(components: frozenset[str], tensors: Mapping[str, np.ndarray],
 
 
 def _place(model: nn.Module, layouts: Mapping[str, WeightLayout], variables: Variables,
-           entries: Sequence[_Entry]) -> Adapter:
-    """Build the adapter the entries describe, its factors restored into the model's tree."""
+           entries: Sequence[_Entry], trained: frozenset[Path]) -> Adapter:
+    """Build the adapter the entries describe, its factors restored into the model's tree, beside
+    the `trained` leaves the tree already trained."""
     components = _components(layouts)
     settings = {(entry.config.rslora, entry.config.dropout) for entry in entries}
     if len(settings) != 1:
@@ -1180,7 +1187,8 @@ def _place(model: nn.Module, layouts: Mapping[str, WeightLayout], variables: Var
         bound[entry.module] = layout
         _insert_factors(leaves, factors.module, factors.a.restore(entry.a, shape_a),
                         factors.b.restore(entry.b, shape_b))
-    return Adapter.bound(model, overlay(thaw(variables), leaves), targets, rslora, dropout, bound, bases)
+    return Adapter.bound(model, overlay(thaw(variables), leaves), targets, rslora, dropout, bound, bases,
+                         trained)
 
 
 def _diffusers_configs(tensors: Mapping[str, np.ndarray], metadata: str | None,

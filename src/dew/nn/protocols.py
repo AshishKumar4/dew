@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
     from dew.inputs.encoders import ConditionWork
     from dew.nn.backbones.decoder_block import RematPolicy
+    from dew.nn.cross_attention import CrossAttention
     from dew.nn.dit import TextContext
     from dew.nn.dspark import DSpark
     from dew.nn.hyper_connections import HyperConnections
@@ -454,6 +455,16 @@ class RematChoosing(Protocol):
     """
 
     def with_remat(self, policy: RematPolicy | None) -> Self: ...
+
+
+@runtime_checkable
+class CrossAttending(Protocol):
+    """A decoder whose layers can read a conditioning sequence through gated
+    cross-attention (`dew.nn.cross_attention`): CausalTransformer answers this."""
+
+    cross_attention: CrossAttention | None
+
+    def with_cross_attention(self, cross: CrossAttention | None) -> Self: ...
 
 
 @runtime_checkable

@@ -21,6 +21,7 @@ from dew.records import JSON
 from ..activations import GatedActivation, gated_product
 from ..attention import LayerNorm, RMSNorm
 from ..attention_residuals import DepthAttention, ResidualSite, sources
+from ..cross_attention import NAME as CROSS_ATTENTION
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock
 from ..gemma4_moe import Gemma4Experts
@@ -537,7 +538,9 @@ class DecoderBlock(nn.Module):
     the attention residual is divided by sqrt(2).
 
     `engram` first writes the layer's n-gram lookup into the streams, reading
-    the metadata's `engram_ids` at `engram_index`. A DSpark target layer
+    the metadata's `engram_ids` at `engram_index`. `cross` is the layer's gated
+    cross-attention factory (`dew.nn.cross_attention`): its block reads the
+    metadata's `context` and adds to the plain stream before the mixer reads it. A DSpark target layer
     (`prediction_target`) sows the mean of the streams its attention reads, or
     of those it hands on when `prediction_site` is 'output', as
     `prediction_inputs/draft_context`.
@@ -573,6 +576,7 @@ class DecoderBlock(nn.Module):
     media_routed: bool = False  # the feed-forward routes a media span by its own bias
     engram: Callable[..., nn.Module] | None = None  # the layer's EngramLayer factory
     engram_index: int | None = None
+    cross: Callable[..., nn.Module] | None = None  # the layer's GatedCrossAttention factory
     prediction_target: bool = False  # records its streams' mean for DSpark
     prediction_site: Literal['input', 'output'] = 'input'  # where `prediction_target` records
     attention_norm: bool = True  # False: the attention reads its input unnormed (ModernBERT's first block)
@@ -729,6 +733,8 @@ class DecoderBlock(nn.Module):
                 raise ValueError("an engram lookup gates into mHC's residual streams and reads "
                                  "one engram layer's bucket ids, so it needs both")
             self.engram_layer = self.engram(name='engram')
+        if self.cross is not None:
+            self._cross_block(self.cross)
         self.dropout = nn.Dropout(rate=self.dropout_rate)
 
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
@@ -795,6 +801,12 @@ class DecoderBlock(nn.Module):
         every form.
         """
         state = self._enter(x, train, attention_metadata)
+        if self.cross is not None:
+            # Only the plain form admits cross-attention (setup refuses the rest).
+            assert isinstance(state, _Plain)
+            context = None if attention_metadata is None else attention_metadata.context
+            state = state._replace(x=constrain(
+                self.cross_attention(state.x, context, decode=decode, train=train), RESIDUAL))
         state, read, site = self._read(state, "attention")
         if not (self.wiring.pre_norms and self.attention_norm):
             normed = read
@@ -933,6 +945,14 @@ class DecoderBlock(nn.Module):
             state = _Depth(state.blocks.at[:, :, state.finished].set(state.partial), state.partial,
                            state.finished + 1)
         return state, read, None
+
+    def _cross_block(self, cross: Callable[..., nn.Module]):
+        """The gated cross-attention block, which adds to the plain stream alone."""
+        if (self.hyper_connections is not None or self.residual_site is not None or self.altup is not None
+                or self.wiring.ngpt is not None):
+            raise ValueError("cross-attention adds to the plain residual stream: it takes no "
+                             "hyper-connections, depth mixture, altup or nGPT steps")
+        self.cross_attention = cross(name=CROSS_ATTENTION)
 
     def _ngpt_rates(self, ngpt: NGPT):
         """nGPT's per-feature step rates, one a sublayer, each stored from its initializer's scale
