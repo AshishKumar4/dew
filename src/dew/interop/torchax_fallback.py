@@ -45,7 +45,7 @@ from dew.interop.pickles import host_view
 from dew.interop.pretrained import PretrainedFallback, source_processor
 from dew.interop.weights import AUTO
 from dew.nn.precision import configured_precision, float32_products
-from dew.nn.protocols import OutputTable
+from dew.nn.protocols import Lacks, OutputTable
 from dew.nn.sharding import LogicalAxes, Suffix, parameter_path
 from dew.registry import resolve_dtype
 from dew.training.distributed import Layout
@@ -471,9 +471,9 @@ def _refuse_packing(packing: Mapping[str, object]) -> None:
     """Refuse every field past the tokens: transformers' forward takes whole
     plain rows, with no packing columns and no cache."""
     if packing:
-        raise ValueError(
-            f"a torchax model runs transformers' forward over whole plain token rows, with no cache, "
-            f"which takes no {sorted(packing)}; train it on unpacked rows without packing columns")
+        raise Lacks("packing",
+                    f"a torchax model runs transformers' forward over whole plain token rows, with no cache, "
+                    f"which takes no {sorted(packing)}; train it on unpacked rows without packing columns")
 
 
 def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtype: str,

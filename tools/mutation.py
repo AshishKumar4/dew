@@ -14,9 +14,9 @@ import time
 from collections import Counter
 from pathlib import Path
 
-# The tests CI selects (tools/armada/ci.py), which a mutant's tests are too.
+# The tests CI selects (tools/armada/session.py), which a mutant's tests are too.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "armada"))
-from ci import SELECTION
+from session import SELECTION
 
 
 @dataclasses.dataclass(frozen=True)
