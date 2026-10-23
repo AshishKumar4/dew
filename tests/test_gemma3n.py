@@ -196,6 +196,13 @@ def clipped_gemma3n():
     return loaded, loaded.model.clone(altup=dataclasses.replace(loaded.model.altup, coef_clip=clip)), clip
 
 
+def exported(loaded, params) -> dict:
+    """`params`, a tree of the loaded decoder's parameters' shape (its parameters or their gradient), as
+    the source's float32 tensors by name (`Pretrained.export`)."""
+    tensors = loaded.export({**loaded.variables, "params": params})
+    return {name: np.asarray(value, np.float32) for name, value in tensors.items()}
+
+
 def reference_decoder(directory, clip, dtype, sparsity=None):
     """The source's Gemma3nForCausalLM with its AltUp clip at `clip`, in `dtype` (float64 built under
     `float64`, the norm's and the router's float32 pins widened), its gaussian top-k at `sparsity` where
@@ -275,8 +282,7 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
         return model.projected(optax.apply_updates(stored, update), updated=True)
 
     def stepped(rows, gradient):
-        trained = loaded.export({**loaded.variables, "params": updated(rows, gradient)})
-        return {name: np.asarray(trained[name], np.float32) for name in names}
+        return exported(loaded, updated(rows, gradient))
 
     references = {dtype: reference_decoder(loaded.source, clip, dtype)
                   for dtype in (torch.float32, torch.float64)}
@@ -349,8 +355,7 @@ def test_the_dense_decoders_gradient_is_the_references():
         return gradient
 
     def differentiated(rows, one):
-        exported = loaded.export({**loaded.variables, "params": gradient_of(rows, one)})
-        return {name: np.asarray(exported[name], np.float32) for name in names}
+        return exported(loaded, gradient_of(rows, one))
 
     def reference(dtype, rows, one):
         reference = references[dtype]
