@@ -194,7 +194,7 @@ def main() -> None:
     arguments = options.arguments[1:] if options.arguments[:1] == ["--"] else options.arguments
     if options.cell:
         code = cells.cell(options.cell)
-        target = SITE / "public/examples/framework" / options.cell
+        target = (SITE / cells.recordings()[options.cell][0]).parent
         work = Path(tempfile.mkdtemp(prefix=f"cell-{options.cell}-"))
         script = work / f"{options.cell}.py"
         script.write_text(code + "\n")

@@ -8,14 +8,23 @@ recording's digest, and keeps the outputs:
 
     python site/scripts/redigest.py [--base origin/main]
 
-For each recording whose program differs from what its digest names, this checks
-two things. First, the recording is of `base`'s program: its digest matches that
-program. Second, the program differs from it only by identifiers: the same tokens
-in the same order, with numbers, strings, operators and keywords unchanged. An
-API's names (an attribute after `.`, a keyword argument before `=`) may be renamed
-where they are used. A variable's name is renamed everywhere it appears, to one
-name the program did not use, so every use still means what it meant. It then
-prints each renaming and writes the new digest. Nothing else in the recording changes.
+The programs and the captures that name their digests are site/snippets/cells.py's,
+the page's one declaration of both. For each recording whose program differs from
+what its digest names, this checks two things. First, the recording is of `base`'s
+program: its digest matches that program. Second, the program is that one renamed,
+read as Python parses it:
+- every value, string, f-string conversion and literal text, operator and keyword
+  is unchanged;
+- an API's names (a call's keyword argument, an attribute, an imported name) may be
+  renamed where they are used;
+- a variable (a name, a parameter, a function or class it defines, an import's
+  binding) is renamed everywhere, each to its own name, which no other variable of
+  the program had, so every use still means what it meant;
+- the result compiles.
+It then prints each renaming and writes the new digest, and nothing else in the
+recording changes, byte for byte. Whether the library's rename keeps what the
+recording shows (a label, a value it prints) is the head's own claim. Its reviewer
+reads the renamings printed here.
 
 One other change keeps a recording too: the pinned model (site/live/container/
 text-to-image, which site/scripts/gen_pin.py writes everywhere) moved to a revision
@@ -23,103 +32,126 @@ with the same weights. A string that names the base's pinned revision may name t
 new one when the Hub (HF_ENDPOINT) lists the two revisions with the same files and
 every weight object (each LFS file) the same; the other files that differ, a run's
 record for one, are printed for the reviewer.
-Whether the library's rename keeps what the recording shows (a label, a value it
-prints) is the head's own claim. Its reviewer reads the renamings printed here. A
-change that is not a renaming, or a recording that was already of other code,
+
+A change that is not one of these, or a recording that was already of other code,
 writes nothing and says to record again (site/scripts/capture_snippets.py).
 """
 
 from __future__ import annotations
 
 import argparse
-import io
+import ast
 import json
-import keyword
 import os
 import subprocess
 import sys
-import tokenize
 import urllib.request
-from collections.abc import Callable
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "snippets"))
 import cells
 
-SITE = Path(__file__).resolve().parents[1]
+SITE = cells.SITE
 REPO = SITE.parent
-IGNORED = (tokenize.COMMENT, tokenize.NL, tokenize.ENCODING, tokenize.ENDMARKER)
-PIN = "site/live/container/text-to-image"
+PIN = "live/container/text-to-image"
+VARIABLE, MEMBER = "variable", "member"
+ROLES = {(ast.Name, "id"): VARIABLE, (ast.arg, "arg"): VARIABLE, (ast.FunctionDef, "name"): VARIABLE,
+         (ast.AsyncFunctionDef, "name"): VARIABLE, (ast.ClassDef, "name"): VARIABLE,
+         (ast.Global, "names"): VARIABLE, (ast.Nonlocal, "names"): VARIABLE,
+         (ast.ExceptHandler, "name"): VARIABLE, (ast.MatchAs, "name"): VARIABLE,
+         (ast.MatchStar, "name"): VARIABLE, (ast.MatchMapping, "rest"): VARIABLE,
+         (ast.alias, "asname"): VARIABLE, (ast.keyword, "arg"): MEMBER, (ast.Attribute, "attr"): MEMBER,
+         (ast.ImportFrom, "module"): MEMBER, (ast.MatchClass, "kwd_attrs"): MEMBER}
+"""Each identifier of the syntax, by node and field, and what it names: a variable of the program, or an API's
+name, which the program uses but does not bind."""
 
 
-def recordings(read: Callable[[str], str]) -> dict[tuple[str, str], str]:
-    """Each recording's digest, (its capture.json, the digest's key there), to the program it names, as `read`
-    (a path in the repository to its text) has the page's sources (src/pages/index.astro checks the same)."""
-    framework, hero = read("site/snippets/framework.py"), read("site/src/data/hero.py")
-    cell = "site/public/examples/framework/{}/capture.json"
-    return {**{(cell.format(name), "script_sha256"): cells.cell(name, framework)
-               for name in [*cells.CELLS["pool"], *cells.CELLS["colab"]]},
-            ("site/public/examples/text/capture.json", "script_sha256"): read("site/src/data/text.py"),
-            ("site/public/examples/sampler/capture.json", "script_sha256"): read("site/src/data/sampler.py"),
-            ("site/src/data/capture.json", "script_sha256"): hero,
-            ("site/src/data/capture.json", "cell_sha256"): cells.training_example(hero)}
+class Renaming:
+    """The renamings between two parsed programs: each variable to its one new name, injectively, and each
+    API name where it is used; and the pinned revision, where a string names its new one."""
+
+    def __init__(self, moved: tuple[str, str]):
+        self.moved = moved
+        self.variables: dict[str, str] = {}
+        self.members: dict[str, set[str]] = {}
+        self.pin = False
+
+    def name(self, role: str, was: str | None, now: str | None, line: int) -> None:
+        if (was is None) != (now is None):
+            raise ValueError(f"line {line}: {was!r} became {now!r}")
+        if was is None:
+            return
+        if role == MEMBER:
+            if was != now:
+                self.members.setdefault(was, set()).add(now)
+            return
+        if self.variables.setdefault(was, now) != now:
+            raise ValueError(f"line {line}: the variable {was!r} became both {self.variables[was]!r} and "
+                             f"{now!r}")
+
+    def compare(self, was: object, now: object, line: int = 0) -> None:
+        """`now` is `was` up to the renamings; a ValueError at the first other difference."""
+        if type(was) is not type(now):
+            raise ValueError(f"line {line}: {type(was).__name__} became {type(now).__name__}")
+        if isinstance(was, list):
+            if len(was) != len(now):
+                raise ValueError(f"line {line}: {len(was)} items became {len(now)}")
+            for before, after in zip(was, now, strict=True):
+                self.compare(before, after, line)
+        elif isinstance(was, ast.AST):
+            line = getattr(was, "lineno", line)
+            for field, before in ast.iter_fields(was):
+                after = getattr(now, field, None)
+                role = ROLES.get((type(was), field))
+                if role is not None:
+                    names, renames = (item if isinstance(item, list) else [item] for item in (before, after))
+                    if len(names) != len(renames):
+                        raise ValueError(f"line {line}: {names} became {renames}")
+                    for one, other in zip(names, renames, strict=True):
+                        self.name(role, one, other, line)
+                elif isinstance(was, ast.alias) and field == "name":
+                    self.alias(was, now, line)
+                else:
+                    self.compare(before, after, line)
+        elif was != now:
+            if isinstance(was, str) and self.moved[0] in was and was.replace(*self.moved) == now:
+                self.pin = True
+                return
+            raise ValueError(f"line {line}: {was!r} became {now!r}, not a rename")
+
+    def alias(self, was: ast.alias, now: ast.alias, line: int) -> None:
+        """An import's name: an API name, and with no `as`, the variable it binds too (a module's first
+        part)."""
+        self.name(MEMBER, was.name, now.name, line)
+        if was.asname is None and now.asname is None:
+            self.name(VARIABLE, was.name.split(".")[0], now.name.split(".")[0], line)
+
+    def check(self, after: str) -> None:
+        """Every variable renamed to a name of its own; the renamed program compiles."""
+        bound = list(self.variables.values())
+        if len(set(bound)) != len(bound):
+            twice = sorted({name for name in bound if bound.count(name) > 1})
+            raise ValueError(f"two variables became one: {', '.join(twice)}")
+        compile(after, "<program>", "exec")
+
+    def printed(self) -> str:
+        names = {f"{was} -> {now}" for was, now in self.variables.items() if was != now}
+        names |= {f"{was} -> {now}" for was, nows in self.members.items() for now in nows}
+        pin = [f"@{self.moved[0][:9]} -> @{self.moved[1][:9]}"] if self.pin else []
+        return ", ".join(sorted(names) + pin)
 
 
-def stored(capture: dict, key: str) -> str:
-    """The digest `key` of a capture: at its top level for a cell's recording, in its meta for the hero's."""
-    return capture[key] if key in capture else capture["meta"][key]
-
-
-def tokens(source: str) -> list[tuple[tokenize.TokenInfo, bool]]:
-    """`source`'s tokens, each with whether it names an API's member: an attribute (after `.`) or a keyword
-    argument (before `=` in a call's parentheses), rather than a variable."""
-    found = [token for token in tokenize.generate_tokens(io.StringIO(source).readline)
-             if token.type not in IGNORED]
-    marked, brackets = [], []
-    for index, token in enumerate(found):
-        following = found[index + 1].string if index + 1 < len(found) else ""
-        attribute = index > 0 and found[index - 1].string == "."
-        argument = brackets[-1:] == ["("] and following == "="
-        member = token.type == tokenize.NAME and (attribute or argument)
-        marked.append((token, member))
-        if token.string in "([{" and token.type == tokenize.OP:
-            brackets.append(token.string)
-        elif token.string in ")]}" and token.type == tokenize.OP:
-            brackets.pop()
-    return marked
-
-
-def renamings(before: str, after: str, moved: tuple[str, str]) -> dict[str, str]:
-    """The identifiers `after` renames from `before`, old to new, and `moved`, the pinned revision's
-    (old, new), where a string names the new one in place of the old; a ValueError, naming the first other
-    difference, when it differs otherwise."""
-    old, new = tokens(before), tokens(after)
-    if len(old) != len(new):
-        raise ValueError(f"{len(old)} tokens became {len(new)}")
-    renamed: dict[str, str] = {}
-    variables = {token.string for token, member in old if token.type == tokenize.NAME and not member}
-    for (was, member), (now, _) in zip(old, new, strict=True):
-        if (was.type, was.string) == (now.type, now.string):
-            continue
-        if was.type == now.type == tokenize.STRING and moved[0] in was.string and \
-                was.string.replace(*moved) == now.string:
-            renamed.setdefault(*moved)
-            continue
-        if not (was.type == now.type == tokenize.NAME) or any(
-                keyword.iskeyword(name) or keyword.issoftkeyword(name) for name in (was.string, now.string)):
-            raise ValueError(f"line {was.start[0]}: {was.string!r} became {now.string!r}, "
-                             "not an identifier's rename")
-        if renamed.setdefault(was.string, now.string) != now.string:
-            raise ValueError(f"line {was.start[0]}: {was.string!r} became both {renamed[was.string]!r} and "
-                             f"{now.string!r}")
-        if not member and now.string in variables:
-            raise ValueError(f"line {was.start[0]}: the variable {was.string!r} became {now.string!r}, "
-                             "a name the program already used")
-    for (was, member), (now, _) in zip(old, new, strict=True):
-        if not member and was.string in renamed and was.string == now.string:
-            raise ValueError(f"line {was.start[0]}: the variable {was.string!r} kept its name here and "
-                             f"became {renamed[was.string]!r} elsewhere")
-    return renamed
+def renamed(before: str, after: str, moved: tuple[str, str]) -> Renaming:
+    """How `after` renames `before`; a ValueError, naming the first other difference, when it differs
+    otherwise."""
+    renaming = Renaming(moved)
+    try:
+        was, now = ast.parse(before), ast.parse(after)
+        renaming.compare(was, now)
+        renaming.check(after)
+    except SyntaxError as error:
+        raise ValueError(f"the renamed program does not compile: {error}") from error
+    return renaming
 
 
 def weights_kept(repository: str, old: str, new: str) -> list[str]:
@@ -131,18 +163,26 @@ def weights_kept(repository: str, old: str, new: str) -> list[str]:
         with urllib.request.urlopen(url, timeout=60) as answer:
             return {item["path"]: item for item in json.load(answer) if item["type"] == "file"}
 
+    def oid(item: dict) -> str | None:
+        return (item.get("lfs") or {}).get("oid")
+
     was, now = tree(old), tree(new)
     if set(was) != set(now):
         raise ValueError(f"{repository}@{new[:9]} holds other files than @{old[:9]}: "
                          f"{sorted(set(was) ^ set(now))[:5]}")
     weights = [path for path in was if "lfs" in was[path] or "lfs" in now[path]]
-    def oid(item: dict) -> str | None:
-        return (item.get("lfs") or {}).get("oid")
-
     changed = [path for path in weights if oid(was[path]) != oid(now[path])]
     if changed:
         raise ValueError(f"{repository}@{new[:9]} has other weights than @{old[:9]}: {changed[:5]}")
     return sorted(path for path in was if path not in weights and was[path]["oid"] != now[path]["oid"])
+
+
+def digest_of(capture: bytes, key: str) -> str:
+    """The digest a capture names under `key` (dotted: `meta.cell_sha256`)."""
+    value = json.loads(capture)
+    for part in key.split("."):
+        value = value[part]
+    return value
 
 
 def main() -> int:
@@ -152,26 +192,25 @@ def main() -> int:
     options = parser.parse_args()
 
     def at_base(path: str) -> str:
-        return subprocess.run(["git", "-C", str(REPO), "show", f"{options.base}:{path}"], check=True,
+        return subprocess.run(["git", "-C", str(REPO), "show", f"{options.base}:site/{path}"], check=True,
                               capture_output=True, text=True).stdout
 
-    now, before = recordings(lambda path: (REPO / path).read_text()), recordings(at_base)
+    now, before = cells.programs(), cells.programs(at_base)
     repository, old = at_base(PIN).strip().split("@")
-    new = (REPO / PIN).read_text().strip().split("@")[1]
-    moved, kept = (old, new), False
-    captures = {path: json.loads((REPO / path).read_text()) for path, _ in now}
-    digests, refused = {}, []
-    for (path, key), program in now.items():
-        recorded, digest = stored(captures[path], key), cells.digest(program)
+    new = (SITE / PIN).read_text().strip().split("@")[1]
+    captures = {capture: (SITE / capture).read_bytes() for capture, _ in cells.recordings().values()}
+    written = dict(captures)
+    refused, kept = [], False
+    for name, (capture, key) in cells.recordings().items():
+        recorded, digest = digest_of(captures[capture], key), cells.digest(now[name])
         if recorded == digest:
             continue
-        name = f"{Path(path).parent.name} ({key})"
-        if cells.digest(before[path, key]) != recorded:
+        if cells.digest(before[name]) != recorded:
             refused.append(f"{name}: the recording is not of {options.base}'s program either")
             continue
         try:
-            renamed = renamings(before[path, key], program, moved)
-            if old in renamed and not kept:
+            renaming = renamed(before[name], now[name], (old, new))
+            if renaming.pin and not kept:
                 differing = weights_kept(repository, old, new)
                 print(f"{repository}: @{old[:9]} -> @{new[:9]}, the same weights; other files differing: "
                       f"{', '.join(differing) or 'none'}")
@@ -179,19 +218,20 @@ def main() -> int:
         except ValueError as difference:
             refused.append(f"{name}: {difference}")
             continue
-        print(f"{name}: " + ", ".join(f"{a} -> {b}" for a, b in sorted(renamed.items())))
-        digests[path, key] = (recorded, digest)
+        field = f'"{key.rsplit(".", 1)[-1]}": "{recorded}"'.encode()
+        if written[capture].count(field) != 1:
+            refused.append(f"{name}: {capture} names {key} {recorded} other than once")
+            continue
+        written[capture] = written[capture].replace(field, field.replace(recorded.encode(), digest.encode()))
+        print(f"{name}: {renaming.printed()}")
     if refused:
         print("not a rename, so record again (site/scripts/capture_snippets.py):\n  "
               + "\n  ".join(refused), file=sys.stderr)
         return 1
-    for (path, key), (recorded, digest) in digests.items():
-        text = (REPO / path).read_text()
-        written = f'"{key}": "{recorded}"'
-        if text.count(written) != 1:
-            raise ValueError(f"{path} names {key} {recorded} other than once")
-        (REPO / path).write_text(text.replace(written, f'"{key}": "{digest}"'))
-    print(f"{len(digests)} recordings re-digested, their outputs kept")
+    changed = [capture for capture in written if written[capture] != captures[capture]]
+    for capture in changed:
+        (SITE / capture).write_bytes(written[capture])
+    print(f"{len(changed)} captures re-digested, their outputs kept")
     return 0
 
 
