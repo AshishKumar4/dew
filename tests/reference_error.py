@@ -116,10 +116,15 @@ def widened(tree):
         leaf, np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype), tree)
 
 
-def _stacked(trees):
-    """`trees`' leaves stacked on a new leading axis, each an array of the dtype JAX gives the leaf
-    (a Python scalar's the default one)."""
-    return jax.tree.map(lambda *leaves: np.stack([np.asarray(jnp.asarray(leaf)) for leaf in leaves]), *trees)
+def _stacked(trees, *, host: bool):
+    """`trees`' leaves stacked on a new leading axis: as NumPy arrays of their own dtypes (`host`, a
+    looped arm's outputs, a torch or NumPy reference's float64 among them), or a draw's for a JAX arm,
+    a JAX array or Python scalar as JAX stacks it, its weak type kept, and a host array as NumPy."""
+    def stack(*leaves):
+        if not host and all(isinstance(leaf, jax.Array | bool | int | float | complex) for leaf in leaves):
+            return jnp.stack([jnp.asarray(leaf) for leaf in leaves])
+        return np.stack([np.asarray(leaf) for leaf in leaves])
+    return jax.tree.map(stack, *trees)
 
 
 def windows(draw, count: int):
@@ -129,7 +134,7 @@ def windows(draw, count: int):
     (a parameter's gradient, a short window's) resolves at fewer seeds, a leaf of one row a draw
     becoming `count` rows; its arms take the windows through `over_windows`."""
     def drawn(seed):
-        return _stacked([draw(seed * count + index) for index in range(count)])
+        return _stacked([draw(seed * count + index) for index in range(count)], host=False)
     return drawn
 
 
@@ -146,7 +151,7 @@ def over_windows(fn, *, looped: bool = False):
     def each(single, *arguments):
         count = len(jax.tree.leaves(arguments)[0])
         return _stacked([single(*jax.tree.map(lambda leaf, index=index: leaf[index], arguments))
-                         for index in range(count)])
+                         for index in range(count)], host=True)
 
     if looped:
         return functools.partial(each, fn)
@@ -154,8 +159,9 @@ def over_windows(fn, *, looped: bool = False):
 
     def run(*arguments):
         found = batched(*arguments)
-        signature = (bool(jax.config.jax_enable_x64),
-                     tuple((np.shape(leaf), np.result_type(leaf).str) for leaf in jax.tree.leaves(arguments)))
+        # Every argument's shape, dtype and weak type (`jax.typeof`), their tree, and x64's setting.
+        signature = (bool(jax.config.jax_enable_x64), jax.tree.structure(arguments),
+                     tuple(jax.typeof(leaf) for leaf in jax.tree.leaves(arguments)))
         if signature not in checked:
             expected = each(single, *arguments)
             if jax.tree.structure(found) != jax.tree.structure(expected) or not jax.tree.leaves(found):

@@ -85,6 +85,25 @@ def test_windows_stack_a_sites_own_draws_and_its_arms_take_them_all():
                 np.testing.assert_array_equal(np.asarray(got[index]), np.asarray(want))
 
 
+def test_windows_keep_a_draws_dtypes_and_weak_types_and_a_host_arms_outputs():
+    """A window keeps what one draw holds: a host array its dtype, a weak JAX scalar its weak type, so a
+    float16 arm computes in float16 over windows as over one draw; a looped NumPy reference's float64
+    outputs stay float64."""
+    from reference_error import over_windows, windows
+
+    def draw(seed):
+        return np.array([1 / 3], np.float16), jnp.asarray(1.5), np.int64(2**40 + seed)
+
+    stacked = windows(draw, 2)(0)
+    assert stacked[0].dtype == np.float16 and stacked[2].dtype == np.int64
+    assert jax.typeof(stacked[1]).weak_type
+    found = over_windows(lambda x, scale, big: x * scale)(*stacked)
+    assert found.dtype == np.float16
+    np.testing.assert_array_equal(found[0], draw(0)[0] * draw(0)[1])
+    reference = over_windows(lambda x, scale, big: np.asarray(x, np.float64) * 1.1, looped=True)(*stacked)
+    assert reference.dtype == np.float64
+
+
 def test_a_batched_arm_that_computes_otherwise_than_one_draws_is_refused():
     """`over_windows` refuses a batched arm whose windows differ, by a bit, from one draw's compiled
     arm window by window: here a batching rule that adds one, where a fusion or a route would move a
@@ -115,6 +134,19 @@ def test_a_batched_arm_that_computes_otherwise_than_one_draws_is_refused():
     both(np.zeros((3, 2), np.float32))
     with jax.enable_x64(new_val=True), pytest.raises(AssertionError):
         both(np.zeros((3, 2), np.float64))
+    # So are another tree of arguments and another narrow format of the same width.
+    @jax.custom_batching.custom_vmap
+    def fnuz_only(x):
+        return x
+
+    @fnuz_only.def_vmap
+    def shifted(axis_size, in_batched, x):
+        return (x + 1 if x.dtype == jnp.float8_e4m3fnuz else x), in_batched[0]
+
+    formats = over_windows(fnuz_only)
+    formats(np.zeros((3, 2), jnp.float8_e4m3fn))
+    with pytest.raises(AssertionError):
+        formats(np.zeros((3, 2), jnp.float8_e4m3fnuz))
     np.testing.assert_array_equal(over_windows(lambda x: arm(x), looped=True)(np.zeros((3, 2), np.float32)),
                                   np.zeros((3, 2), np.float32))
 
