@@ -22,10 +22,3 @@ with jax.disable_jit():
 print("eager", np.asarray(eager.query)[0, 0, 0, :2], [np.asarray(p).ravel()[:2] for p in jax.tree.leaves(eager.score_params)] if hasattr(eager, "score_params") else "")
 jitted = jax.jit(lambda q, k, v, d: run(q, k, v, dout=d))(query, key, value, dout)
 print("jit", np.asarray(jitted.query)[0, 0, 0, :2])
-# The pieces under jit.
-w = jnp.asarray([[0.5, 0.5]], jnp.float32)
-slopes = (jnp.full((1, 2), 2e38, jnp.float32), jnp.full((1, 2), 0.0, jnp.float32))
-for name, fn in (("split 1e38", lambda x: algebra._split(x)), ("power2 1e38 by -127", lambda x: algebra.power2(x, jnp.float32(-127.0))),
-                 ("inverse 2", lambda x: algebra.inverse(x))):
-    x = jnp.asarray([1e38], jnp.float32) if "inverse" not in name else jnp.asarray([2.0], jnp.float32)
-    print(name, "jit", jax.jit(fn)(x), "eager", fn(x))

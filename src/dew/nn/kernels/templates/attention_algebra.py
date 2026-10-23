@@ -1149,6 +1149,9 @@ def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax
         expand(refined_mantissa * sums.keyed_mass, sums.keyed) * keyed_mantissa,
         expand(refined_exponent + sums.keyed_shift, sums.keyed) + keyed_exponent)
     dq = (sums.dq - correction) * expand(ratio, sums.dq)
+    jax.debug.print("dq_finish: sums.dq0 {a} residual {r} mass {m} refined {f} keyed_mass {km} keyed_shift {ks} keyed0 {k0} correction0 {c} ratio {t} delta {d} dq0 {q}",
+                    a=sums.dq[0, :2], r=residual[0], m=mass[0], f=refined[0], km=sums.keyed_mass[0], ks=sums.keyed_shift[0],
+                    k0=sums.keyed[0, :2], c=correction[0, :2], t=ratio[0], d=delta[0], q=dq[0, :2])
     return dq, delta + refined, total, mass, grads
 
 
