@@ -667,7 +667,7 @@ def test_queries_reading_another_sequences_documents_on_the_tpu_kernels_are_as_e
     """Packed queries over a context packed by its own documents (`key_segment_ids`) on 'tpu', which
     interprets off a TPU: the output and the three gradients within tests/reference_error.py's rule of
     xla's against float64, a document of the queries' the context lacks among them; xla's sums are
-    the TPU's, fp32 (`FP32_SUMS`)."""
+    the TPU's, fp32 (`FP32_SUMS`), and a CPU runs them on its reference path."""
     queries = jnp.asarray([[1] * 40 + [2] * 30 + [3] * 30 + [0] * 28])
     keys = jnp.asarray([[1] * 50 + [3] * 50 + [0] * 28])
     arrays = [jax.random.normal(jax.random.key(seed), (1, 128, 2, 128), jnp.float32) for seed in range(3)]
