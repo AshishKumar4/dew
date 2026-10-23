@@ -27,7 +27,7 @@ from jax.experimental import pallas as pl
 
 from dew.nn.precision import L2NORM_EPS, compensated_add, l2norm
 
-from . import chunked_launch, norm_swiglu, short_conv, tuning
+from . import chunked_launch, short_conv, tuning
 from .generation import triton_runs
 
 
@@ -157,7 +157,8 @@ def gated_rms(out, z, weight, norm: OutputNorm):
     """The epilogue over a head's output `[..., Dv]` in fp32 or wider: `rms_norm(o) weight act(z)`,
     the mean a product by the reciprocal, as XLA's."""
     inverse = jax.lax.rsqrt(jnp.sum(out * out, axis=-1, keepdims=True) * (1.0 / out.shape[-1]) + norm.epsilon)
-    return out * inverse * weight * norm_swiglu.activation_and_slope(z, norm.activation)[0]
+    activated = jax.nn.sigmoid(z) if norm.activation == 'sigmoid' else z * jax.nn.sigmoid(z)
+    return out * inverse * weight * activated
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)

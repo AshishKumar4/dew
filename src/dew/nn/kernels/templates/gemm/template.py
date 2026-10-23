@@ -19,7 +19,7 @@ routed ones sums nothing, so `gemm(..., epilogue=e)` is `e` of the plain product
 with a hook needs a module-level hook (`tuning.encoded`).
 
 Each call runs the launch the cost model picks among the implementations that take it
-(`grouped_matmul`'s Triton and Mosaic GPU launches) where it lowers for CUDA, interpreted on the CPU
+(`grouped_matmul`'s Mosaic GPU launches, Hopper's) where it lowers for CUDA, interpreted on the CPU
 where `interpret_on_cpu` asks (an assumed TPU's, the TPU launches on Megablox's schedule), and XLA's
 ragged dot with the hooks applied around it everywhere else, a TPU's own lowering included until a
 scoreboard row measures its launches.

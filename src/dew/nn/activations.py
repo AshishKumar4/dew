@@ -31,7 +31,6 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 
-from .kernels import norm_swiglu
 from .precision import at_least_fp32, rounded_to
 
 
@@ -141,11 +140,8 @@ GatedActivation = str | Situ
 """A gated MLP's activation: 'swiglu', 'geglu' or 'geglu_exact' by name, or a `Situ`."""
 
 
-def _gate_function(activation: str, implementation: str) -> Callable[[jax.Array], jax.Array]:
-    """The gate's activation `activation` names, refusing an unknown name or implementation."""
-    if implementation not in norm_swiglu.IMPLEMENTATIONS:
-        raise ValueError(f"implementation must be one of {norm_swiglu.IMPLEMENTATIONS}, "
-                         f"got {implementation!r}")
+def _gate_function(activation: str) -> Callable[[jax.Array], jax.Array]:
+    """The gate's activation `activation` names, refusing an unknown name."""
     gates = {"swiglu": silu, "geglu": gelu_tanh, "geglu_exact": exact_gelu}
     if activation not in gates:
         raise ValueError(f"mlp must be 'swiglu', 'geglu', 'geglu_exact' or a Situ, got {activation!r}")
@@ -180,38 +176,25 @@ def swiglu_clamped(gate: jax.Array, up: jax.Array, limit: float | None) -> tuple
     return jnp.minimum(gate, limit), jnp.clip(up, -limit, limit)
 
 
-def gated_product(activation: GatedActivation, *, implementation: str = 'auto',
-                  axes=None) -> Callable[[jax.Array, jax.Array], jax.Array]:
+def gated_product(activation: GatedActivation) -> Callable[[jax.Array, jax.Array], jax.Array]:
     """The product a gated MLP takes of its gate and up projections, rounded
     where torch rounds `act_fn(gate) * up`: the activation (silu 'swiglu', tanh
     gelu 'geglu', erf gelu 'geglu_exact') runs in fp32 and rounds to the gate's
     dtype, and the product rounds again. Every rounding is explicit
     (`rounded_to`), the inputs' included: left to XLA, a third of Qwen3-0.6B's
     bf16 products differed from transformers' by up to 2 ulp. fp32 and wider
-    round nowhere. A `Situ` computes its own product. SwiGLU's
-    `implementation` defaults to the generation's measured kernel; explicit
-    'pallas' interprets on CPU. GeGLU and SiTU remain XLA products. `axes`,
-    the operands' logical axes, place the kernel on a mesh."""
+    round nowhere. A `Situ` computes its own product. XLA computes each,
+    fused where it fuses the elementwise ops beside it."""
     if isinstance(activation, Situ):
         return activation
-    portable = _portable(_gate_function(activation, implementation), lambda gate, up: (gate, up))
-    return _dispatched(activation, portable,
-                       lambda gate, up: norm_swiglu.swiglu_kernel(implementation, gate, up, axes=axes),
-                       lambda gate, up, portable: norm_swiglu.swiglu(gate, up, portable, axes=axes))
+    return _portable(_gate_function(activation), lambda gate, up: (gate, up))
 
 
-def packed_gated_product(activation: str, *, implementation: str = 'auto',
-                         axes=None) -> Callable[[jax.Array], jax.Array]:
+def packed_gated_product(activation: str) -> Callable[[jax.Array], jax.Array]:
     """`gated_product` of one packed projection's `[..., 2, H]` output, gate
-    then up, read where the projection wrote them: SwiGLU's kernel reads and
-    writes the packed layout (`norm_swiglu.packed_swiglu`), and XLA's product
-    recomputes from the packed output itself, so neither copies a half out.
-    `axes` are the product's logical axes, `[..., H]`'s."""
-    portable = _portable(_gate_function(activation, implementation),
-                         lambda gate_up: (gate_up[..., 0, :], gate_up[..., 1, :]))
-    return _dispatched(activation, portable,
-                       lambda gate_up: norm_swiglu.packed_swiglu_kernel(implementation, gate_up, axes=axes),
-                       lambda gate_up, portable: norm_swiglu.packed_swiglu(gate_up, portable, axes=axes))
+    then up, read where the projection wrote them: the product recomputes from
+    the packed output itself, so it never copies a half out."""
+    return _portable(_gate_function(activation), lambda gate_up: (gate_up[..., 0, :], gate_up[..., 1, :]))
 
 
 def _portable(activate, halves):
@@ -229,14 +212,3 @@ def _portable(activate, halves):
         return rounded_product(*operands)
 
     return portable
-
-
-def _dispatched(activation, portable, kernel_choice, kernel):
-    """The product over the operands: SwiGLU's Pallas `kernel(*operands, portable)` where
-    `kernel_choice(*operands)` chooses it (every order of its derivative is the portable product's;
-    every level runs the kernels), else `portable`, which every other activation runs."""
-    def product(*operands: jax.Array) -> jax.Array:
-        chosen = 'xla' if activation != 'swiglu' else kernel_choice(*operands)
-        return kernel(*operands, portable) if chosen == 'pallas' else portable(*operands)
-
-    return product

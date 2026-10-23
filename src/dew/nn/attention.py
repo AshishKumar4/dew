@@ -49,7 +49,7 @@ from .documents import (
 )
 from .flops import cross_attention_flops, projection_flops, self_attention_flops
 from .inputs import cu_seqlens
-from .kernels import decode_attention, generation, norm_swiglu
+from .kernels import decode_attention, generation
 from .kernels.generation import bf16_dot_runs, gpu_placed
 from .kernels.selection import forced, select
 from .kv_cache import Append, KVCache, KVStore, filled_slots
@@ -386,13 +386,8 @@ def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_af
     `scale_offset` adds one to the stored weight; `scale_after_cast` rounds
     the normalized activation before multiplying and rounds the product
     again. `fp32_statistics=False` retains the input-dtype arithmetic.
-    `implementation` selects the generation's measured kernel by default;
-    explicit 'pallas' interprets on CPU. The fused VJP retains only the
-    narrow input, weight and per-row mean square, not fp32 activations.
-    Unsupported variants run the checkpointed XLA reference instead
-    (`norm_swiglu.rms_kernel`), including float64 and input-dtype statistics.
-    `axes`, `x`'s logical axes, place the kernel's rows on a mesh; without
-    them a split mesh runs XLA.
+    XLA computes it (`_norm_implementation`); `axes`, `x`'s logical axes,
+    are the norm's placement on a mesh.
     """
     return stream_rms_normalized(x, None, scale, epsilon, dtype, scale_offset, scale_after_cast,
                                  fp32_statistics, implementation=implementation, axes=axes)[1]
@@ -404,24 +399,16 @@ def stream_rms_normalized(x, branch, scale, epsilon: float, dtype, scale_offset:
     """A pre-norm block's seam: the residual stream `x` plus `branch` (None
     adds nothing) and that stream's `rms_normalized`, as `(stream, normed)`.
 
-    The caller carries the returned stream on, so the fused kernel
-    (`norm_swiglu.stream_rms_norm`) owns both ends of the norm: its forward
-    reads the two addends once and writes the sum beside the norm, and its
-    reverse adds the stream's own cotangent to the norm's in the same pass.
-    XLA's add and norm are the portable path and the oracle. `activation`
-    (None for none) runs on the norm before its last cast, on XLA's path.
+    The caller carries the returned stream on, the seam a fused kernel
+    owning both ends of the norm would take; XLA computes it
+    (`_norm_implementation`). `activation` (None for none) runs on the norm
+    before its last cast.
     """
-    chosen = norm_swiglu.rms_kernel(implementation, x, scale, dtype, fp32_statistics, branch=branch,
-                                    axes=axes, activated=activation is not None)
-    def portable(x, branch, scale):
-        stream = x if branch is None else x + branch
-        return stream, _xla_rms_normalized(stream, scale, epsilon, dtype, scale_offset, scale_after_cast,
-                                           fp32_statistics, activation)
-
-    if chosen == 'pallas':
-        return norm_swiglu.stream_rms_norm(x, branch, scale, epsilon, dtype, scale_offset, scale_after_cast,
-                                           portable, axes=axes)
-    return portable(x, branch, scale)
+    del axes
+    _norm_implementation(implementation)
+    stream = x if branch is None else x + branch
+    return stream, _xla_rms_normalized(stream, scale, epsilon, dtype, scale_offset, scale_after_cast,
+                                       fp32_statistics, activation)
 
 
 def gated_rms_normalized(x, gate, scale, epsilon: float, dtype, activation: str, *,
@@ -429,21 +416,23 @@ def gated_rms_normalized(x, gate, scale, epsilon: float, dtype, activation: str,
     """Qwen3-Next's gated norm (`Qwen3NextRMSNormGated`,
     modeling_qwen3_next.py:57-74): `x` normalized in fp32, times `scale`,
     times `activation(gate)` ('silu' or 'sigmoid'), cast once to `dtype`.
-    The fused kernel (`norm_swiglu.gated_rms_norm`) reads both inputs once a
-    pass; XLA's arithmetic is the portable path and the oracle. `axes`, the
-    inputs' logical axes, place the kernel's rows on a mesh.
+    XLA computes it (`_norm_implementation`).
     """
-    def portable(x, gate, scale):
-        wide = at_least_fp32(x.dtype)
-        y = unweighted_rmsnorm(x.astype(wide), epsilon, implementation='xla')
-        y = y if scale is None else y * scale.astype(wide)
-        gate = gate.astype(wide)
-        return (y * (jax.nn.silu(gate) if activation == 'silu' else jax.nn.sigmoid(gate))).astype(dtype)
+    del axes
+    _norm_implementation(implementation)
+    wide = at_least_fp32(x.dtype)
+    y = unweighted_rmsnorm(x.astype(wide), epsilon, implementation='xla')
+    y = y if scale is None else y * scale.astype(wide)
+    gate = gate.astype(wide)
+    return (y * (jax.nn.silu(gate) if activation == 'silu' else jax.nn.sigmoid(gate))).astype(dtype)
 
-    chosen = norm_swiglu.gated_rms_kernel(implementation, x, gate, scale, dtype, activation, axes=axes)
-    if chosen == 'pallas':
-        return norm_swiglu.gated_rms_norm(x, gate, scale, epsilon, dtype, activation, portable, axes=axes)
-    return portable(x, gate, scale)
+
+def _norm_implementation(implementation: str) -> None:
+    """Refuse a norm `implementation` no kernel runs: 'auto' and 'xla' are XLA's, which computes every
+    norm since Dew's Pallas Triton kernels' removal; 'pallas' names none until a Mosaic norm lands."""
+    if implementation not in ('auto', 'xla'):
+        raise ValueError(f"a norm's implementation is 'auto' or 'xla' (no Pallas norm kernel runs), "
+                         f"got {implementation!r}")
 
 
 def _moment_normalized(x, scale, bias, axes: tuple[int, ...], epsilon: float, requested):
@@ -506,16 +495,9 @@ def unweighted_rmsnorm(x, eps: float, *, implementation: str = 'auto'):
 
     The reduction runs in fp32 and the inverse deviation is cast back
     before it multiplies, which is what `DeepseekV4UnweightedRMSNorm`
-    (modeling_deepseek_v4.py:66-72) and its GLM twin do; the fused RMSNorm
-    takes it where the target's row names it, rounding the inverse as they do
-    (`norm_swiglu.rms_norm`'s `inverse_rounded`).
+    (modeling_deepseek_v4.py:66-72) and its GLM twin do.
     """
-    if norm_swiglu.rms_kernel(implementation, x, None, x.dtype, fp32_statistics=True) == 'pallas':
-        def portable(x, scale):
-            return unweighted_rmsnorm(x, eps, implementation='xla')
-
-        return norm_swiglu.rms_norm(x, None, eps, x.dtype, offset=False, after_cast=False, portable=portable,
-                                    inverse_rounded=True)
+    _norm_implementation(implementation)
     fp32 = x.astype(at_least_fp32(x.dtype))
     inverse = jax.lax.rsqrt(jnp.mean(jnp.square(fp32), axis=-1, keepdims=True) + eps)
     return x * inverse.astype(x.dtype)

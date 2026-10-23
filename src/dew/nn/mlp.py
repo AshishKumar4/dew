@@ -190,7 +190,7 @@ class GatedMLP(nn.Module):
                 # Both names on the one output: a remat policy that keeps either keeps it whole.
                 gate_up = checkpoint_name(checkpoint_name(constrain(gate_up, PACKED_HIDDEN), 'gate_proj'),
                                           'up_proj')
-                return self._down(packed_gated_product(activation, axes=MLP_HIDDEN)(gate_up), train)
+                return self._down(packed_gated_product(activation)(gate_up), train)
         if self._packed():
             group = self._group()
             halves = dict(zip(group.members, group.split(self.gate_up_proj(x)), strict=True))
@@ -204,7 +204,7 @@ class GatedMLP(nn.Module):
         gate, up = swiglu_clamped(gate, up, self.swiglu_limit)
         if self.activation_sparsity:
             gate = gaussian_topk(gate, self.activation_sparsity)
-        return self._down(gated_product(activation, axes=MLP_HIDDEN)(gate, up), train)
+        return self._down(gated_product(activation)(gate, up), train)
 
     def _ngpt_hidden(self, ngpt: NGPT, gate, up, activation):
         """nGPT's hidden activations: the gate and up projections times their gains in at least fp32,
@@ -214,7 +214,7 @@ class GatedMLP(nn.Module):
         wide = at_least_fp32(jnp.result_type(gate, up))
         gate = (gate.astype(wide) * gain(self.suv_gate, factor)).astype(gate.dtype)
         up = (up.astype(wide) * gain(self.suv_up, factor)).astype(up.dtype)
-        hidden = gated_product(activation, axes=MLP_HIDDEN)(gate.astype(wide), up.astype(wide))
+        hidden = gated_product(activation)(gate.astype(wide), up.astype(wide))
         return l2norm(hidden.astype(gate.dtype))
 
     def _down(self, hidden, train: bool):
