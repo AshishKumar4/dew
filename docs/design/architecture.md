@@ -23,7 +23,13 @@ A model is a plain Flax module. An objective defines variables, loss and validat
 | Outcomes and telemetry | `src/dew/telemetry/records.py` | Trackers, display and reports consume the same outcome records. |
 | Environments and suite selection | Project extras and lock files; `.armada.json` + `tools/armada/ci.py` | Installers and CI read their package and test selections from these owners. No other package list anywhere. |
 | Reinforcement-learning imports | `src/dew/rl` | `dew.rl` imports nothing from `dew.training`. Nothing under `src/dew` outside `src/dew/rl` and `src/dew/objectives/rl` may import `dew.rl`. A test walks the module tree and asserts it. |
+| The batch contract | `src/dew/batch.py` | `Batch` and `Variables`, the two open mappings every layer reads, the frozen split (`FROZEN`, `merge`), and the rows and tokens a batch carries (`VALID_ROWS`, `EXAMPLE_ROWS`, `padded_rows`, `Coordinates` and its token helpers) live here alone, below every package that reads a batch. |
+| Mesh axis names and the batch's rules | `src/dew/mesh.py` | The axis names (`MESH_AXES`, `BATCH_AXES`), `MeshAxes`, `LogicalAxisRules` and the rules that place a batch's rows (`BATCH_RULES`, `row_axes`, `batch_axes`); `nn.sharding`'s parameter rules compose them. |
 | Staged training | `Recipe` and `Stage`, `recipes/chain.py` | Stages compose existing data, objectives and rollouts. `Objective.model_variables` defines what passes to the next stage. |
+
+## Layering
+
+Packages import downward only. `dew.batch` and `dew.mesh` are the foundation every package reads: they import no other Dew package, and nothing below them owns a batch or a mesh axis of its own. Above them the order is `telemetry.devices < nn < data, inputs < diffusion, sampling < interop < inference, lora, quantization < objectives < checkpoints < training < config < cli, decision`, which the import contracts in `pyproject.toml` (`[tool.importlinter]`) hold as they land.
 
 ## Interfaces stay shared
 
