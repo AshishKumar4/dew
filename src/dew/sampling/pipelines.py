@@ -6,7 +6,6 @@ import functools
 import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from enum import Enum
 from typing import TYPE_CHECKING, Generic
 
 import jax
@@ -25,7 +24,7 @@ from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, local_rows, mesh_of, request_key
 from dew.nn.kernels.options import compiler_options
-from dew.objectives.base import Variables, thaw
+from dew.objectives.base import OMITTED, Omitted, Variables, thaw
 from dew.records import JSON
 from dew.registry import dtype_name, resolve_dtype
 from dew.sampling.guidance import CFG, Guidance, guidance_modules
@@ -42,16 +41,6 @@ if TYPE_CHECKING:
     from dew.objectives.diffusion import DiffusionObjective
     from dew.quantization import Quantization
     from dew.training.distributed import Layout, MeshSpec
-
-class _Default(Enum):
-    """The sentinel that tells `guidance=None` from an omitted `guidance=`.
-
-    None is a value a caller passes to turn guidance off, so the default
-    cannot be None.
-    """
-
-    GUIDANCE = "guidance"
-
 
 @dataclass(frozen=True)
 class _Resolved:
@@ -449,7 +438,7 @@ class TextToImage:
         the grid, the solver and the guidance a call runs with. The value
         ends with the signature a pool compares.
         """
-        chosen = self.guidance if guidance is _Default.GUIDANCE else guidance
+        chosen = self.guidance if guidance is OMITTED else guidance
         if isinstance(chosen, (int, float)) and not isinstance(chosen, bool):
             chosen = CFG(float(chosen))
         if chosen is not None and not isinstance(chosen, Guidance):
@@ -679,7 +668,7 @@ class TextToImage:
         prompts: str | Sequence[str | Mapping[str, object]] | DenoisingInputs,
         *,
         steps: int | None = None,
-        guidance: Guidance | float | None | _Default = _Default.GUIDANCE,
+        guidance: Guidance | float | None | Omitted = OMITTED,
         solver: Solver | None = None,
         key: int | jax.Array,
         decode: bool = True,
