@@ -172,8 +172,10 @@ STEP_ROWS, STEP_LENGTH = 4, 32
 """A training step's draw: rows a device and ids a row, within the checkpoint's 64 positions."""
 UPDATE_SEEDS = {0.0: 8, 0.1: 8}
 """Each decay's declared seeds for the update's check 1, sized by `seeds_for` (on armada)."""
-DENSE_SEEDS = 8
-"""The dense decoder's gradient check 1's declared seeds, sized by `seeds_for` (on armada)."""
+DENSE_ROWS, DENSE_SEEDS = 16, 8
+"""The dense decoder's gradient draw's rows, and its check 1's declared seeds, sized by `seeds_for` (on
+armada): at STEP_ROWS AltUp's output scale in its third layer, a leaf of 32 values each summed over a
+draw's tokens, did not resolve within 512 seeds."""
 
 
 def clipped_gemma3n():
@@ -314,11 +316,19 @@ def test_the_dense_decoders_gradient_is_the_references():
     names = list(loaded.export(loaded.variables))
     stored = dense.projected(loaded.variables["params"], updated=False)
 
+    sparsity = (0.0,) * len(model.activation_sparsity_pattern)
+    references = {dtype: reference_decoder(loaded.source, clip, dtype, sparsity)
+                  for dtype in (torch.float32, torch.float64)}
+    pad = references[torch.float32].config.pad_token_id
+
     def draw(seed):
-        """Rows of ids drawn uniformly from the vocabulary, and the loss's cotangent, one."""
-        rows = np.random.default_rng([0xDE, seed]).integers(
-            0, int(dense.vocab_size), (STEP_ROWS, STEP_LENGTH)).astype(np.int32)
-        return rows, np.float32(1)
+        """Rows of ids drawn uniformly from the vocabulary but the pad id, and the loss's cotangent, one.
+        The reference's embeddings are `nn.Embedding(padding_idx=pad)`, whose pad row takes no gradient
+        whatever reads it, where Dew's takes its own: a padding convention, apart from the arithmetic
+        held here, which the ledger tracks."""
+        ids = np.setdiff1d(np.arange(int(dense.vocab_size)), [] if pad is None else [pad])
+        rows = ids[np.random.default_rng([0xDE, seed]).integers(0, len(ids), (DENSE_ROWS, STEP_LENGTH))]
+        return rows.astype(np.int32), np.float32(1)
 
     def loss(params, rows):
         # The source's loss: the mean cross entropy of each next id.
@@ -333,10 +343,6 @@ def test_the_dense_decoders_gradient_is_the_references():
     def differentiated(rows, one):
         exported = loaded.export({**loaded.variables, "params": gradient_of(rows, one)})
         return {name: np.asarray(exported[name], np.float32) for name in names}
-
-    sparsity = (0.0,) * len(model.activation_sparsity_pattern)
-    references = {dtype: reference_decoder(loaded.source, clip, dtype, sparsity)
-                  for dtype in (torch.float32, torch.float64)}
 
     def reference(dtype, rows, one):
         reference = references[dtype]
