@@ -120,10 +120,11 @@ def test_a_stride_changes_the_training_windows_only(tmp_path):
     default = _trained(corpus.train, seq_len, batch, seed=17)
     explicit = _trained(corpus.train, seq_len, batch, stride=seq_len, seed=17)
     overlap = _trained(corpus.train, seq_len, batch, stride=1, seed=17)
-    assert overlap.records == 13 and overlap.steps_per_epoch == 3
+    # 13 windows a pass in batches of four: four steps, the last leading into the next pass.
+    assert overlap.records == 13 and overlap.steps_per_epoch == 4
     assert default.records == explicit.records == 4
     assert default.steps_per_epoch == explicit.steps_per_epoch == 1
-    assert overlap.epoch_steps(3) == 9
+    assert overlap.epoch_steps(3) == 10
 
     def first_rows(data, steps):
         stream = data.train(DataPartition())
