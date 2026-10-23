@@ -355,12 +355,16 @@ def test_a_layer_over_bf16_parameters_fed_float32_multiplies_float32_products():
 
 def test_soft_embeddings_over_a_bf16_table_multiply_float32_products():
     """Soft embeddings mix a bf16-stored table by float32 probabilities, a product jax computes in
-    float32, so it multiplies at HIGHEST as a float32-stored table's does."""
+    float32, so it multiplies at HIGHEST as a float32-stored table's does: the same products, each at
+    HIGHEST (a CPU's float64 sum and every other backend's product, `accumulated`)."""
     logits = jax.random.normal(jax.random.key(0), (2, 3, 32), jnp.float32)
+    traced = {}
     for stored in (jnp.float32, jnp.bfloat16):
         table = jax.random.normal(jax.random.key(1), (32, 16), jnp.float32).astype(stored)
         precisions = dot_precisions(lambda logits, table: soft_embeddings(logits, table, 1.0), logits, table)
-        assert [precision for precision, _ in precisions] == [HIGHEST]
+        traced[stored] = [precision for precision, _ in precisions]
+        assert traced[stored] and all(precision == HIGHEST for precision in traced[stored])
+    assert traced[jnp.bfloat16] == traced[jnp.float32]
 
 
 def test_a_projection_factory_keeps_the_contraction_its_caller_gives():
