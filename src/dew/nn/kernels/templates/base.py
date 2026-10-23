@@ -33,8 +33,9 @@ class Template[Config: Hashable](tuning.KernelOp):
         """Every config the launch is proven over for `ba`, in a fixed order."""
         raise NotImplementedError(f"{type(self).__name__} declares no space")
 
-    def staged_bytes(self, ba: tokamax.BoundArguments, config: Config) -> int:
-        """The shared memory, in bytes, a program of the launch of `ba` stages at `config`."""
+    def staged_bytes(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> int:
+        """The shared memory, in bytes, a program of the launch of `ba` stages at `config` on `target`, whose
+        family sets how a compiler lays it out (a warpgroup MMA's operands, a pipeline's stages)."""
         raise NotImplementedError(f"{type(self).__name__} declares no staged bytes")
 
     def registers(self, ba: tokamax.BoundArguments, config: Config) -> int | None:
@@ -64,11 +65,11 @@ class Template[Config: Hashable](tuning.KernelOp):
         the call before it reaches a launch."""
         budget = generation.shared_budget(target)
         space = tuple(self.space(ba))
-        fits = tuple(config for config in space if self.staged_bytes(ba, config) <= budget
+        fits = tuple(config for config in space if self.staged_bytes(ba, config, target) <= budget
                      and (self.registers(ba, config) or 0) <= cost.THREAD_REGISTERS)
         if not fits:
-            raise Unfitted(type(self).__name__, min((self.staged_bytes(ba, config) for config in space),
-                                                     default=None), budget, target.generation)
+            least = min((self.staged_bytes(ba, config, target) for config in space), default=None)
+            raise Unfitted(type(self).__name__, least, budget, target.generation)
         return fits
 
     def unpinnable(self, ba: tokamax.BoundArguments, config: Hashable) -> str:
@@ -82,7 +83,8 @@ class Template[Config: Hashable](tuning.KernelOp):
             return (f"its threads hold {registers} registers live, past the {cost.THREAD_REGISTERS} a "
                     "thread has")
         target = generation.gpu_target()
-        return (f"its programs stage {self.staged_bytes(ba, held[0])} bytes of shared memory, past the "
+        staged = self.staged_bytes(ba, held[0], target)
+        return (f"its programs stage {staged} bytes of shared memory, past the "
                 f"{generation.shared_budget(target)} a block of {target.generation} holds")
 
     def estimate(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[float, Config]:
