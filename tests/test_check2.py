@@ -106,3 +106,96 @@ def test_the_lanes_unfaithful_operations_are_findings_with_their_paths():
     _, findings = oc.certified(lambda x: x / 3, x)
     assert len(findings) == 1 and findings[0].startswith("div#0")
     assert oc.certified(jnp.divide, x, np.float32(np.full(512, 3)))[1] == []
+
+
+def test_the_lane_detects_tininess_after_rounding_and_keeps_subnormals_in_moves_and_casts():
+    """A product exactly 2^-126 - 2^-172 rounds to the least normal at an unbounded exponent, and the lane
+    keeps it (tininess after rounding); a reshape, a negation and a cast between bf16 and float32 keep a
+    subnormal; a comparison reads it as zero; a float32 past int32's range saturates and NaN casts to 0."""
+    import ml_dtypes
+
+    a, b = np.float32(1 - 2.0 ** -23), np.float32(2.0 ** -126 + 2.0 ** -149)
+    native = np.asarray(jax.jit(jnp.multiply)(a, b))
+    assert float(native) == 2.0 ** -126
+    assert np.all(oc.CONTRACTS["mul"]({}, [a, b], native, oc.FLOAT32))
+    assert not np.all(oc.CONTRACTS["mul"]({}, [a, b], np.float32(0), oc.FLOAT32))
+    flushed = [np.float32(2.0 ** -70)] * 2
+    assert not np.all(oc.CONTRACTS["mul"]({}, flushed, np.float32(2.0 ** -140), oc.FLOAT32))
+    tiny = np.float32([2.0 ** -140, -(2.0 ** -130)])
+    assert np.array_equal(np.asarray(jax.jit(lambda x: -x.reshape(2, 1))(tiny)).ravel(), -tiny)
+    assert np.all(oc.CONTRACTS["neg"]({}, [tiny], -tiny, oc.FLOAT32))
+    narrow = np.array([2.0 ** -130], ml_dtypes.bfloat16)
+    assert float(jax.jit(lambda x: x.astype(jnp.float32))(narrow)[0]) == 2.0 ** -130
+    assert float(jax.jit(lambda x: x.astype(jnp.bfloat16))(np.float32(2.0 ** -130))) == 2.0 ** -130
+    assert bool(jax.jit(jnp.equal)(np.float32(2.0 ** -140), np.float32(0)))
+    saturated = jax.jit(lambda x: x.astype(jnp.int32))(np.float32([2.0 ** 31, -(2.0 ** 32), np.nan]))
+    assert np.array_equal(saturated, [2 ** 31 - 1, -(2 ** 31), 0])
+    beyond = np.float32([2.0 ** 31, -(2.0 ** 32), np.nan, 2.7])
+    assert oc.certified(lambda x: x.astype(jnp.int32), beyond)[1] == []
+
+
+def test_a_faithful_result_is_one_of_its_two_neighbours_on_the_lanes_grid():
+    """exp(-2^-25) lies between 1 - 2^-24 and 1: both are faithful, and 1 - 2^-23, the value below the
+    next binade's spacing, is not; a tiny exact value's neighbours on the flushing grid are zero and the
+    least normal; specials are their limits."""
+    x = np.float32([-(2.0 ** -25)])
+    assert np.all(oc.CONTRACTS["exp"]({}, [x], np.float32([1 - 2.0 ** -24]), oc.FLOAT32))
+    assert np.all(oc.CONTRACTS["exp"]({}, [x], np.float32([1.0]), oc.FLOAT32))
+    assert not np.any(oc.CONTRACTS["exp"]({}, [x], np.float32([1 - 2.0 ** -23]), oc.FLOAT32))
+    deep = np.float32([-100.0])
+    assert np.all(oc.CONTRACTS["exp"]({}, [deep], np.float32([0.0]), oc.FLOAT32))
+    assert np.all(oc.CONTRACTS["exp"]({}, [deep], np.float32([2.0 ** -126]), oc.FLOAT32))
+    specials = np.float32([np.inf, -np.inf, np.nan])
+    assert np.all(oc.CONTRACTS["exp"]({}, [specials], np.float32([np.inf, 0.0, np.nan]), oc.FLOAT32))
+    limits = np.float32([-np.inf, np.inf, np.nan])
+    assert np.all(oc.CONTRACTS["log"]({}, [np.float32([0.0, np.inf, -1.0])], limits, oc.FLOAT32))
+    poles = np.float32([np.inf, -np.inf])
+    assert np.all(oc.CONTRACTS["erf_inv"]({}, [np.float32([1.0, -1.0])], poles, oc.FLOAT32))
+
+
+def test_each_equation_runs_under_its_own_context():
+    """Random bits drawn under a local threefry setting other than the caller's are held to the bits
+    that setting draws."""
+    key = jax.random.key(3)
+
+    def drawn(key):
+        with jax.threefry_partitionable(not jax.config.jax_threefry_partitionable):
+            return jax.random.bits(key, (64,))
+
+    outputs, findings = oc.certified(drawn, key)
+    assert findings == []
+    assert np.array_equal(outputs, jax.jit(drawn)(key))
+
+
+def test_moves_keep_their_bits_and_integer_operations_wrap():
+    """A bitcast of a NaN keeps its payload, and one with another payload breaks; a reshape by a
+    permutation, a logical shift of a negative integer, a narrowing bitcast's trailing axis, integer
+    sums that wrap and an empty sum are each their own results."""
+    payload = np.uint32([0x7FC00001])
+    native = np.asarray(jax.lax.bitcast_convert_type(payload, jnp.float32))
+    params = {"new_dtype": np.float32}
+    assert np.all(oc.CONTRACTS["bitcast_convert_type"](params, [payload], native, oc.FLOAT32))
+    other = np.uint32([0x7FC00002]).view(np.float32)
+    assert not np.any(oc.CONTRACTS["bitcast_convert_type"](params, [payload], other, oc.FLOAT32))
+    ints = np.int32([[-1, 2 ** 31 - 1], [5, -7]])
+    for fn in (lambda a: jax.lax.reshape(a, (4,), dimensions=(1, 0)),
+               lambda a: jax.lax.shift_right_logical(a, np.int32(1)),
+               lambda a: jax.lax.bitcast_convert_type(a, jnp.int16),
+               lambda a: jnp.sum(a * a + a, axis=0),
+               lambda a: jnp.sum(a.astype(jnp.float32)[:, :0], axis=1)):
+        assert oc.certified(fn, ints)[1] == [], fn
+
+
+def test_calls_are_certified_inside_and_unsupported_types_refused():
+    """A rematerialised body is run one primitive at a time; a float16, float64-free complex or float8
+    value has no contract of ours, and a key's wrapping is held to its data."""
+    x = np.float32(np.linspace(1, 2, 8))
+    _, findings = oc.certified(jax.checkpoint(lambda x: jnp.log(x) * x), x)
+    assert findings == []
+    _, findings = oc.certified(jax.checkpoint(lambda x: jnp.sin(x)), x)
+    assert findings and "remat" in findings[0] and "sin" in findings[0]
+    for dtype in (jnp.float16, jnp.complex64, jnp.float8_e4m3fn):
+        _, findings = oc.certified(lambda x, dtype=dtype: x.astype(dtype).reshape(2, 4), x)
+        assert findings and "no format" in findings[0], dtype
+    data = np.uint32([0, 7])
+    assert oc.certified(lambda data: jax.random.key_data(jax.random.wrap_key_data(data)), data)[1] == []
