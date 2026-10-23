@@ -754,7 +754,8 @@ class Layout:
 
     def _axes(self, path, ndim: int, declared: Mapping[Suffix, LogicalAxes]) -> LogicalAxes | None:
         """The logical axes of the leaf at `path`: those its module declared, or None for the shape
-        heuristic. Placement, its minimum size, `frozen_whole` and its checks follow from them."""
+        heuristic. Placement, its minimum size, `frozen_whole` and its checks follow from them. A layout
+        that names axes otherwise overrides it (torchax's `TorchLayout`, by a module's torch names)."""
         return declared_axes(path, ndim, declared)
 
     def _splitting(self, path, value, declared: Mapping[Suffix, LogicalAxes]) -> set[str]:

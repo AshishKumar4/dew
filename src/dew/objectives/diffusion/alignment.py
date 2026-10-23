@@ -24,7 +24,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.nn.attention import l2_normalized
-from dew.nn.blocks import torch_bicubic_resize
+from dew.nn.blocks import IMAGENET_MEAN, IMAGENET_STD, torch_bicubic_resize
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
 from dew.objectives.base import Batch, Objective, Variables
@@ -35,8 +35,6 @@ ALIGNMENT = "alignment_projector"
 REPRESENTATION = "representation"
 """The variables collection that holds the frozen encoder's weights, as `encoders` hold theirs."""
 
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 class Projector(nn.Module):

@@ -24,9 +24,10 @@ import numpy as np
 
 from dew import records
 from dew.diffusion.process import Process
-from dew.diffusion.schedules.common import GeneralizedNoiseScheduler, NoiseScheduler
+from dew.diffusion.schedules.common import GeneralizedNoiseScheduler, NoiseScheduler, ancestral_variance
 from dew.diffusion.schedules.discrete import DiscreteNoiseScheduler
-from dew.diffusion.schedules.flow import RectifiedFlow
+from dew.diffusion.schedules.flow import RectifiedFlow, static_shift
+from dew.diffusion.schedules.karras import rho_ramp
 from dew.diffusion.transforms import PredictionTransform
 from dew.nn.sharding import rows_taken
 from dew.records import JSON
@@ -310,8 +311,7 @@ def empirical_mu(tokens: int, steps: int) -> float:
 
 def _shifted(flow: FlowShift, sigmas: np.ndarray, tokens: int | None, mu: float | None = None) -> np.ndarray:
     """The sigmas after this file's shift."""
-    base = flow.base(tokens, mu)
-    return base * sigmas / (1 + (base - 1) * sigmas)
+    return static_shift(flow.base(tokens, mu), sigmas)
 
 
 def _stretched(flow: FlowShift, sigmas: np.ndarray) -> np.ndarray:
@@ -358,8 +358,7 @@ def _transformed_sigmas(transform: str, low: float, high: float, steps: int,
     `low` and `high`."""
     ramp = np.linspace(0, 1, steps, dtype=np.float64)
     if transform == "karras":
-        low_inv, high_inv = low ** (1 / rho), high ** (1 / rho)
-        return (high_inv + ramp * (low_inv - high_inv)) ** rho
+        return rho_ramp(low ** (1 / rho), high ** (1 / rho), ramp, rho)
     if transform == "exponential":
         return np.exp(np.linspace(np.log(high), np.log(low), steps, dtype=np.float64))
     try:
@@ -450,7 +449,7 @@ def _flow_sigmas(policy: SourcePolicy, steps: int, sigma_min: float) -> tuple[np
     assert policy.flow_shift is not None
     shift = policy.flow_shift
     rising = 1.0 - np.linspace(1, 1 / policy.train_steps, steps + 1)
-    sigmas = np.flip(shift * rising / (1 + (shift - 1) * rising))[:-1].copy()
+    sigmas = np.flip(static_shift(shift, rising))[:-1].copy()
     terminal = (0.0 if policy.terminal == "zero"
                 else float(sigmas[-1]) if policy.grid_terminal else sigma_min)
     return np.append(sigmas, terminal), np.trunc(sigmas * policy.train_steps), 1.0
@@ -492,7 +491,7 @@ def _stage_grid(policy: SourcePolicy, betas: np.ndarray, steps: int) -> tuple[np
     levels = np.asarray(sigmas, np.float64)
     following = levels[1:]
     if policy.kind == "KDPM2AncestralDiscrete":
-        up = np.sqrt(following ** 2 * (levels[:-1] ** 2 - following ** 2) / levels[:-1] ** 2)
+        up = np.sqrt(ancestral_variance(levels[:-1], following))
         targets = np.sqrt(np.maximum(following ** 2 - up ** 2, 0.0))
     else:
         targets = following
