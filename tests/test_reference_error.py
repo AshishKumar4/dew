@@ -56,6 +56,11 @@ def test_a_torch_arm_pulls_back_the_cotangent_it_is_given():
         for got, want in zip((grad_x, *(grads[name] for name in params)), wanted, strict=True):
             np.testing.assert_array_equal(got, want.numpy())
         np.testing.assert_array_equal(grad_unused, np.zeros_like(unused))
+    # A bfloat16 output, of float32 inputs cast inside, comes back in float32, its values exactly.
+    x = np.arange(4, dtype=np.float32) / 3
+    out, grad = torch_with_gradients(lambda x: (x.bfloat16() * 3).bfloat16())(x, np.ones(4, np.float32))
+    np.testing.assert_array_equal(out, (torch.from_numpy(x).bfloat16() * 3).float().numpy())
+    np.testing.assert_array_equal(grad, np.full(4, 3, np.float32))
 
 
 def test_a_small_row_beside_large_ones_is_held_to_its_own_size():
