@@ -307,7 +307,7 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     own. Its facts (`name`, the MMA's row unit `rows`), its launch and roles (`kernel`, `roles`), its operand
     streams (`streams`, `opened`, `stream` the producer's, `walk` and `passed` the consumer's), its products
     (`product` into a fresh accumulator, `register_products` and `staged_products` in place, `settled`), and
-    its accumulator's layouts (`zeros`, `full`, `iota`, `rows_of`, `as_row`). It is generic in its streams'
+    its accumulator's layouts (`zeros`, `full`, `indices`, `rows_of`, `as_row`). It is generic in its streams'
     allocations (`Allocated`, `streams`'), its opened streams (`Opened`, `opened`'s) and the accumulator its
     products issue into in place (`Accumulator`: a warpgroup accumulator ref, or a register array)."""
 
@@ -415,8 +415,9 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         """fp32 `value` in the accumulator's layout or a row's (`zeros`)."""
 
     @abc.abstractmethod
-    def iota(self, shape: tuple[int, int], dimension: int) -> jax.Array:
-        """Indices along `dimension` of a tile in the accumulator's layout."""
+    def indices(self, count: int, dimension: int) -> jax.Array:
+        """The indices `0..count` of a tile's rows (`dimension` 0, in a row's layout) or its columns (1, in a
+        column's), which broadcast against the tile as `[count, 1]` and `[1, count]`."""
 
     @abc.abstractmethod
     def rows_of(self, ref) -> jax.Array:

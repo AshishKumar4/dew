@@ -140,16 +140,17 @@ def _hooked_of(hooks: Hooks, call: PaddedCall) -> _Hooked:
 
 def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_first=None):
     """A hook parameter's values for a tile `like` of queries from `first` (and keys from `k_first`, a score
-    tile's), as `kind` lays them out: the head's scalar, else the tile's entries (a score tile's
-    `[bq, bk]`, an output tile's `[bq, Dv]`), in the accumulator's layout."""
+    tile's), as `kind` lays them out and every mainloop gives them (`attention._per_head`): the head's scalar,
+    the tile's queries' `[bq, 1]`, its keys' `[1, bk]`, or its entries (a score tile's `[bq, bk]`, an output
+    tile's `[bq, Dv]`, in the accumulator's layout)."""
     rows = pl.ds(first, like.shape[0])
     match kind:
         case Kind.HEAD:
             return ref[head]
         case Kind.QUERY:
-            return algebra.expand(family.rows_of(ref.at[row, head, rows]), like)
+            return family.rows_of(ref.at[row, head, rows])[:, None]
         case Kind.KEY:
-            return algebra.across(family.columns_of(ref.at[row, head, pl.ds(k_first, like.shape[1])]), like)
+            return family.columns_of(ref.at[row, head, pl.ds(k_first, like.shape[1])])[None, :]
         case Kind.TILE:
             return family.tile_of(ref.at[row, head, rows, pl.ds(k_first, like.shape[1])])
         case Kind.OUTPUT:
@@ -283,13 +284,19 @@ def _streamed(reaches: list) -> tuple[jax.Array, jax.Array]:
             functools.reduce(jnp.maximum, [hi for _, hi in reaches]))
 
 
+def _rows_at(family: mosaic.Family, first, count: int) -> jax.Array:
+    """The places `[count, 1]` of the queries from `first`."""
+    return (first + family.indices(count, 0))[:, None]
+
+
 def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, shape: tuple[int, int],
             q_pos=None, columns=None) -> algebra.Coords:
-    """A tile's coordinates (`algebra.Coords`): its queries' and keys' places from `first` and `k_first`
-    (`q_pos` the query places and `columns` the tile's key offsets in the accumulator's layout, where the
-    caller holds them), and a spans call's queries' intervals and, with documents, both blocks' ids."""
-    q_pos = first + family.iota(shape, 0) if q_pos is None else q_pos
-    k_pos = k_first + (family.iota(shape, 1) if columns is None else columns)
+    """A tile's coordinates (`algebra.Coords`): its queries' places `[bq, 1]` from `first` and its keys'
+    `[1, bk]` from `k_first` (`q_pos` the query places and `columns` the tile's key offsets, `[bk]`, where the
+    caller holds them; `Family.indices`), and a spans call's queries' intervals and, with documents, both
+    blocks' ids."""
+    q_pos = _rows_at(family, first, shape[0]) if q_pos is None else q_pos
+    k_pos = (k_first + (family.indices(shape[1], 1) if columns is None else columns))[None, :]
     if spans is None:
         return algebra.Coords(q_pos, k_pos)
     rows = (row, pl.ds(first, shape[0]))
@@ -314,7 +321,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     lo, hi, whole = program.reach(first, spans, row)
     family.loaded(((q_view, q_smem, q_loaded),))
     q = family.held(q_smem)
-    q_pos, columns = first + family.iota(shape, 0), family.iota(shape, 1)
+    q_pos, columns = _rows_at(family, first, tiles.block_q), family.indices(tiles.block_k, 1)
     width = q_smem.shape[-1]
     # The weighted values' running sums live in the family's accumulator (`Family.walk`), from the initial
     # state's where there is one; the walk carries the maxima and denominators, the state's `acc` an empty
@@ -488,7 +495,7 @@ def _scores(walk: _Backward, coords: algebra.Coords, masked: bool, s, dp, peak, 
     logits, slopes = algebra.tile_logits(None, s, seen, None, None, (),
                                          scale=walk.spec.scale if how.factor is None else 1.0, slopes=True)
     exponentials, weights = algebra.normalized(logits, peak, total, how)
-    at_anchor = coords.k_pos == algebra.expand(chosen, coords.k_pos)
+    at_anchor = coords.k_pos == algebra.expand(chosen, s)
     cotangents = algebra.grad_scores(exponentials, dp, anchor, delta, seen, at_anchor, algebra.inverse(total))
     return exponentials, weights, cotangents, slopes, seen
 
@@ -574,7 +581,7 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, s
             nothing = family.zeros((block_q,))
             operands = family.held(q_smem.at[index]), family.held(do_smem.at[index])
             shape = (block_q, block_k)
-            q_pos, columns = first + family.iota(shape, 0), family.iota(shape, 1)
+            q_pos, columns = _rows_at(family, first, block_q), family.indices(block_k, 1)
             coords_of = functools.partial(_coords, family, spans_of, row, first, shape=shape, q_pos=q_pos,
                                           columns=columns)
             step = functools.partial(_dq_step, walk, operands, stats, coords_of, whole)

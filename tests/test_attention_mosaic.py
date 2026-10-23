@@ -16,7 +16,7 @@ from generation_support import INTERPRETS
 from jax.sharding import Mesh
 from reference_error import assert_as_exact
 from test_attention_template import CASES, ROWS, arguments, geometry as core_geometry
-from test_attention_triton import HOOKS, gate_of, hooks_for
+from test_attention_triton import HOOKS, SCORE_HOOKS, gate_of, hooks_for, score_hooks
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import (
@@ -42,6 +42,11 @@ SEEDS = 8
 against the reference's own."""
 ALL_HOOKS_SEEDS = 32
 """The draws of a site with every hook at once (`test_attention_triton.ALL_HOOKS_SEEDS`)."""
+FORWARD_HOOKS = {**{name: (names, False) for name, names in SCORE_HOOKS.items()}, "gate": ((), True),
+                 "all": (("softcap", "sinks", "alibi", "temperature", "key", "tile", "indexed"), True)}
+"""The forward's hooks: each score hook the backward differentiates (`test_attention_triton.SCORE_HOOKS`:
+every kind of parameter, the initial state as sinks or a resumed partial, a hook through a custom VJP and
+one indexed off the query's coordinates), an output gate, and all at once; each `(score hooks, gate)`."""
 HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False),
               "float16-natural": (jnp.float16, True)}
 """The hooked forward's dtypes and forms: the fold over both 16-bit dtypes, and fp16's natural form (bf16's
@@ -90,46 +95,60 @@ def _check_forward(call: str, dtype, shape, *, natural: bool, interpret: bool):
 
 
 def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool, backward: bool = False,
-                 accurate: bool = False, names: frozenset = HOOKS["none"], dtype=jnp.bfloat16,
+                 accurate: bool = False, score: tuple = (), gate: bool = False, dtype=jnp.bfloat16,
                  natural: bool = False):
     """The forward, or the backward in the form `accurate` names, over `spans` at `FORM_TILES` under the
-    hooks `names` (`test_attention_triton.hooks_for`), draws of `shape` (rows, queries, four query heads and
-    two key heads) over the spans' keys in `dtype`, the forward's logits `natural` or folded."""
+    score hooks `score` (`test_attention_triton.score_hooks`, their parameters and initial state drawn with
+    the operands) and with `gate` an output gate (`hooks_for`), draws of `shape` (rows, queries, query and
+    key heads, four and two under a hook) over the spans' keys in `dtype`, the forward's logits `natural` or
+    folded."""
     queries = shape[1]
-    draw = _drawn(shape, dtype, width=64, keys=spans.keys)
-    hooks = hooks_for(names, queries, 64, gate_of(queries, 64))
+    score_mod, kinds, draw_hooks = score_hooks(score, queries, spans.keys, 64)
+    output = hooks_for(HOOKS["gate" if gate else "none"], queries, 64, gate_of(queries, 64))
+    draw_operands = _drawn(shape, dtype, width=64, keys=spans.keys)
 
-    def ours(query, key, value, dout):
+    def draw(seed):
+        return *draw_operands(seed), *draw_hooks(seed)
+
+    def hooked(params, initial):
+        return template.Hooks(score_mod, tuple(template.Param(value, kind)
+                                               for value, kind in zip(params, kinds, strict=True)), initial,
+                              output.output_mod, output.output_params)
+
+    def ours(query, key, value, dout, params, initial):
+        hooks = hooked(params, initial)
         if not backward:
             return attention_mosaic.forward(query, key, value, spans, hooks, natural=natural,
                                             tiles=FORM_TILES, interpret=interpret, family=_family(interpret))
-        residuals = attention_triton.forward(query, key, value, spans, residuals=True,
+        residuals = attention_triton.forward(query, key, value, spans, hooks, residuals=True,
                                              interpret=interpret)[1:]
-        grads = attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals,
+        grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
                                           accurate=accurate, tiles=FORM_TILES, interpret=interpret,
                                           family=_family(interpret))
         return grads.query, grads.key, grads.value
 
-    def reference(query, key, value, dout):
+    def reference(query, key, value, dout, params, initial):
+        hooks = hooked(params, initial)
         if not backward:
             return template.reference(query, key, value, spans, hooks)
         _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, hooks), query, key, value)
         return pull(dout)
 
-    name = (f"mosaic {'backward' if backward else 'forward'} {label} {sorted(names)} {jnp.dtype(dtype).name}"
-            f"{' accurate' if accurate else ''}{' natural' if natural else ''}")
+    name = (f"mosaic {'backward' if backward else 'forward'} {label} {score}{' gate' if gate else ''} "
+            f"{jnp.dtype(dtype).name}{' accurate' if accurate else ''}{' natural' if natural else ''}")
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, name,
-                    seeds=ALL_HOOKS_SEEDS if names == HOOKS["all"] else SEEDS)
+                    seeds=ALL_HOOKS_SEEDS if len(score) + gate > 1 else SEEDS)
 
 
-def _check_hooks(names: frozenset, dtype, natural: bool, *, interpret: bool):
-    """The forward under the hooks `names` over the template core's causal packed documents under a window
-    (`test_attention_triton`'s hook site)."""
+def _check_hooks(hooks: str, dtype, natural: bool, *, interpret: bool):
+    """The forward under the hooks `FORWARD_HOOKS[hooks]` over the template core's causal packed documents
+    under a window (`test_attention_triton`'s hook site)."""
     case = CASES["causal-documents-window"]
     queries, keys = core_geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
-    _check_spans("causal-documents-window", spans, (ROWS, queries, 4, 2), interpret=interpret, names=names,
-                 dtype=dtype, natural=natural)
+    score, gate = FORWARD_HOOKS[hooks]
+    _check_spans("causal-documents-window", spans, (ROWS, queries, 4, 2), interpret=interpret, score=score,
+                 gate=gate, dtype=dtype, natural=natural)
 
 
 def _check_call_form(form: str, *, interpret: bool, backward: bool = False, accurate: bool = False):
@@ -186,11 +205,11 @@ def test_the_forward_is_on_par_over_every_call_form_interpreted(form):
 
 @INTERPRETS
 @pytest.mark.parametrize(("dtype", "natural"), HOOK_FORMS.values(), ids=HOOK_FORMS)
-@pytest.mark.parametrize("hooks", HOOKS.values(), ids=HOOKS)
+@pytest.mark.parametrize("hooks", FORWARD_HOOKS)
 def test_the_forward_is_on_par_under_every_hook_interpreted(hooks, dtype, natural):
-    """The forward under each hook (a softcap, ALiBi's slopes, sinks, an output gate, and all at once) over
-    causal packed documents under a window, under the interpreter: the fold over both 16-bit dtypes, and
-    fp16's natural form (bf16's takes a headroom guard the mainloop has not yet)."""
+    """The forward under each hook (`FORWARD_HOOKS`) over causal packed documents under a window, under the
+    interpreter: the fold over both 16-bit dtypes, and fp16's natural form (bf16's takes a headroom guard the
+    mainloop has not yet)."""
     _check_hooks(hooks, dtype, natural, interpret=True)
 
 
@@ -248,7 +267,12 @@ def test_the_launches_lower_for_an_h100(call, accurate):
     split = template.Split(others, rows_shape, rows_shape, rows_shape)
     residuals = (rows_shape, rows_shape, jax.ShapeDtypeStruct((rows, heads, tokens), jnp.int32), split)
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
-    hooks = hooks_for(HOOKS["all"], tokens, 128, gate_of(tokens, 128))
+    score_mod, kinds, draw_hooks = score_hooks(FORWARD_HOOKS["all"][0], tokens, tokens, 128)
+    params, initial = draw_hooks(0)
+    gate = hooks_for(HOOKS["gate"], tokens, 128, gate_of(tokens, 128))
+    hooks = template.Hooks(score_mod, tuple(template.Param(value, kind)
+                                            for value, kind in zip(params, kinds, strict=True)), initial,
+                           gate.output_mod, gate.output_params)
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
         for forward_hooks in (None, hooks):
             jax.jit(functools.partial(attention_mosaic.forward, spans=spans, hooks=forward_hooks)).trace(
@@ -286,7 +310,7 @@ def test_the_forward_is_on_par_over_every_call_form_on_an_h100(form):
 @ON_HOPPER
 @pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize(("dtype", "natural"), HOOK_FORMS.values(), ids=HOOK_FORMS)
-@pytest.mark.parametrize("hooks", HOOKS.values(), ids=HOOKS)
+@pytest.mark.parametrize("hooks", FORWARD_HOOKS)
 def test_the_forward_is_on_par_under_every_hook_on_an_h100(hooks, dtype, natural):
     """The forward under each hook compiled on an H100."""
     _check_hooks(hooks, dtype, natural, interpret=False)
