@@ -411,6 +411,19 @@ LANE_TEST = ("import os, subprocess, sys, time\n"
 grows."""
 
 
+def gpu_lane_at(root: Path, monkeypatch, url: str, files: int) -> list[str]:
+    """A GPU lane's machine at `root`: the test cache at `url`, half of one 80 GiB GPU, and `files` test files
+    of `LANE_TEST`. Their names."""
+    cached(monkeypatch, url)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
+    gpu_driver(root, monkeypatch)
+    names = [f"tests/test_file_{index}.py" for index in range(files)]
+    for name in names:
+        (root / name).write_text(LANE_TEST)
+    return names
+
+
 def lane_runs(root: Path, stem: str) -> list[list[str]]:
     """Each run of `stem`'s `LANE_TEST`, oldest first: its share, start, end and growth."""
     return [path.read_text().split() for path in sorted(root.glob(f"ran-{stem}-*"),
@@ -434,14 +447,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     row stays red: nothing is run again. The rows join one verdict, each
     recorded as a task's are, and a later lane reuses the green ones."""
     url, stored, _ = cache_worker
-    cached(monkeypatch, url)
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
-    monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
-    gpu_driver(tmp_path, monkeypatch)
-    source = LANE_TEST
-    names = [f"tests/test_file_{index}.py" for index in range(5)]
-    for name in names:
-        (tmp_path / name).write_text(source)
+    names, source = gpu_lane_at(tmp_path, monkeypatch, url, 5), LANE_TEST
     # One that fails on any share, and one that starts a process.
     (tmp_path / "tests/test_red.py").write_text(source + "    assert share == 'all of it'\n")
     (tmp_path / "tests/test_spawner.py").write_text(
@@ -502,14 +508,7 @@ def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
     lane on it reads its own, not the borrowed one. A file no class measured runs alone, as every unmeasured
     one does where the Worker does not list its records."""
     url, stored, _ = cache_worker
-    cached(monkeypatch, url)
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
-    monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
-    gpu_driver(tmp_path, monkeypatch)
-    source = LANE_TEST
-    names = [f"tests/test_file_{index}.py" for index in range(4)]
-    for name in names:
-        (tmp_path / name).write_text(source)
+    names, source = gpu_lane_at(tmp_path, monkeypatch, url, 4), LANE_TEST
     # Red on any share but the whole: run again alone, its second row green.
     (tmp_path / "tests/test_tight.py").write_text(source + "    assert share == '0.5'\n")
     (tmp_path / "tests/test_new.py").write_text(source)
