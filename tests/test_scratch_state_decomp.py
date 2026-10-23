@@ -31,15 +31,44 @@ def wide_issue(name, left, right):
     return (left.astype(jnp.float64) @ right.astype(jnp.float64)).astype(left.dtype)
 
 
-VARIANTS = {"portable": {}, "wide readout": {"readout": wide_readout}, "wide carry": {"carry": wide_carry},
+@jax.custom_vjp
+def memory_product(decayed, entered):
+    return decayed @ entered
+
+
+def _memory_fwd(decayed, entered):
+    return decayed @ entered, (decayed, entered)
+
+
+def _memory_bwd(residual, out_grad):
+    decayed, entered = residual
+    # d entered: sum over the chunk's tokens of decayed[t]^T out_grad[t], smallest (last) first
+    def step(total, t):
+        row, grad = t
+        return total + row[..., :, None] * grad[..., None, :], None
+    rows = jnp.moveaxis(decayed, -2, 0)[::-1]
+    grads = jnp.moveaxis(out_grad, -2, 0)[::-1]
+    total, _ = jax.lax.scan(step, jnp.zeros(entered.shape, entered.dtype), (rows, grads))
+    return out_grad @ jnp.swapaxes(entered, -1, -2), total
+
+
+memory_product.defvjp(_memory_fwd, _memory_bwd)
+
+
+def reversed_readout(query, entering, entered, key, pairs, corrected, issue=algebra.portable):
+    return (memory_product(query * entering, entered)
+            + issue("local", algebra.paired("scores", query, key, pairs, issue), corrected))
+
+
+VARIANTS = {"reversed readout": {"readout": reversed_readout},"portable": {}, "wide readout": {"readout": wide_readout}, "wide carry": {"carry": wide_carry},
             "wide readout+carry": {"readout": wide_readout, "carry": wide_carry},
             "wide products": {"portable": wide_issue}}
 
 
-@pytest.mark.parametrize("name", ["scalar write", "scalar delta"])
-def test_decomp(name, monkeypatch):
+@pytest.mark.parametrize("regime", ["saturated gates", "decays near one", "aligned keys"])
+@pytest.mark.parametrize("name", ["scalar write", "scalar delta", "vector delta", "gated"])
+def test_decomp(name, regime, monkeypatch):
     hooks = st.SITES[name]
-    regime = "saturated gates"
     reference = jax.jit(with_gradients(functools.partial(token_by_token, hooks)))
     errors = {"reference": []}
     draws = [st.cotangents(hooks, regime, seed) for seed in range(64)]
@@ -58,4 +87,4 @@ def test_decomp(name, monkeypatch):
             errors[label] = [float(np.sum((np.asarray(arm(*drawn)[1].state, np.float64) - truth) ** 2))
                              for drawn, truth in zip(draws, truths)]
     rms = {k: float(np.sqrt(np.mean(v))) for k, v in errors.items()}
-    raise AssertionError(f"DECOMP|{name}|" + " ".join(f"{k}={v / rms['reference']:.2f}" for k, v in rms.items()))
+    raise AssertionError(f"DECOMP|{name}|{regime}|" + " ".join(f"{k}={v / rms['reference']:.2f}" for k, v in rms.items()))
