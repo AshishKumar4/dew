@@ -6,8 +6,7 @@ keyed in the plan by the rules and the model it runs."""
 import pytest
 
 from dew.data import Loading, Memory, text
-from dew.data.compile import compile
-from dew.data.dataset import DataPartition
+from dew.data.compile import compile, iterate
 from dew.data.pipeline import Pipeline
 
 pytest.importorskip("datatrove")
@@ -31,15 +30,9 @@ EVALUATION = ("Which of these is the capital of France and has been since the la
 
 
 def read(chain: Pipeline) -> tuple[list[int], dict[str, float]]:
-    """The ids one pass of a chain keeps, in order, and what it drops by reason, as a run reads and
-    logs them."""
-    data = compile(chain.batch(1), read="memory", loading=Loading(workers=0, threads=1, read_buffer=1))
-    reader = data.train(DataPartition())
-    try:
-        kept = [int(batch["id"][0]) for batch in reader]
-    finally:
-        reader.close()
-    dropped = {key.rsplit("/", 1)[1]: count for key, count in data.statistics().items()
+    """The ids one pass of a chain keeps, in order, and what a run counts it dropping, by reason."""
+    kept = [int(record["id"]) for record in iterate(chain, read="memory")]
+    dropped = {key.rsplit("/", 1)[1]: count for key, count in chain.stats(records=len(PROSE) + 2).items()
                if key.startswith("data/rejected/") and count}
     return kept, dropped
 
