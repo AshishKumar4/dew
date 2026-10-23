@@ -609,9 +609,11 @@ class EpisodeCollector:
                     slots, generation, policy_step, binding_id, turn, run))
             agreed("episode verification", lambda: self._verify(slots, policy_step, binding_id, run))
 
-    def collect(self, snapshot: Snapshot, tasks: Sequence[Task], samples: int) -> list[list[Session]]:
+    def collect(self, snapshot: Snapshot, tasks: Sequence[Task], samples: int, *,
+                scored: bool = True) -> list[list[Session]]:
         """`samples` episodes of each task under `snapshot` (`episodes`), as sessions by task
-        (`session_of`)."""
+        (`session_of`). Every reader is a share's first, since replicated readers are refused, so
+        every collection is `scored`."""
         sessions = [session_of(episode, group="") for episode in self.episodes(snapshot, tasks, samples)]
         return [sessions[index * samples:(index + 1) * samples] for index in range(len(tasks))]
 

@@ -142,12 +142,15 @@ class PolicyCollector:
         return prompts, width, ModelInputs(jnp.asarray(rows), {name: jnp.asarray(value)
                                                                for name, value in fields.items()})
 
-    def collect(self, snapshot: Snapshot, tasks: Sequence[Task], samples: int) -> list[list[Session]]:
+    def collect(self, snapshot: Snapshot, tasks: Sequence[Task], samples: int, *,
+                scored: bool = True) -> list[list[Session]]:
         # Every process of the mesh validates its prompts before generation enters its collectives.
         prompts, width, inputs = (self._prepared(tasks) if mesh_of(snapshot.variables) is None
                                   else agreed("rollout input preparation", lambda: self._prepared(tasks)))
         generated = self.objective.policy(snapshot.variables, self.sampling)(
             inputs, self.max_new_tokens, key=snapshot.key, n=samples).host()
+        if not scored:
+            return []
 
         def grouped(values: np.ndarray) -> np.ndarray:
             return values.reshape(len(prompts), samples, *values.shape[1:])
