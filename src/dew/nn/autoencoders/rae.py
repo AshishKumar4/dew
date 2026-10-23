@@ -35,7 +35,7 @@ from dew.interop.components import bind_component, component_source
 from dew.nn.activations import activation
 from dew.nn.attention import LayerNorm, projected_heads, projected_output, scaled_dot_product_attention
 from dew.nn.backbones.sd3 import sincos_position
-from dew.nn.blocks import torch_bicubic_resize
+from dew.nn.blocks import IMAGENET_MEAN, IMAGENET_STD, torch_bicubic_resize
 from dew.nn.dense import Dense
 from dew.nn.mlp import GatedMLP
 from dew.nn.precision import float32_dot_general
@@ -247,8 +247,8 @@ class RAE(nn.Module):
     decoder_heads: int = 16
     decoder_intermediate: int = 2048
     patch: int = 16
-    pixel_mean: tuple[float, ...] = (0.485, 0.456, 0.406)
-    pixel_std: tuple[float, ...] = (0.229, 0.224, 0.225)
+    pixel_mean: tuple[float, ...] = IMAGENET_MEAN
+    pixel_std: tuple[float, ...] = IMAGENET_STD
     dtype: Dtype = jnp.float32
 
     @property
@@ -319,8 +319,8 @@ def rae_fields(config: Mapping[str, object]) -> RAEFields:
         decoder_heads=integer("decoder_num_attention_heads", 16),
         decoder_intermediate=integer("decoder_intermediate_size", 2048),
         patch=integer("patch_size", 16),
-        pixel_mean=per_channel("encoder_norm_mean", (0.485, 0.456, 0.406)),
-        pixel_std=per_channel("encoder_norm_std", (0.229, 0.224, 0.225)),
+        pixel_mean=per_channel("encoder_norm_mean", IMAGENET_MEAN),
+        pixel_std=per_channel("encoder_norm_std", IMAGENET_STD),
     )
     if fields["input_size"] % fields["encoder_patch"]:
         raise ValueError(f"encoder_input_size {fields['input_size']} is not a multiple of "

@@ -27,7 +27,7 @@ from dew.coordination import (
     collective_host,
     from_every_process,
 )
-from dew.data.dataset import Closeable, DataPartition, Reader, rows_of
+from dew.data.dataset import Closeable, DataPartition, Reader, rows_of, take_rows
 from dew.data.pipeline import Dataset
 from dew.objectives.base import Effects, Loss, Metric, Objective, Step, TrainingScalar, recorded_name
 
@@ -421,11 +421,13 @@ def _covered(mesh: Mesh, batch: Batch | None, last: Batch | None, index: int
 def _cut(leaf, keep: np.ndarray):
     """`leaf` without the rows `keep` marks as repeats, when its leading axis
     is the batch's rows: an array, a per-row tuple of captions or texts, or a
-    per-row list of opaque records (`dew.data.dataset.take_batch`)."""
-    if isinstance(leaf, list | tuple) and len(leaf) == keep.size:
-        return type(leaf)(row for row, kept in zip(leaf, keep, strict=True) if kept)
+    per-row list of opaque records (`dew.data.dataset.take_rows`)."""
+    if isinstance(leaf, list | tuple):
+        return take_rows(leaf, np.flatnonzero(keep)) if len(leaf) == keep.size else leaf
     array = np.asarray(leaf) if isinstance(leaf, np.ndarray | jax.Array) else None
-    return array[keep] if array is not None and array.ndim and array.shape[0] == keep.size else leaf
+    if array is None or not array.ndim or array.shape[0] != keep.size:
+        return leaf
+    return take_rows(array, np.flatnonzero(keep))
 
 
 def _real_artifact[A: Artifact](artifact: A, keep: np.ndarray) -> A:

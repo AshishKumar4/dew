@@ -313,6 +313,20 @@ _SEEDS = (0x9E3779B9, 0x7F4A7C15)
 """The two multipliers `_marks` mixes a word's flat index by."""
 
 
+def _word_type(width: int) -> type:
+    """The unsigned type `_marks` reads `width`-byte elements as: their own width up to 2 bytes,
+    32-bit words past it (an 8-byte element is two)."""
+    return {1: np.uint8, 2: np.uint16}.get(width, np.uint32)
+
+
+def _mixed(module, words, index):
+    """The two marks of 32-bit `words` at their flat positions `index`, in `module` (NumPy on the
+    host, jax.numpy on the devices): each word mixed with its index times a seed (`fmix32`) and the
+    words summed, wrapping."""
+    return module.stack([module.sum(fmix32(words ^ (index * module.uint32(seed))), dtype=module.uint32)
+                         for seed in _SEEDS])
+
+
 @jax.jit
 def _marks(leaves: list[jax.Array]) -> jax.Array:
     """Two 32-bit marks of each leaf's stored bits at their positions, `[leaves, 2]`.
@@ -330,33 +344,30 @@ def _marks(leaves: list[jax.Array]) -> jax.Array:
 
 def _leaf_marks(leaf: jax.Array) -> jax.Array:
     bits = leaf.astype(jnp.uint8) if leaf.dtype == jnp.bool_ else leaf
-    width = np.dtype(bits.dtype).itemsize
     # An 8-byte element becomes a trailing pair of 32-bit words.
-    unsigned = {1: jnp.uint8, 2: jnp.uint16}.get(width, jnp.uint32)
-    bits = jax.lax.bitcast_convert_type(bits, unsigned).astype(jnp.uint32)
+    bits = jax.lax.bitcast_convert_type(bits, _word_type(np.dtype(bits.dtype).itemsize)).astype(jnp.uint32)
     index = jnp.zeros(bits.shape, jnp.uint32)
     stride = 1
     for axis in reversed(range(bits.ndim)):
         index = index + jax.lax.broadcasted_iota(jnp.uint32, bits.shape, axis) * jnp.uint32(stride)
         stride = stride * bits.shape[axis] % 2 ** 32
-    return jnp.stack([jnp.sum(fmix32(bits ^ (index * jnp.uint32(seed))), dtype=jnp.uint32)
-                      for seed in _SEEDS])
+    return _mixed(jnp, bits, index)
 
 
 def _host_marks(leaf: np.ndarray, chunk: int = 1 << 24) -> np.ndarray:
-    """`_marks` of a host array, from its stored bytes, `chunk` words at a time."""
+    """`_marks` of a host array, from its stored bytes, `chunk` words at a time: the same mixing
+    (`_mixed`) on the host, so a leaf JAX does not hold as stored (float64 with x64 off) is marked
+    from its bytes, and no more than a chunk's words are widened at once."""
     array = np.ascontiguousarray(leaf)
     if array.dtype == np.bool_:
         array = array.astype(np.uint8)
-    width = array.dtype.itemsize
-    words = array.reshape(-1).view({1: np.uint8, 2: np.uint16}.get(width, np.uint32))
+    words = array.reshape(-1).view(_word_type(array.dtype.itemsize))
     marks = np.zeros(2, np.uint32)
     with np.errstate(over="ignore"):
         for start in range(0, words.size, chunk):
             bits = words[start:start + chunk].astype(np.uint32)
             index = (np.arange(start, start + bits.size, dtype=np.uint64) & 0xFFFFFFFF).astype(np.uint32)
-            for slot, seed in enumerate(_SEEDS):
-                marks[slot] += np.sum(fmix32(bits ^ (index * np.uint32(seed))), dtype=np.uint32)
+            marks += _mixed(np, bits, index)
     return marks
 
 

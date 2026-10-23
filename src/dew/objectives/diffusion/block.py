@@ -23,7 +23,7 @@ import jax.numpy as jnp
 from flax import linen as nn, struct
 
 from dew.artifacts import TokenScores
-from dew.batch import FROZEN, Batch, Variables, token_layout
+from dew.batch import FROZEN, Batch, Variables, real_places, token_layout
 from dew.inference.tasks import BlockGeneration, BlockSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import ModelInputs
@@ -64,12 +64,6 @@ class BlockSFTStatistics:
     support: jax.Array
 
 
-def _positions(valid: jax.Array) -> jax.Array:
-    """Number the valid tokens of each row from zero, padding included."""
-    counts = jnp.cumsum(valid, axis=-1)
-    return counts - (counts >= 1)
-
-
 def _cache_geometry(valid: jax.Array, selected: jax.Array, prompt_length: int, canvas_size: int,
                     positions: jax.Array | None = None, image_groups: jax.Array | None = None):
     """Build the attention masks and positions of one SFT step.
@@ -89,7 +83,7 @@ def _cache_geometry(valid: jax.Array, selected: jax.Array, prompt_length: int, c
     physical = jnp.arange(total)
     ordered = jnp.argsort(~valid, axis=-1, stable=True)
     packed_valid = jnp.take_along_axis(valid, ordered, axis=-1)
-    positions = _positions(valid) if positions is None else positions
+    positions = real_places(valid) if positions is None else positions
     packed_positions = jnp.take_along_axis(positions, ordered, axis=-1)
     encoder_mask = ordered[:, None, :] <= physical[None, :, None]
     if image_groups is not None:

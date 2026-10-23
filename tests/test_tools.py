@@ -21,7 +21,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, chain_roundings
 from test_moe import OUTPUT_TOLERANCE, ROUTER_TOLERANCE
 from test_t5_encoders import TOLERANCE as T5_TOLERANCE
 from test_text_encoders import transformers_clip
@@ -354,8 +354,9 @@ def test_layout_parity_orders_preserve_the_tiny_nemotron_function():
         model = loaded.model.clone(dtype=jnp.float64)
         truth = np.asarray(model.apply(wide, ids))
         reordered = np.asarray(model.apply(permuted(wide, order), ids))
+        roundings = chain_roundings(jax.make_jaxpr(lambda variables: model.apply(variables, ids))(wide))
     tool.order_invariance({'logits': reordered}, {'logits': truth},
-                          float(reordered.sum()), float(truth.sum()))
+                          float(reordered.sum()), float(truth.sum()), roundings=roundings)
 
 
 def test_residual_orders_preserve_a_decoder_whose_heads_are_the_residual_width():
@@ -378,8 +379,41 @@ def test_residual_orders_preserve_a_decoder_whose_heads_are_the_residual_width()
         truth = np.asarray(model.apply(wide, ids))
         order = orders(residual_width(variables), 2, seed=6)[1]
         reordered = np.asarray(model.apply(permuted(wide, order), ids))
+        roundings = chain_roundings(jax.make_jaxpr(lambda variables: model.apply(variables, ids))(wide))
     load('layout_parity').order_invariance({'logits': reordered}, {'logits': truth},
-                                           float(reordered.sum()), float(truth.sum()))
+                                           float(reordered.sum()), float(truth.sum()), roundings=roundings)
+
+
+def test_a_nonfinite_order_fails_the_invariance_check():
+    """A residual order whose function or loss is not finite fails the check, as a NaN compares
+    with nothing."""
+    tool = load('layout_parity')
+    for logits, loss in ((np.array([np.nan, 1.0]), 1.0), (np.array([1.0, 2.0]), np.nan)):
+        with pytest.raises(ValueError):
+            tool.order_invariance({'logits': logits}, {'logits': np.array([1.0, 2.0])}, loss, 1.0,
+                                  roundings=1)
+
+
+def test_residual_orders_preserve_a_looped_ngpt():
+    """A residual order is an exact symmetry of Dory's looped nGPT decoder: its per-feature step rates
+    (`attn_alpha`, `mlp_alpha`) live on the residual stream and are reordered with it, as its norms'
+    scales are; left in place, the reordered model computes another function (the 4B release's order 1
+    sat at an RMS of 10 from vLLM's log probabilities)."""
+    from residual_orders import orders, permuted, residual_width
+
+    from dew.interop import Pretrained
+
+    loaded = Pretrained.load(FIXTURES / 'hf/dory-tiny', dtype='float32', attention_impl='reference')
+    ids = jnp.array([[2, 7, 11, 3, 5, 1, 9, 4]], jnp.int32)
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), loaded.variables)
+        model = loaded.model.clone(dtype=jnp.float64)
+        truth = np.asarray(model.apply(wide, ids))
+        order = orders(residual_width(loaded.variables), 2, seed=6)[1]
+        reordered = np.asarray(model.apply(permuted(wide, order), ids))
+        roundings = chain_roundings(jax.make_jaxpr(lambda variables: model.apply(variables, ids))(wide))
+    load('layout_parity').order_invariance({'logits': reordered}, {'logits': truth},
+                                           float(reordered.sum()), float(truth.sum()), roundings=roundings)
 
 
 @pytest.mark.parametrize("model", ["dit", "dense_mdlm"])

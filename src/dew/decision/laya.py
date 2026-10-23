@@ -76,6 +76,10 @@ IN_PROJ = tuple(Packed(f"in_proj_{leaf}", tuple(f"{part}.{leaf}" for part in ("q
 """How `nn.MultiheadAttention` holds an attention's q, k and v: one in_proj, the three in turn on axis 0."""
 
 
+LAYA = "convaiinnovations/laya"
+"""The released Laya checkpoint the decision task, its runs and the checkpoint loader start from."""
+
+
 @dataclass(frozen=True)
 class LayaCheckpoint:
     """One released Laya checkpoint: its model, variables, layout and tokenizer, and its agent's temperatures.
@@ -106,7 +110,7 @@ class LayaCheckpoint:
         return sources.has_file(str(name_or_dir), config, revision=revision)
 
     @classmethod
-    def load(cls, name_or_dir: str | Path = "convaiinnovations/laya", *, subfolder: str | None = None,
+    def load(cls, name_or_dir: str | Path = LAYA, *, subfolder: str | None = None,
              revision: str | None = None, dtype: str = "float32", param_dtype: str = "float32",
              attention_impl: str = "auto") -> Self:
         """Read the checkpoint at `name_or_dir`, a Hub repo or a directory.

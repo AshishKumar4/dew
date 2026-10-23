@@ -975,12 +975,18 @@ def rows_of(batch: Mapping[str, object]) -> int:
                  for leaf in leaves if isinstance(leaf, list) or np.shape(leaf)), 0)
 
 
+def take_rows(column, indices: np.ndarray):
+    """`column`'s rows at `indices`: a list or tuple of per-row records as its own type, an array
+    along its leading axis."""
+    if isinstance(column, list | tuple):
+        return type(column)(column[int(index)] for index in indices)
+    return column[indices]
+
+
 def take_batch(batch: Batch, indices: int | slice | np.ndarray) -> Batch:
-    """Rows selected along array axes and opaque lists of object records."""
+    """Rows selected along array axes and opaque lists of object records (`take_rows`)."""
     return jax.tree.map(
-        lambda column: ([column[int(index)] for index in indices]
-                        if isinstance(column, list) and isinstance(indices, np.ndarray)
-                        else column[indices]),
+        lambda column: take_rows(column, indices) if isinstance(indices, np.ndarray) else column[indices],
         batch, is_leaf=lambda column: isinstance(column, list),
     )
 

@@ -112,3 +112,17 @@ class ImageMetric(Mean[ImageGrid | VideoGrid]):
     def __call__(self, artifact: Artifact, batch: Batch) -> tuple[float, float]:
         with metric_device():
             return super().__call__(artifact, batch)
+
+
+class PairedImageMetric(ImageMetric):
+    """An `ImageMetric` of a pairwise measure of each sample against its batch's image, both on the
+    [-1, 1] scale `paired` moves them to, which a `data_range` of 2.0 spans: `measure(samples, targets,
+    data_range, per_example=True)`."""
+
+    def __init__(self, name: str, measure: Callable[..., ArrayLike], data_range: float = 2.0,
+                 field: str = "image", reads: type[ImageGrid | VideoGrid] = ImageGrid):
+        def measured(artifact, batch):
+            samples, targets = paired(artifact, batch, field)
+            return measure(samples, targets, data_range, per_example=True)
+
+        super().__init__(name=name, measure=measured, reads=reads)

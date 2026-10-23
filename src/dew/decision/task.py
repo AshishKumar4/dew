@@ -22,12 +22,20 @@ from dew.batch import Variables
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Reader
 from dew.data.text import HFTokenizer, Tokenizer
-from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures
+from dew.decision.calibration import (
+    BUCKET_MINIMUM,
+    TYPE_MINIMUM,
+    Abstention,
+    Binning,
+    Calibration,
+    Scored,
+    Temperatures,
+)
 from dew.decision.data import Example
 from dew.decision.head import Head
 from dew.decision.images import Images
 from dew.decision.joint_checkpoint import JointCheckpoint
-from dew.decision.laya import LayaCheckpoint
+from dew.decision.laya import LAYA, LayaCheckpoint
 from dew.decision.layout import (
     DecisionInputs,
     Encoded,
@@ -157,7 +165,7 @@ class Decide:
     """The backbone's own processor, which prepares a request's images for it."""
 
     @classmethod
-    def from_pretrained(cls, name: str | Path = "convaiinnovations/laya", *, subfolder: str | None = None,
+    def from_pretrained(cls, name: str | Path = LAYA, *, subfolder: str | None = None,
                         revision: str | None = None, dtype: str = "float32", param_dtype: str = "float32",
                         attention_impl: str = "auto") -> Self:
         """Load a released Laya checkpoint (`LayaCheckpoint`) or joint-head
@@ -431,8 +439,8 @@ class Decide:
         return self(state, final)
 
     def calibrated(self, held_out: Iterable[Example | Mapping[str, object]] | Reader, *,
-                   binning: bool = False, target_error: float | None = None, type_minimum: int = 10,
-                   bucket_minimum: int = 2000) -> Self:
+                   binning: bool = False, target_error: float | None = None,
+                   type_minimum: int = TYPE_MINIMUM, bucket_minimum: int = BUCKET_MINIMUM) -> Self:
         """Return this task with temperatures fitted to held-out answers.
 
         If asked, it also fits a binning map and abstention thresholds that keep the
@@ -461,12 +469,11 @@ class Decide:
         and the log loss. The pass agrees its result across a process pool, so
         there every process calls it.
         """
-        from dew.decision.metrics import AURC, ECE, Accuracy
-        from dew.decision.scoring import LogLoss
+        from dew.decision.scoring import default_metrics
         from dew.training.distributed import MeshSpec
         from dew.training.evaluation import Evaluation
 
-        chosen = list(metrics) or [Accuracy(), ECE(), AURC(), LogLoss()]
+        chosen = list(metrics) or default_metrics()
         evaluation = Evaluation.run(self._scoring, self.variables, self._held(examples),
                                     key=0, metrics=chosen, mesh=MeshSpec().build(jax.local_devices()[:1]))
         return {metric.name: evaluation.scores[f"val/{metric.name}"] for metric in chosen}

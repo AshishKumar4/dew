@@ -6,7 +6,6 @@ import functools
 import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from enum import Enum
 from typing import TYPE_CHECKING, Generic
 
 import jax
@@ -21,12 +20,12 @@ from typing_extensions import TypeVar
 from dew.artifacts import uint8_pixels
 from dew.batch import Variables
 from dew.coordination import agreed
-from dew.diffusion.process import Conditioning, Process
-from dew.inputs import InputSpec, unit_range
+from dew.diffusion.process import Conditioning, Denoiser, Process
+from dew.inputs import InputSpec, encode_conditions, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, local_rows, mesh_of, request_key
 from dew.nn.kernels.options import compiler_options
-from dew.objectives.base import thaw
+from dew.objectives.base import OMITTED, Omitted, thaw
 from dew.records import JSON
 from dew.registry import dtype_name, resolve_dtype
 from dew.sampling.guidance import CFG, Guidance, guidance_modules
@@ -43,16 +42,6 @@ if TYPE_CHECKING:
     from dew.objectives.diffusion import DiffusionObjective
     from dew.quantization import Quantization
     from dew.training.distributed import Layout, MeshSpec
-
-class _Default(Enum):
-    """The sentinel that tells `guidance=None` from an omitted `guidance=`.
-
-    None is a value a caller passes to turn guidance off, so the default
-    cannot be None.
-    """
-
-    GUIDANCE = "guidance"
-
 
 @dataclass(frozen=True)
 class _Resolved:
@@ -358,18 +347,14 @@ class TextToImage:
         shape = self.inputs.sample.shape
         return shape if self.autoencoder is None else self.autoencoder.latent_shape(shape)
 
-    @property
-    def _conditions(self) -> tuple[tuple[str, object], ...]:
-        return tuple((keyword, condition.encoder) for keyword, condition in self.inputs.conditions.items())
-
     def _unconditional(self, tokens, plan: RowPlan) -> dict:
         """The unconditional branch: the task's own blank prompt or the caller's negatives, encoded
         by the task's towers as the training step encodes its blank (`DiffusionObjective.encode`)."""
         leaves = jax.tree.leaves(tokens)
         if leaves and leaves[0].shape[0] != 1:
-            return _encode(plan.sharding)(self._conditions, self.variables, plan.place(plan.pad(tokens)))
+            return _encode(plan.sharding)(self.inputs.encoders, self.variables, plan.place(plan.pad(tokens)))
         # Host tokens, which reach the encoders' devices as the call places them.
-        return _encode(None)(self._conditions, self.variables, jax.tree.map(np.asarray, tokens))
+        return _encode(None)(self.inputs.encoders, self.variables, jax.tree.map(np.asarray, tokens))
 
 
     def prepare(
@@ -450,7 +435,7 @@ class TextToImage:
         the grid, the solver and the guidance a call runs with. The value
         ends with the signature a pool compares.
         """
-        chosen = self.guidance if guidance is _Default.GUIDANCE else guidance
+        chosen = self.guidance if guidance is OMITTED else guidance
         if isinstance(chosen, (int, float)) and not isinstance(chosen, bool):
             chosen = CFG(float(chosen))
         if chosen is not None and not isinstance(chosen, Guidance):
@@ -649,7 +634,7 @@ class TextToImage:
         plan, process = settled.plan, settled.process
         given = plan.place(plan.pad(settled.tokens))
         if "given" not in settled.encoded:
-            given = _encode(plan.sharding)(self._conditions, self.variables, given)
+            given = _encode(plan.sharding)(self.inputs.encoders, self.variables, given)
         if settled.null_tokens is None:
             null = {}
         elif "null" in settled.encoded:
@@ -680,7 +665,7 @@ class TextToImage:
         prompts: str | Sequence[str | Mapping[str, object]] | DenoisingInputs,
         *,
         steps: int | None = None,
-        guidance: Guidance | float | None | _Default = _Default.GUIDANCE,
+        guidance: Guidance | float | None | Omitted = OMITTED,
         solver: Solver | None = None,
         key: int | jax.Array,
         decode: bool = True,
@@ -816,9 +801,9 @@ def _image_start(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[s
 
 @functools.cache
 def _encode(rows: jax.sharding.NamedSharding | None):
-    def encode(conditions, params, tokens):
-        return {keyword: encoder.encode(params["encoders"][keyword], tokens[keyword])
-                for keyword, encoder in conditions}
+    def encode(encoders, params, tokens):
+        # A task without conditions holds no encoder weights.
+        return encode_conditions(encoders, params["encoders"] if encoders else {}, tokens)
     return jax.jit(encode, static_argnums=(0,), in_shardings=(None, rows), out_shardings=rows)
 
 
@@ -862,6 +847,21 @@ def sampling_modules(model: nn.Module, guidance: Guidance | None,
     return (model, *guidance_modules(guidance), *(() if autoencoder is None else (autoencoder.model,)))
 
 
+def walk_and_decode(denoise: Denoiser, autoencoder: AutoEncoder | None, params, x_T: jax.Array, *,
+                    solver: Solver, guidance: Guidance | None, key: jax.Array, times, final_denoise: bool,
+                    initial=None, decode: bool = True) -> Images:
+    """`denoise`'s reverse walk from `x_T`, and with `decode` the latents it reaches decoded by
+    `autoencoder` (its weights `params["autoencoder"]`) and clipped to [-1, 1]: the one sampling
+    program a task (`TextToImage`) and an objective's evaluation and preview
+    (`DiffusionObjective.evaluate`) run."""
+    latents = sample(denoise, x_T, solver=solver, guidance=guidance, key=key, times=times,
+                     initial=initial, final_denoise=final_denoise)
+    if not decode:
+        return Images(None, latents=latents)
+    images = autoencoder.decode(params["autoencoder"], latents) if autoencoder is not None else latents
+    return Images(jnp.clip(images, -1.0, 1.0), latents=latents)
+
+
 @functools.cache
 def _run(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
     """The walk over `rows`, compiled with the XLA `options` of its denoiser, its guidance's guide and
@@ -876,15 +876,11 @@ def _run(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool
             solver, guidance, times, initial, params, given, null, x_T, key):
         variables = {name: value for name, value in params.items() if name not in ("encoders", "autoencoder")}
         denoise = process.denoiser(model, variables, given, None if guidance is None else null)
-        latents = sample(denoise, x_T, solver=solver, guidance=guidance, key=key, times=times,
-                         initial=initial, final_denoise=final_denoise)
-        if not decode:
-            return Images(None, latents=latents)
-        images = autoencoder.decode(params["autoencoder"], latents) if autoencoder is not None else latents
-        images = jnp.clip(images, -1.0, 1.0)
-        if finish is not None:
-            images = finish(params, images)
-        return Images(images, latents=latents)
+        walked = walk_and_decode(denoise, autoencoder, params, x_T, solver=solver, guidance=guidance, key=key,
+                                 times=times, final_denoise=final_denoise, initial=initial, decode=decode)
+        if finish is None or walked.images is None:
+            return walked
+        return Images(finish(params, walked.images), latents=walked.latents)
     return jax.jit(run, static_argnums=(0, 1, 2, 3, 4, 5),
                    in_shardings=(None, None, None, None, None, rows, None, rows, None), out_shardings=rows,
                    compiler_options=dict(options))
