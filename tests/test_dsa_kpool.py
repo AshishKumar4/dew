@@ -111,7 +111,7 @@ MARGIN = 1e-3
 rounding, so float64 and fp32 select the same pools."""
 
 SEEDS = {'output': 8, 'biased': 8, 'dense': 8, 'gradients': 64, 'parallel': 8, 'decode': 8,
-         'padded decode': 8, 'hole': 8, 'gated layer': 8, 'ordinary step': 8, 'reordered draft': 8}
+         'padded decode': 8, 'hole': 8, 'gated layer': 8, 'ordinary step': 32, 'reordered draft': 32}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 
 
