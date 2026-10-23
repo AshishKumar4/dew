@@ -1976,7 +1976,10 @@ class CausalTransformer(nn.Module):
                 self.layers, self.block, self.specs, view.groups, x,
                 train=train, decode=decode, kv_store={} if self._provides else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata,
-                banked='params' in view.banked)
+                banked='params' in view.banked,
+                # A layer a fetched stack runs in a scope of its own keeps what a reader of layer
+                # states reads, wherever the caller opened the collection it keeps them in.
+                capture=self.capture_layers if self.is_mutable_collection(_INTERMEDIATES) else False)
         return run_pipeline(
             self,
             view,
