@@ -34,7 +34,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact, widened, with_gradients
-from test_recurrence_chunk import CHUNK, KEY_WIDTH, draw, token_by_token
+from test_recurrence_chunk import CHUNK, KEY_WIDTH, VALUE_HEADS, draw, token_by_token
 
 from dew.nn.kernels import recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk, port_refusal
@@ -272,11 +272,12 @@ def floor(regime: str) -> float:
     return FLOORS.get(regime, -5.0)
 
 
-def stressed(hooks, regime: str, seed: int) -> tuple[Chunk]:
-    """Draw `seed`'s operands for `hooks` under `regime`, a decay per key dimension no steeper than the
-    regime's floor (`FLOORS`)."""
+def stressed(hooks, regime: str, seed: int, *, value_heads: int = VALUE_HEADS) -> tuple[Chunk]:
+    """Draw `seed`'s operands for `hooks` under `regime` over `value_heads` value heads, a decay per key
+    dimension no steeper than the regime's floor (`FLOORS`)."""
     transform, length = REGIMES[regime]
-    (operands,) = draw(hooks, packed=False, seed=seed, **({} if length is None else {'length': length}))
+    (operands,) = draw(hooks, packed=False, seed=seed, value_heads=value_heads,
+                       **({} if length is None else {'length': length}))
     operands = transform(operands, hooks, jax.random.fold_in(jax.random.key(seed), 99))
     if hooks.decay == 'vector':
         operands = dataclasses.replace(operands, log_decay=jnp.maximum(operands.log_decay, floor(regime)))
@@ -288,12 +289,17 @@ def cotangents(hooks, regime: str, seed: int) -> tuple[Chunk, tuple[jax.Array, j
     puts them back: they are not differentiable), and fp32 cotangents of their output `[B, S, Hv, Dv]`
     and final memory `[B, Hv, Dk, Dv]` from the seed's own key, which the float64 truth takes as they
     are."""
-    (operands,) = stressed(hooks, regime, seed)
+    (operands,) = stressed(hooks, regime, seed, value_heads=GRADIENT_HEADS)
     batch, length, heads, width = operands.value.shape
     keys = jax.random.split(jax.random.fold_in(jax.random.key(seed), 101))
     return dataclasses.replace(operands, starts=None), (
         jax.random.normal(keys[0], (batch, length, heads, width)),
         jax.random.normal(keys[1], (batch, heads, operands.key.shape[-1], width)))
+
+
+GRADIENT_HEADS = 16
+"""The gradient arms' value heads: a head's own parameters (the gates' `log_a` and `bias`, a rated decay's
+rate) are a leaf of a head each, which two heads do not resolve within 512 seeds."""
 
 
 def restarting(fn, regime: str):
