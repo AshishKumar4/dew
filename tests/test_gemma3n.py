@@ -299,6 +299,28 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
         return {name: state_dict[name].detach().numpy() for name in names}
 
     import os
+    if os.environ.get("NORM_BLOCK"):
+        import flax.linen as fnn
+        first, last = (int(value) for value in os.environ["NORM_BLOCK"].split(":"))
+        for seed in range(first, last):
+            rows, _ = draw(seed)
+            seen = {}
+
+            def record(next_fun, args, kwargs, context):
+                module = context.module
+                if context.method_name == "__call__" and type(module).__name__ == "RMSNorm" and args:
+                    x = np.asarray(args[0], np.float64)
+                    rms = np.sqrt(np.mean(x * x, axis=-1)).ravel()
+                    live = rms[rms > 0]
+                    name = "/".join(str(part) for part in module.scope.path[-3:])
+                    if live.size:
+                        seen[name] = min(seen.get(name, np.inf), float(live.min() / np.median(live)))
+                return next_fun(*args, **kwargs)
+
+            with fnn.intercept_methods(record):
+                model.apply(loaded.variables, jnp.asarray(rows[:, :-1]), train=True)
+            print("NORMROW", seed, " ".join(f"{name}={value:.3e}" for name, value in sorted(seen.items())), flush=True)
+        return
     if os.environ.get("FLIP_SEEDS"):
         from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextMLP
         records = []
