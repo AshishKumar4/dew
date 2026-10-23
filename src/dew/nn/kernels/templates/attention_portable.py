@@ -92,7 +92,8 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
         spans = (start[row, rows], end[row, rows]) if spec.form == "spans" else None
         row_ids = None if ids is None else (ids[0][row, rows], ids[1][row])
 
-        def keys_at(j) -> algebra.Keys:
+        def keys_at(form: algebra.Forward, j) -> algebra.Keys:
+            # A key tile's logits in `form` (the call's, or the fold's rewalk's, `algebra.walked`).
             columns = j * block_k + jnp.arange(block_k)
             coords = algebra.Coords(q_pos, columns[None, :], spans,
                                     None if row_ids is None else (row_ids[0], row_ids[1][columns]))
@@ -100,7 +101,7 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
                            for param, kind in zip(score_params, score_kinds, strict=True))
             k_tile = jax.lax.dynamic_slice_in_dim(key[row, :, kv_head], j * block_k, block_k)
             v_tile = jax.lax.dynamic_slice_in_dim(value[row, :, kv_head], j * block_k, block_k)
-            return algebra.Keys(coords, algebra.modify(spec, interpreted_dot(q, k_tile.T), coords, params),
+            return algebra.Keys(coords, algebra.modify(form, interpreted_dot(q, k_tile.T), coords, params),
                                 lambda: v_tile, interpreted_dot)
 
         def anchor_rows(keys):
@@ -110,7 +111,6 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
         resumed = None if initial is None else (initial[0][row, head, rows], initial[1][row, head, rows],
                                                 initial[2][row, head, rows])
 
-        started = functools.partial(algebra.started, spec, resumed, block_q, value_width)
         if spec.form == "spans":
             lo, hi = blocks_map.lo[row, i], blocks_map.hi[row, i]
         elif spec.form == "causal":
@@ -120,29 +120,33 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
         out_params = tuple(_output_param(param, kind, row, head, rows)
                            for param, kind in zip(output_params, output_kinds, strict=True))
 
-        # Each walk is the plain one where `live` is None, else the guarded one, those rows shifting.
-        def plain(live=None):
-            return algebra.plain_walk(spec, lo, hi, keys_at, started(live))
+        def walk(form: algebra.Forward, live):
+            # The walk in `form`: the plain one where `live` is None, else the guarded one, those rows
+            # shifting (`algebra.walked`).
+            start_state = algebra.started(form, resumed, block_q, value_width, live)
+            tiles_of = functools.partial(keys_at, form)
+            if residuals:
+                return algebra.training_walk(form, lo, hi, tiles_of, anchor_rows, start_state)
+            return algebra.plain_walk(form, lo, hi, tiles_of, start_state)
 
-        def training(live=None):
-            return algebra.training_walk(spec, lo, hi, keys_at, anchor_rows, started(live))
+        def finished(form: algebra.Forward, carry):
+            # A walk's outputs in `form`: a guarded training walk's live rows take their split sums from a
+            # normalized pass at its maximum and denominator, as the Triton mainloop's.
+            kept = ()
+            state = carry
+            if residuals:
+                normalized = functools.partial(algebra.normalized_pass, form, carry,
+                                               functools.partial(keys_at, form), anchor_rows, (lo, hi),
+                                               None if resumed is None else (resumed[0], resumed[2]))
+                state, anchors, sums = algebra.split_written(carry, anchor_rows, normalized)
+                kept = (anchors, *sums)
+            out, m, denominator = algebra.finish(form, state, initial=initial is not None,
+                                                 output_mod=output_mod, output_params=out_params)
+            return (out.astype(query.dtype), m, denominator, *kept) if residuals else out.astype(query.dtype)
 
-        kept = ()
-        if residuals:
-            # A training walk's weighted values are its split sums joined, where they overflow; a guarded
-            # walk's live rows take their split sums from a normalized pass at its maximum and denominator,
-            # as the Triton mainloop's.
-            weighted = functools.partial(_weighted, rows=anchor_rows)
-            walked = algebra.guarded(training, training, weighted) if spec.headroom else training()
-            normalized = functools.partial(algebra.normalized_pass, spec, walked, keys_at, anchor_rows,
-                                           (lo, hi), None if resumed is None else (resumed[0], resumed[2]))
-            state, anchors, sums = algebra.split_written(walked, anchor_rows, normalized)
-            kept = (anchors, *sums)
-        else:
-            state = algebra.guarded(plain, plain) if spec.headroom else plain()
-        out, m, denominator = algebra.finish(spec, state, initial=initial is not None, output_mod=output_mod,
-                                             output_params=out_params)
-        return (out.astype(query.dtype), m, denominator, *kept) if residuals else out.astype(query.dtype)
+        # A training walk's weighted values are its split sums joined, where they overflow.
+        weighted = functools.partial(_weighted, rows=anchor_rows) if residuals else None
+        return algebra.walked(spec, walk, finished, weighted)
 
     mapped = jax.lax.map(program, jnp.arange(blocks * batch * heads))
     return _unmapped(mapped, (blocks, batch, heads, block_q, value_width), residuals=residuals)
@@ -186,11 +190,12 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
         state = hooks.initial
         initial = (call.rows(state.m, -jnp.inf), call.rows(state.total),
                    jnp.pad(call.rows(state.acc), ((0, 0),) * 3 + ((0, call.value.shape[-1] - value_width),)))
-    # The accurate form alone guards its sums (`algebra.Forward.headroom`); the fold walks as ever.
+    # Every form guards its sums where its values can overflow them (`algebra.Forward.headroom`), and the
+    # fold its logits' reach (`algebra.walked`).
     resumes = initial is not None
     spec = algebra.Forward(spans.form, spans.keys, call.query_ids is not None,
                            query.shape[3] ** -0.5 if scale is None else scale, hooks.score_mod, natural,
-                           natural and algebra.headroom(value.dtype), resumes)
+                           algebra.headroom(value.dtype), resumes)
     out, kept = forward(
         spec, call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
         call.score_params, tuple(param.kind for param in hooks.score_params), call.output_params,
@@ -216,11 +221,13 @@ def _seen(spans: tuple[jax.Array, jax.Array, jax.Array | None, jax.Array | None]
 
 def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value, shift,
                sums, spans, score_params, *, score_mod, score_kinds: tuple[Kind, ...], scale: float,
-               how: algebra.Recompute, block_q: int, block_k: int, accurate: bool):
+               how: algebra.Recompute, block_q: int, block_k: int, split: bool, accurate: bool):
     """The Triton mainloop's dQ launch (`attention_triton._dq_launch`), a query block and head at a time:
-    the first pass at the forward's maximum to each query's denominator and `D - c`
-    (`algebra.off_anchor_delta`), then dQ and the dQ program's hook gradients under it, `D` refined once
-    from its own sums (`algebra.refinement`)."""
+    each query's denominator and `D - c` from the forward's split `sums` (`algebra.split_delta`), or without
+    `split` from a first pass at the forward's maximum (`algebra.off_anchor_delta`) but for the rows whose
+    forward walked them normalized (shift -1, `algebra.split_residuals`), which the first pass cannot
+    recompute without the forward's denominator; then dQ and the dQ program's hook gradients under it, `D`
+    refined once from its own sums (`algebra.refinement`)."""
     batch, queries, heads, width = query.shape
     # The logits' scale as the forward took it: 1 for raw products, scaled in the weights (`how`).
     factor = scale if how.factor is None else 1.0
@@ -254,7 +261,11 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             return columns, _seen(spans, row, rows, columns), params, k_tile, v_tile
 
         before, state_total = algebra.off_anchor_start(peak0, total0, maxima, value.shape[-1], shifts)
-        if sums is None:
+        # The forward took the first pass (`algebra.split_delta`).
+        others, own, others_total, prior = (part[row, head, rows] for part in sums)
+        anchor, delta, chosen = algebra.split_delta(others, own, others_total, prior, state_total,
+                                                    anchor_rows, do, chosen, shifts)
+        if not split:
             # D without the forward's split sums: the dQ launch's own pass over the keys.
             def row_terms(j, state):
                 columns, seen, params, k_tile, v_tile = tile(j)
@@ -267,14 +278,12 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                                           shifts, small, interpreted_dot(small, v_tile))
 
             walked = jax.lax.fori_loop(lo, hi, row_terms, before)
-            prior = algebra.power2(walked.total, shifts)
-            anchor, delta, chosen = algebra.off_anchor_delta(walked, anchor_rows, do, state_total, mean0,
-                                                             chosen, shifts)
-        else:
-            # The forward took the first pass (`algebra.split_delta`).
-            others, own, others_total, prior = (part[row, head, rows] for part in sums)
-            anchor, delta, chosen = algebra.split_delta(others, own, others_total, prior, state_total,
-                                                        anchor_rows, do, chosen, shifts)
+            first = algebra.off_anchor_delta(walked, anchor_rows, do, state_total, mean0,
+                                             key_index[row, head, rows], shifts)
+            kept = shifts < 0
+            prior = jnp.where(kept, prior, algebra.power2(walked.total, shifts))
+            anchor, delta, chosen = (jnp.where(kept, ours, theirs)
+                                     for ours, theirs in zip((anchor, delta, chosen), first, strict=True))
         m = maxima
 
         def step(j, carry):
@@ -418,10 +427,10 @@ def _launch(query, key, value, dout, peak, total, initial_term, maximum, key_ind
                                             natural=natural, initial=initial))
     shared = {"score_mod": score_mod, "score_kinds": score_kinds, "scale": scale, "how": how,
               "block_q": block_q, "block_k": block_k, "accurate": accurate}
-    sums = (others, own, others_total, forward_total) if split else None
+    sums = others, own, others_total, forward_total
     dq, softmax, chosen, dq_grads = _dq_launch(query, key, value, dout, peak, total, initial_term, maximum,
                                                key_index, anchor_value, shift, sums, spans, score_params,
-                                               **shared)
+                                               split=split, **shared)
     delta, anchor, m, denominator, _ = softmax
     dk, dv, key_grads = _dkv_launch(query, key, value, dout, m, denominator, anchor, delta, chosen, spans,
                                     score_params, **shared)
@@ -444,9 +453,6 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
                                                   natural=natural)
         residuals = maxima, totals, anchors, sums
     initial = hooks is not None and hooks.initial is not None
-    # A guarded forward's live rows carry normalized split sums (`algebra.split_residuals`), which the first
-    # pass cannot recompute without the forward's denominator: D comes from them.
-    split = split or (natural and algebra.headroom(value.dtype))
     launch = functools.partial(_launch, block_q=block_q, block_k=block_k, split=split, natural=natural,
                                accurate=accurate, initial=initial)
     return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=pad, scale=scale)
