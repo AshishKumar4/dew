@@ -431,18 +431,53 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, starts=None, max_segm
                 scale: float | None = None, delta: bool = True, wide: bool = False):
     """The chunked rule, a decay a head (`g` `[B, S, Hv]`) or a key dimension (`[B, S, Hv, Dk]`), with or
     without the `delta` rule, on the recurrence template's Mosaic GPU mainloop
-    (`templates.recurrence.mainloop.forward`, its forward alone): `fla_rule`'s operands and results, the
-    operands in their common dtype and beta with them, the decay and the memory fp32, on one device, by the
-    bundle of its instruction family (`mainloop.family_of`), interpreted off a GPU of a family a bundle claims
-    (Mosaic GPU's interpreter, `mainloop.INTERPRETED`'s)."""
+    (`templates.recurrence.mainloop.forward`): `fla_rule`'s operands and results, the operands in their
+    common dtype and beta with them, the decay and the memory fp32, on one device, by the bundle of its
+    instruction family (`mainloop.family_of`), interpreted off a GPU of a family a bundle claims (Mosaic GPU's
+    interpreter, `mainloop.INTERPRETED`'s). Its gradient: the gated delta rule's in a 16-bit call on the
+    mainloop (`mainloop.gradients`, fla's DAG, fla's rounding); every other call's the portable math's
+    (`chunk_delta_rule`'s, the recurrence's own adjoint), its forward recomputed there."""
     from .templates.recurrence import mainloop
 
     dtype = jnp.result_type(query, key, value)
     query, key, value, beta = (x.astype(dtype) for x in (query, key, value, beta))
+    g = g.astype(jnp.float32)
     family = mainloop.family_of()
-    return mainloop.forward(query, key, value, g.astype(jnp.float32), beta, state, starts=starts,
-                            max_segments=max_segments, scale=scale, delta=delta, wide=wide,
-                            family=family or mainloop.INTERPRETED, interpret=family is None)
+    run = {"family": family or mainloop.INTERPRETED, "interpret": family is None}
+    fast = delta and g.ndim == 3 and dtype != jnp.float32
+
+    # The documents' starts an operand, not closed over (a custom VJP's function closes over no tracer).
+    @jax.custom_vjp
+    def rule(query, key, value, g, beta, state, starts):
+        return mainloop.forward(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
+                                scale=scale, delta=delta, wide=wide, **run)
+
+    def forward(*operands):
+        return rule(*operands), operands
+
+    def backward(operands, grads):
+        out_grad, final_grad = grads
+        *operands, starts = operands
+        if fast:
+            grads = mainloop.gradients(*operands, out_grad, final_grad, starts=starts,
+                                       max_segments=max_segments, scale=scale, **run)
+            return (*grads[:5], None if operands[5] is None else grads[5], None)
+
+        def portable(query, key, value, g, beta, state):
+            group = value.shape[2] // key.shape[2]
+            if group > 1:
+                query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
+            out, final = chunk_delta_rule(query, key, value, g.reshape(*value.shape[:3], -1), beta, state,
+                                          held_chunk(CHUNK_SIZE, key.shape[-1]) if delta else CHUNK_SIZE,
+                                          starts=starts, delta=delta, scale=scale,
+                                          dtype=jnp.float32 if wide else None)
+            return out, final
+
+        _, pull = jax.vjp(portable, *operands)
+        return (*pull((out_grad, final_grad)), None)
+
+    rule.defvjp(forward, backward)
+    return rule(query, key, value, g, beta, state, starts)
 
 
 RECOMPUTED: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar("recomputed", default=())

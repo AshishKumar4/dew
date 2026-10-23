@@ -42,6 +42,7 @@ between a prologue (the conv's halo and the gates) and an epilogue (the gated RM
 import dataclasses
 import functools
 import math
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -158,6 +159,9 @@ class _Issuer:
     def _operand(self, x, name: str, other=None) -> tuple:
         if isinstance(x, _Parts):
             return x.refs
+        if isinstance(x, algebra.Transposed):
+            # Staged as it is and read transposed (`algebra.Transposed`).
+            return tuple(ref.T for ref in self._operand(x.value, name, other))
         buffers = self.buffers[name]
         if isinstance(buffers, list):
             held = self.held.setdefault(name, [[None, -1] for _ in buffers])
@@ -777,6 +781,47 @@ def forward(q, k, v, g, beta, h0=None, *, starts=None, max_segments: int | None 
     blocks; under a decay a key dimension in an fp32 call at most a block wide (its tiles' three parts fill a
     block's shared memory past that). Its launches issue by `family`'s bundle (the device's, `family_of`,
     where None), interpreted where `interpret`."""
+    run = _prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
+                    tiles=tiles, family=family, interpret=interpret)
+    call, tiles = run.call, run.tiles
+    o = _output(run.q, run.k, run.h, run.corrected, run.hi, run.lo, run.taken, call, tiles, scale=run.scale,
+                out_dtype=jnp.float32 if wide else run.dtype, scores=run.scores)
+    o = run.unlaid(o.reshape(call.rows, call.heads, call.value_width))[..., :run.value_width]
+    return o, run.final
+
+
+@dataclasses.dataclass(frozen=True)
+class _Run:
+    """A call's operands laid a chunk at a time and the forward's values before the output (`_prepared`):
+    what the output launch and the backward's take."""
+
+    call: _Call
+    tiles: Tiles
+    dtype: jnp.dtype
+    scale: float
+    key_width: int
+    value_width: int
+    batch: int
+    q: jax.Array
+    k: jax.Array
+    v: jax.Array
+    hi: jax.Array
+    lo: jax.Array
+    beta: jax.Array
+    a: jax.Array | None
+    w: jax.Array | None
+    scores: jax.Array | None
+    h: jax.Array
+    corrected: jax.Array
+    final: jax.Array
+    taken: jax.Array
+    sequences: jax.Array
+    laid: Callable
+    unlaid: Callable
+
+
+def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles, family, interpret) -> _Run:
+    """`forward`'s operands checked, padded and laid, and its launches before the output run."""
     family = family_of() if family is None else family
     if family is None:
         raise NotImplementedError(f"the mainloop has no bundle for the "
@@ -823,7 +868,306 @@ def forward(q, k, v, g, beta, h0=None, *, starts=None, max_segments: int | None 
         w, u = _weighted(k, v, a, hi, lo, beta, taken, call)
     tiles = DEFAULT[held.parts] if tiles is None else tiles
     h, corrected, final = _states(keys, w, u, hi, lo, beta, h0.reshape(-1, columns), sequences, call, tiles)
-    o = _output(q, k, h, corrected, hi, lo, taken, call, tiles, scale=scale,
-                out_dtype=jnp.float32 if wide else dtype, scores=scores)
-    o = unlaid(o.reshape(rows, heads, columns))[..., :value_width]
-    return o, final.reshape(batch, heads, width, columns)[:, :, :key_width, :value_width]
+    final = final.reshape(batch, heads, width, columns)[:, :, :key_width, :value_width]
+    return _Run(call, tiles, dtype, scale, key_width, value_width, batch, q, k, v, hi, lo, beta,
+                a if delta and not per_key else None, w, scores, h, corrected, final, taken, sequences, laid,
+                unlaid)
+
+
+def gradients(q, k, v, g, beta, h0, do, dfinal, *, starts=None, max_segments: int | None = None,
+              scale: float | None = None, family: mosaic.Family | None = None, interpret: bool = False):
+    """The fast backward of the gated delta rule, a decay a head (`forward`'s, `g` `[B, T, HV]`), in a 16-bit
+    call: `(dq, dk, dv, dg, dbeta, dh0)` for the output's and final memory's gradients `do`, `dfinal`, fla's
+    DAG (recomputing the forward's values, as fla does) through the algebra's backward tile functions:
+    `_reverse`, `_query_key`, `_weighted_back`, the decay's gradient summed token by token
+    (`algebra.summed_back`) and the memory's decay's term added, a key head's value heads summed. Its
+    rounding is fla's; the accurate backward is the portable math's token adjoint."""
+    run = _prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=True,
+                    tiles=None, family=family, interpret=interpret)
+    call = run.call
+    if call.per_key or call.held.parts > 1:
+        raise NotImplementedError("the fast backward takes a decay a head in a 16-bit call")
+    rows, heads, width, columns = call.rows, call.heads, call.width, call.value_width
+    batch = run.batch
+    laid_do = call.given.split(run.laid(_padded(do.astype(run.dtype), 3, columns)).reshape(rows, -1))
+    dht = _padded(_padded(dfinal.astype(jnp.float32), 2, width), 3, columns).reshape(-1, columns)
+    dh, dv2, dh0 = _reverse(run.q, run.k, run.w, laid_do, run.hi, run.lo, dht, run.sequences, call,
+                            scale=run.scale)
+    dq, dk, dw, decay = _query_key(run.q, run.k, run.corrected, laid_do, dv2, run.h, dh, run.hi, run.lo,
+                                   run.taken, call, scale=run.scale)
+    dk_w, dv, decay_w, dbeta = _weighted_back(run.a, run.k, run.v, dw, dv2, run.hi, run.lo, run.beta,
+                                              run.taken, call)
+    chunks = call.chunks
+
+    def per_chunk(x):
+        """`[R, HV * C]` as `[chunks, HV, C, C]`."""
+        return jnp.moveaxis(x.reshape(chunks, CHUNK, heads, CHUNK), 2, 1)
+
+    terms = per_chunk(decay.sum(0) + decay_w)
+    diagonal = jnp.eye(CHUNK, dtype=bool)
+    after = jnp.sum(jnp.where(diagonal, terms, 0.0), -1)
+    pairs = jnp.where(diagonal, 0.0, terms)
+    dg = jax.vmap(jax.vmap(algebra.summed_back))(pairs, after)
+    # The memory's decay across each chunk: its gradient `sum(S dS)` through the decay `exp(g_last)` from
+    # the chunk's start, every token's.
+    memory = jnp.sum((run.h.astype(jnp.float32) * dh.astype(jnp.float32)).reshape(chunks, heads, -1), -1)
+    ending = (run.hi + run.lo).reshape(heads, chunks, CHUNK)[..., -1]
+    dg = dg + (memory * jnp.exp2(ending.T))[..., None]
+    dg = jnp.moveaxis(dg, 1, 2).reshape(rows, heads)
+    dbeta = jnp.sum(jnp.where(diagonal, per_chunk(dbeta), 0.0), -1)
+    dbeta = jnp.moveaxis(dbeta, 1, 2).reshape(rows, heads)
+
+    def headed(x, size):
+        """`[R, HV * size]` laid back as `[B, T, HV, size]`."""
+        return run.unlaid(x.reshape(rows, heads, size))
+
+    def keyed(x):
+        """A value head's gradient `[B, T, HV, Dk]` summed onto its key head's."""
+        return x.reshape(*x.shape[:2], heads // call.group, call.group, width).sum(3)[..., :run.key_width]
+
+    dq = keyed(headed(dq, width))
+    dk = keyed(headed(dk, width) + headed(dk_w, width))
+    dv = headed(dv, columns)[..., :run.value_width]
+    dh0 = dh0.reshape(batch, heads, width, columns)[:, :, :run.key_width, :run.value_width]
+    if starts is not None:
+        dh0 = jnp.where(jnp.asarray(starts, bool)[:, 0, None, None, None], 0.0, dh0)
+    return (dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype), run.unlaid(dg).astype(g.dtype),
+            run.unlaid(dbeta).astype(beta.dtype), dh0)
+
+
+# The fast backward of a decay a head under the delta rule (fla's DAG through the algebra's backward tile
+# functions, `algebra.local_gradient` ... `algebra.summed_back`), a 16-bit call's: the memory's reverse
+# recurrence a sequence at a time (`_reverse`), the queries', keys' and weights' gradients a key block of a
+# chunk at a time (`_query_key`), and the WY representation's (`_weighted_back`); the decay's gradient summed
+# token by token in XLA. A decay's terms leave a launch as a `[C, C]` tile a chunk and value head, its pairs
+# strictly lower and each token's terms from its chunk's start on its diagonal, which `summed_back` never
+# reads as a pair.
+
+
+def _flipped(x, call: _Call):
+    """`x` `[parts * R, columns]` with its chunks in reverse order: walked forward, a sequence's chunks from
+    its last (a chunk `n`'s rows at chunk `chunks - 1 - n`)."""
+    parts = x.shape[0] // call.rows
+    return x.reshape(parts, call.chunks, CHUNK, -1)[:, ::-1].reshape(x.shape)
+
+
+def _reverse(q, k, w, do, hi, lo, dht, sequences, call: _Call, *, scale: float):
+    """`(dh [chunks * HV * Dk, Dv], dv [R, HV * Dv], dh0 [B * HV * Dk, Dv])`: the gradient of the memory each
+    chunk leaves as `call.memories`, the corrected values' gradient as `call.held` (their own output's,
+    `algebra.local_gradient`, and the memory's, `algebra.reverse_carried`) and each row's initial memory's
+    gradient, fp32, each sequence's chunks from its last over a value block (fla's dhu and dv_local in one
+    launch). `q`, `k`, `w` and `do` are laid as the forward's; `dht` `[B * HV * Dk, Dv]` fp32 each row's
+    final memory's gradient."""
+    width, value_width, family = call.width, call.value_width, call.family
+    bv, slices = BLOCK, width // BLOCK
+    held, memories, given = dataclasses.replace(call.held, rows=call.rows), call.memories, call.given
+    batch = dht.shape[0] // (call.heads * width)
+    final = _Operand(dht.shape[0], 1, jnp.dtype(jnp.float32))
+    chunks = call.chunks
+
+    def program(q_ref, k_ref, w_ref, do_ref, hi_ref, lo_ref, column_hi_ref, column_lo_ref, dht_ref, seq_ref,
+                dh_ref, dv_ref, dh0_ref, *, streams, staging):
+        j, s, h = lax.axis_index("blocks"), lax.axis_index("sequences"), lax.axis_index("heads")
+        first, count, row, begins, ends = (seq_ref[s, i] for i in range(5))
+        (staged,) = staging
+        issue = _Issuer(call, dict.fromkeys(("local_dv", "values_dv", "reads", "weights_dv"), staged))
+
+        def memory(base, i):
+            return (base * call.heads + h) * width + i * BLOCK
+
+        key_columns = h // call.group * width
+        views = _views(CHUNK, queries=given.views(q_ref, 0, call.rows, key_columns, width),
+                       keys=given.views(k_ref, 0, call.rows, key_columns, width),
+                       w=held.views(w_ref, 0, call.rows, h * width, width),
+                       out=given.views(do_ref, 0, call.rows, h * value_width + j * bv, bv))
+        final_views = _views(**{f"final{i}": final.views(dht_ref, memory(row, i), BLOCK, j * bv, bv)
+                                for i in range(slices)})
+        walked = family.opened({name: streams[name] for name in views}, views)
+        leaving = family.opened({name: streams[name] for name in final_views}, final_views)
+
+        def step(f, slots, grad, accumulators):
+            n = chunks - 1 - f
+            span, last = pl.ds(n * CHUNK, CHUNK), n * CHUNK + CHUNK - 1
+            for i, part in enumerate(grad):
+                memories.store(dh_ref, part, memory(n, i), BLOCK, j * bv, bv)
+
+            def block(name, operand, i):
+                return _tile(slots, name, operand, columns=pl.ds(i * BLOCK, BLOCK))
+
+            gate, low = family.rows_of(hi_ref.at[h, span]), family.rows_of(lo_ref.at[h, span])
+            out = _tile(slots, "out", given)
+            local = algebra.local_gradient(
+                functools.partial(block, "keys", given), functools.partial(block, "queries", given), slices,
+                gate, low, out, scale, issue, laid=(family.columns_of(column_hi_ref.at[h, span]),
+                                                    family.columns_of(column_lo_ref.at[h, span])))
+            ending, ending_low = (jnp.full((CHUNK,), ref[h, last]) for ref in (hi_ref, lo_ref))
+            grad, dv = algebra.reverse_carried(
+                grad, functools.partial(block, "keys", given), functools.partial(block, "w", held),
+                functools.partial(block, "queries", given), out.value(), local, gate, low, ending,
+                ending_low, scale, held.dtype, issue)
+            held.store(dv_ref, dv, n * CHUNK, CHUNK, h * value_width + j * bv, bv)
+            return grad, accumulators
+
+        def taken(index, slots, carry, accumulators):
+            del index, carry
+            kept = jnp.where(ends > 0, 1.0, 0.0)
+            return [_tile(slots, f"final{i}", final).value() * kept for i in range(slices)], accumulators
+
+        start = chunks - first - count
+
+        def consumer(_):
+            grad = family.walk(leaving, ((taken, 0, 1),), [family.zeros((BLOCK, bv))] * slices, (),
+                               call.interpret)[0]
+            grad = family.walk(walked, ((step, start, start + count),), grad, (), call.interpret,
+                               first=start)[0]
+
+            @pl.when(begins > 0)
+            def _():
+                for i, part in enumerate(grad):
+                    dh0_ref.at[pl.ds(memory(row, i), BLOCK), pl.ds(j * bv, bv)][...] = part
+
+        def producer():
+            family.stream(leaving, final_views, 0, 1)
+            family.stream(walked, views, start, start + count)
+
+        family.roles(1, consumer, producer)
+
+    out_type = (memories.shape(value_width), held.shape(call.heads * value_width),
+                jax.ShapeDtypeStruct((batch * call.heads * width, value_width), jnp.float32))
+    blocks = _streamed(queries=((CHUNK, width), given), keys=((CHUNK, width), given),
+                       w=((CHUNK, width), held), out=((CHUNK, bv), given))
+    finals = _streamed(**{f"final{i}": ((BLOCK, bv), final) for i in range(slices)})
+    flipped = [_flipped(x, call) for x in (q, k, w, do)]
+    return _kernel(program, call, out_type=out_type, grid=(value_width // bv, sequences.shape[0], call.heads),
+                   grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=2,
+                   live=lambda refs: refs[9][lax.axis_index("sequences"), 1] > 0,
+                   staging=_staging(held, (BLOCK, bv)), once=finals)(*flipped, hi, lo, hi, lo, dht,
+                                                                     sequences)
+
+
+def _query_key(q, k, corrected, do, dv, h, dh, hi, lo, taken, call: _Call, *, scale: float):
+    """`(dq, dk [R, HV * Dk] fp32, dw [R, HV * Dk] as call.held, decay [blocks, R, HV * C] fp32)`: each
+    chunk's and key block's queries', keys' and weights' gradients a value head's (fla's dqkwg,
+    `algebra.query_key_gradients`), and its decay's terms over the block's key columns, the pairs strictly
+    lower and the terms from the chunk's start on the diagonal. `h` and `dh` the memories each chunk enters
+    and its leaving memory's gradient (`call.memories`)."""
+    width, value_width, family = call.width, call.value_width, call.family
+    held, memories, given = dataclasses.replace(call.held, rows=call.rows), call.memories, call.given
+    blocks = value_width // BLOCK
+
+    def program(q_ref, k_ref, v_ref, do_ref, dv_ref, h_ref, dh_ref, hi_ref, lo_ref, column_hi_ref,
+                column_lo_ref, taken_ref, dq_ref, dk_ref, dw_ref, decay_ref, *, streams, staging):
+        c, n, h = lax.axis_index("blocks"), lax.axis_index("chunks"), lax.axis_index("heads")
+        row, span, last = n * CHUNK, pl.ds(n * CHUNK, CHUNK), n * CHUNK + CHUNK - 1
+        (staged,) = staging
+        key_columns = h // call.group * width + c * BLOCK
+        memory = (n * call.heads + h) * width + c * BLOCK
+        views = _views(queries=given.views(q_ref, row, CHUNK, key_columns, BLOCK),
+                       keys=given.views(k_ref, row, CHUNK, key_columns, BLOCK),
+                       values=held.views(v_ref, row, CHUNK, h * value_width, value_width),
+                       out=given.views(do_ref, row, CHUNK, h * value_width, value_width),
+                       value_grads=held.views(dv_ref, row, CHUNK, h * value_width, value_width),
+                       entered=memories.views(h_ref, memory, BLOCK, 0, value_width),
+                       leaving=memories.views(dh_ref, memory, BLOCK, 0, value_width))
+
+        def step(index, slots, carry, accumulators):
+            del index
+
+            def column(name, operand, j):
+                return _tile(slots, name, operand, columns=pl.ds(j * BLOCK, BLOCK))
+
+            def whole(name, operand, i):
+                del i
+                return _tile(slots, name, operand)
+
+            gate, low = family.rows_of(hi_ref.at[h, span]), family.rows_of(lo_ref.at[h, span])
+            ending, ending_low = (jnp.full((CHUNK,), ref[h, last]) for ref in (hi_ref, lo_ref))
+            ((dq, dk, dw),), (pairs, after) = algebra.query_key_gradients(
+                functools.partial(whole, "queries", given), functools.partial(whole, "keys", given), 1,
+                functools.partial(column, "values", held), functools.partial(column, "out", given),
+                functools.partial(column, "value_grads", held),
+                lambda i, j: column("entered", memories, j), lambda i, j: column("leaving", memories, j),
+                blocks, gate, low, ending, ending_low, None, scale, held.dtype,
+                _Issuer(call, {"scores_dq": [staged]}), laid=(family.columns_of(column_hi_ref.at[h, span]),
+                                                              family.columns_of(column_lo_ref.at[h, span])))
+            out_columns = pl.ds(h * width + c * BLOCK, BLOCK)
+            dq_ref.at[span, out_columns][...] = dq
+            dk_ref.at[span, out_columns][...] = dk
+            held.store(dw_ref, dw, row, CHUNK, h * width + c * BLOCK, BLOCK)
+            decay_ref.at[c, span, pl.ds(h * CHUNK, CHUNK)][...] = jnp.where(_diagonal(CHUNK, family),
+                                                                            after[:, None], pairs)
+            return carry, accumulators
+
+        _walk(streams, views, step, call)
+
+    tiles = _streamed(queries=((CHUNK, BLOCK), given), keys=((CHUNK, BLOCK), given),
+                      values=((CHUNK, value_width), held), out=((CHUNK, value_width), given),
+                      value_grads=((CHUNK, value_width), held), entered=((BLOCK, value_width), memories),
+                      leaving=((BLOCK, value_width), memories))
+    wide = jax.ShapeDtypeStruct((call.rows, call.heads * width), jnp.float32)
+    out_type = (wide, wide, held.shape(call.heads * width),
+                jax.ShapeDtypeStruct((width // BLOCK, call.rows, call.heads * CHUNK), jnp.float32))
+    return _kernel(program, call, out_type=out_type, grid=(width // BLOCK, call.chunks, call.heads),
+                   grid_names=("blocks", "chunks", "heads"), blocks=tiles, stages=1, live=_taken(11),
+                   staging=_staging(held, (CHUNK, CHUNK)))(q, k, corrected, do, dv, h, dh, hi, lo, hi, lo,
+                                                           taken)
+
+
+def _weighted_back(a, k, v, dw, du, hi, lo, beta, taken, call: _Call):
+    """`(dk [R, HV * Dk], dv [R, HV * Dv], decay [R, HV * C], dbeta [R, HV * C])`, fp32: the WY
+    representation's backward a chunk and value head at a time (fla's prepare_wy_repr_bwd,
+    `algebra.weighted_gradient`) from `w`'s and `u`'s gradients `dw`, `du` (`call.held`), the inverse `a` less
+    its unit diagonal (`_solve`'s); the decay's terms as `_query_key`'s, the write gate's gradient on a
+    tile's diagonal."""
+    width, value_width, family = call.width, call.value_width, call.family
+    held, given = dataclasses.replace(call.held, rows=call.rows), call.given
+
+    def program(a_ref, k_ref, v_ref, dw_ref, du_ref, hi_ref, lo_ref, beta_ref, column_hi_ref, column_lo_ref,
+                taken_ref, dk_ref, dv_ref, decay_ref, dbeta_ref, *, streams, staging):
+        n, h = lax.axis_index("chunks"), lax.axis_index("heads")
+        row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
+        (staged,) = staging
+        views = _views(lower=held.views(a_ref, row, CHUNK, h * CHUNK, CHUNK),
+                       keys=given.views(k_ref, row, CHUNK, h // call.group * width, width),
+                       values=given.views(v_ref, row, CHUNK, h * value_width, value_width),
+                       w_grads=held.views(dw_ref, row, CHUNK, h * width, width),
+                       u_grads=held.views(du_ref, row, CHUNK, h * value_width, value_width))
+
+        def step(index, slots, carry, accumulators):
+            del index
+
+            def column(name, operand, j):
+                return _tile(slots, name, operand, columns=pl.ds(j * BLOCK, BLOCK))
+
+            gate, low = family.rows_of(hi_ref.at[h, span]), family.rows_of(lo_ref.at[h, span])
+            beta = family.rows_of(beta_ref.at[h, span])
+            names = ("inverse_t", "inverse_dx", "inverse_l", "keys_dl", "keys_dlt")
+            key_grads, value_grads, d_beta, (pairs, after) = algebra.weighted_gradient(
+                _tile(slots, "lower", held), functools.partial(column, "keys", given), width // BLOCK,
+                functools.partial(column, "values", given), value_width // BLOCK,
+                functools.partial(column, "w_grads", held), functools.partial(column, "u_grads", held), beta,
+                gate, low, held.dtype, _Issuer(call, dict.fromkeys(names, staged)),
+                laid=(family.columns_of(column_hi_ref.at[h, span]),
+                      family.columns_of(column_lo_ref.at[h, span])))
+            for i, grad in enumerate(key_grads):
+                dk_ref.at[span, pl.ds(h * width + i * BLOCK, BLOCK)][...] = grad
+            for j, grad in enumerate(value_grads):
+                dv_ref.at[span, pl.ds(h * value_width + j * BLOCK, BLOCK)][...] = grad
+            diagonal = _diagonal(CHUNK, family)
+            decay_ref.at[span, pl.ds(h * CHUNK, CHUNK)][...] = jnp.where(diagonal, after[:, None], pairs)
+            dbeta_ref.at[span, pl.ds(h * CHUNK, CHUNK)][...] = jnp.where(diagonal, d_beta[:, None], 0.0)
+            return carry, accumulators
+
+        _walk(streams, views, step, call)
+
+    tiles = _streamed(lower=((CHUNK, CHUNK), held), keys=((CHUNK, width), given),
+                      values=((CHUNK, value_width), given), w_grads=((CHUNK, width), held),
+                      u_grads=((CHUNK, value_width), held))
+
+    def wide(columns):
+        return jax.ShapeDtypeStruct((call.rows, call.heads * columns), jnp.float32)
+
+    out_type = (wide(width), wide(value_width), wide(CHUNK), wide(CHUNK))
+    return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
+                   grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=_taken(10),
+                   staging=_staging(held, (CHUNK, CHUNK)))(a, k, v, dw, du, hi, lo, beta, hi, lo, taken)
