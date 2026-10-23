@@ -15,6 +15,7 @@ import pytest
 from generation_support import INTERPRETS
 from jax.sharding import Mesh
 from reference_error import assert_as_exact
+from test_attention_template import CASES, ROWS, arguments, geometry as core_geometry
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import (
@@ -38,6 +39,9 @@ on an H100."""
 SEEDS = 8
 """Draws a case takes, check 1's fewest (`reference_error.seeds_for`): it bounds the worst row over them
 against the reference's own."""
+FORM_TILES = attention_mosaic.Tiles(64, 64, 2)
+"""The call forms' tiles: the template core's 100 queries over 96 keys (`test_attention_template.CASES`) in a
+pair of query blocks over two key tiles, so a block's spans begin and end within the keys it streams."""
 
 
 def _drawn(shape: tuple[int, int, int, int], dtype, width: int = 128, keys: int | None = None):
@@ -78,6 +82,25 @@ def _check_forward(call: str, dtype, shape, *, natural: bool, interpret: bool):
                     f"mosaic forward {call} {jnp.dtype(dtype).name} natural {natural}", seeds=SEEDS)
 
 
+def _check_call_form(form: str, *, interpret: bool):
+    """The forward over the template core's call form `form` (`test_attention_template.CASES`), bf16, two
+    query heads a key head, at `FORM_TILES`."""
+    queries, keys = core_geometry(CASES[form])
+    spans = template.spans(queries, keys, ROWS, **arguments(CASES[form]))
+    draw = _drawn((ROWS, queries, 4, 2), jnp.bfloat16, width=64, keys=keys)
+
+    def ours(query, key, value, dout):
+        del dout
+        return attention_mosaic.forward(query, key, value, spans, tiles=FORM_TILES, interpret=interpret,
+                                        family=_family(interpret))
+
+    def reference(query, key, value, dout):
+        del dout
+        return template.reference(query, key, value, spans)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"mosaic forward {form}", seeds=SEEDS)
+
+
 def _check_backward(call: str, shape, *, accurate: bool, interpret: bool, keys: int | None = None):
     keys = shape[1] if keys is None else keys
     spans = template.spans(shape[1], keys, shape[0], **CALLS[call])
@@ -112,6 +135,13 @@ def test_the_natural_forward_is_on_par_interpreted(call):
     """The forward with natural logits, fp16's (bf16's takes a headroom guard the mainloop has not yet), under
     the interpreter."""
     _check_forward(call, jnp.float16, SHAPES["interpreted"], natural=True, interpret=True)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("form", CASES)
+def test_the_forward_is_on_par_over_every_call_form_interpreted(form):
+    """The forward over each of the template core's call forms under the interpreter."""
+    _check_call_form(form, interpret=True)
 
 
 @INTERPRETS
@@ -165,6 +195,14 @@ def test_the_forward_is_on_par_on_an_h100(call, dtype):
 def test_the_natural_forward_is_on_par_on_an_h100(call):
     """The forward with natural logits, fp16's, compiled on an H100."""
     _check_forward(call, jnp.float16, SHAPES["compiled"], natural=True, interpret=False)
+
+
+@ON_HOPPER
+@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
+@pytest.mark.parametrize("form", CASES)
+def test_the_forward_is_on_par_over_every_call_form_on_an_h100(form):
+    """The forward over each of the template core's call forms compiled on an H100."""
+    _check_call_form(form, interpret=False)
 
 
 @ON_HOPPER

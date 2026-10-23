@@ -422,6 +422,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         """A row vector read from `ref` (`[rows]`) in a row's layout."""
 
     @abc.abstractmethod
+    def columns_of(self, ref) -> jax.Array:
+        """A column vector read from `ref` (`[columns]`) in a column's layout (a tile's keys')."""
+
+    @abc.abstractmethod
     def as_row(self, vector: jax.Array) -> jax.Array:
         """`vector` `[rows]` in a row's layout, whatever its own."""
 
