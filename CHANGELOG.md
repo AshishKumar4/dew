@@ -5,6 +5,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- The grouped GEMM's kernel gradient on Hopper streams its operand stages
+  across a persistent tile loop, so the next tile's loads overlap this one's
+  stores; it runs as fast as CUTLASS's grouped kernel gradient at the MoE
+  shapes measured. A fused RMS norm's Mosaic GPU forward now lowers on Hopper.
 - `dew.figures` draws SVG figures for notebooks and docs. Their colors follow
   the page's light or dark theme (dewml.dev, Colab, JupyterLab, VS Code, and
   the system setting elsewhere), and their animations are CSS, so they play
