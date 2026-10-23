@@ -39,7 +39,7 @@ from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import Field, InputSpec
 from dew.interop.processors import Processor
 from dew.lora import Adapter
-from dew.nn.cross_attention import crossing
+from dew.nn.cross_attention import crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import ModelInputs
 from dew.nn.protocols import CountedDecisions, CountedTraining, CrossAttending, TokenModel
@@ -490,9 +490,7 @@ class DecisionObjective(Objective[Ratio]):
         held = self.variables
         if held is None or FROZEN not in held or "backbone" not in held[FROZEN]:
             return False
-        trained = held.get("params", {}).get("backbone", {})
-        return all(crossing(tuple(entry.key for entry in path))
-                   for path, _ in jax.tree_util.tree_leaves_with_path(trained))
+        return crosses_alone(held.get("params", {}).get("backbone", {}))
 
     def __init__(self, backbone: nn.Module | Source | Adapter | Decide, *,
                  loss: ScoringRule | None = None, tokenizer: Tokenizer | None = None,
