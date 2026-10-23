@@ -933,9 +933,9 @@ def test_a_stale_policy_reruns_every_file_whose_run_read_a_tool(ci, tmp_path, mo
 def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_changes(
         ci, tmp_path, monkeypatch, cache_worker):
     """A file's green row is kept across a change its tests never meet, the plan's own code (ci.py, which
-    runs outside every test process); it runs again once what its test process runs or reads changes: a
-    plugin loaded into it, a fixture, a Python file added (a conftest.py, a package's __init__.py, a test
-    module), which can change what an import finds, or the process group it runs as."""
+    runs outside every test process), or another test module; it runs again once what its test process
+    runs or reads changes: a plugin loaded into it, a fixture, a Python file added that can change what an
+    import finds (a conftest.py, a top-level package under src/), or the process group it runs as."""
     (tmp_path / "tests/test_kept.py").write_text(
         "from pathlib import Path\n"
         "def test_kept():\n"
@@ -948,8 +948,8 @@ def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_c
     changes = [(None, "", 1), ("tools/armada/ci.py", "# the plan's own code\n", 1),
                ("tools/armada/executed.py", "# a plugin loaded into it\n", 2),
                ("tests/fixtures/data.json", "{}\n", 3), ("tests/conftest.py", "VALUE = 1\n", 4),
-               ("src/package/__init__.py", "", 5), ("tests/more/test_added.py", "VALUE = 2\n", 6),
-               ("tools/armada/child_groups.py", "# its process group\n", 7)]
+               ("src/package/__init__.py", "", 5), ("tests/more/test_added.py", "VALUE = 2\n", 5),
+               ("tools/armada/child_groups.py", "# its process group\n", 6)]
     for path, text, runs in changes:
         if path:
             (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
@@ -1012,9 +1012,10 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
         (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / name).write_text(source)
     written(tmp_path, {
+        # Imported as it runs, not as it is collected, which every file of the task shares.
         f"test_{name}.py": "import sys\nsys.path.insert(0, 'src')\n"
-                           f"from {package} import value\n"
                            f"def test_{name}():\n"
+                           f"    from {package} import value\n"
                            f"    with open('runs-{name}', 'a') as runs: runs.write('x')\n"
                            "    assert value()\n"
         for name, package in (("uses", "pkg.used"), ("lone", "other.lone"))})
