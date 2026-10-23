@@ -14,8 +14,9 @@ runs the consumer waits for its next key tile. A block reads the key tiles its s
 call's from its places, a spans call's from its block map, `attention.block_map`) and masks only those it
 does not see whole (`algebra.seen`); a consumer keeps releasing the slots its partner alone reads.
 
-The forward over every call form of 16-bit operands, the base-2 fold and the natural form without headroom
-(fp16 values, which cannot overflow it), no hooks."""
+The forward over every call form of 16-bit operands under every hook (`Hooks`: the score hook and its
+parameters on each tile, the softmax's initial state in the walk's start, the output hook on its output),
+the base-2 fold and the natural form without headroom (fp16 values, which cannot overflow it)."""
 
 import dataclasses
 import functools
@@ -80,7 +81,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
             *, scale: float | None = None, natural: bool = NATURAL, tiles: Tiles | None = None,
             family: mosaic.Family | None = None, interpret: bool = False) -> jax.Array:
     """The template's forward on this mainloop: `query` `[B, Q, H, D]` over `key` and `value` `[B, K, Hk, D]`
-    and the keys `spans` leaves each query, as `dew.nn.kernels.templates.attention.reference`
+    and the keys `spans` leaves each query under `hooks`, as `dew.nn.kernels.templates.attention.reference`
     computes it, by `family`'s bundle (the device's, `family_of`) at `tiles` (its default, `DEFAULTS`).
     `natural` keeps the logits natural (`algebra.Forward.base2`); `interpret` runs it on the CPU (Mosaic
     GPU's interpret mode)."""
