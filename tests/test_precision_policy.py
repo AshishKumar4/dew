@@ -284,7 +284,7 @@ def test_the_gpu_divides_fp32_to_the_nearest_float():
 
 
 def test_quantizer_division_rounds_midpoint_neighbours_as_ieee_division():
-    from dew.nn.fake_quant import correctly_rounded_divide
+    from dew.nn.precision import correctly_rounded_divide
 
     rng = np.random.default_rng(411)
     denominator = rng.uniform(1e-4, 10, (1, 16384)).astype(np.float32)

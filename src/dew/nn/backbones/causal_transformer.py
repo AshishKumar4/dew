@@ -25,7 +25,7 @@ block, and that is where a linear-attention mixer goes.
 import dataclasses
 import functools
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import ClassVar, Literal, Self
 
 import flax.core
@@ -45,6 +45,7 @@ from ..activations import GatedActivation, Situ, ungated_activation
 from ..attention import RMSNorm
 from ..attention_residuals import AttentionResiduals, DepthAttention
 from ..blocks import TokenEmbedding, normal_kernel
+from ..cross_attention import CrossAttention, GatedCrossAttention
 from ..deepseek_v4 import DeepseekV4Mixer
 from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..dspark import DSpark, DSparkStage, draft as dspark_draft
@@ -60,11 +61,17 @@ from ..hyper_connections import (
     expand_streams,
     first_stream,
 )
-from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase, coordinates_of, numbered_blocks
+from ..inputs import (
+    AttentionMetadata,
+    CrossContext,
+    LayerInputs,
+    PredictionPhase,
+    coordinates_of,
+    numbered_blocks,
+)
 from ..kv_cache import KVCache
 from ..mixer_base import MLP_RESIDUALS, RESIDUALS
 from ..mixers import AttentionMixer, MixerBase, MixerContext
-from ..mixers.mamba2 import Mamba2Mixer
 from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
 from ..mlp import GatedMLP
@@ -95,6 +102,7 @@ from .decoder_block import (
     remat_policy,
     remat_record,
 )
+from .decoder_fields import refuse_unbuildable
 from .decoder_stack import (
     WRITTEN,
     DecoderBank,
@@ -352,6 +360,10 @@ class CausalTransformer(nn.Module):
     the `constants` collection. A loaded checkpoint derives it from its
     tokenizer, and a fresh model fills it with each id modulo the compressed
     vocabulary's size."""
+    cross_attention: CrossAttention | None = None
+    """The layers that read a conditioning sequence through Flamingo's gated
+    cross-attention (`dew.nn.cross_attention`), before their own sublayers; None
+    for a model without them. A call passes the sequence as its `conditioning`."""
     dspark: DSpark | None = None
     """DeepSeek's block drafter (`dew.nn.dspark`, V4.1 and V4-Flash-0731), or
     None for a model without one. Its stages are decoder blocks that attend
@@ -632,261 +644,6 @@ class CausalTransformer(nn.Module):
                 f"{sorted(set(types))}")
         return {layer_type: self.kind_of(layer_type) for layer_type in set(types) | prediction_kinds}
 
-    def refuse_unbuildable_mup(self, kinds: Mapping[str, "ResolvedKind"]):
-        """Raise `ValueError` if lm-engine's multipliers or initialisation are set on a model that
-        cannot apply them.
-
-        `embedding_multiplier` and `logits_scaling` act at the root, on the embeddings before the
-        first layer (`scaled_embeddings`) and on the final states, so any stack of blocks takes
-        them; prediction depths and the DSpark drafter embed their own tokens unscaled and score
-        their own states. `residual_multiplier` and `initializer_range` act inside lm-engine's
-        dense and routed blocks."""
-        root = self.embedding_multiplier != 1.0 or self.logits_scaling != 1.0
-        block = self.residual_multiplier != 1.0 or self.initializer_range is not None
-        if (root or block) and (self.num_nextn_predict_layers or self.dspark is not None):
-            raise ValueError(
-                "embedding_multiplier, residual_multiplier, logits_scaling and initializer_range "
-                "are lm-engine's; prediction depths and the DSpark drafter do not carry them")
-        if block and (self.hyper_connections is not None
-                      or (self.mixture is not None and self.mixture.parallel)
-                      or self.mlp == 'swigluoai' or self.laurel_rank is not None
-                      or self.altup is not None or self.per_layer_input_dim):
-            raise ValueError(
-                "residual_multiplier and initializer_range are lm-engine's dense and routed "
-                "blocks; hyper-connection streams, Gemma 4's parallel experts, gpt-oss experts, "
-                "LAuReL, AltUp and per-layer inputs do not carry them")
-        if self.logits_scaling <= 0 or (self.initializer_range is not None
-                                        and self.initializer_range <= 0):
-            raise ValueError("logits_scaling and initializer_range are positive")
-        if self.initializer_range is not None:
-            for layer_type, kind in sorted(kinds.items()):
-                mixer = kind.mixer or self.mixer
-                if mixer is not None and not isinstance(mixer, (AttentionMixer, Mamba2Mixer)):
-                    raise ValueError(
-                        f"initializer_range draws the attention and mamba2 mixers' "
-                        f"projections; {layer_type!r} runs {type(mixer).__name__}, "
-                        f"which keeps its own initializers")
-        elif self.depth_scaled_init:
-            raise ValueError("depth_scaled_init scales initializer_range's std; set it")
-
-    def refuse_unbuildable_dropout(self, kinds: Mapping[str, "ResolvedKind"]) -> None:
-        """Raise `ValueError` for a dropout rate outside [0, 1), or for attention dropout with a mixer that
-        cannot drop probabilities."""
-        for field in ("embedding_dropout_rate", "attention_dropout_rate"):
-            rate = getattr(self, field)
-            if not 0 <= rate < 1:
-                raise ValueError(f"{field} must be within [0, 1), got {rate}")
-        if self.attention_dropout_rate:
-            for kind in kinds.values():
-                if not isinstance(kind.mixer or self.mixer or AttentionMixer(), AttentionMixer):
-                    raise ValueError("attention_dropout_rate requires ordinary attention mixers")
-
-    def refuse_unbuildable_classic_fields(self):
-        """Raise `ValueError` for norm, position and feed-forward combinations that no supported
-        model uses."""
-        if self.norm_type not in ('rms', 'layer'):
-            raise ValueError(f'norm_type must be rms or layer, got {self.norm_type!r}')
-        if self.norm_type == 'rms' and self.norm_bias:
-            raise ValueError('norm_bias requires LayerNorm')
-        if not self.first_attention_norm and not self.pre_norms:
-            raise ValueError('first_attention_norm=False drops a pre-norm, so it requires pre_norms')
-        if self.head_transform not in (None, 'gelu', 'gelu_exact'):
-            raise ValueError("head_transform must be None, 'gelu' or 'gelu_exact'")
-        if self.norm_type == 'layer' and self.scale_offset:
-            raise ValueError('scale_offset describes RMSNorm weights')
-        if self.position_embedding not in ('rotary', 'learned', 'alibi'):
-            raise ValueError('position_embedding must be rotary, learned or alibi')
-        if self.position_embedding_size is not None and (
-                self.position_embedding != 'learned' or self.position_embedding_size < self.max_seq_len):
-            raise ValueError('position_embedding_size requires learned positions and covers max_seq_len')
-        if self.position_embedding_offset < 0 or (self.position_embedding_offset and (
-                self.position_embedding != 'learned' or self.position_embedding_size is None
-                or self.position_embedding_size < self.max_seq_len + self.position_embedding_offset)):
-            raise ValueError('position_embedding_offset requires learned table rows past max_seq_len')
-        if self.position_embedding != "rotary" and (
-            self.partial_rotary_factor is not None or self.rope_scaling is not None or self.yarn is not None
-        ):
-            raise ValueError('rotary scaling requires rotary positions')
-        if self.mixture is not None and (self.mlp_bias or self.mlp in ('gelu', 'gelu_exact', 'relu')):
-            raise ValueError('the routed experts require a bias-free gated MLP')
-        if self.num_nextn_predict_layers and (self.norm_type != 'rms' or self.position_embedding != 'rotary'):
-            raise ValueError('prediction depths require RMSNorm and rotary positions')
-
-    def refuse_unbuildable_kinds(self, kinds: Mapping[str, "ResolvedKind"]):
-        """Raise `ValueError` for a kind with invalid rotary, local-mask or grouped-head geometry."""
-        for layer_type, kind in sorted(kinds.items()):
-            if self.position_embedding == 'rotary' and kind.head_dim % 2:
-                raise ValueError(
-                    "rotary positions rotate pairs, so the head dim of "
-                    f"{layer_type!r} must be even, got {kind.head_dim}")
-            if kind.window is not None and kind.window < 1:
-                raise ValueError(
-                    f"the window of {layer_type!r} must be positive, got {kind.window}")
-            if kind.chunk is not None and kind.chunk < 1:
-                raise ValueError(
-                    f"the chunk of {layer_type!r} must be positive, got {kind.chunk}")
-            if kind.chunk is not None and kind.window is not None:
-                raise ValueError(
-                    f"{layer_type!r} sets a window and a chunk; a local layer "
-                    f"reads one or the other")
-            if kind.chunk is not None and not self.causal:
-                raise ValueError(
-                    f"{layer_type!r} chunks a causal layer's keys, and this model "
-                    f"is not causal")
-            if kind.bidirectional_window and (self.causal or kind.window is None):
-                raise ValueError(
-                    f"{layer_type!r} keeps a window on both sides of a query, which "
-                    f"needs a window and a model that is not causal")
-            if kind.num_kv_heads < 1 or self.num_heads % kind.num_kv_heads:
-                raise ValueError(
-                    f"num_heads ({self.num_heads}) must be a multiple of the key/value "
-                    f"heads of {layer_type!r} ({kind.num_kv_heads})")
-
-    def refuse_unbuildable_ngpt(self, kinds: Mapping[str, "ResolvedKind"]):
-        """Raise `ValueError` for what nGPT's arithmetic does not reach: its gains and unit norms
-        live in the attention and the dense gated feed-forward (an MLP mixer's too), so routed or
-        parallel experts, another mixer, prediction depths and the DSpark drafter, which would
-        compute without them, are refused."""
-        if self.ngpt is None:
-            return
-        if self.mixture is not None or self.num_nextn_predict_layers or self.dspark is not None:
-            raise ValueError("nGPT unit-norms the attention and the dense gated feed-forward; routed or "
-                             "parallel experts (mixture), prediction depths and the DSpark drafter take "
-                             "none of it")
-        for layer_type, kind in sorted(kinds.items()):
-            mixer = kind.mixer or self.mixer
-            dense = isinstance(mixer, MLPMixer) and mixer.mixture is None
-            if mixer is not None and not (isinstance(mixer, AttentionMixer) or dense):
-                raise ValueError(f"nGPT's gains and unit norms are the attention's and the dense gated "
-                                 f"feed-forward's; {layer_type!r} runs {mixer!r}")
-
-    def refuse_unbuildable_fields(self, kinds: Mapping[str, "ResolvedKind"]):
-        """Raise `ValueError` for a field, or a pair of fields, that this model cannot build.
-
-        Each error names the field the caller set and what a model without it
-        looks like, so whoever translated the config can see which entry to fix.
-        """
-        self.refuse_unbuildable_mup(kinds)
-        self.refuse_unbuildable_dropout(kinds)
-        self.refuse_unbuildable_classic_fields()
-        self.refuse_unbuildable_ngpt(kinds)
-        mtp_hc = self.mtp_hyper_connections
-        if mtp_hc is not None:
-            if self.num_nextn_predict_layers != 1:
-                raise ValueError("mtp_hyper_connections requires a single prediction depth")
-            if mtp_hc.head != 'weighted':
-                raise ValueError("mtp_hyper_connections requires the V4 weighted stream-collapse head")
-            if self.hyper_connections is None or mtp_hc.hc_mult != self.hyper_connections.hc_mult:
-                raise ValueError("mtp_hyper_connections must match the trunk's residual stream count")
-        self.refuse_unbuildable_kinds(kinds)
-        carried = [name for name in ("altup", "hyper_connections", "attention_residuals", "dspark")
-                   if getattr(self, name) is not None]
-        if self.loop is not None and carried:
-            raise ValueError(f"a loop norms the one residual between its passes, and {carried} carry "
-                             "others beside it; a model with them runs its stack once (loop=None)")
-        if self.loop is not None and self.loop.layers is not None:
-            if self.loop.layers[1] > self.num_layers:
-                raise ValueError(f"the loop's block {self.loop.layers} ends past layer {self.num_layers}")
-            if self.sharing_layers:
-                raise ValueError("a loop over a block reads its layers' keys and values apart from the rest, "
-                                 "and kv_shared_layers reads them across it; loop the whole stack")
-        if self.num_heads % self.kv_heads:
-            raise ValueError(
-                f"num_heads ({self.num_heads}) must be a multiple of num_kv_heads "
-                f"({self.kv_heads})")
-        if self.partial_rotary_factor is not None and not 0 < self.partial_rotary_factor <= 1:
-            raise ValueError(
-                "partial_rotary_factor must be within (0, 1], "
-                f"got {self.partial_rotary_factor}")
-        if self.partial_rotary_type not in ('proportional', 'default'):
-            raise ValueError(
-                "partial_rotary_type names the convention of a partial rotary, "
-                f"'proportional' or 'default', got {self.partial_rotary_type!r}")
-        sparse = self.sparse_layers
-        outside = sorted(index for index in sparse
-                         if not 0 <= index < self.num_layers)
-        if outside:
-            raise ValueError(
-                f"the mixture's layers {outside} are outside the "
-                f"{self.num_layers} layers of this model")
-        hashed = self.hash_layers
-        if hashed - set(sparse):
-            raise ValueError(
-                f"the mixture's hash_layers {sorted(hashed - set(sparse))} are not "
-                "among its sparse layers, which are the ones with experts to route")
-        sharing = self.kv_sharing
-        if self.use_double_wide_mlp and not sharing:
-            raise ValueError(
-                "use_double_wide_mlp widens the MLP of the layers that share "
-                "their keys and values, so it needs kv_shared_layers set")
-        ple = self.per_layer_input_dim
-        if ple is not None and ple < 1:
-            raise ValueError(
-                f"per_layer_input_dim is the width of a layer's own input, got "
-                f"{ple}; None is a model without them")
-        if self.num_nextn_predict_layers < 0:
-            raise ValueError(
-                f"num_nextn_predict_layers counts prediction depths, got "
-                f"{self.num_nextn_predict_layers}; 0 is a model without them")
-        widths = self.mlp_widths
-        if len(widths) != self.num_layers or min(widths) < 0:
-            raise ValueError(
-                f"mlp_features names one width per layer of {self.num_layers}, "
-                f"0 for a layer without a feed-forward, got {self.mlp_features}")
-        sparsity = self.activation_sparsity_pattern
-        if sparsity is not None and (len(sparsity) != self.num_layers
-                                     or not all(0 <= fraction < 1 for fraction in sparsity)):
-            raise ValueError(
-                f"activation_sparsity_pattern names one fraction within [0, 1) per "
-                f"layer of {self.num_layers}, got {sparsity}")
-        if self.altup is not None and self.num_nextn_predict_layers:
-            raise ValueError(
-                "altup carries a stack of residual copies through the layers and "
-                "the prediction depths read one, so a model has one or the other")
-        if self.altup is not None and self.hyper_connections is not None:
-            raise ValueError(
-                "altup and hyper_connections each carry their own stack of residual "
-                "copies through the layers, so a model has one or the other")
-        self.refuse_unbuildable_stream_fields()
-        if self.swiglu_limit is not None and self.swiglu_limit <= 0:
-            raise ValueError(
-                f"swiglu_limit caps the gate and up projections, so it is positive, "
-                f"got {self.swiglu_limit}; None leaves them unclamped")
-        mask = self.mask_token_id
-        if mask is not None and (isinstance(mask, bool) or not isinstance(mask, int) or mask < 0):
-            raise ValueError(
-                f"mask_token_id names a vocabulary id, got {mask!r}; None is a "
-                "model trained on plain next-token prediction")
-
-    def refuse_unbuildable_stream_fields(self):
-        """Raise `ValueError` for settings on mHC's residual streams that cannot be
-        built: engram's layers, DSpark's stages and the Single-Pass schedule."""
-        engram, hc = self.engram, self.hyper_connections
-        if engram is not None:
-            if hc is None:
-                raise ValueError("engram gates its lookup into each of mHC's residual streams, "
-                                 "so it needs hyper_connections")
-            outside = sorted(set(engram.layer_ids) - set(range(self.num_layers)))
-            if outside:
-                raise ValueError(f"engram layers {outside} are outside the {self.num_layers} layers")
-        if self.dspark is not None:
-            # The stages are the trunk's mHC blocks, V4.1's Single-Pass ones
-            # (v41:1100-1156) or V4's with a learned head on the last stage
-            # (V4-Flash-0731 model.py:818-874); a drafter for another trunk's
-            # residual is not built here.
-            if hc is None or not (hc.single_pass or hc.head == 'weighted') or self.mixture is None:
-                raise ValueError("the DSpark drafter chains mHC blocks over routed experts and "
-                                 "collapses them by Single-Pass's carried pre (V4.1) or by a "
-                                 "learned head (V4), as the trunk it drafts for does")
-            outside = sorted(set(self.dspark.target_layers) - set(range(self.num_layers)))
-            if outside:
-                raise ValueError(f"DSpark target layers {outside} are outside the {self.num_layers} layers")
-            if self.num_nextn_predict_layers:
-                raise ValueError("a model drafts with DSpark or with MTP depths, not both")
-        if hc is not None and hc.single_pass and self.mtp_hyper_connections:
-            raise ValueError("Single-Pass mHC carries the next sublayer's collapse beside the "
-                             "streams, which no stream prediction depth reads")
-
     def feedforward_factories(self):
         """Build the three feed-forward factories a layer can use.
 
@@ -922,7 +679,8 @@ class CausalTransformer(nn.Module):
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
-        """Real-row hidden-state work, summing the same block factories as setup."""
+        """Real-row hidden-state work, summing the same block factories as setup. A context's
+        cross-attention work is `cross_flops`, which needs the context's lengths."""
         return (self._layer_flops(lengths, counted_flops)
                 + self._root_flops(lengths, DepthAttention.depth_flops))
 
@@ -971,18 +729,23 @@ class CausalTransformer(nn.Module):
         mixer = self.layer_mixer
         specs = self._layer_specs(types, kinds, mixer)
         factories = self.feedforward_factories()
-        loop_start, loop_end = (0, self.num_layers) if self.loop is None or self.loop.layers is None else (
-            self.loop.layers)
         total = 0.0
         for index in range(self.num_layers):
             block = self._block(specs, mixer, factories, self.wiring, index, f'layers_{index}')
-            passes = self.loop.steps if self.loop is not None and loop_start <= index < loop_end else 1
-            total += passes * counter(block, lengths)
+            total += self.layer_passes(index) * counter(block, lengths)
         if self.per_layer_input_dim:
             total += projection_flops(lengths, *self.projections()['per_layer_model_projection'])
         if self.loop is not None and self.loop.exit_gate:
             total += self.loop.steps * projection_flops(lengths, *self.projections()['early_exit_gate'])
         return total
+
+    @nn.nowrap
+    def layer_passes(self, index: int) -> int:
+        """How many times a call runs layer `index`: a loop's steps for a layer it repeats, else once."""
+        if self.loop is None:
+            return 1
+        start, end = (0, self.num_layers) if self.loop.layers is None else self.loop.layers
+        return self.loop.steps if start <= index < end else 1
 
     @nn.nowrap
     def logits_flops(self, lengths) -> float:
@@ -1069,7 +832,7 @@ class CausalTransformer(nn.Module):
         """
         types = self.per_layer_types
         kinds = self.layer_kinds(types)
-        self.refuse_unbuildable_fields(kinds)
+        refuse_unbuildable(self, kinds)
         projections = self.projections()
         ple = self.per_layer_input_dim
 
@@ -1205,6 +968,7 @@ class CausalTransformer(nn.Module):
                                else self.attention_residuals.site(index)),
                 engram=(None if self.engram is None or index not in self.engram.layer_ids
                         else self.engram.layer_ids.index(index)),
+                cross=self.cross_attention is not None and index in self.cross_attention.layer_ids,
                 prediction_target=(index if self.dspark is not None and index in self.dspark.target_layers
                                    else None),
                 attention_norm=index > 0 or self.first_attention_norm)
@@ -1242,6 +1006,7 @@ class CausalTransformer(nn.Module):
                 emb_features=self.emb_features, norm_eps=self.norm_eps,
                 dtype=self.dtype, precision=self.precision),
             engram_index=spec.engram,
+            cross=self._cross_layer(index) if spec.cross else None,
             prediction_target=spec.prediction_target is not None,
             prediction_site='input' if self.dspark is None else self.dspark.reads,
             attention_norm=spec.attention_norm,
@@ -1265,6 +1030,44 @@ class CausalTransformer(nn.Module):
             dtype=self.dtype,
             precision=self.precision,
             name=name)
+
+    @nn.nowrap
+    def _cross_layer(self, index: int) -> Callable[..., GatedCrossAttention]:
+        """Layer `index`'s gated cross-attention factory: the model's norms, none under nGPT, a
+        gated MLP of the block's own activation at its width, with nGPT's gains under nGPT, and the
+        model's attention heads, kernel, initializers and dtypes."""
+        cross = self.cross_attention
+        assert cross is not None
+        init_std, output_init_std = self.init_stds
+        return functools.partial(
+            GatedCrossAttention,
+            norm=None if self.ngpt is not None else decoder_norm(
+                self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias, scale_offset=self.scale_offset,
+                scale_after_cast=self.scale_after_cast, dtype=self.dtype, specs=self.norms),
+            ngpt=self.ngpt is not None,
+            feedforward=functools.partial(
+                GatedMLP, hidden_features=cross.intermediate_size or self.mlp_widths[index],
+                out_features=self.emb_features, activation=cross.activation, ngpt=self.ngpt,
+                init_std=init_std, output_init_std=output_init_std, dtype=self.dtype,
+                precision=self.precision),
+            emb_features=self.emb_features,
+            context_features=self.context_width,
+            context_length=cross.context_length, heads=self.num_heads, kv_heads=self.kv_heads,
+            head_dim=self.features_per_head, dropout_rate=self.dropout_rate,
+            attention_impl=self.attention_impl, force_fp32_for_softmax=self.force_fp32_for_softmax,
+            dtype=self.dtype, precision=self.precision)
+
+    @nn.nowrap
+    def cross_flops(self, lengths, context_lengths) -> float:
+        """The cross-attention blocks' work over rows of `lengths` tokens reading contexts of
+        `context_lengths` tokens (`GatedCrossAttention.cross_flops`), each block on every pass of its
+        layer (`layer_passes`), which `model_flops` leaves out: a call without a context runs none
+        of it."""
+        cross = self.cross_attention
+        if cross is None:
+            return 0.0
+        return sum(self.layer_passes(index) * self._cross_layer(index)(parent=None).cross_flops(
+            lengths, context_lengths) for index in cross.layer_ids)
 
     @nn.nowrap
     def _prediction_depths(self, types: Sequence[str], kinds: dict[str, ResolvedKind], mixer_spec,
@@ -1394,13 +1197,13 @@ class CausalTransformer(nn.Module):
                  input_embeddings=None,
                  attention_mask=None, image_groups=None, rotary_positions=None,
                  attention_pairwise_mask=None, attention_key_positions=None, right_padded: bool = False,
-                 coordinates: Coordinates | None = None):
+                 coordinates: Coordinates | None = None, conditioning: Mapping[str, jax.Array] | None = None):
         x, prediction = self.hidden_and_mtp_inputs(
             tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
             input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
             rotary_positions=rotary_positions, attention_pairwise_mask=attention_pairwise_mask,
             attention_key_positions=attention_key_positions, right_padded=right_padded,
-            coordinates=coordinates)
+            coordinates=coordinates, conditioning=conditioning)
         if self.is_initializing() and self.dspark is not None:
             self.reach_drafter(tokens, x.dtype)
         if self.is_initializing() and self.mtp:
@@ -1463,7 +1266,8 @@ class CausalTransformer(nn.Module):
                           positions=None, segment_ids=None, input_embeddings=None,
                           attention_mask=None,
                           image_groups=None, rotary_positions=None,
-                          coordinates: Coordinates | None = None):
+                          coordinates: Coordinates | None = None,
+                          conditioning: Mapping[str, jax.Array] | None = None):
         """Return one final-normed state array per shifted prediction depth.
 
         Each depth combines the preceding hidden state with the next token's
@@ -1471,8 +1275,11 @@ class CausalTransformer(nn.Module):
         positions. A pair counts only when both of its positions are valid and
         belong to the same packed document, so padded positions in between
         never become keys. A sequence no longer than the number of depths
-        raises `ValueError`.
+        raises `ValueError`. The depths keep no cross-attention: `hidden`, the
+        trunk's states, already read the call's `conditioning`, which they take
+        as the trunk does and leave unread.
         """
+        del conditioning
         if self.mtp and tokens.shape[1] <= len(self.mtp):
             raise ValueError("prediction depths need a sequence longer than their depth count")
         if coordinates is None and (segment_ids is not None or attention_mask is not None
@@ -1513,12 +1320,14 @@ class CausalTransformer(nn.Module):
 
     def mtp_logits(self, hidden, tokens, train: bool = False, positions=None,
                    segment_ids=None, input_embeddings=None,
-                   attention_mask=None, image_groups=None, rotary_positions=None):
-        """Return the shared language head's logits for each prediction depth's hidden states."""
+                   attention_mask=None, image_groups=None, rotary_positions=None,
+                   conditioning: Mapping[str, jax.Array] | None = None):
+        """Return the shared language head's logits for each prediction depth's hidden states; a
+        call's `conditioning` is the trunk's (`mtp_hidden_states`)."""
         return [self._logits(state) for state in self.mtp_hidden_states(
             hidden, tokens, train=train, positions=positions, segment_ids=segment_ids,
             input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
-            rotary_positions=rotary_positions)]
+            rotary_positions=rotary_positions, conditioning=conditioning)]
 
     def mtp_step(self, hidden, tokens, *, depth: int = 0, positions=None,
                  input_embeddings=None, attention_mask=None, rotary_positions=None,
@@ -1698,7 +1507,8 @@ class CausalTransformer(nn.Module):
                               attention_mask=None, image_groups=None, rotary_positions=None,
                               attention_pairwise_mask=None, attention_key_positions=None,
                               routed_experts=None, routed=None, media_mask=None, admitted=None,
-                              right_padded: bool = False, coordinates: Coordinates | None = None):
+                              right_padded: bool = False, coordinates: Coordinates | None = None,
+                              conditioning: Mapping[str, jax.Array] | None = None):
         """Return the final normalized states and the prediction depths' input.
 
         V4's depth reads the raw residual streams from before the collapse head
@@ -1731,11 +1541,15 @@ class CausalTransformer(nn.Module):
           the batch's builder made them (`dew.batch.coordinates`, with the
           packer's `max_segments`); where None they are built here from
           `segment_ids`, `attention_mask`, `positions` and `right_padded`.
+        - `conditioning` carries the sequence the `cross_attention` layers read
+          (`dew.nn.inputs.CONTEXT`) and its rows' lengths (`CONTEXT_LENGTHS`).
+          A cached call that carries it keeps its keys and values for the
+          calls after it. A model without cross-attention takes none.
         """
         attention_metadata = self._attention_metadata(
             tokens, decode, positions, segment_ids, attention_mask, image_groups, rotary_positions,
             attention_pairwise_mask, attention_key_positions, media_mask, admitted, right_padded,
-            coordinates)
+            coordinates, conditioning)
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.
@@ -1799,12 +1613,24 @@ class CausalTransformer(nn.Module):
                             rotary_positions, pairwise_mask, key_positions,
                             media_mask, admitted=None,
                             right_padded: bool = False,
-                            coordinates: Coordinates | None = None) -> AttentionMetadata | None:
+                            coordinates: Coordinates | None = None,
+                            conditioning: Mapping[str, jax.Array] | None = None) -> AttentionMetadata | None:
         """What the layers read beside the residual, None for a call that
         carries none of it: the masks and positions `hidden_and_mtp_inputs`
         takes, the token ids a hash router selects by, the engram layers'
-        bucket ids, and the media mask, which only a model with engram or a
-        router with a media bias reads."""
+        bucket ids, the media mask, which only a model with engram or a
+        router with a media bias reads, and the cross-attention's context."""
+        if conditioning and self.cross_attention is None:
+            raise TypeError(f"this decoder has no cross-attention to read the conditioning "
+                            f"{sorted(conditioning)}")
+        context = CrossContext.from_conditioning(conditioning) if conditioning else None
+        if context is not None and context.embeddings.shape[0] != tokens.shape[0]:
+            raise ValueError(f"a context row per token row, got {context.embeddings.shape[0]} for "
+                             f"{tokens.shape[0]}")
+        if context is not None:
+            # The context enters in the dtype a server holds it in (`context_dtype`), so a served and
+            # a standalone call, and a cached and a full one, project the same values.
+            context = CrossContext(context.embeddings.astype(self.context_dtype), context.lengths)
         # A layer whose mixer reads no pairwise mask refuses one (`MixerCall`).
         if key_positions is not None and pairwise_mask is None:
             raise ValueError("attention_key_positions requires attention_pairwise_mask")
@@ -1828,13 +1654,14 @@ class CausalTransformer(nn.Module):
             block)
         if (coordinates is None and image_groups is None and rotary_positions is None
                 and pairwise_mask is None and key_positions is None and not self.hash_layers
-                and engram_ids is None and media_mask is None and admitted is None and blocks is None):
+                and engram_ids is None and media_mask is None and admitted is None and blocks is None
+                and context is None):
             return None
         return AttentionMetadata(
             coordinates=coordinates, image_groups=image_groups, rotary_positions=rotary_positions,
             pairwise_mask=pairwise_mask, key_positions=key_positions,
             token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids, media=media_mask,
-            admitted=admitted, blocks=blocks, routing_block=block)
+            admitted=admitted, blocks=blocks, context=context, routing_block=block)
 
     def looped(self, x, **stack):
         """Run the layer stack over `x` once, or as `loop` says: the layers before
@@ -2310,7 +2137,25 @@ class CausalTransformer(nn.Module):
             return params
         return clamped_predictions(params, self.altup.coef_clip)
 
+    @property
+    def context_width(self) -> int:
+        """The width of a context's tokens (`CrossAttending`): the spec's, or the decoder's own."""
+        cross = self.cross_attention
+        if cross is None or cross.context_features is None:
+            return self.emb_features
+        return cross.context_features
+
+    @property
+    def context_dtype(self) -> jnp.dtype:
+        """The dtype a context's tokens enter in (`CrossAttending`): the decoder's compute dtype, at
+        least float32, as its projections widen what they read."""
+        return at_least_fp32(self.dtype)
+
     @nn.nowrap
+    def with_cross_attention(self, cross: CrossAttention | None) -> Self:
+        """This decoder with `cross` as its cross-attention layers (`CrossAttending`), None for none."""
+        return self.clone(cross_attention=cross)
+
     def with_remat(self, policy: RematPolicy | None) -> Self:
         """Start at `policy`, including policies outside `DECODER_REMAT`.
 
@@ -2397,13 +2242,17 @@ class CausalTransformer(nn.Module):
 
     @nn.nowrap
     def mixed_admission_refusal(self) -> str | None:
-        """A cache rebuilt per request, a reader beyond the token, or a layer
-        whose mixer, over the context it is built with, would not run the mixed
-        call as the separate calls would (`MixerBase.mixed_refusal`)."""
+        """A cache rebuilt per request, a reader beyond the token, a context
+        read beside the tokens, or a layer whose mixer, over the context it is
+        built with, would not run the mixed call as the separate calls would
+        (`MixerBase.mixed_refusal`)."""
         position = self.cache_rebuild_position
         if position is not None:
             return (f'LongRoPE crossing position {position} requires separate admission so each '
                     'request keeps its own table and rebuild history')
+        if self.cross_attention is not None:
+            return ("cross-attention reads each row's own context, which the mixed call's one row of "
+                    "every slot's tokens does not seat")
         if self.position_embedding == "learned" or self.engram is not None or self.hash_layers:
             return "a learned position embedding, n-gram or hash routing reads beyond the token"
         types = self.per_layer_types

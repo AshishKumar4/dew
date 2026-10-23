@@ -169,6 +169,7 @@ def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     assert moved["gpt_neox.embed_in.weight"].sharding.spec == P(("fsdp", "tensor"))
 
 
+@pytest.mark.mesh(devices=4)
 def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placement(loaded, tokens):
     """`Layout.frozen_whole` reaches a torch-named tree: TorchLayout's name table picks each
     tensor's axes, and the one placement keeps the frozen tensors whole over fsdp, split over the

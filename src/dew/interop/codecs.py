@@ -70,7 +70,8 @@ from numpy.typing import ArrayLike, DTypeLike
 
 from dew import records
 from dew.interop.weights import checkpoint_array
-from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS, correctly_rounded_divide
+from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS
+from dew.nn.precision import correctly_rounded_divide
 
 # --------------------------------------------------------------------------
 # E2M1 codes under E8M0 exponents, shared by every FP4 format
