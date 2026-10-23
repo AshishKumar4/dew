@@ -89,6 +89,12 @@ class Renaming:
                 self.compare(before, after, line)
         elif isinstance(was, ast.AST):
             line = getattr(was, "lineno", line)
+            if isinstance(was, ast.Import):
+                # `import a.b` binds the package a, `import a.b as m` the module a.b: an alias there is no
+                # rename.
+                for one, other in zip(was.names, now.names, strict=False):
+                    if "." in one.name and (one.asname is None) != (other.asname is None):
+                        raise ValueError(f"line {line}: an alias on import {one.name} binds another module")
             for field, before in ast.iter_fields(was):
                 after = getattr(now, field, None)
                 role = ROLES.get((type(was), field))

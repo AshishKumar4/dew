@@ -134,6 +134,8 @@ def recorded(root: Path, source: str) -> None:
     ("import math\nimport json\nprint(math.pi, json)\n",
      "import math as json\nimport json\nprint(json.pi, json)\n", False),
     ("from json import dumps\nprint(dumps(1))\n", "from json import dumps as d\nprint(d(1))\n", True),
+    ("import os.path\nprint(os.__name__)\n", "import os.path as m\nprint(m.__name__)\n", False),
+    ("import os.path as m\nprint(m.__name__)\n", "import os.path\nprint(os.__name__)\n", False),
     ("a, b = 1, 2\nprint(a, b)\n", "b, a = 1, 2\nprint(b, a)\n", True),
     ("value = 9\ndef f(unused=0):\n    return value\nprint(f())\n",
      "value = 9\ndef f(value=0):\n    return value\nprint(f())\n", False),
@@ -141,7 +143,8 @@ def recorded(root: Path, source: str) -> None:
     ("x = 1\nprint(f'{x=}')\n", "x = 1\nprint(f'{ x = }')\n", False),
     ("print(dict(steps=3))\nsteps = 1\n", "print(dict(num_steps=3))\nsteps = 1\n", True),
 ], ids=["an alias renamed", "an alias added", "an alias that takes another import's name",
-        "an imported name given an alias", "two variables swapped",
+        "an imported name given an alias", "an alias added to a dotted import", "an alias taken from one",
+        "two variables swapped",
         "a parameter renamed to another variable's name", "an f-string's conversion", "an f-string's label",
         "a keyword renamed beside a variable of its spelling"])
 def test_the_programs_parsed_roles_decide_what_is_a_rename(site, before, after, kept):
