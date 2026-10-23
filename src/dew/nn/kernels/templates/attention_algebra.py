@@ -1197,6 +1197,15 @@ def _scaled(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     return power2(x, 14.0 - exponent), exponent - 14.0
 
 
+def _below_bf16(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """`x` (fp32) taken down by the power of two that puts its largest at 2^126 where it is larger, so it
+    rounds to bf16 within bf16's largest, unscaled elsewhere, and that power's exponent."""
+    top = jnp.max(jnp.abs(x))
+    largest = jnp.where(top > 0, jnp.ceil(jnp.log2(jnp.where(top > 0, top, 1.0))), 0.0)
+    exponent = jnp.maximum(largest - 126.0, 0.0)
+    return power2(x, -exponent), exponent
+
+
 def _fp16_scaled(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     """`_scaled`'s `x` in fp16 and its exponent: within fp16's range whatever `x`'s, an entry far below the
     largest losing only what is far below the product's own rounding."""
@@ -1210,18 +1219,19 @@ def cotangent_product(cotangents: jax.Array, operand: jax.Array,
     """A tile's score cotangents `[bq, bk]` (fp32, scaled) times the call's queries or keys `operand` (its
     transpose's product where `transposed`: dK's `dSᵀ Q`, else dQ's `dS K`), in fp32 to fp32's accuracy, as
     the reference differentiates (its score cotangents are fp32). An fp32 operand takes the fp32 product.
-    A 16-bit one takes two 16-bit products: the cotangents at a power-of-two scale that puts their largest
-    at 2^14 rounded to the operand's dtype, and what that rounding lost, at its own scale in fp16 against
-    the operand in fp16 likewise: 7 and 10 bits more, so a key's or a query's gradient whose cotangents
-    cancel across the other axis loses no more than the reference's fp32 product does, where one 16-bit
-    product loses every bit the cancellation exposes. The rounding is taken in the scaled domain, so no
-    part leaves fp32's range where the cotangents are near its largest."""
+    A 16-bit one takes two 16-bit products: the cotangents rounded to the operand's dtype, at a power of
+    two that keeps them in its range (fp16's: their largest at 2^14; bf16's, fp32's own: taken down only
+    where their largest would round past bf16's), and what that rounding lost, at its own scale in fp16
+    against the operand in fp16 likewise: 7 and 10 bits more, so a key's or a query's gradient whose
+    cotangents cancel across the other axis loses no more than the reference's fp32 product does, where one
+    16-bit product loses every bit the cancellation exposes. No part's product leaves fp32's range where
+    the gradient is in it: the high part is never raised against an operand of bf16's full range."""
     def oriented(x):
         return x.T if transposed else x
 
     if operand.dtype == jnp.float32:
         return dot(oriented(cotangents), operand)
-    scaled, high_exponent = _scaled(cotangents)
+    scaled, high_exponent = _scaled(cotangents) if operand.dtype == jnp.float16 else _below_bf16(cotangents)
     high = scaled.astype(operand.dtype)
     low, low_exponent = _fp16_scaled(scaled - high.astype(jnp.float32))
     low_exponent = low_exponent + high_exponent
