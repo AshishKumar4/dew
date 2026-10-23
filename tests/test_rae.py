@@ -63,7 +63,9 @@ def test_every_computed_tensor_is_mapped_and_exports_bit_identical(variant):
 def test_the_latent_matches_the_source(variant):
     """The normalized latent: the encoder's patch tokens as a grid, less the
     checkpoint's mean and over its deviation, per position where it gives
-    one per position."""
+    one per position. The DINOv2 and MAE checkpoints omit encoder_norm_mean
+    and encoder_norm_std, so their latents hold the encoder input's default
+    ImageNet statistics (`dew.nn.blocks.IMAGENET_MEAN`) to the source's."""
     _, (autoencoder, params, _, config), reference = variant
     image = channels_last(reference["image"])
     latent = autoencoder.encode(params, 2 * image - 1)

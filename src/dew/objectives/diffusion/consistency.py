@@ -33,6 +33,7 @@ from flax import linen as nn
 from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
+from dew.diffusion.schedules.flow import static_shift
 from dew.inputs import InputSpec
 from dew.nn.attention import forward_mode_attention
 from dew.objectives.base import TEACHER, Aux, EMASpec, ProgramModule, Step, Variables, part
@@ -114,7 +115,7 @@ def discrete_consistency_loss(student: Callable[[jax.Array, jax.Array], jax.Arra
     """
     def trig(k):
         s = 1.0 - (u + k / steps)
-        rf = shift * s / (1 + (shift - 1) * s)
+        rf = static_shift(shift, s)
         rf = jnp.clip(rf, 0.0, 1.0 - jnp.finfo(rf.dtype).eps)
         return jnp.arctan(rf / (1 - rf))
     times = [trig(k) for k in range(skip + 1)]

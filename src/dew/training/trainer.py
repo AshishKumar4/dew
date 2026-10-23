@@ -209,6 +209,27 @@ class Rollout(Protocol):
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch: ...
 
 
+def run_length(steps: int | None, epochs: int | None, tokens: int | None, *, required: bool = True) -> None:
+    """Refuse a run whose length is named twice, as both `steps` and `epochs`, or, where `required`,
+    not at all; `tokens` caps either or bounds a run alone."""
+    if None not in (steps, epochs):
+        raise ValueError("steps and epochs both name the run length; set one")
+    if required and steps is epochs is tokens is None:
+        raise ValueError("the run length is steps or epochs, or tokens, which also caps either")
+
+
+def run_steps(loader: Loader, steps: int | None, epochs: int | None, tokens: int | None,
+              accumulation: int) -> int | None:
+    """The microsteps a run takes over `loader`, the one policy for a fit's and a config's run length:
+    `steps`, or `epochs` of it, whose ramp stages begin where updates do, as the stream cuts them, or None
+    where `tokens` alone bounds it. Refuses a run with no length or two, and epochs of a stream with no
+    record count."""
+    run_length(steps, epochs, tokens)
+    if epochs is None:
+        return steps
+    return loader.epoch_steps(epochs, accumulation)
+
+
 def _rollout_metrics(rollout: Rollout) -> Mapping[str, float]:
     """The rollout's report of its latest call. A rollout is any callable,
     and a plain function reports nothing, so the trainer reads `metrics` at this boundary."""
@@ -1408,15 +1429,13 @@ class Trainer(Generic[Loss, Effects]):
         `prepare_process` readies it: a program that never called that gets Dew's
         log handler, and one whose JAX opened on the CPU beside an NVIDIA GPU stops.
         """
-        if steps is epochs is tokens is None or None not in (steps, epochs):
-            raise ValueError("fit's run length is steps= or epochs=, or tokens=, which also caps either")
+        run_length(steps, epochs, tokens)
         if tokens is not None and not self.objective.counts_tokens:
             raise ValueError("tokens= needs an objective that counts real tokens")
         ready_process()
         loader, validation = fitted(dataset, validation, objective=self.objective.data())
         self._device, self._prefetch = loader.device, device_prefetch
-        if epochs is not None:
-            steps = loader.epoch_steps(epochs, self.accumulation)
+        steps = run_steps(loader, steps, epochs, tokens, self.accumulation)
         count_compilation_cache()
         self._schedule(None if steps is None else steps // self.accumulation)
         suites = _suites(loader, validation, metrics, eval_every)
