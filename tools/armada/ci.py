@@ -39,8 +39,8 @@ each test of the newest at its least time as the floor's Python ran it.
 The test cache reuses a file's row when its inputs are unchanged since it ran green. A
 green row records the checkout's Python files its tests executed
 (tools/armada/executed.py) and its key, a hash of those files, the
-directories under src/ that hold them (so a module added beside one changes
-it), the file itself and what every file shares (`shared`: the environment's
+directories under src/ that hold them, however deep (so a module added
+beside one, or an __init__.py on the way to one, changes it), the file itself and what every file shares (`shared`: the environment's
 locks, the CI tools, every non-Python file under tests/ and src/, the names
 of the Python files under tests/ but the test modules, and src/'s entries).
 A test module, or a module in a package a file never imported, is no input
@@ -243,12 +243,13 @@ def cache_key(common: str, name: str, depends: list[str]) -> str:
 
 
 def inputs(name: str, depends: list[str]) -> list[str]:
-    """What test file `name`'s key covers, given that its run executed or read `depends`: those, and the
-    directory of each module it executed under src/, whose entries name the modules an import there
-    finds: a module added beside one it imported (which shadows it, or which an import it tried now
-    finds) changes its key, and one added to a package it never imported does not."""
-    packages = {str(Path(path).parent) for path in depends
-                if path.startswith("src/") and path.endswith(".py")}
+    """What test file `name`'s key covers, given that its run executed or read `depends`: those, and each
+    directory under src/ that holds a module it executed, however deep, whose entries name the modules an
+    import there finds: a module added beside one it imported (which shadows it, or which an import it
+    tried now finds), or an __init__.py added to a namespace package on the way to one, which executes
+    as the import passes, changes its key; one added to a package it never imported does not."""
+    packages = {str(parent) for path in depends if path.startswith("src/") and path.endswith(".py")
+                for parent in Path(path).parents if parent.parts[:1] == ("src",) and parent != Path("src")}
     return sorted({name, *depends, *packages})
 
 
