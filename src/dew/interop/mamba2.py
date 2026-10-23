@@ -21,12 +21,14 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from functools import partial
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 from dew import records
 from dew.interop.config_records import native_fields
+from dew.interop.decoder_parts import record_bool, record_int
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 
@@ -59,14 +61,7 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None
     `mixer_decoder`'s; the SSD layer reads its own heads from the mixer value.
     """
     read = {"model_type", "num_hidden_layers"} if used is None else used
-
-    def integer(key: str, default: int) -> int:
-        read.add(key)
-        return records.integer(hf_config.get(key, default), key)
-
-    def flag(key: str, *, default: bool) -> bool:
-        read.add(key)
-        return records.boolean(hf_config.get(key, default), key)
+    integer, flag = partial(record_int, hf_config, used=read), partial(record_bool, hf_config, used=read)
 
     hidden, expand = integer("hidden_size", 4096), integer("expand", 2)
     heads, head_dim = integer("num_heads", 128), integer("head_dim", 64)

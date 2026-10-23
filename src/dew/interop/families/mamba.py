@@ -17,7 +17,14 @@ from functools import partial
 
 from dew import records
 from dew.interop import mamba2
-from dew.interop.decoder_parts import DecoderFamily, DecoderFields, decoder_tensors, refuse
+from dew.interop.decoder_parts import (
+    DecoderFamily,
+    DecoderFields,
+    decoder_tensors,
+    record_bool,
+    record_int,
+    refuse,
+)
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.mamba import MambaMixer
 
@@ -41,13 +48,7 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     backbone validates takes one head of the model width; the mixer reads
     none of it.
     """
-    def integer(key: str, default: int) -> int:
-        used.add(key)
-        return records.integer(hf_config.get(key, default), key)
-
-    def flag(key: str, *, default: bool) -> bool:
-        used.add(key)
-        return records.boolean(hf_config.get(key, default), key)
+    integer, flag = partial(record_int, hf_config, used=used), partial(record_bool, hf_config, used=used)
 
     hidden, expand = integer("hidden_size", 768), integer("expand", 2)
     stated = hf_config.get("intermediate_size")
