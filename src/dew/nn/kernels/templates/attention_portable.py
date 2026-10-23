@@ -343,6 +343,10 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
     """The Triton mainloop's dK/dV launch (`attention_triton._dkv_launch`), a key block and query head at a
     time, under the dQ launch's softmax at its tiles: the query head's dK, dV `[B, Kp, H, ...]` and the
     key and tile parameters' gradients (`DKV_GRADS`, `[B, H, Kp]` and `[B, H, Qp, Kp]`)."""
+
+    def transposed_dot(a, b):
+        # A query tile's share of the keys' gradients, `aᵀ @ b` (`algebra.cotangent_product`).
+        return interpreted_dot(a.T, b)
     batch, queries, heads, width = query.shape
     # The logits' scale as the forward took it: 1 for raw products, scaled in the weights (`how`).
     factor = scale if how.factor is None else 1.0
@@ -377,9 +381,8 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
                                              columns[None, :] == key_index[row, head, rows][:, None],
                                              algebra.inverse(denominator))
             pulled, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
-            dv = dv + interpreted_dot(*algebra.value_operands(exponentials, weights, do, denominator))
-            dk = dk + algebra.cotangent_product(pulled * scale, q, interpreted_dot, accurate=accurate,
-                                                transposed=True)
+            dv = dv + transposed_dot(*algebra.value_operands(exponentials, weights, do, denominator))
+            dk = dk + algebra.cotangent_product(pulled * scale, q, transposed_dot, accurate=accurate)
             tiled = tuple(jax.lax.dynamic_update_slice_in_dim(entries, piece, i * block_q, axis=0)
                           for entries, piece in zip(tiled, (piece for kind, piece in zip(score_kinds, pieces,
                                                                                        strict=True)

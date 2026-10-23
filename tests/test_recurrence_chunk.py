@@ -67,12 +67,14 @@ independently by `seeds_for` on armada (2026-10-21), on the draw with a memory e
 document starting on a chunk's first token."""
 
 
-def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENGTH) -> tuple[Chunk]:
+def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENGTH,
+         value_heads: int = VALUE_HEADS) -> tuple[Chunk]:
     """A sequence's operands for `hooks` from `seed`, its keys' and values' dimensions each permuted
     by an order the seed draws (an exact symmetry of every head's recurrence): fresh queries, keys
     and values (`NORMED_WIDTH` wide under the norm), a log decay a head or a key dimension in (-1, 0),
-    a gate in (0, 1), a skip, a memory entering, `length` tokens, and with `packed` documents starting
-    at tokens 0, 23 and 40 of the first row and 9 and 48 of the second, 48 a chunk's first token."""
+    a gate in (0, 1), a skip, a memory entering, `length` tokens over `value_heads` value heads, and with
+    `packed` documents starting at tokens 0, 23 and 40 of the first row and 9 and 48 of the second, 48 a
+    chunk's first token."""
     keys = jax.random.split(jax.random.key(seed), 8)
     rng = np.random.default_rng(seed)
     width = VALUE_WIDTH if hooks.output is None else NORMED_WIDTH
@@ -80,27 +82,27 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
     query = jax.random.normal(keys[0], (ROWS, length, KEY_HEADS, KEY_WIDTH))
     key = jax.random.normal(keys[1], (ROWS, length, KEY_HEADS, KEY_WIDTH))
     key = key / jnp.linalg.norm(key, axis=-1, keepdims=True)
-    value = jax.random.normal(keys[2], (ROWS, length, VALUE_HEADS, width))
-    shape = (ROWS, length, VALUE_HEADS, KEY_WIDTH) if hooks.decay == 'vector' else (ROWS, length, VALUE_HEADS)
+    value = jax.random.normal(keys[2], (ROWS, length, value_heads, width))
+    shape = (ROWS, length, value_heads, KEY_WIDTH) if hooks.decay == 'vector' else (ROWS, length, value_heads)
     log_decay = -jax.nn.softplus(jax.random.normal(keys[3], shape) - 1.0)
-    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (ROWS, length, VALUE_HEADS)))
-    skip = jax.random.normal(keys[5], (VALUE_HEADS,))
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (ROWS, length, value_heads)))
+    skip = jax.random.normal(keys[5], (value_heads,))
     gates = {}
     if hooks.gates is not None:
         # Pre-activations: the gate and beta raw, `log_a` and `bias` a head's.
         heads = jax.random.split(keys[6], 3)
-        gates = {'gate': jax.random.normal(heads[0], (ROWS, length, VALUE_HEADS)),
-                 'log_a': 0.5 * jax.random.normal(heads[1], (VALUE_HEADS,)),
-                 'bias': jax.random.normal(heads[2], (VALUE_HEADS,))}
-        beta = jax.random.normal(keys[4], (ROWS, length, VALUE_HEADS))
+        gates = {'gate': jax.random.normal(heads[0], (ROWS, length, value_heads)),
+                 'log_a': 0.5 * jax.random.normal(heads[1], (value_heads,)),
+                 'bias': jax.random.normal(heads[2], (value_heads,))}
+        beta = jax.random.normal(keys[4], (ROWS, length, value_heads))
     if hooks.rated:
         # The step through softplus is the write gate; the rate is `A = -exp(A_log)`, a head's.
-        beta = jax.nn.softplus(jax.random.normal(keys[4], (ROWS, length, VALUE_HEADS)) - 1.0)
-        gates = {'rate': -jnp.exp(0.5 * jax.random.normal(keys[6], (VALUE_HEADS,)))}
+        beta = jax.nn.softplus(jax.random.normal(keys[4], (ROWS, length, value_heads)) - 1.0)
+        gates = {'rate': -jnp.exp(0.5 * jax.random.normal(keys[6], (value_heads,)))}
     epilogue = {}
     if hooks.output is not None:
         norms = jax.random.split(keys[7], 2)
-        epilogue = {'z': jnp.take(jax.random.normal(norms[0], (ROWS, length, VALUE_HEADS, width)),
+        epilogue = {'z': jnp.take(jax.random.normal(norms[0], (ROWS, length, value_heads, width)),
                                   value_order, axis=-1),
                     'weight': jnp.take(1.0 + 0.1 * jax.random.normal(norms[1], (width,)), value_order)}
     query, key = (jnp.take(x, key_order, axis=-1) for x in (query, key))
@@ -108,7 +110,7 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
     if hooks.decay == 'vector':
         log_decay = jnp.take(log_decay, key_order, axis=-1)
     state = 0.3 * jax.random.normal(jax.random.fold_in(jax.random.key(seed), 8),
-                                    (ROWS, VALUE_HEADS, KEY_WIDTH, width))
+                                    (ROWS, value_heads, KEY_WIDTH, width))
     state = jnp.take(jnp.take(state, key_order, axis=2), value_order, axis=3)
     starts = None
     if packed:
@@ -246,6 +248,91 @@ def test_the_operands_are_checked_as_the_decode_steps():
                                                       beta=jnp.ones((1, 4, 1))))
 
 
+def test_aligned_unit_keys_erase_the_decay_gradient():
+    """In one dimension k=beta=1 writes S'=v, independently of the decay. The WY inverse/readout
+    paths cancelled only after rounding, leaving a spurious 4.74e-8 gradient in this exact zero."""
+    unit = jnp.ones((1, 4, 1, 1), jnp.float32)
+    value = jnp.array([0.314159, -0.271828, 0.577216, 1.414214], jnp.float32).reshape(unit.shape)
+    decay = jnp.array([-0.17, -0.23, -0.31, -0.41], jnp.float32).reshape(unit.shape)
+    beta = jnp.ones((1, 4, 1), jnp.float32)
+    gradient = jax.jit(jax.grad(lambda g: jnp.sum(recurrence_chunk.chunk_delta_rule(
+        unit, unit, value, g, beta, chunk_size=4, scale=1.0)[0])))(decay)
+    np.testing.assert_array_equal(np.asarray(gradient), np.zeros_like(np.asarray(gradient)))
+
+
+@pytest.mark.parametrize("length, chunk_size", [(3, 1), (3, 4), (9, 4), (10, 4), (12, 4), (9, 16)])
+@pytest.mark.parametrize("packed", PACKED, ids=["one sequence", "packed"])
+@pytest.mark.parametrize("delta", [False, True], ids=["write", "delta"])
+@pytest.mark.parametrize("channels", [1, 2], ids=["scalar decay", "vector decay"])
+def test_the_peeled_write_keeps_ragged_tokens_and_document_resets(
+        length, chunk_size, packed, delta, channels):
+    """The peeled token is the last real one, including an empty prefix and starts before or on it.
+    Dyadic operands make the writes and outputs exact, so a misplaced reset or token has no tolerance."""
+    key = np.zeros((2, length, 1, 2), np.float32)
+    key[..., 0] = 1.0
+    value = np.broadcast_to(np.arange(1, length + 1, dtype=np.float32)[None, :, None, None] / 4,
+                             (2, length, 1, 1)).copy()
+    g = np.zeros((2, length, 1, channels), np.float32)
+    beta = np.full((2, length, 1), 0.5, np.float32)
+    initial = np.full((2, 1, 2, 1), 2.0, np.float32)
+    begins = np.zeros((2, length), bool)
+    if packed:
+        for row, positions in enumerate(((0, chunk_size - 1, chunk_size + 1, length - 1),
+                                          (chunk_size - 2, 2 * chunk_size - 1))):
+            begins[row, [i for i in positions if 0 <= i < length]] = True
+    starts = jnp.asarray(begins) if packed else None
+    expected_output = np.zeros_like(value)
+    expected_final = initial.copy()
+    for row in range(2):
+        for t in range(length):
+            if begins[row, t]:
+                expected_final[row] = 0.0
+            predicted = expected_final[row, 0, 0, 0] if delta else 0.0
+            expected_final[row, 0, 0, 0] += 0.5 * (value[row, t, 0, 0] - predicted)
+            expected_output[row, t, 0, 0] = expected_final[row, 0, 0, 0]
+    run = jax.jit(functools.partial(recurrence_chunk.chunk_delta_rule, chunk_size=chunk_size,
+                                    starts=starts, delta=delta, scale=1.0))
+    output, final = run(*(jnp.asarray(x) for x in (key, key, value, g, beta, initial)))
+    np.testing.assert_array_equal(np.asarray(output), expected_output)
+    np.testing.assert_array_equal(np.asarray(final), expected_final)
+
+    steps = recurrence_chunk.chunked(*(jnp.asarray(x) for x in (key, key, value, g, beta)),
+                                      chunk_size, starts=starts, delta=delta, scale=1.0)
+    _, _, kept, last = recurrence_chunk._peeled_chunk_inputs(
+        steps, jnp.asarray(value), jnp.asarray(g), jnp.asarray(beta), starts, chunk_size)
+    positions = np.minimum((np.arange(steps.key.shape[2]) + 1) * chunk_size, length) - 1
+    np.testing.assert_array_equal(np.asarray(last[1]), np.moveaxis(value[:, positions], 2, 1))
+    np.testing.assert_array_equal(np.asarray(last[-1]), begins[:, positions, None].transpose(0, 2, 1))
+    expected_kept = np.array([[not begins[row, i * chunk_size:end].any()
+                               for i, end in enumerate(positions)] for row in range(2)])[:, None]
+    actual_kept = np.broadcast_to(np.asarray(kept[..., 0, 0]), expected_kept.shape)
+    np.testing.assert_array_equal(actual_kept, expected_kept)
+
+
+@pytest.mark.parametrize("packed", PACKED, ids=["one sequence", "packed"])
+@pytest.mark.parametrize("delta", [False, True], ids=["write", "delta"])
+def test_the_peeled_transition_carries_the_peeled_memory_and_its_adjoint(packed, delta):
+    """The custom VJP's boundary transition is the peeled carry's own linear part; corrected values
+    keep the whole chunk's WY readout, even when its ragged last chunk has an empty prefix."""
+    key = jnp.broadcast_to(jnp.array([1.0, 0.0]), (1, 5, 1, 2))
+    value = jnp.arange(1, 6, dtype=jnp.float32).reshape(1, 5, 1, 1) / 4
+    g, beta = jnp.zeros((1, 5, 1, 2)), jnp.full((1, 5, 1), 0.5)
+    starts = jnp.array([[False, False, True, False, True]]) if packed else None
+    steps = recurrence_chunk.chunked(key, key, value, g, beta, 4, starts=starts, delta=delta, scale=1.0)
+    grown, last, kept, tail = recurrence_chunk._peeled_chunk_inputs(steps, value, g, beta, starts, 4)
+    step = steps.key, steps.w, steps.u, grown, last, kept, *tail
+    entered = jnp.full((1, 1, 2, 2, 1), 2.0)
+    carried, (_, corrected) = algebra.peeled_carry(entered, step, delta=delta)
+    linear, written = algebra.peeled_transition(
+        steps.key, steps.w, steps.u, grown, last, kept, tail, delta=delta)
+    np.testing.assert_array_equal(np.asarray(carried), np.asarray(linear @ entered + written))
+    np.testing.assert_array_equal(np.asarray(corrected), np.asarray(steps.u - steps.w @ entered))
+    gradient = jax.jit(jax.grad(
+        lambda state: algebra.peeled_carry(state, step, delta=delta)[0].sum()))(entered)
+    np.testing.assert_array_equal(np.asarray(gradient),
+                                   np.asarray(jnp.swapaxes(linear, -1, -2) @ jnp.ones_like(carried)))
+
+
 @pytest.mark.parametrize('packed', PACKED, ids=['one sequence', 'packed'])
 @pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[8], HOOKS[6]], ids=str)
 def test_composed_chunks_leave_the_memory_the_recurrence_leaves(hooks, packed):
@@ -262,7 +349,7 @@ def test_composed_chunks_leave_the_memory_the_recurrence_leaves(hooks, packed):
         steps = recurrence_chunk.chunked(query, key, operands.value, g, operands.beta, CHUNK,
                                          starts=operands.starts, delta=hooks.delta)
         t, w = jax.lax.associative_scan(algebra.compose, algebra.transition(
-            steps.key, steps.w, steps.u, steps.gc, steps.last, steps.kept), axis=2)
+            steps.key, steps.w, steps.u, steps.grown, steps.last, steps.kept), axis=2)
         entered = float32_einsum('bhkj,bhjv->bhkv', t[:, :, -1], operands.state.astype(t.dtype))
         return entered + w[:, :, -1]
 

@@ -645,7 +645,9 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
     k_pos = pl.program_id(0) * block_k + jnp.arange(block_k)[None, :]
     key, value = key_ref[...], value_ref[...]
     key_ids = [ref[...] for ref in id_refs[1:]]
-    product = functools.partial(kernel_dot, interpret=interpret)
+    def transposed(a, b):
+        # A query tile's share of the keys' gradients, `aᵀ @ b` (`algebra.cotangent_product`).
+        return kernel_dot(a.T, b, interpret)
 
     def step(index, carry):
         dk, dv, *grads = carry
@@ -661,10 +663,9 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
             delta_ref[rows], seen, q_pos, k_pos, params, key_index=index_ref[rows], scale=scale, how=how,
             interpret=interpret)
         logits, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
-        dv = dv + kernel_dot(*algebra.value_operands(exponentials, weights, dout, total_ref[rows]), interpret)
+        dv = dv + transposed(*algebra.value_operands(exponentials, weights, dout, total_ref[rows]))
         # Scaled before it meets the queries, in the backward's form (`algebra.cotangent_product`).
-        dk = dk + algebra.cotangent_product(logits * scale, query, product, accurate=accurate,
-                                            transposed=True)
+        dk = dk + algebra.cotangent_product(logits * scale, query, transposed, accurate=accurate)
         for place, (kind, piece) in enumerate(zip(score_kinds, pieces, strict=True)):
             if kind == Kind.TILE:
                 # A tile parameter's entries, under the refined D (`algebra.refinement`).
