@@ -613,6 +613,10 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     EXACT_SUMS: ClassVar[bool] = False
     """Whether the kernel adds each depth step's product apart (`exact_sums`); one that does not is not
     eligible where the call asks for it."""
+    STORES_SERIALLY: ClassVar[bool] = False
+    """Whether a one-warpgroup tile's store holds back its next tile's loads (`cost.Cost.serial_stored`):
+    `tgmm`'s, whose few steps a tile leave the store most of its time, where `gmm`'s depth hides it and a
+    cooperative `tgmm` tile streams its stages across tiles."""
 
     def eligible(self, ba, target) -> bool:
         first, second = (value.dtype for name, value in ba.arguments.items()
@@ -687,7 +691,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             program_flops=2 * steps * config.block_m * config.block_n * config.block_k,
             program_staged=steps * step + config.block_m * config.block_n * out,
             program_exponentials=epilogue_exponentials, mode=_mode(tokens.dtype), steps=steps,
-            stages=config.stages, serial_staged=rewritten, serial_exponentials=prologue_exponentials)
+            stages=config.stages, serial_staged=rewritten, serial_exponentials=prologue_exponentials,
+            serial_stored=(config.block_m * config.block_n * out
+                           if self.STORES_SERIALLY and config.warpgroups == 1 else 0))
 
     def _multiprocessors(self, interpret: bool) -> int:
         # The interpreter runs one block (jax/_src/pallas/mosaic_gpu/interpret).
@@ -756,6 +762,7 @@ class MosaicTgmm(_Mosaic):
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
     EXACT_SUMS: ClassVar[bool] = True
+    STORES_SERIALLY: ClassVar[bool] = True
 
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         depth, width = ba.arguments['tokens'].shape[1], ba.arguments['cotangent'].shape[1]
