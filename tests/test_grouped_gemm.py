@@ -17,7 +17,7 @@ from reference_error import assert_as_exact_as_the_reference, equations
 
 from dew.nn.kernels import generation, grouped_matmul, ragged_dot
 from dew.nn.kernels.templates import cost
-from dew.nn.kernels.templates.gemm import mosaic_gpu
+from dew.nn.kernels.templates.gemm import mosaic_gpu, mosaic_tpu
 from dew.nn.moe import expert_projection
 from tools import grouped_oracle as oracle
 
@@ -86,8 +86,8 @@ def test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla(sizes
 @pytest.mark.parametrize("sizes", ["ragged", "unrouted-tail"])
 def test_a_paired_product_gates_both_matrices_as_exactly_as_xla(sizes):
     """A paired product (a gated activation's gate and up, `paired=`), interpreted on a CPU, through Mosaic
-    GPU's kernel at one warpgroup a tile and two and through Triton's, both orientations: the epilogue of
-    its two accumulators as exact as XLA's two ragged dots and the same epilogue from float64 sums of the
+    GPU's kernel at one warpgroup a tile and two, Triton's and Mosaic TPU's, both orientations: the epilogue
+    of its two accumulators as exact as XLA's two ragged dots and the same epilogue from float64 sums of the
     same rounded operands, unrouted rows zero."""
     sizes = SIZES[sizes]
     dtype = jnp.bfloat16
@@ -105,6 +105,7 @@ def test_a_paired_product_gates_both_matrices_as_exactly_as_xla(sizes):
     reference = gated(xla(gate), xla(up)).astype(dtype)
     truth_gate, truth_up = oracle.forward(x, gate, sizes), oracle.forward(x, up, sizes)
     truth = truth_gate / (1 + np.exp(-truth_gate)) * truth_up
+    tpu_block = mosaic_tpu.Blocks(128, 128, 128)
     for transpose in (False, True):
         first, second = (jnp.asarray(np.swapaxes(m, 1, 2) if transpose else m, dtype) for m in (gate, up))
         for tiles in (mosaic_gpu.Tiles(64, 64, 64, 2, 1),
@@ -117,6 +118,10 @@ def test_a_paired_product_gates_both_matrices_as_exactly_as_xla(sizes):
                              trans_rhs=transpose, interpret=True, out_dtype=dtype, epilogue=gated,
                              paired=second)
         check(got, reference, truth, group, f"paired triton transpose={transpose}")
+        got = mosaic_tpu.gmm(jnp.asarray(x, dtype), first, group_sizes, blocks=tpu_block,
+                             transpose_rhs=transpose, out_dtype=dtype, epilogue=gated, paired=second,
+                             interpret=grouped_matmul.TPU_INTERPRETED)
+        check(got, reference, truth, group, f"paired tpu transpose={transpose}")
 
 
 def check(got, reference, truth, group, label):

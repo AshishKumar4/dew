@@ -48,18 +48,24 @@ def _compiler_params() -> pltpu.CompilerParams:
 def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Blocks, transpose_rhs: bool,
         out_dtype, interpret: bool | pltpu.InterpretParams = False, prologue=None,
         prologue_operands: tuple = (), prologue_axes: tuple = (), epilogue=None,
-        epilogue_operands: tuple = (), epilogue_axes: tuple = (),
-        out_dtypes: tuple | None = None) -> jax.Array | tuple[jax.Array, ...]:
+        epilogue_operands: tuple = (), epilogue_axes: tuple = (), out_dtypes: tuple | None = None,
+        paired: jax.Array | None = None) -> jax.Array | tuple[jax.Array, ...]:
     """Each group's rows of `lhs` `[rows, depth]` times its matrix of `rhs`, `[groups, depth, width]` or
     with `transpose_rhs` `[groups, width, depth]`: `[rows, width]` in `out_dtype` (or a tuple in
     `out_dtypes`), each row past the routed ones the epilogue of a zero accumulator. The depth must divide
-    by `blocks.block_k` and the width by `blocks.block_n`."""
+    by `blocks.block_k` and the width by `blocks.block_n`. `paired`, a second matrix of `rhs`'s shape,
+    makes each block two products of one `lhs` block, combined by `epilogue(acc, paired_acc, *sides)`."""
     block_m, block_n, block_k = blocks.block_m, blocks.block_n, blocks.block_k
     rows, depth = lhs.shape
     groups = rhs.shape[0]
     rhs_depth, width = (rhs.shape[2], rhs.shape[1]) if transpose_rhs else rhs.shape[1:]
     if depth != rhs_depth or depth % block_k or width % block_n:
         raise ValueError(f"a [{rows}, {depth}] x {list(rhs.shape)} product does not take {blocks}")
+    if paired is not None and (paired.shape != rhs.shape or epilogue is None):
+        raise ValueError("a paired product takes a second matrix of the first's shape and an epilogue of "
+                         "both")
+    matrices = (rhs,) if paired is None else (rhs, paired)
+    count = len(matrices)
     lhs = _rows_padded(lhs, 0, block_m)
     m = lhs.shape[0]
     sizes = group_sizes.astype(jnp.int32)
@@ -74,15 +80,17 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
     steps = depth // block_k
     sides = len(prologue_operands) + len(epilogue_operands)
 
-    def kernel(group_offsets, group_ids, m_tile_ids, lhs_ref, rhs_ref, *refs):
+    def kernel(group_offsets, group_ids, m_tile_ids, lhs_ref, *refs):
+        rhs_refs, refs = refs[:count], refs[count:]
         prologue_refs, epilogue_refs = refs[:len(prologue_operands)], refs[len(prologue_operands):sides]
-        out_refs, acc_ref = refs[sides:-1], refs[-1]
+        out_refs, acc_refs = refs[sides:-count], refs[-count:]
         slot, step = pl.program_id(1), pl.program_id(2)
         group = group_ids[slot]
 
         @pl.when(step == 0)
         def _():
-            acc_ref[...] = jnp.zeros_like(acc_ref)
+            for acc_ref in acc_refs:
+                acc_ref[...] = jnp.zeros_like(acc_ref)
 
         # Dew: the unrouted rows' group multiplies nothing; its accumulator stays zero.
         @pl.when(group < groups)
@@ -90,14 +98,15 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
             tile = lhs_ref[...]
             if prologue is not None:
                 tile = prologue(tile, *(side[...] for side in prologue_refs)).astype(lhs_ref.dtype)
-            acc_ref[...] += lax.dot_general(tile, rhs_ref[...], (((1,), (int(transpose_rhs),)), ((), ())),
-                                            preferred_element_type=jnp.float32)
+            for acc_ref, rhs_ref in zip(acc_refs, rhs_refs, strict=True):
+                acc_ref[...] += lax.dot_general(tile, rhs_ref[...], (((1,), (int(transpose_rhs),)), ((), ())),
+                                                preferred_element_type=jnp.float32)
 
         @pl.when(step == steps - 1)
         def _():
-            acc = acc_ref[...]
-            outs = (acc,) if epilogue is None else _as_tuple(
-                epilogue(acc, *(side[...] for side in epilogue_refs)))
+            accs = tuple(acc_ref[...] for acc_ref in acc_refs)
+            outs = accs if epilogue is None else _as_tuple(
+                epilogue(*accs, *(side[...] for side in epilogue_refs)))
             start, end = group_offsets[group], group_offsets[group + 1]
             row = m_tile_ids[slot] * block_m + lax.broadcasted_iota(jnp.int32, (block_m, block_n), 0)
             mine = (row >= start) & (row < end)
@@ -129,15 +138,15 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
             in_specs=[pl.BlockSpec((block_m, block_k), lhs_index),
-                      pl.BlockSpec((None, block_n, block_k) if transpose_rhs else (None, block_k, block_n),
-                                   rhs_index),
+                      *(pl.BlockSpec((None, block_n, block_k) if transpose_rhs else (None, block_k, block_n),
+                                     rhs_index) for _ in matrices),
                       *(side_spec(axes) for axes in (*prologue_axes, *epilogue_axes))],
             out_specs=tuple(pl.BlockSpec((block_m, block_n), out_index) for _ in dtypes),
             grid=(width // block_n, active, steps),
-            scratch_shapes=[pltpu.VMEM((block_m, block_n), jnp.float32)]),
+            scratch_shapes=[pltpu.VMEM((block_m, block_n), jnp.float32) for _ in matrices]),
         compiler_params=_compiler_params(),
         interpret=interpret,
-    )(*metadata, lhs, rhs, *prologue_operands, *epilogue_operands)
+    )(*metadata, lhs, *matrices, *prologue_operands, *epilogue_operands)
     outs = tuple(out[:rows] for out in outs)
     return outs if out_dtypes else outs[0]
 
