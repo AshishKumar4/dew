@@ -5,6 +5,21 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- `OptimConfig.rate` is the learning rate, a number or a schedule's record, in
+  place of `learning_rate` and `schedule`; on the command line it is one value,
+  `--optim.rate 3e-4` or a schedule's JSON record.
+- Module moves, each name at one path: the run configurations are
+  `dew.config.lm.LMRunConfig`, `dew.config.jepa.JepaRunConfig` and
+  `dew.config.diffusion.DiffusionRunConfig` (with `FlowRolloutConfig`); the
+  condition records `TextCondition` and `AudioCondition` are `dew.inputs`';
+  `PretrainedAutoencoder` is `dew.nn.autoencoders.pretrained`'s; the optimizers
+  and schedules are `dew.optim`; the device facts and CUDA builds are
+  `dew.devices` and `dew.builds`. A run's record names its run class by its
+  alias (`"class": "diffusion"`, `dew.registry.runs`), so it reads back wherever
+  the class moves; a run.json written before this names the old import path and
+  no longer loads. A distillation's teacher run is the run config's
+  `--teacher-run`, and the objectives take the loaded teacher
+  (`teacher_variables=`, and guidance distillation's `teacher=`).
 - `train/flops`, a step's analytical training work, is logged on every device,
   CPU and TPU included; `train/mfu` still needs a device with a known peak.
 - `dew.figures` draws SVG figures for notebooks and docs. Their colors follow

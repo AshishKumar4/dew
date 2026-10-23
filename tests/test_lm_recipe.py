@@ -12,13 +12,14 @@ from token_support import write_token_corpus
 from tool_support import load
 
 import dew
+from dew.config.lm import LMRunConfig
 from dew.data import Loading, presets
 from dew.data.compile import compile, held
 from dew.data.dataset import Loader
 from dew.data.pipeline import Dataset
 from dew.data.sources.tokens import TokenFiles
 from dew.inference import TextGeneration
-from dew.objectives.lm import LMObjective, LMRunConfig
+from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling
 
 pytestmark = pytest.mark.mesh
@@ -524,7 +525,7 @@ def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
         "--trainer.steps", "1", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "masked",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--objective.ema-decay", "None", "--max-new-tokens", "0", "--optim.learning-rate", "0.001"],
+        "--objective.ema-decay", "None", "--max-new-tokens", "0", "--optim.rate", "0.001"],
         default=LMRunConfig(data=data))
 
     state = config.run()
@@ -566,7 +567,7 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
         "--trainer.steps", "1", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "block",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--max-new-tokens", "0", "--optim.learning-rate", "0.001"], default=LMRunConfig(data=spans))
+        "--max-new-tokens", "0", "--optim.rate", "0.001"], default=LMRunConfig(data=spans))
     state = config.run()
     assert int(state.updates) == 1
     original = Pretrained.load(checkpoint, dtype="float32", attention_impl="xla", max_seq_len=12)
@@ -603,7 +604,7 @@ def test_block_diffusion_trains_quantized_as_any_lm_recipe_does(tmp_path):
             "--trainer.steps", "1", "--trainer.log-every", "1",
             "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", name,
             "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-            "--max-new-tokens", "0", "--optim.learning-rate", "0.001", *quantized],
+            "--max-new-tokens", "0", "--optim.rate", "0.001", *quantized],
             default=LMRunConfig(data=spans))
 
     quantized = run("quantized")

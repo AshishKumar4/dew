@@ -36,10 +36,10 @@ from dew.config import OptimConfig
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader, replayed
 from dew.objectives.base import Aux, EMASpec, Objective, merge, under
+from dew.optim import Cosine, Power
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainState, ema_update
 from dew.training.evaluation import WARM_BATCHES
 from dew.training.model_flops import _TokenCount
-from dew.training.optim import Cosine, Power
 from dew.training.runtime import Preempted
 from dew.training.state import CHECKPOINTED
 
@@ -97,7 +97,7 @@ def test_a_token_budget_and_step_cap_stop_at_the_first_reached():
 @pytest.mark.parametrize("schedule", [None, Power(peak=.1, warmup_steps=2, a=.1, b=0),
                                        Cosine(peak=.1, warmup_steps=1, decay_steps=8)])
 def test_a_token_only_run_uses_the_schedules_own_horizon(schedule):
-    config = OptimConfig(schedule=schedule)
+    config = OptimConfig() if schedule is None else OptimConfig(rate=schedule)
     state = make_trainer(objective=TokenRegression(), optimizer=config).fit(dataset(), tokens=30)
     assert int(state.step) == 3
 
@@ -811,7 +811,7 @@ from dew.cache import enable_compilation_cache
 from dew.config import OptimConfig
 from dew.telemetry.instrumentation import compilation_cache_counts
 from dew.training import Checkpoints, Layout, Trainer
-from dew.training.optim import Cosine, ParamGroup
+from dew.optim import Cosine, ParamGroup
 
 root, grouped = sys.argv[1], sys.argv[2] == "grouped"
 enable_compilation_cache(root + "/cache")
@@ -819,7 +819,7 @@ enable_compilation_cache(root + "/cache")
 
 def fit(peak, steps, path):
     groups = (ParamGroup("kernel", ("*kernel",), learning_rate_multiplier=0.5), ParamGroup("rest", ("*",)))
-    config = OptimConfig(schedule=Cosine(peak=peak, warmup_steps=1, decay_steps=8),
+    config = OptimConfig(rate=Cosine(peak=peak, warmup_steps=1, decay_steps=8),
                          param_groups=groups if grouped else ())
     sink = RecordingTracker()
     trainer = Trainer(Regression(), config, key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
