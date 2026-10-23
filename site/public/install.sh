@@ -31,16 +31,18 @@ cuda_builds='cuda13:580:7.5 cuda12:525:5.2'
 uv_least=0.13.4
 # uv at uv_least or newer (pyproject.toml's [tool.uv] required-version). bootstrap_uv [NAME=VALUE...]
 # installs that release from astral's installer, NAME=VALUE in the installer's environment, where uv is
-# missing or older; uv_older VERSION says whether VERSION is older.
+# missing or older; uv_version is the release of the uv on PATH (none where there is none), and
+# uv_older VERSION says whether VERSION is older: a pre-release of uv_least is.
+uv_version() { (uv --version 2>/dev/null || true) | awk '{print $2}'; }
 uv_older() {
 	awk -v have="$1" -v least="$uv_least" 'BEGIN {
 		split(have, h, "."); split(least, l, ".")
 		for (i = 1; i <= 3; i++) if (h[i] + 0 != l[i] + 0) exit !(h[i] + 0 < l[i] + 0)
-		exit 1
+		exit have !~ /[^0-9.]/
 	}'
 }
 bootstrap_uv() {
-	have=$(uv --version 2>/dev/null | awk '{print $2}')
+	have=$(uv_version)
 	if [ -z "$have" ] || uv_older "$have"; then
 		curl -LsSf "https://astral.sh/uv/$uv_least/install.sh" | env "$@" sh
 	fi
@@ -148,7 +150,7 @@ printf '%sDew installer%s\n' "$bold" "$plain"
 printf '  hardware  %s\n' "$hardware"
 printf '  python    %s\n' "${found:-no environment active}"
 if [ -z "$use_pip" ]; then
-	have=$(uv --version 2>/dev/null | awk '{print $2}')
+	have=$(uv_version)
 	if [ -z "$have" ]; then printf '  uv        not installed; uv %s will be, from astral.sh, unless you run this with --pip\n' "$uv_least"
 	elif uv_older "$have"; then printf '  uv        %s, older than %s, which will be installed from astral.sh, unless you run this with --pip\n' "$have" "$uv_least"
 	fi
@@ -177,12 +179,12 @@ fi
 # uv, from its own installer, where it is missing or older than uv_least.
 if [ -z "$use_pip" ]; then
 	bootstrap_uv || die "uv's installer failed; install uv $uv_least or newer from https://docs.astral.sh/uv, or rerun with --pip"
-	have=$(uv --version 2>/dev/null | awk '{print $2}')
+	have=$(uv_version)
 	if [ -z "$have" ] || uv_older "$have"; then
 		# Where uv's installer put it (https://docs.astral.sh/uv/reference/storage/#executable-directory).
 		bin=${UV_INSTALL_DIR:-${UV_UNMANAGED_INSTALL:-${XDG_BIN_HOME:-${XDG_DATA_HOME:+$XDG_DATA_HOME/../bin}}}}
 		PATH="${bin:-$HOME/.local/bin}:${bin:+$bin/bin:}$PATH"
-		have=$(uv --version 2>/dev/null | awk '{print $2}')
+		have=$(uv_version)
 	fi
 	[ -n "$have" ] || die "uv is installed but not on PATH; open a new shell and rerun"
 	! uv_older "$have" || die "uv $have, older than $uv_least, comes first on PATH; remove it or update it with uv self update"
