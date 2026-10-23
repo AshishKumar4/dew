@@ -21,9 +21,15 @@ from __future__ import annotations
 
 import argparse
 import ast
+import functools
+import io
 import json
 import re
+import shlex
+import subprocess
 import sys
+import tempfile
+import tokenize
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -104,6 +110,8 @@ class Package:
     overview_title: str = ""  # with a title, the page is written afresh; without, it is extended
     generated: str = "site/src/generated"  # the sidebar and the name index
     usage: list[str] = field(default_factory=list)  # files whose imports must resolve
+    declared: str = "site/scripts/gen_api.py"  # the file declaring `groups` at any commit (`groups_at`)
+    distribution: str = "dewml"  # the name pip installs the package by (`pinned`)
     usage_skip: tuple[str, ...] = ()
     special: tuple[str, ...] = ()  # private-looking methods a class documents, such as "__call__"
     fence_indented: bool = False  # an indented block after a blank line in a docstring is Python
@@ -709,9 +717,10 @@ def unresolved_chain(start: griffe.Object, path: list[str], home: dict[str, str]
     return None
 
 
-def load() -> griffe.Module:
-    """Load the package with its namespace subpackages, which griffe's finder skips."""
-    root = P.repo / "src"
+def load(root: Path | None = None) -> griffe.Module:
+    """Load the package with its namespace subpackages, which griffe's finder skips, from the source under
+    `root` (the repository's src/, or a commit's)."""
+    root = root or P.repo / "src"
     loader = griffe.GriffeLoader(search_paths=[str(root)])
     package = loader.load(P.package)
     for directory in sorted((root / P.package).rglob("*")):
@@ -746,15 +755,16 @@ def module_of(package: griffe.Module, path: str) -> griffe.Module:
     return obj
 
 
-def documented(package: griffe.Module) -> tuple[dict[str, Page], dict[str, str]]:
-    """Each page, and each documented object's home: the page with the longest
-    module prefix of its path, else the first page that exports it."""
+def documented(package: griffe.Module, paths: list[str]) -> tuple[dict[str, Page], dict[str, str]]:
+    """Each page of the modules `paths` names (`P.pages`, or a pinned commit's), and each documented
+    object's home: the page with the longest module prefix of its path, else the first page that exports
+    it."""
     pages = {path: Page(module_of(package, path), list(public_entries(module_of(package, path))))
-             for path in P.pages}
+             for path in paths}
     home: dict[str, str] = {}
-    for path in P.pages:
+    for path in paths:
         for entry in pages[path].entries:
-            prefixes = [page for page in P.pages if entry.canonical.startswith(page + ".")
+            prefixes = [page for page in paths if entry.canonical.startswith(page + ".")
                         and any(e.canonical == entry.canonical for e in pages[page].entries)]
             home.setdefault(entry.canonical, max(prefixes, key=len) if prefixes else path)
     return pages, home
@@ -820,17 +830,28 @@ def main() -> None:
         P = Package.read(args.config)
     content, generated = P.repo / P.content, P.repo / P.generated
     package = load()
-    pages, home = documented(package)
+    pages, home = documented(package, P.pages)
 
     linker = linked(pages, home)
 
     # Coverage: every module that declares __all__ has a page, and every exported
     # name and every name the docs import is documented.
     problems = undocumented(package, pages, home)
-    for file, module_path, name in usage_imports():
+    # A file shows the API as it is, or as the commit its install pins holds it (`pinned`).
+    shown: dict[str, tuple[griffe.Module, dict[str, Page], dict[str, str]]] = {}
+    for file, path in usage_files():
         try:
-            module = (module_of(package, module_path) if module_path == P.package
-                      else module_at(package, module_path))
+            commit = pinned(path)
+            shown[file] = (package, pages, home) if commit is None else at_commit(commit)
+        except Unresolved as error:
+            problems.append(f"{file}: {error}")
+    for file, module_path, name in usage_imports():
+        if file not in shown:
+            continue
+        shown_package, shown_pages, shown_home = shown[file]
+        try:
+            module = (module_of(shown_package, module_path) if module_path == P.package
+                      else module_at(shown_package, module_path))
             member = module.members.get(name)
             if member is None:
                 problems.append(f"{file}: `from {module_path} import {name}`: {module_path} has no {name}")
@@ -840,14 +861,15 @@ def main() -> None:
             problems.append(f"{file}: `from {module_path} import {name}`: {error}")
             continue
         if target.is_module:
-            if name in target.members and target.path + "." + name in home:
+            if name in target.members and target.path + "." + name in shown_home:
                 continue
-            if target.path not in pages:
+            if target.path not in shown_pages:
                 problems.append(f"{file}: imports the module {target.path}, which has no API page")
-        elif target.path not in home:
+        elif target.path not in shown_home:
             problems.append(f"{file}: imports {module_path}.{name} ({target.path}), which no API page documents")
     for file, path in usage_files():
-        problems.extend(f"{file}: {problem}" for problem in unresolved_in(file, path, package, pages, home))
+        if file in shown:
+            problems.extend(f"{file}: {problem}" for problem in unresolved_in(file, path, *shown[file]))
     if problems:
         print("gen_api: the API reference does not cover what is public:", file=sys.stderr)
         for problem in sorted(set(problems)):
@@ -915,6 +937,85 @@ def main() -> None:
     (generated / "api-index.json").write_text(json.dumps(linker.by_path, indent=1, sort_keys=True) + "\n")
     count = sum(1 for path in P.pages for entry in pages[path].entries if home[entry.canonical] == path)
     print(f"gen_api: {len(P.pages)} pages, {count} objects documented")
+
+
+REQUIREMENT = re.compile(r"^(?P<name>[A-Za-z0-9._-]+)(?:\[[^\]]*\])?\s*"
+                         r"(?:@\s*git\+(?P<url>[^@\s]+)(?:@(?P<rev>\S+))?)?(?:[=<>!~].*)?$")
+"""A requirement a pip install names: a distribution, its extras, and a git repository and revision it
+installs from, if any (`dewml[cuda13] @ git+https://github.com/AshishKumar4/dew@<revision>`, with or
+without the spaces)."""
+COMMIT = re.compile(r"[0-9a-f]{7,40}")
+
+
+def install_commands(source: str) -> Iterator[list[str]]:
+    """The arguments of each `pip install` or `uv pip install` a code cell runs as IPython does: a line
+    that starts with `%` or `!`, outside a Python string, with its backslash continuations joined."""
+    lines = source.splitlines()
+    magic = [index for index, line in enumerate(lines) if line.lstrip().startswith(("%", "!"))]
+    # A magic line inside a string literal is the string's text: read the cell as Python with each magic
+    # line a statement, and keep those no string token spans.
+    python = "\n".join("pass" if index in magic else line for index, line in enumerate(lines))
+    tokens = tokenize.generate_tokens(io.StringIO(python).readline)
+    strings = [(token.start[0], token.end[0]) for token in tokens if token.type == tokenize.STRING]
+    index = 0
+    while index < len(lines):
+        command, start = lines[index], index
+        while command.endswith("\\") and index + 1 < len(lines):
+            index += 1
+            command = command[:-1] + " " + lines[index]
+        index += 1
+        if start in magic and not any(first < start + 1 <= last for first, last in strings):
+            words = shlex.split(command.lstrip().lstrip("%!"), comments=True)
+            if words[:2] == ["pip", "install"] or words[:3] == ["uv", "pip", "install"]:
+                yield words
+
+
+def pinned(path: Path) -> str | None:
+    """The commit a notebook's installs of the package (`Package.distribution`) pin it to, which the API
+    it shows is that commit's; None where it installs none, or the package as published or at a branch or
+    tag. Two installs of different revisions are refused: which API a cell sees would turn on the cell."""
+    if path.suffix != ".ipynb":
+        return None
+    repository = P.source.split("/blob/")[0].removesuffix("/")
+    revisions: list[str | None] = []
+    for cell in json.loads(path.read_text())["cells"]:
+        for words in install_commands("".join(cell["source"])) if cell["cell_type"] == "code" else ():
+            for found in filter(None, map(REQUIREMENT.match, words)):
+                if found["name"] == P.distribution:
+                    url = (found["url"] or "").removesuffix(".git").removesuffix("/")
+                    revisions.append(found["rev"] if url == repository and found["rev"] else None)
+    if len(set(revisions)) > 1:
+        raise Unresolved(f"it installs the package at {len(set(revisions))} revisions: "
+                         f"{', '.join(str(revision) for revision in revisions)}")
+    return revisions[0] if revisions and revisions[0] and COMMIT.fullmatch(revisions[0]) else None
+
+
+def groups_at(commit: str) -> list[tuple[str, list[str]]]:
+    """The reference's groups as `commit` declared them (`Package.declared`): a JSON file's `groups`, or
+    the Python file's `DEW_GROUPS`."""
+    text = subprocess.run(["git", "-C", str(P.repo), "show", f"{commit}:{P.declared}"], check=True,
+                          stdout=subprocess.PIPE, text=True).stdout
+    if P.declared.endswith(".json"):
+        return json.loads(text)["groups"]
+    for node in ast.parse(text).body:
+        if (isinstance(node, ast.Assign | ast.AnnAssign) and node.value is not None
+                and any(isinstance(target, ast.Name) and target.id == "DEW_GROUPS"
+                        for target in (node.targets if isinstance(node, ast.Assign) else [node.target]))):
+            return ast.literal_eval(node.value)
+    raise Unresolved(f"{P.declared} declares no DEW_GROUPS at {commit}")
+
+
+@functools.cache
+def at_commit(commit: str) -> tuple[griffe.Module, dict[str, Page], dict[str, str]]:
+    """The package's API at `commit` and the reference it documented there: its source read as `load`
+    reads the checkout's, and its pages as that commit's groups name them (`groups_at`). A file pinned
+    there may use any name that commit documented, whatever pages the reference has now."""
+    archive = subprocess.run(["git", "-C", str(P.repo), "archive", commit, "src"], check=True,
+                             stdout=subprocess.PIPE).stdout
+    with tempfile.TemporaryDirectory() as root:
+        subprocess.run(["tar", "-x", "-C", root], input=archive, check=True)
+        package = load(Path(root) / "src")
+    return package, *documented(package, [module for _, modules in groups_at(commit) for module in modules])
 
 
 def iter_modules(module: griffe.Module) -> Iterator[griffe.Module]:
