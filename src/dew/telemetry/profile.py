@@ -85,9 +85,8 @@ def _drain() -> None:
     """Wait for the work in flight: every live array, then the effects.
 
     An array can list as live with one of its buffers deleted, one whose
-    shard's buffer its holder deleted, and waiting on it raises. No work is
-    in flight on a deleted buffer, and the step's outputs are the arrays to
-    wait on, so it is passed over."""
+    shard's buffer its holder deleted, and waiting on it raises. The step's
+    outputs are the arrays to wait on, so it is passed over."""
     jax.block_until_ready([array for array in jax.live_arrays()
                            if not any(shard.data.is_deleted() for shard in array.addressable_shards)])
     jax.effects_barrier()
