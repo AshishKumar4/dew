@@ -11,6 +11,8 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   divide the quantizers use (`dew.nn.precision.correctly_rounded_divide`, moved from
   `dew.nn.fake_quant`); a bfloat16 or float16 state's is the float32 quotient rounded to its
   dtype, as PyTorch's opmath gives it.
+- `train/flops`, a step's analytical training work, is logged on every device,
+  CPU and TPU included; `train/mfu` still needs a device with a known peak.
 - `dew.figures` draws SVG figures for notebooks and docs. Their colors follow
   the page's light or dark theme (dewml.dev, Colab, JupyterLab, VS Code, and
   the system setting elsewhere), and their animations are CSS, so they play
