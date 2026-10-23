@@ -16,6 +16,7 @@ from generation_support import INTERPRETS
 from jax.sharding import Mesh
 from reference_error import assert_as_exact
 from test_attention_template import CASES, ROWS, arguments, geometry as core_geometry
+from test_attention_triton import HOOKS, gate_of, hooks_for
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import (
@@ -39,6 +40,12 @@ on an H100."""
 SEEDS = 8
 """Draws a case takes, check 1's fewest (`reference_error.seeds_for`): it bounds the worst row over them
 against the reference's own."""
+ALL_HOOKS_SEEDS = 32
+"""The draws of a site with every hook at once (`test_attention_triton.ALL_HOOKS_SEEDS`)."""
+HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False),
+              "float16-natural": (jnp.float16, True)}
+"""The hooked forward's dtypes and forms: the fold over both 16-bit dtypes, and fp16's natural form (bf16's
+takes a headroom guard the mainloop has not yet)."""
 FORM_TILES = attention_mosaic.Tiles(64, 64, 2)
 """The call forms' tiles: the template core's 100 queries over 96 keys (`test_attention_template.CASES`) in a
 pair of query blocks over two key tiles, so a block's spans begin and end within the keys it streams."""
@@ -83,15 +90,19 @@ def _check_forward(call: str, dtype, shape, *, natural: bool, interpret: bool):
 
 
 def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool, backward: bool = False,
-                 accurate: bool = False):
-    """The forward, or the backward in the form `accurate` names, over `spans` at `FORM_TILES`, bf16 draws of
-    `shape` (rows, queries, query and key heads) over the spans' keys."""
-    draw = _drawn(shape, jnp.bfloat16, width=64, keys=spans.keys)
+                 accurate: bool = False, names: frozenset = HOOKS["none"], dtype=jnp.bfloat16,
+                 natural: bool = False):
+    """The forward, or the backward in the form `accurate` names, over `spans` at `FORM_TILES` under the
+    hooks `names` (`test_attention_triton.hooks_for`), draws of `shape` (rows, queries, four query heads and
+    two key heads) over the spans' keys in `dtype`, the forward's logits `natural` or folded."""
+    queries = shape[1]
+    draw = _drawn(shape, dtype, width=64, keys=spans.keys)
+    hooks = hooks_for(names, queries, 64, gate_of(queries, 64))
 
     def ours(query, key, value, dout):
         if not backward:
-            return attention_mosaic.forward(query, key, value, spans, tiles=FORM_TILES, interpret=interpret,
-                                            family=_family(interpret))
+            return attention_mosaic.forward(query, key, value, spans, hooks, natural=natural,
+                                            tiles=FORM_TILES, interpret=interpret, family=_family(interpret))
         residuals = attention_triton.forward(query, key, value, spans, residuals=True,
                                              interpret=interpret)[1:]
         grads = attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals,
@@ -101,12 +112,24 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
 
     def reference(query, key, value, dout):
         if not backward:
-            return template.reference(query, key, value, spans)
-        _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans), query, key, value)
+            return template.reference(query, key, value, spans, hooks)
+        _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, hooks), query, key, value)
         return pull(dout)
 
-    name = f"mosaic {'backward' if backward else 'forward'} {label}{' accurate' if accurate else ''}"
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, name, seeds=SEEDS)
+    name = (f"mosaic {'backward' if backward else 'forward'} {label} {sorted(names)} {jnp.dtype(dtype).name}"
+            f"{' accurate' if accurate else ''}{' natural' if natural else ''}")
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, name,
+                    seeds=ALL_HOOKS_SEEDS if names == HOOKS["all"] else SEEDS)
+
+
+def _check_hooks(names: frozenset, dtype, natural: bool, *, interpret: bool):
+    """The forward under the hooks `names` over the template core's causal packed documents under a window
+    (`test_attention_triton`'s hook site)."""
+    case = CASES["causal-documents-window"]
+    queries, keys = core_geometry(case)
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
+    _check_spans("causal-documents-window", spans, (ROWS, queries, 4, 2), interpret=interpret, names=names,
+                 dtype=dtype, natural=natural)
 
 
 def _check_call_form(form: str, *, interpret: bool, backward: bool = False, accurate: bool = False):
@@ -162,6 +185,16 @@ def test_the_forward_is_on_par_over_every_call_form_interpreted(form):
 
 
 @INTERPRETS
+@pytest.mark.parametrize(("dtype", "natural"), HOOK_FORMS.values(), ids=HOOK_FORMS)
+@pytest.mark.parametrize("hooks", HOOKS.values(), ids=HOOKS)
+def test_the_forward_is_on_par_under_every_hook_interpreted(hooks, dtype, natural):
+    """The forward under each hook (a softcap, ALiBi's slopes, sinks, an output gate, and all at once) over
+    causal packed documents under a window, under the interpreter: the fold over both 16-bit dtypes, and
+    fp16's natural form (bf16's takes a headroom guard the mainloop has not yet)."""
+    _check_hooks(hooks, dtype, natural, interpret=True)
+
+
+@INTERPRETS
 @pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
 @pytest.mark.parametrize("form", CASES)
 def test_the_backward_is_on_par_over_every_call_form_interpreted(form, accurate):
@@ -200,7 +233,8 @@ def test_a_causal_backward_of_more_keys_than_queries_is_on_par_interpreted():
 @pytest.mark.parametrize("call", ["causal", "causal-documents-window"])
 def test_the_launches_lower_for_an_h100(call, accurate):
     """The forward and the backward's launches lower for an H100 on any host, as the GPU gate runs them: a
-    causal call, and a spans one of documents, whose programs read its block map and ids."""
+    causal call, and a spans one of documents, whose programs read its block map and ids; the forward under
+    every hook too, whose programs read each kind of parameter and the initial state."""
     if call == "causal":
         rows, tokens, heads, kv_heads = SHAPES["compiled"]
         spans = template.spans(tokens, tokens, rows, causal=True)
@@ -214,9 +248,11 @@ def test_the_launches_lower_for_an_h100(call, accurate):
     split = template.Split(others, rows_shape, rows_shape, rows_shape)
     residuals = (rows_shape, rows_shape, jax.ShapeDtypeStruct((rows, heads, tokens), jnp.int32), split)
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    hooks = hooks_for(HOOKS["all"], tokens, 128, gate_of(tokens, 128))
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-        jax.jit(functools.partial(attention_mosaic.forward, spans=spans)).trace(q, kv, kv).lower(
-            lowering_platforms=("cuda",))
+        for forward_hooks in (None, hooks):
+            jax.jit(functools.partial(attention_mosaic.forward, spans=spans, hooks=forward_hooks)).trace(
+                q, kv, kv).lower(lowering_platforms=("cuda",))
         jax.jit(lambda q, k, v, dout, residuals: attention_mosaic.backward(
             q, k, v, spans, None, dout, residuals=residuals, accurate=accurate)).trace(
             q, kv, kv, q, residuals).lower(lowering_platforms=("cuda",))
@@ -245,6 +281,15 @@ def test_the_natural_forward_is_on_par_on_an_h100(call):
 def test_the_forward_is_on_par_over_every_call_form_on_an_h100(form):
     """The forward over each of the template core's call forms compiled on an H100."""
     _check_call_form(form, interpret=False)
+
+
+@ON_HOPPER
+@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
+@pytest.mark.parametrize(("dtype", "natural"), HOOK_FORMS.values(), ids=HOOK_FORMS)
+@pytest.mark.parametrize("hooks", HOOKS.values(), ids=HOOKS)
+def test_the_forward_is_on_par_under_every_hook_on_an_h100(hooks, dtype, natural):
+    """The forward under each hook compiled on an H100."""
+    _check_hooks(hooks, dtype, natural, interpret=False)
 
 
 @ON_HOPPER
