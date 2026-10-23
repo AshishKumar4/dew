@@ -43,8 +43,9 @@ def test_the_packed_feed_forward_is_diffusers_geglu_bit_for_bit(approximate, dty
 
 
 def test_a_unets_feed_forward_declares_its_kernels_axes():
-    """Every leaf of a UNet's feed-forward, the packed projection's included, carries its declared
-    axes, the hidden width `mlp`, so a tensor axis splits it as it splits any MLP."""
+    """Every leaf of a UNet's feed-forward, the packed projection's included, carries declared axes:
+    the packed projection's kernel `embed` to `mlp` and its bias `mlp`, so a tensor axis splits it as
+    it splits any MLP."""
     from dew.registry import models
 
     model = models.build("unet_2d_condition", stages=[{"features": 32, "heads": 2}], blocks_per_level=1)
@@ -55,9 +56,13 @@ def test_a_unets_feed_forward_declares_its_kernels_axes():
     leaves = [(path, leaf) for path, leaf in jax.tree_util.tree_leaves_with_path(params)
               if "feed_forward" in parameter_path(path)]
     assert {parameter_path(path)[-2] for path, _ in leaves} == {"gate_up_proj", "down_proj"}
+    expected = {"kernel": ("embed", "mlp"), "bias": ("mlp",)}
     for path, leaf in leaves:
         axes = declared_axes(path, len(leaf.shape), declared)
-        assert axes is not None and "mlp" in axes, parameter_path(path)
+        names = parameter_path(path)
+        assert axes is not None, names
+        if names[-2] == "gate_up_proj":
+            assert axes == expected[names[-1]], names
 
 
 def test_a_packed_order_names_the_gate_and_up_projections():
