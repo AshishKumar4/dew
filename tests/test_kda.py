@@ -22,7 +22,14 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import decode_through
-from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, widened
+from reference_error import (
+    assert_as_exact,
+    declared_seeds,
+    indexed_recording,
+    recording,
+    widened,
+    with_gradients,
+)
 
 from dew.nn.inputs import MixerCall
 from dew.nn.kda import KimiDeltaAttention
@@ -33,8 +40,8 @@ from tools.kda_reference import (
     oracle_chunk,
     oracle_recurrent,
     oracle_rule,
+    rule_gradients,
     rule_inputs,
-    with_gradients,
 )
 
 B, S, H, D, E, K = 2, 7, 2, 4, 8, 4  # batch, tokens, heads, head dim, model width, conv kernel
@@ -72,10 +79,10 @@ def oracle_layer(x, p, lower_bound, eps, rule):
     return normed.reshape(batch, length, H * D) @ p["o_proj"]
 
 
-def oracle_loss(x, p, cotangent, *, eps):
-    """`oracle_layer`'s output with the safe gate over the chunked transcription, summed against
-    `cotangent`: the loss whose gradients the gradient sites hold."""
-    return jnp.sum(oracle_layer(x, p, -5.0, eps, partial(oracle_chunk, chunk_size=4)) * cotangent)
+def oracle_forward(x, p, *, eps):
+    """`oracle_layer`'s output with the safe gate over the chunked transcription: the forward whose
+    gradients the gradient sites hold (`with_gradients`)."""
+    return oracle_layer(x, p, -5.0, eps, partial(oracle_chunk, chunk_size=4))
 
 
 def oracle_params(variables) -> dict:
@@ -113,8 +120,8 @@ def test_the_rule_and_all_operand_gradients_match_the_executed_torch_reference(r
     label = f"{rule} rule"
     seeds = declared_seeds(RECORDED)[label]
     draw, recorded, truth = indexed_recording(recording(RECORDED), label, seeds, inputs_of=rule_inputs,
-                                              truth_fn=jax.jit(partial(with_gradients, oracle_rule(rule))))
-    dew = jax.jit(partial(with_gradients, dew_rule(rule)))
+                                              truth_fn=jax.jit(partial(rule_gradients, oracle_rule(rule))))
+    dew = jax.jit(partial(rule_gradients, dew_rule(rule)))
     assert_as_exact(lambda index, inputs: dew(inputs), recorded, draw, label, seeds=seeds, truth_fn=truth)
 
 
@@ -197,21 +204,16 @@ def test_the_layer_gradients_match_the_oracle():
     wide = {"E": 16, "H": 4, "D": 8, "eps": 1e-2}
     module, _, _ = layer_and_params(-5.0, **wide)
 
-    def loss_module(x, variables, cotangent):
-        return jnp.sum(module.apply(variables, x) * cotangent)
-
-    loss_oracle = partial(oracle_loss, eps=1e-2)
-
     @jax.jit
     @jax.vmap
     def ours(x, p, cotangent):
-        grad_x, grad_params = jax.grad(loss_module, argnums=(0, 1))(x, variables_of(p), cotangent)
+        _, grad_params, grad_x = with_gradients(module.apply)(variables_of(p), x, cotangent)
         return {"x": grad_x, **oracle_params(grad_params)}
 
     @jax.jit
     @jax.vmap
     def theirs(x, p, cotangent):
-        grad_x, grad_p = jax.grad(loss_oracle, argnums=(0, 1))(x, p, cotangent)
+        _, grad_x, grad_p = with_gradients(partial(oracle_forward, eps=1e-2))(x, p, cotangent)
         return {"x": grad_x, **grad_p}
 
     params = oracle_params(layer_and_params(-5.0, **wide)[2])
@@ -226,7 +228,7 @@ def test_the_layer_gradients_match_the_oracle():
 
 
 BOUND = 1e-4
-"""The retiring site's bound (`test_default_eps_gradients_hold_their_prior_bound`), its gradients'
+"""The existing bound (`test_default_eps_gradients_hold_their_prior_bound`), its gradients'
 largest error over their largest value."""
 
 
@@ -235,7 +237,7 @@ def scaled(actual, wanted) -> float:
 
 
 def test_default_eps_gradients_hold_their_prior_bound():
-    """A retiring site (ledger row 1343): at the gated norm's own eps 1e-5, a gradient through the norm
+    """An existing bound (ledger row 1348): at the gated norm's own eps 1e-5, a gradient through the norm
     of a near-zero row errs as the row's inverse square, a tail check 1 cannot resolve, so the layer's
     gradients there keep the prior bound, their largest error within BOUND of their largest value from
     the transcription's float64 gradients (its autodiff, where central differences were), until the
@@ -244,16 +246,11 @@ def test_default_eps_gradients_hold_their_prior_bound():
     x = jnp.asarray(np.random.RandomState(4).randn(B, S, E), jnp.float32)
     cotangent = jnp.asarray(np.random.RandomState(5).randn(B, S, E), jnp.float32)
 
-    def loss_module(x, variables):
-        return jnp.sum(module.apply(variables, x) * cotangent)
-
-    def loss_oracle(x, p):
-        return oracle_loss(x, p, cotangent, eps=1e-5)
-
-    grad_x, grad_params = jax.grad(loss_module, argnums=(0, 1))(x, variables)
+    _, grad_params, grad_x = with_gradients(module.apply)(variables, x, cotangent)
     ours = {"x": grad_x, **oracle_params(grad_params)}
     with jax.enable_x64(new_val=True):
-        wanted_x, wanted = jax.grad(loss_oracle, argnums=(0, 1))(*widened((x, oracle_params(variables))))
+        _, wanted_x, wanted = with_gradients(partial(oracle_forward, eps=1e-5))(
+            *widened((x, oracle_params(variables), cotangent)))
         wanted = {"x": wanted_x, **wanted}
     for name, value in ours.items():
         assert scaled(value, np.asarray(wanted[name])) < BOUND, name

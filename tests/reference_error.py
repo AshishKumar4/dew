@@ -29,9 +29,9 @@ dropped term, a wrong scale, a format coarser than the reference's, a mask
 one step off) moves the RMS error by more than that and fails.
 
 Why not once, the reference's own distance plus a floor for summing in
-another order. Measured over the suite (2026-10-14: 862 float64
-comparisons in 85 files), Dew's distance over the reference's sits at a
-median of 1.00, p25 0.94, p75 1.07 and p95 1.55: exactly as exact, the two
+another order. Measured over the suite (862 float64 comparisons in 85
+files), Dew's distance over the reference's sits at a median of 1.00,
+p25 0.94, p75 1.07 and p95 1.55: exactly as exact, the two
 part by their own rounding draws, so a ratio above one is as likely as
 below. At once, 95 comparisons in 20 files failed with no defect behind
 them, and holding them needed a reduction-length floor of half the
@@ -80,7 +80,7 @@ row (`rows_over`). An RMS over every entry averages a few wrong rows into a
 large tensor, so each comparison also holds Dew's worst row to the
 reference's. The worst of many rows is an extreme value, not an average,
 and parts further by chance: over the suite's 3,660 comparisons whose rows
-differ from float64 at all (99 files, 2026-10-14), Dew's worst row over the
+differ from float64 at all (99 files), Dew's worst row over the
 reference's sat at a median of 0.21, p99 1.55 and at most 2.42 (Mixtral's
 exported logits). A row that differs rather than rounds moves further: the
 suite's deliberate failures, a GDN chunk's plain fp32 prefix and a MiMo tower
@@ -115,12 +115,154 @@ def widened(tree):
         leaf, np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype), tree)
 
 
+def _stack_draws(trees):
+    """A draw's leaves of each window stacked on a new leading axis. A JAX array or Python scalar stacks
+    as JAX stacks it, its weak type kept, and a host array as NumPy stacks it, its dtype kept."""
+    def stack(*leaves):
+        if all(isinstance(leaf, jax.Array | bool | int | float | complex) for leaf in leaves):
+            return jnp.stack([jnp.asarray(leaf) for leaf in leaves])
+        return np.stack([np.asarray(leaf) for leaf in leaves])
+    return jax.tree.map(stack, *trees)
+
+
+def _stack_host(trees):
+    """An arm's outputs of each window stacked on a new leading axis as host arrays of their own dtypes."""
+    return jax.tree.map(lambda *leaves: np.stack([np.asarray(leaf) for leaf in leaves]), *trees)
+
+
+def _window_count(arguments) -> int:
+    """The windows an arm's stacked arguments hold, the leading axis of each."""
+    leaves = jax.tree.leaves(arguments)
+    count = len(leaves[0]) if leaves else 0
+    if count < 1:
+        raise ValueError(f"an arm over {count} windows")
+    return count
+
+
+def windows(draw, count: int):
+    """A check-1 draw of `count` windows a seed. Seed `s` gives the site's draws of seeds `s * count` to
+    `s * count + count - 1`, each leaf stacked on a new leading axis, and every argument is a window. A
+    seed's evidence then pools `count` draws, as independent as the site's draws of different seeds
+    are. A leaf that is one row in a draw, such as a parameter's gradient, becomes `count` rows. Its
+    arms take the windows through `over_windows`."""
+    if count < 1:
+        raise ValueError(f"windows of {count} draws")
+
+    def drawn(seed):
+        return _stack_draws([draw(seed * count + index) for index in range(count)])
+    return drawn
+
+
+def over_windows(fn):
+    """`fn`, an arm of one draw, run over `windows`' stacked arguments window by window, each window's
+    arguments sliced from the stack, with its outputs stacked on their leading axis as host arrays.
+
+    Each window runs the program one draw runs, never a batched one: a batch axis changes the program
+    XLA compiles (its fusions, its reductions' order, its dots' batching, a kernel's route), which XLA
+    holds to no common bits with one draw's, so check 1 would judge a program users never run. Pass a
+    JAX arm jitted (`jax.jit(fn)`, `without_ynn(fn)`), so it compiles once a signature and every window
+    calls that program; a torch or NumPy reference as it is."""
+    def run(*arguments):
+        return _stack_host([fn(*jax.tree.map(lambda leaf, index=index: leaf[index], arguments))
+                            for index in range(_window_count(arguments))])
+    return run
+
+
+WITHOUT_YNN = {"xla_cpu_experimental_ynn_fusion_type": ""}
+"""XLA:CPU's compiler options with every YNNPACK fusion off (dots, reductions, element-wise and layout
+ops alike), so that a program runs on XLA's own code, compiled for the host's instruction set with no
+dispatch at run time. YNNPACK picks its microkernels at run time by that instruction set, and both
+the interpreted SSD kernel and XLA's scan fuse parts of themselves to it by default, which moved
+check 1 between the two across PARITY by host; without the fusions the verdicts held on two hosts
+of different instruction sets, though the bits still part with the host (docs/performance.md, "The
+SSD kernel's host check 1 without YNNPACK"). The empty list, not the documented `-individual_dot`,
+because compiler options take no such spelling and that one leaves a scan's reductions fused."""
+
+
+def without_ynn(fn, **jit_options):
+    """`fn` jitted with WITHOUT_YNN on the CPU lane, the process's default backend
+    (`jax.default_backend()`), and plain `jax.jit` elsewhere. It compiles both arms of a check 1
+    between two Dew paths, such as an interpreted kernel and the XLA program it replaces, the latter
+    the arm the check measures against, so that the two run the same kind of code on any host. A
+    program Dew's users run compiles with the fusions, as they do. Call it at top level, since on the
+    CPU lane its compiler options refuse to be nested in another jit, differentiated through or
+    batched; `over_windows` runs it window by window. A caller's own compiler options take
+    precedence over WITHOUT_YNN's."""
+    if jax.default_backend() == "cpu":
+        jit_options["compiler_options"] = {**WITHOUT_YNN, **(jit_options.get("compiler_options") or {})}
+    return jax.jit(fn, **jit_options)
+
+
 def with_gradients(fn):
     """`fn` as `run(*inputs, cotangent)`, which returns `fn(*inputs)` and the gradients of its inputs
     under the cotangent passed last: a differentiated call's leaves, as the gate compares them."""
     def run(*arguments):
         out, pull = jax.vjp(fn, *arguments[:-1])
         return out, *pull(arguments[-1])
+
+    return run
+
+
+def _host_tensor(value):
+    """A torch copy of a host array, of its own shape and dtype. NumPy holds bfloat16, the float8
+    formats and the 4-bit integers as ml_dtypes' types: a float of those goes through float32, which
+    holds it exactly, to torch's format of the same name, and an integer enters as int32, which holds
+    its values. A copy, so autograd never writes an array JAX holds."""
+    import torch
+
+    value = np.array(value)
+    if value.dtype.type.__module__.startswith("ml_dtypes"):
+        if jnp.issubdtype(value.dtype, jnp.floating):
+            return torch.as_tensor(value.astype(np.float32)).to(getattr(torch, value.dtype.name))
+        return torch.as_tensor(value.astype(np.int32))
+    return torch.as_tensor(value)
+
+
+def _host_array(value):
+    """A tensor as a host array. A format NumPy lacks, such as bfloat16, comes back as float32, which holds
+    its values exactly."""
+    import torch
+
+    value = value.detach()
+    narrow = value.is_floating_point() and value.dtype not in (torch.float16, torch.float32, torch.float64)
+    return (value.float() if narrow else value).numpy()
+
+
+def torch_with_gradients(fn):
+    """`with_gradients` for a torch arm. `fn(*tensors)` becomes `run(*inputs, cotangent)`, which returns
+    `fn`'s output and the gradients of its inputs under the cotangent passed last, as host arrays.
+    - Each floating input enters as a tensor of its own dtype that requires a gradient; a module's
+      parameters are inputs too, called through `torch.func.functional_call`.
+    - The cotangent has the output's tree (an array, or a tuple or dict of them), as `jax.vjp` requires,
+      each leaf cast to its output's dtype.
+    - An input the output does not reach has a zero gradient, a non-floating one none, and an output no
+      input reaches pulls nothing back.
+    - A narrow float array (bfloat16, the float8 formats) goes in and comes out through the float32 that
+      holds it."""
+    def run(*arguments):
+        import torch
+
+        inputs, cotangent = jax.tree.map(_host_tensor, arguments[:-1]), arguments[-1]
+        for leaf in jax.tree.leaves(inputs):
+            if leaf.is_floating_point():
+                leaf.requires_grad_()
+        out = fn(*inputs)
+        if jax.tree.structure(out) != jax.tree.structure(cotangent):
+            raise ValueError(f"a cotangent of tree {jax.tree.structure(cotangent)} for an output of tree "
+                             f"{jax.tree.structure(out)}")
+        flat, tree = jax.tree.flatten(inputs)
+        wanted = [index for index, leaf in enumerate(flat) if leaf.requires_grad]
+        reached = [(leaf, c) for leaf, c in zip(jax.tree.leaves(out), jax.tree.leaves(cotangent), strict=True)
+                   if leaf.requires_grad]
+        pulled = [None] * len(wanted)
+        if wanted and reached:
+            pulled = torch.autograd.grad([leaf for leaf, _ in reached], [flat[index] for index in wanted],
+                                         grad_outputs=[_host_tensor(c).to(leaf.dtype) for leaf, c in reached],
+                                         allow_unused=True)
+        gradients = [None] * len(flat)
+        for index, grad in zip(wanted, pulled, strict=True):
+            gradients[index] = _host_array(torch.zeros_like(flat[index]) if grad is None else grad)
+        return jax.tree.map(_host_array, out), *jax.tree.unflatten(tree, gradients)
 
     return run
 
@@ -224,7 +366,7 @@ def assert_as_exact_as_the_reference(dew, reference, truth, label: str, *, terms
 
 
 PARITY = 1.5
-"""The owner's factor (bible §7, 2026-10-20): each leaf's RMS error from float64 within 1.5 times the
+"""The owner's factor (bible §7): each leaf's RMS error from float64 within 1.5 times the
 reference's, on the same inputs, with no floor of any kind. Check 1 (`assert_as_exact`) holds it now;
 the one-draw rule's FACTOR joins it once every site that rule would then fail has moved to check 1."""
 
@@ -293,7 +435,7 @@ def _status(ratio: float, low: float, high: float, *, contained: bool = True) ->
     pass certifies the ratio's high end at most PARITY², whether the interval lies wholly at or under
     PARITY or is resolved (no wider than PARITY) with the ratio under it, and an over its low end above
     one. Straddling PARITY and wider than it, the leaf is inconclusive, as is a ratio or end that is not
-    a number. Not `contained`, the rule before 2026-10-21: the interval as it is, a leaf over PARITY
+    a number. Not `contained`, the earlier rule: the interval as it is, a leaf over PARITY
     by its ratio wherever the interval does not straddle it unresolved."""
     if not contained:
         if low <= PARITY < high and not _resolves(low, high):
@@ -555,7 +697,7 @@ def _staged(drawn, seeds: int, label: str, *, two_stage: bool = True) -> tuple[l
     `seeds`, a site whose every leaf passes (`_judgement`: its ratio, rows and values) passes; any leaf
     that does not draws the second stage, REDRAW times as many further seeds, and every leaf is judged
     again over all of them, that verdict final. Its findings, the leaves left inconclusive and the stage
-    reached. With `two_stage` false, the procedure before it (2026-10-21), for comparison: tails
+    reached. With `two_stage` false, the procedure before it, for comparison: tails
     PREVIOUS_TAILS, the interval as it is, only a leaf whose ratio is over PARITY drawing again."""
     tails = (LOWER_TAIL, UPPER_TAIL) if two_stage else PREVIOUS_TAILS
     draws = drawn(0, seeds)
@@ -586,7 +728,7 @@ def _logged(label: str, stage: int, verdict: str) -> None:
 
 
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None) -> None:
-    """Check 1 of the owner's gate (bible §7, 2026-10-20): on par. Each leaf's RMS error from float64,
+    """Check 1 of the owner's gate (bible §7): on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst; each row of float64 zero (below RESOLUTION
     of its leaf where a live reference does not measure it, `_paired`) no further from it than
@@ -1284,7 +1426,7 @@ def _assert_rows_over_orders(dew, members, label: str, sizes=None) -> None:
 STAGES = 4
 """The batches of ORDERS fresh orders an element is measured over before it fails
 (`assert_elements_as_exact`): the first, and a confirmation of each element still flagged in each of
-the rest. Provisional, from the review of the rule (2026-10-19): with errors independent across
+the rest. Provisional, from the review of the rule: with errors independent across
 elements and orders, K = ORDERS a side needs three stages for a familywise FALSE_FAILURE at Dory's
 43.5M elements where the errors are Gaussian, and four where they are Laplace. Shapes with heavier
 or rarer tails (a Student t of 3 degrees, rare bf16 flips) are certified at none of these: the stage

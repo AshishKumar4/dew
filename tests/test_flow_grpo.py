@@ -22,7 +22,14 @@ import optax
 import pytest
 from flax import linen as nn
 from recording import RecordingTracker
-from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, widened
+from reference_error import (
+    assert_as_exact,
+    declared_seeds,
+    indexed_recording,
+    recording,
+    widened,
+    with_gradients,
+)
 
 from dew.diffusion import FlowMatchingScheduler, FlowMatchPredictionTransform, Process
 from dew.diffusion.presets import JiT
@@ -324,9 +331,10 @@ def test_flow_objective_matches_clipping_and_conditional_gaussian_kl():
     def draw(seed):
         # Sixteen batches a draw: each loss and gradient is one number a batch.
         keys = jax.random.split(jax.random.fold_in(jax.random.key(5), seed), 3)
+        # Each batch's loss pulls back one, the cotangent of a loss, held in the draw as the gate takes it.
         return (0.5 * jax.random.normal(keys[0], (BATCHES, ROWS, 2)),
                 jax.random.uniform(keys[1], (BATCHES, ROWS), minval=-3, maxval=3),
-                jax.random.bernoulli(keys[2], 0.6, (BATCHES, ROWS, 3)))
+                jax.random.bernoulli(keys[2], 0.6, (BATCHES, ROWS, 3)), jnp.ones(BATCHES, jnp.float32))
 
     def batch_of(start, advantages, mask):
         batch = trajectory_batch(walk(start), advantages, mask)
@@ -334,36 +342,37 @@ def test_flow_objective_matches_clipping_and_conditional_gaussian_kl():
 
     @jax.jit
     @jax.vmap
-    def scored(start, advantages, mask):
+    def scored(start, advantages, mask, one):
         batch = batch_of(start, advantages, mask)
 
         def loss(gain, objective, step):
             return objective.scalar_loss({**current, "params": {"gain": gain}}, batch, step)[0]
 
-        value, gradient = jax.value_and_grad(loss)(current["params"]["gain"], objective, step)
+        scoring = with_gradients(lambda gain: loss(gain, objective, step))
+        value, gradient = scoring(current["params"]["gain"], one)
         return {"loss": value, "gradient": gradient,
                 "policy": loss(current["params"]["gain"], without_reference, step.replace(ema=None))}
 
     # The policies' gains as their parameters hold them, at float32 or widened from it.
     gains = (current["params"]["gain"], reference["params"]["gain"])
 
-    def closed(states, times, advantages, mask, gain, frozen):
+    def closed(states, times, advantages, mask, one, gain, frozen):
         terms = (frozen, states, times, advantages, mask)
-        value, gradient = jax.value_and_grad(clipped_objective)(gain, *terms, beta=0.2)
+        value, gradient = with_gradients(lambda gain: clipped_objective(gain, *terms, beta=0.2))(gain, one)
         return {"loss": value, "gradient": gradient,
                 "policy": clipped_objective(gain, *terms, beta=0.0)}
 
-    def reference_arm(start, advantages, mask):
+    def reference_arm(start, advantages, mask, one):
         trajectory = jax.vmap(walk)(start)
-        return jax.vmap(closed, (0, 0, 0, 0, None, None))(trajectory.states, trajectory.times, advantages,
-                                                          mask, *gains)
+        return jax.vmap(closed, (0, 0, 0, 0, 0, None, None))(trajectory.states, trajectory.times, advantages,
+                                                             mask, one, *gains)
 
-    def truth(start, advantages, mask):
+    def truth(start, advantages, mask, one):
         trajectory = walked_in_float32(jax.vmap(walk), start)
         with jax.enable_x64(new_val=True):
-            return jax.vmap(closed, (0, 0, 0, 0, None, None))(
+            return jax.vmap(closed, (0, 0, 0, 0, 0, None, None))(
                 np.asarray(trajectory.states, np.float64), np.asarray(trajectory.times, np.float64),
-                advantages, mask, *widened(gains))
+                advantages, mask, one, *widened(gains))
 
     assert_as_exact(scored, reference_arm, draw, "clipping", seeds=SEEDS['clipping'], truth_fn=truth)
 
@@ -377,7 +386,7 @@ def test_flow_objective_matches_clipping_and_conditional_gaussian_kl():
                     drawn_rows((2,)), "rescored clipping walk", seeds=SEEDS['rescored walk'],
                     truth_fn=lambda start: walked(walked_in_float32(walk, start), np.float64))
 
-    start, advantages, mask = (value[0] for value in draw(0))
+    start, advantages, mask, _ = (value[0] for value in draw(0))
     trajectory = walk(start)
     with jax.enable_x64(new_val=True):
         policy, _, ratio, advantage = clipped_terms(

@@ -1,5 +1,6 @@
 """The tiny decoder and the parameter-tree view several model tests share."""
 
+import functools
 import json
 import os
 import subprocess
@@ -21,6 +22,43 @@ from dew.sampling import Sampling
 TINY_DECODER = {"emb_features": 32, "num_layers": 2, "num_heads": 4, "mlp_features": 64, "max_seq_len": 16}
 """A causal transformer 32 wide, two layers of four heads; each test file adds
 its own vocabulary and any field its claim turns on."""
+
+
+def model_draw(model, shape: tuple[int, ...], vocab: int):
+    """Check 1's draw for `model` (tests/reference_error.py): a seed's variables and `shape` tokens below
+    `vocab`, the variables initialized compiled."""
+    init = jax.jit(model.init)
+
+    def draw(seed):
+        ids = jax.random.randint(jax.random.fold_in(jax.random.key(1), seed), shape, 0, vocab)
+        return init(jax.random.fold_in(jax.random.key(0), seed), ids), ids
+    return draw
+
+
+def with_logit_cotangent(draw, vocab: int, salt: int):
+    """`draw` (`model_draw`'s) with a cotangent on the logits drawn with each seed's variables and
+    tokens, float32 normals, for a gradient site's `reference_error.with_gradients`; `salt` keeps one
+    site's draws its own."""
+    def drawn(seed):
+        variables, ids = draw(seed)
+        cotangent = np.random.default_rng([salt, seed]).normal(size=(*ids.shape, vocab))
+        return variables, ids, cotangent.astype(np.float32)
+    return drawn
+
+
+@functools.cache
+def decode_steps(model):
+    """`model`'s decode cache made for a count of rows, and its decode step from a cache, each one
+    compiled program: `made(variables, rows)` the cache, `step(variables, cache, ids)` the logits and
+    the cache after them."""
+    def made(variables, rows):
+        _, made = model.apply(variables, rows, method=CausalTransformer.init_cache, mutable=['cache'])
+        return made['cache']
+
+    def step(variables, cache, ids):
+        logits, mutated = model.apply({**variables, 'cache': cache}, ids, decode=True, mutable=['cache'])
+        return logits, mutated['cache']
+    return jax.jit(made, static_argnums=1), jax.jit(step)
 
 
 def two_documents(rng: np.random.Generator, rows: int, length: int):
@@ -81,6 +119,12 @@ def decoder(kind: str = "attention") -> CausalTransformer:
     return CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
                              head_dim=8, mlp_features=32, max_seq_len=12,
                              dtype="float32", mixer=mixer)
+
+
+def initialized_decoder(kind: str = "attention", length: int = 2) -> tuple[CausalTransformer, dict]:
+    """`decoder(kind)` and its parameters, initialized from key 0 over `length` tokens."""
+    module = decoder(kind)
+    return module, module.init(jax.random.key(0), jnp.ones((1, length), jnp.int32))
 
 
 class Digits:
