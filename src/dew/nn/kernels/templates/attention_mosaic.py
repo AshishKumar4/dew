@@ -214,16 +214,8 @@ def _launch(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpret
                       keys, values, turn, schedule, most, first, interpret=interpret)
 
         def producer():
-            kv_head = lax.div(head, group)
-
-            @pl.loop(0, most)
-            def _(index):
-                tile = (row, pl.ds(index * block_k, block_k), kv_head)
-                keys.load(index, k_ref.at[tile])
-                values.load(index, v_ref.at[tile])
-
-            keys.drain(most)
-            values.drain(most)
+            mosaic.streamed((keys, values), _tiles_of((k_ref, v_ref), row, lax.div(head, group), block_k), 0,
+                            most)
 
         mosaic.roles(wg, CONSUMERS, consumer, producer)
 
@@ -260,6 +252,15 @@ def _rows(ref, row, head, first, count: int):
     return plgpu.load(ref.at[row, head, pl.ds(first, count)], layout=mosaic_sm90.ROW, optimized=False)
 
 
+def _tiles_of(refs: tuple, row, head, block: int):
+    """A ring step's views of `refs` (`[B, S, H, D]` operands, `mosaic.streamed`): its `block` rows of each
+    at batch row `row` and head `head`."""
+    def views(index):
+        return tuple(ref.at[row, pl.ds(index * block, block), head] for ref in refs)
+
+    return views
+
+
 class _Tile(NamedTuple):
     """A backward tile's place: its first query and key, its shape, whether it takes a mask (`masked`), and
     the call's form (`causal`, its keys)."""
@@ -288,9 +289,63 @@ def _scores(tile: _Tile, s, dp, peak, total, anchor, delta, chosen, *, how: alge
     return exponentials, weights, cotangents, slopes, seen
 
 
-def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, *, how: algebra.Recompute,
-               scale: float, causal: bool, keys_count: int, tiles: Tiles, accurate: bool, consumers: int,
-               interpret: bool):
+@dataclasses.dataclass(frozen=True)
+class _Backward:
+    """A backward launch's static choices: its program's geometry, how it recomputes the weights, the
+    logits' scale, its form, its consumers and whether it is interpreted."""
+
+    program: _Program
+    how: algebra.Recompute
+    scale: float
+    accurate: bool
+    consumers: int
+    interpret: bool
+
+
+def _dq_step(walk: _Backward, rings: tuple, operands: tuple, stats: tuple, first, whole, index, rows,
+             accumulators):
+    """A dQ consumer's key tile `index`: its scores and score cotangents from the key and value slots
+    (`rings`) and its queries and output cotangents (`operands`) under its rows' statistics (`stats`), the
+    row sums carried (`rows`) and dQ's and the keyed sums' products issued into `accumulators` in place."""
+    keys, values = rings
+    q_smem, do_smem = operands
+    peak, prior, anchor, delta, chosen = stats
+    tiles, empty = walk.program.tiles, jnp.zeros((), jnp.float32)
+    shape = (tiles.block_q, tiles.block_k)
+    dq_acc, keyed_acc = accumulators
+    k_slot, v_slot = keys.acquire(index), values.acquire(index)
+    s = mosaic_sm90.product(q_smem, k_slot.transpose((1, 0)), shape)
+    dp = mosaic_sm90.product(do_smem, v_slot.transpose((1, 0)), shape)
+    values.release(index)
+
+    def scores(*, masked: bool):
+        # A tile every query sees whole (`masked` False) takes no mask. Without a hook nothing past the
+        # cotangents reads the mask (`algebra.pulled`).
+        tile = _Tile(first, index * tiles.block_k, shape, masked, walk.program.causal, walk.program.keys)
+        exponentials, _, cotangents, _, _ = _scores(tile, s, dp, peak, prior, anchor, delta, chosen,
+                                                    how=walk.how, scale=walk.scale)
+        return exponentials, cotangents
+
+    # One walk, its tiles' masks chosen a tile at a time: a walk of two loops into one warpgroup accumulator,
+    # the first empty, faults on an H100 under jax 0.11.2's Mosaic GPU lowering.
+    exponentials, cotangents = lax.cond(index < whole, functools.partial(scores, masked=False),
+                                        functools.partial(scores, masked=True))
+    # The weights' sums unnormalized (`algebra.dq_finish` takes them to the pass's own denominator); dQ's and
+    # the keyed sums' places in the step's sums empty, as they accumulate in place.
+    residual, mass, keyed_mass, keyed_shift = rows
+    sums = algebra.DqSums(empty, residual, mass, (), (), empty, keyed_mass, keyed_shift)
+    sums, products = algebra.dq_terms(sums, exponentials, cotangents, None, None, prior, scale=walk.scale,
+                                      kinds=(), summed=(), dtype=k_slot.dtype, accurate=walk.accurate)
+    dq_acc = mosaic_sm90.register_products(dq_acc, products.parts, k_slot, walk.interpret)
+    if products.keyed is not None:
+        keyed_acc = mosaic_sm90.register_products(keyed_acc, products.keyed, k_slot, walk.interpret)
+    # The key slot's reads done before it is released.
+    plgpu.wgmma_wait(0)
+    keys.release(index)
+    return (sums.residual, sums.mass, sums.keyed_mass, sums.keyed_shift), (dq_acc, keyed_acc)
+
+
+def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, *, walk: _Backward):
     """The dQ program's sums over its key tiles (`algebra.dq_step`), unfinished: dQ's and, in the accurate
     form, the keys' product with the weights (`DqSums.keyed`), `[B, Qp, H, D]` fp32 each, and the cotangents'
     and weights' row sums and the keyed sums' mass and exponent, `[B, H, Qp]` each; `dq_finish` takes them to
@@ -298,17 +353,14 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, *
     streamed through a ring each."""
     batch, queries, heads, width = query.shape
     kv_heads, value_width = key.shape[2], value.shape[-1]
-    group = heads // kv_heads
-    block_q, block_k = tiles.block_q, tiles.block_k
+    program, consumers = walk.program, walk.consumers
+    block_q, block_k = program.tiles.block_q, program.tiles.block_k
     pair = consumers * block_q
-    steps = key.shape[1] // block_k
-    program = _Program(tiles, steps, min(tiles.stages, steps), keys_count, causal)
-    shape = (block_q, block_k)
 
     def body(q_ref, k_ref, v_ref, do_ref, peak_ref, prior_ref, anchor_ref, delta_ref, index_ref, dq_ref,
              keyed_ref, rows_ref, q_smem, do_smem, out_smem, row_smem, q_loaded, do_loaded, key_ring,
              value_ring):
-        keys, values = mosaic.Ring(**key_ring), mosaic.Ring(**value_ring)
+        rings = mosaic.Ring(**key_ring), mosaic.Ring(**value_ring)
         row, head, wg = lax.axis_index("batch"), lax.axis_index("heads"), lax.axis_index("wg")
         pair_first = lax.axis_index("q_tiles") * pair
         most = program.walked(pair_first + pair - block_q)
@@ -316,80 +368,22 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, *
         def consumer(wg):
             first = pair_first + wg * block_q
             rows = (row, pl.ds(first, block_q), head)
-            plgpu.copy_gmem_to_smem(q_ref.at[rows], q_smem.at[wg], q_loaded.at[wg])
-            plgpu.copy_gmem_to_smem(do_ref.at[rows], do_smem.at[wg], do_loaded.at[wg])
-            plgpu.barrier_wait(q_loaded.at[wg])
-            plgpu.barrier_wait(do_loaded.at[wg])
-            peak, prior, anchor, delta, chosen = (_rows(ref, row, head, first, block_q)
-                                                  for ref in (peak_ref, prior_ref, anchor_ref, delta_ref,
-                                                              index_ref))
+            mosaic.loaded(((q_ref.at[rows], q_smem.at[wg], q_loaded.at[wg]),
+                           (do_ref.at[rows], do_smem.at[wg], do_loaded.at[wg])))
+            stats = tuple(_rows(ref, row, head, first, block_q)
+                          for ref in (peak_ref, prior_ref, anchor_ref, delta_ref, index_ref))
             walked = program.walked(first)
-            whole = program.whole(first, walked)
             nothing = mosaic_sm90.zeros((block_q,))
-            # The row sums carried; dQ and the keyed sums accumulate in place (`mosaic_sm90.walked_products`),
-            # their places in a step's sums empty (a constant the walk would forward, which no kernel's
-            # scope may return).
-            empty = jnp.zeros((), jnp.float32)
-            start = (nothing, nothing, nothing, nothing + algebra.NO_SHIFT)
-
-            def step(index, rows, accumulators):
-                dq_acc, keyed_acc = accumulators
-                sums = algebra.DqSums(empty, rows[0], rows[1], (), (), empty, rows[2], rows[3])
-                k_slot, v_slot = keys.acquire(index), values.acquire(index)
-                s = mosaic_sm90.product(q_smem.at[wg], k_slot.transpose((1, 0)), shape)
-                dp = mosaic_sm90.product(do_smem.at[wg], v_slot.transpose((1, 0)), shape)
-                values.release(index)
-
-
-                def scores(*, masked: bool):
-                    # A tile every query sees whole (`masked` False) takes no mask, so no positions. Without
-                    # a hook nothing past the cotangents reads the mask (`algebra.pulled`).
-                    tile = _Tile(first, index * block_k, shape, masked, causal, keys_count)
-                    exponentials, _, cotangents, _, _ = _scores(tile, s, dp, peak, prior, anchor, delta,
-                                                                chosen, how=how, scale=scale)
-                    return exponentials, cotangents
-
-                # One walk, its tiles' masks chosen a tile at a time: a walk of two loops into one warpgroup
-                # accumulator, the first empty, faults on an H100 under jax 0.11.2's Mosaic GPU lowering
-                # (a query block from 0's whole tiles, or a full call's diagonal ones).
-                exponentials, cotangents = lax.cond(index < whole, functools.partial(scores, masked=False),
-                                                    functools.partial(scores, masked=True))
-                slopes, seen = None, None
-
-                # The weights' sums unnormalized (`algebra.dq_finish` takes them to the pass's own
-                # denominator); each product's parts issued into one accumulator.
-                sums, products = algebra.dq_terms(sums, exponentials, cotangents, slopes, seen, prior,
-                                                  scale=scale, kinds=(), summed=(), dtype=k_slot.dtype,
-                                                  accurate=accurate)
-                dq_acc = mosaic_sm90.register_products(dq_acc, products.parts, k_slot, interpret)
-                if products.keyed is not None:
-                    keyed_acc = mosaic_sm90.register_products(keyed_acc, products.keyed, k_slot, interpret)
-                # The key slot's reads done before it is released.
-                plgpu.wgmma_wait(0)
-                keys.release(index)
-                return (sums.residual, sums.mass, sums.keyed_mass, sums.keyed_shift), (dq_acc, keyed_acc)
-
-            segments = ((step, 0, walked),)
-            accumulators = ((block_q, width), (block_q, width))
-            rows, (dq, keyed) = mosaic_sm90.walked_products(segments, start, accumulators, interpret)
-            sums = algebra.DqSums(dq, rows[0], rows[1], (), (), keyed, rows[2], rows[3])
-
-            @pl.loop(walked, most)
-            def _(index):
-                # The tiles a block whose diagonal ends first leaves its partner, awaited and released
-                # unread (each consumer waits on every load: a wait takes its barrier's next phase).
-                keys.acquire(index)
-                keys.release(index)
-                values.acquire(index)
-                values.release(index)
-
-            out = (row, pl.ds(first, block_q), head)
-            for target, part in ((dq_ref, sums.dq), *(((keyed_ref, sums.keyed),) if accurate else ())):
-                out_smem.at[wg][...] = part
-                plgpu.commit_smem()
-                plgpu.copy_smem_to_gmem(out_smem.at[wg], target.at[out])
-                plgpu.wait_smem_to_gmem(0)
-            for place, part in enumerate((sums.residual, sums.mass, sums.keyed_mass, sums.keyed_shift)):
+            step = functools.partial(_dq_step, walk, rings, (q_smem.at[wg], do_smem.at[wg]), stats, first,
+                                     program.whole(first, walked))
+            sums, (dq, keyed) = mosaic_sm90.walked_products(
+                ((step, 0, walked),), (nothing, nothing, nothing, nothing + algebra.NO_SHIFT),
+                ((block_q, width), (block_q, width)), walk.interpret)
+            # The tiles a block whose diagonal ends first leaves its partner.
+            mosaic.passed(rings, walked, most)
+            mosaic.stored((dq, keyed) if walk.accurate else (dq,), out_smem.at[wg],
+                          (dq_ref.at[rows], keyed_ref.at[rows]))
+            for place, part in enumerate(sums):
                 # A row's layout whatever the sum's (the keyed mass of a call without a hook is a constant).
                 row_smem.at[wg, place][...] = plgpu.layout_cast(part, mosaic_sm90.ROW)
             plgpu.commit_smem()
@@ -399,16 +393,8 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, *
             plgpu.wait_smem_to_gmem(0)
 
         def producer():
-            kv_head = lax.div(head, group)
-
-            @pl.loop(0, most)
-            def _(index):
-                tile = (row, pl.ds(index * block_k, block_k), kv_head)
-                keys.load(index, k_ref.at[tile])
-                values.load(index, v_ref.at[tile])
-
-            keys.drain(most)
-            values.drain(most)
+            mosaic.streamed(rings, _tiles_of((k_ref, v_ref), row, lax.div(head, heads // kv_heads), block_k),
+                            0, most)
 
         mosaic.roles(wg, consumers, consumer, producer)
 
@@ -431,13 +417,52 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, *
         grid=(heads, queries // pair, batch), grid_names=("heads", "q_tiles", "batch"),
         num_threads=consumers + 1, thread_name="wg",
         compiler_params=mosaic.compiler_params(approx_math=True),
-        interpret=plgpu.InterpretGPUParams() if interpret else None,
+        interpret=plgpu.InterpretGPUParams() if walk.interpret else None,
     )(query, key, value, dout, peak, prior, anchor, delta, key_index)
 
 
-def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, *, how: algebra.Recompute,
-                scale: float, causal: bool, keys_count: int, tiles: Tiles, accurate: bool, consumers: int,
-                interpret: bool):
+def _dkv_step(walk: _Backward, rings: tuple, resident: tuple, rows_of, buffers, k_first, whole, least, index,
+              carry, accumulators):
+    """A dK/dV consumer's query tile `index`: its scores and score cotangents from the query and output
+    cotangent slots (`rings`, counted from `least`) and its resident keys and values (`resident`) under the
+    tile's rows' statistics (`rows_of(first query)`), dV's and dK's products issued into `accumulators` in
+    place, each part staged in `buffers` as its transposed product's left operand."""
+    queries_ring, douts = rings
+    k_smem, v_smem = resident
+    tiles = walk.program.tiles
+    shape = (tiles.block_q, tiles.block_k)
+    dk_acc, dv_acc = accumulators
+    q_slot, do_slot = queries_ring.acquire(index - least), douts.acquire(index - least)
+    q_first = index * tiles.block_q
+    peak, denominator, centre, rest, chosen = rows_of(q_first)
+    s = mosaic_sm90.product(q_slot, k_smem.transpose((1, 0)), shape)
+    dp = mosaic_sm90.product(do_slot, v_smem.transpose((1, 0)), shape)
+
+    def scores(*, masked: bool):
+        # A tile every query sees whole (`masked` False) takes no mask (`_dq_step`'s).
+        tile = _Tile(q_first, k_first, shape, masked, walk.program.causal, walk.program.keys)
+        exponentials, weights, cotangents, _, _ = _scores(tile, s, dp, peak, denominator, centre, rest,
+                                                          chosen, how=walk.how, scale=walk.scale)
+        return exponentials, weights, cotangents
+
+    # The block's diagonal tiles masked, the rest whole, chosen a tile at a time in one walk (`_dq_step`).
+    exponentials, weights, cotangents = lax.cond(index < whole, functools.partial(scores, masked=True),
+                                                 functools.partial(scores, masked=False))
+    narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype)
+    parts = algebra.cotangent_parts(cotangents * walk.scale, q_slot.dtype, accurate=walk.accurate)
+    # Each staged part's transpose the left operand (`algebra.cotangent_product`'s `aᵀ @ b`).
+    dv_acc = mosaic_sm90.staged_products(dv_acc, ((narrowed, None),), do_slot, buffers.at[pl.ds(0, 1)],
+                                         walk.interpret, transposed=True)
+    dk_acc = mosaic_sm90.staged_products(dk_acc, parts, q_slot, buffers.at[pl.ds(1, len(parts))],
+                                         walk.interpret, transposed=True)
+    # The slots' and the staged parts' reads done before either is reused.
+    plgpu.wgmma_wait(0)
+    queries_ring.release(index - least)
+    douts.release(index - least)
+    return carry, (dk_acc, dv_acc)
+
+
+def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, *, walk: _Backward):
     """The dK/dV program under the dQ program's softmax: each consumer's `block_k` keys of a query head,
     resident, walked by the query tiles that see them, streamed with their output cotangents through a
     ring each; a tile's weights and score cotangents (the algebra's, rows the queries) staged in shared
@@ -445,105 +470,51 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
     the query head's dK and dV `[B, Kp, H, D]` fp32."""
     batch, queries, heads, width = query.shape
     keys_padded, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
-    group = heads // kv_heads
-    block_q, block_k = tiles.block_q, tiles.block_k
+    program, consumers = walk.program, walk.consumers
+    block_q, block_k = program.tiles.block_q, program.tiles.block_k
     pair = consumers * block_k
     q_steps = queries // block_q
-    stages = min(tiles.stages, q_steps)
-    shape = (block_q, block_k)
+    stages = min(program.tiles.stages, q_steps)
 
     def first_tile(k_first):
         # The first query tile that sees a key block from `k_first`: every one, or those from its diagonal,
         # at most the last (a causal call of more keys than queries leaves its last keys unseen).
-        return jnp.minimum(lax.div(k_first, block_q), q_steps) if causal else jnp.int32(0)
+        return jnp.minimum(lax.div(k_first, block_q), q_steps) if program.causal else jnp.int32(0)
 
     def body(q_ref, k_ref, v_ref, do_ref, peak_ref, total_ref, anchor_ref, delta_ref, index_ref, dk_ref,
              dv_ref, k_smem, v_smem, staged, out_smem, k_loaded, v_loaded, query_ring, dout_ring):
-        queries_ring, douts = mosaic.Ring(**query_ring), mosaic.Ring(**dout_ring)
+        rings = mosaic.Ring(**query_ring), mosaic.Ring(**dout_ring)
         row, head, wg = lax.axis_index("batch"), lax.axis_index("heads"), lax.axis_index("wg")
         pair_first = lax.axis_index("k_tiles") * pair
-        kv_head = lax.div(head, group)
         least = first_tile(pair_first)
+
+        def rows_of(q_first):
+            return tuple(_rows(ref, row, head, q_first, block_q)
+                         for ref in (peak_ref, total_ref, anchor_ref, delta_ref, index_ref))
 
         def consumer(wg):
             k_first = pair_first + wg * block_k
-            keys_view = (row, pl.ds(k_first, block_k), kv_head)
-            plgpu.copy_gmem_to_smem(k_ref.at[keys_view], k_smem.at[wg], k_loaded.at[wg])
-            plgpu.copy_gmem_to_smem(v_ref.at[keys_view], v_smem.at[wg], v_loaded.at[wg])
-            plgpu.barrier_wait(k_loaded.at[wg])
-            plgpu.barrier_wait(v_loaded.at[wg])
+            keys_view = (row, pl.ds(k_first, block_k), lax.div(head, heads // kv_heads))
+            mosaic.loaded(((k_ref.at[keys_view], k_smem.at[wg], k_loaded.at[wg]),
+                           (v_ref.at[keys_view], v_smem.at[wg], v_loaded.at[wg])))
             mine = first_tile(k_first)
             # The query tiles from which every query sees the block whole: past its diagonal, and none if
             # it holds padding.
-            whole = jnp.minimum(pl.cdiv(k_first + block_k - 1, block_q), q_steps) if causal else mine
-            whole = jnp.where(k_first + block_k > keys_count, q_steps, jnp.maximum(whole, mine))
-
-
-            @pl.loop(least, mine)
-            def _(index):
-                # The tiles before this block's diagonal its partner reads, awaited and released unread
-                # (each ring's counter the program's tile count from its first, `least`).
-                queries_ring.acquire(index - least)
-                queries_ring.release(index - least)
-                douts.acquire(index - least)
-                douts.release(index - least)
-
-            def step(index, carry, accumulators):
-                dk_acc, dv_acc = accumulators
-                q_slot, do_slot = queries_ring.acquire(index - least), douts.acquire(index - least)
-                q_first = index * block_q
-                peak, denominator, centre, rest, chosen = (_rows(ref, row, head, q_first, block_q)
-                                                           for ref in (peak_ref, total_ref, anchor_ref,
-                                                                       delta_ref, index_ref))
-                s = mosaic_sm90.product(q_slot, k_smem.at[wg].transpose((1, 0)), shape)
-                dp = mosaic_sm90.product(do_slot, v_smem.at[wg].transpose((1, 0)), shape)
-                def scores(*, masked: bool):
-                    # A tile every query sees whole (`masked` False) takes no mask, so no positions. Without
-                    # a hook nothing past the cotangents reads the mask (`algebra.pulled`).
-                    tile = _Tile(q_first, k_first, shape, masked, causal, keys_count)
-                    exponentials, weights, cotangents, _, _ = _scores(
-                        tile, s, dp, peak, denominator, centre, rest, chosen, how=how, scale=scale)
-                    return exponentials, weights, cotangents
-
-                # One walk, its tiles' masks chosen a tile at a time (`_dq_launch`'s walk).
-                exponentials, weights, pulled = lax.cond(index < whole,
-                                                         functools.partial(scores, masked=True),
-                                                         functools.partial(scores, masked=False))
-                narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype)
-                cotangent_parts = algebra.cotangent_parts(pulled * scale, q_slot.dtype, accurate=accurate)
-                buffers = staged.at[wg]
-                # Each staged part's transpose the left operand (`algebra.cotangent_product`'s `aᵀ @ b`).
-                dv_acc = mosaic_sm90.staged_products(dv_acc, ((narrowed, None),), do_slot,
-                                                     buffers.at[pl.ds(0, 1)], interpret, transposed=True)
-                dk_acc = mosaic_sm90.staged_products(dk_acc, cotangent_parts, q_slot,
-                                                     buffers.at[pl.ds(1, len(cotangent_parts))], interpret,
-                                                     transposed=True)
-                # The slots' and the staged parts' reads done before either is reused.
-                plgpu.wgmma_wait(0)
-                queries_ring.release(index - least)
-                douts.release(index - least)
-                return carry, (dk_acc, dv_acc)
-
-            # The block's diagonal tiles masked, then the rest whole.
-            segments = ((step, mine, q_steps),)
-            accumulators = ((block_k, width), (block_k, value_width))
-            _, (dk, dv) = mosaic_sm90.walked_products(segments, None, accumulators, interpret)
+            whole = (jnp.minimum(pl.cdiv(k_first + block_k - 1, block_q), q_steps) if program.causal
+                     else mine)
+            whole = jnp.where(k_first + block_k > program.keys, q_steps, jnp.maximum(whole, mine))
+            # The tiles before this block's diagonal its partner reads.
+            mosaic.passed(rings, least, mine, first=least)
+            step = functools.partial(_dkv_step, walk, rings, (k_smem.at[wg], v_smem.at[wg]), rows_of,
+                                     staged.at[wg], k_first, whole, least)
+            _, (dk, dv) = mosaic_sm90.walked_products(((step, mine, q_steps),), None,
+                                                      ((block_k, width), (block_k, value_width)),
+                                                      walk.interpret)
             out = (row, pl.ds(k_first, block_k), head)
-            for target, part in ((dk_ref, dk), (dv_ref, dv)):
-                out_smem.at[wg][...] = part
-                plgpu.commit_smem()
-                plgpu.copy_smem_to_gmem(out_smem.at[wg], target.at[out])
-                plgpu.wait_smem_to_gmem(0)
+            mosaic.stored((dk, dv), out_smem.at[wg], (dk_ref.at[out], dv_ref.at[out]))
 
         def producer():
-            @pl.loop(least, q_steps)
-            def _(index):
-                rows = (row, pl.ds(index * block_q, block_q), head)
-                queries_ring.load(index - least, q_ref.at[rows])
-                douts.load(index - least, do_ref.at[rows])
-
-            queries_ring.drain(q_steps - least)
-            douts.drain(q_steps - least)
+            mosaic.streamed(rings, _tiles_of((q_ref, do_ref), row, head, block_q), least, q_steps)
 
         mosaic.roles(wg, consumers, consumer, producer)
 
@@ -552,9 +523,9 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
             lambda *scoped, **rings: body(*refs, *scoped, **rings),
             plgpu.SMEM((consumers, block_k, width), key.dtype),
             plgpu.SMEM((consumers, block_k, value_width), value.dtype),
-            # A tile's parts staged for the transposed products: dV's weights, or dK's cotangents in as many
+            # A tile's parts staged for the transposed products: dV's weights, and dK's cotangents in as many
             # parts as the form takes (`algebra.cotangent_parts`, three in the accurate form's bf16).
-            plgpu.SMEM((consumers, 4 if accurate else 2, block_q, block_k), query.dtype),
+            plgpu.SMEM((consumers, 4 if walk.accurate else 2, block_q, block_k), query.dtype),
             plgpu.SMEM((consumers, block_k, width), jnp.float32),
             plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_barriers=consumers),
             query_ring=mosaic.ring((block_q, width), query.dtype, stages, consumers=consumers),
@@ -567,7 +538,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
         grid=(heads, keys_padded // pair, batch), grid_names=("heads", "k_tiles", "batch"),
         num_threads=consumers + 1, thread_name="wg",
         compiler_params=mosaic.compiler_params(approx_math=True),
-        interpret=plgpu.InterpretGPUParams() if interpret else None,
+        interpret=plgpu.InterpretGPUParams() if walk.interpret else None,
     )(query, key, value, dout, peak, total, anchor, delta, key_index)
 
 
@@ -616,15 +587,16 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     # The family's swizzled tiles hold whole rows of `FAMILY.rows` 16-bit entries.
     query, key, value, dout = (jnp.pad(array, ((0, 0),) * 3 + ((0, -array.shape[3] % FAMILY.rows),))
                                for array in (query, key, value, dout))
-    shared = {"how": how, "scale": scale, "causal": causal, "keys_count": keys_count, "tiles": tiles,
-              "accurate": accurate, "consumers": consumers, "interpret": interpret}
+    steps = key.shape[1] // tiles.block_k
+    program = _Program(tiles, steps, min(tiles.stages, steps), keys_count, causal)
+    walk = _Backward(program, how, scale, accurate, consumers, interpret)
     dq_sum, keyed, rows = _dq_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
-                                     **shared)
+                                     walk=walk)
     sums = algebra.DqSums(jnp.swapaxes(dq_sum, 1, 2), rows[0], rows[1], (), (), jnp.swapaxes(keyed, 1, 2),
                           rows[2], rows[3])
     dq, refined, denominator, mass, _ = algebra.dq_finish(sums, forward_total, state_total, peak0,
                                                           (total0, initial_term), maximum, anchor, delta,
                                                           accurate=accurate)
-    dk, dv = _dkv_launch(query, key, value, dout, maximum, denominator, anchor, refined, chosen, **shared)
+    dk, dv = _dkv_launch(query, key, value, dout, maximum, denominator, anchor, refined, chosen, walk=walk)
     return (jnp.swapaxes(dq, 1, 2)[..., :width], refined, anchor, maximum, denominator, mass, chosen,
             dk[..., :width], dv[..., :value_width])
