@@ -322,8 +322,8 @@ def prefix() -> str:
 
     kind = "".join(character if character.isalnum() else "-" for character in jax.devices()[0].device_kind)
     backend = jax.default_backend()
-    return f"jaxlib{jaxlib.__version__}/{backend}/py{sys.version_info.major}.{sys.version_info.minor}/{kind}/" \
-           f"{cpu_class()}"
+    minor = f"py{sys.version_info.major}.{sys.version_info.minor}"
+    return f"jaxlib{jaxlib.__version__}/{backend}/{minor}/{kind}/{cpu_class()}"
 
 
 def install(url: str, token: str) -> RemoteCache | None:
