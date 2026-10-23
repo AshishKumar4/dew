@@ -19,12 +19,13 @@ import concurrent.futures
 import dataclasses
 import logging
 from collections.abc import Mapping, Sequence
+from typing import ClassVar
 
 import grain.python as pygrain
 import numpy as np
 
 from dew.data.analysis import _analyzed, _identity, _label, _name
-from dew.data.dataset import Batch, Records
+from dew.data.dataset import Batch, Ranges, Records
 from dew.data.lowering import (
     _cache_inputs,
     _CachedOutputs,
@@ -50,19 +51,21 @@ from dew.data.pipeline import (
     Windows,
 )
 from dew.data.plan import fingerprint
-from dew.data.sources.base import Read, ShardManifest, Source, _uncounted
+from dew.data.sources.base import Read, Rows, ShardManifest, Source, View, _uncounted
 from dew.data.steps.generic import Fields
-from dew.data.steps.text import CountRule, CountTargets, LayoutRule, ValidTargets, targets_changed
+from dew.data.steps.text import CountRule, CountTargets, LayoutRule, ValidTargets, counted_window
 from dew.records import JSON, integer, json_value, record
 
 _log = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass(frozen=True)
-class _Memory:
-    """Accepted rows and their facts, keeping measured targets through field projections."""
+class _Memory(View[Source]):
+    """Accepted rows and their facts, keeping measured targets through field projections: the rows
+    a memory read of `source` made by running the pipeline's first stages (`ran`) over its rows."""
 
-    original: Source
+    rows: ClassVar[Rows] = "materialized"
+    source: Source
     held: tuple[Batch | bytes, ...]
     measured: np.ndarray | None
     derived: Mapping[str, str]
@@ -70,23 +73,16 @@ class _Memory:
     identifiers: tuple[tuple[int, ...], ...] = ()
     inputs: int = 0
     ran: tuple[Stage, ...] = ()
-    target_counts: tuple[int, ...] | None = None
-    documents: int | None = None
+    segments: int | None = None
     """The most documents a window holds where `ran` packs them, which its
     batches declare (`Coordinates.max_segments`)."""
-
-    def label(self) -> str:
-        return self.original.label()
-
-    def describe(self) -> str:
-        return self.original.describe()
 
     def fingerprint(self) -> Mapping[str, object]:
         """The rows as a memory read made them: the source it read, the
         derived order facts and the steps it ran, by what they compute. The
         manifest records those steps' modules in its environment."""
         return {
-            "materialized": self.original.fingerprint(),
+            "materialized": self.source.fingerprint(),
             "derived": self.derived,
             "steps": [_identity(stage).semantic() for stage in self.ran],
         }
@@ -100,7 +96,7 @@ class _Memory:
     def metadata(self) -> Mapping[str, object]:
         """Its source's facts, the counts only where it ran no stage over the source's rows, then
         the counts it measured."""
-        stated = self.original.metadata()
+        stated = self.source.metadata()
         return {**(_uncounted(stated) if self.ran else stated), **self.facts, "rows": len(self.held),
                 "accepted": len(self.held)}
 
@@ -108,16 +104,14 @@ class _Memory:
         return self.measured
 
     def locality(self) -> tuple[tuple[int, ...], bool]:
-        if not isinstance(self.original, _Locality) or any(
+        if not isinstance(self.source, _Locality) or any(
             len(identifier) != 1 for identifier in self.identifiers
         ):
             raise ValueError("block shuffle needs an unchanged physical shard index")
-        sizes, remote = self.original.locality()
-        ends = np.cumsum(sizes)
-        selected = np.bincount(
-            [int(np.searchsorted(ends, identifier[0], side="right")) for identifier in self.identifiers],
-            minlength=len(sizes),
-        )
+        sizes, remote = self.source.locality()
+        shards = Ranges(tuple(sizes))
+        selected = np.bincount([shards.holding(identifier[0]) for identifier in self.identifiers],
+                               minlength=len(sizes))
         return tuple(int(size) for size in selected), remote
 
     def manifest(self) -> ShardManifest:
@@ -211,18 +205,16 @@ def _memory_stages(
 ) -> Pipeline:
     derived: dict[str, str] = {}
     targets: Mapping[str, int] | None = None
-    documents = source.documents if isinstance(source, _Memory) else None
-    counted: dict[tuple[int, ...], int] | None = (
-        dict(zip(source.identifiers, source.target_counts, strict=True))
-        if isinstance(source, _Memory) and source.target_counts is not None
-        else None
-    )
+    documents = source.segments if isinstance(source, _Memory) else None
+    # Whether the rows' targets are counted, which they carry (`recounted`, `counted_window`): by the
+    # memory read this one reads on from, a count step or a layout.
+    counting = isinstance(source, _Memory) and any(
+        isinstance(value, Mapping) and "_dew_valid_targets" in value for value in source.held)
     for stage in pipeline.stages[consumed:eager]:
+        counting = counting or isinstance(stage, (Windows, Pack)) or (
+            isinstance(stage, Map) and isinstance(stage.step, CountTargets))
         if isinstance(stage, TokenSplit):
             split = _TokenSplit(pygrain.MapDataset.source([value for _, value in rows]), stage)
-            if counted is not None:
-                counted = {(*rows[row][0], first, last): counted[rows[row][0]]
-                           for row, first, last in split.spans}
             spans = enumerate(split.spans)
             rows = [((*rows[row][0], first, last), split[index]) for index, (row, first, last) in spans]
         elif isinstance(stage, Windows):
@@ -231,21 +223,20 @@ def _memory_stages(
             derived[f"accepted_before_windows_{consumed}"] = fingerprint(
                 [list(identifier) for identifier, _ in rows]
             )
-            rule = _count_rule(rows)
+            rule = LayoutRule.of(record(value, "layout document") for _, value in rows)
             windows = IndexedWindows.from_records(
                 tuple(record(value, "window document") for _, value in rows), stage
             )
             derived["windows"] = fingerprint([windows.size, stage.seq_len, stage.stride])
             rows, targets = _targeted([((index,), windows[index]) for index in range(len(windows))], counter,
                                       stage.fields[0], rule)
-            counted = _recounted(rows, stage.fields[0])
         elif isinstance(stage, Pack):
             from dew.data.packing import _Held, _PackedRows, refuse_overlong
 
             derived[f"accepted_before_pack_{consumed}"] = fingerprint(
                 [list(identifier) for identifier, _ in rows]
             )
-            rule = _count_rule(rows)
+            rule = LayoutRule.of(record(value, "layout document") for _, value in rows)
             kept = Fields(stage.packed)
             documents = tuple(kept.map(record(value, "packing document")) for _, value in rows)
             sizes = np.asarray([len(value[stage.fields[0]]) for value in documents], np.int64)
@@ -273,11 +264,8 @@ def _memory_stages(
             ids = f"{stage.fields[0]}_segment_ids"
             documents = max((int(np.asarray(record(value, "packed window")[ids]).max(initial=0))
                              for _, value in rows), default=0)
-            counted = _recounted(rows, stage.fields[0])
         else:
             expanded: list[tuple[tuple[int, ...], Record]] = []
-            expanded_counts: dict[tuple[int, ...], int] = {}
-            counts_targets = isinstance(stage, Map) and isinstance(stage.step, CountTargets)
             threads = _threads((stage,))
             if threads is None:
                 made = (_outputs(stage, identifier[0], value, counts=counter) for identifier, value in rows)
@@ -286,48 +274,33 @@ def _memory_stages(
                 pool = concurrent.futures.ThreadPoolExecutor(threads, thread_name_prefix="dew-step")
                 with pool:
                     made = iter(list(pool.map(_Fetched(stage), rows)))
-            for (identifier, value), outputs in zip(rows, made, strict=True):
+            for (identifier, _), outputs in zip(rows, made, strict=True):
                 for child, output in enumerate(outputs):
                     if isinstance(output, Rejected):
                         counter.rejected[output.reason] += 1
                     else:
                         output_id = (*identifier, child) if isinstance(stage, FlatMap) else identifier
                         expanded.append((output_id, output))
-                        if counts_targets:
-                            expanded_counts[output_id] = ValidTargets()(record(output, "counted row"))
-                        elif counted is not None:
-                            # A row's count holds while the step left the fields it was counted from;
-                            # where it changed one, the row's own targets, as `recounted` carries them.
-                            if (isinstance(value, Mapping) and isinstance(output, Mapping)
-                                    and targets_changed(value, output)):
-                                expanded_counts[output_id] = ValidTargets()(output)
-                            else:
-                                expanded_counts[output_id] = counted[identifier]
             rows = expanded
-            if counts_targets or counted is not None:
-                counted = expanded_counts
         consumed += 1
-    if counted is not None:
-        targets = {"valid_targets": sum(counted.values())}
+    if counting:
+        targets = {"valid_targets": sum(ValidTargets()(record(value, "counted row")) for _, value in rows)}
     if targets is not None and targets["valid_targets"] == 0 and training:
         raise ValueError(f"corpus {_name(pipeline)} has zero valid target tokens")
     inputs = source.inputs if isinstance(source, _Memory) else len(stored)
-    return _memory_order(pipeline, rows, consumed, source, inputs, counter, derived, targets, counted,
-                         documents)
+    return _memory_order(pipeline, rows, consumed, source, inputs, counter, derived, targets, documents)
 
 
 def _targeted(
     rows: list[tuple[tuple[int, ...], Record]], counter: CorpusCounts, field: str, rule: CountRule | None
 ) -> tuple[list[tuple[tuple[int, ...], Record]], Mapping[str, int]]:
     """The windows a pack or windows stage made that hold a valid target of
-    their token `field`, counted by the rule their documents were (`CountRule`),
-    and their counts before record steps rename or remove their token fields."""
+    their token `field`, each counted by the rule their documents were (`counted_window`),
+    and their total, as an indexed or streamed read accepts them."""
 
     kept, total = [], 0
     for identifier, value in rows:
-        window = record(value, "packed window")
-        if rule is not None:
-            window = rule.counted(window, field)
+        window = counted_window(record(value, "packed window"), rule, field)
         count = ValidTargets(field)(window)
         if count:
             kept.append((identifier, window))
@@ -335,21 +308,6 @@ def _targeted(
         else:
             counter.rejected["zero_targets"] += 1
     return kept, {"valid_targets": total}
-
-
-def _count_rule(rows: list[tuple[tuple[int, ...], Record]]) -> CountRule | None:
-    """The one rule the documents a pack or windows stage lays out were counted by (`LayoutRule`)."""
-    seen = LayoutRule()
-    for _, value in rows:
-        seen(record(value, "layout document"))
-    return seen.rule
-
-
-def _recounted(rows: list[tuple[tuple[int, ...], Record]], field: str) -> dict[tuple[int, ...], int]:
-    """The targets of the windows a pack or windows stage made (`_targeted`), by the windows' own
-    ids, tracked as a counted row's are: a later step that changes a window's tokens, as a crop
-    does, counts it again, so the corpus states what its rows deliver."""
-    return {identifier: ValidTargets(field)(record(value, "packed window")) for identifier, value in rows}
 
 
 def _measured_targets(child: Pipeline, mixture: Mixture) -> Pipeline:
@@ -405,7 +363,6 @@ def _memory_order(
     counter: CorpusCounts,
     derived: dict[str, str],
     packed: Mapping[str, int] | None,
-    counted: Mapping[tuple[int, ...], int] | None,
     documents: int | None,
 ) -> Pipeline:
     rows = [
@@ -443,7 +400,6 @@ def _memory_order(
             tuple(identifier for identifier, _ in rows),
             inputs,
             pipeline.stages[:consumed],
-            None if counted is None else tuple(counted[identifier] for identifier, _ in rows),
             documents,
         ),
         stages=remaining,

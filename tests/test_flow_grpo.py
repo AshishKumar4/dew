@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from certified import assert_certified
 from flax import linen as nn
 from recording import RecordingTracker
 from reference_error import (
@@ -629,13 +630,18 @@ def test_transition_matches_released_sampler_and_torch_distribution():
     """The transition's mean, variance, mean log density, that density's velocity gradient and its
     conditional KL, on par with the pinned author code's and torch.distributions' from their float64
     run over the recorded seeds (check 1, tools/parity_flow_grpo.py), the truth Dew's own transition
-    in float64, held at every seed to the recording's sketch."""
+    in float64, held at every seed to the recording's sketch; and every operation that computes them
+    within its own operation's bound on each of those draws (check 2, tests/certified.py)."""
     seeds = declared_seeds(RECORDED)["transition"]
     draw, recorded, truth = indexed_recording(recording(RECORDED), "transition", seeds,
                                               inputs_of=transition_inputs, truth_fn=jax.jit(dew_transition))
     dew = jax.jit(dew_transition)
     assert_as_exact(lambda index, inputs: dew(inputs), recorded, draw, "released transition", seeds=seeds,
                     truth_fn=truth)
+    # Check 2: every operation of the transition and its velocity gradient, one at a time, within its
+    # own contract on every draw check 1 judged.
+    assert_certified(dew_transition, lambda seed: (transition_inputs(seed),), "released transition",
+                     seeds=seeds)
 
 
 

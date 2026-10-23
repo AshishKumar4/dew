@@ -147,3 +147,73 @@ def test_an_orbit_of_a_recorded_reference_or_of_one_order_is_refused():
         _drawn(_left_to_right, recorded, _cancelling_draw, range(2), orders=_swapped)
     with pytest.raises(ValueError):
         _drawn(_left_to_right, _outer_first, _cancelling_draw, range(2), orders=lambda inputs: [inputs])
+
+
+def test_narrow_rows_take_their_narrow_factor_and_wider_rows_row_factor():
+    """The worst-row rule judged alone (`_judgement` on a leaf whose pooled ratio is one): Dew's worst
+    row just inside its width's factor times the reference's passes and just past it fails, at one and
+    two values a row (NARROW_FACTORS) and at three and eight (ROW_FACTOR)."""
+    from reference_error import NARROW_FACTORS, ROW_FACTOR, _Draws, _judgement
+
+    for width in (1, 2, 3, 8):
+        factor = NARROW_FACTORS.get(width, ROW_FACTOR)
+        for worst, fails in ((0.99 * factor, False), (1.01 * factor, True)):
+            draws = _Draws(["leaf"], np.ones((8, 1)), np.ones((8, 1)), np.tile([[[worst, 1.0]]], (8, 1, 1)),
+                           np.zeros((8, 1), int), np.ones((8, 1), bool), (width,))
+            over, _ = _judgement(draws, "leaf")
+            assert bool(over) == fails, (width, worst)
+
+
+def test_a_narrow_rows_factor_holds_through_check_one():
+    """Through `assert_as_exact`: a first row of one value ten times the reference's relative error, too
+    small a value for the pooled ratio to see, passes at one value a row and fails at eight."""
+    def arms(width):
+        def draw(seed):
+            values = np.random.default_rng([0x0D, seed]).standard_normal((4096, width))
+            values[0] *= 2.0 ** -8
+            return (values,)
+
+        def reference(values):
+            return {"leaf": values * (1 + 2.0 ** -20)}
+
+        def dew(values):
+            moved = values * (1 + 2.0 ** -20)
+            moved[0] = values[0] * (1 + 10 * 2.0 ** -20)
+            return {"leaf": moved}
+
+        return dew, reference, draw
+
+    def truth(values):
+        return {"leaf": values}
+
+    for width, fails in ((1, False), (8, True)):
+        dew, reference, draw = arms(width)
+        if fails:
+            with pytest.raises(AssertionError) as raised:
+                assert_as_exact(dew, reference, draw, f"width {width}", seeds=8, truth_fn=truth)
+            assert raised.type is AssertionError
+        else:
+            assert_as_exact(dew, reference, draw, f"width {width}", seeds=8, truth_fn=truth)
+
+
+def test_the_stages_log_names_a_judgements_narrow_leaves(tmp_path, monkeypatch):
+    """Each judgement's stages-log line names its leaves of narrow rows (NARROW_FACTORS), whose local
+    errors rest on check 2, and no other."""
+    import json
+
+    from reference_error import STAGES_LOG
+
+    log = tmp_path / "stages.jsonl"
+    monkeypatch.setenv(STAGES_LOG, str(log))
+
+    def draw(seed):
+        rng = np.random.default_rng([0x1E, seed])
+        return rng.standard_normal((64, 1)), rng.standard_normal((64, 8))
+
+    def computed(narrow, wide):
+        return {"narrow": narrow * (1 + 2.0 ** -20), "wide": wide * (1 + 2.0 ** -20)}
+
+    assert_as_exact(computed, computed, draw, "narrow and wide", seeds=8,
+                    truth_fn=lambda narrow, wide: {"narrow": narrow, "wide": wide})
+    [entry] = [json.loads(line) for line in log.read_text().splitlines()]
+    assert entry["narrow_leaves"] == ["['narrow']"]
