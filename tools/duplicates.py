@@ -1,7 +1,9 @@
 """The duplicate-code gate: no code is written twice. It reads code two ways.
 
-- As text, with pylint's similarity check: a block of more than six lines two files share, once imports,
-  signatures, docstrings and comments are set aside, fails.
+- As text, with pylint's similarity check (`Symilar`, the `symilar` command's): a block of more than six
+  lines two files share, once imports, signatures, docstrings and comments are set aside, fails. No pragma
+  holds a copy: a `pylint: disable=duplicate-code` is not read. The script strips the files in a pool of
+  processes, one a processor, and compares them in one, in the files' order, as pylint's own run does.
 - As structure: two functions whose bodies are equal once every name is renamed in the order it is first
   used, every constant is read as its type, and docstrings and annotations are dropped (at least
   `FUNCTION_NODES` syntax nodes), fail, in one file or in two. So do six consecutive statements of two
@@ -13,11 +15,14 @@
   by one) declares data, so its constants are read as their values: runs alike in shape that declare
   other data are no copy, and a run copied with its data is one.
 
-    python tools/duplicates.py [--base=REF] PATH...
+    python tools/duplicates.py [--base=REF] [--reading=text|structure] PATH...
 
-Every copy is printed, and any fails. With `--base`, a structural copy fails only where it is written in
-more places than at the merge-base of REF and HEAD, wherever those places are: a copy that moved is held,
-and one written beside it, or once more, fails. Main still holds the copies the gate's runs and the
+Every copy is printed, and any fails. `--reading` reads one way alone: tools/check.sh runs the two as gates of
+their own (tools/check_gates), side by side, and its `--changed` the structure alone, in seconds.
+
+With `--base`, a structural copy fails only where it is written in more places than at the merge-base of REF
+and HEAD, wherever those places are: a copy that moved is held, and one written beside it, or once more,
+fails. Main still holds the copies the gate's runs and the
 duplication audits found (ledger 896-1287, 1309), and a head is held to adding none. The text reading has no
 base: main holds no text copy, so any fails. tools/check.sh (CI's lint job, the lanes' lint gate) runs the
 gate held to origin/main until main's last copy goes, then with no base. tests/test_duplicates.py runs it
@@ -28,8 +33,11 @@ It runs the test environment's pylint, which pyproject.toml's test extra pins.
 
 import argparse
 import ast
+import contextlib
 import hashlib
+import io
 import os
+import re
 import subprocess
 import sys
 import time
@@ -38,9 +46,16 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-ARGUMENTS = ("--disable=all", "--enable=duplicate-code", "--min-similarity-lines=6", "--ignore-imports=y",
-             "--ignore-signatures=y", "--ignore-docstrings=y", "--ignore-comments=y", "--score=n")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from forked import forked_map
+
+if TYPE_CHECKING:
+    from pylint.checkers.symilar import LineSet
+
+SIMILARITY = {"min_lines": 6, "ignore_comments": True, "ignore_docstrings": True, "ignore_imports": True,
+              "ignore_signatures": True}
 """The text reading: pylint's similarity check, as the gate runs it."""
 
 FUNCTION_NODES = 20
@@ -389,12 +404,77 @@ def judged(hits: list[Hit], merged: str, top: Path) -> tuple[list[Hit], list[Hit
     return failing, [hit for hit in hits if hit not in failing]
 
 
-def main(arguments: Sequence[str]) -> int:
+def stripped(file: Path) -> tuple["LineSet", set[int]]:
+    """`file`'s lines as the text reading compares them (`SIMILARITY`), and the hashes of their windows of one
+    line past `min_lines`, as pylint hashes a window (`hash_lineset`), read in a process of its own (a fork,
+    which hashes text as its parent does). pylint reports a run of lines two files share only past
+    `min_lines` lines, so the two share such a window."""
+    from pylint.checkers.symilar import Symilar, hash_lineset
+
+    reading = Symilar(**SIMILARITY)
+    with file.open(encoding="utf-8") as stream:
+        reading.append_stream(str(file), stream)
+    [lineset] = reading.get_map_data()
+    windows, _ = hash_lineset(lineset, SIMILARITY["min_lines"] + 1)
+    return lineset, {hash(window) for window in windows}
+
+
+def text_copies(files: list[Path], forked: bool) -> int:
+    """Print pylint's similarity report on the files of `files` that share a window, and return how many
+    lines the copies it finds repeat.
+
+pylint compares every two files, hashing both each time, which is quadratic in the files; it reports a
+    copy only where two files share a window one line past its minimum (`stripped`). So each file is stripped
+    and hashed once, in forked processes when `forked`; files are grouped where they share such a window,
+    transitively; and pylint compares each group's files, in the files' order, as it compares them in a run
+    over all of them: a group shares no file and no line with another, so no copy in one changes what pylint
+    reports in another.
+    """
+    from pylint.checkers.symilar import Symilar  # its import alone takes seconds, which the structure skips
+
+    read = forked_map(stripped, files) if forked else [stripped(file) for file in files]
+    # Each file's group, as the first file it shares a window with names it, merged where two groups meet.
+    group = list(range(len(read)))
+
+    def root(index: int) -> int:
+        while group[index] != index:
+            group[index] = group[group[index]]
+            index = group[index]
+        return index
+
+    first: dict[int, int] = {}
+    for index, (_, windows) in enumerate(read):
+        for window in windows:
+            group[root(index)] = root(first.setdefault(window, index))
+    members: dict[int, list[int]] = defaultdict(list)
+    for index in range(len(read)):
+        members[root(index)].append(index)
+    repeated = 0
+    for indexes in sorted(members.values()):
+        if len(indexes) < 2:
+            continue
+        reading = Symilar(**SIMILARITY)
+        reading.combine_mapreduce_data([[read[index][0]] for index in indexes])
+        report = io.StringIO()
+        with contextlib.redirect_stdout(report):
+            reading.run()
+        # The report's last line: "TOTAL lines=N duplicates=M percent=P".
+        totals = re.search(r"^TOTAL lines=\d+ duplicates=(\d+) ", report.getvalue(), re.MULTILINE)
+        assert totals is not None, "pylint's similarity report ends with its totals"
+        if int(totals.group(1)):
+            print(report.getvalue(), end="")
+            repeated += int(totals.group(1))
+    return repeated
+
+
+def main(arguments: Sequence[str], forked: bool = False) -> int:
+    """The gate, the text read in forked processes when `forked` (`forked_map`), as the script reads it; a
+    caller in a process that may hold threads (a test, under JAX) reads it in its own."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base", help="a commit: a structural copy fails if written in more places than at"
                                        " its merge-base with HEAD")
-    parser.add_argument("--structural", action="store_true",
-                        help="the structural reading alone, no text (check.sh --changed, for iterating)")
+    parser.add_argument("--reading", choices=("text", "structure"),
+                        help="one reading alone (tools/check_gates' two gates); both by default")
     parser.add_argument("paths", nargs="+")
     options = parser.parse_args(arguments)
     files = python_files(options.paths)
@@ -414,14 +494,12 @@ def main(arguments: Sequence[str]) -> int:
             return 2
     started = time.monotonic()
     text = 0
-    if not options.structural:
-        from pylint.lint import Run  # its import alone takes seconds, which --structural skips
-
-        # pylint reads a directory as a package; the files, as files.
-        text = Run([*ARGUMENTS, *map(str, files)], exit=False).linter.msg_status
+    if options.reading != "structure":
+        text = text_copies(files, forked)
     read = time.monotonic()
-    hits = found({os.path.relpath(file.resolve(), top) if options.base else str(file): file.read_text()
-                  for file in files})
+    hits = [] if options.reading == "text" else found({
+        os.path.relpath(file.resolve(), top) if options.base else str(file): file.read_text()
+        for file in files})
     failing, held = judged(hits, merged, top) if options.base else (hits, [])
     for hit in named(failing):
         print(report(hit))
@@ -435,4 +513,4 @@ def main(arguments: Sequence[str]) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(main(sys.argv[1:], forked=True))

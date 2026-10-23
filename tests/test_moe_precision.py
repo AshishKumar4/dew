@@ -16,7 +16,7 @@ import numpy as np
 import optax
 import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, with_gradients
 from scipy.special import erfc
 from tuned import each_config
 
@@ -237,9 +237,9 @@ def _tile_gate_arm(implementation, fault=1.0):
     """A bf16 projection's output and both gradients through `implementation` ('pallas' with the CPU's
     interpreter), its output times `fault`."""
     def run(x, kernel_matrix, dy):
-        y, pull = jax.vjp(lambda x, k: expert_projection(x, k, jnp.asarray(TILE_SIZES), jnp.bfloat16,
-                                                         implementation, None), x, kernel_matrix)
-        return ((y.astype(jnp.float32) * fault).astype(y.dtype), *pull(dy))
+        y, *gradients = with_gradients(lambda x, k: expert_projection(
+            x, k, jnp.asarray(TILE_SIZES), jnp.bfloat16, implementation, None))(x, kernel_matrix, dy)
+        return ((y.astype(jnp.float32) * fault).astype(y.dtype), *gradients)
     return run
 
 

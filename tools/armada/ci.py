@@ -90,9 +90,6 @@ import sys
 import threading
 import time
 import tomllib
-import urllib.error
-import urllib.parse
-import urllib.request
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from pathlib import Path
@@ -109,6 +106,7 @@ def _beside(name: str):
 
 
 child_groups = _beside("child_groups")
+r2 = _beside("r2")
 SETTLE = 30.0
 """Seconds a task's process group has, after SIGKILL, to be reaped and gone: inside armada's own timeout
 with the default deadline and grace (1680 + 60 + 30 + the reader's 10 < .armada.json's 1800)."""
@@ -253,36 +251,28 @@ def gpu_query(field: str) -> list[str]:
                           check=True).stdout.split("\n")[:-1]
 
 
-def worker() -> str:
-    """The URL of the Worker that holds the records."""
-    return os.environ["DEW_XLA_CACHE_URL"].rstrip("/")
+def store(token: str) -> r2.Store:
+    """The Worker that holds the records."""
+    return r2.Store(os.environ["DEW_XLA_CACHE_URL"], token, "dew-ci-test-cache", timeout=10)
 
 
-def cache_url(python: str, row_name: str, held: str, inputs: str | None = None) -> str:
+def record_key(python: str, row_name: str, held: str, inputs: str | None = None) -> str:
     """Where the record of `row_name` on class `held` (`device_class`) lives: the last run's, or with
     `inputs`, the last of the runs on those shared inputs (`shared`), apart from the last runs' list
     (`listed`). Any run of another commit replaces the last record, so a commit's retry reads its own
     under its inputs first (`reused`). The Worker's key alphabet has no colon or hash."""
     _, name, split = parsed_row(row_name)
     at = f"{CACHE_PREFIX}/{python}" if inputs is None else f"{CACHE_PREFIX}-inputs/{inputs[:16]}/{python}"
-    return f"{worker()}/{at}/{held}/{name}/" + ("-of-".join(split.split("/")) if split else "whole")
+    return f"{at}/{held}/{name}/" + ("-of-".join(split.split("/")) if split else "whole")
 
 
-def cache_request(url: str, token: str, data: bytes | None = None) -> bytes | None:
-    """GET (or with `data`, PUT) `url`: None on a miss, and on a failure, which it reports and which
-    costs only a rerun."""
-    headers = {"Authorization": f"Bearer {token}", "User-Agent": "dew-ci-test-cache"}
-    method = "PUT" if data is not None else "GET"
-    request = urllib.request.Request(url, data=data, method=method, headers=headers)
+def record_of(key: str, token: str) -> bytes | None:
+    """The record at `key`, or None where there is none and where the Worker did not give it, which it
+    reports and which costs only a rerun."""
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            return response.read()
-    except urllib.error.HTTPError as error:
-        if error.code != 404:
-            print(f"the test cache answered {error.code} to {method} {url}", file=sys.stderr)
-        return None
-    except (urllib.error.URLError, TimeoutError, OSError) as error:
-        print(f"the test cache is unreachable ({error}); {method} {url} skipped", file=sys.stderr)
+        return store(token).get(key)
+    except (r2.R2Error, ValueError) as error:
+        print(f"the test cache did not give {key}: {error}", file=sys.stderr)
         return None
 
 
@@ -294,7 +284,7 @@ def reused(python: str, name: str, split: str, common: str) -> dict | None:
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
-    record = cache_request(cache_url(python, row(python, name, split), device_class(), common), token)
+    record = record_of(record_key(python, row(python, name, split), device_class(), common), token)
     recorded = None if record is None else json.loads(record)
     return recorded["row"] if recorded is not None and fresh(recorded, name, common) else None
 
@@ -545,11 +535,39 @@ def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
     return 0
 
 
+SELECTION = ("-m", "not network")
+"""Which tests CI runs: every one but those marked network, which reach the Hub (`CLOSED_HUB`)."""
+
 CLOSED_HUB = {"HF_HUB_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
               "HF_ENDPOINT": "http://127.0.0.1:9"}
-"""What a task's tests see of the Hugging Face Hub, which none of them may reach (`-m "not network"`):
-the libraries offline, and the Hub's address a closed port for any that would ask it regardless. A
-test that needs the Hub is marked network; one that reads a model or dataset otherwise brings it."""
+"""What a task's tests see of the Hugging Face Hub, which none of them may reach (`SELECTION`): the
+libraries offline, and the Hub's address a closed port for any that would ask it regardless. A test
+that needs the Hub is marked network; one that reads a model or dataset otherwise brings it."""
+
+
+def pytest_run(python: str, report: Path, *measured: str) -> list[str]:
+    """CI's pytest under `python`, as every task runs it: CI's `SELECTION`, failures and errors summarized
+    with short tracebacks, a file that does not collect beside those that do, every thread's stack
+    printed when a test runs ten minutes, unbuffered (-u) so the output holds every test that finished
+    when a run is cut short, and pytest's JUnit report written to `report`."""
+    return [f".venv-{python}/bin/python", "-u", *measured, "-m", "pytest", "-q", *SELECTION, "-rfE",
+            "--tb=short", "--continue-on-collection-errors", "-o", "faulthandler_timeout=600",
+            f"--junitxml={report}"]
+
+
+def pytest_environment(environ: Mapping[str, str]) -> dict[str, str]:
+    """What CI's pytest runs under: this process's environment, `environ` over it, the Hub closed, and
+    tools/armada on the path, where the plugins a task loads (split.py, executed.py) import from."""
+    path = os.pathsep.join(filter(None, [str(Path(__file__).resolve().parent), os.environ.get("PYTHONPATH")]))
+    return {**os.environ, **environ, **CLOSED_HUB, "PYTHONPATH": path}
+
+
+def targeted(python: str, arguments: list[str], report: Path) -> int:
+    """pytest's exit status on `arguments` (files, node ids and options) run as a CI task runs its files
+    (`pytest_run`): a lane's targeted run (tmp/run_tests.py) and the gangs select as CI does, and an
+    option of their own (a `-m` after CI's) chooses instead."""
+    return subprocess.run([*pytest_run(python, report), *arguments], env=pytest_environment({}),
+                          check=False).returncode
 
 
 def apportioned(own_seconds: Mapping[str, float], wall: float, rows: int) -> dict[str, float]:
@@ -590,24 +608,17 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     report.unlink(missing_ok=True)
     executed_report.unlink(missing_ok=True)
     grouping = ["-p", "split", f"--ci-group={split}"] if split else []
-    # faulthandler prints every thread's stack when a test runs ten minutes. Unbuffered (-u), so the
-    # log holds every test that finished when a task is cut short.
     # coverage.py follows the Python processes the tests start (pyproject.toml's patch), each writing
     # its data where COVERAGE_FILE says.
     measured = [] if coverage is None else ["-m", "coverage", "run"]
     environ = environ if coverage is None else {**environ, "COVERAGE_FILE": str(coverage / ".coverage")}
-    command = [f".venv-{python}/bin/python", "-u", *measured, "-m", "pytest", "-q", "-m", "not network",
-               "-rfE", "--tb=short", "--continue-on-collection-errors", "-o", "faulthandler_timeout=600",
-               "-p", "executed", f"--junitxml={report}", *tests, *grouping]
+    command = [*pytest_run(python, report, *measured), "-p", "executed", *tests, *grouping]
     # pytest leads a process group of its own, so what its tests start ends with it. Its output is
     # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
     # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
     lines: list[str] = []
-    # split.py, the plugin that keeps a split file's group, imports from beside this file.
-    path = os.pathsep.join(filter(None, [str(Path(__file__).resolve().parent), os.environ.get("PYTHONPATH")]))
     done = child_groups.start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                       env={**os.environ, **environ, **CLOSED_HUB, "PYTHONPATH": path,
-                            "DEW_EXECUTED": str(executed_report)})
+                              env=pytest_environment({**environ, "DEW_EXECUTED": str(executed_report)}))
 
     def read() -> None:
         for line in done.stdout or ():
@@ -691,34 +702,34 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str) ->
                            "peak": ran["peak"], "shares": ran["shares"], "pools": ran["pools"]}).encode()
         # The record under these inputs, which `reused` reads, and the last run's, which the GPU tier and
         # lane read, only once the first is written, so it is never newer.
-        if written(cache_url(python, row_["name"], held, common), token, body):
-            written(cache_url(python, row_["name"], held), token, body)
+        if written(record_key(python, row_["name"], held, common), token, body):
+            written(record_key(python, row_["name"], held), token, body)
 
 
-def written(url: str, token: str, body: bytes) -> bool:
-    """Whether `body` was PUT at `url`, tried `RECORD_TRIES` times: a record not written leaves the
-    one before it, such as an older green row a red run should have replaced."""
+def written(key: str, token: str, body: bytes) -> bool:
+    """Whether `body` was PUT at `key`, tried `RECORD_TRIES` times while the Worker is unavailable: a
+    record not written leaves the one before it, such as an older green row a red run should have
+    replaced."""
     for attempt in range(RECORD_TRIES):
         if attempt:
             time.sleep(2 ** attempt)
-        if cache_request(url, token, body) is not None:
+        try:
+            store(token).put(key, body)
             return True
+        except r2.Unavailable as error:
+            print(f"the test cache did not take {key}: {error}", file=sys.stderr)
+        except (r2.R2Error, ValueError) as error:
+            print(f"the test cache refused {key}: {error}", file=sys.stderr)
+            return False
     return False
 
 
 def listed(prefix: str, token: str) -> list[str]:
     """The names of the Worker's records under `prefix`, without it, a page of a thousand at a time."""
-    names, cursor = [], None
-    while True:
-        fields = {"list": prefix} | ({"cursor": cursor} if cursor else {})
-        page = cache_request(f"{worker()}/?{urllib.parse.urlencode(fields)}", token)
-        if page is None:
-            raise SystemExit(f"the test cache did not list {prefix}")
-        listing = json.loads(page)
-        names += listing["keys"]
-        cursor = listing["cursor"]
-        if not cursor:
-            return names
+    try:
+        return list(store(token).keys(prefix))
+    except r2.R2Error as error:
+        raise SystemExit(f"the test cache did not list {prefix}: {error}") from error
 
 
 def gpu_tier(python: str) -> dict[str, list[str]]:
@@ -736,7 +747,7 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
 
     def evidence_of(key: str) -> tuple[str, list[str]]:
         name = key.split("/", 1)[1].rsplit("/", 1)[0]  # <class>/<test file>/<group>
-        record = cache_request(f"{worker()}/{prefix}{key}", token)
+        record = record_of(f"{prefix}{key}", token)
         if record is None:
             return name, ["unrecorded"]
         recorded = json.loads(record)
@@ -816,7 +827,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
     held = device_class()
 
     def needs(name: str) -> tuple[float, float]:
-        record = cache_request(cache_url(python, row(python, name, ""), held), token)
+        record = record_of(record_key(python, row(python, name, ""), held), token)
         return gpu_needs(json.loads(record) if record else None, budget)
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
@@ -983,6 +994,12 @@ def main() -> int:
                          help="seconds before armada's own task timeout (.armada.json) to interrupt at")
     running.add_argument("--coverage", type=Path, default=None,
                          help="run the files under coverage.py, its data file in this directory")
+    selecting = operations.add_parser(
+        "pytest", help="pytest on the arguments as a CI task runs it, CI's selection first; its exit status")
+    selecting.add_argument("--python", choices=PYTHONS, required=True)
+    selecting.add_argument("--report", type=Path, required=True, help="where pytest writes its JUnit report")
+    selecting.add_argument("arguments", nargs=argparse.REMAINDER,
+                           help="after --, pytest's own: files, node ids and options")
     measuring = operations.add_parser("coverage")
     stages = measuring.add_subparsers(dest="stage", required=True)
     itemizing = stages.add_parser("items")
@@ -1031,6 +1048,10 @@ def main() -> int:
         for _, names in packed({name: sum(recorded.get(name, [1.0])) for name in tier}, args.shards):
             print(*names)
         return 0
+    if args.operation == "pytest":
+        # argparse keeps the `--` that sets pytest's arguments apart from these.
+        arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
+        return targeted(args.python, arguments, args.report)
     if args.operation == "gpu-lane":
         return gpu_lane(PYTHONS[0], args.tests.split(), args.out, cache=args.cache == "on",
                         processes=args.processes, deadline=args.deadline)

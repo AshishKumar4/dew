@@ -11,7 +11,7 @@ import logging
 import platform
 import re
 import subprocess
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 
@@ -26,6 +26,8 @@ _log = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
+    from dew.data.dataset import Batch
+
 
 def _canonical(value: JSON | Mapping[str, object]) -> bytes:
     return json.dumps(
@@ -33,10 +35,25 @@ def _canonical(value: JSON | Mapping[str, object]) -> bytes:
     ).encode()
 
 
+class Digest(Protocol):
+    """A running hash, as `hashlib`'s are."""
+
+    def update(self, chunk: bytes, /) -> None: ...
+
+    def hexdigest(self) -> str: ...
+
+
+def array_digest(dtype: np.dtype, shape: Sequence[int]) -> Digest:
+    """The digest an array of `dtype` and `shape` is fingerprinted by, its header taken: its
+    elements' bytes follow in C order, whole (`fingerprint`) or page by page as a published plan
+    writes them (`generation._write_plan`), to the same hash."""
+    return hashlib.sha256(_canonical([dtype.str, list(shape)]))
+
+
 def fingerprint(value: JSON | Mapping[str, object] | np.ndarray) -> str:
     """Hash order metadata, including an array's shape and dtype."""
     if isinstance(value, np.ndarray):
-        digest = hashlib.sha256(_canonical([value.dtype.str, list(value.shape)]))
+        digest = array_digest(value.dtype, value.shape)
         if value.dtype.hasobject:
             digest.update(_canonical(value.tolist()))
         else:
@@ -57,6 +74,15 @@ def identified(value: dict[str, JSON] | list[JSON] | str | int | float | bool | 
     if isinstance(value, list):
         return all(identified(child) for child in value)
     return True
+
+
+def callable_name(step: Callable[..., Batch]) -> str:
+    """`step`'s qualified name, `module.qualname`: a function's or a bound method's own, else its
+    type's, as a batch encoder names the reader it runs. A step's identity (`StepIdentity.of`) names
+    a bound method by its type, as plans have always written it; only a function is named by its
+    own name there."""
+    kind = step if inspect.isfunction(step) or inspect.ismethod(step) else type(step)
+    return f"{kind.__module__}.{kind.__qualname__}"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -395,7 +421,7 @@ class Plan:
     """A mixture's members, each what it reads and runs as one digest under its key, and its own
     stages under the empty key (`dew.data.analysis._member_manifests`): what a streamed mix's
     resume reads of a member that joined or left (`check`)."""
-    version: ClassVar[int] = 4
+    version: ClassVar[int] = 5
 
     def record(self) -> dict[str, JSON]:
         return {
