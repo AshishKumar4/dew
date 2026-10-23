@@ -464,6 +464,11 @@ class CrossAttending(Protocol):
 
     cross_attention: CrossAttention | None
 
+    @property
+    def context_width(self) -> int:
+        """The width of the tokens of a context its cross-attention layers read."""
+        ...
+
     def with_cross_attention(self, cross: CrossAttention | None) -> Self: ...
 
 
