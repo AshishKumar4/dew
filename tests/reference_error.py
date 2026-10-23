@@ -63,7 +63,6 @@ rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
 import dataclasses
-import functools
 import hashlib
 import math
 
@@ -154,59 +153,18 @@ def windows(draw, count: int):
     return drawn
 
 
-def over_windows(fn, *, looped: bool = False):
-    """`fn`, an arm of one draw, run over `windows`' stacked arguments, each sliced by window, with its
-    outputs stacked on their leading axis as host arrays.
+def over_windows(fn):
+    """`fn`, an arm of one draw, run over `windows`' stacked arguments window by window, each window's
+    arguments sliced from the stack, with its outputs stacked on their leading axis as host arrays.
 
-    By default it is one compiled program over every window (`jax.vmap`). A batch axis may change the
-    program XLA compiles (its fusions, a kernel's route), so the first call at each signature also runs
-    `jax.jit(fn)` window by window and fails unless every window's output is the same bit for bit. The
-    signature is every argument's `jax.typeof`, their tree, x64's setting and the default matmul
-    precision; a reference and its float64 truth have two. Any other configuration a call changes needs
-    an `over_windows` of its own.
-
-    `looped` runs `fn` window by window instead, for a torch or NumPy reference, for a JAX arm a batch
-    axis changes, and for a `without_ynn` arm, whose compiler options refuse to be nested in the batched
-    program. Pass a JAX arm jitted, `over_windows(jax.jit(fn), looped=True)`, so each window runs the
-    program one draw compiles."""
-    def each(single, *arguments):
-        count = _window_count(arguments)
-        return _stack_host([single(*jax.tree.map(lambda leaf, index=index: leaf[index], arguments))
-                            for index in range(count)])
-
-    if looped:
-        return functools.partial(each, fn)
-    batched, single, checked = jax.jit(jax.vmap(fn)), jax.jit(fn), set()
-
+    Each window runs the program one draw runs, never a batched one: a batch axis changes the program
+    XLA compiles (its fusions, its reductions' order, its dots' batching, a kernel's route), which XLA
+    holds to no common bits with one draw's, so check 1 would judge a program users never run. Pass a
+    JAX arm jitted (`jax.jit(fn)`, `without_ynn(fn)`), so it compiles once a signature and every window
+    calls that program; a torch or NumPy reference as it is."""
     def run(*arguments):
-        # Before the batched program, which would compile a batch of none.
-        _window_count(arguments)
-        found = jax.tree.map(np.asarray, batched(*arguments))
-        signature = (bool(jax.config.jax_enable_x64), str(jax.config.jax_default_matmul_precision),
-                     jax.tree.structure(arguments),
-                     tuple(jax.typeof(leaf) for leaf in jax.tree.leaves(arguments)))
-        if signature not in checked:
-            expected = each(single, *arguments)
-            if jax.tree.structure(found) != jax.tree.structure(expected) or not jax.tree.leaves(found):
-                raise AssertionError("the batched arm over windows returns no output, or another tree")
-            for (path, got), want in zip(jax.tree_util.tree_leaves_with_path(found),
-                                         jax.tree.leaves(expected), strict=True):
-                if got.dtype != want.dtype or got.shape != want.shape or got.tobytes() != want.tobytes():
-                    where = jax.tree_util.keystr(path) or "the output"
-                    differs = ""
-                    if got.shape == want.shape and got.dtype == want.dtype and got.size:
-                        # By bits, so a zero of the other sign names its window too.
-                        moved = [index for index in range(len(got))
-                                 if np.ascontiguousarray(got[index]).tobytes()
-                                 != np.ascontiguousarray(want[index]).tobytes()]
-                        gap = np.max(np.abs(np.asarray(got, np.float64) - np.asarray(want, np.float64)))
-                        differs = f" (from window {moved[0]}, by up to {gap:.3e})"
-                    raise AssertionError(
-                        f"{where}: the batched arm over windows computes otherwise than one draw's "
-                        f"compiled arm does, window by window{differs}. Take "
-                        "`over_windows(jax.jit(fn), looped=True)`.")
-            checked.add(signature)
-        return found
+        return _stack_host([fn(*jax.tree.map(lambda leaf, index=index: leaf[index], arguments))
+                            for index in range(_window_count(arguments))])
     return run
 
 
@@ -228,7 +186,7 @@ def without_ynn(fn, **jit_options):
     the arm the check measures against, so that the two run the same kind of code on any host. A
     program Dew's users run compiles with the fusions, as they do. Call it at top level, since on the
     CPU lane its compiler options refuse to be nested in another jit, differentiated through or
-    batched; `over_windows` takes it with `looped=True`. A caller's own compiler options take
+    batched; `over_windows` runs it window by window. A caller's own compiler options take
     precedence over WITHOUT_YNN's."""
     if jax.default_backend() == "cpu":
         jit_options["compiler_options"] = {**WITHOUT_YNN, **(jit_options.get("compiler_options") or {})}
