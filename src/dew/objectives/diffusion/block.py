@@ -26,7 +26,7 @@ from dew.artifacts import TokenScores
 from dew.inference.tasks import BlockGeneration, BlockSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import ModelInputs, token_layout
-from dew.nn.protocols import BlockDenoiser, CacheCapacity, LayerScalars
+from dew.nn.protocols import BlockDenoiser, CacheCapacity, Lacks, LayerScalars
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
     FROZEN,
@@ -163,10 +163,10 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                  processor: Processor | None | Omitted = OMITTED):
         model = self.bind_model(model, variables=variables, processor=processor)
         if not (isinstance(model, BlockDenoiser) and isinstance(model, LayerScalars)):
-            raise TypeError(
-                f"block diffusion encodes a clean prefix into a model's cache and denoises canvases "
-                f"against it, with the layer scalars the published SFT trains, as DiffusionGemma "
-                f"does, and a {type(model).__name__} does none of that")
+            raise Lacks("canvas",
+                        f"block diffusion encodes a clean prefix into a model's cache and denoises canvases "
+                        f"against it, with the layer scalars the published SFT trains, as DiffusionGemma "
+                        f"does, and a {type(model).__name__} does none of that")
         canvas_size = model.canvas_length if canvas_size is None else canvas_size
         for name, value in (("prompt_length", prompt_length), ("num_canvases", num_canvases),
                             ("canvas_size", canvas_size), ("head_chunks", head_chunks)):
