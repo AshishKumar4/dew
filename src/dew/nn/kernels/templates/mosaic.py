@@ -347,11 +347,12 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
 
     @abc.abstractmethod
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
-                first: jax.Array | int = 0) -> tuple[C, tuple[jax.Array, ...]]:
+                first: jax.Array | int = 0, initial: tuple | None = None) -> tuple[C, tuple[jax.Array, ...]]:
         """A consumer's walk of `segments`, each `(step, lo, hi)`, `step(index, slots, carry, accumulators)
         -> (carry, accumulators)` given each stream's slots (`Slots`, the streams' steps counted from
-        `first`), from `start`, with fp32 accumulators of `shapes` (zero) its products issue into in place.
-        Returns the carry and the accumulators' values."""
+        `first`), from `start`, with fp32 accumulators of `shapes` its products issue into in place, zero
+        or their `initial` values (in the accumulator's layout; None, zero). Returns the carry and the
+        accumulators' values."""
 
     @abc.abstractmethod
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
@@ -426,6 +427,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         """A column vector read from `ref` (`[columns]`) in a column's layout (a tile's keys')."""
 
     @abc.abstractmethod
+    def tile_of(self, ref) -> jax.Array:
+        """A tile read from `ref` (`[rows, columns]`) in the accumulator's layout."""
+
+    @abc.abstractmethod
     def as_row(self, vector: jax.Array) -> jax.Array:
         """`vector` `[rows]` in a row's layout, whatever its own."""
 
@@ -466,7 +471,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         streamed(tuple(streams.values()), tiles, lo, hi)
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
-                first: jax.Array | int = 0) -> tuple[C, tuple[jax.Array, ...]]:
+                first: jax.Array | int = 0, initial: tuple | None = None) -> tuple[C, tuple[jax.Array, ...]]:
         def slotted(step):
             def run(index, carry, accumulators):
                 slots = Slots(streams, index - first)
@@ -479,13 +484,13 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             return run
 
         return self.accumulated(tuple((slotted(step), lo, hi) for step, lo, hi in segments), start, shapes,
-                                interpret)
+                                interpret, initial)
 
     @abc.abstractmethod
-    def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool
+    def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool, initial: tuple | None = None
                        ) -> tuple[C, tuple[jax.Array, ...]]:
         """A walk of `segments`, `step(index, carry, accumulators)`, with the family's accumulators of
-        `shapes` held across it (`walk`)."""
+        `shapes` held across it from their `initial` values (`walk`)."""
 
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
         passed(tuple(streams.values()), lo, hi, first=first, between=between)
