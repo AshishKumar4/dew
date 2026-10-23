@@ -11,7 +11,7 @@ from collections.abc import Callable
 import jax.numpy as jnp
 import numpy as np
 
-from dew.telemetry.devices import deterministic_ops_requested
+from dew.devices import deterministic_ops_requested
 
 from .kernels import decode_attention, generation
 from .kernels.generation import (

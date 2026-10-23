@@ -1,7 +1,7 @@
 """site/scripts/gen_install.py writes the install facts their owners declare into the files that repeat them,
 and holds docs/installation.md's extras table to the extras pyproject.toml declares: on a scratch copy of the
 files it reads and writes, a new extra fails it until the table names it, a new JAX requirement is written
-into the page, and the standalone installer picks the CUDA build dew.telemetry.builds picks, a build added
+into the page, and the standalone installer picks the CUDA build dew.builds picks, a build added
 there included."""
 
 import shutil
@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from dew.telemetry import builds
+from dew import builds
 
 REPO = Path(__file__).resolve().parents[1]
 READ = ("pyproject.toml", "constraints.txt", "README.md", "docs/installation.md", "tools/pip.txt",
