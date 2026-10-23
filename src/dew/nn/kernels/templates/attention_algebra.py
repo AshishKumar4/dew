@@ -131,6 +131,17 @@ PLAIN = Recompute()
 """The default fold's recomputation: scaled logits, the largest logit's weight as its arithmetic gives it."""
 
 
+def finite(x: jax.Array) -> jax.Array:
+    """Whether each entry of `x` is finite, `|x| < inf` (NaN not), as `jnp.isfinite`: a mainloop's lowering
+    may take no `is_finite` (Mosaic GPU's warpgroup lowering, jax 0.11.2)."""
+    return jnp.abs(x) < jnp.inf
+
+
+def infinite(x: jax.Array) -> jax.Array:
+    """Whether each entry of `x` is infinite, `|x| == inf`, as `jnp.isinf` (`finite`)."""
+    return jnp.abs(x) == jnp.inf
+
+
 def expand(x: jax.Array, like: jax.Array) -> jax.Array:
     """A per-row `x` (each query's, `[..., bq]`) broadcast over `like`'s trailing axis, as `x[..., None]`
     broadcasts, by `lax.broadcast_in_dim`: the one broadcast every mainloop lowers, Mosaic GPU's
@@ -230,7 +241,7 @@ def overflowed(acc: jax.Array) -> jax.Array:
     way a row of finite inputs turns non-finite (an infinite sum stays infinite under every later
     factor)."""
     # A maximum, the reduction every mainloop lowers (Pallas Triton takes no `jnp.all`).
-    return jnp.max(jnp.where(jnp.isfinite(acc), 0.0, 1.0), axis=-1) > 0
+    return jnp.max(jnp.where(finite(acc), 0.0, 1.0), axis=-1) > 0
 
 
 def guarded[C: (Partial, tuple)](plain: Callable[[], C], shifted: Callable[[jax.Array], C],
@@ -291,7 +302,7 @@ def walked[C: (Partial, tuple), O](spec: Forward, walk: Callable[[Forward, jax.A
         return finished(spec, guarded_walk(spec, functools.partial(walked_plain, spec)))
     carry = walk(spec, None)
     state = carry if isinstance(carry, Partial) else carry[0]
-    reach = jnp.max(jnp.where(jnp.isfinite(state.m), jnp.abs(state.m), 0.0))
+    reach = jnp.max(jnp.where(finite(state.m), jnp.abs(state.m), 0.0))
     natural = unfolded(spec)
 
     def folded() -> C:
@@ -358,7 +369,7 @@ def needed(total: jax.Array, reach: jax.Array) -> jax.Array:
     many binades as that product passes it by (log2 rounded up, so the bound holds whatever their
     rounding)."""
     binades = jnp.ceil(jnp.log2(total) + jnp.log2(reach)) - HEADROOM
-    return jnp.where(jnp.isfinite(binades) & (binades > 0), binades, 0.0)
+    return jnp.where(finite(binades) & (binades > 0), binades, 0.0)
 
 
 WEIGHT_SHIFT = 64
@@ -462,7 +473,7 @@ def base2_maximum(m: jax.Array) -> jax.Array:
     state's own one; one past its negative is below every key's alike."""
     folded = m * LOG2E
     largest = float(jnp.finfo(jnp.float32).max)
-    return jnp.where(jnp.isinf(folded) & jnp.isfinite(m), jnp.sign(m) * largest, folded)
+    return jnp.where(infinite(folded) & finite(m), jnp.sign(m) * largest, folded)
 
 
 def resumed(spec: Forward, m: jax.Array, total: jax.Array, acc: jax.Array, *,
@@ -535,7 +546,7 @@ def carried(spec: Forward, m: jax.Array, safe: jax.Array) -> jax.Array:
         alpha = jnp.exp(product)
         error = rounding + error * spec.scale
     corrected = alpha * (1.0 + error)
-    return jnp.where(jnp.isfinite(corrected), corrected, spec.carry(difference))
+    return jnp.where(finite(corrected), corrected, spec.carry(difference))
 
 
 def weights(spec: Forward, s: jax.Array, m: jax.Array) -> jax.Array:
@@ -887,14 +898,14 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
     fields = state.guard
     if fields is not None:
         # The natural denominator: the unshifted one where finite, else the shifted one taken back.
-        finite = jnp.isfinite(fields.plain_total)
-        denominator = jnp.where(finite, fields.plain_total, power2(denominator, fields.shift))
+        bounded = finite(fields.plain_total)
+        denominator = jnp.where(bounded, fields.plain_total, power2(denominator, fields.shift))
         # A live row's elements from the unshifted sums where they and their denominator are finite, as
         # the plain walk's; the shifted sums' ratio where they overflowed (`Guard.plain`). Every other
         # row shifted nothing, so its sums are the plain walk's own (a training walk's joined split sums).
-        kept = (jnp.isfinite(fields.plain)
-                & expand(fields.live & finite & (fields.plain_total > 0), out))
-        safe = expand(jnp.where(finite & (fields.plain_total > 0), fields.plain_total, 1.0), out)
+        kept = (finite(fields.plain)
+                & expand(fields.live & bounded & (fields.plain_total > 0), out))
+        safe = expand(jnp.where(bounded & (fields.plain_total > 0), fields.plain_total, 1.0), out)
         out = jnp.where(kept, fields.plain / safe, out)
     if output_mod is not None:
         out = output_mod(out, *output_params)
