@@ -252,7 +252,7 @@
           }
         },
         "solver": {
-          "class": "dpmsolver_multistep",
+          "class": "dew.sampling.solvers.dpm:DPMSolverMultistep",
           "fields": {
             "order": 2,
             "algorithm": "dpmsolver++",
@@ -274,7 +274,7 @@
     },
     "lora": null,
     "preset": {
-      "class": "edm",
+      "class": "dew.diffusion.presets:EDM",
       "fields": {
         "sigma_min": 0.002,
         "sigma_max": 80.0,
