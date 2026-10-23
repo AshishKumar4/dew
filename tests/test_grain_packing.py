@@ -24,10 +24,21 @@ READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
 FIELDS = ("text", "text_roles")
 
 
-@pytest.mark.parametrize("window, bins, segments", [(8, 1, None), (8, 3, None), (16, 4, 3), (5, 2, 2)])
+def _drawn(count: int) -> list[tuple[int, int, int | None]]:
+    """`count` packings drawn at random: a window of 2 to 48 tokens, 1 to 12 bins, and no cap or a
+    cap of 1 to 6 documents a window."""
+    rng = np.random.default_rng(1064)
+    return [(int(rng.integers(2, 49)), int(rng.integers(1, 13)),
+             None if rng.random() < 0.3 else int(rng.integers(1, 7))) for _ in range(count)]
+
+
+@pytest.mark.parametrize("window, bins, segments",
+                         [(8, 1, None), (8, 3, None), (16, 4, 3), (5, 2, 2), *_drawn(16)])
 def test_planned_windows_are_grains_first_fit_windows(window, bins, segments):
-    """Documents from one token to well past the window, a few exactly the
-    window, with ids and roles, cut by a chunk step before a first-fit pack:
+    """Dew plans first-fit windows by documents' lengths alone (`dew.data.tokens.first_fit`), a
+    placement Grain's packer reaches only by packing every token, so Grain's packer is its oracle,
+    over packings drawn at random as over the edge cases. Documents from one token to well past the
+    window, a few exactly the window, with ids and roles, cut by a chunk step before a first-fit pack:
     grain's packer, given the chunks in file order and its bins emitted in
     order, writes window for window what a memory read and an indexed read of
     documents that state their lengths read by the plan (`plan_windows`), and

@@ -281,6 +281,98 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
     return product, rounded(tail - lost if subtract else lost + tail)
 
 
+@jax.custom_jvp
+def correctly_rounded_divide(numerator: jax.typing.ArrayLike, denominator: jax.typing.ArrayLike) -> jax.Array:
+    """The correctly rounded fp32 quotient, IEEE division's, on XLA's approximate
+    dividers too: XLA:CPU rewrites a division by a broadcast into a multiplication
+    by its reciprocal (openxla/xla#51148), and XLA:GPU's fp32 a / b is off IEEE on
+    30 to 50% of quotients (DIVIDE-a100, DIVIDE-h100 receipts), where a quantizer's
+    scales and a diffusion schedule's states must round as the reference's host or
+    CUDA division does (compressed-tensors' NVFP4, the FP8 block cast, PyTorch's
+    schedulers).
+
+    Each operand's significand, in [0.5, 1), divides apart from its exponent
+    (`_rounded_significand`), so every intermediate stays normal whatever the
+    operands' range; the exponents' difference then scales the rounded
+    significand by its exponent bits, exact for a normal result. A quotient
+    below the normal range rounds once to the subnormal grid: the significand
+    scaled onto that grid rounds to its nearest integer, ties to even, the exact
+    residual settling a scaled significand that lands on a half, and the
+    integer is the result's bits, which no flush to zero reaches. Past the
+    largest float the quotient is infinite. A zero, infinite or NaN operand,
+    or a subnormal one, which XLA:CPU reads as zero, is the division's. Its
+    derivative is the division's, as JAX differentiates `a / b`.
+    """
+    numerator, denominator = jnp.broadcast_arrays(jnp.asarray(numerator, jnp.float32),
+                                                  jnp.asarray(denominator, jnp.float32))
+    plain = numerator / denominator
+    tiny = jnp.finfo(jnp.float32).tiny
+    special = ((jnp.abs(numerator) < tiny) | (jnp.abs(denominator) < tiny)
+               | ~jnp.isfinite(numerator) | ~jnp.isfinite(denominator))
+    negative = (numerator < 0) != (denominator < 0)
+    # Away from the specials both operands are normal: frexp's significands are exact, in [0.5, 1).
+    held = jnp.where(special, 1.0, numerator), jnp.where(special, 1.0, denominator)
+    (top, top_exponent), (bottom, bottom_exponent) = (jnp.frexp(jnp.abs(value)) for value in held)
+    significand, residual = _rounded_significand(top, bottom)
+    exponent = top_exponent - bottom_exponent
+    bits = jax.lax.bitcast_convert_type(significand, jnp.int32)
+    # The rounded significand's biased exponent once scaled: 1 to 254 is a normal float.
+    field = ((bits >> 23) & 0xFF) + exponent
+    normal = jax.lax.bitcast_convert_type(bits + (exponent << 23), jnp.float32)
+    # Below the normal range: the significand on the grid of 2^-149, a value under 2^23 whose
+    # integer part and half are exact in fp32; within the float32 range scaled by 2^shift.
+    shift = jnp.clip(exponent + 149, -126, 127)
+    scaled = significand * jax.lax.bitcast_convert_type((shift + 127) << 23, jnp.float32)
+    whole = jnp.floor(scaled)
+    fraction = scaled - whole
+    odd = (whole.astype(jnp.int32) & 1) == 1
+    half_up = (residual > 0) | ((residual == 0) & odd)
+    up = (fraction > 0.5) | ((fraction == 0.5) & half_up)
+    subnormal = jax.lax.bitcast_convert_type((whole.astype(jnp.int32) + up.astype(jnp.int32)),
+                                             jnp.float32)
+    magnitude = jnp.where(field >= 255, jnp.inf, jnp.where(field >= 1, normal, subnormal))
+    signed = jnp.where(negative, -magnitude, magnitude)
+    return jnp.where(special, plain, signed)
+
+
+def _rounded_significand(numerator: jax.Array, denominator: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """The correctly rounded fp32 quotient of two significands in [0.5, 1), and the sign of the exact
+    quotient's distance from it (+1 above, -1 below, 0 exact).
+
+    A Dekker TwoProduct gives the exact residual of the approximate
+    quotient, split into two fp32 values. One residual correction puts the
+    quotient within one ulp; comparing its exact residual with each
+    neighbour's half-spacing times the divisor chooses nearest-even.
+    That threshold product is exact because the half-spacing is a power
+    of two, and every intermediate is normal at these magnitudes."""
+    quotient = numerator / denominator
+    product, error = two_product(quotient, denominator, bit_split=True, subtract=True)
+    residual = (numerator - product) - error
+    quotient = quotient + residual / denominator
+    product, error = two_product(quotient, denominator, bit_split=True, subtract=True)
+    difference = numerator - product
+    high = difference - error
+    recovered = high - difference
+    low = (difference - (high - recovered)) - (error + recovered)
+    above, below = jnp.nextafter(quotient, jnp.inf), jnp.nextafter(quotient, -jnp.inf)
+    upper = (above - quotient) * 0.5 * denominator
+    lower = (quotient - below) * 0.5 * denominator
+    odd = (jax.lax.bitcast_convert_type(quotient, jnp.uint32) & 1) != 0
+    up = (high > upper) | ((high == upper) & ((low > 0) | ((low == 0) & odd)))
+    down = (high < -lower) | ((high == -lower) & ((low < 0) | ((low == 0) & odd)))
+    rounded = jnp.where(up, above, jnp.where(down, below, quotient))
+    # The exact quotient's side of the rounded one: the sign of its exact residual, the product's
+    # difference from the numerator less its error, which is zero only where the two are equal.
+    product, error = two_product(rounded, denominator, bit_split=True, subtract=True)
+    return rounded, jnp.sign((numerator - product) - error)
+
+
+@correctly_rounded_divide.defjvp
+def _divide_jvp(primals, tangents):
+    """The rounding is a selection among neighbours, so the quotient's tangent is the division's."""
+    return correctly_rounded_divide(*primals), jax.jvp(jnp.divide, primals, tangents)[1]
+
+
 def compensated_add(left, right):
     """Add two double-float values, `(hi, lo)` pairs whose sum is the value:
     `hi` is the sum rounded and `lo` what the rounding dropped (the his'
