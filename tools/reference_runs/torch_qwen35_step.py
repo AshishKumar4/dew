@@ -416,8 +416,9 @@ def result_record(args: argparse.Namespace, model, device, batch: int, seq: int,
                   observed_sdpa, work) -> dict:
     """The unprofiled metrics and later launch evidence keep separate scopes."""
     import torch
-    from common import chrome_trace_kernels, git_head, host, peak_flops, throughput, trim_trace
+    from common import chrome_trace_kernels, host, peak_flops, throughput, trim_trace
     from qwen35 import MODEL, REVISION, WHOLE_PEAK_SCOPE, workload
+    from reference_source import git_head
     from torch._dynamo.utils import counters
 
     config = model.backbone.config
