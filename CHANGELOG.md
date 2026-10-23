@@ -12,6 +12,12 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   A CPU forward costs about 1.6 times, a training step 1.4 to 1.9 times;
   GPU and TPU programs are unchanged, and convolutions keep their float32 sum.
   `jax.default_matmul_precision("F32_F32_F32")` takes the float32 sum back.
+- A diffusion schedule's division of a state by a rate (`divided`: epsilon from a clean
+  prediction, the clean sample from epsilon, a sigma solver's derivative) is IEEE's correctly
+  rounded quotient whatever the backend's division flags, through the one correctly rounded
+  divide the quantizers use (`dew.nn.precision.correctly_rounded_divide`, moved from
+  `dew.nn.fake_quant`); a bfloat16 or float16 state's is the float32 quotient rounded to its
+  dtype, as PyTorch's opmath gives it.
 - `train/flops`, a step's analytical training work, is logged on every device,
   CPU and TPU included; `train/mfu` still needs a device with a known peak.
 - `dew.figures` draws SVG figures for notebooks and docs. Their colors follow
@@ -61,6 +67,14 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   left each, which reads other records after a phase switch for weights whose
   scaling Grain truncates (1, 10 and 15), so a data position saved by an
   earlier Dew is refused (data plan version 5).
+- An epoch's steps count the step that reads its last records short of a
+  batch where the order reads on into the next epoch (a training order that
+  repeats for ever) or keeps its short last batch (`Loader.tail`): 39 windows
+  in batches of 8 are 5 steps an epoch, not 4, so a run counted in epochs
+  reads every record of each. An order that ends and drops its short last
+  batch counts as before. A part of a mixture cut by a slice or a limit comes
+  round once its cut records are read, and a packing's or token windows'
+  facts keep none of the counts of the documents in them.
 - `dew.data` and `dew.data.sources` export `from_torch`, `from_grain`,
   `from_hf` and `from_iter`, not the `Torch`, `Grain`, `HF` and `Iterated`
   classes they make, which a recorded chain still names by their modules. A

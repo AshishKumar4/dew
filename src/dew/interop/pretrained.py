@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     from jax.sharding import Mesh
 
     from dew.lora import Adapter, LoRA
+    from dew.nn.cross_attention import CrossAttention
     from dew.training.distributed import Layout, MeshSpec
 
 
@@ -502,6 +503,38 @@ class Pretrained:
                              base=None if self.origin is None else AdapterBase(self.origin, self.revision))
         return replace(self, model=adapter.model, variables=adapter.variables, adapter=adapter)
 
+    def with_cross_attention(self, cross: CrossAttention, *, key: int | jax.Array) -> Self:
+        """Return this source with gated cross-attention before the layers `cross` names, each
+        block drawn from `key` (`dew.nn.cross_attention`).
+
+        The blocks' gates start at zero, so the model computes what the source
+        does until they train. The variables hold the blocks under `params` and
+        the source's weights under `FROZEN`, so an objective built over the
+        result trains the blocks alone; an adapter's factors that already train
+        keep training, and `adapt` keeps the blocks training, so the two
+        compose in either order. The source's own format holds no
+        cross-attention, so `save` and `export` refuse the result; a run's
+        checkpoint keeps it.
+        """
+        from dew.nn.cross_attention import crossing
+        from dew.nn.inputs import request_key
+        from dew.nn.protocols import CrossAttending
+        from dew.objectives.base import freeze, merge, select, thaw
+
+        if not isinstance(self.model, CrossAttending):
+            raise TypeError(f"a {type(self.model).__name__} takes no cross-attention layers")
+        if self.model.cross_attention is not None:
+            raise ValueError("this bundle already reads a context; attach cross-attention to the source")
+        model = self.model.with_cross_attention(cross)
+
+        def drawn(draw: jax.Array) -> Variables:
+            # Only the blocks leave the program, so the source's own draws are dead code to XLA.
+            return select(thaw(model.init(draw, jnp.zeros((1, 1), jnp.int32))),
+                          lambda path: path[0] == "params" and crossing(path))
+
+        variables = freeze(merge(self.variables, jax.jit(drawn)(request_key(key))), crossing)
+        return replace(self, model=model, variables=variables)
+
     def export(self, variables: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
         """Return the tensors `save` writes, by their source names; `dew.inference.NCCLPush` sends these.
 
@@ -512,7 +545,11 @@ class Pretrained:
         as the source's own members (`dew.inference.projections.unpacked`).
         """
         from dew.inference.projections import unpacked
+        from dew.nn.protocols import CrossAttending
 
+        if isinstance(self.model, CrossAttending) and self.model.cross_attention is not None:
+            raise ValueError("the source's format holds no cross-attention layers; a run's checkpoint "
+                             "keeps this model")
         values = unpacked(self.model, self.variables if variables is None else variables)
         if self.adapter is not None:
             values = self.adapter.merge(values)
@@ -603,7 +640,8 @@ class PretrainedDecoder(Pretrained):
         weights. Gemma 4 writes frozen or trainable layer-scalar values into HF
         buffers; reloading that layout reproduces the computation, but not which
         scalars were trainable. The config is derived from a `causal_transformer`'s
-        fields, so any other model is refused.
+        fields, so any other model is refused. A decoder with cross-attention takes the
+        config of the decoder its blocks join and runs as a bundle, but `save` refuses it.
 
         `tokenizer` is the vocabulary the weights were trained with, as an object or
         by name. `save` writes its files next to the weights, so the directory that
@@ -615,7 +653,9 @@ class PretrainedDecoder(Pretrained):
             decoder = from_record(CausalTransformer, model)
         except ValueError as error:
             raise TypeError(f"{type(model).__name__} has no Hugging Face decoder layout") from error
-        config = decoders.export_config(decoder)
+        # Cross-attention blocks have no layout in any family: the config is the decoder's they join,
+        # and `export` refuses the blocks themselves.
+        config = decoders.export_config(decoder.with_cross_attention(None))
         built = rebuilt(dict, decoder)
         return cls(decoder, variables, None, config, None, built,
                    {**decoders.GENERATION_DEFAULTS, 'use_cache': config.get('use_cache', decoder.causal)}
