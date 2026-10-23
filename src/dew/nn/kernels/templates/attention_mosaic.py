@@ -69,26 +69,6 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     and the keys `spans` leaves each query (full or causal), as `dew.nn.kernels.templates.attention.reference`
     computes it. `natural` keeps the logits natural (`algebra.Forward.base2`); `interpret` runs it on the CPU
     (Mosaic GPU's interpret mode)."""
-    return _forward(query, key, value, spans, hooks, scale=scale, natural=natural, tiles=tiles,
-                    interpret=interpret, rows=False)[0]
-
-
-def training_rows(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
-                  hooks: Hooks | None = None, *, scale: float | None = None, natural: bool = NATURAL,
-                  tiles: Tiles = DEFAULT, interpret: bool = False) -> Rows:
-    """`forward`'s output with the backward's fast form's residuals (`Rows`): each query's maximum and
-    denominator `[B, H, Q]` as the walk finished them (`algebra.finish`), written beside the output."""
-    out, kept = _forward(query, key, value, spans, hooks, scale=scale, natural=natural, tiles=tiles,
-                         interpret=interpret, rows=True)
-    if kept is None:
-        raise ValueError("a forward with rows keeps its maxima and denominators (`_forward`)")
-    return Rows(*kept, out)
-
-
-def _forward(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: float | None, natural: bool,
-             tiles: Tiles, interpret: bool, rows: bool
-             ) -> tuple[jax.Array, tuple[jax.Array, jax.Array] | None]:
-    """`forward`'s output and, with `rows`, its maxima and denominators, cut to the call."""
     if hooks is not None and hooks != Hooks():
         raise NotImplementedError("the sm90 mainloop takes no hooks yet")
     if spans.form not in ("full", "causal"):
@@ -106,11 +86,8 @@ def _forward(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: 
     # The family's swizzled tiles hold whole rows of `FAMILY.rows` 16-bit entries.
     query, key, value = (jnp.pad(array, ((0, 0),) * 3 + ((0, -array.shape[3] % FAMILY.rows),))
                          for array in (call.query, call.key, call.value))
-    out, maxima, totals = _launch(query, key, value, spec=spec, tiles=tiles, interpret=interpret)
-    out = out[:, :call.queries, :, :value_width]
-    if not rows:
-        return out, None
-    return out, (maxima[:, :, :call.queries], totals[:, :, :call.queries])
+    out = _launch(query, key, value, spec=spec, tiles=tiles, interpret=interpret)
+    return out[:, :call.queries, :, :value_width]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -140,10 +117,9 @@ class _Program:
 
 
 def _consumer(program: _Program, spec: algebra.Forward, wg, q_view, out_view, q_smem, q_loaded, keys, values,
-              turn, schedule, most, first, rows_view, row_smem, *, interpret: bool):
+              turn, schedule, most, first, *, interpret: bool):
     """A consumer warpgroup's query block: its walk of the key tiles through the rings (`algebra.plain_walk`),
-    then its output stored through its query stage and its maxima and denominators through `row_smem`
-    (`rows_view` `[2, block_q]`)."""
+    then its output stored through its query stage."""
     tiles = program.tiles
     shape = (tiles.block_q, tiles.block_k)
     walked = program.walked(first)
@@ -205,14 +181,10 @@ def _consumer(program: _Program, spec: algebra.Forward, wg, q_view, out_view, q_
 
     lax.fori_loop(walked, most, released, None)
     pl.when(wg == 0)(turn)
-    out, m, total = algebra.finish(spec, state, initial=False)
+    out, _, _ = algebra.finish(spec, state, initial=False)
     q_smem[...] = out.astype(q_smem.dtype)
-    for place, part in enumerate((m, total)):
-        row_smem.at[place][...] = plgpu.layout_cast(part, mosaic_sm90.ROW)
     plgpu.commit_smem()
     plgpu.copy_smem_to_gmem(q_smem, out_view)
-    for place in range(2):
-        plgpu.copy_smem_to_gmem(row_smem.at[place], rows_view.at[place])
     plgpu.wait_smem_to_gmem(0)
 
 
@@ -226,8 +198,7 @@ def _launch(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpret
     # No more stages than key tiles: a slot past them would load past the keys.
     program = _Program(tiles, steps, min(tiles.stages, steps), spec.keys, spec.form == "causal")
 
-    def body(q_ref, k_ref, v_ref, out_ref, rows_ref, q_smem, row_smem, q_loaded, schedule, key_ring,
-             value_ring):
+    def body(q_ref, k_ref, v_ref, out_ref, q_smem, q_loaded, schedule, key_ring, value_ring):
         keys, values = mosaic.Ring(**key_ring), mosaic.Ring(**value_ring)
         row, head, wg = lax.axis_index("batch"), lax.axis_index("heads"), lax.axis_index("wg")
         pair_first = lax.axis_index("q_tiles") * pair
@@ -241,8 +212,7 @@ def _launch(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpret
             first = pair_first + wg * block_q
             rows = (row, pl.ds(first, block_q), head)
             _consumer(program, spec, wg, q_ref.at[rows], out_ref.at[rows], q_smem.at[wg], q_loaded.at[wg],
-                      keys, values, turn, schedule, most, first,
-                      rows_ref.at[:, row, head, pl.ds(first, block_q)], row_smem.at[wg], interpret=interpret)
+                      keys, values, turn, schedule, most, first, interpret=interpret)
 
         def producer():
             kv_head = lax.div(head, group)
@@ -258,25 +228,22 @@ def _launch(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpret
 
         mosaic.roles(wg, CONSUMERS, consumer, producer)
 
-    def entry(q_ref, k_ref, v_ref, out_ref, rows_ref):
+    def entry(q_ref, k_ref, v_ref, out_ref):
         pl.run_scoped(
-            lambda *scoped, **rings: body(q_ref, k_ref, v_ref, out_ref, rows_ref, *scoped, **rings),
+            lambda *scoped, **rings: body(q_ref, k_ref, v_ref, out_ref, *scoped, **rings),
             plgpu.SMEM((CONSUMERS, block_q, width), query.dtype),
-            plgpu.SMEM((CONSUMERS, 2, block_q), jnp.float32),
             plgpu.Barrier(num_barriers=CONSUMERS), plgpu.Barrier(num_arrivals=CONSUMERS),
             key_ring=mosaic.ring((block_k, width), key.dtype, program.stages, consumers=CONSUMERS),
             value_ring=mosaic.ring((block_k, value.shape[-1]), value.dtype, program.stages,
                                    consumers=CONSUMERS),
             collective_axes="wg")
 
-    out, rows = plgpu.kernel(
-        entry, out_type=(jax.ShapeDtypeStruct((batch, queries, heads, value.shape[-1]), query.dtype),
-                         jax.ShapeDtypeStruct((2, batch, heads, queries), jnp.float32)),
+    return plgpu.kernel(
+        entry, out_type=jax.ShapeDtypeStruct((batch, queries, heads, value.shape[-1]), query.dtype),
         grid=(heads, queries // pair, batch), grid_names=("heads", "q_tiles", "batch"),
         num_threads=CONSUMERS + 1, thread_name="wg", compiler_params=mosaic.compiler_params(approx_math=True),
         interpret=plgpu.InterpretGPUParams() if interpret else None,
     )(query, key, value)
-    return out, rows[0], rows[1]
 
 
 BACKWARD_DEFAULT = Tiles(64, 64, 2)
