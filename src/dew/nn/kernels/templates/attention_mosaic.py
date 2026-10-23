@@ -862,7 +862,7 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
                                for array in (query, key, value, dout))
     steps = key.shape[1] // tiles.block_k
     program = _Program(family, tiles, steps, min(tiles.stages, steps), spec.keys, spec.form == "causal")
-    walk = _Backward(program, spec, accurate, consumers, interpret, not accurate)
+    walk = _Backward(program, spec, accurate, consumers, interpret, False)
     padded = PaddedCall(query, key, value, start, end, query_ids, key_ids, (), (), query.shape[1],
                         spec.keys)
     spans = _spans_of(spec, padded, tiles.block_q, tiles.block_k)
