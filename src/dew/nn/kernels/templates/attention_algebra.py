@@ -1179,6 +1179,14 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
             jnp.where(anchored, key_index, -1))
 
 
+def split_mass(own: jax.Array, others_total: jax.Array, total: jax.Array, shift: jax.Array) -> jax.Array:
+    """The keys' share of a query's weights from a training forward's split sums (`split_delta`'s), the
+    initial state's the rest: 0 exactly where no key weighs anything (`dq_finish`'s mass, for a backward
+    with no dQ pass)."""
+    over = jnp.where(shift < 0, 1.0, inverse(power2(total, -shift)))
+    return (own + others_total) * over
+
+
 Parts = tuple[tuple[jax.Array, jax.Array | None], ...]
 """A product's parts as a mainloop issues them (`cotangent_parts`, `weights_parts`): each a narrowed
 operand with the power of two its product takes back (None: none)."""
