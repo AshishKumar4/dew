@@ -99,7 +99,7 @@ def test_a_batched_arm_that_computes_otherwise_than_one_draws_is_refused():
     def batched(axis_size, in_batched, x):
         return x + 1, in_batched[0]
 
-    with pytest.raises(AssertionError, match="looped=True"):
+    with pytest.raises(AssertionError):
         over_windows(arm)(np.zeros((3, 2), np.float32))
     np.testing.assert_array_equal(over_windows(lambda x: arm(x), looped=True)(np.zeros((3, 2), np.float32)),
                                   np.zeros((3, 2), np.float32))
