@@ -140,14 +140,15 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     quantized one, Qwix's `QArray`) leaves the product to its own library, whose dequantized sum
     keeps XLA's accumulation.
 
-    It is real CPU execution's policy alone: a step traced for an assumed GPU target
-    (`dew.nn.kernels.generation.assumed`) keeps the target's fp32 sum, and a Pallas kernel's body,
-    interpreted on a CPU to stand in for a GPU, never forms its products here."""
-    from dew.nn.kernels.generation import ASSUMED, linear_tangent
+    It is real CPU execution's policy alone, chosen by the platform the program is lowered for
+    (`platform_dependent`), which keys every compiled program: a step a CPU lowers for a GPU target
+    (`dew.training.trainer.Trainer.lower_for`, `lowering_platforms=('cuda',)`) takes the target's
+    fp32 sum, and a Pallas kernel's body, interpreted on a CPU to stand in for a GPU, never forms its
+    products here."""
+    from dew.nn.kernels.generation import linear_tangent
 
     narrow = functools.partial(product, preferred_element_type=preferred_element_type)
-    if (ASSUMED.get() is not None
-            or not all(isinstance(operand, jax.Array | np.ndarray) for operand in operands)
+    if (not all(isinstance(operand, jax.Array | np.ndarray) for operand in operands)
             or products_dtype(*operands) != jnp.dtype(jnp.float32)):
         return narrow(*operands)
     dtype = jax.eval_shape(narrow, *operands).dtype
