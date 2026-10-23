@@ -46,8 +46,8 @@ from dew.nn.sharding import ADAPTER_RANK, declarations, declared_axes, parameter
 from dew.objectives.base import FROZEN, Step, merge, thaw
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
+from dew.optim import OPTIMIZER_MAP, muon_weight_dimension_numbers
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
-from dew.training.optim import OPTIMIZER_MAP, muon_weight_dimension_numbers
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures" / "lora"

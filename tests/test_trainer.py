@@ -36,10 +36,10 @@ from dew.config import OptimConfig
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader, replayed
 from dew.objectives.base import Aux, EMASpec, Objective, merge, under
+from dew.optim import Cosine, Power
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainState, ema_update
 from dew.training.evaluation import WARM_BATCHES
 from dew.training.model_flops import _TokenCount
-from dew.training.optim import Cosine, Power
 from dew.training.runtime import Preempted
 from dew.training.state import CHECKPOINTED
 
@@ -811,7 +811,7 @@ from dew.cache import enable_compilation_cache
 from dew.config import OptimConfig
 from dew.telemetry.instrumentation import compilation_cache_counts
 from dew.training import Checkpoints, Layout, Trainer
-from dew.training.optim import Cosine, ParamGroup
+from dew.optim import Cosine, ParamGroup
 
 root, grouped = sys.argv[1], sys.argv[2] == "grouped"
 enable_compilation_cache(root + "/cache")

@@ -661,7 +661,7 @@ def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
     """Return the learning rate stored in `opt_state`, if the optimizer stores one.
 
     An OptimConfig's solver holds a rate scale and the schedule's value at
-    the last applied update (`dew.training.optim.scaled_solver`), whose
+    the last applied update (`dew.optim.scaled_solver`), whose
     product is the rate; an Optax optimizer can inject `learning_rate`
     itself (`optax.inject_hyperparams`). The result is None when the
     optimizer closes over the rate, or when parameter groups hold several

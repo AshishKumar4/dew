@@ -37,8 +37,8 @@ from tool_support import REPO_ROOT, load
 from dew.config import OptimConfig
 from dew.interop import Pretrained
 from dew.objectives.lm import TEXT_KEY, LMObjective
+from dew.optim import Cosine, ParamGroup
 from dew.training import MeshSpec, Trainer
-from dew.training.optim import Cosine, ParamGroup
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 

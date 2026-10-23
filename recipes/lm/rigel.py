@@ -39,7 +39,7 @@ from dew.data import mix, phases, presets
 from dew.data.pipeline import Pipeline
 from dew.data.sources.tokens import TokenFiles
 from dew.objectives.lm import LMRunConfig
-from dew.training.optim import ParamGroup, Power, PowerTail
+from dew.optim import ParamGroup, Power, PowerTail
 
 LAYERS = 40
 VOCAB = 100_352

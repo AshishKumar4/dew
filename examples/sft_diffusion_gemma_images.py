@@ -42,9 +42,9 @@ from dew.interop.diffusion_gemma import build
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import VALID_ROWS
 from dew.objectives.lm import Perplexity
+from dew.optim import Cosine
 from dew.records import record as read_record, strings
 from dew.training import MeshSpec, prepare_process
-from dew.training.optim import Cosine
 
 EOS, PAD, IMAGE = 256, 257, 258
 """The ids past the 256 bytes: end of caption, padding and the image placeholder."""
