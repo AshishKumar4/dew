@@ -304,7 +304,7 @@ def _gmm_cooperative(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_r
             allocations=pipeline(hopper.ignore, hopper.ignore).get_allocations(
                 lhs_gmem.at[pl.ds(0, block_m)], rhs_columns(rhs_gmem.at[0], 0),
                 *stepped_views(pl.ds(0, block_m))),
-            o_smems=[plgpu.SMEM((2, part[1] // staged, part[0], staged), gmem.dtype) for gmem in o_gmems],
+            o_smems=[plgpu.SMEM((2, part[0], staged), gmem.dtype) for gmem in o_gmems],
             **hopper.staging('side', zip(side_shapes, side_gmems, strict=True)),
             **hopper.staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]), prologue_gmems[i])
                                  for i in fixed]),
@@ -431,17 +431,17 @@ def _finish_half(acc, epilogue, sides: tuple, outs: tuple, place: tuple, wg) -> 
     values = (acc,) if epilogue is None else epilogue(acc, *tiles_of)
     values = values if isinstance(values, tuple) else (values,)
     for o_gmem, o_smem, value in zip(*outs, values, strict=True):
-        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-        chunks, width = o_smem.shape[1], o_smem.shape[-1]
-        for chunk in range(chunks):
-            o_smem[wg, chunk] = value[:, chunk * width:(chunk + 1) * width].astype(o_smem.dtype)
-        plgpu.commit_smem()
-        for chunk in range(chunks):
-            hopper.store_rows(o_smem.at[wg, chunk], o_gmem, row_start, first, stored, column + chunk * width,
-                              most)
+        # One chunk's buffer a consumer, refilled once its last store has read it: a 128 x 256 tile's
+        # output staged whole took the shared memory a fourth stage needs.
+        width = o_smem.shape[-1]
+        for chunk in range(value.shape[1] // width):
+            plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+            o_smem[wg] = value[:, chunk * width:(chunk + 1) * width].astype(o_smem.dtype)
+            plgpu.commit_smem()
+            hopper.store_rows(o_smem.at[wg], o_gmem, row_start, first, stored, column + chunk * width, most)
 
 
-_STAGED_BYTES = 256
+STAGED_BYTES = 256
 """The widest row, in bytes, a consumer stages its output in at a time: a consumer's 256 bf16 columns
 written to shared memory as one 512-byte row conflicted on its banks 195 times as often as in two
 256-byte halves (ncu, Qwen3's down projection forward: 18.3M conflicts against 94K, the kernel 16%
@@ -449,9 +449,9 @@ slower)."""
 
 
 def _staged_columns(block_n: int, dtypes) -> int:
-    """The columns of each chunk a consumer stages its output tile in: `_STAGED_BYTES` of the widest
+    """The columns of each chunk a consumer stages its output tile in: `STAGED_BYTES` of the widest
     output, or the whole tile where that is narrower; the tile must divide into them."""
-    columns = min(block_n, _STAGED_BYTES // max(jnp.dtype(dtype).itemsize for dtype in dtypes))
+    columns = min(block_n, STAGED_BYTES // max(jnp.dtype(dtype).itemsize for dtype in dtypes))
     if block_n % columns:
         raise ValueError(f"a cooperative tile of {block_n} columns does not stage in chunks of {columns}")
     return columns
@@ -639,7 +639,7 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
 
         @functools.partial(
             pl.run_scoped,
-            o_smem=plgpu.SMEM((2, block_n // staged, depth_half, staged), out_dtype),
+            o_smem=plgpu.SMEM((2, depth_half, staged), out_dtype),
             **hopper.staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]), side_gmems[i])
                                  for i in fixed]),
             halves=plgpu.Barrier(num_arrivals=2, num_barriers=2),
@@ -671,15 +671,14 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
                 fixed_refs = [smem.at[wg] for smem in fixed_smems]
 
                 def store(acc, g_i, depth, columns):
-                    # In `_staged_columns` chunks, as `_finish_half` stores.
-                    plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-                    for chunk in range(block_n // staged):
-                        o_smem[wg, chunk] = acc[:, chunk * staged:(chunk + 1) * staged].astype(o_smem.dtype)
-                    plgpu.commit_smem()
+                    # One `_staged_columns` chunk at a time through one buffer, as `_finish_half` stores.
                     mine = pl.ds(depth.start + wg * depth_half, depth_half)
                     for chunk in range(block_n // staged):
+                        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+                        o_smem[wg] = acc[:, chunk * staged:(chunk + 1) * staged].astype(o_smem.dtype)
+                        plgpu.commit_smem()
                         chunk_columns = pl.ds(columns.start + chunk * staged, staged)
-                        plgpu.copy_smem_to_gmem(o_smem.at[wg, chunk], o_gmem.at[g_i, mine, chunk_columns])
+                        plgpu.copy_smem_to_gmem(o_smem.at[wg], o_gmem.at[g_i, mine, chunk_columns])
 
                 hook = None if prologue is None else (prologue, prologue_axes, stepped, fixed, fixed_refs)
 

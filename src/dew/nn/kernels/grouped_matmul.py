@@ -389,12 +389,12 @@ class _Triton(_GroupedLaunch[Tile]):
     def contraction(tile: Tile) -> int:
         """The contraction one step of `tile` takes, the dot's K."""
 
-    def staged_bytes(self, ba, config: Tile, target) -> int:
+    def staged_bytes(self, ba, config: Tile) -> int:
         # Pallas Triton's pipeline holds `stages - 1` depth steps, and on Hopper `stages` where it
         # pipelines a wgmma, which reads one step while the next loads; an A100 and an H100 refuse
         # exactly those bytes, so a Hopper tile is sized for the larger. The prologue's side tiles load
         # in the same steps.
-        held = 0 if generation.effective(target).wgmma else 1
+        held = 0 if generation.gpu_target().wgmma else 1
         step = self.loaded(config) * jnp.dtype(ba.arguments['tokens'].dtype).itemsize + _side_tile_bytes(
             ba.arguments['prologue_operands'], ba.arguments['hooks'].prologue_axes, self.extents(config))
         return step * (config.stages - held)
@@ -411,7 +411,7 @@ class _Triton(_GroupedLaunch[Tile]):
         threads = 32 * config.warps
         # One MMA's k of 16 of each operand fragment, the warps' shares together.
         fragments = (rows + columns) * 16 // threads
-        return cost.resident(target, self.staged_bytes(ba, config, target), threads,
+        return cost.resident(target, self.staged_bytes(ba, config), threads,
                              rows * columns // threads + fragments)
 
     @staticmethod
@@ -631,7 +631,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             return False
         return _hooks_lower(ba, dtype, mosaic_gpu_lowering.mosaic_lowering_rules[plgpu_core.WGxWG_SEMANTICS])
 
-    def staged_bytes(self, ba, config: mosaic_gpu.Tiles, target) -> int:
+    def staged_bytes(self, ba, config: mosaic_gpu.Tiles) -> int:
         # The pipeline's stages of both operand blocks and the prologue's side tiles, the epilogue's side
         # tiles, and the output block each output stores from.
         size = jnp.dtype(ba.arguments['tokens'].dtype).itemsize
@@ -641,14 +641,18 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         step = (config.block_m + config.block_n) * config.block_k * size + _side_tile_bytes(
             ba.arguments['prologue_operands'], hooks.prologue_axes, extents)
         epilogue = _side_tile_bytes(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes, extents)
-        # One warpgroup stages each output in turn; two hold every output's staging buffer at once, and
-        # each consumer its own copy of an epilogue side tile without rows (`hopper.staging`; a
-        # prologue side's per-consumer copies are within the stages' count of it).
-        staged_outs = sum(outs) if config.warpgroups == 2 else max(outs)
+        # One warpgroup stages each output in turn, whole; two hold every output's buffer at once, each
+        # consumer one chunk of its half (`mosaic_gpu._staged_columns`), and each its own copy of an
+        # epilogue side tile without rows (`hopper.staging`; a prologue side's per-consumer copies are
+        # within the stages' count of it).
         if config.warpgroups == 2:
+            columns = min(config.block_n, mosaic_gpu.STAGED_BYTES // max(outs))
+            staged = sum(outs) * config.block_m * columns
             epilogue_sides = ba.arguments.get('epilogue_operands', ())
             epilogue += _side_tile_bytes(*_uncut(epilogue_sides, hooks.epilogue_axes), extents)
-        return config.stages * step + epilogue + staged_outs * config.block_m * config.block_n
+        else:
+            staged = max(outs) * config.block_m * config.block_n
+        return config.stages * step + epilogue + staged
 
     @staticmethod
     @abc.abstractmethod
@@ -836,13 +840,13 @@ class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
             raise ValueError(f"{target.generation} states no scoped VMEM, which the TPU launches fit their "
                              "blocks to")
         space = self.space(ba)
-        fits = tuple(blocks for blocks in space if self.staged_bytes(ba, blocks, target) <= budget)
+        fits = tuple(blocks for blocks in space if self.staged_bytes(ba, blocks) <= budget)
         if not fits:
-            least = min((self.staged_bytes(ba, blocks, target) for blocks in space), default=None)
-            raise base.Unfitted(type(self).__name__, least, budget, target.generation)
+            raise base.Unfitted(type(self).__name__, min((self.staged_bytes(ba, blocks) for blocks in space),
+                                                         default=None), budget, target.generation)
         return fits
 
-    def staged_bytes(self, ba, config: mosaic_tpu.Blocks, target) -> int:
+    def staged_bytes(self, ba, config: mosaic_tpu.Blocks) -> int:
         # Pallas's pipeline holds two of each operand's and output's blocks (one in flight), beside the
         # fp32 accumulator.
         size = jnp.dtype(ba.arguments['tokens'].dtype).itemsize
