@@ -59,7 +59,8 @@ def peak_row(tmp_path, platform: str) -> dict:
     subprocess.run([sys.executable, str(REPO_ROOT / "tools/benchmark_step.py"), "--preset", "cpu-smoke",
                     "--architectures", "causal_transformer", "--warmup", "1", "--steps", "2",
                     "--dtype", "float32", "--mesh", "{}", "--json-out", str(out)],
-                   env={**environment, "JAX_PLATFORMS": platform}, check=True, capture_output=True, timeout=900)
+                   env={**environment, "JAX_PLATFORMS": platform}, check=True, capture_output=True,
+                   timeout=900)
     (row,) = json.loads(out.read_text())
     return row
 
