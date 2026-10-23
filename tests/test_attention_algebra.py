@@ -21,6 +21,7 @@ from test_attention_triton import (
     gate_of,
     geometry,
     hooks_for,
+    joint,
     score_hooks,
 )
 
@@ -598,3 +599,134 @@ def test_the_accurate_forms_rescale_is_as_exact_as_its_exponent_rounded_once(raw
 
     assert_as_exact(jax.jit(functools.partial(algebra.carried, spec)), jax.jit(rounded), draw,
                     f"the accurate form's rescale, {'raw' if raw else 'scaled'}", seeds=8)
+
+
+@pytest.mark.parametrize("scale, slope, size", [(2.0, None, 2e38), (1.0, 2.0, 2e38), (2.0, 1.7e38, 0.25)],
+                         ids=["scale-2", "slope-2", "slope-1.7e38"])
+def test_a_querys_gradient_over_keys_near_fp32s_largest_is_finite_at_any_scale_and_slope(scale, slope, size):
+    """One query of zeros over two equal keys at equal logits (each weighs 1/2) under a scale and a score
+    hook's slope: the query's gradient is the cotangents' difference times the keys, 0, and D's refinement 0,
+    so dQ is exactly 0 in both mainloops (`algebra.DqSums.keyed`): keys near fp32's largest at a scale or a
+    slope of 2, whose sum under coefficients summing to 2 would overflow, and small keys under a score whose
+    derivative, the slope times the scale, is fp32's largest, whose coefficients' magnitudes would (held as
+    mantissas and exponents, `keyed_shift`). A derivative past fp32's largest is no fp32 number: XLA's
+    compiled arithmetic forms it whole in the logits themselves (`template.scores` is NaN there), so no form
+    of the backward is asked of it. The slope is a head's parameter, traced as a learned slope is."""
+    query = jnp.zeros((1, 1, 1, 16), jnp.float32)
+    key = jnp.zeros((1, 2, 1, 16), jnp.float32).at[:, :, :, 0].set(size)
+    # Equal values, so the score cotangents are exactly 0 and dQ's own sum is 0 on any accumulation: the
+    # test holds the weights' correction (`keyed`) alone.
+    value = jnp.zeros((1, 2, 1, 16), jnp.float32).at[..., 0].set(1.0)
+    dout = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
+    spans = template.spans(1, 2, 1)
+    hooks = template.Hooks() if slope is None else template.Hooks(
+        score_mod=lambda s, q_pos, k_pos, slope: slope * s,
+        score_params=(template.Param(jnp.full((1,), slope, jnp.float32), template.Kind.HEAD),))
+    tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
+    with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
+        triton = attention_triton.backward(query, key, value, spans, hooks, dout, scale=scale, interpret=True)
+    portable = attention_portable.backward(query, key, value, spans, hooks, dout, scale=scale, **tiles)
+    for name, grads in (("triton", triton), ("portable", portable)):
+        np.testing.assert_array_equal(np.asarray(grads.query), 0.0, err_msg=name)
+
+
+def test_a_querys_gradient_with_a_large_refinement_at_a_small_scale_is_finite():
+    """Three equal keys of 2^100 at a scale of 2^-80, one value of 2^54: equal logits, so the cotangents'
+    rounding leaves D's refinement at -2^29 against keys of 2^100, while the correction it makes,
+    -2^29 · 2^-80 · 2^100 times the weights' mass, is 2^49 (`algebra.dq_finish`: each factor's mantissa and
+    exponent apart). dQ is finite in both mainloops, and the two agree to the bit."""
+    query = jnp.zeros((1, 1, 1, 16), jnp.float32)
+    key = jnp.zeros((1, 3, 1, 16), jnp.float32).at[:, :, :, 0].set(2.0 ** 100)
+    value = jnp.zeros((1, 3, 1, 16), jnp.float32).at[:, 2, :, 0].set(2.0 ** 54)
+    dout = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
+    spans = template.spans(1, 3, 1)
+    tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
+    with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
+        triton = attention_triton.backward(query, key, value, spans, None, dout, scale=2.0 ** -80,
+                                           natural=True, interpret=True)
+    portable = attention_portable.backward(query, key, value, spans, None, dout, scale=2.0 ** -80,
+                                           natural=True, **tiles)
+    for name, grads in (("triton", triton), ("portable", portable)):
+        assert np.isfinite(np.asarray(grads.query)).all(), name
+    assert_same_bits(triton.query, portable.query, "a large refinement at a small scale")
+
+
+def test_a_querys_gradient_from_a_state_of_a_small_denominator_at_a_large_scale_is_finite():
+    """One key resumed from a state of denominator 2^-40 at maximum 40, at a scale of 2^100: the key's
+    probability is about 4.7e-6 and dQ about 5.9e24, finite, though the scale over the denominator, 2^140,
+    is not (`algebra.dq_step`: each factor's mantissa and exponent apart). Both mainloops agree to the bit."""
+    query = jnp.zeros((1, 1, 1, 16), jnp.float32)
+    key = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
+    value = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
+    dout = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
+    spans = template.spans(1, 1, 1)
+    state = template.Initial(jnp.full((1, 1, 1), 40.0), jnp.full((1, 1, 1), 2.0 ** -40),
+                             jnp.zeros((1, 1, 1, 16)))
+    hooks = template.Hooks(initial=state)
+    tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
+    with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
+        triton = attention_triton.backward(query, key, value, spans, hooks, dout, scale=2.0 ** 100,
+                                           natural=True, interpret=True)
+    portable = attention_portable.backward(query, key, value, spans, hooks, dout, scale=2.0 ** 100,
+                                           natural=True, **tiles)
+    for name, grads in (("triton", triton), ("portable", portable)):
+        assert np.isfinite(np.asarray(grads.query)).all(), name
+    assert_same_bits(triton.query, portable.query, "a small denominator at a large scale")
+
+
+def test_a_bf16_querys_gradient_over_a_large_key_with_small_cotangents_is_exact():
+    """bf16, one query of zeros over two keys, the first's first entry 2^120: equal logits, so the score
+    cotangents are exactly -2^-4 and 2^-4 at the scale of 1/4, and the query's gradient's first entry is
+    exactly -2^116, in bf16's range. The cotangents' product with the keys keeps bf16's range in both its
+    parts (`algebra.cotangent_product`), in both mainloops, to the bit."""
+    query = jnp.zeros((1, 1, 1, 16), jnp.bfloat16)
+    key = jnp.zeros((1, 2, 1, 16), jnp.bfloat16).at[0, 0, 0, 0].set(2.0 ** 120)
+    value = jnp.zeros((1, 2, 1, 16), jnp.bfloat16).at[0, :, 0, 0].set(jnp.asarray([1.0, 2.0]))
+    dout = jnp.zeros((1, 1, 1, 16), jnp.bfloat16).at[..., 0].set(1.0)
+    spans = template.spans(1, 2, 1)
+    tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
+    with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
+        triton = attention_triton.backward(query, key, value, spans, None, dout, natural=True, interpret=True)
+    portable = attention_portable.backward(query, key, value, spans, None, dout, natural=True, **tiles)
+    for name, grads in (("triton", triton), ("portable", portable)):
+        assert float(grads.query[0, 0, 0, 0]) == -(2.0 ** 116), name
+    assert_same_bits(triton.query, portable.query, "a large bf16 key under small cotangents")
+
+
+def test_a_querys_gradient_from_a_state_near_fp32s_largest_over_a_tiny_weight_at_a_small_scale_is_finite():
+    """One key at logit -83 (a weight near 2^-120) resumed from a state of denominator 2^127 at maximum 0,
+    at a scale of 2^-40: the key's coefficient against its key, weight times scale over the denominator, is
+    near 2^-287, past fp32's range, and its share of dQ is below fp32's least value, so dQ is finite in both
+    mainloops (`algebra.NO_SHIFT` below every composed exponent, so a tile's running mass is never
+    subnormal) and the two agree to the bit."""
+    query = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
+    key = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(-83.0 * 2.0 ** 40)
+    value = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
+    dout = jnp.ones((1, 1, 1, 16), jnp.float32)
+    spans = template.spans(1, 1, 1)
+    state = template.Initial(jnp.zeros((1, 1, 1)), jnp.full((1, 1, 1), 2.0 ** 127), jnp.zeros((1, 1, 1, 16)))
+    hooks = template.Hooks(initial=state)
+    tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
+    with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
+        triton = attention_triton.backward(query, key, value, spans, hooks, dout, scale=2.0 ** -40,
+                                           natural=True, interpret=True)
+    portable = attention_portable.backward(query, key, value, spans, hooks, dout, scale=2.0 ** -40,
+                                           natural=True, **tiles)
+    for name, grads in (("triton", triton), ("portable", portable)):
+        assert np.isfinite(np.asarray(grads.query)).all(), name
+    assert_same_bits(triton.query, portable.query, "a tiny weight beside a state near fp32's largest")
+
+
+def test_power2_is_exact_under_jit_at_every_exponent():
+    """`algebra.power2` scales by powers of two exactly wherever the result is a normal fp32, compiled
+    (where XLA computes `exp2` as an inexact `exp` and fuses a product of them into one `exp`, past fp32's
+    range), at exponents from -380 to 380 against exact float64 scaling, and zero stays zero."""
+    exponents = jnp.arange(-380.0, 381.0, dtype=jnp.float32)
+    mantissas = jnp.asarray([0.0, 0.5, 0.75, 1.0, -0.6], jnp.float32)
+    found = np.asarray(jax.jit(lambda x, k: algebra.power2(x[:, None], k[None, :]))(mantissas, exponents))
+    exact = np.ldexp(np.asarray(mantissas, np.float64)[:, None], np.asarray(exponents, np.int64)[None, :])
+    normal = (np.abs(exact) >= np.finfo(np.float32).tiny) & (np.abs(exact) <= np.finfo(np.float32).max)
+    np.testing.assert_array_equal(found[normal], exact[normal].astype(np.float32))
+    np.testing.assert_array_equal(found[0], 0.0)
+    assert np.all(np.isinf(found[1:][np.abs(exact[1:]) > np.finfo(np.float32).max]))
+

@@ -32,7 +32,7 @@ from jax.sharding import PartitionSpec as P
 
 from dew.nn.attention import FORWARD_MODE, repeat_kv_heads
 from dew.nn.inputs import cu_seqlens
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, l2norm
 from dew.nn.sharding import grouped_heads, manual_map, rows_like
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
@@ -282,9 +282,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     dtype = jnp.result_type(query, key, value) if dtype is None else jnp.dtype(dtype)
     work = at_least_fp32(jnp.result_type(query, key, value))
     if hooks.l2norm:
-        query, key = (x.astype(work) for x in (query, key))
-        query, key = (x * jax.lax.rsqrt(jnp.sum(x * x, axis=-1, keepdims=True) + recurrence.L2NORM_EPS)
-                      for x in (query, key))
+        query, key = (l2norm(x.astype(work)) for x in (query, key))
     scale = (key.shape[-1] ** -0.5 if hooks.l2norm else 1.0) if hooks.scale is None else hooks.scale
     g, beta = recurrence.log_gates(hooks, given, work)
     g = jnp.zeros(value.shape[:3], work) if g is None else g
@@ -367,6 +365,16 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
     its own. The kernels' grids are sized by that bound, a chunk more for
     each document and the row's padding; the memories they keep are not
     (`chunked_launch.Sequences`).
+
+    A known defect (ledger row 1328, its measured ratios and reproduction):
+    fla's arithmetic, which the port is, holds the recurrence less exactly
+    than the portable math, check 1 against the token-by-token reference,
+    under saturated write gates (5.8 to 5.9 times the reference's error from
+    float64, every family), aligned keys under a decay a key dimension
+    (5.4), documents resetting on chunk edges (1.6, every family) and every
+    token at the decay's bound (a row 8e-7 from float64 over its size, a
+    decay a head and a key dimension). Its error grows with the chunk's
+    length, its prefix difference `exp2(gc_s - gc_t)` uncompensated.
 
     The operands go to their common dtype, beta with them, as fla's layer
     holds them. On a mesh the rule runs per shard (`manual_map`): rows where

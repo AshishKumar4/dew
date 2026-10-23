@@ -252,8 +252,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             v_tile = jax.lax.dynamic_slice_in_dim(value[row, :, kv_head], j * block_k, block_k)
             return columns, _seen(spans, row, rows, columns), params, k_tile, v_tile
 
-        before, state_total, state_share = algebra.off_anchor_start(peak0, total0, mean0, maxima,
-                                                                    value.shape[-1], shifts)
+        before, state_total = algebra.off_anchor_start(peak0, total0, maxima, value.shape[-1], shifts)
         if sums is None:
             # D without the forward's split sums: the dQ launch's own pass over the keys.
             def row_terms(j, state):
@@ -268,8 +267,8 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
 
             walked = jax.lax.fori_loop(lo, hi, row_terms, before)
             prior = algebra.power2(walked.total, shifts)
-            anchor, delta, chosen = algebra.off_anchor_delta(walked, anchor_rows, do, state_total,
-                                                             state_share, chosen, shifts)
+            anchor, delta, chosen = algebra.off_anchor_delta(walked, anchor_rows, do, state_total, mean0,
+                                                             chosen, shifts)
         else:
             # The forward took the first pass (`algebra.split_delta`).
             others, own, others_total, prior = (part[row, head, rows] for part in sums)
@@ -293,7 +292,8 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
         nothing = jnp.zeros((block_q,), jnp.float32)
         rows_sums = tuple(nothing for _ in score_kinds)
         zeros = jnp.zeros((block_q, width), jnp.float32)
-        start = algebra.DqSums(zeros, nothing, nothing, rows_sums, rows_sums, zeros)
+        start = algebra.DqSums(zeros, nothing, nothing, rows_sums, rows_sums, zeros, nothing,
+                               jnp.full((block_q,), algebra.NO_SHIFT, jnp.float32))
         found = jax.lax.fori_loop(lo, hi, step, start)
         dq, delta, denominator, mass, grads = algebra.dq_finish(found, prior, state_total, peak0,
                                                                 (total0, mean0), m, anchor, delta)
