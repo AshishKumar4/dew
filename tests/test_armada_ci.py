@@ -4,6 +4,7 @@ import itertools
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -55,25 +56,43 @@ def gpu_driver(root: Path, monkeypatch) -> None:
     monkeypatch.setenv("PATH", f"{tools}:{os.environ['PATH']}")
 
 
+def main_ran(ci, root: Path, monkeypatch, tests: dict[str, float], ranges: dict | None = None) -> None:
+    """The verdict of main's last green run as CI's suite step fetches it (DEW_TEST_TIMES): a 3.12 row a file,
+    holding its tests' times, or with `ranges` a row a group (`row name: range`), each with its tests."""
+    rows: dict[str, dict] = {}
+    for name, bounds in (ranges or {}).items():
+        rows[name] = {"name": name, "exitCode": 0, "tests": {}, "bounds": bounds}
+    for node, seconds in tests.items():
+        file = node.split("::")[0]
+        held = [name for name, found in rows.items() if name.startswith(f"3.12:{file}")
+                and in_range(node, found.get("bounds"))]
+        name = held[0] if held else f"3.12:{file}"
+        rows.setdefault(name, {"name": name, "exitCode": 0, "tests": {}})["tests"][node] = seconds
+    (root / "times.json").write_text(json.dumps({"rows": list(rows.values())}))
+    monkeypatch.setenv("DEW_TEST_TIMES", str(root / "times.json"))  # as CI's suite step exports it
+
+
+def in_range(node: str, bounds: str | None) -> bool:
+    if not bounds:
+        return True
+    low, high = json.loads(bounds)
+    return (low is None or low <= node) and (high is None or node < high)
+
+
 def armada_task(ci, monkeypatch, out: Path, policy: str = "on") -> dict:
     """The 3.12 task the plan makes under DEW_TEST_CACHE=`policy`, run as armada starts it: .armada.json's
     command filled from its plan entry, in .armada.json's environment, which the plan's DEW_TEST_CACHE is
     not part of. Its one row."""
-    command = json.loads((ROOT / ".armada.json").read_text())["task"]["command"]
     monkeypatch.setenv("DEW_TEST_CACHE", policy)
     [entry] = [entry for entry in ci.plan(300.0, {}) if entry["python"] == "3.12"]
-    values = {**entry, "out": out}
-    filled = [re.sub(r"\{(\w+)\}", lambda field: str(values[field[1]]), word) for word in command]
-    monkeypatch.setattr(sys, "argv", ["ci.py", *filled[2:]])
     monkeypatch.delenv("DEW_TEST_CACHE")
-    assert ci.main() == 0
-    [only] = json.loads(out.read_text())["rows"]
+    [only] = filled(ci, monkeypatch, entry, out)
     return only
 
 
 def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(ci, tmp_path, monkeypatch):
     """On 3.12 files are packed near the target by armada's medians, else
-    the recorded durations; a file nothing has timed runs alone; a file
+    their tests' times in main's last green run; a file nothing has timed runs alone; a file
     heavier than the target splits into groups of itself. On a pushed run
     3.14 runs its own files (NEWEST_FILES) the same way and imports every
     other one in a few collect-only tasks; the daily run (DEW_TEST_CACHE off)
@@ -81,10 +100,10 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
     once, test_gen_api never."""
     for name in ("test_heavy", "test_light", "test_new", "test_measured", "test_gen_api", "test_config"):
         (tmp_path / "tests" / f"{name}.py").write_text("")
-    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
-        {"tests/test_heavy.py::test_a": 150.0, "tests/test_heavy.py::test_b": 100.0,
-         "tests/test_light.py::test_c": 30.0, "tests/test_measured.py::test_d": 25.0,
-         "tests/test_config.py::test_e": 20.0}))
+    main_ran(ci, tmp_path, monkeypatch,
+             {"tests/test_heavy.py::test_a": 150.0, "tests/test_heavy.py::test_b": 100.0,
+              "tests/test_light.py::test_c": 30.0, "tests/test_measured.py::test_d": 25.0,
+              "tests/test_config.py::test_e": 20.0})
     monkeypatch.setattr(ci, "NEWEST_FILES", ("tests/test_config.py", "tests/test_light.py"))
     entries = ci.plan(120.0, {"files": {"3.12:tests/test_measured.py": 40.0,
                                         "3.12:tests/test_light.py": 30.0}})
@@ -170,7 +189,7 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
     written(tmp_path, files)
     interpreter(tmp_path, "3.12")
     out = tmp_path / "verdict.json"
-    ci.task("3.12", [f"tests/{name}" for name in files], "", out, 600.0)
+    ci.task("3.12", [f"tests/{name}" for name in files], "", "", out, 600.0)
     rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
     assert {name: row["exitCode"] for name, row in rows.items()} == {
         "3.12:tests/test_pass.py": 0, "3.12:tests/test_fail.py": 1, "3.12:tests/test_missing.py": 1,
@@ -186,7 +205,7 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
     # A process that dies after its report is written leaves every row it ran red, green cases included.
     (tmp_path / "tests/test_dies.py").write_text("import atexit, os\natexit.register(lambda: os._exit(3))\n"
                                                  "def test_ok(): pass\n")
-    ci.task("3.12", ["tests/test_pass.py", "tests/test_dies.py"], "", out, 600.0)
+    ci.task("3.12", ["tests/test_pass.py", "tests/test_dies.py"], "", "", out, 600.0)
     assert {row["name"]: (row["exitCode"], row["kind"]) for row in json.loads(out.read_text())["rows"]} == {
         "3.12:tests/test_pass.py": (1, "whole"), "3.12:tests/test_dies.py": (1, "whole")}
 
@@ -272,7 +291,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     fixtures = ["tests/test_one.py", "tests/test_two.py"]
     ran = [f"tests/{name}" for name in files if name.startswith("test_") and name != "test_new.py"]
     for tests in ([name for name in ran if name not in fixtures], fixtures):
-        ci.task("3.12", tests, "", out, 600.0)
+        ci.task("3.12", tests, "", "", out, 600.0)
         assert {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]} == {
             f"3.12:{name}": 0 for name in tests}
     (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
@@ -295,7 +314,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         "tests/test_spawn.py": ["changed"],
         "tests/test_two.py": ["tests/devices.py:placed"]}
     common = ci.shared("3.12")
-    assert [ci.reused("3.12", f"tests/{name}", "", common) is not None
+    assert [ci.reused("3.12", f"tests/{name}", "", "", common) is not None
             for name in ("test_machine.py", "test_tool.py", "test_spawn.py", "test_forkserver.py",
                          "test_fork.py", "test_shell.py")] == [True, True, False, False, False, False]
     monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--shards=2"])
@@ -344,11 +363,11 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
     (tmp_path / "notes/page.md").write_text("page\n")
     interpreter(tmp_path, "3.12")
     tests = [f"tests/{name}" for name in files if name.startswith("test_")]
-    ci.task("3.12", tests, "", tmp_path / "verdict.json", 600.0)
+    ci.task("3.12", tests, "", "", tmp_path / "verdict.json", 600.0)
 
     def reused() -> list[bool]:
         common = ci.shared("3.12")
-        return [ci.reused("3.12", name, "", common) is not None for name in tests]
+        return [ci.reused("3.12", name, "", "", common) is not None for name in tests]
 
     assert reused() == [True, True, False, False]
     (tmp_path / "notes/page.md").write_text("page again\n")
@@ -533,17 +552,19 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
         "def test_positive():\n"
         "    subprocess.run([sys.executable, '-c', 'from dew.sign import sign; assert sign(2) == 1'],\n"
         "                   check=True, env={**os.environ, 'PYTHONPATH': 'src'})\n")
-    items = ci.coverage_items(300.0, {})
-    assert items and all("--python=3.12 " in item and "--cache=off" in item
-                         and f"--coverage={ci.ARTIFACTS}" in item for item in items)
-    assert sorted(name for item in items for name in re.search(r"--tests='([^']*)'", item)[1].split()) == [
+    items = [shlex.split(item.split(" && ", 1)[1]) for item in ci.coverage_items(300.0, {})]
+    assert items and all({"--python=3.12", "--cache=off", f"--coverage={ci.ARTIFACTS}"} <= set(words)
+                         for words in items)
+    tests = [word.removeprefix("--tests=") for words in items for word in words
+             if word.startswith("--tests=")]
+    assert sorted(name for names in tests for name in names.split()) == [
         "tests/test_negative.py", "tests/test_positive.py"]
     interpreter(tmp_path, "3.12")
     # armada keeps each task's artifacts under its index; a directory of another name is no task.
     for index, name in enumerate(("negative", "positive")):
         (tmp_path / "runs" / str(index)).mkdir(parents=True)
-        ci.task("3.12", [f"tests/test_{name}.py"], "", tmp_path / "runs" / str(index) / "rows.json", 600.0,
-                cache=False, coverage=tmp_path / "runs" / str(index))
+        ci.task("3.12", [f"tests/test_{name}.py"], "", "", tmp_path / "runs" / str(index) / "rows.json",
+                600.0, cache=False, coverage=tmp_path / "runs" / str(index))
     (tmp_path / "runs/logs").mkdir()
     assert ci.coverage_report(tmp_path / "runs") == 0
     files = {Path(name).name: measured for name, measured in
@@ -554,8 +575,8 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
     # A task interrupted at its deadline leaves its later tests' coverage out: the pass is refused.
     (tmp_path / "tests/test_slow.py").write_text("import time\ndef test_slow(): time.sleep(30)\n")
     (tmp_path / "runs/2").mkdir()
-    ci.task("3.12", ["tests/test_slow.py"], "", tmp_path / "runs/2/rows.json", 1.0, cache=False, grace=5.0,
-            coverage=tmp_path / "runs/2")
+    ci.task("3.12", ["tests/test_slow.py"], "", "", tmp_path / "runs/2/rows.json", 1.0, cache=False,
+            grace=5.0, coverage=tmp_path / "runs/2")
     assert ci.coverage_report(tmp_path / "runs") == 1
     [interrupted] = json.loads((tmp_path / "runs/2/rows.json").read_text())["rows"]
     assert (interrupted["kind"], interrupted["failed"]) == ("deadline", [])
@@ -569,16 +590,15 @@ def test_a_coverage_task_has_a_deadline_for_tracing(ci, tmp_path):
     assert items and all(f"--deadline={ci.COVERAGE_DEADLINE:.0f}" in item for item in items)
 
 
-def test_a_file_whose_recorded_tests_outweigh_its_median_runs_split_by_them(ci, tmp_path):
-    """Train 18's census: main's runs timed the file at 6 s with one test; a head recorded the 1,576
-    tests it added (here 40 of 30 s). Each record is a test's least time, so their sum past the median
-    may mean those runs predate the file's tests, and is a floor on its time: it runs split by its
-    records, alone, not packed with the light files by the median it had before."""
+def test_a_file_whose_tests_outweigh_its_median_runs_split_by_them(ci, tmp_path, monkeypatch):
+    """Train 18's census: armada's median timed the file at 6 s, from runs before its 1,576 tests; main's
+    last green run took them (here 40 of 30 s). Their sum past the median is a floor on its time: it runs
+    split by them, alone, not packed with the light files by the median it had before."""
     for name in ("test_census", "test_light", "test_other"):
         (tmp_path / "tests" / f"{name}.py").write_text("")
-    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
-        {**{f"tests/test_census.py::test_cell[{n}]": 30.0 for n in range(40)},
-         "tests/test_light.py::test_a": 20.0, "tests/test_other.py::test_b": 20.0}))
+    main_ran(ci, tmp_path, monkeypatch,
+             {**{f"tests/test_census.py::test_cell[{n}]": 30.0 for n in range(40)},
+              "tests/test_light.py::test_a": 20.0, "tests/test_other.py::test_b": 20.0})
     timings = {"files": {"3.12:tests/test_census.py": 6.0, "3.12:tests/test_light.py": 20.0,
                          "3.12:tests/test_other.py": 20.0},
                "rows": {"3.12:tests/test_census.py": 6.0}}
@@ -616,55 +636,114 @@ def test_a_split_file_pays_its_setup_once_a_group_and_is_not_cut_finer_for_it(ci
     assert ci.measured_cut(timings, "3.12", "tests/test_unseen.py") is None
 
 
-def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
-    """Each task of a split file runs its own group (split.py) of the same
-    cut, so the groups together run every test, none twice, a test the
-    durations lack included. Each group times the file at what it spent,
-    which armada sums over the groups."""
-    (tmp_path / "tests/test_split.py").write_text(
-        "import pytest\n@pytest.mark.parametrize('n', range(6))\ndef test_n(n): pass\n"
-        "def test_unrecorded(): pass\n")
-    Path("tests/test_durations.json").write_text(json.dumps(
-        {f"tests/test_split.py::test_n[{n}]": seconds for n, seconds in enumerate([5, 1, 1, 1, 5, 1])}))
-    interpreter(tmp_path, "3.12")
+def filled(ci, monkeypatch, entry: dict, out: Path) -> list[dict]:
+    """Plan `entry` run as armada starts its task: .armada.json's command filled from it. Its rows."""
+    command = json.loads((ROOT / ".armada.json").read_text())["task"]["command"]
+    values = {**entry, "out": out}
+    words = [re.sub(r"\{(\w+)\}", lambda field: str(values[field[1]]), word) for word in command]
+    monkeypatch.setattr(sys, "argv", ["ci.py", *words[2:]])
+    assert ci.main() == 0
+    return json.loads(out.read_text())["rows"]
+
+
+SPLIT = ("import pytest\n@pytest.mark.parametrize('n', [2, 10, \"it's\", 'a b'])\n"
+         "def test_n(n): open('runs.log', 'a').write(f'{n}\\n')\n")
+"""A file whose ids sort as strings, not numbers ([10] before [2]), one holding a quote and one a space.
+Each test it runs writes its id to runs.log."""
+
+
+def logged_test(name: str) -> str:
+    """One more test for SPLIT's file, which writes its name to runs.log as it runs."""
+    return f"def {name}(): open('runs.log', 'a').write('{name}\\n')\n"
+
+
+def logged(root: Path) -> list[str]:
+    """What runs.log saw run, a test a line."""
+    return (root / "runs.log").read_text().splitlines() if (root / "runs.log").exists() else []
+
+
+def split_entries(ci, target: float, timings: dict | None = None) -> list[dict]:
+    return [entry for entry in ci.plan(target, timings or {}) if entry["python"] == "3.12" and entry["split"]]
+
+
+def ran_by(ci, tmp_path, monkeypatch, entries: list[dict], reused: bool = False) -> list[list[str]]:
+    """What each entry's task covered, as its rows say: runs.log saw each run, or, `reused`, nothing run."""
     ran = []
-    for group in ("1/3", "2/3", "3/3"):
-        out = tmp_path / f"verdict-{group.replace('/', '-')}.json"
-        ci.task("3.12", ["tests/test_split.py"], group, out, 120.0)
-        [verdict] = json.loads(out.read_text())["rows"]
+    for index, entry in enumerate(entries):
+        (tmp_path / "runs.log").unlink(missing_ok=True)
+        [verdict] = filled(ci, monkeypatch, entry, tmp_path / f"verdict-{index}.json")
         assert verdict["exitCode"] == 0, verdict["output"]
-        assert verdict["timings"] == {"3.12:tests/test_split.py": verdict["seconds"]}
+        assert len(logged(tmp_path)) == (0 if reused else len(verdict["tests"]))
         ran.append(sorted(verdict["tests"]))
-    assert all(ran)
-    every = sorted(node for nodes in ran for node in nodes)
-    assert every == sorted([f"tests/test_split.py::test_n[{n}]" for n in range(6)]
-                           + ["tests/test_split.py::test_unrecorded"])
+    return ran
 
 
-def test_durations_are_each_tests_least_time_over_green_runs_floors(ci):
-    """`durations` records each test of the newest verdict at its least time
-    over green verdicts' floor rows, so a slow container or run moves nothing
-    and a test since removed is dropped, and refuses a red run or rows that
-    carry no times."""
-    def verdict(x, y):
-        return {"rows": [
-            {"name": "3.12:tests/test_a.py#1/2", "exitCode": 0, "tests": {"tests/test_a.py::test_x": x}},
-            {"name": "3.12:tests/test_a.py#2/2", "exitCode": 0, "tests": {"tests/test_a.py::test_y": y}},
-            {"name": "3.14:tests/test_a.py", "exitCode": 0, "tests": {"tests/test_a.py::test_x": 90.0}}]}
+def test_a_split_files_groups_run_every_test_once(ci, tmp_path, monkeypatch):
+    """Each group of a split file runs the range of node ids the plan cut from main's last green run
+    (`ranges`), its task started from .armada.json's command, so the groups together run every test once:
+    one added since that run (test_new), ids that sort as strings, and one holding a quote and a space,
+    included. Without that run's times, each group is cut by count, and every test still runs once."""
+    (tmp_path / "tests/test_split.py").write_text(SPLIT + logged_test("test_new"))
+    interpreter(tmp_path, "3.12")
+    every = sorted(["tests/test_split.py::test_n[2]", "tests/test_split.py::test_n[10]",
+                    "tests/test_split.py::test_n[it's]", "tests/test_split.py::test_n[a b]",
+                    "tests/test_split.py::test_new"])
+    recorded = [node for node in every if not node.endswith("test_new")]
+    main_ran(ci, tmp_path, monkeypatch, dict.fromkeys(recorded, 2.0))
+    ranged = split_entries(ci, 4.0)
+    assert len(ranged) >= 2 and all(entry["bounds"] for entry in ranged)
+    assert sorted(node for nodes in ran_by(ci, tmp_path, monkeypatch, ranged) for node in nodes) == every
+    # A plan with no verdict of main's (one run in a container) knows the file by armada's median alone.
+    monkeypatch.delenv("DEW_TEST_TIMES")
+    counted = split_entries(ci, 4.0, {"files": {"3.12:tests/test_split.py": 10.0}})
+    assert len(counted) >= 2 and not any(entry["bounds"] for entry in counted)
+    assert sorted(node for nodes in ran_by(ci, tmp_path, monkeypatch, counted) for node in nodes) == every
 
-    assert ci.durations([verdict(1.2346, 2.0)]) == {
-        "tests/test_a.py::test_x": 1.235, "tests/test_a.py::test_y": 2.0}
-    assert ci.durations([verdict(1.5, 2.0), verdict(30.0, 60.0), verdict(1.0, 2.5)]) == {
-        "tests/test_a.py::test_x": 1.0, "tests/test_a.py::test_y": 2.0}
-    removed = {"rows": [{"name": "3.12:tests/test_a.py", "exitCode": 0,
-                         "tests": {"tests/test_a.py::test_x": 0.5, "tests/test_a.py::test_gone": 3.0}}]}
-    assert ci.durations([verdict(1.0, 2.0), removed]) == {
-        "tests/test_a.py::test_x": 0.5, "tests/test_a.py::test_y": 2.0}
-    red = {"name": "3.12:tests/test_b.py", "exitCode": 1, "tests": {}}
-    with pytest.raises(SystemExit):
-        ci.durations([verdict(1.0, 2.0), {"rows": [*verdict(1.0, 2.0)["rows"], red]}])
-    with pytest.raises(SystemExit):
-        ci.durations([{"rows": [{"name": "3.12:tests/test_b.py", "exitCode": 0}]}])
+
+def test_a_plan_keeps_the_ranges_main_cut_a_file_into_while_it_keeps_the_cut(ci, tmp_path, monkeypatch):
+    """A file cut as main's last green run cut it keeps that run's ranges, whatever its tests' times are
+    now, so its groups' rows and programs keep their keys; cut into another count, it is cut afresh."""
+    (tmp_path / "tests/test_split.py").write_text(SPLIT)
+    nodes = sorted(f"tests/test_split.py::test_n[{n}]" for n in ("2", "10", "it's", "a b"))
+    kept = {"3.12:tests/test_split.py#1/2": json.dumps([None, nodes[3]]),
+            "3.12:tests/test_split.py#2/2": json.dumps([nodes[3], None])}
+    main_ran(ci, tmp_path, monkeypatch, dict.fromkeys(nodes, 2.0), kept)
+    assert [entry["bounds"] for entry in split_entries(ci, 4.0)] == list(kept.values())
+    fresh = [entry["bounds"] for entry in split_entries(ci, 2.0)]
+    assert len(fresh) == 4 and fresh[0] == json.dumps([None, nodes[1]])
+
+
+def test_a_split_rows_record_is_reused_only_for_the_tests_its_range_ran(ci, tmp_path, monkeypatch,
+                                                                          cache_worker):
+    """A green group's row is reused, through .armada.json's command, only where the plan gives its task
+    the range it ran: moved by main's times (the same G/N), the group runs its new range; kept, the row is
+    reused; a test added to the file, its range kept, changes its inputs and runs again."""
+    url, _, _ = cache_worker
+    cached(monkeypatch, url)
+    (tmp_path / "tests/test_split.py").write_text(SPLIT)
+    interpreter(tmp_path, "3.12")
+    nodes = sorted(f"tests/test_split.py::test_n[{n}]" for n in ("2", "10", "it's", "a b"))
+
+    def run(times: dict[str, float], ranges: dict | None = None,
+            reused: bool = False) -> tuple[list[str], list[list[str]]]:
+        main_ran(ci, tmp_path, monkeypatch, times, ranges)
+        entries = split_entries(ci, 4.0)
+        return [entry["bounds"] for entry in entries], ran_by(ci, tmp_path, monkeypatch, entries, reused)
+
+    first, ran = run(dict.fromkeys(nodes, 2.0))
+    assert sorted(node for group in ran for node in group) == nodes
+    # The same total, so the same G/N, with times that would cut the file elsewhere.
+    lopsided = {nodes[0]: 5.0, **dict.fromkeys(nodes[1:], 1.0)}
+    rows = {f"3.12:tests/test_split.py#{index}/2": bounds for index, bounds in enumerate(first, start=1)}
+    kept, ran = run(lopsided, rows, reused=True)
+    assert kept == first and sorted(node for group in ran for node in group) == nodes, "kept: the rows reused"
+    moved, ran = run(lopsided)
+    assert moved != first and logged(tmp_path), "moved ranges at the same G/N run again"
+    assert sorted(node for group in ran for node in group) == nodes
+    (tmp_path / "tests/test_split.py").write_text(SPLIT + logged_test("test_added"))
+    rows = {f"3.12:tests/test_split.py#{index}/2": bounds for index, bounds in enumerate(moved, start=1)}
+    again, ran = run(dict.fromkeys(nodes, 2.0), rows)
+    assert again == moved and "tests/test_split.py::test_added" in {node for group in ran for node in group}
 
 
 def test_a_tasks_wall_time_is_apportioned_by_its_files_tests_times(ci):
@@ -691,7 +770,7 @@ def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
     interpreter(tmp_path, "3.12")
     out = tmp_path / "verdict.json"
     began = time.monotonic()
-    ci.task("3.12", ["tests/test_short.py", "tests/test_long.py"], "", out, 60.0)
+    ci.task("3.12", ["tests/test_short.py", "tests/test_long.py"], "", "", out, 60.0)
     wall = time.monotonic() - began
     rows = {row["name"]: row["seconds"] for row in json.loads(out.read_text())["rows"]}
     short, long = rows["3.12:tests/test_short.py"], rows["3.12:tests/test_long.py"]
@@ -830,7 +909,7 @@ def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(c
     interpreter(tmp_path, "3.12")
     out = tmp_path / "verdict.json"
     began = time.monotonic()
-    ci.task("3.12", ["tests/test_quick.py", "tests/test_hangs.py"], "", out, 3.0, grace=2.0)
+    ci.task("3.12", ["tests/test_quick.py", "tests/test_hangs.py"], "", "", out, 3.0, grace=2.0)
     # The deadline, the interrupt's grace, one settle budget and the reader's join, with room to spare.
     assert time.monotonic() - began < 3.0 + 2.0 + ci.SETTLE + 10 + 15
     rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
