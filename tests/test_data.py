@@ -99,7 +99,6 @@ def _bounded(iterator, limit):
     return taken, next(iterator, None) is None
 
 
-@pytest.mark.parametrize("workers", [0, 2])
 def test_rows_are_taken_from_arrays_and_from_per_row_records_kept_in_their_own_type():
     """`take_rows` takes a list's or a tuple's records in its own type and an array's leading axis;
     `take_batch` maps it over a batch, a list of opaque records taken as one column."""
@@ -112,6 +111,7 @@ def test_rows_are_taken_from_arrays_and_from_per_row_records_kept_in_their_own_t
     assert taken["records"] == [{"id": 2}, {"id": 0}]
 
 
+@pytest.mark.parametrize("workers", [0, 2])
 def test_a_validation_pass_reads_every_held_out_record_once(workers):
     """A pass is the split, once, in record order, and then it ends.
 

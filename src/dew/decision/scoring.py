@@ -163,8 +163,8 @@ class Combined(ScoringRule):
 
 
 def default_metrics() -> list:
-    """A decision model's default held-out suite, fresh: accuracy, calibration error, the
-    risk-coverage area and the log loss, in that order."""
+    """The held-out suite a decision run scores by default, fresh: accuracy, calibration error,
+    the risk-coverage area and the log loss, in that order."""
     from dew.decision.metrics import AURC, ECE, Accuracy
 
     return [Accuracy(), ECE(), AURC(), LogLoss()]

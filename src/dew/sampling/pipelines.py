@@ -801,7 +801,8 @@ def _image_start(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[s
 @functools.cache
 def _encode(rows: jax.sharding.NamedSharding | None):
     def encode(encoders, params, tokens):
-        return encode_conditions(encoders, params["encoders"], tokens)
+        # A task without conditions holds no encoder weights.
+        return encode_conditions(encoders, params["encoders"] if encoders else {}, tokens)
     return jax.jit(encode, static_argnums=(0,), in_shardings=(None, rows), out_shardings=rows)
 
 

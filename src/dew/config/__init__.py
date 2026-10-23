@@ -34,6 +34,7 @@ import shlex
 import sys
 import types
 import typing
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from enum import Enum
 from pathlib import Path
@@ -126,7 +127,7 @@ ModelWrapper = InputQuantization | AdapterRecord | Quantization
 
 
 @dataclasses.dataclass(frozen=True)
-class _Configured:
+class _Configured(ABC):
     """A registered class, named by an alias or an import path and held as the path, and the arguments a
     run gives it: `fields`, the ones the run states, and `defaults`, every other one the class
     defaults as it defaulted them when the run was first recorded, so the record builds the same
@@ -140,8 +141,11 @@ class _Configured:
     one a record lacks, as an argument the class has since gained, takes the class's default now."""
 
     _recorded: ClassVar[bool] = True
-    _member: ClassVar[Callable[[str], type]]
-    """The class `name` names, from the kind's registry."""
+
+    @staticmethod
+    @abstractmethod
+    def _member(name: str) -> type:
+        """The class `name` names, from the kind's registry."""
 
     def __post_init__(self) -> None:
         member = self._member(self.name)
