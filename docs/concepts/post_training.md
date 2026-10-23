@@ -591,7 +591,7 @@ class SquareSession:
             value = {CALL_THREE: 3, CALL_FOUR: 4}[command]
             self.expected = value * value
             result = {9: NINE, 16: SIXTEEN}[self.expected]
-            return Observation((*action.context, *action.tokens, result))
+            return Observation((*action.prompt, *action.tokens, result))
         answer = {ANSWER_NINE: 9, ANSWER_SIXTEEN: 16, WRONG: 8}[command]
         result = json.dumps({"answer": answer, "expected": self.expected})
         return Observation((), EpisodeStatus.COMPLETED, result)
