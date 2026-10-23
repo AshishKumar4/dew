@@ -1139,6 +1139,54 @@ def exponent_product(mantissa: jax.Array, exponent: jax.Array) -> jax.Array:
     return jnp.where(mantissa == 0, 0.0, power2(mantissa, exponent))
 
 
+class DqProducts(NamedTuple):
+    """A dQ tile's products with its keys as a mainloop issues them (`dq_terms`): dQ's parts
+    (`cotangent_parts`) and, in the accurate form, the parts of the weights' product with the keys
+    (`weights_parts`, `DqSums.keyed`), None in the fast form."""
+
+    parts: tuple[tuple[jax.Array, jax.Array | None], ...]
+    keyed: tuple[tuple[jax.Array, jax.Array | None], ...] | None
+
+
+def _dq_rows(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array, *,
+             kinds: tuple, summed: tuple) -> tuple[DqSums, jax.Array]:
+    """A dQ tile's row sums (`dq_step`): the HEAD and QUERY parameters' pullbacks of the cotangents and of
+    the weights, the cotangents' and the weights' sums; and the weights pulled through the score hook."""
+    _, pieces = pulled(cotangents, slopes, seen, kinds)
+    grads = tuple(grad + piece if row else grad for grad, row, piece in zip(sums.grads, summed, pieces,
+                                                                           strict=True))
+    pulled_weights, pieces = pulled(weights, slopes, seen, kinds)
+    weighed = sums.weighed
+    if any(summed):
+        weighed = tuple(total + piece if row else total
+                        for total, row, piece in zip(sums.weighed, summed, pieces, strict=True))
+    residual, mass = sums.residual + cotangents.sum(axis=-1), sums.mass + weights.sum(axis=-1)
+    return sums._replace(residual=residual, mass=mass, grads=grads, weighed=weighed), pulled_weights
+
+
+def dq_terms(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array,
+             prior: jax.Array, *, scale: float, kinds: tuple, summed: tuple, dtype,
+             accurate: bool) -> tuple[DqSums, DqProducts]:
+    """`dq_step` where its products add to dQ and the keyed sums unscaled (the fast form, or the accurate one
+    without a score hook): its row sums and keyed sums' mass and exponent after the tile, and the products
+    a mainloop adds (`DqProducts`), into its accumulators in place where it can, of keys of `dtype`."""
+    terms, _ = _dq_rows(sums, weights, cotangents, slopes, seen, kinds=kinds, summed=summed)
+    parts = cotangent_parts(pulled(cotangents, slopes, seen, kinds)[0] * scale, dtype, accurate=accurate)
+    if not accurate:
+        return terms, DqProducts(parts, None)
+    if slopes is not None:
+        raise ValueError("a score hook's keyed sums rescale each tile (`dq_step`), which no product adds")
+    # Without a score hook each coefficient is the scale times a weight over the prior denominator, which
+    # holds every weight at its maximum: the weights over it sum to at most one, so their product with the
+    # keys is a mean of them, finite wherever they are, and the scale is the mass's, its mantissa and
+    # exponent apart (`dq_finish`). One product, no exponent a row.
+    scale_mantissa, scale_exponent = _static_split(scale)
+    keyed = weights_parts(weights * expand(inverse(prior), weights), dtype)
+    return (terms._replace(keyed_mass=jnp.full_like(sums.keyed_mass, scale_mantissa),
+                           keyed_shift=jnp.full_like(sums.keyed_shift, scale_exponent)),
+            DqProducts(parts, keyed))
+
+
 def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array, key: jax.Array,
             prior: jax.Array, *, scale: float, kinds: tuple, summed: tuple,
             dot: Callable[[jax.Array, jax.Array], jax.Array], accurate: bool) -> DqSums:
@@ -1152,28 +1200,15 @@ def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, see
     parameter's gradient sums its cotangents over every key and query, a position's or a scale's times
     each, so the first pass's D error enters it multiplied (ALiBi's slope 2.3 to 6.7 times the reference's
     error at its first D), where dQ's per query is FlashAttention's."""
-    pulled_cotangents, pieces = pulled(cotangents, slopes, seen, kinds)
-    dq = sums.dq + cotangent_product(pulled_cotangents * scale, key, dot, accurate=accurate)
-    grads = tuple(grad + piece if row else grad for grad, row, piece in zip(sums.grads, summed, pieces,
-                                                                           strict=True))
-    pulled_weights, pieces = pulled(weights, slopes, seen, kinds)
-    weighed = sums.weighed
-    if any(summed):
-        weighed = tuple(total + piece if row else total
-                        for total, row, piece in zip(sums.weighed, summed, pieces, strict=True))
-    residual, mass = sums.residual + cotangents.sum(axis=-1), sums.mass + weights.sum(axis=-1)
-    if not accurate:
-        return sums._replace(dq=dq, residual=residual, mass=mass, grads=grads, weighed=weighed)
-    if slopes is None:
-        # Without a score hook each coefficient is the scale times a weight over the prior denominator,
-        # which holds every weight at its maximum: the weights over it sum to at most one, so their product
-        # with the keys is a mean of them, finite wherever they are, and the scale is the mass's, its
-        # mantissa and exponent apart (`dq_finish`). One product, no exponent a row.
-        scale_mantissa, scale_exponent = _static_split(scale)
-        keyed = sums.keyed + weights_product(weights * expand(inverse(prior), weights), key, dot)
-        mantissa = jnp.full_like(sums.keyed_mass, scale_mantissa)
-        return DqSums(dq, residual, mass, grads, weighed, keyed, mantissa,
-                      jnp.full_like(sums.keyed_shift, scale_exponent))
+    if not accurate or slopes is None:
+        terms, products = dq_terms(sums, weights, cotangents, slopes, seen, prior, scale=scale, kinds=kinds,
+                                   summed=summed, dtype=key.dtype, accurate=accurate)
+        keyed = (sums.keyed if products.keyed is None
+                 else sums.keyed + summed_products(products.keyed, key, dot))
+        return terms._replace(dq=sums.dq + summed_products(products.parts, key, dot), keyed=keyed)
+    terms, pulled_weights = _dq_rows(sums, weights, cotangents, slopes, seen, kinds=kinds, summed=summed)
+    dq = sums.dq + cotangent_product(pulled(cotangents, slopes, seen, kinds)[0] * scale, key, dot,
+                                     accurate=accurate)
     # The tile's coefficients against the keys, `pulled weight · scale / prior`, joined into the running
     # mean as a softmax's sums are joined under a running maximum. Each is held at its row's power of two,
     # never formed whole where it would overflow (a hook's slope near fp32's largest): the row's largest
@@ -1193,7 +1228,7 @@ def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, see
     over = inverse(keyed_mass)
     keyed = (expand(before * over, sums.keyed) * sums.keyed
              + weights_product(coefficients * expand(over, coefficients), key, dot))
-    return DqSums(dq, residual, mass, grads, weighed, keyed, keyed_mass, keyed_shift)
+    return terms._replace(dq=dq, keyed=keyed, keyed_mass=keyed_mass, keyed_shift=keyed_shift)
 
 
 def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax.Array,
@@ -1301,50 +1336,74 @@ def _fp16_scaled(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     return scaled.astype(jnp.float16), exponent
 
 
-def cotangent_product(cotangents: jax.Array, operand: jax.Array,
-                      dot: Callable[[jax.Array, jax.Array], jax.Array], *, accurate: bool) -> jax.Array:
-    """A tile's score cotangents `[bq, bk]` (fp32, scaled) times the call's queries or keys `operand` by the
-    mainloop's `dot` (dQ's `dS K`, `dot(a, b) = a @ b`; dK's `dSᵀ Q`, its transposed product
-    `dot(a, b) = aᵀ @ b`, which a mainloop issues from where the tile lies), fp32. An fp32 operand takes the
-    fp32 product. The fast form (`accurate` False) narrows bf16's cotangents to bf16 for one product,
+def cotangent_parts(cotangents: jax.Array, dtype, *, accurate: bool
+                    ) -> tuple[tuple[jax.Array, jax.Array | None], ...]:
+    """The parts a tile's score cotangents `[bq, bk]` (fp32, scaled) take to their product with an operand of
+    `dtype` (`cotangent_product`), each narrowed to it, with the power of two its product takes back (None:
+    none), so a mainloop may issue their products into one accumulator. An fp32 operand's part is the
+    cotangents themselves. The fast form (`accurate` False) narrows bf16's cotangents to bf16 for one product,
     FlashAttention's. fp16's take the accurate form's two products in both forms: one fp16 product of
-    cotangents that cancel against equal keys near fp16's largest leaves a gradient past it once it returns
-    in fp16 (three keys of 65504, values -65504, 16384 and 65504: 131008 where the exact one is 0 and the
-    reference's finite), the stability rule's breach. The accurate form takes them to fp32's accuracy, as
-    the reference differentiates (its
-    score cotangents are fp32), so a key's or a query's gradient whose cotangents cancel across the other
-    axis loses no more than the reference's fp32 product does, where one 16-bit product loses every bit the
-    cancellation exposes (bf16 small weights on large values: dK's worst row 3700x the reference's). A bf16
-    operand takes three bf16 products, the cotangents split exactly into three bf16 parts (each what the
-    parts before it lost, rounded), 24 bits in all, with no scaling: bf16 holds fp32's range, so no part
-    leaves it (measured on the H100: 28% over one product, where a scaled bf16-and-fp16 pair cost 3x). An
-    fp16 one takes two fp16 products at power-of-two scales that keep each part in its range: the
-    cotangents' largest at 2^14, and what their rounding lost likewise, 21 bits."""
-    if operand.dtype == jnp.float32:
-        return dot((cotangents), operand)
-    if operand.dtype == jnp.bfloat16 and not accurate:
-        return dot((cotangents.astype(jnp.bfloat16)), operand)
-    if operand.dtype == jnp.bfloat16:
+    cotangents that cancel against equal keys near fp16's largest leaves a gradient past it once it returns in
+    fp16 (three keys of 65504, values -65504, 16384 and 65504: 131008 where the exact one is 0 and the
+    reference's finite), the stability rule's breach. The accurate form takes them to fp32's accuracy, as the
+    reference differentiates (its score cotangents are fp32), so a key's or a query's gradient whose
+    cotangents cancel across the other axis loses no more than the reference's fp32 product does, where one
+    16-bit product loses every bit the cancellation exposes (bf16 small weights on large values: dK's worst
+    row 3700x the reference's). A bf16 operand takes three bf16 products, the cotangents split exactly into
+    three bf16 parts (each what the parts before it lost, rounded), 24 bits in all, with no scaling: bf16
+    holds fp32's range, so no part leaves it (measured on the H100: 28% over one product, where a scaled
+    bf16-and-fp16 pair cost 3x). An fp16 one takes two fp16 products at power-of-two scales that keep each
+    part in its range: the cotangents' largest at 2^14, and what their rounding lost likewise, 21 bits."""
+    if dtype == jnp.float32:
+        return ((cotangents, None),)
+    if dtype == jnp.bfloat16 and not accurate:
+        return ((cotangents.astype(jnp.bfloat16), None),)
+    if dtype == jnp.bfloat16:
         high = cotangents.astype(jnp.bfloat16)
         rest = cotangents - high.astype(jnp.float32)
         middle = rest.astype(jnp.bfloat16)
         low = (rest - middle.astype(jnp.float32)).astype(jnp.bfloat16)
-        return (dot((high), operand) + dot((middle), operand)) + dot((low), operand)
+        return (high, None), (middle, None), (low, None)
     scaled, high_exponent = _scaled(cotangents)
-    high = scaled.astype(operand.dtype)
+    high = scaled.astype(dtype)
     low, low_exponent = _fp16_scaled(scaled - high.astype(jnp.float32))
-    return (power2(dot((high), operand), high_exponent)
-            + power2(dot((low), operand), low_exponent + high_exponent))
+    return (high, high_exponent), (low, low_exponent + high_exponent)
+
+
+def cotangent_product(cotangents: jax.Array, operand: jax.Array,
+                      dot: Callable[[jax.Array, jax.Array], jax.Array], *, accurate: bool) -> jax.Array:
+    """A tile's score cotangents `[bq, bk]` (fp32, scaled) times the call's queries or keys `operand` by the
+    mainloop's `dot` (dQ's `dS K`, `dot(a, b) = a @ b`; dK's `dSᵀ Q`, its transposed product
+    `dot(a, b) = aᵀ @ b`, which a mainloop issues from where the tile lies), fp32: its parts' products
+    (`cotangent_parts`), each taken back by its power of two, summed in order."""
+    return summed_products(cotangent_parts(cotangents, operand.dtype, accurate=accurate), operand, dot)
+
+
+def summed_products(parts: tuple[tuple[jax.Array, jax.Array | None], ...], operand: jax.Array,
+                    dot: Callable[[jax.Array, jax.Array], jax.Array]) -> jax.Array:
+    """The sum of `parts`' products with `operand` by `dot` (`cotangent_parts`, `weights_parts`), each taken
+    back by its power of two, in order."""
+    total = None
+    for part, exponent in parts:
+        product = dot(part, operand)
+        product = product if exponent is None else power2(product, exponent)
+        total = product if total is None else total + product
+    return total
+
+
+def weights_parts(weights: jax.Array, dtype) -> tuple[tuple[jax.Array, jax.Array | None], ...]:
+    """Weights `[bq, bk]` (fp32) narrowed for their product with an operand of `dtype` (`weights_product`):
+    fp16's at a power-of-two scale that keeps them in its range (`_fp16_scaled`), which its product takes
+    back."""
+    if dtype == jnp.float16:
+        return (_fp16_scaled(weights),)
+    return ((weights.astype(dtype), None),)
 
 
 def weights_product(weights: jax.Array, operand: jax.Array,
                     dot: Callable[[jax.Array, jax.Array], jax.Array]) -> jax.Array:
-    """Weights `[bq, bk]` (fp32) times the queries or keys `operand` in its dtype, fp32: an fp16 operand's
-    at a power-of-two scale that keeps the weights in its range (`_fp16_scaled`), taken back after."""
-    if operand.dtype == jnp.float16:
-        narrow, exponent = _fp16_scaled(weights)
-        return power2(dot(narrow, operand), exponent)
-    return dot(weights.astype(operand.dtype), operand)
+    """Weights `[bq, bk]` (fp32) times the queries or keys `operand` in its dtype, fp32 (`weights_parts`)."""
+    return summed_products(weights_parts(weights, operand.dtype), operand, dot)
 
 
 def value_operands(exponentials: jax.Array, weights: jax.Array, dout: jax.Array,
