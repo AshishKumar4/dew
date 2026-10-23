@@ -40,14 +40,15 @@ def test_a_float32_product_sums_in_float64_and_rounds_once(name):
 
 
 def test_a_layers_gradient_and_tangent_sum_in_float64():
-    """A Dense layer's kernel gradient sums the inputs' products over the batch in float64, and its
-    output tangent sums the input tangent's: both 1 exactly over the cancelling terms."""
-    layer = Dense(1, use_bias=False)
+    """A Dense layer forming its product as Dew's layers do (`float32_dot_general`): its kernel
+    gradient sums the inputs' products over the batch in float64, and its output tangent sums the
+    input tangent's, both 1 exactly over the cancelling terms."""
+    layer = Dense(1, use_bias=False, dot_general=float32_dot_general)
     x = CANCELLING[:, None]
     params = {"params": {"kernel": np.ones((1, 1), np.float32)}}
     _, gradient = with_gradients(lambda params: layer.apply(params, x))(params, np.ones((3, 1), np.float32))
     assert np.asarray(gradient["params"]["kernel"]).tolist() == [[1.0]]
-    rows = Dense(1, use_bias=False)
+    rows = Dense(1, use_bias=False, dot_general=float32_dot_general)
     weights = {"params": {"kernel": np.ones((3, 1), np.float32)}}
     _, tangent = jax.jvp(lambda x: rows.apply(weights, x), (np.zeros((1, 3), np.float32),),
                          (CANCELLING[None],))
