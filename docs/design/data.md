@@ -242,13 +242,13 @@ Each stage runs for its committed valid target tokens, the same clock as `fit(to
 
 ### Offline preparation, published once
 
-This sketch includes the language, deduplication and decontamination stages tracked in the [roadmap](../roadmap.md#data).
+The language, quality, classifier and decontamination steps run DataTrove's filters, with the `curation` extra: `text.Language`, `text.Quality` (Gopher's, C4's or FineWeb's rules), `text.Classifier` (a fastText model) and `text.Decontaminated` (n-grams shared with evaluation texts). Each drops a record with the reason its filter names, and each is keyed in the plan by its rules and its model. The sketch's deduplication stage is tracked in the [roadmap](../roadmap.md#data).
 
 ```python
 (Files("s3://raw/dclm/**/*.jsonl")
-   .filter(text.language("en", min_score=0.65))
+   .filter_map(text.Language(("en",), min_score=0.65), text.Quality("fineweb"))
    .pipe(text.dedup_minhash(threshold=0.8))        # DataTrove's phases
-   .pipe(text.decontaminate(against=EVAL_SETS))
+   .filter_map(text.Decontaminated(against=EVAL_TEXTS))
    .map(text.tokenize(tok, eos=True))
    .snapshot("s3://tokens/v3/web/"))               # a sealed generation
 
