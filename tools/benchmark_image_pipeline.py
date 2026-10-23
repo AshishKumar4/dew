@@ -60,13 +60,13 @@ class Config:
     """Also time the real Trainer's prefetched pixel-diffusion update."""
     out: Path | None = None
     peak_run: str | None = None
-    """Run this device pipeline (`DEVICE_PIPELINES`) alone, for its measured peak (tools/peak_memory.py),
+    """Run this mode's device pipeline (`PIPELINES`) alone, for its measured peak (tools/peak_memory.py),
     writing nothing."""
 
 
-DEVICE_PIPELINES = {"device_flip_jitter": (1.0, 1.0), "device_crop_flip_jitter": (0.6, 1.0)}
-"""The pipelines that augment on the device, by name, each with its crop scale: the ones a measured peak is
-taken of."""
+PIPELINES = {"flip_jitter": (1.0, 1.0), "crop_flip_jitter": (0.6, 1.0)}
+"""The augmentation modes the pipeline is timed in, each with its crop scale: each runs on the host and on the
+device, and the device's measured peak is taken of each."""
 
 
 def decoders(size):
@@ -252,12 +252,12 @@ def training_timing(config, backend):
 def main(config):
     cv2.setNumThreads(1)
     if config.peak_run is not None:
-        pipeline_timing(config, "device", DEVICE_PIPELINES[config.peak_run])
+        pipeline_timing(config, "device", PIPELINES[config.peak_run])
         return None
-    # Each device pipeline's measured peak, in a process of its own, before this one opens a backend.
+    # Each mode's device pipeline's measured peak, in a process of its own, before this one opens a backend.
     peaks = {} if config.decoder_only else {
-        name: peak_memory.measured([os.path.abspath(__file__), *sys.argv[1:], "--peak-run", name])
-        for name in DEVICE_PIPELINES}
+        mode: peak_memory.measured([os.path.abspath(__file__), *sys.argv[1:], "--peak-run", mode])
+        for mode in PIPELINES}
     source = TFDS("oxford_flowers102", path=config.flowers, split="all",
                   decoders={"image": tfds.decode.SkipDecoding()}).records("indexed")
     encoded = [source[index]["image"] for index in range(min(config.images, len(source)))]
@@ -286,11 +286,11 @@ def main(config):
             source[index]
         report["pipeline"] = {
             f"{backend}_{mode}": pipeline_timing(config, backend, scale)
-            for mode, scale in (("flip_jitter", (1.0, 1.0)), ("crop_flip_jitter", (0.6, 1.0)))
+            for mode, scale in PIPELINES.items()
             for backend in ("host", "device")
         }
-        for name, peak in peaks.items():
-            report["pipeline"][name]["peak_device_bytes"] = None if None in peak else max(peak)
+        for mode, peak in peaks.items():
+            report["pipeline"][f"device_{mode}"]["peak_device_bytes"] = None if None in peak else max(peak)
         if config.training:
             report["training"] = {backend: training_timing(config, backend) for backend in ("host", "device")}
     text = json.dumps(report, indent=2)
