@@ -464,12 +464,12 @@ def test_a_server_refuses_a_context_its_layers_cannot_read():
 
 
 def test_a_zero_gate_leaves_an_ngpt_stream_whatever_its_length():
-    """Under nGPT a zero gate moves the stream by nothing, tiny, large and zero rows alike, bit for
-    bit, where a step normed back to the stream's length would shrink a tiny one; the gradients stay
-    finite, a zero row's included."""
+    """Under nGPT a zero gate moves the stream by nothing, tiny, large (1e20, whose squares overflow
+    float32) and zero rows alike, bit for bit, where a step normed back to the stream's length would
+    shrink a tiny one; the gradients stay finite, a zero row's included."""
     block = BLOCK.clone(norm=None, ngpt=True)
     x, context, params, lengths, cotangent = block_draw(2)
-    x = x * np.asarray([1e-4, 1.0, 30.0, 0.0], np.float32)[:, None, None]
+    x = x * np.asarray([1e-4, 1.0, 1e20, 0.0], np.float32)[:, None, None]
     shut = {**params, "alpha_cross_attn": np.zeros(1, np.float32), "alpha_dense": np.zeros(1, np.float32)}
 
     def block_out(x, params):
@@ -599,3 +599,19 @@ def test_zero_gates_leave_a_pretrained_ngpt_decoder_bit_for_bit():
         lambda path, leaf: jnp.full_like(leaf, 0.5) if path[-1].key.startswith("alpha_") else leaf, variables)
     moved = np.asarray(attached.model.apply(gated, ids, conditioning=conditioning))
     assert np.isfinite(moved).all() and not np.array_equal(moved, base)
+
+
+@pytest.mark.parametrize("loop", [None, (1, 3)], ids=["whole", "partial"])
+def test_cross_flops_count_each_pass_of_a_looped_layer(loop):
+    """A looped decoder runs a block on every pass of its layer: `cross_flops` counts it that many
+    times (`layer_passes`), a layer outside a partial loop once."""
+    from dew.nn.backbones.decoder_stack import Loop
+
+    lengths, context = np.array([5, 3]), np.array([6, 2])
+    looped = MODEL.clone(loop=Loop(steps=3, layers=loop))
+    alone = [MODEL.clone(cross_attention=dataclasses.replace(CROSS, layer_ids=(index,)))
+             for index in CROSS.layer_ids]
+    blocks = [model.cross_flops(lengths, context) for model in alone]
+    passes = [looped.layer_passes(index) for index in CROSS.layer_ids]
+    assert passes == ([3, 3] if loop is None else [1, 3])
+    assert looped.cross_flops(lengths, context) == sum(p * b for p, b in zip(passes, blocks, strict=True))
