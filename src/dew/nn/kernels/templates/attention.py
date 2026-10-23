@@ -133,8 +133,8 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     document's keys, under causality or a window a cross call's queries aligned to their document's last
     keys (`aligned_places`); `lengths` `[B]` end each row's keys and `starts` `[B]` begin them.
     Lengths and starts are int32 token coordinates; places and ids keep their own dtypes."""
-    from dew.nn.attention import window_sides
     from dew.nn.documents import CrossDocuments, aligned_places, document_ids
+    from dew.nn.visibility import window_sides
 
     index = jnp.broadcast_to(jnp.arange(queries, dtype=jnp.int32)[None, :], (batch, queries))
     place = index

@@ -37,6 +37,7 @@ from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew.checkpoints import Checkpoints, Ranking
+from dew.cleanup import attempted
 from dew.coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew.data.compile import fitted
 from dew.data.dataset import (
@@ -1599,23 +1600,18 @@ class Trainer(Generic[Loss, Effects]):
         # A failed run's peers may be gone: its last log is read only where no read waits on them.
         unread = (None if run.taken is None or not run.taken.ready()
                   else functools.partial(self._read_taken, run, agree=False))
-        for label, cleanup in (
-            ("Training log", unread), ("Training iterator", close), ("Profiler", stop_trace),
-            ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
-            ("Display", self._display.close),
-        ):
-            if cleanup is None:
-                continue
-            try:
-                cleanup()
-            except BaseException as failure:
-                if error is None:
-                    error = failure
-                else:
-                    error.add_note(f"{label} cleanup failed: {failure!r}")
+        cleanups = (("Training log", unread), ("Training iterator", close), ("Profiler", stop_trace),
+                    ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
+                    ("Display", self._display.close))
+        try:
+            attempted([(f"{label} cleanup", cleanup) for label, cleanup in cleanups if cleanup is not None],
+                      primary=error)
+        except BaseException as failure:
+            # The first cleanup to fail, where the run itself did not, is the run's outcome.
+            error = failure
         # The traceback of a failed run holds fit's frame and this one, and what these names point at.
         run.source, run.train, run.taken = None, None, None
-        close = stop_trace = cleanup = unread = None
+        close = stop_trace = cleanups = unread = None
         run.other += time.perf_counter() - paused
         return self._reported_outcome(error, run)
 
