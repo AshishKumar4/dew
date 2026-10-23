@@ -73,8 +73,9 @@ class Forward:
     def base2(self) -> bool:
         """Whether the logits fold log2(e) into the scale for exp2, the fast form and the default
         (FlashAttention 2's and jax's mha's arithmetic): unless the call keeps them `natural`, where no
-        hook reads them and the scale times log2(e) is below 1, so the fold takes no logit the reference
-        keeps finite past fp32's largest, and every folded logit is at least an ulp of fp32's largest
+        hook reads them and the scale times log2(e) is below 1 in magnitude, so the fold takes no logit the
+        reference keeps finite past fp32's largest, of either sign (a negative scale of magnitude 1 takes a
+        finite -3e38 to -inf, its weight NaN), and every folded logit is at least an ulp of fp32's largest
         below it (`base2_maximum`). Otherwise they stay natural, each exponential taken
         of their difference (`natural_exp`), as the reference's. The fold rounds each logit at log2(e)
         times its size, so logits the reference keeps apart can tie: keys of 2 * 1610613120 and 2 * 1610612992
@@ -82,7 +83,8 @@ class Forward:
         cotangent of 2**125 then overflows its backward (docs/design/kernel-templates.md, §3, the
         exponent's forms). On drawn inputs both forms pass check 1."""
         # The factor as the kernel multiplies by it, rounded to fp32.
-        return not self.natural and self.score_mod is None and float(np.float32(self.scale * LOG2E)) < 1.0
+        factor = abs(float(np.float32(self.scale * LOG2E)))
+        return not self.natural and self.score_mod is None and factor < 1.0
 
     @property
     def guarded(self) -> bool:
