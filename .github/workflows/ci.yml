@@ -129,7 +129,7 @@ jobs:
         grep -q "No matching distribution found for jax" plain.txt || { cat plain.txt; exit 1; }
     - name: Resolve the accelerator extras
       run: |
-        index=$(python -c "import runpy; print(runpy.run_path('src/dew/telemetry/builds.py')['PACKAGE_INDEX'])")
+        index=$(python -c "import runpy; print(runpy.run_path('src/dew/builds.py')['PACKAGE_INDEX'])")
         for extras in cuda12,quantization,profile cuda13,quantization,profile tpu,quantization,profile; do
           echo "dewml[$extras] @ file://$(realpath dist/*.whl)" \
             | uv pip compile - --extra-index-url "$index" \
