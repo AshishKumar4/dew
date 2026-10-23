@@ -39,14 +39,14 @@ Scope is per rule, because the rules are not all about the same thing:
   runs: it sleeps, polls and retries only where it deals with what leaves
   the process, and it detects no feature by the exception its absence raises.
 - SLOP020 is about `tests` and `tools`: every accuracy comparison goes through
-  the one assertion of the gate (bible §7, `tests/reference_error.py`), so a
+  the one assertion of the gate (`tests/reference_error.py`), so a
   float compared within a tolerance anywhere else is a finding. The files that
   still hold such comparisons are the inventory
   (`tools/tolerance_inventory.json`), each at its count and lane, and it only
   shrinks.
 - SLOP021 is about every file: a private attribute of JAX's own objects
-  (`JAX_PRIVATE`) is read nowhere (bible: no private attributes of other
-  libraries), whose public way the finding names.
+  (`JAX_PRIVATE`) is read nowhere (Dew reads no other library's private
+  attributes), whose public way the finding names.
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -1772,7 +1772,7 @@ GATE = frozenset({"tests/reference_error.py", "tests/op_certificates.py", "tools
                   "tests/test_reference_orders.py", "tests/test_reference_graph.py",
                   "tests/test_gate_calibration.py", "tests/test_float64_terms.py"})
 """The gate's modules and the tests of the gate itself, the one place a float is compared within a
-bound (bible §7): every other comparison goes through its assertion."""
+bound: every other comparison goes through its assertion."""
 INVENTORY = "tools/tolerance_inventory.json"
 RULE = "tools/lint_tolerances.py"
 """SLOP020's reading of a file (`tolerance_rules`), whose change may grow what the inventory holds."""

@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.telemetry.benchmark import benchmark, resident_memory
+from dew.telemetry.benchmark import benchmark
 
 
 class Slow:
@@ -61,13 +61,43 @@ def test_pair_labels_lay_out_as_rows_by_columns_in_one_unit():
     assert "&lt;script&gt;" in slow._repr_html_()
 
 
-def test_resident_memory_reads_the_kernel_fields_in_bytes_and_sees_an_allocation():
-    """Each of the kernel's memory fields in bytes under its own name: an array of 64 MiB written
-    through raises the anonymous resident memory by more than half its size, which a field read in
-    the kernel's KiB would not show."""
+NEIGHBOURED = """
+import ctypes
+import json
+import mmap
+
+import numpy as np
+
+from dew.telemetry.benchmark import resident_memory
+
+# The heap serves 64 MiB (glibc's M_MMAP_THRESHOLD, -3), and a freed 64 MiB block stays resident under
+# a live one: memory a process's earlier work left for its allocator to hand out again.
+ctypes.CDLL(None).mallopt(-3, 1 << 30)
+held = np.ones(64 * 2**20, np.uint8)
+guard = np.ones(2**20, np.uint8)
+del held
+# A new private mapping is pages no allocator held: the kernel hands each in as it is written.
+with mmap.mmap(-1, 64 * 2**20, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS) as pages:
     before = resident_memory()
-    assert {"VmRSS", "RssAnon", "RssFile", "VmHWM"} <= set(before)
-    block = np.ones(64 * 2**20, np.uint8)
+    for offset in range(0, len(pages), mmap.PAGESIZE):
+        pages[offset] = 1
     after = resident_memory()
-    assert after["RssAnon"] > before["RssAnon"] + block.nbytes // 2
+    print(json.dumps({"before": before, "after": after, "size": len(pages)}))
+"""
+
+
+def test_resident_memory_reads_the_kernel_fields_in_bytes_and_sees_an_allocation():
+    """Each of the kernel's memory fields in bytes under its own name: 64 MiB of new pages written
+    through raises the anonymous resident memory by more than half its size, which a field read in
+    the kernel's KiB would not show, even in a process whose allocator holds a freed block of that
+    size resident, which an array of that size would be served from without a new page."""
+    import json
+    import subprocess
+    import sys
+
+    measured = json.loads(subprocess.run([sys.executable, "-c", NEIGHBOURED], check=True, capture_output=True,
+                                         text=True).stdout.splitlines()[-1])
+    before, after = measured["before"], measured["after"]
+    assert {"VmRSS", "RssAnon", "RssFile", "VmHWM"} <= set(before)
+    assert after["RssAnon"] > before["RssAnon"] + measured["size"] // 2
     assert after["VmHWM"] >= after["VmRSS"] >= after["RssAnon"]

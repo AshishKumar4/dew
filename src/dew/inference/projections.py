@@ -26,9 +26,8 @@ from flax.core import FrozenDict, freeze, unfreeze
 from jax.sharding import SingleDeviceSharding
 
 from dew.batch import Variables
-from dew.nn.kernels.options import QuantizedClass
 from dew.nn.protocols import ProjectionGroup, Serving
-from dew.quantization import QUANTIZATION
+from dew.quantization import QUANTIZATION, QuantizedClass
 
 
 def _node(variables: Variables, collection: str, path: Sequence[str]) -> dict:

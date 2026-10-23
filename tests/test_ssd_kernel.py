@@ -29,7 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, assert_computes_the_oracle, without_ynn
+from reference_error import assert_as_exact, assert_computes_the_oracle, with_gradients, without_ynn
 from ssd_support import ssd_orbit
 
 from dew.nn.kernels.recurrence_chunk import RESET_DECAY
@@ -161,10 +161,11 @@ def xla_chunk_scan(x, B, C, a, carried, chunk_size: int):
 
 
 def evaluated(scan, operands, seeded):
-    """A scan's output, final state and every operand gradient under both cotangents."""
-    output, backward = jax.vjp(scan, *operands)
+    """A scan's output, final state and every operand gradient under both cotangents, pulled back through
+    the gate (`reference_error.with_gradients`)."""
+    output, *gradients = with_gradients(scan)(*operands, seeded)
     return dict(zip(("output", "final", "x", "B", "C", "A dt", "state"),
-                    (*output, *backward(seeded)), strict=True))
+                    (*output, *gradients), strict=True))
 
 
 def parity_functions(chunk_size: int, roundings: int, platform: str = "tpu"):
