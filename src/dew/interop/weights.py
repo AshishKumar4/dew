@@ -42,8 +42,8 @@ def declared_dtype(config: Mapping[str, object], tensors: Mapping[str, np.ndarra
         name = storage_name(tensor.dtype)
         if name is not None:
             return name
-    raise ValueError("param_dtype 'auto' found neither a stated dtype nor a float32, bfloat16 or "
-                     "float16 tensor in the checkpoint")
+    raise ValueError("param_dtype 'auto' found neither a stated dtype nor a floating tensor a config "
+                     "names (`dew.registry.DtypeName`) in the checkpoint")
 
 
 def checkpoint_dtype(stored: np.dtype, param_dtype: str = "float32", *,
