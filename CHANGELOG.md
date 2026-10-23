@@ -7,8 +7,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 - `Decide.systemone` takes a list of request bodies and answers each as it
   would alone, their rows scored together, a refused body's `ValueError` in its
-  place; `examples/serve_decisions.py` answers concurrent requests in batches
-  (`--batch-window`, `--max-batch`) instead of one at a time.
+  place. `dew.inference.ScoringServer` serves a task answered by one forward
+  pass a batch (`Decide.scoring`), and `dew.inference.Engine` serves it and
+  generation's `Server` from one thread; `examples/serve_decisions.py` answers
+  concurrent requests in batches (`--batch-tokens`, `--batch-rows`) through it.
 - A diffusion schedule's division of a state by a rate (`divided`: epsilon from a clean
   prediction, the clean sample from epsilon, a sigma solver's derivative) is IEEE's correctly
   rounded quotient whatever the backend's division flags, through the one correctly rounded

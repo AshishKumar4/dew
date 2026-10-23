@@ -253,6 +253,11 @@ class NativeRolloutServer:
         return self._server.sampling
 
     @property
+    def engine(self) -> Engine:
+        """The engine that steps the server, and orders a load with its steps."""
+        return self._engine
+
+    @property
     def version(self) -> int:
         return self._version
 
