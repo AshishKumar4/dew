@@ -250,9 +250,15 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
     (`test_steps_from_coefficients_past_the_clip_are_the_steps_from_the_clamped_ones`); an AdamW
     step itself is not held to torch's here, since optax forms Adam's bias corrections in float32
     (`1 - 0.999 ** t`), 6.4e-6 off at the first step, where torch forms them in float64."""
+    import dataclasses
+
     import optax
     import torch
 
+    from dew.objectives.base import Aux
+    from dew.objectives.lm import LMObjective
+    from dew.training.state import TrainState
+    from dew.training.transaction import Transaction
     from tools.diffusers_wan_reference import float64
 
     loaded, model, clip = clipped_gemma3n()
@@ -274,12 +280,19 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
                                               * rng.standard_normal(leaf.shape)).astype(np.float32), params)
         return rows, gradient
 
+    # The Trainer's own commit of a drawn gradient (`Transaction.commit`): the constraint's
+    # projection, the optimizer's update and the projection again, over the clipped decoder's state.
+    objective = LMObjective(dataclasses.replace(loaded, model=model), STEP_LENGTH, ema_decay=None)
+    transaction = Transaction(objective, tx, 1, (jax.ShapeDtypeStruct((), jnp.float32), Aux({})))
+    zero = jnp.zeros((), jnp.int32)
+    state = TrainState(step=zero, microstep=zero, updates=zero, variables=loaded.variables,
+                       opt_state=tx.init(params), ema=None, key=jax.random.key(0), scale=None,
+                       window_size=jnp.ones((), jnp.int32))
+
     @jax.jit
     def updated(rows, gradient):
-        # The transaction's update (`Objective.projected` before and after the optimizer's).
-        stored = model.projected(params, updated=False)
-        update, _ = tx.update(gradient, tx.init(stored), stored)
-        return model.projected(optax.apply_updates(stored, update), updated=True)
+        committed, _, _ = transaction.commit(state, gradient, (), None)
+        return committed.variables["params"]
 
     def stepped(rows, gradient):
         return exported(loaded, updated(rows, gradient))
