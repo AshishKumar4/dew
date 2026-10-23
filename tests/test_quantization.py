@@ -67,8 +67,9 @@ def quantized_forward(spec, **overrides):
 
 @pytest.mark.parametrize("scan_layers", [False, True])
 def test_the_wrapped_forward_matches_qwixs_own_call(scan_layers):
-    """Dew's wrapping against the provider built by hand (`quantize_with`), over the layer
-    loop and over the scanned stack: identical compiled logits, and both
+    """Dew's wrapping against the provider built by hand, over the layer
+    loop and over the scanned stack, the hand-built one traced under its own key (`quantize_with`),
+    as Dew traces every Qwix-quantized model so Qwix owns its products: identical compiled logits, and both
     away from the fp32 forward. The gap is the assertion: rules that never
     reached a matmul would leave the fp32 numerics bitwise, so any bit moved
     says they did. Observed with both layouts: wrapped and hand-built bitwise

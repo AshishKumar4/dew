@@ -302,13 +302,13 @@ ORACLE_CASES = {
 }
 
 
-
 def with_fp32_sums(function):
     """`function` run with its fp32 products summed in fp32 (`FP32_SUMS`), as an accelerator sums."""
     def run(*arguments, **keywords):
         with jax.default_matmul_precision(FP32_SUMS):
             return function(*arguments, **keywords)
     return run
+
 
 @pytest.mark.parametrize("case", ORACLE_CASES)
 def test_splash_is_as_exact_as_the_reference_attention(case):

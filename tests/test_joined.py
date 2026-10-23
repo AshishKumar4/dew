@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference, float64_terms, with_gradients
+from reference_error import assert_as_exact_as_the_reference, equations, float64_terms, with_gradients
 
 from dew.nn.dense import Dense
 from dew.nn.joined import joined_dense
@@ -22,30 +22,10 @@ def row_joins(choice: str, *, joins: bool = True):
 
 
 def dots(function, *args) -> int:
-    """The dot products a run of `function` executes, its sub-jaxprs' included: a branch (a `cond`,
-    and the platform choice `precision.accumulated` makes is one) counts the dots of its one taken
-    branch, the most any branch runs."""
-    def counted(graph) -> int:
-        total = 0
-        for equation in graph.eqns:
-            if equation.primitive.name == "dot_general":
-                total += 1
-            elif equation.primitive.name == "cond":
-                total += max(counted(branch.jaxpr) for branch in equation.params["branches"])
-            else:
-                total += sum(counted(sub) for sub in equations_of(equation))
-        return total
-    return counted(jax.make_jaxpr(lambda *operands: function(*operands))(*args).jaxpr)
-
-
-def equations_of(equation):
-    """The jaxprs directly under `equation` (a call's, a scan's, a custom derivative's)."""
-    for value in jax.tree.leaves(equation.params, is_leaf=lambda leaf: hasattr(leaf, "eqns")
-                                 or hasattr(leaf, "jaxpr")):
-        if hasattr(value, "eqns"):
-            yield value
-        elif hasattr(value, "jaxpr") and hasattr(value.jaxpr, "eqns"):
-            yield value.jaxpr
+    """The dot products a CPU's run of `function` executes, its sub-jaxprs' included, of each
+    platform choice (`precision.accumulated`'s) the branch a CPU runs."""
+    graph = jax.make_jaxpr(lambda *operands: function(*operands))(*args)
+    return sum(equation.primitive.name == "dot_general" for equation in equations(graph, platform="cpu"))
 
 
 def assert_joined_as_exact(choice: str, run, arguments, wide_run):

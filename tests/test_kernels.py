@@ -26,7 +26,7 @@ from dew.nn import kernels
 from dew.nn.attention import NormalAttention, scaled_dot_product_attention, weighted_values
 from dew.nn.kernels import bf16_dot_runs
 from dew.nn.kernels.selection import KernelRefused
-from dew.nn.precision import FP32_SUMS, float32_einsum
+from dew.nn.precision import FP32_SUMS
 
 pytestmark = pytest.mark.kernel
 
@@ -851,21 +851,24 @@ def test_a_layer_that_builds_its_mask_sums_its_cpu_fp32_values_in_float64_too():
 def test_the_reference_path_is_flax_attention_op_for_op(dtype, forced, dropout_rate):
     """Without sinks the reference path (`reference_attention`) is flax's
     `dot_product_attention` handed the key heads repeated over their group and
-    Dew's two products (`float32_einsum`, `weighted_values`), bitwise: in each compute dtype,
+    its probability product (`weighted_values`), bitwise: in each compute dtype,
     the softmax forced to fp32 or not, an fp32 bias wider than half-precision
-    logits, a causal mask and a probability draw from the same key."""
+    logits, a causal mask and a probability draw from the same key. Both sum
+    their fp32 products as XLA does (`FP32_SUMS`), the reference path's own
+    float64 sums on a CPU being the policy's (tests/test_cpu_accumulation.py)."""
     keys = jax.random.split(jax.random.key(0), 5)
     query = jax.random.normal(keys[0], (2, 6, 4, 8), dtype)
     key, value = (jax.random.normal(drawn, (2, 6, 2, 8), dtype) for drawn in keys[1:3])
     bias = jax.random.normal(keys[3], (2, 4, 6, 6), jnp.float32)
     drop = {"dropout_rate": dropout_rate, "dropout_rng": keys[4], "deterministic": not dropout_rate}
-    ours = scaled_dot_product_attention(query, key, value, implementation="reference", causal=True, bias=bias,
-                                        force_fp32_for_softmax=forced, **drop)
-    theirs = nn.dot_product_attention(
-        query, jnp.repeat(key, 2, axis=2), jnp.repeat(value, 2, axis=2), bias=bias,
-        mask=jnp.tril(jnp.ones((6, 6), bool))[None, None], broadcast_dropout=False,
-        force_fp32_for_softmax=forced, qk_attn_weights_einsum=float32_einsum,
-        attn_weights_value_einsum=weighted_values, **drop)
+    with jax.default_matmul_precision(FP32_SUMS):
+        ours = scaled_dot_product_attention(query, key, value, implementation="reference", causal=True,
+                                            bias=bias, force_fp32_for_softmax=forced, **drop)
+        theirs = nn.dot_product_attention(
+            query, jnp.repeat(key, 2, axis=2), jnp.repeat(value, 2, axis=2), bias=bias,
+            mask=jnp.tril(jnp.ones((6, 6), bool))[None, None], broadcast_dropout=False,
+            force_fp32_for_softmax=forced, qk_attn_weights_einsum=jnp.einsum,
+            attn_weights_value_einsum=weighted_values, **drop)
     np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 
 

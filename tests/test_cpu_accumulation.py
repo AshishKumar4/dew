@@ -126,7 +126,6 @@ def test_a_scope_that_states_fp32_sums_gets_them(stated_first):
     assert results == {True: 0.0, False: 1.0}
 
 
-
 def test_a_bias_spread_over_a_sharded_axis_keeps_its_sharding():
     """A batched bias, `[2, 1, 4]` spread to `[2, 3, 4]`, its last axis split over an Explicit mesh,
     adds itself to every position and takes the cancelling cotangents' float64 sum, 1, under jit:
