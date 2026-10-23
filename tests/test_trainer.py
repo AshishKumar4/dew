@@ -367,8 +367,13 @@ def test_a_run_that_fails_after_a_failed_write_raises_its_own_error_and_closes_i
         neighbour.join()
         raise primary
 
-    with pytest.raises(ValueError) as raised:
-        run.train(Regression(), dataset(), name="failed", after=after)
+    try:
+        with pytest.raises(ValueError) as raised:
+            run.train(Regression(), dataset(), name="failed", after=after)
+    finally:
+        # A run that fails before `after` must not leave the neighbour waiting.
+        release.set()
+        neighbour.join()
     assert raised.value is primary and primary.__notes__
     assert set(threading.enumerate()) <= settled
 
