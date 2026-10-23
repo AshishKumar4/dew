@@ -5,6 +5,27 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- `Decide.systemone` takes a list of request bodies and answers each as it
+  would alone, their rows scored together, a refused body's `ValueError` in its
+  place. `dew.inference.ScoringServer` serves a task answered by one forward
+  pass a batch (`Decide.scoring`), and `dew.inference.Engine` serves it and
+  generation's `Server` from one thread; `examples/serve_decisions.py` answers
+  concurrent requests in batches (`--batch-tokens`, `--batch-rows`) through it.
+- `OptimConfig.rate` is the learning rate, a number or a schedule's record, in
+  place of `learning_rate` and `schedule`; on the command line it is one value,
+  `--optim.rate 3e-4` or a schedule's JSON record.
+- Module moves, each name at one path: the run configurations are
+  `dew.config.lm.LMRunConfig`, `dew.config.jepa.JepaRunConfig` and
+  `dew.config.diffusion.DiffusionRunConfig` (with `FlowRolloutConfig`); the
+  condition records `TextCondition` and `AudioCondition` are `dew.inputs`';
+  `PretrainedAutoencoder` is `dew.nn.autoencoders.pretrained`'s; the optimizers
+  and schedules are `dew.optim`; the device facts and CUDA builds are
+  `dew.devices` and `dew.builds`. A run's record names its run class by its
+  alias (`"class": "diffusion"`, `dew.registry.runs`), so it reads back wherever
+  the class moves; a run.json written before this names the old import path and
+  no longer loads. A distillation's teacher run is the run config's
+  `--teacher-run`, and the objectives take the loaded teacher
+  (`teacher_variables=`, and guidance distillation's `teacher=`).
 - A diffusion schedule's division of a state by a rate (`divided`: epsilon from a clean
   prediction, the clean sample from epsilon, a sigma solver's derivative) is IEEE's correctly
   rounded quotient whatever the backend's division flags, through the one correctly rounded

@@ -66,7 +66,7 @@ class DecisionRunConfig(RunConfig):
     objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("decision"))
     """The decision objective and its arguments: its scoring rule (`loss`),
     label smoothing, option shuffling and none-of-the-above rate."""
-    optim: OptimConfig = dataclasses.field(default_factory=lambda: OptimConfig(learning_rate=2.5e-5))
+    optim: OptimConfig = dataclasses.field(default_factory=lambda: OptimConfig(rate=2.5e-5))
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
     pretrained: str = LAYA

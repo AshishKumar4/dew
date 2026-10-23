@@ -120,7 +120,7 @@ PYTHON_RUN: dict[str, JSON] = {
 def _is_profiles(node) -> bool:
     """Whether `node` is a `PowerProfilesState`, or the mapping of its fields
     a restore without a template reads it as."""
-    from dew.training.optim import PowerProfilesState
+    from dew.optim import PowerProfilesState
     return isinstance(node, PowerProfilesState) or (
         isinstance(node, Mapping) and set(node) == set(PowerProfilesState._fields))
 
