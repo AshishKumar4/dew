@@ -1,9 +1,9 @@
 """A CI task's pytest session, as the plan (ci.py) and the plugins a task loads into it (split.py,
-executed.py) share it: how pytest runs and what it sees (`pytest_run`, `pytest_environment`), which tests
-take another path on a GPU (`MARKS`), and how a split file's tests are cut (`groups`). It runs inside every
-test process, so the test cache keys every file's record on it (ci.py's `SHARED`); the plan's own code does
-not, and a change to it reruns nothing. The standard library alone: the plan imports it where pytest is not
-installed."""
+executed.py) share it: how pytest runs and what it sees (`pytest_run`, `pytest_environment`), how long it
+runs (`DEADLINE`, `GRACE`), which tests take another path on a GPU (`MARKS`), and how a split file's tests
+are cut (`groups`). What it decides changes a task's outcome, so the test cache keys every file's record on
+it (ci.py's `SHARED`); the plan's own code does not, and a change to it reruns nothing. The standard library
+alone: the plan imports it where pytest is not installed."""
 
 import os
 from collections.abc import Mapping
@@ -20,6 +20,12 @@ CLOSED_HUB = {"HF_HUB_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1", "TRANSFORMERS_O
 """What a task's tests see of the Hugging Face Hub, which none of them may reach (`SELECTION`): the
 libraries offline, and the Hub's address a closed port for any that would ask it regardless. A test
 that needs the Hub is marked network; one that reads a model or dataset otherwise brings it."""
+
+DEADLINE = 1680.0
+"""Seconds a task's tests run before they are interrupted and the files they hold are red: below armada's own
+task timeout (.armada.json's), so the verdict is written."""
+GRACE = 60.0
+"""Seconds an interrupted task's tests have to end before their process group is killed."""
 
 
 def pytest_run(python: str, report: Path, *measured: str) -> list[str]:
