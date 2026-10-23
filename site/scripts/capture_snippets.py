@@ -1,8 +1,9 @@
 """Run a landing page cell on a terminal and record what it showed.
 
 The page shows each cell beside the terminal it ran on, so a recording must come
-from running exactly that code. Run this after changing a cell, in an
-environment with Dew and pyte installed, and commit what it writes:
+from running exactly that code. Run this after changing what a cell does, in an
+environment with Dew and pyte installed, and commit what it writes (a change that
+only renames keeps its recording: site/scripts/redigest.py):
 
     python site/scripts/capture_snippets.py --where "a 4-vCPU Cloudflare container" --cell lm
 

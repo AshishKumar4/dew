@@ -63,6 +63,7 @@ rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
 import dataclasses
+import functools
 import hashlib
 import math
 
@@ -115,12 +116,195 @@ def widened(tree):
         leaf, np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype), tree)
 
 
+def _stack_draws(trees):
+    """A draw's leaves of each window stacked on a new leading axis. A JAX array or Python scalar stacks
+    as JAX stacks it, its weak type kept, and a host array as NumPy stacks it, its dtype kept."""
+    def stack(*leaves):
+        if all(isinstance(leaf, jax.Array | bool | int | float | complex) for leaf in leaves):
+            return jnp.stack([jnp.asarray(leaf) for leaf in leaves])
+        return np.stack([np.asarray(leaf) for leaf in leaves])
+    return jax.tree.map(stack, *trees)
+
+
+def _stack_host(trees):
+    """An arm's outputs of each window stacked on a new leading axis as host arrays of their own dtypes."""
+    return jax.tree.map(lambda *leaves: np.stack([np.asarray(leaf) for leaf in leaves]), *trees)
+
+
+def _window_count(arguments) -> int:
+    """The windows an arm's stacked arguments hold, the leading axis of each."""
+    leaves = jax.tree.leaves(arguments)
+    count = len(leaves[0]) if leaves else 0
+    if count < 1:
+        raise ValueError(f"an arm over {count} windows")
+    return count
+
+
+def windows(draw, count: int):
+    """A check-1 draw of `count` windows a seed. Seed `s` gives the site's draws of seeds `s * count` to
+    `s * count + count - 1`, each leaf stacked on a new leading axis, and every argument is a window. A
+    seed's evidence then pools `count` draws, as independent as the site's draws of different seeds
+    are. A leaf that is one row in a draw, such as a parameter's gradient, becomes `count` rows. Its
+    arms take the windows through `over_windows`."""
+    if count < 1:
+        raise ValueError(f"windows of {count} draws")
+
+    def drawn(seed):
+        return _stack_draws([draw(seed * count + index) for index in range(count)])
+    return drawn
+
+
+def over_windows(fn, *, looped: bool = False):
+    """`fn`, an arm of one draw, run over `windows`' stacked arguments, each sliced by window, with its
+    outputs stacked on their leading axis as host arrays.
+
+    By default it is one compiled program over every window (`jax.vmap`). A batch axis may change the
+    program XLA compiles (its fusions, a kernel's route), so the first call at each signature also runs
+    `jax.jit(fn)` window by window and fails unless every window's output is the same bit for bit. The
+    signature is every argument's `jax.typeof`, their tree, x64's setting and the default matmul
+    precision; a reference and its float64 truth have two. Any other configuration a call changes needs
+    an `over_windows` of its own.
+
+    `looped` runs `fn` window by window instead, for a torch or NumPy reference, for a JAX arm a batch
+    axis changes, and for a `without_ynn` arm, whose compiler options refuse to be nested in the batched
+    program. Pass a JAX arm jitted, `over_windows(jax.jit(fn), looped=True)`, so each window runs the
+    program one draw compiles."""
+    def each(single, *arguments):
+        count = _window_count(arguments)
+        return _stack_host([single(*jax.tree.map(lambda leaf, index=index: leaf[index], arguments))
+                            for index in range(count)])
+
+    if looped:
+        return functools.partial(each, fn)
+    batched, single, checked = jax.jit(jax.vmap(fn)), jax.jit(fn), set()
+
+    def run(*arguments):
+        # Before the batched program, which would compile a batch of none.
+        _window_count(arguments)
+        found = jax.tree.map(np.asarray, batched(*arguments))
+        signature = (bool(jax.config.jax_enable_x64), str(jax.config.jax_default_matmul_precision),
+                     jax.tree.structure(arguments),
+                     tuple(jax.typeof(leaf) for leaf in jax.tree.leaves(arguments)))
+        if signature not in checked:
+            expected = each(single, *arguments)
+            if jax.tree.structure(found) != jax.tree.structure(expected) or not jax.tree.leaves(found):
+                raise AssertionError("the batched arm over windows returns no output, or another tree")
+            for (path, got), want in zip(jax.tree_util.tree_leaves_with_path(found),
+                                         jax.tree.leaves(expected), strict=True):
+                if got.dtype != want.dtype or got.shape != want.shape or got.tobytes() != want.tobytes():
+                    where = jax.tree_util.keystr(path) or "the output"
+                    differs = ""
+                    if got.shape == want.shape and got.dtype == want.dtype and got.size:
+                        # By bits, so a zero of the other sign names its window too.
+                        moved = [index for index in range(len(got))
+                                 if np.ascontiguousarray(got[index]).tobytes()
+                                 != np.ascontiguousarray(want[index]).tobytes()]
+                        gap = np.max(np.abs(np.asarray(got, np.float64) - np.asarray(want, np.float64)))
+                        differs = f" (from window {moved[0]}, by up to {gap:.3e})"
+                    raise AssertionError(
+                        f"{where}: the batched arm over windows computes otherwise than one draw's "
+                        f"compiled arm does, window by window{differs}. Take "
+                        "`over_windows(jax.jit(fn), looped=True)`.")
+            checked.add(signature)
+        return found
+    return run
+
+
+WITHOUT_YNN = {"xla_cpu_experimental_ynn_fusion_type": ""}
+"""XLA:CPU's compiler options with every YNNPACK fusion off (dots, reductions, element-wise and layout
+ops alike), so that a program runs on XLA's own code, compiled for the host's instruction set with no
+dispatch at run time. YNNPACK picks its microkernels at run time by that instruction set, and both
+the interpreted SSD kernel and XLA's scan fuse parts of themselves to it by default, which moved
+check 1 between the two across PARITY by host; without the fusions the verdicts held on two hosts
+of different instruction sets, though the bits still part with the host (docs/performance.md, "The
+SSD kernel's host check 1 without YNNPACK"). The empty list, not the documented `-individual_dot`,
+because compiler options take no such spelling and that one leaves a scan's reductions fused."""
+
+
+def without_ynn(fn, **jit_options):
+    """`fn` jitted with WITHOUT_YNN on the CPU lane, the process's default backend
+    (`jax.default_backend()`), and plain `jax.jit` elsewhere. It compiles both arms of a check 1
+    between two Dew paths, such as an interpreted kernel and the XLA program it replaces, the latter
+    the arm the check measures against, so that the two run the same kind of code on any host. A
+    program Dew's users run compiles with the fusions, as they do. Call it at top level, since on the
+    CPU lane its compiler options refuse to be nested in another jit, differentiated through or
+    batched; `over_windows` takes it with `looped=True`. A caller's own compiler options take
+    precedence over WITHOUT_YNN's."""
+    if jax.default_backend() == "cpu":
+        jit_options["compiler_options"] = {**WITHOUT_YNN, **(jit_options.get("compiler_options") or {})}
+    return jax.jit(fn, **jit_options)
+
+
 def with_gradients(fn):
     """`fn` as `run(*inputs, cotangent)`, which returns `fn(*inputs)` and the gradients of its inputs
     under the cotangent passed last: a differentiated call's leaves, as the gate compares them."""
     def run(*arguments):
         out, pull = jax.vjp(fn, *arguments[:-1])
         return out, *pull(arguments[-1])
+
+    return run
+
+
+def _host_tensor(value):
+    """A torch copy of a host array, of its own shape and dtype. NumPy holds bfloat16, the float8
+    formats and the 4-bit integers as ml_dtypes' types: a float of those goes through float32, which
+    holds it exactly, to torch's format of the same name, and an integer enters as int32, which holds
+    its values. A copy, so autograd never writes an array JAX holds."""
+    import torch
+
+    value = np.array(value)
+    if value.dtype.type.__module__.startswith("ml_dtypes"):
+        if jnp.issubdtype(value.dtype, jnp.floating):
+            return torch.as_tensor(value.astype(np.float32)).to(getattr(torch, value.dtype.name))
+        return torch.as_tensor(value.astype(np.int32))
+    return torch.as_tensor(value)
+
+
+def _host_array(value):
+    """A tensor as a host array. A format NumPy lacks, such as bfloat16, comes back as float32, which holds
+    its values exactly."""
+    import torch
+
+    value = value.detach()
+    narrow = value.is_floating_point() and value.dtype not in (torch.float16, torch.float32, torch.float64)
+    return (value.float() if narrow else value).numpy()
+
+
+def torch_with_gradients(fn):
+    """`with_gradients` for a torch arm. `fn(*tensors)` becomes `run(*inputs, cotangent)`, which returns
+    `fn`'s output and the gradients of its inputs under the cotangent passed last, as host arrays.
+    - Each floating input enters as a tensor of its own dtype that requires a gradient; a module's
+      parameters are inputs too, called through `torch.func.functional_call`.
+    - The cotangent has the output's tree (an array, or a tuple or dict of them), as `jax.vjp` requires,
+      each leaf cast to its output's dtype.
+    - An input the output does not reach has a zero gradient, a non-floating one none, and an output no
+      input reaches pulls nothing back.
+    - A narrow float array (bfloat16, the float8 formats) goes in and comes out through the float32 that
+      holds it."""
+    def run(*arguments):
+        import torch
+
+        inputs, cotangent = jax.tree.map(_host_tensor, arguments[:-1]), arguments[-1]
+        for leaf in jax.tree.leaves(inputs):
+            if leaf.is_floating_point():
+                leaf.requires_grad_()
+        out = fn(*inputs)
+        if jax.tree.structure(out) != jax.tree.structure(cotangent):
+            raise ValueError(f"a cotangent of tree {jax.tree.structure(cotangent)} for an output of tree "
+                             f"{jax.tree.structure(out)}")
+        flat, tree = jax.tree.flatten(inputs)
+        wanted = [index for index, leaf in enumerate(flat) if leaf.requires_grad]
+        reached = [(leaf, c) for leaf, c in zip(jax.tree.leaves(out), jax.tree.leaves(cotangent), strict=True)
+                   if leaf.requires_grad]
+        pulled = [None] * len(wanted)
+        if wanted and reached:
+            pulled = torch.autograd.grad([leaf for leaf, _ in reached], [flat[index] for index in wanted],
+                                         grad_outputs=[_host_tensor(c).to(leaf.dtype) for leaf, c in reached],
+                                         allow_unused=True)
+        gradients = [None] * len(flat)
+        for index, grad in zip(wanted, pulled, strict=True):
+            gradients[index] = _host_array(torch.zeros_like(flat[index]) if grad is None else grad)
+        return jax.tree.map(_host_array, out), *jax.tree.unflatten(tree, gradients)
 
     return run
 

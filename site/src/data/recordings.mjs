@@ -10,7 +10,7 @@ const read = (...parts) => readFileSync(path.join(process.cwd(), 'public', 'exam
 /** `capture`, after checking it recorded exactly `code`. */
 export function checked(name, code, capture) {
 	if (capture.script_sha256 !== createHash('sha256').update(code).digest('hex')) {
-		throw new Error(`${name}: the recording is of other code than the page shows; record it again (site/scripts/capture_snippets.py)`);
+		throw new Error(`${name}: the recording is of other code than the page shows; record it again (site/scripts/capture_snippets.py), or, where the change only renames, keep it (site/scripts/redigest.py)`);
 	}
 	return capture;
 }
