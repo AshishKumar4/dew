@@ -1658,8 +1658,30 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
     if count is None or rooted or unending or (not onward and repeated >= batched):
         return count
     # An order that ends holds no more than it reads before its batch, whatever bounds it after its repeat.
+    length = _order_length(train, build)
+    return count if length is None else min(count, length)
+
+
+def _order_length(train: Pipeline, build: _Build) -> int | None:
+    """The records `train`'s order holds before its batch, all its passes, as the lowering builds
+    them; None where its read counts none ahead."""
+    order = dataclasses.replace(train, stages=train.stages[:_until(train.stages, (BatchStage, TokenBudget))])
     with _closing(build.records(order, DataPartition())) as rows:
-        return min(count, len(rows)) if isinstance(rows, pygrain.MapDataset) else count
+        return len(rows) if isinstance(rows, pygrain.MapDataset) else None
+
+
+def _order_records(train: Pipeline, build: _Build) -> int | None:
+    """The records a training read of `train`'s global order hands out where it ends, the same on
+    every share (`Loader.order_records`): its order before its batch, whole where its batch keeps a
+    short one, else cut to whole batches as the read cuts it (`_Build.batched`); None where it
+    never ends or its read counts none ahead."""
+    if not build.global_order or build.lowering.endless:
+        return None
+    length = _order_length(train, build)
+    stage = next((stage for stage in train.stages if isinstance(stage, BatchStage)), None)
+    if length is None or stage is None or not stage.drop_remainder:
+        return length
+    return length // stage.size * stage.size
 
 
 def _tail(train: Pipeline, build: _Build) -> Tail:
