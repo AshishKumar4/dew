@@ -639,7 +639,7 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
 
         @functools.partial(
             pl.run_scoped,
-            o_smem=plgpu.SMEM((2, block_n // staged, depth_half, staged), out_dtype),
+            o_smem=plgpu.SMEM((2, depth_half, staged), out_dtype),
             **mosaic.staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]), side_gmems[i])
                                  for i in fixed]),
             halves=plgpu.Barrier(num_arrivals=2, num_barriers=2),
@@ -671,15 +671,14 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
                 fixed_refs = [smem.at[wg] for smem in fixed_smems]
 
                 def store(acc, g_i, depth, columns):
-                    # In `_staged_columns` chunks, as `_finish_half` stores.
-                    plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-                    for chunk in range(block_n // staged):
-                        o_smem[wg, chunk] = acc[:, chunk * staged:(chunk + 1) * staged].astype(o_smem.dtype)
-                    plgpu.commit_smem()
+                    # One `_staged_columns` chunk at a time through one buffer, as `_finish_half` stores.
                     mine = pl.ds(depth.start + wg * depth_half, depth_half)
                     for chunk in range(block_n // staged):
+                        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+                        o_smem[wg] = acc[:, chunk * staged:(chunk + 1) * staged].astype(o_smem.dtype)
+                        plgpu.commit_smem()
                         chunk_columns = pl.ds(columns.start + chunk * staged, staged)
-                        plgpu.copy_smem_to_gmem(o_smem.at[wg, chunk], o_gmem.at[g_i, mine, chunk_columns])
+                        plgpu.copy_smem_to_gmem(o_smem.at[wg], o_gmem.at[g_i, mine, chunk_columns])
 
                 hook = None if prologue is None else (prologue, prologue_axes, stepped, fixed, fixed_refs)
 
