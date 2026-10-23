@@ -44,6 +44,7 @@ from jinja2 import TemplateError
 
 from dew.data.facts import unshaped
 from dew.data.text import HFTokenizer, SavedTokenizer, tokenizer_name
+from dew.records import JSON
 
 if TYPE_CHECKING:
     from transformers import BatchEncoding, PreTrainedTokenizerBase
@@ -390,14 +391,17 @@ def _token_ids(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping
 
 
 def _rendered(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping[str, object]], *,
-              generation_prompt: bool, where: str, thinking: bool | None, tokenize: bool
+              generation_prompt: bool, where: str, thinking: bool | None, tokenize: bool,
+              chat_template: str | None = None, options: Mapping[str, JSON] | None = None
               ) -> str | list[int] | list[str] | list[list[int]] | BatchEncoding:
-    """The chat template's rendering of `rows`, as token ids (`tokenize`) or as text; `thinking` and a
-    refusal as `_token_ids` says."""
+    """The chat template's rendering of `rows`, as token ids (`tokenize`) or as text: `chat_template`
+    in place of the tokenizer's own where given, and `options` the variables the template reads beside
+    the messages; `thinking` and a refusal as `_token_ids` says."""
     try:
         render = functools.partial(
             tokenizer.apply_chat_template, rows, tools=[dict(tool) for tool in tools] or None,
-            tokenize=tokenize, return_dict=False, add_generation_prompt=generation_prompt)
+            tokenize=tokenize, return_dict=False, add_generation_prompt=generation_prompt,
+            **({} if chat_template is None else {"chat_template": chat_template}), **(options or {}))
         return render() if thinking is None else render(enable_thinking=thinking)
     except (TemplateError, TypeError) as exc:
         raise ValueError(f"{where}: the chat template refused the conversation: {exc}") from exc
@@ -408,17 +412,18 @@ CONTENT = "\x00content\x00"
 template's own markup holds it, and none trims or escapes it."""
 
 
-def framed(tokenizer: PreTrainedTokenizerBase, system: str, *, where: str,
-           thinking: bool | None = None) -> tuple[str, str]:
+def framed(tokenizer: PreTrainedTokenizerBase, system: str, *, where: str, thinking: bool | None = None,
+           chat_template: str | None = None, options: Mapping[str, JSON] | None = None) -> tuple[str, str]:
     """The text a chat template renders around one user turn's content: a system message and the
     user's turn up to its content, then the rest of the turn and the assistant's opening (the
     generation prompt), as `tokenizer`'s own template writes them, with `thinking` its
-    `_token_ids`' switch. A row that frames its own content between the two is the conversation the
+    `_token_ids`' switch, `chat_template` in place of its own and `options` the template's other
+    variables (`_rendered`). A row that frames its own content between the two is the conversation the
     template renders, its markup the template's own tokens, whatever the backbone's family; the
     content is placed as written, never re-rendered, so its tokens and spans are the caller's."""
     rows = [{"role": "system", "content": system}, {"role": "user", "content": CONTENT}]
     text = _rendered(tokenizer, rows, (), generation_prompt=True, where=where, thinking=thinking,
-                     tokenize=False)
+                     tokenize=False, chat_template=chat_template, options=options)
     if not isinstance(text, str) or text.count(CONTENT) != 1:
         raise ValueError(f"{where}: the chat template does not render a user turn's content once, as written")
     before, after = text.split(CONTENT)

@@ -92,3 +92,26 @@ def test_an_image_stands_as_its_processors_own_image_part(name, written):
 
     processor = AutoProcessor.from_pretrained(str(LOCAL[name]), local_files_only=True)
     assert image_text(processor, where=name) == written
+
+
+
+def test_a_framing_reads_a_chat_template_of_its_own_and_its_variables_and_its_record_reloads_them():
+    """A framing's own Jinja chat template frames a row in place of the tokenizer's (a base model's,
+    which has none, or a templated one's, overridden), its variables reach the template, and the
+    layout's record carries both, so a run that reloads its layout frames its rows alike."""
+    from dew.registry import from_record, to_record
+
+    template = ("{% for message in messages %}[{{ message.role }}{{ ' ' + mark if mark else '' }}]"
+                "{{ message.content }}{% endfor %}{% if add_generation_prompt %}[reply]{% endif %}")
+    templated = HFTokenizer(str(LOCAL["qwen3.5"]), local_files_only=True)
+    framing = Framing(chat_template=template, options={"mark": "x"})
+    before, after = framing.around(templated)
+    assert before.startswith(f"[system x]{JOINT_SYSTEM}[user x]")
+    assert after.endswith(f"[reply]{JOINT_PREFILL}")
+    assert not any(markup in before + after for markup in CHATML)
+    layout = JointLayout(framing=framing)
+    reloaded = from_record(JointLayout, to_record(layout, JointLayout))
+    assert reloaded == layout
+    specials = Specials.of(templated)
+    rows = [laid.rows(templated, specials, "one two", QUESTIONS) for laid in (reloaded, layout)]
+    assert rows[0] == rows[1]
