@@ -248,7 +248,7 @@ The planes are computed on the devices that hold the EMA. So a save holds one mo
 
 ## Post-hoc EMA
 
-You usually pick an EMA's length before training and judge it afterwards. Post-hoc EMA (Karras et al. 2024, [arXiv:2312.02696](https://arxiv.org/abs/2312.02696)) lets you pick it after training. Setting `OptimConfig.ema_profiles`, for example to `(0.05, 0.10)`, wraps the optimizer in `dew.training.optim.power_profiles`. That keeps one power-function EMA of the weights per relative standard deviation (the paper's σ_rel) in the optimizer state, so the profiles are sharded, placed and saved with that state.
+You usually pick an EMA's length before training and judge it afterwards. Post-hoc EMA (Karras et al. 2024, [arXiv:2312.02696](https://arxiv.org/abs/2312.02696)) lets you pick it after training. Setting `OptimConfig.ema_profiles`, for example to `(0.05, 0.10)`, wraps the optimizer in `dew.optim.power_profiles`. That keeps one power-function EMA of the weights per relative standard deviation (the paper's σ_rel) in the optimizer state, so the profiles are sharded, placed and saved with that state.
 
 A snapshot is the ordinary checkpoint itself, which Orbax's public preservation policy keeps even after `keep` would prune it. The state and the averages go into one atomic save, so an interrupted save cannot publish a state without its profiles.
 

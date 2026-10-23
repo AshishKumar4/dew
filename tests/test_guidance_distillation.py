@@ -14,12 +14,13 @@ from diffusion_stubs import batch_for
 from diffusion_support import images_of, saved_after_one_step
 
 from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
+from dew.config.diffusion import DiffusionRunConfig
 from dew.diffusion import broadcast_rates
 from dew.diffusion.presets import EDM, Flow
 from dew.diffusion.process import aligned_conditions
-from dew.inputs import unit_range
+from dew.inputs import TextCondition, unit_range
 from dew.objectives.base import TEACHER, Step
-from dew.objectives.diffusion import DiffusionRunConfig, GuidanceDistillationObjective, TextCondition
+from dew.objectives.diffusion import GuidanceDistillationObjective
 from dew.objectives.diffusion.guidance_distillation import with_guidance
 from dew.sampling import Euler, TextToImage
 
@@ -56,9 +57,8 @@ def runs(tmp_path_factory, request):
                                   {"solver": Euler(), "guidance": None, "steps": 2, "ema_decay": None}))
     _, _, batch = saved_after_one_step(teacher, lambda task: batch_for(task, 8), root / "teacher", 1e-2,
                                        key=0)
-    student = dataclasses.replace(teacher, objective=ObjectiveConfig("guidance_distillation", {
-        "teacher_run": str(root / "teacher"), "scales": [1.0, 6.0], "solver": Euler(), "steps": 2,
-        "ema_decay": None}))
+    student = dataclasses.replace(teacher, teacher_run=str(root / "teacher"), objective=ObjectiveConfig(
+        "guidance_distillation", {"scales": [1.0, 6.0], "solver": Euler(), "steps": 2, "ema_decay": None}))
     return root, student, batch
 
 

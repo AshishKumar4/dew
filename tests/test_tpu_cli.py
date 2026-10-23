@@ -9,9 +9,9 @@ from pathlib import Path
 
 import pytest
 
+from dew.builds import PACKAGE_INDEX
 from dew.cli import config as tpu_config, tpu as tpu_cli, tpu_setup
 from dew.cli.launch import remote_script
-from dew.telemetry.builds import PACKAGE_INDEX
 
 #: Stands in for gcloud and rsync. Records every argv, answers from a state file.
 FAKE = '''#!/usr/bin/env python3
