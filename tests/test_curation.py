@@ -1,11 +1,12 @@
 """Curating a web corpus as a chain reads it, through DataTrove's filters: heuristic quality,
 n-gram decontamination against evaluation texts, a fastText classifier and language
 identification, each dropping the records it rejects, counted by the reason it names, and each
-keyed in the plan by the rules and the model it runs."""
+keyed in the plan by the rules and the model it runs; and sealing it without its near-duplicates
+by DataTrove's MinHash stages."""
 
 import pytest
 
-from dew.data import Loading, Memory, text
+from dew.data import Files, Loading, Memory, text
 from dew.data.compile import compile, iterate
 from dew.data.pipeline import Pipeline
 
@@ -91,3 +92,19 @@ def test_language_identification_keeps_the_language_it_is_asked_for():
     kept, dropped = one_pass(Pipeline(Memory(records, shard_rows=len(records)))
                          .filter_map(text.Language(("en",))))
     assert kept == [0, 1, 2] and dropped == {"language": 1}
+
+
+def test_a_corpus_sealed_without_its_near_duplicates_keeps_one_record_of_each_group(tmp_path):
+    """A page copied whole, and one copied with a word changed, are near-duplicates of their source:
+    the sealed corpus keeps one record of each group and every distinct page, in their order, and its
+    manifest records the rule and the records removed."""
+    copied = PROSE[1].replace("bread", "loaf", 1)
+    pages = [PROSE[0], PROSE[1], PROSE[0], PROSE[2], copied]
+    corpus = Memory([{"id": index, "text": page} for index, page in enumerate(pages)], shard_rows=len(pages))
+    manifest = text.deduplicated(Pipeline(corpus), str(tmp_path / "sealed"))
+    stored = Files(str(tmp_path / "sealed")).records("indexed")
+    kept = [int(stored[index]["id"]) for index in range(len(stored))]
+    assert sorted({pages[index] for index in kept}) == sorted(set(PROSE))
+    assert kept == sorted(kept) and len(kept) == len(PROSE)
+    assert manifest["rows"] == len(PROSE)
+    assert manifest["metadata"]["near_duplicates"]["removed"] == len(pages) - len(PROSE)
