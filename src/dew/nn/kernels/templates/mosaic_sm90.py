@@ -22,6 +22,7 @@ class Wgmma(mosaic.RingFamily):
 
     name = "wgmma"
     rows = 64
+    consumers = 2
     layout = plgpu.Layout.WGMMA
     row = plgpu.Layout.WGMMA.reduce(1)
     column = plgpu.Layout.WGMMA.reduce(0)
@@ -41,7 +42,7 @@ class Wgmma(mosaic.RingFamily):
         return self.product(lhs, rhs, (lhs.shape[0], rhs.shape[1]))
 
     def register_products(self, acc, parts, rhs, interpret: bool):
-        _unscaled(parts)
+        mosaic.unscaled(parts)
         for part, _ in parts:
             if interpret:
                 acc = acc + jnp.dot(part, rhs[...], preferred_element_type=jnp.float32)
@@ -50,7 +51,7 @@ class Wgmma(mosaic.RingFamily):
         return acc
 
     def staged_products(self, acc, parts, rhs, buffers, interpret: bool, *, transposed: bool = False):
-        _unscaled(parts)
+        mosaic.unscaled(parts)
         for place, (part, _) in enumerate(parts):
             buffers.at[place][...] = part.astype(buffers.dtype)
         plgpu.commit_smem()
@@ -61,6 +62,14 @@ class Wgmma(mosaic.RingFamily):
             else:
                 plgpu.wgmma(acc, lhs, rhs)
         return acc
+
+    def rescaled_products(self, acc, scale, parts, rhs, interpret: bool):
+        if interpret:
+            return self.register_products(scale(acc), parts, rhs, interpret)
+        # The accumulator's value read once its products are done, scaled, stored back.
+        plgpu.wgmma_wait(0)
+        acc[...] = scale(acc[...])
+        return self.register_products(acc, parts, rhs, interpret)
 
     def settled(self) -> None:
         plgpu.wgmma_wait(0)
@@ -102,12 +111,6 @@ class Wgmma(mosaic.RingFamily):
 
     def as_row(self, vector: jax.Array) -> jax.Array:
         return plgpu.layout_cast(vector, self.row)
-
-
-def _unscaled(parts) -> None:
-    """A product's parts issued in place take no power of two back (bf16's, `cotangent_parts`)."""
-    if any(exponent is not None for _, exponent in parts):
-        raise NotImplementedError("a scaled part's product is no in-place accumulation (fp16's)")
 
 
 WGMMA = Wgmma()
