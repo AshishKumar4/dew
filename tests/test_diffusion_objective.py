@@ -378,6 +378,8 @@ def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_
         tokens = explicit(rows, masked(jax.tree.map(lambda leaf: np.asarray(leaf, np.float32)
                                                     if np.issubdtype(np.asarray(leaf).dtype, np.floating)
                                                     else leaf, values), rows, at))
+        # The pixels in float64 too, so the loss's normalization, rates and noising run in float64.
+        tokens = {**tokens, "image": np.asarray(tokens["image"], np.float64)}
         with jax.enable_x64(new_val=True):
             wide = DiffusionObjective(source.model.clone(dtype=jnp.float64), source.process, source.inputs,
                                       unconditional_prob=0.0, steps=3, solver=Euler(),
