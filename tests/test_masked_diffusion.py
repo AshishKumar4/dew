@@ -198,6 +198,22 @@ def test_a_masked_family_unmasks_each_position_from_the_logits_its_reference_rea
                                       unmasking(np.load(directory / "logits_f64.npy")), f"{name} unmasking")
 
 
+def test_a_shifted_model_reads_each_document_and_padded_row_as_if_alone():
+    """Dream reads position i's prediction from position i-1, but a packed document's first token,
+    and a left-padded row's first real one, read their own, as the reference does a row's first: a
+    packed row's predictions are its documents' each aligned alone, and a padded row's real ones are
+    its text's aligned alone."""
+    from dew.diffusion.discrete import aligned
+
+    model, _ = loaded("dream-tiny")
+    scores = jnp.arange(6.0).reshape(1, 6, 1) + 10
+    alone = [aligned(model, scores[:, :3]), aligned(model, scores[:, 3:])]
+    packed = aligned(model, scores, {"segment_ids": jnp.array([[1, 1, 1, 2, 2, 2]])})
+    np.testing.assert_array_equal(packed, jnp.concatenate(alone, axis=1))
+    padded = aligned(model, scores, {"attention_mask": jnp.array([[False, False, True, True, True, True]])})
+    np.testing.assert_array_equal(padded[:, 2:], aligned(model, scores[:, 2:]))
+
+
 def test_a_dream_shaped_record_keeps_how_its_logits_line_up():
     """The alignment is a fact of the checkpoint, so the model's record carries it: a Dream config
     reads to a model that shifts, which its record rebuilds as one that shifts, and LLaDA's to one

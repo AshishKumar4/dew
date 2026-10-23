@@ -225,7 +225,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         # Each position's prediction, as the checkpoint's logits line up with its inputs.
         read = aligned(self.model, final_read(self.model, params, masked, train=train,
                                               rngs=model_rngs(dropout_key, training=train), mutable=False,
-                                              capture_intermediates=False, **prepared.kwargs()))
+                                              capture_intermediates=False, **prepared.kwargs()), fields)
         # MDLM's SUBS parameterization gives the mask token no mass: it is
         # never a target, so the partition and the prediction leave it out.
         mask_id = self.process.mask_id
