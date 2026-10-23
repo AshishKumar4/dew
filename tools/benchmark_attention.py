@@ -35,6 +35,7 @@ import json
 import os
 import statistics
 import sys
+import dataclasses
 from dataclasses import dataclass
 from typing import Optional
 
@@ -251,7 +252,8 @@ def format_table(rows: list[dict]) -> str:
 
 def main(config: BenchmarkConfig) -> list[dict]:
     if config.peak_run is not None:
-        measure(cases(config)[config.peak_run], config)
+        # The row's own work alone: its accuracy reference materializes the logits a fused kernel avoids.
+        measure(cases(config)[config.peak_run], dataclasses.replace(config, reference_error=False))
         return []
     # Each row's measured peak, before this process opens a backend, which would hold the device each
     # row's peak process needs.
