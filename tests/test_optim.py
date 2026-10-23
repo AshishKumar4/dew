@@ -73,7 +73,7 @@ def dit_params():
 
 
 def muon_solver(**kwargs):
-    return OptimConfig(optimizer='muon', learning_rate=LR, **kwargs).build(10)
+    return OptimConfig(optimizer='muon', rate=LR, **kwargs).build(10)
 
 
 def fixed_gradients(params):
@@ -184,7 +184,7 @@ def test_a_schedule_that_marks_no_rate_is_its_own_shape():
             return lambda count: self.start * 0.5 ** count
 
     assert scaled(Halving()) == (1.0, Halving())
-    solver = OptimConfig(optimizer="adam", learning_rate=Halving(), clip_grads=0).build(4)
+    solver = OptimConfig(optimizer="adam", rate=Halving(), clip_grads=0).build(4)
     params = {"w": jnp.ones(3)}
     state = solver.init(params)
     for step in range(3):
@@ -214,7 +214,7 @@ def test_weight_decay_spares_the_biases_and_the_norms_unless_a_group_claims_them
     params = fixed_gradients(dit_params()['params'])
 
     def decay_step(**groups):
-        solver = OptimConfig(optimizer=optimizer, learning_rate=LR, weight_decay=0.1,
+        solver = OptimConfig(optimizer=optimizer, rate=LR, weight_decay=0.1,
                              state_dtype=state_dtype, **groups).build(1)
         return solver.update(jax.tree.map(jnp.zeros_like, params), solver.init(params), params)[0]
 
@@ -236,8 +236,8 @@ def test_both_groups_step_with_the_one_schedule():
     params = decoder_params()
     grads = fixed_gradients(params)
     cosine = Cosine(init=1e-4, peak=4e-3, end=1e-3, warmup_steps=1, decay_steps=4)
-    scheduled = OptimConfig(optimizer='muon', schedule=cosine).build(4)
-    unscaled = OptimConfig(optimizer='muon', learning_rate=1.0).build(4)
+    scheduled = OptimConfig(optimizer='muon', rate=cosine).build(4)
+    unscaled = OptimConfig(optimizer='muon', rate=1.0).build(4)
     rate = optax.warmup_cosine_decay_schedule(
         init_value=cosine.init, peak_value=cosine.peak,
         warmup_steps=cosine.warmup_steps, decay_steps=4, end_value=cosine.end)
@@ -340,7 +340,7 @@ MEGATRON = np.load(QK_FIXTURE.parent / "megatron.npz")
 
 
 def muonclip_solver(**kwargs):
-    return OptimConfig(optimizer='muonclip', learning_rate=LR, **kwargs).build(10)
+    return OptimConfig(optimizer='muonclip', rate=LR, **kwargs).build(10)
 
 
 def qk_tree(layers=1, heads=4, kv_heads=4, dim=8, seed=0):
@@ -524,7 +524,7 @@ def test_the_threshold_rides_optimizer_opts():
                                 qk_stats=stats)
     assert largest_difference(updates, plain) == 0.0
     low = OptimConfig(
-        optimizer='muonclip', learning_rate=LR,
+        optimizer='muonclip', rate=LR,
         optimizer_opts={'qk_clip_threshold': 5.0}).build(10)
     clipped, _ = low.update(grads, low.init(params), params, qk_stats=stats)
     factor = float(np.sqrt(5.0 / 50.0))
@@ -623,7 +623,7 @@ def test_policy_steps_carry_live_qk_statistics_to_muonclip(kind):
         packing = {"segment_ids": batch["text_segment_ids"][:, :-1],
                    "positions": batch["text_positions"][:, :-1]}
     threshold = .01
-    optimizer = OptimConfig(optimizer="muonclip", learning_rate=0.,
+    optimizer = OptimConfig(optimizer="muonclip", rate=0.,
                             optimizer_opts={"qk_clip_threshold": threshold}).build(1)
     trainer = Trainer(objective, optimizer, key=jax.random.key(0))
     initial = trainer.initial_state()
@@ -654,7 +654,7 @@ def test_policy_steps_carry_live_qk_statistics_to_muonclip(kind):
 # --- bf16 optimizer state ---------------------------------------------------
 
 def bf16_state_adamw(**kwargs):
-    return OptimConfig(optimizer='adamw', learning_rate=LR, weight_decay=0.0,
+    return OptimConfig(optimizer='adamw', rate=LR, weight_decay=0.0,
                                        state_dtype='bfloat16', **kwargs).build(10)
 
 
@@ -735,7 +735,8 @@ def test_rates_of_one_schedule_lower_to_one_update(optimizer, form):
             ParamGroup("kernels", ("*kernel",), learning_rate_multiplier=rate * 100,
                        schedule=Linear(peak=rate * 2, warmup_steps=1, end=rate / 8)),
             ParamGroup("rest", ("*",)))
-        return OptimConfig(optimizer=optimizer, learning_rate=rate, schedule=schedule, param_groups=groups)
+        return OptimConfig(optimizer=optimizer, rate=rate if schedule is None else schedule,
+                           param_groups=groups)
 
     programs, updates = [], []
     for rate in (1e-3, 4e-3):
@@ -770,8 +771,8 @@ def test_a_configured_optimizer_is_optaxs_own_at_the_rate_its_state_holds(optimi
     params = decoder_params()["params"]
     adam = optimizer in ("adam", "adamw", "lamb")
     betas, opts = ({"b1": 0.8, "b2": 0.95}, {"eps": 1e-5, "eps_root": 1e-9}) if adam else ({}, {})
-    config = OptimConfig(optimizer=optimizer, **betas, optimizer_opts=opts, learning_rate=3e-3,
-                         schedule=schedule, clip_grads=0.5)
+    config = OptimConfig(optimizer=optimizer, **betas, optimizer_opts=opts,
+                         rate=3e-3 if schedule is None else schedule, clip_grads=0.5)
     solver = config.build(10)
     scale, shape = scaled(config.rate)
     ratio = (lambda count: 1.0) if shape is None else shape.schedule(10)

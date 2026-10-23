@@ -766,7 +766,7 @@ class ParamGroup:
 
     def rate(self, learning_rate: float | ScheduleBase) -> tuple[float, ScheduleBase | None]:
         """This group's rate scale and shape (`scaled`): its own `schedule`,
-        else the config's `learning_rate`, times `learning_rate_multiplier`."""
+        else the config's `rate`, times `learning_rate_multiplier`."""
         scale, shape = scaled(learning_rate if self.schedule is None else self.schedule)
         return scale * self.learning_rate_multiplier, shape
 
