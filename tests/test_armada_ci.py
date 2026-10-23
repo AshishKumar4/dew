@@ -666,14 +666,14 @@ def split_entries(ci, target: float, timings: dict | None = None) -> list[dict]:
     return [entry for entry in ci.plan(target, timings or {}) if entry["python"] == "3.12" and entry["split"]]
 
 
-def ran_by(ci, tmp_path, monkeypatch, entries: list[dict]) -> list[list[str]]:
-    """What each entry's task ran, as its rows say and runs.log saw."""
+def ran_by(ci, tmp_path, monkeypatch, entries: list[dict], reused: bool = False) -> list[list[str]]:
+    """What each entry's task covered, as its rows say: runs.log saw each run, or, `reused`, nothing run."""
     ran = []
     for index, entry in enumerate(entries):
         (tmp_path / "runs.log").unlink(missing_ok=True)
         [verdict] = filled(ci, monkeypatch, entry, tmp_path / f"verdict-{index}.json")
         assert verdict["exitCode"] == 0, verdict["output"]
-        assert len(logged(tmp_path)) == len(verdict["tests"])
+        assert len(logged(tmp_path)) == (0 if reused else len(verdict["tests"]))
         ran.append(sorted(verdict["tests"]))
     return ran
 
@@ -724,18 +724,19 @@ def test_a_split_rows_record_is_reused_only_for_the_tests_its_range_ran(ci, tmp_
     interpreter(tmp_path, "3.12")
     nodes = sorted(f"tests/test_split.py::test_n[{n}]" for n in ("2", "10", "it's", "a b"))
 
-    def run(times: dict[str, float], ranges: dict | None = None) -> tuple[list[str], list[list[str]]]:
+    def run(times: dict[str, float], ranges: dict | None = None,
+            reused: bool = False) -> tuple[list[str], list[list[str]]]:
         main_ran(ci, tmp_path, monkeypatch, times, ranges)
         entries = split_entries(ci, 4.0)
-        return [entry["bounds"] for entry in entries], ran_by(ci, tmp_path, monkeypatch, entries)
+        return [entry["bounds"] for entry in entries], ran_by(ci, tmp_path, monkeypatch, entries, reused)
 
     first, ran = run(dict.fromkeys(nodes, 2.0))
     assert sorted(node for group in ran for node in group) == nodes
     # The same total, so the same G/N, with times that would cut the file elsewhere.
     lopsided = {nodes[0]: 5.0, **dict.fromkeys(nodes[1:], 1.0)}
     rows = {f"3.12:tests/test_split.py#{index}/2": bounds for index, bounds in enumerate(first, start=1)}
-    kept, _ = run(lopsided, rows)
-    assert kept == first and not logged(tmp_path), "kept ranges: the rows are reused, nothing runs"
+    kept, ran = run(lopsided, rows, reused=True)
+    assert kept == first and sorted(node for group in ran for node in group) == nodes, "kept: the rows reused"
     moved, ran = run(lopsided)
     assert moved != first and logged(tmp_path), "moved ranges at the same G/N run again"
     assert sorted(node for group in ran for node in group) == nodes
