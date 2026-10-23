@@ -150,22 +150,24 @@ def with_gradients(fn):
 
 
 def _host_tensor(value):
-    """A torch copy of a host array, its own shape and dtype, bfloat16 through the float32 that holds it
-    exactly (NumPy holds it as ml_dtypes'). A copy, so autograd never writes an array JAX holds."""
+    """A torch copy of a host array, its own shape and dtype. A narrow float NumPy holds as ml_dtypes'
+    (bfloat16, the float8 formats) goes through the float32 that holds it exactly to torch's format of
+    its name. A copy, so autograd never writes an array JAX holds."""
     import torch
 
     value = np.array(value)
-    if value.dtype.name == "bfloat16":
-        return torch.as_tensor(value.astype(np.float32)).bfloat16()
+    if value.dtype.kind == "V" or value.dtype.type.__module__.startswith("ml_dtypes"):
+        return torch.as_tensor(value.astype(np.float32)).to(getattr(torch, value.dtype.name))
     return torch.as_tensor(value)
 
 
 def _host_array(value):
-    """A tensor as a host array, bfloat16 as the float32 that holds it exactly."""
+    """A tensor as a host array, a narrow float NumPy has no format for as the float32 that holds it."""
     import torch
 
     value = value.detach()
-    return (value.float() if value.dtype == torch.bfloat16 else value).numpy()
+    narrow = value.is_floating_point() and value.dtype not in (torch.float16, torch.float32, torch.float64)
+    return (value.float() if narrow else value).numpy()
 
 
 def torch_with_gradients(fn):
@@ -177,7 +179,8 @@ def torch_with_gradients(fn):
       each leaf cast to its output's dtype.
     - An input the output does not reach has a zero gradient, a non-floating one none, and an output no
       input reaches pulls nothing back.
-    - A bfloat16 array goes in and comes out through the float32 that holds it."""
+    - A narrow float array (bfloat16, the float8 formats) goes in and comes out through the float32 that
+      holds it."""
     def run(*arguments):
         import torch
 
