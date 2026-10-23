@@ -121,6 +121,14 @@ class GpuTarget:
     """The generation's global-memory load latency in multiprocessor clocks, as a pointer chase measures
     it (the kernel cost model's waiting term, `dew.nn.kernels.templates.cost`); None where no
     measurement states it."""
+    l2_bandwidth: float | None = None
+    """The bytes a second the L2 serves all multiprocessors' loads together, as a streaming probe measures
+    it (programs re-reading a buffer the L2 holds; the kernel cost model's L2 term); None where no
+    measurement states it, the L2 term then dropped."""
+    grid_step_seconds: float | None = None
+    """A TPU grid step's fixed cost, the seconds each program's step adds beside its work, as a least-squares
+    fit over a sweep of blocks measures it (the kernel cost model's step term); None on GPUs, whose
+    pipelined steps the model prices by their latency, the term then dropped."""
     scoped_vmem: int | None = None
     """A TPU's scoped VMEM limit in bytes at XLA's default, past which a Mosaic kernel refuses to compile
     (`dew.nn.attention.splash_block_sizes`); None where no measurement states it."""
@@ -232,7 +240,7 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('sm86', 'NVIDIA A10', 99 * 1024, {'attention_narrow': 'flash'},
               {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}, multiprocessors=72,
               clock_hz=1695e6, memory_bandwidth=600e9,
-              tensor_rates={'16bit': 1024, 'tf32': 512, 'fp32': 256}),
+              tensor_rates={'16bit': 1024, 'tf32': 512, 'fp32': 256}, l2_bandwidth=4.74e12),
     GpuTarget('sm89', 'NVIDIA L4', 99 * 1024,
               {'attention': 'flash', 'attention_window': 'flash', 'attention_sinks': 'flash',
                'xla_triton_gemm': 'off', 'gated_delta_rule': 'fla'},
@@ -251,7 +259,8 @@ TARGETS = {target.generation: target for target in (
         'NVIDIA H200': {'bf16': 989e12, 'fp8': 1979e12},
         'NVIDIA H200 NVL': {'bf16': 835e12, 'fp8': 1670.5e12}}, wgmma=True, multiprocessors=132,
               clock_hz=1830e6, memory_bandwidth=3350e9,
-              tensor_rates={'16bit': 4096, 'tf32': 2048, 'fp32': 256}, load_latency=478.8),
+              tensor_rates={'16bit': 4096, 'tf32': 2048, 'fp32': 256}, load_latency=478.8,
+              l2_bandwidth=13.2e12),
     # Datasheet facts alone, no routes: what a compile-only sm100 device needs (`tests/kernel_compile.py`),
     # its peaks the scoreboard's MFU; a B200 run states its own clock and bandwidth (`runtime_facts`).
     GpuTarget('sm100', 'NVIDIA B200', 227 * 1024,
@@ -271,7 +280,7 @@ TARGETS = {target.generation: target for target in (
     # derived from the peak, no stated clock.
     GpuTarget('v5e', 'TPU v5 lite', dense_peaks={'TPU v5 lite': {'bf16': 197e12}}, scoped_vmem=16 * 2 ** 20,
               multiprocessors=1, clock_hz=197e12 / 131072, memory_bandwidth=800 * 2 ** 30,
-              tensor_rates={'16bit': 131072}),
+              tensor_rates={'16bit': 131072}, grid_step_seconds=0.356e-6),
     GpuTarget('v5p', 'TPU v5', dense_peaks={'TPU v5': {'bf16': 459e12}, 'TPU v5p': {'bf16': 459e12}}),
     GpuTarget('v6e', 'TPU v6 lite', dense_peaks={'TPU v6 lite': {'bf16': 918e12}}),
 )}
