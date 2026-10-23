@@ -38,7 +38,6 @@ from common import (
     WorkloadWork,
     attach_xplane_profile,
     documents,
-    git_head,
     host,
     peak_flops,
     run_arguments,
@@ -48,6 +47,7 @@ from common import (
     window_rows,
     write_record,
 )
+from reference_source import git_head
 
 
 class NormState(NamedTuple):
@@ -122,13 +122,12 @@ def build(args: argparse.Namespace) -> Run:
     from dew.config import OptimConfig
     from dew.interop import Pretrained
     from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.inputs import coordinates
     from dew.nn.multimodal import MultimodalTransformer
     from dew.objectives.lm import TEXT_KEY, LMObjective
     from dew.training import MeshSpec, Trainer
     from dew.training.distributed import batch_shardings
     from dew.training.optim import Cosine, ParamGroup
-
-    from dew.nn.inputs import coordinates
 
     data = np.load(args.data)
     windows, order = data["windows"], data["order"]

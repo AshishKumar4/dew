@@ -15,6 +15,7 @@ from reference_error import assert_as_exact_as_the_reference, assert_as_exact_ov
 from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
 from dew.nn.backbones import SimpleDiT
+from dew.nn.scan_orders import patchify
 from dew.objectives.base import Step
 from dew.objectives.diffusion import Alignment, DiffusionObjective
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, spatial_zscore
@@ -104,13 +105,6 @@ COMPOSED = np.load(Path(__file__).resolve().parent / "fixtures" / "repa" / "comp
 PREPROCESSED = np.load(Path(__file__).resolve().parent / "fixtures" / "repa" / "preprocessed.npz")
 
 
-def patches(images, patch: int):
-    """`[B, H, W, C]` as `[B, N, p * p * C]` tokens in raster order."""
-    b, h, w, c = images.shape
-    grid = images.reshape(b, h // patch, patch, w // patch, patch, c).transpose(0, 1, 3, 2, 4, 5)
-    return grid.reshape(b, (h // patch) * (w // patch), patch * patch * c)
-
-
 class Network(nn.Module):
     """`tools/repa_reference.py`'s stand-in model at Dew's model time (t times
     1000): patch tokens plus the time, the aligned `block`, a head."""
@@ -121,7 +115,7 @@ class Network(nn.Module):
     @nn.compact
     def __call__(self, x, time, train=False):
         b, side, _, c = x.shape
-        tokens = patches(x, self.patch)
+        tokens = patchify(x, self.patch)
         hidden = (tokens @ self.param("embed", nn.initializers.zeros, (tokens.shape[-1], self.width))
                   + (time / 1000).reshape(-1, 1, 1)
                   * self.param("time", nn.initializers.zeros, (self.width,)))
@@ -138,7 +132,7 @@ class Projected(nn.Module):
 
     @nn.compact
     def __call__(self, pixels):
-        tokens = patches(pixels, self.patch)
+        tokens = patchify(pixels, self.patch)
         return tokens @ self.param("encoder", nn.initializers.zeros, (tokens.shape[-1], 6))
 
 

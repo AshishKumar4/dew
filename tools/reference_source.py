@@ -10,17 +10,27 @@ scope; a generator that retargets a dtype, drops a decorator or builds a
 class around them does so between `selected` and `ran`. `simple_statements`
 takes single lines out of a published function. `verified` keeps a
 reference file on disk, fetched once and checked against its pinned SHA-256
-on every use. `stub_torch_utils` stands in for the two `torch_utils` names
-NVIDIA's EDM and EDM2 networks import. `saved_fixture` writes a generator's
-arrays with its provenance as the suite reads them, and `recipe_images` draws the images a recipe names.
+on every use; `github` keeps one of a GitHub repository's, and
+`published_files` a pinned set of them. `loaded` runs one file as a module,
+and `package` imports a directory of them as a package whose own `__init__`
+never runs (`hub_modules` a Hugging Face repo's remote code).
+`stub_torch_utils` stands in for the two `torch_utils` names NVIDIA's EDM and
+EDM2 networks import. `saved_fixture` writes a generator's arrays with its
+provenance as the suite reads them, `git_head` names the commit of the
+checkout a record came from, and `recipe_images` draws the images a recipe
+names.
 """
 
 from __future__ import annotations
 
 import ast
 import hashlib
+import importlib.util
+import subprocess
+import sys
+import types
 import urllib.request
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
 TIMEOUT = 120
@@ -33,9 +43,6 @@ def stub_torch_utils() -> None:
     """NVIDIA's `torch_utils` as EDM and EDM2's networks import it:
     `persistence.persistent_class` is only pickling metadata, and
     `misc.const_like` a tensor of a value on another tensor's dtype and device."""
-    import sys
-    import types
-
     import torch
 
     persistence = types.ModuleType("torch_utils.persistence")
@@ -58,6 +65,13 @@ def saved_fixture(path: Path, arrays: dict, meta: dict) -> None:
     arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(path, **arrays)
+
+
+def git_head(path: str | Path) -> str:
+    """The commit the git checkout at `path` is at; a record without one cannot be traced, so a
+    checkout git cannot read fails the run."""
+    return subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True,
+                          text=True, check=True).stdout.strip()
 
 
 def recipe_images(recipe: dict):
@@ -85,6 +99,55 @@ def verified(url: str, local: Path, digest: str) -> Path:
     if found != digest:
         raise RuntimeError(f"{local} has SHA-256 {found}, not the pinned {digest}")
     return local
+
+
+def github(repo: str, commit: str, path: str, digest: str) -> Path:
+    """`path` of the GitHub repository `repo` at `commit`, kept under `CACHE` as `verified` keeps it."""
+    return verified(f"https://raw.githubusercontent.com/{repo}/{commit}/{path}", CACHE / repo / commit / path,
+                    digest)
+
+
+def published_files(repo: str, commit: str, files: Mapping[str, str]) -> Path:
+    """Where `github` keeps `repo` at `commit`, holding each of `files` (a path in it, to its pinned
+    SHA-256)."""
+    for path, digest in files.items():
+        github(repo, commit, path, digest)
+    return CACHE / repo / commit
+
+
+def loaded(name: str, path: Path | str) -> types.ModuleType:
+    """The Python file at `path` run as the module `name`, which `sys.modules` holds before it runs,
+    so its dataclasses and pickles find their module."""
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def package(name: str, directory: Path) -> types.ModuleType:
+    """`directory` as the package `name`, in place of any `name` and modules of it imported before:
+    `name.module` reads `directory`'s module.py and a subdirectory is a namespace package, while no
+    `__init__.py` runs, so nothing a published package's own would import is needed. Each call
+    imports its modules afresh, so two revisions of one package load side by side as the module
+    objects each call's imports returned."""
+    for imported in [key for key in sys.modules if key == name or key.startswith(f"{name}.")]:
+        del sys.modules[imported]
+    module = types.ModuleType(name)
+    module.__path__ = [str(directory)]
+    sys.modules[name] = module
+    return module
+
+
+def hub_modules(name: str, repo: str, revision: str, files: Sequence[str]) -> tuple[types.ModuleType, ...]:
+    """The remote code `files` at the top of the Hugging Face repo `repo` at `revision`, fetched
+    through the hub's own cache and each imported as a module of the package `name` (`package`), so
+    their relative imports find each other."""
+    from huggingface_hub import hf_hub_download
+
+    paths = [Path(hf_hub_download(repo, file, revision=revision)) for file in files]
+    package(name, paths[0].parent)
+    return tuple(importlib.import_module(f"{name}.{path.stem}") for path in paths)
 
 
 def _defined(node: ast.stmt) -> set[str]:
