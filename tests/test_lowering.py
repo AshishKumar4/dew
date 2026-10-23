@@ -23,9 +23,11 @@ from dew.nn.kernels.generation import (
     GpuTarget,
     Refusal,
     Route,
+    architecture,
     assumed,
     chosen as kernel_choices,
     device_generation,
+    family,
     fp8_tensor_cores,
     gpu_mesh,
     gpu_target,
@@ -299,14 +301,52 @@ def test_fp8_tensor_cores_are_a_fact_of_the_compute_capability(generation, cores
     assert fp8_tensor_cores(generation) is cores
 
 
+@pytest.mark.parametrize("generation, claimed", [
+    ("sm75", "mma.sync"), ("sm80", "mma.sync"), ("sm86", "mma.sync"), ("sm87", "mma.sync"),
+    ("sm89", "mma.sync"), ("sm90", "wgmma"), ("sm100", "tcgen05"), ("sm103", "tcgen05"),
+    ("sm110", "tcgen05"), ("sm120", "mma.sync"), ("sm121", "mma.sync"), ("sm70", None), ("sm60", None),
+    ("v5e", "tpu"), ("cpu", None)])
+def test_a_generations_instruction_family_is_its_compute_capabilitys(generation, claimed):
+    """The family a template's mainloop claims comes from the compute capability alone, a GPU the table
+    names or not (sm87, sm110 and sm121 it does not); a GPU before Turing or a CPU is in none."""
+    assert family(generation) == claimed
+
+
+def test_an_unseen_member_of_a_family_takes_its_familys_facts_and_its_own_device_attributes():
+    """A Blackwell GPU no row names (sm110) ranks as the family's: its tensor rates, tensor memory and
+    model latency are tcgen05's, and its L2 bandwidth is the family's bytes a multiprocessor a clock over
+    the multiprocessors and clock its device reports, so the cost model ranks its configs."""
+    from dew.nn.kernels.templates import cost
+
+    target = GpuTarget("sm110", "an unseen Blackwell", 227 * 1024, multiprocessors=20, clock_hz=1.5e9,
+                       memory_bandwidth=273e9)
+    blackwell = architecture("sm100")
+    assert blackwell is not None
+    assert (target.tensor_rates, target.tmem_columns, target.wgmma) == (blackwell.tensor_rates, 512, False)
+    assert target.load_latency == blackwell.load_latency
+    assert target.l2_bandwidth == blackwell.l2_bytes_per_clock * 20 * 1.5e9
+    assert cost.seconds(cost.Cost(programs=40, device_bytes=1e6, program_flops=1e9), target) > 0
+
+
+def test_a_devices_calibration_replaces_its_familys_model_values_and_nothing_else():
+    """The opt-in calibration's facts take the place of the family's model latency and L2 bandwidth; the
+    rates stay the family's."""
+    target = GpuTarget("sm90", "an H100", 227 * 1024, multiprocessors=132, clock_hz=1.83e9,
+                       calibration={"load_latency": 500.0, "l2_bandwidth": 1.0e13})
+    assert (target.load_latency, target.l2_bandwidth) == (500.0, 1.0e13)
+    assert target.tensor_rates == TARGETS["sm90"].tensor_rates and target.wgmma
+
+
 def test_a_gpu_the_table_does_not_name_keeps_the_resources_its_device_reports():
     """A CUDA device of a generation no row names (a B200, sm100) takes its multiprocessors and its
     block's shared memory from the device, and Hopper's warpgroup MMA from its capability, 9.0 alone,
     so a launch sized by them sizes itself rather than taking a default for want of a row."""
     blackwell = runtime_facts(GpuTarget("sm100", "NVIDIA B200"), SimpleNamespace(
-        compute_capability="10.0", core_count=148, shared_memory_per_block_optin=232448, local_hardware_id=0))
+        compute_capability="10.0", core_count=148, shared_memory_per_block_optin=232448, local_hardware_id=0,
+        device_kind="NVIDIA B200"))
     hopper = runtime_facts(GpuTarget("sm90", "NVIDIA H100 80GB HBM3"), SimpleNamespace(
-        compute_capability="9.0", core_count=132, shared_memory_per_block_optin=232448, local_hardware_id=0))
+        compute_capability="9.0", core_count=132, shared_memory_per_block_optin=232448, local_hardware_id=0,
+        device_kind="NVIDIA H100 80GB HBM3"))
     assert (blackwell.multiprocessors, blackwell.shared_limit, blackwell.wgmma) == (148, 232448, False)
     assert (hopper.multiprocessors, hopper.shared_limit, hopper.wgmma) == (132, 232448, True)
 
