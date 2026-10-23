@@ -880,13 +880,13 @@ def test_the_procedure_before_the_two_stages_draws_again_as_it_did():
     """Compared against, the procedure before check 1's two stages (`_staged(two_stage=False)`) draws
     the second set wherever a leaf's ratio is over PARITY, a value not finite included, and only there:
     an inconclusive leaf is final at its declared seeds."""
-    from reference_error import _Draws, _staged
+    from reference_error import NO_ZERO_ROWS, _Draws, _staged
 
     def law(dew):
         def drawn(start, stop):
             count = stop - start
             return _Draws(["leaf"], np.full((count, 1), dew), np.ones((count, 1)), np.zeros((count, 1, 2)),
-                          np.zeros((count, 1), int), np.full((count, 1), np.isfinite(dew)), (0,))
+                          [[NO_ZERO_ROWS]] * count, np.full((count, 1), np.isfinite(dew)), (0,))
         return drawn
 
     with np.errstate(invalid="ignore"):
@@ -945,3 +945,26 @@ def test_a_change_moves_by_its_intervals_lower_end_and_one_leaf_is_enough():
 
     with pytest.raises(AssertionError):
         assert_moves(reference, infinite, errors, "infinite", seeds=8, truth_fn=truth)
+
+
+def test_a_row_of_float64_zero_is_judged_over_the_runs_seeds():
+    """A row of float64 zero is held to the reference's residue on it pooled over the run's seeds
+    (`pooled_zero_rows`): one seed's residue far past the reference's own, where the other seeds' are
+    alike, passes; Dew ten times the reference's residue on every seed fails, and so does a residue
+    where the reference holds the row at exactly zero on every seed."""
+    from reference_error import ROW_FACTOR, pooled_zero_rows
+
+    rows = np.asarray([3, 7])
+
+    def seed(mine, theirs):
+        return rows, np.asarray(mine, np.float64), np.asarray(theirs, np.float64)
+
+    alike = [seed([1.0, 2.0], [1.0, 2.0]) for _ in range(7)]
+    assert pooled_zero_rows([*alike, seed([1.0, 2.0 * ROW_FACTOR * 1.5], [1.0, 2.0])]) == []
+    tenfold = [seed([10.0, 2.0], [1.0, 2.0]) for _ in range(8)]
+    assert [row for row, _, _ in pooled_zero_rows(tenfold)] == [3]
+    exact = [seed([0.0, 1e-30], [0.0, 0.0]) for _ in range(8)]
+    assert [row for row, _, _ in pooled_zero_rows(exact)] == [7]
+    # A row zero on some seeds alone pools over those.
+    assert pooled_zero_rows([seed([1.0, 1.0], [1.0, 1.0]), (np.asarray([3]), np.asarray([5.0]),
+                                                             np.asarray([1.0]))]) == []
