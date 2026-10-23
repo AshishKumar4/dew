@@ -85,6 +85,12 @@ class Forward:
         return not self.natural and self.score_mod is None and float(np.float32(self.scale * LOG2E)) < 1.0
 
     @property
+    def factor(self) -> float:
+        """The factor the logits are the products times (`modify`): 1 raw, the scale times log2(e) folded,
+        the scale natural."""
+        return 1.0 if self.raw else self.scale * LOG2E if self.base2 else self.scale
+
+    @property
     def guarded(self) -> bool:
         """Whether a query can see no key, so its maxima and denominators need the empty row's guard: a
         call of no keys, one whose spans narrow, or one a score hook may mask."""
@@ -499,16 +505,24 @@ def modify(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array,
     takes no mask; a traced `masked` chooses at run time. Without a hook the mask is taken on the products,
     at the infinity the scale takes to -inf, and the scale after it, so a mainloop's multiply feeds the
     weights' subtraction whole, which its compiler contracts to one FMA (`weights`), whichever the tile."""
-    factor = 1.0 if spec.raw else spec.scale * LOG2E if spec.base2 else spec.scale
+    return logits_of(spec, s, coords, params, masked)[0]
+
+
+def logits_of(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array, ...] = (),
+              masked: bool | jax.Array = True) -> tuple[jax.Array, jax.Array | None]:
+    """`modify`'s logits and, where they are the products (masked) times `Forward.factor` alone, those
+    products, whose extreme the tile's maximum takes exactly (`peak`), so the logits' multiply feeds only
+    the weights' subtraction, one FMA (`weights`); None under a hook or a zero factor."""
+    factor = spec.factor
     if spec.score_mod is None and factor != 0:
         # The infinity the factor takes to -inf (a zero factor takes none, so it masks after scaling).
         unseen = -jnp.inf if factor > 0 else jnp.inf
         products = _chosen(masked, lambda: _masked(spec, s, coords, unseen), lambda: s)
-        return products if spec.raw else products * factor
+        return (products if spec.raw else products * factor), products
     logits = s * factor
     if spec.score_mod is not None:
         logits = hooked(spec.score_mod, logits, coords.q_pos, coords.k_pos, params)
-    return _chosen(masked, lambda: _masked(spec, logits, coords, -jnp.inf), lambda: logits)
+    return _chosen(masked, lambda: _masked(spec, logits, coords, -jnp.inf), lambda: logits), None
 
 
 def _chosen(masked: bool | jax.Array, mask: Callable[[], jax.Array], whole: Callable[[], jax.Array]):
@@ -540,13 +554,21 @@ def _safe(spec: Forward, m: jax.Array) -> jax.Array:
     return jnp.where(m == -jnp.inf, 0.0, m) if spec.guarded else m
 
 
-def peak(spec: Forward, m: jax.Array, s: jax.Array) -> tuple[jax.Array, jax.Array]:
+def peak(spec: Forward, m: jax.Array, s: jax.Array, products: jax.Array | None = None
+         ) -> tuple[jax.Array, jax.Array]:
     """The running maximum after a tile's logits `s`, and `alpha`, the factor the state before it
     takes to the new maximum. In the accurate form the exponent `m - new` is compensated (its subtraction's
     rounding, by TwoSum, carried to first order): every weight before the new maximum shares this one
     factor, so its exponent's rounding would not average out over them as the reference's per-key exponents'
-    do, an error some sqrt(keys) times the reference's where the maximum jumps far."""
-    new = jnp.maximum(m, s.max(axis=-1))
+    do, an error some sqrt(keys) times the reference's where the maximum jumps far. Where the logits are
+    `products` times `Forward.factor` (`logits_of`), the tile's maximum is their extreme times it, the
+    same bits (fp32's rounding is monotonic: the largest of `fl(p c)` is `fl(max(p) c)` for a positive `c`,
+    `fl(min(p) c)` for a negative one), taken once a row."""
+    if products is None:
+        tile = s.max(axis=-1)
+    else:
+        tile = (products.max(axis=-1) if spec.factor > 0 else products.min(axis=-1)) * spec.factor
+    new = jnp.maximum(m, tile)
     return new, carried(spec, m, _safe(spec, new))
 
 
@@ -623,15 +645,18 @@ def started(spec: Forward, initial: tuple[jax.Array, jax.Array, jax.Array] | Non
 class Keys(NamedTuple):
     """A key tile as a mainloop gives it the algebra: its coordinates and (modified) logits `[bq, bk]`,
     `load()` its values `[bk, Dv]`, which a step calls after the softmax (where jax's mha loads them), the
-    mainloop's product `dot(a, b)`, `a @ b` in fp32, and where the mainloop holds the running sums of the
+    mainloop's product `dot(a, b)`, `a @ b` in fp32, where the mainloop holds the running sums of the
     weighted values itself (an MMA's accumulator), `accumulate(scale, p, value)`, which takes them by
-    `scale` and adds the narrowed weights' product with the values in place (the plain walk's step)."""
+    `scale` and adds the narrowed weights' product with the values in place (the plain walk's step), and the
+    products the logits are a factor of, where they are (`logits_of`), whose extreme the tile's maximum
+    takes (`peak`)."""
 
     coords: Coords
     logits: jax.Array
     load: Callable[[], jax.Array]
     dot: Callable[[jax.Array, jax.Array], jax.Array]
     accumulate: Callable[[Callable[[jax.Array], jax.Array], jax.Array, jax.Array], None] | None = None
+    products: jax.Array | None = None
 
 
 Carry = tuple[Partial, Argmax, jax.Array, jax.Array]
@@ -647,7 +672,7 @@ def _times(dot: Callable[[jax.Array, jax.Array], jax.Array], value: jax.Array, p
 def _softmax(spec: Forward, state: Partial, keys: Keys):
     """A tile's softmax: the running maximum, the factor the state's sums take, the weights for the
     product (the guarded walk's at the row's shift, `tile`), the tile's values and the guarded `Room`."""
-    m, alpha = peak(spec, state.m, keys.logits)
+    m, alpha = peak(spec, state.m, keys.logits, keys.products)
     p = weights(spec, keys.logits, m)
     value = keys.load()
     p, factor, held = tile(state, alpha, p, value)

@@ -170,7 +170,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         coords = algebra.Coords(q_pos, index * tiles.block_k + columns)
         # A tile every query sees whole takes no mask: one walk, the choice a tile's (a walk of each, these
         # rings' waits and arrivals in two loops, faulted on an H100 under jax 0.11.2's lowering).
-        logits = algebra.modify(spec, s, coords, masked=index >= whole)
+        logits, products = algebra.logits_of(spec, s, coords, masked=index >= whole)
 
         def load():
             # The value slot, once the partner's products are issued: its turn on the tensor cores is over
@@ -189,7 +189,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
             held[0] = family.rescaled_products(held[0], scale, ((p, None),), value, interpret)
 
         state = algebra.Partial(jnp.zeros((), jnp.float32), *rows)
-        state = algebra.plain_step(spec, state, algebra.Keys(coords, logits, load, dot, accumulate))
+        state = algebra.plain_step(spec, state, algebra.Keys(coords, logits, load, dot, accumulate, products))
         return (state.m, state.total), tuple(held)
 
     rows, (acc,) = family.walk(streams, ((step, 0, walked),), rows, ((tiles.block_q, width),), interpret)
