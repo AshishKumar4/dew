@@ -120,10 +120,12 @@ def test_a_bias_sums_its_gradient_over_every_position_at_fp32(layer, shape):
                     truth_fn=lambda x, cotangent: {"bias": summed(cotangent, np.float64)})
 
 
-BIAS_SEEDS = 16
-"""Check 1's declared seeds for a bias summed over every position (to size)."""
-PROJECTION_SEEDS = 16
-"""Check 1's declared seeds for a biased bfloat16 projection against torch's (to size)."""
+BIAS_SEEDS = 64
+"""Check 1's declared seeds for a bias summed over every position, sized by `seeds_for` on armada: the
+most any layer took."""
+PROJECTION_SEEDS = 8
+"""Check 1's declared seeds for a biased bfloat16 projection against torch's, sized by `seeds_for` on
+armada."""
 SPLIT = {"conv": (Conv(3, (3, 3)), (8, 32, 32, 4), 256), "dense": (Dense(3), (8, 32, 32, 4), 256)}
 """Each split bias gradient's layer, input shape and declared seeds for check 1 (`assert_as_exact`),
 sized by `seeds_for` (2026-10-20, on armada): a U-ViT's output convolution, and a projection over the same
