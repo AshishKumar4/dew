@@ -170,8 +170,8 @@ def test_old_decoder_record_keeps_zero_dropout_and_bitwise_outputs():
                                  for name, leaf in held.items() if name.startswith("params/")})
 
         expected = before.call(params, ids)
-        # The export was traced before Dew summed a CPU's fp32 products in float64; the model states
-        # the fp32 sums it was traced with (`FP32_SUMS`).
+        # The export's bits are XLA's fp32 sums, which `before.call` runs as serialized; the model
+        # states those sums (`FP32_SUMS`) to be held to them bit for bit.
         with jax.default_matmul_precision(FP32_SUMS):
             actual = jax.jit(forward_and_gradient(model))(params, ids)
         assert jax.tree.structure(actual) == jax.tree.structure(expected)

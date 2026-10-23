@@ -396,8 +396,9 @@ def test_the_fused_path_returns_the_value_columns_and_not_the_padding():
         return tuple(jnp.asarray(rng.standard_normal(shape), jnp.float32)
                      for shape in ((2, 7, 4, 16), (2, 7, 4, 16), (2, 7, 4, 8)))
 
-    # A CPU's calls take the reference path; one routed as an A100's runs the fused kernel.
-    query, key, value = (x.astype(jnp.bfloat16) for x in draw(0))
+    # A CPU's calls take the reference path, whose float64 sums and exact softmax derivative the
+    # fused kernel's are not; routed as an A100's, the call runs the fused kernel this test is about.
+    query, key, value = draw(0)
     fused = functools.partial(scaled_dot_product_attention, query, key, implementation="xla", causal=True)
     with generation.assumed("sm80"):
         narrow = fused(value)

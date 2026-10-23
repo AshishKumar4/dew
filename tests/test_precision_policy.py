@@ -301,12 +301,13 @@ def test_quantizer_division_rounds_midpoint_neighbours_as_ieee_division():
 def dot_precisions(function, *arguments) -> list:
     """The precision of every dot_general `function` traces over `arguments` under JAX's own default
     precision (the test lane sets 'highest' for every product that states none), with the dtype its
-    operands promote to, sub-jaxprs included."""
+    operands promote to, sub-jaxprs included, as a GPU runs them: a CPU's float64 sums
+    (`dew.nn.precision.accumulated`) are tests/test_cpu_accumulation.py's."""
     with jax.default_matmul_precision(None):
         graph = jax.make_jaxpr(function)(*arguments)
     return [(equation.params["precision"],
              jnp.result_type(*(variable.aval.dtype for variable in equation.invars)))
-            for equation in equations(graph) if equation.primitive.name == "dot_general"]
+            for equation in equations(graph, platform="cuda") if equation.primitive.name == "dot_general"]
 
 
 HIGHEST = (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)
@@ -355,16 +356,12 @@ def test_a_layer_over_bf16_parameters_fed_float32_multiplies_float32_products():
 
 def test_soft_embeddings_over_a_bf16_table_multiply_float32_products():
     """Soft embeddings mix a bf16-stored table by float32 probabilities, a product jax computes in
-    float32, so it multiplies at HIGHEST as a float32-stored table's does: the same products, each at
-    HIGHEST (a CPU's float64 sum and every other backend's product, `accumulated`)."""
+    float32, so it multiplies at HIGHEST as a float32-stored table's does."""
     logits = jax.random.normal(jax.random.key(0), (2, 3, 32), jnp.float32)
-    traced = {}
     for stored in (jnp.float32, jnp.bfloat16):
         table = jax.random.normal(jax.random.key(1), (32, 16), jnp.float32).astype(stored)
         precisions = dot_precisions(lambda logits, table: soft_embeddings(logits, table, 1.0), logits, table)
-        traced[stored] = [precision for precision, _ in precisions]
-        assert traced[stored] and all(precision == HIGHEST for precision in traced[stored])
-    assert traced[jnp.bfloat16] == traced[jnp.float32]
+        assert [precision for precision, _ in precisions] == [HIGHEST]
 
 
 def test_a_projection_factory_keeps_the_contraction_its_caller_gives():
