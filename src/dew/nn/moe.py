@@ -33,7 +33,7 @@ from jax.sharding import PartitionSpec as P
 
 from dew.nn.dense import Dense
 
-from .activations import GatedActivation, gated_product, relu2, swiglu_clamped
+from .activations import GatedActivation, gated_arithmetic, gated_product, relu2, swiglu_clamped
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
 from .kernels.generation import backend, ran_kernel, route, triton_runs
@@ -457,10 +457,7 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     compute = canonicalize_dtype(x, kernel, dtype=dtype)
     resolved = float32_products(compute, precision)
     named = forced('grouped_matmul')
-    # The kernels run in a GPU's process, or interpreted in a CPU's where 'pallas' asks; what they compute
-    # is the template's to refuse (`template.gemm`).
-    placed = triton_runs() or (implementation == 'pallas' and backend() == 'cpu')
-    refusal = None if placed else "the Pallas kernels need a GPU of sm80 or later"
+    refusal = None if _placed(implementation) else "the Pallas kernels need a GPU of sm80 or later"
     if named == 'xla' or (named is None and implementation == 'xla'):
         route('grouped_matmul', kernel='xla')
     elif refusal is not None and named is not None:
@@ -474,6 +471,37 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
         return template.gemm(x, kernel, group_sizes, compute=compute, out_dtype=compute, precision=resolved,
                              interpret_on_cpu=implementation == 'pallas')
     return portable_projection(x, kernel, group_sizes, dtype, resolved)
+
+
+def _placed(implementation: str) -> bool:
+    """Whether the GEMM template's kernels run here: in a GPU's process, or interpreted in a CPU's where
+    'pallas' asks; what they compute is the template's to refuse (`template.gemm`)."""
+    return triton_runs() or (implementation == 'pallas' and backend() == 'cpu')
+
+
+def gated_projections(x: jax.Array, gate_kernel: jax.Array, up_kernel: jax.Array, group_sizes: jax.Array,
+                      dtype: Dtype | None, implementation: str, precision: PrecisionLike,
+                      activation: GatedActivation, limit: float | None) -> jax.Array:
+    """A gated MLP's two input projections of `x`'s expert-sorted rows and their product,
+    `activation(clamped gate) * clamped up` (`swiglu_clamped`): where the GEMM template runs the
+    projections, one paired launch (`template.gemm(paired=)`) whose epilogue computes the product on its
+    two fp32 accumulators, rounded once to the compute dtype, so neither projection is written nor read
+    back, nor its cotangent; elsewhere the two projections (`expert_projection`) and `gated_product`,
+    each rounded as the unfused program rounds it."""
+    named = forced('grouped_matmul')
+    templated = (named != 'xla' and (named is not None or implementation != 'xla') and _placed(implementation)
+                 and all(seen_whole(array) for array in (x, gate_kernel, up_kernel)))
+    if templated:
+        compute = canonicalize_dtype(x, gate_kernel, up_kernel, dtype=dtype)
+        arithmetic = gated_arithmetic(activation)
+        return template.gemm(x, gate_kernel, group_sizes, paired=up_kernel,
+                             epilogue=lambda gate, up: arithmetic(*swiglu_clamped(gate, up, limit)),
+                             compute=compute, out_dtype=compute,
+                             precision=float32_products(compute, precision),
+                             interpret_on_cpu=implementation == 'pallas')
+    gate, up = (expert_projection(x, kernel, group_sizes, dtype, implementation, precision)
+                for kernel in (gate_kernel, up_kernel))
+    return gated_product(activation)(*swiglu_clamped(jnp.asarray(gate), jnp.asarray(up), limit))
 
 
 
@@ -922,10 +950,11 @@ class ExpertMLP(nn.Module):
             up = checkpoint_name(linear(tokens, kernels[0]), 'up_proj')
             hidden = relu2(up)
             return checkpoint_name(linear(hidden, kernels[1]), 'down_proj')
-        gate = checkpoint_name(linear(tokens, kernels[0]), 'gate_proj')
-        up = checkpoint_name(linear(tokens, kernels[1]), 'up_proj')
-        gate, up = swiglu_clamped(gate, up, self.swiglu_limit)
-        return checkpoint_name(linear(gated_product(self.activation)(gate, up), kernels[2]), 'down_proj')
+        # The gate and up projections' product, one paired launch where the template runs them (no gate
+        # or up written: the residuals' names stay unused there).
+        hidden = gated_projections(tokens, kernels[0], kernels[1], sizes, dtype, self.implementation,
+                                   self.precision, self.activation, self.swiglu_limit)
+        return checkpoint_name(linear(hidden, kernels[2]), 'down_proj')
 
     def _combine(self, slots: jax.Array, weights: jax.Array) -> jax.Array:
         wide = at_least_fp32(slots.dtype)

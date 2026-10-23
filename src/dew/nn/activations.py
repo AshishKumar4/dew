@@ -194,10 +194,20 @@ def gated_product(activation: GatedActivation, *, implementation: str = 'auto',
     the operands' logical axes, place the kernel on a mesh."""
     if isinstance(activation, Situ):
         return activation
-    portable = _portable(_gate_function(activation, implementation), lambda gate, up: (gate, up))
+    portable = _portable(activation, implementation, lambda gate, up: (gate, up))
     return _dispatched(activation, portable,
                        lambda gate, up: norm_swiglu.swiglu_kernel(implementation, gate, up, axes=axes),
                        lambda gate, up, portable: norm_swiglu.swiglu(gate, up, portable, axes=axes))
+
+
+def gated_arithmetic(activation: GatedActivation) -> Callable[[jax.Array, jax.Array], jax.Array]:
+    """The gated product's arithmetic at fp32 and wider, `act(gate) * up` (a `Situ`'s own product), as a
+    kernel epilogue computes it on a paired product's two accumulators (`templates.gemm.template.gemm`):
+    `gated_product`'s at those widths, nothing rounded and no kernel chosen."""
+    if isinstance(activation, Situ):
+        return activation
+    activate = _gate_function(activation, 'auto')
+    return lambda gate, up: activate(gate) * up
 
 
 def packed_gated_product(activation: str, *, implementation: str = 'auto',
@@ -207,25 +217,24 @@ def packed_gated_product(activation: str, *, implementation: str = 'auto',
     writes the packed layout (`norm_swiglu.packed_swiglu`), and XLA's product
     recomputes from the packed output itself, so neither copies a half out.
     `axes` are the product's logical axes, `[..., H]`'s."""
-    portable = _portable(_gate_function(activation, implementation),
-                         lambda gate_up: (gate_up[..., 0, :], gate_up[..., 1, :]))
+    portable = _portable(activation, implementation, lambda gate_up: (gate_up[..., 0, :], gate_up[..., 1, :]))
     return _dispatched(activation, portable,
                        lambda gate_up: norm_swiglu.packed_swiglu_kernel(implementation, gate_up, axes=axes),
                        lambda gate_up, portable: norm_swiglu.packed_swiglu(gate_up, portable, axes=axes))
 
 
-def _portable(activate, halves):
+def _portable(activation: str, implementation: str, halves):
     """The XLA product of a gate and up projection that `halves(*operands)` reads from the operands
-    (the two projections, or one packed output's two halves): `activate(gate) * up` at fp32 and
+    (the two projections, or one packed output's two halves): `gated_arithmetic`'s at fp32 and
     wider, else rounded where torch rounds it (`_rounded`) and recomputed from the operands
     themselves in the backward, so a packed output is never copied into halves."""
-    rounded = _rounded(activate)
+    rounded = _rounded(_gate_function(activation, implementation))
     rounded_product = _recomputed(lambda *operands: rounded(*halves(*operands)))
+    arithmetic = gated_arithmetic(activation)
 
     def portable(*operands: jax.Array) -> jax.Array:
         if jnp.finfo(jnp.result_type(*operands)).bits >= 32:
-            gate, up = halves(*operands)
-            return activate(gate) * up
+            return arithmetic(*halves(*operands))
         return rounded_product(*operands)
 
     return portable
