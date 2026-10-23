@@ -1016,9 +1016,11 @@ class DqSums(NamedTuple):
     QUERY hook parameters' pullbacks of them (`grads`), each cotangent taken over a `prior` denominator
     (the forward's, or the first pass's; `grad_scores`); and the unnormalized weights' row sums, the hook
     parameters' pullbacks of them (`weighed`) and their product with the keys as dQ's, scaled and pulled
-    through the hook over the prior denominator, held as its coefficients' magnitude `keyed_mass` `[bq]`
-    times a mean of the keys under coefficients of magnitudes summing to at most one, `keyed` `[bq, D]`, so
-    finite wherever the keys are, whatever the scale and the hook's slopes, fp32."""
+    through the hook over the prior denominator, held as its coefficients' magnitude
+    `keyed_mass · 2^keyed_shift` (`[bq]` each, the mantissa at most the keys' count, the exponent the
+    largest coefficient's) times a mean
+    of the keys under coefficients of magnitudes summing to at most one, `keyed` `[bq, D]`: each finite
+    wherever the keys are, whatever the scale and the hook's slopes, fp32."""
 
     dq: jax.Array
     residual: jax.Array
@@ -1027,6 +1029,20 @@ class DqSums(NamedTuple):
     weighed: tuple[jax.Array, ...]
     keyed: jax.Array
     keyed_mass: jax.Array
+    keyed_shift: jax.Array
+
+
+NO_SHIFT = -150.0
+"""The exponent of an empty sum of coefficients (`DqSums.keyed_shift`): below every fp32's, so any tile's
+exponent is the larger, and `power2` of a zero mantissa by it stays zero."""
+
+
+def _shifted(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """`x` (`[bq, ...]`) taken by each row's power of two to magnitudes at most one, and that power's
+    exponent `[bq]`, `NO_SHIFT` for a row of zeros."""
+    top = jnp.max(jnp.abs(x), axis=tuple(range(1, x.ndim)))
+    shift = jnp.where(top > 0, jnp.ceil(jnp.log2(jnp.where(top > 0, top, 1.0))), NO_SHIFT)
+    return power2(x, expand(-shift, x)), shift
 
 
 def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array, key: jax.Array,
@@ -1043,18 +1059,22 @@ def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, see
                                                                            strict=True))
     pulled_weights, pieces = pulled(weights, slopes, seen, kinds)
     # The tile's coefficients against the keys joined into the running mean, as a softmax's sums are joined
-    # under a running maximum: its magnitude grows by the tile's, the mean taken to it.
-    coefficients = pulled_weights * expand(scale * inverse(prior), pulled_weights)
-    keyed_mass = sums.keyed_mass + jnp.abs(coefficients).sum(axis=-1)
-    kept = jnp.where(keyed_mass > 0, sums.keyed_mass / jnp.where(keyed_mass > 0, keyed_mass, 1.0), 0.0)
-    keyed = (expand(kept, sums.keyed) * sums.keyed
-             + weights_product(coefficients * expand(inverse(keyed_mass), coefficients), key, dot))
+    # under a running maximum: each taken by a power of two to magnitudes at most one (`_shifted`), the
+    # running mass and the tile's brought to the larger exponent, the mean taken to their sum.
+    coefficients, tile_shift = _shifted(pulled_weights * expand(scale * inverse(prior), pulled_weights))
+    keyed_shift = jnp.maximum(sums.keyed_shift, tile_shift)
+    before = power2(sums.keyed_mass, sums.keyed_shift - keyed_shift)
+    coefficients = power2(coefficients, expand(tile_shift - keyed_shift, coefficients))
+    keyed_mass = before + jnp.abs(coefficients).sum(axis=-1)
+    over = inverse(keyed_mass)
+    keyed = (expand(before * over, sums.keyed) * sums.keyed
+             + weights_product(coefficients * expand(over, coefficients), key, dot))
     weighed = sums.weighed
     if any(summed):
         weighed = tuple(total + piece if row else total
                         for total, row, piece in zip(sums.weighed, summed, pieces, strict=True))
     return DqSums(dq, sums.residual + cotangents.sum(axis=-1), sums.mass + weights.sum(axis=-1), grads,
-                  weighed, keyed, keyed_mass)
+                  weighed, keyed, keyed_mass, keyed_shift)
 
 
 def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax.Array,
@@ -1074,7 +1094,9 @@ def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax
     refined = refinement(residual, mass, peak0, shares, peak, total, anchor, delta)
     grads = tuple(grad * ratio - refined * (weighed * over)
                   for grad, weighed in zip(sums.grads, sums.weighed, strict=True))
-    dq = (sums.dq - expand(refined * sums.keyed_mass, sums.keyed) * sums.keyed) * expand(ratio, sums.dq)
+    correction = power2(expand(refined * sums.keyed_mass, sums.keyed) * sums.keyed,
+                        expand(sums.keyed_shift, sums.keyed))
+    dq = (sums.dq - correction) * expand(ratio, sums.dq)
     return dq, delta + refined, total, mass, grads
 
 

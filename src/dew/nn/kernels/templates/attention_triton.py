@@ -591,7 +591,8 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     rows = tuple(nothing for _ in score_kinds)
     zeros = jnp.zeros(query.shape, jnp.float32)
     sums = jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], step,
-                             algebra.DqSums(zeros, nothing, nothing, rows, rows, zeros, nothing))
+                             algebra.DqSums(zeros, nothing, nothing, rows, rows, zeros, nothing,
+                                            jnp.full((block_q,), algebra.NO_SHIFT, jnp.float32)))
     dq, delta, total, mass, grads = algebra.dq_finish(sums, prior, state_total, peak0, shares, peak, anchor,
                                                       delta)
     dq_ref[...] = dq
