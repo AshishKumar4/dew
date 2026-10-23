@@ -93,6 +93,22 @@ def test_a_torch_arm_pulls_back_the_cotangent_it_is_given():
     np.testing.assert_array_equal(loss, np.float32(12))
     np.testing.assert_array_equal(gradient, np.float32(12))
     assert np.shape(gradient) == ()
+    # A constant output pulls nothing back, beside a reached one or alone, and an integer input has no
+    # gradient.
+    x = np.array([2.0, 3.0], np.float32)
+    out, gradient = torch_with_gradients(lambda x: torch.ones_like(x))(x, np.ones(2, np.float32))
+    np.testing.assert_array_equal(gradient, np.zeros(2, np.float32))
+    _, gradient = torch_with_gradients(lambda x: (2 * x, torch.ones_like(x)))(
+        x, (np.ones(2, np.float32), np.ones(2, np.float32)))
+    np.testing.assert_array_equal(gradient, np.full(2, 2, np.float32))
+    out, gradient = torch_with_gradients(lambda i: i.float() * 2)(np.array([1, 2], np.int32),
+                                                                   np.ones(2, np.float32))
+    assert gradient is None
+    # A bfloat16 input and cotangent, as JAX holds them on the host, go in through float32 exactly.
+    halves = np.array([2.0, 3.0], jnp.bfloat16)
+    out, gradient = torch_with_gradients(lambda x: x * 2)(halves, np.ones(2, jnp.bfloat16))
+    np.testing.assert_array_equal(out, np.array([4.0, 6.0], np.float32))
+    np.testing.assert_array_equal(gradient, np.full(2, 2, np.float32))
     # A bfloat16 output, of float32 inputs cast inside, comes back in float32, its values exactly.
     x = np.arange(4, dtype=np.float32) / 3
     out, grad = torch_with_gradients(lambda x: (x.bfloat16() * 3).bfloat16())(x, np.ones(4, np.float32))
