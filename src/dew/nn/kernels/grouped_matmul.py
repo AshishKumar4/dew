@@ -664,27 +664,31 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         return _hooks_lower(ba, dtype, mosaic_gpu_lowering.mosaic_lowering_rules[semantics])
 
     def staged_bytes(self, ba, config: mosaic_gpu.Tiles, target) -> int:
-        # The pipeline's stages of both operand blocks and the prologue's side tiles, the epilogue's side
-        # tiles, and the output block each output stores from.
+        # Each allocation a program scopes, rounded up to Mosaic's alignment (`mosaic.allocated`): each
+        # stream's stages (both operand blocks and each prologue side's tile), each output's staging (every
+        # output's at once), each epilogue side's two staging copies (`mosaic.staging`), and the barriers:
+        # each stream stage's two and each staged side's two (at a block's edge, a Hopper tile's barriers
+        # alone took it 128 bytes past, the reason they are counted).
         size = jnp.dtype(ba.arguments['tokens'].dtype).itemsize
         hooks = ba.arguments['hooks']
         outs = [jnp.dtype(dtype).itemsize for dtype in (hooks.out_dtypes or (ba.arguments['out_dtype'],))]
         extents = self.extents(config)
-        step = (config.block_m + config.block_n) * config.block_k * size + _side_tile_bytes(
-            ba.arguments['prologue_operands'], hooks.prologue_axes, extents)
-        epilogue = _side_tile_bytes(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes, extents)
-        # One warpgroup stages each output in turn; two hold every output's staging buffer at once, and
-        # each consumer its own copy of an epilogue side tile without rows (`mosaic.staging`; a
-        # prologue side's per-consumer copies are within the stages' count of it).
-        staged_outs = sum(outs) if config.warpgroups == 2 else max(outs)
-        if config.warpgroups == 2:
-            epilogue_sides = ba.arguments.get('epilogue_operands', ())
-            epilogue += _side_tile_bytes(*_uncut(epilogue_sides, hooks.epilogue_axes), extents)
+        prologue_sides = ba.arguments['prologue_operands']
+        epilogue_sides = ba.arguments.get('epilogue_operands', ())
+        streams = [config.block_m * config.block_k * size, config.block_k * config.block_n * size,
+                   *(_side_tile_bytes((side,), (axes,), extents)
+                     for side, axes in zip(prologue_sides, hooks.prologue_axes, strict=True))]
+        staged = [config.block_m * config.block_n * out for out in outs]
+        sides = [2 * _side_tile_bytes((side,), (axes,), extents)
+                 for side, axes in zip(epilogue_sides, hooks.epilogue_axes, strict=True)]
+        barriers = 2 * config.stages * len(streams) + 2 * (len(epilogue_sides) + len(prologue_sides) + 1)
         if config.family == 'mma.sync':
-            # Its pipeline's stages are scoped within the walk and its output's staging after it, so the
+            # Its pipeline's stages are scoped within the walk and each output's staging after it, so the
             # block holds the larger (`mosaic_sm80.Mma.persist`).
-            return max(config.stages * step, staged_outs * config.block_m * config.block_n)
-        return config.stages * step + epilogue + staged_outs * config.block_m * config.block_n
+            return max(mosaic.allocated(*(config.stages * stream for stream in streams)),
+                       mosaic.allocated(max(staged)))
+        return (mosaic.allocated(*(config.stages * stream for stream in streams), *staged, *sides)
+                + mosaic.BARRIER_BYTES * barriers)
 
     @staticmethod
     @abc.abstractmethod
@@ -731,7 +735,6 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     def _in_flight(config: mosaic_gpu.Tiles, target) -> float:
         """The row tiles a band of the planar snake keeps in flight at once on `target`."""
         return max(1.0, _multiprocessors(generation.effective(target)) / config.grid_block_n)
-
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1192,12 +1195,6 @@ def _side_arrays(sides: tuple, axes_of: tuple) -> tuple:
     named 'width'."""
     return tuple((side.shape, tuple('width' if axis == 'columns' else axis for axis in axes),
                   jnp.dtype(side.dtype).itemsize) for side, axes in zip(sides, axes_of, strict=True))
-
-
-def _uncut(sides: tuple, axes_of: tuple) -> tuple[tuple, tuple]:
-    """The side operands, and their axes, without the rows a cooperative consumer's half cuts."""
-    kept = [(side, axes) for side, axes in zip(sides, axes_of, strict=True) if 'rows' not in axes]
-    return tuple(side for side, _ in kept), tuple(axes for _, axes in kept)
 
 
 def _facts(target: generation.GpuTarget) -> generation.GpuTarget:

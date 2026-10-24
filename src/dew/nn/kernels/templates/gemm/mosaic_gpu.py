@@ -54,6 +54,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels.templates import mosaic, mosaic_sm80, mosaic_sm90
+from dew.nn.kernels.templates.gemm import rows_padded
 
 FAMILY: mosaic.Family = mosaic_sm90.WGMMA
 """Hopper's warpgroup MMA bundle, which `tgmm`'s kernels run on."""
@@ -210,7 +211,7 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
         raise ValueError(f"a [{rows}, {k}] x [{g}, {k2}, {n}] product does not take {tiles}")
     # Dew: a TMA descriptor tiles the rows by 8, so they are padded to a multiple of 8, and the rows past
     # the routed ones, the padding among them, are a last group, whose tiles store zeros.
-    lhs = _rows_padded(lhs)
+    lhs = rows_padded(lhs, 0, 8)  # the rows a TMA descriptor tiles by
     m = lhs.shape[0]
     lengths = jnp.concatenate([group_sizes.astype(jnp.int32),
                                jnp.maximum(m - jnp.sum(group_sizes, dtype=jnp.int32), 0)[None]])
@@ -424,7 +425,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     # Dew: the rows padded to a multiple of 8, as `gmm`'s, past every group; to whole row blocks where the
     # family's loads read past an operand unpredicated (its last group's last block).
     multiple = 8 if family_of(tiles, lhs.dtype).bounded_loads else math.lcm(8, block_k)
-    lhs, rhs = _rows_padded(lhs, multiple=multiple), _rows_padded(rhs, multiple=multiple)
+    lhs, rhs = rows_padded(lhs, 0, multiple), rows_padded(rhs, 0, multiple)
     k = lhs.shape[0]
     prologue_operands = tuple(_side_padded(side, axes) for side, axes in zip(prologue_operands, prologue_axes,
                                                                                strict=True))
@@ -606,14 +607,6 @@ def _group_blocks(group_sizes: jax.Array, block_k: int) -> tuple:
     return group_starts, group_ends, (group_block_ends - group_block_starts) // block_k, group_block_starts
 
 
-def _rows_padded(array: jax.Array, axis: int = 0, *, multiple: int = 8) -> jax.Array:
-    """`array` with zeros after its own along `axis` up to a multiple of `multiple`: 8, the rows a TMA
-    descriptor tiles by, unless a family's unbounded loads read whole blocks."""
-    pad = -array.shape[axis] % multiple
-    widths = tuple((0, pad if dim == axis else 0) for dim in range(array.ndim))
-    return jnp.pad(array, widths) if pad else array
-
-
 def _side_padded(side: jax.Array, axes: tuple) -> jax.Array:
     """A side operand padded as the rows are along the dimension that follows them, wherever it is."""
-    return _rows_padded(side, axes.index('rows')) if 'rows' in axes else side
+    return rows_padded(side, axes.index('rows'), 8) if 'rows' in axes else side

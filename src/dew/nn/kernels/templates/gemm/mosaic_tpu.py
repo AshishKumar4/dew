@@ -28,6 +28,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas.ops.tpu.megablox.gmm import make_group_metadata
 
+from dew.nn.kernels.templates.gemm import rows_padded
+
 
 @dataclasses.dataclass(frozen=True)
 class Blocks:
@@ -60,7 +62,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
     rhs_depth, width = (rhs.shape[2], rhs.shape[1]) if transpose_rhs else rhs.shape[1:]
     if depth != rhs_depth or depth % block_k or width % block_n:
         raise ValueError(f"a [{rows}, {depth}] x {list(rhs.shape)} product does not take {blocks}")
-    lhs = _rows_padded(lhs, 0, block_m)
+    lhs = rows_padded(lhs, 0, block_m)
     m = lhs.shape[0]
     sizes = group_sizes.astype(jnp.int32)
     lengths = jnp.concatenate([sizes, jnp.maximum(m - jnp.sum(sizes), 0)[None]])
@@ -156,7 +158,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Bloc
     groups = group_sizes.shape[0]
     if rhs.shape[0] != rows or depth % block_m or width % block_n:
         raise ValueError(f"a [{rows}, {depth}] by {list(rhs.shape)} kernel gradient does not take {blocks}")
-    lhs, rhs = _rows_padded(lhs, 0, block_k), _rows_padded(rhs, 0, block_k)
+    lhs, rhs = rows_padded(lhs, 0, block_k), rows_padded(rhs, 0, block_k)
     m = lhs.shape[0]
     metadata, active = make_group_metadata(group_sizes=group_sizes.astype(jnp.int32), m=m, tm=block_k,
                                            start_group=jnp.int32(0), num_nonzero_groups=groups,
@@ -231,14 +233,6 @@ def _as_tuple(outs) -> tuple:
     return outs if isinstance(outs, tuple) else (outs,)
 
 
-def _rows_padded(array: jax.Array, axis: int, block: int) -> jax.Array:
-    """`array` with zeros after its own along `axis` up to a multiple of `block`, the row blocks the
-    group metadata tiles by."""
-    pad = -array.shape[axis] % block
-    widths = tuple((0, pad if dim == axis else 0) for dim in range(array.ndim))
-    return jnp.pad(array, widths) if pad else array
-
-
 def _side_padded(side: jax.Array, axes: tuple, block: int) -> jax.Array:
     """A side operand padded as the rows are along the dimension that follows them, wherever it is."""
-    return _rows_padded(side, axes.index('rows'), block) if 'rows' in axes else side
+    return rows_padded(side, axes.index('rows'), block) if 'rows' in axes else side

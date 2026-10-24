@@ -24,7 +24,6 @@ import subprocess
 import sys
 import traceback
 from pathlib import Path
-from typing import cast
 
 SHAPES = {
     # rows (tokens x top-k), width in, width out, experts
@@ -70,13 +69,12 @@ def device_ms(executable, *args) -> float:
     """The median over `REPEATS` runs of the executable's kernels' device time, in ms (CUPTI)."""
     from jax.experimental.mosaic.gpu import profiler
 
-    cupti = profiler.Cupti(finalize=False)
     times = []
     for _ in range(REPEATS):
-        _, kernels = cupti.measure(executable, aggregate=False)(*args)
-        # Unaggregated, each kernel's name and device ms.
-        times.append(sum(ms for _, ms in cast("list[tuple[str, float]]", kernels or [])))
-    profiler.Cupti().measure(executable, aggregate=False)(*args)
+        _, elapsed = profiler.measure(executable)(*args)
+        if elapsed is None:
+            raise RuntimeError("CUPTI timed no kernel of the executable")
+        times.append(elapsed)
     return statistics.median(times)
 
 
