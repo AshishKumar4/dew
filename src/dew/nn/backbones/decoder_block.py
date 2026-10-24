@@ -476,9 +476,12 @@ Qwen 3.5-0.8B at 8 x 3072 on an A100, 'minimal' cost 14.7% a token over none
 and kept 13.5 GiB of temporaries, 'save_dot_except_mlp' 18.4% and 6.4 GiB,
 none 59 GiB; 'all_but_delta_memory' recomputes a delta rule's memory alone,
 as fla's backward always does; 'minimal_with_context_and_conv' keeps a mixer's
-context, attention's output or an SSM's or delta rule's scan, so no rung below
-it recomputes the scan, and its short conv output beside 'minimal''s;
-'minimal_with_conv' keeps the conv alone. A decoder's own remat is where it
+context, attention's output or an SSM's or delta rule's scan, and its short
+conv output beside 'minimal''s, so a step that does not fit recomputes the
+rest of a layer before its scan: on an A100 an 8-layer Mamba-2 decoder's bf16 step over
+16,384 tokens took 161.8 ms there and 166.9 ms at 'minimal_with_conv', for
+1.07 GB more at its peak, and an attention decoder's 131.6 and 131.1 ms at
+4 x 4096; 'minimal_with_conv' keeps the conv alone. A decoder's own remat is where it
 starts, and it moves up one rung at a time (`CausalTransformer.recompute_more`),
 past a rung that keeps nothing more of its layers' names than the next, never
 past a policy the ladder names."""
