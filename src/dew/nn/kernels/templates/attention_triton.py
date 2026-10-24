@@ -28,8 +28,8 @@ from dew.nn.kernels.templates.attention import (
     DQ_GRADS,
     NATURAL,
     TRACED_TILE,
+    AttentionLaunch,
     Gradients,
-    HookKeys,
     Hooks,
     KeySpans,
     Kind,
@@ -39,7 +39,6 @@ from dew.nn.kernels.templates.attention import (
     kept_dtype,
     kernel_dot,
     padded_call,
-    spanned,
     within,
 )
 from dew.nn.kernels.templates.base import Template, dividing
@@ -235,7 +234,7 @@ def _written(spec, walked, *, rows, out_ref, residual_refs, flag_ref, residuals:
 
 
 @dataclasses.dataclass(frozen=True)
-class TritonForward(HookKeys, Template[Tiles]):
+class TritonForward(AttentionLaunch, Template[Tiles]):
     """The template's forward in Pallas Triton over padded operands (`forward` pads them): queries
     `[B, Qp, H, Dp]` over keys `[B, Kp, Hk, Dp]` and values `[B, Kp, Hk, Dvp]`, each query's keys
     `start` to `end` `[B, Qp]` and, with documents, its id `[B, Qp]` against the keys' `[B, Kp]`; the
@@ -396,9 +395,6 @@ class TritonForward(HookKeys, Template[Tiles]):
 
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         return _eligible(ba, target)
-
-    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
-        return spanned(specs, super().operands(specs, seed))
 
 
 def _dividing[T: (Tiles, BackwardTiles)](space: tuple[T, ...], ba: tokamax.BoundArguments) -> tuple[T, ...]:
@@ -696,13 +692,16 @@ its dK/dV launch, its default first."""
 
 
 @dataclasses.dataclass(frozen=True)
-class TritonBackward(HookKeys, Template[BackwardTiles]):
+class TritonBackward(AttentionLaunch, Template[BackwardTiles]):
     """The template's backward over padded operands (`backward` pads them), one tuning decision for its
     two launches: the dQ launch (`_dq_launch`), then the dK/dV launch (`_dkv_launch`) under its softmax.
     Returns the dQ launch's outputs, then the dK/dV launch's."""
 
     HOOKS = ("score_mod",)
     DIFFERENTIATED = True
+    SPANS = 15
+    """Its arrays' spans after the queries, keys, values, the output's cotangent and the forward's eleven
+    residual and state arrays (`_fwd`)."""
     name = "triton"
     config_cls = BackwardTiles
     score_mod: Callable | None = None
@@ -760,9 +759,6 @@ class TritonBackward(HookKeys, Template[BackwardTiles]):
 
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         return _eligible(ba, target)
-
-    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
-        return spanned(specs, super().operands(specs, seed))
 
 
 def _backward_registers(ba: tokamax.BoundArguments, config: BackwardTiles, *, dq: bool) -> int:
