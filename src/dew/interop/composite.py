@@ -19,6 +19,7 @@ from dew.records import JSON
 
 if TYPE_CHECKING:
     from dew.interop.pretrained import Pretrained
+    from dew.objectives.base import Variables
 
 
 @dataclass(frozen=True)
@@ -41,8 +42,10 @@ class HeadComponent:
     packed: tuple[Packed, ...] = ()
     weight_file: str | None = None
     reshape: Callable[[nn.Module, dict], dict] | None = None
+    initialize: Callable[[nn.Module, Pretrained], Variables] | None = None
 
-    def build(self, backbone: Pretrained | None, dtype: str, attention_impl: str) -> nn.Module:
+    def build(self, backbone: Pretrained | None, dtype: str, attention_impl: str, *,
+              shapes: Mapping[str, tuple[int, ...]] | None) -> nn.Module:
         """Build the readout against the backbone's output contract."""
         raise NotImplementedError
 
