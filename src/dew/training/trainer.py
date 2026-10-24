@@ -41,7 +41,7 @@ from dew.cleanup import attempted
 from dew.coordination import (
     agree_process_phase,
     agreed,
-    agreed_count,
+    agreed_next,
     agreed_same,
     broadcast_from_process_zero,
 )
@@ -384,35 +384,23 @@ class _FitRun:
         assert self.train is not None
         return next(self.train)
 
-    def read_or_end(self) -> Batch | None:
-        """`read`, or None once the stream has run out."""
-        assert self.train is not None
-        return next(self.train, None)
-
 
 def _waited_read(run: _FitRun, interval: Interval, *, agree: bool) -> Batch | None:
     """The training stream's next batch, its wait counted in `interval`, or None where it has run out
     on every process, which ends the run as its length would. Where `agree`, the read is agreed
-    (`agreed_count`): one that fails stops every process, and a stream that runs out on some
-    processes and reads on on the others is refused on all of them, at the step it ran out at, as
-    is one with no batch for a run at step 0 to train on. An endless stream's later reads are not
-    agreed, as it never runs out. A batch read ahead (`_FitRun.ahead`) is this read's."""
+    (`agreed_next`): one that fails, or runs out on some processes only, stops every process, as
+    does a stream with no batch for a run at step 0. An endless stream's later reads are not agreed,
+    as it never runs out. A batch read ahead (`_FitRun.ahead`) is this read's."""
     if run.ahead is not None:
         (batch,), run.ahead = run.ahead, None
         return batch
+    assert run.train is not None
     with region("input.wait"):
         asked = time.perf_counter()
-        if not agree:
-            batch = run.read()
-        else:
-            batch, ran_out = agreed_count("training read", run.read_or_end, lambda batch: batch is None)
-            if 0 < ran_out < jax.process_count():
-                raise ValueError(f"the training data ran out on {ran_out} of {jax.process_count()} processes "
-                                 f"at step {run.current}, and the others read on: each process's stream must "
-                                 "hold as many batches")
-            if ran_out and not run.current:
-                raise ValueError("the training data holds no batch to train on")
+        batch = agreed_next(f"training read at step {run.current}", run.train) if agree else run.read()
         interval.waited += time.perf_counter() - asked
+    if batch is None and not run.current:
+        raise ValueError("the training data holds no batch to train on")
     return batch
 
 

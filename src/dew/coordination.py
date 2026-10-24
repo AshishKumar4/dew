@@ -19,7 +19,7 @@ import socket
 import sys
 import threading
 import types
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import TYPE_CHECKING, Literal, overload
 
 import jax
@@ -189,6 +189,16 @@ def agreed[T](phase: str, operation: Callable[[], T]) -> T:
     re-raises its own error. On one process this is a plain call.
     """
     return agreed_count(phase, operation, lambda _: True)[0]
+
+
+def agreed_next[T](phase: str, stream: Iterator[T]) -> T | None:
+    """`stream`'s next item, read on every rank and agreed (`agreed`), or None where it has ended on
+    every rank; refused on all of them where it ended on some and not the others."""
+    item, ended = agreed_count(phase, lambda: next(stream, None), lambda item: item is None)
+    if 0 < ended < jax.process_count():
+        raise ValueError(f"{phase}: the stream ended on {ended} of {jax.process_count()} processes and the "
+                         "others read on: each process's stream must hold as many items")
+    return item
 
 
 def agreed_count[T](phase: str, operation: Callable[[], T], counted: Callable[[T], bool]) -> tuple[T, int]:
@@ -492,6 +502,7 @@ __all__ = [
     "agree_process_phase",
     "agreed",
     "agreed_count",
+    "agreed_next",
     "agreed_same",
     "broadcast_from_process_zero",
     "collective_host",
