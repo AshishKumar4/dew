@@ -4,8 +4,9 @@ bundle) against the chunked op's port (fla's kernels, `generation.chosen(gated_d
 portable math in XLA (`ported=False`), at the scoreboard's delta-rule shapes (`benchmark_recurrence.SHAPES`),
 on the same operands: device milliseconds by CUPTI (every kernel of a call summed, the median of `--repeats`
 calls after `--warmup`) and the heaviest kernels, and memory: the compiled program's arguments, outputs and
-temporaries, and the device's peak in use. One arm a process (`--arm`), so the device's peak is its own; one
-JSON line an arm and shape.
+temporaries, and the device's peak in use. The forward, or with `--pass training` the forward and its
+gradient under a fixed cotangent (the template's fast backward, the port's, XLA's). One arm a process
+(`--arm`), so the device's peak is its own; one JSON line an arm, pass and shape.
 
     PYTHONPATH=src:tools python tools/benchmark_recurrence_mosaic.py --arm mosaic --out runs.jsonl
 """
@@ -54,7 +55,7 @@ def measured(compiled, args, warmup: int, repeats: int) -> tuple[float, list]:
     return statistics.median(times), top
 
 
-def row(name: str, arm: str, dtype, warmup: int, repeats: int) -> dict:
+def row(name: str, arm: str, dtype, warmup: int, repeats: int, training: bool = False) -> dict:
     shape = SHAPES[name]
     given = {key: jnp.asarray(value) for key, value in operands(shape).items()
              if key in ('q', 'k', 'v', 'g', 'beta')}
@@ -65,15 +66,22 @@ def row(name: str, arm: str, dtype, warmup: int, repeats: int) -> dict:
     def forward(q, k, v, g, beta):
         return chunk(hooks, Chunk(q, k, v, log_decay=g, beta=beta), chunk_size=shape.chunk, **ROUTES[arm])
 
-    found = {'shape': name, 'arm': arm, 'dtype': jnp.dtype(dtype).name,
-             'device': jax.devices()[0].device_kind}
+    if training:
+        def trained(*args):
+            out, pull = jax.vjp(forward, *args)
+            return pull(jax.tree.map(jnp.ones_like, out))
+        timed = trained
+    else:
+        timed = forward
+    found = {'shape': name, 'arm': arm, 'pass': 'training' if training else 'forward',
+             'dtype': jnp.dtype(dtype).name, 'device': jax.devices()[0].device_kind}
     try:
         start = time.perf_counter()
         if arm == 'port':
             with generation.chosen(gated_delta_rule='fla'):
-                compiled = jax.jit(forward).lower(*args).compile()
+                compiled = jax.jit(timed).lower(*args).compile()
         else:
-            compiled = jax.jit(forward).lower(*args).compile()
+            compiled = jax.jit(timed).lower(*args).compile()
         found['compile_s'] = round(time.perf_counter() - start, 1)
         memory = compiled.memory_analysis()
         found.update({f'{part}_mb': round(getattr(memory, f'{part}_size_in_bytes') / 2**20, 1)
@@ -92,13 +100,15 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument('--arm', choices=tuple(ROUTES), required=True)
     parser.add_argument('--shape', default='all', help=f"one of {DELTA} or 'all'")
     parser.add_argument('--dtype', default='bfloat16', help="bfloat16, float32, or both comma-separated")
+    parser.add_argument('--pass', dest='training', choices=('forward', 'training'), default='forward')
     parser.add_argument('--warmup', type=int, default=3)
     parser.add_argument('--repeats', type=int, default=10)
     parser.add_argument('--out', help='append JSON lines here as well as printing them')
     args = parser.parse_args(argv)
     for name in DELTA if args.shape == 'all' else (args.shape,):
         for dtype in args.dtype.split(','):
-            line = json.dumps(row(name, args.arm, jnp.dtype(dtype), args.warmup, args.repeats))
+            line = json.dumps(row(name, args.arm, jnp.dtype(dtype), args.warmup, args.repeats,
+                                  args.training == 'training'))
             print(line, flush=True)
             if args.out:
                 with open(args.out, 'a') as handle:
