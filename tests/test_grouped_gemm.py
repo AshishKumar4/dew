@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS, generations, lowers
+from generation_support import INTERPRETS, generations, lowers, runs
 from jax.sharding import Mesh
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference, equations, with_gradients
 
@@ -397,6 +397,7 @@ def test_a_tile_of_192_columns_stages_every_column_it_writes():
         check(got, reference[0], truth[0], group, f"forward {tiles}")
 
 
+@runs("sm80")
 @pytest.mark.parametrize("sizes", [name for name in SIZES if any(SIZES[name])])
 def test_an_ampere_gpu_runs_the_mosaic_forward_only_by_name(sizes):
     """Without warpgroup MMA the Mosaic GPU forward runs mma.sync's tiles (`AMPERE_TILES`) only where the
@@ -413,11 +414,14 @@ def test_an_ampere_gpu_runs_the_mosaic_forward_only_by_name(sizes):
         return template.gemm(x, w, group_sizes, out_dtype=jnp.float32, precision="default",
                              interpret_on_cpu=True)
 
-    for named, kernel in ((None, "triton"), ("mosaic_gpu", "mosaic_gpu")):
+    for named, kernel in ((None, "Gmm"), ("mosaic_gpu", "MosaicGmm")):
         with (generation.assumed("sm80"), generation.chosen(grouped_matmul=named),
-              generation.routes() as routes):
+              tuning.seen() as launches):
             got = jax.jit(forward)(jnp.asarray(x, jnp.bfloat16), jnp.asarray(w, jnp.bfloat16))
-        assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {kernel}
+        # The branch the call runs; a GPU process's CPU branch beside it interprets Triton's.
+        ran = {type(launch).__name__ for launch, ba in launches
+               if ba.arguments["interpret"] == (jax.default_backend() == "cpu")}
+        assert ran == {kernel}
         check(got, reference[0], truth[0], group, f"sm80 forward through {kernel}")
 
 
