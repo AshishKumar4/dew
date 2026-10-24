@@ -310,7 +310,7 @@ def test_the_templates_arithmetic_is_on_par_with_dews_reference_attention(case, 
 LAYOUTS = ("causal-documents-window", "cross-causal-lengths-starts")
 
 
-def layout_site(case, dtype):
+def layout_site(case, dtype, *, widen_bias=False):
     """A score hook reading a parameter of each score layout, a query's temperature, a key's bias and a
     dense bias, `s * t_q + b_k + B_qk`, and an output gate `o * sigmoid(g)`, on par with Dew's reference
     path taking them as it can: the temperature in the queries, the biases as one dense bias, the gate
@@ -341,7 +341,10 @@ def layout_site(case, dtype):
     def dews(query, key, value):
         wide = jnp.promote_types(query.dtype, jnp.float32)
         scaled = (query.astype(wide) * jnp.swapaxes(temperature, 1, 2)[..., None]).astype(query.dtype)
-        bias = (key_bias[:, :, None, :] + dense_bias).astype(query.dtype)
+        if widen_bias:
+            bias = (key_bias.astype(wide)[:, :, None, :] + dense_bias.astype(wide)).astype(query.dtype)
+        else:
+            bias = (key_bias[:, :, None, :] + dense_bias).astype(query.dtype)
         out = scaled_dot_product_attention(scaled, key, value, mask=mask, bias=bias,
                                            implementation="reference")
         return (out.astype(wide) * jax.nn.sigmoid(gate.astype(wide))).astype(query.dtype)
