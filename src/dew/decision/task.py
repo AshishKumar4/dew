@@ -43,7 +43,6 @@ from dew.decision.layout import (
     Layout,
     MarkerLayout,
     Specials,
-    StateFirstLayout,
     context_tokens,
     render,
 )
@@ -77,8 +76,6 @@ if TYPE_CHECKING:
 
 TASK_FILE = "decide.json"
 """The file `Decide.save` writes into a run: its calibration, budget and name."""
-_LAYOUTS: Mapping[str, type[Layout]] = {
-    layout.__name__: layout for layout in (MarkerLayout, StateFirstLayout, JointLayout)}
 
 
 @dataclass(frozen=True)
@@ -133,14 +130,28 @@ def usage_of(rows: Sequence[Encoded]) -> Usage:
 @dataclass(frozen=True)
 class DecideSettings:
     """What a decision run records beside its backbone, and its task is built with
-    (`Decide.from_run`): the head's record (`Head.record`), the layout's name and fields, the
-    special tokens, the text tokenizer's name, and an image processor's source, or None."""
+    (`Decide.from_run`): the head's record (`Head.record`), the layout (by import path, its
+    segments with it), the special tokens, the text tokenizer's name, and an image processor's
+    source, or None."""
 
     head: JSON
-    layout: JSON
+    layout: Layout
     specials: Specials
     tokenizer: str | None
     processor: str | None
+
+    @staticmethod
+    def of(record: Mapping[str, object]) -> "DecideSettings":
+        """The settings a run's record holds (`saved_settings`). An earlier run's record names its
+        layout by class name alone, one of `dew.decision.layout`'s, and is read as that class's."""
+        from dew.inference.tasks import saved_settings
+
+        laid = record.get("layout")
+        if isinstance(laid, Mapping) and "name" in laid:
+            name = records.text(laid["name"], "layout.name")
+            record = {**record, "layout": {"class": f"dew.decision.layout:{name}",
+                                           "fields": records.json_value(laid.get("fields"), "layout.fields")}}
+        return saved_settings(record, DecideSettings)
 
 
 @dataclass(frozen=True)
@@ -212,22 +223,19 @@ class Decide:
         the tokenizer that lays out the task's text.
         """
         from dew.data.text import tokenizer_for
-        from dew.inference.tasks import run_record, saved_model, saved_settings
+        from dew.inference.tasks import run_record, saved_model
         from dew.interop.pretrained import load_processor
         from dew.registry import from_record, objectives
 
         record, step = run_record(directory, step)
-        settings = saved_settings(record, DecideSettings)
+        settings = DecideSettings.of(record)
         backbone = saved_model(record, dtype).build()
         width, head_dtype = DecisionModel.head_size(backbone)
         head = Head.from_record(records.json_value(settings.head, "head"), width)
         # The head computes in the dtype it recorded, or as a fresh head over
         # the backbone would where the caller overrides the compute dtype.
         model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype))
-        laid = records.record(settings.layout, "layout")
-        # A layout is plain data, its framing's template variables included: no field is a dtype.
-        rows = from_record(_LAYOUTS[records.text(laid["name"], "layout.name")],
-                           records.json_value(laid["fields"], "layout.fields"), dtypes=False)
+        rows = settings.layout
         if settings.tokenizer is None:
             raise ValueError("the run records no tokenizer to lay its rows out with")
         processor = None if settings.processor is None else load_processor(settings.processor, backbone)
@@ -371,13 +379,15 @@ class Decide:
         """A request's answers and usage from its one row and images (`_shown`), by a pass of its own."""
         return self._replied(questions, [row], self._seen_pass([(row, media)]))
 
-    def _seen_pass(self, rows: Sequence[tuple[Encoded, Images]]) -> list[np.ndarray]:
+    def _seen_pass(self, rows: Sequence[tuple[Encoded, Images]],
+                   variables: Variables | None = None) -> list[np.ndarray]:
         """Each row's raw `[Q, K]` logits from one pass over rows that hold images, alike as
         `Images.joined` takes them (`seen_together`)."""
         assert self.processor is not None, "a row of images was laid out with the processor"
         encoded = [row for row, _ in rows]
         inputs = DecisionInputs.collate(encoded, self.specials.pad, context_length=self.context_length)
-        scores = np.asarray(self._forward(self.variables, inputs, media=Images.joined(self.processor, rows)))
+        held = self.variables if variables is None else variables
+        scores = np.asarray(self._forward(held, inputs, media=Images.joined(self.processor, rows)))
         return [scores[index, :len(row.questions)] for index, row in enumerate(encoded)]
 
     @property
@@ -388,7 +398,19 @@ class Decide:
     def _encoded(self, state: JSON, questions: Mapping[str, Question],
                  media: Sequence[int] = (), *, context: JSON | None = None) -> list[Encoded]:
         rows = self.layout.rows(self.tokenizer, self.specials, state, questions, media=media)
-        if context is not None:
+        if any(row.spans_in_context for row in rows):
+            # The row's context is its schema (`Schema.stream`), read whole by the cross-attention.
+            if context is not None:
+                raise ValueError("this task reads each request's schema as its context, so it reads no "
+                                 "context of the request's own")
+            if self.context_length is None:
+                raise ValueError("a schema read as the row's context needs a backbone with cross-attention "
+                                 "layers to read it (Pretrained.with_cross_attention)")
+            for row in rows:
+                if len(row.context or ()) > self.context_length:
+                    raise ValueError(f"the schema needs {len(row.context or ())} context tokens, more than "
+                                     f"the {self.context_length} the backbone's cross-attention reads")
+        elif context is not None:
             if self.context_length is None:
                 raise ValueError(f"a request's context is read by a backbone's cross-attention, which this "
                                  f"task's {type(self.model.backbone).__name__} does not have")
@@ -430,12 +452,13 @@ class Decide:
             start = stop
         return [found[index] for index in range(len(rows))]
 
-    def scored(self, rows: Sequence[Encoded]) -> list[np.ndarray]:
-        """Each of `rows`' raw `[Q, K]` logits from one pass over them all, which `fits` allows."""
-        scores = self._pass(rows)
+    def scored(self, rows: Sequence[Encoded], variables: Variables | None = None) -> list[np.ndarray]:
+        """Each of `rows`' raw `[Q, K]` logits from one pass over them all, which `fits` allows, over
+        `variables` (the task's own by default)."""
+        scores = self._pass(rows, self.variables if variables is None else variables)
         return [scores[index, :len(row.questions)] for index, row in enumerate(rows)]
 
-    def _pass(self, rows: Sequence[Encoded]) -> np.ndarray:
+    def _pass(self, rows: Sequence[Encoded], variables: Variables | None = None) -> np.ndarray:
         """One forward pass at bucketed shapes, its rows placed on the
         weights' mesh (`RowPlan`)."""
         questions = max(len(row.questions) for row in rows)
@@ -451,8 +474,9 @@ class Decide:
             slots=None if inputs.slots is None else _widened(inputs.slots, length))
         count = shape_bucket(len(rows), 1)
         padded = RowPlan(None, len(rows), count, 0, 1).pad(inputs)
-        plan = RowPlan.over(mesh_of(self.variables), count)
-        return plan.host(self._forward(self.variables, plan.place(plan.pad(padded))))[:len(rows)]
+        held = self.variables if variables is None else variables
+        plan = RowPlan.over(mesh_of(held), count)
+        return plan.host(self._forward(held, plan.place(plan.pad(padded))))[:len(rows)]
 
     def _forward(self, variables: Variables, inputs: DecisionInputs, *,
                  media: ModelInputs | None = None) -> jax.Array:
@@ -562,9 +586,10 @@ class Decide:
         """Each answered question of `reader`'s rows, with its raw logits and its
         gold distribution in the order the row shows its options."""
         scored = []
-        segments = self.layout.bounds(self.tokenizer, self.specials).segments
+        segments = self.layout.bounds(self.tokenizer, self.specials, self.context_length).segments
         for batch in reader(DataPartition()):
-            inputs = laid_out(batch, segments)
+            inputs = laid_out(batch, segments, spans_in_context=isinstance(self.layout, JointLayout)
+                              and self.layout.schema_in_context)
             logits = np.asarray(self._forward(self.variables, inputs))
             answered = (np.asarray(batch["scored"])
                         & (np.asarray(Objective.row_weights(batch, len(logits))) > 0)[:, None])
@@ -748,11 +773,12 @@ class WireScoring(scoring.Scoring[Mapping[str, object], _Row, _Admitted, np.ndar
                 and all(seen[0].alike(media) for media in seen) and self.decide.fits(encoded))
 
     def forward(self, variables: Variables, rows: Sequence[_Row]) -> list[np.ndarray]:
-        # The server chose these rows as one pass (`fits`), so they run as one.
-        decide = replace(self.decide, variables=variables)
+        # The server chose these rows as one pass (`fits`), so they run as one, over the weights it
+        # hands the pass; the task's compiled forwards are kept across passes.
         if rows[0].media is None:
-            return decide.scored([row.encoded for row in rows])
-        return decide._seen_pass([(row.encoded, row.media) for row in rows if row.media is not None])
+            return self.decide.scored([row.encoded for row in rows], variables)
+        return self.decide._seen_pass([(row.encoded, row.media) for row in rows if row.media is not None],
+                                      variables)
 
     def answer(self, payload: _Admitted, outputs: Sequence[np.ndarray]) -> dict[str, JSON]:
         return self.decide._wire_response(payload.questions,
@@ -804,9 +830,11 @@ def _ordered(laid: Laid, logits: np.ndarray) -> np.ndarray:
     return ordered
 
 
-def laid_out(batch: Mapping[str, object], max_segments: int) -> DecisionInputs:
+def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context: bool = False
+             ) -> DecisionInputs:
     """The `DecisionInputs` of a batch of packed windows (`PackedRows`), each
-    holding at most `max_segments` rows."""
+    holding at most `max_segments` rows, the questions' spans in each row's context where
+    `spans_in_context` (`JointLayout.schema_in_context`)."""
     def array(name: str) -> jax.Array:
         return jnp.asarray(batch[name])
 
@@ -819,7 +847,7 @@ def laid_out(batch: Mapping[str, object], max_segments: int) -> DecisionInputs:
                           positions=array("positions"), slots=given("slots"),
                           option_slots=given("option_slots"), slotted=given("slotted"),
                           context=given("context"), context_lengths=given("context_lengths"),
-                          max_segments=max_segments)
+                          max_segments=max_segments, spans_in_context=spans_in_context)
 
 
 def _widened(leaf: jax.Array, length: int, fill: int = 0) -> jax.Array:

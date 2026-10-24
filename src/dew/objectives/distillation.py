@@ -40,6 +40,7 @@ from flax import linen as nn
 from typing_extensions import TypeVar
 
 from dew.artifacts import Artifacts
+from dew.nn.precision import accumulated
 from dew.objectives.base import (
     OMITTED,
     TEACHER,
@@ -146,6 +147,10 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """The student's real lengths of the batch it reads."""
         return self.student.real_lengths(batch)
+
+    def scored_tokens(self, batch: Batch) -> np.ndarray:
+        """The targets the student scores of the batch it reads."""
+        return self.student.scored_tokens(batch)
 
     def inference_record(self) -> JSON:
         """The student's record: a saved distillation loads as the student it trained, on the
@@ -271,7 +276,7 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
             distances = []
             for index, (own, other) in enumerate(zip(student.hidden, teacher.hidden, strict=True)):
                 if own.shape[-1] != other.shape[-1]:
-                    own = own.astype(jnp.float32) @ projections[f"projection_{index}"]
+                    own = accumulated(jnp.matmul, own.astype(jnp.float32), projections[f"projection_{index}"])
                 distances.append(self._distance(own, other))
             feature = self.row_mean(jnp.stack(distances) * weights, batch, rows=1).total / len(self.features)
             total = total + beta * feature
