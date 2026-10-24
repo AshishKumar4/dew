@@ -114,8 +114,8 @@ def assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, 
         return jax.tree.map(lambda before, grad: applied(before, (before - grad).astype(np.float32)),
                             values["params"], grads)
 
-    # Compiled once, as each arm is: run op by op, every draw's float64 gradient compiled the model's
-    # inner programs afresh.
+    # Compiled once, as each arm is, rather than run op by op at every draw: a 0.12 CPU sizing of this
+    # site ran its process out of memory for compiled code within its draws.
     wide = jax.jit(lambda values: objective_gradient(twin, values, widened(batch), step))
 
     def truth(values):
