@@ -127,6 +127,8 @@ MESH_CASES = {
 WIDE_HEADS = 24
 """The query heads of the partly split mesh tests: eight ways over the tensor and expert axes, three on each
 shard."""
+WIDE_SHARDS = 8
+"""The shards those query heads split over: a tensor axis of two and an expert axis of four."""
 QUERY_HEADS_EIGHT_WAYS = (("activation_heads", ("tensor", "expert")),)
 """The query heads' rule when they split over the tensor and expert axes together, as a trainer's layout may
 split them."""
@@ -143,12 +145,44 @@ KEY_HEADS_LEADING_THE_OTHER_WAY = (*QUERY_HEADS_EIGHT_WAYS, ("activation_kv", ("
 heads."""
 
 
+def shares_on_one_device(case: dict, heads: int, kv_heads: int, shards: int):
+    """`case`'s template call on one device, its query heads in `shards` shares, each run as its own call
+    over the key heads it reads: query head `h` reads key head `h // group`, gathered per share.
+    A share has the shape its shard runs at, and a call's rounding depends on its shape (the packed
+    documents' sinks gradient differs by about 1.5 between three query heads and twenty-four, with no
+    mesh). A head split's shards compare with these shares, and the key and value gradients add across
+    the shares that read a key head."""
+    share, group = heads // shards, heads // kv_heads
+
+    def routed(query, key, value, sinks):
+        return scaled_dot_product_attention(query, key, value, implementation="template", sinks=sinks,
+                                            **keywords(case))
+
+    def run(query, key, value, sinks, dout):
+        parts = []
+        for shard in range(shards):
+            first = shard * share
+            read = np.arange(first, first + share) // group
+            out, dq, dk, dv, dsinks = with_gradients(routed)(
+                query[:, :, first:first + share], key[:, :, read], value[:, :, read],
+                sinks[first:first + share], dout[:, :, first:first + share])
+            parts.append((read, out, dq, dk, dv, dsinks))
+        dk, dv = jnp.zeros(key.shape, key.dtype), jnp.zeros(value.shape, value.dtype)
+        for read, _, _, part_dk, part_dv, _ in parts:
+            dk, dv = dk.at[:, :, read].add(part_dk), dv.at[:, :, read].add(part_dv)
+        return (jnp.concatenate([part[1] for part in parts], axis=2),
+                jnp.concatenate([part[2] for part in parts], axis=2), dk, dv,
+                jnp.concatenate([part[5] for part in parts], axis=0))
+
+    return run
+
+
 def per_shard_contract(case: dict, mesh: Mesh, specs: list, *, heads: int, kv_heads: int, rules, label: str,
-                       moves=()) -> None:
-    """`case`'s named template call on `mesh`, its arguments placed by `specs` and the logical axis
-    `rules` in context, runs per shard (`sharded.assert_runs_per_shard`). Its output and gradients are on
-    par with one device's over the site's draws (check 1), measured from float64 on the reference path,
-    and the compiled step moves no operand between devices beyond `moves`."""
+                       moves=(), arm=None) -> None:
+    """`case`'s named template call on `mesh`, its arguments placed by `specs` and the logical axis `rules`
+    in context, runs per shard (`sharded.assert_runs_per_shard`). Its output and gradients are on par with one
+    device's whole call, or with `arm` when given, over the site's draws (check 1), measured from float64 on
+    the reference path, and the compiled step moves no operand between devices beyond `moves`."""
     queries, keys = geometry(case)
     draw = drawing(queries, keys, jnp.float32, sinks=True, heads=heads, kv_heads=kv_heads)
 
@@ -162,7 +196,7 @@ def per_shard_contract(case: dict, mesh: Mesh, specs: list, *, heads: int, kv_he
 
     with nn.logical_axis_rules(rules):
         assert_runs_per_shard(with_gradients(routed), draw, specs, mesh, label, seeds=MESH_SEEDS,
-                              truth_fn=with_gradients(reference), moves=moves)
+                              truth_fn=with_gradients(reference), moves=moves, arm=arm)
 
 
 @pytest.mark.mesh(devices=8)
@@ -187,29 +221,33 @@ def test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh
 def test_partly_split_key_heads_keep_the_kernel_contract_on_a_tensor_and_expert_mesh(kv_heads):
     """A named template call with 24 query heads split eight ways over a tensor axis of two and an expert axis
     of four, and key heads split over the tensor axis alone. Each shard holds part of the key heads its query
-    heads read, and reads them at their offset in that part. It runs per shard as the others do, on par with
-    one device's, and no operand moves between devices."""
+    heads read, and reads them at their offset in that part. It runs per shard, on par with its shares run on
+    one device (`shares_on_one_device`), and no operand moves between devices."""
     mesh = Mesh(np.asarray(jax.devices()[:8]).reshape(2, 4), ("tensor", "expert"))
     heads = PartitionSpec(None, None, ("tensor", "expert"))
     keys = PartitionSpec(None, None, "tensor")
     specs = [heads, keys, keys, PartitionSpec(("tensor", "expert")), heads]
-    per_shard_contract(MESH_CASES["own-documents"], mesh, specs, heads=WIDE_HEADS, kv_heads=kv_heads,
+    case = MESH_CASES["own-documents"]
+    arm = jax.jit(shares_on_one_device(case, WIDE_HEADS, kv_heads, WIDE_SHARDS))
+    per_shard_contract(case, mesh, specs, heads=WIDE_HEADS, kv_heads=kv_heads,
                        rules=PARTLY_SPLIT_KEY_HEADS[kv_heads],
-                       label=f"template split eight ways, {kv_heads} key heads on the tensor axis")
+                       label=f"template split eight ways, {kv_heads} key heads on the tensor axis", arm=arm)
 
 
 @pytest.mark.mesh(devices=8)
 def test_key_heads_the_query_heads_do_not_lead_are_gathered_on_a_tensor_and_expert_mesh():
     """Eight key heads split over the expert and tensor axes, in the other order from the query heads' split.
     No shard holds the key heads its query heads read, so every shard holds them whole, and the key and value
-    heads are gathered once before the map. It runs per shard on par with one device's."""
+    heads are gathered once before the map. It runs per shard, on par with its shares run on one device."""
     mesh = Mesh(np.asarray(jax.devices()[:8]).reshape(2, 4), ("tensor", "expert"))
     heads = PartitionSpec(None, None, ("tensor", "expert"))
     keys = PartitionSpec(None, None, ("expert", "tensor"))
     specs = [heads, keys, keys, PartitionSpec(("tensor", "expert")), heads]
-    per_shard_contract(MESH_CASES["own-documents"], mesh, specs, heads=WIDE_HEADS, kv_heads=8,
+    case = MESH_CASES["own-documents"]
+    arm = jax.jit(shares_on_one_device(case, WIDE_HEADS, 8, WIDE_SHARDS))
+    per_shard_contract(case, mesh, specs, heads=WIDE_HEADS, kv_heads=8,
                        rules=KEY_HEADS_LEADING_THE_OTHER_WAY, moves=("all-gather",),
-                       label="template split eight ways, key heads the other way")
+                       label="template split eight ways, key heads the other way", arm=arm)
 
 
 def test_a_route_call_under_forward_mode_keeps_the_template_value_and_the_reference_derivative():
