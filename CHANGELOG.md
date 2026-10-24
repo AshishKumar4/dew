@@ -12,9 +12,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   and every other kind stays causal. A cached call reads the groups of its own tokens, so no cache
   keeps them, and a layer that shares another's keys and values reads them too.
 - `scaled_dot_product_attention(block_groups=, image_groups=)` reads blocks and images as the
-  attention template's key spans, one interval a query, so a GPU runs a block or image layer on the
+  attention template's key spans, one interval a query, so an A100 runs a block or image layer on the
   template's fused kernels rather than xla's `[B, 1, S, S]` mask (268 MB a row a layer at 16k
-  tokens); every other path takes the mask the spans mean. A window counts a call's places, padding
+  tokens), where it measured faster at every length; every other path takes the mask the spans mean. A window counts a call's places, padding
   inside a row skipped, in the spans too.
 - `scaled_dot_product_attention(key_valid=, places=)` reads a call's real keys and the places its
   window counts as the template's spans, the invalid keys hidden as padding's document id hides
