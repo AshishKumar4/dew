@@ -76,7 +76,7 @@ def _home(array: jax.Array | np.ndarray) -> np.ndarray:
         raise ValueError(
             "a tracker was handed a shard of a global array, which it cannot "
             "complete from one process: bring the artifact home with "
-            "dew._coordination.collective_host on every process before drawing it")
+            "dew.distributed.collective_host on every process before drawing it")
     return np.asarray(array)
 
 def _uint8(images: jax.Array | np.ndarray) -> np.ndarray:

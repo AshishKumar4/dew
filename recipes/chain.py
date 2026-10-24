@@ -26,7 +26,6 @@ import jax
 import optax
 from flax import linen as nn
 
-from dew._records import integer, record, text
 from dew.batch import Variables
 from dew.data.chat import Role
 from dew.data.pipeline import Dataset
@@ -185,7 +184,7 @@ class Recipe:
         # which refuses a missing field by name; one that states them is checked here.
         facts = stage.data.facts()
         stated = facts.get("fields")
-        fields = None if stated is None else record(stated, "the chain's fields")
+        fields = None if stated is None else _stated(facts, "fields", Mapping)
         # A conversation's rows carry their roles, whose assistant turns alone SFT scores; a preference
         # pair's are as `preferences.PreferencePair` lays them out.
         needed = {"pretrain": ("text",), "sft": ("text", "text_roles"),
@@ -210,17 +209,17 @@ class Recipe:
                                          temperature=teacher.temperature), None, student
         if stage.loss == "dpo":
             beta = 0.1 if stage.beta is None else stage.beta
-            objective = DPOObjective(self.model, integer(facts["seq_len"], "seq_len") - 1, beta=beta,
+            objective = DPOObjective(self.model, _stated(facts, "seq_len", int) - 1, beta=beta,
                                      variables=None)
             return objective, None, objective
         beta = 0.0 if stage.beta is None else stage.beta
         if stage.loss == "grpo":
             if stage.reward is None:
                 raise ValueError(f"stage {stage.name!r} samples without a reward; name one")
-            prompt = integer(list(fields["prompt"])[-1], "the prompt's length")
+            prompt = int(_stated(_stated(facts, "fields", Mapping), "prompt", list)[-1])
             objective = GRPOObjective(self.model, prompt + stage.max_new_tokens - 1, beta=beta,
                                       variables=None)
-            tokenizer = tokenizer_for(text(facts["tokenizer"], "tokenizer"))
+            tokenizer = tokenizer_for(_stated(facts, "tokenizer", str))
             sampling = with_ids_of(stage.sampling, Sampling(eos_token_ids=tokenizer.eos_id))
             return objective, RolloutScheduler.sampled(
                 objective, stage.reward, decode=tokenizer.decode, groups=stage.groups,
@@ -238,8 +237,16 @@ class Recipe:
         return objective, rollout, objective.actor
 
 
+def _stated[Value](facts: Mapping[str, object], name: str, kind: type[Value]) -> Value:
+    """The fact `name` the chain states (`Dataset.facts`), refused where it is not a `kind`."""
+    value = facts.get(name)
+    if not isinstance(value, kind):
+        raise ValueError(f"the chain states its {name} as {value!r}, not a {kind.__name__}")
+    return value
+
+
 def _scored(model: nn.Module | Source, stage: Stage, facts: Mapping[str, object],
             variables: Variables | None | Omitted = OMITTED) -> LMObjective:
     """The next-token objective over the stage's token windows, counting only assistant tokens of SFT."""
-    return LMObjective(model, integer(facts["seq_len"], "seq_len"),
+    return LMObjective(model, _stated(facts, "seq_len", int),
                        loss_role=Role.ASSISTANT if stage.loss == "sft" else None, variables=variables)

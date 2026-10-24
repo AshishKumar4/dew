@@ -118,15 +118,8 @@ class ModelConfig(Registered):
         """Return the module's class and constructor fields, and each wrapper
         its class was made in, in the order they were applied."""
         model_type, layers = registry.wrapper_layers(type(model))
-        wrappers = []
-        for layer in reversed(layers):
-            wrapper = layer._dew_wrapper()
-            if not isinstance(wrapper, Wrapper):
-                raise ValueError(f"{type(wrapper).__name__} wraps {model_type.__name__} where no model "
-                                 f"record can name it")
-            wrappers.append(wrapper)
         return cls(registry.import_path(model_type), registry.record_fields(model, model_type),
-                   wrappers=tuple(wrappers))
+                   wrappers=tuple(layer._dew_wrapper() for layer in reversed(layers)))
 
     def with_dtype(self, dtype: str | None) -> Self:
         """This model computing in `dtype` (`dew.registry.with_dtype`); None keeps it."""
