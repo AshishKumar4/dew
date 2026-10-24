@@ -154,10 +154,14 @@ def route_arm(case: dict):
 
 def reference_arm(case: dict):
     """`case`'s reference path over the same keys, dropping from the seed words."""
-    mask = jnp.asarray(dews_mask(case))[:, None]
+    mask = np.asarray(dews_mask(case))
+    live = jnp.asarray(mask.any(axis=-1))[:, :, None, None]
 
     def call(query, key, value, words):
-        return reference_attention(query, key, value, mask=mask, dropout_rate=RATE, dropout_seed=words)
+        # A query that sees no key reads zero, as `attention_kernel` makes every reference call read.
+        out = reference_attention(query, key, value, mask=jnp.asarray(mask)[:, None], dropout_rate=RATE,
+                                  dropout_seed=words)
+        return jnp.where(live, out, 0)
 
     return call
 
@@ -214,7 +218,7 @@ def probe(words: jax.Array, queries: int, keys: int, batch: int, heads: int, *, 
     computes them at the tiles `block`."""
     query = jnp.zeros((batch, queries, heads, 8), jnp.float32)
     key = jnp.zeros((batch, keys, heads, 8), jnp.float32)
-    value = jnp.broadcast_to(jnp.eye(keys, dtype=jnp.float32), (batch, keys, heads, keys))
+    value = jnp.broadcast_to(jnp.eye(keys, dtype=jnp.float32)[None, :, None, :], (batch, keys, heads, keys))
     spans = template.spans(queries, keys, batch)
     out = attention_portable.attend(query, key, value, spans, hooked(words, batch, heads), block_q=block[0],
                                     block_k=block[1], pad=8)
@@ -237,7 +241,7 @@ def test_the_triton_mainloop_interpreted_draws_the_reference_mask():
     words = seed_words(3)
     query = jnp.zeros((2, 8, 4, 8), jnp.float32)
     key = jnp.zeros((2, 16, 2, 8), jnp.float32)
-    value = jnp.broadcast_to(jnp.eye(16, dtype=jnp.float32), (2, 16, 2, 16))
+    value = jnp.broadcast_to(jnp.eye(16, dtype=jnp.float32)[None, :, None, :], (2, 16, 2, 16))
     spans = template.spans(8, 16, 2)
     out = attention_triton.forward(query, key, value, spans, hooked(words, 2, 4), interpret=True)
     mask = np.asarray(dropout_draw(words, RATE, (2, 4, 8, 16))) > 0

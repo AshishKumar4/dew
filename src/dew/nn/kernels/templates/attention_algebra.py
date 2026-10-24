@@ -406,12 +406,16 @@ HEADROOM = 126
 tile's product adds at most as much again and the sum stays finite."""
 
 
-def needed(total: jax.Array, reach: jax.Array) -> jax.Array:
+def needed(total: jax.Array, reach: jax.Array, bound: float = 1.0) -> jax.Array:
     """The shift a row's sums need, `[...]` fp32 integers: none while its natural denominator `total` times
     the largest value it weighs, `reach`, is below `2^HEADROOM`, the weighted values' bound; past it, as
     many binades as that product passes it by (log2 rounded up, so the bound holds whatever their
-    rounding)."""
-    binades = jnp.ceil(jnp.log2(total) + jnp.log2(reach)) - HEADROOM
+    rounding). A dropping call's draw multiplies each weight by at most `bound`, which counts in the log
+    rather than in a product: `reach * bound` may itself pass fp32's largest."""
+    log = jnp.log2(total) + jnp.log2(reach)
+    if bound != 1.0:
+        log = log + math.log2(bound)
+    binades = jnp.ceil(log) - HEADROOM
     return jnp.where(finite(binades) & (binades > 0), binades, 0.0)
 
 
@@ -457,14 +461,14 @@ def carry_factor(x: jax.Array, alpha: jax.Array, held: Room | None) -> jax.Array
     return power2(taken, held.drop if taken.ndim == held.drop.ndim else expand(held.drop, taken))
 
 
-def tile(state: Partial, alpha: jax.Array, p: jax.Array, largest: Callable[[], jax.Array]
-         ) -> tuple[jax.Array, jax.Array, Room | None]:
+def tile(state: Partial, alpha: jax.Array, p: jax.Array, largest: Callable[[], jax.Array],
+         bound: float = 1.0) -> tuple[jax.Array, jax.Array, Room | None]:
     """A tile's weights for its product and the factor the state's sums take (`carry_factor`), with the
     guarded walk's `Room` (`room`, its keys' values' largest magnitudes `largest()`), None on the plain walk,
     whose weights are `p` as ever."""
     if state.guard is None:
         return p, alpha, None
-    held = room(state.guard, state.total, alpha, p, largest())
+    held = room(state.guard, state.total, alpha, p, largest(), bound)
     return held.weights, alpha, held
 
 
@@ -485,7 +489,8 @@ def stepped(state: Partial, m: jax.Array, factor: jax.Array, p: jax.Array, produ
     return Partial(acc, m, denominator, Guard(held.shift, held.reach, plain, plain_total, held.before.live))
 
 
-def room(guard: Guard, total: jax.Array, alpha: jax.Array, p: jax.Array, largest: jax.Array) -> Room:
+def room(guard: Guard, total: jax.Array, alpha: jax.Array, p: jax.Array, largest: jax.Array,
+         bound: float = 1.0) -> Room:
     """A tile's weights `p` (`weights`) and the factor the sums of its state (`guard`, denominator
     `total`) take (`alpha`, `peak`'s) with each live row's shift (`needed`; `Guard.live`). The weighted
     values of a row can pass fp32's largest only where its values are near it (a sum of up to `total` of
@@ -502,7 +507,7 @@ def room(guard: Guard, total: jax.Array, alpha: jax.Array, p: jax.Array, largest
     # the row does not see (padding, a stale cache slot, another document) would shift it for nothing.
     reach = jnp.maximum(guard.reach, jnp.where(p > 0, across(largest, p), 0.0).max(axis=-1))
     natural = power2(alpha * total, guard.shift) + p.sum(axis=-1)
-    shift = jnp.where(guard.live, jnp.maximum(guard.shift, needed(natural, reach)), guard.shift)
+    shift = jnp.where(guard.live, jnp.maximum(guard.shift, needed(natural, reach, bound)), guard.shift)
     weight = jnp.minimum(shift, WEIGHT_SHIFT)
     return Room(power2(p, expand(-weight, p)), guard.shift - shift, shift, reach, weight - shift, p, alpha,
                 guard)
@@ -721,10 +726,6 @@ def drawn(coords: Coords, queries: jax.Array, keys: jax.Array) -> jax.Array | No
     return None if coords.drop is None else coords.drop(queries, keys)
 
 
-def _bounded(largest: Callable[[], jax.Array], bound: float) -> jax.Array:
-    """Each key's largest value magnitude taken to the draw's bound, a kept weight's largest multiplier."""
-    return largest() * bound
-
 
 def _times(dot: Callable[[jax.Array, jax.Array], jax.Array], value: jax.Array, p: jax.Array,
            multiplier: jax.Array | None = None) -> jax.Array:
@@ -743,9 +744,8 @@ def _softmax(spec: Forward, state: Partial, keys: Keys):
     p = weights(spec, keys.logits, m)
     value = keys.load()
     largest = keys.largest if keys.largest is not None else functools.partial(magnitudes, value)
-    if keys.coords.drop is not None:
-        largest = functools.partial(_bounded, largest, keys.coords.drop.bound)
-    p, factor, held = tile(state, alpha, p, largest)
+    bound = 1.0 if keys.coords.drop is None else keys.coords.drop.bound
+    p, factor, held = tile(state, alpha, p, largest, bound)
     return m, factor, p, value, held
 
 
