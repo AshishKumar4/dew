@@ -219,3 +219,15 @@ def test_extrema_order_zeros_and_propagate_nan_as_the_lane_does():
     assert ct.certified(jax.lax.erf_inv, np.float32([0.0, -0.0, 2.0 ** -140]))[1] == []
     assert not np.any(ct.CONTRACTS["erf_inv"]({}, [np.float32([0.0])], np.float32([2.0 ** -126]), oc.FLOAT32))
     assert ct.certified(jnp.exp, np.float32([1000.0, 88.0, 89.0]))[1] == []
+
+
+def test_an_exp_past_its_range_is_held_at_its_neighbours_however_far():
+    """Past `EXP_RANGE` every exp lies between the same two neighbours of the lane's grid: a finite fp32
+    as far as ±1e30 or ±3e38 certifies as exp(±100) does, with no enclosure of its exponent, and the
+    largest finite value is as faithful above as inf, the least normal below as zero."""
+    far = np.float32([1e30, -1e30, 3e38, -3e38, 1000.0, -1000.0])
+    assert ct.certified(jnp.exp, far)[1] == []
+    biggest, least = np.finfo(np.float32).max, np.finfo(np.float32).tiny
+    for native in (np.float32([np.inf, 0.0] * 3), np.float32([biggest, least] * 3)):
+        assert np.all(ct.CONTRACTS["exp"]({}, [far], native, oc.FLOAT32))
+    assert not np.any(ct.CONTRACTS["exp"]({}, [far], np.float32([1.0] * 6), oc.FLOAT32))
