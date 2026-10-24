@@ -18,7 +18,7 @@ MASKED_SEEDS = 8
 """Check 1's declared seeds for a masked row against the row of its held classes alone."""
 COLLAPSE_SEEDS = {20: 8, 40: 8, 80: 8}
 """Check 1's declared seeds for a confident label's derivative at each margin, sized by `seeds_for`."""
-CANCELLATION_SEEDS = 8
+CANCELLATION_SEEDS = 256
 """Check 1's declared seeds for the divergence's derivative near its reference, sized by `seeds_for`."""
 
 
