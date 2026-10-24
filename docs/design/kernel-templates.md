@@ -586,8 +586,9 @@ Variants these libraries ship that rows 1–51 did not name, each against the de
 | 62 | Total attention: `Σ_q P[q, k]`, the probability each key receives over the queries, returned beside the output | a key-major pass | the dK/dV program's walk (keys resident, query tiles streamed) over the forward's maxima and denominators, summing the normalized weights per key | The forward can't form it: each weight needs its row's final denominator. Comparator: FlagAttention `return_total_attention`. |
 | 63 | MLA over a sliding window of a paged latent cache, returning partial accumulators (tokamax `mla_swa`) | composition | rows 25, 3, 27, and the partial state out (row 19) for the merge with the sparse part | |
 | 64 | Block-mask sparse prefill with FP8 operands (FlagAttention's Hy3) | structure + product declaration | a caller's block mask as the indexed block lists, rows 45 and 46 for the operands | The mask's density buckets are the scheduler's. |
+| 65 | KV sharing across layers: YOCO's cross-decoder layers, Gemma 3n/4's shared caches | consumer contract | a layer attends over another layer's cache, read only: the K/V source is a cache it does not write (prefill and decode, rows 27 and 30), its spans that cache's | No new math; the contract is that a call's K/V may be a cache another layer owns, which the work list's per-item K/V source (row 33) already allows. Comparator: fla `yoco`. arXiv 2405.05254. |
 
-Not attention variants, so in other templates: fla's YOCO is an architecture (one cache, cross-decoder layers that read it, plain attention); BitAttention changes the projections (the GEMM template's 1.58-bit weights), not attention; tokamax's DeepSeek-V4 compressor writes the cache. DeltaFormer and log-linear attention are Appendix B's (§App. B, C-class).
+Not attention variants, so in other templates: BitAttention changes the projections (the GEMM template's 1.58-bit weights), not attention; tokamax's DeepSeek-V4 compressor writes the cache. DeltaFormer and log-linear attention are Appendix B's (§App. B, C-class).
 
 ### Table 2: consumer → op map
 
