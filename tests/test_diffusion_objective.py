@@ -310,7 +310,7 @@ def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_
     rows, images and prompts, its weights moved from the fixture's, and its step's key, which draws
     the times, the noise and the dropped rows. The two routes are two programs, which round
     otherwise."""
-    from reference_error import assert_as_exact, widened
+    from reference_error import assert_as_exact, widened, without_ynn
 
     source, variables, _, step = conditional_mmdit
     dropped = DiffusionObjective(source.model, source.process, source.inputs,
@@ -363,8 +363,9 @@ def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_
     def through(objective, values, rows, at):
         return jax.value_and_grad(lambda values: objective.scalar_loss(values, rows, at)[0])(values)
 
-    through_dropped = jax.jit(lambda values, rows, at: through(dropped, values, rows, at))
-    through_explicit = jax.jit(lambda values, rows, at: through(conditional, values, rows, at))
+    # Both arms are Dew's, so both compile without YNNPACK's fusions (`without_ynn`).
+    through_dropped = without_ynn(lambda values, rows, at: through(dropped, values, rows, at))
+    through_explicit = without_ynn(lambda values, rows, at: through(conditional, values, rows, at))
 
     def dew(values, rows, seed):
         return trained(through_dropped(values, rows, stepped(seed)))
@@ -378,6 +379,8 @@ def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_
         tokens = explicit(rows, masked(jax.tree.map(lambda leaf: np.asarray(leaf, np.float32)
                                                     if np.issubdtype(np.asarray(leaf).dtype, np.floating)
                                                     else leaf, values), rows, at))
+        # The pixels in float64 too, so the loss's normalization, rates and noising run in float64.
+        tokens = {**tokens, "image": np.asarray(tokens["image"], np.float64)}
         with jax.enable_x64(new_val=True):
             wide = DiffusionObjective(source.model.clone(dtype=jnp.float64), source.process, source.inputs,
                                       unconditional_prob=0.0, steps=3, solver=Euler(),

@@ -414,14 +414,20 @@ def resident(model: nn.Module, variables: Variables) -> Variables:
     weights are rather than moving them. A jax.Array stays where it is, a pinned-host bank's among
     them. A task's generations and a server's steps read their weights so, where a host leaf
     would be copied to the device again at each call."""
-    stored = decoding_storage(model, variables)
-    mesh = mesh_of(stored)
+    return held(decoding_storage(model, variables))
+
+
+def held(variables: Variables) -> Variables:
+    """`variables` placed on the device once (`resident`'s placement, its storage as given): each host
+    leaf replicated on the mesh the tree's arrays sit on, or committed to this process's default
+    device; a jax.Array stays where it is."""
+    mesh = mesh_of(variables)
     target = default_placement() if mesh is None else NamedSharding(mesh, P())
 
     def placed(leaf):
         return jax.device_put(leaf, target) if isinstance(leaf, (np.ndarray, np.generic)) else leaf
 
-    return jax.tree.map(placed, stored)
+    return jax.tree.map(placed, variables)
 
 
 class _NativeTextTask:
@@ -623,8 +629,9 @@ class TextGeneration(_NativeTextTask):
                  trust: Sequence[str] = ()) -> TextGeneration:
         """Load the causal language-model run in `directory` as a task.
 
-        The task rebuilds the model that the run's `run.json` records, the
-        way the recipe built it, over the weights of the latest checkpoint
+        The task rebuilds the model that the checkpoint's inference record
+        (`Checkpoints.artifact`) declares, the way the recipe built it, over
+        the weights of the latest checkpoint
         (or of `step`), and decodes text through the run's own tokenizer.
         The run's preview budget and sampling policy become the task's
         defaults, and a PPO run loads only its policy weights.
@@ -710,8 +717,8 @@ class BlockGeneration(_NativeTextTask):
                  trust: Sequence[str] = ()) -> BlockGeneration:
         """Load the block-diffusion run in `directory` as a task.
 
-        The task rebuilds the block denoiser that the run's `run.json`
-        records, over the weights of the latest checkpoint (or of `step`),
+        The task rebuilds the block denoiser that the checkpoint's inference
+        record declares, over the weights of the latest checkpoint (or of `step`),
         and samples with the run's saved `BlockProcess` over the canvas the
         model declares. The run's preview budget becomes the task's
         `max_new_tokens`, and its pad id the task's `pad_token_id`. A run
@@ -787,8 +794,8 @@ class MaskedGeneration(_NativeTextTask):
                  trust: Sequence[str] = ()) -> MaskedGeneration:
         """Load the masked-diffusion run in `directory` as a task.
 
-        The task rebuilds the bidirectional model that the run's `run.json`
-        records, over the weights of the latest checkpoint (or of `step`),
+        The task rebuilds the bidirectional model that the checkpoint's inference
+        record declares, over the weights of the latest checkpoint (or of `step`),
         and refines responses with MDLM over the run's own mask token, using
         the solver and step count the run saved. The model must score the
         whole row with every position reading the others (`Logits`, and

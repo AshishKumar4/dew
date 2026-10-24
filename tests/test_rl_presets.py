@@ -185,6 +185,35 @@ def test_a_measured_reward_width_is_the_whole_stores_in_both_parts_of_a_holdout(
         held.close()
 
 
+def test_a_measured_reward_width_through_a_generation_is_the_whole_stores_in_both_parts(tmp_path):
+    """The same holdout read through a generation published from the whole store: both parts bind
+    the width of the widest row of the whole store, as uncached, so a generation standing in for
+    the store changes no padded shape."""
+    from dew.data.cache import Cache
+    from dew.data.compile import publish
+    from dew.data.prompts import TRUTH_KEY
+
+    store = _prompts(12, widest_first=True)
+
+    def kept(rows):
+        return rows.map(lambda row: row, identity="kept@1")
+
+    generation = publish(kept(store), Cache(str(tmp_path / "cache")), read="memory", loading=LOADING)
+    train, scored = kept(store).cache(generation).holdout(records=3)
+
+    def rendered(part):
+        return part.pipe(presets.prompts, "byte", max_prompt_len=16, batch=None)
+
+    loaded = compile(rendered(train).shuffle(0).repeat().batch(1), validation=rendered(scored).batch(1),
+                     read="memory", loading=LOADING)
+    assert _widths(loaded, 4) == {12}
+    held = loaded.val(DataPartition())
+    try:
+        assert {np.asarray(batch[TRUTH_KEY]).shape[-1] for batch in held} == {12}
+    finally:
+        held.close()
+
+
 def test_a_mixtures_prompt_step_binds_the_widest_of_its_stores():
     """The prompts preset over a mixture of two stores, one with wider reward strings: the step the
     mixture runs binds the wider store's width, so every row of either fits."""
