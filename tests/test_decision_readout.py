@@ -262,10 +262,9 @@ def test_a_slot_heads_work_is_each_real_options_slot_key_and_pooling():
 
 def test_a_parallel_labelled_rows_lines_read_none_of_each_other():
     """In the parallel layout each lettered line starts at the first one's position, a slot of its own,
-    and the cue after the longest reads them all: no line reads another, so through one attention
-    layer a line's states are the same whatever another line holds (the row's other option changed to
-    text of its length). Deeper, a line reads the others through the tokens that read them all, as the
-    parallel layout's tokens after the options do."""
+    and the cue after the longest reads them all: over a causal backbone no line reads another,
+    directly or through the tokens after them, so a line's states through every layer are the same
+    whatever another line holds (the row's other option changed to text of its length)."""
     layout = replace(LAYOUT, parallel=True)
     choices = [Choice("Which team?", ["billing", "tech", other]) for other in ("sales", "games")]
     rows = [layout.rows(TOKENIZER, SPECIALS, "one two three", {"team": choice})[0] for choice in choices]
@@ -275,7 +274,7 @@ def test_a_parallel_labelled_rows_lines_read_none_of_each_other():
     assert len(set(starts)) == 1
     assert [rows[0].slots[start] for start, _ in laid.options] == [1, 2, 3]
     assert rows[0].slots[-1] == 0
-    decision = DecisionModel(backbone().clone(num_layers=1), LabelReadout(32, ids()))
+    decision = model(LabelReadout(32, ids()))
     inputs = [DecisionInputs.collate([row], SPECIALS.pad) for row in rows]
     variables = {"params": {"backbone": decision.backbone.init(jax.random.key(0), inputs[0].tokens)["params"],
                             "head": {}}}
