@@ -6,6 +6,7 @@ import contextlib
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -32,9 +33,24 @@ def attempted(steps: Sequence[tuple[str, Callable[[], None]]], *,
         raise error
 
 
+def exit_code(process: subprocess.Popen) -> int | None:
+    """The code `process` exited with, as Popen reports it (-N for death by signal N), or None while
+    it runs, read without reaping it: a leader not yet reaped keeps its pid, and so its group's id,
+    from every other process until `end_group` reaps it."""
+    if process.returncode is not None:
+        return process.returncode
+    exited = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    if exited is None:
+        return None
+    return -exited.si_status if exited.si_code in (os.CLD_KILLED, os.CLD_DUMPED) else exited.si_status
+
+
 def signal_group(process: subprocess.Popen, signum: int) -> bool:
     """Send `signum` to the process group `process` leads, whether a process of it was there to take
-    it. Its id is the leader's pid, which Linux gives no other process while the group holds one."""
+    it. Its id is the leader's pid, which no other process takes while the leader is unreaped
+    (`exit_code`), so a leader already reaped (its `returncode` set) is not signalled."""
+    if process.returncode is not None:
+        return False
     try:
         os.killpg(process.pid, signum)
     except ProcessLookupError:
@@ -42,29 +58,23 @@ def signal_group(process: subprocess.Popen, signum: int) -> bool:
     return True
 
 
-def group_held(process: subprocess.Popen) -> bool:
-    """Whether the group `process` leads still holds a process: the leader, or one it started, which
-    its exit leaves running on in the group (a data worker, a server). The leader's own exit is
-    reaped first, which a group of exited processes alone no longer counts."""
-    process.poll()
-    return signal_group(process, 0)
-
-
 def groups_ended(processes: Sequence[subprocess.Popen], grace: float, forced: threading.Event | None = None
                  ) -> None:
-    """Wait up to `grace` seconds, or until `forced` is set, for every group `processes` lead to hold
-    no process (`group_held`)."""
+    """Wait up to `grace` seconds, or until `forced` is set, for every leader of `processes` to exit,
+    left unreaped (`exit_code`)."""
     deadline = time.monotonic() + grace
     while ((forced is None or not forced.is_set()) and time.monotonic() < deadline
-           and any(group_held(process) for process in processes)):
+           and any(exit_code(process) is None for process in processes)):
         time.sleep(POLL_SECONDS)
 
 
 def end_group(process: subprocess.Popen, grace: float = 0.0, interrupt: int = signal.SIGTERM) -> int:
     """End the group `process` leads: with a `grace`, `interrupt` to every process in it and up to
-    `grace` seconds for them to exit; then SIGKILL to what remains, and the leader reaped. Returns its
-    exit code. A process that left the group on purpose (a session of its own) is out of reach."""
-    if grace > 0 and group_held(process) and signal_group(process, interrupt):
+    `grace` seconds for the leader to exit; then SIGKILL to every process left in the group, a child
+    the leader left running among them, sent before the leader is reaped, while the group's id is
+    still its own; then the leader reaped. Returns its exit code. A process that left the group on
+    purpose (a session of its own) is out of reach."""
+    if grace > 0 and exit_code(process) is None and signal_group(process, interrupt):
         groups_ended((process,), grace)
     signal_group(process, signal.SIGKILL)
     return process.wait()
@@ -86,4 +96,4 @@ def process_group(command: Sequence[str], *, grace: float = 0.0, interrupt: int 
     finally:
         streams = [stream for stream in (process.stdin, process.stdout, process.stderr) if stream is not None]
         attempted([("end the process group", end),
-                   *((f"close {stream!r}", stream.close) for stream in streams)])
+                   *((f"close {stream!r}", stream.close) for stream in streams)], primary=sys.exception())

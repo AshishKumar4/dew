@@ -59,7 +59,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
-from dew.cleanup import end_group, signal_group
+from dew.cleanup import end_group, exit_code, signal_group
 from dew.objectives.rl.sessions import Call, Session, Status, Task
 
 from .gateway import SESSION, Gateway, Recorded, calls, engine_failure, refused_prompt
@@ -433,7 +433,8 @@ class HarnessSource:
                 reading = len(ready.get_map()) > 1
                 if not reading:
                     with self._lock:
-                        if process.poll() is not None:
+                        # Read unreaped, so the trial's group keeps its id until `end_group` ends it.
+                        if exit_code(process) is not None:
                             record.process = None
                             break
                 if deadline is not None and time.monotonic() >= deadline:

@@ -36,7 +36,7 @@ from typing import Annotated, TextIO
 
 import tyro
 
-from dew.cleanup import group_held, groups_ended, signal_group
+from dew.cleanup import exit_code, groups_ended, signal_group
 from dew.cli import tpu_setup
 from dew.cli.gcloud import emit
 from dew.cli.tpu import reach
@@ -515,12 +515,11 @@ def _stop(running: Sequence[subprocess.Popen], grace: float, forced: threading.E
     """
     # Each rank leads a session of its own (`supervise`), whose group its pid names.
     for child in running:
-        if group_held(child) and not (child.stdin is not None and _interrupted(child)):
+        if not (child.stdin is not None and _interrupted(child)):
             signal_group(child, signal.SIGTERM)
     groups_ended(running, grace, forced)
     for child in (*running[1:], *running[:1]):
-        if group_held(child):
-            signal_group(child, signal.SIGKILL)
+        signal_group(child, signal.SIGKILL)
         child.wait()
 
 
@@ -598,7 +597,8 @@ def supervise(processes: Sequence[Process], cwd: str | None) -> int:
             relay.start()
             relays.append(relay)
         while True:
-            codes = [child.poll() for child in running]
+            # Read unreaped, so each rank's group keeps its id until `_stop` signals it.
+            codes = [exit_code(child) for child in running]
             failed = next(((rank, code) for rank, code in enumerate(codes) if code), None)
             if failed is not None:
                 rank, code = failed
