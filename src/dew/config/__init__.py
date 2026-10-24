@@ -868,16 +868,18 @@ class TrainerConfig:
         with Checkpoints(os.path.join(self.checkpoint_dir, self.name), keep=self.keep) as checkpoints:
             return checkpoints.latest is not None
 
-    def source_placement(self) -> SourcePlacement:
-        """Where a run that starts from a source (`Pretrained.load`) reads it: the load's keywords. A run
-        that resumes reads no weights (`resumes`), as its checkpoint holds them. One whose state lives on
-        the host (`Layout.host` holds the variables) keeps them as host arrays, which its start streams
-        into place leaf by leaf. Any other reads each leaf onto this run's mesh, sharded as its layout
-        shards the state, so each process reads only the shards its devices hold, and the start then
-        takes those arrays as they are (`Trainer.place`): no process holds the whole source."""
+    def source_placement(self, *, frozen: bool) -> SourcePlacement:
+        """Where a run that starts from a source (`Pretrained.load`) reads it: the load's keywords,
+        `frozen` where the run keeps the source as it is (an adapter trained over it). A run that
+        resumes reads no weights (`resumes`), as its checkpoint holds them. A frozen source is read onto
+        this run's mesh, sharded as its layout shards the state, each process reading its devices'
+        shards, and the start takes those arrays as they are (`Trainer.place`): the run and its
+        objective hold one copy. A source the run trains stays on the host, as its start copies the
+        arrays it trains, and so does one whose state lives on the host (`Layout.host` holds the
+        variables) or keeps its frozen tree whole (`frozen_whole`), which its start places itself."""
         if self.resumes():
             return {"weights": False}
-        if "variables" in self.layout.host:
+        if not frozen or "variables" in self.layout.host or self.layout.frozen_whole:
             return {"on_host": True}
         return {"mesh": self.mesh, "layout": self.layout}
 
