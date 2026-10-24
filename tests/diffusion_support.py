@@ -232,6 +232,31 @@ def objective_gradient(objective, variables, batch, step):
     return jax.grad(loss)(variables["params"])
 
 
+def float32_update(gradient):
+    """The update a trainer's sgd(1) step is held to (`applied`): `gradient(variables)`, the objective's
+    own, applied in float32 as the trainer applies it."""
+    def update(variables):
+        grads = jax.tree.map(np.asarray, gradient(variables))
+        return jax.tree.map(lambda before, grad: applied(before, (before - grad).astype(np.float32)),
+                            variables["params"], grads)
+
+    return update
+
+
+def float64_gradient(twin, batch, step):
+    """Check 1's truth of an sgd(1) update over `batch` at `step`'s draws: `twin`'s gradient, the
+    objective over its model in float64, of the variables widened, compiled once as each arm is."""
+    from reference_error import widened
+
+    wide = jax.jit(lambda variables: objective_gradient(twin, variables, widened(batch), step))
+
+    def truth(variables):
+        with jax.enable_x64(new_val=True):
+            return jax.tree.map(np.asarray, wide(widened(variables)))
+
+    return truth
+
+
 class DeterministicObjective(Objective):
     """Squared error against the input, straight through the real DiT.
 
