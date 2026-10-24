@@ -67,6 +67,9 @@ class DecisionModel:
         """The row's final states (`states`), and the context's where the questions' spans are in it."""
         backbone = thaw(part(variables, "backbone"))
         laid = inputs.coordinates()
+        # A row in blocks is read by the backbone's attention whole within each block, on the kinds
+        # that read blocks (`AttentionMetadata.block_groups`); a row in order passes none.
+        blocked: dict[str, jax.Array] = {} if inputs.blocks is None else {"block_groups": inputs.blocks}
         spanned = conditioning = None
         if inputs.context is not None:
             # The context's own pass where it holds the schema, else the backbone's token table.
@@ -83,12 +86,15 @@ class DecisionModel:
                     held = kwargs.get("conditioning", {})
                     assert isinstance(held, Mapping)
                     kwargs["conditioning"] = {**held, **conditioning}
-                return module.hidden_states(rows.tokens, train=train, coordinates=laid, **kwargs)
+                return module.hidden_states(rows.tokens, train=train, coordinates=laid, **kwargs, **blocked)
             return _array(self.backbone.apply(backbone, inputs, media, rngs=rngs, method=read_media)), spanned
         if inputs.slots is None:
-            return _array(self.backbone.apply(backbone, inputs.tokens, train=train, coordinates=laid,
-                                              conditioning=conditioning, method="hidden_states",
-                                              rngs=rngs)), spanned
+            def read(module, tokens):
+                return module.hidden_states(tokens, train=train, coordinates=laid, conditioning=conditioning,
+                                            **blocked)
+            return _array(self.backbone.apply(backbone, inputs.tokens, rngs=rngs, method=read)), spanned
+        if blocked:
+            raise ValueError("a row of option positions sets what each token reads, which blocks set too")
         slots, segments = inputs.slots, inputs.segments
         other = (slots[:, :, None] > 0) & (slots[:, None, :] > 0) & (slots[:, :, None] != slots[:, None, :])
         # A token reads its own row's, and the padding its own; an option reads no other option.

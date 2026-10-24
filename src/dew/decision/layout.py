@@ -193,6 +193,15 @@ class Encoded:
     spans_in_context: bool = False
     """Whether the questions' spans are positions in the context, which holds the schema
     (`Schema.stream`), rather than in the row."""
+    blocks: tuple[int, ...] | None = None
+    """Each token's block (`QuestionLayout.blocks`): 0 on the row before its question, 1 from the
+    question to the row's end, which a backbone that reads blocks attends to whole within each
+    (`AttentionMetadata.block_groups`); None for a row read in order."""
+
+
+def _blocked(row: Encoded, boundary: int) -> Encoded:
+    """`row` with its tokens before `boundary` block 0 and the rest block 1 (`Encoded.blocks`)."""
+    return dataclasses.replace(row, blocks=(0,) * boundary + (1,) * (len(row.tokens) - boundary))
 
 
 def question_fields(row: Encoded, count: int, width: int, labelled: bool = False) -> dict[str, np.ndarray]:
@@ -465,6 +474,11 @@ class QuestionLayout(Layout):
     """How `segments`' text is encoded: piece by piece, or whole (`dew.decision.renderer`)."""
     framing: "Framing | None" = None
     """The conversation `segments`' text is the user's turn of, or None for none."""
+    blocks: bool = False
+    """Whether each row splits into two blocks (`Encoded.blocks`): its state and what comes before
+    its question, and its question to the row's end, a published slot release's prefix and suffix
+    (serve.patch `block_ids`); a backbone that reads blocks attends to each whole, and the second to
+    the first in order. Off, every row is read in order."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -480,6 +494,11 @@ class QuestionLayout(Layout):
             if self.labels is None or self.parallel:
                 raise ValueError("a question row of segments reads its options under labels (labels=), one "
                                  "line after another")
+        if self.blocks and self.parallel:
+            raise ValueError("blocks and parallel options each say what a row's tokens read; a row takes one")
+        if self.blocks and not self._state_first and self.segments is None:
+            raise ValueError(f"a {type(self).__name__} asks its question before its state, so its rows have "
+                             "no state prefix to read as a block")
 
     def state(self, encoder: Tokenizer, specials: Specials, state: JSON) -> tuple[int, ...]:
         """Return the state's tokens, which every question of a request shares."""
@@ -496,9 +515,11 @@ class QuestionLayout(Layout):
                     for name, question in questions.items()]
         if tokens is None:
             tokens = self.state(encoder, specials, state)
-        return [self.encode(encoder, specials, question, tokens, conversation=_conversation(state),
+        rows = [self.encode(encoder, specials, question, tokens, conversation=_conversation(state),
                             order=(orders or {}).get(name), name=name)
                 for name, question in questions.items()]
+        # A state-first row asks its question from its head's first token.
+        return [_blocked(row, row.questions[0].span[0]) for row in rows] if self.blocks else rows
 
     def _segmented(self, encoder: Tokenizer, specials: Specials, state: JSON, question: Question,
                    order: Sequence[int] | None, name: str) -> Encoded:
@@ -523,8 +544,12 @@ class QuestionLayout(Layout):
                 instructions = (rendered(question.instructions, segment.render, specials)
                                 or segment.defaults.get(question.kind, ""))
                 head, tail = segment.headers[question.kind].split("{}")
-                chunks.extend([Chunk(head), Chunk(instructions, marks=(("question", 0, len(instructions)),)),
-                               Chunk(tail)])
+                # The question starts at its header, or at its instructions under a header of none: the
+                # suffix a release's blocks read from (serve.patch `suffix_start`).
+                opening = (("suffix", 0, len(head)),) if head else ()
+                marks = (("question", 0, len(instructions)),
+                         *(() if head else (("suffix", 0, len(instructions)),)))
+                chunks.extend([Chunk(head, marks=opening), Chunk(instructions, marks=marks), Chunk(tail)])
             elif isinstance(segment, OptionLines):
                 for index, (label, slot) in enumerate(zip(names, slots, strict=True)):
                     key, description = described[slot]
@@ -559,7 +584,10 @@ class QuestionLayout(Layout):
         row = Laid(name, kind_of(question), laid.marks["question"],
                    tuple(laid.marks[("option", index)] for index in range(len(slots))), tuple(slots),
                    readout=len(tokens) - 1, label_ids=self.labels.ids(encoder, len(slots)))
-        return Encoded(tokens, (row,), None, None, whole, state_kept)
+        encoded = Encoded(tokens, (row,), None, None, whole, state_kept)
+        # The prefix is the tokens that end at or before the suffix's first character (serve.patch
+        # `token_layout`), the first the suffix's mark holds.
+        return _blocked(encoded, laid.marks["suffix"][0]) if self.blocks else encoded
 
     def _cut_ids(self, built: Callable[[tuple[int, ...]], Rendered], ids: tuple[int, ...],
                  keep: Literal["start", "end", "all"]) -> tuple[Rendered, int]:
@@ -1245,6 +1273,9 @@ class DecisionInputs:
     readout: jnp.ndarray | None = None
     """`[B, Q]` where a readout of labels reads each question's answer (`Laid.readout`), or None; the
     labels' ids are the readout head's own (`LabelReadout.label_ids`)."""
+    blocks: jnp.ndarray | None = None
+    """`[B, L]` each token's block in its row (`Encoded.blocks`), -1 on the padding, or None for rows
+    read in order."""
     max_segments: int = struct.field(pytree_node=False, default=1)
     spans_in_context: bool = struct.field(pytree_node=False, default=False)
     """Whether the questions' spans are positions in `context`, which holds the schema
@@ -1296,10 +1327,15 @@ class DecisionInputs:
         in_context = rows[0].spans_in_context
         if any(row.spans_in_context != in_context for row in rows):
             raise ValueError("one batch reads its rows' schemas one way, in the row or as its context")
+        blocked = rows[0].blocks is not None
+        if any((row.blocks is not None) != blocked for row in rows):
+            raise ValueError("one batch reads its rows one way, in blocks or in order")
         fields = ({"positions": [row.positions or () for row in rows],
-                   "slots": [row.slots or () for row in rows]} if parallel else None)
+                   "slots": [row.slots or () for row in rows]} if parallel else {})
+        if blocked:
+            fields["blocks"] = [row.blocks or () for row in rows]
         tokens, padded = pad_token_rows([row.tokens for row in rows], pad_id=pad, padding_side="right",
-                                        fields=fields)
+                                        fields=fields or None)
         valid = padded.get("attention_mask", np.ones(tokens.shape, bool))
         count = max(questions or 1, *(len(row.questions) for row in rows))
         width = max(options or 1, *(len(laid.options) for row in rows for laid in row.questions))
@@ -1332,6 +1368,8 @@ class DecisionInputs:
                    None if indexed is None else jnp.asarray(np.stack([real for _, real in indexed])),
                    context, lengths,
                    jnp.asarray(np.stack([fields["readout"] for fields in laid])) if labelled else None,
+                   # The padding is in no block.
+                   jnp.asarray(np.where(valid, padded["blocks"], -1), jnp.int32) if blocked else None,
                    spans_in_context=in_context)
 
 

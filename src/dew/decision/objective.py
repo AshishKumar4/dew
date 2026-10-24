@@ -172,6 +172,8 @@ class Encoding:
         if encoded.positions is not None and encoded.slots is not None:
             row["positions"] = np.asarray(encoded.positions, np.int32)
             row["slots"] = np.asarray(encoded.slots, np.int32)
+        if encoded.blocks is not None:
+            row["blocks"] = np.asarray(encoded.blocks, np.int32)
         if self.context_length is not None:
             row["context"] = np.asarray(encoded.context or (), np.int32)
         return row
@@ -351,11 +353,12 @@ def packing(layout: Layout, bounds: Bounds, context_length: int | None = None) -
     and with a `context_length` each row's context along an axis of that
     many tokens."""
     parallel = isinstance(layout, QuestionLayout) and layout.parallel
+    blocked = isinstance(layout, QuestionLayout) and layout.blocks
     along = tuple((name, bounds.questions) for name in _along(layout))
     if context_length is not None:
         along = (*along, ("context", context_length))
-    return Pack(layout.max_len, ("tokens", "positions", "slots") if parallel else ("tokens",),
-                segments=bounds.segments, along=along)
+    fields = ("tokens", *(("positions", "slots") if parallel else ()), *(("blocks",) if blocked else ()))
+    return Pack(layout.max_len, fields, segments=bounds.segments, along=along)
 
 
 def _rows(batch: Batch, spans_in_context: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -404,6 +407,9 @@ class PackedRows(pygrain.MapTransform):
             laid["readout"] = element["readout"] + moved
         if "slots" in element:
             laid["slots"] = element["slots"]
+        if "blocks" in element:
+            # Each row keeps its own blocks where the window packed it; the padding is in none.
+            laid["blocks"] = np.where(segments > 0, np.asarray(element["blocks"]), -1).astype(np.int32)
         if "context" in element:
             # A conditioned window holds one row (`DecisionObjective.bounds`), whose context it is.
             laid["context"] = element["context"]
