@@ -41,6 +41,10 @@ DTYPES = [jnp.float32, jnp.bfloat16]
 MESH_TENSOR, MESH_HEADS = 4, 8
 """The tensor shards of the per-shard test's mesh, beside its `ROWS` data shards, and its query heads: two on
 each tensor shard, over one or two key heads, which is fewer than the shards."""
+MESH_SEEDS = 512
+"""The per-shard test's draws, sized by `seeds_for` with one device compared with
+itself: the fewest, doubling from `FEWEST_SEEDS`, that resolve the factor for each
+case, which is 512 for lengths and starts over two key heads."""
 
 CASES = {
     "full-grouped": {},
@@ -163,7 +167,7 @@ def test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh
     draw = drawing(queries, keys, jnp.float32, sinks=True, heads=MESH_HEADS, kv_heads=key_heads)
     specs = [rows_and_heads, rows, rows, PartitionSpec("tensor"), rows_and_heads]
     assert_runs_per_shard(with_gradients(routed), draw, specs, mesh,
-                          f"template split over rows and heads, {key_heads} key heads", seeds=SEEDS,
+                          f"template split over rows and heads, {key_heads} key heads", seeds=MESH_SEEDS,
                           truth_fn=with_gradients(reference))
 
 
