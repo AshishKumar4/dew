@@ -251,13 +251,15 @@ def test_a_length_limit_truncates_a_row_and_a_stop_terminates_it(model):
 
 def test_a_float64_decoders_beam_searches_in_float64(model):
     """A float64 decoder's beam scores and log probabilities are float64, as the categorical computes
-    them (`dew.nn.categorical`): its search scans its carry in float64 and draws its tokens."""
+    them (`dew.nn.categorical`): over its own logits, no transform between (`logits=()`), its search
+    scans its carry in float64 and draws its tokens."""
     module, params = model
     with jax.enable_x64(new_val=True):
         wide = module.clone(dtype=jnp.float64)
         values = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), params)
         searched = generate(wide, values, jnp.asarray([[1, 2, 3]], jnp.int32), 2, key=jax.random.key(0),
-                            sampling=Sampling(temperature=0, pad_token_id=11), strategy=Beam(width=2))
+                            sampling=Sampling(temperature=0, pad_token_id=11), logits=(),
+                            strategy=Beam(width=2))
         assert searched.lengths.tolist() == [2]
 
 
