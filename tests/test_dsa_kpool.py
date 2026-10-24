@@ -297,7 +297,7 @@ def test_the_gradients_match_torch_autograd():
 def test_decode_cache_preserves_the_expanded_projection_storage_dtype():
     """A promoted KV projection stores its actual keys and values, even when the preceding
     latent norm computes in a narrower dtype."""
-    with jax.experimental.enable_x64():
+    with jax.enable_x64(new_val=True):
         hidden, _ = inputs()
         block = module()
         variables = block.init(jax.random.key(91), jnp.asarray(hidden))
