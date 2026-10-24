@@ -930,7 +930,8 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.Wra
     if family in GEMMA4_TYPES and text_config.get(
             "use_bidirectional_attention", vision_default) == "vision":
         kinds = decoder_parts.kinds_of(text_fields).copy()
-        selected = kinds if family == "gemma4_unified" else ("sliding_attention",)
+        selected = (dict.fromkeys(records.strings(text_fields["layer_types"], "layer_types"))
+                    if family == "gemma4_unified" else ("sliding_attention",))
         for name in selected:
             kind = kinds.get(name, {})
             mixer = records.record(kind.get("mixer", {"class": "attention", "fields": {}}), "mixer")

@@ -604,6 +604,10 @@ GEMMA4_TEXT = DecoderFamily(
 )
 
 def gemma4_unified_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
+    used.add('is_causal')
+    if hf_config.get('is_causal', True) is not True:
+        refuse('Gemma4Unified text configuration',
+               'only its causal text path with optional vision blocks is mapped')
     if hf_config.get('enable_moe_block') or hf_config.get('hidden_size_per_layer_input'):
         refuse('Gemma4Unified text configuration', 'the unified decoder has no MoE or per-layer input branch')
     return gemma4_config(hf_config, used)
