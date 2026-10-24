@@ -1210,13 +1210,14 @@ class CausalTransformer(nn.Module):
     def __call__(self, tokens, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None,
                  input_embeddings=None,
-                 attention_mask=None, image_groups=None, rotary_positions=None,
+                 attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
                  attention_pairwise_mask=None, attention_key_positions=None, right_padded: bool = False,
                  coordinates: Coordinates | None = None, conditioning: Mapping[str, jax.Array] | None = None):
         x, prediction = self.hidden_and_mtp_inputs(
             tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
             input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
-            rotary_positions=rotary_positions, attention_pairwise_mask=attention_pairwise_mask,
+            block_groups=block_groups, rotary_positions=rotary_positions,
+            attention_pairwise_mask=attention_pairwise_mask,
             attention_key_positions=attention_key_positions, right_padded=right_padded,
             coordinates=coordinates, conditioning=conditioning)
         if self.is_initializing() and self.dspark is not None:
@@ -1229,8 +1230,8 @@ class CausalTransformer(nn.Module):
             self.mtp_hidden_states(prediction, tokens, train=train, positions=positions,
                                    segment_ids=segment_ids, input_embeddings=input_embeddings,
                                    attention_mask=attention_mask,
-                                   image_groups=image_groups, rotary_positions=rotary_positions,
-                                   coordinates=coordinates)
+                                   image_groups=image_groups, block_groups=block_groups,
+                                   rotary_positions=rotary_positions, coordinates=coordinates)
         return self._logits(x)
 
     def states_and_logits(self, tokens, **kwargs):
@@ -1280,7 +1281,7 @@ class CausalTransformer(nn.Module):
     def mtp_hidden_states(self, hidden, tokens, train: bool = False,
                           positions=None, segment_ids=None, input_embeddings=None,
                           attention_mask=None,
-                          image_groups=None, rotary_positions=None,
+                          image_groups=None, block_groups=None, rotary_positions=None,
                           coordinates: Coordinates | None = None,
                           conditioning: Mapping[str, jax.Array] | None = None):
         """Return one final-normed state array per shifted prediction depth.
@@ -1325,6 +1326,7 @@ class CausalTransformer(nn.Module):
                     (hidden.shape[0], hidden.shape[1] - 1), segments=segments, valid=valid, positions=places,
                     max_segments=coordinates.max_segments),
                 image_groups=None if image_groups is None else image_groups[:, depth:],
+                block_groups=None if block_groups is None else block_groups[:, depth:],
                 rotary_positions=None if rotary_positions is None else rotary_positions[:, depth:])
             hidden = block(hidden[:, :-1], embeds[:, depth:], train=train, attention_metadata=metadata)
             states.append(hidden)
@@ -1332,14 +1334,14 @@ class CausalTransformer(nn.Module):
 
     def mtp_logits(self, hidden, tokens, train: bool = False, positions=None,
                    segment_ids=None, input_embeddings=None,
-                   attention_mask=None, image_groups=None, rotary_positions=None,
+                   attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
                    conditioning: Mapping[str, jax.Array] | None = None):
         """Return the shared language head's logits for each prediction depth's hidden states; a
         call's `conditioning` is the trunk's (`mtp_hidden_states`)."""
         return [self._logits(state) for state in self.mtp_hidden_states(
             hidden, tokens, train=train, positions=positions, segment_ids=segment_ids,
             input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
-            rotary_positions=rotary_positions, conditioning=conditioning)]
+            block_groups=block_groups, rotary_positions=rotary_positions, conditioning=conditioning)]
 
     def mtp_step(self, hidden, tokens, *, depth: int = 0, positions=None,
                  input_embeddings=None, attention_mask=None, rotary_positions=None,
@@ -1516,8 +1518,9 @@ class CausalTransformer(nn.Module):
     def hidden_and_mtp_inputs(self, tokens, train: bool = False, decode: bool = False,
                               positions=None, segment_ids=None,
                               input_embeddings=None,
-                              attention_mask=None, image_groups=None, rotary_positions=None,
-                              attention_pairwise_mask=None, attention_key_positions=None,
+                              attention_mask=None, image_groups=None, block_groups=None,
+                              rotary_positions=None, attention_pairwise_mask=None,
+                              attention_key_positions=None,
                               routed_experts=None, routed=None, media_mask=None, admitted=None,
                               right_padded: bool = False, coordinates: Coordinates | None = None,
                               conditioning: Mapping[str, jax.Array] | None = None):
@@ -1531,6 +1534,9 @@ class CausalTransformer(nn.Module):
         - `input_embeddings` `[B, S, D]` replace the scaled token embeddings,
           for a caller that fuses in another encoder's output. The token ids
           still feed the per-layer inputs and routing.
+        - `image_groups` and `block_groups` `[B, S]` number the tokens' images
+          and blocks, -1 outside any, which the attention layers that read them
+          see whole (`dew.nn.inputs.AttentionMetadata`).
         - `attention_pairwise_mask` is an explicit [B, queries, keys]
           visibility mask for ordinary attention, and the optional
           `attention_key_positions` [B, keys] give key positions for local
@@ -1559,9 +1565,9 @@ class CausalTransformer(nn.Module):
           calls after it. A model without cross-attention takes none.
         """
         attention_metadata = self._attention_metadata(
-            tokens, decode, positions, segment_ids, attention_mask, image_groups, rotary_positions,
-            attention_pairwise_mask, attention_key_positions, media_mask, admitted, right_padded,
-            coordinates, conditioning)
+            tokens, decode, positions, segment_ids, attention_mask, image_groups, block_groups,
+            rotary_positions, attention_pairwise_mask, attention_key_positions, media_mask, admitted,
+            right_padded, coordinates, conditioning)
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.
@@ -1622,7 +1628,7 @@ class CausalTransformer(nn.Module):
         return hidden, prediction
 
     def _attention_metadata(self, tokens, decode: bool, positions, segment_ids, attention_mask, image_groups,
-                            rotary_positions, pairwise_mask, key_positions,
+                            block_groups, rotary_positions, pairwise_mask, key_positions,
                             media_mask, admitted=None,
                             right_padded: bool = False,
                             coordinates: Coordinates | None = None,
@@ -1664,14 +1670,14 @@ class CausalTransformer(nn.Module):
         blocks = None if block is None else numbered_blocks(
             coordinates_of(None, *tokens.shape[:2]) if coordinates is None else coordinates, tokens.shape[:2],
             block)
-        if (coordinates is None and image_groups is None and rotary_positions is None
+        if (coordinates is None and image_groups is None and block_groups is None and rotary_positions is None
                 and pairwise_mask is None and key_positions is None and not self.hash_layers
                 and engram_ids is None and media_mask is None and admitted is None and blocks is None
                 and context is None):
             return None
         return AttentionMetadata(
-            coordinates=coordinates, image_groups=image_groups, rotary_positions=rotary_positions,
-            pairwise_mask=pairwise_mask, key_positions=key_positions,
+            coordinates=coordinates, image_groups=image_groups, block_groups=block_groups,
+            rotary_positions=rotary_positions, pairwise_mask=pairwise_mask, key_positions=key_positions,
             token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids, media=media_mask,
             admitted=admitted, blocks=blocks, context=context, routing_block=block)
 
