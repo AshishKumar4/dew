@@ -96,11 +96,10 @@ from benchmark_models import build_trainer
 from dew.checkpoints import Checkpoints
 case = Case(**json.loads(sys.argv[1]))
 trainer = build_trainer(case)
-abstract = jax.eval_shape(trainer.initial_state)
-shardings = trainer.shardings(abstract)
-state = jax.block_until_ready(jax.jit(trainer.initial_state, out_shardings=shardings)())
+state, shardings, _ = trainer.place()
+state = jax.block_until_ready(state)
 template = jax.tree.map(lambda leaf, where: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=where),
-                        abstract, shardings)
+                        state, shardings)
 saves, restores = [], []
 # A train state is checkpointed under its own step, which a restore checks.
 step = int(state.step)
