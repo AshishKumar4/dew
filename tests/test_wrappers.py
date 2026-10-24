@@ -59,7 +59,6 @@ def test_released_block_attention_matches_transformers_against_float64():
     from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording
 
     from dew.interop import Pretrained
-    from dew.nn.inputs import AttentionMetadata
 
     directory = FIXTURES / "qwen35-blocks-tiny"
     source = Pretrained.load(directory, dtype="float32", attention_impl="reference")
@@ -69,9 +68,8 @@ def test_released_block_attention_matches_transformers_against_float64():
 
     @jax.jit
     def forward(index, inputs):
-        metadata = AttentionMetadata(block_groups=inputs["block_groups"])
         return {"logits": source.model.apply(
-            source.variables, inputs["input_ids"], attention_metadata=metadata)}
+            source.variables, inputs["input_ids"], block_groups=inputs["block_groups"])}
 
     assert_as_exact(forward, reference, draw, "Qwen3.5 released block attention",
                     seeds=seeds, truth_fn=truth)
@@ -83,7 +81,6 @@ def test_wrapper_block_overrides_survive_export_and_admit_their_future_block_mat
     import shutil
 
     from dew.interop import Pretrained
-    from dew.nn.inputs import AttentionMetadata
 
     directory = tmp_path / "source"
     shutil.copytree(FIXTURES / "qwen35-tiny-mm", directory)
@@ -94,10 +91,10 @@ def test_wrapper_block_overrides_survive_export_and_admit_their_future_block_mat
     loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
     altered = ids.at[0, 1].set(7)
-    blocked = AttentionMetadata(block_groups=jnp.asarray([[0, 0, -1, -1]], jnp.int32))
+    blocked = jnp.asarray([[0, 0, -1, -1]], jnp.int32)
 
-    def first(bundle, tokens, metadata=None):
-        return np.asarray(bundle.model.apply(bundle.variables, tokens, attention_metadata=metadata))[0, 0]
+    def first(bundle, tokens, groups=None):
+        return np.asarray(bundle.model.apply(bundle.variables, tokens, block_groups=groups))[0, 0]
 
     np.testing.assert_array_equal(first(loaded, ids), first(loaded, altered))
     assert np.any(first(loaded, ids, blocked) != first(loaded, altered, blocked))
