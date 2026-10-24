@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 import jax
@@ -127,8 +127,7 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout 
 def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
                  dtype: str | None, param_dtype: str | None,
                  revision: str | None) -> SavedTask:
-    from dew.inference.projections import packed_owned
-    from dew.interop import Pretrained, PretrainedPipeline
+    from dew.interop import Pretrained
     from dew.training.distributed import MeshSpec as DefaultMesh
 
     storage = "auto" if param_dtype is None else param_dtype
@@ -137,9 +136,6 @@ def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | 
               if dtype is None else
               Pretrained.load(source, revision=revision, dtype=dtype, param_dtype=storage, mesh=placement,
                               layout=layout))
-    if not isinstance(loaded, PretrainedPipeline):
-        # The task owns the weights it loaded: their projections pack once, where they were placed.
-        loaded = replace(loaded, variables=packed_owned(loaded.model, loaded.variables))
     return loaded.pipeline()
 
 

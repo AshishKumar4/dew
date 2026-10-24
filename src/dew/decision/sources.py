@@ -63,12 +63,12 @@ class PretrainedDecision(Pretrained):
                                    head_variables=transform(self.head_variables))
 
     def pipeline(self) -> Decide:
-        return Decide.of(self)
+        return Decide.of(self.packed())
 
     def save(self, directory: str | Path, **options) -> None:
         if options:
             raise ValueError(f"the decision release writer has no options {sorted(options)}")
-        self.pipeline().save_pretrained(directory)
+        Decide.of(self).save_pretrained(directory)
 
     @classmethod
     def from_components(cls, backbone: Pretrained, head: Head, head_variables: Variables,

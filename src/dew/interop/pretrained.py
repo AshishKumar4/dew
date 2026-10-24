@@ -248,6 +248,12 @@ class Pretrained:
         """The native task declared by this source kind."""
         raise TypeError(f"{type(self).__name__} has no native task")
 
+    def packed(self) -> Self:
+        """Own and pack the native backbone's projections once for a serving task."""
+        from dew.inference.projections import packed_owned
+
+        return replace(self, variables=packed_owned(self.model, self.variables))
+
     @property
     def text_processor(self) -> TaskProcessor | None:
         """Return what the bundle's tasks encode and decode text with.
@@ -624,7 +630,7 @@ class PretrainedDecoder(Pretrained):
     model: CausalTransformer | MultimodalTransformer
 
     def pipeline(self):
-        return self.text_generation()
+        return self.packed().text_generation()
 
     @classmethod
     def from_model(cls, model: nn.Module, variables: Variables, *,
@@ -703,7 +709,7 @@ class PretrainedMaskedDecoder(Pretrained):
     model: CausalTransformer
 
     def pipeline(self):
-        return self.text_generation()
+        return self.packed().text_generation()
 
     def text_generation(self) -> MaskedGeneration:
         """Build the masked generation task this source describes.
@@ -738,7 +744,7 @@ class PretrainedBlockDecoder(Pretrained):
     names_tokenizer: ClassVar[bool] = False
 
     def pipeline(self):
-        return self.block_generation()
+        return self.packed().block_generation()
 
     def block_generation(self) -> BlockGeneration:
         """Build the DiffusionGemma canvas task, with the source's sampler config as its default."""
