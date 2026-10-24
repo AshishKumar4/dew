@@ -18,10 +18,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording
-from rl_support import TinyHead, TinyLogits, clipped_surrogate, padded_text, token_mean
+from rl_support import TinyHead, TinyLogits, clipped_surrogate, token_mean
 from steady_state import steady_state
 
-from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
+from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY, _utf8
 from dew.objectives.base import Step
 from dew.objectives.rl import GRPOObjective
 from dew.objectives.rl.rollout import SampledRollout
@@ -191,7 +191,7 @@ def test_a_rollout_after_the_first_reuses_its_programs_and_reads_only_what_it_sc
                              max_new_tokens=RESPONSE_WIDTH, sampling=Sampling(temperature=1.0))
     info = len("other")
     def pad(text):
-        return padded_text(text, info)
+        return _utf8(text, info)
 
     def batch(offset):
         rows = np.arange(PROMPT_WIDTH, dtype=np.int32)[None] + np.arange(2)[:, None] + offset
