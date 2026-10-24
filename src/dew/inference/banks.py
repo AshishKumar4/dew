@@ -304,6 +304,7 @@ class SafetensorsBanks(LayerBanks):
             _load_native_component,
             source_route,
         )
+        from dew.interop.safetensors_io import read_weights
         from dew.interop.sources import SourceReference
         from dew.registry import dtype_name
 
@@ -341,7 +342,8 @@ class SafetensorsBanks(LayerBanks):
             SourceReference(str(folder)), folder, component, placed=lambda variables: variables,
             streaming=True, dtype="float32",
             param_dtype="auto" if param_dtype == "auto" else dtype_name(param_dtype),
-            attention_impl="reference", max_seq_len=None)
+            attention_impl="reference", max_seq_len=None,
+            tensors=read_weights(folder / component.weights_folder))
         self._variables: Variables = backbone.variables
         self._shapes = jax.tree.map(
             lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), self._variables

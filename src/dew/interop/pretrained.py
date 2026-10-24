@@ -1383,14 +1383,15 @@ def _composite_description(directory: Path) -> CompositeSource | None:
 
 def _load_native_component(source: sources.SourceReference, root: Path, component: NativeComponent, *,
                             placed: Callable[[Variables], Variables], streaming: bool, dtype: str,
-                            param_dtype: str, attention_impl: str, max_seq_len: int | None
+                            param_dtype: str, attention_impl: str, max_seq_len: int | None,
+                            tensors: Mapping[str, np.ndarray] | None = None
                             ) -> tuple[Pretrained, Mapping[str, np.ndarray], Path]:
     """A metadata-selected backbone, its shared tensors and resolved snapshot root."""
     weight_source = source.component(component.weights_folder)
     root = weight_source.weights(root)
     if source.revision is not None:
         source = replace(source, revision=root.name)
-    shared = sources.load_shards(weight_source.directory(root))
+    shared = sources.load_shards(weight_source.directory(root)) if tensors is None else tensors
     prefix = component.tensor_prefix
     tensors = ({name[len(prefix):]: tensor for name, tensor in shared.items() if name.startswith(prefix)}
                if prefix else shared)
