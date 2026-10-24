@@ -25,6 +25,8 @@ from dew.nn.kernels.templates.attention import (
     gradients,
     interpreted_dot,
     padded_call,
+    step_table,
+    stepped,
     within,
 )
 
@@ -57,6 +59,16 @@ def _output_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array):
             return value[row, rows, head]
         case Kind.KEY | Kind.TILE:
             raise ValueError("an output hook's parameter has no key axis")
+
+
+def _identity(step: jax.Array) -> jax.Array:
+    """A walk's step as its key tile: a range's walk, one step a tile."""
+    return step
+
+
+def _composed(keys_at, tile_of):
+    """`keys_at` of each step's key tile (`stepped`)."""
+    return lambda step: keys_at(tile_of(step))
 
 
 def _weighted(carry: algebra.Carry, *, rows) -> jax.Array:
@@ -112,7 +124,12 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
         resumed = None if initial is None else (initial[0][row, head, rows], initial[1][row, head, rows],
                                                 initial[2][row, head, rows])
 
-        if spec.form == "spans":
+        tile_of = _identity
+        if spec.form == "spans" and blocks_map.ranges is not None:
+            # Runs walk their ranges' tiles in turn.
+            hi, tile_of = stepped(*step_table(blocks_map.ranges[row, i])[:3])
+            lo = 0
+        elif spec.form == "spans":
             lo, hi = blocks_map.lo[row, i], blocks_map.hi[row, i]
         elif spec.form == "causal":
             lo, hi = 0, jnp.minimum(-(-(first_query + block_q) // block_k), tiles)
@@ -125,7 +142,7 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             # The walk in `form`: the plain one where `live` is None, else the guarded one, those rows
             # shifting (`algebra.walked`).
             start_state = algebra.started(form, resumed, block_q, value_width, live)
-            tiles_of = functools.partial(keys_at, form)
+            tiles_of = _composed(functools.partial(keys_at, form), tile_of)
             if residuals:
                 return algebra.training_walk(form, lo, hi, tiles_of, anchor_rows, start_state)
             return algebra.plain_walk(form, lo, hi, tiles_of, start_state)
@@ -137,7 +154,8 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             state = carry
             if residuals:
                 normalized = functools.partial(algebra.normalized_pass, form, carry,
-                                               functools.partial(keys_at, form), anchor_rows, (lo, hi),
+                                               _composed(functools.partial(keys_at, form), tile_of),
+                                               anchor_rows, (lo, hi),
                                                None if resumed is None else (resumed[0], resumed[2]))
                 state, anchors, sums = algebra.split_written(carry, anchor_rows, normalized)
                 kept = (anchors, *sums)
@@ -265,9 +283,14 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
         maxima, chosen = maximum[row, head, rows], key_index[row, head, rows]
         shifts = shift[row, head, rows]
         anchor_rows = jax.lax.dynamic_slice_in_dim(anchor_value[row, :, head], i * block_q, block_q)
-        lo, hi = bounds.lo[row, i], bounds.hi[row, i]
+        lo, hi, tile_of = bounds.lo[row, i], bounds.hi[row, i], _identity
+        if bounds.ranges is not None:
+            # Runs walk their ranges' tiles in turn, as the forward does.
+            hi, tile_of = stepped(*step_table(bounds.ranges[row, i])[:3])
+            lo = 0
 
-        def tile(j):
+        def tile(step):
+            j = tile_of(step)
             columns = j * block_k + jnp.arange(block_k)
             params = tuple(_tile_param(param, kind, row, head, rows, columns)
                            for param, kind in zip(score_params, score_kinds, strict=True))

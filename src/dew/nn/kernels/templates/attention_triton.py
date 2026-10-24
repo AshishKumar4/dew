@@ -37,6 +37,9 @@ from dew.nn.kernels.templates.attention import (
     kept_dtype,
     kernel_dot,
     padded_call,
+    power_of_two,
+    step_table,
+    stepped,
     within,
 )
 from dew.nn.kernels.templates.base import Template, dividing
@@ -121,6 +124,20 @@ def _hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, .
     return tuning.program(pulled, square, *positions, *params)
 
 
+def _identity(step: jax.Array) -> jax.Array:
+    """A walk's step as its key tile: a range's walk, one step a tile."""
+    return step
+
+
+def _runs_whole(bounds: jax.Array) -> jax.Array:
+    """A spans' starts or ends, runs `[B, Q, R]` padded with empty ones (0) to a power of two of them, the
+    tiles a launch takes; one interval a query `[B, Q]` as it is."""
+    if bounds.ndim == 2:
+        return bounds
+    count = bounds.shape[-1]
+    return jnp.pad(bounds, ((0, 0), (0, 0), (0, power_of_two(count) - count)))
+
+
 def _spanned(specs: list[jax.ShapeDtypeStruct], arrays: list[jax.Array]) -> list[jax.Array]:
     """A launch's timing operands with its spans whole: of its integer operands by row `[B, Q]` (the
     others, an anchor key `[B, H, Q]`, keep their draw), the first two each query's first key (0) and
@@ -153,7 +170,7 @@ def _tile_param(ref, kind: Kind, head, queries: jax.Array, keys: pl.Slice | None
 
 def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
                     output_kinds: tuple[Kind, ...], initial: bool, residuals: bool, output_mod, block_k: int,
-                    interpret: bool, guard: str):
+                    interpret: bool, guard: str, runs: bool = False):
     """The forward's Triton mainloop: one program a query block and head walks the key tiles its form
     gives it (every tile, the causal diagonal's, or the spans' block map), issuing the tile's two
     products and calling the algebra between them (`attention_algebra`). Under headroom
@@ -163,10 +180,16 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
     walk itself is unchanged (`guard` 'none' where no row can overflow)."""
     refs = list(refs)
     spans = bounds = ids = None
+    tile_of = _identity
     if spec.form == "spans":
-        # Only spans read their block map's bounds and their queries' intervals.
+        # Only spans read their block map's bounds and their queries' intervals; runs walk their ranges'
+        # tiles in turn (`stepped`).
         bounds_ref = refs.pop(0)
-        bounds = bounds_ref[0], bounds_ref[1]
+        if runs:
+            steps, tile_of = stepped(bounds_ref[0, :], bounds_ref[1, :], bounds_ref[2, :])
+            bounds = 0, steps
+        else:
+            bounds = bounds_ref[0], bounds_ref[1]
         spans = refs.pop(0)[...], refs.pop(0)[...]
     if spec.ids:
         # The queries' ids, and the keys' ref a tile reads its own from.
@@ -196,9 +219,10 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
     query = query_ref[...]
     q_pos = first_query + jnp.arange(block_q)[:, None]
 
-    def keys_at(index) -> algebra.Keys:
+    def keys_at(step) -> algebra.Keys:
         # A key tile's logits; its values load where the step calls for them, after the softmax, where
         # jax's mha loads them.
+        index = tile_of(step)
         tile = pl.ds(index * block_k, block_k)
         coords = algebra.Coords(q_pos, index * block_k + jnp.arange(block_k)[None, :], spans,
                                 None if ids is None else (ids[0], ids[1][tile]))
@@ -305,12 +329,22 @@ class TritonForward(Template[Tiles]):
         per_query = pl.BlockSpec((None, block_q), lambda i, b, h: (b, i))
         whole_keys = pl.BlockSpec((None, keys), lambda i, b, h: (b, 0))
         in_specs, arrays = [], []
+        runs = start.ndim == 3
         if self.form == "spans":
-            # Only spans read their bounds, which the block map gives each query block.
+            # Only spans read their bounds, which the block map gives each query block: runs their walk's
+            # table (`step_table`), their intervals a power of two of them.
+            start, end = _runs_whole(start), _runs_whole(end)
             blocks = block_map(KeySpans(start, end, query_ids, key_ids, keys), block_q, block_k)
-            bounds = jnp.stack([blocks.lo, blocks.hi, blocks.full_lo, blocks.full_hi],
-                               axis=-1).astype(jnp.int32)
-            in_specs += [pl.BlockSpec((None, None, 4), lambda i, b, h: (b, i, 0)), per_query, per_query]
+            if blocks.ranges is not None:
+                count = start.shape[-1]
+                bounds = step_table(blocks.ranges)
+                per_runs = pl.BlockSpec((None, block_q, count), lambda i, b, h: (b, i, 0))
+                in_specs += [pl.BlockSpec((None, None, 4, count), lambda i, b, h: (b, i, 0, 0)), per_runs,
+                             per_runs]
+            else:
+                bounds = jnp.stack([blocks.lo, blocks.hi, blocks.full_lo, blocks.full_hi],
+                                   axis=-1).astype(jnp.int32)
+                in_specs += [pl.BlockSpec((None, None, 4), lambda i, b, h: (b, i, 0)), per_query, per_query]
             arrays += [bounds, start, end]
         if ids:
             in_specs += [per_query, whole_keys]
@@ -345,7 +379,7 @@ class TritonForward(Template[Tiles]):
         kernel = functools.partial(
             _forward_kernel, spec=spec, score_kinds=self.score_kinds, output_kinds=self.output_kinds,
             initial=initial, residuals=residuals, output_mod=self.output_mod, block_k=block_k,
-            interpret=interpret)
+            interpret=interpret, runs=runs)
         launch = functools.partial(
             pl.pallas_call, grid=(queries // block_q, batch, heads), interpret=interpret,
             compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=config.stages))
@@ -545,7 +579,7 @@ def _tile_scores(score_mod, query, key, value, dout, peak, total, anchor, delta,
 
 def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tuple[Kind, ...], score_mod,
                scale: float, how: algebra.Recompute, block_k: int, split: bool, accurate: bool,
-               interpret: bool):
+               interpret: bool, runs: bool = False):
     refs = list(refs)
     id_refs = [refs.pop(0), refs.pop(0)] if ids else []
     (query_ref, key_ref, value_ref, dout_ref, peak_ref, total_ref, initial_ref, maximum_ref, index_ref,
@@ -563,8 +597,14 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     product = functools.partial(kernel_dot, interpret=interpret)
     start, end = start_ref[...], end_ref[...]
     query_ids = [ref[...] for ref in id_refs[:1]]
+    # Runs walk their ranges' tiles in turn (`stepped`), the forward's order.
+    lo, hi, tile_of = bounds_ref[0], bounds_ref[1], _identity
+    if runs:
+        hi, tile_of = stepped(bounds_ref[0, :], bounds_ref[1, :], bounds_ref[2, :])
+        lo = 0
 
-    def tile(index):
+    def tile(step):
+        index = tile_of(step)
         keys = pl.ds(index * block_k, block_k)
         k_pos = index * block_k + jnp.arange(block_k)[None, :]
         seen = within(k_pos, start[:, None], end[:, None],
@@ -602,7 +642,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
             others_ref[...], own_ref[...], others_total_ref[...], prior, state_total, anchor_value_ref[...],
             dout, key_index, shift)
     else:
-        state = jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], row_terms, before)
+        state = jax.lax.fori_loop(lo, hi, row_terms, before)
         prior = algebra.power2(state.total, shift)
         anchor, delta, key_index = algebra.off_anchor_delta(state, anchor_value_ref[...], dout, state_total,
                                                             shares[1], key_index, shift)
@@ -624,7 +664,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     nothing = jnp.zeros((block_q,), jnp.float32)
     rows = tuple(nothing for _ in score_kinds)
     zeros = jnp.zeros(query.shape, jnp.float32)
-    sums = jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], step,
+    sums = jax.lax.fori_loop(lo, hi, step,
                              algebra.DqSums(zeros, nothing, nothing, rows, rows, zeros, nothing,
                                             jnp.full((block_q,), algebra.NO_SHIFT, jnp.float32)))
     dq, delta, total, mass, grads = algebra.dq_finish(sums, prior, state_total, peak0, shares, peak, anchor,
@@ -700,9 +740,10 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
             grad_refs[place][...] = grad
 
 
-def _spans_specs(per_rows, whole, ids: bool) -> list:
-    """The specs of the spans' starts and ends and, with documents, the queries' and keys' ids."""
-    return [per_rows, per_rows, *([per_rows, whole] if ids else [])]
+def _spans_specs(per_rows, whole, ids: bool, ids_spec=None) -> list:
+    """The specs of the spans' starts and ends and, with documents, the queries' ids (`ids_spec`, by
+    default the starts') and the keys'."""
+    return [per_rows, per_rows, *([per_rows if ids_spec is None else ids_spec, whole] if ids else [])]
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -876,10 +917,11 @@ def _launch_cost(ba: tokamax.BoundArguments, config: BackwardTiles, target: gene
 
 def _geometry(query, key, value, start, end, query_ids, key_ids, block_q: int, block_k: int):
     """A backward launch's sizes (rows, padded queries, query heads, widths, padded keys, a key head's
-    group) and the spans' block map at its tiles."""
+    group) and the spans' block map at its tiles, its runs a power of two of them (`_runs_whole`)."""
     batch, queries, heads, width = query.shape
     keys, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
-    blocks = block_map(KeySpans(start, end, query_ids, key_ids, keys), block_q, block_k)
+    blocks = block_map(KeySpans(_runs_whole(start), _runs_whole(end), query_ids, key_ids, keys), block_q,
+                       block_k)
     return batch, queries, heads, width, keys, value_width, heads // kv_heads, blocks
 
 
@@ -902,12 +944,23 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
 
     batch, queries, heads, width, keys, value_width, group, blocks = _geometry(
         query, key, value, start, end, query_ids, key_ids, block_q, block_k)
-    bounds = jnp.stack([blocks.lo, blocks.hi], axis=-1).astype(jnp.int32)
+    runs = start.ndim == 3
+    start, end = _runs_whole(start), _runs_whole(end)
     ids = query_ids is not None
-    per_query = pl.BlockSpec((None, block_q), lambda i, b, h: (b, i))
     per_head = pl.BlockSpec((None, None, block_q), lambda i, b, h: (b, h, i))
-    in_specs = [pl.BlockSpec((None, None, 2), lambda i, b, h: (b, i, 0)),
-                *_spans_specs(per_query, pl.BlockSpec((None, keys), lambda i, b, h: (b, 0)), ids),
+    if blocks.ranges is not None:
+        # Runs walk their ranges' tiles, as the forward does (`step_table`).
+        count = start.shape[-1]
+        bounds = step_table(blocks.ranges)
+        bounds_spec = pl.BlockSpec((None, None, 4, count), lambda i, b, h: (b, i, 0, 0))
+        per_query = pl.BlockSpec((None, block_q, count), lambda i, b, h: (b, i, 0))
+    else:
+        bounds = jnp.stack([blocks.lo, blocks.hi], axis=-1).astype(jnp.int32)
+        bounds_spec = pl.BlockSpec((None, None, 2), lambda i, b, h: (b, i, 0))
+        per_query = pl.BlockSpec((None, block_q), lambda i, b, h: (b, i))
+    in_specs = [bounds_spec,
+                *_spans_specs(per_query, pl.BlockSpec((None, keys), lambda i, b, h: (b, 0)), ids,
+                              ids_spec=pl.BlockSpec((None, block_q), lambda i, b, h: (b, i))),
                 pl.BlockSpec((None, block_q, None, width), lambda i, b, h: (b, i, h, 0)),
                 pl.BlockSpec((None, keys, None, width), lambda i, b, h: (b, 0, h // group, 0)),
                 pl.BlockSpec((None, keys, None, value_width), lambda i, b, h: (b, 0, h // group, 0)),
@@ -939,7 +992,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                 out_specs.append(per_head)
     kernel = functools.partial(_dq_kernel, ids=ids, score_kinds=score_kinds,
                                score_mod=score_mod, scale=scale, how=how, block_k=block_k,
-                               split=sums is not None, accurate=accurate, interpret=interpret)
+                               split=sums is not None, accurate=accurate, interpret=interpret, runs=runs)
     out = pl.pallas_call(
         kernel, grid=(queries // block_q, batch, heads), in_specs=in_specs, out_specs=out_specs,
         out_shape=out_shape, interpret=interpret, name="attention_dq",
@@ -964,10 +1017,15 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
         query, key, value, start, end, query_ids, key_ids, block_q, block_k)
     ranges = jnp.stack([blocks.q_lo, blocks.q_hi], axis=-1).astype(jnp.int32)
     ids = query_ids is not None
+    start, end = _runs_whole(start), _runs_whole(end)
     whole_queries = pl.BlockSpec((None, queries), lambda j, b, h: (b, 0))
+    # Runs' intervals, a power of two of them a query, which a tile's predicate reads (`within`).
+    whole_spans = (whole_queries if start.ndim == 2
+                   else pl.BlockSpec((None, queries, start.shape[-1]), lambda j, b, h: (b, 0, 0)))
     whole_head = pl.BlockSpec((None, None, queries), lambda j, b, h: (b, h, 0))
     in_specs = [pl.BlockSpec((None, None, 2), lambda j, b, h: (b, j, 0)),
-                *_spans_specs(whole_queries, pl.BlockSpec((None, block_k), lambda j, b, h: (b, j)), ids),
+                *_spans_specs(whole_spans, pl.BlockSpec((None, block_k), lambda j, b, h: (b, j)), ids,
+                              ids_spec=whole_queries),
                 pl.BlockSpec((None, queries, None, width), lambda j, b, h: (b, 0, h, 0)),
                 pl.BlockSpec((None, block_k, None, width), lambda j, b, h: (b, j, h // group, 0)),
                 pl.BlockSpec((None, block_k, None, value_width), lambda j, b, h: (b, j, h // group, 0)),
