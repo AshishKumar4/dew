@@ -7,7 +7,15 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact, assert_fp32_reduction_bound
-from test_attention_template import CASES, ROWS, SINKS, SOFTCAP, arguments, geometry as core_geometry
+from test_attention_template import (
+    CASES,
+    ROWS,
+    RUN_CASES,
+    SINKS,
+    SOFTCAP,
+    arguments,
+    geometry as core_geometry,
+)
 
 from dew.nn.attention import alibi_bias
 from dew.nn.kernels import tuning
@@ -149,6 +157,15 @@ def test_the_forward_is_on_par_over_every_call_form(form, config):
 def test_the_forward_is_on_par_over_the_core_s_other_call_forms(form):
     """The rest of the template core's call forms (`test_attention_template.CASES`), at one config."""
     check(CASES[form], HOOKS["none"], jnp.float32, PINNED[1])
+
+
+@pytest.mark.parametrize("mainloop", ["triton", "portable"])
+@pytest.mark.parametrize("config", PINNED[:3], ids=str)
+@pytest.mark.parametrize("form", RUN_CASES)
+def test_the_forward_is_on_par_over_runs(form, config, mainloop):
+    """Each query's runs (`test_attention_template.RUN_CASES`), a decision row's: both mainloops walk each
+    query block's ranges in turn, at tiles that part its fragments."""
+    check(RUN_CASES[form], HOOKS["none"], jnp.float32, config, mainloop=mainloop)
 
 
 @pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
@@ -362,6 +379,16 @@ backward's fast form) and the accurate one (natural logits and the backward's ac
 def test_the_backward_is_on_par_over_every_call_form(form, config, options):
     """Each call form's keys, fp32, no hooks, at pinned dQ and dK/dV configs, in both forms."""
     check_backward(CASES[form], (), jnp.float32, config, **options)
+
+
+@pytest.mark.parametrize("mainloop", ["triton", "portable"])
+@pytest.mark.parametrize("options", TEMPLATE_FORMS.values(), ids=TEMPLATE_FORMS)
+@pytest.mark.parametrize("config", PINNED[:2], ids=str)
+@pytest.mark.parametrize("form", RUN_CASES)
+def test_the_backward_is_on_par_over_runs(form, config, options, mainloop):
+    """Each query's runs: the dQ launch walks its ranges as the forward does, and the dK/dV launch reads
+    the query blocks some range of which holds its keys, in both forms, on both mainloops."""
+    check_backward(RUN_CASES[form], (), jnp.float32, config, mainloop=mainloop, **options)
 
 
 @pytest.mark.parametrize("form", [form for form in CASES if form not in BACKWARD_FORMS])

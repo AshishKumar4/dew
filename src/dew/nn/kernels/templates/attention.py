@@ -26,6 +26,8 @@ rounds to the query's dtype (`reference`).
 
 import dataclasses
 import enum
+import functools
+import operator
 from collections.abc import Callable
 from typing import NamedTuple
 
@@ -40,7 +42,8 @@ from dew.nn.precision import at_least_fp32
 @dataclasses.dataclass(frozen=True)
 class KeySpans:
     """Each query's visible keys: the interval `[start, end)` `[B, Q]` of key indices, int32, empty
-    where `end <= start`, and where the call packs documents, the queries' ids `[B, Q]` and the keys'
+    where `end <= start`, or R of them `[B, Q, R]`, disjoint and sorted, whose union a query sees (a
+    call's `runs`, `spans`), and where the call packs documents, the queries' ids `[B, Q]` and the keys'
     `[B, K]`, 0 as padding, a key visible only to queries of its own id (`visible`). `keys` is the
     key count, static, and `form` what the spans are, static, so a kernel resolves at trace time what
     a plain call needs: 'full', every query sees every key; 'causal', query i sees keys 0 to i (top
@@ -59,8 +62,14 @@ def within(keys: jax.Array, start: jax.Array, end: jax.Array,
     """Whether each key index of `keys` lies in its query's interval `start` to `end` and, with `ids`
     (the queries' and the keys', broadcasting alike), is of its document: the keys a call's spans let a
     query see, which the reference (`visible`) and every mainloop (`attention_algebra.modify`, the
-    backward's tiles) mask by."""
-    seen = (keys >= start) & (keys < end)
+    backward's tiles) mask by. Runs, an interval axis more on `start` and `end` than on `keys`, see their
+    union, taken run by run (their count is static), which Pallas Triton lowers where a reduction over the
+    axis (`reduce_or`) it does not."""
+    if start.ndim > keys.ndim:
+        held = [(keys >= start[..., run]) & (keys < end[..., run]) for run in range(start.shape[-1])]
+        seen = functools.reduce(operator.or_, held)
+    else:
+        seen = (keys >= start) & (keys < end)
     return seen if ids is None else seen & (ids[0] == ids[1])
 
 
@@ -77,6 +86,24 @@ def dense(spans: KeySpans) -> jax.Array:
     queries = jnp.arange(spans.start.shape[1])[:, None]
     keys = jnp.arange(spans.keys)[None, :]
     return jax.vmap(lambda row: visible(spans, row, queries, keys))(jnp.arange(spans.start.shape[0]))
+
+
+def reads(spans: KeySpans) -> jax.Array:
+    """Whether each query sees a key, `[B, Q]`: one of its intervals holds one, of its document where the
+    call has ids, counted among that document's keys in index order however the documents lie (`_runs`)."""
+    start, end = spans.start, spans.end
+    runs = start.ndim == 3
+    if spans.query_ids is None or spans.key_ids is None:
+        held = end > start
+        return jnp.any(held, axis=-1) if runs else held
+    batch, queries = start.shape[:2]
+    order, lo, hi = _runs(spans.query_ids, spans.key_ids, batch, queries, spans.keys)
+    if runs:
+        count = start.shape[2]
+        lo, hi = (jnp.repeat(bound, count, axis=1) for bound in (lo, hi))
+        start, end = start.reshape(batch, -1), end.reshape(batch, -1)
+    held = _searched(order, lo, hi, end, "left") > _searched(order, lo, hi, start, "left")
+    return jnp.any(held.reshape(batch, queries, -1), axis=-1) if runs else held
 
 
 def _runs(query_ids: jax.Array | None, key_ids: jax.Array | None, batch: int, queries: int,
@@ -122,25 +149,46 @@ def _searched(values: jax.Array, lo: jax.Array, hi: jax.Array, wanted: jax.Array
 
 def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_window: int | None = None,
           chunk: int | None = None, positions: tuple[jax.Array, jax.Array] | None = None, segment_ids=None,
-          lengths: jax.Array | None = None, starts: jax.Array | None = None) -> KeySpans:
+          lengths: jax.Array | None = None, starts: jax.Array | None = None,
+          block_groups: jax.Array | None = None, image_groups: jax.Array | None = None,
+          valid: jax.Array | None = None, runs: jax.Array | None = None) -> KeySpans:
     """The `KeySpans` of a call of `queries` queries over `keys` keys in `batch` rows, in the terms
     `dew.nn.attention.scaled_dot_product_attention` takes them: `causal` keeps query i to keys 0..i (top
     left aligned, as jax's `is_causal`); `sliding_window=w` keeps the keys `window_sides` gives, the w - 1
     before a query and it, or without causality those within w - 1 of it; `chunk=c` keeps a query to the
     keys of its own chunk of c places (`chunk_mask`, Llama 4's, under causality those before it), the
     queries' `[B, Q]` and keys' `[B, K]` places `positions`, which never decrease along a document's
-    keys, as Dew's coordinates count them, by default their indices; `segment_ids`, one `[B, S]` array or a
-    `CrossDocuments` (its keys in ascending id order, as it takes them), keeps each query to its
+    keys, as Dew's coordinates count them, by default their indices, over which a window also counts where
+    they are given (the keys within w - 1 places, padding inside a row skipped: a key's place there is the
+    least at or after it in its document, so a padding slot that took the document before's place keeps
+    the real keys' windows exact); `segment_ids`, one `[B, S]`
+    array or a `CrossDocuments` (its keys in ascending id order, as it takes them), keeps each query to its
     document's keys, under causality or a window a cross call's queries aligned to their document's last
     keys (`aligned_places`); `lengths` `[B]` end each row's keys and `starts` `[B]` begin them.
-    Lengths and starts are int32 token coordinates; places and ids keep their own dtypes."""
+    `block_groups` and `image_groups` `[B, K]` number the keys' blocks, runs of contiguous keys, -1 outside
+    any: under causality a query whose own key (its index, or a cross call's aligned place: a cache call's
+    slot) is in a block also sees the block's later keys, within its document. A block of `block_groups`
+    is read whole whatever the window, transformers' `block_sequence_ids` (`(causal and window) or block`);
+    an image of `image_groups` within the window, which bounds the keys behind the query (Gemma 3's and
+    4's, `window and (causal or image)`). A block holds the query's key and is one run, so the query's keys
+    stay one interval, the union of both kinds' among them. `valid` `[B, K]` marks the real keys, any
+    others hidden from every query as the document ids hide them: an invalid key takes id 0, the padding
+    id no query matches, after every place a cross call's alignment reads is taken from the ids as given,
+    and a call of no documents takes 1 for its queries and its valid keys. `runs` `[B, Q, R, 2]` are each
+    query's key intervals `[lo, hi)`, R of them, static, whose union it may see, intersected with all the
+    rest: a window over `positions` is searched within each run alone, whose key places never decrease
+    (its builder's contract: a layout whose places restart, as a decision row's options do, splits its
+    runs there), so the spans keep R intervals a query `[B, Q, R]`. Lengths and starts are int32 token
+    coordinates; places and ids keep their own dtypes."""
     from dew.nn.documents import CrossDocuments, aligned_places, document_ids
-    from dew.nn.visibility import window_sides
+    from dew.nn.visibility import block_ends, block_starts, window_sides
 
     index = jnp.broadcast_to(jnp.arange(queries, dtype=jnp.int32)[None, :], (batch, queries))
     place = index
     start = jnp.zeros((batch, queries), jnp.int32)
     end = jnp.full((batch, queries), keys, jnp.int32)
+    # Each query's document's first key and one past its last, which bound a block's keys; 0 for padding.
+    floor, bound = start, end
     query_ids, key_ids = (None, None) if segment_ids is None else document_ids(segment_ids)
     order, run_lo, run_hi = _runs(query_ids, key_ids, batch, queries, keys)
     present = run_hi > run_lo
@@ -151,47 +199,169 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
         padding = query_ids == 0
         start = jnp.where(padding, 0, jnp.maximum(start, first))
         end = jnp.where(padding, 0, jnp.minimum(end, last))
+        floor, bound = start, end
         if isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None) and keys > 0:
             # A cross call's query sits at its rank among its document's keys, counted from the
             # document's first key (`cross_document_mask`).
             place = first + aligned_places(segment_ids).astype(jnp.int32)
     if causal:
         end = jnp.minimum(end, place + 1)
-    if sliding_window is not None:
+    # The query's own key, which its block holds: a query placed before its document's keys has none.
+    own = (place >= start) & (place < keys)
+    if sliding_window is not None and positions is not None and runs is None:
+        # The query's document's keys within the window's places run together in document order, since
+        # their places never decrease along it, and their first and last key indices bound the span.
+        before, after = window_sides(causal, sliding_window)
+        query_places, key_places = _widened(positions)
+        ordered = _least_after(jnp.take_along_axis(key_places, order, axis=1),
+                               None if key_ids is None else jnp.take_along_axis(key_ids, order, axis=1))
+        start, end = _narrowed(start, end, order, run_lo, run_hi, ordered, _moved(query_places, -before),
+                               _moved(query_places, after))
+    elif sliding_window is not None and positions is None:
         # No two places of the call lie further apart than its queries and keys, so a wider window
         # keeps what that one does, and its bounds stay within int32.
         before, after = window_sides(causal, min(sliding_window, queries + keys + 1))
         start = jnp.maximum(start, place - before)
         end = jnp.minimum(end, place + after + 1)
+    for groups, whole in ((block_groups, True), (image_groups, False)):
+        if groups is None or not causal or keys == 0:
+            continue
+        # The block of the query's own key runs on to its end, and a whole block from its start, within
+        # the query's document.
+        groups = jnp.asarray(groups)
+        at = jnp.clip(place, 0, keys - 1)
+        inside = own & (jnp.take_along_axis(groups, at, axis=1) >= 0)
+        ends = jnp.take_along_axis(block_ends(groups), at, axis=1)
+        end = jnp.where(inside, jnp.maximum(end, jnp.minimum(ends, bound)), end)
+        if whole:
+            begins = jnp.take_along_axis(block_starts(groups), at, axis=1)
+            start = jnp.where(inside, jnp.minimum(start, jnp.maximum(begins, floor)), start)
     if chunk is not None:
         query_places, key_places = (
             (index, jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32)[None, :], (batch, keys)))
             if positions is None else positions)
-
-        def chunk_of(places):
-            # Each place's chunk number in the places' own dtype; a chunk wider than it holds every
-            # place of one sign.
-            places = jnp.asarray(places)
-            if chunk > jnp.iinfo(places.dtype).max:
-                return jnp.where(places >= 0, 0, -1).astype(places.dtype)
-            return places // chunk
-
         # The query's document's keys of its chunk run together in document order, since their places
         # never decrease along it, and their first and last key indices bound the span.
-        wanted = chunk_of(query_places)
-        numbers = jnp.take_along_axis(chunk_of(key_places), order, axis=1)
-        inside_lo = _searched(numbers, run_lo, run_hi, wanted, "left")
-        inside_hi = _searched(numbers, run_lo, run_hi, wanted, "right")
-        held = inside_hi > inside_lo
-        start = jnp.where(held, jnp.maximum(start, _indexed(order, inside_lo, 0)), start)
-        end = jnp.where(held, jnp.minimum(end, _indexed(order, inside_hi - 1, -1) + 1), 0)
+        wanted = _chunk_of(query_places, chunk)
+        numbers = jnp.take_along_axis(_chunk_of(key_places, chunk), order, axis=1)
+        start, end = _narrowed(start, end, order, run_lo, run_hi, numbers, wanted, wanted)
     if lengths is not None:
         end = jnp.minimum(end, lengths.astype(jnp.int32)[:, None])
     if starts is not None:
         start = jnp.maximum(start, starts.astype(jnp.int32)[:, None])
-    narrowed = (sliding_window, chunk, segment_ids, lengths, starts)
+    if runs is not None:
+        start, end = _within_runs(jnp.asarray(runs, jnp.int32), start, end, keys,
+                                  None if sliding_window is None else window_sides(causal, sliding_window),
+                                  positions)
+    blocks = True if causal and (block_groups is not None or image_groups is not None) else None
+    narrowed = (sliding_window, chunk, segment_ids, lengths, starts, blocks, valid, runs)
     form = "spans" if any(narrowing is not None for narrowing in narrowed) else "causal" if causal else "full"
+    if valid is not None:
+        query_ids, key_ids = _valid_ids(query_ids, key_ids, jnp.asarray(valid, bool), batch, queries)
     return KeySpans(start, end, query_ids, key_ids, keys, form)
+
+
+def _narrowed(start: jax.Array, end: jax.Array, order: jax.Array, run_lo: jax.Array, run_hi: jax.Array,
+              values: jax.Array, low: jax.Array, high: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Each query's `[start, end)` narrowed to its document's keys whose `values` (`[B, K]` in document
+    order, `order`, never decreasing along a document's run `[run_lo, run_hi)`) lie in `[low, high]`: they
+    run together, and their first and last key indices bound the span, which is empty where none do. The
+    first key at or above `low` bounds the start whether or not any lies within, so a key a block or image
+    later adds past the end stays within the lower bound (past every key where none lies at or above it)."""
+    inside_lo = _searched(values, run_lo, run_hi, low, "left")
+    inside_hi = _searched(values, run_lo, run_hi, high, "right")
+    held = inside_hi > inside_lo
+    return (jnp.maximum(start, jnp.where(inside_lo < run_hi, _indexed(order, inside_lo, 0), values.shape[1])),
+            jnp.where(held, jnp.minimum(end, _indexed(order, inside_hi - 1, -1) + 1), 0))
+
+
+def _chunk_of(places, chunk: int) -> jax.Array:
+    """Each place's chunk number in the places' own dtype; a chunk wider than it holds every place of one
+    sign."""
+    places = jnp.asarray(places)
+    if chunk > jnp.iinfo(places.dtype).max:
+        return jnp.where(places >= 0, 0, -1).astype(places.dtype)
+    return places // chunk
+
+
+def _within_runs(runs: jax.Array, start: jax.Array, end: jax.Array, keys: int, sides: tuple[int, int] | None,
+                 positions: tuple[jax.Array, jax.Array] | None) -> tuple[jax.Array, jax.Array]:
+    """Each query's `runs` `[B, Q, R, 2]` within its interval `[start, end)` `[B, Q]`, and with a window of
+    `sides` (`window_sides`) over `positions`, each run's keys within it, searched in the run alone (its
+    places never decrease), `[B, Q, R]` each."""
+    lo = jnp.maximum(jnp.clip(runs[..., 0], 0, keys), start[..., None])
+    hi = jnp.minimum(jnp.clip(runs[..., 1], 0, keys), end[..., None])
+    hi = jnp.maximum(hi, lo)
+    if sides is None or positions is None:
+        return lo, hi
+    before, after = sides
+    query_places, key_places = _widened(positions)
+    batch, _, count = lo.shape
+    flat_lo, flat_hi = lo.reshape(batch, -1), hi.reshape(batch, -1)
+    first = _searched(key_places, flat_lo, flat_hi, jnp.repeat(_moved(query_places, -before), count, axis=1),
+                      "left")
+    last = _searched(key_places, flat_lo, flat_hi, jnp.repeat(_moved(query_places, after), count, axis=1),
+                     "right")
+    return first.reshape(lo.shape), jnp.maximum(last, first).reshape(hi.shape)
+
+
+def _valid_ids(query_ids: jax.Array | None, key_ids: jax.Array | None, valid: jax.Array, batch: int,
+               queries: int) -> tuple[jax.Array, jax.Array]:
+    """The queries' and keys' ids that hide the keys `valid` `[B, K]` does not mark: a key's own id where it
+    is valid, else 0, which no query matches; without documents every query and valid key 1."""
+    if query_ids is None or key_ids is None:
+        return jnp.ones((batch, queries), jnp.int32), valid.astype(jnp.int32)
+    return query_ids, jnp.where(valid, key_ids, jnp.zeros((), key_ids.dtype))
+
+
+def _least_after(places: jax.Array, ids: jax.Array | None) -> jax.Array:
+    """Each of `places` `[B, K]`, in document order, as the least place at or after it in its document's run
+    of equal `ids` (the whole row without them): the places themselves where they never decrease along a
+    document, and never decreasing however a padding slot was placed."""
+    if places.shape[1] == 0:
+        return places
+    # A run's last key, where the reversed scan starts again.
+    rows, keys = places.shape
+    changes = jnp.zeros((rows, keys - 1), bool) if ids is None else ids[:, 1:] != ids[:, :-1]
+    ends = jnp.concatenate([changes, jnp.ones((rows, 1), bool)], axis=1)
+
+    def least(left, right):
+        return jnp.where(right[1], right[0], jnp.minimum(left[0], right[0])), left[1] | right[1]
+
+    return jax.lax.associative_scan(least, (places, ends), reverse=True, axis=1)[0]
+
+
+def _widened(positions: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Array]:
+    """The queries' and keys' places in one integer dtype that holds both, in which a window's bounds move
+    (`_moved`): a bound past the narrower one's range is still a place the other may hold."""
+    query_places, key_places = (jnp.asarray(places) for places in positions)
+    wide = jnp.promote_types(query_places.dtype, key_places.dtype)
+    return query_places.astype(wide), key_places.astype(wide)
+
+
+def _moved(places: jax.Array, by: int) -> jax.Array:
+    """`places` moved by `by`, exactly, in their own integer dtype, held at its least and largest rather
+    than wrapping: a window's bound past either end of the dtype keeps every place on that side. The move
+    runs on the places' distances from the dtype's least, unsigned, which hold any shift a window makes."""
+    limits = jnp.iinfo(places.dtype)
+    span = int(limits.max) - int(limits.min)
+    if by == 0:
+        return places
+    if abs(by) > span:
+        return jnp.full(places.shape, limits.min if by < 0 else limits.max, places.dtype)
+    word = jnp.dtype(f"uint{8 * places.dtype.itemsize}")
+
+    def unsigned(value: int) -> jax.Array:
+        return jnp.asarray(value, word)
+
+    flip = unsigned(-int(limits.min))
+    # A signed place's distance from the least is its two's complement word with the sign bit flipped.
+    distance = jax.lax.bitcast_convert_type(places, word) ^ flip
+    if by < 0:
+        moved = jnp.where(distance < unsigned(-by), unsigned(0), distance - unsigned(-by))
+    else:
+        moved = jnp.where(distance > unsigned(span - by), unsigned(span), distance + unsigned(by))
+    return jax.lax.bitcast_convert_type(moved ^ flip, places.dtype)
 
 
 @jax.tree_util.register_dataclass
@@ -202,7 +372,11 @@ class BlockMap:
     visible in every entry for its every query (the kernel skips the predicate there, where the ids
     agree: `query_doc[b, i] == key_doc[b, j] != 0`, or the call has none); key block j is read by query
     blocks `[q_lo[b, j], q_hi[b, j])`, each of which still checks `lo <= j < hi`. Every visible entry lies
-    in a visited tile; a visited tile may hold none (an envelope over a block's spans)."""
+    in a visited tile; a visited tile may hold none (an envelope over a block's spans). Over runs
+    (`KeySpans`), query block i reads the union of its runs' tile envelopes, `ranges[b, i]` `[R, 2]`
+    sorted, disjoint and nonempty first, `(0, 0)` after, which `[lo, hi)` envelops, and its tiles in any
+    of `wholes[b, i]` `[R, 2]`, each run's tiles every query of the block sees, are whole; `[full_lo,
+    full_hi)` is the widest of them. A key block is read where some range holds it."""
 
     lo: jax.Array
     hi: jax.Array
@@ -214,12 +388,16 @@ class BlockMap:
     key_doc: jax.Array | None
     block_q: int = dataclasses.field(metadata={"static": True})
     block_k: int = dataclasses.field(metadata={"static": True})
+    ranges: jax.Array | None = None
+    wholes: jax.Array | None = None
 
 
 def _blocked(values: jax.Array, block: int, fill) -> jax.Array:
-    """`values` `[B, N]` padded with `fill` to whole blocks, `[B, N // block, block]`."""
+    """`values` `[B, N, ...]` padded with `fill` to whole blocks, `[B, N // block, block, ...]`."""
     pad = -values.shape[1] % block
-    return jnp.pad(values, ((0, 0), (0, pad)), constant_values=fill).reshape(values.shape[0], -1, block)
+    widths = ((0, 0), (0, pad), *((0, 0),) * (values.ndim - 2))
+    padded = jnp.pad(values, widths, constant_values=fill)
+    return padded.reshape(values.shape[0], -1, block, *values.shape[2:])
 
 
 def _uniform_doc(ids: jax.Array | None, block: int) -> jax.Array | None:
@@ -234,6 +412,8 @@ def _uniform_doc(ids: jax.Array | None, block: int) -> jax.Array | None:
 
 def block_map(spans: KeySpans, block_q: int, block_k: int) -> BlockMap:
     """The `BlockMap` of `spans` at `block_q` by `block_k` tiles."""
+    if spans.start.ndim == 3:
+        return _runs_map(spans, block_q, block_k)
     keys = spans.keys
     key_blocks = -(-keys // block_k)
     start, end = _blocked(spans.start, block_q, 0), _blocked(spans.end, block_q, 0)
@@ -260,6 +440,76 @@ def block_map(spans: KeySpans, block_q: int, block_k: int) -> BlockMap:
     q_lo = jnp.where(q_hi > 0, q_lo, 0)
     return BlockMap(lo, hi, full_lo, full_hi, q_lo, q_hi, _uniform_doc(spans.query_ids, block_q),
                     _uniform_doc(spans.key_ids, block_k), block_q, block_k)
+
+
+def step_table(ranges: jax.Array) -> jax.Array:
+    """Query blocks' walks over their tile `ranges` `[..., R, 2]` (`BlockMap.ranges`) as `[..., 4, R]`
+    int32: each range's first tile, the steps before it and its length, and a row of zeros, so a launch
+    tiles it by powers of two (R being one, `stepped`)."""
+    lo, hi = ranges[..., 0], ranges[..., 1]
+    lengths = hi - lo
+    offsets = jnp.cumsum(lengths, axis=-1) - lengths
+    return jnp.stack([lo, offsets, lengths, jnp.zeros_like(lo)], axis=-2).astype(jnp.int32)
+
+
+def stepped(lo: jax.Array, offsets: jax.Array, lengths: jax.Array) -> tuple[jax.Array,
+                                                                          Callable[[jax.Array], jax.Array]]:
+    """A query block's walk over its ranges (`step_table`'s rows `[R]`): its step count, and each step's
+    key tile, the ranges' tiles in turn, by a select over the ranges every mainloop lowers."""
+
+    def tile(step: jax.Array) -> jax.Array:
+        inside = (offsets <= step) & (step < offsets + lengths)
+        return jnp.sum(jnp.where(inside, lo + step - offsets, 0))
+
+    return jnp.sum(lengths), tile
+
+
+def _runs_map(spans: KeySpans, block_q: int, block_k: int) -> BlockMap:
+    """`block_map` over runs: each query block's runs' tile envelopes merged into their union, sorted
+    (a later run's envelope may start inside an earlier one's), and each run's whole tiles."""
+    keys = spans.keys
+    key_blocks = -(-keys // block_k)
+    big = jnp.iinfo(jnp.int32).max
+    start, end = _blocked(spans.start, block_q, 0), _blocked(spans.end, block_q, 0)
+    nonempty = end > start
+    held = jnp.any(nonempty, axis=2)
+    # Each run's envelope over the block's queries, an empty one at the end of the keys.
+    lo_r = jnp.where(held, jnp.min(jnp.where(nonempty, start, big), axis=2) // block_k, key_blocks)
+    hi_r = jnp.where(held, -(-jnp.max(jnp.where(nonempty, end, 0), axis=2) // block_k), key_blocks)
+    order = jnp.argsort(lo_r, axis=-1, stable=True)
+    lo_s, hi_s = (jnp.take_along_axis(bound, order, axis=-1) for bound in (lo_r, hi_r))
+    # A range opens where an envelope starts past every one before it, and runs to its group's last end.
+    covered = jax.lax.cummax(hi_s, axis=hi_s.ndim - 1)
+    before = jnp.concatenate([jnp.full_like(covered[..., :1], -1), covered[..., :-1]], axis=-1)
+    opens = lo_s > before
+    group = jnp.cumsum(opens, axis=-1)
+    same = group[..., :, None] == group[..., None, :]
+    closes = jnp.max(jnp.where(same, hi_s[..., None, :], 0), axis=-1)
+    kept = opens & (closes > lo_s)
+    rank = jnp.argsort(jnp.where(kept, lo_s, big), axis=-1, stable=True)
+    r_lo, r_hi = (jnp.take_along_axis(jnp.where(kept, bound, 0), rank, axis=-1) for bound in (lo_s, closes))
+    any_rows = jnp.any(kept, axis=-1)
+    lo = jnp.where(any_rows, r_lo[..., 0], 0)
+    hi = jnp.max(r_hi, axis=-1)
+    # A run's tile is whole where every query of the block sees all its keys through that run.
+    every = jnp.all(nonempty, axis=2)
+    whole_lo = -(-jnp.max(start, axis=2) // block_k)
+    whole_hi = jnp.minimum(jnp.min(end, axis=2), keys) // block_k
+    whole = every & (whole_hi > whole_lo)
+    wholes = jnp.stack([jnp.where(whole, whole_lo, 0), jnp.where(whole, whole_hi, 0)], axis=-1)
+    widest = jnp.argmax(jnp.where(whole, whole_hi - whole_lo, -1), axis=-1)[..., None]
+    some = jnp.any(whole, axis=-1)
+    full_lo = jnp.where(some, jnp.take_along_axis(whole_lo, widest, axis=-1)[..., 0], lo)
+    full_hi = jnp.where(some, jnp.take_along_axis(whole_hi, widest, axis=-1)[..., 0], full_lo)
+    j = jnp.arange(key_blocks)[None, None, :, None]
+    reads = jnp.any((r_lo[:, :, None, :] <= j) & (j < r_hi[:, :, None, :]), axis=-1)
+    i = jnp.arange(lo.shape[1])[None, :, None]
+    q_lo = jnp.min(jnp.where(reads, i, big), axis=1, initial=big)
+    q_hi = jnp.max(jnp.where(reads, i + 1, 0), axis=1, initial=0)
+    q_lo = jnp.where(q_hi > 0, q_lo, 0)
+    return BlockMap(lo, hi, full_lo, full_hi, q_lo, q_hi, _uniform_doc(spans.query_ids, block_q),
+                    _uniform_doc(spans.key_ids, block_k), block_q, block_k,
+                    jnp.stack([r_lo, r_hi], axis=-1), wholes)
 
 
 class Kind(enum.Enum):
@@ -544,7 +794,7 @@ def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySp
         return jnp.pad(array, ((0, 0), (0, rows - array.shape[1]), (0, 0), (0, columns - array.shape[3])))
 
     def pad_rows(array: jax.Array, rows: int) -> jax.Array:
-        return jnp.pad(array, ((0, 0), (0, rows - array.shape[1])))
+        return jnp.pad(array, ((0, 0), (0, rows - array.shape[1]), *((0, 0),) * (array.ndim - 2)))
 
     def pad_ids(array: jax.Array | None, rows: int) -> jax.Array | None:
         return None if array is None else pad_rows(array, rows)

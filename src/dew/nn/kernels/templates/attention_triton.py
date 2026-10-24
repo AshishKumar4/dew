@@ -77,11 +77,23 @@ BLOCK = max(max(tiles.block_q for tiles in SPACE), max(tiles.block_k for tiles i
 
 def _eligible(ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
     """Whether a launch runs on `target`: a CUDA GPU, one dtype of `DTYPES` on the queries, keys and
-    values, and bf16 only from `generation.BF16_GPU` on, where Triton compiles its products."""
+    values, and bf16 only from `generation.BF16_GPU` on, where Triton compiles its products; spans of one
+    interval a query (`refused`)."""
     query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
     capability = generation.capability(target.generation)
     return (capability is not None and query.dtype == key.dtype == value.dtype and query.dtype in DTYPES
-            and (query.dtype != jnp.bfloat16 or 10 * capability[0] + capability[1] >= generation.BF16_GPU))
+            and (query.dtype != jnp.bfloat16 or 10 * capability[0] + capability[1] >= generation.BF16_GPU)
+            and ba.arguments["start"].ndim == 2)
+
+
+def refused(spans: KeySpans) -> str | None:
+    """Why this mainloop takes no call over `spans`, or None: a call's runs, several key intervals a query
+    (`KeySpans`), which the frozen mainloop does not walk; the Mosaic and plain-JAX mainloops do (ledger
+    956, `attention_route`)."""
+    if spans.start.ndim == 3:
+        return ("the Triton mainloop walks one key interval a query; a call's runs take the Mosaic or the "
+                "plain-JAX mainloop")
+    return None
 
 
 def _mode(dtype) -> str:
@@ -155,7 +167,8 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         # A key tile's logits; its values load where the step calls for them, after the softmax, where
         # jax's mha loads them.
         tile = pl.ds(index * block_k, block_k)
-        coords = algebra.Coords(q_pos, index * block_k + jnp.arange(block_k)[None, :], spans,
+        coords = algebra.Coords(q_pos, index * block_k + jnp.arange(block_k)[None, :],
+                                None if spans is None else (spans,),
                                 None if ids is None else (ids[0], ids[1][tile]))
         params = tuple(_tile_param(ref, kind, head, q_pos, tile)
                        for ref, kind in zip(score_refs, score_kinds, strict=True))
@@ -438,7 +451,9 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     denominators `[B, H, Q]` too, and each query's anchor key `[B, H, Q]` int32 (`backward` reads them
     all). The operands pad to whole blocks of the largest tile and to power-of-two
     head widths (`padded_call`). `natural` keeps the logits natural (`algebra.Forward.base2`).
-    `interpret` runs it on the CPU."""
+    `interpret` runs it on the CPU. A call over runs is refused (`refused`)."""
+    if reason := refused(spans):
+        raise NotImplementedError(reason)
     hooks = Hooks() if hooks is None else hooks
     call = padded_call(query, key, value, spans, hooks, BLOCK)
     queries, value_width = call.queries, value.shape[-1]
@@ -996,7 +1011,10 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     `residuals`: its maxima, denominators, anchor keys and split sums (`forward`'s, which it takes again
     where None). With `split`, D comes from the split sums; without, the dQ launch takes its own first pass
     over the keys (`algebra.off_anchor`). `natural` keeps the forward's logits natural; `accurate` takes
-    the backward's accurate form (`ACCURATE`). `interpret` runs it on the CPU."""
+    the backward's accurate form (`ACCURATE`). `interpret` runs it on the CPU. A call over runs is refused
+    (`refused`)."""
+    if reason := refused(spans):
+        raise NotImplementedError(reason)
     if residuals is None:
         plain = Hooks() if hooks is None else Hooks(hooks.score_mod, hooks.score_params, hooks.initial)
         _, maxima, totals, anchors, sums = forward(query, key, value, spans, plain, scale=scale,

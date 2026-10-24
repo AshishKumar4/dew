@@ -392,7 +392,7 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give(unseen):
     call's extents and fit the GPU's block, and the forward, the training forward and the backward at the
     tiles the cost model picks on its facts alone are on par interpreted; on a family without this
     mainloop's bundle neither op is eligible, so the route takes another mainloop
-    (`attention_mosaic.backward_runs`)."""
+    (`attention_mosaic.backward_takes`)."""
     target = UNSEEN[unseen]
     shape = (1, 160, 2, 1)
     with generation.assumed(target):
@@ -402,7 +402,7 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give(unseen):
             query, key, value, dout = _drawn(shape, jnp.bfloat16)(0)
             spans = template.spans(shape[1], shape[1], shape[0], causal=True)
             residuals = attention_triton.forward(query, key, value, spans, residuals=True, interpret=True)[1:]
-            assert not attention_mosaic.backward_runs(query, key, value, spans, None, dout,
+            assert not attention_mosaic.backward_takes(query, key, value, spans, None, dout,
                                                       residuals=residuals)
             return
         fits = op.fitting(ba, target)

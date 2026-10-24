@@ -469,7 +469,7 @@ Later decisions (2026-10-22 and 2026-10-23), which §0 states as the design; whe
 | 5 | packed documents | structure + runtime plan | spans from the document starts; ids compared in `modify` on partial blocks only | The plan is built on device per tile config (§5). `max_segments` stops being a refusal: FLASH_SUPPORTS' `document_bound`/`packed_documents` go. |
 | 6 | cross documents (another sequence's ids, aligned) | structure | spans + ids, query permutation (`query_order`) for the transpose | Intervals aren't monotone in the query (§5's case). |
 | 7 | key lengths and starts (varlen, ragged) | structure | spans per batch row: `[starts[b], lengths[b])` | |
-| 8 | compositions of 2–7 | structure | intersection of spans | `KeySpans` composes today. |
+| 8 | compositions of 2–7 | structure | intersection of spans | `KeySpans` composes today. Block groups (images and blocks a causal query reads whole, `block_groups`) widen a causal query's end to its block's end within its document: a block is a contiguous run holding the query's key, so the keys stay one interval. |
 | 9 | arbitrary dense mask (`AttentionCase.mask`) | hook | TILE-kind bool param in `modify`, every block partial | Expressible but nothing is skipped. Kept for correctness, not speed: today only xla/reference take it. |
 | 10 | speculative tree masks | structure + hook | spans for the prefix, plus a TILE-kind mask param over the tree's own tail block | ⚑ "spans ∪ a tail TILE mask" isn't a stated composition. The tail is ≤ 64 keys, so one partial block. Name the composition in §5. |
 
