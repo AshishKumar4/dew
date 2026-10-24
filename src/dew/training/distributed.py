@@ -1221,7 +1221,7 @@ def shard_batch(mesh: Mesh, batch: Batch, reads: Mapping[Signature, tuple[bool, 
             else np.broadcast_to(np.zeros((), np.asarray(leaf).dtype), placed(np.shape(leaf)))
             for index, (leaf, kept) in enumerate(zip(leaves, read, strict=True))
             if not kept and not isinstance(leaf, jax.Array)}
-    moving = [leaf if isinstance(leaf, jax.Array) else np.array(leaf, copy=True) if cpu else np.asarray(leaf)
+    moving = [np.array(leaf, copy=True) if cpu else leaf if isinstance(leaf, jax.Array) else np.asarray(leaf)
               for index, leaf in enumerate(leaves) if index not in held]
     every: list[NamedSharding] = jax.tree.leaves(batch_shardings(mesh, batch))
     shardings = [sharding for index, sharding in enumerate(every) if index not in held]
