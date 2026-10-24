@@ -55,6 +55,29 @@ def precision() -> ModelConfig:
     return dataclasses.replace(model, fields={**model.fields, "dtype": "float32", "attention_impl": "xla"})
 
 
+def test_a_shape_only_pipeline_load_needs_headers_but_no_weight_payloads(pipelines, tmp_path):
+    """The resumed-run path derives every component's shapes from safetensors headers without
+    reading its payload. Files with intact headers and no payload still describe the full tree."""
+    from dew.interop import Pretrained
+
+    original = pipelines / "sd3" / "pipeline"
+    expected = Pretrained.load(original, dtype="float32", attention_impl="xla", on_host=True)
+    selected = tmp_path / "headers"
+    shutil.copytree(original, selected)
+    weights = list(selected.rglob("*.safetensors"))
+    assert weights
+    for path in weights:
+        with path.open("r+b") as stream:
+            size = int.from_bytes(stream.read(8), "little")
+            stream.truncate(8 + size)
+    loaded = Pretrained.load(selected, dtype="float32", attention_impl="xla", weights=False)
+    shapes = jax.tree.leaves(loaded.variables)
+    assert all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in shapes)
+    assert jax.tree.structure(loaded.variables) == jax.tree.structure(expected.variables)
+    for actual, wanted in zip(shapes, jax.tree.leaves(expected.variables), strict=True):
+        assert actual.shape == wanted.shape and actual.dtype == wanted.dtype
+
+
 def value(objective, params, batch) -> float:
     loss, _ = objective.loss(params, batch, Step(jnp.asarray(0), jax.random.PRNGKey(5), None))
     return float(loss.total / loss.mass)
