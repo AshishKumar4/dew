@@ -186,13 +186,15 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
         # The query's document's keys within the window's places run together in document order, since
         # their places never decrease along it, and their first and last key indices bound the span.
         before, after = window_sides(causal, sliding_window)
-        query_places, key_places = (jnp.asarray(places) for places in positions)
+        query_places, key_places = _widened(positions)
         ordered = _least_after(jnp.take_along_axis(key_places, order, axis=1),
                                None if key_ids is None else jnp.take_along_axis(key_ids, order, axis=1))
         inside_lo = _searched(ordered, run_lo, run_hi, _moved(query_places, -before), "left")
         inside_hi = _searched(ordered, run_lo, run_hi, _moved(query_places, after), "right")
         held = inside_hi > inside_lo
-        start = jnp.where(held, jnp.maximum(start, _indexed(order, inside_lo, 0)), start)
+        # The window's first key bounds the query's keys behind it whether or not it holds one, so an
+        # image's later keys stay within it (past every key where none lies at or after its bound).
+        start = jnp.maximum(start, jnp.where(inside_lo < run_hi, _indexed(order, inside_lo, 0), keys))
         end = jnp.where(held, jnp.minimum(end, _indexed(order, inside_hi - 1, -1) + 1), 0)
     elif sliding_window is not None:
         # No two places of the call lie further apart than its queries and keys, so a wider window
@@ -260,6 +262,14 @@ def _least_after(places: jax.Array, ids: jax.Array | None) -> jax.Array:
         return jnp.where(right[1], right[0], jnp.minimum(left[0], right[0])), left[1] | right[1]
 
     return jax.lax.associative_scan(least, (places, ends), reverse=True, axis=1)[0]
+
+
+def _widened(positions: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Array]:
+    """The queries' and keys' places in one integer dtype that holds both, in which a window's bounds move
+    (`_moved`): a bound past the narrower one's range is still a place the other may hold."""
+    query_places, key_places = (jnp.asarray(places) for places in positions)
+    wide = jnp.promote_types(query_places.dtype, key_places.dtype)
+    return query_places.astype(wide), key_places.astype(wide)
 
 
 def _moved(places: jax.Array, by: int) -> jax.Array:
