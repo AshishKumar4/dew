@@ -1515,7 +1515,7 @@ class Registered(ABC):
     @staticmethod
     @abstractmethod
     def _member(name: str) -> type:
-        """The class `name` names, from the kind's """
+        """The class `name` names, from the kind's aliases (`models`, `objectives`, `metrics`)."""
 
     def __post_init__(self) -> None:
         member = self._member(self.name)
@@ -1577,7 +1577,7 @@ class ModelConfig(Registered):
                    wrappers=tuple(layer._dew_wrapper() for layer in reversed(layers)))
 
     def with_dtype(self, dtype: str | None) -> Self:
-        """This model computing in `dtype` (`dew.with_dtype`); None keeps it."""
+        """This model computing in `dtype` (`with_dtype`); None keeps it."""
         return dataclasses.replace(self, fields=with_dtype(self.name, self.fields, dtype))
 
     def build(self, **derived: Configured):
