@@ -153,8 +153,13 @@ class AudioLinear(nn.Module):
 
 def _clippable(config: Gemma4Audio, dtype: Dtype | None, precision: PrecisionLike):
     """Gemma 4's linear map: each one an `AudioLinear`."""
-    return functools.partial(AudioLinear, dense=_dense(config, dtype, precision),
-                             use_clipped_linears=config.use_clipped_linears)
+    dense = _dense(config, dtype, precision)
+
+    def linear(features, *, name=None, **fields):
+        return AudioLinear(features, dense=functools.partial(dense, **fields),
+                           use_clipped_linears=config.use_clipped_linears, name=name)
+
+    return linear
 
 
 class CumulativeGroupNorm(nn.Module):
@@ -385,13 +390,19 @@ class AudioFeedForward(nn.Module):
     linear: Callable[..., nn.Module]
     activation: str = "silu"
     dtype: Dtype | None = None
+    precision: PrecisionLike = None
 
     @nn.compact
     def __call__(self, x):
         residual = x
         x = RMSNorm(dtype=self.dtype, epsilon=1e-6, name="pre_layer_norm")(_clip(x, self.clipping))
-        x = activation(self.activation)(self.linear(self.width * 4, name="ffw_layer_1")(x))
-        x = self.linear(self.width, name="ffw_layer_2")(x)
+        from .mlp import GatedMLP
+
+        mlp = GatedMLP(self.width * 4, self.width, activation=activation(self.activation),
+                        names=("ffw_layer_1", "ffw_layer_2"), linear=self.linear, dtype=self.dtype,
+                        precision=self.precision)
+        nn.share_scope(self, mlp)
+        x = mlp(x)
         x = RMSNorm(dtype=self.dtype, epsilon=1e-6, name="post_layer_norm")(_clip(x, self.clipping))
         return residual + x * self.residual_weight
 
@@ -455,7 +466,8 @@ class Gemma3nConformer(nn.Module):
         cfg = self.config
         dense = _dense(cfg, self.dtype, self.precision)
         feed_forward = functools.partial(AudioFeedForward, cfg.hidden_size, cfg.conf_residual_weight,
-                                         cfg.gradient_clipping, dense, dtype=self.dtype)
+                                         cfg.gradient_clipping, dense, dtype=self.dtype,
+                                         precision=self.precision)
         x = feed_forward(name="ffw_layer_start")(x)
         x = Gemma3nConformerAttention(cfg, dtype=self.dtype, precision=self.precision, name="attention")(
             x, valid
@@ -477,7 +489,8 @@ class Gemma4Conformer(nn.Module):
         cfg = self.config
         linear = _clippable(cfg, self.dtype, self.precision)
         feed_forward = functools.partial(AudioFeedForward, cfg.hidden_size, cfg.residual_weight,
-                                         cfg.gradient_clipping, linear, cfg.hidden_act, dtype=self.dtype)
+                                         cfg.gradient_clipping, linear, cfg.hidden_act, dtype=self.dtype,
+                                         precision=self.precision)
         x = feed_forward(name="feed_forward1")(x)
         residual = x
         x = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="norm_pre_attn")(_clip(x, cfg.gradient_clipping))
