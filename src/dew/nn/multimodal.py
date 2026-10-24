@@ -66,7 +66,7 @@ class VisionConditioner(nn.Module):
 
     def setup(self):
         self.tower = self.vision.build().clone(dtype=self.dtype, precision=self.precision)
-        self.projector = self.projection.build().clone(dtype=self.dtype, precision=self.precision)
+        self.projector = self.projection.clone(dtype=self.dtype, precision=self.precision)
 
     def __call__(self, conditioning: Mapping[str, jax.Array], train: bool = False) -> jax.Array:
         pixels = conditioning["pixel_values"]
@@ -135,7 +135,7 @@ class AudioConditioner(nn.Module):
     def setup(self):
         # Named for the shared root scope beside the vision tower and projector.
         self.audio_tower = self.audio.build().clone(dtype=self.dtype, precision=self.precision)
-        self.audio_projector = self.projection.build().clone(dtype=self.dtype, precision=self.precision)
+        self.audio_projector = self.projection.clone(dtype=self.dtype, precision=self.precision)
 
     def __call__(self, conditioning: Mapping[str, jax.Array]) -> jax.Array:
         features = conditioning["input_features"]

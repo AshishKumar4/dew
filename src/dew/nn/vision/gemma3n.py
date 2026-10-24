@@ -15,6 +15,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
+from dew.interop.config_records import native_fields
 from dew.interop.weights import placed
 from dew.nn.attention import RMSNorm
 from dew.nn.dense import Dense
@@ -48,7 +49,7 @@ class Gemma3nVision(MobileNetV5, TowerBase):
         return TowerGeometry(channels=self.in_chans)
 
 
-class Gemma3nProjectorModule(nn.Module):
+class Gemma3nProjector(ProjectorBase):
     """Gemma3nMultimodalEmbedder's vision hard and soft token paths."""
 
     vision_width: int
@@ -113,18 +114,6 @@ class Gemma3nProjectorModule(nn.Module):
         chosen = jnp.where(mask, ids, self.vocab_offset + self.vocab_size - 1)
         hard = self.embed_hard(chosen).astype(token_embeddings.dtype)
         return jnp.where(mask[..., None], hard, token_embeddings)
-
-
-@dataclasses.dataclass(frozen=True)
-class Gemma3nProjector(ProjectorBase):
-    vision_width: int
-    text_width: int
-    vocab_size: int = 128
-    vocab_offset: int = 262144
-    norm_eps: float = 1e-6
-
-    def build(self) -> nn.Module:
-        return Gemma3nProjectorModule(**dataclasses.asdict(self))
 
 
 def gemma3n_vision_path(hf_name: str) -> tuple[str, ...]:
@@ -240,8 +229,10 @@ def translate_gemma3n_vision_config(hf_config: Mapping[str, object]) -> Record:
 def translate_gemma3n_projector_config(hf_config: Mapping[str, object],
                                        text_width: int) -> Record:
     embedder, _ = _gemma3n_vision_record(hf_config)
-    value: Gemma3nProjector = from_record(Gemma3nProjector, {**embedder, "text_width": text_width})
-    return {"class": "gemma3n", "fields": {**dataclasses.asdict(value)}}
+    return {"class": "gemma3n", "fields": native_fields(Gemma3nProjector)(
+        vision_width=embedder["vision_width"], text_width=text_width,
+        vocab_size=embedder["vocab_size"], vocab_offset=embedder["vocab_offset"],
+        norm_eps=embedder["norm_eps"])}
 
 
 Gemma3nVision.checkpoint = TowerLayout("vision_tower.", in_params(gemma3n_vision_path))

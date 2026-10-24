@@ -94,7 +94,7 @@ class MuseGlimmerVision(TowerBase):
         return TowerGeometry(patch_size=self.patch_size, block_size=self.merge_size, channels=3)
 
 
-class MuseGlimmerProjectorModule(nn.Module):
+class MuseGlimmerProjector(ProjectorBase):
     """The merged image tokens as the decoder reads them (MuseGlimmerModel.get_image_features): each
     merge block's features channel by channel through the adapter's two bias-free maps, each followed
     by the activation (`MergeProjector`), a bias-free map to the decoder width, and a scale-free RMS
@@ -119,24 +119,6 @@ class MuseGlimmerProjectorModule(nn.Module):
         projected = Dense(self.text_width, use_bias=False, dtype=self.dtype, precision=self.precision,
                           name="projection", dot_general=float32_dot_general)(adapted)
         return RMSNorm(epsilon=self.norm_eps, with_scale=False, dtype=self.dtype, name="norm")(projected)
-
-
-@dataclasses.dataclass(frozen=True)
-class MuseGlimmerProjector(ProjectorBase):
-    """Muse Glimmer's projector fields: the trunk width, the merge size, the adapter's width and
-    activation, the decoder width and its RMS epsilon."""
-
-    vision_width: int
-    merge_size: int
-    adapter_width: int
-    text_width: int
-    activation: str = "gelu"
-    norm_eps: float = 1e-6
-
-    def build(self) -> nn.Module:
-        return MuseGlimmerProjectorModule(vision_width=self.vision_width, merge_size=self.merge_size,
-                                          adapter_width=self.adapter_width, text_width=self.text_width,
-                                          activation=self.activation, norm_eps=self.norm_eps)
 
 
 _TENSORS = {
