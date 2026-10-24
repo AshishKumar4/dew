@@ -83,8 +83,15 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     # With a thread per device, a 4-core runner's 8, a loop that ran ahead
     # left the launch it waited on one device short, and the rendezvous
     # aborted the process (tests/test_discrete.py's toy run on CI, three
-    # times). Two threads per device hold both launches.
-    environ.setdefault("PJRT_NPROC", str(max(len(os.sched_getaffinity(0)), 2 * cpu_devices)))
+    # times). A device's program also goes on past a parallel loop on the pool
+    # thread that finished the loop's last task, so a launch holds up to two
+    # threads a device at its collective (its launching thread at the
+    # barrier and the one in the collective) while the devices yet to arrive
+    # still need threads for their loops' tasks. With two a device, every
+    # thread was held and the rendezvous aborted the process (rCM's step in
+    # tests/test_capability_matrix.py, about half its runs: row 1545). Four a
+    # device leave each device two for its work.
+    environ.setdefault("PJRT_NPROC", str(max(len(os.sched_getaffinity(0)), 4 * cpu_devices)))
     # Parity tests assert fp32 against references computed in fp32. Ampere and
     # later GPUs default fp32 matmuls to TF32, a 10-bit mantissa, which puts
     # 1e-2 between two correct implementations.
