@@ -6,6 +6,7 @@ import contextlib
 import os
 import signal
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 
@@ -13,7 +14,7 @@ POLL_SECONDS = 0.05
 """How often a group's end asks whether a process is left in it."""
 
 
-def attempted(steps: Sequence[tuple[str, Callable[[], object]]], *,
+def attempted(steps: Sequence[tuple[str, Callable[[], None]]], *,
               primary: BaseException | None = None) -> None:
     """Run every step, even after one fails. Each failure is noted on `primary`, the error its
     caller is already raising, which stays the one raised; without one the first failure is raised
@@ -49,14 +50,22 @@ def group_held(process: subprocess.Popen) -> bool:
     return signal_group(process, 0)
 
 
+def groups_ended(processes: Sequence[subprocess.Popen], grace: float, forced: threading.Event | None = None
+                 ) -> None:
+    """Wait up to `grace` seconds, or until `forced` is set, for every group `processes` lead to hold
+    no process (`group_held`)."""
+    deadline = time.monotonic() + grace
+    while ((forced is None or not forced.is_set()) and time.monotonic() < deadline
+           and any(group_held(process) for process in processes)):
+        time.sleep(POLL_SECONDS)
+
+
 def end_group(process: subprocess.Popen, grace: float = 0.0, interrupt: int = signal.SIGTERM) -> int:
     """End the group `process` leads: with a `grace`, `interrupt` to every process in it and up to
     `grace` seconds for them to exit; then SIGKILL to what remains, and the leader reaped. Returns its
     exit code. A process that left the group on purpose (a session of its own) is out of reach."""
     if grace > 0 and group_held(process) and signal_group(process, interrupt):
-        deadline = time.monotonic() + grace
-        while group_held(process) and time.monotonic() < deadline:
-            time.sleep(POLL_SECONDS)
+        groups_ended((process,), grace)
     signal_group(process, signal.SIGKILL)
     return process.wait()
 
@@ -68,9 +77,13 @@ def process_group(command: Sequence[str], *, grace: float = 0.0, interrupt: int 
     with `options`), whose group ends with the block on every exit, a success's too (`end_group`),
     and whose pipes close after it."""
     process = subprocess.Popen(command, start_new_session=True, **options)
+
+    def end() -> None:
+        end_group(process, grace, interrupt)
+
     try:
         yield process
     finally:
         streams = [stream for stream in (process.stdin, process.stdout, process.stderr) if stream is not None]
-        attempted([("end the process group", lambda: end_group(process, grace, interrupt)),
+        attempted([("end the process group", end),
                    *((f"close {stream!r}", stream.close) for stream in streams)])

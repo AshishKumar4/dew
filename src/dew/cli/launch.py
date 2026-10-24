@@ -36,7 +36,7 @@ from typing import Annotated, TextIO
 
 import tyro
 
-from dew.cleanup import group_held, signal_group
+from dew.cleanup import group_held, groups_ended, signal_group
 from dew.cli import tpu_setup
 from dew.cli.gcloud import emit
 from dew.cli.tpu import reach
@@ -517,10 +517,7 @@ def _stop(running: Sequence[subprocess.Popen], grace: float, forced: threading.E
     for child in running:
         if group_held(child) and not (child.stdin is not None and _interrupted(child)):
             signal_group(child, signal.SIGTERM)
-    deadline = time.monotonic() + grace
-    while (not forced.is_set() and time.monotonic() < deadline
-           and any(group_held(child) for child in running)):
-        time.sleep(POLL_SECONDS)
+    groups_ended(running, grace, forced)
     for child in (*running[1:], *running[:1]):
         if group_held(child):
             signal_group(child, signal.SIGKILL)
