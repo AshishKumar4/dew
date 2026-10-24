@@ -40,6 +40,7 @@ from flax import linen as nn
 from typing_extensions import TypeVar
 
 from dew.artifacts import Artifacts
+from dew.nn import categorical
 from dew.nn.precision import accumulated
 from dew.objectives.base import (
     OMITTED,
@@ -264,8 +265,7 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         weights = student.weights.astype(jnp.float32)
         mass = statistics.mass
         counted = jnp.where(mass > 0, mass, 1)
-        divergence = optax.kl_divergence(jax.nn.log_softmax(student.logits / temperature),
-                                         jax.nn.softmax(teacher.logits / temperature))
+        divergence = categorical.kl_divergence(student.logits / temperature, teacher.logits / temperature)
         soft = self.row_mean(divergence * weights, batch).total
         total = (1 - alpha) * statistics.total + alpha * temperature ** 2 * soft
         reported = {**aux.metrics, "distill/alpha": alpha, "distill/temperature": temperature,
