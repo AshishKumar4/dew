@@ -556,6 +556,13 @@ def _families() -> dict[str, Family]:
             functools.partial(_subnormal_share, equal=True), np.ones((64, 1, 1, 256), bool), folded=False,
             dtype="bfloat16"),
     }
+    return {**families, **_structured_families()}
+
+
+def _structured_families() -> dict[str, Family]:
+    """The families of a call's structure beside its values (`_families`'): rows of no keys, documents, slices
+    merged, resumed states and a decode step's sinks."""
+    families = {}
     lengths = np.tile([4, 0], ROWS // 2)
     empty = np.broadcast_to((lengths > 0)[:, None, None, None], (ROWS, 1, 4, 4))
     families["a row of no keys"] = Family(_drawn(4, 4), empty, {"lengths": lengths},
