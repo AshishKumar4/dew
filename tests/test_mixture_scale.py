@@ -113,17 +113,27 @@ def test_a_thousand_file_sources_hold_no_file_open_per_source(tmp_path, record_p
 
 
 def test_the_weights_are_each_sources_share_of_the_records_read():
-    """A thousand sources weighted 1 to 1000 each fill their share of what is read, to a record."""
-    weights = [float(tag + 1) for tag in range(SOURCES)]
-    data = compile(mix(sources(), weights=weights).batch(BATCH), read="memory", loading=READ)
-    stream = data.train(DataPartition())
-    try:
-        read = ids(stream, 4000)
-    finally:
-        stream.close()
-    counts = np.bincount(np.asarray(read) // 1000, minlength=SOURCES)
-    expected = len(read) * np.asarray(weights) / sum(weights)
-    assert np.max(np.abs(counts - expected)) <= 1
+    """A thousand sources weighted 1 or 2 each read their share of a whole period of the mix, the
+    records in which every proportion comes round once, to the record; weights scaled together
+    read the same records."""
+    weights = [float(tag % 2 + 1) for tag in range(SOURCES)]
+
+    def read(scale, batches):
+        data = compile(mix(sources(), weights=[scale * weight for weight in weights]).batch(BATCH),
+                       read="memory", loading=READ)
+        stream = data.train(DataPartition())
+        try:
+            return ids(stream, batches)
+        finally:
+            stream.close()
+
+    # Grain's mix scales the least weight to 100 records a period.
+    period = int(100 * sum(weights))
+    whole = read(1.0, period // BATCH)
+    assert len(whole) == period
+    counts = np.bincount(np.asarray(whole) // 1000, minlength=SOURCES)
+    np.testing.assert_array_equal(counts, 100 * np.asarray(weights, np.int64))
+    assert read(0.25, 64) == whole[:64 * BATCH]
 
 
 def test_an_epoch_of_a_thousand_finite_sources_reads_every_record():
