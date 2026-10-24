@@ -404,6 +404,27 @@ def test_a_draw_that_breaks_its_contract_fails_both_sources_rollouts():
     prompts.close()
 
 
+def test_tokens_after_eos_never_execute_an_environment_turn():
+    """A completed server future is still untrusted: a token after EOS must fail admission before
+    a tool sees it or a verifier assigns it reward, and the opened environment is released."""
+    entered, exited, stepped, scored = [], [], [], []
+    server = Server(tokens=(EOS, 7))
+
+    def reward(task, episode):
+        scored.append(episode)
+        return 1.0
+
+    episodes = source(server, factory(entered, exited, on_step=lambda _: stepped.append(True)),
+                      verifier=reward)
+    try:
+        with pytest.raises(ValueError):
+            episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=10)
+    finally:
+        episodes.close()
+    assert entered and exited == entered
+    assert not stepped and not scored
+
+
 def test_an_environment_exit_that_fails_after_broken_code_does_not_turn_it_into_a_retry():
     """The environment returns no Observation, then its exit fails with an OSError. The OSError
     that `with` raises carries the broken code's error, and the rollout fails with it."""
