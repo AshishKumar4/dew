@@ -3,8 +3,10 @@ of a block (`AttentionMetadata.block_groups`, `image_groups`) sees the block's l
 document, on the layers that read them, and every other layer stays causal; a window bounds an image's keys
 behind the query and not a block's. A layer reads exactly the keys the rule keeps, written out here apart
 from Dew (`block_causal`), its QK-Clip maxima taken over them: over packed documents, over windows shorter
-than a block or an image, with padding inside the row, and on a layer reading both groups. A cached call
-over its blocks decodes on par with the full pass (check 1), its groups at its tokens' slots.
+than a block or an image, with padding inside the row, and on a layer reading both groups. A cached rollout
+decodes on par with the full pass (check 1), its cache keeping each slot's groups, so a block's token reads
+the block's earlier keys past the window from any earlier call. A non-causal kind keeps its kernel, a
+server keeps a block layer's prefill apart, and a prediction depth reads the groups of the tokens it reads.
 """
 import jax
 import jax.numpy as jnp
@@ -14,6 +16,7 @@ from model_support import TINY_DECODER, model_draw
 from reference_error import assert_as_exact
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.kernels import generation
 from dew.nn.mixers import AttentionMixer
 
 VOCAB = 37
@@ -148,24 +151,135 @@ def test_a_cached_rollout_reads_its_blocks_as_the_full_pass_does(shared):
     decoder = (model(4, **kinds).clone(kv_shared_layers=(2, 3)) if shared else model(**kinds))
     blocks, images = jnp.asarray(CACHED_BLOCKS), jnp.asarray(CACHED_IMAGES)
 
-    def rolled(decoder):
-        def run(params, ids):
-            _, made = decoder.apply(params, ids.shape[0], method=CausalTransformer.init_cache,
-                                    mutable=["cache"])
-            cache, logits = made["cache"], []
-            for lo, hi in CALLS:
-                out, mutated = decoder.apply({**params, "cache": cache}, ids[:, lo:hi], decode=True,
-                                             block_groups=blocks[:, lo:hi], image_groups=images[:, lo:hi],
-                                             mutable=["cache"])
-                cache = mutated["cache"]
-                logits.append(out)
-            return jnp.concatenate(logits, axis=1)[:, 3:]
-        return jax.jit(run)
-
     def full(decoder):
         return jax.jit(lambda params, ids: decoder.apply(params, ids, block_groups=blocks,
                                                          image_groups=images)[:, 3:])
 
+    rolled = rollout(decoder, CALLS, block_groups=blocks, image_groups=images)
     wide = decoder.clone(dtype=jnp.float64, attention_impl="reference")
-    assert_as_exact(rolled(decoder), full(decoder), model_draw(decoder, (2, 12), VOCAB), "cached blocks",
-                    seeds=CACHED_SEEDS, truth_fn=full(wide))
+    assert_as_exact(lambda params, ids: rolled(params, ids)[:, 3:], full(decoder),
+                    model_draw(decoder, (2, 12), VOCAB), "cached blocks", seeds=CACHED_SEEDS,
+                    truth_fn=full(wide))
+
+
+def rollout(decoder, calls, **groups):
+    """`decoder`'s logits over a row's tokens fed through its cache in `calls`, each a slice of the tokens
+    with its slice of `groups`, as a function of its variables and tokens, compiled."""
+    def run(params, ids):
+        _, made = decoder.apply(params, ids.shape[0], method="init_cache", mutable=["cache"])
+        cache, logits = made["cache"], []
+        for lo, hi in calls:
+            out, mutated = decoder.apply({**params, "cache": cache}, ids[:, lo:hi], decode=True,
+                                         mutable=["cache"], **{name: value[:, lo:hi]
+                                                               for name, value in groups.items()})
+            cache = mutated["cache"]
+            logits.append(out)
+        return jnp.concatenate(logits, axis=1)
+    return jax.jit(run)
+
+
+PAST_THE_WINDOW = {
+    "single-step": (((0, 3), (3, 4)), np.asarray([[0, 0, 0, 0], [-1, 1, 1, 1]], np.int32), 3),
+    "cached-call": (((0, 3), (3, 6)), np.asarray([[0, 0, 0, 0, 0, 0], [-1, 2, 2, 2, 2, 2]], np.int32), 3),
+}
+"""Calls over a row, its blocks, which run past the window of two from earlier calls into the last, and
+where the last call begins."""
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["own-keys", "shared-keys"])
+@pytest.mark.parametrize("case", PAST_THE_WINDOW.values(), ids=list(PAST_THE_WINDOW))
+def test_a_blocks_last_call_reads_its_earlier_keys_past_the_window_from_the_cache(case, shared):
+    """A block read whole that a rollout's calls part, under a window of two: its tokens in the last call,
+    a single step or a cached call of several, read its keys in earlier calls past the window, by the groups
+    the cache keeps beside them, on par with the full pass from float64 (check 1). One layer, or a second
+    that shares the first's keys, so those tokens' outputs read only keys the cache holds as the full pass
+    computes them; a block's tokens in an earlier call cannot see its later ones, which no cache gives."""
+    calls, blocks, last = case
+    kinds = {"sliding_attention": {"window": 2, "mixer": AttentionMixer(bidirectional_blocks=True)}}
+    decoder = model(2, **kinds).clone(kv_shared_layers=(1,)) if shared else model(1, **kinds)
+    groups = jnp.asarray(blocks)
+
+    def full(decoder):
+        return jax.jit(lambda params, ids: decoder.apply(params, ids, block_groups=groups)[:, last:])
+
+    rolled = rollout(decoder, calls, block_groups=groups)
+    wide = decoder.clone(dtype=jnp.float64, attention_impl="reference")
+    assert_as_exact(lambda params, ids: rolled(params, ids)[:, last:], full(decoder),
+                    model_draw(decoder, blocks.shape, VOCAB), "blocks past the window", seeds=CACHED_SEEDS,
+                    truth_fn=full(wide))
+
+
+def test_a_non_causal_kind_reading_blocks_keeps_its_kernel():
+    """A non-causal kind sees its whole row already, so the groups it would read add nothing: a call with
+    and without them reports the same attention routes on an A100 (`generation.routes`), cuDNN named, with
+    no mask of their own."""
+    decoder = model(full_attention={"mixer": AttentionMixer(bidirectional_blocks=True)}).clone(
+        causal=False, attention_impl="cudnn", dtype=jnp.bfloat16)
+    ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
+    params = decoder.init(jax.random.key(1), ids)
+
+    def routes(**groups):
+        with generation.assumed("sm80"), generation.routes() as found:
+            jax.eval_shape(lambda params, ids: decoder.apply(params, ids, **groups), params, ids)
+        return [(route.choice, route.kernel) for route in found]
+
+    plain = routes()
+    assert ("attention", "cudnn") in plain
+    assert routes(block_groups=jnp.asarray(BLOCKS)) == plain
+
+
+def test_a_server_keeps_a_block_layers_prefill_apart():
+    """A server's mixed step reads each row's cache as a decode step does, which carries no groups, so a
+    model with a kind reading blocks or images keeps its prompts' prefill in a forward of its own."""
+    assert model(full_attention={}).mixed_admission_refusal() is None
+    for mixer in (AttentionMixer(bidirectional_blocks=True), AttentionMixer(bidirectional_images=True)):
+        assert model(full_attention={"mixer": mixer}).mixed_admission_refusal() is not None
+
+
+def test_a_prediction_depth_reads_the_groups_of_the_tokens_it_reads():
+    """Prediction depth 1 reads the tokens from the second on (`mtp_hidden_states`), so its layers read the
+    groups from there: a block of the first two tokens is one token to it, which adds no key, and its
+    states are those of no block, bitwise; a block of the second and third is two, which moves them."""
+    decoder = model(full_attention={"mixer": AttentionMixer(bidirectional_blocks=True)}).clone(
+        num_nextn_predict_layers=1)
+    ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
+    params = decoder.init(jax.random.key(1), ids)
+    hidden = decoder.apply(params, ids, method=CausalTransformer.hidden_states)
+
+    def depth(lo: int, hi: int) -> np.ndarray:
+        groups = np.full((2, LENGTH), -1, np.int32)
+        groups[:, lo:hi] = 0
+        return np.asarray(decoder.apply(params, hidden, ids, block_groups=jnp.asarray(groups),
+                                        method=CausalTransformer.mtp_hidden_states)[0])
+
+    none = depth(0, 0)
+    np.testing.assert_array_equal(depth(0, 2), none)
+    assert not np.array_equal(depth(1, 3), none)
+
+
+def test_a_multimodal_wrappers_cached_rollout_reads_its_blocks_as_its_full_pass_does():
+    """A multimodal wrapper hands its language model the call's groups (`MultimodalTransformer`): text alone
+    through its cache, a prefill, a cached call and single steps, with blocks inside each call, on par with
+    its full pass over the same groups from float64 (check 1)."""
+    from dew.nn.multimodal import MultimodalTransformer
+    from dew.nn.vision import GemmaProjector, SiglipVision
+
+    def wrapped(decoder):
+        return MultimodalTransformer(
+            decoder, SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2,
+                                  image_size=8, patch_size=4),
+            GemmaProjector(text_width=TINY_DECODER["emb_features"], patches_per_side=2, tokens_per_side=1),
+            family="gemma3", image_token_id=1)
+
+    decoder = model(full_attention={"mixer": AttentionMixer(bidirectional_blocks=True)})
+    wrapper = wrapped(decoder)
+    groups = jnp.asarray(CACHED_BLOCKS)
+
+    def full(wrapper):
+        return jax.jit(lambda params, ids: wrapper.apply(params, ids, block_groups=groups)[:, 3:])
+
+    rolled = rollout(wrapper, CALLS, block_groups=groups)
+    wide = wrapped(decoder.clone(dtype=jnp.float64, attention_impl="reference"))
+    assert_as_exact(lambda params, ids: rolled(params, ids)[:, 3:], full(wrapper),
+                    model_draw(wrapper, (2, 12), VOCAB), "multimodal cached blocks", seeds=CACHED_SEEDS,
+                    truth_fn=full(wide))
