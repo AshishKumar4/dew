@@ -45,7 +45,7 @@ from jax.custom_derivatives import SymbolicZero
 from jax.experimental.pallas import mosaic_gpu as plgpu, tpu as pltpu
 from jax.extend import core as jax_core
 
-from ..precision import rounded_operand
+from ..precision import at_least_fp32, rounded_operand
 from . import generation, selection, tuning
 from .generation import INHERENT
 from .templates import base, cost, mosaic
@@ -1407,7 +1407,7 @@ def portable_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     fp32 accumulator, which its epilogue reads)."""
     x, kernel = promote_dtype(x, kernel, dtype=dtype)
     accumulated = xla_ragged_dot(x, kernel, group_sizes, precision=precision,
-                                 preferred_element_type=jnp.promote_types(x.dtype, jnp.float32))
+                                 preferred_element_type=at_least_fp32(x.dtype))
     return accumulated.astype(out_dtype or x.dtype)
 
 
@@ -1418,7 +1418,7 @@ def _portable_projection_jvp(dtype: Dtype | None, precision: PrecisionLike, out_
     x, kernel, group_sizes = primals
     dx, dkernel, _ = tangents
     output = jnp.asarray(portable_projection(x, kernel, group_sizes, dtype, precision, out_dtype))
-    work = jnp.result_type(output.dtype, x.dtype, kernel.dtype, jnp.float32)
+    work = at_least_fp32(jnp.result_type(output.dtype, x.dtype, kernel.dtype))
     compute = jnp.dtype(dtype) if dtype is not None else jnp.result_type(x.dtype, kernel.dtype)
     # A symbolic zero tangent contributes no term. Only the others pass the
     # barrier: jax 0.11.2 cannot transpose one that holds a constant zero.
