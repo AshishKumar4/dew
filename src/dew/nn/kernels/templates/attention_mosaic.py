@@ -1255,19 +1255,34 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
 
 
 
+@functools.cache
+def _keyed_parts(dtype) -> int:
+    """The parts the accurate form's keyed weights take to their product with the keys
+    (`algebra.weights_parts`: one in bf16)."""
+    tile = jax.ShapeDtypeStruct((1, 1), jnp.float32)
+    return len(jax.eval_shape(lambda weights: algebra.weights_parts(weights, dtype), tile))
+
+
 def _backward_costs(op: MosaicBackward, ba: tokamax.BoundArguments, config: BackwardTiles,
                     target: generation.GpuTarget) -> list[cost.Cost]:
-    """Each part's work at `config` (`cost.Cost`): the dQ launch's programs (a query head's consumers' query
-    blocks) walking the key tiles their blocks reach (`_walked`), each consumer step's logits, output
-    cotangents', dQ and the accurate form's keyed sums' products; the dK/dV launch's (a key head's
-    consumers' key blocks) walking the query tiles reading them (`_readers`), each step's logits, output
-    cotangents', dV and dK products, its parts staged between them (`serial_staged`), and a fused launch's
-    dQ tile, added into dQ in fp32 through its output stage and the L2 (read and written) in place of the
-    dQ launch. Their shared memory's traffic: each streamed tile written once and read by each consumer's
-    products, each resident or staged block written once, each output staged and stored. Every array read
-    once a launch and every gradient written once in fp32; and the passes between and around the launches
-    (`gradients`, `dq_finish`; a fused launch's dQ zeroed and summed), over the device's memory. With one
-    consumer the softmax runs between the products, with two under the partner's
+    """Each part's work at `config` (`cost.Cost`), each product's FLOPs and shared-memory reads as the launch
+    issues it (a product reads its shared-memory operands, a register operand none):
+    - the dQ launch's programs (a query head's consumers' query blocks) walking the key tiles their blocks
+      reach (`_walked`), a step's logits `Q·Kᵀ` and output cotangents' `dO·Vᵀ`, then dQ's parts' products
+      with the key slot (`algebra.cotangent_parts`) and the accurate form's keyed weights' parts' too
+      (`algebra.weights_parts`), the parts in registers;
+    - the dK/dV launch's (a key head's consumers' key blocks) walking the query tiles reading them
+      (`_readers`), a step's logits and output cotangents' products against its resident keys and values,
+      then dV's from its staged weights and dK's from each staged part, against the query and cotangent
+      slots, the staged parts written before their products read them (`serial_staged`); a fused launch's
+      dQ tile, the staged part times the resident keys, added into dQ in fp32 through its output stage and
+      the L2 (read and written) in place of the dQ launch;
+    - each streamed tile written once a program, each resident or staged block once, each output staged
+      and stored; every array read once a launch and every gradient written once in fp32, the dQ launch's
+      rows only for the score kinds it sums (`DQ_GRADS`);
+    - the passes between and around the launches (`gradients`, `dq_finish`; a fused launch's dQ zeroed and
+      summed), over the device's memory.
+    With one consumer the softmax runs between the products, with two under the partner's
     (`serial_exponentials`)."""
     family = BUNDLES[config.family]
     query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
@@ -1278,19 +1293,21 @@ def _backward_costs(op: MosaicBackward, ba: tokamax.BoundArguments, config: Back
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     padded_q, padded_k = _padded(queries, keys, config)
     parts = _parts(op.accurate, dtype)
+    keyed = _keyed_parts(dtype) if op.accurate else 0
+    fused = 1 if config.fused else 0
     causal = op.form == "causal"
     resident = cost.resident(target, op.staged_bytes(ba, config, target), mosaic.THREADS * (consumers + 1),
                              op.register_budget(config))
     read = _read_bytes(ba)
     query_rows, key_rows = batch * padded_q * heads, batch * padded_k * heads
+    tile = block_q * block_k
 
     def launch(programs: int, consumed: float, streamed: float, products: float, staged: float, *,
                written: float, serial: float = 0.0, l2: float = 0.0, stages: int) -> cost.Cost:
-        exponentials = consumed / programs * block_q * block_k
+        exponentials = consumed / programs * tile
         return cost.Cost(
             programs=batch * heads * programs, device_bytes=read + written,
-            program_flops=consumed / programs * 2.0 * block_q * block_k * products,
-            program_staged=staged / programs,
+            program_flops=consumed / programs * 2.0 * tile * products, program_staged=staged / programs,
             program_exponentials=exponentials if consumers > 1 else 0.0,
             serial_exponentials=0.0 if consumers > 1 else exponentials,
             serial_staged=consumed / programs * serial, mode="16bit", steps=streamed / programs,
@@ -1300,38 +1317,44 @@ def _backward_costs(op: MosaicBackward, ba: tokamax.BoundArguments, config: Back
     consumed, streamed = _readers(causal, consumers, block_q, block_k, key_programs, padded_q // block_q,
                                   keys)
     slot = block_q * (width + value_width) * size
-    staged_parts = (1 + parts) * block_q * block_k * size
-    dkv_staged = (streamed * slot + consumed * (slot + block_k * (width + value_width) * size + staged_parts)
-                  + key_programs * consumers * block_k * (width + value_width) * (size + 2 * 4))
-    dkv_products = width + 2 * value_width + width * parts + (width if config.fused else 0)
-    # A fused step's dQ tile staged and added by TMA, which its next store waits for.
-    dkv_serial = staged_parts + (2 * block_q * width * 4 if config.fused else 0)
+    # A step's reads: the logits' and cotangents' slots and resident blocks, dV's staged weights and
+    # cotangent slot, each dK part and its query slot, a fused step's staged part and resident keys.
+    dkv_reads = ((block_q + block_k) * (width + value_width) + tile + block_q * value_width
+                 + parts * (tile + block_q * width) + fused * (tile + block_k * width)) * size
+    once = key_programs * consumers * block_k * (width + value_width) * (size + 2 * 4)
+    dkv_staged = streamed * slot + consumed * dkv_reads + once
+    dkv_products = width + 2 * value_width + width * parts + width * fused
+    # A step's staged parts, written before their products read them, and a fused step's dQ tile, staged
+    # and added by TMA, which its next store waits for.
+    dkv_serial = (1 + parts) * tile * size + fused * 2 * block_q * width * 4
     written = key_rows * (width + value_width) * 4
     l2 = batch * heads * streamed * slot
     # Around the launches: D from the split sums and the anchor's value row, gathered from the values for
     # each query head; dK and dV summed over a key head's query heads.
     passes = (query_rows * (value_width * (4 + 2 * size) + 4 * 4)
               + key_rows * (width + value_width) * 4 + batch * keys * heads * (width + value_width) * size)
+    stages = min(config.stages, padded_q // block_q)
     if config.fused:
         written += query_rows * width * 4
         l2 += 2 * batch * heads * consumed * block_q * width * 4
         # dQ zeroed, then read out of its one copy.
         passes += 3 * query_rows * width * 4
         return [launch(key_programs, consumed, streamed, dkv_products, dkv_staged, written=written,
-                       serial=dkv_serial, l2=l2, stages=min(config.stages, padded_q // block_q)),
+                       serial=dkv_serial, l2=l2, stages=stages),
                 cost.Cost(programs=1, device_bytes=passes)]
     costs = [launch(key_programs, consumed, streamed, dkv_products, dkv_staged, written=written,
-                    serial=dkv_serial, l2=l2, stages=min(config.stages, padded_q // block_q))]
+                    serial=dkv_serial, l2=l2, stages=stages)]
     query_programs = padded_q // (consumers * block_q)
     consumed, streamed = _walked(causal, consumers, block_q, block_k, query_programs, keys)
     sums = 2 if op.accurate else 1
     slot = block_k * (width + value_width) * size
-    # A step reads its queries and cotangents, its key and value slots, and its key slot again for dQ.
-    dq_step = block_q * (width + value_width) * size + slot + block_k * width * size
-    stages_once = (width + value_width) * size + 2 * 4 * width * sums
-    dq_staged = streamed * slot + consumed * dq_step + query_programs * consumers * block_q * stages_once
-    dq_products = width + value_width + width * parts * sums
-    rows = 4 + 2 * len(op.score_kinds)
+    # A step's reads: the logits' and cotangents' stages and slots, the key slot again for each dQ part and
+    # keyed part.
+    dq_reads = ((block_q + block_k) * (width + value_width) + (parts + keyed) * block_k * width) * size
+    once = query_programs * consumers * block_q * ((width + value_width) * size + 2 * 4 * width * sums)
+    dq_staged = streamed * slot + consumed * dq_reads + once
+    dq_products = width + value_width + width * (parts + keyed)
+    rows = 4 + 2 * sum(kind in DQ_GRADS for kind in op.score_kinds)
     costs.append(launch(query_programs, consumed, streamed, dq_products, dq_staged,
                         written=query_rows * (width * sums + rows) * 4, l2=batch * heads * streamed * slot,
                         stages=min(config.stages, padded_k // block_k)))
