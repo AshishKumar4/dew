@@ -35,7 +35,7 @@ class JepaRunConfig(RunConfig):
     Its EMA ramps over the whole run unless it names `momentum_steps`."""
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("jepa_encoder", {"precision": "default", "dtype": "bfloat16"}))
-    optim: OptimConfig = dataclasses.field(default_factory=lambda: OptimConfig(rate=1e-3))
+    optim: OptimConfig = dataclasses.field(default_factory=lambda: OptimConfig(learning_rate=1e-3))
     predictor: JsonDict = dataclasses.field(default_factory=dict)
     """Predictor kwargs, over the encoder's shared ones."""
     num_target_blocks: int = 4

@@ -1,7 +1,7 @@
 {
 	"about": "The screen profile.py left on a terminal, written by site/scripts/capture_snippets.py.",
 	"arguments": [],
-	"script_sha256": "b3b9e2912510a81eec7c159d222c4f41a02ee27df731a81bcc376ef105ab3f55",
+	"script_sha256": "38ede65177fe7128415b560c89a0f901d618748350ac49a1f017e97a99e4512d",
 	"meta": {
 		"where": "a 4-vCPU Cloudflare container",
 		"python": "3.12.15",

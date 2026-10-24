@@ -27,7 +27,7 @@ predictor = JepaPredictor(grid=(4, 4), emb_features=32,
 mask = MultiBlockMask.for_grid((4, 4), num_targets=1, scale=(0.25, 0.25))
 objective = JepaObjective(encoder, predictor, mask=mask,
                           sample=Field("image", (16, 16, 3)))
-trainer = Trainer(objective, OptimConfig(optimizer="adam", rate=0.001), key=jax.random.key(0))
+trainer = Trainer(objective, OptimConfig(optimizer="adam", learning_rate=0.001), key=jax.random.key(0))
 state = trainer.fit(data, steps=3, log_every=1)
 assert int(state.step) == 3
 assert state.ema is not None

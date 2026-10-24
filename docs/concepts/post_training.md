@@ -60,7 +60,7 @@ sft_data = Loader(train=lambda partition: itertools.repeat(sft_batch), val=None,
                    records=8, batch=8)
 sft_objective = LMObjective(model, seq_len=len(row) - 1, variables=base,
                             loss_role=Role.ASSISTANT)
-sft_state = Trainer(sft_objective, OptimConfig(rate=1e-3), key=jax.random.key(1)).fit(
+sft_state = Trainer(sft_objective, OptimConfig(learning_rate=1e-3), key=jax.random.key(1)).fit(
     sft_data, steps=20, log_every=10)
 ```
 
@@ -84,7 +84,7 @@ pair = {"chosen": prompt + response, "rejected": prompt + rejected,
 width = max(len(pair["chosen"]), len(pair["rejected"]))
 pairs = Memory([pair] * 8).repeat().pipe(presets.preferences, seq_len=width, batch=8)
 dpo = DPOObjective(model, seq_len=width - 1, beta=0.1, variables=sft_state.variables)
-dpo_state = Trainer(dpo, OptimConfig(optimizer="adam", rate=1e-3), key=jax.random.key(2)).fit(
+dpo_state = Trainer(dpo, OptimConfig(optimizer="adam", learning_rate=1e-3), key=jax.random.key(2)).fit(
     pairs, steps=10, log_every=5)
 ```
 
@@ -126,7 +126,7 @@ rl_objective = GRPOObjective(model, seq_len=len(story) + 7, beta=0.01,
 rollout = RolloutScheduler.sampled(rl_objective, reward, groups=4, max_new_tokens=8,
                                    sampling=Sampling(temperature=1.0, top_k=40),
                                    decode=tokenizer.decode)
-rl_state = Trainer(rl_objective, OptimConfig(rate=1e-4), key=jax.random.key(3),
+rl_state = Trainer(rl_objective, OptimConfig(learning_rate=1e-4), key=jax.random.key(3),
                    rollout=rollout).fit(rl_data, steps=4, log_every=2)
 print(int(rl_state.updates), "GRPO updates")
 ```
@@ -217,7 +217,7 @@ data = Memory(rows * 4).repeat().pipe(presets.preferences, seq_len=row_width, ba
 model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
                           num_heads=2, mlp_features=32, max_seq_len=row_width)
 objective = DPOObjective(model, seq_len=row_width - 1, beta=0.1)
-trainer = Trainer(objective, OptimConfig(optimizer="adam", rate=1e-3).build(2), key=jax.random.key(0))
+trainer = Trainer(objective, OptimConfig(optimizer="adam", learning_rate=1e-3).build(2), key=jax.random.key(0))
 initial = trainer.initial_state()
 # Copy the snapshot to host memory before training donates device buffers.
 reference = jax.tree.map(lambda x: np.array(x, copy=True), initial.ema)
@@ -663,7 +663,7 @@ def brightness(images, batch):
 rollout = FlowRollout(objective, brightness, groups=4, steps=5, train_steps=2)
 batch = {"image": np.zeros((2, 4, 4, 1), dtype=np.uint8)}
 data = Loader(train=lambda partition: itertools.repeat(batch), val=None, records=2, batch=2)
-trainer = Trainer(objective, OptimConfig(optimizer="adam", rate=1e-3), key=jax.random.key(0), rollout=rollout)
+trainer = Trainer(objective, OptimConfig(optimizer="adam", learning_rate=1e-3), key=jax.random.key(0), rollout=rollout)
 state = trainer.fit(data, steps=2, log_every=1)
 print(int(state.updates))
 ```

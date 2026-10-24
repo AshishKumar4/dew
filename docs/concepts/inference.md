@@ -31,7 +31,7 @@ model = CausalTransformer(vocab_size=tokenizer.vocab_size,
                           emb_features=64, num_layers=2, num_heads=2, mlp_features=256,
                           max_seq_len=128)
 objective = LMObjective(model, seq_len=64)
-state = Trainer(objective, OptimConfig(rate=3e-3), key=jax.random.key(0)).fit(
+state = Trainer(objective, OptimConfig(learning_rate=3e-3), key=jax.random.key(0)).fit(
     data, steps=150, log_every=150)
 
 task = objective.pipeline(state, processor=RunProcessor(tokenizer))

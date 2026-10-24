@@ -1,7 +1,7 @@
 {
 	"about": "The screen reliability.py left on a terminal, written by site/scripts/capture_snippets.py.",
 	"arguments": [],
-	"script_sha256": "41c0c0546130f4949c5b6082bb3c07d3da9e0894c67649cbe5e6e0dff1a0c94b",
+	"script_sha256": "ea234863b203c9cf4b193fcabb1e9b6a5e5161889deb4217f486424a06c14624",
 	"meta": {
 		"where": "a 4-vCPU Cloudflare container",
 		"python": "3.12.15",

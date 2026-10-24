@@ -180,6 +180,22 @@ def broadcast_from_process_zero(value):
     return from_every_process(value if jax.process_index() == 0 else None)[0]
 
 
+def seen_by_every_process(directory: str) -> list[bool]:
+    """Whether each process of the pool, in rank order, finds a file process 0 writes in the local
+    `directory` (made if absent): whether they all read it as one directory, on a filesystem they
+    share, rather than each on a disk of its own."""
+    mark = os.path.join(directory, f".dew-shared-{broadcast_from_process_zero(os.urandom(8).hex())}")
+    if jax.process_index() == 0:
+        os.makedirs(directory, exist_ok=True)
+        with open(mark, "w"):
+            pass
+    from_every_process(None)  # every process looks once the mark is written
+    seen = from_every_process(os.path.exists(mark))
+    if jax.process_index() == 0:
+        os.remove(mark)
+    return seen
+
+
 def agreed[T](phase: str, operation: Callable[[], T]) -> T:
     """Run `operation` on every rank, then agree on the outcome before going on.
 
@@ -491,4 +507,5 @@ __all__ = [
     "collective_host",
     "end_pool_on_failure",
     "from_every_process",
+    "seen_by_every_process",
 ]

@@ -143,7 +143,7 @@ def train_and_export(root: Path) -> Path:
         "--trainer.checkpoint-dir", str(root / "runs"),
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
         "--model.dtype", "float32", "--max-new-tokens", "0",
-        "--optim.rate", "3e-3",
+        "--optim.learning-rate", "3e-3",
         *model_args], default=LMRunConfig(data=windows))
     state = config.run()
     assert int(state.step) == STEPS

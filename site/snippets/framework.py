@@ -31,7 +31,7 @@ def lm():
     data = Hub("winglian/tiny-shakespeare").shuffle(0).repeat().pipe(presets.lm, "byte", seq_len=64, batch=8)
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
                               mlp_features=64, max_seq_len=128)
-    trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(rate=1e-3), key=0)
+    trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0)
     state = trainer.fit(data, steps=3)
     # End snippet: lm
     assert int(state.step) == 3 and int(state.updates) == 3
@@ -52,7 +52,7 @@ def diffusion():
     model = SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=2)
     objective = DiffusionObjective(model, Flow(), InputSpec(Field("image", (32, 32, 3))),
                                    solver=Euler(), steps=4)
-    state = Trainer(objective, OptimConfig(rate=1e-3), key=0).fit(data, steps=3)
+    state = Trainer(objective, OptimConfig(learning_rate=1e-3), key=0).fit(data, steps=3)
     # End snippet: diffusion
     assert int(state.step) == 3 and int(state.updates) == 3
     return {"steps": int(state.step)}
@@ -71,7 +71,7 @@ def jepa():
                               num_layers=1, num_heads=2)
     objective = JepaObjective(encoder, predictor, mask=MultiBlockMask.for_grid((8, 8)),
                               sample=Field("image", (32, 32, 3)), momentum_steps=3)
-    state = Trainer(objective, OptimConfig(rate=1e-3), key=0).fit(data, steps=3)
+    state = Trainer(objective, OptimConfig(learning_rate=1e-3), key=0).fit(data, steps=3)
     # End snippet: jepa
     assert int(state.step) == 3 and int(state.updates) == 3
     return {"steps": int(state.step), "averaged": sorted(state.averaged)}
@@ -104,7 +104,7 @@ def grpo():
     rollout = RolloutScheduler.sampled(objective, reward, groups=4, max_new_tokens=8,
                                        sampling=Sampling(temperature=1.0))
     tracker = LocalTracker("tracking")
-    trainer = Trainer(objective, OptimConfig(rate=1e-3), key=0, rollout=rollout, tracker=tracker)
+    trainer = Trainer(objective, OptimConfig(learning_rate=1e-3), key=0, rollout=rollout, tracker=tracker)
     state = trainer.fit(data, steps=150, log_every=1)
     tracker.close()
     # End snippet: grpo
@@ -131,7 +131,7 @@ def finetune():
     name = "HuggingFaceTB/SmolLM2-135M-Instruct"
     model = PretrainedDecoder.load(name, dtype="float32", max_seq_len=256)
     data = Hub("winglian/tiny-shakespeare").shuffle(0).repeat().pipe(presets.lm, name, seq_len=64, batch=1)
-    state = Trainer(LMObjective(model, seq_len=64), OptimConfig(rate=1e-4), key=0).fit(
+    state = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-4), key=0).fit(
         data, steps=20, log_every=5)
     before = model.text_generation(sampling=Sampling(temperature=0))
     after = replace(model, variables=state.variables).text_generation(sampling=Sampling(temperature=0))
@@ -160,7 +160,7 @@ def pretrained():
 
     shakespeare = Hub("winglian/tiny-shakespeare").shuffle(0).repeat()
     data = shakespeare.pipe(presets.lm, "Qwen/Qwen3-0.6B", seq_len=64, batch=1)
-    trainer = Trainer(LMObjective(bundle, seq_len=64), OptimConfig(rate=1e-5), key=0)
+    trainer = Trainer(LMObjective(bundle, seq_len=64), OptimConfig(learning_rate=1e-5), key=0)
     state = trainer.fit(data, steps=1)
     bundle.save("export", variables=state.variables)
     # End snippet: pretrained
@@ -245,7 +245,7 @@ def mesh():
     data = Hub("winglian/tiny-shakespeare").shuffle(0).repeat().pipe(presets.lm, "byte", seq_len=64, batch=8)
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
                               mlp_features=64, max_seq_len=128)
-    trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(rate=1e-3), key=0,
+    trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0,
                       mesh=MeshSpec(fsdp=2, tensor=2))
     state = trainer.fit(data, steps=3)
     # End snippet: mesh
@@ -268,13 +268,13 @@ def reliability():
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
                               mlp_features=64, max_seq_len=128)
     objective = LMObjective(model, seq_len=64)
-    state = Trainer(objective, OptimConfig(rate=1e-3), key=0,
+    state = Trainer(objective, OptimConfig(learning_rate=1e-3), key=0,
                     checkpoints=Checkpoints("checkpoints")).fit(data, steps=2, checkpoint_every=1)
     # A new trainer on the same directory resumes from step 2.
-    resumed = Trainer(objective, OptimConfig(rate=1e-3), key=0,
+    resumed = Trainer(objective, OptimConfig(learning_rate=1e-3), key=0,
                       checkpoints=Checkpoints("checkpoints")).fit(data, steps=3, checkpoint_every=1)
     # End snippet: reliability
-    baseline = Trainer(objective, OptimConfig(rate=1e-3), key=0).fit(data, steps=3)
+    baseline = Trainer(objective, OptimConfig(learning_rate=1e-3), key=0).fit(data, steps=3)
     differences = []
     assert jax.tree.structure(resumed) == jax.tree.structure(baseline)
     left, _ = jax.tree_util.tree_flatten_with_path(resumed)
@@ -304,7 +304,7 @@ def profile():
     data = Hub("winglian/tiny-shakespeare").shuffle(0).repeat().pipe(presets.lm, "byte", seq_len=64, batch=8)
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
                               mlp_features=64, max_seq_len=128)
-    trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(rate=1e-3), key=0,
+    trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0,
                       profile=ProfileWindow("profile", steps=2))
     trainer.fit(data, steps=5)
     # End snippet: profile

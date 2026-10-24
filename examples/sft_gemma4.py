@@ -109,7 +109,7 @@ def run_config(config: Config, tokenizer: str, chat: str) -> LMRunConfig:
                     .read(config.data_read).loading(loading)),
         tokenizer=tokenizer,
         max_new_tokens=4 if smoke else 64,
-        optim=OptimConfig(rate=config.learning_rate, weight_decay=0.0,
+        optim=OptimConfig(learning_rate=config.learning_rate, weight_decay=0.0,
                           clip_grads=1.0),
         # A smoke run stays out of any process pool; a real run joins one
         # when a cluster started it and runs alone otherwise.

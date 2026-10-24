@@ -71,7 +71,7 @@ def build_solver(config: Comparison) -> optax.GradientTransformation:
         return optax.contrib.muon(config.learning_rate,
                                   weight_decay=config.weight_decay,
                                   adam_weight_decay=config.weight_decay)
-    optim = OptimConfig(optimizer=config.optimizer, rate=config.learning_rate,
+    optim = OptimConfig(optimizer=config.optimizer, learning_rate=config.learning_rate,
                         weight_decay=config.weight_decay)
     return optim.build(config.steps)
 

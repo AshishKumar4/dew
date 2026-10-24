@@ -7,6 +7,7 @@ to (B*T, H, W, C) and every frame scores independently.
 import jax.numpy as jnp
 
 from dew.artifacts import ImageGrid
+from dew.nn.precision import at_least_fp32
 
 from .common import PairedImageMetric
 
@@ -39,7 +40,7 @@ def peak_signal_noise_ratio(
     """
     pred, targ = frame_batch(predictions), frame_batch(targets)
     # Widened before the difference: uint8 pixels would wrap it and square it modulo 256.
-    wide = jnp.promote_types(jnp.result_type(pred, targ), jnp.float32)
+    wide = at_least_fp32(jnp.result_type(pred, targ))
     mse = jnp.mean((pred.astype(wide) - targ.astype(wide)) ** 2, axis=(1, 2, 3))
     scores = 10.0 * jnp.log10(data_range**2 / mse)
     return scores if per_example else jnp.mean(scores)
