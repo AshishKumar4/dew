@@ -49,13 +49,6 @@ class TowerLayout:
         return self.read(hf_tensors, self.path, param_dtype)
 
 
-def in_params(path: Callable[[str], tuple[str, ...] | None]) -> Callable[[str], tuple[str, ...] | None]:
-    """`path`, whose leaves are parameters, rooted at `params`."""
-    def rooted(name: str) -> tuple[str, ...] | None:
-        leaf = path(name)
-        return None if leaf is None else ("params", *leaf)
-    return rooted
-
 
 @dataclasses.dataclass(frozen=True)
 class ProjectorLayout:

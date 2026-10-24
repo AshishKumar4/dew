@@ -64,6 +64,7 @@ if TYPE_CHECKING:
 
     from dew.diffusion.presets import Preset
     from dew.inputs.encoders import ConditionEncoder
+    from dew.interop.composite import SourceKind
     from dew.nn.mixers import MixerBase
     from dew.nn.vision import ProjectorBase, TowerBase
     from dew.objectives.base import Metric, Objective
@@ -1252,6 +1253,11 @@ def _part_type(member: type, field: str, value: Configured) -> type | None:
 
 
 # Each kind's aliases, for the command line and the records a person writes.
+source_kinds: Aliases[type[SourceKind], SourceKind] = Aliases("source", {
+    "decision": "dew.decision.sources:DecisionSource",
+}, base="dew.interop.composite:SourceKind")
+
+
 models: Aliases[type[nn.Module], nn.Module] = Aliases("model", {
     "causal_transformer": "dew.nn.backbones.causal_transformer:CausalTransformer",
     "diffusion_gemma": "dew.nn.diffusion_gemma:DiffusionGemma",

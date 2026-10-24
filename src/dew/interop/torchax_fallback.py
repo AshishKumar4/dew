@@ -678,7 +678,7 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     graph = TorchGraph(jittable, persistent)
     module = (TorchCausalLM(graph, vocab, dtype=resolve_dtype(dtype)) if head_name is None
               else TorchTableLM(graph, vocab, dtype=resolve_dtype(dtype), head=head_name))
-    source = str(name_or_dir) if revision is None else f"{name_or_dir}@{revision}"
+    source = sources.SourceReference(str(name_or_dir), revision)
     processor = source_processor(directory, config, config, module, source=source)
     versions = {name: importlib.metadata.version(name) for name in ("transformers", "torchax", "torch")}
     why = ("fallback='torchax'" if admission is None else

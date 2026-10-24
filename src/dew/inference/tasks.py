@@ -32,6 +32,7 @@ from dew.coordination import agreed
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_causal
 from dew.inference.projections import packed_owned
+from dew.interop.sources import SourceReference
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key
 from dew.nn.protocols import Bounded, CacheCapacity, TokenModel
@@ -325,7 +326,7 @@ class TaskSettings:
     seq_len: int
     max_new_tokens: int
     tokenizer: str | None
-    processor: str | None
+    processor: SourceReference | None
 
     def __post_init__(self) -> None:
         if type(self.max_new_tokens) is not int or self.max_new_tokens < 0:
@@ -391,7 +392,7 @@ def recorded_tokenizer(processor: Processor | None) -> str | None:
     return None
 
 
-def recorded_processor(processor: Processor | None) -> str | None:
+def recorded_processor(processor: Processor | None) -> SourceReference | None:
     """The source a run's record keeps for a checkpoint's own processor
     (`dew.interop.processors.Processor.source`), which `_saved_processor`
     reloads from its files; any other processor records none here."""
