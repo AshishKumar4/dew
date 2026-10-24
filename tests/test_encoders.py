@@ -12,6 +12,23 @@ import pytest
 from dew.inputs import Condition, Field, InputSpec
 from dew.nn.dit import ConditioningEmbed, TextContext, masked_mean
 
+
+def test_text_pooling_excludes_nonfinite_padding_from_values_and_gradients():
+    """Changing excluded text to NaN or infinity changes neither its pooled conditioning nor its
+    gradient, including an entirely padded row."""
+    values = jnp.arange(24, dtype=jnp.float32).reshape(2, 4, 3) / 8
+    weights = jnp.asarray([[0.5, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]])
+
+    def loss(x):
+        return jnp.sum(masked_mean(x, weights))
+
+    clean = jax.value_and_grad(loss)(values)
+    for filler in (jnp.nan, jnp.inf, -jnp.inf):
+        poisoned = jnp.where(weights[:, :, None] != 0, values, filler)
+        actual = jax.value_and_grad(loss)(poisoned)
+        for observed, expected in zip(actual, clean, strict=True):
+            np.testing.assert_array_equal(observed, expected)
+
 ############################################################################################################
 # Text pooling reads the mask (T23)
 ############################################################################################################
