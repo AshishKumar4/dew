@@ -821,19 +821,22 @@ def _transposed(cotangent, operands, numbers, side: int, product) -> jax.Array:
 
 def bf16_einsum(subscripts: str, lhs: jax.Array, rhs: jax.Array) -> jax.Array:
     """`jnp.einsum(subscripts, lhs, rhs)` as `bf16_dot_general` multiplies, of two operands each of
-    whose indices is in the result or in the other operand."""
-    numbers, order = _dot_numbers(subscripts, lhs.ndim, rhs.ndim)
+    whose indices is in the result or in the other operand. An index the two share at sizes 1 and n
+    broadcasts to n, as einsum's does."""
+    numbers, order, shapes = _dot_numbers(subscripts, lhs.shape, rhs.shape)
+    lhs, rhs = (jnp.broadcast_to(operand, shape) for operand, shape in zip((lhs, rhs), shapes, strict=True))
     return jnp.transpose(bf16_dot_general(lhs, rhs, numbers), order)
 
 
-def _dot_numbers(subscripts: str, lhs_rank: int, rhs_rank: int):
-    """An einsum's `subscripts` over two operands of these ranks as `jax.lax.dot_general`'s dimension
-    numbers, and the permutation that takes the dot's result (batch, left free, right free) to the
-    einsum's. An ellipsis spans each operand's remaining axes, aligned from the right."""
+def _dot_numbers(subscripts: str, lhs_shape: tuple[int, ...], rhs_shape: tuple[int, ...]):
+    """An einsum's `subscripts` over two operands of these shapes as `jax.lax.dot_general`'s dimension
+    numbers, the permutation that takes the dot's result (batch, left free, right free) to the
+    einsum's, and each operand's shape with every index the two share broadcast from 1 to the other's
+    size. An ellipsis spans each operand's remaining axes, aligned from the right."""
     given, produced = subscripts.replace(" ", "").split("->")
     left_spec, right_spec = given.split(",")
-    extents = [rank - len(spec.replace("...", "")) for spec, rank in ((left_spec, lhs_rank),
-                                                                       (right_spec, rhs_rank))]
+    extents = [len(shape) - len(spec.replace("...", "")) for spec, shape in ((left_spec, lhs_shape),
+                                                                              (right_spec, rhs_shape))]
 
     def labels(spec: str, extent: int) -> list[str]:
         if "..." not in spec:
@@ -850,11 +853,16 @@ def _dot_numbers(subscripts: str, lhs_rank: int, rhs_rank: int):
     if len(set(left)) < len(left) or len(set(right)) < len(right) or sorted(formed) != sorted(out):
         raise ValueError(f"{subscripts!r} is not a product of two operands each of whose indices is in "
                          f"the result or in the other operand")
+    sizes: dict[str, int] = {}
+    for label, size in (*zip(left, lhs_shape, strict=True), *zip(right, rhs_shape, strict=True)):
+        sizes[label] = max(size, sizes.get(label, 1))
+
     def axes(labels: list[str], named: list[str]) -> tuple[int, ...]:
         return tuple(labels.index(label) for label in named)
 
     numbers = ((axes(left, contracted), axes(right, contracted)), (axes(left, batch), axes(right, batch)))
-    return numbers, tuple(formed.index(label) for label in out)
+    shapes = tuple(tuple(sizes[label] for label in labels) for labels in (left, right))
+    return numbers, tuple(formed.index(label) for label in out), shapes
 
 
 def at_default_precision[Output](fn: Callable[..., Output]) -> Callable[..., Output]:
