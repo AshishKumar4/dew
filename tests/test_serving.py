@@ -75,7 +75,8 @@ def test_a_meshless_server_draws_on_the_selected_default_device():
         assert result.done()
         draw = result.result()
         assert int(draw.lengths[0]) > 0
-        assert all(leaf.devices() == {device} for leaf in jax.tree.leaves(draw))
+        assert all(leaf.devices() == {device} for leaf in jax.tree.leaves(server.variables))
+        assert all(leaf.devices() == {device} for leaf in jax.tree.leaves(server.cache))
 
 
 def test_prepacked_queries_keys_and_values_preserve_attention_and_cache():
