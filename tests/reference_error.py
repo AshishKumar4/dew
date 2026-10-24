@@ -970,8 +970,8 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     widened to float64, or `truth_fn` on them where the reference fixes a precision of its own (an
     output dtype it closes over). A draw may be an orbit's: the same values under an exact symmetry
     the seed picks. `seeds` is the site's declared count, sized by `seeds_for` so the reference
-    compared with itself resolves PARITY; jit the two functions so every seed reuses one compiled
-    program.
+    compared with itself resolves PARITY, or, where the arms share their upstream rounding, so Dew
+    paired with the reference does; jit the two functions so every seed reuses one compiled program.
 
     Where a computation has an orbit of summation orders, `orders(inputs)` lists a draw's inputs at K
     of them, the draw itself first: an exact symmetry of the result (a batch's rows in another order
