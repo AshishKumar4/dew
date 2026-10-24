@@ -549,7 +549,8 @@ def test_the_blocks_attach_to_a_decoder_whose_own_feed_forward_they_do_not_run()
 def test_a_wider_context_enters_in_the_decoders_context_dtype():
     """With x64 on, a float64 context enters a float32 decoder as float32 (`context_dtype`), as a
     server holds it: no product of the call, the cross-attention's key and value maps included, takes
-    a float64 operand, and the cached keys and values are float32."""
+    a float64 operand as an accelerator runs it (a CPU's own float64 sums of float32 products are
+    `dew.nn.precision.accumulated`'s), and the cached keys and values are float32."""
     from reference_error import equations
 
     variables, ids, context, lengths = model_draw(MODEL)(5)
@@ -557,8 +558,8 @@ def test_a_wider_context_enters_in_the_decoders_context_dtype():
         conditioning = {CONTEXT: np.asarray(context, np.float64), CONTEXT_LENGTHS: lengths}
         traced = jax.make_jaxpr(lambda variables: MODEL.apply(variables, ids, conditioning=conditioning))(
             variables)
-        wide = [equation for equation in equations(traced) if equation.primitive.name == "dot_general"
-                and any(variable.aval.dtype == np.float64 for variable in equation.invars)]
+        wide = [equation for equation in equations(traced, platform="cuda") if equation.primitive.name ==
+                "dot_general" and any(variable.aval.dtype == np.float64 for variable in equation.invars)]
         assert not wide
         _, made = MODEL.apply(variables, B, method=CausalTransformer.init_cache, mutable=["cache"])
         _, held = MODEL.apply({**variables, **made}, ids[:, :PROMPT], decode=True, mutable=["cache"],
