@@ -109,7 +109,7 @@ class SlotSource(SourceKind):
         mode = names.get(records.text(head["name"], "head.name"))
         if mode is None or fields.get("untied", False):
             raise ValueError("the slot format holds its tied label readout or its slot-and-pointer head")
-        settings = DecideSettings.of(records.record(bundle.settings, "decision settings"))
+        settings = from_record(DecideSettings, bundle.settings)
         if not isinstance(settings.layout, QuestionLayout) or settings.layout.labels is None:
             raise ValueError("the slot format needs its whole-question layout")
         labels = settings.layout.labels
