@@ -127,8 +127,8 @@ def test_the_fit_ladder_tiles_the_head_fused_then_unfused_before_it_recomputes_m
         rungs.append(rung_record(climbing, xla_defaults=False))
     tile = list(chunked_tile())
     assert [(rung["head_tile"], rung["head_fused"], rung["remat"]) for rung in rungs] == [
-        (None, False, None), (tile, True, None), (tile, False, None), (None, False, "minimal"),
-        (tile, True, "minimal")]
+        (None, False, None), (tile, True, None), (tile, False, None),
+        (None, False, "minimal_with_context_and_conv"), (tile, True, "minimal_with_context_and_conv")]
     resumed = objective()
     climb_to(resumed, rungs[2])
     assert rung_record(resumed, xla_defaults=False) == rungs[2]
@@ -381,7 +381,8 @@ def test_a_resumed_run_reads_its_batches_in_the_microbatches_its_checkpoint_trai
         windowed(tmp_path / "split", 4).fit(windows(corpus), steps=6, checkpoint_every=2)
 
 
-@pytest.mark.parametrize("seconds, split, remat", [([0.2, 0.1], 1, "minimal"), ([0.1, 0.2], 2, None)])
+@pytest.mark.parametrize("seconds, split, remat", [([0.2, 0.1], 1, "minimal_with_context_and_conv"),
+                                                   ([0.1, 0.2], 2, None)])
 def test_a_split_plan_is_timed_against_its_batch_whole_a_rung_up_and_the_faster_kept(
         monkeypatch, seconds, split, remat):
     """Where the devices hold a byte less than the batch whole needs at the
@@ -397,7 +398,7 @@ def test_a_split_plan_is_timed_against_its_batch_whole_a_rung_up_and_the_faster_
     assert (trainer.plan["split"], trainer.plan["remat"]) == (split, remat)
     assert trainer.objective.model.remat == (None if remat is None else REMAT_POLICIES[remat])
     assert [(plan["split"], plan["remat"], plan["seconds"]) for plan in trainer.plan["timed"]] == [
-        (2, None, seconds[0]), (1, "minimal", seconds[1])]
+        (2, None, seconds[0]), (1, "minimal_with_context_and_conv", seconds[1])]
     state, loss, *_ = step(state, BATCH)
     assert np.isfinite(float(loss))
 
@@ -415,7 +416,7 @@ def test_a_plan_with_no_second_point_to_fit_is_not_timed(monkeypatch, split):
     assert trainer.objective.model.remat is None
     last = trainer.plan["probes"][-1]
     assert (last["split"], last["remat"], last["fits"]) == ((1, None, True) if trainer.plan["split"] == 1
-                                                            else (1, "minimal", False))
+                                                            else (1, "minimal_with_context_and_conv", False))
 
 
 def asked(trainer) -> list[tuple[int, str | None, bool]]:
@@ -488,7 +489,7 @@ def test_a_decoder_without_a_half_rung_asks_its_splits_at_no_recomputation(monke
     trainer = lm()
     state, _, _ = trainer.place()
     trainer.compile(state, BATCH, lambda steps: pytest.fail("a single plan was timed"))
-    assert_searched(asked(trainer), (4, None), 2, (1, "minimal"))
+    assert_searched(asked(trainer), (4, None), 2, (1, "minimal_with_context_and_conv"))
     assert all(remat is None for _, remat, _ in asked(trainer)[:-1])
 
 
