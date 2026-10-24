@@ -29,8 +29,10 @@ DELTA = ('qwen3.5-27b-gdn', 'qwen3-next-gdn', 'kimi-linear-kda')
 """The delta-rule shapes the template's forward takes: a decay a head (Qwen3.5-27B's and Qwen3-Next's
 gated delta nets) and a key dimension's (Kimi Linear's)."""
 
-ROUTES = {'mosaic': {'mainloop': 'mosaic'}, 'port': {}, 'xla': {'ported': False}}
-"""Each arm's route through the chunked op; the port's under `generation.chosen(gated_delta_rule='fla')`."""
+ROUTES = {'mosaic': {'mainloop': 'mosaic'}, 'port': {}, 'hybrid': {}, 'xla': {'ported': False}}
+"""Each arm's route through the chunked op; the port's under `generation.chosen(gated_delta_rule='fla')`,
+the hybrid's (the port's forward, the template's fast backward) under `gated_delta_rule_backward='mosaic'`
+too."""
 
 
 def measured(compiled, args, warmup: int, repeats: int) -> tuple[float, list]:
@@ -77,8 +79,9 @@ def row(name: str, arm: str, dtype, warmup: int, repeats: int, training: bool = 
              'dtype': jnp.dtype(dtype).name, 'device': jax.devices()[0].device_kind}
     try:
         start = time.perf_counter()
-        if arm == 'port':
-            with generation.chosen(gated_delta_rule='fla'):
+        if arm in ('port', 'hybrid'):
+            backward = {'gated_delta_rule_backward': 'mosaic' if arm == 'hybrid' else 'fla'}
+            with generation.chosen(gated_delta_rule='fla', **backward):
                 compiled = jax.jit(timed).lower(*args).compile()
         else:
             compiled = jax.jit(timed).lower(*args).compile()

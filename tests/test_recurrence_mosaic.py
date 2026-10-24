@@ -22,7 +22,7 @@ import pytest
 from reference_error import assert_as_exact, with_gradients
 from test_recurrence_chunk import FORMED, HOOKS, SEEDS as HOOK_SEEDS, draw as hooked_draw, token_by_token
 
-from dew.nn.kernels import recurrence
+from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.kernels.templates.recurrence import mainloop
 
@@ -154,6 +154,31 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype):
     reference = truth if dtype == jnp.float32 else compiled(ported=True)
     assert_as_exact(compiled(mainloop='mosaic'), reference, functools.partial(drawn, dtype, **geometry(case)),
                     f'the mosaic gradient, {case} in {jnp.dtype(dtype).name}', seeds=SEEDS, truth_fn=truth)
+
+
+def chosen(fn, **kernels):
+    """`fn` called with `kernels` chosen (`generation.chosen`), which a jitted function's trace keys on."""
+    def run(*args):
+        with generation.chosen(**kernels):
+            return fn(*args)
+
+    return run
+
+
+@ON_ITS_FAMILY
+@pytest.mark.parametrize('case', GRADIENT_CASES)
+def test_the_ports_forward_takes_the_mosaic_backward_as_exact_as_its_own(case):
+    """The port's rule (`recurrence_chunk.fla_rule`) with the template's fast backward
+    (`gated_delta_rule_backward='mosaic'`, `_mosaic_backward_rule`) in a 16-bit call: its gradient on par
+    from float64 with the port's own backward's over the case's draws (check 1), the route a target's row
+    takes it by."""
+    hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5)
+    trained = jax.jit(with_gradients(restarted(functools.partial(chunk, hooks, ported=True), case)))
+    truth = jax.jit(with_gradients(restarted(functools.partial(token_by_token, hooks), case)))
+    assert_as_exact(chosen(trained, gated_delta_rule='fla', gated_delta_rule_backward='mosaic'),
+                    chosen(trained, gated_delta_rule='fla', gated_delta_rule_backward='fla'),
+                    functools.partial(drawn, jnp.bfloat16, **geometry(case)),
+                    f"the port's forward with the mosaic backward, {case}", seeds=SEEDS, truth_fn=truth)
 
 
 TAKEN = HOOKS + FORMED
