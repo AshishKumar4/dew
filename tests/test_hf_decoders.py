@@ -270,6 +270,10 @@ def test_a_float32_decoder_multiplies_float32_products_on_a_gpu():
 STALE_FIELD_SEEDS = {"qwen2-tiny": 8, "mamba2-tiny": 8, "nemotron-h-tiny": 8, "qwen35-tiny": 8,
                      "granitemoe-tiny": 8, "modernbert-tiny": 8}
 """Check 1's declared seeds for each stale-field checkpoint, sized by `seeds_for` (on armada)."""
+STALE_FIELD_ROWS = (8, 32)
+"""A stale-field draw's rows of ids: at the fixtures' own 2 rows of 12, Qwen 3.5's float32 error
+from float64 is heavy-tailed enough across draws that the reference compared with itself resolves
+no factor within 512 seeds."""
 
 
 @pytest.mark.parametrize(("name", "stale"), [
@@ -302,15 +306,16 @@ def test_a_field_the_reference_does_not_read_leaves_its_logits_whatever_it_holds
     loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     forward = jax.jit(lambda ids: loaded.model.apply(loaded.variables, ids))
     architecture = getattr(transformers, config["architectures"][0])
+    # The experts' loop, whose float64 run the grouped product (`torch._grouped_mm`) does not take.
+    eager = {"attn_implementation": "eager", "experts_implementation": "eager"}
     with float64():
-        wide = architecture.from_pretrained(directory, dtype=torch.float64, attn_implementation="eager")
-    references = {torch.float32: architecture.from_pretrained(directory, attn_implementation="eager").eval(),
+        wide = architecture.from_pretrained(directory, dtype=torch.float64, **eager)
+    references = {torch.float32: architecture.from_pretrained(directory, **eager).eval(),
                   torch.float64: wide.eval()}
-    shape = np.load(FIXTURES / name / "input_ids.npy").shape
 
     def draw(seed):
         rng = np.random.default_rng([0x57, seed])
-        return (rng.integers(0, config["vocab_size"], shape).astype(np.int32),)
+        return (rng.integers(0, config["vocab_size"], STALE_FIELD_ROWS).astype(np.int32),)
 
     def theirs(dtype):
         def logits(ids):
