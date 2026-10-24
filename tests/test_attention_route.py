@@ -86,16 +86,17 @@ def keywords(case: dict) -> dict:
     return keywords
 
 
-def drawing(queries: int, keys: int, dtype, *, sinks: bool, heads: int = HEADS, kv_heads: int = KV_HEADS):
-    """A draw `(query, key, value, sinks, dout)` in `dtype`: queries and the output's cotangent `[2, queries,
-    heads, 32]`, keys and values `[2, keys, kv_heads, 32]`, and sinks `[heads]` where `sinks`."""
+def drawing(queries: int, keys: int, dtype, *, sinks: bool, heads: int = HEADS, kv_heads: int = KV_HEADS,
+            rows: int = ROWS):
+    """A draw `(query, key, value, sinks, dout)` in `dtype`: queries and the output's cotangent `[rows,
+    queries, heads, 32]`, keys and values `[rows, keys, kv_heads, 32]`, and sinks `[heads]` where `sinks`."""
 
     def draw(seed: int):
         q_key, k_key, v_key, d_key, s_key = jax.random.split(jax.random.key(seed), 5)
-        query = jax.random.normal(q_key, (ROWS, queries, heads, WIDTH), dtype)
-        key = jax.random.normal(k_key, (ROWS, keys, kv_heads, WIDTH), dtype)
-        value = jax.random.normal(v_key, (ROWS, keys, kv_heads, WIDTH), dtype)
-        dout = jax.random.normal(d_key, (ROWS, queries, heads, WIDTH), dtype)
+        query = jax.random.normal(q_key, (rows, queries, heads, WIDTH), dtype)
+        key = jax.random.normal(k_key, (rows, keys, kv_heads, WIDTH), dtype)
+        value = jax.random.normal(v_key, (rows, keys, kv_heads, WIDTH), dtype)
+        dout = jax.random.normal(d_key, (rows, queries, heads, WIDTH), dtype)
         logits = jax.random.normal(s_key, (heads,), dtype) if sinks else None
         return query, key, value, logits, dout
 
@@ -160,6 +161,10 @@ PARTLY_SPLIT_KEY_HEADS = {
 eight, which the tensor axis splits only in part of the query heads' eight ways."""
 KEY_HEADS_LEADING_THE_OTHER_WAY = (*QUERY_HEADS_EIGHT_WAYS, ("activation_kv", ("expert", "tensor")),
                                    *DEFAULT_RULES)
+HEADS_BEFORE_ROWS = (*QUERY_HEADS_EIGHT_WAYS, ("activation_kv", ("tensor", "expert")),
+                     ("activation_batch", "expert"), *DEFAULT_RULES)
+"""Rules under which the heads take the expert axis before the rows can: a query, its keys and its values
+keep every row on each shard, where a `[B, S]` argument alone would split its rows over the expert axis."""
 """Rules that split eight key heads over the expert and tensor axes, in the other order from the query
 heads."""
 
@@ -264,6 +269,33 @@ def test_key_heads_the_query_heads_do_not_lead_are_gathered_on_a_tensor_and_expe
     per_shard_contract(case, mesh, specs, heads=WIDE_HEADS, kv_heads=8,
                        rules=KEY_HEADS_LEADING_THE_OTHER_WAY, moves=("all-gather",),
                        label="template split eight ways, key heads the other way", shards=WIDE_SHARDS)
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_calls_row_arguments_split_as_its_query_rows_do_where_the_heads_contend_for_the_axis():
+    """Eight query and key heads split eight ways over a tensor axis of two and an expert axis of four,
+    which the heads take before the rows can (`HEADS_BEFORE_ROWS`), so every shard holds all four rows.
+    A causal call with block groups and no sinks or documents: its groups, `[B, S]`, split as the query's
+    rows do, not as their own name alone would (over the expert axis), so each shard reads every row's
+    groups. Its output is on par with one device's (check 1, from float64 on the reference path), and no
+    operand moves between devices."""
+    mesh = Mesh(np.asarray(jax.devices()[:8]).reshape(2, 4), ("tensor", "expert"))
+    heads = PartitionSpec(None, None, ("tensor", "expert"))
+    case = {"causal": True, "block_groups": True}
+    queries, keys = geometry(case)
+    blocks, images = (jnp.asarray(np.tile(groups, (2, 1))) for groups in block_groups(keys))
+
+    def call(implementation: str):
+        def run(query, key, value):
+            return scaled_dot_product_attention(query, key, value, implementation=implementation, causal=True,
+                                                block_groups=blocks, image_groups=images)
+        return run
+
+    draw = drawing(queries, keys, jnp.float32, sinks=False, heads=8, kv_heads=8, rows=4)
+    with nn.logical_axis_rules(HEADS_BEFORE_ROWS):
+        assert_runs_per_shard(call("template"), lambda seed: draw(seed)[:3], [heads] * 3, mesh,
+                              "template rows under contending heads", seeds=MESH_SEEDS,
+                              truth_fn=call("reference"))
 
 
 @pytest.mark.parametrize("name", ["causal-window", "block-causal-documents-window"])

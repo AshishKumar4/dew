@@ -549,6 +549,29 @@ def test_a_window_counts_the_places_it_is_given(valid, ids, causal):
             assert np.asarray(template.dense(spans))[0, 3, 0]
 
 
+def test_a_window_holding_no_key_keeps_its_lower_bound_against_an_image():
+    """A cache call's query at place 100 under a causal window of two over keys at places 0 and 1: its
+    window holds no key, so neither is seen, though its own key (its document's last, aligned) begins an
+    image, which reads only within the window; a whole block reads past it."""
+    ids = CrossDocuments(jnp.asarray([[1]], jnp.int32), jnp.asarray([[1, 1]], jnp.int32))
+    places = (jnp.asarray([[100]], jnp.int32), jnp.asarray([[0, 1]], jnp.int32))
+    groups = jnp.asarray([[-1, 0]], jnp.int32)
+    images = template.spans(1, 2, 1, causal=True, sliding_window=2, positions=places, segment_ids=ids,
+                            image_groups=groups)
+    np.testing.assert_array_equal(np.asarray(template.dense(images)), [[[False, False]]])
+    blocks = template.spans(1, 2, 1, causal=True, sliding_window=2, positions=places, segment_ids=ids,
+                            block_groups=groups)
+    np.testing.assert_array_equal(np.asarray(template.dense(blocks)), [[[False, True]]])
+
+
+def test_a_window_moves_its_bound_in_a_dtype_that_holds_both_places():
+    """Queries' places at the top of int8, keys' in int16 past it: a two-sided window of two around 127
+    keeps the key at 128, its bound moved in the wider dtype rather than held at int8's largest."""
+    places = (jnp.asarray([[127]], jnp.int8), jnp.asarray([[127, 128]], jnp.int16))
+    spans = template.spans(1, 2, 1, sliding_window=2, positions=places)
+    np.testing.assert_array_equal(np.asarray(template.dense(spans)), [[[True, True]]])
+
+
 @pytest.mark.parametrize("window", [2 ** 31, 2 ** 32 - 1, 2 ** 32 + 7], ids=["half", "span", "past"])
 def test_a_window_over_the_widest_places_neither_wraps_nor_aliases(window):
     """Places at both ends of int32, under windows as wide as their whole range and past it, keep the keys
