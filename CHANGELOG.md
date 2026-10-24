@@ -5,11 +5,14 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
-- `dew.nn.attention.scaled_dot_product_attention(..., implementation='template')` runs the attention
-  template's route (`dew.nn.kernels.templates.attention_route.attend`): causality, windows, documents,
-  key lengths and starts, a softcap and sinks, differentiable in the query, key, value and sinks. It runs
-  the Triton and Mosaic GPU mainloops on a GPU and the plain-JAX one elsewhere. No target prefers it yet,
-  so a call takes it only when it names it, or `generation.chosen(attention='template')` does.
+- `dew.nn.attention.scaled_dot_product_attention(..., implementation='template')`
+  runs the attention template's route
+  (`dew.nn.kernels.templates.attention_route.attend`): causality, windows,
+  documents, key lengths and starts, a softcap and sinks, differentiable in the
+  query, key, value and sinks. It runs the Triton and Mosaic GPU mainloops on a
+  GPU and the plain-JAX one elsewhere, per shard on a mesh. No target prefers it
+  yet, so a call takes it only when it names it, or
+  `generation.chosen(attention='template')` does.
 - `dew.nn.moe.expert_projection` with `'pallas'` or `'auto'` runs its grouped
   matmuls through Dew's GEMM template and differentiates at every order:
   forward mode and higher-order derivatives no longer need `'xla'`. The old

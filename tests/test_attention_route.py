@@ -3,15 +3,19 @@
 Its output and its gradients of the query, key, value and sinks are on par with Dew's reference path from
 float64 (check 1), for each call form the route takes. Every case has grouped key heads: four query heads
 over two. The selector refuses the route a mask and a bias by their inherent limits, and no target's
-preference picks it, so only a call that names it runs it.
+preference picks it, so only a call that names it runs it. On a mesh of two rows by four heads, with fewer
+key heads than tensor shards, a named call runs per shard under `sharded.assert_runs_per_shard`.
 """
 
 import functools
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
-from reference_error import assert_as_exact
+from jax.sharding import Mesh, PartitionSpec
+from reference_error import assert_as_exact, with_gradients
+from sharded import assert_runs_per_shard
 
 from dew.nn import attention
 from dew.nn.attention import scaled_dot_product_attention
@@ -27,11 +31,16 @@ QUERIES, KEYS = 100, 96
 as queries (`geometry`)."""
 LENGTHS = jnp.asarray([96, 61], jnp.int32)
 """Each row's keys: the second row ends short of the keys' end."""
+STARTS = jnp.asarray([0, 17], jnp.int32)
+"""Each row's first key: the second row starts past the first key."""
 SOFTCAP = 0.5
 """Gemma 2's logit cap, as the template's own tests set it."""
 SEEDS = 8
 """The reference arithmetic's declared draws (check 1), sized by `seeds_for`."""
 DTYPES = [jnp.float32, jnp.bfloat16]
+MESH_TENSOR, MESH_HEADS = 4, 8
+"""The tensor shards of the per-shard test's mesh, beside its `ROWS` data shards, and its query heads: two on
+each tensor shard, over one or two key heads, which is fewer than the shards."""
 
 CASES = {
     "full-grouped": {},
@@ -63,8 +72,8 @@ def geometry(case: dict) -> tuple[int, int]:
 
 
 def keywords(case: dict) -> dict:
-    """`case`'s keywords of `scaled_dot_product_attention`, its ids and lengths materialized. The sinks are an
-    argument of their own."""
+    """`case`'s keywords of `scaled_dot_product_attention`, its ids, lengths and starts materialized. The
+    sinks are an argument of their own."""
     keywords = {name: case[name] for name in ("causal", "sliding_window", "softcap") if name in case}
     if case.get("segment_ids") == "own":
         keywords["segment_ids"] = own_documents()
@@ -72,20 +81,22 @@ def keywords(case: dict) -> dict:
         keywords["segment_ids"], keywords["key_segment_ids"] = cross_documents()
     if case.get("lengths"):
         keywords["key_value_seq_lengths"] = LENGTHS
+    if case.get("starts"):
+        keywords["key_value_seq_starts"] = STARTS
     return keywords
 
 
-def drawing(queries: int, keys: int, dtype, *, sinks: bool):
-    """A draw `(query, key, value, sinks, dout)` in `dtype`: queries and the output's cotangent
-    `[2, queries, 4, 32]`, keys and values `[2, keys, 2, 32]`, and sinks `[4]` where the case has them."""
+def drawing(queries: int, keys: int, dtype, *, sinks: bool, heads: int = HEADS, kv_heads: int = KV_HEADS):
+    """A draw `(query, key, value, sinks, dout)` in `dtype`: queries and the output's cotangent `[2, queries,
+    heads, 32]`, keys and values `[2, keys, kv_heads, 32]`, and sinks `[heads]` where `sinks`."""
 
     def draw(seed: int):
         q_key, k_key, v_key, d_key, s_key = jax.random.split(jax.random.key(seed), 5)
-        query = jax.random.normal(q_key, (ROWS, queries, HEADS, WIDTH), dtype)
-        key = jax.random.normal(k_key, (ROWS, keys, KV_HEADS, WIDTH), dtype)
-        value = jax.random.normal(v_key, (ROWS, keys, KV_HEADS, WIDTH), dtype)
-        dout = jax.random.normal(d_key, (ROWS, queries, HEADS, WIDTH), dtype)
-        logits = jax.random.normal(s_key, (HEADS,), dtype) if sinks else None
+        query = jax.random.normal(q_key, (ROWS, queries, heads, WIDTH), dtype)
+        key = jax.random.normal(k_key, (ROWS, keys, kv_heads, WIDTH), dtype)
+        value = jax.random.normal(v_key, (ROWS, keys, kv_heads, WIDTH), dtype)
+        dout = jax.random.normal(d_key, (ROWS, queries, heads, WIDTH), dtype)
+        logits = jax.random.normal(s_key, (heads,), dtype) if sinks else None
         return query, key, value, logits, dout
 
     return draw
@@ -115,6 +126,45 @@ def test_a_named_template_route_is_on_par_with_the_reference_path_forward_and_ba
     assert_as_exact(jax.jit(pulled("template", case)), jax.jit(pulled("reference", case)),
                     drawing(queries, keys, dtype, sinks=bool(case.get("sinks"))),
                     f"template route {case} {jnp.dtype(dtype).name}", seeds=SEEDS)
+
+
+MESH_CASES = {
+    "own-documents": {"causal": True, "segment_ids": "own", "softcap": SOFTCAP},
+    "cross-documents": {"causal": True, "segment_ids": "cross"},
+    "lengths-and-starts": {"lengths": True, "starts": True},
+}
+"""The calls the per-shard test takes, each with sinks: its ids, lengths and starts split with their rows."""
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize("key_heads", [1, 2], ids=["one-key-head", "two-key-heads"])
+@pytest.mark.parametrize("case", MESH_CASES.values(), ids=list(MESH_CASES))
+def test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh(case, key_heads):
+    """A named template call on a mesh of two rows by four heads, with one or two key heads, fewer than the
+    four tensor shards, runs per shard (`sharded.assert_runs_per_shard`): its output and its gradients of the
+    query, key, value and sinks are on par with one device's over the site's draws (check 1), measured from
+    float64 on the reference path, and the compiled step moves no operand between devices. Each shard holds
+    the key heads its query heads read, which `_per_shard` repeats until the tensor axis splits them."""
+    queries, keys = geometry(case)
+    mesh = Mesh(np.asarray(jax.devices()[:ROWS * MESH_TENSOR]).reshape(ROWS, MESH_TENSOR),
+                ("data", "tensor"))
+    rows_and_heads = PartitionSpec("data", None, "tensor")
+    # Fewer key heads than tensor shards: no shard splits them, so each holds them whole, split by rows alone.
+    rows = PartitionSpec("data")
+
+    def routed(query, key, value, sinks):
+        return scaled_dot_product_attention(query, key, value, implementation="template", sinks=sinks,
+                                            **keywords(case))
+
+    def reference(query, key, value, sinks):
+        return scaled_dot_product_attention(query, key, value, implementation="reference", sinks=sinks,
+                                            **keywords(case))
+
+    draw = drawing(queries, keys, jnp.float32, sinks=True, heads=MESH_HEADS, kv_heads=key_heads)
+    specs = [rows_and_heads, rows, rows, PartitionSpec("tensor"), rows_and_heads]
+    assert_runs_per_shard(with_gradients(routed), draw, specs, mesh,
+                          f"template split over rows and heads, {key_heads} key heads", seeds=SEEDS,
+                          truth_fn=with_gradients(reference))
 
 
 def test_a_route_call_under_forward_mode_keeps_the_template_value_and_the_reference_derivative():
