@@ -232,6 +232,13 @@ class Processor:
             return self._media_reference(**kwargs)
         return self._media_reference(images=images, **kwargs)
 
+    def image_text(self) -> str:
+        """The text one image stands as in a prompt, as this checkpoint's own chat template writes
+        an image part (`dew.data.chat.image_text`), which `media` expands to the image's tokens."""
+        from dew.data.chat import image_text
+
+        return image_text(self._media_reference, where=self.source or str(self.directory))
+
     def __call__(self, text: str | Sequence[str], *, images: Media | None = None,
                  audio: Media | None = None, videos: Media | None = None,
                  video_metadata: Sequence[Mapping[str, object]] | None = None) -> ModelInputs:
