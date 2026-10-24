@@ -1,0 +1,16 @@
+{
+  "site": "audio",
+  "seeds": 256,
+  "revision": "2e05596d82055892eb0ce2ae607e153d261d3a80",
+  "model_sha256": "bd2e6963d007d5fc5a68b5fd08f610529c968d827664a397e1b93f57376bda5a",
+  "config_sha256": "4956bcf2721048002d02fa555d8b53b57b762a64b027df41d36e8e9f896bbb36",
+  "method": "reference_vs_reference",
+  "start": 256,
+  "most": 256,
+  "packages": {
+    "jax": "0.11.2.post16",
+    "torch": "2.14.1+cpu",
+    "transformers": "5.17.0",
+    "numpy": "2.5.4"
+  }
+}

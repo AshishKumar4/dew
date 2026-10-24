@@ -1,6 +1,7 @@
 """The encoder-free wrapper, its processor layout and its ordinary-forward mask policy."""
 
 import copy
+import json
 import shutil
 from pathlib import Path
 
@@ -20,6 +21,11 @@ from tools.multimodal_reference import _row_slices, unified_draw
 from tools.torch_precision import default_dtype
 
 FIXTURE = Path(__file__).parent / "fixtures" / "hf" / "gemma4-unified-native-tiny"
+
+
+def seed_count(site):
+    """The count measured by tools/qualify_gemma4_unified.py for this exact reference workload."""
+    return json.loads((FIXTURE / "qualification" / f"{site}.json").read_text())["seeds"]
 
 
 def source_pair(directory, dtype="float32"):
@@ -71,26 +77,26 @@ def forward_functions(source):
     return ours, lambda inputs: theirs(reference, inputs), oracle
 
 
-def assert_forward(source, draw, label):
+def assert_forward(source, draw, label, site):
     ours, reference, truth = forward_functions(source)
     assert_as_exact(ours, reference, lambda seed: (draw(seed),),
-                    label, seeds=8, truth_fn=truth)
+                    label, seeds=seed_count(site), truth_fn=truth)
 
 
 def test_unified_processor_and_native_forward_follow_the_published_forward(source):
     assert_forward(source, lambda seed: unified_draw(source[1].config, seed),
-                    "Gemma4 Unified source forward")
+                    "Gemma4 Unified source forward", "forward")
 
 
 def test_vision_blocks_longer_than_the_window_keep_their_whole_block(source):
     assert_forward(source, lambda seed: unified_draw(source[1].config, seed, side=4),
-                    "Gemma4 Unified long vision block")
+                    "Gemma4 Unified long vision block", "long")
 
 
 def test_a_bfloat16_unified_source_uses_the_same_media_and_decoder_policy():
     source = source_pair(FIXTURE, "bfloat16")
     assert_forward(source, lambda seed: unified_draw(source[1].config, seed),
-                    "Gemma4 Unified bfloat16 source forward")
+                    "Gemma4 Unified bfloat16 source forward", "bfloat16")
 
 
 def gradient_functions(source):
@@ -193,7 +199,8 @@ def gradient_functions(source):
 
 def test_unified_backward_reaches_all_source_parameters_and_media_inputs(source):
     ours, reference, truth, draw = gradient_functions(source)
-    assert_as_exact(ours, reference, draw, "Gemma4 Unified complete backward", seeds=8, truth_fn=truth)
+    assert_as_exact(ours, reference, draw, "Gemma4 Unified complete backward",
+                    seeds=seed_count("backward"), truth_fn=truth)
 
 
 def test_raw_media_train_and_reload_through_the_public_source(source, tmp_path):
@@ -288,7 +295,7 @@ def cached_functions(source):
 def test_cached_unified_calls_keep_the_ordinary_forward_mask(source):
     ours, reference, truth, draw = cached_functions(source)
     assert_as_exact(ours, reference, draw,
-                    "Gemma4 Unified cached ordinary forward", seeds=8, truth_fn=truth)
+                    "Gemma4 Unified cached ordinary forward", seeds=seed_count("cached"), truth_fn=truth)
 
 
 def optional_source(source, directory, media):
@@ -329,7 +336,7 @@ def optional_source(source, directory, media):
 @pytest.mark.parametrize("media", ["text", "vision", "audio"])
 def test_a_unified_source_can_omit_either_media_component(source, tmp_path, media):
     pair, draw = optional_source(source, tmp_path, media)
-    assert_forward(pair, draw, f"Gemma4 Unified {media} source")
+    assert_forward(pair, draw, f"Gemma4 Unified {media} source", media)
 
 
 def equal_geometry_source(source, directory):
@@ -353,4 +360,4 @@ def equal_geometry_source(source, directory):
 def test_equal_attention_geometries_still_use_the_full_layer_vision_mask(source, tmp_path):
     pair, draw = equal_geometry_source(source, tmp_path)
     assert_forward(pair, draw,
-                    "Gemma4 Unified equal attention geometries")
+                    "Gemma4 Unified equal attention geometries", "equal")

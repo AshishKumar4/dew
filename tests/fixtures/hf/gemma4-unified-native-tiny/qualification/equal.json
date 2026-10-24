@@ -1,0 +1,16 @@
+{
+  "site": "equal",
+  "seeds": 64,
+  "revision": "2e05596d82055892eb0ce2ae607e153d261d3a80",
+  "model_sha256": "3f2d0efc51e212a22cdc9be167a7e0b517437a7eaa6e82359903ca1ce323a55a",
+  "config_sha256": "f935277a1d0be5ea5b74f46b28599b4718aa306e6208c585b7c1e92d36c676e9",
+  "method": "reference_vs_reference",
+  "start": 64,
+  "most": 64,
+  "packages": {
+    "jax": "0.11.2.post16",
+    "torch": "2.14.1+cpu",
+    "transformers": "5.17.0",
+    "numpy": "2.5.4"
+  }
+}
