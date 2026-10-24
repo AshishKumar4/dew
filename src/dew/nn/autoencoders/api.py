@@ -132,7 +132,7 @@ class AutoEncoder(ABC):
     def record_arguments(self) -> dict:
         """The subclass's constructor arguments besides `model` and `params`, as it was given them (a
         built-in's compute dtype and latent normalization), which its record rebuilds it with
-        (`to_json`). A subclass a run records states them."""
+        (`dew.registry.to_record`). A subclass a run records states them."""
         raise TypeError(f"{type(self).__name__} states no constructor arguments for its record "
                         f"(`AutoEncoder.record_arguments`)")
 
@@ -164,10 +164,15 @@ class AutoEncoder(ABC):
         """Rebuild the autoencoder a run recorded (`dew.registry.to_record`), around the checkpoint's own
         `params`, reading no source: its class found as every component's is (`dew.registry.component`),
         of Dew's or of a package the run trusts, and its fields read against its constructor."""
-        from dew.registry import component, read_arguments
+        from dew._records import record as fields_of
+        from dew.registry import component, from_record, read_arguments
 
         autoencoder, fields = component(AutoEncoder, record)
-        return _built(autoencoder, read_arguments(autoencoder, fields), params)
+        # The module's record names its class, which an inherited constructor's `model: M` cannot.
+        model = from_record(nn.Module, fields_of(fields.get('model'), 'model'))
+        arguments = read_arguments(autoencoder, {name: value for name, value in fields.items()
+                                                 if name != 'model'})
+        return _built(autoencoder, {**arguments, 'model': model}, params)
 
     @abstractmethod
     def encode_batch(self, params, x: jnp.ndarray, key: jax.Array | None = None,
