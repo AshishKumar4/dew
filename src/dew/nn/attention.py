@@ -1143,18 +1143,29 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
                        lengths, starts):
     """The attention template's route (`attention_route.attend`) over the call's visibility as spans: its
     causality, window, documents (`segment_ids`, or `CrossDocuments` aligned to their last keys), key lengths
-    and starts. A softcap is a score hook and sinks are the softmax's initial state. Its requirements
+    and starts. A softcap is a score hook and sinks are the softmax's initial state. On a mesh it runs per
+    shard (`_per_shard`), as the decode kernel does: the key heads repeat until the tensor axes split them,
+    the sinks split with their heads, and the ids, lengths and starts with their rows. Its requirements
     (`attention_kernels.TEMPLATE_SUPPORTS`) keep it off a sharded sequence axis.
     """
-    batch, queries, keys = query.shape[0], query.shape[1], key.shape[1]
     if sinks is not None and sinks.shape != (query.shape[2],):
         raise ValueError(f"sinks must have one logit per query head, got {sinks.shape}")
-    spans = template.spans(queries, keys, batch, causal=causal, sliding_window=sliding_window,
-                           segment_ids=segment_ids, lengths=lengths, starts=starts)
-    hooks = template.Hooks(
-        score_mod=None if softcap is None else functools.partial(template.capped, softcap),
-        initial=None if sinks is None else template.sinks(sinks, batch, queries, value.shape[-1]))
-    return attention_route.attend(query, key, value, spans, hooks)
+
+    def local(query, key, value, sinks=None, segment_ids=None, lengths=None, starts=None):
+        batch, queries, keys = query.shape[0], query.shape[1], key.shape[1]
+        spans = template.spans(queries, keys, batch, causal=causal, sliding_window=sliding_window,
+                               segment_ids=segment_ids, lengths=lengths, starts=starts)
+        hooks = template.Hooks(
+            score_mod=None if softcap is None else functools.partial(template.capped, softcap),
+            initial=None if sinks is None else template.sinks(sinks, batch, queries, value.shape[-1]))
+        return attention_route.attend(query, key, value, spans, hooks)
+
+    # The GPU arms are Pallas launches, which have no partitioning rule, so each shard runs them on its own
+    # rows and heads.
+    rows = ("activation_batch",)
+    return _per_shard(local, query, key, value, sinks=(sinks, ("activation_heads",)),
+                      segment_ids=(segment_ids, ("activation_batch", None)), lengths=(lengths, rows),
+                      starts=(starts, rows))
 
 
 VALUE_BLOCK = 256
