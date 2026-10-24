@@ -446,11 +446,13 @@ grows."""
 
 
 def gpu_lane_at(root: Path, monkeypatch, url: str, files: int) -> list[str]:
-    """A GPU lane's machine at `root`: the test cache at `url`, half of one 80 GiB GPU, and `files` test files
-    of `LANE_TEST`. Their names."""
+    """A GPU lane's machine at `root`: the test cache at `url`, half of one 80 GiB GPU, its session growing
+    every job's pool as a GPU node's does (dewops' settings), and `files` test files of `LANE_TEST`. Their
+    names."""
     cached(monkeypatch, url)
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
     monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
     gpu_driver(root, monkeypatch)
     names = [f"tests/test_file_{index}.py" for index in range(files)]
     for name in names:
