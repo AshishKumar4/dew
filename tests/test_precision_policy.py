@@ -303,15 +303,16 @@ BF16_PRODUCTS = [
     ("tv,td->vd", ((3, 5), (3, 8))),
     ("...d,vd->...v", ((2, 3, 8), (6, 8))),
     ((((3, 2), (1, 3)), ((0,), (0,))), ((2, 3, 4, 5), (2, 5, 6, 4))),
+    ("bxd,byd->bxy", ((1, 3, 16), (3, 5, 16))),
 ]
 """Products of the dot family at the BF16_BF16_F32 algorithm: an einsum's subscripts or a
 dot_general's dimension numbers, and the operands' shapes. A decode's one-query product, a one-token
-tile's state gradient, a head's gradient, a broadcast head, and a batched product contracting two axes
-paired out of order."""
+tile's state gradient, a head's gradient, a broadcast head, a batched product contracting two axes
+paired out of order, and a batch of one broadcast against three, as einsum broadcasts it."""
 
 
 @pytest.mark.parametrize("form, shapes", BF16_PRODUCTS,
-                         ids=["decode", "token", "head", "ellipsis", "batched"])
+                         ids=["decode", "token", "head", "ellipsis", "batched", "broadcast"])
 @pytest.mark.parametrize("scope", [None, "F16_F16_F32"])
 def test_the_dot_family_at_the_bf16_algorithm_multiplies_bf16_operands(form, shapes, scope):
     """`float32_einsum` and `float32_dot_general` at XLA's BF16_BF16_F32 algorithm form the products

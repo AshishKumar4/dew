@@ -339,17 +339,20 @@ def test_lm_head_variants_compute_the_same_loss_accuracy_and_gradients(states_dt
 
         return jax.jit(run)
 
+    # Each arm compiled once, so every draw runs its one program.
+    arms = {name: taken(name) for name in ("baseline", "stored", "remat")}
+
     def compared(name):
         def run(states, table):
-            return {key: value for key, value in taken(name)(states, table).items() if key != "accuracy"}
+            return {key: value for key, value in arms[name](states, table).items() if key != "accuracy"}
 
         return run
 
+    exact = eighths(*draw(0))
     for name in ("stored", "remat"):
         assert_as_exact(compared(name), compared("baseline"), draw, f"{states_dtype} {name} lm head",
                         seeds=LM_HEAD_SEEDS)
-        exact = eighths(*draw(0))
-        assert taken(name)(*exact)["accuracy"] == taken("baseline")(*exact)["accuracy"], name
+        assert arms[name](*exact)["accuracy"] == arms["baseline"](*exact)["accuracy"], name
 
 
 # ---------------------------------------------------------------------------
