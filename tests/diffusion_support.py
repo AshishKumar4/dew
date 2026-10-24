@@ -262,16 +262,17 @@ def float32_update(gradient):
     return update
 
 
-def float64_gradient(twin, batch, step):
-    """Check 1's truth of an sgd(1) update over `batch` at `step`'s draws: `twin`'s gradient, the
-    objective over its model in float64, of the variables widened, compiled once as each arm is."""
+def float64_gradient(twin, step):
+    """Check 1's truth of an sgd(1) update at `step`'s draws, `truth(variables, batch)`: `twin`'s
+    gradient, the objective over its model in float64, of the variables and the batch widened,
+    compiled once as each arm is."""
     from reference_error import widened
 
-    wide = jax.jit(lambda variables: objective_gradient(twin, variables, widened(batch), step))
+    wide = jax.jit(lambda variables, batch: objective_gradient(twin, variables, batch, step))
 
-    def truth(variables):
+    def truth(variables, batch):
         with jax.enable_x64(new_val=True):
-            return jax.tree.map(np.asarray, wide(widened(variables)))
+            return jax.tree.map(np.asarray, wide(widened(variables), widened(batch)))
 
     return truth
 
