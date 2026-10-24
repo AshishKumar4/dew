@@ -1,8 +1,11 @@
-"""Attention's probability dropout on the Triton mainloop and on a mesh: the interpreted Triton forward and
-backward are on par with the reference path on the same draw (check 1), and a dropping call on a data and
-head mesh keeps the entries one device's draw keeps, since the draw takes each entry's global batch row and
+"""Attention's probability dropout on the Triton mainloop, and on a mesh: the interpreted Triton forward and
+backward are on par with the reference path on the same draw (check 1), over causality, documents, and
+sinks with a softcap, the draw's four query heads grouped over two key heads; and a dropping call on a data
+and head mesh keeps the entries one device's draw keeps, the draw taking each entry's global batch row and
 query head through `_per_shard`.
 """
+
+import dataclasses
 
 import jax
 import jax.numpy as jnp
@@ -11,42 +14,53 @@ import pytest
 from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from reference_error import assert_as_exact
-from test_attention_dropout import RATE, grads_of, hooked, reference_arm, route_draw
-from test_attention_template import CASES, SEEDS, arguments, geometry
+from test_attention_dropout import RATE, dropout_of, grads_of, keyed_draw, reference_arm
+from test_attention_template import CASES, ROWS, SEEDS, arguments, geometry
+from test_attention_triton import hooks_for
 
 from dew.nn.attention import dropout_draw, dropout_seed, scaled_dot_product_attention
 from dew.nn.kernels.templates import attention as template, attention_triton
 from dew.nn.sharding import DEFAULT_RULES
 
-TRITON_CASES = ("causal-window", "causal-documents-window")
-"""The span forms the interpreted Triton check runs: a window, and documents under a window."""
+FORMS = (
+    ("causal-window", frozenset()),
+    ("causal-documents-window", frozenset()),
+    ("causal-window", frozenset({"softcap", "sinks"})),
+)
+"""The forms the interpreted Triton check drops over: causality under a window, documents under a window,
+and a causal window with sinks and a softcap."""
 
 
-def triton_arm(case: dict):
-    """`case`'s Triton forward and backward, interpreted, dropping from the seed words, as a function of
-    `(query, key, value, words, dout)` returning the output and the query, key and value gradients."""
+def triton_arm(name: str, names: frozenset):
+    """The interpreted Triton forward and backward of `name`'s spans with the score hooks `names`, dropping
+    from the call's key, as `(query, key, value, rng, dout)` to the output and the query, key and value
+    gradients."""
+    case = CASES[name]
     queries, keys = geometry(case)
-    spans = template.spans(queries, keys, 2, **arguments(case))
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
 
-    def run(query, key, value, words, dout):
-        hooks = hooked(words, 2, query.shape[2])
-        out, peak, total, anchors, split = attention_triton.forward(
-            query, key, value, spans, hooks, residuals=True, interpret=True)
-        grads = attention_triton.backward(query, key, value, spans, hooks, dout,
-                                          residuals=(peak, total, anchors, split), interpret=True)
+    def run(query, key, value, rng, dout):
+        base = hooks_for(names, queries, value.shape[-1])
+        hooks = dataclasses.replace(base, drop=dropout_of(dropout_seed(rng), ROWS, query.shape[2]))
+        out = attention_triton.forward(query, key, value, spans, hooks, interpret=True)
+        grads = attention_triton.backward(query, key, value, spans, hooks, dout, interpret=True)
         return out, grads.query, grads.key, grads.value
 
     return run
 
 
-@pytest.mark.parametrize("name", TRITON_CASES)
-def test_the_interpreted_triton_mainloop_drops_on_par_with_the_reference_path(name):
-    """The Triton forward and backward, interpreted, on the same draw as the reference path, both measured
-    from float64 (check 1)."""
+@pytest.mark.parametrize("dtype", attention_triton.DTYPES, ids=lambda dtype: jnp.dtype(dtype).name)
+@pytest.mark.parametrize("form", FORMS, ids=lambda form: "+".join([form[0], *sorted(form[1])]))
+def test_the_interpreted_triton_mainloop_drops_on_par_with_the_reference_path(form, dtype):
+    """The Triton forward and backward, interpreted, on the same draw as the reference path: the output and
+    the query, key and value gradients, both measured from float64 (check 1). The sinks are the call's
+    constants here, as in the Triton on-par tests, so their gradient is not measured by this check."""
+    name, names = form
     case = CASES[name]
     queries, keys = geometry(case)
-    assert_as_exact(triton_arm(case), grads_of(reference_arm(case)),
-                    route_draw(queries, keys, jnp.float32), f"interpreted triton dropping {name}",
+    assert_as_exact(jax.jit(triton_arm(name, names)), jax.jit(grads_of(reference_arm(case, names))),
+                    keyed_draw(queries, keys, dtype),
+                    f"interpreted triton dropping {name} {sorted(names)} {jnp.dtype(dtype).name}",
                     seeds=SEEDS)
 
 

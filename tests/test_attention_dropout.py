@@ -1,9 +1,9 @@
 """Attention's probability dropout: the template's weights hook, on every route, and the selector's Route
 for a dropping call. A dropping call on the template is on par with the reference path on the same draw,
-forward and backward, both measured from float64 (check 1). The draw is one hash of the call's seed and
-each entry's global batch row, query head, query and key, so every mainloop and the reference keep the
-same entries; the overflow witnesses stay finite where the reference does, and the reference's draw is
-unbiased in bf16.
+forward and backward, both measured from float64 (check 1). The draw is one hash of the call's key and each
+entry's global batch row, query head, query and key, so every mainloop and the reference keep the same
+entries; the overflow witnesses stay finite where the reference does, and the reference's draw is unbiased
+in bf16.
 """
 
 import jax
@@ -19,25 +19,32 @@ from test_attention_template import (
     QUERIES,
     ROWS,
     SEEDS,
+    SINKS,
+    SOFTCAP,
     arguments,
     dews_mask,
     drawing as value_drawing,
     geometry,
 )
 
-from dew.nn.attention import dropout_draw, reference_attention, scaled_dot_product_attention
+from dew.nn.attention import dropout_draw, dropout_seed, reference_attention, scaled_dot_product_attention
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import (
-    attention as template,
-    attention_portable,
-    attention_route,
-    attention_triton,
-)
+from dew.nn.kernels.templates import attention as template, attention_portable, attention_route
 
 RATE = 0.25
 """The dropout rate the check-1 tests drop at: a quarter of the weights."""
 
 DROPPED = ("full-grouped", "causal-window", "packed-documents", "sinks-softcap")
+"""The public calls the check-1 tests drop over: grouped heads, a window, packed documents, and sinks with a
+softcap."""
+
+HOOKED = ("causal-window", "causal-documents-window", "cross-causal-lengths-starts")
+"""The span forms the template route's check-1 tests drop over: a window, documents under a window, and
+cross documents with lengths and starts."""
+
+PUBLIC = ("cross-causal-lengths-starts", "cross-causal-window", "cross-window")
+"""The cross-document forms whose dropping calls the public call materializes for the reference path:
+causality or a window aligns each document to its last keys, and the key bounds ride beside them."""
 
 
 def dropping(case: dict, implementation: str):
@@ -72,6 +79,88 @@ def dropping_draw(queries: int, keys: int, dtype, *, sinks: bool):
         return (*base(seed), jax.random.PRNGKey(seed))
 
     return draw
+
+
+def keyed_draw(queries: int, keys: int, dtype):
+    """A draw `(query, key, value, rng, dout)`: the value draw's inputs, a dropout key of its seed and a
+    cotangent."""
+    base = value_drawing(queries, keys, dtype)
+
+    def draw(seed: int):
+        query, key, value = base(seed)
+        dout = jax.random.normal(jax.random.PRNGKey(2000 + seed), query.shape, dtype)
+        return query, key, value, jax.random.PRNGKey(1000 + seed), dout
+
+    return draw
+
+
+def grads_of(call):
+    """`call`'s output and its gradients of the query, key and value, under the cotangent `dout`."""
+    def run(query, key, value, rng, dout):
+        out, pull = jax.vjp(lambda q, k, v: call(q, k, v, rng), query, key, value)
+        return (out, *pull(dout))
+
+    return run
+
+
+def dropout_of(words: jax.Array, batch: int, heads: int, rate: float = RATE) -> template.Dropout:
+    """The dropout hook of the seed `words`, each batch row and query head its own global index."""
+    return template.Dropout(words, jnp.arange(batch, dtype=jnp.int32), jnp.arange(heads, dtype=jnp.int32),
+                            rate)
+
+
+def hooked(words: jax.Array, batch: int, heads: int, rate: float = RATE) -> template.Hooks:
+    """The template's hooks with only the dropout hook of `dropout_of`."""
+    return template.Hooks(drop=dropout_of(words, batch, heads, rate))
+
+
+def route_arm(case: dict):
+    """`case`'s template route over its spans, dropping from the call's key, as `(query, key, value, rng)`."""
+    queries, keys = geometry(case)
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
+
+    def call(query, key, value, rng):
+        return attention_route.attend(query, key, value, spans, hooked(dropout_seed(rng), ROWS,
+                                                                       query.shape[2]))
+
+    return call
+
+
+def reference_arm(case: dict, names: frozenset = frozenset()):
+    """`case`'s reference path over its dense mask `dews_mask(case)`, dropping at `RATE` from the call's
+    key, with the score hooks `names` (`sinks`, `softcap`); a query that sees no key reads zero, as every
+    attention call reads (`attention_kernel`)."""
+    mask = np.asarray(dews_mask(case))
+    live = jnp.asarray(mask.any(axis=-1))[:, :, None, None]
+    sinks = SINKS if "sinks" in names else None
+    softcap = SOFTCAP if "softcap" in names else None
+
+    def call(query, key, value, rng):
+        out = reference_attention(query, key, value, mask=jnp.asarray(mask)[:, None], sinks=sinks,
+                                  softcap=softcap, dropout_rate=RATE, dropout_seed=dropout_seed(rng))
+        return jnp.where(live, out, 0)
+
+    return call
+
+
+def public_keywords(case: dict) -> dict:
+    """`case`'s keywords of `scaled_dot_product_attention` for its documents and key bounds."""
+    spans = arguments(case)
+    return {"causal": spans.get("causal", False), "sliding_window": spans.get("sliding_window"),
+            "segment_ids": spans.get("segment_ids"), "key_value_seq_lengths": spans.get("lengths"),
+            "key_value_seq_starts": spans.get("starts")}
+
+
+def public_arm(case: dict, implementation: str):
+    """`case`'s dropping public call on `implementation`, as `(query, key, value, rng)`."""
+    options = public_keywords(case)
+
+    def call(query, key, value, rng):
+        return scaled_dot_product_attention(query, key, value, implementation=implementation,
+                                            dropout_rate=RATE, dropout_rng=rng, deterministic=False,
+                                            **options)
+
+    return call
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=lambda dtype: jnp.dtype(dtype).name)
@@ -109,85 +198,37 @@ def test_a_dropping_call_reports_its_route_and_a_chosen_template_runs_it():
     assert out.shape == (ROWS, QUERIES, HEADS, WIDTH)
 
 
+def test_a_dropping_call_at_eval_takes_no_dropout():
+    """A call that is not training (`deterministic=True`) takes no dropout whatever its rate, on every
+    route: each route's output is its own undropped output, bit for bit."""
+    keys = jax.random.split(jax.random.PRNGKey(0), 3)
+    query = jax.random.normal(keys[0], (ROWS, QUERIES, HEADS, WIDTH), jnp.bfloat16)
+    key = jax.random.normal(keys[1], (ROWS, KEYS, KV_HEADS, WIDTH), jnp.bfloat16)
+    value = jax.random.normal(keys[2], (ROWS, KEYS, KV_HEADS, WIDTH), jnp.bfloat16)
+    for implementation in ("reference", "template"):
+        plain = scaled_dot_product_attention(query, key, value, implementation=implementation)
+        out = scaled_dot_product_attention(query, key, value, implementation=implementation,
+                                           dropout_rate=RATE, dropout_rng=jax.random.PRNGKey(0),
+                                           deterministic=True)
+        np.testing.assert_array_equal(np.asarray(out), np.asarray(plain))
+
+
 def test_the_reference_draw_keeps_a_bf16_call_unbiased():
-    """Over the draws, each query row's output has mean equal to its weights' sum, 1: a kept weight
-    keeps with probability 0.9 and scales by 1/0.9. The 131072 rows are independent draws over generic
-    weights, so the bf16 rounding of their products averages out (uniform weights round alike). A row's
-    output has standard deviation about 0.03, so the mean has standard error 0.0003, and the bound is 3.5
-    of those. A multiplier rounded to bf16 (1.109375 for 1/0.9) would bias the mean by -0.00156 (ledger
-    1533)."""
-    keys = jax.random.split(jax.random.key(0), 2)
+    """Over the draws, each query row's output has the mean of its undropped output: a kept weight keeps
+    with probability 0.9 and scales by 1/0.9, so the expected output is the weights' sum. The 131072 rows
+    are independent draws over generic weights, so the bf16 rounding of their products averages out
+    (uniform weights round alike). The bound is four standard errors of the mean over the sample's own
+    spread. A multiplier rounded to bf16 (1.109375 for 1/0.9) biases the mean by -0.00156 (ledger 1533)."""
+    keys = jax.random.split(jax.random.PRNGKey(0), 2)
     query = jax.random.normal(keys[0], (1, 131072, 1, 8), jnp.float32).astype(jnp.bfloat16)
     key = jax.random.normal(keys[1], (1, 128, 1, 8), jnp.float32).astype(jnp.bfloat16)
     value = jnp.ones((1, 128, 1, 8), jnp.bfloat16)
-    out = scaled_dot_product_attention(query, key, value, implementation="reference", dropout_rate=0.1,
-                                       dropout_rng=jax.random.PRNGKey(0), deterministic=False)
-    assert abs(float(jnp.mean(out.astype(jnp.float32))) - 1) < 0.001
-
-
-HOOKED = ("causal-window", "causal-documents-window", "cross-causal-lengths-starts")
-"""The span forms the template-level check-1 tests drop over: a window, documents under a window, and
-cross documents with lengths and starts."""
-
-
-def seed_words(seed: int) -> jax.Array:
-    """A call's two dropout words for the draw `seed`, the same on every arm."""
-    return jax.random.bits(jax.random.key(1000 + seed), (2,), jnp.uint32)
-
-
-def hooked(words: jax.Array, batch: int, heads: int, rate: float = RATE) -> template.Hooks:
-    """The template's hooks dropping at `rate` from `words`, each batch row and query head its own global
-    index."""
-    dropout = template.Dropout(words, jnp.arange(batch, dtype=jnp.int32), jnp.arange(heads, dtype=jnp.int32),
-                               rate)
-    return template.Hooks(drop=dropout)
-
-
-def route_arm(case: dict):
-    """The template route over `case`'s spans, dropping from the seed words: `(query, key, value, words)`."""
-    queries, keys = geometry(case)
-    spans = template.spans(queries, keys, ROWS, **arguments(case))
-
-    def call(query, key, value, words):
-        return attention_route.attend(query, key, value, spans, hooked(words, ROWS, query.shape[2]))
-
-    return call
-
-
-def reference_arm(case: dict):
-    """`case`'s reference path over the same keys, dropping from the seed words."""
-    mask = np.asarray(dews_mask(case))
-    live = jnp.asarray(mask.any(axis=-1))[:, :, None, None]
-
-    def call(query, key, value, words):
-        # A query that sees no key reads zero, as `attention_kernel` makes every reference call read.
-        out = reference_attention(query, key, value, mask=jnp.asarray(mask)[:, None], dropout_rate=RATE,
-                                  dropout_seed=words)
-        return jnp.where(live, out, 0)
-
-    return call
-
-
-def grads_of(call):
-    """`call`'s output and its gradients of the query, key and value, under the cotangent `dout`."""
-    def run(query, key, value, words, dout):
-        out, pull = jax.vjp(lambda q, k, v: call(q, k, v, words), query, key, value)
-        return (out, *pull(dout))
-
-    return run
-
-
-def route_draw(queries: int, keys: int, dtype):
-    """A draw `(query, key, value, words, dout)`: the value draw's inputs, the dropout words of its seed
-    and a cotangent."""
-    base = value_drawing(queries, keys, dtype)
-
-    def draw(seed: int):
-        query, key, value = base(seed)
-        dout = jax.random.normal(jax.random.key(2000 + seed), query.shape, dtype)
-        return query, key, value, seed_words(seed), dout
-
-    return draw
+    undropped = scaled_dot_product_attention(query, key, value, implementation="reference")
+    dropped = scaled_dot_product_attention(query, key, value, implementation="reference", dropout_rate=0.1,
+                                           dropout_rng=jax.random.PRNGKey(0), deterministic=False)
+    rows, base = np.asarray(dropped, np.float64)[0, :, 0, 0], np.asarray(undropped, np.float64)[0, :, 0, 0]
+    error = np.sqrt(np.var(rows) / rows.size)
+    assert abs(rows.mean() - base.mean()) < 4 * error
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=lambda dtype: jnp.dtype(dtype).name)
@@ -195,12 +236,26 @@ def route_draw(queries: int, keys: int, dtype):
 def test_the_template_route_drops_on_par_with_the_reference_path(name, dtype):
     """The route's output and its gradients of the query, key and value, dropping over the spans of each
     form, on par with the reference path on the same draw (`reference_attention`'s dropout from the same
-    words), both measured from float64 (check 1)."""
+    key), both measured from float64 (check 1)."""
     case = SPAN_CASES[name]
     queries, keys = geometry(case)
     assert_as_exact(jax.jit(grads_of(route_arm(case))), jax.jit(grads_of(reference_arm(case))),
-                    route_draw(queries, keys, dtype), f"dropped route {name} {jnp.dtype(dtype).name}",
+                    keyed_draw(queries, keys, dtype), f"dropped route {name} {jnp.dtype(dtype).name}",
                     seeds=SEEDS)
+
+
+@pytest.mark.parametrize("implementation", ["reference", "template"])
+@pytest.mark.parametrize("name", PUBLIC)
+def test_a_dropping_call_materializes_its_documents_and_key_bounds_as_the_mask_they_mean(name,
+                                                                                         implementation):
+    """A dropping public call on `implementation`, with cross documents, causality or a window, and key
+    bounds, is on par with the reference path over the dense mask those documents and bounds mean, on the
+    same draw, forward and backward, both measured from float64 (check 1)."""
+    case = SPAN_CASES[name]
+    queries, keys = geometry(case)
+    assert_as_exact(jax.jit(grads_of(public_arm(case, implementation))),
+                    jax.jit(grads_of(reference_arm(case))), keyed_draw(queries, keys, jnp.float32),
+                    f"dropping public {implementation} {name}", seeds=SEEDS)
 
 
 def first_seed(rate: float, keys: int, wanted) -> jax.Array:
@@ -227,6 +282,11 @@ def probe(words: jax.Array, queries: int, keys: int, batch: int, heads: int, *, 
     return out > 0
 
 
+def seed_words(seed: int) -> jax.Array:
+    """A call's two dropout words for the draw `seed`, the same on every arm."""
+    return jax.random.bits(jax.random.PRNGKey(1000 + seed), (2,), jnp.uint32)
+
+
 @pytest.mark.parametrize("block", [(8, 8), (4, 8), (8, 4)], ids=["8x8", "4x8", "8x4"])
 def test_the_portable_mainloop_draws_the_reference_mask_at_every_tiling(block):
     """The portable mainloop's kept entries, at tiles of each shape, are the reference's draw bit for bit
@@ -235,19 +295,6 @@ def test_the_portable_mainloop_draws_the_reference_mask_at_every_tiling(block):
     mask = np.asarray(dropout_draw(words, RATE, (2, 4, 8, 16))) > 0
     np.testing.assert_array_equal(np.asarray(probe(words, 8, 16, 2, 4, block=block)),
                                   mask.transpose(0, 2, 1, 3))
-
-
-def test_the_triton_mainloop_interpreted_draws_the_reference_mask():
-    """The Triton mainloop, interpreted, keeps the entries the reference draws: the same identity probe
-    through its forward kernel, bit for bit."""
-    words = seed_words(3)
-    query = jnp.zeros((2, 8, 4, 8), jnp.float32)
-    key = jnp.zeros((2, 16, 2, 8), jnp.float32)
-    value = jnp.broadcast_to(jnp.eye(16, dtype=jnp.float32)[None, :, None, :], (2, 16, 2, 16))
-    spans = template.spans(8, 16, 2)
-    out = attention_triton.forward(query, key, value, spans, hooked(words, 2, 4), interpret=True)
-    mask = np.asarray(dropout_draw(words, RATE, (2, 4, 8, 16))) > 0
-    np.testing.assert_array_equal(np.asarray(out) > 0, mask.transpose(0, 2, 1, 3))
 
 
 def test_the_draw_under_vmap_is_each_calls_own_draw():
