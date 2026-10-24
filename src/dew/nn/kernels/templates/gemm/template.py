@@ -89,9 +89,13 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
     def forward(*operands):
         return value(*operands), ()
 
-    def backward(saved, operands, cotangent):
+    def backward(saved, operands, cotangent, live):
         del saved
         lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays = operands
+        # The operands a reverse pass differentiates, by their place among the operands' leaves: a frozen
+        # matrix's kernel gradient, or an operand no reverse pass reaches, is never formed.
+        wanted = set(live)
+        prologue_places = set(range(3, 3 + len(prologue_arrays)))
         cotangents = cotangent if several else (cotangent,)
         acc_shape = (lhs.shape[0], rhs.shape[1] if transpose_rhs else rhs.shape[2])
         if epilogue is None:
@@ -113,30 +117,39 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
         # through), wide otherwise, each product rounding once.
         work = compute if narrow else jnp.promote_types(d_acc.dtype, jnp.float32)
         d_product = d_acc.astype(work)
-        matrix = rhs.astype(compute)
-        # The cotangent of the operand the forward multiplied, `prologue(lhs)` rounded to `lhs`'s dtype.
-        d_operand = jnp.asarray(_gemm(d_product, matrix, group_sizes, None, (), (), None, (), (),
-                                      (jnp.dtype(lhs.dtype),), several=False, transpose_rhs=not transpose_rhs,
-                                      interpret_on_cpu=interpret_on_cpu, precision=precision, dense=dense))
-        if narrow:
-            d_rhs = gemm_t(lhs.astype(compute), d_product, None if dense else group_sizes, prologue=prologue,
-                           prologue_operands=tuple(zip(prologue_arrays, prologue_axes, strict=True)),
-                           out_dtype=rhs.dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
-        else:
-            operand = (lhs.astype(compute) if prologue is None
-                       else prologue(lhs, *prologue_arrays).astype(lhs.dtype))
-            d_rhs = gemm_t(operand.astype(work), d_product, None if dense else group_sizes,
-                           out_dtype=rhs.dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
-        d_rhs = jnp.swapaxes(d_rhs, 1, 2) if transpose_rhs else d_rhs
-        d_lhs, d_prologue = d_operand, ()
-        if prologue is not None:
-            d_lhs, d_prologue = _prologue_cotangents(prologue, lhs, prologue_arrays, prologue_axes,
-                                                     group_sizes, d_operand)
-        return (d_lhs.astype(lhs.dtype), d_rhs, np.zeros(group_sizes.shape, jax.dtypes.float0),
-                tuple(_as_cotangent(d, a) for d, a in zip(d_prologue, prologue_arrays, strict=True)),
-                tuple(_as_cotangent(d, a) for d, a in zip(d_epilogue, epilogue_arrays, strict=True)))
+        d_lhs = d_rhs = None
+        d_prologue = ()
+        if wanted & ({0} | prologue_places):
+            matrix = rhs.astype(compute)
+            # The cotangent of the operand the forward multiplied, `prologue(lhs)` rounded to `lhs`'s dtype.
+            d_operand = jnp.asarray(_gemm(d_product, matrix, group_sizes, None, (), (), None, (), (),
+                                          (jnp.dtype(lhs.dtype),), several=False,
+                                          transpose_rhs=not transpose_rhs, interpret_on_cpu=interpret_on_cpu,
+                                          precision=precision, dense=dense))
+            d_lhs = d_operand
+            if prologue is not None:
+                d_lhs, d_prologue = _prologue_cotangents(prologue, lhs, prologue_arrays, prologue_axes,
+                                                         group_sizes, d_operand)
+            d_lhs = d_lhs.astype(lhs.dtype)
+            d_prologue = tuple(_as_cotangent(d, a) for d, a in zip(d_prologue, prologue_arrays, strict=True))
+        if 1 in wanted:
+            if narrow:
+                d_rhs = gemm_t(lhs.astype(compute), d_product, None if dense else group_sizes,
+                               prologue=prologue,
+                               prologue_operands=tuple(zip(prologue_arrays, prologue_axes, strict=True)),
+                               out_dtype=rhs.dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
+            else:
+                operand = (lhs.astype(compute) if prologue is None
+                           else prologue(lhs, *prologue_arrays).astype(lhs.dtype))
+                d_rhs = gemm_t(operand.astype(work), d_product, None if dense else group_sizes,
+                               out_dtype=rhs.dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
+            d_rhs = jnp.swapaxes(d_rhs, 1, 2) if transpose_rhs else d_rhs
+        leaves = [d_lhs, d_rhs, np.zeros(group_sizes.shape, jax.dtypes.float0),
+                  *(d_prologue or (None,) * len(prologue_arrays)),
+                  *(_as_cotangent(d, a) for d, a in zip(d_epilogue, epilogue_arrays, strict=True))]
+        return tuple(leaves[index] for index in live)
 
-    differentiable = generation.linear_tangent(forward, backward, portable)
+    differentiable = generation.linear_tangent(forward, backward, portable, live_cotangents=True)
     return differentiable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays)
 
 
