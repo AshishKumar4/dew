@@ -1198,14 +1198,16 @@ def _part_type(member: type, field: str, value: Configured) -> type | None:
 
     if isinstance(value, nn.Module):
         return type(value)
-    declared = _unwrapped(declared_type(member, field))
+    declared = tuple(part for part in _union_members(declared_type(member, field))
+                     if isinstance(part, type) and issubclass(part, nn.Module))
+    if not declared:
+        return None
     named = class_record(value) if isinstance(value, Mapping) else None
     if named is not None:
-        base = declared if isinstance(declared, type) else nn.Module
-        held = _member(named[0], (base,))
+        held = _member(named[0], declared)
         return held if isinstance(held, type) and issubclass(held, nn.Module) else None
-    if isinstance(value, Mapping) and isinstance(declared, type) and issubclass(declared, nn.Module):
-        return declared
+    if isinstance(value, Mapping) and len(declared) == 1:
+        return declared[0]
     return None
 
 
