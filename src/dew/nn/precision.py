@@ -29,6 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype, PrecisionLike
+from jax.extend import core
 from jax.typing import DTypeLike
 
 
@@ -159,13 +160,12 @@ def _own_backward(jaxpr) -> bool:
     """Whether a product's trace calls a backward of its own (a `jax.custom_vjp`, as Qwix's quantized
     products are when Qwix quantizes a model directly), in it or any program inside it: a product its
     library owns, which `accumulated` neither widens nor transposes."""
-    from jax.extend import core
 
     def programs(value):
         return isinstance(value, (core.Jaxpr, core.ClosedJaxpr))
 
     for eqn in jaxpr.eqns:
-        if eqn.primitive.name.startswith("custom_vjp_call"):
+        if eqn.primitive is core.primitives.custom_vjp_call_p:
             return True
         inner = [value.jaxpr if isinstance(value, core.ClosedJaxpr) else value
                  for value in jax.tree.leaves(eqn.params, is_leaf=programs) if programs(value)]
