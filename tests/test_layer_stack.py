@@ -605,13 +605,39 @@ def fetched_layer_states():
 
 
 def test_a_host_resident_stacks_layer_states_are_a_resident_ones():
-    """A stack whose layers sit in host memory runs each fetched layer in a scope of its own
-    (`decoder_stack._applied`): every layer's output a reader of layer states keeps is there, on
-    par with the resident stack's, both measured from float64 (check 1), where the fetched scope
-    once kept none of it."""
+    """A stack whose layers sit in host memory, read by a caller that keeps intermediates, fetches
+    each row in Flax's lifted scope (`decoder_stack.run_stack`): every layer's output a reader of
+    layer states keeps is there, on par with the resident stack's, both measured from float64
+    (check 1), where a fetched scope of its own once kept none of it."""
     hosted, resident, truth = fetched_layer_states()
     assert_as_exact(hosted, resident, token_draw(2), "host-fetched layer states",
                     seeds=FETCHED_STATES_SEEDS, truth_fn=truth)
+
+
+def test_a_host_resident_stack_keeps_what_its_callers_own_filter_asks_for():
+    """A caller's own capture filter, every layer's input norm and nothing else, reaches the layers
+    a host-resident stack fetches: it keeps the sublayer outputs the resident stack keeps, at the
+    same places, and no layer output nobody asked for."""
+    model = tiny(scan_layers=True, attention_impl="reference")
+    variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
+    host = jax.sharding.SingleDeviceSharding(jax.devices()[0], memory_kind="pinned_host")
+    on_host = {**variables, "params": {
+        name: jax.device_put(tree, host) if name.startswith("layers_") else tree
+        for name, tree in variables["params"].items()}}
+
+    def norms(module, method):
+        return method == "__call__" and module.name == "input_layernorm"
+
+    ids = jnp.asarray(np.arange(2 * SEQ_LEN).reshape(2, SEQ_LEN) % VOCAB, jnp.int32)
+
+    def kept(tree):
+        _, collections = model.apply(tree, ids, capture_intermediates=norms, mutable=["intermediates"])
+        return [(jax.tree_util.keystr(path), leaf.shape)
+                for path, leaf in jax.tree_util.tree_flatten_with_path(collections)[0]]
+
+    resident = kept(variables)
+    assert resident and all("input_layernorm" in path for path, _ in resident)
+    assert kept(on_host) == resident
 
 
 def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_resident_one():
