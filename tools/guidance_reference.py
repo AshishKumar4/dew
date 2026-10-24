@@ -24,17 +24,15 @@
   for what it returns; each run reads its own precision for both.
 
 Each runs in float64 and in float32; what lands per case is the initial
-state, the settings and both results.
+state, the settings and both results. APG's cases land over the seeds check 1
+draws (`apg-seeds`, `tools/recorded_references.py`): one initial state's
+rounding is a single draw, which a pointwise walk's spatial orders do not
+move.
 
     PYTHONPATH=src python tools/guidance_reference.py
 
-    PYTHONPATH=src python tools/guidance_reference.py apg-ensemble OUTPUT.npz
+    PYTHONPATH=src python tools/guidance_reference.py apg-seeds tests/fixtures/guidance/apg_seeds.npz
     PYTHONPATH=src python tools/guidance_reference.py apg-projection OUTPUT.npz
-
-The ensemble mode leaves the existing fixtures alone, checks every APG
-array regenerates bit for bit, and records plain APG over 1024 independent
-initial states. Spatial orders leave this pointwise case's fp32 result
-unchanged, so more states are what resolve its RMS error.
 """
 
 from __future__ import annotations
@@ -51,8 +49,8 @@ import numpy as np
 import torch
 from reference_source import definitions, fetched, selected
 
-GUIDERS = ("https://raw.githubusercontent.com/huggingface/diffusers/"
-           "5ff8e59ff9fe81c6e2df4fb4c6ea0d97a5df5ab2/src/diffusers/guiders/")
+DIFFUSERS = "5ff8e59ff9fe81c6e2df4fb4c6ea0d97a5df5ab2"
+GUIDERS = f"https://raw.githubusercontent.com/huggingface/diffusers/{DIFFUSERS}/src/diffusers/guiders/"
 EDM2 = ("https://raw.githubusercontent.com/NVlabs/edm2/"
         "4bf8162f601bcc09472ce8a32dd0cbe8889dc8fc/generate_images.py")
 INTERVAL = ("https://raw.githubusercontent.com/kynkaat/guidance-interval/"
@@ -80,7 +78,6 @@ INTERVAL_CASES = {
     "tail": {"num_steps": 10, "guidance_interval": [7, 9], "G": 2.5},
 }
 CONDITIONAL, UNCONDITIONAL = 0.5, 0.35
-APG_SAMPLES = 1024
 
 
 def members(url: str, owner: str, names: set[str]) -> list[str]:
@@ -139,22 +136,33 @@ def apg_walk(published: type, case: dict, x: torch.Tensor) -> torch.Tensor:
     return x
 
 
-def apg_ensemble(destination: Path) -> None:
-    """Plain APG has no order-dependent reductions. Independent initial
-    states instead resolve its RMS rounding error against the same reference."""
+def apg_draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's initial state for the APG walks, a unit normal of SHAPE from torch's generator."""
+    return {"x_T": torch.randn(*SHAPE, generator=torch.Generator().manual_seed(seed)).numpy()}
+
+
+def apg_seeds(destination: Path) -> None:
+    """Every APG case over the seeds check 1 draws (`record_case`): each seed's initial state, the
+    published guider's float32 walk from it and its float64 one, the count planned on Dew's own walk
+    (tests/diffusion_support.py's `apg_walked`)."""
+    from diffusion_support import apg_walked
+    from recorded_references import provenance, record_case, save
+
     published = guider()
-    with np.load(FIXTURE / "apg.npz") as stored:
-        original = torch.from_numpy(stored["x_T"])
-        for name, case in APG_CASES.items():
-            for dtype, suffix in ((torch.float64, ""), (torch.float32, "32")):
-                assert np.array_equal(apg_walk(published, case, original.to(dtype)).numpy(),
-                                      stored[f"{name}.result{suffix}"]), name
-    x = torch.randn(APG_SAMPLES, *SHAPE[1:], generator=torch.Generator().manual_seed(23))
-    case = APG_CASES["plain"]
-    np.savez_compressed(destination, x_T=x.numpy(), case=np.asarray(json.dumps(case)),
-                        label=np.asarray(LABEL),
-                        result=apg_walk(published, case, x.double()).numpy(),
-                        result32=apg_walk(published, case, x).numpy())
+    arrays = {"cases": np.asarray(json.dumps(APG_CASES)), "label": np.asarray(LABEL)}
+    for name, case in APG_CASES.items():
+        def evaluate(inputs, case=case):
+            x = torch.from_numpy(inputs["x_T"])
+            return ({"walked": apg_walk(published, case, x).numpy()},
+                    {"walked": apg_walk(published, case, x.double()).numpy()})
+
+        def walked(inputs, case=case):
+            return {"walked": apg_walked(case, LABEL, inputs["x_T"])}
+
+        arrays.update(record_case(name, apg_draw, evaluate, walked))
+    save(destination, {**arrays, "provenance": provenance(
+        "diffusers", DIFFUSERS, "cpu", f"python tools/guidance_reference.py apg-seeds {destination}",
+        torch=torch.__version__)}, reference=f"huggingface/diffusers {DIFFUSERS}", license="Apache-2.0")
 
 
 def apg_projection(destination: Path) -> None:
@@ -199,14 +207,6 @@ class Denoiser:
 
 def main() -> None:
     FIXTURE.mkdir(parents=True, exist_ok=True)
-    published = guider()
-    x = torch.randn(*SHAPE, generator=torch.Generator().manual_seed(3))
-    arrays = {"x_T": x.numpy(), "cases": np.asarray(json.dumps(APG_CASES)), "label": np.asarray(LABEL)}
-    for name, case in APG_CASES.items():
-        arrays[f"{name}.result"] = apg_walk(published, case, x.double()).numpy()
-        arrays[f"{name}.result32"] = apg_walk(published, case, x).double().numpy()
-    np.savez(FIXTURE / "apg.npz", **arrays)
-
     noise = torch.randn(*SHAPE, generator=torch.Generator().manual_seed(5))
     arrays = {"noise": noise.numpy(), "cases": np.asarray(json.dumps(INTERVAL_CASES)),
               "strengths": np.asarray([CONDITIONAL, UNCONDITIONAL])}
@@ -237,8 +237,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == "apg-ensemble":
-        apg_ensemble(Path(sys.argv[2]))
+    if len(sys.argv) == 3 and sys.argv[1] == "apg-seeds":
+        apg_seeds(Path(sys.argv[2]))
     elif len(sys.argv) == 3 and sys.argv[1] == "apg-projection":
         apg_projection(Path(sys.argv[2]))
     elif len(sys.argv) == 1:
