@@ -1,6 +1,6 @@
 """A mixture of a thousand sources at CPU scale: it compiles, reads and resumes with no cost per
 source at each step, its weights are each source's share, and a source that runs out follows its
-policy. Each test records what it measured (`record_property`), which the run's report holds."""
+policy. Each test records what it measured (`record_property`) and prints it."""
 
 import gc
 import itertools
@@ -82,10 +82,12 @@ def test_a_thousand_sources_compile_and_step_without_a_cost_per_source(record_pr
         measured[count] = {"compile_s": built, "compile_peak_mib": peak / 2**20, "step_ms": 1e3 * stepped,
                            "reads_per_step": reads / 64}
         record_property(f"sources_{count}", measured[count])
+        print(f"sources={count}", measured[count])
     # A read buffer reads at most its depth ahead, so 64 steps reach no more than 64 batches and it.
     for count in (10, SOURCES):
         assert measured[count]["reads_per_step"] <= BATCH + READ.read_buffer * BATCH / 64
     record_property("rss_mib", resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
+    print("rss_mib", resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
 
 
 def test_a_thousand_file_sources_hold_no_file_open_per_source(tmp_path, record_property):
@@ -106,6 +108,7 @@ def test_a_thousand_file_sources_hold_no_file_open_per_source(tmp_path, record_p
     finally:
         stream.close()
     record_property("open_files_while_reading", held)
+    print("open_files_while_reading", held)
     assert held < 64
 
 
