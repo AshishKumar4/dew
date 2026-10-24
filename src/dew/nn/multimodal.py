@@ -52,12 +52,12 @@ class Fusion:
 
 @overload
 def _conditioner_modules(tower: TowerBase, projector: ProjectorBase, dtype, precision
-                          ) -> tuple[nn.Module, nn.Module]: ...
+                          ) -> tuple[nn.Module, ProjectorBase]: ...
 
 
 @overload
 def _conditioner_modules(tower: None, projector: ProjectorBase, dtype, precision
-                          ) -> tuple[None, nn.Module]: ...
+                          ) -> tuple[None, ProjectorBase]: ...
 
 
 def _conditioner_modules(tower: TowerBase | None, projector: ProjectorBase, dtype, precision):

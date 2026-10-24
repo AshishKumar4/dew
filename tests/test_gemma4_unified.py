@@ -81,7 +81,8 @@ def gradient_functions(source):
     parameters = dict(reference.named_parameters())
     conversions = get_checkpoint_conversion_mapping(reference.config.model_type)
     bindings = {}
-    for source_name, layout in native.weight_layouts.items():
+    for layout in native.weight_layouts:
+        source_name = layout.name
         runtime_name = source_name
         for conversion in conversions:
             renamed, matched = conversion.rename_source_key(source_name)
@@ -252,15 +253,14 @@ def test_equal_attention_geometries_still_use_the_full_layer_vision_mask(source,
     from dew.interop.verify import scatter_weights
 
     config = source[1].config.to_dict()
-    config["text_config"].update(global_head_dim=8, num_global_key_value_heads=2, per_layer_config=None)
+    config["text_config"].update(global_head_dim=8, num_global_key_value_heads=2, per_layer_config={})
     config = Gemma4UnifiedConfig.from_dict(config)
     config._attn_implementation = "eager"
     torch.manual_seed(502)
     reference = Gemma4UnifiedForConditionalGeneration(config).float().eval()
     scatter_weights(reference)
     reference.save_pretrained(tmp_path, safe_serialization=True)
-    # An explicit null per_layer_config means no override. A diff-only config omits it and
-    # reconstructs the reference's default 512-wide global heads on reload.
+    # Preserve the explicitly empty per-layer geometry instead of reconstructing default global heads.
     reference.config.to_json_file(tmp_path / "config.json", use_diff=False)
     for name in ("processor_config.json", "tokenizer_config.json", "tokenizer.json"):
         shutil.copyfile(FIXTURE / name, tmp_path / name)
