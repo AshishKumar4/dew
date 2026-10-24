@@ -239,8 +239,8 @@ def test_both_groups_step_with_the_one_schedule():
     scheduled = OptimConfig(optimizer='muon', learning_rate=cosine).build(4)
     unscaled = OptimConfig(optimizer='muon', learning_rate=1.0).build(4)
     rate = optax.warmup_cosine_decay_schedule(
-        init_value=cosine.init, peak_value=cosine.peak,
-        warmup_steps=cosine.warmup_steps, decay_steps=4, end_value=cosine.end)
+        init_value=cosine.init_value, peak_value=cosine.peak_value,
+        warmup_steps=cosine.warmup_steps, decay_steps=4, end_value=cosine.end_value)
 
     scheduled_state, unscaled_state = scheduled.init(params), unscaled.init(params)
     for step in range(5):
