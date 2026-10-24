@@ -319,16 +319,19 @@ def test_a_draw_that_fails_its_checks_fails_its_future_instead_of_hanging():
 
 
 def test_a_submission_does_not_wait_for_the_step_under_way(native_server):
-    """Draws submitted while another thread holds the step lock return at
+    """Draws submitted while another thread holds the engine's step return at
     once, and are served once the step ends."""
     # A rollout source submits a batch's draws one after another; each waiting
     # for a step made one-turn RLVR eight times slower (ledger 518).
     stepping, done = threading.Event(), threading.Event()
 
+    def held():
+        stepping.set()
+        done.wait()
+
     def step_under_way():
-        with native_server._lock:
-            stepping.set()
-            done.wait()
+        # What the engine runs between two steps holds its step as a step does.
+        native_server.engine.reload(held)
 
     holder = threading.Thread(target=step_under_way)
     futures = []
