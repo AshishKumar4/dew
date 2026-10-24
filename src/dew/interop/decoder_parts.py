@@ -870,8 +870,7 @@ def modeling_overrides(source: Mapping[str, object], config: DecoderFields, used
     attention = records.record(overrides.get("attention", {}), "modeling_overrides.attention")
     kinds = kinds_of(config)
     declared = config.get("layer_types")
-    if declared is None:
-        declared = ("full_attention",)
+    declared = ("full_attention",) if declared is None else records.strings(declared, "layer_types")
     for name, mode in attention.items():
         if name not in declared:
             refuse(f"attention override for {name}", "the decoder has no such layer kind")
