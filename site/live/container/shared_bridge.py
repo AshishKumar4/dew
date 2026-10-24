@@ -237,6 +237,8 @@ class Gateway:
         self.token, self.secret, self.commit, self.kernels = token, secret, commit, kernels
         # session -> cell -> context; None holds the context made ready before the page names a cell.
         self.contexts: dict[str, dict[str | None, Context]] = {}
+        # session -> the one task creating its first context, which create and close await or cancel.
+        self.creating: dict[str, asyncio.Task] = {}
         self.connected = set()
         self.allocating = asyncio.Lock()
         # The training slot: whether a training cell runs, and the tickets of those waiting, in order.
@@ -321,13 +323,29 @@ class Gateway:
         # Waits for its end without raising its failure, and leaves it running if the caller is cancelled.
         await asyncio.wait({task})
 
+    async def first(self, session):
+        """`session`'s first context, made ready before the page names a cell: the one creation the gateway
+        owns for the session (`creating`), which a close cancels, `start` then deleting the kernel it made."""
+        try:
+            self.contexts[session][None] = await self.start(session)
+        except BaseException:
+            self.contexts.pop(session, None)
+            raise
+        finally:
+            del self.creating[session]
+
     async def create(self, session):
+        """`session`'s contexts, its first made ready if it has none (`first`), which every create of the
+        session waits for, and a close of it ends."""
         if session not in self.contexts:
             self.contexts[session] = {}
+            self.creating[session] = asyncio.ensure_future(self.first(session))
+        if task := self.creating.get(session):
             try:
-                self.contexts[session][None] = await self.start(session)
-            except BaseException:
-                del self.contexts[session]
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if task.cancelled():
+                    raise RuntimeError("this session was closed while its context started") from None
                 raise
         return self.contexts[session]
 
@@ -343,6 +361,11 @@ class Gateway:
         await self.settle(self.discard(context.channels, context.identifier))
 
     async def close(self, session):
+        """End `session`: its first context's creation, if one runs, cancelled to its end (`start` deletes
+        the kernel it made), then every context it holds."""
+        if task := self.creating.get(session):
+            task.cancel()
+            await asyncio.wait({task})
         for context in self.contexts.pop(session, {}).values():
             await self.stop(context)
 
@@ -383,6 +406,9 @@ class Gateway:
             context = await self.start(session, "dew-train")
             started(context)
             try:
+                # A Stop while the context started ends the run before its code reaches the kernel.
+                if stopped():
+                    return {"status": "aborted", "count": None}
                 return await context.execute(code, send)
             finally:
                 await self.stop(context)
@@ -519,7 +545,9 @@ class Gateway:
                                           lambda started: page.training.__setitem__(cell, started))
             else:
                 context = await self.context(page.session, cell)
-                result = await context.execute(message["code"], send)
+                # A Stop while the context started ends the run before its code reaches the kernel.
+                result = ({"status": "aborted", "count": None} if cell in page.stops
+                          else await context.execute(message["code"], send))
             await socket.send(json.dumps({"id": message["id"], "type": "done", **result}))
         except Exception as error:
             if isinstance(error, Stopped) and context is not None and page.cells.get(cell) is context:

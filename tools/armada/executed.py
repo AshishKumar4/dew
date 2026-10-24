@@ -57,6 +57,11 @@ everywhere: set[str] = set()
 """What session-scoped fixtures read, and module bodies before collection."""
 readers: list[set[str]] = []
 """Where a read is kept. conftest.py's reads are every test's, so they are left out."""
+collected: dict[str, int] = {}
+"""Each test file's tests as collection found them, before any hook chose among them; a module of none
+is 0."""
+deselected: dict[str, int] = {}
+"""Each test file's tests the selection set aside, as pytest reports it (`pytest_deselected`)."""
 starts: dict[str, int] = {}
 """How many followed children each test file's own process started (`followed.start`)."""
 children = Path(tempfile.mkdtemp(prefix="dew-children-"))
@@ -158,6 +163,22 @@ def pytest_make_collect_report(collector):
         readers.pop()
 
 
+def pytest_collectreport(report):
+    if report.passed and report.nodeid.endswith(".py"):
+        collected.setdefault(report.nodeid, 0)
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(items):
+    for item in items:
+        collected[item.nodeid.split("::")[0]] = collected.get(item.nodeid.split("::")[0], 0) + 1
+
+
+def pytest_deselected(items):
+    for item in items:
+        deselected[item.nodeid.split("::")[0]] = deselected.get(item.nodeid.split("::")[0], 0) + 1
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_fixture_setup(fixturedef, request):
     if fixturedef.scope != "session":
@@ -193,6 +214,10 @@ def pytest_sessionfinish(session):
                                               | child["reads"]),
                               "peak": peak, "shares": child["shares"], "pools": child["pools"]}
         Path(out).write_text(json.dumps(recorded))
+    # Each file's collection, which accounts for a file whose every test the selection set aside (`ci.py`).
+    if counted := os.environ.get("DEW_COLLECTED"):
+        Path(counted).write_text(json.dumps({name: {"collected": count, "deselected": deselected.get(name, 0)}
+                                             for name, count in collected.items()}))
 
 
 def gpu_peak() -> int | None:
