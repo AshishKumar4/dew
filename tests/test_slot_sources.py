@@ -226,6 +226,7 @@ def test_the_loaded_slot_runtime_matches_author_scores_and_readout_vjps(tmp_path
     task = Decide.of(bundle)
     path = REFERENCE / "reference.npz"
     site = f"{attention}_{mode}"
+    requests = json.loads((REFERENCE / "requests.json").read_text())
     seeds = declared_seeds(path)[site]
     draw, reference, truth = indexed_recording(recording(path), site, seeds)
     head = task.model.head
@@ -251,8 +252,7 @@ def test_the_loaded_slot_runtime_matches_author_scores_and_readout_vjps(tmp_path
 
     def native(index, held):
         rows = []
-        for text in held["requests"]:
-            request = json.loads(str(text))
+        for request in requests[int(index)]:
             questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
             rows.extend(task.layout.rows(task.tokenizer, task.specials, request["state"], questions))
         laid = DecisionInputs.collate(rows, task.specials.pad, options=held["options"].shape[1])

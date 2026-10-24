@@ -68,7 +68,7 @@ def runtime():
         yield prompt, schema, readout
 
 
-def draw(seed: int, tokenizer, prompt, schema, readout) -> dict[str, np.ndarray]:
+def draw(seed: int, tokenizer, prompt, schema, readout):
     """Unequal choice/score rows, structured and raw UTF-8 states, and asymmetric VJP probes."""
     rng = np.random.default_rng(seed)
     words = ("refund", "broken", "invoice", "urgent", "late", "help", "café", "delta")
@@ -103,10 +103,9 @@ def draw(seed: int, tokenizer, prompt, schema, readout) -> dict[str, np.ndarray]
         options[index, :len(positions)] = True
         lengths.append(len(ids))
         prefixes.append(prefix)
-    return {"tokens": tokens, "lengths": np.asarray(lengths, np.int32), "spans": spans,
-            "options": options, "blocks": readout["block_ids"](prefixes, lengths, WIDTH, "cpu").numpy(),
-            "requests": np.asarray([json.dumps(request, ensure_ascii=False) for request in requests]),
-            "probe": rng.standard_normal(int(options.sum())).astype(np.float32)}
+    return ({"tokens": tokens, "lengths": np.asarray(lengths, np.int32), "spans": spans,
+             "options": options, "blocks": readout["block_ids"](prefixes, lengths, WIDTH, "cpu").numpy(),
+             "probe": rng.standard_normal(int(options.sum())).astype(np.float32)}, requests)
 
 
 def observed(model, head, capture, readout, inputs, labels, *, blocked: bool, dtype) -> dict[str, dict]:
@@ -189,10 +188,11 @@ def main():
         torch.save(head.state_dict(), args.output / "readout_head.pt")
         (args.output / "readout.json").write_text(json.dumps(
             {"readout": "head", "head_dim": 8, "n_slots": len(labels), "attention": "noncausal"}))
-        draws, outputs = [], {site: {"reference": [], "truth": []} for site in SITES}
+        draws, requests, outputs = [], [], {site: {"reference": [], "truth": []} for site in SITES}
         for seed in range(args.seeds * (1 + args.redraw)):
-            inputs = draw(seed, tokenizer, prompt, schema, readout)
+            inputs, request = draw(seed, tokenizer, prompt, schema, readout)
             draws.append(inputs)
+            requests.append(request)
             for attention, blocked in (("causal", False), ("block", True)):
                 reference = observed(model, head, capture, readout, inputs, labels,
                                      blocked=blocked, dtype=torch.float32)
@@ -211,6 +211,7 @@ def main():
                 arrays.update({f"{site}.{arm}.{name}": np.stack([value[name] for value in values])
                                for name in values[0]})
         save(args.output / "reference.npz", arrays, reference=REFERENCE, license=LICENSE)
+        (args.output / "requests.json").write_text(json.dumps(requests, ensure_ascii=False) + "\n")
         provenance = {"generator": "tools/slot_readout_reference.py", "generator_revision": git_head(ROOT),
                       "prompt_repo": PROMPT_REPO, "prompt_revision": PROMPT_REVISION,
                       "prompt_files": PROMPT_FILES, "patch_sha256": PATCH_SHA256,
