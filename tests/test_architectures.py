@@ -690,9 +690,13 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, tmp_p
                 assert mine.dtype == theirs.dtype and mine.shape == theirs.shape, name
                 assert np.array_equal(mine.view(np.uint8), theirs.view(np.uint8)), name
     truth = drawn_steps(case, tmp_path, 1, 1, initial, steps, exact=True)
-    for name in ("8x1 data", "2x4 fsdp"):
-        assert_as_exact(drawn[name], drawn["one device"], draw, f"{case.name} {name}, {steps} step(s)",
-                        seeds=seeds, truth_fn=truth)
+    # Both layouts in one draw of their trees, each held to one device's run and the float64 run, which
+    # a draw computes once for both.
+    layouts_drawn = ("8x1 data", "2x4 fsdp")
+    assert_as_exact(lambda *inputs: {name: drawn[name](*inputs) for name in layouts_drawn},
+                    lambda *inputs: dict.fromkeys(layouts_drawn, drawn["one device"](*inputs)), draw,
+                    f"{case.name}, {steps} step(s)", seeds=seeds,
+                    truth_fn=lambda *inputs: dict.fromkeys(layouts_drawn, truth(*inputs)))
     replicated, state = layouts
     assert not fsdp_leaves(replicated.variables), "nothing may shard on a 1-wide fsdp axis"
     sharded = fsdp_leaves(state.variables)
