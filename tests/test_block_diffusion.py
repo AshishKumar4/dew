@@ -45,6 +45,46 @@ def prefill(model, variables, prompt):
                        mutable=["cache"])[1]["cache"]
 
 
+def test_diffusion_gemma_deferred_translation_materializes_the_same_model(system):
+    """Text checkpoint leaves stay deferred until placement asks for their arrays, while their
+    materialized tree retains the eager decoder's parameter values."""
+    from dew.interop.streaming import SourceLeaf, materialize
+
+    _, eager, _, _, config = system
+    tensors = load_file(str(WORKFLOW / "model.safetensors"))
+    deferred, _ = adapter.translate_weights(tensors, config, lazy=True)
+    assert any(isinstance(leaf, SourceLeaf) for leaf in jax.tree.leaves(deferred["params"]["text"]))
+    restored = materialize(deferred)
+    for actual, expected in zip(jax.tree.leaves(restored), jax.tree.leaves(eager), strict=True):
+        np.testing.assert_array_equal(actual, expected)
+
+
+def test_diffusion_gemma_export_reads_only_the_requested_decoder_tensor(system, monkeypatch):
+    """Renaming decoder tensors and adding encoder scalar aliases preserve the lazy export
+    mapping: inspecting its keys and specs reads none, and one lookup reads just that tensor."""
+    from dew.interop import hf_decoders
+    from dew.interop.safetensors_io import LazyTensors
+
+    model, variables, _, _, config = system
+    arrays = {"model.norm.weight": np.arange(4, dtype=np.float32),
+              "model.layers.0.layer_scalar": np.asarray([0.75], np.float32)}
+    reads = []
+
+    def read(name):
+        reads.append(name)
+        return arrays[name]
+
+    exported = LazyTensors({name: jax.ShapeDtypeStruct(value.shape, value.dtype)
+                           for name, value in arrays.items()}, read)
+    monkeypatch.setattr(hf_decoders, "export_decoder_weights", lambda *args: exported)
+    result = adapter.export_weights(model, variables, config)
+    assert len(result) > len(arrays)
+    assert not reads
+    np.testing.assert_array_equal(result["model.encoder.language_model.layers.0.layer_scalar"],
+                                  arrays["model.layers.0.layer_scalar"])
+    assert reads == ["model.layers.0.layer_scalar"]
+
+
 def test_native_shared_model_forward_matches_reference(system):
     """Bare and self-conditioned canvas logits, held to twice the fp32
     reference's own distance from its float64 run (tests/reference_error.py).
