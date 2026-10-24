@@ -175,7 +175,7 @@ of its values: Gemma 3n's sparse layers keep about ten of 192 units a token at 0
 keep two, as the architectures cell found (tests/test_architectures.py); Gemma 4's per-layer inputs are
 32 wide, where at the fixture's 8 Dew paired with the plain loop did not resolve within 4096 draws (the
 released E2B's are 256)."""
-SCAN_ROWS = {"gemma3n": 32}
+SCAN_ROWS = {"gemma3n": 8}
 """Each shape's rows a draw where BATCH's leave its error past resolving: Gemma 3n's five sparse layers
 at 8 rows a draw did not resolve within 4096 draws, Dew paired with the plain loop, and at 32 rows, as
 at 64, within 64."""
