@@ -17,7 +17,7 @@ import json
 import logging
 import os
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import jax
@@ -90,6 +90,11 @@ class SourceReference:
     def directory(self, root: Path) -> Path:
         return root / (self.subfolder or "")
 
+    def component(self, folder: str) -> SourceReference:
+        """The same snapshot, selecting a component below this source's folder."""
+        selected = (Path(self.subfolder or "") / folder).as_posix()
+        return replace(self, subfolder=None if selected == "." else selected)
+
     def file(self, root: Path, filename: str) -> Path:
         """Resolve a component file against the pinned snapshot root, not its folder name."""
         return repo_file(self.name, root, (Path(self.subfolder or "") / filename).as_posix())
@@ -115,6 +120,16 @@ def missing_weights(source: str, files: Collection[str]) -> str:
         return (f"{source} ships GGUF files ({', '.join(gguf)}); load one with "
                 f"Pretrained.load(..., gguf_file={gguf[0]!r})")
     return f"{source} has no model.safetensors or model.safetensors.index.json"
+
+
+def tensor_file(path: Path) -> dict[str, np.ndarray]:
+    """One explicitly selected tensor file, using the canonical safetensors reader or safe
+    pickle conversion. No caller needs a separate torch.load path for a named readout file."""
+    if path.suffix == ".safetensors":
+        return read_file(path)[0]
+    if path.suffix in _PICKLES:
+        return read_weights(pickles.converted(path.parent, (path.name,)))
+    raise ValueError(f"{path} is not a supported tensor file")
 
 
 _CONVERSION_TITLE = "Adding `safetensors` variant of this model"

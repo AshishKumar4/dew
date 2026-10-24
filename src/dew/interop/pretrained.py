@@ -417,7 +417,7 @@ class Pretrained:
             name_or_dir, revision, subfolder, selected, fallback)
         reference = sources.SourceReference(str(name_or_dir), commit, folder or None)
         if composite is not None:
-            loaded = _load_composite_source(name_or_dir, directory, commit, folder, composite,
+            loaded = _load_composite_source(reference, directory, composite,
                                             placed=placed, streaming=streaming or not weights, dtype=dtype,
                                             param_dtype=param_dtype, attention_impl=attention_impl,
                                             max_seq_len=max_seq_len)
@@ -1367,33 +1367,29 @@ def _composite_description(directory: Path) -> CompositeSource | None:
     return None
 
 
-def _load_composite_source(name_or_dir: str | Path, root: Path, commit: str | None, folder: str,
+def _load_composite_source(source: sources.SourceReference, root: Path,
                            description: CompositeSource, *, placed: Callable[[Variables], Variables],
                            streaming: bool, dtype: str, param_dtype: str, attention_impl: str,
                            max_seq_len: int | None) -> Pretrained:
     """Materialize the described components through the native backbone and tensor-map owners.
     All Hub paths remain relative to the resolved snapshot root, including a selected subfolder."""
-    from dew.interop.safetensors_io import read_file
     from dew.interop.weights import translate_parameters
 
     component = description.backbone
-    directory = root / folder
+    directory = source.directory(root)
     backbone, shared, prefix = None, {}, ""
     if component is not None:
-        weights_folder = str(Path(folder) / component.weights_folder)
-        if weights_folder == ".":
-            weights_folder = ""
-        root = sources.snapshot(str(name_or_dir), commit,
-                                weights=True if not weights_folder else (weights_folder,))
-        directory = root / folder
-        if commit is not None:
-            commit = root.name
-        shared = sources.load_shards(root / weights_folder)
+        weight_source = source.component(component.weights_folder)
+        root = weight_source.weights(root)
+        directory = source.directory(root)
+        if source.revision is not None:
+            source = replace(source, revision=root.name)
+        shared = sources.load_shards(weight_source.directory(root))
         prefix = component.tensor_prefix
         tensors = ({name[len(prefix):]: tensor for name, tensor in shared.items() if name.startswith(prefix)}
                    if prefix else shared)
         backbone = _load_native_source(
-            sources.SourceReference(str(name_or_dir), commit, folder or None), root,
+            source, root,
             gguf_file=None, component=component, tensors=tensors,
             placed=placed, streaming=streaming, dtype=dtype, param_dtype=param_dtype,
             attention_impl=attention_impl, max_seq_len=max_seq_len)
@@ -1401,8 +1397,7 @@ def _load_composite_source(name_or_dir: str | Path, root: Path, commit: str | No
     if head_source.weight_file is None:
         head_tensors = {name: tensor for name, tensor in shared.items() if not name.startswith(prefix)}
     else:
-        filename = (Path(folder) / head_source.weight_file).as_posix()
-        head_tensors = read_file(sources.repo_file(name_or_dir, root, filename))[0]
+        head_tensors = sources.tensor_file(source.file(root, head_source.weight_file))
     head = head_source.build(backbone, dtype, attention_impl)
     params = translate_parameters(decoder_parts.split_packed(head_tensors, head_source.packed),
                                   head_source.path, param_dtype)
@@ -1410,7 +1405,7 @@ def _load_composite_source(name_or_dir: str | Path, root: Path, commit: str | No
         params = head_source.reshape(head, params)
     if backbone is None:
         return Pretrained(head, placed({"params": params}), None, {}, directory,
-                          record_fields(head, type(head)), revision=commit)
+                          record_fields(head, type(head)), revision=source.revision)
     return description.bundle(backbone, head, placed({"params": params}), directory,
                               description.tokenizer_folder, **description.fields)
 
@@ -1432,7 +1427,7 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
         config, tensors = _source_config(name_or_dir, directory, commit, gguf_path)
     else:
         config = component.config
-        directory = directory / component.config_folder
+        directory = source.component(component.config_folder).directory(root)
     mamba_ssm = mamba2.is_mamba_ssm(config)
     if mamba_ssm:
         config = mamba2.config_from_mamba_ssm(config)
