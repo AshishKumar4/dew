@@ -102,14 +102,19 @@ def test_a_layer_initializes_and_computes_what_flaxs_does(ours, flaxs, build, dt
 def test_a_batched_kernel_draws_each_member_at_its_own_fan_in():
     """A DenseGeneral batched over 8 groups of 512 inputs draws each group's kernel as a layer of 512
     inputs draws its own, at lecun's variance 1 / 512, where flax counts the groups as inputs too and
-    draws at 1 / 4096; DeepSeek V4's grouped output projection is such a layer. Each group's sample
-    variance over its 32,768 entries lies within 5% of 1 / 512, over six of its standard errors, the
-    groups apart, and a partitioned initializer keeps its box."""
+    draws at 1 / 4096; DeepSeek V4's grouped output projection is such a layer. Each group's 32,768
+    entries pass the chi-square test of variance 1 / 512 at one in a billion each side (a normal's
+    bounds; lecun's truncated normal varies its sample variance less), which flax's draw fails by
+    far, the groups apart, and a partitioned initializer keeps its box."""
+    from scipy import stats
+
     x = jnp.zeros((8, 2, 512))
     layer = DenseGeneral(64, batch_dims=(0,), use_bias=False)
     kernel = layer.init(jax.random.key(0), x)["params"]["kernel"]
-    variances = np.var(np.asarray(kernel, np.float64), axis=(1, 2)) * 512
-    assert np.all(np.abs(variances - 1) < 0.05), variances
+    entries = kernel[0].size
+    statistics = (entries - 1) * 512 * np.var(np.asarray(kernel, np.float64), axis=(1, 2), ddof=1)
+    low, high = stats.chi2.ppf([1e-9, 1 - 1e-9], entries - 1)
+    assert np.all((low < statistics) & (statistics < high)), (statistics, low, high)
     assert len({np.asarray(member).tobytes() for member in kernel}) == 8
     np.testing.assert_array_equal(layer.init(jax.random.key(0), x)["params"]["kernel"], kernel)
     boxed = DenseGeneral(64, batch_dims=(0,), use_bias=False, kernel_init=PARTITIONED).init(

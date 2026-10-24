@@ -496,9 +496,10 @@ def test_deepseek_v4_draws_each_output_group_at_its_own_fan_in():
     """A from-scratch DeepSeek V4's grouped output projection (`o_a_proj`, one `[in, o_lora_rank]`
     block per head group) starts each group at lecun's variance over that group's inputs, as
     `DeepseekV4GroupedLinear`'s per-group blocks are each a projection of their own: at eight groups
-    of 128 inputs, each group's sample variance over its 8,192 entries lies within 10% of 1 / 128,
-    over six of its standard errors, where counting the groups as inputs starts them at 1 / 1024."""
+    of 128 inputs, each group's 8,192 entries pass the chi-square test of variance 1 / 128 at one in a
+    billion each side, where counting the groups as inputs starts them at 1 / 1024."""
     import jax
+    from scipy import stats
 
     from dew.registry import models
 
@@ -508,9 +509,10 @@ def test_deepseek_v4_draws_each_output_group_at_its_own_fan_in():
     params = jax.jit(model.init)(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))["params"]
     kernels = [leaf for path, leaf in flat_tree(params).items() if "o_a_proj" in path]
     assert kernels and all(kernel.shape == (8, 128, 64) for kernel in kernels)
+    low, high = stats.chi2.ppf([1e-9, 1 - 1e-9], 128 * 64 - 1)
     for kernel in kernels:
-        variances = np.var(np.asarray(kernel, np.float64), axis=(1, 2)) * 128
-        assert np.all(np.abs(variances - 1) < 0.1), variances
+        statistics = (128 * 64 - 1) * 128 * np.var(np.asarray(kernel, np.float64), axis=(1, 2), ddof=1)
+        assert np.all((low < statistics) & (statistics < high)), (statistics, low, high)
 
 
 def test_deepseek_v4_a_left_padded_row_pools_its_compressed_windows_over_its_own_tokens():
