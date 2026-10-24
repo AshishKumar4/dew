@@ -98,16 +98,6 @@ def _logits_cotangent(cotangent, precision: jax.lax.PrecisionLike):
     return cotangent.astype(jnp.bfloat16) if precision is BF16 else cotangent
 
 
-def _backward_product(subscripts: str, lhs, rhs, precision: jax.lax.PrecisionLike, work):
-    """A backward product of the head's: under the bf16 algorithm its bf16 operands multiplied
-    exactly and summed in fp32 (`bf16_einsum`), which an A100 computes wrong under the algorithm
-    itself where the product has a vector side, a one-token tile's; otherwise the product of the
-    work dtype (`float32_einsum`)."""
-    if precision is BF16:
-        return bf16_einsum(subscripts, lhs, rhs)
-    return float32_einsum(subscripts, lhs, rhs, precision=precision, preferred_element_type=work)
-
-
 def head_table(model: nn.Module, variables) -> OutputTable | None:
     """`model`'s head over `variables` as one matrix (`AffineHead.output_table`),
     or None for a model whose head no matrix alone is, or that names none."""
@@ -215,6 +205,16 @@ def _tile_logits(states, matrix, precision: jax.lax.PrecisionLike):
         return bf16_product('td,vd->tv', states, matrix)
     return float32_einsum('td,vd->tv', states, matrix.astype(states.dtype),
                       precision=precision, preferred_element_type=at_least_fp32(states.dtype))
+
+
+def _backward_product(subscripts: str, lhs, rhs, precision: jax.lax.PrecisionLike, work):
+    """A backward product of the head's: under the bf16 algorithm its bf16 operands multiplied
+    exactly and summed in fp32 (`bf16_einsum`), which an A100 computes wrong under the algorithm
+    itself where the product has a vector side, a one-token tile's; otherwise the product of the
+    work dtype (`float32_einsum`)."""
+    if precision is BF16:
+        return bf16_einsum(subscripts, lhs, rhs)
+    return float32_einsum(subscripts, lhs, rhs, precision=precision, preferred_element_type=work)
 
 
 def _row_terms(logits, predict: bool) -> tuple[
