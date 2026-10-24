@@ -614,11 +614,12 @@ class Tgmm(_Triton):
 
 
 class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
-    """JAX's Pallas Mosaic GPU kernels (`templates.gemm.mosaic_gpu`): Hopper's warpgroup MMA, one 16-bit
-    dtype, and widths the space's tiles divide. Each runs one warpgroup a multiprocessor, or two
-    consumers beside a producer (a cooperative tile), persistent over the output tiles in a planar snake,
-    so the rows a band of `grid_block_n` column tiles shares and the matrix block the row tiles in flight
-    share come from the L2."""
+    """JAX's Pallas Mosaic GPU kernels (`templates.gemm.mosaic_gpu`) on their instruction family's bundle
+    (Hopper's warpgroup MMA, Ampere's mma.sync), one 16-bit dtype, and widths the space's tiles divide,
+    the tiles generated from the family's facts (`mosaic_gpu.generated`). Each runs one warpgroup a
+    multiprocessor, or two consumers beside a producer (a cooperative tile), persistent over the output
+    tiles in a planar snake, so the rows a band of `grid_block_n` column tiles shares and the matrix block
+    the row tiles in flight share come from the L2."""
     name: ClassVar[str] = 'mosaic_gpu'
     config_cls: ClassVar[type[mosaic_gpu.Tiles]] = mosaic_gpu.Tiles
     EXACT_SUMS: ClassVar[bool] = False
@@ -635,16 +636,24 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # Interpreted only in a CPU process: the interpreter's callbacks are ordered effects, which a GPU
         # process's lowering of the platform choice cannot carry in the CPU branch it does not take.
         interpretable = not ba.arguments['interpret'] or jax.default_backend() == 'cpu'
+        # mma.sync's tiles take the plain product alone: its side operands' staging and fixed loads are
+        # TMA's, which an Ampere GPU has none of.
+        hooked = ba.arguments['hooks'] != NO_HOOKS
         return (first == second and jnp.dtype(first).itemsize == 2 and interpretable
                 and _rated(target, first) and bool(self._family_tiles(self.space(ba), target))
+                and (generation.effective(target).wgmma or not hooked)
                 and self._hooks_lower(ba, first, target)
                 and (self.EXACT_SUMS or not ba.arguments.get('exact_sums')))
 
     @staticmethod
     def _family_tiles(tiles, target) -> tuple[mosaic_gpu.Tiles, ...]:
-        """The tiles of `tiles` of `target`'s instruction family: Hopper's warpgroup MMA where it has it,
-        else Ampere's mma.sync."""
-        family = 'wgmma' if target.wgmma else 'mma.sync'
+        """The tiles of `tiles` of `target`'s instruction family (its `effective` target's, a CPU
+        interpreting as an A100): Hopper's warpgroup MMA where it has it, Ampere's mma.sync on a CUDA GPU
+        without it, none on any other device (a TPU's launches are its own)."""
+        facts = generation.effective(target)
+        if generation.capability(facts.generation) is None:
+            return ()
+        family = 'wgmma' if facts.wgmma else 'mma.sync'
         return tuple(tile for tile in tiles if tile.family == family)
 
     def fitting(self, ba, target) -> tuple[mosaic_gpu.Tiles, ...]:
@@ -652,16 +661,15 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
     @staticmethod
     def _hooks_lower(ba, dtype, target) -> bool:
-        """Whether Mosaic GPU's lowering takes the launch's hooks (`_hooks_lower`) under the semantics its
-        family's kernels lower in (a warpgroup's arrays for warpgroup MMA's, a lane's for mma.sync's). A
-        side operand the launch squeezes and gives back with its dimension of one
-        (`Hooks.prologue_broadcast`) has no layout Mosaic's inference finds for the size-one dimension,
-        so a hook taking one does not lower there (GMMGATE-h100-8), where Triton's lowering takes it."""
+        """Whether Mosaic GPU's lowering takes the launch's hooks (`_hooks_lower`). A side operand the
+        launch squeezes and gives back with its dimension of one (`Hooks.prologue_broadcast`) has no
+        layout Mosaic's inference finds for the size-one dimension, so a hook taking one does not lower
+        there (GMMGATE-h100-8), where Triton's lowering takes it."""
+        del target  # every hooked launch is warpgroup MMA's (`eligible`)
         hooks = ba.arguments['hooks']
         if hooks.prologue_broadcast or hooks.epilogue_broadcast:
             return False
-        semantics = plgpu_core.WGxWG_SEMANTICS if target.wgmma else plgpu_core.LANExWG_SEMANTICS
-        return _hooks_lower(ba, dtype, mosaic_gpu_lowering.mosaic_lowering_rules[semantics])
+        return _hooks_lower(ba, dtype, mosaic_gpu_lowering.mosaic_lowering_rules[plgpu_core.WGxWG_SEMANTICS])
 
     def staged_bytes(self, ba, config: mosaic_gpu.Tiles, target) -> int:
         # Each allocation a program scopes, rounded up to Mosaic's alignment (`mosaic.allocated`): each
@@ -739,14 +747,15 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
 @dataclasses.dataclass(frozen=True)
 class MosaicGmm(_Mosaic):
-    """`Gmm` on Hopper (`mosaic_gpu.gmm`)."""
+    """`Gmm` through the Mosaic GPU kernels (`mosaic_gpu.gmm`)."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
 
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         kernel = ba.arguments['kernel']
         depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
-        return mosaic_gpu.generated(_families(kernel.dtype), depth=depth, width=width, dtype=kernel.dtype)
+        return mosaic_gpu.generated(_families(kernel.dtype, ba.arguments['interpret']), depth=depth,
+                                    width=width, dtype=kernel.dtype)
 
     @staticmethod
     def extents(tile: mosaic_gpu.Tiles) -> dict:
@@ -798,10 +807,13 @@ class MosaicTgmm(_Mosaic):
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         tokens, cotangent = ba.arguments['tokens'], ba.arguments['cotangent']
         # A gradient tile's rows divide the tokens' width; its steps run over a group's rows, padded to
-        # whole steps (`mosaic_gpu.tgmm`).
-        return tuple(tile for tile in mosaic_gpu.generated(_families(tokens.dtype), depth=None,
+        # whole steps (`mosaic_gpu.tgmm`), which mma.sync masks at a group's edges in its accumulator's
+        # layout, whose base tile is a role's rows: no step shorter.
+        families = _families(tokens.dtype, ba.arguments['interpret'])
+        return tuple(tile for tile in mosaic_gpu.generated(families, depth=None,
                                                            width=cotangent.shape[1], dtype=tokens.dtype)
-                     if tokens.shape[1] % tile.block_m == 0)
+                     if tokens.shape[1] % tile.block_m == 0
+                     and (tile.family != 'mma.sync' or tile.block_k >= mosaic_sm80.Mma.role_rows))
 
     def fitting(self, ba, target) -> tuple[mosaic_gpu.Tiles, ...]:
         """The tiles that fit `target` (`Template.fitting`), with `exact_sums` those whose two fp32
@@ -1266,10 +1278,13 @@ def _launch_kernel(name: str, *measured: _Need) -> selection.Kernel[GroupedCase]
         cost=lambda case: case.call.seconds(name))
 
 
-def _families(dtype) -> tuple[mosaic.Family, ...]:
+def _families(dtype, interpret) -> tuple[mosaic.Family, ...]:
     """The bundles the Mosaic GPU launches generate tiles for at operands of `dtype`: Hopper's warpgroup
-    MMA's and Ampere's mma.sync's; a launch's fitting keeps its target's (`_Mosaic._family_tiles`)."""
-    return mosaic_sm90.WGMMA, mosaic_sm80.Mma(jnp.dtype(dtype))
+    MMA's, and Ampere's mma.sync's where the call is interpreted or this JAX's layout inference places
+    its tiles (`mosaic_sm80.staging_solved`); a launch's fitting keeps its target's
+    (`_Mosaic._family_tiles`)."""
+    lowers = bool(interpret) or mosaic_sm80.staging_solved()
+    return mosaic_sm90.WGMMA, *((mosaic_sm80.Mma(jnp.dtype(dtype)),) if lowers else ())
 
 
 AMPERE_MEASURED = _Need(

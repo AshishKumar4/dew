@@ -261,12 +261,15 @@ SWIZZLE_BYTES = 128
 def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int], dtype) -> int:
     """The registers a consumer thread holds at a `(rows, columns, depth)` tile of `consumers` roles of
     `family`: its share of the fp32 accumulator, a step's operand fragments where its products read
-    registers (`Family.operands_in_registers`), and what it holds beside them (`Family.held_registers`)."""
+    registers (`Family.operands_in_registers`; the right operand's in each of its `rhs_copies` warps whole),
+    and what it holds beside them (`Family.held_registers`)."""
     rows, columns, depth = block
     share = rows // consumers
     fragments = 0
     if family.operands_in_registers:
-        fragments = (share * depth + depth * columns) * jnp.dtype(dtype).itemsize // 4 // THREADS
+        words = jnp.dtype(dtype).itemsize / 4
+        lhs, rhs = share * depth * words, depth * columns * words * family.rhs_copies
+        fragments = int((lhs + rhs) / THREADS)
     return share * columns // THREADS + fragments + family.held_registers
 
 
@@ -367,9 +370,13 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     operands_in_registers: bool
     """Whether a product reads its operands from registers a consumer loads them into (mma.sync's), where
     warpgroup MMA reads both from shared memory."""
+    rhs_copies: int = 1
+    """The warps of a role each holding the right operand's whole fragment (mma.sync's four warps along
+    the rows each hold every column's, JAX's `MMALayouts`' `rhs` replicated over its warps)."""
     block_extent: int = 256
-    """The longest extent an operand block a load moves takes (a TMA box's 256), which a tile spans at
-    most along each of its axes."""
+    """The longest axis a generated tile spans: warpgroup MMA's widest product (256 columns), and the most
+    rows a sweep has measured, past which the cost model is uncalibrated (a TMA box bounds a load's
+    transformed extents, which the tiles' 8-row tiling keeps far below it)."""
 
     @abc.abstractmethod
     def registers(self, consumers: int) -> int:

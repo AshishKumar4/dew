@@ -631,9 +631,10 @@ def _resource_exhausted(error: Exception) -> bool:
             or "CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES" in message)
 
 
-def materialized(op: KernelOp, ba: tokamax.BoundArguments):
-    """The arrays the tuner times `ba` on, `op.operands` of its `ShapeDtypeStruct` arguments, and
-    `fill(arrays) -> (args, kwargs)`, its arguments with those arrays (or traced ones) in their places."""
+def materialized(op: KernelOp, ba: tokamax.BoundArguments, arrays: list | None = None):
+    """The arrays the tuner times `ba` on, `op.operands` of its `ShapeDtypeStruct` arguments (or `arrays`,
+    a caller's own draw of them, in their order), and `fill(arrays) -> (args, kwargs)`, its arguments
+    with those arrays (or traced ones) in their places."""
     leaves, tree = jax.tree.flatten((ba.args, ba.kwargs),
                                     is_leaf=lambda leaf: isinstance(leaf, jax.ShapeDtypeStruct))
     places = [index for index, leaf in enumerate(leaves) if isinstance(leaf, jax.ShapeDtypeStruct)]
@@ -644,19 +645,21 @@ def materialized(op: KernelOp, ba: tokamax.BoundArguments):
             filled[index] = array
         return jax.tree.unflatten(tree, filled)
 
-    return op.operands([leaves[index] for index in places], 0), fill
+    return (op.operands([leaves[index] for index in places], 0) if arrays is None else list(arrays)), fill
 
 
-def _measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None) -> Timings:
+def measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None, *,
+             arrays: list | None = None) -> Timings:
     """Every config of `ba`'s launch (at its key's shapes), each compiled on a
     thread and timed alone: the device time CUPTI reads for the launch's own
     kernels, each run after `FLUSH_BYTES` are read, so every config starts
     with its operands out of cache. `profiler` is Mosaic GPU's, whose `Cupti`
-    reads the times, or a stand-in with its `Cupti`."""
+    reads the times, or a stand-in with its `Cupti`; `arrays`, a caller's own
+    draw of the launch's operands (`materialized`), else the tuner's."""
     if profiler is None:
         from jax.experimental.mosaic.gpu import profiler
 
-    arrays, fill = materialized(op, ba)
+    arrays, fill = materialized(op, ba, arrays)
     flush = jnp.zeros(FLUSH_BYTES // 4, jnp.float32)
     evicting = jax.jit(jnp.sum).lower(flush).compile()
 
@@ -709,7 +712,7 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None) -> Timing
 
 
 def _benchmarks(read: Mapping, flushes: set[str]) -> dict[Hashable, tokamax.BenchmarkData]:
-    """The configs `_measured` timed, each run's time the sum of its own kernels', the flush's left out."""
+    """The configs `measured` timed, each run's time the sum of its own kernels', the flush's left out."""
     benchmarks = {}
     for config, (runs, lowering, compiling) in read.items():
         times = tuple(sum(milliseconds for name, milliseconds in run if name not in flushes) for run in runs)
@@ -720,7 +723,7 @@ def _benchmarks(read: Mapping, flushes: set[str]) -> dict[Hashable, tokamax.Benc
 
 def observed(op: KernelOp, ba: tokamax.BoundArguments, measured: Mapping[Hashable, object],
              device) -> None:
-    """Log each config `_measured` timed or saw exhaust the device's resources, with the launch's features
+    """Log each config `measured` timed or saw exhaust the device's resources, with the launch's features
     and estimate where it states them, where `DEW_TIMINGS` asks (`kernels.timings`): after the timing
     loop, on the measuring thread, so logging never runs beside a measurement and changes no pick. A
     failure to log raises, failing the tune: logging was asked for."""
@@ -942,23 +945,23 @@ def _settle(found: list[Launch], *, measure: bool) -> int:
     def decided() -> str | None:
         if jax.process_index() != 0:
             return None
-        decisions, measured, nearest = [], [], []
+        decisions, timed, nearest = [], [], []
         for op, ba in found:
             if (fastest := _pick(ba)) is not None:
                 decisions.append((ba, fastest))
                 continue
             if measure and cache.measures_picks():
-                timings = _measured(op, ba)
+                timings = measured(op, ba)
                 if timings.prune_errors():
-                    measured.append((ba, timings))
+                    timed.append((ba, timings))
                     decisions.append((ba, timings.prune()))
                     continue
                 _log.warning("no config of %s compiled or ran; it keeps its heuristic: %s",
                              type(op).__name__, next(iter(timings.values()), None))
             if (near := op._stored_nearest(ba)) is not None:
                 nearest.append((ba, near))
-        if measured:
-            _store(kind, measured)
+        if timed:
+            _store(kind, timed)
         return json.dumps([json.loads(dumps_picks(kind, chosen)) for chosen in (decisions, nearest)])
 
     text = coordination.broadcast_from_process_zero(coordination.agreed("settling kernel configs", decided))
