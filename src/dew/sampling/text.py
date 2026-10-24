@@ -32,6 +32,7 @@ from jax.experimental import checkify
 from jax.typing import ArrayLike
 from typing_extensions import TypeVar
 
+from dew.hashing import array_fingerprint
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import (
     ModelInputs,
@@ -740,7 +741,7 @@ def _stable(value: object, seen: frozenset[int] = frozenset()) -> Identity:
         return ("mapping", tuple(sorted((repr(name), _stable(entry, seen))
                                         for name, entry in value.items())))
     if isinstance(value, (np.ndarray, np.generic, jax.Array)):
-        return ("array", *_hashed(value))
+        return ("array", _hashed(value))
     if isinstance(value, functools.partial):
         return ("partial", _stable(value.func, seen), _stable(value.args, seen),
                 _stable(dict(value.keywords), seen))
@@ -769,10 +770,11 @@ def _stable(value: object, seen: frozenset[int] = frozenset()) -> Identity:
     return (_named(kind), text)
 
 
-def _hashed(value: np.ndarray | np.generic | jax.Array) -> tuple[tuple[int, ...], str, str]:
-    """An array's shape, dtype and contents, as a comparable triple."""
-    array = np.ascontiguousarray(np.asarray(value))
-    return (array.shape, str(array.dtype), hashlib.sha256(array.tobytes()).hexdigest())
+def _hashed(value: np.ndarray | np.generic | jax.Array) -> str:
+    """An array's dtype, shape and contents, fingerprinted (`dew.hashing.array_fingerprint`)."""
+    digest = hashlib.sha256()
+    array_fingerprint(digest, np.asarray(value))
+    return digest.hexdigest()
 
 
 def _digest(components: Components) -> tuple[Identity, str]:
