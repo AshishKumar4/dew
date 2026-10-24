@@ -14,6 +14,7 @@ import copy
 import importlib
 import importlib.metadata
 import json
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -87,10 +88,15 @@ def main():
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--seeds", type=int, required=True)
-    parser.add_argument("--redraw", type=int, required=True)
+    parser.add_argument("--seeds", type=int)
+    parser.add_argument("--redraw", type=int)
+    parser.add_argument("--calibrate", action="store_true",
+                        help="size the recorded draws in the checkout's gate environment")
     args = parser.parse_args()
-    if args.seeds <= 0 or args.redraw < 0:
+    if args.calibrate:
+        calibrate(args.output)
+        return
+    if args.seeds is None or args.redraw is None or args.seeds <= 0 or args.redraw < 0:
         parser.error("seeds must be positive and redraw nonnegative")
     version = importlib.metadata.version("transformers")
     if version != "5.19.0":
@@ -151,6 +157,25 @@ def main():
                   "seeds": args.seeds, "redraw": args.redraw, "parameter_seed": 43,
                   "attention_impl": "eager", "device": "cpu", "precision": "ieee"}
     (args.output / "source.json").write_text(json.dumps(provenance, indent=2) + "\n")
+
+
+def calibrate(directory: Path):
+    """Declare the recorded site's seeds with the gate's reference-vs-reference sizing, retaining
+    enough recorded draws for its redraw policy. No candidate implementation is measured."""
+    sys.path.insert(0, str(ROOT / "tests"))
+    from reference_error import REDRAW, indexed_recording, recording, seeds_for
+
+    path = directory / "reference.npz"
+    arrays = recording(path)
+    capacity = len(arrays["blocks.reference.logits"]) // (1 + REDRAW)
+    draw, reference, truth = indexed_recording(arrays, "blocks", capacity)
+    count = seeds_for(reference, draw, "Qwen3.5 block attention", most=capacity, truth_fn=truth)
+    arrays["blocks.seeds"] = np.asarray(count, np.int64)
+    np.savez_compressed(path, **arrays)
+    provenance = json.loads((directory / "source.json").read_text())
+    provenance.update(seeds=count, recorded_seed_capacity=capacity, sizing_revision=git_head(ROOT))
+    (directory / "source.json").write_text(json.dumps(provenance, indent=2) + "\n")
+    print(f"Qwen3.5 block attention: {count} declared seeds, {capacity} recorded with redraw")
 
 
 if __name__ == "__main__":
