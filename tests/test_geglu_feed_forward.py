@@ -82,3 +82,34 @@ def test_a_packed_order_names_the_gate_and_up_projections():
                    packed_order=("gate_proj", "down_proj"))
     with pytest.raises(ValueError):
         mlp.init(jax.random.key(0), jnp.zeros((1, 4)))
+
+
+def test_a_transformer_with_dropout_trains_and_evaluates_without_a_dropout_key():
+    """A nonzero-dropout spatial transformer trains with sampled masks and evaluates with them
+    disabled. Its update reaches both attentions and the feed-forward; evaluation needs no RNG."""
+    from dew.nn.attention import BasicTransformerBlock
+
+    block = BasicTransformerBlock(8, heads=2, dim_head=4, norm="layer", dropout_rate=0.1,
+                                  attention_impl="reference")
+    x = jax.random.normal(jax.random.key(1), (2, 4, 8))
+    context = jax.random.normal(jax.random.key(2), (2, 3, 8))
+    variables = block.init({"params": jax.random.key(3), "dropout": jax.random.key(4)}, x, context,
+                           train=True)
+
+    def loss(params, key):
+        output = block.apply({"params": params}, x, context, train=True, rngs={"dropout": key})
+        return jnp.mean(jnp.square(output))
+
+    value, gradient = jax.value_and_grad(loss)(variables["params"], jax.random.key(5))
+    assert np.isfinite(value)
+    for name in ("Attention1", "Attention2", "ff"):
+        leaves = jax.tree.leaves(gradient[name])
+        assert all(np.isfinite(np.asarray(leaf)).all() for leaf in leaves)
+        assert any(np.any(np.asarray(leaf) != 0) for leaf in leaves)
+    updated = jax.tree.map(lambda weight, grad: weight - 0.01 * grad, variables["params"], gradient)
+    evaluated = block.apply({"params": updated}, x, context, train=False)
+    assert np.isfinite(np.asarray(evaluated)).all()
+    sampled = [block.apply({"params": updated}, x, context, train=True,
+                           rngs={"dropout": jax.random.key(seed)})
+               for seed in (6, 7)]
+    assert np.any(np.asarray(sampled[0]) != np.asarray(sampled[1]))
