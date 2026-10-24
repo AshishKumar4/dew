@@ -156,14 +156,11 @@ def plan(compiled) -> dict[str, int]:
 
 
 def entry_spaces(compiled) -> dict[str, int]:
-    """How many of the entry computation's parameters XLA put in each memory
-    space, read off the compiled module's own layout: `S(5)` is its name for
-    pinned host memory."""
-    head = compiled.as_text().splitlines()[0]
-    body = head.partition("entry_computation_layout={(")[2].partition(")->")[0]
+    """How many of the compiled program's parameters XLA put in each memory
+    space, as its input shardings name it (`memory_kind`)."""
     counts = {"pinned_host": 0, "device": 0}
-    for entry in body.split(", ") if body else []:
-        counts["pinned_host" if "S(5)" in entry else "device"] += 1
+    for sharding in jax.tree.leaves(compiled.input_shardings):
+        counts["pinned_host" if sharding.memory_kind == "pinned_host" else "device"] += 1
     return counts
 
 

@@ -20,8 +20,8 @@ from episode_support import (
     START,
     action,
     build,
-    collect,
     environment,
+    trained_batch,
     verify,
 )
 
@@ -82,14 +82,14 @@ def test_parent_death_kills_the_worker(tmp_path):
 def test_episodes_collect_through_subprocess_workers():
     """The rollout collects a cohort from real workers and scores it."""
     harness = environment()
-    trainer, rollout = build(harness)
+    episodes = []
+    trainer, collector = build(harness, record=episodes.append)
     state = trainer.initial_state()
-    episodes = collect(rollout, state)
+    batch = trained_batch(collector, state)
     assert len(episodes) == GROUPS
     assert {episode.status for episode in episodes} <= {EpisodeStatus.COMPLETED, EpisodeStatus.TRUNCATED}
     assert {verify(episode) for episode in episodes} <= {-1., 0., 1.}
-    batch = rollout.project(episodes)
-    assert batch["input_ids"].shape[1] == PROMPT + rollout.max_new_tokens
+    assert batch["input_ids"].shape[1] == PROMPT + collector.max_new_tokens
     assert np.isfinite(batch["advantages"]).all()
 
 

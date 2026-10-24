@@ -35,11 +35,11 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.rl import (
     DPOObjective,
     EnvironmentFactory,
-    EpisodeRollout,
+    EpisodeCollector,
     GRPOObjective,
     PPOObjective,
     PPORollout,
-    SampledRollout,
+    RolloutScheduler,
     Verifier,
 )
 from dew.objectives.rl.rollout import Reward
@@ -220,18 +220,19 @@ class Recipe:
                                       variables=None)
             tokenizer = tokenizer_for(text(facts["tokenizer"], "tokenizer"))
             sampling = with_ids_of(stage.sampling, Sampling(eos_token_ids=tokenizer.eos_id))
-            return objective, SampledRollout(objective, stage.reward, decode=tokenizer.decode,
-                                             groups=stage.groups, max_new_tokens=stage.max_new_tokens,
-                                             estimator=stage.estimator, sampling=sampling), objective
+            return objective, RolloutScheduler.sampled(
+                objective, stage.reward, decode=tokenizer.decode, groups=stage.groups,
+                max_new_tokens=stage.max_new_tokens, estimator=stage.estimator, sampling=sampling), objective
         episodes = stage.episodes
         assert episodes is not None, "a PPO stage holds its episodes, as checked above"
         objective = PPOObjective(self.model, episodes.max_prompt_tokens + stage.max_new_tokens - 1,
                                  critic=episodes.critic, beta=beta, variables=None)
         # Every collection binds the step's variables, so the policy here holds none.
-        source = EpisodeRollout(objective.policy({}), episodes.environment, episodes.verifier,
-                                episodes.max_prompt_tokens, stage.max_new_tokens, episodes.max_turns,
-                                stage.sampling, groups=stage.groups)
-        rollout = PPORollout(objective, source, gamma=episodes.gamma, lam=episodes.lam)
+        collector = EpisodeCollector(objective.policy({}), episodes.environment, episodes.verifier,
+                                     episodes.max_prompt_tokens, stage.max_new_tokens, episodes.max_turns,
+                                     stage.sampling)
+        rollout = PPORollout(objective, collector, groups=stage.groups, gamma=episodes.gamma,
+                             lam=episodes.lam)
         return objective, rollout, objective.actor
 
 

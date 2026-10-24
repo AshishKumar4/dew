@@ -24,7 +24,7 @@ from dew.nn.dense import Dense
 from dew.records import JSON
 
 from .activations import gelu_exact_torch, gelu_tanh
-from .attention import LayerNorm, NormalAttention
+from .attention import LayerNorm, NormalAttention, QKNorm
 from .blocks import FourierEmbedding, TimeProjection, modulation
 from .conv import Conv
 from .flops import MissingFlopsCount, counted_flops, projection_flops, real_lengths
@@ -35,9 +35,8 @@ from .scan_orders import (
     ScanOrder,
     build_2d_sincos_pos_embed,
     hilbert_indices,
-    hilbert_unpatchify,
     inverse_permutation,
-    unpatchify,
+    unscanned,
     zigzag_indices,
 )
 from .sharding import RESIDUAL, constrain, logical_axes
@@ -140,6 +139,12 @@ class PatchEmbedding(nn.Module):
         return (projection_flops(lengths, self.patch_size**2 * input_channels, projected)
                 + (projection_flops(lengths, projected, self.embedding_dim) if self.bottleneck else 0))
 
+    def scanned(self, x, scan_order: str) -> tuple[jax.Array, np.ndarray | None]:
+        """`x`'s patch tokens gathered into `scan_order`, and the inverse that restores row-major
+        order (`scan_ordered`; `unscanned` undoes both)."""
+        _, height, width, _ = x.shape
+        return scan_ordered(self(x), scan_order, height // self.patch_size, width // self.patch_size)
+
     @nn.compact
     def __call__(self, x):
         batch, height, width, _ = x.shape
@@ -218,10 +223,9 @@ class PatchSequenceEmbed(nn.Module):
 
     def __call__(self, x):
         _, H, W, _ = x.shape
-        H_P, W_P = H // self.patch_size, W // self.patch_size
-        tokens, inv_idx = scan_ordered(self.patch_embed(x), self.scan_order, H_P, W_P)
+        tokens, inv_idx = self.patch_embed.scanned(x, self.scan_order)
         pos_embed = scan_ordered_pos_embed(
-            self.emb_features, H_P, W_P, self.scan_order)
+            self.emb_features, H // self.patch_size, W // self.patch_size, self.scan_order)
         tokens = tokens + jnp.asarray(pos_embed, dtype=tokens.dtype)[None, :, :]
         return tokens, inv_idx
 
@@ -336,9 +340,7 @@ class PatchSequenceOutput(nn.Module):
             name="final_proj",
         )(x_out)
 
-        if inv_idx is not None:
-            return hilbert_unpatchify(x_out, inv_idx, self.patch_size, H, W, self.output_channels)
-        return unpatchify(x_out, self.patch_size, H, W, self.output_channels)
+        return unscanned(x_out, inv_idx, self.patch_size, H, W, self.output_channels)
 
 
 # A fused attention forward reaches a remat policy as one of these
@@ -633,7 +635,7 @@ class ModulatedBlock(nn.Module):
                 precision=self.precision,
                 use_bias=True,
                 qkv_bias=self.qkv_bias,
-                qk_norm=self.qk_norm,
+                qk_norm=QKNorm() if self.qk_norm else None,
                 attention_impl=self.attention_impl,
                 force_fp32_for_softmax=self.force_fp32_for_softmax,
             )

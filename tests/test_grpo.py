@@ -23,8 +23,7 @@ from steady_state import steady_state
 
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
 from dew.objectives.base import Step
-from dew.objectives.rl import GRPOObjective
-from dew.objectives.rl.rollout import SampledRollout
+from dew.objectives.rl import GRPOObjective, RolloutScheduler
 from dew.objectives.rl.sessions import (
     ADVANTAGES_KEY,
     BEHAVIOR_LOG_PROBS_KEY,
@@ -114,8 +113,8 @@ def test_a_prompt_dataset_trains_as_the_prompt_config_does():
 
     def trained(data):
         objective = GRPOObjective(TinyHead(vocab_size=vocab), 8 + 4 - 1)
-        rollout = SampledRollout(objective, lambda text, record: float(len(text)), groups=2,
-                                 max_new_tokens=4, sampling=Sampling(temperature=1.0))
+        rollout = RolloutScheduler.sampled(objective, lambda text, record: float(len(text)), groups=2,
+                                           max_new_tokens=4, sampling=Sampling(temperature=1.0))
         trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0),
                           layout=Layout(min_shard=1, tolerance=1.0), rollout=rollout)
         return trainer.fit(data, steps=1).variables
@@ -186,9 +185,9 @@ def test_a_rollout_after_the_first_reuses_its_programs_and_reads_only_what_it_sc
     advantages by name and nothing else (`steady_state`). The prompts reach
     the device as each batch arrives, so only reads are held."""
     objective = GRPOObjective(TinyHead(vocab_size=VOCAB), PROMPT_WIDTH + RESPONSE_WIDTH - 1, beta=0.01)
-    state = SimpleNamespace(variables=objective.init(jax.random.key(0)), updates=0)
-    rollout = SampledRollout(objective, lambda *args: float(len(args[0]) % 3), groups=2,
-                             max_new_tokens=RESPONSE_WIDTH, sampling=Sampling(temperature=1.0))
+    state = SimpleNamespace(variables=objective.init(jax.random.key(0)), step=0, updates=0)
+    rollout = RolloutScheduler.sampled(objective, lambda *args: float(len(args[0]) % 3), groups=2,
+                                       max_new_tokens=RESPONSE_WIDTH, sampling=Sampling(temperature=1.0))
     info = len("other")
     def pad(text):
         return padded_text(text, info)

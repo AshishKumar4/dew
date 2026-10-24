@@ -305,6 +305,22 @@ def test_rms_weight_gradient_accumulates_a_full_step_of_rows(dtype):
             draw=lambda draw: full_step(dtype, draw), seeds=SEEDS[(24576, 1000)], judged=("scale",))
 
 
+def test_a_weight_gradient_past_fp32s_range_is_an_infinity_as_xlas():
+    """A weight gradient whose column sum overflows fp32 is +inf, as XLA's sum and the shared
+    finalization give it (`precision.compensated_total`), not the NaN the compensated pair's residual
+    past the infinity (inf - inf) would make: four rows of ones under cotangents of 1e38."""
+    xla, fused, _ = norm_functions(jnp.float32, offset=False, after_cast=False)
+    x, scale = jnp.ones((4, 128), jnp.float32), jnp.ones((128,), jnp.float32)
+    seed = jnp.full(x.shape, 1e38, jnp.float32)
+
+    def weight_gradient(norm):
+        return jax.vjp(lambda scale: norm(x, scale), scale)[1](seed)[0]
+
+    expected = weight_gradient(xla)
+    assert np.isposinf(np.asarray(expected)).all()
+    np.testing.assert_array_equal(np.asarray(weight_gradient(fused)), np.asarray(expected))
+
+
 def full_step(dtype, draw: int = 0):
     """24,576 rows of one repeated 1000-wide token, so the weight gradient's sums reach a step's
     length (`test_rms_weight_gradient...`)."""

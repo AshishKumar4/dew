@@ -52,7 +52,7 @@ from dew.interop import PretrainedDecoder
 from dew.interop.gateway import Gateway
 from dew.interop.harbor import HARBOR_KEY, Harbor
 from dew.interop.harness import HarnessSource
-from dew.objectives.rl import GRPOObjective, RolloutScheduler, SchedulerRecord
+from dew.objectives.rl import Asynchronous, GRPOObjective, RolloutScheduler, SchedulerRecord
 from dew.objectives.rl.scheduler import task_ids
 from dew.objectives.rl.sessions import Task
 from dew.sampling import Sampling
@@ -132,10 +132,10 @@ def main(config: Config) -> dict:
     def harbor_tasks(batch) -> list[Task]:
         return [Task(task.id, {HARBOR_KEY: str(tasks[int(task.id)])}) for task in task_ids(batch)]
 
-    rollout = RolloutScheduler(objective, trials, Publication(push, stamp=gateway.stamp), width=config.width,
-                               rows=config.prompts * config.groups, tasks=harbor_tasks, groups=config.groups,
-                               max_lag=config.max_lag, ahead=config.max_lag, truncation=config.truncation,
-                               log=history.append)
+    rollout = RolloutScheduler(
+        Asynchronous(trials, Publication(push, stamp=gateway.stamp), objective, width=config.width,
+                     rows=config.prompts * config.groups, max_lag=config.max_lag, ahead=config.max_lag),
+        tasks=harbor_tasks, groups=config.groups, truncation=config.truncation, log=history.append)
     draw = np.random.default_rng(config.seed)
     data = Loader(train=lambda partition: iter(
                        lambda: {"task_id": draw.integers(0, len(tasks), config.prompts, np.int32)}, None),

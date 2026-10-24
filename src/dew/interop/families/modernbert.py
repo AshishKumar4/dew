@@ -26,6 +26,7 @@ from dew.interop.decoder_parts import (
     Leaves,
     Packed,
     Renames,
+    RopeSpelling,
     context_lengths,
     decoder_kinds,
     hf_activation,
@@ -41,6 +42,13 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 
 _ENCODER = 'ModernBertModel'
 _MASKED_LM = 'ModernBertForMaskedLM'
+
+
+_MODERNBERT_SPELLING = RopeSpelling(theta=160000.0, per_kind=True, local_theta=10000.0,
+                                    legacy_kinds=('full_attention', 'sliding_attention'),
+                                    local_field='local_rope_theta')
+"""ModernBertConfig's rope: a record per layer type, at 160000 on the full layers and 10000 on the
+sliding ones where the file names no base (its `default_theta`)."""
 
 
 def _modernbert_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -88,18 +96,14 @@ def _modernbert_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
 
     every = records.integer(hf.get('global_attn_every_n_layers', 3), 'global_attn_every_n_layers')
     layer_types = specified_layer_types(hf, used, ('full_attention',) + ('sliding_attention',) * (every - 1))
-    if isinstance(hf.get('rope_parameters'), Mapping):
-        ropes = read_rope(hf, used)
-        if ropes.scaling is not None or ropes.local_scaling is not None:
-            refuse('rope_parameters', 'ModernBERT rotates at its plain frequencies')
-        theta, local_theta = ropes.theta, ropes.local_theta
-    else:
-        used.update(('rope_theta', 'rope_parameters', 'rope_scaling'))
-        if hf.get('rope_scaling') is not None:
-            refuse('rope_scaling', 'ModernBERT rotates at its plain frequencies')
-        theta = records.number(hf.get('global_rope_theta', 160000.0), 'global_rope_theta')
-        local = records.number(hf.get('local_rope_theta', 10000.0), 'local_rope_theta')
-        local_theta = None if local == theta else local
+    # ModernBertConfig keeps a record per layer type, filling the full one's base from
+    # global_rope_theta and the sliding one's from local_rope_theta, else its defaults
+    # (configuration_modernbert.py:77, :141-147).
+    ropes = read_rope({'rope_theta': hf.get('global_rope_theta'), **hf}, used, _MODERNBERT_SPELLING)
+    used.add('global_rope_theta')
+    if ropes.scaling is not None or ropes.local_scaling is not None:
+        refuse('rope_parameters', 'ModernBERT rotates at its plain frequencies')
+    theta, local_theta = ropes.theta, ropes.local_theta
     window = records.integer(hf.get('local_attention', 128), 'local_attention') // 2 + 1
 
     head = records.strings(hf.get('architectures', [_MASKED_LM]), 'architectures') != (_ENCODER,)

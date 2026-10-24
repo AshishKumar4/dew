@@ -504,13 +504,12 @@ def verify(args):
 
 
 def trajectory(pipe, prompt, seed, config):
-    """Every step's clean prediction on the walk `single` takes: `sample`'s scan,
-    with the predictions kept, and the closing prediction last."""
+    """Every step's clean prediction on the walk `single` takes, `sample`'s own walk recording each,
+    and the closing prediction last."""
     import jax
     import jax.numpy as jnp
-    from jax import lax
 
-    from dew.sampling.guidance import Walk
+    from dew.sampling import sample
 
     solver, guidance, negative = call_settings(config)
     steps = config["steps"]
@@ -523,27 +522,8 @@ def trajectory(pipe, prompt, seed, config):
     @jax.jit
     def run(params, given, null, x_T):
         variables = {name: value for name, value in params.items() if name not in ("encoders", "autoencoder")}
-        with jax.ensure_compile_time_eval():
-            times = process.times(steps)
-            initial = solver.init(x_T, times, process, key=key)
-        count = times.shape[0] - 1
-        walk = Walk.over(process.denoiser(pipe.model, variables, given, null), guidance, count)
-        batch = x_T.shape[0]
-
-        def body(carry, inputs):
-            x, state, guided = carry
-            t, t_next, index = inputs
-            t, t_next = jnp.full((batch,), t), jnp.full((batch,), t_next)
-            (denoised, eps), guided = walk.step(x, t, index, guided)
-            step_key = jax.random.fold_in(key, index)
-            guide = walk.at(guided, index)
-            x, state = solver.step(x, t, t_next, denoised, eps, state, step_key, process, guide)
-            return (x, state, guided), denoised
-
-        (x, _, guided), x0s = lax.scan(
-            body, (x_T, initial, walk.init(x_T)), (times[:-1], times[1:], jnp.arange(times.shape[0] - 1))
-        )
-        final = walk.at(guided, count)(x, jnp.full((batch,), times[-1]))[0]
+        final, x0s = sample(process.denoiser(pipe.model, variables, given, null), x_T, steps, solver=solver,
+                            guidance=guidance, key=key, record=lambda x, state, denoised: denoised)
         return jnp.concatenate([x0s, final[None]])
 
     walked = run(pipe.variables, prepared.conditions, prepared.unconditional, prepared.noise)

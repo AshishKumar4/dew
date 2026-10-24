@@ -19,6 +19,7 @@ from functools import partial
 
 from dew import records
 from dew.interop.decoder_parts import (
+    PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
     Leaves,
@@ -55,7 +56,7 @@ def _ouro_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     # OuroConfig drops the window unless use_sliding_window is set, and
     # derives layer_types with Qwen2's rule when none are stated.
     windowed = {**hf, 'sliding_window': hf.get('sliding_window') if hf.get('use_sliding_window') else None}
-    config = base_config(windowed, used, layer_types=qwen_layer_types(windowed, used),
+    config = base_config(windowed, used, rope=PLAIN_SPELLING, layer_types=qwen_layer_types(windowed, used),
                          reads=frozenset({'layer_types', 'sliding_window'}))
     config.update(sandwich_norms=True, loop={'steps': steps, 'exit_gate': True})
     return config

@@ -285,6 +285,29 @@ def test_run_record_names_the_package_checkout_and_hardware(tmp_path, monkeypatc
     assert not run.logged
 
 
+@pytest.mark.parametrize("shown", [None, "arm 3, stage 2"])
+def test_a_runs_wandb_name_is_its_own_and_its_checkpoints_keep_the_runs(tmp_path, monkeypatch, shown):
+    """A W&B run shows the name the tracker is given, and the run's own name where it is given none;
+    its checkpoints are kept under the run's name either way."""
+    import wandb
+    from test_publish import TrackedRun
+
+    opened = {}
+
+    def init(**given):
+        opened.update(given)
+        return TrackedRun()
+
+    monkeypatch.setattr(wandb, 'init', init)
+    config = RunConfig(trainer=TrainerConfig(
+        name='kept', steps=2, checkpoint_dir=str(tmp_path), log_every=1, eval_every=None,
+        checkpoint_every=None, wandb=Wandb('dew', offline=True, name=shown)))
+    monkeypatch.chdir(tmp_path)
+    config.train(Squared(), targets([1., 3.]), name='kept')
+    assert opened['name'] == ('kept' if shown is None else shown)
+    assert (tmp_path / 'kept').is_dir()
+
+
 def test_wandb_counts_each_new_step_shape_once(monkeypatch):
     import wandb
     from test_publish import TrackedRun

@@ -87,7 +87,7 @@ def grpo():
     from dew.config import OptimConfig
     from dew.data import Memory, presets
     from dew.nn.backbones import CausalTransformer
-    from dew.objectives.rl import GRPOObjective, SampledRollout
+    from dew.objectives.rl import GRPOObjective, RolloutScheduler
     from dew.sampling import Sampling
 
     def reward(completion, record):
@@ -101,8 +101,8 @@ def grpo():
     model = CausalTransformer(vocab_size=13, emb_features=64, num_layers=2, num_heads=4,
                               head_dim=16, mlp_features=128, max_seq_len=16)
     objective = GRPOObjective(model, seq_len=11, beta=0.02)
-    rollout = SampledRollout(objective, reward=reward, groups=4, max_new_tokens=8,
-                             sampling=Sampling(temperature=1.0))
+    rollout = RolloutScheduler.sampled(objective, reward, groups=4, max_new_tokens=8,
+                                       sampling=Sampling(temperature=1.0))
     tracker = LocalTracker("tracking")
     trainer = Trainer(objective, OptimConfig(rate=1e-3), key=0, rollout=rollout, tracker=tracker)
     state = trainer.fit(data, steps=150, log_every=1)

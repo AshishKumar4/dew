@@ -8,6 +8,7 @@ import http.server
 import itertools
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -95,7 +96,7 @@ def test_a_fetch_with_threads_of_its_own_fetches_that_many_at_once_in_order_and_
     read, a gone url dropped and counted; leaves the plan as a fetch without threads makes it; a
     position saved part way restores to the same remaining records; and a closed reader leaves no
     thread of its pool running."""
-    handle = Slow(gone="9")
+    handle = Slow(gone="9", hold={"": 4})
     with serving(handle) as address:
         catalog = Memory([{"url": f"http://{address}/{index}", "id": index} for index in range(17)],
                          shard_rows=17)
@@ -143,7 +144,7 @@ def test_a_cached_fetch_with_threads_of_its_own_fetches_that_many_at_once(tmp_pa
     its own fetches alone."""
 
     def ids(cache):
-        handle = Slow(sides=True)
+        handle = Slow(sides=True, hold={"before": 4, "after": 2})
         with serving(handle) as address:
             urls = [{"url": f"http://{address}/before/{index}", "id": index} for index in range(12)]
             catalog = Memory(urls)
@@ -180,12 +181,19 @@ class Slow:
     """A server's answer to each GET: its path, after a pause, or 404 for the path `gone`; it counts
     the requests in flight, by their path's first part where it reads `sides`, and the most at once.
     A request is in flight from its arrival until its answer starts, so a client that has its answer
-    and asks again is never counted twice, however late its handler's thread finishes."""
+    and asks again is never counted twice, however late its handler's thread finishes.
 
-    def __init__(self, *, gone: str | None = None, sides: bool = False):
-        self.gone, self.sides = gone, sides
-        self.lock = threading.Lock()
+    Each side's first `hold[side]` requests are answered only once that many are in flight together,
+    so a client that fetches that many at once is seen to, however loaded the machine that runs it:
+    one that fetched fewer would leave them waiting until its own fetch timeout dropped them. The
+    most at once is then exactly what the client fetches together, never more."""
+
+    def __init__(self, *, gone: str | None = None, sides: bool = False,
+                 hold: Mapping[str, int] | None = None):
+        self.gone, self.sides, self.hold = gone, sides, dict(hold or {})
+        self.lock = threading.Condition()
         self.active, self.most = collections.Counter(), collections.Counter()
+        self.arrived = collections.Counter()
 
     def __call__(self, request):
         path = request.path.strip("/")
@@ -197,6 +205,11 @@ class Slow:
         with self.lock:
             self.active[side] += 1
             self.most[side] = max(self.most[side], self.active[side])
+            self.arrived[side] += 1
+            held = self.hold.get(side, 0)
+            if self.arrived[side] <= held:
+                self.lock.notify_all()
+                self.lock.wait_for(lambda: self.arrived[side] >= held)
         time.sleep(0.2)
         with self.lock:
             self.active[side] -= 1

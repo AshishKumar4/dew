@@ -173,25 +173,38 @@ def test_steps_and_epochs_are_one_choice():
         )
 
 
+def test_a_runs_updates_are_its_microsteps_over_its_accumulation():
+    """What moves once an update, a JEPA target's average, ramps over the run's updates: an epoch of
+    64 records in batches of 8 is 8 steps, and accumulating 4 of them commits 2 updates."""
+    from dew.config import TrainerConfig
+    from dew.data.dataset import Loader
+
+    loader = Loader(lambda partition: iter(()), None, batch=8, records=64)
+    assert TrainerConfig(epochs=1, accumulation=4).total_updates(loader) == 2
+
+
 def test_the_cli_sets_a_token_budget_the_datas_token_batches_divide():
     config = parse(RunConfig, ["--trainer.update-tokens", "98304", "--trainer.steps", "1"])
     assert config.trainer.update_tokens == 98304
     assert RunConfig.from_dict(json.loads(json.dumps(config.to_dict()))) == config
 
 
-def test_a_jepa_run_without_probes_trains_and_validates_its_loss(tmp_path):
-    """A checkpointed JEPA recipe validates without class probes or a representation preview."""
+@pytest.mark.parametrize("size", [(16, 16), (16, 8)], ids=["square", "wide-grid"])
+def test_a_jepa_run_without_probes_trains_and_validates_its_loss(tmp_path, size):
+    """A checkpointed JEPA recipe validates without class probes or a representation preview, over
+    square images and over images twice as tall as they are wide, whose patch grid is as tall."""
     import numpy as np
 
     from dew.config import ModelConfig, TrainerConfig
-    from dew.data import TFDS, Loading, presets
+    from dew.data import TFDS, Loading, images, presets
 
-    images = TFDS("dew_images", path=str(REPO_ROOT / "tests" / "fixtures" / "tfds" / "dew_images" / "1.0.0"),
-                  split="all")
-    train, held = images.holdout(records=4)
+    root = REPO_ROOT / "tests" / "fixtures" / "tfds" / "dew_images" / "1.0.0"
+    pictures = TFDS("dew_images", path=str(root), split="all")
+    train, held = pictures.holdout(records=4)
 
     def prepared(chain):
-        return chain.pipe(presets.images, 16, batch=8).read("memory").loading(Loading(workers=0))
+        return (chain.pipe(presets.images, 16, batch=None).map(images.Resize(size)).batch(8)
+                .read("memory").loading(Loading(workers=0)))
 
     run = JepaRunConfig(
         model=ModelConfig("jepa_encoder", {"patch_size": 2, "emb_features": 16, "num_layers": 1,

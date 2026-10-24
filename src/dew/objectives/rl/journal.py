@@ -6,16 +6,17 @@ import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
 import jax
 import numpy as np
 
+from dew.inference.rollouts import Draw
 from dew.objectives.base import Variables
 
-from .episodes import Action, Episode, EpisodeId
-from .records import action_record, episode_from_record
+from .episodes import Episode, EpisodeId
+from .records import draw_record, episode_from_record, record_json
 
 
 def policy_digest(variables: Variables) -> str:
@@ -63,10 +64,10 @@ def _cohort(connection: sqlite3.Connection, cohort: str, signature: str, binding
 
 @dataclass(frozen=True)
 class SavedTurn:
-    """One committed turn: the episode so far, any pending action, the snapshot."""
+    """One committed turn: the episode so far, any pending draw, the snapshot."""
 
     episode: Episode
-    pending: Action | None
+    pending: Draw | None
     snapshot: bytes
 
 
@@ -107,15 +108,15 @@ class JournalRun:
         if episode.identity != identity or episode._binding_id != self.binding:
             raise ValueError("journal episode identity or policy binding differs")
         return SavedTurn(
-            episode, None if row[1] is None else action_record(json.loads(row[1])), bytes(row[2])
-        )
+            episode, None if row[1] is None else draw_record(json.loads(row[1]), episode.sampling),
+            bytes(row[2]))
 
-    def save(self, episode: Episode, pending: Action | None, snapshot: bytes) -> None:
-        """Commit one sample's episode, its pending action and the environment snapshot."""
+    def save(self, episode: Episode, pending: Draw | None, snapshot: bytes) -> None:
+        """Commit one sample's episode, its pending draw and the environment snapshot."""
         if episode._binding_id != self.binding:
             raise ValueError("journal cannot mix collection bindings")
-        encoded = json.dumps(asdict(episode), allow_nan=False)
-        action = None if pending is None else json.dumps(asdict(pending), allow_nan=False)
+        encoded = record_json(episode)
+        action = None if pending is None else record_json(pending)
         with self.connection:
             self.connection.execute("INSERT OR REPLACE INTO turns VALUES (?, ?, ?, ?, ?)",
                                     (self.cohort, episode.identity.sample, encoded, action, snapshot))

@@ -628,24 +628,15 @@ class Refusal:
     detail: str
     row: str | None = None
     """The roadmap or ledger row that tracks lifting the limit (`dew.nn.kernels.selection.Requirement`),
-    `INHERENT` where no implementation of the kernel lifts it, None for a refusal its site gives as text
-    alone (`refused`, `UNCLASSIFIED`)."""
+    `INHERENT` where no implementation of the kernel lifts it, None for a refusal no requirement gives
+    (an analysis's own, which its op's requirements read)."""
 
     def __str__(self) -> str:
         return self.detail
 
 
-UNCLASSIFIED = 'unclassified'
-"""The code of a refusal its site gives as text alone, which no kernel's `SUPPORTS` declares."""
-
 INHERENT = 'inherent'
 """The row of a limit no implementation of the kernel lifts (`Refusal.row`)."""
-
-
-def refused(*checks: tuple[bool, str, str]) -> Refusal | None:
-    """The `Refusal` of the first of `checks`, each `(holds, code, detail)`, that does not hold, or
-    None where all hold: how a kernel's eligibility says why it turns a call down (`route`)."""
-    return next((Refusal(code, detail) for holds, code, detail in checks if not holds), None)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -699,22 +690,20 @@ def _site() -> str:
 _logged: set[tuple[str, str, str]] = set()
 
 
-def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Refusal | str | None = None,
+def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Refusal | None = None,
           ran: str | None = None) -> Route:
     """Report the dispatch of `choice` to `kernel`, the one call every dispatch site makes once it has
-    decided: `preferred` defaults to the kernel `chosen` or the generation's row names, else `kernel`;
-    a `refusal` given as text alone is `UNCLASSIFIED`; `ran` is what this host executes, `kernel` by
-    default. Every `routes` block open records it. A call off the measured kernel is the dispatch's
-    own choice, logged once a process for each kernel and refusal at INFO, naming both; one that runs
-    the preferred kernel, or a choice no row names, logs nothing."""
+    decided (`dew.nn.kernels.selection.select`): `preferred` defaults to the kernel `chosen` or the
+    generation's row names, else `kernel`; `ran` is what this host executes, `kernel` by default.
+    Every `routes` block open records it. A call off the measured kernel is the dispatch's own choice,
+    logged once a process for each kernel and refusal at INFO, naming both; one that runs the
+    preferred kernel, or a choice no row names, logs nothing."""
     from dew import cache
 
     _named((choice,))
     generation = device_generation()
     picked = None if preferred else dict(cache.KERNEL_CHOICES.value).get(choice)
     measured = preferred or picked or gpu_target(generation).kernels.get(choice)
-    if isinstance(refusal, str):
-        refusal = Refusal(UNCLASSIFIED, refusal)
     found = Route(choice, kernel, measured or kernel, refusal, ran or kernel, generation, _site())
     for collected in cache.KERNEL_ROUTES.value:
         collected.found.append(found)
@@ -724,13 +713,6 @@ def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Re
         named = "the kernel `chosen` names" if picked else f"the kernel measured fastest on {generation}"
         _log.info("%s runs %r, not %r, %s: %s", choice, kernel, measured, named, detail)
     return found
-
-
-def ran_kernel(choice: str, kernel: str, refusal: str, fastest: str | None = None) -> str:
-    """Return `kernel`, which a call to `choice` runs because the kernel measured fastest on this
-    generation, `fastest`, `chosen` or else the one `KERNELS` names, turned it down for `refusal`,
-    reported as `route` reports it."""
-    return route(choice, kernel=kernel, preferred=fastest, refusal=refusal).kernel
 
 
 def linear_tangent(forward: Callable, backward: Callable, portable: Callable) -> Callable:
@@ -812,12 +794,6 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable) ->
 
     bounded.defjvp(bounded_jvp, symbolic_zeros=True)
     return bounded
-
-
-def first_refusal(*checks: tuple[bool, str]) -> str | None:
-    """The reason beside the first of `checks` that does not hold, or None where all hold: how a
-    kernel's eligibility says why it turns a call down (`ran_kernel`)."""
-    return next((reason for holds, reason in checks if not holds), None)
 
 
 def bf16_dot_runs() -> bool:

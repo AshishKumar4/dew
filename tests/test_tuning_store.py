@@ -42,14 +42,6 @@ def test_a_steps_launches_and_their_timings_round_trip_through_dews_json():
                                norm_swiglu.SwigluBackward))
 
 
-def test_a_stored_timing_keeps_every_field_tokamax_measures():
-    """`tuning.TIMING_FIELDS` is every field of `tokamax.BenchmarkData`, so a field a later tokamax adds
-    fails here rather than going unstored."""
-    import dataclasses
-
-    assert {field.name for field in dataclasses.fields(tokamax.BenchmarkData)} == set(tuning.TIMING_FIELDS)
-
-
 def test_a_timing_mapping_takes_its_fastest_run_and_drops_its_failures():
     def timed(ms):
         return tokamax.BenchmarkData(compile_time_ms=0.0, lower_time_ms=0.0, evaluation_times_ms=(ms,),

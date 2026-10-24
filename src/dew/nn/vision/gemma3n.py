@@ -17,6 +17,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew import records
 from dew.interop.weights import placed
 from dew.nn.attention import RMSNorm
+from dew.nn.blocks import TokenEmbedding
 from dew.nn.dense import Dense
 from dew.nn.precision import float32_dot_general
 from dew.registry import Record, from_record
@@ -66,7 +67,7 @@ class Gemma3nProjectorModule(nn.Module):
             )
         if self.norm_eps <= 0:
             raise ValueError("norm_eps must be positive")
-        self.embedding = nn.Embed(self.vocab_size, self.vision_width, dtype=self.dtype,
+        self.embedding = TokenEmbedding(self.vocab_size, self.vision_width, dtype=self.dtype,
                                   name="embedding")
         norm = functools.partial(RMSNorm, epsilon=self.norm_eps, dtype=self.dtype)
         self.hard_embedding_norm = norm(name="hard_embedding_norm")

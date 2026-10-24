@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 import tokamax
 from fla_gdn_support import CONV_SHAPES, conv_config_cases, conv_training_cases, kda_training_cases
+from generation_support import lowers
 from kernel_compile import compile_kernels, failures
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, recurrence, short_conv, tuning
@@ -187,6 +188,7 @@ def test_every_short_conv_config_compiles_on_tritons_compiler_within_each_gpus_b
     assert not failures(found), "\n".join(failures(found))
 
 
+@lowers("sm90")
 def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources():
     """The GEMM template's Mosaic GPU grouped matmul, lone and cooperative, compiled by Mosaic for a
     compile-only H100 on this CPU through ptxas (tests/kernel_compile.py): within the multiprocessor's

@@ -361,10 +361,10 @@ def test_packed_grpo_preserves_each_calls_conflicting_prefix_routing(conflict):
             for call in (first, second):
                 assert call.routed_experts is not None
                 ids = np.zeros((1, SEQ_LEN + 1), np.int32)
-                size = len(call.prompt_ids) + len(call.sampled_ids)
-                ids[0, :size] = call.prompt_ids + call.sampled_ids
+                size = len(call.prompt) + len(call.tokens)
+                ids[0, :size] = call.prompt + call.tokens
                 routes = np.pad(call.routed_experts, ((0, SEQ_LEN + 2 - size), (0, 0), (0, 0)))[None]
-                found.append(run(params, jnp.asarray(ids), routes)[0, len(call.prompt_ids) - 1:size - 1])
+                found.append(run(params, jnp.asarray(ids), routes)[0, len(call.prompt) - 1:size - 1])
             return jnp.concatenate(found)
         return direct
 

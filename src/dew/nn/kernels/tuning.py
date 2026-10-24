@@ -306,17 +306,16 @@ def _launch(entry: object) -> tokamax.BoundArguments:
     return ba
 
 
-TIMING_FIELDS = ("compile_time_ms", "lower_time_ms", "evaluation_times_ms", "metadata", "peak_memory_mb")
+TIMING_FIELDS = tuple(field.name for field in dataclasses.fields(tokamax.BenchmarkData))
 """Every field of `tokamax.BenchmarkData`, which a launch's stored timings keep."""
 
 
 def _timings_json(timings: Timings) -> list[JSON]:
-    """The configs that ran and every field of their times (`TIMING_FIELDS`), as JSON (`_timings`)."""
-    return [[encoded(config), {"compile_time_ms": timing.compile_time_ms,
-                               "lower_time_ms": timing.lower_time_ms,
+    """The configs that ran and every field of their times (`TIMING_FIELDS`), as JSON (`_timings`): its
+    numbers as they are, its evaluation times a list and its metadata `encoded`."""
+    return [[encoded(config), {**dataclasses.asdict(timing),
                                "evaluation_times_ms": list(timing.evaluation_times_ms),
-                               "metadata": encoded(dict(timing.metadata)),
-                               "peak_memory_mb": timing.peak_memory_mb}]
+                               "metadata": encoded(dict(timing.metadata))}]
             for config, timing in timings.prune_errors().items()]
 
 

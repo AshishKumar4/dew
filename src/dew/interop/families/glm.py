@@ -18,6 +18,7 @@ from flax.traverse_util import flatten_dict
 from dew import records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
+    PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
     KindFields,
@@ -334,7 +335,9 @@ def _glm4_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decoder
     # rope_parameters, the spelling Glm4MoeRotaryEmbedding reads.
     if hf_config.get('rope_scaling') is not None:
         refuse("rope_scaling", "Glm4MoeRotaryEmbedding is the plain rotary")
-    theta, factor = plain_partial_rope(hf_config, default_factor=1.0, reference='Glm4MoeRotaryEmbedding')
+    # Glm4MoeConfig sets an absent factor to half the head (configuration_glm4_moe.py:123).
+    theta, factor = plain_partial_rope(hf_config, PLAIN_SPELLING, default_factor=0.5,
+                                       reference='Glm4MoeRotaryEmbedding')
     used.update(('rope_theta', 'rope_parameters', 'rope_scaling', 'use_qk_norm',
                  'partial_rotary_factor', 'num_nextn_predict_layers'))
     config = base_config(hf_config, used, rope=Ropes(theta),
@@ -448,6 +451,8 @@ GLM5_NEXT_TEXT = DecoderFamily(
     weight_path=layer_depth_path,
     export_weights=_glm5_next_export_weights,
     preserve_source_layout=True,
+    # The config class's norm epsilon.
+    defaults={'rms_norm_eps': 1e-5},
 )
 
 GLM4_MOE = DecoderFamily(
@@ -463,6 +468,9 @@ GLM4_MOE = DecoderFamily(
     lambda model: {},
     weight_path=layer_depth_path,
     preserve_source_layout=True,
+    # Glm4MoeConfig's defaults for the fields its decoder reads.
+    defaults={'rms_norm_eps': 1e-5, 'num_key_value_heads': 8, 'max_position_embeddings': 131072,
+              'n_shared_experts': 1, 'first_k_dense_replace': 1, 'num_nextn_predict_layers': 1},
 )
 
 
@@ -481,4 +489,6 @@ GLM_MOE_DSA = DecoderFamily(
     lambda model: {},
     weight_path=layer_depth_path,
     preserve_source_layout=True,
+    # The config class's norm epsilon.
+    defaults={'rms_norm_eps': 1e-5},
 )

@@ -627,9 +627,10 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         out.write_text(json.dumps({"rows": rows}))
         return 0
     executed_report = out.with_name(f"{out.name}.executed.json")
+    collection = out.with_name(f"{out.name}.collected.json")
     report = out.with_name(f"{out.name}.junit.xml")
-    report.unlink(missing_ok=True)
-    executed_report.unlink(missing_ok=True)
+    for stale in (report, executed_report, collection):
+        stale.unlink(missing_ok=True)
     grouping = ["-p", "split", f"--ci-group={split}"] if split else []
     # coverage.py follows the Python processes the tests start (pyproject.toml's patch), each writing
     # its data where COVERAGE_FILE says.
@@ -640,7 +641,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
     # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
     lines: list[str] = []
-    environment = session.pytest_environment({**environ, "DEW_EXECUTED": str(executed_report)})
+    environment = session.pytest_environment({**environ, "DEW_EXECUTED": str(executed_report),
+                                              "DEW_COLLECTED": str(collection)})
     done = child_groups.start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                               env=environment)
 
@@ -664,6 +666,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     reader.join(10)
     output = "".join(lines)
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
+    # How collection found each file: a file with no row is green only where every test it holds was set aside
+    # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
+    counts = json.loads(collection.read_text()) if collection.is_file() else {}
     ran = []
     own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if file_of(case) == name)
                    for name in tests}
@@ -678,15 +683,25 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                    f"{node.get('message')}" for case in own for node in case.iter("skipped")
                    if "could not import" in f"{node.get('message')} {node.text}"]
         # pytest exits 1 for failed tests and 5 for none collected; any other exit (a crash, a signal,
-        # an internal error) leaves even a written report untrustworthy, so every row it holds is red.
+        # an internal error) leaves even a written report untrustworthy, so every row it holds is red. A file
+        # whose every test the selection set aside has no report however pytest exits, another file's failure
+        # among the task's included.
+        counted = counts.get(name, {})
+        deselected = bool(counted) and counted["collected"] == counted["deselected"]
         exited = ([f"pytest exited {done.returncode}" + ("" if own else f" with no report of {name}")]
-                  if done.returncode not in (0, 1, 5) or (not own and done.returncode == 1) else [])
-        red += skipped + exited
+                  if done.returncode not in (0, 1, 5) or (not own and not deselected and done.returncode == 1)
+                  else [])
+        unaccounted = ([] if exited or (report.is_file() and (own or deselected))
+                       else [f"no evidence {name} ran: " + ("pytest wrote no report" if not report.is_file()
+                                                            else "pytest reported none of its tests, and its "
+                                                                 "collection shows them not all deselected")])
+        red += skipped + exited + unaccounted
         if expired:
             red.append(f"{INTERRUPTED} of {deadline:.0f} s and was interrupted")
         # A failed case with no class path is a file that did not collect, no test of it.
         nodes = sorted({node_of(case) for case, _, _ in failed if case.get("classname")})
-        whole = skipped or exited or not nodes or any(not case.get("classname") for case, _, _ in failed)
+        whole = skipped or exited or unaccounted or not nodes or any(not case.get("classname")
+                                                                      for case, _, _ in failed)
         cause = ({} if not red else red_as("deadline", []) if expired else red_as("whole", []) if whole
                  else red_as("nodes", nodes))
         seconds = shares[name]

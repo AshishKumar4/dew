@@ -48,7 +48,7 @@ def main() -> None:
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.decoder_block import Mixture
     from dew.objectives.rl import GRPOObjective
-    from dew.objectives.rl.scheduler import RolloutScheduler
+    from dew.objectives.rl.scheduler import Asynchronous, RolloutScheduler
     from dew.objectives.rl.sessions import Call, Session, Status
     from dew.training import Layout, MeshSpec, Trainer
 
@@ -109,8 +109,10 @@ def main() -> None:
     )
     partition = DataPartition.of(trainer.device_mesh)
     # Two samples a task, two chains of four ids a row of eight.
-    scheduler = RolloutScheduler(objective, Scripted(), Publisher(), width=8, rows=partition.rows(TASKS),
-                                 groups=2, max_lag=1, ahead=1, support_capacity=16 if args.records else None)
+    scheduler = RolloutScheduler(
+        Asynchronous(Scripted(), Publisher(), objective, width=8, rows=partition.rows(TASKS), max_lag=1,
+                     ahead=1),
+        groups=2, support_capacity=16 if args.records else None)
     data = scheduler.tasks(Loader(train=share, val=None, records=TASKS, batch=TASKS))
     final = trainer.fit(data, steps=1, log_every=1, checkpoint_every=None)
     rows = multihost_utils.process_allgather({name: trained[0][name] for name in PACKED})

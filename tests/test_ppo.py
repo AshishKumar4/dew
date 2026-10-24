@@ -19,6 +19,7 @@ from episode_support import (
     VOCAB,
     Harness,
     ToolPolicy,
+    collect,
     per_call,
     verify,
 )
@@ -28,7 +29,7 @@ from rl_support import clipped_surrogate, token_mean
 
 from dew.data.dataset import Loader
 from dew.objectives.base import Ratio, Step, part
-from dew.objectives.rl import EpisodeRollout, EpisodeStatus, PPOObjective, PPORollout, ValueHead
+from dew.objectives.rl import EpisodeCollector, EpisodeStatus, PPOObjective, PPORollout, ValueHead
 from dew.objectives.rl.ppo import OLD_VALUES_KEY, RETURNS_KEY
 from dew.objectives.rl.sessions import BEHAVIOR_LOG_PROBS_KEY, OLD_LOG_PROBS_KEY
 from dew.rl import clipped_value_loss_terms, gae, token_log_ratio
@@ -48,9 +49,9 @@ def build_ppo(verifier=verify, gamma=.97, *, lam=.9, split=None, **policy_option
     objective = PPOObjective(ToolPolicy(), PROMPT + RESPONSE - 1,
                              critic=ValueHead(TokenFeatures()), beta=.03, **policy_options)
     trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(19), split=split)
-    source = EpisodeRollout(objective.policy(objective.init(jax.random.key(19))), Harness(), verifier,
-                            PROMPT, RESPONSE, TURNS, sampling=SAMPLING, groups=GROUPS)
-    rollout = PPORollout(objective, source, gamma=gamma, lam=lam)
+    episodes = EpisodeCollector(objective.policy(objective.init(jax.random.key(19))), Harness(), verifier,
+                                PROMPT, RESPONSE, TURNS, sampling=SAMPLING)
+    rollout = PPORollout(objective, episodes, groups=GROUPS, gamma=gamma, lam=lam)
     trainer.rollout = rollout
     return trainer, rollout
 
@@ -87,7 +88,7 @@ def test_episode_gae_crosses_turns_without_discounting_observations_or_padding()
     trainer, rollout = build_ppo()
     state = trainer.initial_state()
     batch = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
-    episodes = rollout.episodes.collect(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
+    episodes = collect(rollout.episodes, state)
     with np.load(FIXTURE) as reference:
         # The fixture holds verl's GAE in the old one-row-per-call layout,
         # whose unsupported slots carry the recursion's neighbouring values.
@@ -130,7 +131,7 @@ def test_each_step_reward_lands_on_the_last_action_of_the_call_it_paid_for():
     rollout = replace(rollout, episodes=replace(rollout.episodes, environment=Harness(paid=(0.5, 0.25))))
     state = trainer.initial_state()
     batch = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
-    episodes = rollout.episodes.collect(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
+    episodes = collect(rollout.episodes, state)
     mine, reference, truth = [], [], []
     for index, episode in enumerate(episodes):
         ids = [(turn, position) for turn, transition in enumerate(episode.transitions)
@@ -212,7 +213,7 @@ def test_whitened_advantages_of_rewards_far_above_the_values_are_as_exact_as_the
     def drawn(seed):
         """One rollout's whitened advantages and, per completed episode, its rewards and values."""
         batch = rollout(state, task, jax.random.key(seed))
-        episodes = rollout.episodes.collect(state, task, jax.random.key(seed))
+        episodes = collect(rollout.episodes, state, seed, tasks=task["task_id"])
         advantages, rewards, values = [], [], []
         for index, episode in enumerate(episodes):
             ids = [(turn, position) for turn, transition in enumerate(episode.transitions)

@@ -44,8 +44,8 @@ from typing import Protocol
 
 from websockets.exceptions import ConnectionClosed
 
-from dew.inference.rollouts import InfrastructureError
-from dew.objectives.rl.episodes import Action, EpisodeId, EpisodeStatus, Observation
+from dew.inference.rollouts import Draw, InfrastructureError
+from dew.objectives.rl.episodes import EpisodeId, EpisodeStatus, Observation
 from dew.objectives.rl.sessions import Task
 from dew.records import JSON
 
@@ -116,14 +116,14 @@ class _Episode[ObservationT, ActionT]:
             return Observation((), EpisodeStatus.COMPLETED, reward=answered.reward, messages=said.messages)
         return Observation(said.ids, reward=answered.reward, messages=said.messages)
 
-    def step(self, action: Action) -> Observation:
+    def step(self, action: Draw) -> Observation:
         sent = self.adapters.action(action.tokens)
         with _dropped():
             answered = self.session.step(sent)
         said = self.adapters.reply(answered.observation)
         if answered.done:
             return Observation((), EpisodeStatus.COMPLETED, reward=answered.reward, messages=said.messages)
-        return Observation(action.context + action.tokens + said.ids, reward=answered.reward,
+        return Observation(action.prompt + action.tokens + said.ids, reward=answered.reward,
                            messages=said.messages)
 
 

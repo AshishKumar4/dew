@@ -138,7 +138,7 @@ def test_disk_rows_preserve_requested_physical_formats():
             assert actual.format.sharding == target.sharding
 
 
-def test_streaming_refuses_training_and_closed_sources():
+def test_streaming_keeps_captured_layers_and_refuses_training_and_closed_sources():
     from dew.inference.banks import SafetensorsBanks
 
     with SafetensorsBanks(FIXTURE, cache_bytes=0) as source:
@@ -147,6 +147,10 @@ def test_streaming_refuses_training_and_closed_sources():
         tokens = jnp.ones((1, 2), jnp.int32)
         with pytest.raises(ValueError):
             model.apply(variables, tokens, train=True)
+        _, kept = model.apply(variables, tokens, capture_intermediates=model.capture_layers,
+                              mutable=list(model.layer_collections))
+        states = [model.layer_state(kept, index) for index in range(model.num_layers)]
+        assert all(state.shape[:2] == tokens.shape for state in states)
     with pytest.raises(RuntimeError):
         source.read(0)
 

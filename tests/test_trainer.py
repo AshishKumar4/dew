@@ -16,6 +16,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import jax
@@ -70,7 +71,7 @@ def make_trainer(tmp_path=None, objective=None, optimizer=None, keep=3, **kwargs
 class TokenRegression(Regression):
     counts_tokens = True
 
-    def real_lengths(self, batch):
+    def scored_tokens(self, batch):
         return batch["index"] + 1
 
 
@@ -181,7 +182,7 @@ def test_a_step_only_prefix_keeps_lifetime_real_tokens(tmp_path):
 class LargeTokenRegression(Regression):
     counts_tokens = True
 
-    def real_lengths(self, batch):
+    def scored_tokens(self, batch):
         return batch["real_length"]
 
 
@@ -278,34 +279,33 @@ def test_typed_root_key_round_trips_and_resumes_bit_exactly(tmp_path):
         np.testing.assert_array_equal(np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right)))
 
 
+# The threads Orbax writes checkpoints on, by the names orbax-checkpoint 0.12 gives them: its
+# asynchronous save, its metadata stores' executors, its deleter and the event loops it runs.
+WRITERS = ("async_save", "metadata_store", "DeleterThread", "ScanThread", "_run_loop", "_run_event_loop")
+
+
+def checkpoint_writers() -> set[threading.Thread]:
+    """The live threads of this process that write checkpoints."""
+    return {thread for thread in threading.enumerate() if any(name in thread.name for name in WRITERS)}
+
+
 def test_closed_checkpoints_leave_no_writer_running_across_trials(tmp_path):
     """Trials in one process each close their checkpoints, as RunConfig.train does, so Orbax's
-    managers and metadata stores leave no thread behind: two more trials run no more threads than
-    the first left, and a closed Checkpoints reopens to read what it wrote. A neighbour's thread that
-    ends meanwhile, as another test's pool does in a shared process, is not a trial's."""
-    import threading
-
-    release = threading.Event()
-    neighbour = threading.Thread(target=release.wait)
-    neighbour.start()
-
+    managers and metadata stores leave no writer behind: after the first, which starts what Orbax
+    keeps for the process, every checkpoint writer alive after each trial was alive before it,
+    whatever threads the rest of the process starts or ends, and a closed Checkpoints reopens to
+    read what it wrote."""
     def trial(index):
         with Checkpoints(str(tmp_path / str(index))) as checkpoints:
             Trainer(Regression(), optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
                 dataset(), steps=2, checkpoint_every=1, log_every=1)
         return checkpoints
 
-    try:
-        trial(0)
-        settled = set(threading.enumerate())
-        release.set()
-        neighbour.join()
-        for index in (1, 2):
-            reopened = trial(index)
-            assert set(threading.enumerate()) <= settled
-    finally:
-        release.set()
-        neighbour.join()
+    trial(0)
+    before = checkpoint_writers()
+    for index in (1, 2):
+        reopened = trial(index)
+        assert checkpoint_writers() <= before
     assert reopened.latest == 2
 
 
@@ -330,10 +330,9 @@ def failed_write(monkeypatch) -> OSError:
 def test_checkpoints_whose_write_failed_close_and_keep_the_error_their_run_raised(tmp_path, monkeypatch,
                                                                                   body_fails):
     """A run whose last checkpoint write failed still closes its checkpoints' managers, each waited
-    on and closed after the failure, so no thread outlives the scope. A run that failed first raises
-    its own error with the write's failure noted on it; one that did not raises the write's."""
-    import threading
-
+    on and closed after the failure, so no checkpoint writer outlives the scope. A run that failed
+    first raises its own error with the write's failure noted on it; one that did not raises the
+    write's."""
     def trained(index):
         checkpoints = Checkpoints(str(tmp_path / str(index)))
         Trainer(Regression(), optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
@@ -342,7 +341,7 @@ def test_checkpoints_whose_write_failed_close_and_keep_the_error_their_run_raise
 
     with trained(0):
         pass
-    settled = threading.active_count()
+    before = checkpoint_writers()
     primary = ValueError("training failed first")
     with pytest.raises((ValueError, OSError)) as raised, trained(1):
         failure = failed_write(monkeypatch)
@@ -350,43 +349,30 @@ def test_checkpoints_whose_write_failed_close_and_keep_the_error_their_run_raise
             raise primary
     assert raised.value is (primary if body_fails else failure)
     assert bool(getattr(primary, "__notes__", ())) == body_fails
-    assert threading.active_count() == settled
+    assert checkpoint_writers() <= before
 
 
 def test_a_run_that_fails_after_a_failed_write_raises_its_own_error_and_closes_its_checkpoints(
         tmp_path, monkeypatch):
     """RunConfig.train closes the run's tracker and checkpoints however it ends: a run whose step
     after training fails, once its last checkpoint write failed, raises its own error with the
-    write's failure noted on it, and leaves no checkpoint thread behind. A neighbour's thread that
-    ends meanwhile, as another test's pool does in a shared process, is not the run's."""
-    import threading
-
+    write's failure noted on it, and leaves no checkpoint writer behind."""
     from dew.config import RunConfig, TrainerConfig
 
     run = RunConfig(trainer=TrainerConfig(steps=2, checkpoint_dir=str(tmp_path),
                                           eval_every=None, checkpoint_every=1))
     run.train(Regression(), dataset(), name="settled")
-    release = threading.Event()
-    neighbour = threading.Thread(target=release.wait)
-    neighbour.start()
-    settled = set(threading.enumerate())
+    before = checkpoint_writers()
     primary = ValueError("calibration failed")
 
     def after(state, directory):
         failed_write(monkeypatch)
-        release.set()
-        neighbour.join()
         raise primary
 
-    try:
-        with pytest.raises(ValueError) as raised:
-            run.train(Regression(), dataset(), name="failed", after=after)
-    finally:
-        # A run that fails before `after` must not leave the neighbour waiting.
-        release.set()
-        neighbour.join()
+    with pytest.raises(ValueError) as raised:
+        run.train(Regression(), dataset(), name="failed", after=after)
     assert raised.value is primary and primary.__notes__
-    assert set(threading.enumerate()) <= settled
+    assert checkpoint_writers() <= before
 
 
 class Keyed(Regression):

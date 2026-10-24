@@ -6,6 +6,7 @@ from functools import partial
 from dew import records
 from dew.interop.decoder_parts import (
     MEGATRON_NAMES,
+    PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
     base_config,
@@ -40,7 +41,8 @@ def _falcon_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     config = base_config({**hf, 'hidden_size': hidden, 'num_attention_heads': heads,
                            'num_key_value_heads': 1 if hf.get('multi_query', True) else heads,
                            'intermediate_size': hf.get('ffn_hidden_size') or 4 * hidden,
-                           'hidden_act': 'silu'}, used, reads=frozenset(), tie_embeddings=True)
+                           'hidden_act': 'silu'}, used, rope=PLAIN_SPELLING, reads=frozenset(),
+                         tie_embeddings=True)
     config.update({
         'mlp': mlp, 'mlp_bias': bool(hf.get('bias', False)),
         'attention_bias': bool(hf.get('bias', False)),

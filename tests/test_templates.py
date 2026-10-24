@@ -1,5 +1,6 @@
 """dew.nn.kernels.templates.base: a template's configs are the ones a block of the device holds, its
-heuristic its cost model's fastest of them, and a call's implementation the one estimated fastest."""
+heuristic its cost model's fastest of them, and a call's implementation, as a selector over them ranks
+it (`dew.nn.kernels.selection`), the one estimated fastest."""
 
 import dataclasses
 from typing import ClassVar
@@ -9,7 +10,8 @@ import jax.numpy as jnp
 import pytest
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates.base import Template, Unfitted, choose
+from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Requirement, select
+from dew.nn.kernels.templates.base import Call, Template, Unfitted, call
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -120,26 +122,73 @@ class Unpriced(Doubling):
         raise ValueError("no cost facts")
 
 
+def choose(implementations, x) -> Template:
+    """The implementation of `implementations` a selector over them runs for a call on `x`: each its
+    kernel where it runs the call (`Template.eligible`), costed by its estimate (`Call.seconds`)."""
+    op = Op("decode", tuple(Kernel(
+        implementation.name,
+        (Requirement[Call]("eligible", lambda case, name=implementation.name: case.eligible(name),
+                           "it does not run the call here", row=generation.INHERENT),),
+        cost=lambda case, name=implementation.name: case.seconds(name))
+        for implementation in implementations))
+    bound = call(implementations, x)
+    return bound.implementation(select(op, bound).kernel)
+
+
 def test_a_call_runs_the_implementation_estimated_fastest_on_the_device_or_the_one_chosen():
     """Among the implementations that run the call on the device, the one whose fastest fitting
     config is estimated fewest seconds, reported as the call's route; `generation.chosen` names
-    another, and one that does not run the call there is refused. Hopper's runs bf16 on sm90 alone."""
+    another, and one that does not run the call there is refused, naming why. Hopper's runs bf16 on sm90
+    alone."""
     x = jax.ShapeDtypeStruct((4096, 512), jnp.float32)
     implementations = [Slow(), Doubling(), Hopper()]
     with generation.assumed("sm80"), generation.routes() as found:
-        assert type(choose("decode", implementations, x)) is Doubling
+        assert type(choose(implementations, x)) is Doubling
         with generation.chosen(decode="slow"):
-            assert type(choose("decode", implementations, x)) is Slow
-        with generation.chosen(decode="hopper"), pytest.raises(ValueError):
-            choose("decode", implementations, x)
+            assert type(choose(implementations, x)) is Slow
+        with generation.chosen(decode="hopper"), pytest.raises(KernelRefused) as refused:
+            choose(implementations, x)
+    assert [refusal.code for refusal in refused.value.refusals] == ["eligible"]
     assert [(route.kernel, route.preferred) for route in found] == [
         ("doubling", "doubling"), ("slow", "slow")]
     with generation.assumed("sm80"), generation.chosen(decode="doubling"):
         # A chosen implementation estimates no other: one whose cost needs facts the target lacks, or
         # whose programs fit no block of it, leaves the chosen one its call.
-        assert type(choose("decode", [Unpriced(), Doubling()], x)) is Doubling
-        assert type(choose("decode", [Unfitting(), Doubling()], x)) is Doubling
+        assert type(choose([Unpriced(), Doubling()], x)) is Doubling
+        assert type(choose([Unfitting(), Doubling()], x)) is Doubling
     with generation.assumed("sm90"):
-        assert type(choose("decode", implementations, x)) is Doubling
-        assert type(choose("decode", [Unpriced()], x)) is Unpriced
-        assert type(choose("decode", implementations, x.update(dtype=jnp.bfloat16))) is Hopper
+        assert type(choose(implementations, x)) is Doubling
+        assert type(choose([Unpriced()], x)) is Unpriced
+        assert type(choose(implementations, x.update(dtype=jnp.bfloat16))) is Hopper
+
+
+def _ranked(costs: dict, generic: dict | None = None, named: str | None = None) -> str:
+    """The kernel a selector over kernels of `costs` (each taking the call; None states no cost) runs,
+    the `generic` ones (name to cost) after them, `named` as `generation.chosen` names it."""
+    takes = (Requirement[None]("takes", lambda case: True, "", row=generation.INHERENT),)
+
+    def priced(cost):
+        return None if cost is None else (lambda case: cost)
+
+    kernels = [Kernel[None](name, takes, cost=priced(cost)) for name, cost in costs.items()]
+    kernels += [Kernel[None](name, takes, generic=True, cost=priced(cost))
+                for name, cost in (generic or {}).items()]
+    with generation.assumed("sm90"), generation.chosen(decode=named):
+        return select(Op("decode", tuple(kernels)), None).kernel
+
+
+def test_a_selector_ranks_every_costed_kernel_and_runs_an_unqualified_one_only_by_name():
+    """Where each kernel that takes the call states a cost, the selector runs the cheapest, a generic
+    kernel stating one among them (XLA's program beating a launch); a kernel costing no finite seconds,
+    which no measurement qualified, runs only where named, the call handed to the generic kernel where no
+    other qualifies and refused where no generic kernel takes it; an op whose kernels do not all state
+    costs keeps its declared order whole."""
+    assert _ranked({"a": 2.0, "b": 1.0}) == "b"
+    assert _ranked({"a": 2.0, "b": 1.0}, {"xla": 0.5}) == "xla"
+    assert _ranked({"a": 2.0, "b": 2.0}) == "a"
+    assert _ranked({"a": float("inf"), "b": 3.0}, {"xla": None}) == "b"
+    assert _ranked({"a": float("inf"), "b": float("inf")}, {"xla": None}) == "xla"
+    with pytest.raises(ValueError):
+        _ranked({"a": float("inf"), "b": float("inf")})
+    assert _ranked({"a": float("inf"), "b": 3.0}, named="a") == "a"
+    assert _ranked({"a": None, "b": 1.0}, {"xla": 0.5}) == "a"

@@ -292,6 +292,22 @@ def test_masked_generation_names_what_a_model_lacks(rng, model, lacks):
         process.generate(model, model.init(rng, jnp.zeros((1, 4), jnp.int32)), [[1, 2]], 3, key=0)
 
 
+def test_masked_generation_reads_its_ids_as_every_parser_of_ids_does(rng):
+    """NumPy integers are token ids as Python's are (`dew.nn.inputs.token_id`), so a request built
+    from a tokenizer's arrays generates as one built from Python ints; a flag or a fraction where
+    an id goes is refused."""
+    model = transformer(causal=False)
+    variables = model.init(rng, jnp.zeros((1, 4), jnp.int32))
+    process = DiscreteProcess(LogLinear(), mask_id=MASK)
+    python = process.generate(model, variables, [[1, 2]], 3, key=0, pad_token_id=0, eos_token_ids=(3,))
+    arrays = process.generate(model, variables, [[1, 2]], 3, key=0, pad_token_id=np.int64(0),
+                              eos_token_ids=(np.int32(3),))
+    np.testing.assert_array_equal(arrays.tokens, python.tokens)
+    for wrong in ({"pad_token_id": True}, {"eos_token_ids": (3.0,)}):
+        with pytest.raises(ValueError):
+            process.generate(model, variables, [[1, 2]], 3, key=0, **wrong)
+
+
 class FieldReader(nn.Module):
     """A user's bidirectional model that spells out what each slot is handed:
     a text slot scores its logical position, one past it when the row

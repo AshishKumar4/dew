@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import jax
 import numpy as np
-from episode_support import Harness, build
+from episode_support import Harness, build, episode_scheduler
 from process_support import serve_mode, worker_parser
 
 from dew.data.dataset import DataPartition
@@ -23,7 +23,8 @@ def replicated_readers(args):
         trainer, rollout = build_ppo(verifier)
         rollout = replace(rollout, episodes=replace(rollout.episodes, environment=harness))
     else:
-        trainer, rollout = build(harness, verifier=verifier)
+        trainer, collector = build(harness, verifier=verifier)
+        rollout = episode_scheduler(collector)
     trainer.mesh = MeshSpec(tensor=args.processes)
     state = trainer.place()[0]
     partition = DataPartition.of(trainer.device_mesh)

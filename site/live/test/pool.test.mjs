@@ -63,6 +63,12 @@ test('a pool of no minimum, as the preview\'s, starts a host only when one is wa
 test('a generation handed over after a newer one does not replace it', async () => {
 	assert.equal((await scenario('older')).desired, 'newer');
 });
+test('a session reconnecting while every host is full keeps the slot it holds', async () => {
+	const result = await scenario('full');
+	assert.equal(result.image, null);
+	assert.deepEqual(result.held, { host: result.first, image: 'snapshot' });
+	assert.equal(result.fresh, null);
+});
 test('a host that fails its health check restarts at once when idle, and at its third miss when busy', async () => {
 	const { restarts } = await scenario('health');
 	assert.deepEqual(restarts, [{ idle: 1, held: 0, ready: 1 }, { idle: 1, held: 0, ready: 1 }, { idle: 1, held: 1, ready: 2 }]);

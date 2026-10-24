@@ -20,6 +20,7 @@ from dew._model_types import SANDWICH_NORMS
 from dew.interop.weights import native_layouts, placed
 from dew.nn.attention import RMSNorm
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
+from dew.nn.blocks import table_rows
 from dew.nn.dense import Dense
 from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.mixer_base import MixerContext
@@ -171,8 +172,8 @@ class Gemma4VisionTransformer(nn.Module):
         valid = (pixel_position_ids >= 0).all(axis=-1)
         safe = jnp.maximum(pixel_position_ids, 0)
         hidden_states = self.patch_embed(2 * (pixels - 0.5))
-        table = jnp.asarray(self.position_table, hidden_states.dtype)
-        positional = table[0, safe[..., 0]] + table[1, safe[..., 1]]
+        positional = (table_rows(self.position_table[0], safe[..., 0], hidden_states.dtype)
+                      + table_rows(self.position_table[1], safe[..., 1], hidden_states.dtype))
         hidden_states = hidden_states + jnp.where(valid[..., None], positional, 0)
         metadata = AttentionMetadata(coordinates=coordinates(valid=valid),
                                      rotary_positions=pixel_position_ids)

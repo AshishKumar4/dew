@@ -1,6 +1,6 @@
 """What every algorithm template shares: a launch whose configs fit the device and whose heuristic is
-its cost model's fastest fitting config (`Template`), and one call's choice among a template's
-implementations by the same estimates (`choose`).
+its cost model's fastest fitting config (`Template`), and one call of a template's implementations
+(`Call`), whose eligibility and estimates a selector over them reads (`dew.nn.kernels.selection`).
 
 A template's launch declares the configs it is proven over (`space`), the shared memory a program
 stages at each (`staged_bytes`), and the seconds it estimates at each on a target (`cost`,
@@ -8,12 +8,13 @@ stages at each (`staged_bytes`), and the seconds it estimates at each on a targe
 it to (`tuning.tune`); without a measurement the launch takes its heuristic, the same on every run.
 """
 
-from collections.abc import Callable, Hashable, Sequence
+import dataclasses
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import ClassVar
 
 import tokamax
 
-from dew.nn.kernels import generation, selection, tuning
+from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import cost
 
 
@@ -124,37 +125,32 @@ class Unfitted(ValueError):
         return type(self), (self.launch, self.least, self.budget, self.generation)
 
 
-def choose(choice: str, implementations: Sequence[Template], *args, **kwargs) -> Template:
-    """The implementation of `implementations` one call of `choice` runs, reported as its route: the
-    one `generation.chosen` names, else the one whose fastest fitting config `estimate`s fewest
-    seconds among those `eligible` for the call on this device, the first of the order given where
-    several tie. The choice is the cost model's: a measured pick chooses a launch's config, never its
-    implementation. Every implementation shares the template's signature, so each binds the call's
-    own arguments. A named implementation that does not run the call here raises."""
-    target = generation.gpu_target()
-    bound = {implementation.name: (implementation, implementation.bind(*args, **kwargs))
-             for implementation in implementations}
-    eligible = [(implementation, ba) for implementation, ba in bound.values()
-                if implementation.eligible(ba, target)]
-    if not eligible:
-        raise ValueError(f"no implementation of {choice} runs this call on {target.generation}: "
-                         f"{', '.join(bound)}")
-    named = selection.forced(choice)
-    if named is not None:
-        # A chosen implementation is the call's without estimating the others, whose costs may need
-        # facts the target does not state.
-        if named not in bound or not bound[named][0].eligible(bound[named][1], target):
-            raise ValueError(f"{choice}'s implementation {named!r} is chosen and does not run this call on "
-                             f"{target.generation}; the ones that do are "
-                             f"{', '.join(implementation.name for implementation, _ in eligible)}")
-        picked, ba = bound[named]
-        picked.fitting(ba, target)
-        generation.route(choice, kernel=picked.name)
-        return picked
-    # One eligible implementation is the call's without an estimate, so a target with no cost facts
-    # (a TPU, where XLA's alone runs) needs none.
-    costs = [0.0] if len(eligible) == 1 else [implementation.estimate(ba, target)[0]
-                                              for implementation, ba in eligible]
-    picked = eligible[min(range(len(eligible)), key=lambda index: (costs[index], index))][0]
-    generation.route(choice, kernel=picked.name, preferred=picked.name)
-    return picked
+@dataclasses.dataclass(frozen=True)
+class Call:
+    """One call of a template's implementations on `target`, each bound to the call's own arguments by
+    its `name` (every implementation shares the template's signature): what a selector over them reads,
+    whether each runs the call (`Template.eligible`) and the seconds its fastest fitting config is
+    estimated to take (`Template.estimate`), each asked once."""
+
+    bound: Mapping[str, tuple[Template, tokamax.BoundArguments]]
+    target: generation.GpuTarget
+    _eligible: dict[str, bool] = dataclasses.field(default_factory=dict, compare=False, repr=False)
+
+    def implementation(self, name: str) -> Template:
+        return self.bound[name][0]
+
+    def eligible(self, name: str) -> bool:
+        if name not in self._eligible:
+            implementation, ba = self.bound[name]
+            self._eligible[name] = implementation.eligible(ba, self.target)
+        return self._eligible[name]
+
+    def seconds(self, name: str) -> float:
+        implementation, ba = self.bound[name]
+        return implementation.estimate(ba, self.target)[0]
+
+
+def call(implementations: Sequence[Template], *args, **kwargs) -> Call:
+    """The call of `implementations` with `args` and `kwargs` on this device's target."""
+    return Call({implementation.name: (implementation, implementation.bind(*args, **kwargs))
+                 for implementation in implementations}, generation.gpu_target())

@@ -211,6 +211,11 @@ class RunProcessor:
     def decode(self, tokens: jax.typing.ArrayLike) -> list[str]:
         return [self.tokenizer.decode(row) for row in np.asarray(tokens)]
 
+    def encode(self, text: str, *, specials: bool) -> list[int]:
+        """`text`'s ids from the run's tokenizer, with the special tokens it adds around a sequence
+        where `specials`, and none otherwise."""
+        return self.tokenizer.encode(text, add_special_tokens=specials)
+
     @property
     def bos_id(self) -> int | None:
         """The id the run's tokenizer starts a sequence with, or None."""

@@ -24,6 +24,7 @@ import jax.numpy as jnp
 from dew.artifacts import TokenScores
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.inputs import Field, InputSpec
+from dew.nn.inputs import rotate_rows
 from dew.nn.precision import at_least_fp32
 from dew.objectives.base import Aux, EMASpec, Ratio, Shown, Variables, thaw
 from dew.objectives.lm.chunked import final_read, head_cross_entropy
@@ -36,7 +37,7 @@ from dew.rl.surrogate import (
     sequence_rejection_mask,
 )
 
-from ..lm.objective import TokenScorer, _shift_rows, _unpadded
+from ..lm.objective import TokenScorer, _unpadded
 from .sessions import (
     ADVANTAGES_KEY,
     BEHAVIOR_LOG_PROBS_KEY,
@@ -378,7 +379,7 @@ class GRPOObjective(TokenScorer):
             raise ValueError(
                 f"a prompt needs two tokens to score one target, got {prompts.shape[1]}")
         padding = prompts.shape[1] - lengths
-        aligned = _shift_rows(prompts, padding)
+        aligned = rotate_rows(prompts, padding)
         read = final_read(self.model, params, aligned[:, :-1], train=False)
         losses, predicted, _ = head_cross_entropy(self.model, params, read, aligned[:, 1:],
                                                   self.head_chunks, predict=True)
