@@ -47,7 +47,7 @@ from dew.nn.inputs import (
     document_reach,
 )
 from dew.nn.kernels.selection import select
-from dew.nn.kv_cache import PAGED, PLACES, TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
+from dew.nn.kv_cache import PAGED, PLACES, TABLE, Append, KVCache, KVStore, filled_slots, rotated
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import QKV_RESIDUALS, MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain
@@ -55,7 +55,7 @@ from dew.nn.precision import at_least_fp32, float32_dot_general, l2norm, rounded
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, mrope_tables, rotary_freqs, rotate
 from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
-from dew.nn.visibility import same_group, visible, windowed
+from dew.nn.visibility import block_starts, same_group, visible, windowed
 
 
 def temperature_scale(positions, floor_scale: float, attn_scale: float, *, dtype: DTypeLike):
@@ -398,19 +398,27 @@ class CausalSelfAttention(nn.Module):
                 f"head dims, got {factor} of head_dim {self.ctx.head_dim}")
         return rot_dim
 
-    def _shared_kv(self, kv_store):
-        """Read the keys, values, query positions and key places the provider layer stashed.
+    def _shared_kv(self, kv_store, decode: bool):
+        """Read the keys, values, query positions, key places and key groups the provider layer stashed
+        (`_kept_groups`).
 
         The provider ran earlier in the same forward pass and left them
         post-norm and post-rope, so a sharing layer projects, norms,
-        rotates and caches nothing of its own.
+        rotates and caches nothing of its own. A decode step reads the
+        groups its provider's cache keeps, so the provider's kind reads every
+        group field this one does.
         """
         if kv_store is None or self.ctx.kv_store_key not in kv_store:
             raise ValueError(
                 f"layer shares K/V under {self.ctx.kv_store_key!r} but no provider "
                 "stashed them; the model has to pass one kv_store dict down "
                 "its layer stack")
-        return kv_store[self.ctx.kv_store_key]
+        stashed = kv_store[self.ctx.kv_store_key]
+        missing = sorted(set(self._group_fields()) - set(stashed[4])) if decode else []
+        if missing:
+            raise ValueError(f"layer shares K/V under {self.ctx.kv_store_key!r} and reads {missing}, which "
+                             "its provider's cache does not keep: the provider's kind reads them too")
+        return stashed
 
     def _projected_kv(self, x, whole: bool, projected=None):
         """Project the keys and values, norm them, and split them into heads.
@@ -480,19 +488,20 @@ class CausalSelfAttention(nn.Module):
             rope_scaling=self.ctx.rope_scaling if self.ctx.yarn is None else self.ctx.yarn,
             dtype=dtype, reach=reach)
 
-    def _metadata_mask(self, metadata: AttentionMetadata | None, slots, counted, documents, batch: int,
-                       length: int, key_length: int, decode: bool):
+    def _metadata_mask(self, metadata: AttentionMetadata | None, slots, counted, documents,
+                       history: dict[str, jax.Array], batch: int, length: int, key_length: int, decode: bool):
         """The call's visibility as one mask `[B, 1, S, keys]`: causality, its keys' validity (an uncached
         call's real tokens, a cache call's filled slots, which its `documents` hold), its own documents,
         the layer's window, which counts tokens (a cache's slots are its tokens, and an uncached call's are
         `counted`, `counted_places`, padding among them skipped), and the image and block groups a causal
-        layer reads (`_groups`): an image's token sees its later tokens within the window, which bounds
-        only the keys behind it (Gemma's `AND(window, OR(causal, image))`), and a block's token its whole
-        block whatever the window (transformers' `block_sequence_ids`)."""
+        layer reads (`_groups`, a cache's kept beside its keys in `history`): an image's token sees its
+        later tokens within the window, which bounds only the keys behind it (Gemma's
+        `AND(window, OR(causal, image))`), and a block's token its whole block whatever the window
+        (transformers' `block_sequence_ids`)."""
         query_slots = (slots if decode else jnp.broadcast_to(jnp.arange(length), (batch, length)))
         keep = (causal_attention_mask(query_slots, key_length)
                 if self.ctx.causal else jnp.ones((batch, 1, length, key_length), bool))
-        images, blocks = (self._groups(metadata, name, slots, key_length, decode) if self.ctx.causal else None
+        images, blocks = (self._groups(metadata, name, history, decode)
                           for name in ("image_groups", "block_groups"))
         if images is not None:
             keep = keep | same_group(images[0][:, :, None], images[1][:, None, :])[:, None]
@@ -517,33 +526,39 @@ class CausalSelfAttention(nn.Module):
         return keep
 
     def _group_fields(self) -> tuple[str, ...]:
-        """The `AttentionMetadata` fields of groups the layer reads: `image_groups` under
-        `bidirectional_images`, `block_groups` under `bidirectional_blocks`."""
+        """The `AttentionMetadata` fields of groups a causal layer reads: `image_groups` under
+        `bidirectional_images`, `block_groups` under `bidirectional_blocks`; a non-causal one reads none,
+        since it sees its whole row already."""
         return tuple(name for name, reads in (("image_groups", self.bidirectional_images),
-                                              ("block_groups", self.bidirectional_blocks)) if reads)
+                                              ("block_groups", self.bidirectional_blocks))
+                     if reads and self.ctx.causal)
 
     def _reads_groups(self, metadata: AttentionMetadata | None, decode: bool = False,
                       length: int = 0) -> bool:
-        """Whether the call carries groups the layer reads, a call of `length` tokens: a single decode step
-        reads none, since its keys are those before it, so its block's later ones are not yet there."""
+        """Whether the call carries groups the layer reads (`_group_fields`), a call of `length` tokens: a
+        single decode step reads them through its first key instead (`_decode_masks`), since its block's
+        later keys are not yet there."""
         return (metadata is not None and not (decode and length == 1)
                 and any(getattr(metadata, name) is not None for name in self._group_fields()))
 
-    def _groups(self, metadata: AttentionMetadata | None, name: str, slots, key_length: int,
+    def _groups(self, metadata: AttentionMetadata | None, name: str, history: dict[str, jax.Array],
                 decode: bool) -> tuple[jax.Array, jax.Array] | None:
         """The queries' `[B, S]` and keys' `[B, keys]` groups of field `name`, None where the layer reads
-        none or the call carries none: an uncached call's keys are its own tokens, and a cache call's are
-        its tokens at their `slots` and -1 elsewhere. A cache call matches its whole pass where each block
-        lies in one call, since a call's queries were computed before any later call's keys: the keys of
-        its own block it reads are then the call's tokens. So no cache keeps the groups, and a layer
-        sharing another's keys reads them as its own."""
+        none or the call carries none: an uncached call's keys are its own tokens, and a cache call's keys
+        carry the groups the cache keeps beside them (`history`, `_kept_groups`), its own tokens' among
+        them, so a later call's token reads its block's earlier keys."""
         groups = None if metadata is None or name not in self._group_fields() else getattr(metadata, name)
         if groups is None:
             return None
         groups = jnp.asarray(groups, jnp.int32)
-        if not decode:
-            return groups, groups
-        return groups, write_cache(jnp.full((groups.shape[0], key_length), -1, jnp.int32), groups, slots)
+        return groups, history[name] if decode else groups
+
+    def _kept_groups(self, append: Append, metadata: AttentionMetadata | None) -> dict[str, jax.Array]:
+        """Every cache slot's groups of the fields the layer reads, `[B, keys]` each, the call's tokens'
+        written at their slots first, -1 where it carries none (`Append.groups`): what a later call and a
+        layer sharing these keys read them by."""
+        return {name: append.groups(name, None if metadata is None else getattr(metadata, name))
+                for name in self._group_fields()}
 
     def _restricts_visibility(self, metadata: AttentionMetadata | None, decode: bool) -> bool:
         """Whether metadata narrows who sees whom, so the mask has to be built.
@@ -604,9 +619,9 @@ class CausalSelfAttention(nn.Module):
         if self.ctx.output_gate and self.gate_projection == 'own':
             gate = checkpoint_name(self.gate_proj(x), 'output_gate')
             gate = gate.reshape(B, S, self.ctx.num_heads, self.ctx.head_dim)
-        held_places = None
+        held = None
         if self.ctx.kv_shared:
-            key, value, positions, held_places = self._shared_kv(kv_store)
+            key, value, positions, *held = self._shared_kv(kv_store, decode)
         else:
             key, value = self._projected_kv(x, whole, projected_kv)
         if self.ctx.qk_norm and not whole:
@@ -657,7 +672,7 @@ class CausalSelfAttention(nn.Module):
             if kv_store is not None and self.ctx.kv_store_key is not None:
                 # Post-norm, post-rope, the same tensors the reference hands
                 # its sharing layers (modeling_gemma4.py, Gemma4TextAttention).
-                kv_store[self.ctx.kv_store_key] = (key, value, positions, places)
+                kv_store[self.ctx.kv_store_key] = (key, value, positions, places, {})
         if decode and attention_metadata is not None and attention_metadata.admitted is not None:
             attention = self._mixed_attended(query, key, value, positions, attention_metadata)
             return self._output(attention, gate, B, S, own_value)
@@ -675,7 +690,7 @@ class CausalSelfAttention(nn.Module):
                 implementation=self.ctx.attention_impl, sinks=sinks,
                 softcap=self.ctx.attn_logit_softcap), 'context')
             return self._output(attention, gate, B, S, own_value)
-        masking = self._masking(query, key, value, positions, counted, held_places, rotary_positions, append,
+        masking = self._masking(query, key, value, positions, counted, held, rotary_positions, append,
                                 prefix, kv_len, kv_store, segment_ids, attention_metadata, decode)
         bias = None
         if self.alibi:
@@ -712,7 +727,7 @@ class CausalSelfAttention(nn.Module):
                     positions, append = open_kv_cache(
                         self, key, self.ctx.max_seq_len, value_dim=self.value_dim,
                         valid=None if attention_metadata is None else attention_metadata.valid,
-                        layout=self.ctx.kv_cache, places=self._reads_places)
+                        layout=self.ctx.kv_cache, places=self._reads_places, groups=self._group_fields())
             elif self.ctx.kv_cache != KVCache():
                 self.ctx.refuse("attention", {"kv_cache": True}, "a bidirectional canvas reads its "
                                 "encoder prefix as dense, full-precision keys")
@@ -763,7 +778,7 @@ class CausalSelfAttention(nn.Module):
         value,
         positions,
         places,
-        held_places,
+        held,
         rotary_positions,
         append,
         prefix,
@@ -779,13 +794,13 @@ class CausalSelfAttention(nn.Module):
         visibility comes to (the canvas prefix, a shared or cached decode step,
         packed documents, metadata, a pairwise mask, a chunk). `places` are the
         queries' places counted over their documents' tokens (`counted_places`),
-        and `held_places` a sharing layer's keys'."""
+        and `held` a sharing layer's keys' places and groups (`_kept_groups`)."""
         B, S = query.shape[:2]
         causal, mask, documents, implementation = self.ctx.causal, None, None, self.ctx.attention_impl
-        # An uncached call's keys are its own tokens; a cached call's keys are
-        # at the places their cache keeps beside them where the layer reads
-        # them (`Append.places`), else at their slots, which nothing reads.
-        key_places = places
+        # An uncached call's keys are its own tokens; a cached call's are at the places and in the groups
+        # their cache keeps beside them where the layer reads them (`Append.places`, `_kept_groups`),
+        # else at their slots, which nothing reads.
+        key_places, history = places, {}
         # A bidirectional layer windows only where its kind keeps the window on
         # both sides; DiffusionGemma's decoder reads its whole canvas
         # (modeling_diffusion_gemma.py:1399-1401), and its prefix branch below
@@ -817,28 +832,29 @@ class CausalSelfAttention(nn.Module):
                           if self._reads_places else jnp.arange(alloc + S))
         elif self.ctx.kv_shared and decode:
             # The provider's stashed keys carry the full history, read as its own cache is.
+            key_places, history = held
             if S == 1:
-                mask, causal = causal_attention_mask(positions, kv_len, self.ctx.sliding_window), False
+                (mask, _), causal = self._decode_masks(positions, B, kv_len, None, history), False
             else:
                 last = jnp.max(jnp.asarray(positions).reshape(B, S), axis=-1, keepdims=True)
                 documents, causal, window = self._cached_call(
                     positions, visible(last, jnp.arange(kv_len)[None, :], causal=True))
-            key_places = held_places
             # A quantized provider stashed its keys in the cache's rotation.
             rotation = self.ctx.kv_cache.key_rotation(self.ctx.head_dim)
             if rotation is not None:
                 query = rotated(query, rotation)
         elif append is not None:
             key, value = append(key, value)
-            query = append.query(query)
+            query, history = append.query(query), self._kept_groups(append, attention_metadata)
             if S == 1:
-                (mask, starts), causal = self._decode_masks(positions, key.shape[0], key.shape[-3]), False
+                (mask, starts), causal = self._decode_masks(
+                    positions, B, key.shape[-3], cached_validity(self, key.shape[-3]), history), False
                 cursor = mask
             else:  # several tokens appended after the keys their rows held
                 documents, causal, window = self._cached_call(positions, cached_validity(self, key.shape[-3]))
             key_places = append.places(places) if self._reads_places else jnp.arange(key.shape[-3])
             if kv_store is not None and self.ctx.kv_store_key is not None:
-                kv_store[self.ctx.kv_store_key] = (key, value, positions, key_places)
+                kv_store[self.ctx.kv_store_key] = (key, value, positions, key_places, history)
         elif segment_ids is not None:
             # Attention stays inside each packed document. The ids travel to
             # the kernel beside the causal flag and the window: splash compares
@@ -855,7 +871,7 @@ class CausalSelfAttention(nn.Module):
                                or grouped):
             # A decode step's mask and a cache call's documents hold the rows' validity; groups add to them.
             if not decode or grouped:
-                mask = self._metadata_mask(attention_metadata, positions, places, documents, B, S,
+                mask = self._metadata_mask(attention_metadata, positions, places, documents, history, B, S,
                                            key.shape[-3], decode)
             documents = None
             causal, window = False, None
@@ -1077,21 +1093,31 @@ class CausalSelfAttention(nn.Module):
                           named=self.ctx.attention_impl, windowed=windowed, sinks=sunk)
         return select(PAGED, case).kernel != 'gathered'
 
-    def _decode_masks(self, positions, rows: int, key_length: int) -> tuple[jax.Array, jax.Array | None]:
-        """The layer's decode mask over the cache's filled slots, and each
-        row's first key under its window `[rows]`, None where the layer
-        narrows nothing: the kernels stand in for the mask with each row's key
-        count and that start (`_decode_attention`). A window at least the
-        cache's capacity narrows nothing.
+    def _decode_masks(self, positions, rows: int, key_length: int, valid,
+                      history: dict[str, jax.Array]) -> tuple[jax.Array, jax.Array | None]:
+        """The layer's decode mask over the cache's filled slots (`valid`, None for every slot up to the
+        query's), and each row's first key under its window `[rows]`, None where the layer narrows
+        nothing: the kernels stand in for the mask with each row's key count and that start
+        (`_decode_attention`). A window at least the cache's capacity narrows nothing. A token of a block
+        read whole sees its block's earlier keys past the window too, its first key the earlier of the
+        window's and the block's (`block_starts` over the groups the cache keeps, `history`), so the step
+        keeps its decode kernel.
         """
-        valid = cached_validity(self, key_length)
         window = self.ctx.sliding_window
         if window is None or window >= key_length:
             return causal_attention_mask(positions, key_length, key_valid=valid), None
         # A decode token's first key under the window.
-        first = jnp.broadcast_to(jnp.atleast_2d(jnp.asarray(positions))[:, 0], (rows,)) + 1 - window
-        return (causal_attention_mask(positions, key_length, window, key_valid=valid),
-                jnp.maximum(first, 0).astype(jnp.int32))
+        slot = jnp.broadcast_to(jnp.atleast_2d(jnp.asarray(positions))[:, 0], (rows,))
+        first = jnp.maximum(slot + 1 - window, 0)
+        if "block_groups" in history:
+            at = jnp.clip(slot, 0, key_length - 1)[:, None]
+            groups = history["block_groups"]
+            begins = jnp.take_along_axis(block_starts(groups), at, axis=1)[:, 0]
+            inside = jnp.take_along_axis(groups, at, axis=1)[:, 0] >= 0
+            first = jnp.where(inside, jnp.minimum(first, begins), first)
+        keep = jnp.arange(key_length)[None, :] >= first[:, None]
+        return (causal_attention_mask(positions, key_length, key_valid=valid) & keep[:, None, None, :],
+                first.astype(jnp.int32))
 
     def _cached_call(self, positions, held) -> tuple[CrossDocuments, bool, int | None]:
         """A cache call of several tokens at `positions` `[B, S]` (-1 for padding) over the keys

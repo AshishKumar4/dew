@@ -4,6 +4,7 @@ Dew's attention masks and banded layouts compare positions by. The coordinates a
 caller's layout counts, slots, places in a document or banded rows, so a caller keeps its layout and
 builds no global mask to ask. An asymmetric window (Gemma's audio blocks) states its own sides."""
 
+import jax
 import jax.numpy as jnp
 
 
@@ -35,6 +36,16 @@ def same_group(query_groups, key_groups):
     """Whether a key is in the query's block (broadcast): both carry one group id, -1 being none, as an
     image's tokens (`AttentionMetadata.image_groups`) or a prompt's blocks (`block_groups`) do."""
     return (query_groups == key_groups) & (query_groups >= 0)
+
+
+def block_starts(groups):
+    """Each token's block's first token, `[B, S]` int32 of `groups` `[B, S]`: where the run of equal ids
+    that holds it begins (a block is such a run, -1 tokens runs of their own)."""
+    groups = jnp.asarray(groups)
+    batch, length = groups.shape
+    index = jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
+    opens = jnp.concatenate([jnp.ones((batch, 1), bool), groups[:, 1:] != groups[:, :-1]], axis=1)
+    return jax.lax.cummax(jnp.where(opens, index, 0), axis=1)
 
 
 def window_sides(causal: bool, sliding_window: int) -> tuple[int, int]:
