@@ -198,6 +198,23 @@ def test_a_dropping_call_reports_its_route_and_a_chosen_template_runs_it():
     assert out.shape == (ROWS, QUERIES, HEADS, WIDTH)
 
 
+def test_a_dropping_decode_step_takes_the_reference_path_and_never_the_decode_kernel():
+    """A dropping call shaped as a decode step (one query over key lengths) is not the decode kernel's: it
+    reads no draw, so the selector runs it on the reference path, which reads the lengths and drops."""
+    keys = jax.random.split(jax.random.PRNGKey(0), 3)
+    query = jax.random.normal(keys[0], (ROWS, 1, HEADS, WIDTH), jnp.bfloat16)
+    key = jax.random.normal(keys[1], (ROWS, KEYS, KV_HEADS, WIDTH), jnp.bfloat16)
+    value = jax.random.normal(keys[2], (ROWS, KEYS, KV_HEADS, WIDTH), jnp.bfloat16)
+    lengths = jnp.full((ROWS,), KEYS - 3, jnp.int32)
+    with generation.routes() as found:
+        out = scaled_dot_product_attention(query, key, value, key_value_seq_lengths=lengths,
+                                           dropout_rate=RATE, dropout_rng=jax.random.PRNGKey(0),
+                                           deterministic=False)
+    (route,) = [route for route in found if route.choice == "attention"]
+    assert route.kernel == "reference"
+    assert out.shape == (ROWS, 1, HEADS, WIDTH)
+
+
 def test_a_dropping_call_at_eval_takes_no_dropout():
     """A call that is not training (`deterministic=True`) takes no dropout whatever its rate, on every
     route: each route's output is its own undropped output, bit for bit."""
