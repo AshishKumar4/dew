@@ -1117,9 +1117,13 @@ def batch_layout(batch: Batch) -> str:
                      for path, leaf in jax.tree_util.tree_leaves_with_path(batch))
 
 
+STEP_BATCH = 2
+"""Where a compiled train step takes its batch among its arguments: after the moving state and the
+frozen tree (`dew.training.state.apart`, `Trainer._jitted`), before the part of the step it runs."""
+
+
 def step_reads(executable: jax.stages.Compiled, signature: Signature) -> tuple[bool, ...]:
-    """Which leaves of its batch, the third argument (after the moving state and the frozen tree,
-    `Trainer._jitted`), a compiled step reads,
+    """Which leaves of its batch (`STEP_BATCH`) a compiled step reads,
     in the leaf order of the batch's own `signature` (`batch_signature`):
     those the executable kept, where JAX pruned the rest
     (`jax.stages.Compiled.input_shardings` names no sharding for those). A
@@ -1128,7 +1132,7 @@ def step_reads(executable: jax.stages.Compiled, signature: Signature) -> tuple[b
     not the shardings', says where its leaves are."""
     arguments, _ = executable.input_shardings
     tree, _ = signature
-    return tuple(sharding is not None for sharding in tree.flatten_up_to(arguments[2]))
+    return tuple(sharding is not None for sharding in tree.flatten_up_to(arguments[STEP_BATCH]))
 
 
 def batch_shardings(mesh: Mesh | AbstractMesh, batch: Batch) -> Placement[Batch]:
