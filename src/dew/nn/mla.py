@@ -38,7 +38,7 @@ from dew.nn.attention import (
 from dew.nn.dense import Dense
 from dew.nn.documents import document_mask
 from dew.nn.flops import MissingFlopsCount, attention_flops, projection_flops
-from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
+from dew.nn.inputs import PLAIN_CALL, MixerCall, PredictionPhase, coordinates_of
 from dew.nn.kv_cache import KVCache, write_cache
 
 # dsa_kpool reads INDEXER and the expanded cache below. Reading the registry
@@ -518,7 +518,16 @@ class MultiHeadLatentAttention(nn.Module):
         return jnp.concatenate([nope, rot], axis=-1), values
 
     @nn.compact
-    def __call__(self, x, call: MixerCall = PLAIN_CALL):
+    def __call__(self, x, call: MixerCall = PLAIN_CALL, prediction_phase: PredictionPhase = "ordinary"):
+        """Project once in the shared latent shell, then apply the kind's attention/index policy."""
+        place = down_projection(x, (self.q_lora_rank or 0) + self.kv_lora_rank + self.qk_rope_head_dim)
+        queries, q_resid = self._queries(x, place)
+        latent, rot = self._latents(x, place)
+        return self._attend_projected(x, call, queries, q_resid, latent, rot, prediction_phase)
+
+    def _attend_projected(self, x, call: MixerCall, queries, q_resid, latent, rot,
+                          prediction_phase: PredictionPhase):
+        """Ordinary MLA's rotary, visibility and indexer selection over the shared projections."""
         decode, kv_store, attention_metadata = call.decode, call.kv_store, call.metadata
         causal, mask, objective = self.causal, None, None
         implementation = self.attention_impl
@@ -530,16 +539,10 @@ class MultiHeadLatentAttention(nn.Module):
         if attention_metadata is not None and attention_metadata.rotary_positions is not None:
             raise ValueError("MLA does not implement multi-axis rotary positions")
         logical_positions = positions
-        # The down-projections run where `down_projection` places them: on each
-        # tensor shard's own tokens where the link pays for gathering the
-        # latents back, which one residual gradient serves for both.
-        place = down_projection(x, (self.q_lora_rank or 0) + self.kv_lora_rank + self.qk_rope_head_dim)
-        queries, q_resid = self._queries(x, place)
         # jnp splits at indices where torch splits into sizes: one cut point,
         # since the widths add up exactly.
         q_pass, q_rot = jnp.split(
             queries, [self.qk_nope_head_dim], axis=-1)
-        latent, rot = self._latents(x, place)
         if decode:
             q_rot, key, value, mask = self._decode_step(
                 x, q_rot, rot, latent, q_resid, logical_positions, valid, kv_store)
