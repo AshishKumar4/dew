@@ -23,16 +23,15 @@ from benchmark_recurrence import SHAPES, operands
 from jax.experimental.mosaic.gpu import profiler
 
 from dew.nn.kernels import generation, recurrence
-from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.nn.kernels.recurrence_chunk import Chunk, chunk, fla_rule
 
 DELTA = ('qwen3.5-27b-gdn', 'qwen3-next-gdn', 'kimi-linear-kda')
 """The delta-rule shapes the template's forward takes: a decay a head (Qwen3.5-27B's and Qwen3-Next's
 gated delta nets) and a key dimension's (Kimi Linear's)."""
 
 ROUTES = {'mosaic': {'mainloop': 'mosaic'}, 'port': {}, 'hybrid': {}, 'xla': {'ported': False}}
-"""Each arm's route through the chunked op; the port's under `generation.chosen(gated_delta_rule='fla')`,
-the hybrid's (the port's forward, the template's fast backward) under `gated_delta_rule_backward='mosaic'`
-too."""
+"""Each arm's route through the chunked op; the port's under `generation.chosen(gated_delta_rule='fla')`;
+the hybrid the port's rule itself with the template's fast backward (`fla_rule(..., backward='mosaic')`)."""
 
 
 def measured(compiled, args, warmup: int, repeats: int) -> tuple[float, list]:
@@ -66,6 +65,8 @@ def row(name: str, arm: str, dtype, warmup: int, repeats: int, training: bool = 
     args = (*(given[key].astype(dtype) for key in ('q', 'k', 'v')), given['g'], given['beta'].astype(dtype))
 
     def forward(q, k, v, g, beta):
+        if arm == 'hybrid':
+            return fla_rule(q, k, v, g, beta, scale=shape.key_width ** -0.5, backward='mosaic')
         return chunk(hooks, Chunk(q, k, v, log_decay=g, beta=beta), chunk_size=shape.chunk, **ROUTES[arm])
 
     if training:
@@ -80,8 +81,7 @@ def row(name: str, arm: str, dtype, warmup: int, repeats: int, training: bool = 
     try:
         start = time.perf_counter()
         if arm in ('port', 'hybrid'):
-            backward = {'gated_delta_rule_backward': 'mosaic' if arm == 'hybrid' else 'fla'}
-            with generation.chosen(gated_delta_rule='fla', **backward):
+            with generation.chosen(gated_delta_rule='fla'):
                 compiled = jax.jit(timed).lower(*args).compile()
         else:
             compiled = jax.jit(timed).lower(*args).compile()

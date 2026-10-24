@@ -42,9 +42,9 @@ def assumed(generation: str | None) -> Iterator[None]:
 
 CHOICES = frozenset({'attention', 'attention_narrow', 'attention_packed', 'attention_sinks',
                      'attention_window', 'decode', 'delta_decode', 'delta_gates', 'gate_up', 'gemm_epilogue',
-                     'gemm_prologue', 'gated_delta_rule', 'gated_delta_rule_backward', 'grouped_matmul',
-                     'local_attention', 'mla', 'narrow_copies', 'paged_decode', 'rms_norm', 'short_conv',
-                     'ssd', 'ssd_decode', 'swiglu'})
+                     'gemm_prologue', 'gated_delta_rule', 'grouped_matmul', 'local_attention', 'mla',
+                     'narrow_copies', 'paged_decode', 'rms_norm', 'short_conv', 'ssd', 'ssd_decode',
+                     'swiglu'})
 """The choices `measured_kernel` answers, and so the ones `chosen` may name and a dispatch reports
 (`route`). A choice no generation's row names runs its site's own best kernel."""
 

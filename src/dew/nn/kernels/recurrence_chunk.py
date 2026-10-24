@@ -567,7 +567,7 @@ def on_the_port(query, key, value) -> bool:
 
 
 def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segments: int | None = None,
-             scale: float | None = None, wide: bool = False):
+             scale: float | None = None, wide: bool = False, backward: str = 'fla'):
     """The port's chunked rule for any call the portable math takes:
     `[B, S, Hk, Dk]` queries and keys, `[B, S, Hv, Dv]` values, the log decay
     `g` `[B, S, Hv]` per head (`fla_gdn.chunk_gated_delta_rule`) or `[B, S,
@@ -617,40 +617,17 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
     rows, heads = grouped_heads(value.shape, key.shape[2])
     P = jax.sharding.PartitionSpec
     four, three, memory = P(rows, None, heads, None), P(rows, None, heads), P(rows, heads, None, None)
-    rule = _blocked_rule if backward_route(query, key, value, g) == 'fla' else _mosaic_backward_rule
+    rule = _mosaic_backward_rule if backward == 'mosaic' else _blocked_rule
     return manual_map(functools.partial(rule, documents=documents, scale=scale, wide=wide),
                       (four, four, four, P(*four[:g.ndim]), three, memory, P(rows, None)),
                       (four, memory))(query, key, value, g, beta, state, starts)
 
 
-def backward_route(query, key, value, g) -> str:
-    """The port's rule's backward: the recurrence template's Mosaic GPU mainloop's fast backward
-    (`_mosaic_backward_rule`, fla's DAG through the algebra) where the target's row names it
-    ('gated_delta_rule_backward') and the call is one it takes (a decay a head, 16-bit operands, keys and
-    values at most `mainloop.WIDEST` wide, on a GPU of a family a bundle claims); else the port's own
-    (`fla_gdn`'s), reported as the target's route (`generation.route`)."""
-    from .templates.recurrence import mainloop
-
-    preferred = measured_kernel('gated_delta_rule_backward', 'fla')
-    refusal = None
-    if preferred == 'mosaic':
-        dtype = jnp.result_type(query, key, value)
-        refusal = refused(
-            (g.ndim == 3, 'decay',
-             "a decay a key dimension, whose fast backward the mainloop does not take yet"),
-            (dtype.itemsize == 2, 'dtype', f"{dtype.name} operands; the fast backward takes 16-bit ones"),
-            (max(key.shape[-1], value.shape[-1]) <= mainloop.WIDEST, 'width',
-             f"keys {key.shape[-1]} and values {value.shape[-1]} wide; the mainloop takes at most "
-             f"{mainloop.WIDEST}"),
-            (mainloop.family_of() is not None, 'family',
-             "no bundle of the mainloop claims this GPU's family"))
-    kernel = 'mosaic' if preferred == 'mosaic' and refusal is None else 'fla'
-    return route('gated_delta_rule_backward', kernel=kernel, refusal=refusal).kernel
-
-
 def _mosaic_backward_rule(query, key, value, g, beta, state, starts, *, documents: int | None, scale: float,
                           wide: bool):
-    """`_blocked_rule`'s values, the port's forward, with the recurrence template's fast backward
+    """`fla_rule`'s per-shard rule with `backward='mosaic'` (the selector's candidate, which the target's
+    chooser ranks per shape): `_blocked_rule`'s values, the port's forward, with the recurrence template's
+    fast backward
     (`mainloop.gradients`, fla's DAG through the algebra's tile functions, recomputing the forward's values as
     fla's does): on an A100 the 27B gated delta net's training pass at 0.93 times the port's time and 1.14
     times its peak memory, its gradient held to the port's by check 1 (tests/test_recurrence_mosaic.py)."""
