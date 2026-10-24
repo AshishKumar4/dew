@@ -316,13 +316,17 @@ from dew.checkpoints import Checkpoints
 
 checkpoints = Checkpoints(run_directory)
 seen = set()
-while not finished(run_directory):
+while True:
+    # Read before listing, so the last listing holds the final checkpoint the run committed.
+    done = finished(run_directory)
     for step in checkpoints.committed():
         if step in seen:
             continue
         state, _ = checkpoints.restore(template, step=step)
         report(step, evaluate(state))
         seen.add(step)
+    if done:
+        break
     time.sleep(60)
 ```
 
