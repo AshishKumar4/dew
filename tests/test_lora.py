@@ -32,7 +32,7 @@ from affine_run import Replaying
 from flax import linen as nn
 from interop_support import extract_fixture, hub_cache
 from model_support import flat_tree
-from reference_error import assert_as_exact_as_the_reference, widened
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened
 from safetensors.numpy import load_file
 from test_joined import row_joins
 
@@ -569,6 +569,81 @@ def _adapted(model, tree, *, contracted=1, rank=2, alpha=4.0, seed=0):
     adapter = Adapter.bound(model, adapted_tree, {("params", "proj"): Target(rank, alpha)}, rslora=False,
                             dropout=0.0, layouts={})
     return adapter, adapter.model, adapted_tree, adapter.merge(adapted_tree)
+
+
+def clipped_adapter_case():
+    """A bounded Gemma linear with nonzero LoRA factors, against the clipped linear equation."""
+    import torch
+    import torch.nn.functional as functional
+
+    from dew.nn.vision.gemma4 import Gemma4ClippableLinear
+
+    model = _BranchHost(Gemma4ClippableLinear(12, use_clipped_linears=True))
+    variables = model.init(jax.random.key(7), jnp.zeros((8, 16), jnp.float32))
+    limits = variables["constants"]["proj"]
+    limits.update(input_min=jnp.float32(-0.7), input_max=jnp.float32(0.7),
+                  output_min=jnp.float32(-1), output_max=jnp.float32(1))
+    rank, alpha = 2, 4.0
+    adapter = LoRA(rank=rank, modules=("proj",), alpha=alpha).apply(model, variables, key=9)
+    kernel, bias = (np.asarray(variables["params"]["proj"][name]) for name in ("kernel", "bias"))
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        factors = {"proj": {"lora_A": rng.standard_normal((16, rank), np.float32) * np.float32(0.25),
+                            "lora_B": rng.standard_normal((rank, 12), np.float32) * np.float32(0.1)}}
+        return factors, rng.standard_normal((8, 16), np.float32), rng.standard_normal((8, 12), np.float32)
+
+    @jax.jit
+    def forward(factors, inputs, cotangent):
+        output, pullback = jax.vjp(
+            lambda params, values: adapter.model.apply({**adapter.variables, "params": params}, values),
+            factors, inputs)
+        parameters, values = pullback(cotangent)
+        return {"output": output, "parameters": parameters, "inputs": values}
+
+    def reference(dtype, factors, inputs, cotangent):
+        x = torch.tensor(np.asarray(inputs), dtype=dtype, requires_grad=True)
+        a, b = (torch.tensor(np.asarray(factors["proj"][name]), dtype=dtype, requires_grad=True)
+                for name in lora.FACTORS)
+        low, high = (torch.tensor(np.asarray(limits[name]), dtype=dtype)
+                     for name in ("input_min", "input_max"))
+        clipped = x.clamp(low, high)
+        base = functional.linear(clipped, torch.tensor(kernel.T, dtype=dtype),
+                                 torch.tensor(bias, dtype=dtype))
+        delta = functional.linear(functional.linear(clipped, a.T), b.T)
+        low, high = (torch.tensor(np.asarray(limits[name]), dtype=dtype)
+                     for name in ("output_min", "output_max"))
+        output = (base + (alpha / rank) * delta).clamp(low, high)
+        dx, da, db = torch.autograd.grad(output, (x, a, b), torch.tensor(np.asarray(cotangent), dtype=dtype))
+        return {"output": output.detach().numpy(), "inputs": dx.numpy(),
+                "parameters": {"proj": {"lora_A": da.numpy(), "lora_B": db.numpy()}}}
+
+    return model, variables, adapter, draw, forward, reference
+
+
+def test_a_clipped_linear_adapts_once_inside_its_bounds_and_reloads(tmp_path):
+    import torch
+
+    model, variables, adapter, draw, forward, reference = clipped_adapter_case()
+    assert_as_exact(forward, lambda *args: reference(torch.float32, *args), draw,
+                    "clipped linear adapter", seeds=8,
+                    truth_fn=lambda *args: reference(torch.float64, *args))
+    factors, inputs, _ = draw(3)
+    def loss(params):
+        return jnp.mean(jnp.square(adapter.model.apply({**adapter.variables, "params": params}, inputs)))
+
+    optimizer = optax.sgd(0.01)
+    updates, _ = optimizer.update(jax.grad(loss)(factors), optimizer.init(factors), factors)
+    moving = optax.apply_updates(factors, updates)
+    assert any(not np.array_equal(before, after)
+               for before, after in zip(jax.tree.leaves(factors), jax.tree.leaves(moving), strict=True))
+    trained = {**adapter.variables, "params": moving}
+    adapter.save(trained, tmp_path)
+    restored = LoRA.load(model, variables, tmp_path)
+    np.testing.assert_array_equal(restored.model.apply(restored.variables, inputs),
+                                  adapter.model.apply(trained, inputs))
+    merged = model.apply(adapter.merge(trained), inputs)
+    assert np.all(np.isfinite(merged)) and np.all(np.abs(merged) <= 1)
 
 
 def test_the_branch_reads_a_keyword_input():
