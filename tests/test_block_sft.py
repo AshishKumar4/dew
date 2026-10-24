@@ -109,7 +109,18 @@ def assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, 
 
     objective_update = float32_update(jax.jit(lambda values: objective_gradient(obj, values, batch, step)))
     truth = float64_gradient(twin, batch, step)
-    assert_as_exact(trained, objective_update, moved_weights(variables), "trainer update", seeds=seeds,
+    host = jax.tree.map(np.asarray, variables)
+
+    def draw(seed):
+        keys = iter(jax.random.split(jax.random.key(seed), len(jax.tree.leaves(host["params"]))))
+
+        def moved(leaf):
+            return np.asarray(leaf * (1 + 1e-2 * np.asarray(jax.random.normal(next(keys), leaf.shape))),
+                              leaf.dtype)
+
+        return ({**host, "params": jax.tree.map(moved, host["params"])},)
+
+    assert_as_exact(trained, objective_update, draw, "trainer update", seeds=seeds,
                     truth_fn=truth)
     taken, _ = trainer_update(obj, batch, run_key, 0.001)
     solo = Trainer(obj, optax.sgd(0.001), key=run_key)
