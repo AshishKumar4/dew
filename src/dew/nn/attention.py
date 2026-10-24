@@ -318,9 +318,9 @@ def max_attention_logits(query: jax.Array, key: jax.Array, *, causal: bool = Fal
     heads = query.shape[-2]
     key = repeat_kv_heads(key, heads)
     scale = 1.0 / math.sqrt(query.shape[-1])
-    logits = jnp.einsum('...qhd,...khd->...hqk',
-                        query.astype(jnp.float32) * jnp.asarray(scale, jnp.float32),
-                        key.astype(jnp.float32), precision=operand_precision(jnp.float32))
+    logits = float32_einsum('...qhd,...khd->...hqk',
+                            query.astype(jnp.float32) * jnp.asarray(scale, jnp.float32),
+                            key.astype(jnp.float32), precision=operand_precision(jnp.float32))
     if bias is not None:
         logits = logits + bias.astype(jnp.float32)
     combined = combined_attention_mask(
@@ -1136,10 +1136,6 @@ def triton_attention(query, key, value, causal: bool):
         query, key, value, is_causal=causal, implementation='triton'), query, key, value)
 
 
-VALUE_BLOCK = 256
-"""Keys per block of `weighted_values`' fp32 sum on XLA:CPU."""
-
-
 def weighted_values(equation, weights, value, *, precision=None) -> jax.Array:
     """The probability-value product, with the probabilities in the value's dtype.
 
@@ -1152,36 +1148,12 @@ def weighted_values(equation, weights, value, *, precision=None) -> jax.Array:
     that produced them still reduced in fp32, which is where the precision
     was needed.
 
-    `equation` is flax's value product, '...hqk,...khd->...qhd'. On XLA:CPU
-    an fp32 product sums each block of VALUE_BLOCK keys apart and the
-    blocks' sums after. YNNPACK, XLA:CPU's dot, sums up to about 1024 keys
-    in one chain: fp32 attention over 512, 2048 and 8192 keys rounded 1.34,
-    1.75 and 1.63 times as far from float64 as torch's SDPA does, and 0.98,
-    0.96 and 0.87 times in blocks. Writing each block's product costs a
-    forward 3% to 9% at 512 to 1024 keys on two threads (docs/performance.md).
+    `equation` is flax's value product, '...hqk,...khd->...qhd'; a CPU sums
+    an fp32 one in float64 and rounds once (`precision.accumulated`).
     """
     if equation != '...hqk,...khd->...qhd':
         raise ValueError(f"weighted_values takes flax's value product, got {equation!r}")
-    weights = weights.astype(value.dtype)
-    plain = functools.partial(float32_einsum, equation, precision=precision)
-    if value.dtype != jnp.float32 or value.shape[-3] <= VALUE_BLOCK or generation.backend() != 'cpu':
-        return plain(weights, value)
-    # Both modes differentiate the plain product: neither sums over the keys, and the blocked
-    # form's own cost the backward an eighth more on two threads.
-    return forward_differentiable(functools.partial(_blocked_values, precision=precision), plain,
-                                  weights, value)
-
-
-def _blocked_values(weights, value, precision) -> jax.Array:
-    """`weighted_values`' product summed in blocks of VALUE_BLOCK keys."""
-    keys = value.shape[-3]
-    blocks = -(-keys // VALUE_BLOCK)
-    pad = blocks * VALUE_BLOCK - keys
-    weights = jnp.pad(weights, [(0, 0)] * (weights.ndim - 1) + [(0, pad)])
-    value = jnp.pad(value, [(0, 0)] * (value.ndim - 3) + [(0, pad), (0, 0), (0, 0)])
-    weights = weights.reshape(*weights.shape[:-1], blocks, VALUE_BLOCK)
-    value = value.reshape(*value.shape[:-3], blocks, VALUE_BLOCK, *value.shape[-2:])
-    return float32_einsum('...hqck,...ckhd->...qhdc', weights, value, precision=precision).sum(-1)
+    return float32_einsum(equation, weights.astype(value.dtype), value, precision=precision)
 
 
 
@@ -1545,17 +1517,33 @@ def forward_differentiable(value, tangent, *arrays, precision: str | None = None
     `precision` is the kernel's own arithmetic, which the reference's products
     take too (`jax.default_matmul_precision`), so a kernel of IEEE fp32 products
     is not differentiated by TF32 ones; None leaves the products at the
-    caller's."""
+    caller's. Only the arrays a derivative moves are the reference's tangents: a known zero stays
+    out of its derivative, where a product's own derivative (`dew.nn.precision.accumulated`'s on a
+    CPU) takes its moving operands alone."""
+    from jax.custom_derivatives import SymbolicZero
+
     @jax.custom_jvp
     def attend(*arrays):
         return value(*arrays)
 
-    @attend.defjvp
     def rule(primals, tangents):
-        with contextlib.nullcontext() if precision is None else jax.default_matmul_precision(precision):
-            differentiated = jax.jvp(tangent, primals, tangents)[1]
-        return attend(*primals), differentiated
+        live = [index for index, direction in enumerate(tangents) if not isinstance(direction, SymbolicZero)]
+        output = attend(*primals)
+        if not live:
+            return output, jax.tree.map(jnp.zeros_like, output)
 
+        def moved(*moving):
+            arrays = list(primals)
+            for index, array in zip(live, moving, strict=True):
+                arrays[index] = array
+            return tangent(*arrays)
+
+        with contextlib.nullcontext() if precision is None else jax.default_matmul_precision(precision):
+            differentiated = jax.jvp(moved, tuple(primals[index] for index in live),
+                                     tuple(tangents[index] for index in live))[1]
+        return output, differentiated
+
+    attend.defjvp(rule, symbolic_zeros=True)
     return attend(*arrays)
 
 
@@ -1634,10 +1622,10 @@ def _xla_kernel_narrows(query) -> bool:
 
 def _xla_kernel_on_cpu() -> bool:
     """Whether jax.nn's xla attention would run this call on a CPU, where 'auto' and 'xla' take the
-    reference path. jax's differentiates the softmax through rowsum(dO * O), which leaves a query
-    that reads one key a rounding's gradient where the softmax's own derivative, the reference
-    path's, is exactly zero; and it sums an fp32 value product over every key in one chain, as
-    YNNPACK, XLA:CPU's dot, does, where `weighted_values` sums it in blocks."""
+    reference path. jax's sums fp32 products in fp32, as XLA:CPU's dot does, where Dew sums a CPU's
+    in float64 (`precision.accumulated`), and it differentiates the softmax through rowsum(dO * O),
+    which leaves a query that reads one key a rounding's gradient where the softmax's own derivative,
+    the reference path's, is exactly zero."""
     return generation.backend() == 'cpu'
 
 
@@ -2025,6 +2013,20 @@ def projected_output(attended, name: str, features: int, *, flat: bool, bias: bo
                         name=name, dot_general=float32_dot_general)(attended)
 
 
+@dataclasses.dataclass(frozen=True)
+class QKNorm:
+    """How an attention RMS-normalizes its queries and keys: the norms' module `names`, their
+    `epsilon`, whether over each head's channels or, `across_heads`, each token's whole projection
+    before it splits (Wan's `rms_norm_across_heads`: another function, not another order), and
+    whether the normalized row rounds to the weight's dtype before it scales (`scale_after_cast`,
+    diffusers' `RMSNorm`)."""
+
+    names: tuple[str, str] = ("q_norm", "k_norm")
+    epsilon: float = 1e-6
+    across_heads: bool = False
+    scale_after_cast: bool = False
+
+
 @logical_axes({
     ("to_q",): ("embed", "heads", "head_dim"),
     ("to_k",): ("embed", "heads", "head_dim"),
@@ -2039,6 +2041,13 @@ class NormalAttention(nn.Module):
     `use_bias` is the projections' bias; `qkv_bias`, when given, the
     query, key and value projections' alone, as timm's ViT attention
     (U-ViT's) has them without one and its output projection with one.
+    `flat` stores each projection as the published attentions do,
+    `[C, heads * head_dim]`, rather than Dew's headed `[C, heads, head_dim]`
+    (`projected_heads`), under `names` (query, key, value, output): Wan's
+    are the defaults, the AutoencoderKL mid-block's `query/key/value/
+    proj_attn`. `qk_norm` normalizes the queries and keys (`QKNorm`), and
+    `rotary_pairs` names the channels each angle of `freqs_cis` turns
+    (`dew.nn.rope.rotate`).
     `mask`, boolean and broadcasting to `[B, H, S, S_context]`, keeps the keys
     each query may read. `key_value_seq_lengths` `[B]` ends each row's keys
     instead, for a right-padded context, which a fused kernel skips rather
@@ -2055,15 +2064,19 @@ class NormalAttention(nn.Module):
     use_bias: bool = True
     qkv_bias: bool | None = None
     force_fp32_for_softmax: bool = True
-    qk_norm: bool = False  # RMSNorm on q/k per head (SD3-style bf16 logit safety)
+    qk_norm: QKNorm | None = None
     attention_impl: str = "auto"  # an AttentionImpl
+    flat: bool = False
+    names: tuple[str, str, str, str] = ("to_q", "to_k", "to_v", "to_out_0")
+    rotary_pairs: Literal["half", "adjacent"] = "half"
 
     @nn.nowrap
     def projections(self, context_features: int | None = None) -> dict[str, tuple[int, int]]:
         inner = self.heads * self.dim_head
         context = self.query_dim if context_features is None else context_features
-        return {'to_q': (self.query_dim, inner), 'to_k': (context, inner), 'to_v': (context, inner),
-                'to_out_0': (inner, self.query_dim)}
+        query, key, value, output = self.names
+        return {query: (self.query_dim, inner), key: (context, inner), value: (context, inner),
+                output: (inner, self.query_dim)}
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
@@ -2074,16 +2087,19 @@ class NormalAttention(nn.Module):
     def cross_flops(self, lengths, context_lengths, context_features: int) -> float:
         """Cross-attention with the context geometry supplied by its owner."""
         maps = self.projections(context_features)
-        return (sum(projection_flops(lengths, *maps[name]) for name in ('to_q', 'to_out_0'))
-                + sum(projection_flops(context_lengths, *maps[name]) for name in ('to_k', 'to_v'))
+        query, key, value, output = self.names
+        return (sum(projection_flops(lengths, *maps[name]) for name in (query, output))
+                + sum(projection_flops(context_lengths, *maps[name]) for name in (key, value))
                 + cross_attention_flops(lengths, context_lengths, self.heads, self.dim_head, self.dim_head))
 
     def _heads(self, name: str, x, norm: str | None = None):
+        normed = self.qk_norm if norm is not None else None
+        rms = None if normed is None else RMSNorm(
+            epsilon=normed.epsilon, scale_after_cast=normed.scale_after_cast, dtype=self.dtype, name=norm)
         projected = projected_heads(
-            x, name, self.heads, self.dim_head, flat=False,
+            x, name, self.heads, self.dim_head, flat=self.flat,
             bias=self.use_bias if self.qkv_bias is None else self.qkv_bias, dtype=self.dtype,
-            precision=self.precision,
-            norm=RMSNorm(epsilon=1e-6, dtype=self.dtype, name=norm) if norm and self.qk_norm else None)
+            precision=self.precision, across_heads=normed is not None and normed.across_heads, norm=rms)
         return constrain(projected, HEADS)
 
     @nn.compact
@@ -2099,14 +2115,14 @@ class NormalAttention(nn.Module):
         # [B, S, heads, head_dim], column-parallel under a tensor axis; a
         # context's positions split over a sequence axis where its link pays
         # for it (`split_positions`).
-        query = self._heads("to_q", x, "q_norm")
+        q_name, k_name, v_name, out_name = self.names
+        q_norm, k_norm = self.qk_norm.names if self.qk_norm is not None else (None, None)
+        query = self._heads(q_name, x, q_norm)
         key, value = split_positions(context, (self.heads, self.dim_head),
-                                     lambda tokens: (self._heads("to_k", tokens, "k_norm"),
-                                                     self._heads("to_v", tokens)))
+                                     lambda tokens: (self._heads(k_name, tokens, k_norm),
+                                                     self._heads(v_name, tokens)))
         if freqs_cis is not None:
-            freqs_cos, freqs_sin = freqs_cis
-            query = rotate(query, freqs_cos, freqs_sin)
-            key = rotate(key, freqs_cos, freqs_sin)
+            query, key = (rotate(part, *freqs_cis, pairs=self.rotary_pairs) for part in (query, key))
 
         hidden_states = scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,
@@ -2114,17 +2130,24 @@ class NormalAttention(nn.Module):
             implementation=self.attention_impl, mask=mask, key_value_seq_lengths=key_value_seq_lengths,
             segment_ids=segment_ids, key_segment_ids=key_segment_ids, max_segments=max_segments,
         )
-        proj = projected_output(constrain(hidden_states, HEADS), "to_out_0", self.query_dim, flat=False,
+        proj = projected_output(constrain(hidden_states, HEADS), out_name, self.query_dim, flat=self.flat,
                                 bias=self.use_bias, dtype=self.dtype, precision=self.precision)
         return proj.reshape(orig_x_shape)
 
 
 class BasicTransformerBlock(nn.Module):
-    """Run self-attention, cross-attention over `context`, then feed-forward.
+    """Run a first attention, cross-attention over `context`, then feed-forward.
 
-    Each is pre-normed with a residual. `use_cross_only` drops the
-    self-attention. `only_pure_attention` runs the cross-attention alone,
-    with no norm and no residual, which the UNets' stages do by default.
+    Each is pre-normed (`norm`, RMS or affine layer norm, at `norm_epsilon`)
+    with a residual. `first_attention` names what the first attention reads:
+    the tokens themselves (`self`), the `context` too (`context`, the SD
+    checkpoints with no self-attention), or nothing, when the block has none
+    (`none`). `only_pure_attention` runs the cross-attention alone, with no
+    norm and no residual, which the UNets' stages do by default.
+    `qkv_bias` is the attentions' (`NormalAttention`). `dropout_rate` drops
+    each attention's output, inside the feed-forward and the block's output,
+    as diffusers' `BasicTransformerBlock` does in training; `approximate_gelu`
+    is the feed-forward's GELU (`geglu_feed_forward`).
     """
     query_dim: int
     heads: int = 4
@@ -2132,10 +2155,14 @@ class BasicTransformerBlock(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     use_bias: bool = True
-    use_cross_only:bool = False
+    qkv_bias: bool | None = None
+    first_attention: Literal["self", "context", "none"] = "self"
     only_pure_attention:bool = False
     force_fp32_for_softmax: bool = True
+    norm: Literal["rms", "layer"] = "rms"
     norm_epsilon: float = 1e-4
+    dropout_rate: float = 0.0
+    approximate_gelu: bool = True
     attention_impl: str = "auto"  # an AttentionImpl
 
     @nn.nowrap
@@ -2144,10 +2171,11 @@ class BasicTransformerBlock(nn.Module):
         from .mlp import geglu_feed_forward  # mlp's blocks import this module's norms
 
         attention = NormalAttention(self.query_dim, self.heads, self.dim_head, parent=None)
-        count = attention.cross_flops(lengths, context_lengths, context_features)
+        crossed = attention.cross_flops(lengths, context_lengths, context_features)
+        count = crossed
         if not self.only_pure_attention:
-            if not self.use_cross_only:
-                count += attention.model_flops(lengths)
+            first = {"self": attention.model_flops(lengths), "context": crossed, "none": 0}
+            count += first[self.first_attention]
             count += geglu_feed_forward(self.query_dim, parent=None).model_flops(lengths)
         return count
 
@@ -2159,6 +2187,7 @@ class BasicTransformerBlock(nn.Module):
             dim_head=self.dim_head,
             precision=self.precision,
             use_bias=self.use_bias,
+            qkv_bias=self.qkv_bias,
             dtype=self.dtype,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             attention_impl=self.attention_impl,
@@ -2168,19 +2197,26 @@ class BasicTransformerBlock(nn.Module):
 
         from .mlp import geglu_feed_forward  # mlp's blocks import this module's norms
 
-        self.ff = geglu_feed_forward(self.query_dim, dtype=self.dtype, precision=self.precision)
-        self.norm1 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
-        self.norm2 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
-        self.norm3 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
+        self.ff = geglu_feed_forward(self.query_dim, approximate=self.approximate_gelu, dtype=self.dtype,
+                                     precision=self.precision, dropout_rate=self.dropout_rate)
+        norm = RMSNorm if self.norm == "rms" else LayerNorm
+        self.norm1, self.norm2, self.norm3 = (norm(epsilon=self.norm_epsilon, dtype=self.dtype)
+                                              for _ in range(3))
+        self.dropout = nn.Dropout(self.dropout_rate)
 
-    def __call__(self, hidden_states, context=None):
+    def _dropped(self, x, train: bool):
+        return self.dropout(x, deterministic=not train)
+
+    def __call__(self, x, context=None, *, train: bool = False):
         if self.only_pure_attention:
-            return self.attention2(hidden_states, context)
+            return self.attention2(x, context)
 
-        if not self.use_cross_only:
-            hidden_states = hidden_states + self.attention1(self.norm1(hidden_states))
-        hidden_states = hidden_states + self.attention2(self.norm2(hidden_states), context)
-        return hidden_states + self.ff(self.norm3(hidden_states))
+        if self.first_attention != "none":
+            first = context if self.first_attention == "context" else None
+            x = x + self._dropped(self.attention1(self.norm1(x), first), train)
+        x = x + self._dropped(self.attention2(self.norm2(x), context), train)
+        x = x + self.ff(self.norm3(x), train=train)
+        return self._dropped(x, train)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2255,7 +2291,7 @@ class TransformerBlock(nn.Module):
         context_lengths = lengths if context_lengths is None else context_lengths
         context_features = inner if context_features is None else context_features
         block = BasicTransformerBlock(inner, self.heads, self.dim_head,
-                                       use_cross_only=not self.use_self_and_cross,
+                                       first_attention="self" if self.use_self_and_cross else "none",
                                        only_pure_attention=self.only_pure_attention, parent=None)
         count = block.cross_flops(lengths, context_lengths, context_features)
         return count + (2 * projection_flops(lengths, input_features, inner) if self.use_projection else 0)
@@ -2283,7 +2319,7 @@ class TransformerBlock(nn.Module):
             precision=self.precision,
             use_bias=False,
             dtype=self.dtype,
-            use_cross_only=(not self.use_self_and_cross),
+            first_attention="self" if self.use_self_and_cross else "none",
             only_pure_attention=self.only_pure_attention,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             attention_impl=self.attention_impl,

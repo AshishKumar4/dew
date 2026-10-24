@@ -277,7 +277,7 @@ The directory holds `config.json`, `generation_config.json` and `model.safetenso
 
 An export with an `HFTokenizer` writes the tokenizer's own files (`save_pretrained`) and does not record its name, because for a local tokenizer the name would be a path on the exporting machine. So the directory loads on any other machine, and its task accepts strings and returns `result.text`. `from_model` refuses a model whose computation the exported config would not reproduce, and names the field.
 
-A Hub name such as `"Qwen/Qwen3-0.6B"` loads the same way, and the published checkpoint needs enough host and device memory for its weights and cache. `LMObjective.policy(params)` returns the same kind of task for a training tree, and `SampledRollout` samples with it. To serve the weights with Ollama or vLLM, export them and point the runtime at the directory; the [README](https://github.com/AshishKumar4/dew/blob/main/README.md#exporting-a-decoder-and-serving-it) shows the steps.
+A Hub name such as `"Qwen/Qwen3-0.6B"` loads the same way, and the published checkpoint needs enough host and device memory for its weights and cache. `LMObjective.policy(params)` returns the same kind of task for a training tree, and `RolloutScheduler.sampled` samples with it. To serve the weights with Ollama or vLLM, export them and point the runtime at the directory; the [README](https://github.com/AshishKumar4/dew/blob/main/README.md#exporting-a-decoder-and-serving-it) shows the steps.
 
 ### Loading from the Hub
 

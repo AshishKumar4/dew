@@ -18,6 +18,7 @@ from dew.nn.attention import attention_case, scaled_dot_product_attention, with_
 from dew.nn.attention_kernels import DECODE, kernel_refusals
 from dew.nn.decode_geometry import folded_attention
 from dew.nn.kernels.generation import chosen, routes as generation_routes
+from dew.nn.precision import FP32_SUMS
 
 pytestmark = pytest.mark.kernel
 
@@ -187,7 +188,9 @@ def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, ho
         wide = [None if x is None else jnp.asarray(np.asarray(x, np.float64))
                 for x in (query, key, value, sinks)]
         truth = np.asarray(exact_attention(*wide, softcap=softcap, mask=read))
-    with jax.default_matmul_precision("float32"):
+    # The decode kernel interprets on this CPU what a GPU computes: its reference sums as the target
+    # does (fp32), not as the CPU's policy does.
+    with jax.default_matmul_precision(FP32_SUMS):
         plain = reference_attention(query, key, value, mask=jnp.asarray(read), sinks=sinks, softcap=softcap)
 
     def attend(query, key, value, lengths):

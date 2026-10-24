@@ -647,14 +647,14 @@ def quantize_fp8_blocks(weight: ArrayLike, block: Block = BLOCK, *,
     return np.ascontiguousarray(codes), scale_inv
 
 
-def fp8_block_cast(x: jax.Array, block: Block) -> tuple[jax.Array, jax.Array]:
+def fp8_block_cast(x: ArrayLike, block: Block) -> tuple[jax.Array, jax.Array]:
     """`quantize_fp8_blocks`' cast in a traced program, on a matrix where it
     computes, to the same bytes: a frozen FP8 product's activation rows
     (`dew.quantization`). No value is refused and no scale is
     rounded to ue8m0 here."""
     rows, cols = _sides(block)
     # XLA divides through a reciprocal; the cast's two divisions round as IEEE's do.
-    return _cast_blocks(x.astype(jnp.float32), rows, cols, xp=jnp, divide=correctly_rounded_divide,
+    return _cast_blocks(jnp.asarray(x, jnp.float32), rows, cols, xp=jnp, divide=correctly_rounded_divide,
                         rounded=jnp.asarray)
 
 
