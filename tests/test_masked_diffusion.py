@@ -212,6 +212,8 @@ def test_a_shifted_model_reads_each_document_and_padded_row_as_if_alone():
     np.testing.assert_array_equal(packed, jnp.concatenate(alone, axis=1))
     padded = aligned(model, scores, {"attention_mask": jnp.array([[False, False, True, True, True, True]])})
     np.testing.assert_array_equal(padded[:, 2:], aligned(model, scores[:, 2:]))
+    one = aligned(model, scores[:, :1], {"segment_ids": jnp.array([[1]])})
+    np.testing.assert_array_equal(one, scores[:, :1])
 
 
 def test_a_dream_shaped_record_keeps_how_its_logits_line_up():
