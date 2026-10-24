@@ -351,7 +351,8 @@ class MaskedSettings(TaskSettings):
     def __post_init__(self) -> None:
         super().__post_init__()
         integer(self.sampling_steps, "sampling_steps")
-        object.__setattr__(self, "eos_token_ids", id_row("eos_token_ids", self.eos_token_ids))
+        if len(self.eos_token_ids):
+            object.__setattr__(self, "eos_token_ids", id_row("eos_token_ids", self.eos_token_ids))
         if not isinstance(self.solver, Unmask):
             raise ValueError("a masked run's task unmasks with an Unmask solver")
 
@@ -368,7 +369,8 @@ class BlockSettings(TaskSettings):
     def __post_init__(self) -> None:
         super().__post_init__()
         integer(self.pad_token_id, "pad_token_id")
-        object.__setattr__(self, "eos_token_ids", id_row("eos_token_ids", self.eos_token_ids))
+        if len(self.eos_token_ids):
+            object.__setattr__(self, "eos_token_ids", id_row("eos_token_ids", self.eos_token_ids))
 
 
 def saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> ModelConfig:
