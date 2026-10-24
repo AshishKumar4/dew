@@ -58,7 +58,6 @@ import io
 import json
 import os
 import sys
-import time
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal
 
@@ -71,6 +70,7 @@ from dew.nn.attention import AttentionImpl
 from dew.nn.flops import MissingFlopsCount
 from dew.pool import joins_pool, pool_cluster
 from dew.registry import models
+from dew.telemetry.benchmark import carried
 from dew.telemetry.instrumentation import COLLECTIVES, model_flops_utilization
 from dew.telemetry.profile import capture_options
 from dew.training import Trainer
@@ -372,13 +372,9 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
         # does, so timing its individual iterations would time the dispatch and
         # not the step. These per-step numbers are a different quantity from
         # ms_per_step above, and each carries one synchronisation.
-        synced = []
-        for _ in range(config.steps):
-            step_start = time.perf_counter()
-            state, loss, is_finite = step(state)
-            loss.block_until_ready()
-            synced.append((time.perf_counter() - step_start) * 1e3)
-        p10, p50, p90 = np.percentile(synced, [10, 50, 90])
+        (state, loss, is_finite), synced = carried(lambda carry: step(carry[0]), (state, loss, is_finite),
+                                                   config.steps, each=True)
+        p10, p50, p90 = np.percentile(np.asarray(synced) * 1e3, [10, 50, 90])
 
         timeline = {}
         if config.profile_dir:

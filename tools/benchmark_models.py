@@ -50,6 +50,7 @@ from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, sessions
 from dew.registry import models, projectors, resolve_dtype, towers
+from dew.telemetry.benchmark import carried
 from dew.training import Layout, MeshSpec, Trainer
 from dew.training.distributed import DevicePrefetchIterator
 from dew.training.state import TrainState
@@ -443,12 +444,10 @@ def compiled_step(case: Case, trainer: Trainer, *, fixed_batch: bool = False) ->
 
 def timed_steps(step: Step, state: TrainState, steps: int
                 ) -> tuple[TrainState, jax.Array, jax.Array, float]:
-    """Run `steps` steps, at least one, dispatched as a run dispatches them, waiting once at the end.
+    """Run `steps` steps, at least one, dispatched as a run dispatches them, waiting once at the end
+    (`dew.telemetry.benchmark.carried`).
 
     Returns the last state, loss and finiteness, and the seconds the window took.
     """
-    start = time.perf_counter()
-    for _ in range(steps):
-        state, loss, finite = step(state)
-    loss.block_until_ready()
-    return state, loss, finite, time.perf_counter() - start
+    (state, loss, finite), (seconds,) = carried(lambda carry: step(carry[0]), (state, None, None), steps)
+    return state, loss, finite, seconds

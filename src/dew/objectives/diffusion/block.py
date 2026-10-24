@@ -28,6 +28,7 @@ from dew.inputs import Field, InputSpec
 from dew.nn.inputs import ModelInputs, real_places, shifted_span, token_layout
 from dew.nn.protocols import BlockDenoiser, CacheCapacity, Lacks, LayerScalars
 from dew.nn.sharding import LOGITS, constrain
+from dew.nn.visibility import same_group
 from dew.objectives.base import (
     FROZEN,
     OMITTED,
@@ -90,8 +91,7 @@ def _cache_geometry(valid: jax.Array, selected: jax.Array, prompt_length: int, c
     encoder_mask = ordered[:, None, :] <= physical[None, :, None]
     if image_groups is not None:
         key_groups = jnp.take_along_axis(image_groups, ordered, axis=-1)
-        encoder_mask |= ((image_groups[:, :, None] == key_groups[:, None, :])
-                         & (image_groups[:, :, None] >= 0))
+        encoder_mask |= same_group(image_groups[:, :, None], key_groups[:, None, :])
     encoder_mask &= packed_valid[:, None, :]
     write_slots = (prompt_length + selected[:, None] * canvas_size
                    + jnp.arange(response)[None, :]) % total
