@@ -103,8 +103,9 @@ def muon_weight_dimension_numbers(params):
     space, or the expert a router picks. That is the split four labs
     cross-confirmed. Everything else is a matrix and goes to Muon.
 
-    An undeclared matrix of rank two takes Linen's kernel convention,
-    contracting axis 0 into axis 1. An undeclared parameter of higher rank
+    An undeclared matrix of rank two, or one declared with no axis named
+    (replicated, as Gemma 3n's AltUp matrices are), takes Linen's kernel
+    convention, contracting axis 0 into axis 1. An undeclared parameter of higher rank
     raises, because its matrix axes are what this spec cannot guess, and
     orthogonalizing the wrong pair would show up as a worse loss curve.
 
@@ -117,7 +118,9 @@ def muon_weight_dimension_numbers(params):
         if not decays:
             return None
         axes = declared_axes(path, param.ndim, declared)
-        if axes is None:
+        # A declaration that names no axis says how the parameter shards (whole, on every device),
+        # not which of its axes form the matrix, so it reads as an undeclared one (AltUp's).
+        if axes is None or all(axis is None for axis in axes):
             if param.ndim > 2:
                 raise ValueError(
                     f"{jax.tree_util.keystr(path)} has rank {param.ndim} and no "
@@ -377,19 +380,25 @@ def _bias_corrected(moment, decay, count):
 
 
 def scale_by_adam(b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, *,
-                  nesterov: bool = False) -> optax.GradientTransformation:
+                  nesterov: bool = False, nu_dtype=None) -> optax.GradientTransformation:
     """`optax.scale_by_adam` (optax 0.2.8) with its bias corrections formed in double
     (`_bias_corrected`): optax's moments, state layout (`optax.ScaleByAdamState`) and update,
-    composed from optax's public tree math."""
+    composed from optax's public tree math. `nu_dtype` stores the second moment as `mu_dtype` does
+    the first, each the parameter's dtype where None; a gradient narrower than its moment is
+    widened before either reads it, so an fp16 gradient's square does not underflow first."""
     mu_dtype = None if mu_dtype is None else jax.dtypes.canonicalize_dtype(mu_dtype)
+    nu_dtype = None if nu_dtype is None else jax.dtypes.canonicalize_dtype(nu_dtype)
 
     def init_fn(params):
         return optax.ScaleByAdamState(count=jnp.zeros([], jnp.int32),
                                       mu=optax.tree.zeros_like(params, dtype=mu_dtype),
-                                      nu=optax.tree.zeros_like(params))
+                                      nu=optax.tree.zeros_like(params, dtype=nu_dtype))
 
     def update_fn(updates, state, params=None):
         del params  # Adam reads only the gradients
+        updates = jax.tree.map(lambda update, moment: None if update is None else update.astype(
+            jnp.promote_types(update.dtype, moment.dtype)), updates, state.nu,
+            is_leaf=lambda leaf: leaf is None)
         mu = optax.tree.update_moment(updates, state.mu, b1, 1)
         nu = optax.tree.update_moment_per_elem_norm(updates, state.nu, b2, 2)
         count = optax.safe_increment(state.count)
@@ -484,17 +493,17 @@ def _adam_chain(moments: optax.GradientTransformation, learning_rate, weight_dec
 
 
 def _adam(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, weight_decay=0.0,
-          mask=None, *, nesterov: bool = False):
+          mask=None, *, nesterov: bool = False, nu_dtype=None):
     """optax.adam over `scale_by_adam`, with torch's coupled weight decay."""
-    return _adam_chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov), learning_rate,
-                       weight_decay, mask, coupled=True)
+    return _adam_chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov, nu_dtype=nu_dtype),
+                       learning_rate, weight_decay, mask, coupled=True)
 
 
 def _adamw(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, weight_decay=1e-4,
-           mask=None, *, nesterov: bool = False):
+           mask=None, *, nesterov: bool = False, nu_dtype=None):
     """optax.adamw over `scale_by_adam`."""
-    return _adam_chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov), learning_rate,
-                       weight_decay, mask, coupled=False)
+    return _adam_chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov, nu_dtype=nu_dtype),
+                       learning_rate, weight_decay, mask, coupled=False)
 
 
 def _bf16_adam(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, weight_decay=0.0, mask=None, *,

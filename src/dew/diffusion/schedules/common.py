@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 import jax
 import jax.numpy as jnp
 
-from dew.nn.precision import correctly_rounded_divide
+from dew.nn.precision import at_least_fp32, correctly_rounded_divide
 
 
 def expand(coefficient, x):
@@ -49,7 +49,7 @@ def divided(numerator, rate):
 def times(t) -> jax.Array:
     """`t` as an array of at least float32: a float64 run's times stay float64."""
     t = jnp.asarray(t)
-    return t.astype(jnp.promote_types(t.dtype, jnp.float32))
+    return t.astype(at_least_fp32(t.dtype))
 
 class NoiseScheduler(ABC):
     """Defines a forward process x_t = alpha(t) x_0 + sigma(t) eps on the time domain [0, T].
