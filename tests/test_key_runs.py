@@ -113,11 +113,12 @@ def test_a_layer_reading_key_runs_computes_what_it_computes_over_the_same_mask(k
 
 def test_a_local_layer_given_key_runs_leaves_its_banded_path():
     """A windowed layer's whole-sequence pass runs `local_attention`'s bands, which read no runs; given
-    them, it takes the kernel that does: on an A100, the template."""
+    them, it hands them to the general kernel: a layer naming the template runs it on an A100, where the
+    bands would take no runs and the template refuses a mask."""
     slots, segments, positions = layout(ROWS, LENGTH)
-    decoder = model(sliding_attention={"window": 2}).clone(attention_impl="auto", dtype=jnp.bfloat16)
+    decoder = model(sliding_attention={"window": 2}).clone(attention_impl="template", dtype=jnp.bfloat16)
     ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
-    params = decoder.init(jax.random.key(1), ids)
+    params = decoder.clone(attention_impl="xla").init(jax.random.key(1), ids)
     runs = key_runs(jnp.asarray(slots), jnp.asarray(segments), OPTIONS)
     places = jnp.asarray(positions)
     with generation.assumed("sm80"), generation.routes() as found:
