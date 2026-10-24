@@ -454,8 +454,9 @@ def test_the_launches_lower_for_an_h100(call, accurate):
                            gate.output_mod, gate.output_params)
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
         for forward_hooks in (None, hooks):
-            jax.jit(functools.partial(attention_mosaic.forward, spans=spans, hooks=forward_hooks)).trace(
-                q, kv, kv).lower(lowering_platforms=("cuda",))
+            for entry in (attention_mosaic.forward, attention_mosaic.training):
+                jax.jit(functools.partial(entry, spans=spans, hooks=forward_hooks)).trace(
+                    q, kv, kv).lower(lowering_platforms=("cuda",))
         jax.jit(lambda q, k, v, dout, residuals: attention_mosaic.backward(
             q, k, v, spans, None, dout, residuals=residuals, accurate=accurate)).trace(
             q, kv, kv, q, residuals).lower(lowering_platforms=("cuda",))
