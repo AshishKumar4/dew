@@ -23,7 +23,7 @@ from dew.decision.head import DecisionHead
 from dew.decision.layout import MarkerLayout, Specials
 from dew.decision.model import DecisionModel
 from dew.interop.decoder_parts import Packed, joined_packed
-from dew.interop.safetensors_io import write_file
+from dew.interop.safetensors_io import MAX_SHARD_SIZE, save_sharded
 from dew.lora import FACTORS
 from dew.objectives.base import Variables, part, thaw
 from dew.registry import from_record
@@ -92,7 +92,7 @@ class LayaCheckpoint:
 
 
 
-    def save(self, directory: str | Path) -> None:
+    def save(self, directory: str | Path, *, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
         """Write this checkpoint in Laya's layout, which `Pretrained.load` and llama.cpp's converter read.
 
         That is `model.safetensors` (the encoder's ModernBertModel tensors under
@@ -120,7 +120,7 @@ class LayaCheckpoint:
         tensors = {f"encoder.{name.removeprefix('model.')}": np.asarray(tensor)
                    for name, tensor in bundle.export().items()}
         tensors.update(_head_tensors(thaw(part(self.variables, "head"))["params"]))
-        write_file(tensors, root / "model.safetensors", {"format": "pt"})
+        save_sharded(tensors, root, max_shard_size)
         config = {**bundle.config, "architectures": ["ModernBertModel"]}
         (root / "encoder" / "config.json").write_text(json.dumps(config, indent=2) + "\n")
         self.tokenizer.save_pretrained(root / "tokenizer")

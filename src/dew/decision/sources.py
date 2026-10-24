@@ -6,7 +6,7 @@ files, translates weights and places them through the ordinary native route.
 
 import dataclasses
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from functools import partial
 from pathlib import Path
 from typing import Self
@@ -17,6 +17,7 @@ from dew import records
 from dew.data.text import HFTokenizer
 from dew.interop.composite import CompositeSource, HeadComponent, NativeComponent, SourceKind
 from dew.interop.pretrained import Pretrained
+from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.objectives.base import Variables
 from dew.registry import dtype_name, from_record, import_path, to_record
 
@@ -65,10 +66,10 @@ class PretrainedDecision(Pretrained):
     def pipeline(self) -> Decide:
         return Decide.of(self.packed())
 
-    def save(self, directory: str | Path, **options) -> None:
-        if options:
-            raise ValueError(f"the decision release writer has no options {sorted(options)}")
-        Decide.of(self).save_pretrained(directory)
+    def save(self, directory: str | Path, *, variables: Mapping[str, object] | None = None,
+             max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
+        bundle = self if variables is None else dataclasses.replace(self, variables=dict(variables))
+        Decide.of(bundle).save_pretrained(directory, max_shard_size=max_shard_size)
 
     @classmethod
     def from_components(cls, backbone: Pretrained, head: Head, head_variables: Variables,

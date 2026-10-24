@@ -269,7 +269,7 @@ class Decide:
                        budget=from_record(Budget, records.json_value(settings["budget"], "budget")),
                        name=records.text(settings["name"], "name"))
 
-    def save_pretrained(self, directory: str | Path) -> None:
+    def save_pretrained(self, directory: str | Path, *, max_shard_size: int | str = "5GB") -> None:
         """Write this task as a released checkpoint, which `from_pretrained` reads back.
 
         A ModernBERT backbone under Laya's head and layout is written in Laya's
@@ -289,7 +289,7 @@ class Decide:
         types = applied.types
         LayaCheckpoint(self.model, self.variables, self.layout, self.tokenizer, self.specials,
                        (types.get("choice", 1.0), types.get("score", 1.0), types.get("noul", 1.0)),
-                       dict(applied.buckets)).save(directory)
+                       dict(applied.buckets)).save(directory, max_shard_size=max_shard_size)
 
     def save(self, directory: str) -> None:
         """Write this task's calibration, budget and name into the run `directory`.

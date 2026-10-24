@@ -249,10 +249,10 @@ class Pretrained:
         raise TypeError(f"{type(self).__name__} has no native task")
 
     def packed(self) -> Self:
-        """Own and pack the native backbone's projections once for a serving task."""
-        from dew.inference.projections import packed_owned
+        """A serving view with packed projections, preserving this bundle's arrays for reuse."""
+        from dew.inference.projections import inference_projections
 
-        return replace(self, variables=packed_owned(self.model, self.variables))
+        return replace(self, variables=inference_projections(self.model, self.variables))
 
     @property
     def text_processor(self) -> TaskProcessor | None:
@@ -418,7 +418,7 @@ class Pretrained:
         folder = "" if subfolder is None else subfolder
         if Path(folder).is_absolute() or ".." in Path(folder).parts:
             raise ValueError("subfolder must stay inside the resolved source")
-        composite = None if selected else _composite_description(directory / folder)
+        composite = None if selected or fallback is not None else _composite_description(directory / folder)
         if composite is not None:
             loaded = _load_composite_source(name_or_dir, directory, commit, folder, composite,
                                             placed=placed, streaming=streaming or not weights, dtype=dtype,
