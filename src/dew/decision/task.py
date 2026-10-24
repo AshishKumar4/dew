@@ -47,7 +47,7 @@ from dew.decision.layout import (
     render,
     with_context,
 )
-from dew.decision.model import DecisionModel
+from dew.decision.model import ContextEncoder, DecisionModel
 from dew.decision.questions import (
     KINDS,
     Answer,
@@ -141,6 +141,9 @@ class DecideSettings:
     specials: Specials
     tokenizer: str | None
     processor: str | None
+    context_encoder: ContextEncoder = "table"
+    """How the model encodes a row's context (`DecisionModel.context_encoder`); a run recorded before
+    the choice existed embedded it by its token table."""
 
     @staticmethod
     def of(record: Mapping[str, object]) -> "DecideSettings":
@@ -236,7 +239,8 @@ class Decide:
         head = Head.from_record(records.json_value(settings.head, "head"), width)
         # The head computes in the dtype it recorded, or as a fresh head over
         # the backbone would where the caller overrides the compute dtype.
-        model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype))
+        model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype),
+                              settings.context_encoder)
         rows = settings.layout
         if settings.tokenizer is None:
             raise ValueError("the run records no tokenizer to lay its rows out with")
@@ -682,9 +686,9 @@ class Decide:
         return held, self.variables
 
     def _read_wire(self, request: Mapping[str, object], *, strict: bool
-                   ) -> tuple[JSON, dict[str, Question], list[Image.Image]]:
-        """A Jev body's state, questions and images (none where `strict`), refused with a ValueError
-        where Jev would refuse it."""
+                   ) -> tuple[JSON, dict[str, Question], list[Image.Image], JSON | None]:
+        """A Jev body's state, questions, images and context (neither where `strict`), refused with a
+        ValueError where Jev would refuse it."""
         unknown = set(request) - {"state", "questions", "model", *EXTENSIONS}
         if unknown:
             raise ValueError(f"a request holds state, questions and model, not {sorted(unknown)}")
@@ -695,7 +699,8 @@ class Decide:
         if not questions:
             raise ValueError("a request needs at least one question")
         state = json_value(request["state"], "state")
-        return state, questions, [] if strict else decoded_images(request.get("images"))
+        context = None if strict or "context" not in request else json_value(request["context"], "context")
+        return state, questions, [] if strict else decoded_images(request.get("images")), context
 
     def _wire_response(self, questions: Mapping[str, Question], answers: Mapping[str, Answer], usage: Usage,
                        *, details: bool) -> dict[str, JSON]:
@@ -711,7 +716,7 @@ class Decide:
                 "usage": reported}
 
 
-EXTENSIONS = ("images",)
+EXTENSIONS = ("images", "context")
 """The request fields `Decide.systemone` reads beyond Jev's, which `strict` drops."""
 
 
@@ -749,12 +754,12 @@ class WireScoring(scoring.Scoring[Mapping[str, object], _Row, _Admitted, np.ndar
 
     def admit(self, request: Mapping[str, object]) -> scoring.Scored[_Row, _Admitted]:
         decide = self.decide
-        state, questions, images = decide._read_wire(request, strict=self.strict)
+        state, questions, images, context = decide._read_wire(request, strict=self.strict)
         if images:
-            row, media = decide._shown(state, questions, images)
+            row, media = decide._shown(state, questions, images, context)
             rows = (_Row(row, media),)
         else:
-            rows = tuple(_Row(row) for row in decide._encoded(state, questions))
+            rows = tuple(_Row(row) for row in decide._encoded(state, questions, context=context))
         usage = usage_of([row.encoded for row in rows])
         if self.whole and (usage.truncated or usage.trimmed):
             cut = "state" if usage.truncated else "instructions or options"

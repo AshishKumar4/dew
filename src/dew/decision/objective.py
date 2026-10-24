@@ -32,7 +32,7 @@ from dew.decision.layout import (
     question_fields,
     with_context,
 )
-from dew.decision.model import DecisionModel
+from dew.decision.model import ContextEncoder, DecisionModel
 from dew.decision.questions import KINDS, Choice, Question, Score
 from dew.decision.scoring import LogLoss, ScoringRule
 from dew.decision.task import Decide, DecideSettings, Weights, laid_out
@@ -229,6 +229,10 @@ class Fit(pygrain.MapTransform):
     tokenizer: Tokenizer
     specials: Specials
     head: Head
+    context_length: int | None = None
+    """The most context tokens the backbone's cross-attention reads, or None where it reads none: an
+    example whose context is longer refuses the run (ValueError), which the data plan's compile meets
+    before training, so no example is silently cut or dropped."""
     rejects = True
 
     def map(self, element: Batch) -> Batch | Rejected:
@@ -241,6 +245,8 @@ class Fit(pygrain.MapTransform):
         laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked, tokens=state)
         if not all(map(self.layout.fits, laid)):
             return Rejected("unfit")
+        if self.context_length is not None:
+            with_context(laid, self.tokenizer, example.context, self.context_length)
         self.head.validate_rows(laid)
         tokens = np.asarray(state, np.int32)
         fitted = tuple(
@@ -479,8 +485,10 @@ class DecisionObjective(Objective[Ratio]):
 
     def _context_lengths(self, batch: Batch) -> np.ndarray | None:
         """Each window row's context length where the backbone reads the context in a pass of its own,
-        as it reads a schema in context (`schema_in_context`); None where it reads none."""
-        if not self.schema_in_context or "context_lengths" not in batch:
+        as it reads a schema in context (`schema_in_context`) or encodes every context
+        (`DecisionModel.context_encoder`); None where it reads none."""
+        passes = self.schema_in_context or self.model.context_encoder == "backbone"
+        if not passes or "context_lengths" not in batch:
             return None
         return np.asarray(batch["context_lengths"])
 
@@ -506,7 +514,7 @@ class DecisionObjective(Objective[Ratio]):
         if not isinstance(model.head, CountedDecisions):
             raise MissingFlopsCount(f"{type(model.head).__name__} has no declared decision_flops")
         # Spans in the context pool over its tokens, not the row's.
-        pooled = self._context_lengths(batch)
+        pooled = self._context_lengths(batch) if self.schema_in_context else None
         return model.head.decision_flops(*_rows(batch, self.schema_in_context),
                                          **({} if pooled is None else {"pooled": pooled}))
 
@@ -545,7 +553,7 @@ class DecisionObjective(Objective[Ratio]):
                  head: Head | None = None, variables: Variables | None | Omitted = OMITTED,
                  label_smoothing: float = 0.0, shuffle_options: bool = True,
                  none_of_the_above: float = 0.0, temperatures: Temperatures | None = None,
-                 segments: int | None = 16):
+                 segments: int | None = 16, context_encoder: ContextEncoder | None = None):
         held: Variables | None = None
         self.image_processor = None
         match backbone:
@@ -553,6 +561,7 @@ class DecisionObjective(Objective[Ratio]):
                 model, held = backbone.model, backbone.variables
                 self.image_processor = backbone.processor
                 head = head or model.head
+                context_encoder = context_encoder or model.context_encoder
                 layout = layout or backbone.layout
                 tokenizer = tokenizer or backbone.tokenizer
                 specials = specials or backbone.specials
@@ -576,7 +585,7 @@ class DecisionObjective(Objective[Ratio]):
         if head is None:
             width, dtype = DecisionModel.head_size(module)
             head = DecisionHead(width, dtype=dtype)
-        self.model = DecisionModel(module, head)
+        self.model = DecisionModel(module, head, context_encoder or "table")
         if layout is None:
             if not isinstance(module, TokenModel):
                 raise ValueError(
@@ -749,7 +758,7 @@ class DecisionObjective(Objective[Ratio]):
         training = ConfigureLayout(self.layout, self.tokenizer, self.specials, self.shuffle_options,
                                    self.none_of_the_above, train=True, context_length=self.context_length)
         evaluating = dataclasses.replace(training, train=False)
-        fit = Fit(self.layout, self.tokenizer, self.specials, self.model.head)
+        fit = Fit(self.layout, self.tokenizer, self.specials, self.model.head, self.context_length)
         expand = () if self.layout.joint else (QuestionRows(),)
         options = self.bounds.options if self.layout.joint else None
         compact = None if options is None else -(-options // OPTION_TILE) * OPTION_TILE
@@ -776,7 +785,8 @@ class DecisionObjective(Objective[Ratio]):
             self.specials, recorded_tokenizer(RunProcessor(self.tokenizer)),
             # A decision task reads text through its own tokenizer, so only a media processor is kept.
             None if self.image_processor is None or self.image_processor.directory is None
-            else self.image_processor.source)
+            else self.image_processor.source,
+            self.model.context_encoder)
 
     def recorded_model(self) -> nn.Module:
         """The backbone; the head is a task setting of its own."""
