@@ -179,9 +179,9 @@ def test_a_module_a_record_holds_twice_is_built_once_whether_or_not_it_records_i
     record = json.loads(json.dumps(to_record(shared, object)))
     first, second = read_arguments(Pair, record["fields"]).values()
     assert first is second
-    outer = json.loads(json.dumps(to_record(nn.Sequential([shared, shared]), object)))
-    layers = from_record(nn.Sequential, outer["fields"]).layers
-    assert layers[0] is layers[1]
+    outer = json.loads(json.dumps(to_record(Pair(shared, shared), object)))
+    inner, again = read_arguments(Pair, outer["fields"]).values()
+    assert inner is again
 
 
 def test_a_protocol_typed_field_reads_its_record_and_keeps_a_value_built_for_it():
