@@ -16,6 +16,13 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   (`DecisionRunConfig.segments`): the backbone reads the schema in a pass of its own, with its own
   weights, its cross-attention layers read that pass beside the row, and the joint head pools the
   questions and options from it; the pass counts in `train/flops`.
+- On a CPU, every float32 product a Dew model forms (the dot family, a bias's
+  gradient, attention's reference path, which a CPU's attention now takes in
+  every dtype) sums in float64 and rounds once (`dew.nn.precision.accumulated`),
+  rather than XLA:CPU's float32 sum, whose order its shape and release choose.
+  A CPU forward costs about 1.6 times, a training step 1.4 to 1.9 times;
+  GPU and TPU programs are unchanged, and convolutions keep their float32 sum.
+  `jax.default_matmul_precision("F32_F32_F32")` takes the float32 sum back.
 - A run's W&B display name is its own, `Wandb.name` (`--trainer.wandb.name`), apart from the
   name its checkpoints are kept under; it shows the run's name where none is given.
 - `Checkpoints.committed()` lists a run's committed steps at each call without opening or writing
