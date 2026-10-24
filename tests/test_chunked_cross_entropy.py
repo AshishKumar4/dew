@@ -753,10 +753,14 @@ def test_lm_training_with_small_vocabularies_matches_the_unchunked_head(chunks):
             return optax.softmax_cross_entropy_with_integer_labels(logits, ids[:, 1:])
 
         def run(ids, cotangent):
-            _, gradient = pulled(lambda params, ids: jnp.mean(losses(params, ids)), 1)(
-                variables["params"], ids, cotangent)
+            def mean(params, ids):
+                # The per-token losses ride the same evaluation as the mean they pull back through.
+                each = losses(params, ids)
+                return jnp.mean(each), each
+
+            (_, gradient), each = pulled(mean, 1, has_aux=True)(variables["params"], ids, cotangent)
             updated = jax.tree.map(lambda p, g: p - .01 * g, variables["params"], gradient)
-            return {"losses": losses(variables["params"], ids), "params": updated}
+            return {"losses": each, "params": updated}
         return run
 
     assert_as_exact(trained, jax.jit(stepped(model, initial.variables)), draw,
