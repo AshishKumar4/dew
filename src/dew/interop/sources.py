@@ -235,14 +235,13 @@ def snapshot(name_or_dir: str, revision: str | None, *,
     def read(name: str) -> records.JSON:
         return json.loads((directory / name).read_text())
 
-    selected = [name for folder in (("",) if weights is True else weights)
-                for name in weight_files(files, folder, read)]
-    if isinstance(weights, tuple):
-        # Components follow the same safetensors-first, native-pickle fallback as a root model.
-        # A selected subfolder stays on this exact metadata commit; conversion is local on read.
-        selected = [name for folder in weights
-                    for name in (weight_files(files, folder, read) or weight_files(
-                        files, folder, read, stems=pickles.STEMS, suffix=pickles.SUFFIX))]
+    selected = []
+    for folder in (("",) if weights is True else weights):
+        names = weight_files(files, folder, read)
+        if not names and weights is not True:
+            # A selected component stays at this metadata commit; pickle conversion is local on read.
+            names = weight_files(files, folder, read, stems=pickles.STEMS, suffix=pickles.SUFFIX)
+        selected.extend(names)
     if weights is True and not selected:
         from huggingface_hub.errors import HfHubHTTPError, OfflineModeIsEnabled
 
