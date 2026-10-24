@@ -38,13 +38,7 @@ from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew.checkpoints import Checkpoints, Ranking
 from dew.cleanup import attempted
-from dew.coordination import (
-    agree_process_phase,
-    agreed,
-    agreed_next,
-    agreed_same,
-    broadcast_from_process_zero,
-)
+from dew.coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew.data.compile import fitted
 from dew.data.dataset import (
     Closeable,
@@ -110,6 +104,7 @@ from dew.telemetry.records import (
     Record,
     StepCompiled,
 )
+from dew.training._fit import FitPlan, FitRun, split_metrics, waited_read
 from dew.training._lowering import Lowered
 from dew.training.budget import Pause, Plateau, run_length, run_steps
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
@@ -147,7 +142,7 @@ from dew.training.distributed import (
     taking_over,
 )
 from dew.training.evaluation import EvalSuite, Evaluation
-from dew.training.interval import Interval, Taken, held
+from dew.training.interval import Interval, held
 from dew.training.memory import (
     climb_to,
     device_tokens,
@@ -175,7 +170,7 @@ from dew.training.planning import Candidate, Planned, Timer, plan_step, settled,
 from dew.training.profiling import ProfileWindow, owned_capture, start_capture, stop_capture
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
-from dew.training.selection import Best, HeldBest, rankings
+from dew.training.selection import Best, rankings
 from dew.training.state import MODEL_STATE, Accumulation, TrainState, kept_window
 from dew.training.tracker import Tracker
 from dew.training.transaction import Committed, Transaction, compact_qk, outcome, window_dropped, with_ema
@@ -234,12 +229,6 @@ def _reported(rollout: Rollout | None, metrics: Sequence[Metric]) -> dict[str, S
     }
 
 
-def _split_metrics(suites: Mapping[str, EvalSuite]) -> dict[str, tuple[Metric, ...]]:
-    """Each split's own metrics, by its name: two suites may each hold their own instance of one
-    metric."""
-    return {name: tuple(suite.metrics) for name, suite in suites.items()}
-
-
 def _suites(dataset: Loader, validation: Mapping[str, Reader | EvalSuite] | None,
             metrics: Sequence[Metric], eval_every: int | None) -> dict[str, EvalSuite]:
     """Every split `fit` validates, by name, with its metrics and cadence
@@ -258,152 +247,6 @@ def _suites(dataset: Loader, validation: Mapping[str, Reader | EvalSuite] | None
         suites[name] = EvalSuite(suite.data, tuple(suite.metrics) or tuple(metrics),
                                  eval_every if suite.every is None else suite.every)
     return suites
-
-
-@dataclasses.dataclass(frozen=True)
-class _FitPlan:
-    """What one `Trainer.fit` call was asked for."""
-
-    dataset: Loader
-    steps: int | None
-    log_every: int
-    eval_every: int | None
-    tokens: int | None
-    checkpoint_every: int | datetime.timedelta | None
-    checkpoint_final: bool
-    local_every: int | None
-    metrics: Sequence[Metric]
-    preview: bool
-    best: tuple[Best, ...] = ()
-    stop: Plateau | None = None
-    pause: tuple[int | None, int | None] = (None, None)
-    """The step and the real tokens a `Pause` ends the run at (`Pause.at`)."""
-    suites: Mapping[str, EvalSuite] = dataclasses.field(default_factory=dict)
-    held_best: bool = False  # a restore_best without Checkpoints (`HeldBest`)
-    """Every validation split by name, its metrics and cadence resolved."""
-    observe: Observe | None = None
-
-    @property
-    def validation(self) -> bool:
-        return bool(self.suites)
-
-    def finished(self, step: int, real: int) -> bool:
-        """Whether either run-length cap has been reached, after `real` tokens."""
-        return ((self.steps is not None and step >= self.steps)
-                or (self.tokens is not None and real >= self.tokens))
-
-    def paused(self, step: int, real: int) -> bool:
-        """Whether the run has reached where its `Pause` ends it, after `real` tokens."""
-        at, tokens = self.pause
-        return (at is not None and step >= at) or (tokens is not None and real >= tokens)
-
-    def ended(self, step: int, real: int) -> bool:
-        """Whether this fit has nothing left to train: its budget reached, or its pause."""
-        return self.finished(step, real) or self.paused(step, real)
-
-    def real(self, interval: Interval) -> int:
-        """The run's real tokens where a token budget reads them, else 0: the count is read from the
-        devices, which a run without one need not wait on."""
-        return interval.real_tokens if self.tokens is not None else 0
-
-    @property
-    def declared(self) -> dict[str, tuple[Metric, ...]]:
-        """Each validation split's metrics, by the split's name (`_split_metrics`)."""
-        return _split_metrics(self.suites)
-
-    @property
-    def scored(self) -> tuple[Metric, ...]:
-        """Fit's metrics and every suite's, each instance once: two suites' instances of one metric
-        are both a selection's to name."""
-        every = (*self.metrics, *(metric for suite in self.suites.values() for metric in suite.metrics))
-        return tuple({id(metric): metric for metric in every}.values())
-
-    @property
-    def cadenced(self) -> bool:
-        """Whether any evaluation runs before the end."""
-        return bool(self.eval_every or any(suite.every for suite in self.suites.values()))
-
-    @property
-    def evaluates_midway(self) -> bool:
-        """Whether an evaluation can run before the end's: on a cadence shorter than the run, or to
-        rank a checkpoint written before its end."""
-        def before_end(every: int | datetime.timedelta | None) -> bool:
-            return bool(every) and (self.steps is None or not isinstance(every, int) or every < self.steps)
-
-        cadences = (self.eval_every, *(suite.every for suite in self.suites.values()))
-        return any(map(before_end, cadences)) or bool(
-            (self.validation or self.best or self.stop) and before_end(self.checkpoint_every))
-
-    def due(self, step: int) -> tuple[str, ...]:
-        """The suites whose own cadence falls on `step`."""
-        return tuple(name for name, suite in self.suites.items() if suite.every and step % suite.every == 0)
-
-
-@dataclasses.dataclass
-class _FitRun:
-    """One `Trainer.fit` call's progress: what its loop carries from step
-    to step and what its cleanup reads however the run ends."""
-
-    started: float
-    current: int = 0
-    loss: jax.Array | None = None
-    evaluation: Evaluation | None = None
-    last_checkpoint: float = 0.0
-    checkpoint_due: bool = False
-    stop_control: dict = dataclasses.field(default_factory=dict)
-    last_local_saved: int | None = None
-    stopped: bool = False
-    training: dict[str, jax.Array] = dataclasses.field(default_factory=dict)
-    source: Iterator[Batch] | None = None
-    train: DevicePrefetchIterator | None = None
-    tracing: bool = False
-    traced: int = 0
-    other: float = 0.0
-    first_step: float | None = None
-    preempted: int | None = None
-    paused: int | None = None
-    notice: PreemptionNotice | None = None
-    endless: bool = False
-    taken: Taken | None = None
-    scored: frozenset[str] = frozenset()
-    """The suites `evaluation` scored at its step, which a run whose stream ends there scores once."""
-    ahead: tuple[Batch | None] | None = None
-    """The next batch, or None for the stream's end, read before the step that takes it, where a
-    save had to know whether the run ends there (`Trainer._ends_here`)."""
-    best: HeldBest = dataclasses.field(default_factory=HeldBest)
-    """The log taken at the latest logging step and not yet read."""
-    stepped: tuple[jax.Array, dict[str, jax.Array], jax.Array] | None = None
-    """The latest step's loss, objective metrics and acceptance, which the log of the interval it
-    ends takes."""
-    reads: dict[Signature, tuple[bool, ...]] = dataclasses.field(default_factory=dict)
-    """Which leaves of a batch of each signature its compiled step reads
-    (`step_reads`), which the prefetcher alone places."""
-
-    def read(self) -> Batch:
-        """The training stream's next batch, read through this run each time:
-        a caller's alias would keep the closed stream reachable from a failed
-        run's traceback."""
-        assert self.train is not None
-        return next(self.train)
-
-
-def _waited_read(run: _FitRun, interval: Interval, *, agree: bool) -> Batch | None:
-    """The training stream's next batch, its wait counted in `interval`, or None where it has run out
-    on every process, which ends the run as its length would. Where `agree`, the read is agreed
-    (`agreed_next`): one that fails, or runs out on some processes only, stops every process, as
-    does a stream with no batch for a run at step 0. An endless stream's later reads are not agreed,
-    as it never runs out. A batch read ahead (`_FitRun.ahead`) is this read's."""
-    if run.ahead is not None:
-        (batch,), run.ahead = run.ahead, None
-        return batch
-    assert run.train is not None
-    with region("input.wait"):
-        asked = time.perf_counter()
-        batch = agreed_next("training read", run.train) if agree else run.read()
-        interval.waited += time.perf_counter() - asked
-    if batch is None and not run.current:
-        raise ValueError("the training data holds no batch to train on")
-    return batch
 
 
 def _read_whole(accumulation: int, split: int | None, step: Callable[..., StepFn] | None, layout: Layout,
@@ -1513,7 +1356,7 @@ class Trainer(Generic[Loss, Effects]):
         self._preflight(loader, plateau, suites, preview=preview,
                         loss=(self.checkpoints is not None or restore_best) and not selection)
         preview = preview and self.tracker is not None
-        run = _FitRun(time.perf_counter())
+        run = FitRun(time.perf_counter())
         # A display of this fit's own: one before it may have run other steps.
         self._display = TrainingDisplay()
         profile, checkpoints = self.profile, self.checkpoints
@@ -1522,7 +1365,7 @@ class Trainer(Generic[Loss, Effects]):
         # owns the capture.
         tracer = profiler if profiler is not None else telemetry_profile.active_profile()
         try:
-            plan = _FitPlan(
+            plan = FitPlan(
                 dataset=loader, steps=steps, log_every=log_every, eval_every=eval_every, tokens=tokens,
                 checkpoint_every=checkpoint_every, checkpoint_final=checkpoint_final,
                 local_every=None if checkpoints is None else checkpoints.local_every,
@@ -1552,7 +1395,7 @@ class Trainer(Generic[Loss, Effects]):
         built = self._config.build(updates)
         self._optimizer = self.objective.optimizer(built)
 
-    def _training_loop(self, plan: _FitPlan, run: _FitRun, profiler: Profiler | None,
+    def _training_loop(self, plan: FitPlan, run: FitRun, profiler: Profiler | None,
                        tracer: Profiler | None, profile: ProfileWindow | None,
                        checkpoints: Checkpoints | None,
                        initial: TrainState | None = None) -> TrainState:
@@ -1597,7 +1440,7 @@ class Trainer(Generic[Loss, Effects]):
                 # The first read restores the stream's position and opens its reader on the prefetch
                 # worker, and a stream that may run out can on any read: a process whose read failed stops
                 # its peers before they compile or step without it.
-                batch = _waited_read(run, interval, agree=not (seen and run.endless))
+                batch = waited_read(run, interval, agree=not (seen and run.endless))
                 if batch is None:
                     self._display.note(f"The training data ran out at step {run.current}")
                     break
@@ -1663,7 +1506,7 @@ class Trainer(Generic[Loss, Effects]):
         self._wind_down(plan, run, interval, state, shardings, position, profiler)
         return state
 
-    def _closed(self, run: _FitRun, primary: BaseException | None,
+    def _closed(self, run: FitRun, primary: BaseException | None,
                 profiler: Profiler | None) -> BaseException | None:
         """`fit`'s cleanup however the run ended: the preemption notice, the
         stream, a trace window and the display closed, the checkpoints
@@ -1703,7 +1546,7 @@ class Trainer(Generic[Loss, Effects]):
         run.other += time.perf_counter() - paused
         return self._reported_outcome(error, run)
 
-    def _opened(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState, position, *,
+    def _opened(self, plan: FitPlan, run: FitRun, interval: Interval, state: TrainState, position, *,
                 resumed: bool) -> bool:
         """Start `fit` from the placed state: report it, refuse a run already
         past its steps, a checkpoint cadence with no checkpointer or a resume
@@ -1794,7 +1637,7 @@ class Trainer(Generic[Loss, Effects]):
                 f"the training step compiled for step {step} failed on its first run. It was checked to "
                 f"fit: {json.dumps(self.memory)}; the devices now hold {json.dumps(now)}") from error
 
-    def _between_steps(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState,
+    def _between_steps(self, plan: FitPlan, run: FitRun, interval: Interval, state: TrainState,
                        shardings: Placement[TrainState], position, loss: jax.Array,
                        aux: dict[str, jax.Array], accepted: jax.Array) -> bool:
         """The cadenced work after one step of `fit`: the log, the validation,
@@ -1861,7 +1704,7 @@ class Trainer(Generic[Loss, Effects]):
             return True
         return False
 
-    def _best_model(self, final: TrainState, run: _FitRun) -> TrainState:
+    def _best_model(self, final: TrainState, run: FitRun) -> TrainState:
         """`final` with the model state of the step the run ranked best (`MODEL_STATE`): read from
         its best checkpoint, a weights-only one included, or without `Checkpoints` from the copy the
         run held (`HeldBest`)."""
@@ -1875,7 +1718,7 @@ class Trainer(Generic[Loss, Effects]):
         model, _ = checkpoints.restore(template, step="best")
         return dataclasses.replace(final, **{name: model[name] for name in template})
 
-    def _take(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState, *,
+    def _take(self, plan: FitPlan, run: FitRun, interval: Interval, state: TrainState, *,
               unlogged: bool = False) -> None:
         """Take the log of the interval ending at the current step (`Interval.take`); with
         `unlogged`, only where it holds steps no log took, as the step a run ends on between its
@@ -1892,7 +1735,7 @@ class Trainer(Generic[Loss, Effects]):
                                   {} if self.rollout is None else dict(_rollout_metrics(self.rollout)),
                                   plan.dataset.statistics())
 
-    def _saves(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState, position,
+    def _saves(self, plan: FitPlan, run: FitRun, interval: Interval, state: TrainState, position,
                scores: Mapping[str, float], *, evaluation_due: bool, final: bool = False,
                full: bool = False) -> None:
         """Resolve cadence, ranking, stopping and unconditional final saves in one place; with `full`,
@@ -1929,7 +1772,7 @@ class Trainer(Generic[Loss, Effects]):
                 checkpoints, current, state, position, interval, control=run.stop_control)
             run.last_local_saved = current
 
-    def _wind_down(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState,
+    def _wind_down(self, plan: FitPlan, run: FitRun, interval: Interval, state: TrainState,
                    shardings: Placement[TrainState], position, profiler: Profiler | None) -> None:
         """`fit` after its last step: the stream closed, a preemption
         announced, the trace window stopped, the final validation (skipped on
@@ -1988,14 +1831,14 @@ class Trainer(Generic[Loss, Effects]):
         if checkpoints is not None:
             checkpoints.wait()
 
-    def _ends_here(self, run: _FitRun, interval: Interval) -> bool:
+    def _ends_here(self, run: FitRun, interval: Interval) -> bool:
         """Whether a stream that may run out has, so this step is the run's last: its next batch is
         read now, agreed as every such read is, and kept for the step that takes it (`ahead`), the
         position the step saves taken before it. An endless stream never ends here."""
         if run.endless:
             return False
         if run.ahead is None:
-            run.ahead = (_waited_read(run, interval, agree=True),)
+            run.ahead = (waited_read(run, interval, agree=True),)
         return run.ahead[0] is None
 
     def _fit_policies(self, best, stop, metrics, suites, checkpoint_every, steps, tokens):
@@ -2009,7 +1852,7 @@ class Trainer(Generic[Loss, Effects]):
                              "checkpointer; pass Checkpoints(directory)")
         pause = stop.at(steps, tokens, self.accumulation) if isinstance(stop, Pause) else (None, None)
         plateau = stop if isinstance(stop, Plateau) else None
-        scored = _split_metrics(suites) or {'val': tuple(metrics)}
+        scored = split_metrics(suites) or {'val': tuple(metrics)}
         raw = (
             ()
             if best is None
@@ -2051,7 +1894,7 @@ class Trainer(Generic[Loss, Effects]):
         return selection, plateau, pause
 
     @staticmethod
-    def _plateau(plan: _FitPlan, run: _FitRun, scores: Mapping[str, float]) -> bool:
+    def _plateau(plan: FitPlan, run: FitRun, scores: Mapping[str, float]) -> bool:
         stop = plan.stop
         if stop is None:
             return False
@@ -2080,9 +1923,9 @@ class Trainer(Generic[Loss, Effects]):
         held['step'] = run.current
         return held['bad'] >= stop.evals
 
-    def _warm_evaluations(self, plan: _FitPlan, state: TrainState, shardings: Placement[TrainState]) -> None:
+    def _warm_evaluations(self, plan: FitPlan, state: TrainState, shardings: Placement[TrainState]) -> None:
         """Compile the programs the run's evaluations run beside a step's compile, where any runs
-        between steps (`_FitPlan.evaluates_midway`): every suite warms (`Evaluation.run`'s `warm`),
+        between steps (`FitPlan.evaluates_midway`): every suite warms (`Evaluation.run`'s `warm`),
         its preview included, and nothing is reported.
 
         An evaluation's programs compile at their first call, which would otherwise be an
@@ -2095,7 +1938,7 @@ class Trainer(Generic[Loss, Effects]):
             with region("evaluate"):
                 self._evaluation(plan, state, shardings, {}, warm=True)
 
-    def _evaluation(self, plan: _FitPlan, state: TrainState, shardings: Placement[TrainState],
+    def _evaluation(self, plan: FitPlan, state: TrainState, shardings: Placement[TrainState],
                     training: Mapping[str, jax.Array], names: Sequence[str] | None = None, *,
                     warm: bool = False) -> Evaluation:
         """Score the suites in `names`, every suite when None, as one evaluation.
@@ -2146,7 +1989,7 @@ class Trainer(Generic[Loss, Effects]):
         A validation pass records the objective's validation loss where it
         defines one, and hands its batches to metrics, to the preview and,
         under a checkpointer, or with `loss` where its loss ranks the state a
-        run holds (`_FitPlan.held_best`), to the loss that ranks the run's
+        run holds (`FitPlan.held_best`), to the loss that ranks the run's
         steps. Only an objective with no validation loss (Flow-GRPO's) and
         none of the rest would open nothing and report nothing, and that
         contradiction is refused before the run does any work.
@@ -2198,7 +2041,7 @@ class Trainer(Generic[Loss, Effects]):
 
     def _compiled_for(self, compiled: dict[Signature, tuple[CompiledStep, StepFlops | None]],
                       state: TrainState, batch: Batch,
-                      run: _FitRun) -> tuple[CompiledStep, StepFlops | None, TrainState]:
+                      run: FitRun) -> tuple[CompiledStep, StepFlops | None, TrainState]:
         """Return the step compiled for this batch's abstract signature (`batch_signature`),
         compiling on first sight, and the state to step, a fresh copy where the plan timed steps
         on it (`Timer`). A compile reads `run`'s pending log first: it holds the devices idle
@@ -2288,7 +2131,7 @@ class Trainer(Generic[Loss, Effects]):
         self._display.status("")
         return time.perf_counter() - paused
 
-    def _read_taken(self, run: _FitRun, *, agree: bool = True) -> None:
+    def _read_taken(self, run: FitRun, *, agree: bool = True) -> None:
         """Read the log the loop took (`Taken`), check its losses and report
         one logging interval, its clock ending when its step was done.
 
@@ -2356,7 +2199,7 @@ class Trainer(Generic[Loss, Effects]):
             else:
                 report()
 
-    def _reported_outcome(self, error: BaseException | None, run: _FitRun) -> BaseException | None:
+    def _reported_outcome(self, error: BaseException | None, run: FitRun) -> BaseException | None:
         """Agree the run's cleanup, report its goodput and its outcome.
 
         Every rank reaches the cleanup agreement, so a rank that failed alone
@@ -2484,7 +2327,7 @@ class Trainer(Generic[Loss, Effects]):
     # ------------------------------------------------------------------ Telemetry
     # ------------------------------------------------------------------
 
-    def _stop_trace(self, run: _FitRun, profile: ProfileWindow, profiler: Profiler) -> None:
+    def _stop_trace(self, run: FitRun, profile: ProfileWindow, profiler: Profiler) -> None:
         """Stop the window's owned capture (`stop_capture`), then report it on process zero."""
         stop_capture(profiler, run.loss)
         self._report(ProfileWindowRecord(profile.directory, run.traced), run.current)
