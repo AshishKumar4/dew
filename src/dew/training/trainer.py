@@ -127,7 +127,7 @@ from dew.training.distributed import (
     microbatch,
     microbatch_shapes,
     placed_bytes,
-    placed_held,
+    placed_start,
     prefetched_bytes,
     resumed_link_figures,
     ruled,
@@ -135,7 +135,7 @@ from dew.training.distributed import (
     split_fields,
     stage_microbatches,
     step_reads,
-    taking_over,
+    traced_start,
 )
 from dew.training.evaluation import EvalSuite, Evaluation
 from dew.training.interval import Interval, Taken, held
@@ -711,60 +711,6 @@ class Trainer(Generic[Loss, Effects]):
                 lambda s: s.with_memory_kind("device"), getattr(shardings, field)))
             for field in self.layout.host})
 
-    def _traced_start(self, initializer: Initializer, key: jax.Array) -> tuple[TrainState, dict[int, int]]:
-        """The fresh state's shapes, and which of its frozen leaves are the initializer's arrays as
-        they are: each such leaf's index among the frozen tree's leaves, to the index of the
-        initializer's leaf it is. An init that returns a held leaf as it is, by reference, passes it
-        through (`Objective.held_variables`); one trace finds both."""
-        through: dict[int, int] = {}
-
-        def traced(initializer: Initializer, key: jax.Array) -> TrainState:
-            state = self.initial_state(initializer, key)
-            inputs = {id(leaf): index for index, leaf in enumerate(jax.tree.leaves(initializer))}
-            frozen = jax.tree.leaves(apart(state)[1])
-            through.update({index: inputs[id(leaf)] for index, leaf in enumerate(frozen)
-                            if id(leaf) in inputs})
-            return state
-
-        return jax.eval_shape(traced, initializer, key), through
-
-    def _placed_fresh(self, initializer: Initializer, key: jax.Array, abstract: TrainState,
-                      shardings: Placement[TrainState], through: Mapping[int, int]) -> TrainState:
-        """A fresh state on the mesh, built from the objective's held tree (`placed_held`). The frozen
-        leaves the objective's init passes through as they are (`through`, `_traced_start`), which no
-        step donates (`apart`), are the held arrays themselves, placed where the state keeps them, the
-        same arrays where they are placed already: the run and the objective then hold one frozen tree
-        between them. One program builds the rest, a frozen leaf the init builds among it, taking the
-        other held arrays over."""
-        moving, frozen = apart(shardings)
-        if frozen is None or not through:
-            taken, kept = placed_held(initializer, abstract.variables, shardings.variables, self.device_mesh)
-            return taking_over(self.initial_state, taken, kept, shardings)(key)
-        inputs = jax.tree.leaves(initializer)
-        taken, kept = placed_held(initializer, abstract.variables, shardings.variables, self.device_mesh,
-                                  shared=frozenset(id(inputs[index]) for index in through.values()))
-        placed = jax.tree.leaves(jax.tree.map(lambda one, other: other if one is None else one, taken, kept,
-                                              is_leaf=lambda leaf: leaf is None))
-        where, structure = jax.tree.flatten(frozen)
-        built = [index for index in range(len(where)) if index not in through]
-
-        def rest(tree: Initializer, draw: jax.Array) -> tuple[TrainState, tuple[jax.Array, ...]]:
-            state, own = apart(self.initial_state(tree, draw))
-            leaves = jax.tree.leaves(own)
-            return state, tuple(leaves[index] for index in built)
-
-        state, made = taking_over(rest, taken, kept, (moving, tuple(where[index] for index in built)))(key)
-        drawn = dict(zip(built, made, strict=True))
-
-        def leaf(index: int) -> jax.Array:
-            if index in drawn:
-                return drawn[index]
-            # A held leaf an init passes through at another path is placed where the state keeps that one.
-            held = placed[through[index]]
-            return held if held.sharding == where[index] else jax.device_put(held, where[index])
-
-        return together(state, jax.tree.unflatten(structure, [leaf(index) for index in range(len(where))]))
-
     @ruled
     def place(self) -> tuple[TrainState, Placement[TrainState], bytes | None]:
         """Put the state on the mesh, fresh or restored.
@@ -778,7 +724,7 @@ class Trainer(Generic[Loss, Effects]):
         if self.host_master:
             from dew.training.host import transfer
             key = transfer(key, NamedSharding(self.state_mesh, P()))
-        abstract, through = self._traced_start(initializer, key)
+        abstract, through = traced_start(self.initial_state, initializer, key)
         refuse_wide_floats(abstract, self.device_mesh)
         shardings = self.shardings(abstract)
         self.check(abstract.variables, shardings.variables)
@@ -789,7 +735,8 @@ class Trainer(Generic[Loss, Effects]):
         if checkpoints is None or resume is None:
             if self.host_master:
                 return self._placed_host(initializer, key, shardings), shardings, None
-            return self._placed_fresh(initializer, key, abstract, shardings, through), shardings, None
+            return (placed_start(self.initial_state, initializer, key, abstract, shardings, through,
+                                 self.device_mesh), shardings, None)
         abstract = dataclasses.replace(abstract, accumulation=checkpoints.accumulation_template(resume))
         shardings = self.shardings(abstract)
         if self.host_master and FROZEN in abstract.variables:
