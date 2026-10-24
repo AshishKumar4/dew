@@ -3,8 +3,9 @@
 Its output and its gradients of the query, key, value and sinks are on par with Dew's reference path from
 float64 (check 1), for each call form the route takes. Every case has grouped key heads: four query heads
 over two. The selector refuses the route a mask and a bias by their inherent limits, and no target's
-preference picks it, so only a call that names it runs it. On a mesh of two rows by four heads, with fewer
-key heads than tensor shards, a named call runs per shard under `sharded.assert_runs_per_shard`.
+preference picks it, so only a call that names it runs it. On meshes, a named call runs per shard under
+`sharded.assert_runs_per_shard`: with fewer key heads than the tensor shards, with key heads split partly, or
+with key heads split in the other order from the query heads.
 """
 
 import functools
@@ -13,6 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from jax.sharding import Mesh, PartitionSpec
 from reference_error import assert_as_exact, with_gradients
 from sharded import assert_runs_per_shard
@@ -37,6 +39,7 @@ from dew.nn.kernels import generation
 from dew.nn.kernels.generation import INHERENT
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import attention as template, attention_route
+from dew.nn.sharding import DEFAULT_RULES
 
 HEADS, KV_HEADS, WIDTH = 4, 2, 32
 MESH_TENSOR, MESH_HEADS = 4, 8
@@ -121,23 +124,33 @@ MESH_CASES = {
     "lengths-and-starts": {"lengths": True, "starts": True},
 }
 """The calls the per-shard test takes, each with sinks: its ids, lengths and starts split with their rows."""
+WIDE_HEADS = 24
+"""The query heads of the partly split mesh tests: eight ways over the tensor and expert axes, three on each
+shard."""
+QUERY_HEADS_EIGHT_WAYS = (("activation_heads", ("tensor", "expert")),)
+"""The query heads' rule when they split over the tensor and expert axes together, as a trainer's layout may
+split them."""
+PARTLY_SPLIT_KEY_HEADS = {
+    6: (*QUERY_HEADS_EIGHT_WAYS, ("activation_kv", ("tensor", "expert")), ("activation_kv", "tensor"),
+        *DEFAULT_RULES),
+    8: (*QUERY_HEADS_EIGHT_WAYS, ("activation_kv", "tensor"), *DEFAULT_RULES),
+}
+"""Rules that split the key heads over the tensor axis alone: six, which the full split does not divide, and
+eight, which the tensor axis splits only in part of the query heads' eight ways."""
+KEY_HEADS_LEADING_THE_OTHER_WAY = (*QUERY_HEADS_EIGHT_WAYS, ("activation_kv", ("expert", "tensor")),
+                                   *DEFAULT_RULES)
+"""Rules that split eight key heads over the expert and tensor axes, in the other order from the query
+heads."""
 
 
-@pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize("key_heads", [1, 2], ids=["one-key-head", "two-key-heads"])
-@pytest.mark.parametrize("case", MESH_CASES.values(), ids=list(MESH_CASES))
-def test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh(case, key_heads):
-    """A named template call on a mesh of two rows by four heads, with one or two key heads, fewer than the
-    four tensor shards, runs per shard (`sharded.assert_runs_per_shard`): its output and its gradients of the
-    query, key, value and sinks are on par with one device's over the site's draws (check 1), measured from
-    float64 on the reference path, and the compiled step moves no operand between devices. Each shard holds
-    the key heads its query heads read, which `_per_shard` repeats until the tensor axis splits them."""
+def per_shard_contract(case: dict, mesh: Mesh, specs: list, *, heads: int, kv_heads: int, rules, label: str,
+                       moves=()) -> None:
+    """`case`'s named template call on `mesh`, its arguments placed by `specs` and the logical axis
+    `rules` in context, runs per shard (`sharded.assert_runs_per_shard`). Its output and gradients are on
+    par with one device's over the site's draws (check 1), measured from float64 on the reference path,
+    and the compiled step moves no operand between devices beyond `moves`."""
     queries, keys = geometry(case)
-    mesh = Mesh(np.asarray(jax.devices()[:ROWS * MESH_TENSOR]).reshape(ROWS, MESH_TENSOR),
-                ("data", "tensor"))
-    rows_and_heads = PartitionSpec("data", None, "tensor")
-    # Fewer key heads than tensor shards: no shard splits them, so each holds them whole, split by rows alone.
-    rows = PartitionSpec("data")
+    draw = drawing(queries, keys, jnp.float32, sinks=True, heads=heads, kv_heads=kv_heads)
 
     def routed(query, key, value, sinks):
         return scaled_dot_product_attention(query, key, value, implementation="template", sinks=sinks,
@@ -147,11 +160,56 @@ def test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh
         return scaled_dot_product_attention(query, key, value, implementation="reference", sinks=sinks,
                                             **keywords(case))
 
-    draw = drawing(queries, keys, jnp.float32, sinks=True, heads=MESH_HEADS, kv_heads=key_heads)
+    with nn.logical_axis_rules(rules):
+        assert_runs_per_shard(with_gradients(routed), draw, specs, mesh, label, seeds=MESH_SEEDS,
+                              truth_fn=with_gradients(reference), moves=moves)
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize("key_heads", [1, 2], ids=["one-key-head", "two-key-heads"])
+@pytest.mark.parametrize("case", MESH_CASES.values(), ids=list(MESH_CASES))
+def test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh(case, key_heads):
+    """A named template call on a mesh of two rows by four heads, with one or two key heads, fewer than the
+    four tensor shards. It runs per shard (`sharded.assert_runs_per_shard`): its output and its gradients of
+    the query, key, value and sinks are on par with one device's over the site's draws (check 1), measured
+    from float64 on the reference path, and the compiled step moves no operand between devices."""
+    mesh = Mesh(np.asarray(jax.devices()[:ROWS * MESH_TENSOR]).reshape(ROWS, MESH_TENSOR), ("data", "tensor"))
+    rows_and_heads = PartitionSpec("data", None, "tensor")
+    # Fewer key heads than tensor shards: no shard splits them, so each holds them whole, split by rows alone.
+    rows = PartitionSpec("data")
     specs = [rows_and_heads, rows, rows, PartitionSpec("tensor"), rows_and_heads]
-    assert_runs_per_shard(with_gradients(routed), draw, specs, mesh,
-                          f"template split over rows and heads, {key_heads} key heads", seeds=MESH_SEEDS,
-                          truth_fn=with_gradients(reference))
+    per_shard_contract(case, mesh, specs, heads=MESH_HEADS, kv_heads=key_heads, rules=DEFAULT_RULES,
+                       label=f"template split over rows and heads, {key_heads} key heads")
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize("kv_heads", [6, 8], ids=["six-key-heads", "eight-key-heads"])
+def test_partly_split_key_heads_keep_the_kernel_contract_on_a_tensor_and_expert_mesh(kv_heads):
+    """A named template call with 24 query heads split eight ways over a tensor axis of two and an expert axis
+    of four, and key heads split over the tensor axis alone. Each shard holds part of the key heads its query
+    heads read, and reads them at their offset in that part. It runs per shard as the others do, on par with
+    one device's, and no operand moves between devices."""
+    mesh = Mesh(np.asarray(jax.devices()[:8]).reshape(2, 4), ("tensor", "expert"))
+    heads = PartitionSpec(None, None, ("tensor", "expert"))
+    keys = PartitionSpec(None, None, "tensor")
+    specs = [heads, keys, keys, PartitionSpec(("tensor", "expert")), heads]
+    per_shard_contract(MESH_CASES["own-documents"], mesh, specs, heads=WIDE_HEADS, kv_heads=kv_heads,
+                       rules=PARTLY_SPLIT_KEY_HEADS[kv_heads],
+                       label=f"template split eight ways, {kv_heads} key heads on the tensor axis")
+
+
+@pytest.mark.mesh(devices=8)
+def test_key_heads_the_query_heads_do_not_lead_are_gathered_on_a_tensor_and_expert_mesh():
+    """Eight key heads split over the expert and tensor axes, in the other order from the query heads' split.
+    No shard holds the key heads its query heads read, so every shard holds them whole, and the key and value
+    heads are gathered once before the map. It runs per shard on par with one device's."""
+    mesh = Mesh(np.asarray(jax.devices()[:8]).reshape(2, 4), ("tensor", "expert"))
+    heads = PartitionSpec(None, None, ("tensor", "expert"))
+    keys = PartitionSpec(None, None, ("expert", "tensor"))
+    specs = [heads, keys, keys, PartitionSpec(("tensor", "expert")), heads]
+    per_shard_contract(MESH_CASES["own-documents"], mesh, specs, heads=WIDE_HEADS, kv_heads=8,
+                       rules=KEY_HEADS_LEADING_THE_OTHER_WAY, moves=("all-gather",),
+                       label="template split eight ways, key heads the other way")
 
 
 def test_a_route_call_under_forward_mode_keeps_the_template_value_and_the_reference_derivative():
@@ -183,16 +241,17 @@ def test_the_selector_refuses_a_mask_and_a_bias_by_their_inherent_limits():
     key = jnp.zeros((ROWS, KEYS, KV_HEADS, WIDTH), jnp.bfloat16)
     plain = attention.attention_case(query, key, named="template")
     assert kernel_refusals(ATTENTION, "template", plain) == []
-    dense = {
-        "mask": jnp.ones((ROWS, 1, QUERIES, KEYS), bool),
-        "bias": jnp.zeros((ROWS, HEADS, QUERIES, KEYS), jnp.bfloat16),
-    }
-    for name, operand in dense.items():
-        case = attention.attention_case(query, key, named="template", **{name: operand})
+    mask = jnp.ones((ROWS, 1, QUERIES, KEYS), bool)
+    bias = jnp.zeros((ROWS, HEADS, QUERIES, KEYS), jnp.bfloat16)
+    masked = attention.attention_case(query, key, named="template", mask=mask)
+    biased = attention.attention_case(query, key, named="template", bias=bias)
+    for case, name in ((masked, "mask"), (biased, "bias")):
         refusals = kernel_refusals(ATTENTION, "template", case)
         assert [(refusal.code, refusal.row) for refusal in refusals] == [(name, INHERENT)]
-        with pytest.raises(KernelRefused):
-            scaled_dot_product_attention(query, key, key, implementation="template", **{name: operand})
+    with pytest.raises(KernelRefused):
+        scaled_dot_product_attention(query, key, key, implementation="template", mask=mask)
+    with pytest.raises(KernelRefused):
+        scaled_dot_product_attention(query, key, key, implementation="template", bias=bias)
 
 
 def test_no_target_prefers_the_template_so_only_a_named_call_takes_it():
@@ -223,6 +282,7 @@ def test_the_route_takes_score_hooks_and_the_initial_state_and_refuses_an_output
     """`attend` runs a score hook and the initial state, and refuses an output hook of its own: its backward
     takes the output before one, so the caller applies it."""
     query, key, value, sinks, _ = drawing(QUERIES, KEYS, jnp.float32, sinks=True)(0)
+    assert sinks is not None
     spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
     hooks = template.Hooks(score_mod=functools.partial(template.capped, SOFTCAP),
                            initial=template.sinks(sinks, ROWS, QUERIES, WIDTH))
