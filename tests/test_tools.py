@@ -698,6 +698,28 @@ def test_a_nested_last_kernel_does_not_shorten_a_traced_window():
 # tools/benchmark_quantized_serving.py
 # ---------------------------------------------------------------------------
 
+def test_the_quantized_serving_benchmark_samples_through_the_task_and_reads_its_real_rows():
+    """The benchmark's samples are the task's own walk and decode, read back as their real rows: a
+    pixel-space model's too, which has no autoencoder, and its twelve prompts once on eight devices,
+    which the walk pads to sixteen rows, so quality() scores twelve images against twelve prompts."""
+    from flax import linen as nn
+
+    from dew.diffusion import DirectPredictionTransform, FlowMatchingScheduler, Process
+    from dew.inputs import Field, InputSpec
+    from dew.sampling import Euler, TextToImage
+
+    class Zero(nn.Module):
+        def __call__(self, x, time, train=False):
+            return jnp.zeros_like(x)
+
+    tool = load("benchmark_quantized_serving")
+    pipe = TextToImage(Zero(), Process(FlowMatchingScheduler(), DirectPredictionTransform()),
+                       InputSpec(Field("image", (2, 2, 1))), {}, steps=1, guidance=None, solver=Euler())
+    pixels, found = tool.sample(pipe, 0)
+    assert pixels.shape == (len(tool.PROMPTS), 2, 2, 1) and pixels.dtype == np.uint8
+    assert found == {"latents": 0, "pixels": 0}
+
+
 # ---------------------------------------------------------------------------
 # tools/check_distribution.py
 # ---------------------------------------------------------------------------
