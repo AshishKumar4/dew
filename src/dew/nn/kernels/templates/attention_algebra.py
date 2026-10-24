@@ -343,9 +343,15 @@ def power2(x: jax.Array, k: jax.Array) -> jax.Array:
     factors each within 2^±127 (`exact_power2`), of `k`'s sign, so each partial product lies between `x`
     and the result; `k` held within `POWER2_REACH`, past which the result is zero or infinite."""
     k = jnp.clip(jnp.asarray(k, jnp.float32), -POWER2_REACH, POWER2_REACH)
-    first = jnp.trunc(k / 3)
-    second = jnp.trunc((k - first) / 2)
+    first = _truncated(k / 3)
+    second = _truncated((k - first) / 2)
     return x * exact_power2(first) * exact_power2(second) * exact_power2(k - first - second)
+
+
+def _truncated(x: jax.Array) -> jax.Array:
+    """`trunc(x)` of an fp32 `x` within int32's range, through an int32: Mosaic GPU's lane lowering (the
+    mma.sync bundle's) has no floor or ceil, which `jnp.trunc` lowers to."""
+    return x.astype(jnp.int32).astype(jnp.float32)
 
 
 def headroom(dtype) -> bool:
