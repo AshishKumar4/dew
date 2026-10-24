@@ -14,6 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental import checkify
 from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 
@@ -127,7 +128,16 @@ def test_canvas_generation_can_resume_at_committed_boundaries(system, budget):
                                 eos_token_ids=eos_ids, pad_token_id=0)
     plan = CanvasPlan(process, eos_ids, 0, budget)
     begin = jax.jit(lambda weights, data: _begin(model, weights, data, plan))
-    advance = jax.jit(lambda weights, state: _advance(model, weights, state, jax.random.key(11), plan))
+    # A refinement checks its draws (`dew._distributions`), so its program carries the check out.
+    def advanced(weights, state):
+        return _advance(model, weights, state, jax.random.key(11), plan)
+
+    checked = jax.jit(checkify.checkify(advanced, errors=checkify.user_checks))
+
+    def advance(weights, state):
+        error, advanced = checked(weights, state)
+        error.throw()
+        return advanced
     state = begin(variables, inputs)
     for _ in range(plan.blocks):
         state = advance(variables, jax.device_get(state))
@@ -304,3 +314,13 @@ def test_canvas_generation_rejects_lossy_token_coercion_and_batched_keys(system)
     with pytest.raises(ValueError):
         process.generate(model, variables, reference["prompt"], 3,
                          key=jax.random.split(jax.random.key(1), 2))
+
+
+def test_a_canvas_whose_model_scores_nothing_refuses_rather_than_draw_a_token(system):
+    """A canvas refinement draws each unfinished position from the model's scores; scores of NaN
+    hold no distribution, so generation raises instead of committing arbitrary tokens."""
+    model, variables, process, reference, _ = system
+    poisoned = jax.tree.map(lambda leaf: jnp.full_like(leaf, jnp.nan), variables)
+    with pytest.raises(checkify.JaxRuntimeError):
+        process.generate(model, poisoned, ModelInputs(jnp.asarray(reference["prompt"])), 3,
+                         key=jax.random.key(11))

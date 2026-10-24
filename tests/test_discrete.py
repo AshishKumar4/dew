@@ -292,6 +292,20 @@ def test_masked_generation_names_what_a_model_lacks(rng, model, lacks):
         process.generate(model, model.init(rng, jnp.zeros((1, 4), jnp.int32)), [[1, 2]], 3, key=0)
 
 
+def test_a_masked_walk_whose_model_scores_nothing_refuses_rather_than_reveal_a_token(rng):
+    """A model whose scores are NaN holds no distribution to reveal a token from, so masked generation
+    raises instead of committing an arbitrary one; the same model with finite scores generates."""
+    from jax.experimental import checkify
+
+    model = transformer(causal=False)
+    variables = model.init(rng, jnp.zeros((1, 4), jnp.int32))
+    process = DiscreteProcess(LogLinear(), mask_id=MASK)
+    process.generate(model, variables, [[1, 2]], 3, key=0, steps=4)
+    poisoned = jax.tree.map(lambda leaf: jnp.full_like(leaf, jnp.nan), variables)
+    with pytest.raises(checkify.JaxRuntimeError):
+        process.generate(model, poisoned, [[1, 2]], 3, key=0, steps=4)
+
+
 class FieldReader(nn.Module):
     """A user's bidirectional model that spells out what each slot is handed:
     a text slot scores its logical position, one past it when the row

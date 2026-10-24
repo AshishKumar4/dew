@@ -16,6 +16,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental import checkify
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion.discrete import MDLM, DiscreteDenoiser, Unmask
@@ -121,7 +122,10 @@ def test_the_reverse_step_draws_from_mdlms_categorical():
     def step(key):
         return Unmask().step(row, t, s, denoised, log_probs, (), key, process, denoise)[0]
 
-    outcomes = jax.vmap(step)(jax.random.split(jax.random.key(3), draws))
+    # The step checks its draws (`dew._distributions`), so its program carries the check out.
+    error, outcomes = checkify.checkify(jax.vmap(step), errors=checkify.user_checks)(
+        jax.random.split(jax.random.key(3), draws))
+    error.throw()
     masked = np.asarray(row == MASK)
     counts = np.asarray(jax.nn.one_hot(outcomes, MASK + 1).sum(axis=0))[masked]
     expected = draws * REFERENCE["reverse_categorical"][masked]
