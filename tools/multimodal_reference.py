@@ -19,9 +19,15 @@ import numpy as np
 import torch
 from safetensors.torch import load_file, save_file
 from tokenizers import Tokenizer, models, pre_tokenizers
-from transformers import AddedToken, AutoProcessor, Gemma3Config, Gemma3ForConditionalGeneration, Gemma3Processor, GemmaTokenizer
+from transformers import (
+    AddedToken,
+    AutoProcessor,
+    Gemma3Config,
+    Gemma3ForConditionalGeneration,
+    Gemma3Processor,
+    GemmaTokenizer,
+)
 from transformers.models.gemma3.image_processing_pil_gemma3 import Gemma3ImageProcessorPil
-
 
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 LEARNING_RATE = 1e-4
@@ -78,7 +84,8 @@ def _row_slices(encoded: dict, model) -> list[dict]:
         if grid is None:
             single["pixel_values"] = encoded["pixel_values"][image_offset:image_offset + images]
             if "image_position_ids" in encoded:
-                single["image_position_ids"] = encoded["image_position_ids"][image_offset:image_offset + images]
+                single["image_position_ids"] = encoded["image_position_ids"][
+                    image_offset:image_offset + images]
         else:
             patches = grid.prod(dim=1)
             start = int(patches[:image_offset].sum())
@@ -100,7 +107,8 @@ def _encode(processor, images: np.ndarray, prompts: list[str], audio: list[np.nd
     """The padded batch encoding: one image in the first row, two in the second."""
     rows = [[images[0]], [images[1], images[2]]]
     media: dict[str, object] = {} if audio is None else {"audio": list(audio)}
-    encoded = processor(text=prompts, images=rows, padding=True, truncation=False, return_tensors="pt", **media)
+    encoded = processor(text=prompts, images=rows, padding=True, truncation=False,
+                        return_tensors="pt", **media)
     # The fp32 reference widens bfloat16 processor pixels exactly.
     encoded["pixel_values"] = encoded["pixel_values"].float()
     return encoded
@@ -114,7 +122,7 @@ def _sgd_step(model, singles: list[dict], valid: torch.Tensor) -> tuple[torch.Te
     loss = torch.zeros((), device=model.device)
     pixel_inputs = []
     for single in singles:
-        pixels = single["pixel_values"].clone().requires_grad_(True)
+        pixels = single["pixel_values"].clone().requires_grad_(requires_grad=True)
         pixel_inputs.append(pixels)
         predictions = model(**{**single, "pixel_values": pixels}, use_cache=False).logits[0, :-1]
         loss = loss + torch.nn.functional.cross_entropy(
@@ -153,7 +161,8 @@ def _write_forward_backward(model, processor, destination: Path, images: np.ndar
         for row, single in enumerate(singles):
             updated[row, valid[row]] = model(**single, use_cache=False).logits[0]
     np.save(destination / "updated_logits.npy", updated.numpy())
-    (destination / "training.json").write_text(json.dumps({"loss": float(loss.detach()), "learning_rate": LEARNING_RATE}) + "\n")
+    (destination / "training.json").write_text(json.dumps(
+        {"loss": float(loss.detach()), "learning_rate": LEARNING_RATE}) + "\n")
 
     np.save(destination / "raw_images.npy", images)
     np.save(destination / "logits.npy", logits.numpy())
@@ -180,7 +189,8 @@ def write_gemma3n_native() -> None:
     source = ROOT / "gemma-3n-audio-tiny"
     destination = ROOT / "gemma3n-native-tiny"
     destination.mkdir(parents=True, exist_ok=True)
-    model = Gemma3nForConditionalGeneration.from_pretrained(source, attn_implementation="eager").float().eval()
+    model = Gemma3nForConditionalGeneration.from_pretrained(
+        source, attn_implementation="eager").float().eval()
     processor = AutoProcessor.from_pretrained(source, local_files_only=True)
     audio = [np.load(source / "waveform_0.npy"), np.load(source / "waveform_1.npy")]
     images = np.random.default_rng(2604).integers(0, 256, (3, 32, 32, 3), dtype=np.uint8)
@@ -214,7 +224,8 @@ def gemma3n_post_sgd_spread() -> None:
                    for single in _row_slices(encoded, model)]
         _sgd_step(model, singles, valid)
         with torch.no_grad():
-            updated[device] = torch.cat([model(**single, use_cache=False).logits[0].cpu() for single in singles])
+            updated[device] = torch.cat([model(**single, use_cache=False).logits[0].cpu()
+                                         for single in singles])
     recorded = torch.from_numpy(np.load(destination / "updated_logits.npy"))[valid]
     report = {"torch": torch.__version__, "device": torch.cuda.get_device_name(),
               "cuda_vs_cpu": float((updated["cuda"] - updated["cpu"]).abs().max()),
@@ -277,9 +288,13 @@ def write_gemma3_native() -> None:
 
 def write_gemma4_native() -> None:
     """Released patch preprocessing, active clipping and frozen standardization."""
-    from transformers import (Gemma4AudioFeatureExtractor, Gemma4Config,
-                              Gemma4ForConditionalGeneration, Gemma4Processor,
-                              Gemma4VideoProcessor)
+    from transformers import (
+        Gemma4AudioFeatureExtractor,
+        Gemma4Config,
+        Gemma4ForConditionalGeneration,
+        Gemma4Processor,
+        Gemma4VideoProcessor,
+    )
     from transformers.models.gemma4.image_processing_pil_gemma4 import Gemma4ImageProcessorPil
 
     source = ROOT / "gemma4-tiny-mm"
@@ -321,6 +336,81 @@ def write_gemma4_native() -> None:
 
 
 
+def unified_draw(config, seed: int) -> dict[str, np.ndarray]:
+    """Unequal image, video and audio runs, including holes in each media item's padded slots."""
+    rng = np.random.default_rng(seed)
+    tokens = rng.integers(4, 50, (2, 14), dtype=np.int32)
+    tokens[:, 0] = config.bos_token_id
+    tokens[0, 2:6], tokens[1, 2:5] = config.image_token_id, config.video_token_id
+    tokens[0, 7:10], tokens[1, 6:8] = config.audio_token_id, config.audio_token_id
+    tokens[1, 10:] = config.pad_token_id
+    types = np.where(tokens == config.image_token_id, 1,
+                     np.where(tokens == config.video_token_id, 2,
+                              np.where(tokens == config.audio_token_id, 3, 0))).astype(np.int32)
+    vision = config.vision_config
+    patch_width = 3 * (vision.patch_size * vision.pooling_kernel_size) ** 2
+    return {"input_ids": tokens, "attention_mask": tokens != config.pad_token_id,
+            "mm_token_type_ids": types,
+            "pixel_values": rng.random((1, 6, patch_width), dtype=np.float32),
+            "image_position_ids": np.asarray([[[0, 0], [-1, 0], [1, 0], [0, 1], [-1, -1], [1, 1]]], np.int32),
+            "pixel_values_videos": rng.random((1, 1, 4, patch_width), dtype=np.float32),
+            "video_position_ids": np.asarray([[[[0, 0], [1, 0], [0, -1], [0, 1]]]], np.int32),
+            "input_features": rng.standard_normal((2, 4, config.audio_config.audio_embed_dim), np.float32),
+            "input_features_mask": np.asarray([[1, 0, 1, 1], [1, 1, 0, 0]], bool)}
+
+
+def write_gemma4_unified_native() -> None:
+    """The encoder-free wrapper's tiny source, with the release's public image/audio processor."""
+    from hf_reference import scatter_weights
+    from transformers import (
+        Gemma4UnifiedAudioFeatureExtractor,
+        Gemma4UnifiedConfig,
+        Gemma4UnifiedForConditionalGeneration,
+        Gemma4UnifiedImageProcessor,
+        Gemma4UnifiedProcessor,
+        Gemma4UnifiedVideoProcessor,
+    )
+
+    destination = ROOT / "gemma4-unified-native-tiny"
+    destination.mkdir(parents=True, exist_ok=True)
+    config = Gemma4UnifiedConfig(
+        text_config={"vocab_size": 64, "hidden_size": 32, "intermediate_size": 64, "num_hidden_layers": 4,
+                     "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+                     "global_head_dim": 16, "num_global_key_value_heads": 1, "max_position_embeddings": 128,
+                     "layer_types": ["sliding_attention", "full_attention"] * 2, "sliding_window": 8,
+                     "num_kv_shared_layers": 2, "attention_k_eq_v": True, "use_double_wide_mlp": True,
+                     "pad_token_id": 0, "bos_token_id": 1, "eos_token_id": 2},
+        vision_config={"patch_size": 2, "pooling_kernel_size": 2, "mm_embed_dim": 24,
+                       "output_proj_dims": 24, "mm_posemb_size": 32},
+        audio_config={"audio_embed_dim": 16}, image_token_id=60, video_token_id=56,
+        audio_token_id=57, boa_token_id=58, eoa_token_index=59,
+        pad_token_id=0, bos_token_id=1, eos_token_id=2)
+    config._attn_implementation = "eager"
+    torch.manual_seed(2410)
+    model = Gemma4UnifiedForConditionalGeneration(config).float().eval()
+    scatter_weights(model)
+    with torch.no_grad():
+        for index, layer in enumerate(model.model.language_model.layers):
+            layer.layer_scalar.fill_(0.8 + index * 0.125)
+    model.save_pretrained(destination, safe_serialization=True)
+    special = {"<pad>": 0, "<bos>": 1, "<eos>": 2, "<unk>": 3,
+               "<|video|>": 56, "<audio>": 57, "<start_of_audio>": 58, "<end_of_audio>": 59,
+               "<image_soft_token>": 60, "<start_of_image>": 61, "<end_of_image>": 62}
+    tokenizer = _tokenizer(64, special, audio_token="<audio>", video_token="<|video|>",
+                           boa_token="<start_of_audio>", eoa_token="<end_of_audio>")
+    processor = Gemma4UnifiedProcessor(
+        Gemma4UnifiedAudioFeatureExtractor(feature_size=16, audio_samples_per_token=16),
+        Gemma4UnifiedImageProcessor(patch_size=2, pooling_kernel_size=2, max_soft_tokens=70, do_resize=False),
+        tokenizer, Gemma4UnifiedVideoProcessor(patch_size=2, pooling_kernel_size=2, max_soft_tokens=70),
+        audio_ms_per_token=1)
+    processor.save_pretrained(destination)
+    inputs = unified_draw(config, 0)
+    with torch.no_grad():
+        result = model(**{name: torch.from_numpy(value) for name, value in inputs.items()}, use_cache=False)
+    np.savez(destination / "reference.npz", **inputs, logits=result.logits.numpy())
+    print(f"{destination.name}: forward shape {tuple(result.logits.shape)}", flush=True)
+
+
 def write_llama4_native() -> None:
     """The actual Llama4Processor tiling: local tiles, a global tile and separators."""
     from transformers import Llama4Config, Llama4ForConditionalGeneration, Llama4Processor
@@ -352,12 +442,16 @@ def write_qwen35_native() -> None:
     processor, _ = qwen3_vl_processor(destination)
     images = np.random.default_rng(2305).integers(0, 256, (3, 32, 32, 3), dtype=np.uint8)
     prompts = ["token7 <start_of_image><image_soft_token><end_of_image> token9",
-               "token5 <start_of_image><image_soft_token><end_of_image> token8 <start_of_image><image_soft_token><end_of_image> token6"]
+               "token5 <start_of_image><image_soft_token><end_of_image> token8 "
+               "<start_of_image><image_soft_token><end_of_image> token6"]
     _write_forward_backward(model, processor, destination, images, prompts)
 
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["gemma4-unified"]:
+        write_gemma4_unified_native()
+        sys.exit()
     if sys.argv[1:] == ["gemma3n-spread"]:
         gemma3n_post_sgd_spread()
         sys.exit()
