@@ -491,11 +491,9 @@ class QuestionLayout(Layout):
         _least("option_tokens", self.option_tokens, 1)
         if self.segments is not None:
             kinds = [type(segment) for segment in self.segments]
-            if (kinds.count(Instructions) != 1 or kinds.count(OptionLines) != 1 or kinds.count(State) > 1
-                    or kinds.count(AnswerCue) > 1):
+            if kinds.count(Instructions) != 1 or kinds.count(OptionLines) != 1 or kinds.count(AnswerCue) > 1:
                 raise ValueError("a question row's segments hold its instructions and its options once, and "
-                                 "its state and its cue at most once each, not "
-                                 f"{[kind.__name__ for kind in kinds]}")
+                                 f"its cue at most once, not {[kind.__name__ for kind in kinds]}")
             if self.labels is None or self.parallel:
                 raise ValueError("a question row of segments reads its options under labels (labels=), one "
                                  "line after another")
@@ -565,21 +563,19 @@ class QuestionLayout(Layout):
             else:
                 template = segment.template if len(names) <= segment.at else segment.many
                 chunks.append(Chunk(template.format(labels=segment.join.join(names))))
-        held = next((segment for segment in self.segments if isinstance(segment, State)), None)
-        text = "" if held is None else rendered(state, held.render, specials)
-        keep = "all" if held is None else held.keep
+        copies = [segment for segment in self.segments if isinstance(segment, State)]
+        texts = [rendered(state, copy.render, specials) for copy in copies]
 
-        def built(kept: str | tuple[int, ...]) -> Rendered:
-            # Under pieces the state is its own piece, its ids; whole, its text read with the rest.
-            state_chunk = Chunk(ids=kept) if isinstance(kept, tuple) else Chunk(kept)
-            pieces = [state_chunk if isinstance(part, State) else part for part in chunks]
+        def built(kept: Sequence[str | tuple[int, ...]]) -> Rendered:
+            # Under pieces each copy is its own piece, its ids; whole, its text read with the rest.
+            given = iter(kept)
+            pieces = [(lambda own: Chunk(ids=own) if isinstance(own, tuple) else Chunk(own))(next(given))
+                      if isinstance(part, State) else part for part in chunks]
             return rendered_chunks(self._framed(encoder, pieces), encoder, self.unit)
 
-        ids = tuple(encoder.encode(text, add_special_tokens=False)) if text else ()
-        laid, state_kept = (self._cut_ids(built, ids, keep) if self.unit == "pieces"
-                            else self._cut(built, text, keep, encoder))
+        laid, (whole, state_kept) = (self._cut_ids(built, texts, copies, encoder) if self.unit == "pieces"
+                                     else self._cut(built, texts, copies, encoder))
         tokens = laid.tokens
-        whole = len(ids)
         row = Laid(name, kind_of(question), laid.marks["question"],
                    tuple(laid.marks[("option", index)] for index in range(len(slots))), tuple(slots),
                    readout=len(tokens) - 1, label_ids=self.labels.ids(encoder, len(slots)))
@@ -588,54 +584,75 @@ class QuestionLayout(Layout):
         # `token_layout`).
         return _blocked(encoded, laid.points["suffix"]) if self.blocks else encoded
 
-    def _cut_ids(self, built: Callable[[tuple[int, ...]], Rendered], ids: tuple[int, ...],
-                 keep: Literal["start", "end", "all"]) -> tuple[Rendered, int]:
-        """The row `built` over the state's own piece `ids`, cut to `max_len` keeping its `keep`, and the
-        ids it keeps: a piece's ids add to the row as they are, so what the rest of the row leaves is
-        exactly what the state keeps, as a question layout cuts its state. A state kept whole is never
-        cut, and a row it leaves too long is `fits`' to refuse."""
-        full = built(ids)
-        excess = len(full.tokens) - self.max_len
-        if excess <= 0 or keep == "all" or not ids:
-            return full, len(ids)
-        kept = ids[:max(len(ids) - excess, 0)] if keep == "start" else ids[min(excess, len(ids)):]
-        return built(kept), len(kept)
+    def _cut_ids(self, built: Callable[[Sequence[tuple[int, ...]]], Rendered], texts: Sequence[str],
+                 copies: "Sequence[State]", encoder: Tokenizer) -> tuple[Rendered, tuple[int, int]]:
+        """The row `built` over each copy of the state, its own text (`texts`) its own piece of ids,
+        each cut to its share of what the rest of the row leaves of `max_len` and to its own budget
+        (`shared_budgets`), keeping its `keep`; and the least-kept copy's tokens and how many it keeps
+        (`_least_kept`): a piece's ids add to the row as they are, so the shares are exact. A copy kept
+        whole is never cut, and a row it leaves too long is `fits`' to refuse."""
+        ids = [tuple(encoder.encode(text, add_special_tokens=False)) if text else () for text in texts]
+        if not copies:
+            return built([]), (0, 0)
+        rest = len(built([()] * len(copies)).tokens)
+        whole = sum(len(own) for own, copy in zip(ids, copies, strict=True) if copy.keep == "all")
+        cut = [(own, copy) for own, copy in zip(ids, copies, strict=True) if copy.keep != "all"]
+        shares = iter(shared_budgets([len(own) for own, _ in cut], [copy.max_tokens for _, copy in cut],
+                                     self.max_len - rest - whole))
+        kept = [_kept(own, len(own) if copy.keep == "all" else next(shares), copy.keep)
+                for own, copy in zip(ids, copies, strict=True)]
+        return built(kept), _least_kept([(len(own), len(held)) for own, held in zip(ids, kept, strict=True)])
 
-    def _cut(self, built: Callable[[str], Rendered], text: str, keep: Literal["start", "end", "all"],
-             encoder: Tokenizer) -> tuple[Rendered, int]:
-        """The row `built` over the state `text`, encoded whole with the rest, cut to `max_len` keeping
-        its `keep`, and the tokens the kept state encodes to alone: the longest prefix (or suffix) ending
-        at one of the state's own token boundaries (`Offsets`) whose row fits, reached from budget
-        subtraction's estimate, each candidate's row encoded whole, as a merge across the cut changes
-        its length; the row of no state where none fits, which `fits` refuses. Only the boundaries and
-        the last row that fit are held. A state kept whole is never cut."""
-        full = built(text)
-        if len(full.tokens) <= self.max_len or keep == "all" or not text:
-            return full, len(encoder.encode(text, add_special_tokens=False)) if text else 0
+    def _cut(self, built: Callable[[Sequence[str]], Rendered], texts: Sequence[str],
+             copies: "Sequence[State]", encoder: Tokenizer) -> tuple[Rendered, tuple[int, int]]:
+        """The row `built` over each copy of the state, its own text (`texts`), encoded whole with the
+        rest, each copy cut to its share of what the rest of the row leaves of `max_len` and its own
+        budget (`shared_budgets`, counted in its own tokens) at one of its token boundaries
+        (`Offsets`), keeping its `keep`; and the least-kept copy's tokens and how many it keeps,
+        encoded alone (`_least_kept`). A merge across a cut can lengthen the row, so while it does not
+        fit the copy that keeps the most steps back one boundary, the row encoded whole again each
+        time, until it fits or no copy keeps any, which `fits` then refuses. A copy kept whole is
+        never cut."""
+        if not copies:
+            return built([]), (0, 0)
+        counts = [len(encoder.encode(text, add_special_tokens=False)) if text else 0 for text in texts]
+        full = built(list(texts))
+        capped = any(copy.max_tokens is not None and copy.max_tokens < count
+                     for copy, count in zip(copies, counts, strict=True))
+        if len(full.tokens) <= self.max_len and not capped:
+            return full, _least_kept([(count, count) for count in counts])
         if not isinstance(encoder, Offsets):
             raise TypeError(f"a row encoded whole cuts its state at the tokenizer's character offsets, "
                             f"which a {type(encoder).__name__} does not keep")
-        ids, starts, ends = encoder.offsets(text)
-        # Each candidate is a character boundary of the state's own tokens, in the order a cut keeps more.
-        bounds = sorted({0, *ends}) if keep == "start" else sorted({len(text), *starts}, reverse=True)
+        offsets = [encoder.offsets(text) if text else ([], [], []) for text in texts]
+        rest = len(built([""] * len(copies)).tokens)
+        lengths = [len(own) for own, _, _ in offsets]
+        whole = sum(length for length, copy in zip(lengths, copies, strict=True) if copy.keep == "all")
+        cut = [(length, copy) for length, copy in zip(lengths, copies, strict=True) if copy.keep != "all"]
+        shares = iter(shared_budgets([length for length, _ in cut], [copy.max_tokens for _, copy in cut],
+                                     self.max_len - rest - whole))
+        kept = [length if copy.keep == "all" else next(shares)
+                for length, copy in zip(lengths, copies, strict=True)]
 
-        def candidate(at: int) -> str:
-            return text[:bounds[at]] if keep == "start" else text[bounds[at]:]
+        def piece(at: int) -> str:
+            # A copy's first (or last) `kept[at]` tokens, at the character boundary their offsets give.
+            text, (own, starts, ends), copy, count = texts[at], offsets[at], copies[at], kept[at]
+            if count >= len(own):
+                return text
+            if count <= 0:
+                return ""
+            return text[:ends[count - 1]] if copy.keep != "end" else text[starts[len(own) - count]:]
 
-        def row(at: int) -> Rendered | None:
-            laid = built(candidate(at))
-            return laid if len(laid.tokens) <= self.max_len else None
-
-        index = min(max(len(ids) - (len(full.tokens) - self.max_len), 0), len(bounds) - 1)
-        fitting = row(index)
-        while fitting is None and index > 0:
-            index -= 1
-            fitting = row(index)
-        while fitting is not None and index + 1 < len(bounds) and (longer := row(index + 1)) is not None:
-            index, fitting = index + 1, longer
-        kept = candidate(index)
-        laid = fitting if fitting is not None else built(kept)
-        return laid, len(encoder.encode(kept, add_special_tokens=False)) if kept else 0
+        laid = built([piece(at) for at in range(len(copies))])
+        while len(laid.tokens) > self.max_len:
+            movable = [at for at, copy in enumerate(copies) if copy.keep != "all" and kept[at] > 0]
+            if not movable:
+                break
+            kept[max(movable, key=lambda at: kept[at])] -= 1
+            laid = built([piece(at) for at in range(len(copies))])
+        alone = [len(encoder.encode(own, add_special_tokens=False)) if (own := piece(at)) else 0
+                 for at in range(len(copies))]
+        return laid, _least_kept(list(zip(counts, alone, strict=True)))
 
     def _framed(self, encoder: Tokenizer, chunks: list[Chunk]) -> list[Chunk]:
         """`chunks` as the user's turn of `self.framing`, none without one: under a whole unit the turn
@@ -943,13 +960,51 @@ type Render = Literal["question", "compact", "entry", "state"]
 
 @dataclass(frozen=True)
 class State:
-    """The state, as compact JSON with sorted keys, its start kept: cut to the layout's
-    `max_state_tokens`, and to what the rest of the row leaves of its `max_len`. A question row's
-    segments say how it renders (`render`, `rendered`) and what a cut keeps of it (`keep`: its start,
-    its end, or all of it, a row that it leaves too long then unfit); a joint row's is the default."""
+    """The state, as compact JSON with sorted keys, its start kept: cut to its own budget
+    (`max_tokens`, or a joint layout's `max_state_tokens` where it gives none) and to its share of
+    what the rest of the row leaves of its `max_len` (`shared_budgets`). A row may hold the state more
+    than once, each copy its own segment, budget and `keep`, the copies of a row rendered alike. A
+    question row's segments say how it renders (`render`, `rendered`) and what a cut keeps of it
+    (`keep`: its start, its end, or all of it, a row that it leaves too long then unfit); a joint row
+    renders it compact."""
 
     render: Render = "compact"
     keep: Literal["start", "end", "all"] = "start"
+    max_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_tokens is not None:
+            _least("max_tokens", self.max_tokens, 0)
+
+
+def shared_budgets(lengths: Sequence[int], caps: Sequence[int | None], room: int) -> list[int]:
+    """How many tokens each copy of the state keeps: as many as it holds (`lengths`) up to its cap
+    (`caps`, None for none), and where those exceed `room`, what the copies share of it max-min
+    fairly: no copy keeps more than another wants while that one keeps less than it wants, every
+    share is nonnegative, they sum to at most `room`, and none is left over while a copy wants more."""
+    wants = [length if cap is None else min(cap, length) for length, cap in zip(lengths, caps, strict=True)]
+    left = max(0, room)
+    if sum(wants) <= left:
+        return wants
+    shares = [0] * len(wants)
+    remaining = len(wants)
+    for index in sorted(range(len(wants)), key=lambda at: wants[at]):
+        shares[index] = min(wants[index], left // remaining)
+        left -= shares[index]
+        remaining -= 1
+    return shares
+
+
+def _least_kept(pairs: Sequence[tuple[int, int]]) -> tuple[int, int]:
+    """Of each copy's tokens and how many it keeps, the copy that keeps the least share of its own
+    (the first of equals), so `Encoded.state_kept < state_tokens` says whether any copy was cut;
+    `(0, 0)` for a row of none."""
+    return min(pairs, key=lambda pair: pair[1] / pair[0] if pair[0] else 1.0, default=(0, 0))
+
+
+def _kept(ids: Sequence[int], count: int, keep: Literal["start", "end", "all"]) -> tuple[int, ...]:
+    """`count` of the state's `ids`, its first (or, with `keep` the end, its last)."""
+    return tuple(ids[:count] if keep != "end" else ids[len(ids) - count:])
 
 
 @dataclass(frozen=True)
@@ -1067,11 +1122,11 @@ class JointLayout(Layout):
         if self.max_state_tokens is not None:
             _least("max_state_tokens", self.max_state_tokens, 0)
         kinds = [type(segment) for segment in self.segments]
-        if kinds.count(Schema) != 1 or kinds.count(State) > 1 or kinds.count(Media) > 1:
-            raise ValueError("a joint row's segments hold the schema once, and the state and the images "
+        if kinds.count(Schema) != 1 or kinds.count(Media) > 1:
+            raise ValueError("a joint row's segments hold the schema once, and the images "
                              f"at most once each, not {[kind.__name__ for kind in kinds]}")
-        if any(isinstance(segment, State) and segment != State() for segment in self.segments):
-            raise ValueError("a joint row writes its state as sorted compact JSON, its start kept (State())")
+        if any(isinstance(segment, State) and segment.render != "compact" for segment in self.segments):
+            raise ValueError("a joint row writes its state as sorted compact JSON (State(render='compact'))")
 
     @property
     def schema_in_context(self) -> bool:
@@ -1095,8 +1150,6 @@ class JointLayout(Layout):
         schema, laid = self._schema(piece, questions, orders)
         state_ids = list(self.state(encoder, specials, state) if tokens is None else tokens)
         whole = len(state_ids)
-        if self.max_state_tokens is not None:
-            state_ids = state_ids[:self.max_state_tokens]
         # The turn's markup and the text beside it are read as one piece each, as the turn writes them.
         before, after = self.framing.around(encoder)
         parts: list[str | Segment] = [before, *self.segments, after]
@@ -1123,14 +1176,23 @@ class JointLayout(Layout):
             laid_out.append((part, own))
             index += 1
         room = self.max_len - sum(len(ids) for segment, ids in laid_out if not isinstance(segment, State))
+        copies = [segment for segment, _ in laid_out if isinstance(segment, State)]
+        # A copy kept whole is never cut: it takes its tokens first, and the others share what is left.
+        whole_copies = sum(whole for copy in copies if copy.keep == "all")
+        cut = [copy for copy in copies if copy.keep != "all"]
+        shares = iter(shared_budgets([whole] * len(cut), [
+            self.max_state_tokens if copy.max_tokens is None else copy.max_tokens for copy in cut],
+            room - whole_copies))
+        kept_ids = [list(_kept(state_ids, whole if copy.keep == "all" else next(shares), copy.keep))
+                    for copy in copies]
         # A row without a state segment keeps none of the state.
-        stated = any(isinstance(segment, State) for segment, _ in laid_out)
-        state_ids = state_ids[:max(0, room)] if stated else []
+        kept_count = min((len(ids) for ids in kept_ids), default=0)
+        copied = iter(kept_ids)
         row: list[int] = []
         offset, place = 0, None
         for segment, ids in laid_out:
             if isinstance(segment, State):
-                ids = state_ids
+                ids = next(copied)
             if isinstance(segment, Schema) and not self.schema_in_context:
                 offset = len(row)
             if isinstance(segment, Media) and media:
@@ -1145,9 +1207,9 @@ class JointLayout(Layout):
                         for question in laid)
         if self.schema_in_context:
             # The schema is the row's context, its spans the context's own positions.
-            return [Encoded(tuple(row), shifted, None, None, whole, len(state_ids), place,
+            return [Encoded(tuple(row), shifted, None, None, whole, kept_count, place,
                             context=tuple(schema), spans_in_context=True)]
-        return [Encoded(tuple(row), shifted, None, None, whole, len(state_ids), place)]
+        return [Encoded(tuple(row), shifted, None, None, whole, kept_count, place)]
 
     def _schema(self, piece: Callable[[str], list[int]], questions: Mapping[str, Question],
                 orders: Mapping[str, Sequence[int]] | None) -> tuple[list[int], list[Laid]]:
