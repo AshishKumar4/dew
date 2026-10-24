@@ -27,10 +27,11 @@ def programs(directory: Path) -> dict[str, bytes]:
 
 
 def test_a_bundle_is_its_host_class_s_alone_on_every_backend():
-    """A bundle is its host class's (`dew._host.cpu_class`) whatever the backend: XLA:CPU compiles for the host
-    that compiles, and a GPU lane's programs hold CPU executables too (its host-side computations), so a program
-    from another class need not link here ("Failed to materialize symbols"), after which the process compiles
-    nothing more. On the CPU, whose device kind is "cpu" on every host, and on a GPU lane's backend alike."""
+    """A bundle is its host class's (`dew._host.cpu_class`) whatever the backend: XLA:CPU compiles for the
+    host that compiles, and a GPU lane's programs hold CPU executables too (its host-side computations), so
+    a program from another class need not link here ("Failed to materialize symbols"), after which the
+    process compiles nothing more. On the CPU, whose device kind is "cpu" on every host, and on a GPU
+    lane's backend alike."""
     import os
     import subprocess
     import sys
