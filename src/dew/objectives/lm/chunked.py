@@ -38,7 +38,6 @@ from typing import NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
 from dew.nn.kernels.generation import gpu_target
@@ -59,7 +58,15 @@ from dew.nn.precision import (
     running_total,
     scaled_logits,
 )
-from dew.nn.protocols import AffineHead, HiddenStates, Lacks, Logits, LogitsFromHidden, OutputTable
+from dew.nn.protocols import (
+    AffineHead,
+    HiddenStates,
+    Lacks,
+    Logits,
+    LogitsFromHidden,
+    OutputTable,
+    head_table,
+)
 from dew.nn.sharding import logical_spec, mesh_axes
 
 
@@ -98,16 +105,6 @@ def _logits_cotangent(cotangent, precision: jax.lax.PrecisionLike):
     applies to an fp32 operand; a CPU runs the algorithm unrounded, so there
     the cast is the rounding."""
     return cotangent.astype(jnp.bfloat16) if precision is BF16 else cotangent
-
-
-def head_table(model: nn.Module, variables) -> OutputTable | None:
-    """`model`'s head over `variables` as one matrix (`AffineHead.output_table`),
-    or None for a model whose head no matrix alone is, or that names none."""
-    table = model.apply(variables, method="output_table") if isinstance(model, AffineHead) else None
-    if table is not None and not isinstance(table, OutputTable):
-        raise TypeError(f"{type(model).__name__}.output_table gives a {type(table).__name__}, "
-                        f"not an OutputTable")
-    return table
 
 
 def reads_states(model) -> bool:
