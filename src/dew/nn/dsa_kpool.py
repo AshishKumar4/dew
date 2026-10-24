@@ -35,8 +35,10 @@ from flax import linen as nn
 from flax.linen.dtypes import promote_dtype
 from flax.typing import Dtype, PrecisionLike
 
+from dew.batch import valid_order
+
 from .attention import LayerNorm
-from .inputs import MixerCall, PredictionPhase, coordinates_of, valid_order
+from .inputs import MixerCall, PredictionPhase, coordinates_of
 from .mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
 from .mla import INDEXER, IndexerFront, MultiHeadLatentAttention, latent_refusals
 from .precision import at_least_fp32, float32_einsum
