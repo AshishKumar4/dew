@@ -15,18 +15,21 @@ def pytest_configure(config):
     judged = reference_error.assert_as_exact
 
     def relative(reference_fn, draw, truth_fn):
-        worst = 0.0
-        for seed in range(2):
-            inputs = draw(seed)
-            with jax.enable_x64(True):
-                truth = (truth_fn or reference_fn)(*reference_error.widened(inputs))
-            for mine, true in zip(jax.tree.leaves(reference_fn(*inputs)), jax.tree.leaves(truth), strict=True):
-                true = np.asarray(true, np.float64)
-                size = np.sqrt(np.mean(np.square(true)))
-                if size > 0:
-                    worst = max(worst, float(np.sqrt(np.mean(np.square(np.asarray(mine, np.float64) - true)))
-                                             / size))
-        return worst
+        """Each leaf's reference error over its truth's size on seed 0: the median, and the five worst
+        with their sizes."""
+        inputs = draw(0)
+        with jax.enable_x64(new_val=True):
+            truth = (truth_fn or reference_fn)(*reference_error.widened(inputs))
+        rows = []
+        for (path, mine), true in zip(jax.tree_util.tree_leaves_with_path(reference_fn(*inputs)),
+                                      jax.tree.leaves(truth), strict=True):
+            true = np.asarray(true, np.float64)
+            size = float(np.sqrt(np.mean(np.square(true))))
+            error = float(np.sqrt(np.mean(np.square(np.asarray(mine, np.float64) - true))))
+            rows.append((error / size if size > 0 else float("inf"), size, jax.tree_util.keystr(path)))
+        rows.sort()
+        worst = "; ".join(f"{name} {ratio:.2e} (size {size:.2e})" for ratio, size, name in rows[-5:])
+        return f"median {rows[len(rows) // 2][0]:.2e} of {len(rows)} leaves; worst {worst}"
 
     def sizing(dew_fn, reference_fn, draw, label, *, seeds, truth_fn=None, orders=None):
         worst = relative(reference_fn, draw, truth_fn)
@@ -35,9 +38,9 @@ def pytest_configure(config):
                                               most=1024)
         except AssertionError as refused:
             sized.append(f"{label!r}: declared {seeds}, paired seeds_for refused: {str(refused)[:300]}; "
-                         f"reference/truth {worst:.3e}")
+                         f"reference/truth {worst}")
             raise
-        sized.append(f"{label!r}: declared {seeds}, paired seeds_for {count}; reference/truth {worst:.3e}")
+        sized.append(f"{label!r}: declared {seeds}, paired seeds_for {count}; reference/truth {worst}")
         judged(dew_fn, reference_fn, draw, label, seeds=max(count, seeds), truth_fn=truth_fn, orders=orders)
 
     reference_error.assert_as_exact = sizing
