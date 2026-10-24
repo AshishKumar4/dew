@@ -33,12 +33,28 @@ def largest(left, right) -> float:
 
 def test_the_public_loader_reads_the_fixture(tensors):
     """`Pretrained.load` dispatches the `mamba2` model type through the
-    decoder family table and reproduces the reference logits."""
+    decoder family table and reproduces the reference logits, its config's
+    unbounded time step written as transformers writes an infinity."""
     source = Pretrained.load(FIXTURE, dtype="float32", attention_impl="reference")
     ids = jnp.asarray(np.load(FIXTURE / "input_ids.npy"))
     logits = source.model.apply(source.variables, ids)
     reference = np.load(FIXTURE / "logits.npy")
     assert largest(logits, reference) < 1e-5
+
+
+@pytest.mark.parametrize("bound", [{"__float__": "NaN"}, {"__float__": "nan"}, {"__float__": "inf"},
+                                   {"__float__": "Infinity", "note": 1}, {"value": 1.0}])
+def test_a_time_step_bound_that_is_no_number_or_infinity_refuses_the_load(tmp_path, bound):
+    """The fixture with its time step's upper bound spelled as a NaN, or as a record transformers does
+    not write: the load refuses it rather than build a mixer that clips to NaN."""
+    for path in FIXTURE.iterdir():
+        (tmp_path / path.name).symlink_to(path)
+    config = json.loads((FIXTURE / "config.json").read_text())
+    config["time_step_limit"] = [0.0, bound]
+    (tmp_path / "config.json").unlink()
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    with pytest.raises(ValueError):
+        Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
 
 
 def test_a_bf16_mamba2_sums_its_residual_stream_in_fp32(tmp_path, tensors):

@@ -33,7 +33,7 @@ from dew.objectives.base import Variables
 from dew.sampling import decoding
 from dew.sampling.decoding import LogitsTransform, StepState
 from dew.sampling.guided import Grammar
-from dew.sampling.strategies import DecoderState, draw
+from dew.sampling.strategies import DecoderState, row_step
 from dew.sampling.text import decode_ops, prefill_state
 
 
@@ -298,18 +298,16 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
                                                                 state.decoder.logits))
     view = StepState(state.tokens, state.valid, state.step, state.active,
                      jax.random.wrap_key_data(state.keys), prompt_width=capacity, budget=state.budget)
-    chain = decoding.chain(transforms)
-    token, behavior, raw = draw(view, decoder.logits,
-                                chain if grammar is None else grammar.guiding(chain, state.automaton))
-    committed = view.commit(token, state.active)
-    finished = decoding.finish(stopping)(committed, token)
+    drew = row_step(view, decoder.logits, decoding.chain(transforms), decoding.finish(stopping),
+                    None if grammar is None else (grammar, state.automaton))
     drawn = state.active
-    stopped = drawn & finished.done
+    stopped = drawn & drew.finished.done
+    committed = drew.committed
+    # A row stops at its own budget here, where `Sample` scans one budget for every row.
     return (Slots(decoder, committed.tokens, committed.valid, committed.step, state.budget,
                   drawn & ~stopped & (committed.step < state.budget), state.keys,
-                  state.automaton if grammar is None else grammar.advanced(state.automaton, token, drawn)),
-            Draws(token, drawn, stopped, drawn & finished.ended, jnp.where(drawn, behavior, 0.0),
-                  jnp.where(drawn, raw, 0.0)))
+                  state.automaton if drew.automaton is None else drew.automaton),
+            Draws(drew.token, drawn, stopped, drawn & drew.finished.ended, drew.behavior, drew.raw))
 
 
 def _mixed_step(model: nn.Module, params: Variables, pad_id: int, placement: Placement, decoder: DecoderState,
