@@ -65,7 +65,7 @@ class WanRMSNorm(nn.Module):
     @nn.compact
     def __call__(self, x):
         gamma = self.param("gamma", nn.initializers.ones, (self.features, *(1,) * (self.rank - 1)))
-        wide = x.astype(jnp.promote_types(x.dtype, jnp.float32))
+        wide = x.astype(at_least_fp32(x.dtype))
         return (l2_normalized(wide) * math.sqrt(self.features) * gamma.reshape(-1)).astype(self.dtype)
 
 

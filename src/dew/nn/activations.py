@@ -32,7 +32,7 @@ import jax
 import jax.numpy as jnp
 
 from .kernels import norm_swiglu
-from .precision import at_least_fp32, rounded_to
+from .precision import at_least_fp32, capped_logits, rounded_to
 
 
 def gelu_exact(x: jax.Array) -> jax.Array:
@@ -131,9 +131,9 @@ class Situ:
     def __call__(self, gate: jax.Array, up: jax.Array) -> jax.Array:
         wide = at_least_fp32(gate.dtype)
         work_gate, work_up = gate.astype(wide), up.astype(wide)
-        activated = self.beta * jnp.tanh(work_gate / self.beta) * jax.nn.sigmoid(work_gate)
+        activated = capped_logits(work_gate, self.beta) * jax.nn.sigmoid(work_gate)
         if self.linear_beta is not None:
-            work_up = self.linear_beta * jnp.tanh(work_up / self.linear_beta)
+            work_up = capped_logits(work_up, self.linear_beta)
         return (activated * work_up).astype(gate.dtype)
 
 

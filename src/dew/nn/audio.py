@@ -25,7 +25,7 @@ from dew import records
 from dew.interop.weights import ParamTree, placed
 from dew.nn.dense import Dense
 from dew.nn.inputs import sequence_blocks
-from dew.nn.precision import float32_dot_general, float32_products, products_dtype
+from dew.nn.precision import capped_logits, float32_dot_general, float32_products, products_dtype
 from dew.nn.rope import sinusoid_frequencies, sinusoids
 from dew.registry import from_record
 
@@ -297,7 +297,7 @@ def _chunked_attention(query, key, value, positional, valid, chunk: int, left: i
     query = sequence_blocks(query, chunk)
     key, value = (_block_context(z, chunk, left, right) for z in (key, value))
     logits = _relative_logits(query, key, positional, precision)
-    logits = jnp.tanh(logits / cap) * cap
+    logits = capped_logits(logits, cap)
     distance = left + jnp.arange(chunk)[:, None] - jnp.arange(chunk + left + right)[None, :]
     allowed = _block_context(valid, chunk, left, right)[:, None, :, None, :] & window(distance)
     logits = jnp.where(allowed, logits, fill)
