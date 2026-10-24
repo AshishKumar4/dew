@@ -481,33 +481,6 @@ def translate_clip_weights(
     return translate_parameters(hf_tensors, _clip_path, param_dtype)
 
 
-def check_tree(variables: Mapping[str, object], module: nn.Module, *inputs) -> None:
-    """Refuse variables the module would not accept, naming what is off.
-
-    Every collection `init` returns is held to account, so a routed model
-    whose checkpoint lacks its balancing bias fails here too. `inputs` are
-    what `init` is called with, arrays or `jax.ShapeDtypeStruct`s;
-    `jax.eval_shape` builds the template from shapes alone, so checking a
-    checkpoint costs no second copy of its weights.
-    """
-    def shapes(tree) -> dict[str, tuple[int, ...]]:
-        return {jax.tree_util.keystr(path, simple=True, separator="."): np.shape(leaf)
-                for path, leaf in jax.tree_util.tree_leaves_with_path(tree)}
-
-    expected = shapes(jax.eval_shape(module.init, jax.random.key(0), *inputs))
-    loaded = shapes(dict(variables))
-
-    missing = sorted(set(expected) - set(loaded))
-    unexpected = sorted(set(loaded) - set(expected))
-    mismatched = sorted(
-        f"{name} is {loaded[name]}, the module takes {shape}"
-        for name, shape in expected.items()
-        if name in loaded and loaded[name] != shape)
-    if missing or unexpected or mismatched:
-        raise ValueError(
-            f"the checkpoint does not fit the model: missing {missing}, "
-            f"unexpected {unexpected}, mismatched {mismatched}")
-
 
 def bind_text_tower[Tower: nn.Module](
     name: str, translate: Callable[[Mapping[str, object]], NativeFields[Tower]],

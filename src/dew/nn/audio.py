@@ -22,7 +22,7 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
-from dew.interop.weights import ParamTree, placed
+from dew.interop.weights import ParamTree, check_shapes, native_shape, placed
 from dew.nn.dense import Dense
 from dew.nn.inputs import sequence_blocks
 from dew.nn.precision import float32_dot_general, float32_products, products_dtype
@@ -605,7 +605,7 @@ def _audio_template(config: Gemma3nAudio | Gemma4Audio):
     template = jax.eval_shape(config.build().init, jax.random.key(0),
                               jax.ShapeDtypeStruct((1, 16, features), jnp.float32),
                               jax.ShapeDtypeStruct((1, 16), jnp.bool_))
-    return {tuple(str(k.key) for k in path): value
+    return {tuple(str(k.key) for k in path): value.shape
             for path, value in jax.tree_util.tree_leaves_with_path(template)}
 
 
@@ -641,21 +641,7 @@ def audio_weights(
     requested storage precision; clipping state stays FP32. Integer tensors
     retain their native dtype, and every shape is checked against the encoder.
     """
-    expected = _audio_template(config)
-    seen = set()
-
-    def path_of(name: str) -> tuple[str, ...]:
-        path = audio_weight_path(name, config)
-        shape = tensors[name].shape
-        if path[-1] == "kernel":
-            shape = (*shape[2:], shape[1], shape[0])
-        if path not in expected or shape != expected[path].shape:
-            raise ValueError(f"audio tensor {name!r} with shape {shape} does not match the encoder")
-        seen.add(path)
-        return path
-
-    tree, layouts = placed(tensors, path_of, param_dtype)
-    missing = expected.keys() - seen
-    if missing:
-        raise ValueError(f"audio checkpoint is missing {sorted('/'.join(path) for path in missing)}")
-    return tree, layouts
+    paths = {name: audio_weight_path(name, config) for name in tensors}
+    check_shapes(((path, native_shape(path, tensors[name].shape)) for name, path in paths.items()),
+                 _audio_template(config))
+    return placed(tensors, paths.__getitem__, param_dtype)
