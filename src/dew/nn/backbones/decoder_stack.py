@@ -32,10 +32,6 @@ Block = Callable[[int, str], DecoderBlock]
 """Layer `index`'s block under a module name: what the stack and its stages
 build their layers from, so one factory describes every view of them."""
 
-Capture = bool | Callable[[nn.Module, str], bool]
-"""A `capture_intermediates` filter, as `Module.apply` takes one."""
-
-
 def _fetched(tree):
     """`tree` in device memory, the copy issued and not waited for.
 
@@ -252,8 +248,9 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
                   train: bool, decode: bool, kv_store, per_layer_input, attention_metadata):
     """`run_stack` without the inference prefetch: each run of one layer
     called as the plain loop calls it, and each longer run under flax's
-    scan. Training through host-resident banks scans with the fetch mapped
-    onto each row under remat (`run_stack`)."""
+    scan. Training, or a forward that keeps intermediates, through
+    host-resident banks scans with the fetch mapped onto each row under remat
+    (`run_stack`)."""
     for run, (first, count) in zip(runs, groups, strict=True):
         inputs = None if per_layer_input is None else per_layer_input.span(first, count)
         store = kv_store if count == 1 or specs[first].kv_shared else None
@@ -281,8 +278,7 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
 
 def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[LayerSpec],
               groups: Sequence[tuple[int, int]], x, *, train: bool, decode: bool,
-              kv_store, per_layer_input, attention_metadata=None, banked: bool = False,
-              capture: Capture = False):
+              kv_store, per_layer_input, attention_metadata=None, banked: bool = False):
     """Run the layers over `x`, one run at a time as `groups` says.
 
     A run of one is `layers[first]`; a longer run is one block named for its
@@ -301,8 +297,11 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     iteration or ordered by the carry). Training uses the native Linen scan
     instead, with map_variables staging one row under remat, so the backward
     refetches the pinned bank rather than keeping a device copy. A layer read
-    one at a time runs in a scope of its own, which keeps what `capture`, the
-    caller's `capture_intermediates` filter, keeps.
+    one at a time runs in a scope of its own, where the caller's
+    `capture_intermediates` filter does not reach, so a caller that keeps
+    intermediates runs the native scan too, fetching each row in Flax's lifted
+    scope; a stack streamed from disk is read one layer at a time alone, and
+    refuses such a caller.
     """
     runs = [layers[first] if count == 1 else block(first, group_name(first, count))
             for first, count in groups]
@@ -310,7 +309,11 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     if streaming and train:
         raise ValueError("disk streaming is inference-only")
     fetching = streaming or banked or any(_on_host(run.variables.get('params', {})) for run in runs)
-    if not fetching or train:
+    capturing = any(run.is_mutable_collection('intermediates') for run in runs)
+    if streaming and capturing:
+        raise ValueError("a stack streamed from disk runs each layer in a scope of its own, which keeps "
+                         "no intermediates: capture them from a resident or host-resident stack")
+    if not fetching or train or capturing:
         return _scanned_runs(runs, groups, specs, x, fetching=fetching, train=train, decode=decode,
                              kv_store=kv_store, per_layer_input=per_layer_input,
                              attention_metadata=attention_metadata)
@@ -357,10 +360,10 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         opened = _opened(run, specs[first], probed, staged, state if count == 1 else _layer_slice(state, 0),
                          cached if count == 1 or cached is None else _layer_slice(cached, 0), x,
                          first_slice, store=store, train=train, decode=decode,
-                         attention_metadata=attention_metadata, capture=capture)
+                         attention_metadata=attention_metadata)
 
         layer = functools.partial(_applied, run, opened, store, train=train, decode=decode,
-                                  attention_metadata=attention_metadata, capture=capture)
+                                  attention_metadata=attention_metadata)
 
         if count == 1:
             following = first_of(index + 1, x)
@@ -379,24 +382,24 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
 
 
 def _applied[Hidden](run: DecoderBlock, opened: list[str], store, read, state, cache, hidden: Hidden,
-                     per_layer_slice, *, train: bool, decode: bool, attention_metadata,
-                     capture: Capture) -> tuple[Hidden, dict]:
+                     per_layer_slice, *, train: bool, decode: bool,
+                     attention_metadata) -> tuple[Hidden, dict]:
     """One layer of `run` applied in a scope of its own: `read` its read-only variables, `state`
     the caller's held collections and `cache` its cache slice, writing the `opened` collections
-    and keeping what `capture` keeps (`run_stack`).
+    (`run_stack`).
     The hidden state comes out as it went in, a residual stream or `Carried` streams."""
     variables = {**read, **state} if cache is None else {**read, **state, 'cache': cache}
     hidden, changed = run.apply(
-        variables, hidden, mutable=opened, capture_intermediates=capture, train=train,
-        decode=decode, kv_store=store, per_layer_input=per_layer_slice, attention_metadata=attention_metadata)
+        variables, hidden, mutable=opened, train=train, decode=decode, kv_store=store,
+        per_layer_input=per_layer_slice, attention_metadata=attention_metadata)
     return hidden, dict(changed)
 
 
 def _opened(run: DecoderBlock, spec: LayerSpec, probed: list[tuple[LayerSpec, list[str]]], read, state,
             cache, hidden, per_layer_slice, *, store, train: bool, decode: bool,
-            attention_metadata, capture: Capture) -> list[str]:
+            attention_metadata) -> list[str]:
     """The collections a run applied in a scope of its own opens: those its caller
-    opened that a layer of it writes or captures into, DSpark's `prediction_inputs` among them,
+    opened that a layer of it writes into, DSpark's `prediction_inputs` among them,
     which a layer reads to choose what it records, and the ones the caller holds
     (`state`), which it reads as it writes them; the loop carries them back out.
 
@@ -410,8 +413,8 @@ def _opened(run: DecoderBlock, spec: LayerSpec, probed: list[tuple[LayerSpec, li
         # A provider writes its keys and values into the store it is given: the
         # abstract run writes into a copy, so nothing it traces leaves it.
         _, changed = jax.eval_shape(lambda variables: run.apply(
-            variables, hidden, mutable=True, capture_intermediates=capture, train=train,
-            decode=decode, kv_store=None if store is None else dict(store), per_layer_input=per_layer_slice,
+            variables, hidden, mutable=True, train=train, decode=decode,
+            kv_store=None if store is None else dict(store), per_layer_input=per_layer_slice,
             attention_metadata=attention_metadata), variables)
         written = list(changed)
         probed.append((spec, written))
