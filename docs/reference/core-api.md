@@ -27,6 +27,14 @@ Import `Objective`, `Aux`, `Step` and `Ratio` from `dew.objectives`. `Ratio.mean
 
 `Aux` holds training measurements, sequential mutable replacements, QK maxima and additive deferred effects. The trainer applies the effects once per supported optimizer commit. `objective.scalar_loss(variables, batch, step)` returns a scalar and the same Aux for direct JAX differentiation.
 
+### Categorical log-likelihoods
+
+`dew.nn.categorical` is the one owner of a categorical distribution's log-likelihood over the last axis: a model's logits over its vocabulary, a classifier's over its classes, a decision's over a question's options.
+
+<!-- api: dew.nn.categorical.log_probs dew.nn.categorical.probabilities dew.nn.categorical.cross_entropy dew.nn.categorical.soft_cross_entropy dew.nn.categorical.kl_divergence dew.nn.categorical.entropy dew.nn.categorical.rescaled dew.nn.categorical.target_loss dew.nn.categorical.segment_log_partition -->
+
+Each computes in at least float32 and keeps float64 in float64. `where` excludes the classes a row does not hold; they take no probability and add no term, in value or gradient. `rescaled`, `target_loss` and `segment_log_partition` are the pieces of a partition read in blocks or over ragged supports, as `dew.objectives.lm.chunked` reads its vocabulary.
+
 ### Collections and EMA selection
 
 A variables tree is a nested mapping. Its outer keys name collections such as `params` and `batch_stats`; leaves are arrays such as a dense kernel or a running mean. The optimizer updates the `params` collection. A mutable Linen call returns replacement state collections, which the objective supplies through `Aux.variables`. See the [BatchNorm example](../concepts/objectives.md#non-parameter-state).

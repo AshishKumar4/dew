@@ -10,7 +10,6 @@ import json
 import logging
 import platform
 import re
-import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
@@ -18,6 +17,7 @@ from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 import jax
 import numpy as np
 
+from dew import _checkout
 from dew.data.sources.codec import content_fingerprint
 from dew.records import JSON, json_value, record
 
@@ -289,29 +289,8 @@ class Manifest:
         ran: Sequence[StepIdentity] = (),
         fill: Mapping[str, object] | None = None,
     ) -> Manifest:
-        root = Path(__file__).resolve().parents[3]
-        versioned = (root / ".git").exists()
-        revision, clean = "unversioned", True
-        if versioned:
-            revision = subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
-            ).stdout.strip()
-            dirty = subprocess.run(
-                ["git", "status", "--porcelain", "--untracked-files=no"],
-                cwd=root,
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-            added_code = subprocess.run(
-                ["git", "ls-files", "--others", "--exclude-standard", "src/dew"],
-                cwd=root,
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-            clean = not dirty and not added_code
-        locked = [root / name for name in ("pyproject.toml", "uv.lock", "constraints.txt")]
+        revision, clean = _checkout.revision() or "unversioned", _checkout.clean()
+        locked = [_checkout.ROOT / name for name in ("pyproject.toml", "uv.lock", "constraints.txt")]
         dependencies = {
             distribution.metadata["Name"]: distribution.version
             for distribution in importlib.metadata.distributions()

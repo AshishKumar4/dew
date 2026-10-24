@@ -175,6 +175,28 @@ def test_a_failing_rank_leaves_none_of_its_own_processes_running(tmp_path):
     assert not running(worker)
 
 
+def test_a_pool_that_exits_zero_leaves_none_of_its_ranks_processes_running(tmp_path):
+    """Each rank starts a worker of its own, as a data loader or a server does, and exits 0 with the
+    worker still running in its process group; the launch ends that group with the pool, so nothing a
+    rank started outlives a successful launch either."""
+    program = ("import os, pathlib, subprocess, sys\n"
+               "rank = os.environ['DEW_PROCESS_ID']\n"
+               "worker = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
+               "pathlib.Path(sys.argv[1], 'worker' + rank).write_text(str(worker.pid))\n")
+    launch = launcher("--processes-per-host", "2", "--port", "1", "--",
+                      sys.executable, "-c", program, str(tmp_path))
+    try:
+        launch.communicate(timeout=60)
+    finally:
+        launch.kill()
+    assert launch.returncode == 0
+    workers = [int((tmp_path / f"worker{rank}").read_text()) for rank in (0, 1)]
+    deadline = time.monotonic() + 10
+    while any(running(worker) for worker in workers) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert not any(running(worker) for worker in workers)
+
+
 def running(pid: int) -> bool:
     """Whether `pid` runs: an exited process its new parent has not reaped yet (a zombie, state Z in
     /proc) has stopped, though a signal still finds it."""

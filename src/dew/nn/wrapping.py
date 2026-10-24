@@ -60,6 +60,10 @@ class DecoderWrapper(nn.Module):
         return self._decoder.mask_token_id
 
     @property
+    def shifted_logits(self) -> bool:
+        return self._decoder.shifted_logits
+
+    @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
         return tuple(DecoderBank((self.wraps, *site.namespace), site.view, site.scanned)
                      for site in self._decoder.bank_sites)

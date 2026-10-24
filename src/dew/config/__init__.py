@@ -509,9 +509,11 @@ class OptimConfig:
     state_dtype: Literal["float32", "bfloat16"] = "float32"
     """The dtype of Adam's moments in memory.
 
-    bfloat16 stores both with stochastic rounding (`dew.optim.bf16_moments`),
-    for adam and adamw only. That halves the optimizer state and reduces the
-    update's memory traffic.
+    float32 stores adam's and adamw's two moments, and Muon's momentum, in
+    float32 whatever the parameters' dtype, so bfloat16 or float16 weights
+    train on full-precision moments. bfloat16 stores both with stochastic
+    rounding (`dew.optim.bf16_moments`), for adam and adamw only. That halves
+    the optimizer state and reduces the update's memory traffic.
     """
     forced_weight_normalization: bool = False
     """Whether to renormalize every magnitude-preserving weight (`dew.nn.mp.MPConv`) after each update.
@@ -552,6 +554,10 @@ class OptimConfig:
                     f"state_dtype='bfloat16' stores Adam's moments in bf16, which "
                     f"{sorted(BF16_STATE_OPTIMIZERS)} have; {self.optimizer!r} does not")
             make = BF16_STATE_OPTIMIZERS[self.optimizer]
+        elif self.optimizer in ('adam', 'adamw'):
+            opts = {'mu_dtype': 'float32', 'nu_dtype': 'float32', **opts}
+        elif self.optimizer in ('muon', 'muonclip'):
+            opts = {'mu_dtype': 'float32', **opts}
         if self.param_groups:
             names = [group.name for group in self.param_groups]
             if len(set(names)) != len(names):

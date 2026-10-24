@@ -31,7 +31,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.artifacts import TokenScores
-from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
+from dew.diffusion.discrete import MDLM_STEPS, REVEALED_UNDEFINED, DiscreteProcess, Unmask, aligned
 from dew.inference.tasks import MaskedGeneration, MaskedSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import real_slots
@@ -226,9 +226,10 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         dropout_key = jax.random.fold_in(step.key, 2)
         masked = jnp.where(is_masked, self.process.mask_id, tokens)
 
-        read = final_read(self.model, params, masked, train=train,
-                          rngs=model_rngs(dropout_key, training=train), mutable=False,
-                          capture_intermediates=False, **prepared.kwargs())
+        # Each position's prediction, as the checkpoint's logits line up with its inputs.
+        read = aligned(self.model, final_read(self.model, params, masked, train=train,
+                                              rngs=model_rngs(dropout_key, training=train), mutable=False,
+                                              capture_intermediates=False, **prepared.kwargs()), fields)
         # MDLM's SUBS parameterization gives the mask token no mass: it is
         # never a target, so the partition and the prediction leave it out.
         mask_id = self.process.mask_id
@@ -242,9 +243,12 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         return tokens, losses, counted * weights[:, None], counted, predicted, real
 
     def _sample_impl(self, params, key, *, count: int):
+        """`count` rows sampled from noise, and whether a position stayed masked, its scores holding
+        no distribution (`Unmask`)."""
         denoise = self.process.denoiser(self.model, thaw(params))
         x_T = self.process.noise(key, (count, self.seq_len))
-        return sample(denoise, x_T, self.steps, solver=self.solver, key=key)
+        sampled = sample(denoise, x_T, self.steps, solver=self.solver, key=key)
+        return sampled, jnp.any(sampled == self.process.mask_id)
 
     def preview(self, params, batch, step: Step, *, scored=None):
         """Generate `samples` rows on every process, then decode them on process zero.
@@ -254,7 +258,10 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         """
         def generate(prepared):
             weights, count = prepared
-            return self._sample(weights, step.key, count=count), None, None
+            sampled, undefined = self._sample(weights, step.key, count=count)
+            if bool(jax.device_get(undefined)):
+                raise ValueError(REVEALED_UNDEFINED)
+            return sampled, None, None
 
         return text_preview("masked diffusion preview",
                              lambda: (self.evaluation_variables(params, step), self.samples), generate,

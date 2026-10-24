@@ -47,7 +47,7 @@ from common import (
     window_rows,
     write_record,
 )
-from reference_source import git_head
+from reference_source import dew_revision
 
 
 class NormState(NamedTuple):
@@ -272,7 +272,7 @@ def train(args: argparse.Namespace, run: Run, probe: RouterProbe | None) -> tupl
 def versions() -> dict:
     """The versions a record names, read before the run so an untraceable
     checkout fails at once rather than after it."""
-    return {"jax": jax.__version__, "dew": git_head(Path(__file__).resolve().parents[2]),
+    return {"jax": jax.__version__, "dew": dew_revision(),
             "optax": optax.__version__, "flax": __import__("flax").__version__}
 
 
