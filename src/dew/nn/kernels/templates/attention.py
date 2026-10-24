@@ -27,7 +27,7 @@ rounds to the query's dtype (`reference`).
 import dataclasses
 import enum
 from collections.abc import Callable
-from typing import NamedTuple
+from typing import ClassVar, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -612,6 +612,27 @@ def hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, ..
         return out, pull(jnp.ones_like(out))
 
     return tuning.program(pulled, square, *positions, *params)
+
+
+class HookKeys:
+    """What a template launch's picks key its hooks by (`tuning.KernelOp.traced`, ahead of the op's own in
+    its bases): what each computes (`hook_program`), a score hook at its parameters' kinds and dtypes
+    (`score_kinds`, `score_dtypes`) and with its pullback where the launch differentiates it
+    (`DIFFERENTIATED`, a backward's), a forward's output hook at its parameters' and the padded value
+    width (`output_kinds`, `output_dtypes`, `output_width`)."""
+
+    DIFFERENTIATED: ClassVar[bool] = False
+    score_kinds: tuple[Kind, ...] = ()
+    score_dtypes: tuple[str, ...] = ()
+    output_kinds: tuple[Kind, ...] = ()
+    output_dtypes: tuple[str, ...] = ()
+    output_width: int = TRACED_TILE
+
+    def traced(self, name: str, value: Callable | str | None) -> str | None:
+        if name == "output_mod":
+            return hook_program(name, value, self.output_kinds, self.output_dtypes, width=self.output_width)
+        return hook_program(name, value, self.score_kinds, self.score_dtypes,
+                            differentiated=self.DIFFERENTIATED)
 
 
 def spanned(specs: list[jax.ShapeDtypeStruct], arrays: list[jax.Array]) -> list[jax.Array]:
