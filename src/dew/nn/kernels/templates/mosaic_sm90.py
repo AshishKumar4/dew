@@ -40,12 +40,12 @@ class Wgmma(mosaic.RingFamily):
     column_scratch = 4 * 32 * 2
     """A WGMMA tile's columns sum across its four warps, each lane's two entries a register."""
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0) -> jax.Array:
         def scores(acc_ref):
             plgpu.wgmma(acc_ref, lhs, rhs)
             if then is not None:
                 then()
-            return acc_ref[...]
+            return plgpu.wgmma_accumulator_load(acc_ref, wait_n=pending)
 
         return pl.run_scoped(scores, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 

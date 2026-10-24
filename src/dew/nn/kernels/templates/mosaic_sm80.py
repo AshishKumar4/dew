@@ -92,6 +92,7 @@ class Mma(mosaic.Family):
     bounded_loads = False
     role_rows = 4 * 16
     operands_in_registers = True
+    asynchronous = False
     rhs_copies = 4
 
     def registers(self, consumers: int) -> int:
@@ -182,10 +183,13 @@ class Mma(mosaic.Family):
             pl.when(~active)(lambda: consumer(0, tile, mosaic.unwalked(self), store, active=False))
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
-                first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None
-                ) -> tuple[C, tuple[jax.Array, ...]]:
+                first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
+                kept: tuple[str, ...] = (), last=None) -> tuple[C, tuple[jax.Array, ...]]:
         # Its products are synchronous: none stays in flight past its step, and `emit_pipeline` gives
-        # each stage back as its step ends.
+        # each stage back as its step ends, so no slot is kept past it (`asynchronous`).
+        if kept or last is not None:
+            raise ValueError("mma.sync's pipeline gives each stage back as its step ends: no slot is kept "
+                             "past it")
         del first, in_flight
         blocks = streams.pipeline.blocks
         names = tuple(blocks)
@@ -242,7 +246,8 @@ class Mma(mosaic.Family):
             return plgpu.layout_cast(lhs.astype(self.dtype), self.lhs)
         return plgpu.load(lhs, layout=self.lhs)
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0) -> jax.Array:
+        del pending
         out = plgpu.mma(self.zeros(shape), self._left(lhs), plgpu.load(rhs, layout=self.rhs))
         if then is not None:
             then()
