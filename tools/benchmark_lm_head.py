@@ -100,7 +100,8 @@ def bounded(states, table, targets, variant: Variant):
 
 
 def fused(states, table, targets, variant: Variant):
-    """The gradient-in-forward head (`fused_head_loss`), at most `--token-tile` tokens a chunk (`fused_tokens`)."""
+    """The gradient-in-forward head (`fused_head_loss`), at most `--token-tile` tokens a chunk
+    (`fused_tokens`)."""
     total, (_, predicted, _) = fused_head_loss(
         states, OutputTable(table.T, vocab_major=False, softcap=variant.softcap), targets,
         jnp.ones(targets.shape, jnp.float32), z_loss=variant.z_loss, tile=variant.tile,
