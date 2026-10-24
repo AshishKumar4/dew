@@ -1456,6 +1456,7 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
             # The vision layouts are the export's alone: the bundle's own are derived from its tree, as
             # every adapter (LoRA's projections) reads them.
             variables, vision = diffusion_gemma.translate_weights(tensors, config, param_dtype=param_dtype,
+                                                                  lazy=streaming,
                                                                   checked=checked)
             record, layouts, retained = config, (), {}
             built = {**config, "dtype": dtype, "attention_impl": attention_impl}
