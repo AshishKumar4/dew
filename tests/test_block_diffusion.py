@@ -334,6 +334,32 @@ def test_canvas_generation_rejects_lossy_token_coercion_and_batched_keys(system)
                          key=jax.random.split(jax.random.key(1), 2))
 
 
+TEMPER_SEEDS = 8
+"""Check 1's declared seeds for the tempered logits over every step, sized by `seeds_for`."""
+
+
+def test_the_tempered_logits_divide_by_the_reference_temperature_at_every_step():
+    """The temperature at n steps remaining is the reference's t_min + (t_max - t_min) n / N, and the
+    tempered logits, the logits over it, are on par with the reference's float32 quotient at every
+    step (check 1, float64 the truth), however XLA lowers its division by the constant N."""
+    from reference_error import assert_as_exact
+
+    from dew.diffusion.block import BlockProcess
+
+    process = BlockProcess(canvas_length=4, vocab_size=64, max_steps=48)
+    remaining = np.arange(1, 49, dtype=np.int32)
+    tempered = jax.jit(jax.vmap(process.temper))
+
+    def draw(seed):
+        return (np.random.default_rng(seed).normal(0, 4, (48, 64)).astype(np.float32), remaining)
+
+    def reference(logits, steps):
+        temperature = np.asarray([0.4 + (0.8 - 0.4) * (int(n) / 48) for n in steps])
+        return logits / temperature.astype(logits.dtype)[:, None]
+
+    assert_as_exact(tempered, reference, draw, "tempered logits", seeds=TEMPER_SEEDS)
+
+
 def test_a_canvas_whose_model_scores_nothing_refuses_rather_than_draw_a_token(system):
     """A canvas refinement draws each unfinished position from the model's scores; scores of NaN
     hold no distribution, so generation raises instead of committing arbitrary tokens."""
