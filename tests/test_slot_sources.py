@@ -140,7 +140,8 @@ def test_a_block_slot_source_trains_checkpoints_exports_and_serves_its_updated_r
     task = bundle.pipeline()
     task = replace(task, layout=replace(task.layout, max_len=512))
     request = {"state": "Refund requested.", "questions": {
-        "team": {"type": "choice", "instructions": "Which team?", "options": ["billing", "technical"]}}}
+        "team": {"type": "choice", "instructions": "Which team?",
+                 "criteria": {"billing": None, "technical": None}}}}
     examples = [Example.of({**request, "answers": {"team": 0}})]
     objective = DecisionObjective(task, shuffle_options=False)
     data = decision_rows(examples, 1, objective=objective.data())
