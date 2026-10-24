@@ -626,6 +626,33 @@ def _fullest(op, ba, target):
     return max(op.fitting(ba, target), key=lambda config: op.staged_bytes(ba, config, target))
 
 
+@pytest.mark.parametrize("case", ["runs", "runs-documents-valid"])
+def test_a_tuned_launch_over_runs_times_every_key(case):
+    """The tuner's timing operands of a forward and a backward over a call's runs (`tuning.materialized`,
+    `attention.spanned`): each query's first run holds every key and its others are empty, and its documents'
+    ids are one document, so the timed launch walks every tile a dense call does, never an empty walk."""
+    call = RUN_CASES[case]
+    queries, keys = core_geometry(call)
+    spans = template.spans(queries, keys, ROWS, **arguments(call))
+    query = jax.ShapeDtypeStruct((ROWS, queries, 2, 64), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((ROWS, keys, 1, 64), jnp.bfloat16)
+    stats = jax.ShapeDtypeStruct((ROWS, 2, queries), jnp.float32)
+    others = jax.ShapeDtypeStruct((ROWS, 2, queries, 64), jnp.float32)
+    residuals = (stats, stats, jax.ShapeDtypeStruct((ROWS, 2, queries), jnp.int32),
+                 template.Split(others, stats, stats, stats))
+    bounds = tuple(jax.ShapeDtypeStruct(array.shape, array.dtype) if array is not None else None
+                   for array in (spans.start, spans.end, spans.query_ids, spans.key_ids))
+    forward = attention_mosaic.MosaicForward(form=spans.form, keys=keys)
+    backward = attention_mosaic.MosaicBackward(form=spans.form, keys=keys)
+    for op, ba in ((forward, _bound(forward, query, key, key, *bounds, (), (), None)),
+                   (backward, _bound(backward, query, key, key, query, *bounds, (), None, residuals))):
+        arrays, fill = tuning.materialized(op, ba)
+        args, _ = fill(arrays)
+        start, end, query_ids, key_ids = args[op.SPANS:op.SPANS + 4]
+        timed = template.KeySpans(start, end, query_ids, key_ids, keys, spans.form)
+        assert np.asarray(template.dense(timed)).all(), type(op).__name__
+
+
 @lowers("sm90")
 @pytest.mark.parametrize("launch", ["forward", "training", "default", "accurate"])
 def test_the_fullest_fitting_tiles_lower_within_a_hoppers_block(launch):
