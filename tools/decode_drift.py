@@ -78,23 +78,26 @@ def served(task, rows: np.ndarray, steps: int) -> tuple[np.ndarray, np.ndarray]:
     return np.asarray(tokens), np.asarray(first.raw_log_probs[0, :steps], np.float64)
 
 
-def replayed(model, variables, pad: int, rows: np.ndarray, forced: np.ndarray) -> np.ndarray:
-    """Row 0's log-probability of each of `forced`'s tokens, every row fed `forced` through the cached
-    decode one token at a time (teacher forcing)."""
-    model = model.with_cache_capacity(capacity_for(rows.shape[1], len(forced)))
+def replayer(model, variables, pad: int, batch: int, prompt: int, steps: int):
+    """A function of `(rows, forced)` returning row 0's log-probability of each of `forced`'s tokens, the
+    `batch` rows of `prompt` ids fed `forced` through the cached decode one token at a time (teacher
+    forcing): its single-token step compiled once for every call."""
+    model = model.with_cache_capacity(capacity_for(prompt, steps))
     ops = decode_ops(model, variables, pad, depths=None)
-    state, active = prefill_state(model, variables, ModelInputs(jnp.asarray(rows, jnp.int32)), ops)
 
     @jax.jit
-    def step(state, token):
+    def step(state, active, token):
         score = token_log_probs(state.logits[:1], jnp.full((1,), token, jnp.int32))[0]
-        return score, ops.advance(state, jnp.full((len(rows),), token, jnp.int32), active)
+        return score, ops.advance(state, jnp.full((batch,), token, jnp.int32), active)
 
-    scores = []
-    for token in forced:
-        score, state = step(state, int(token))
-        scores.append(score)
-    return np.asarray(jax.device_get(jnp.stack(scores)), np.float64)
+    def replay(rows: np.ndarray, forced: np.ndarray) -> np.ndarray:
+        state, active = prefill_state(model, variables, ModelInputs(jnp.asarray(rows, jnp.int32)), ops)
+        scores = []
+        for token in forced:
+            score, state = step(state, active, int(token))
+            scores.append(score)
+        return np.asarray(jax.device_get(jnp.stack(scores)), np.float64)
+    return replay
 
 
 def prefilled(model, variables, prompt: np.ndarray, forced: np.ndarray) -> np.ndarray:
@@ -169,6 +172,10 @@ def main() -> int:
     reference = greedy(loaded.text_generation())
     pad = task.sampling.pad
     true = truth(args.model)
+    with chosen(**REFERENCE_KERNELS):
+        alone_of = replayer(reference.model, reference.variables, pad, 1, args.prompt, args.steps)
+        batched_of = replayer(reference.model, reference.variables, pad, BATCH, args.prompt, args.steps)
+        moved_of = replayer(reference.model, perturbed(reference.variables), pad, 1, args.prompt, args.steps)
 
     @functools.cache
     def draw(seed):
@@ -182,7 +189,7 @@ def main() -> int:
 
     def replay(rows, tokens, scores):
         with chosen(**REFERENCE_KERNELS):
-            return blocks(replayed(reference.model, reference.variables, pad, rows[:1], tokens))
+            return blocks(alone_of(rows[:1], tokens))
 
     finding = None
     try:
@@ -196,9 +203,8 @@ def main() -> int:
     together, _ = served(task, rows, args.steps)
     parted = np.flatnonzero(together != tokens)
     with chosen(**REFERENCE_KERNELS):
-        alone = replayed(reference.model, reference.variables, pad, rows[:1], tokens)
-        batched = replayed(reference.model, reference.variables, pad, rows, tokens)
-        moved = replayed(reference.model, perturbed(reference.variables), pad, rows[:1], tokens)
+        alone, moved = alone_of(rows[:1], tokens), moved_of(rows[:1], tokens)
+        batched = batched_of(rows, tokens)
         reference_prefill = prefilled(reference.model, reference.variables, rows[0], tokens)
     served_prefill = prefilled(task.model, task.variables, rows[0], tokens)
     config = json.loads((Path(args.model) / "config.json").read_text())
