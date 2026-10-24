@@ -24,9 +24,8 @@ from dew.data.compile import fitted
 from dew.data.dataset import DataPartition
 from dew.data.sources.files import Files
 from dew.inputs import AudioCondition, Condition, HFAudio
-from dew.model_config import ModelConfig
 from dew.objectives.base import Step
-from dew.registry import to_record
+from dew.registry import ModelConfig, to_record
 from dew.sampling import CFG
 from dew.training import Trainer
 

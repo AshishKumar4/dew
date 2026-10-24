@@ -35,8 +35,8 @@ from dew.data.chat import Role
 from dew.data.sources import Read, source as data_source
 from dew.inference import RunProcessor
 from dew.interop import PretrainedDecoder
-from dew.model_config import ModelConfig
 from dew.objectives.lm import LMObjective, Perplexity, Samples
+from dew.registry import ModelConfig
 from dew.state import TrainState
 from dew.training import MeshSpec, prepare_process
 

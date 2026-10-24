@@ -936,7 +936,7 @@ To trace a window of training, pass `Trainer` a `ProfileWindow` with the trace `
 ```python
 from dew import Evaluation, LocalTracker
 from dew.config import OptimConfig, RunConfig, TrainerConfig
-from dew.model_config import ModelConfig
+from dew.registry import ModelConfig
 from dew.config.sweep import GridSearch
 from dew.data import Memory
 
@@ -1053,7 +1053,7 @@ import optax
 
 from dew import Checkpoints, Trainer
 from dew.config import TrainerConfig
-from dew.model_config import ModelConfig
+from dew.registry import ModelConfig
 from dew.data import TFDS, presets
 from dew.diffusion.presets import EDM
 from dew.inference import TextToImage

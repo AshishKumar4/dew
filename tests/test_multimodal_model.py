@@ -58,7 +58,7 @@ def test_public_processor_and_native_forward_match_conditional_model(source):
     np.testing.assert_array_equal(np.asarray(output)[valid].argmax(-1), reference[valid].argmax(-1))
     from reference_error import assert_moves, widened
 
-    from dew.model_config import ModelConfig
+    from dew.registry import ModelConfig
 
     language = model.language_model
     ordinary = language.mixer or AttentionMixer()

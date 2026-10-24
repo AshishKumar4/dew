@@ -40,10 +40,10 @@ from dew.data import ByteTokenizer, Concatenate, Dataset, Files, Hub, Loading, S
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader
 from dew.interop.diffusion_gemma import build
-from dew.model_config import ModelConfig
 from dew.nn.inputs import ModelInputs
 from dew.objectives.lm import Perplexity
 from dew.optim import Cosine
+from dew.registry import ModelConfig
 from dew.training import MeshSpec, prepare_process
 
 EOS, PAD, IMAGE = 256, 257, 258

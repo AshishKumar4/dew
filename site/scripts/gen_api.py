@@ -82,7 +82,7 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
     ("Decision models", ["dew.decision", "dew.decision.config", "dew.decision.data", "dew.decision.objective",
                          "dew.decision.layout", "dew.decision.task"]),
     ("Conditions and evaluation", ["dew.inputs", "dew.inputs.encoders", "dew.eval", "dew.eval.harness"]),
-    ("Configuration", ["dew.config", "dew.model_config", "dew.config.lm", "dew.config.jepa", "dew.config.diffusion",
+    ("Configuration", ["dew.config", "dew.config.lm", "dew.config.jepa", "dew.config.diffusion",
                        "dew.config.sweep"]),
     ("Utilities", ["dew.rl", "dew.artifacts", "dew.distributed", "dew.telemetry.profile",
                    "dew.telemetry.benchmark", "dew.figures"]),

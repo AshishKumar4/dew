@@ -35,13 +35,12 @@ from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader
 from dew.diffusion import presets
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
-from dew.model_config import ModelConfig
 from dew.nn.attention import Stage
 from dew.nn.text_encoders import DEFAULT_MODEL as CLIP_CHECKPOINT
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
-from dew.registry import from_record, metrics, models, to_record
+from dew.registry import ModelConfig, from_record, metrics, models, to_record
 from dew.sampling import CFG, Euler
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 from dew.training.distributed import shard_batch

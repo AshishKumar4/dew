@@ -17,10 +17,9 @@ import dew.nn.backbones
 from dew.config import OptimConfig, RunConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader, Ramp
-from dew.model_config import ModelConfig
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
-from dew.registry import Aliases, projectors, towers
+from dew.registry import Aliases, ModelConfig, projectors, towers
 from dew.training import Checkpoints, Layout, MeshSpec
 
 

@@ -21,12 +21,12 @@ from dew.config import ObjectiveConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.diffusion.presets import Flow
 from dew.inputs import TextCondition
-from dew.model_config import ModelConfig
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import TEACHER, Step
 from dew.objectives.diffusion import AdversarialDistillationObjective
 from dew.objectives.diffusion.adversarial import Head
 from dew.objectives.diffusion.objective import DISCRIMINATOR, SPECTRAL
+from dew.registry import ModelConfig
 from dew.sampling import Consistency, Euler, TextToImage
 from dew.training import Trainer
 

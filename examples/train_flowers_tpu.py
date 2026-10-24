@@ -39,9 +39,9 @@ from dew.data.sources.codec import pack_dict_of_byte_arrays
 from dew.diffusion.presets import EDM
 from dew.distributed import collective_host
 from dew.inputs import TextCondition
-from dew.model_config import ModelConfig
 from dew.nn.backbones import SimpleDiT
 from dew.optim import Cosine
+from dew.registry import ModelConfig
 from dew.sampling import CFG
 from dew.sampling.solvers import Heun
 from dew.training import LocalTracker, MeshSpec, ProfileWindow, prepare_process

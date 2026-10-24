@@ -328,7 +328,7 @@ class Pretrained:
         their kernels and `adapter.save` writes them alone; the bundle itself where
         `model` carries none."""
         from dew.lora import Adapter, recorded_adapter
-        from dew.model_config import ModelConfig
+        from dew.registry import ModelConfig
 
         record = recorded_adapter(ModelConfig.from_model(model).wrappers)
         return self if record is None else replace(self, adapter=Adapter.recorded(model, variables, record))

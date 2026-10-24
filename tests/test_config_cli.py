@@ -197,7 +197,7 @@ def test_a_jepa_run_without_probes_trains_and_validates_its_loss(tmp_path, size)
 
     from dew.config import TrainerConfig
     from dew.data import TFDS, Loading, images, presets
-    from dew.model_config import ModelConfig
+    from dew.registry import ModelConfig
 
     root = REPO_ROOT / "tests" / "fixtures" / "tfds" / "dew_images" / "1.0.0"
     pictures = TFDS("dew_images", path=str(root), split="all")

@@ -601,8 +601,8 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     from dew.config import ObjectiveConfig, TrainerConfig
     from dew.config.diffusion import DiffusionRunConfig
     from dew.inputs import TextCondition
-    from dew.model_config import ModelConfig
     from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
+    from dew.registry import ModelConfig
 
     for name in ("tiny_diffusers", "rae"):
         with tarfile.open(FIXTURES / f"{name}.tar.xz") as archive:
