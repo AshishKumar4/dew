@@ -110,17 +110,19 @@ def test_a_dropping_call_reports_its_route_and_a_chosen_template_runs_it():
 
 
 def test_the_reference_draw_keeps_a_bf16_call_unbiased():
-    """Each of 128 keys of equal weight 1/128 (exact in bf16) keeps with probability 0.9 and scales by
-    1/0.9, so each query row's output has mean 1 over the draws. The 16384 rows are independent draws:
-    a row's output has standard deviation 0.0295, so the mean of the rows has standard error 0.00023,
-    and the bound is 3.5 of those. A multiplier rounded to bf16 (1.109375 for 1/0.9) would bias the
-    mean by -0.00156."""
-    query = jnp.zeros((1, 16384, 1, 8), jnp.bfloat16)
-    key = jnp.zeros((1, 128, 1, 8), jnp.bfloat16)
+    """Over the draws, each query row's output has mean equal to its weights' sum, 1: a kept weight
+    keeps with probability 0.9 and scales by 1/0.9. The 131072 rows are independent draws over generic
+    weights, so the bf16 rounding of their products averages out (uniform weights round alike). A row's
+    output has standard deviation about 0.03, so the mean has standard error 0.0003, and the bound is 3.5
+    of those. A multiplier rounded to bf16 (1.109375 for 1/0.9) would bias the mean by -0.00156 (ledger
+    1533)."""
+    keys = jax.random.split(jax.random.key(0), 2)
+    query = jax.random.normal(keys[0], (1, 131072, 1, 8), jnp.float32).astype(jnp.bfloat16)
+    key = jax.random.normal(keys[1], (1, 128, 1, 8), jnp.float32).astype(jnp.bfloat16)
     value = jnp.ones((1, 128, 1, 8), jnp.bfloat16)
     out = scaled_dot_product_attention(query, key, value, implementation="reference", dropout_rate=0.1,
-                                       dropout_rng=jax.random.key(0), deterministic=False)
-    assert abs(float(jnp.mean(out.astype(jnp.float32))) - 1) < 0.0008
+                                       dropout_rng=jax.random.PRNGKey(0), deterministic=False)
+    assert abs(float(jnp.mean(out.astype(jnp.float32))) - 1) < 0.001
 
 
 HOOKED = ("causal-window", "causal-documents-window", "cross-causal-lengths-starts")

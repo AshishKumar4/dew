@@ -45,7 +45,7 @@ def test_the_interpreted_triton_mainloop_drops_on_par_with_the_reference_path(na
     from float64 (check 1)."""
     case = CASES[name]
     queries, keys = geometry(case)
-    assert_as_exact(grads_of(triton_arm(case)), grads_of(reference_arm(case)),
+    assert_as_exact(triton_arm(case), grads_of(reference_arm(case)),
                     route_draw(queries, keys, jnp.float32), f"interpreted triton dropping {name}",
                     seeds=SEEDS)
 
