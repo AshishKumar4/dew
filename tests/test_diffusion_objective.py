@@ -14,7 +14,14 @@ import optax
 import pytest
 from affine_run import Replaying
 from diffusion_stubs import RES, StubText
-from diffusion_support import applied, float32_update, float64_gradient, moved_weights, objective_gradient
+from diffusion_support import (
+    applied,
+    as_a_step,
+    float32_update,
+    float64_gradient,
+    moved_weights,
+    objective_gradient,
+)
 from flax import linen as nn
 
 from dew.data.dataset import Loader
@@ -512,7 +519,8 @@ def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_on
         return jax.tree.map(applied, variables["params"], after)
 
     # The whole batch's step.
-    alone = float32_update(jax.jit(lambda variables: objective_gradient(objective, variables, whole, info)))
+    alone = float32_update(as_a_step(objective, initial.variables, whole,
+                                     lambda variables: objective_gradient(objective, variables, whole, info)))
     assert_as_exact(pooled, alone, moved_weights(template.variables), "pooled update", seeds=POOLED_SEEDS,
                     truth_fn=float64_gradient(twin, whole, info))
 
