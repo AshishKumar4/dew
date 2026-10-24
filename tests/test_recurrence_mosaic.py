@@ -171,3 +171,61 @@ def test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_toke
     reference = jax.jit(functools.partial(token_by_token, hooks))
     assert_as_exact(dew, reference, functools.partial(hooked_draw, hooks, packed),
                     f'the mosaic forward, {hooks} packed={packed}', seeds=HOOK_SEEDS[hooks, packed])
+
+
+RESOURCE_SHAPES = {'qwen3.5-27b-gdn': (16, 48, 128, 128, False), 'kimi-linear-kda': (32, 32, 128, 128, True)}
+"""The scoreboard's delta-rule geometries the resource gate compiles (`tools/benchmark_recurrence.SHAPES`):
+key heads, value heads, key and value widths, and whether the decay is a key dimension's."""
+
+
+@pytest.mark.parametrize('target', ['sm80', 'sm90'])
+def test_the_mosaic_mainloop_compiles_within_each_gpus_resources(target):
+    """The mainloop's launches, its forward in a 16-bit and an fp32 call and the gated delta rule's fast
+    backward, at the scoreboard's widths, one row of 256 tokens and packed documents, compiled by Mosaic for a
+    compile-only A100 and H100 on this CPU (tests/kernel_compile.py): within the multiprocessor's shared
+    memory (163 KB, 227 KB), no register spilled. Lowering alone takes no device's budget: a launch past an
+    A100's shared memory lowered and failed on the GPU (the fast backward's readout's third staging tile)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates import mosaic_sm90
+    from dew.nn.kernels.templates.recurrence import _sm80
+
+    family = {'sm80': _sm80.MMA_SYNC, 'sm90': mosaic_sm90.WGMMA}[target]
+    rows, length = 1, 256
+
+    def case(name: str, dtype, *, training: bool, packed: bool):
+        key_heads, value_heads, key_width, value_width, per_key = RESOURCE_SHAPES[name]
+
+        def call():
+            def array(*shape, kind=dtype):
+                return jax.ShapeDtypeStruct(shape, kind)
+
+            decay = (rows, length, value_heads) + ((key_width,) if per_key else ())
+            args = [array(rows, length, key_heads, key_width), array(rows, length, key_heads, key_width),
+                    array(rows, length, value_heads, value_width), array(*decay, kind=jnp.float32),
+                    array(rows, length, value_heads), array(rows, value_heads, key_width, value_width,
+                                                            kind=jnp.float32)]
+            if training:
+                args += [array(rows, length, value_heads, value_width),
+                         array(rows, value_heads, key_width, value_width, kind=jnp.float32)]
+            starts = array(rows, length, kind=jnp.bool_) if packed else None
+            run = mainloop.gradients if training else mainloop.forward
+
+            def fn(*operands):
+                *operands, given = operands if packed else (*operands, None)
+                return run(*operands, starts=given, max_segments=8 if packed else None, family=family)
+
+            return fn, (*args, *([starts] if packed else []))
+
+        label = f"{name} {jnp.dtype(dtype).name} {'training' if training else 'forward'}"
+        return KernelCase(label + (' packed' if packed else ''), call)
+
+    # Kimi's keys, 128 wide, past what an fp32 call takes under a decay a key dimension (`forward`).
+    cases = [case(name, dtype, training=False, packed=packed) for name in RESOURCE_SHAPES
+             for dtype in (jnp.bfloat16, jnp.float32) for packed in (False, True)
+             if not (RESOURCE_SHAPES[name][4] and dtype == jnp.float32)]
+    cases += [case('qwen3.5-27b-gdn', jnp.bfloat16, training=True, packed=packed) for packed in (False, True)]
+    found = compile_mosaic_kernels(cases, target)
+    assert all(record.get('kernels') for record in found), found
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
