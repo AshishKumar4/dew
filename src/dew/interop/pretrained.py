@@ -420,7 +420,7 @@ class Pretrained:
             # A selected GGUF file is a decoder, whatever pipeline index the repo also ships.
             loaded = _pipeline_source(name_or_dir, directory, commit, single_file, dduf_file, placed,
                                       dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
-                                      streaming=streaming or not weights)
+                                      streaming=streaming)
         else:
             loaded = None
         if loaded is None:
