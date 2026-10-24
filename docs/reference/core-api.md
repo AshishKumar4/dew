@@ -114,7 +114,7 @@ An `OptimConfig` is built by `fit` over the run's optimizer updates. If you need
 
 ## TrainState
 
-Import `TrainState` from `dew.training`.
+Import `TrainState` from `dew.state`.
 
 <!-- api: dew.state.TrainState -->
 
