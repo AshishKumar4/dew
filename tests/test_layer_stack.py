@@ -176,9 +176,9 @@ keep two, as the architectures cell found (tests/test_architectures.py); Gemma 4
 32 wide, where at the fixture's 8 Dew paired with the plain loop did not resolve within 4096 draws (the
 released E2B's are 256)."""
 SCAN_ROWS = {"gemma3n": 32}
-"""Each shape's rows a draw where BATCH's leave its error past resolving: Gemma 3n's five sparse layers
-at 8 rows a draw did not resolve within 4096 draws, Dew paired with the plain loop, and at 32 rows, as
-at 64, within 64."""
+"""Each shape's rows a draw where more than BATCH's make its check cheaper: Gemma 3n's draws each run
+three programs to hold their choices alike (`ScanCase.agrees`), and at 8 rows the plain loop against
+itself resolved at 512 draws, a verdict of 417 s on armada, at 32 rows at 256, one of 57 s."""
 SCAN_MARGIN = 5e-5
 """The least selection margin a scanned-stack draw of a DeepSeek shape admits (`selection_margins.margin`),
 relative to the scale of what its routers select: ten times the largest distance float32 rounding moved
@@ -190,14 +190,15 @@ moved a gate value from its float64 value over 48 draws of both parameter sets a
 of the deviation (median 6.1e-6). No margin rule admits Gemma 3n's draws: at 32 rows none of those 96
 cleared it, the median draw's least margin being 7.3e-6, since every draw holds some of its 460,000 gate
 values near a cutoff. Its runs choose alike all the same, but for rounding's rare disagreement: over
-128 draws at 32 rows, both runs and both parameter sets, one draw kept other units than float64 (two, at
-float64 margins up to 1.3e-6), and over 48 draws of the plain loop at 8 rows and at 32 none did."""
-SCAN_SEEDS = {"gemma4": 256, "gemma3n": 64, "deepseek": 8, "deepseek_widths": 8}
-"""Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada, paired
-with the scanned stack, whose arms share every upstream rounding (the same weights, rows and arithmetic,
-the DeepSeek shapes' bit for bit on a CPU) and whose errors are heavy-tailed across draws: the four
-largest of 1024 draws hold up to 40% of a Gemma 4 leaf's pooled error, of 64 up to 43% of a DeepSeek
-one's, which the plain loop against itself resolves within no 512 draws."""
+512 draws at 32 rows, the programs check 1 measures kept other units than float64 on 11 (17 units, at
+float64 margins up to 1.2e-6), and never past the bound."""
+SCAN_SEEDS = {"gemma4": 64, "gemma3n": 256, "deepseek": 8, "deepseek_widths": 8}
+"""Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada: Gemma 3n's
+by the plain loop against itself; the others' paired with the scanned stack, whose arms share every
+upstream rounding (the same weights, rows and arithmetic, the DeepSeek shapes' bit for bit on a CPU) and
+whose errors are heavy-tailed across draws: the four largest of 1024 draws hold up to 40% of a Gemma 4
+leaf's pooled error, of 64 up to 43% of a DeepSeek one's, which the plain loop against itself resolves
+within no 512 draws."""
 def same_metrics(left: dict, right: dict, relative: float = 1e-5) -> bool:
     """Every metric within `relative` of the other run's; perplexity is exp
     of the cross entropy, so an absolute bound would say nothing about it."""
