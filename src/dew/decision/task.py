@@ -5,7 +5,6 @@ import binascii
 import functools
 import io
 import json
-import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -67,7 +66,6 @@ from dew.inference.tasks import shape_bucket
 from dew.interop.processors import Processor
 from dew.nn.inputs import ModelInputs, RowPlan, mesh_of
 from dew.nn.kernels.options import compiler_options
-from dew.nn.sharding import batch_axes
 from dew.objectives.base import Metric, Objective, Variables
 from dew.records import JSON, json_value, record
 
@@ -510,7 +508,7 @@ class Decide:
         minimum counts are Laya's: a type's temperature needs `type_minimum` answers
         and a bucket's `bucket_minimum`.
         """
-        scored = self._scored(held_out if callable(held_out) else self._held(held_out, self._mesh))
+        scored = self._scored(held_out if callable(held_out) else self._held(held_out))
         if not scored:
             raise ValueError("calibration needs examples with answers")
         temperatures = Temperatures.fit(scored, type_minimum=type_minimum, bucket_minimum=bucket_minimum)
@@ -527,39 +525,27 @@ class Decide:
         each probability divided by its temperature; a binning map or abstention
         thresholds are not applied. The default metrics are Accuracy, ECE, AURC
         and the log loss. The pass agrees its result across a process pool, so
-        there every process calls it. It scores on the mesh the task's weights are
-        placed on, its rows split over the mesh's row axes as a run's validation
-        splits them, or on one local device for weights placed on none.
+        there every process calls it.
         """
         from dew.decision.scoring import default_metrics
+        from dew.training.distributed import MeshSpec
         from dew.training.evaluation import Evaluation
 
         chosen = list(metrics) or default_metrics()
-        evaluation = Evaluation.run(self._scoring, self.variables, self._held(examples, self._mesh),
-                                    key=0, metrics=chosen, mesh=self._mesh)
+        evaluation = Evaluation.run(self._scoring, self.variables, self._held(examples),
+                                    key=0, metrics=chosen, mesh=MeshSpec().build(jax.local_devices()[:1]))
         return {metric.name: evaluation.scores[f"val/{metric.name}"] for metric in chosen}
 
-    @property
-    def _mesh(self) -> "Mesh":
-        """The mesh the task's weights are placed on, or one local device for weights placed on none."""
-        from dew.training.distributed import MeshSpec
-
-        placed = mesh_of(self.variables)
-        return MeshSpec().build(jax.local_devices()[:1]) if placed is None else placed
-
-    def _held(self, examples: Iterable[Example | Mapping[str, object]], mesh: "Mesh") -> Reader:
+    def _held(self, examples: Iterable[Example | Mapping[str, object]]) -> Reader:
         """`examples` as a validation reader of this task's rows, laid out as
         its objective evaluates them. A batch is one pass within the budget, as
-        `batch` packs its rows, rounded to a multiple of the rows `mesh` splits a
-        batch over, so every batch divides; a short last batch is filled as a
-        run's validation fills it (`VALID_ROWS`)."""
+        `batch` packs its rows, on one device, as an answer is: a short last
+        batch need not divide."""
         from dew.data import Memory
         from dew.data.compile import validation
         from dew.decision.data import decisions
 
-        shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
         rows = max(1, min(self.budget.rows, self.budget.tokens // self.layout.max_len))
-        rows = -(-rows // shards) * shards
         rows_of = [{"example": row} if isinstance(row, Example) else row for row in examples]
         held = decisions(Memory(rows_of))
         return validation(held, batch=rows, objective=self._scoring.data(), read="memory")

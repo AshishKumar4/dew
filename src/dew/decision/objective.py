@@ -394,7 +394,7 @@ class PackedRows(pygrain.MapTransform):
         }
         if "readout" in element:
             # A question's answer cue moves with its row in the window, as its spans do.
-            laid["readout"] = element["readout"] + moved
+            laid["readout"] = element["readout"]
         if "slots" in element:
             laid["slots"] = element["slots"]
         if "context" in element:
