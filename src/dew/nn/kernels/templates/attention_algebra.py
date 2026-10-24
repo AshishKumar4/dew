@@ -577,7 +577,8 @@ def _masked(spec: Forward, s: jax.Array, coords: Coords, unseen: float) -> jax.A
 
 def seen(spec: Forward, coords: Coords, like: jax.Array) -> jax.Array | None:
     """Whether each query of a tile `like` `[bq, bk]` sees each key (`within`), every mainloop's one
-    predicate, forward and backward; None where each sees every key. A spans call's intervals and, with
+    predicate, forward and backward; None where each sees every key. A spans call's intervals (or runs,
+    `[bq, R]`, whose union it sees) and, with
     documents, ids (its mainloops give each tile its queries' intervals and both blocks' ids); a causal
     call's diagonal; and the call's keys, where a tile reaches past them: no walk visits a tile wholly past
     them, so a call whose keys are whole tiles reads no padding."""
@@ -585,7 +586,13 @@ def seen(spec: Forward, coords: Coords, like: jax.Array) -> jax.Array | None:
     if coords.spans is not None:
         start, end = coords.spans
         ids = None if coords.ids is None else (expand(coords.ids[0], like), across(coords.ids[1], like))
-        visible = within(coords.k_pos, expand(start, like), expand(end, like), ids)
+        if start.ndim == 2:
+            # Runs, `[bq, R]`: each query's intervals beside the tile's keys, `[bq, bk, R]`.
+            shape = (*like.shape, start.shape[-1])
+            visible = within(coords.k_pos, jax.lax.broadcast_in_dim(start, shape, (0, 2)),
+                             jax.lax.broadcast_in_dim(end, shape, (0, 2)), ids)
+        else:
+            visible = within(coords.k_pos, expand(start, like), expand(end, like), ids)
     elif spec.form == "causal":
         visible = coords.k_pos <= coords.q_pos
     if spec.form != "spans" and spec.keys % like.shape[1]:
