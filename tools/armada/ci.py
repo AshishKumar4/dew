@@ -245,12 +245,16 @@ def cache_key(common: str, name: str, depends: list[str]) -> str:
 
 def inputs(name: str, depends: list[str]) -> list[str]:
     """What test file `name`'s key covers, given that its run executed or read `depends`: those, and each
-    directory under src/ that holds a module it executed, however deep, whose entries name the modules an
-    import there finds: a module added beside one it imported (which shadows it, or which an import it
-    tried now finds), or an __init__.py added to a namespace package on the way to one, which executes
-    as the import passes, changes its key; one added to a package it never imported does not."""
-    packages = {str(parent) for path in depends if path.startswith("src/") and path.endswith(".py")
-                for parent in Path(path).parents if parent.parts[:1] == ("src",) and parent != Path("src")}
+    directory under src/ or tools/ that holds a module it executed, however deep, whose entries name the
+    modules an import there finds: a module added beside one it imported (which shadows it, or which an
+    import it tried now finds), or an __init__.py added to a namespace package on the way to one, which
+    executes as the import passes, changes its key; one added to a package it never imported does not.
+    tools/ itself is among them, as a test puts it, or a directory under it, on sys.path and imports a tool
+    by its name, which a package added there shadows; src/'s own entries every key covers (`shared`)."""
+    packages = {str(parent) for path in depends
+                if path.startswith(("src/", "tools/")) and path.endswith(".py")
+                for parent in Path(path).parents
+                if parent.parts[:1] in (("src",), ("tools",)) and parent != Path("src")}
     return sorted({name, *depends, *packages})
 
 
