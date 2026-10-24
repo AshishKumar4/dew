@@ -290,16 +290,22 @@ def _moved(places: jax.Array, by: int) -> jax.Array:
     runs on the places' distances from the dtype's least, unsigned, which hold any shift a window makes."""
     limits = jnp.iinfo(places.dtype)
     span = int(limits.max) - int(limits.min)
+    if by == 0:
+        return places
     if abs(by) > span:
         return jnp.full(places.shape, limits.min if by < 0 else limits.max, places.dtype)
     word = jnp.dtype(f"uint{8 * places.dtype.itemsize}")
-    flip = jnp.asarray(-int(limits.min), word)
+
+    def unsigned(value: int) -> jax.Array:
+        return jnp.asarray(value, word)
+
+    flip = unsigned(-int(limits.min))
     # A signed place's distance from the least is its two's complement word with the sign bit flipped.
     distance = jax.lax.bitcast_convert_type(places, word) ^ flip
     if by < 0:
-        moved = jnp.where(distance < -by, jnp.asarray(0, word), distance - jnp.asarray(-by, word))
+        moved = jnp.where(distance < unsigned(-by), unsigned(0), distance - unsigned(-by))
     else:
-        moved = jnp.where(distance > span - by, jnp.asarray(span, word), distance + jnp.asarray(by, word))
+        moved = jnp.where(distance > unsigned(span - by), unsigned(span), distance + unsigned(by))
     return jax.lax.bitcast_convert_type(moved ^ flip, places.dtype)
 
 
