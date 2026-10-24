@@ -105,6 +105,18 @@ def main():
                                                    attn_implementation="eager").cpu().eval()
     release = release_blocks()
     release["install_noncausal"](model)
+    probe = inputs(1, config.text_config.vocab_size)
+    ids = torch.from_numpy(probe["input_ids"])
+    altered = ids.clone()
+    altered[0, 1] = (altered[0, 1] - 6) % (config.text_config.vocab_size - 7) + 7
+    with torch.no_grad(), release["blocks"](None):
+        causal = model(input_ids=ids, use_cache=False).logits[0, 0]
+        causal_changed = model(input_ids=altered, use_cache=False).logits[0, 0]
+    with torch.no_grad(), release["blocks"](torch.from_numpy(probe["block_groups"])):
+        blocked = model(input_ids=ids, use_cache=False).logits[0, 0]
+        blocked_changed = model(input_ids=altered, use_cache=False).logits[0, 0]
+    if not torch.equal(causal, causal_changed) or torch.equal(blocked, blocked_changed):
+        raise RuntimeError("the reference did not isolate causal rows and admit their future block mate")
     weights = copy.deepcopy(model.state_dict())
     with oracle_precision():
         exact = AutoModelForImageTextToText.from_config(copy.deepcopy(config), dtype=torch.float64,
