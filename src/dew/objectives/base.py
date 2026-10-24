@@ -883,10 +883,12 @@ class Objective(ABC, Generic[Loss, Effects]):
         an objective never has to read its own held arrays inside a trace.
         The default is the starting tree, `variables`.
 
-        `init` returns the held tree's `FROZEN` collection unchanged, as the
-        base `init` does (it projects `params` alone): the trainer's state
-        then shares those very arrays, which no step donates, so a run and its
-        objective hold one frozen tree (`dew.training.state.apart`).
+        A leaf of the `FROZEN` collection that `init` returns as it is, by
+        reference, as the base `init` returns the whole collection (it projects
+        `params` alone), is shared: the trainer's state holds that very array,
+        which no step donates, so a run and its objective hold one frozen tree
+        (`dew.training.state.apart`). A frozen leaf `init` builds, another
+        array's copy or values of its own, is the state's own.
         """
         return self.variables
 
