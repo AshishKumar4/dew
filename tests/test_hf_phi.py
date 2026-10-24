@@ -46,7 +46,7 @@ YARN = {"rope_type": "yarn", "rope_theta": 10000.0, "partial_rotary_factor": 0.5
 """A YaRN entry over Phi's half rotary, which transformers ramps over `head_dim * partial_rotary_factor`
 (`_compute_yarn_parameters`): its rows of 32 tokens reach well past the 12 the ramp stretches from."""
 
-YARN_SEEDS = 8
+YARN_SEEDS = 64
 """The YaRN source's declared draws (check 1, `assert_as_exact`), sized by `seeds_for` on armada."""
 
 
