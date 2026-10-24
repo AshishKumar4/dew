@@ -35,7 +35,9 @@ from attention_oracle import (
     value_and_grads,
 )
 from reference_error import (
+    FEWEST_SEEDS,
     ORDERS,
+    assert_as_exact,
     assert_as_exact_as_the_reference,
     assert_as_exact_over_orders,
     assert_computes_the_oracle,
@@ -378,6 +380,45 @@ def test_splash_is_as_exact_as_the_reference_attention(case):
                 _, grads = run(*inputs, sinks)
                 measured.append(distance(grads[-1], truth[-1]))
         assert_as_exact_over_orders(*distances, f"{case} {ordered}")
+
+
+TPU_CASES = {name: ORACLE_CASES[name] for name in ("full", "causal", "grouped", "softcap", "sinks")}
+"""The oracle's cases whose check 1 runs on a TPU (`test_splash_is_on_par_on_a_tpu`)."""
+
+
+@on_tpu
+@pytest.mark.parametrize("case", TPU_CASES)
+def test_splash_is_on_par_on_a_tpu(case):
+    """Splash compiled by Mosaic on a TPU, fp32, its output and every gradient (the sinks' included),
+    held to check 1 over fresh draws against XLA's own fp32 attention at the precision a TPU runs it
+    (DEFAULT, as Splash's fp32 matmuls run), truth in float64 on the host. Interpreted on a CPU, a
+    kernel's dots are XLA:CPU's, not the kernel's: its dV is bit for bit XLA:CPU's `lax.dot` of the
+    weights transposed by the output cotangent, which XLA:CPU sums 2.6 times less exactly than the
+    reference's contraction of the same operands over their leading axes, so the CPU sites above hold
+    the function and this one the numerics."""
+    q_shape, kv_shape, structure = TPU_CASES[case]
+    structure = dict(structure)
+    sunk = structure.pop("sinks", False)
+    host = jax.devices("cpu")[0]
+
+    def draw(seed):
+        query, _, _ = qkv(q_shape, jnp.float32, seed=10 * seed)
+        _, key, value = qkv(kv_shape or q_shape, jnp.float32, seed=10 * seed + 1)
+        sinks = 2.0 + jax.random.normal(jax.random.PRNGKey(10 * seed + 2), (q_shape[2],), jnp.float32)
+        return query, key, value, sinks
+
+    def splash(query, key, value, sinks):
+        return value_and_grads('tpu', query, key, value, **({"sinks": sinks} if sunk else {}), **structure)
+
+    def reference(query, key, value, sinks):
+        return value_and_grads('reference', query, key, value, **({"sinks": sinks} if sunk else {}),
+                               precision=jax.lax.Precision.DEFAULT, **structure)
+
+    def truth(query, key, value, sinks):
+        with jax.default_device(host):
+            return exact_value_and_grads(query, key, value, **({"sinks": sinks} if sunk else {}), **structure)
+
+    assert_as_exact(splash, reference, draw, f"splash on a tpu, {case}", seeds=FEWEST_SEEDS, truth_fn=truth)
 
 
 @pytest.mark.mesh(devices=2)
