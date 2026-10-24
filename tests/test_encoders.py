@@ -30,16 +30,19 @@ def test_text_pooling_excludes_nonfinite_padding_from_values_and_gradients():
             np.testing.assert_array_equal(observed, expected)
 
 
-def test_a_shared_mask_counts_every_row_in_a_weighted_mean():
+@pytest.mark.parametrize("axis", [None, 0, 1])
+@pytest.mark.parametrize("weights", [[1.0, 0.0, 0.5], [[1.0, 0.0, 0.5]],
+                                     [[1.0], [0.0], [1.0], [0.5]]])
+def test_a_shared_mask_counts_every_row_in_a_weighted_mean(axis, weights):
     """A mask shared across the batch weighs as many rows as its explicit broadcast, including
     its denominator and the gradient of the pooled result."""
     from dew.rl.advantage import masked_mean as token_mean
 
     values = jnp.arange(12, dtype=jnp.float32).reshape(4, 3)
-    shared = jnp.asarray([[1.0, 0.0, 0.5]])
+    shared = jnp.asarray(weights)
     explicit = jnp.broadcast_to(shared, values.shape)
     values = jnp.where(explicit != 0, values, jnp.nan)
-    evaluate = jax.value_and_grad(token_mean)
+    evaluate = jax.value_and_grad(lambda x, mask: jnp.sum(token_mean(x, mask, axis=axis)))
     for observed, expected in zip(evaluate(values, shared), evaluate(values, explicit), strict=True):
         np.testing.assert_array_equal(observed, expected)
 
