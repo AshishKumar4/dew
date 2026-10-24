@@ -1162,18 +1162,19 @@ def _weighted_back(a, k, v, dw, du, hi, lo, beta, taken, call: _Call):
             gate, low = family.rows_of(hi_ref.at[h, span]), family.rows_of(lo_ref.at[h, span])
             beta = family.rows_of(beta_ref.at[h, span])
             names = ("inverse_t", "inverse_dx", "inverse_l", "keys_dl", "keys_dlt")
-            key_grads, value_grads, d_beta, (pairs, after) = algebra.weighted_gradient(
+
+            def stored(kind: str, index: int, grad) -> None:
+                # In the operands' dtype, as fla's prepare_wy_repr_bwd writes them, each as it comes.
+                ref, columns = (dk_ref, width) if kind == "keys" else (dv_ref, value_width)
+                held.store(ref, grad, row, CHUNK, h * columns + index * BLOCK, BLOCK)
+
+            _, _, d_beta, (pairs, after) = algebra.weighted_gradient(
                 _tile(slots, "lower", held), functools.partial(column, "keys", given), width // BLOCK,
                 functools.partial(column, "values", given), value_width // BLOCK,
                 functools.partial(column, "w_grads", held), functools.partial(column, "u_grads", held), beta,
                 gate, low, held.dtype, _Issuer(call, dict.fromkeys(names, staged)),
                 laid=(family.columns_of(column_hi_ref.at[h, span]),
-                      family.columns_of(column_lo_ref.at[h, span])))
-            # In the operands' dtype, as fla's prepare_wy_repr_bwd writes them.
-            for i, grad in enumerate(key_grads):
-                held.store(dk_ref, grad, row, CHUNK, h * width + i * BLOCK, BLOCK)
-            for j, grad in enumerate(value_grads):
-                held.store(dv_ref, grad, row, CHUNK, h * value_width + j * BLOCK, BLOCK)
+                      family.columns_of(column_lo_ref.at[h, span])), emit=stored)
             summed = _summed(tuple(summing), call)
             decay_ref.at[h, span][...] = algebra.summed_back(pairs, after, issue=summed)
             dbeta_ref.at[h, span][...] = d_beta

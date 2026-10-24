@@ -762,14 +762,25 @@ def query_key_gradients(queries: TileLoad, keys: TileLoad, columns: int, values:
 
 
 def weighted_gradient(lower, keys: TileLoad, columns: int, values: TileLoad, blocks: int, w_grads: TileLoad,
-                      u_grads: TileLoad, beta, gate, low, dtype, issue: Issue, *, laid: tuple | None = None):
+                      u_grads: TileLoad, beta, gate, low, dtype, issue: Issue, *, laid: tuple | None = None,
+                      emit: Callable[[str, int, jax.Array], None] | None = None):
     """The WY representation's backward (fla's prepare_wy_repr_bwd) under a decay a head: with the inverse
     `X = I + lower` (`lower` its strictly lower part, a tile), `w = X (k beta exp2(g))` and `u = X (v beta)`,
     the keys', values', write gate's and decay's gradients from `w`'s and `u`'s, `w_grads(c)` and
     `u_grads(j)`: `dX = dw (k beta exp2 g)^T + du (v beta)^T`, `dL = -X^T tril(dX, -1) X^T` gated by
     `exp2(g_s - g_t)` ('inverse_t', 'inverse_dx', 'inverse_l'), then the keys' gradient through the system
     ('keys_dl'). Returns each key block's `dk`, each value block's `dv`, beta's gradient and the decay's terms
-    `(pairs, after)`, fp32."""
+    `(pairs, after)`, fp32; each `dk` and `dv` given to `emit('keys', c, dk)`, `emit('values', j, dv)` as it
+    is computed instead where `emit` is (a mainloop's store, so no gradient stays live past it, and none is
+    returned). The keys' gradient through `w` is `X^T dw` again where it is used, not held across."""
+    found: dict = {"keys": [], "values": []}
+
+    def given(kind: str, index: int, grad) -> None:
+        if emit is None:
+            found[kind].append(grad)
+        else:
+            emit(kind, index, grad)
+
     def transposed_inverse(m):
         """`X^T m`, the diagonal outside the product."""
         return m + issue("inverse_t", lower.T, m.astype(dtype))
@@ -780,23 +791,21 @@ def weighted_gradient(lower, keys: TileLoad, columns: int, values: TileLoad, blo
         return term if total is None else total + term
 
     decay = raised(gate, low)
-    d_x, d_gate, d_betas, through_w = None, None, [], []
+    d_x, d_gate, d_betas = None, None, []
     for c in range(columns):
         key = keys(c).value().astype(jnp.float32)
         scaled = key * (beta * decay)[:, None]
         w_grad = w_grads(c)
         d_scaled = transposed_inverse(w_grad.value().astype(jnp.float32))
-        through_w.append(d_scaled)
         d_x = added(d_x, issue("inverse_dx", w_grad, Transposed(scaled.astype(dtype))))
         d_betas.append(jnp.sum(d_scaled * key * decay[:, None], axis=1))
         d_gate = added(d_gate, jnp.sum(d_scaled * scaled, axis=1))
-    value_grads = []
     for j in range(blocks):
         value = values(j).value().astype(jnp.float32)
         scaled = (value * beta[:, None]).astype(dtype)
         u_grad = u_grads(j)
         d_scaled = transposed_inverse(u_grad.value().astype(jnp.float32))
-        value_grads.append(d_scaled * beta[:, None])
+        given("values", j, d_scaled * beta[:, None])
         d_x = added(d_x, issue("inverse_dx", u_grad, Transposed(scaled)))
         d_betas.append(jnp.sum(d_scaled * value, axis=1))
     rows, cols = _grid(d_x.shape)
@@ -807,17 +816,18 @@ def weighted_gradient(lower, keys: TileLoad, columns: int, values: TileLoad, blo
     column_gate, column_low = (gate, low) if laid is None else laid
     d_l = jnp.where(strict, -d_x * decayed(gate, low, column_gate, column_low), 0.0).astype(dtype)
     weighted_l = (d_l.astype(jnp.float32) * beta[:, None]).astype(dtype)
-    products, key_grads = None, []
+    products = None
     for c in range(columns):
         key = keys(c)
         products = added(products, issue("keys_dl", key, key.T))
         d_key = issue("keys_dl", d_l, key)
+        through_w = transposed_inverse(w_grads(c).value().astype(jnp.float32))
         # `dL^T (k beta)` as `(beta dL)^T k`: one operand in registers, the keys a tile.
-        key_grads.append(through_w[c] * (decay * beta)[:, None] + d_key * beta[:, None]
-                         + issue("keys_dlt", Transposed(weighted_l), key))
+        given("keys", c, through_w * (decay * beta)[:, None] + d_key * beta[:, None]
+              + issue("keys_dlt", Transposed(weighted_l), key))
         d_betas.append(jnp.sum(d_key * key.value().astype(jnp.float32), axis=1))
     pairs = d_l.astype(jnp.float32) * (products * beta[:, None])
-    return key_grads, value_grads, _summed(d_betas), (pairs, d_gate)
+    return found["keys"], found["values"], _summed(d_betas), (pairs, d_gate)
 
 
 def _summed(terms) -> jax.Array:
