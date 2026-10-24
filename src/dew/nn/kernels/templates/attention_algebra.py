@@ -1101,19 +1101,22 @@ def scored(score_mod, logits, q_pos, k_pos, params, *, slopes: bool):
                                                   for index in range(len(params))))
 
 
-def pulled(cotangents, slopes, seen, kinds: tuple[Kind, ...]):
+def pulled(cotangents, slopes, seen, kinds: tuple[Kind, ...],
+           column_sums: Callable[[jax.Array], jax.Array] | None = None):
     """The score cotangents `cotangents` through `score_mod`, its entries' derivatives `slopes`
     (`scored`; None without a hook): the logits' tile, and each parameter's, a head's or a query's its
-    queries' sums `[block_q]`, a key's its keys' `[block_k]`, a tile's the tile. Each entry is masked
-    before any sum, so one the call never sees (padding, another document) adds nothing even where the
-    hook's derivative there is not finite. fp32."""
+    queries' sums `[block_q]`, a key's its keys' `[block_k]` (`column_sums`, the mainloop's sum over a
+    tile's rows where it takes one: `Family.column_sums`), a tile's the tile. Each entry is masked before
+    any sum, so one the call never sees (padding, another document) adds nothing even where the hook's
+    derivative there is not finite. fp32."""
     if slopes is None:
         return cotangents, ()
     logits = where_seen(seen, cotangents * slopes[0], 0.0)
     pieces = []
     for slope, kind in zip(slopes[1:], kinds, strict=True):
         entries = where_seen(seen, cotangents * slope, 0.0)
-        pieces.append(entries.sum(axis=0) if kind == Kind.KEY else entries if kind == Kind.TILE
+        key_sums = (lambda x: x.sum(axis=0)) if column_sums is None else column_sums
+        pieces.append(key_sums(entries) if kind == Kind.KEY else entries if kind == Kind.TILE
                       else entries.sum(axis=-1))
     return logits, tuple(pieces)
 

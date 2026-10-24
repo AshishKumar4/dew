@@ -822,14 +822,15 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, s
 
 
 def _dkv_step(walk: _Backward, resident: tuple, rows_of, buffers, coords_of, params_of, whole, add_dq,
-              store_tiles, index, slots, carry, accumulators):
+              store_tiles, sums_scratch, index, slots, carry, accumulators):
     """A dK/dV consumer's query tile `index`: its scores and score cotangents from the query and output
     cotangent slots (`slots`) and its resident keys and values (`resident`) under the tile's rows' statistics
     (`rows_of(first query)`), its coordinates (`coords_of(first query)`), its hook parameters
     (`params_of(first query, like)`) and whether it sees the keys whole (`whole(index)`). dV's and dK's
     products are issued into `accumulators` in place, each part staged in `buffers` as its transposed
     product's left operand; the key gradients' column sums (`carry`) take the pulled cotangents' key
-    sums, and the tile gradients go to `store_tiles(first query, pieces)`."""
+    sums (`Family.column_sums` through the consumer's `sums_scratch`), and the tile gradients go to
+    `store_tiles(first query, pieces)`."""
     k_smem, v_smem = resident
     family, tiles, kinds = walk.program.family, walk.program.tiles, walk.kinds
     shape = (tiles.block_q, tiles.block_k)
@@ -846,7 +847,8 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, buffers, coords_of, par
         # pieces are taken where the mask is read (`algebra.pulled`).
         exponentials, weights, cotangents, slopes, seen = _scores(
             walk, coords_of(q_first), masked, params, s, dp, peak, denominator, centre, rest, chosen)
-        logits, pieces = algebra.pulled(cotangents, slopes, seen, kinds)
+        column_sums = functools.partial(family.column_sums, scratch=sums_scratch, interpret=walk.interpret)
+        logits, pieces = algebra.pulled(cotangents, slopes, seen, kinds, column_sums)
         return exponentials, weights, logits, pieces
 
     # The tiles a query block sees whole unmasked, the rest masked, chosen a tile at a time in one walk
@@ -899,7 +901,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
         dq_ref, refs = (refs[0], refs[1:]) if walk.fused else (None, refs)
         dk_ref, dv_ref, *refs = refs
         grad_refs, refs = refs[:len(graded)], refs[len(graded):]
-        k_smem, v_smem, staged, out_smem, k_loaded, v_loaded = refs
+        k_smem, v_smem, staged, out_smem, sums_smem, k_loaded, v_loaded = refs
         key_refs = [ref for ref, kind in zip(grad_refs, graded, strict=True) if kind == Kind.KEY]
         tile_refs = [ref for ref, kind in zip(grad_refs, graded, strict=True) if kind == Kind.TILE]
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
@@ -940,7 +942,8 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
             params_of = functools.partial(_score_params, family, score_refs, kinds, row, head,
                                           k_first=k_first)
             step = functools.partial(_dkv_step, walk, (k_smem.at[index], v_smem.at[index]), rows_of,
-                                     staged.at[index], coords_of, params_of, whole, adds, store_tiles)
+                                     staged.at[index], coords_of, params_of, whole, adds, store_tiles,
+                                     sums_smem.at[index])
             key_sums, (dk, dv) = family.walk(streams, ((step, lo, hi),),
                                              tuple(family.column_zeros(block_k) for _ in key_refs),
                                              ((block_k, width), (block_k, value_width)), walk.interpret,
@@ -983,6 +986,8 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
             plgpu.SMEM((consumers, 4 if walk.accurate else 2, block_q, block_k), query.dtype),
             # dK's and dV's output stage, and each tile's dQ's (`fused`).
             plgpu.SMEM((consumers, max(block_q, block_k), width), jnp.float32),
+            # Each consumer's scratch for the key gradients' sums across its warps (`Family.column_sums`).
+            plgpu.SMEM((consumers, family.column_scratch), jnp.float32),
             plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_barriers=consumers),
             streams=family.streams(blocks, stages, consumers))
 
