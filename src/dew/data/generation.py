@@ -15,7 +15,8 @@ from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
 
-from dew.data.dataset import Batch, Records
+from dew.batch import Batch
+from dew.data.dataset import Records
 from dew.data.pipeline import Record, Rejected
 from dew.data.plan import array_digest
 from dew.data.retention import LocalRetention

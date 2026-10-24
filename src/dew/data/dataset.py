@@ -35,7 +35,6 @@ import tyro
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew import position
-
 from dew.batch import VALID_ROWS, Batch, padded_rows
 from dew.mesh import LayoutRefused, batch_axes
 

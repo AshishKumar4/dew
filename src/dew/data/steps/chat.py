@@ -10,8 +10,8 @@ from typing import Literal
 import grain.python as grain
 import numpy as np
 
+from dew.batch import Batch
 from dew.data.chat import ROLES_KEY, Role
-from dew.data.dataset import Batch
 from dew.data.facts import shaped, unshaped
 from dew.data.pipeline import Rejected
 from dew.data.prompts import (

@@ -11,7 +11,7 @@ from flax.training.dynamic_scale import DynamicScale
 
 from dew.batch import Batch, Variables, merge
 
-__all__ = ["CHECKPOINTED", "MODEL_STATE", "Accumulation", "TrainState", "Variables"]
+__all__ = ["CHECKPOINTED", "MODEL_STATE", "Accumulation", "TrainState"]
 
 
 @struct.dataclass

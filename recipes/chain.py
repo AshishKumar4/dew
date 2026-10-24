@@ -26,12 +26,12 @@ import jax
 import optax
 from flax import linen as nn
 
+from dew.batch import Variables
 from dew.data.chat import Role
 from dew.data.pipeline import Dataset
 from dew.data.text import tokenizer_for
 from dew.objectives import DistillationObjective
 from dew.objectives.base import OMITTED, Objective, Omitted, Source
-from dew.batch import Variables
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import (
     DPOObjective,

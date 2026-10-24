@@ -36,8 +36,8 @@ def layouts(tensor: int):
     parameter axes and the memory kind is the only thing the two layouts
     disagree about.
     """
+    from dew.mesh import DEFAULT_RULES
     from dew.training import Layout
-    from dew.training.distributed import DEFAULT_RULES
 
     rules = (
         DEFAULT_RULES

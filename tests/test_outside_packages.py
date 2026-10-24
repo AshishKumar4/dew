@@ -114,8 +114,9 @@ from flax import struct
 
 from dew.config import Prepared, RunConfig, TrainerConfig
 from dew.data import Loading, Memory
+from dew.mesh import DEFAULT_RULES
 from dew.objectives.base import Objective, mean_of_totals, merge_totals
-from dew.training import DEFAULT_RULES, Layout, MeshSpec
+from dew.training import Layout, MeshSpec
 
 
 @struct.dataclass

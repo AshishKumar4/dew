@@ -8,7 +8,7 @@ only when a `WandbTracker` logs.
 from dew.checkpoints import Checkpoints, Keep
 from dew.objectives.base import Aux, EMASpec, Metric, Objective, Step, everything, under
 
-from .distributed import DEFAULT_RULES, Layout, MeshSpec
+from .distributed import Layout, MeshSpec
 from .evaluation import EvalSuite, Evaluation
 from .observe import Observe
 from .profiling import ProfileWindow
@@ -19,7 +19,7 @@ from .tracker import LocalTracker, MLflowTracker, TensorBoardTracker, Tracker, T
 from .trainer import Plateau, Rollout, Trainer
 from .transaction import ema_update
 
-__all__ = ["DEFAULT_RULES", "Aux", "Best", "Checkpoints", "EMASpec", "EvalSuite", "Evaluation", "Keep",
+__all__ = ["Aux", "Best", "Checkpoints", "EMASpec", "EvalSuite", "Evaluation", "Keep",
            "Layout", "LocalTracker", "MLflowTracker", "MeshSpec", "Metric", "Objective", "Observe", "Plateau",
            "Preempted", "ProfileWindow", "Rollout", "Step", "TensorBoardTracker",
            "Tracker", "Trackers", "TrainState", "Trainer", "WandbTracker", "ema_update", "everything",

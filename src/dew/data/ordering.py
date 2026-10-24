@@ -9,7 +9,8 @@ import grain.experimental as gx
 import grain.python as grain
 import numpy as np
 
-from dew.data.dataset import Batch, Ranges
+from dew.batch import Batch
+from dew.data.dataset import Ranges
 
 
 class BlockShuffle(grain.MapDataset[Batch]):

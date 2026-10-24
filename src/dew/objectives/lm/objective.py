@@ -1109,9 +1109,8 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
                      ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             policy, prompt, max_new_tokens = prepared
             tokens = np.asarray(policy(prompt, max_new_tokens, key=step.key).host().tokens)
-            given = prompt.token_fields.get("attention_mask")
             ids = np.asarray(prompt.tokens)
-            asked = np.ones(ids.shape, bool) if given is None else np.asarray(given, bool)
+            asked = real_slots(prompt.token_fields, ids.shape, xp=np)
             # The prompt's padding is no text; every drawn column is shown, as it was drawn.
             drawn = np.ones((ids.shape[0], tokens.shape[1] - ids.shape[1]), bool)
             return tokens, np.concatenate([asked, drawn], axis=1), ids[0][asked[0]]

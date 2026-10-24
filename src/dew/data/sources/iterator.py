@@ -9,7 +9,8 @@ from dataclasses import dataclass, field
 import grain.python as grain
 import numpy as np
 
-from dew.data.dataset import Batch, Closeable, Records, Replayed, Stoppable
+from dew.batch import Batch
+from dew.data.dataset import Closeable, Records, Replayed, Stoppable
 from dew.data.pipeline import Dataset
 
 from .base import Read, Shard, ShardManifest, unnamed

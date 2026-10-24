@@ -22,7 +22,7 @@ from dew.data.facts import shaped, unshaped
 from dew.records import record
 
 if TYPE_CHECKING:
-    from dew.data.dataset import Batch
+    from dew.batch import Batch
 
 IDS_KEY = "input_ids"
 """Batch key holding the `[B, 2, S]` pair ids, chosen at index 0."""

@@ -32,7 +32,7 @@ from jax.experimental import checkify
 from jax.typing import ArrayLike
 from typing_extensions import TypeVar
 
-from dew.batch import Variables, real_slots, token_positions, valid_order, with_validity
+from dew.batch import Variables, real_slots, token_positions, token_validity, valid_order, with_validity
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, PredictionPhase, Request, local_rows, mesh_of, next_position
 from dew.nn.kernels.options import compiler_options
@@ -642,7 +642,7 @@ def check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray
         raise ValueError("max_new_tokens must be a non-negative integer")
     if type(n) is not int or n < 1:
         raise ValueError("n must be a positive integer number of continuations")
-    mask = fields.get("attention_mask")
+    mask = token_validity(fields)
     if mask is not None and (mask.shape != ids.shape or not np.all((mask == 0) | (mask == 1))):
         raise ValueError("attention_mask must be binary [B, P] aligned with token ids")
     valid = real_slots(fields, ids.shape, xp=np)

@@ -10,7 +10,8 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 
-from dew.data.dataset import Batch, Records
+from dew.batch import Batch
+from dew.data.dataset import Records
 from dew.data.pipeline import Dataset
 
 from .base import Read, ShardManifest, _indexed_manifest

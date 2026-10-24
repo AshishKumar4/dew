@@ -24,7 +24,8 @@ from typing import Literal, TypeGuard, Union
 
 import numpy as np
 
-from dew.data.dataset import Batch, Loading
+from dew.batch import Batch
+from dew.data.dataset import Loading
 from dew.data.pipeline import Dataset, Mixture, Phases, Piped, Pipeline, Stage
 from dew.data.sources.base import READS, Read, Source
 from dew.records import JSON, integer, json_value, numbers, record

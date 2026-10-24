@@ -9,7 +9,8 @@ from functools import cached_property
 
 import numpy as np
 
-from dew.data.dataset import Batch, Ranges, Records
+from dew.batch import Batch
+from dew.data.dataset import Ranges, Records
 from dew.data.pipeline import Dataset
 from dew.data.storage import Store, local
 
