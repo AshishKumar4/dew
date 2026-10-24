@@ -314,7 +314,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_decoders.py": {
-   "comparisons": 21,
+   "comparisons": 20,
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_lifecycle.py": {
