@@ -44,7 +44,7 @@ Correctness, contract gaps and duplicated paths come first. After those close, m
 - Hold the Triton grouped GEMM's gradient to XLA's error under the fp32-master tile gate. [863]
 - Block-causal visibility on the attention kinds that opt in: a token reads its own block both ways, in the template's span form so the fused kernels run it, with image groups on the same rule. [1495]
 - Let a recurrence document start from a given memory, so a prefix read once continues into several blocks, in training and in serving's prefix reuse. [1506]
-- Fix the H100 causal attention crash, and give deterministic mode a single-kernel ticket-ordered attention backward. [1559, 1566]
+- Give deterministic mode a single-kernel, ticket-ordered attention backward. [1566]
 - Switch each TPU route to its template where the template passes the gate and wins, measured natively on v5e and v6e. [1560]
 - Make the live kernel's preparation smoke deterministic about the contexts a closed page leaves open. [843]
 - Update a live notebook's displays across its cells, as Jupyter does, once a notebook runs live. [846]
@@ -107,8 +107,6 @@ The kernel direction (owner, 2026-10-21; [design](design/kernel-templates.md)): 
 - Add presets for prompts, preferences and chat canvases, which the run layer's recipes cover today. [810]
 - Teach only names main has in the post-training and inference docs. [815]
 - Build the data design's remaining contracts: uniform stage errors; a pre-read refusal of a missing artifact; slot maxima shared with `fit`'s separately compiled validation chains; per-member committed-token logging; RL prompt tail cuts counted as truncations; volatility read on every stage kind; and the reader's cache report. [design/data.md]
-- Restore the chain verbs limit, iterate, slice, token_split and rebatch, with the data design updated. [1562]
-- Autotune a pipeline's workers, prefetch and read mode, and explain a chain's lowered plan. [1563]
 
 ## Training and parallelism
 
@@ -140,7 +138,6 @@ The kernel direction (owner, 2026-10-21; [design](design/kernel-templates.md)): 
 - Start every run config from a source streamed onto the trainer's mesh, with the frozen base held once on device. [1500]
 - Train hybrids sequence-parallel with padded rows across hosts, and keep Mamba-2's scan under remat. [1438, 1507]
 - Record every component through the registry's records, earlier saved runs loading through one translation per component until 1.0. [1412]
-- Bring dew.batch and dew.mesh onto main or drop them with the reason. [1556]
 - Find what changed Qwen3.5-4B's peak memory between pins. [1555]
 
 ## RL and serving
@@ -188,7 +185,7 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Show a notebook run with prepared data, checkpoints and cache on persistent mounted storage. [233]
 - Re-record the landing example on a matched host within the existing visible training budget. [590]
 - Publish dewml and CUDA kernel wheels through the configured release workflow after qualification, then update installation examples and the site. [335]
-- Make tutorial 11 a real coding agent, add a Terminal-Bench tutorial and the tutorial batteries, and rerun the tutorials whose metric names changed. [1565]
+- Make tutorial 11 a real coding agent, add a Terminal-Bench tutorial, build the tutorials on Dew's primitives instead of hand-rolled code, and rerun them once everything affecting them is final. [1565]
 
 ## CI and tooling
 
@@ -205,8 +202,8 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Delete Dew's remaining deprecated paths, with no compatibility path: the legacy `.bin` token store and the Processor re-exports that only rename its home. [1288, 1291]
 - Give each concept written several ways one owner: array fingerprints, categorical draws, weighted reductions, the at-least-float32 rule, RMS statistics, softcap, embedding gradients, adapter eligibility and checkpoint shape checks. [1467–1492]
 - Move every caller that bypasses a general path onto it: run-length guards, JEPA's momentum and LoRA, decision scoring's mesh, DiffusionGemma's streaming, shapes-only loads, frozen FP8 leaves, multimodal dtypes, dropout's route, private accuracy verdicts, benchmark state and intercepted-call detection. [1512–1525, 1532]
-- Add a layering gate and a per-train report of new public symbols, and have the queue enforce file ownership. [1557, 1558]
-- Report GPU idle hours and dollars by cause, and train on GH200 with aarch64 wheels and its device facts. [1564, 1554]
+- Land the layering gate: import contracts between Dew's layers, with `dew.batch` and `dew.mesh` as its first step. Have the queue refuse a head that edits another lane's files without its sign-off. [1557, 1558]
+- Train on GH200 with aarch64 wheels and its device facts. [1554]
 - Derive executable training and generation qualification from the registries. Cover codec combinations with fusion, scan and pipeline stages. [176, 178]
 - Compare cached and full forwards on logits and likelihoods. [179]
 - Build registry-backed uninterrupted/resumed flows and extend them to compiled-program reuse. [182, 183]
