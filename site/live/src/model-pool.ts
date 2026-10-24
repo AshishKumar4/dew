@@ -82,6 +82,14 @@ export class ModelPool extends DurableObject<Env> {
 			? pool.serving! : null;
 	}
 
+	/** The host a session already holds and its image, or null: a reconnect keeps its slot whatever the pool's
+	 * free capacity (`image`, `allocate`). */
+	async allocated(session: string): Promise<{ host: string; image: string } | null> {
+		const pool = await this.state();
+		const host = pool.hosts.find((candidate) => candidate.id === pool.sessions[session]);
+		return host ? { host: host.id, image: host.generation.snapshot.id } : null;
+	}
+
 	async allocate(session: string, image: string): Promise<string> {
 		const id = await this.ctx.storage.transaction(async (storage) => {
 			const pool = (await storage.get<Pool>('pool'))!;

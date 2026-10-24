@@ -21,7 +21,7 @@ from __future__ import annotations
 import dataclasses
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import jax
 
@@ -61,6 +61,8 @@ class JointShape:
 @dataclasses.dataclass(frozen=True)
 class DecisionRunConfig(RunConfig):
     """A run, plus the decision objective's own knobs."""
+
+    RESUMABLE: ClassVar[tuple[str, ...]] = (*RunConfig.RESUMABLE, "calibrate")
 
     objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("decision"))
     """The decision objective and its arguments: its scoring rule (`loss`),

@@ -306,6 +306,34 @@ A persistent checkpoint can restore into a different, compatible placement throu
 
 Local checkpoints hold only the shards each process had, so they restore onto the placement they were written with. See [Training data](../concepts/data.md) for how datasets save their position.
 
+## Evaluating a run as it trains
+
+A process beside the one that trains, such as an evaluation worker on another GPU, reads the run's checkpoints as they commit. `Checkpoints.committed()` lists the committed steps at each call, reading the store without opening it or writing to it, so a save still in flight is listed only once it commits. `kept()` is the training process's own view, its retained steps and their metadata. The worker opens the run's directory, evaluates each step it has not seen, and waits for the next:
+
+<!-- not run: a worker's loop over a run another process trains; its directory, template and evaluation are the run's -->
+```python
+import time
+
+from dew.checkpoints import Checkpoints
+
+checkpoints = Checkpoints(run_directory)
+seen = set()
+while True:
+    # Read before listing, so the last listing holds the final checkpoint the run committed.
+    done = finished(run_directory)
+    for step in checkpoints.committed():
+        if step in seen:
+            continue
+        state, _ = checkpoints.restore(template, step=step)
+        report(step, evaluate(state))
+        seen.add(step)
+    if done:
+        break
+    time.sleep(60)
+```
+
+A committed step can still be removed by the run's retention (`keep`) before the worker reads it. A worker that must read every step gives the run a retention that keeps them, such as `Keep(every=...)` at the evaluation cadence.
+
 ## Reading a checkpoint with Orbax alone
 
 A step directory is an ordinary Orbax checkpoint of one PyTree item, so Orbax opens it without Dew:

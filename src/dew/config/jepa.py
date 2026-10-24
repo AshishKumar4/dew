@@ -9,12 +9,12 @@ encoder beside the validation loss.
 from __future__ import annotations
 
 import dataclasses
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
 
 from dew.config import JsonDict, ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig, media_field
-from dew.data.dataset import Loader
 from dew.data.pipeline import ObjectiveData
 from dew.inputs import Field
 from dew.objectives.jepa.masking import MultiBlockMask
@@ -29,6 +29,8 @@ SHARED_MODEL_KEYS = ("emb_features", "num_heads", "mlp_ratio", "ssm_attention_ra
 @dataclasses.dataclass(frozen=True)
 class JepaRunConfig(RunConfig):
     """A run, plus the JEPA objective's own knobs."""
+
+    RESUMABLE: ClassVar[tuple[str, ...]] = (*RunConfig.RESUMABLE, "probe_classes", "knn_k")
 
     objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("jepa"))
     """The JEPA objective and its arguments (`--objective.momentum 0.996 1.0`).
@@ -64,7 +66,8 @@ class JepaRunConfig(RunConfig):
         if video != (models[self.model.name] is models["jepa_video_encoder"]):
             raise ValueError("a video dataset and --model jepa_video_encoder go together")
         encoder = self.model.build()
-        grid = (sample.shape[-2] // encoder.patch_size,) * 2
+        # A frame is [height, width, channels], an image's or each of a clip's.
+        grid = (sample.shape[-3] // encoder.patch_size, sample.shape[-2] // encoder.patch_size)
         fields = self.model.fields
         predictor = ModelConfig("jepa_predictor", {
             **{key: value for key, value in fields.items() if key in SHARED_MODEL_KEYS}, **self.predictor,
@@ -72,7 +75,13 @@ class JepaRunConfig(RunConfig):
             **{key: fields[key] for key in ("dtype", "attention_impl") if key in fields}}).build()
         mask = MultiBlockMask.for_grid(grid, num_targets=self.num_target_blocks, scale=self.target_scale,
                                        aspect=self.target_aspect, scan_order=encoder.scan_order)
-        ramp = {} if "momentum_steps" in self.objective.fields else {"momentum_steps": self.updates(dataset)}
+        ramp = {}
+        if "momentum_steps" not in self.objective.fields:
+            updates = self.trainer.total_updates(dataset)
+            if updates is None:
+                raise ValueError("a run bounded by tokens alone counts no updates ahead for the target "
+                                 "encoder's momentum to ramp over; set --objective.momentum_steps")
+            ramp = {"momentum_steps": updates}
         adapted = {}
         if self.lora is not None:
             # A fresh encoder's draw from the run's key, frozen under the factors that train.
@@ -87,17 +96,6 @@ class JepaRunConfig(RunConfig):
             LinearProbe(self.probe_classes), KnnProbe(self.probe_classes, k=self.knn_k))
         return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=probes,
                                                       validation=held))
-
-    def updates(self, dataset: Loader) -> int:
-        """The optimizer updates the run takes over `dataset`, as `train` resolves its length
-        (`TrainerConfig.resolved`), over which the target encoder's momentum ramps: the EMA moves
-        once an update. A run bounded by tokens alone counts none ahead, so it names its own
-        `momentum_steps`."""
-        trainer, _, steps = self.trainer.resolved(dataset)
-        if steps is None:
-            raise ValueError("a run bounded by tokens alone counts no updates ahead for the target encoder's "
-                             "momentum to ramp over; set --objective.momentum_steps")
-        return steps // trainer.accumulation
 
 
 __all__ = ["JepaRunConfig"]

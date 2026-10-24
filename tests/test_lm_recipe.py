@@ -141,6 +141,18 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
     np.testing.assert_allclose(actual.behavior_log_probs, expected.behavior_log_probs, atol=1e-7, rtol=1e-7)
 
 
+def test_a_token_budget_alone_trains_over_data_with_no_epoch_length(tmp_path):
+    """Packing a streamed read online leaves a run no epoch to count, and a run whose length is its
+    tokens alone needs none: it trains until its targets reach the budget."""
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    config = run_config(tokens, "--trainer.tokens", str(2 * 8 * SEQ), "--trainer.name", "budget",
+                        "--trainer.eval-every", "None", "--trainer.checkpoint-every", "None",
+                        pack="first-fit", bins=2)
+    config = dataclasses.replace(config, data=config.chain().read("streamed"))
+    assert compile(config.chain()).steps_per_epoch is None
+    assert int(config.run().step) >= 2
+
+
 def test_the_recipe_trains_on_weighted_corpora(tmp_path):
     """Two token stores, each packed by itself and mixed by their tokens 0.7 to 0.3, train one run:
     the vocabulary comes from the stores' shared meta.json, and run.json records the mixture's chain
@@ -296,6 +308,38 @@ def test_a_pretrained_runs_record_trains_again(tmp_path, lora):
     assert any(not np.array_equal(np.asarray(before), np.asarray(again))
                for before, again in zip(jax.tree.leaves(state.variables["params"]),
                                          jax.tree.leaves(after), strict=True))
+
+
+def test_a_run_resumed_under_its_name_trains_the_model_it_recorded(tmp_path):
+    """A run with checkpoints resumes under its name only as the model and objective it recorded: a
+    rope base that keeps every shape, or a quantized forward pass, is refused before the record is
+    replaced or a weight restored, and the run as recorded trains on."""
+    from dew.checkpoints import Checkpoints
+
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    model = {"emb_features": 16, "num_layers": 1, "num_heads": 2}
+    run_config(tokens, "--trainer.steps", "1", "--trainer.name", "kept", model=json.dumps(model)).run()
+    run = tmp_path / "runs" / "kept"
+    recorded = (run / "run.json").read_bytes()
+
+    from dew.quantization import Quantization
+
+    rotated = run_config(tokens, "--trainer.steps", "2", "--trainer.name", "kept",
+                         model=json.dumps({**model, "rope_theta": 500.0}))
+    same = run_config(tokens, "--trainer.steps", "2", "--trainer.name", "kept", model=json.dumps(model))
+    quantized = dataclasses.replace(same, trainer=dataclasses.replace(same.trainer,
+                                                                      quantization=Quantization()))
+    for other in (rotated, quantized):
+        with pytest.raises(ValueError):
+            other.run()
+        assert (run / "run.json").read_bytes() == recorded
+        assert Checkpoints(str(run)).latest == 1
+
+    # The record may name its class by its import path, as the registry reads it too.
+    record = json.loads((run / "run.json").read_text())
+    (run / "run.json").write_text(json.dumps({**record, "class": "dew.config.lm:LMRunConfig"}))
+    run_config(tokens, "--trainer.steps", "2", "--trainer.name", "kept", model=json.dumps(model)).run()
+    assert Checkpoints(str(run)).latest == 2
 
 
 def test_fresh_processes_train_a_runs_record_and_export_it(tmp_path):
