@@ -41,6 +41,7 @@ from jax.extend import core as jax_core
 
 from dew.nn.kernels import generation, grouped_matmul
 from dew.nn.kernels.templates.product import declared
+from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import seen_whole
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
@@ -111,7 +112,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
         # The accumulator's cotangent meets the forward's rounded operands as the portable program's
         # derivative has it: in `lhs`'s dtype where that holds it exactly (a cotangent no wider, passed
         # through), wide otherwise, each product rounding once.
-        work = compute if narrow else jnp.promote_types(d_acc.dtype, jnp.float32)
+        work = compute if narrow else at_least_fp32(d_acc.dtype)
         d_product = d_acc.astype(work)
         matrix = rhs.astype(compute)
         # The cotangent of the operand the forward multiplied, `prologue(lhs)` rounded to `lhs`'s dtype.
@@ -167,7 +168,7 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
         if prologue is not None:
             lhs = prologue(lhs, *prologue_arrays).astype(lhs.dtype)
         lhs = jnp.where(routed[:, None], lhs, 0)
-        wide = jnp.promote_types(lhs.dtype, jnp.float32)  # an fp64 product's sum in fp64
+        wide = at_least_fp32(lhs.dtype)  # an fp64 product's sum in fp64
         matrix = jnp.zeros((group_sizes.shape[0], lhs.shape[1], rhs.shape[1]), wide)
         _, pullback = jax.vjp(lambda matrix: grouped_matmul.xla_ragged_dot(
             lhs, matrix, group_sizes, precision=precision, preferred_element_type=wide), matrix)
@@ -225,11 +226,11 @@ def _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, epilogue, e
     matrix = jnp.swapaxes(rhs, 1, 2) if transpose_rhs else rhs
     if compute is not None:
         # Summed and kept at least fp32 (an fp64 product's in fp64), the accumulator the epilogue reads.
-        wide = jnp.promote_types(compute, jnp.float32)
+        wide = at_least_fp32(compute)
         summed = grouped_matmul.portable_projection(lhs, matrix, group_sizes, compute, precision, wide)
     else:
         product = lhs if prologue is None else prologue(lhs, *prologue_arrays).astype(lhs.dtype)
-        wide = jnp.promote_types(lhs.dtype, jnp.float32)
+        wide = at_least_fp32(lhs.dtype)
         summed = grouped_matmul.xla_ragged_dot(product, matrix.astype(lhs.dtype), group_sizes,
                                                precision=precision, preferred_element_type=wide)
     outs = _as_tuple(summed if epilogue is None else epilogue(summed, *epilogue_arrays))
