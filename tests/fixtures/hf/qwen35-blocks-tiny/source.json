@@ -10,10 +10,12 @@
     "numpy": "2.4.0",
     "safetensors": "0.8.0"
   },
-  "seeds": 16,
+  "seeds": 8,
   "redraw": 4,
   "parameter_seed": 43,
   "attention_impl": "eager",
   "device": "cpu",
-  "precision": "ieee"
+  "precision": "ieee",
+  "recorded_seed_capacity": 16,
+  "sizing_revision": "a6d2c781d972eb7e8f887f2cea583aea7e2ad48e"
 }

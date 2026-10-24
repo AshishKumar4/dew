@@ -34,6 +34,31 @@ from dew.registry import projectors, towers
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
 
+def test_released_block_attention_matches_transformers_against_float64():
+    """The release's own mask adapter over independent block layouts, including causal-only
+    rows, judged against the paired fp32 and float64 transformers recordings."""
+    import jax
+    from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording
+
+    from dew.interop import Pretrained
+    from dew.nn.inputs import AttentionMetadata
+
+    directory = FIXTURES / "qwen35-blocks-tiny"
+    source = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    path = directory / "reference.npz"
+    seeds = declared_seeds(path)["blocks"]
+    draw, reference, truth = indexed_recording(recording(path), "blocks", seeds)
+
+    @jax.jit
+    def forward(index, inputs):
+        metadata = AttentionMetadata(block_groups=inputs["block_groups"])
+        return {"logits": source.model.apply(
+            source.variables, inputs["input_ids"], attention_metadata=metadata)}
+
+    assert_as_exact(forward, reference, draw, "Qwen3.5 released block attention",
+                    seeds=seeds, truth_fn=truth)
+
+
 def test_wrapper_block_overrides_survive_export_and_admit_their_future_block_mate(tmp_path):
     """A source declaring block attention changes visibility only where runtime block IDs admit
     it. A future block mate can affect the earlier token, and source export preserves that rule."""
