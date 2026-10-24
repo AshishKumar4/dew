@@ -52,6 +52,7 @@ def gelu_exact_torch(x: jax.Array) -> jax.Array:
     return (.5 * work * (1 + jax.lax.erf(work * math.sqrt(.5)))).astype(x.dtype)
 
 
+@jax.custom_jvp
 def gelu_tanh(x: jax.Array) -> jax.Array:
     """`0.5 * x * (1 + tanh(sqrt(2 / pi) (x + 0.044715 x^3)))` in at least fp32, in `x`'s dtype, as
     its identity `x * sigmoid(sqrt(8 / pi) (x + 0.044715 x^3))`, which XLA:GPU leaves as written: the
@@ -59,9 +60,25 @@ def gelu_tanh(x: jax.Array) -> jax.Array:
     relative to its size on an A100 where this form lay 1.1e-7 (each alone 5.6e-8 and 4.9e-8). The
     sigmoid also keeps the tail `1 + tanh` cancels: on a CPU the form lies 3.5e-8 from float64 against
     `jax.nn.gelu`'s 4.5e-8 and torch's 2.8e-8, and 3.1e-7 against 1.3e-4 and 3.4e-5 below x = -3,
-    over 2^22 normal inputs at scale 3."""
+    over 2^22 normal inputs at scale 3. Its derivative is `_gelu_tanh_jvp`'s."""
     work = x.astype(at_least_fp32(x.dtype))
     return (work * jax.nn.sigmoid(math.sqrt(8 / math.pi) * (work + 0.044715 * work ** 3))).astype(x.dtype)
+
+
+@gelu_tanh.defjvp
+def _gelu_tanh_jvp(primals: tuple[jax.Array], tangents: tuple[jax.Array]) -> tuple[jax.Array, jax.Array]:
+    """`gelu_tanh`'s derivative `s(z) + x s(z) s(-z) z'` in at least fp32, its tangent rounded once to
+    `x`'s dtype. `s(-z)` stands for `1 - s(z)`, which autodiff of the sigmoid forms from the rounded
+    `s(z)`: from x near 5 in fp32, `s(z)` rounds to 1 and the term vanishes, a derivative of 1 where
+    float64's is 1.0000016."""
+    x, = primals
+    dx, = tangents
+    work = x.astype(at_least_fp32(x.dtype))
+    scale = math.sqrt(8 / math.pi)
+    z = scale * (work + 0.044715 * work ** 3)
+    rising = jax.nn.sigmoid(z)
+    derivative = rising + work * rising * jax.nn.sigmoid(-z) * scale * (1 + 3 * 0.044715 * work ** 2)
+    return gelu_tanh(x), (derivative * dx.astype(work.dtype)).astype(x.dtype)
 
 
 def quick_gelu(x: jax.Array) -> jax.Array:
