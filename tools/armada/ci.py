@@ -1021,7 +1021,7 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
     rows: dict[str, list[dict]] = {}
     for row_ in verdict["rows"]:
         python, name, split_ = parsed_row(row_["name"])
-        if python == PYTHONS[0] and split_ != COLLECT:
+        if python == PYTHONS[0] and split_ != COLLECT and Path(name).is_file():
             rows.setdefault(name, []).append(row_)
     kept = {node: seconds for node, seconds in record.items() if Path(node.split("::")[0]).is_file()}
     for name, held in rows.items():
