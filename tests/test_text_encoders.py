@@ -311,19 +311,33 @@ def test_tiny_checkpoint_text_projection_matches_the_reference():
                                     text_draw(CLIPText.from_pretrained(str(TINY))), "tiny text projection")
 
 
-def test_tiny_checkpoint_image_embeddings_match_the_reference():
+@pytest.mark.parametrize("fringe", [0, 1])
+def test_tiny_checkpoint_image_embeddings_match_the_reference(fringe, tmp_path):
     """The vision tower on drawn images' pixel values, through
     `visual_projection`. The images are taller than wide, so the processor's
     resize and centre crop both run, and on the reference's own images its
     pixel values have to be the reference's exactly since it is the
     reference's own processor."""
     expected = reference(TINY)
-    model = CLIPModel.from_pretrained(str(TINY))
+    source = tmp_path / "clip"
+    shutil.copytree(TINY, source)
+    config = fixture_config(source)
+    config["vision_config"]["image_size"] += fringe
+    (source / "config.json").write_text(json.dumps(config))
+    model = CLIPModel.from_pretrained(str(source))
 
     pixel_values = image_processor(TINY)(
         images=synthetic_images(TINY), return_tensors="np")["pixel_values"]
     assert np.array_equal(pixel_values, expected["pixel_values"])
     shape = tuple(json.loads((TINY / "prompts.json").read_text())["images"]["shape"])
+    original_draw = image_draw(TINY, shape)
+
+    def fringed(pixels):
+        return np.pad(pixels, ((0, 0), (0, 0), (0, fringe), (0, fringe)), constant_values=100)
+
+    def draw(seed):
+        inputs, = original_draw(seed)
+        return ({"pixel_values": fringed(inputs["pixel_values"])},)
 
     def observed(module, pixels):
         tower = module.vision_model(pixels)
@@ -333,9 +347,10 @@ def test_tiny_checkpoint_image_embeddings_match_the_reference():
     forward = jax.jit(lambda pixels: model.module.apply(model.variables, pixels, method=observed))
     names = ("image_embeds", "vision_hidden_state", "vision_pooler_output")
     assert_as_exact_as_transformers(lambda inputs: forward(inputs["pixel_values"]), names,
-                                    TINY, image_draw(TINY, shape),
+                                    source, draw,
                                     "tiny image embeddings")
 
+    pixel_values = fringed(pixel_values)
     baseline = model.module.apply(
         model.variables, pixel_values, method=lambda clip, pixels: clip.vision_model(pixels))
     moved = model.module.apply(model.variables, np.flip(pixel_values, axis=-1),

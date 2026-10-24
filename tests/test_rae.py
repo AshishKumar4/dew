@@ -93,6 +93,8 @@ def test_the_latent_matches_the_source(variant):
     gap = scaled_gap(latent, expected)
     print(f"{config['encoder_type']} latent gap {gap:.3g}")
     assert gap < FORWARD
+    empty = autoencoder.encode(params, 2 * image[:0] - 1)
+    assert empty.shape == expected[:0].shape
 
 
 def test_the_decode_matches_the_source(variant):
