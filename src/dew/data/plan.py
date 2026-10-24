@@ -18,8 +18,8 @@ import jax
 import numpy as np
 
 from dew import _checkout
+from dew._hashing import array_header
 from dew.data.sources.codec import content_fingerprint
-from dew.hashing import array_header
 from dew.records import JSON, json_value, record
 
 _log = logging.getLogger(__name__)
@@ -46,7 +46,7 @@ class Digest(Protocol):
 
 def array_digest(dtype: np.dtype, shape: Sequence[int]) -> Digest:
     """The digest an array of `dtype` and `shape` is fingerprinted by, its header taken
-    (`dew.hashing.array_header`, which tells apart dtypes of one byte layout): its elements' bytes
+    (`dew._hashing.array_header`, which tells apart dtypes of one byte layout): its elements' bytes
     follow in C order, whole (`fingerprint`) or page by page as a published plan writes them
     (`generation._write_plan`), to the same hash."""
     return hashlib.sha256(array_header(dtype, shape))

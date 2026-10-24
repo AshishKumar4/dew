@@ -68,10 +68,10 @@ from orbax.checkpoint.checkpoint_manager import AsyncOptions, MultiprocessingOpt
 from orbax.checkpoint.checkpoint_managers import preservation_policy as preservation
 
 from dew import position, records
+from dew._hashing import fmix32
 from dew.cleanup import attempted
 from dew.coordination import broadcast_from_process_zero, from_every_process, seen_by_every_process
 from dew.files import write_atomically
-from dew.hashing import fmix32
 from dew.nn import sharding
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import LogicalAxes

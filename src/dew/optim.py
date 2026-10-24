@@ -31,7 +31,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from dew.hashing import fmix32
+from dew._hashing import fmix32
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import LogicalAxes, declarations, declared_axes
 
