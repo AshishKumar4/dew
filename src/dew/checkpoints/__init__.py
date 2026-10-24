@@ -978,8 +978,18 @@ class Checkpoints:
             return self._committed[step][1]
         return ocp.metadata.get_step_metadata(self.path(step)).custom_metadata or {}
 
+    def committed(self) -> list[int]:
+        """The steps whose checkpoints have committed, oldest first, read from the store at each call
+        without opening it or writing to it, as `latest` reads it: what a process beside the one
+        that trains (an evaluation worker) reads as the run saves, a save in flight listed once it
+        commits. `kept` is this process's own view, its retained steps and their metadata."""
+        found = ocp.step.standard_name_format().find_all(self.directory)
+        return sorted(step.step for step in found if self._complete(step.step))
+
     def kept(self) -> list[Kept]:
-        """Return the committed retained steps, oldest first; their immutable metadata is cached."""
+        """Return the committed retained steps, oldest first; their immutable metadata is cached.
+        The steps are those this process's store saw open or saved itself; a process that reads a
+        run another saves into lists its new steps with `committed`."""
         persistent = self._open()
         active = set(persistent.all_steps())
         for step in set(self._committed) - active:
