@@ -34,7 +34,12 @@ from reference_error import assert_as_exact, assert_as_exact_as_the_reference, w
 
 from dew.nn.documents import CrossDocuments
 from dew.nn.kernels import decode_attention, generation, tuning
-from dew.nn.kernels.templates import attention as template, attention_portable, attention_triton
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_mosaic,
+    attention_portable,
+    attention_triton,
+)
 
 PINS = {attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2),
         attention_triton.TritonBackward: attention_triton.BackwardTiles(32, 32, 4, 2, 4, 2)}
@@ -90,7 +95,8 @@ SEEDS = {"ties at scale 1": 64, "ties at scale 1, cotangents near 2**125": 64, "
          "ties at scale 1/2, cotangents near 2**125": 64, "ties at scale 1/4": 64,
          "ties at scale 1/4, cotangents near 2**125": 64, "a logit near fp32's largest": 8,
          "a logit near fp32's largest at scale 1/4": 8, "values near fp32's largest over 2 equal keys": 8,
-         "values near fp32's largest over 64 equal keys": 8, "one key": 8, "a sink and one key": 64,
+         "values near fp32's largest over 64 equal keys": 8,
+         "values near fp32's largest over 2 equal keys, bfloat16": 8, "one key": 8, "a sink and one key": 64,
          "a sink near fp32's largest and one key": 8, "a sink and one key, its logit near fp32's largest": 8,
          "a sink near fp32's largest at scale 1/4": 8, "logits near 1e4": 32, "logits near 1e30": 8,
          "a small weight on a large value, float32": 128, "a small weight on a large value, bfloat16": 256,
@@ -286,13 +292,13 @@ def _near_max_logit(width: int):
     return draw
 
 
-def _large_values(keys: int):
-    # Equal logits over values drawn within a few percent of fp32's largest, one sign: the sum of the
-    # weighted values passes fp32's largest where the reference's normalized one does not. The
-    # cotangent is drawn times 2^-8, so the cotangent's product with the values stays finite in the
-    # reference's backward too.
+def _large_values(keys: int, top: float = 3.4e38):
+    # Equal logits over values drawn within a few percent of fp32's largest (to `top`, bf16's below its
+    # largest), one sign: the sum of the weighted values passes fp32's largest where the reference's
+    # normalized one does not. The cotangent is drawn times 2^-8, so the cotangent's product with the
+    # values stays finite in the reference's backward too.
     def draw(seed):
-        value = _uniform(seed, 3.0e38, 3.4e38, (ROWS, keys, 1, 16))
+        value = _uniform(seed, 3.0e38 * top / 3.4e38, top, (ROWS, keys, 1, 16))
         (dout,) = _normal(seed + 1, (ROWS, 1, 1, 16))
         return (np.zeros((ROWS, 1, 1, 16), np.float32), np.zeros((ROWS, keys, 1, 16), np.float32), value,
                 None, dout * np.float32(2.0 ** -8))
@@ -490,6 +496,8 @@ def _families() -> dict[str, Family]:
         "values near fp32's largest over 2 equal keys": Family(_large_values(2), _kept(1, 2), folded=False),
         "values near fp32's largest over 64 equal keys": Family(_large_values(64), _kept(1, 64),
                                                                 folded=False),
+        "values near fp32's largest over 2 equal keys, bfloat16": Family(
+            _large_values(2, top=3.3e38), _kept(1, 2), folded=False, dtype="bfloat16"),
         # A key at its row's maximum weighs 1 exactly in the accurate form; the fold's contracted weight is
         # 1 within an ulp of its logit's exponent.
         "one key": Family(_drawn(4, 1), _kept(4, 1), folded=False),
@@ -722,9 +730,37 @@ def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
         with tuning.pinned(PINS):
             return attention_triton.backward(*operands, interpret=True, **options)
 
-    return {"triton": mainloop(triton_forward, triton_backward),
-            "portable": mainloop(functools.partial(attention_portable.attend, **tiles, **forward_options),
-                                 functools.partial(attention_portable.backward, **tiles, **options))}
+    def mosaic_forward(*operands):
+        return attention_mosaic.forward(*operands, **forward_options)
+
+    def mosaic_backward(query, key, value, spans, hooks, dout):
+        # From the plain-JAX training forward's residuals, a guarded one's (the Triton forward walks without
+        # the guards, so an overflowing row's split sums would be infinite).
+        residuals = attention_portable.attend(query, key, value, spans, hooks, **tiles, residuals=True,
+                                              **forward_options)[1:]
+        return attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
+                                         **options)
+
+    portable = mainloop(functools.partial(attention_portable.attend, **tiles, **forward_options),
+                        functools.partial(attention_portable.backward, **tiles, **options))
+    mainloops = {"triton": mainloop(triton_forward, triton_backward), "portable": portable}
+    if ON_HOPPER and _mosaic_takes(family):
+        mainloops["mosaic"] = mainloop(mosaic_forward, mosaic_backward)
+    return mainloops
+
+
+ON_HOPPER = generation.device_generation() == "sm90"
+"""Whether the Mosaic mainloop runs here, compiled on an H100: interpreted, a family takes it 6 to 33 minutes
+on a CPU, past a CI task's time, and the interpreter is coverage, not proof (`test_attention_mosaic`)."""
+
+
+def _mosaic_takes(family: Family) -> bool:
+    """Whether the Mosaic mainloop takes `family`'s calls, forward and backward, by its own legality rule
+    (`attention_mosaic.refused`)."""
+    query, _, value, extra, _ = family.draw(0)
+    hooks = _hooks(jnp.asarray(query), jax.tree.map(jnp.asarray, extra))
+    return attention_mosaic.refused(jnp.dtype(family.dtype), query.shape[-1], value.shape[-1], hooks,
+                                    backward=True) is None
 
 
 def _held_empty(family: Family, found, label: str) -> None:
@@ -785,6 +821,20 @@ def test_the_default_form_is_finite_where_the_reference_is_at_fp32s_edges(family
     _default_is_finite(family, "portable")
 
 
+MOSAIC_FAMILIES = [family for family in TEMPLATE_FAMILIES if _mosaic_takes(FAMILIES[family])]
+"""The template's families the Mosaic mainloop takes (`_mosaic_takes`)."""
+
+
+@pytest.mark.skipif(not ON_HOPPER, reason="runs the Mosaic mainloop compiled, on an H100")
+@pytest.mark.gpu(reason="runs the Mosaic mainloop compiled, on an H100")
+@pytest.mark.parametrize("family", MOSAIC_FAMILIES)
+def test_the_mosaic_mainloops_default_is_finite_where_the_reference_is_at_fp32s_edges(family):
+    """The Mosaic mainloop, which walks under the default's guards over whole launches
+    (`algebra.walked_launches`), finite in the default form over every family it takes (its legality rule,
+    `attention_mosaic.refused`: bf16 operands, no hooks yet in its backward; `_default_is_finite`)."""
+    _default_is_finite(family, "mosaic")
+
+
 @pytest.mark.parametrize("family", [family for family in TEMPLATE_FAMILIES if FAMILIES[family].folded])
 def test_the_frozen_triton_mainloops_default_is_finite_where_the_reference_is_at_fp32s_edges(family):
     """The Triton mainloop's default form finite over the families the fold holds (`_default_is_finite`):
@@ -814,6 +864,36 @@ def test_a_resumed_state_of_large_values_under_the_folds_guard_is_finite():
     for name, found in (("reference", reference(query, key, value, state, dout)),
                         ("default", ours(query, key, value, state, dout))):
         assert all(np.isfinite(np.asarray(leaf, np.float32)).all() for leaf in jax.tree.leaves(found)), name
+
+
+@pytest.mark.parametrize("options", [{"scale": 7.99}, {"scale": 7.99, **ACCURATE}],
+                         ids=["default", "accurate"])
+def test_a_score_cotangent_past_bf16s_largest_keeps_the_gradients_finite(options):
+    """bf16, both forms: one zero query over two keys of first components +-1/128 at scale 7.99, values of
+    first components +-2^126 and an output cotangent of 1 there, so each key weighs 1/2 and its score
+    cotangent times the scale is +-7.99 * 2^125, finite in fp32 and past bf16's largest. Narrowed to bf16 for
+    their products it would be infinite, dQ infinite and dK NaN against the zero query (`algebra._bf16`
+    saturates it); every template mainloop's gradients are finite and dK exactly the reference's zero."""
+    def shaped(seed):
+        # The call's shapes, for the mainloops' legality rules (`_mosaic_takes`); the operands are below.
+        del seed
+        one, two = np.zeros((1, 1, 1, 16), np.float32), np.zeros((1, 2, 1, 16), np.float32)
+        return one, two, two, None, one
+
+    family = Family(shaped, np.ones((1, 1, 1, 2), bool), dtype="bfloat16")
+
+    def first(*fills):
+        return jnp.zeros((1, len(fills), 1, 16), jnp.bfloat16).at[:, :, 0, 0].set(jnp.asarray(fills))
+
+    query, key, value, dout = first(0.0), first(1 / 128, -1 / 128), first(2.0 ** 126, -2.0 ** 126), first(1.0)
+    spans = template.spans(1, 2, 1)
+    _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, scale=options["scale"]), query, key,
+                      value)
+    assert all(np.isfinite(np.asarray(leaf, np.float32)).all() for leaf in pull(dout)), "the reference's"
+    for name, mainloop in _mainloops(family, options).items():
+        _, *grads = jax.jit(with_gradients(mainloop))(query, key, value, None, dout)
+        assert all(np.isfinite(np.asarray(leaf, np.float32)).all() for leaf in grads[:3]), name
+        np.testing.assert_array_equal(np.asarray(grads[1], np.float32), 0.0, err_msg=f"{name}'s dK")
 
 
 @pytest.mark.parametrize("scale", [-1.0, -2.0, -0.75])
