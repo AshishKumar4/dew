@@ -192,25 +192,6 @@ def sinusoidal_time(time, features: int, *, dtype: DTypeLike, shift: float = 0, 
     return sinusoids(jnp.asarray(time, dtype).reshape(-1, 1) * frequencies[None], cosine_first=cosine_first)
 
 
-class TimeProjection(nn.Module):
-    """Two dense layers with the activation after each."""
-    features: int
-    activation: Callable = jax.nn.gelu
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    @nn.nowrap
-    def model_flops(self, lengths, input_features: int) -> float:
-        return projection_flops(lengths, input_features + self.features, self.features)
-
-    @nn.compact
-    def __call__(self, x):
-        dense = partial(DenseGeneral, self.features,
-                        dtype=self.dtype, precision=self.precision, dot_general=float32_dot_general)
-        x = self.activation(dense()(x))
-        return self.activation(dense()(x))
-
-
 def torch_nearest_resize(x, height: int, width: int):
     """Resample `[B, H, W, C]` to `height` by `width`, torch's nearest rule.
 

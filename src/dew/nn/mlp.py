@@ -7,6 +7,7 @@ import math
 from collections.abc import Callable
 from statistics import NormalDist
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
@@ -106,9 +107,18 @@ class GatedMLP(nn.Module):
     packed or joined output in place (`packed_gated_product`). `dropout_rate`
     drops the activated hidden units before the down projection while
     training, as T5's `T5DenseActDense` does.
+
+    The ungated MLP may read another width than it writes (`in_features`, which
+    the count reads), apply its activation after the down projection too
+    (`activation_after`, a diffusion time embedding's or a vision adapter's),
+    and store its two projections under the names its checkpoint uses
+    (`names`, up then down).
     """
     hidden_features: int
     out_features: int
+    in_features: int | None = None
+    activation_after: bool = False
+    names: tuple[str, str] = ('up_proj', 'down_proj')
     activation: GatedActivation | Activation = 'swiglu'
     use_bias: bool = False
     activation_sparsity: float = 0.0
@@ -137,11 +147,14 @@ class GatedMLP(nn.Module):
     def projections(self) -> dict[str, tuple[int, int]]:
         """The feed-forward's maps as `{name: (inputs, outputs)}`: what setup
         builds, the count reads and the packed group (`_group`) concatenates."""
-        sites = {'up_proj': (self.out_features, self.hidden_features),
-                 'down_proj': (self.hidden_features, self.out_features)}
         if self._gated():
+            sites = {'up_proj': (self.out_features, self.hidden_features),
+                     'down_proj': (self.hidden_features, self.out_features)}
             sites['gate_proj'] = sites['up_proj']
-        return sites
+            return sites
+        up, down = self.names
+        width = self.out_features if self.in_features is None else self.in_features
+        return {up: (width, self.hidden_features), down: (self.hidden_features, self.out_features)}
 
     def setup(self):
         projections = self.projections()
@@ -156,9 +169,13 @@ class GatedMLP(nn.Module):
                 self.gate_proj = dense(projections['gate_proj'][1], name='gate_proj')
         elif self.activation_sparsity or self.swiglu_limit is not None or self.packed:
             raise ValueError('activation_sparsity, swiglu_limit and packed require a gated MLP')
+        if self._gated() and (self.in_features is not None or self.activation_after
+                              or self.names != ('up_proj', 'down_proj')):
+            raise ValueError('in_features, activation_after and names shape an ungated MLP')
+        up, down = ('up_proj', 'down_proj') if self._gated() else self.names
         if not self._packed():
-            self.up_proj = dense(projections['up_proj'][1], name='up_proj')
-        self.down_proj = dense(projections['down_proj'][1], name='down_proj', **normal_kernel(
+            self.up_proj = dense(projections[up][1], name=up)
+        self.down_proj = dense(projections[down][1], name=down, **normal_kernel(
             self.init_std if self.output_init_std is None else self.output_init_std))
         self.dropout = nn.Dropout(rate=self.dropout_rate)
         if self.ngpt is not None:
@@ -180,8 +197,8 @@ class GatedMLP(nn.Module):
         # down_proj's sum returns to the residual placement in the block.
         activation = self._activation()
         if not isinstance(activation, (str, Situ)):
-            return self._down(activation(checkpoint_name(constrain(self.up_proj(x), MLP_HIDDEN), 'up_proj')),
-                              train)
+            out = self._down(activation(checkpoint_name(self._placed(self.up_proj(x)), 'up_proj')), train)
+            return activation(out) if self.activation_after else out
         # A SiTU, the clamp, the gate's top-k and nGPT's gains take the halves apart.
         if (isinstance(activation, str) and self.swiglu_limit is None and not self.activation_sparsity
                 and self.ngpt is None):
@@ -197,14 +214,20 @@ class GatedMLP(nn.Module):
             gate, up = halves['gate_proj'], halves['up_proj']
         else:
             gate, up = self.gate_proj(x), self.up_proj(x)
-        gate = checkpoint_name(constrain(gate, MLP_HIDDEN), 'gate_proj')
-        up = checkpoint_name(constrain(up, MLP_HIDDEN), 'up_proj')
+        gate = checkpoint_name(self._placed(gate), 'gate_proj')
+        up = checkpoint_name(self._placed(up), 'up_proj')
         if self.ngpt is not None:
             return self._down(self._ngpt_hidden(self.ngpt, gate, up, activation), train)
         gate, up = swiglu_clamped(gate, up, self.swiglu_limit)
         if self.activation_sparsity:
             gate = gaussian_topk(gate, self.activation_sparsity)
         return self._down(gated_product(activation, axes=MLP_HIDDEN)(gate, up), train)
+
+    @staticmethod
+    def _placed(hidden):
+        """A token sequence's hidden activation, placed as `MLP_HIDDEN` names it; one of another
+        rank, a time embedding's or an image grid's, is left where its operands put it."""
+        return constrain(hidden, MLP_HIDDEN) if hidden.ndim == len(MLP_HIDDEN) else hidden
 
     def _ngpt_hidden(self, ngpt: NGPT, gate, up, activation):
         """nGPT's hidden activations: the gate and up projections times their gains in at least fp32,
@@ -265,6 +288,15 @@ class GatedMLP(nn.Module):
         return (group,) if group.held(self.variables.get('params', {})) else ()
 
 
+def time_projection(features: int, *, in_features: int | None = None, dtype: Dtype | None = None,
+                    precision: PrecisionLike = None, name: str | None = None) -> GatedMLP:
+    """flaxdiff's `TimeProjection`: two maps to `features` with a tanh GELU after each, stored as
+    its `DenseGeneral_0` and `DenseGeneral_1` (`GatedMLP`'s ungated path)."""
+    return GatedMLP(features, features, in_features=in_features, activation=jax.nn.gelu, use_bias=True,
+                    activation_after=True, names=('DenseGeneral_0', 'DenseGeneral_1'), dtype=dtype,
+                    precision=precision, name=name)
+
+
 def geglu_feed_forward(dim: int, *, approximate: bool = True, **fields) -> GatedMLP:
     """diffusers' `FeedForward`: a GEGLU to four times `dim` and back, biased, its gate and up
     projections packed as the checkpoint keeps them, the up projection first; `approximate` is the
@@ -274,4 +306,4 @@ def geglu_feed_forward(dim: int, *, approximate: bool = True, **fields) -> Gated
                     packed_order=('up_proj', 'gate_proj'), **fields)
 
 
-__all__ = ["GatedMLP", "geglu_feed_forward"]
+__all__ = ["GatedMLP", "geglu_feed_forward", "time_projection"]
