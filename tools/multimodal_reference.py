@@ -432,7 +432,6 @@ def write_gemma4_unified_native() -> None:
     inputs = unified_draw(config, 0)
     with torch.no_grad():
         result = model(**{name: torch.from_numpy(value) for name, value in inputs.items()}, use_cache=False)
-    np.savez(destination / "reference.npz", **inputs, logits=result.logits.numpy())
     print(f"{destination.name}: forward shape {tuple(result.logits.shape)}", flush=True)
 
 
