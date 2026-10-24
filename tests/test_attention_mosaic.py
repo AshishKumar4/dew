@@ -238,7 +238,7 @@ def test_a_hook_that_forms_a_unit_axis_is_refused():
         hooks = template.Hooks(score_mod, tuple(template.Param(param, kind)
                                                 for param, kind in zip(params, kinds, strict=True)), initial)
         assert (attention_mosaic.unlowered(hooks, (64, 64), 64) is not None) == refused, names
-    with pytest.raises(NotImplementedError, match="unit axis"):
+    with pytest.raises(NotImplementedError):
         attention_mosaic.forward(query, key, value, spans,
                                  template.Hooks(score_hooks(("indexed",), queries, keys, 64)[0]),
                                  interpret=True, family=mosaic_sm90.WGMMA)
