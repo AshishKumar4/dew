@@ -102,7 +102,8 @@ def test_a_validated_fine_tune_is_placed_and_held_as_its_report_said(case):
         assert validation.device_bytes == held
 
     arguments, _ = run.executable.input_shardings
-    rows = {mesh_axes(sharding.spec[0]) for sharding in jax.tree.leaves(arguments[STEP_BATCH]) if sharding.spec}
+    rows = {mesh_axes(sharding.spec[0]) for sharding in jax.tree.leaves(arguments[STEP_BATCH])
+            if sharding.spec}
     assert rows == {report.batch_axes}
     # Every collective the report says an axis implies, the compiled step runs over that axis.
     ran = collective_axes(run.executable.as_text(), run.device_mesh)
