@@ -650,7 +650,7 @@ def test_a_tuned_launch_over_runs_times_every_key(case):
                    for array in (spans.start, spans.end, spans.query_ids, spans.key_ids))
     forward = attention_mosaic.MosaicForward(form=spans.form, keys=keys)
     backward = attention_mosaic.MosaicBackward(form=spans.form, keys=keys)
-    for op, ba in ((forward, _bound(forward, query, key, key, *bounds, (), (), None)),
+    for op, ba in ((forward, _bound(forward, query, key, key, *bounds, (), (), None, residuals=False)),
                    (backward, _bound(backward, query, key, key, query, *bounds, (), None, residuals))):
         arrays, fill = tuning.materialized(op, ba)
         args, _ = fill(arrays)
