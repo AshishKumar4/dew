@@ -12,6 +12,10 @@ Correctness, contract gaps and duplicated paths come first. After those close, m
 - Carry FlaxDiff's remaining capabilities, or record dropping them: the continuous and tangent cosine schedules and the exponential schedule's test, SimpleAutoEncoder, the learned-variance head and the old UViT and wrapper, the W&B sweep promotion and run loading, the older checkpoints. [864–867]
 - Carry MaxText's workflows Dew lacks: the pretrain-to-RL chain, named LoRA directories, MaxText checkpoints, replica and live-slice recovery, a host prefix tier and disaggregated serving, DiLoCo, sparse indexed attention, GPT-3 and Engram, audio language models, and remote-topology compilation. [869–879, 881]
 - Load the requested families Dew does not load yet: Qwen4-Exp, MiniMax Text-01, M1 and M3, the LLaDA MoE variants and LLaDA 2.x, DiffuCoder, Kimi K2.5's and K3's vision, and MiniMax M2.5, M2.7 and H3. [849–856]
+- Load any Hugging Face causal LM: transformers' own modeling code runs automatically when no family matches, with Dew's attention through transformers' `AttentionInterface`, placement from the config's `base_model_tp_plan` and Dew's fsdp rules, and weights streamed by name onto the mesh. Native families stay the fast path. [1493]
+- Load Gemma 4's unified wrapper and Muse Glimmer's wrapper, and qualify Nemotron-Nano-9B-v2 and Nemotron 3.5 Lightning at their sizes. [1501, 357]
+- Read a release's per-layer-kind attention overrides from its config, and load decision releases in the slot-readout format through the one decision loader. [1497, 1510]
+- Run Dory's float64 phases on the booked GPU's FP64 units. [1568]
 - Carry the historical repair plan's RL tickets as rows: each likelihood and the weight version kept, methods composed from explicit choices, lossless episode records, and on-policy distillation. [857–860]
 - Hold stage-local state in a pipeline and qualify its schedule. [861]
 - Test Dew at its declared dependency bounds in a clean environment. [862]
@@ -38,6 +42,10 @@ Correctness, contract gaps and duplicated paths come first. After those close, m
 - Keep a merged FP8 base finite through training on H100's FP8 tensor cores. [841]
 - Settle whether a remat rung's step is bitwise its plain step on an sm86 GPU, or held by the float64 gate. [847]
 - Hold the Triton grouped GEMM's gradient to XLA's error under the fp32-master tile gate. [863]
+- Block-causal visibility on the attention kinds that opt in: a token reads its own block both ways, in the template's span form so the fused kernels run it, with image groups on the same rule. [1495]
+- Let a recurrence document start from a given memory, so a prefix read once continues into several blocks, in training and in serving's prefix reuse. [1506]
+- Fix the H100 causal attention crash, and give deterministic mode a single-kernel ticket-ordered attention backward. [1559, 1566]
+- Switch each TPU route to its template where the template passes the gate and wins, measured natively on v5e and v6e. [1560]
 - Make the live kernel's preparation smoke deterministic about the contexts a closed page leaves open. [843]
 - Update a live notebook's displays across its cells, as Jupyter does, once a notebook runs live. [846]
 - Route MPConv through Conv's shared operand path after its normalization. [785]
@@ -95,17 +103,17 @@ The kernel direction (owner, 2026-10-21; [design](design/kernel-templates.md)): 
 - Remove duplicated worker-shutdown policy by using Grain's lifecycle interface. [DAT-10]
 - Qualify URL-caption fetching through `images.fetch` and `video.fetch` against the previous online flow on CC3M and WebVid. [155]
 - Cache automatically: the deterministic stages before the first random or cross-record step are fingerprinted by content and their output reused on a re-run, with no `cache=`, in a local cache directory with a size cap and eviction; `cache=url` stays for shared or remote caches, and there is an opt-out. [824]
-- Make the chain the one data API: delete the recipes, spec.load and the public loader, and have run.json record the chain. The prompts preset lands first. [213, 780, 1062]
 - Let the image, language-model and SFT presets take the documented `cache=`. [803]
 - Add presets for prompts, preferences and chat canvases, which the run layer's recipes cover today. [810]
 - Teach only names main has in the post-training and inference docs. [815]
 - Build the data design's remaining contracts: uniform stage errors; a pre-read refusal of a missing artifact; slot maxima shared with `fit`'s separately compiled validation chains; per-member committed-token logging; RL prompt tail cuts counted as truncations; volatility read on every stage kind; and the reader's cache report. [design/data.md]
+- Restore the chain verbs limit, iterate, slice, token_split and rebatch, with the data design updated. [1562]
+- Autotune a pipeline's workers, prefetch and read mode, and explain a chain's lowered plan. [1563]
 
 ## Training and parallelism
 
 - Hold Shortcut's halves-against-whole outcome per example, before the batch reduction, against a float64 twin. [1020]
 - Stop a block-diffusion run's generation at its checkpoint's end-of-sequence ids, as a loaded model's does. [895]
-- Log analytic training FLOPs as train/flops on every device, including those with no known peak. [1375]
 - Measure multi-GPU MFU at real sizes: FSDP, FSDP×TP and expert parallelism. [1306]
 - Raise tensor-parallel MFU: stop XLA's rematerialization from re-gathering FSDP weights each step, as MaxText does, and overlap TP's collectives. [1307]
 - Raise Dory's MFU past 0.5: profile the looped block, its normalizations and the residual barrier. [1308, 648]
@@ -113,7 +121,6 @@ The kernel direction (owner, 2026-10-21; [design](design/kernel-templates.md)): 
 - Make second-order and high-precision training compositions of what Dew has: Gauss-Newton as an Optax-style transform over the objective's Jacobian products, float64 as a precision policy, and Fourier-feature pyramids as an input embedding, so work like arXiv 2509.14185 and 2605.24278 is reproducible in Dew. [1316]
 - Make host-memory offload automatic: the memory planner chooses among remat and offloading activations, optimizer state or parameters to pinned host memory, priced by the device's host-link bandwidth (PCIe, NVLink-C2C), and offloads only where the transfer overlaps compute. Explicit XLA host offload, never managed-memory paging. Never slower when a run fits. [1338]
 - Give serving a host-memory KV tier: evicted prefixes kept on pinned host memory and restored on reuse instead of recomputed, chosen from the link bandwidth and hit rate. [1339]
-- Shard persistent optimizer state on sequence-only meshes. [156]
 - Qualify loss, resume, failure handling and throughput on two physical hosts. [158]
 - Expand training and inference across supported parallelism combinations; replace restrictions with composed support where the mathematics permits it. [226, 245]
 - Move logical-axis declarations to Flax's per-parameter partition metadata while preserving placement and Muon semantics. [429]
@@ -128,7 +135,13 @@ The kernel direction (owner, 2026-10-21; [design](design/kernel-templates.md)): 
 - Match PNDM's multistep grouping and startup steps against Diffusers before remeasuring its parity margin. [647]
 - Find the tiled chunked head's residual at small token tiles, where a few head-gradient elements sit further from float64 than the whole-logits reference. [737]
 - Compile a step lowered by `Trainer(lower_for=)` before allocating training time, carry its executable and tuning picks to the run, and measure the saved startup time. Lowering alone already works. [720]
-- Build the training design's remaining contracts: refusing a split leaf that declares no axes, `Layout.validate(mesh)`'s placement report, a token budget ending at the commit that reaches it, and kernel choices in a run's report. [design/training.md]
+- Build the training design's remaining contracts: refusing a split leaf that declares no axes, a token budget ending at the commit that reaches it, and kernel choices in a run's report. [design/training.md]
+- Bound a run in examples (`examples=`), pause it at a fraction through `stop=` with the schedule's horizon kept, and end it cleanly when a finite stream runs out. [1498, 1499]
+- Start every run config from a source streamed onto the trainer's mesh, with the frozen base held once on device. [1500]
+- Train hybrids sequence-parallel with padded rows across hosts, and keep Mamba-2's scan under remat. [1438, 1507]
+- Record every component through the registry's records, earlier saved runs loading through one translation per component until 1.0. [1412]
+- Bring dew.batch and dew.mesh onto main or drop them with the reason. [1556]
+- Find what changed Qwen3.5-4B's peak memory between pins. [1555]
 
 ## RL and serving
 
@@ -158,6 +171,16 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Let FlowRollout alone own collection, the Flow objective's reward, group and rollout fields gone. [817]
 - One route to a task: bundles and objectives delegate to dew.pipeline's task factories. [818]
 
+## Decision models
+
+- Answer from the backbone's own output-head logits at each option's label tokens, exact with its bias and softcap, in fp32; lettered options as a rendering choice on any layout; an untied readout initialised from those rows. [1494]
+- Lay decision rows out with block ids, so attention reads a request's blocks both ways. [1496]
+- Encode a decision context by a pass of the backbone, with no silent cut, and carry contexts through the batched engine. [1502]
+- Let segments repeat and reorder in every layout. [1503]
+- Penalize disagreement between questions that ask the same thing. [1504]
+- Average trained runs' weights, LoRA runs on their merged weights, and refit temperatures after. [1505]
+- Score decisions on the weights' own mesh. [1515]
+
 ## Tutorials and docs
 
 - Run tutorial 07's real-model data-parallel versus FSDP comparison on multiple GPUs. [619]
@@ -165,6 +188,7 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Show a notebook run with prepared data, checkpoints and cache on persistent mounted storage. [233]
 - Re-record the landing example on a matched host within the existing visible training budget. [590]
 - Publish dewml and CUDA kernel wheels through the configured release workflow after qualification, then update installation examples and the site. [335]
+- Make tutorial 11 a real coding agent, add a Terminal-Bench tutorial and the tutorial batteries, and rerun the tutorials whose metric names changed. [1565]
 
 ## CI and tooling
 
@@ -179,6 +203,10 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Give the tests' and tools' remaining small copies the duplicate-code gate finds one owner each: fixtures, toy models, token batches, reference loaders and parity entry points. [1249–1262]
 - Give the copies within one file the duplicate-code gate finds one owner each: test cases written twice as parametrized cases or helpers, and repeated code paths in codecs, pipeline assembly and device partitioning. [1263–1287]
 - Delete Dew's remaining deprecated paths, with no compatibility path: the legacy `.bin` token store and the Processor re-exports that only rename its home. [1288, 1291]
+- Give each concept written several ways one owner: array fingerprints, categorical draws, weighted reductions, the at-least-float32 rule, RMS statistics, softcap, embedding gradients, adapter eligibility and checkpoint shape checks. [1467–1492]
+- Move every caller that bypasses a general path onto it: run-length guards, JEPA's momentum and LoRA, decision scoring's mesh, DiffusionGemma's streaming, shapes-only loads, frozen FP8 leaves, multimodal dtypes, dropout's route, private accuracy verdicts, benchmark state and intercepted-call detection. [1512–1525, 1532]
+- Add a layering gate and a per-train report of new public symbols, and have the queue enforce file ownership. [1557, 1558]
+- Report GPU idle hours and dollars by cause, and train on GH200 with aarch64 wheels and its device facts. [1564, 1554]
 - Derive executable training and generation qualification from the registries. Cover codec combinations with fusion, scan and pipeline stages. [176, 178]
 - Compare cached and full forwards on logits and likelihoods. [179]
 - Build registry-backed uninterrupted/resumed flows and extend them to compiled-program reuse. [182, 183]
