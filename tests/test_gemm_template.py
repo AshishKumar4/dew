@@ -649,16 +649,19 @@ def test_a_fused_norm_lowers_for_an_h100(producer):
     """An RMS norm fused into the Mosaic GPU forward's prologue lowers for an H100 on the CPU: its row
     statistic, a column the template squeezed, comes back to its tile by a broadcast, which Mosaic GPU's
     layout inference lays out (a reshape it does not; FUSEDNORM-h100)."""
-    sizes = jnp.asarray(SIZES)
-    x, w, _, nw, *_ = _draw(0)
+    # A Qwen3 MoE projection's extents, where the cost model ranks Mosaic GPU's forward first (at the draws'
+    # few rows a Triton tile may rank first); lowered, never run.
+    rows, depth, width = 8192, 2048, 1536
+    sizes = jnp.asarray((0, rows // 2, 1, rows // 2 - 101, 100, 0))
+    x, w, nw = (jax.ShapeDtypeStruct((rows, depth), jnp.bfloat16),
+                jax.ShapeDtypeStruct((len(sizes), depth, width), jnp.float32),
+                jax.ShapeDtypeStruct((depth,), jnp.float32))
 
     def fusing(x, w, weight):
         return fused.fusible_gemm(producer(x, weight), w, sizes).astype(jnp.bfloat16)
 
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
-    # Named: at these few rows the cost model may rank another launch first.
-    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"),
-          jax.sharding.use_abstract_mesh(mesh), generation.routes() as taken):
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh), generation.routes() as taken:
         jax.jit(fuser.fuse(fusing)).trace(x, w, nw).lower(lowering_platforms=("cuda",))
     assert 'mosaic_gpu' in {route.kernel for route in taken if route.choice == 'grouped_matmul'}
     assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
