@@ -236,23 +236,30 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
         if whole:
             begins = jnp.take_along_axis(block_starts(groups), at, axis=1)
             start = jnp.where(inside, jnp.minimum(start, jnp.maximum(begins, floor)), start)
+    # Each narrowing by places a run takes alone: its keys' values in index order, never decreasing within a
+    # run, and each query's least and greatest it keeps (`_within_runs`).
+    by_places = []
     if chunk is not None:
         query_places, key_places = (
             (index, jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32)[None, :], (batch, keys)))
             if positions is None else positions)
-        # The query's document's keys of its chunk run together in document order, since their places
-        # never decrease along it, and their first and last key indices bound the span.
         wanted = _chunk_of(query_places, chunk)
-        numbers = jnp.take_along_axis(_chunk_of(key_places, chunk), order, axis=1)
-        start, end = _narrowed(start, end, order, run_lo, run_hi, numbers, wanted, wanted)
+        by_places.append((_chunk_of(key_places, chunk), wanted, wanted))
+        if runs is None:
+            # The query's document's keys of its chunk run together in document order, since their places
+            # never decrease along it, and their first and last key indices bound the span.
+            numbers = jnp.take_along_axis(by_places[-1][0], order, axis=1)
+            start, end = _narrowed(start, end, order, run_lo, run_hi, numbers, wanted, wanted)
     if lengths is not None:
         end = jnp.minimum(end, lengths.astype(jnp.int32)[:, None])
     if starts is not None:
         start = jnp.maximum(start, starts.astype(jnp.int32)[:, None])
     if runs is not None:
-        start, end = _within_runs(jnp.asarray(runs, jnp.int32), start, end, keys,
-                                  None if sliding_window is None else window_sides(causal, sliding_window),
-                                  positions)
+        if sliding_window is not None and positions is not None:
+            before, after = window_sides(causal, sliding_window)
+            query_places, key_places = _widened(positions)
+            by_places.append((key_places, _moved(query_places, -before), _moved(query_places, after)))
+        start, end = _within_runs(jnp.asarray(runs, jnp.int32), start, end, keys, by_places)
     blocks = True if causal and (block_groups is not None or image_groups is not None) else None
     narrowed = (sliding_window, chunk, segment_ids, lengths, starts, blocks, valid, runs)
     form = "spans" if any(narrowing is not None for narrowing in narrowed) else "causal" if causal else "full"
@@ -284,25 +291,21 @@ def _chunk_of(places, chunk: int) -> jax.Array:
     return places // chunk
 
 
-def _within_runs(runs: jax.Array, start: jax.Array, end: jax.Array, keys: int, sides: tuple[int, int] | None,
-                 positions: tuple[jax.Array, jax.Array] | None) -> tuple[jax.Array, jax.Array]:
-    """Each query's `runs` `[B, Q, R, 2]` within its interval `[start, end)` `[B, Q]`, and with a window of
-    `sides` (`window_sides`) over `positions`, each run's keys within it, searched in the run alone (its
-    places never decrease), `[B, Q, R]` each."""
+def _within_runs(runs: jax.Array, start: jax.Array, end: jax.Array, keys: int,
+                 by_places: list[tuple[jax.Array, jax.Array, jax.Array]]) -> tuple[jax.Array, jax.Array]:
+    """Each query's `runs` `[B, Q, R, 2]` within its interval `[start, end)` `[B, Q]`, `[B, Q, R]` each, and
+    each run's keys within each narrowing by places (`by_places`: its keys' values `[B, K]`, a window's
+    places or a chunk's numbers, and each query's least and greatest it keeps `[B, Q]`), searched in the run
+    alone, along which a run's places never decrease where the call's may restart between runs."""
     lo = jnp.maximum(jnp.clip(runs[..., 0], 0, keys), start[..., None])
-    hi = jnp.minimum(jnp.clip(runs[..., 1], 0, keys), end[..., None])
-    hi = jnp.maximum(hi, lo)
-    if sides is None or positions is None:
-        return lo, hi
-    before, after = sides
-    query_places, key_places = _widened(positions)
+    hi = jnp.maximum(jnp.minimum(jnp.clip(runs[..., 1], 0, keys), end[..., None]), lo)
     batch, _, count = lo.shape
-    flat_lo, flat_hi = lo.reshape(batch, -1), hi.reshape(batch, -1)
-    first = _searched(key_places, flat_lo, flat_hi, jnp.repeat(_moved(query_places, -before), count, axis=1),
-                      "left")
-    last = _searched(key_places, flat_lo, flat_hi, jnp.repeat(_moved(query_places, after), count, axis=1),
-                     "right")
-    return first.reshape(lo.shape), jnp.maximum(last, first).reshape(hi.shape)
+    for values, least, greatest in by_places:
+        flat_lo, flat_hi = lo.reshape(batch, -1), hi.reshape(batch, -1)
+        first = _searched(values, flat_lo, flat_hi, jnp.repeat(least, count, axis=1), "left")
+        last = _searched(values, flat_lo, flat_hi, jnp.repeat(greatest, count, axis=1), "right")
+        lo, hi = first.reshape(lo.shape), jnp.maximum(last, first).reshape(hi.shape)
+    return lo, hi
 
 
 def _valid_ids(query_ids: jax.Array | None, key_ids: jax.Array | None, valid: jax.Array, batch: int,
