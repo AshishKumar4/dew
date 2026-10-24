@@ -854,9 +854,11 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     dK/dV program under its refined D, whose cotangents sum to 0 where the first pass's do not (a small
     weight on a large value, bf16: dK's worst row 2.5e1 at the first pass's D, where check 1 allows
     1.55e-2), the accurate form's always. The fast form's one launch (`fused`): the dK/dV program adding each
-    tile's dQ, under the first pass's D and the forward's denominator; on an H100 it is the slower today
-    (llama-d128 causal bf16 2 x 4096: 2.64 ms against two launches' 2.49), each consumer's 64 keys reducing
-    their own dQ tile into global memory, twice FlashAttention-3's traffic."""
+    tile's dQ, under the first pass's D and the forward's denominator. Neither is the faster everywhere: on
+    an H100 at llama-d128 bf16 2 x 4096, 32 heads, the one launch takes 2.53 ms causal and 4.87 full, two
+    launches 2.67 and 4.35 (the one launch's dQ reductions, each consumer's 64 keys reducing its own tile into
+    global memory, twice FlashAttention-3's traffic, cost most where every key block reads every query), and
+    the one launch holds 384 MB of temporaries against 258 (its dQ in fp32), so the chooser ranks them."""
     del score_params, score_mod, score_kinds, score_dtypes, scale
     width, value_width = query.shape[-1], value.shape[-1]
     _, state_total = algebra.off_anchor_start(peak0, total0, maximum, value_width, shift)
