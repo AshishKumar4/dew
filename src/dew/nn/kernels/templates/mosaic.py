@@ -239,6 +239,24 @@ def ring(block: tuple, dtype, stages: int, *, consumers: int = 1) -> dict:
 PRODUCER_REGISTERS = 40
 """The registers a thread of a cooperative block's producer warpgroup holds: it only issues loads."""
 
+THREADS = 128
+"""The threads of a role: a warpgroup's, each family's compute and producer roles alike."""
+
+SWIZZLE_BYTES = 128
+"""The widest swizzle a shared-memory block's rows are staged at, which an MMA reads conflict-free."""
+
+
+def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int], dtype) -> int:
+    """The registers a consumer thread holds at a `(rows, columns, depth)` tile of `consumers` roles of
+    `family`: its share of the fp32 accumulator, a step's operand fragments where its products read
+    registers (`Family.operands_in_registers`), and what it holds beside them (`Family.held_registers`)."""
+    rows, columns, depth = block
+    share = rows // consumers
+    fragments = 0
+    if family.operands_in_registers:
+        fragments = (share * depth + depth * columns) * jnp.dtype(dtype).itemsize // 4 // THREADS
+    return share * columns // THREADS + fragments + family.held_registers
+
 
 def consumer_registers(consumers: int) -> int:
     """The registers a thread of each of `consumers` consumer warpgroups holds: the multiprocessor's 64K less
@@ -328,6 +346,32 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     bounded_loads: bool
     """Whether a load past an operand's extent reads zeros (TMA's) rather than past it (cp.async's), so an
     operand need not be padded to whole tiles."""
+    role_rows: int
+    """The rows a consumer role's products cover at least: one warpgroup's (wgmma's one MMA of 64 rows,
+    mma.sync's four warps of 16 each)."""
+    held_registers: int = 40
+    """The registers a consumer thread holds beside its accumulator and operand fragments (addresses,
+    indices, the walk's carry): CUTLASS's cooperative sm90 kernel's 168 less its accumulator's 128."""
+    operands_in_registers: bool
+    """Whether a product reads its operands from registers a consumer loads them into (mma.sync's), where
+    warpgroup MMA reads both from shared memory."""
+    block_extent: int = 256
+    """The longest extent an operand block a load moves takes (a TMA box's 256), which a tile spans at
+    most along each of its axes."""
+
+    @abc.abstractmethod
+    def registers(self, consumers: int) -> int:
+        """The registers a thread of each of `consumers` consumer roles may hold."""
+
+    @abc.abstractmethod
+    def column_unit(self, dtype) -> int:
+        """The columns a tile's width steps by for operands of `dtype`: the swizzle a block's rows are
+        staged in, or the row its stores lay over a role's threads."""
+
+    @abc.abstractmethod
+    def depths(self, dtype) -> tuple[int, ...]:
+        """The depths a step may take for operands of `dtype`, widest first: the swizzles its products
+        read a block's rows at."""
 
     @property
     @abc.abstractmethod
@@ -490,8 +534,19 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
 class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     """A family whose loads a producer warpgroup issues by TMA into `Ring`s, beside one or two consumer
     warpgroups at `setmaxnreg` budgets (`roles`): sm90's and sm100's. Its walk acquires each step's slots as
-    the step reads them and releases them once its products are done (`Slots`)."""
+    the step reads them and releases them once its products are done (`Slots`). Its products read their
+    operands from the rings, a block's rows staged at the widest swizzle, 128 bytes."""
     bounded_loads = True
+    operands_in_registers = False
+
+    def registers(self, consumers: int) -> int:
+        return consumer_registers(consumers)
+
+    def column_unit(self, dtype) -> int:
+        return SWIZZLE_BYTES // jnp.dtype(dtype).itemsize
+
+    def depths(self, dtype) -> tuple[int, ...]:
+        return (SWIZZLE_BYTES // jnp.dtype(dtype).itemsize,)
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True) -> Callable:

@@ -74,6 +74,21 @@ class Mma(mosaic.Family):
     rows = 16
     consumers = 1
     bounded_loads = False
+    role_rows = 4 * 16
+    operands_in_registers = True
+
+    def registers(self, consumers: int) -> int:
+        del consumers  # one role, at a thread's whole budget
+        return 255
+
+    def column_unit(self, dtype) -> int:
+        # Its stores move a row through registers, laid over the role's threads, one element or more each.
+        del dtype
+        return mosaic.THREADS
+
+    def depths(self, dtype) -> tuple[int, ...]:
+        # Its operand blocks' rows staged at a 128- or 64-byte swizzle (`swizzled`).
+        return tuple(swizzle // jnp.dtype(dtype).itemsize for swizzle in (mosaic.SWIZZLE_BYTES, 64))
 
     @property
     def layout(self):
