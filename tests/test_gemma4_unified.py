@@ -180,9 +180,10 @@ def gradient_functions(source):
             return theirs(truth, inputs, probe, wide=True)
 
     def draw(seed):
+        """Independent examples and a separately tagged cotangent stream, never another draw's media RNG."""
         pairs = [unified_draw(reference.config, 4 * seed + index) for index in range(4)]
         inputs = {name: np.concatenate([pair[name] for pair in pairs]) for name in pairs[0]}
-        probe = np.random.default_rng(seed + 73).standard_normal((8, 14, 64), np.float32)
+        probe = np.random.default_rng([0xBACC, seed]).standard_normal((8, 14, 64), np.float32)
         return inputs, probe
 
     return ours, lambda *args: theirs(reference, *args), oracle, draw
@@ -234,7 +235,8 @@ def cached_functions(source):
 
     @jax.jit
     def ours_cached(batch, continuation):
-        cache = model.apply(native.variables, 1, method="init_cache", mutable=["cache"])[1]["cache"]
+        cache = model.apply(native.variables, batch.tokens.shape[0],
+                            method="init_cache", mutable=["cache"])[1]["cache"]
         prefill, changed = model.apply({**native.variables, "cache": cache}, batch.tokens,
                                        **batch.kwargs(), decode=True, mutable=["cache"])
         outputs = {"prefill": prefill}
@@ -245,31 +247,38 @@ def cached_functions(source):
         return outputs
 
     def ours(inputs, continuation):
-        batch = native.processor.from_hf(inputs).take_rows(jnp.asarray([1])).slice_tokens(0, 10)
+        rows = jnp.arange(1, inputs["input_ids"].shape[0], 2)
+        batch = native.processor.from_hf(inputs).take_rows(rows).slice_tokens(0, 10)
         return ours_cached(batch, continuation)
 
     def theirs(model, inputs, continuation, *, wide=False):
         tensors = {name: torch.tensor(value, dtype=torch.float64 if wide and np.issubdtype(
             value.dtype, np.floating) else None) for name, value in inputs.items()}
-        single = _row_slices(tensors, model)[1]
+        observations = []
         with torch.no_grad():
-            result = model(**single, use_cache=True)
-            outputs = {"prefill": result.logits.numpy()}
-            for step in range(continuation.shape[1]):
-                result = model(input_ids=torch.from_numpy(continuation[:, step:step + 1]),
-                               attention_mask=torch.ones((1, single["input_ids"].shape[1] + step + 1),
-                                                         dtype=torch.bool),
-                               past_key_values=result.past_key_values, use_cache=True)
-                outputs[f"step{step}"] = result.logits.numpy()
-        return outputs
+            for row, single in enumerate(_row_slices(tensors, model)[1::2]):
+                result = model(**single, use_cache=True)
+                outputs = {"prefill": result.logits.numpy()}
+                for step in range(continuation.shape[1]):
+                    result = model(input_ids=torch.from_numpy(continuation[row:row + 1, step:step + 1]),
+                                   attention_mask=torch.ones((1, single["input_ids"].shape[1] + step + 1),
+                                                             dtype=torch.bool),
+                                   past_key_values=result.past_key_values, use_cache=True)
+                    outputs[f"step{step}"] = result.logits.numpy()
+                observations.append(outputs)
+        return {name: np.concatenate([row[name] for row in observations]) for name in observations[0]}
 
     def oracle(inputs, continuation):
         with float64():
             return theirs(truth, inputs, continuation, wide=True)
 
     def draw(seed):
-        return unified_draw(reference.config, seed), np.random.default_rng(seed + 83).integers(
-            4, 50, (1, 3), dtype=np.int32)
+        """Four independent rows retain every cached output while diluting one row's conditioning.
+        Continuations use a separate tagged stream from all media draws."""
+        pairs = [unified_draw(reference.config, 4 * seed + index) for index in range(4)]
+        inputs = {name: np.concatenate([pair[name] for pair in pairs]) for name in pairs[0]}
+        continuation = np.random.default_rng([0xCAC4, seed]).integers(4, 50, (4, 3), dtype=np.int32)
+        return inputs, continuation
 
     return ours, lambda *args: theirs(reference, *args), oracle, draw
 
