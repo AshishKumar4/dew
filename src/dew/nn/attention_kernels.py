@@ -47,6 +47,10 @@ FLASH_MAX_BACKWARD_HEAD_DIM = 192
 # and 6.7 to 13.7 on an A100 against the document mask's 12.3 to 12.7 and 22.7 to 24.7; the row
 # length's cap took 80 and 160 (docs/performance.md).
 FLASH_PACKED_SEGMENTS = 64
+# tokamax's Triton attention computes heads 8 wide or narrower wrong: bf16 and fp16 heads of 1 to 8,
+# causal or not over 4 to 200 tokens, lay 0.37 to 5.8 of the output's size from float64 on an A100, where
+# xla's lay 2e-3, and its own heads of 9 to 128 within twice xla's (ledger 1542).
+TRITON_NARROWEST = 9
 
 
 def flash_architectures() -> tuple[str, ...] | None:
@@ -289,6 +293,10 @@ TRITON_SUPPORTS = (
                 lambda case: f"the heads are {case.head_dim} wide, where it measured no faster than "
                              "cuDNN (`attention_narrow`)",
                 row='measured: tokamax Triton attention (docs/performance.md)', kind='measured'),
+    _Need('head_dim', lambda case: case.head_dim >= TRITON_NARROWEST,
+                lambda case: f"the heads are {case.head_dim} wide, narrower than the {TRITON_NARROWEST} it "
+                             "computes right",
+                row='ledger 1542'),
     *(_Need(code, test, detail, row=INHERENT) for code, test, detail in (
         ('window', lambda case: case.window is None, "the call has a sliding window"),
         ('mask', lambda case: not case.mask, "the call has an arbitrary mask"),
@@ -302,9 +310,9 @@ TRITON_SUPPORTS = (
     _ARITHMETIC,
 )
 """tokamax's Triton flash kernel's requirements (`triton_attention`): a GPU of sm80 or later, heads at
-most 64 wide where it was measured faster (an RTX 4080's SimpleDiT-B attention 5.62 to 4.33 ms, its
-causal 3-layer decoder's 1.82 to 1.24; Qwen3-0.6B's 128-wide 9.13 to 9.24), and no window, mask, bias,
-sinks, softcap, documents or key lengths or starts."""
+least `TRITON_NARROWEST` wide and at most 64 wide where it was measured faster (an RTX 4080's SimpleDiT-B
+attention 5.62 to 4.33 ms, its causal 3-layer decoder's 1.82 to 1.24; Qwen3-0.6B's 128-wide 9.13 to
+9.24), and no window, mask, bias, sinks, softcap, documents or key lengths or starts."""
 
 TPU_BACKEND = _Need('backend', lambda case: generation.backend() == 'tpu', "it runs on a TPU", row=INHERENT,
                     kind='measured')

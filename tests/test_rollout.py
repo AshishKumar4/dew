@@ -14,8 +14,9 @@ import numpy as np
 import pytest
 from affine_run import dataset, frozen_trainer, raw_leaf
 from recording import RecordingTracker
-from rl_support import TinyHead, padded_text
+from rl_support import TinyHead
 
+from dew.data.prompts import _utf8
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import RolloutScheduler
 from dew.rl import group_advantage, rloo_advantage
@@ -133,18 +134,18 @@ def tiny_objective(seq=PROMPT_WIDTH + NEW_TOKENS - 1):
 
 
 def prompt_batch(rows=2):
-    """Two fixed-width prompt rows with distinct reward contexts."""
+    """Two fixed-width prompt rows with distinct reward contexts, one containing multibyte UTF-8."""
     width = PROMPT_WIDTH
     prompts = np.zeros((rows, width), np.int32)
     prompts[0] = [1, 2, 3, 4, 5, 6, 7, 1]
     prompts[1] = [2, 3, 4, 5, 6, 7, 1, 2]
     info = max(len("rule"), len("other"), 1)
     def pad(text):
-        return padded_text(text, info)
+        return _utf8(text, info)
     return {
         "prompt": prompts,
         "prompt_length": np.full(rows, width, np.int32),
-        "data_source": np.stack([pad("rule"), pad("other")]),
+        "data_source": np.stack([pad("rulé"), pad("other")]),
         "ground_truth": np.stack([pad("1"), pad("2")]),
         "extra_info": np.stack([pad(""), pad("")]),
     }
@@ -247,7 +248,7 @@ def test_the_reward_sees_each_rows_own_context():
 
     rollout(FakeState(params), prompt_batch(), jax.random.key(1))
 
-    assert [record.data_source for _, record in reward.seen] == ["rule", "rule", "other", "other"]
+    assert [record.data_source for _, record in reward.seen] == ["rulé", "rulé", "other", "other"]
     assert [record.ground_truth for _, record in reward.seen] == ["1", "1", "2", "2"]
 
 
