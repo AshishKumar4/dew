@@ -52,6 +52,58 @@ def test_a_wrapper_dtype_change_reaches_the_decoder_that_computes_its_logits():
     np.testing.assert_array_equal(loaded.model.apply(loaded.variables, ids), original)
 
 
+def test_released_block_attention_matches_transformers_against_float64():
+    """The release's own mask adapter over independent block layouts, including causal-only
+    rows, judged against the paired fp32 and float64 transformers recordings."""
+    import jax
+    from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording
+
+    from dew.interop import Pretrained
+
+    directory = FIXTURES / "qwen35-blocks-tiny"
+    source = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    path = directory / "reference.npz"
+    seeds = declared_seeds(path)["blocks"]
+    draw, reference, truth = indexed_recording(recording(path), "blocks", seeds)
+
+    @jax.jit
+    def forward(index, inputs):
+        return {"logits": source.model.apply(
+            source.variables, inputs["input_ids"], block_groups=inputs["block_groups"])}
+
+    assert_as_exact(forward, reference, draw, "Qwen3.5 released block attention",
+                    seeds=seeds, truth_fn=truth)
+
+
+def test_wrapper_block_overrides_survive_export_and_admit_their_future_block_mate(tmp_path):
+    """A source declaring block attention changes visibility only where runtime block IDs admit
+    it. A future block mate can affect the earlier token, and source export preserves that rule."""
+    import shutil
+
+    from dew.interop import Pretrained
+
+    directory = tmp_path / "source"
+    shutil.copytree(FIXTURES / "qwen35-tiny-mm", directory)
+    config = json.loads((directory / "config.json").read_text())
+    config["modeling_overrides"] = {"attention": {
+        "full_attention": "block_bidirectional", "linear_attention": "causal"}}
+    (directory / "config.json").write_text(json.dumps(config))
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
+    altered = ids.at[0, 1].set(7)
+    blocked = jnp.asarray([[0, 0, -1, -1]], jnp.int32)
+
+    def first(bundle, tokens, groups=None):
+        return np.asarray(bundle.model.apply(bundle.variables, tokens, block_groups=groups))[0, 0]
+
+    np.testing.assert_array_equal(first(loaded, ids), first(loaded, altered))
+    assert np.any(first(loaded, ids, blocked) != first(loaded, altered, blocked))
+    loaded.save(tmp_path / "export")
+    restored = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
+    np.testing.assert_array_equal(first(restored, ids, blocked), first(loaded, ids, blocked))
+    np.testing.assert_array_equal(first(restored, ids), first(loaded, ids))
+
+
 def load_wrapper(name):
     directory = FIXTURES / name
     record = translate_wrapper_config(
