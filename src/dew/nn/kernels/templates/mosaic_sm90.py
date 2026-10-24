@@ -23,6 +23,7 @@ class Wgmma(mosaic.RingFamily):
     name = "wgmma"
     rows = 64
     consumers = 2
+    role_rows = 64
 
     @property
     def layout(self):

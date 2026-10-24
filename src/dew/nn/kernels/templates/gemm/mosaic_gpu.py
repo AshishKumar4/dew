@@ -99,6 +99,43 @@ class Tiles:
             raise ValueError(f"{self}: two warpgroups stream at least two stages")
 
 
+STAGES = (6, 5, 4, 3, 2)
+"""The stage counts a generated tile takes, deeper first, so where the cost model ties the deeper pipeline
+wins (more of a load's latency hidden than the model's mean charges); each is kept only where its block
+fits (`base.Template.fitting`). Past six no sweep or estimate found a stage worth its shared memory."""
+
+BANDS = (8, 4, 2, 1)
+"""The column tiles a band of the planar snake takes (`Tiles.grid_block_n`), widest first: wider bands
+share a row block's loads across more column tiles in the L2 while a band is in flight."""
+
+
+def generated(families, *, depth: int | None, width: int, dtype) -> tuple[Tiles, ...]:
+    """Every tile a GEMM mainloop may take on each of `families`, from the family's facts and the call's
+    extents alone (no table of tiles): each count of consumer roles it has, rows in multiples of its
+    roles' (`Family.role_rows`), columns in multiples of its column unit dividing the call's `width`, a
+    step of each of its depths dividing `depth` (any, where None: steps over rows padded to whole steps),
+    each axis at most a block's extent; a tile whose
+    consumer threads would hold more registers than the family gives them (`mosaic.tile_registers`,
+    `Family.registers`) is none; each at every count of `STAGES` and of `BANDS`. Larger tiles first, which
+    read each operand fewest times, so the cost model's ties go to them."""
+    tiles = []
+    for family in families:
+        for consumers in range(1, family.consumers + 1):
+            unit = family.role_rows * consumers
+            for block_m in range(family.block_extent // unit * unit, 0, -unit):
+                columns = family.column_unit(dtype)
+                for block_n in range(family.block_extent // columns * columns, 0, -columns):
+                    for block_k in family.depths(dtype):
+                        legal = (width % block_n == 0 and (depth is None or depth % block_k == 0)
+                                 and mosaic.tile_registers(family, consumers, (block_m, block_n, block_k),
+                                                           dtype) <= family.registers(consumers))
+                        if legal:
+                            tiles += [Tiles(block_m, block_n, block_k, stages, band, warpgroups=consumers,
+                                            family=family.name)
+                                      for stages in STAGES for band in BANDS]
+    return tuple(tiles)
+
+
 @dataclasses.dataclass(frozen=True)
 class GroupInfo:
     """Information regarding the group being processed in a block."""
@@ -552,7 +589,8 @@ def _zero_neighbours_of(family: mosaic.Family, refs: tuple, step, start, end, st
     def zero(kept):
         for ref in refs:
             values = family.tile_of(ref)
-            ref[...] = jnp.where(kept(family.iota(values.shape, 0)), values, jnp.zeros_like(values))
+            rows = family.iota((values.shape[0], values.shape[1]), 0)
+            ref[...] = jnp.where(kept(rows), values, jnp.zeros_like(values))
 
     pl.when(first)(lambda: zero(lambda rows: rows >= lax.rem(start, block_k)))
     pl.when(last)(lambda: zero(lambda rows: rows <= lax.rem(end - 1, block_k)))
