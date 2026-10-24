@@ -408,18 +408,20 @@ def widened_state(state):
 LAYOUT_SEEDS: dict[str, int] = {
     "unet": 128, "uvit": 128, "simple_udit": 64, "simple_dit": 64, "simple_mmdit": 64,
     "hierarchical_mmdit": 128, "hybrid_dit": 64, "video_dit": 64, "unet_3d": 128, "jepa_encoder": 128,
-    "jepa_video_encoder": 256, "causal_transformer": 32, "causal_transformer+moe": 64,
-    "causal_transformer+gpt_oss": 256, "causal_transformer+deepseek_v2": 128,
-    "causal_transformer+glm4_moe": 128, "causal_transformer+llama4": 32,
-    "causal_transformer+gemma4_moe": 128, "causal_transformer+gemma3n": 128,
+    "jepa_video_encoder": 256, "causal_transformer": 64, "causal_transformer+moe": 128,
+    "causal_transformer+gpt_oss": 256, "causal_transformer+deepseek_v2": 256,
+    "causal_transformer+glm4_moe": 256, "causal_transformer+llama4": 256,
+    "causal_transformer+gemma4_moe": 256, "causal_transformer+gemma3n": 128,
     "causal_transformer+mla": 64, "causal_transformer+qwen35": 8,
 }
 """Each cell's declared seeds for check 1 (`assert_as_exact`), the most any layout and step count took,
-sized by `seeds_for` on armada: paired with the layout's arm (`dew_fn`) for the language cells, whose
-arms share their upstream rounding and whose errors are heavy-tailed across draws (Gemma 3n's and
-Qwen 3.5's, LONG_SEQ_LEN), and the reference against itself for the image and JEPA cells, whose errors
-are not (the four largest of 64 draws hold 7 to 12% of an arm's pooled error at the median leaf).
-Every cell is named: one added is sized."""
+sized by `seeds_for` on armada. Every cell's arms share their upstream rounding (the same state, batch
+and draws); a cell whose errors are also heavy-tailed across draws is sized paired with the layout's
+arm (`dew_fn`), as testing.md has it: Gemma 3n's and Qwen 3.5's (the four largest of 64 draws hold
+half of a layer's pooled error, LONG_SEQ_LEN), and MLA's, whose embedding momentum the reference
+compared with itself does not resolve within 4096 draws. Every other cell's errors are light-tailed
+(the four largest of 64 draws hold 7 to 12% of an arm's pooled error at the median leaf, 6% being
+uniform), and it is sized by the reference against itself. Every cell is named: one added is sized."""
 
 MARGIN = 1e-5
 """The least selection margin a draw admits (`selection_margin`), relative to the scale of what is
