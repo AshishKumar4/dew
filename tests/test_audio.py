@@ -99,13 +99,10 @@ def test_a_gemma4_tower_runs_any_activation_the_shared_table_computes_as_the_ref
     reference's block with the tower's own weights: in fp32, as exact as the
     reference's fp32 block from its float64 run. The whole reference tower pins
     its attention to float32, so the blocks run alone."""
-    import functools
-
     import torch
-    from flax import linen as nn
     from transformers.models.gemma4.modeling_gemma4 import Gemma4AudioModel
 
-    from dew.nn.audio import AudioFeedForward, AudioLightConv
+    from dew.nn.audio import AudioFeedForward, AudioLightConv, _clippable
     from tools.audio_reference import audio_config as reference_config, perturb
 
     config = reference_config("gemma4")
@@ -116,8 +113,7 @@ def test_a_gemma4_tower_runs_any_activation_the_shared_table_computes_as_the_ref
     ours = audio_config(config.to_dict())
     tensors = {name: tensor.numpy().copy() for name, tensor in reference.state_dict().items()}
     tree, _ = audio_weights(tensors, ours)
-    linear = functools.partial(AudioLinear, dense=functools.partial(nn.Dense, use_bias=False),
-                               use_clipped_linears=ours.use_clipped_linears)
+    linear = _clippable(ours, None, None)
     feed_forward = AudioFeedForward(ours.hidden_size, ours.residual_weight, ours.gradient_clipping, linear,
                                     ours.hidden_act)
     light_conv = AudioLightConv(ours.hidden_size, ours.conv_kernel_size, ours.rms_norm_eps,
