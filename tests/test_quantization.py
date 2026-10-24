@@ -21,7 +21,12 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, assert_fp32_reduction_bound
+from reference_error import (
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    assert_fp32_reduction_bound,
+    with_gradients,
+)
 from token_support import token_rows
 
 from dew.config import ObjectiveConfig, OptimConfig
@@ -998,21 +1003,23 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
     def draw(seed):
         variables = init(jax.random.key(seed), jnp.ones((1, SEQ_LEN), jnp.int32))
         rows = np.random.default_rng(seed).integers(0, VOCAB, size=(8, SEQ_LEN + 1)).astype(np.int32)
-        return variables, rows
+        # A step's loss, taken with its backward under its own cotangent, one.
+        return variables, rows, np.float32(1)
 
     def gradient(objective):
-        def loss(params, variables, batch):
-            return objective.scalar_loss({**variables, "params": params}, batch, info)
-        return jax.jit(jax.value_and_grad(loss, has_aux=True))
+        def step(params, variables, batch, cotangent):
+            return with_gradients(lambda params: objective.scalar_loss(
+                {**variables, "params": params}, batch, info)[0])(params, cotangent)
+        return jax.jit(step)
 
     def runner(spec, microbatches=None):
         mesh = spec.build()
         program = gradient(LMObjective(qmodel, SEQ_LEN))
 
-        def run(variables, rows):
+        def run(variables, rows, cotangent):
             placed = jax.device_put(variables, Layout(min_shard=256).shardings(mesh, variables))
             with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
-                (value, _), grads = program(placed["params"], placed, shard_batch(mesh, {"text": rows}))
+                value, grads = program(placed["params"], placed, shard_batch(mesh, {"text": rows}), cotangent)
             return np.asarray(value), jax.tree.map(np.asarray, grads)
         return run
 
@@ -1022,8 +1029,8 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
     assert np.isfinite(loss) and all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(grads))
     assert_as_exact(lambda *inputs: {"loss": piped(*inputs)[0]}, lambda *inputs: {"loss": loop(*inputs)[0]},
                     draw, "quantized pipeline loss", seeds=PIPELINE_SEEDS,
-                    truth_fn=lambda variables, rows: {"loss": np.asarray(unquantized(
-                        variables["params"], variables, {"text": rows})[0][0])})
+                    truth_fn=lambda variables, rows, cotangent: {"loss": np.asarray(unquantized(
+                        variables["params"], variables, {"text": rows}, cotangent)[0])})
 
 
 def test_stochastic_rounding_draws_from_its_own_stream():

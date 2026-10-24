@@ -37,7 +37,7 @@ import torch
 from interop_support import fixture_arrays
 from jax.sharding import PartitionSpec as P
 from recording import RecordingTracker
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, torch_with_gradients, with_gradients
 from tool_support import load
 
 from dew.data.dataset import Loader
@@ -158,37 +158,30 @@ def reference_block(name: str, wide: bool = False):
 
 
 def reference_walk(name: str, wide: bool = False):
-    """The reference block as a function of a draw, run in float32, or in float64 where `wide` (the
-    truth): its output and the gradient of `sum(output * probe)` into the hidden states."""
+    """The reference block as a function of a draw `(hidden, cotangent)`, run in float32, or in
+    float64 where `wide` (the truth): its output and the hidden states' gradient under the drawn
+    cotangent (`torch_with_gradients`)."""
     from tools.diffusers_wan_reference import float64
 
     block, rotary = reference_block(name, wide)
-    dtype = torch.float64 if wide else torch.float32
 
-    def run(hidden, probe):
-        states = torch.tensor(np.asarray(hidden), dtype=dtype).requires_grad_()
+    def forward(states):
         batch, length = states.shape[:2]
         positions = torch.arange(length).unsqueeze(0).expand(batch, length)
-        mask = torch.triu(torch.full((length, length), float("-inf"), dtype=dtype), diagonal=1)
+        mask = torch.triu(torch.full((length, length), float("-inf"), dtype=states.dtype), diagonal=1)
         with float64() if wide else contextlib.nullcontext(), stable_top_k():
             output, _ = block(states, rotary(states, positions), mask.expand(batch, 1, length, length),
                               position_ids=positions)
-            (gradient,) = torch.autograd.grad((output * torch.tensor(np.asarray(probe), dtype=dtype)).sum(),
-                                              [states])
-        return {"output": output.detach().numpy(), "grad_hidden": gradient.numpy()}
-    return run
+        return output
+    return torch_with_gradients(forward)
 
 
 def dew_walk(name: str, settings: dict, attention_impl: str = "reference"):
     """Dew's block on the fixture's weights as a function of a draw: what `reference_walk` returns."""
     module = mla_module(settings, attention_impl=attention_impl)
     variables = block_variables(fixture(name))
-
-    @jax.jit
-    def run(hidden, probe):
-        output, pullback = jax.vjp(lambda states: module.apply(variables, states), hidden)
-        return {"output": output, "grad_hidden": pullback(probe)[0]}
-    return lambda hidden, probe: run(jnp.asarray(hidden), jnp.asarray(probe))
+    run = jax.jit(with_gradients(lambda states: module.apply(variables, states)))
+    return lambda hidden, cotangent: run(jnp.asarray(hidden), jnp.asarray(cotangent))
 
 
 def boundary_gap(name: str, hidden: np.ndarray) -> float:
@@ -228,7 +221,7 @@ def boundary_gap(name: str, hidden: np.ndarray) -> float:
 
 
 def block_draw(name: str):
-    """Check 1's draw for a block: a seed's hidden states and probe, rows LENGTH tokens long, for the
+    """Check 1's draw for a block: a seed's hidden states and cotangent, rows LENGTH tokens long, for the
     V3.2 block the first of the seed's candidates its reference selects by more than MARGIN
     (`boundary_gap`)."""
     shape = (CONFIG["batch"], LENGTH, CONFIG["v3"]["hidden_size"])
@@ -353,15 +346,9 @@ def test_mla_reproduces_the_v32_block():
 
 
 def walked(module):
-    """`module`'s output and the gradients of `sum(output * probe)` into its every parameter and the
-    hidden states, as a function of a draw `(variables, hidden, probe)`, compiled."""
-    @jax.jit
-    def run(variables, hidden, probe):
-        output, pullback = jax.vjp(lambda variables, hidden: module.apply(variables, hidden),
-                                   variables, hidden)
-        grad_variables, grad_hidden = pullback(probe)
-        return {"output": output, "grad_hidden": grad_hidden, "grad_params": grad_variables["params"]}
-    return run
+    """`module`'s output and the gradients of its every parameter and the hidden states under the
+    drawn cotangent, as a function of a draw `(variables, hidden, cotangent)`, compiled."""
+    return jax.jit(with_gradients(module.apply))
 
 
 @pytest.mark.parametrize("name", ["mla_v3", "mla_v3n", "mla_v32"])
