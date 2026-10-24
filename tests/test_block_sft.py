@@ -93,6 +93,35 @@ UPDATE_SEEDS = {"text": 16, "image": 16}
 the trainer's step as `dew_fn`)."""
 
 
+LOGIT_SPREAD = 8.0
+"""The spread (standard deviation) of a drawn model's first-pass logits over its vocabulary
+(`confident`): at it the pass puts most of its mass on one of the fixture's 32 tokens, as a trained
+model's confident first pass does."""
+
+
+def confident(variables):
+    """Check 1's `draw(seed)` of a block denoiser's weights where its self-conditioning is as well
+    conditioned as a trained model's: the fixture's weights each moved by the seed's draw
+    (`moved_weights`), the tied embedding table then scaled so the first pass's logits spread
+    LOGIT_SPREAD. The pass's soft embedding, the probabilities' mix of the table's rows, is then about
+    one token's row, its norm a row's, where the fixture's random table spread its logits 0.6 and
+    its soft embedding averaged all 32 rows nearly to zero, whose normalization (`pre_norm`) carried
+    each rounding of the mix up to several hundred times further on some draws."""
+    draw = moved_weights(variables)
+
+    def drawn(seed):
+        (values,) = draw(seed)
+        table = values["params"]["text"]["embed_tokens"]["embedding"]
+        # Unit-scale final states meet each row in a logit: sqrt(width) times the rows' RMS spreads them.
+        spread = np.sqrt(table.shape[-1]) * np.sqrt(np.mean(np.square(table.astype(np.float64))))
+        scaled = (table * (LOGIT_SPREAD / spread)).astype(table.dtype)
+        text = {**values["params"]["text"], "embed_tokens": {**values["params"]["text"]["embed_tokens"],
+                                                               "embedding": scaled}}
+        return ({**values, "params": {**values["params"], "text": text}},)
+
+    return drawn
+
+
 def assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, seeds: int):
     """The trainer's update is the objective's at the step's draws: the gradient its step takes, which
     sgd with a momentum of zero keeps as its trace, is on par with the objective's own over drawn
@@ -108,7 +137,7 @@ def assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, 
         return jax.tree.map(np.asarray, optax.tree_utils.tree_get(stepped(values).opt_state, "trace"))
 
     gradient = as_a_step(obj, variables, batch, lambda values: objective_gradient(obj, values, batch, step))
-    assert_as_exact(trained, gradient, moved_weights(variables), "trainer update", seeds=seeds,
+    assert_as_exact(trained, gradient, confident(variables), "trainer update", seeds=seeds,
                     truth_fn=float64_gradient(twin, batch, step))
     taken, _ = trainer_update(obj, batch, run_key, optax.sgd(0.001))
     solo = Trainer(obj, optax.sgd(0.001), key=run_key)
