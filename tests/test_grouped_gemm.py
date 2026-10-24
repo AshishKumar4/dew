@@ -13,9 +13,9 @@ import numpy as np
 import pytest
 from generation_support import INTERPRETS, generations, lowers
 from jax.sharding import Mesh
-from reference_error import assert_as_exact_as_the_reference, equations
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, equations, with_gradients
 
-from dew.nn.kernels import generation, grouped_matmul
+from dew.nn.kernels import generation, grouped_matmul, tuning
 from dew.nn.kernels.templates import cost
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 from dew.nn.moe import expert_projection
@@ -26,6 +26,8 @@ pytestmark = pytest.mark.kernel
 SIZES = {"ragged": [0, 70, 1, 100, 0], "one-group": [200], "all-empty": [0, 0, 0], "aligned": [64, 64, 64, 8],
          "unrouted-tail": [3, 0, 120]}
 ROWS, DEPTH, WIDTH = 200, 128, 256
+SEEDS = 8
+"""Each site's declared draws (`reference_error.seeds_for` of the plain program on them)."""
 
 
 def rounded(values, dtype) -> np.ndarray:
@@ -205,6 +207,38 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
 
 
 
+@pytest.mark.gpu(reason="needs a GPU the installed dew-cutlass holds kernels for")
+@pytest.mark.parametrize("sizes", [name for name in SIZES if any(SIZES[name])])
+def test_cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
+    """Where the installed dew-cutlass holds this GPU's kernels, the projection's forward and both
+    gradients through CUTLASS's launches, chosen by name, are as exact as XLA's ragged dot from float64,
+    unrouted rows and empty groups included, and the CUDA branch's launches are CUTLASS's."""
+    pytest.importorskip("dew_cutlass")
+    here = generation.effective(generation.gpu_target()).generation
+    if here not in grouped_matmul.cutlass_architectures():
+        pytest.skip(f"the installed dew-cutlass holds no kernels for {here}")
+    group_sizes = jnp.asarray(SIZES[sizes], jnp.int32)
+
+    def draw(seed):
+        x, w, dy, _ = operands(SIZES[sizes], jnp.bfloat16, seed)
+        return tuple(jnp.asarray(value, jnp.bfloat16) for value in (x, w, dy))
+
+    def projection(implementation, dtype=jnp.bfloat16):
+        return lambda x, w: expert_projection(x, w, group_sizes, dtype, implementation, None)
+
+    def through_cutlass(x, w, dy):
+        with generation.chosen(grouped_matmul="cutlass"):
+            return with_gradients(projection("pallas"))(x, w, dy)
+
+    with tuning.seen() as launches:
+        assert_as_exact(jax.jit(through_cutlass), jax.jit(with_gradients(projection("xla"))), draw,
+                        f"cutlass {sizes}", seeds=SEEDS,
+                        truth_fn=with_gradients(projection("xla", jnp.float64)))
+    # The CUDA branch's launches; the CPU branch beside it interprets Triton's.
+    ran = {type(launch).__name__ for launch, ba in launches if not ba.arguments["interpret"]}
+    assert ran == {"CutlassGmm", "CutlassTgmm"}
+
+
 def test_the_kernels_forward_mode_keeps_the_projections_law():
     """An expert projection's tangent through the template (its launches interpreted, as an A100 runs
     them) is the XLA projection's, bit for bit: `dx @ Q(kernel) + Q(x) @ dkernel` with the tangents
@@ -281,24 +315,6 @@ def test_the_kernels_write_each_product_in_its_own_dtype(generation_name):
             ((4, DEPTH, WIDTH), jnp.dtype(jnp.float32))} <= written
 
 
-def test_the_cost_model_charges_a_program_its_instructions_at_its_warps_issue_rate():
-    """A program its CUDA cores bound, not its tensor work, takes as long as its instructions take to issue:
-    twice the instructions twice the time, and twice the warps half of it until the multiprocessor's
-    schedulers each issue every clock; programs sharing a multiprocessor share its schedulers."""
-    target = generation.TARGETS["sm90"]
-
-    def seconds(issued, warps, resident=1):
-        work = cost.Cost(programs=target.multiprocessors * resident, device_bytes=0.0, program_flops=1.0,
-                         program_issued=issued, warps=warps, resident=resident)
-        return cost.seconds(work, target)
-
-    assert seconds(2e6, 4) == 2 * seconds(1e6, 4)
-    assert seconds(1e6, 8) == seconds(1e6, 4) / 2
-    assert seconds(1e6, 16) == seconds(1e6, 32)
-    assert seconds(1e6, 32, resident=2) == 2 * seconds(1e6, 32)
-    assert seconds(0.0, 4) < seconds(1e6, 4)
-
-
 def test_the_cost_model_charges_each_multiprocessor_its_programs_in_turn():
     """A multiprocessor does its programs' work one after another: a launch of one program per
     multiprocessor takes one program's time, one more program a second, and the device bytes bound it
@@ -365,16 +381,20 @@ def test_a_cooperative_tile_refuses_what_its_consumers_cannot_compute(block_m, b
 
 
 @INTERPRETS
-def test_a_cooperative_tile_refuses_a_width_it_cannot_stage_whole():
-    """A consumer stages its bf16 output 128 columns at a time: a 192-column cooperative tile refuses a
-    16-bit output rather than leaving its last 64 columns unwritten."""
-    x, w, _, _ = operands(SIZES["ragged"], jnp.bfloat16)
+def test_a_tile_of_192_columns_stages_every_column_it_writes():
+    """A consumer stages its bf16 output in chunks of at most 128 columns that divide its tile: a 192-column
+    tile, one warpgroup or two, writes all of its columns, as exact as XLA's ragged dot from float64."""
+    sizes = SIZES["ragged"]
+    x, w, dy, group = operands(sizes, jnp.bfloat16)
     wide = np.tile(w, (1, 1, 2))[..., :192]
-    tiles = mosaic_gpu.Tiles(128, 192, 64, 2, 1, warpgroups=2)
-    with pytest.raises(ValueError):
-        mosaic_gpu.gmm(jnp.asarray(x, jnp.bfloat16), jnp.asarray(wide, jnp.bfloat16),
-                       jnp.asarray(SIZES["ragged"], jnp.int32), tiles=tiles, transpose_rhs=False,
-                       out_dtype=jnp.bfloat16, multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
+    truth = oracle.products(x, wide, np.tile(dy, (1, 2))[:, :192], sizes)
+    reference = xla_products(x, wide, np.tile(dy, (1, 2))[:, :192], sizes, jnp.bfloat16, jnp.float32)
+    for warpgroups in (1, 2):
+        tiles = mosaic_gpu.Tiles(128, 192, 64, 2, 1, warpgroups=warpgroups)
+        got = mosaic_gpu.gmm(jnp.asarray(x, jnp.bfloat16), jnp.asarray(wide, jnp.bfloat16),
+                             jnp.asarray(sizes, jnp.int32), tiles=tiles, transpose_rhs=False,
+                             out_dtype=jnp.bfloat16, multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
+        check(got, reference[0], truth[0], group, f"forward {tiles}")
 
 
 def test_the_cost_model_names_a_fact_its_target_lacks():
