@@ -7,9 +7,10 @@ from functools import partial
 
 from dew import records
 from dew.interop.decoder_parts import (
+    GPT_MLP,
+    PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
-    Renames,
     base_config,
     hf_ungated,
     renamed_name,
@@ -27,7 +28,7 @@ def _starcoder2_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
     # Starcoder2Model masks every layer by the window when one is set.
     window = hf.get('sliding_window')
     # base_config reads the gated activations; the ungated one is set below.
-    config = base_config({**hf, 'hidden_act': 'gelu_pytorch_tanh'}, used,
+    config = base_config({**hf, 'hidden_act': 'gelu_pytorch_tanh'}, used, rope=PLAIN_SPELLING,
                          layer_types=('full_attention' if window is None else 'sliding_attention',) * layers,
                          tie_embeddings=True, reads=frozenset({'sliding_window'}))
     biased = bool(hf.get('use_bias', True))
@@ -44,9 +45,6 @@ def _starcoder2_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
         'attention_dropout_rate': records.number(hf.get('attention_dropout', 0.), 'attention_dropout'),
     })
     return config
-
-
-_STARCODER2_NAMES: Renames = (('mlp.c_fc', 'mlp.up_proj'), ('mlp.c_proj', 'mlp.down_proj'))
 
 
 def _starcoder2_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -79,7 +77,7 @@ def _matches(fields: CausalTransformer) -> bool:
 
 STARCODER2 = DecoderFamily(
     ('starcoder2',), _starcoder2_config, _matches, 'starcoder2', 'Starcoder2ForCausalLM', _starcoder2_export,
-    weight_path=partial(renamed_path, _STARCODER2_NAMES),
-    export_path=partial(renamed_name, _STARCODER2_NAMES),
+    weight_path=partial(renamed_path, GPT_MLP),
+    export_path=partial(renamed_name, GPT_MLP),
     preserve_source_layout=False,
 )

@@ -20,9 +20,7 @@ Post-training uses the same `Dataset` chain as every other objective. `Files`, `
 
 ### 1.1 Chat and SFT: a role per token
 
-SFT needs one field beyond the pretraining contract: which role wrote each token. The loss counts assistant targets only when `loss_role=Role.ASSISTANT`.
-
-`RenderChat` applies the tokenizer's chat template to the messages and optional tool schemas. It writes int32 `text` ids and aligned int8 `text_roles`: 0 padding, 1 system, 2 user, 3 assistant, 4 tool and 5 developer.
+SFT needs one field beyond the pretraining contract: which role wrote each token. The loss counts assistant targets only when `loss_role=Role.ASSISTANT`. `RenderChat` writes that field, `text_roles`, beside the ids; the batch's fields, shapes and dtypes are [data's post-training batches](data.md#post-training-batches).
 
 The assistant span comes from prefix rendering:
 
@@ -32,30 +30,15 @@ The assistant span comes from prefix rendering:
 
 Other roles retain their spans in the same whole-conversation rendering.
 
-Packing carries ids and roles through one document-coordinate plan. A chunking or truncation step cuts every aligned field together. The prepared batch is:
-
-| Key | Shape | Dtype | Content |
-|---|---|---|---|
-| `text` | `[B, S+1]` | int32 | Packed conversation ids |
-| `text_coordinates` | `Coordinates`, `[B, S+1]` leaves | int32/bool | Document membership, padding and positions |
-| `text_roles` | `[B, S+1]` | int8 | Role per id, 0 on padding |
-
 `loss_role` multiplies the objective's target weights by `text_roles[:, 1:] == loss_role`, together with the existing pad and document-boundary weights. With no `loss_role`, every valid target counts. When `loss_role` is set, the objective refuses a batch with no `text_roles` and names the field.
 
 ### 1.2 Preference pairs
 
-A pair holds `chosen` and `rejected` token-id lists, with `chosen_mask` and `rejected_mask` marking the completion tokens. A missing mask marks the whole sequence as completion. The transform pads each pair together; choosing `seq_len=S+1` prepares the row width expected by `DPOObjective(..., seq_len=S)`.
-
-| Key | Shape | Dtype | Content |
-|---|---|---|---|
-| `input_ids` | `[B, 2, S+1]` | int32 | Chosen at pair index 0, rejected at 1 |
-| `completion_mask` | `[B, 2, S+1]` | int32 | Completion marks aligned with the ids |
-
-The objective reads the pair index explicitly and shifts the completion mask with the next-token targets. Shuffling never separates a pair. A row longer than `seq_len` fails with its lengths. Chunking a pair would cut the completion whose preference was scored.
+A pair's chosen and rejected ids and completion marks arrive as [data's preference batch](data.md#post-training-batches). The objective reads the pair index explicitly and shifts the completion mask with the next-token targets. Shuffling never separates a pair. A row longer than `seq_len` fails with its lengths. Chunking a pair would cut the completion whose preference was scored.
 
 ### 1.3 Prompts and packed rollouts
 
-`RenderPrompt` accepts a message conversation, string or id sequence. Each row encodes to a left-padded `prompt` of `max_prompt_len` ids plus `prompt_length`. The reward columns become fixed-width UTF-8 byte arrays so every leaf survives the device transfer. Missing reward fields become empty strings. Prompts longer than the window keep their tail; `long="drop"` drops them instead, each dropped prompt counted as a rejection. Blank prompts fail. The source makes no masks, because the rollout produces them.
+`RenderPrompt` writes [data's prompt batch](data.md#post-training-batches). Prompts longer than the window keep their tail; `long="drop"` drops them instead, each dropped prompt counted as a rejection. Blank prompts fail. The source makes no masks, because the rollout produces them.
 
 `SampledRollout` generates a group of completions per prompt, scores each completion and builds one-call sessions through `sessions.pack`. The learner reads fixed-width packed chains; a prompt and completion must fit the objective's `seq_len+1`. The primary aligned columns are:
 

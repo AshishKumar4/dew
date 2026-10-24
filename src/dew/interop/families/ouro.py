@@ -15,17 +15,18 @@ pass, so another threshold, or an `early_exit_step` before the last, is refused.
 """
 
 from collections.abc import Mapping
+from functools import partial
 
 from dew import records
 from dew.interop.decoder_parts import (
+    PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
     Leaves,
     Renames,
     base_config,
-    hf_tensor_name,
     refuse,
-    renamed,
+    renamed_name,
     renamed_path,
 )
 from dew.interop.families.qwen import qwen_layer_types
@@ -55,22 +56,10 @@ def _ouro_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     # OuroConfig drops the window unless use_sliding_window is set, and
     # derives layer_types with Qwen2's rule when none are stated.
     windowed = {**hf, 'sliding_window': hf.get('sliding_window') if hf.get('use_sliding_window') else None}
-    config = base_config(windowed, used, layer_types=qwen_layer_types(windowed, used),
+    config = base_config(windowed, used, rope=PLAIN_SPELLING, layer_types=qwen_layer_types(windowed, used),
                          reads=frozenset({'layer_types', 'sliding_window'}))
     config.update(sandwich_norms=True, loop={'steps': steps, 'exit_gate': True})
     return config
-
-
-def _ouro_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    return renamed_path(_NAMES, name, config, leaves=_GATE)
-
-
-def _ouro_name(dew_name: str, config: Mapping[str, object]) -> str | None:
-    gate = next((hf for hf, path in _GATE.items() if '.'.join(path) == dew_name), None)
-    if gate is not None:
-        return gate
-    name = hf_tensor_name(dew_name, config, sandwich_norms=True)
-    return None if name is None else renamed(name, _NAMES, export=True)
 
 
 def _ouro_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -86,5 +75,7 @@ def _ouro_export(model: CausalTransformer) -> Mapping[str, object]:
 
 OURO = DecoderFamily(
     ('ouro',), _ouro_config, lambda fields: fields.loop is not None, 'ouro', 'OuroForCausalLM', _ouro_export,
-    weight_path=_ouro_path, export_path=_ouro_name, preserve_source_layout=False,
+    weight_path=partial(renamed_path, _NAMES, leaves=_GATE),
+    export_path=partial(renamed_name, _NAMES, leaves=_GATE, sandwich_norms=True),
+    preserve_source_layout=False,
 )

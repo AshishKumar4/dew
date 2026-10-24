@@ -12,7 +12,6 @@ import logging
 import math
 import statistics
 import threading
-import time
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Concatenate, Protocol, overload
@@ -62,6 +61,7 @@ from dew.nn.sharding import (
 )
 from dew.objectives.base import EXAMPLE_ROWS, FROZEN, Batch, Variables
 from dew.records import JSON, number, record
+from dew.telemetry.benchmark import samples
 from dew.telemetry.profile import region
 from dew.training.state import VARIABLE_FIELDS
 
@@ -348,12 +348,7 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
     gather = jax.jit(jax.shard_map(
         lambda shard: jax.lax.all_gather(shard, axis, tiled=True), mesh=mesh,
         in_specs=P(axis), out_specs=P(), axis_names={axis}, check_vma=False))
-    seconds = []
-    for attempt in range(7):
-        began = time.perf_counter()
-        jax.block_until_ready(gather(source))
-        if attempt >= 2:
-            seconds.append(time.perf_counter() - began)
+    seconds = samples(gather, source, warmup=2, repeats=5)
     received = min(from_every_process((ways - 1) / ways * count * 4 / statistics.median(seconds)))
     if record is not None and jax.process_index() == 0:
         record.parent.mkdir(parents=True, exist_ok=True)

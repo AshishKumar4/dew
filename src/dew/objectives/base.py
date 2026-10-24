@@ -886,9 +886,21 @@ class Objective(ABC, Generic[Loss, Effects]):
         return self.variables
 
     counts_tokens: bool = False
-    """Whether the objective supplies real token lengths (`real_lengths`), for throughput telemetry
-    and a run whose length is its tokens (`Trainer.fit(tokens=)`); an objective over another's
-    batches, a distillation's, counts as that one does."""
+    """Whether the objective counts the targets its loss scores (`scored_tokens`), for a run whose
+    length is its tokens (`Trainer.fit(tokens=)`) and its tokens a second; an objective over
+    another's batches, a distillation's, counts as that one does."""
+
+    def scored_tokens(self, batch: Batch) -> np.ndarray:
+        """Each row's tokens the loss scores, read before device placement: what a token budget
+        commits. By default every real input, each row's `real_lengths` summed; an objective that
+        scores fewer, a language model its shifted targets, counts those. The FLOP count reads the
+        inputs (`real_lengths`)."""
+        from dew.data.dataset import rows_of
+
+        rows = rows_of(batch)
+        return np.asarray([np.sum(self.real_lengths(jax.tree.map(
+            lambda leaf, index=index: leaf[index:index + 1] if np.ndim(leaf) and np.shape(leaf)[0] == rows
+            else leaf, batch))) for index in range(rows)], np.int64)
 
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """Real row (or packed-segment) lengths, read before device placement.
@@ -1146,6 +1158,17 @@ class Objective(ABC, Generic[Loss, Effects]):
         # Selected rather than multiplied, so a repeat holding a NaN still adds nothing.
         return Ratio(compensated_sum(jnp.where(real, values, jnp.zeros((), values.dtype)), axes),
                      jnp.sum(jnp.broadcast_to(real, values.shape).astype(dtype), axes))
+
+    @staticmethod
+    def row_moments(values: jax.Array, batch: Batch, axis: int | tuple[int, ...], *,
+                    rows: int | tuple[int, ...] = 0) -> tuple[jax.Array, jax.Array]:
+        """Return the mean and the biased variance of `values` over `axis`, over `batch`'s rows
+        (`row_mean`), in two passes as `jnp.mean` and `jnp.var` take them; both drop `axis`."""
+        axes = (axis,) if isinstance(axis, int) else tuple(axis)
+        mean, _ = Objective.row_mean(values, batch, axes, rows=rows).mean()
+        centered = values - jnp.expand_dims(mean, axes)
+        var, _ = Objective.row_mean(jnp.square(centered), batch, axes, rows=rows).mean()
+        return mean, var
 
     @staticmethod
     def row_weights(batch: Batch, rows: int) -> jax.Array:
