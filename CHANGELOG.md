@@ -12,6 +12,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   budget, to resume as one that never paused. A training stream that runs out
   ends the run with its final checkpoint, on every process at the same step,
   instead of raising `StopIteration`.
+- A JEPA run's target momentum ramps over its optimizer updates, the steps
+  over its accumulation, where it ramped over its steps; its `--lora` adapts
+  the encoder, which the run used to record and ignore. An LM run bounded by
+  `--trainer.tokens` alone trains over data with no epoch length.
 - JEPA's `normalize_targets` is Flax's `LayerNorm` with no affine and exact
   variance. Its statistics are at least float32, as I-JEPA's `F.layer_norm`'s
   are, so a bfloat16 run's targets round once.
