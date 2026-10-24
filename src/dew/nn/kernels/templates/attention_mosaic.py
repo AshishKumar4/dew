@@ -32,7 +32,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, mosaic_sm90
+from dew.nn.kernels.templates import attention_algebra as algebra, attention_portable, mosaic, mosaic_sm90
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
     DKV_GRADS,
@@ -93,56 +93,142 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     `natural` keeps the logits natural (`algebra.Forward.base2`); `interpret` runs it on the CPU (Mosaic
     GPU's interpret mode)."""
     family = family_of(query.dtype) if family is None else family
+    hooks = Hooks() if hooks is None else hooks
     tiles = (fitted(DEFAULTS[family.name], query.shape[3], value.shape[3], query.dtype.itemsize, family)
              if tiles is None else tiles)
-    hooks = Hooks() if hooks is None else hooks
-    width, value_width = query.shape[3], value.shape[3]
-    if reason := refused(query.dtype, width, value_width, hooks, backward=False,
-                         tile=(tiles.block_q, tiles.block_k)):
-        raise NotImplementedError(reason)
-    block = max(family.consumers * tiles.block_q, tiles.block_k)
-    call = padded_call(query, key, value, spans, hooks, block)
-    # Every form guards its sums where its values can overflow them (`algebra.Forward.headroom`), and the
-    # fold its logits' reach, over whole launches (`algebra.walked_launches`).
-    spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None,
-                           scale=width ** -0.5 if scale is None else scale, score_mod=hooks.score_mod,
-                           natural=natural, headroom=algebra.headroom(value.dtype),
-                           initial=hooks.initial is not None, queries=call.queries)
-    query, key, value = (_columns(array) for array in (call.query, call.key, call.value))
-    spans_of, hooked = _spans_of(spec, call, tiles.block_q, tiles.block_k), _hooked_of(hooks, call)
+    call, spec, (q, k, v), (spans_of, hooked) = _prepared(query, key, value, spans, hooks, scale=scale,
+                                                          natural=natural, tiles=tiles, family=family)
 
     def launch(form: algebra.Forward, live: jax.Array | None):
         # The guarded launch reads its live rows and its keys' values' largest magnitudes (`algebra.room`).
         guard = None if live is None else _Guard(live.astype(jnp.int32),
-                                                 jnp.swapaxes(algebra.magnitudes(value), 1, 2))
-        out, status = _launch(query, key, value, spans_of, hooked, guard, spec=form, hooks=hooks, tiles=tiles,
-                              family=family, interpret=interpret)
+                                                 jnp.swapaxes(algebra.magnitudes(v), 1, 2))
+        out, status = _launch(q, k, v, spans_of, hooked, guard, spec=form, hooks=hooks, tiles=tiles,
+                              family=family, training=False, interpret=interpret)
         return out, status[0], status[1] > 0
 
     def kept(live: jax.Array, guarded: jax.Array, plain: jax.Array) -> jax.Array:
         return jnp.where(jnp.swapaxes(live, 1, 2)[..., None], guarded, plain)
 
     out = algebra.walked_launches(spec, launch, kept)
-    return out[:, :call.queries, :, :value_width]
+    return out[:, :call.queries, :, :value.shape[3]]
 
 
-def staged_bytes(tiles: Tiles, width: int, value_width: int, itemsize: int, consumers: int) -> int:
+def training(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
+             *, scale: float | None = None, natural: bool = NATURAL, tiles: Tiles | None = None,
+             family: mosaic.Family | None = None, interpret: bool = False
+             ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
+    """`forward`'s training form: its output with the backward's residuals as every mainloop's training
+    forward gives them (`attention_portable.attend(residuals=True)`): the maxima and denominators
+    `[B, H, Q]`, each query's anchor key `[B, H, Q]` int32 and the split sums (`Split`: the other keys'
+    weighted values `[B, H, Q, Dv]`, the anchor's own weight and the other keys' weights' sum, their shift),
+    by the algebra's training step taken in place (`algebra.split_taken`, `split_rows`) at `tiles`
+    (`DEFAULTS` fitted with the split sums' stage, `fitted`). The old anchor's value row, which the split
+    sums take back where the anchor moves, is the walk's own: each row's anchor's row kept in registers,
+    picked from a value tile by its one-hot product where it moved.
+
+    A program walks its keys once, so the default's guards compose over whole launches
+    (`algebra.walked_launches`): the fold's rewalk is this kernel's natural launch, and rows whose weighted
+    values overflowed take the plain-JAX mainloop's guarded training walk (its normalized split sums, shift
+    -1, `algebra.split_residuals`), which this kernel's single pass does not take (ledger row 1594)."""
+    family = family_of(query.dtype) if family is None else family
+    hooks = Hooks() if hooks is None else hooks
+    tiles = (fitted(DEFAULTS[family.name], query.shape[3], value.shape[3], query.dtype.itemsize, family,
+                    training=True) if tiles is None else tiles)
+    call, spec, (q, k, v), (spans_of, hooked) = _prepared(query, key, value, spans, hooks, scale=scale,
+                                                          natural=natural, tiles=tiles, family=family)
+    queries_padded, value_width = call.query.shape[1], value.shape[3]
+
+    def launch(form: algebra.Forward, live: jax.Array | None):
+        if live is None:
+            out, status, rows, anchors, others = _launch(q, k, v, spans_of, hooked, None, spec=form,
+                                                         hooks=hooks, tiles=tiles, family=family,
+                                                         training=True, interpret=interpret)
+            split = Split(jnp.swapaxes(others, 1, 2), rows[2], rows[3], rows[4])
+            return (out, rows[0], rows[1], anchors, split), status[0], status[1] > 0
+        # The overflowed rows' guarded training walk, the plain-JAX mainloop's, padded as this call's; its
+        # maxima and overflows `walked_launches` does not read.
+        guarded = attention_portable.attend(query, key, value, spans, hooks, block_q=tiles.block_q,
+                                            block_k=tiles.block_k, pad=queries_padded, scale=scale,
+                                            residuals=True, natural=form.natural)
+        padded = _padded_query_rows(guarded, queries_padded, v.shape[-1])
+        return padded, padded[1], jnp.zeros_like(live)
+
+    def kept(live: jax.Array, guarded, plain):
+        def chosen(new: jax.Array, old: jax.Array) -> jax.Array:
+            # Each leaf's query rows: the output's `[B, Qp, H, ...]`, the residuals' `[B, H, Qp, ...]`.
+            rows = jnp.swapaxes(live, 1, 2) if new.ndim == 4 and new.shape[1] != live.shape[1] else live
+            return jnp.where(rows.reshape(rows.shape + (1,) * (new.ndim - rows.ndim)), new, old)
+        return jax.tree.map(chosen, guarded, plain)
+
+    out, maximum, total, anchors, split = algebra.walked_launches(spec, launch, kept)
+    queries = call.queries
+    split = Split(split.others[:, :, :queries, :value_width], split.own[:, :, :queries],
+                  split.others_total[:, :, :queries], split.shift[:, :, :queries])
+    return (out[:, :queries, :, :value_width], maximum[:, :, :queries], total[:, :, :queries],
+            anchors[:, :, :queries], split)
+
+
+def _padded_query_rows(outputs: tuple, queries: int, width: int) -> tuple:
+    """A training forward's outputs (`training`'s) with their query rows padded to `queries` and their value
+    widths to `width`, as this mainloop's launch gives them."""
+    out, maximum, total, anchors, split = outputs
+
+    def padded(array: jax.Array, rows_axis: int) -> jax.Array:
+        pads = [(0, 0)] * array.ndim
+        pads[rows_axis] = (0, queries - array.shape[rows_axis])
+        if array.ndim == 4:
+            pads[-1] = (0, width - array.shape[-1])
+        return jnp.pad(array, pads)
+
+    return (padded(out, 1), padded(maximum, 2), padded(total, 2), padded(anchors, 2),
+            Split(*(padded(part, 2) for part in split)))
+
+
+def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
+              scale: float | None, natural: bool, tiles: Tiles, family: mosaic.Family):
+    """A call as this mainloop takes it: refused where it takes no such call (`refused`), else padded to the
+    program's blocks (`padded_call`) and its heads to whole swizzled rows (`_columns`), with its
+    `algebra.Forward` (every form guarding its sums where its values can overflow them, the fold its logits'
+    reach, `algebra.walked_launches`) and the arrays its programs read beside the operands (`_Spans`,
+    `_Hooked`)."""
+    width = query.shape[3]
+    if reason := refused(query.dtype, width, value.shape[3], hooks, backward=False,
+                         tile=(tiles.block_q, tiles.block_k)):
+        raise NotImplementedError(reason)
+    block = max(family.consumers * tiles.block_q, tiles.block_k)
+    call = padded_call(query, key, value, spans, hooks, block)
+    spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None,
+                           scale=width ** -0.5 if scale is None else scale, score_mod=hooks.score_mod,
+                           natural=natural, headroom=algebra.headroom(value.dtype),
+                           initial=hooks.initial is not None, queries=call.queries)
+    operands = tuple(_columns(array) for array in (call.query, call.key, call.value))
+    read = (_spans_of(spec, call, tiles.block_q, tiles.block_k), _hooked_of(hooks, call))
+    return call, spec, operands, read
+
+
+def staged_bytes(tiles: Tiles, width: int, value_width: int, itemsize: int, consumers: int, *,
+                 training: bool = False) -> int:
     """The shared memory the forward's program stages at `tiles`, in bytes: its consumers' query stages, the
     key and value rings' slots, each consumer's output stage where the value is not as wide as the query
-    (`_launch`), and its rows' status, each width padded to whole `COLUMNS` rows."""
+    (`_launch`), its rows' status, and in a training forward its split sums' fp32 stage and anchor keys',
+    each width padded to whole `COLUMNS` rows."""
     width, value_width = (-(-columns // COLUMNS) * COLUMNS for columns in (width, value_width))
     queries = consumers * tiles.block_q * width * itemsize
     rings = tiles.stages * tiles.block_k * (width + value_width) * itemsize
     output = 0 if width == value_width else consumers * tiles.block_q * value_width * itemsize
-    return queries + rings + output + consumers * tiles.block_q * 4
+    residuals = consumers * tiles.block_q * (value_width + 1) * 4 if training else 0
+    return queries + rings + output + consumers * tiles.block_q * 4 + residuals
 
 
-def fitted(tiles: Tiles, width: int, value_width: int, itemsize: int, family: mosaic.Family) -> Tiles:
+def fitted(tiles: Tiles, width: int, value_width: int, itemsize: int, family: mosaic.Family, *,
+           training: bool = False) -> Tiles:
     """`tiles` with the key tile halved, while it stays whole rows of `family`'s, until the program's staging
-    fits a block's shared memory (`generation.shared_budget`): at D 128 and a value 256 wide, 64-key tiles
-    hold in 192 KiB what 128-key tiles stage in 288 KiB, past a Hopper block's 227 KiB."""
+    (`staged_bytes`, a `training` forward's too) fits a block's shared memory (`generation.shared_budget`):
+    at D 128 and a value 256 wide, 64-key tiles hold in 192 KiB what 128-key tiles stage in 288 KiB, past a
+    Hopper block's 227 KiB."""
     budget = generation.shared_budget(generation.gpu_target())
-    while (staged_bytes(tiles, width, value_width, itemsize, family.consumers) > budget
+    while (staged_bytes(tiles, width, value_width, itemsize, family.consumers, training=training) > budget
            and tiles.block_k > family.rows):
         tiles = dataclasses.replace(tiles, block_k=tiles.block_k // 2)
     return tiles
@@ -425,9 +511,23 @@ def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, sh
     return algebra.Coords(q_pos, k_pos, bounds, ids)
 
 
+class _Residuals(NamedTuple):
+    """A training forward consumer's residual views and the shared stages it stores them through: its rows'
+    maxima, denominators, anchor's own weight, other keys' weights' sum and their shift (`[bq]` fp32 views,
+    through the consumer's row stage), its anchor keys (`[bq]` int32, through `keys_smem`) and its split
+    sums (`[bq, Dv]` fp32, through `others_smem`)."""
+
+    rows: tuple
+    keys: object
+    others: object
+    keys_smem: object
+    others_smem: object
+
+
 def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_view, status_views, q_smem,
               q_loaded, out_smem, row_smem, streams, turn, streamed: tuple, first, spans: _Spans | None,
-              hooked: _Hooked, guard: _Guard | None, place: tuple, *, hooks: Hooks, interpret: bool):
+              hooked: _Hooked, guard: _Guard | None, place: tuple, *, hooks: Hooks,
+              residuals: _Residuals | None, interpret: bool):
     """A consumer's query block (batch row, head and key head `place`): its walk of the key tiles it reads
     through the family's streams (`algebra.plain_step` a step) from the hooks' initial state, the score hook
     on each tile, passing those of the program's `streamed` range its partner alone reads; then its output
@@ -435,7 +535,9 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     maxima and whether their weighted values overflowed through `row_smem` to `status_views`
     (`algebra.walked_launches`). The plain walk's running sums are the family's accumulator, issued into in
     place; the guarded walk (`guard`, its rows `live` shifting) carries them, each tile's product fresh
-    (`algebra.stepped`)."""
+    (`algebra.stepped`). With `residuals` the walk is the training step's (`algebra.training_step`'s
+    arithmetic): the accumulator holds the split sums, every key's weighted values but the anchor's, taken
+    in place (`algebra.split_taken`), the anchor's value row kept in registers, and its residuals stored."""
     row, head, kv_head = place
     family, tiles = program.family, program.tiles
     shape = (tiles.block_q, tiles.block_k)
@@ -464,28 +566,33 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     # The slots before this block's first tile its partner reads, the turns it would have taken.
     family.passed(streams, streamed[0], lo, first=streamed[0], between=lambda: (turn(), turn()))
 
-    def step(index, slots, carry, accumulators):
+    def scored(index, slots):
+        # A key tile's logits under the score hook, and their products where the logits are a factor of
+        # them. A tile every query sees whole takes no mask: one walk, the choice a tile's (a walk of each,
+        # these rings' waits and arrivals in two loops, faulted on an H100 under jax 0.11.2's lowering).
         s = family.product(q, slots["keys"].transpose((1, 0)), shape, turn)
         slots.release("keys")
         k_first = index * tiles.block_k
         coords = _coords(family, spans, row, first, k_first, shape, q_pos, columns)
         params = tuple(_param(family, ref, param.kind, row, head, first, s, k_first)
                        for ref, param in zip(hooked.score, hooks.score_params, strict=True))
-        # A tile every query sees whole takes no mask: one walk, the choice a tile's (a walk of each, these
-        # rings' waits and arrivals in two loops, faulted on an H100 under jax 0.11.2's lowering).
         logits, products = algebra.logits_of(spec, s, coords, params, masked=jnp.logical_not(whole(index)))
+        return k_first, coords, logits, products
 
-        def load():
-            # The value slot, once the partner's products are issued: its turn on the tensor cores is over
-            # when this one's come.
-            turn(wait=False)
-            slot = slots["values"]
-            turn(arrive=False)
-            return slot
+    def value_of(slots):
+        # The value slot, once the partner's products are issued: its turn on the tensor cores is over when
+        # this one's come.
+        turn(wait=False)
+        slot = slots["values"]
+        turn(arrive=False)
+        return slot
 
-        def dot(lhs, rhs):
-            return family.registers_product(lhs, rhs, interpret)
+    def dot(lhs, rhs):
+        return family.registers_product(lhs, rhs, interpret)
 
+    def step(index, slots, carry, accumulators):
+        k_first, coords, logits, products = scored(index, slots)
+        load = functools.partial(value_of, slots)
         if guard is not None:
             magnitudes = guard.largest
 
@@ -503,7 +610,11 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         state = algebra.plain_step(spec, state, algebra.Keys(coords, logits, load, dot, accumulate, products))
         return (state.m, state.total), tuple(held)
 
-    if guard is not None:
+    trained = None
+    if residuals is not None:
+        state, trained = _trained(spec, family, start, scored, value_of, (lo, hi), streams, streamed[0],
+                                  kept_dtype=q_smem.dtype, interpret=interpret)
+    elif guard is not None:
         state, _ = family.walk(streams, ((step, lo, hi),), start, (), interpret, first=streamed[0])
     else:
         rows, (acc,) = family.walk(streams, ((step, lo, hi),), (start.m, start.total),
@@ -517,16 +628,67 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     family.stored((family.as_row(state.m), family.as_row(overflowed)), status_views, smem=row_smem)
     out_params = tuple(_param(family, ref, param.kind, row, head, first, state.acc)
                        for ref, param in zip(hooked.output, hooks.output_params, strict=True))
-    out, _, _ = algebra.finish(spec, state, initial=hooked.initial is not None, output_mod=hooks.output_mod,
-                               output_params=out_params)
+    out, maximum, denominator = algebra.finish(spec, state, initial=hooked.initial is not None,
+                                               output_mod=hooks.output_mod, output_params=out_params)
     family.stored((out,), (out_view,), smem=out_smem)
+    if residuals is not None and trained is not None:
+        # The split sums as the walk left them, shift 0 (`algebra.split_residuals`' plain walk).
+        others, own, others_total, key = trained
+        family.stored((others,), (residuals.others,), smem=residuals.others_smem)
+        rows = (maximum, denominator, own, others_total, family.zeros((tiles.block_q,)))
+        family.stored(tuple(family.as_row(part) for part in rows), residuals.rows, smem=row_smem)
+        family.stored((family.as_row(key),), (residuals.keys,), smem=residuals.keys_smem)
+
+
+def _trained(spec: algebra.Forward, family: mosaic.Family, start: algebra.Partial, scored, value_of, reach,
+             streams, first, *, kept_dtype, interpret: bool) -> tuple[algebra.Partial, tuple]:
+    """A training forward consumer's walk of its key tiles `reach` (`[lo, hi)`, the streams' steps from
+    `first`) from `start`: `algebra.training_step`'s arithmetic with the split sums in the family's
+    accumulator, taken in place before the tile's other keys' product joins them (`algebra.split_taken`),
+    and the old anchor's value row the one kept in registers, picked from a value tile by its one-hot
+    product where the anchor moved. `scored(index, slots)` gives a tile's place, coordinates, logits and
+    products, and `value_of(slots)` its value slot. Returns the state with the split sums joined
+    (`algebra.split_output`, the weighted values the output normalizes) and the residuals the walk leaves:
+    the split sums, the anchor's own weight, the other keys' weights' sum and the anchor keys."""
+    rows, width = start.acc.shape
+
+    def step(index, slots, carry, accumulators):
+        m, total, peak, key, own, others_total, kept = carry
+        _, coords, logits, products = scored(index, slots)
+        new, alpha = algebra.peak(spec, m, logits, products)
+        p = algebra.weights(spec, logits, new)
+        value = value_of(slots)
+        anchor = algebra.argmax(algebra.Argmax(peak, key), logits, coords.k_pos)
+        moved = anchor.peak > peak
+        at_anchor = coords.k_pos == algebra.expand(anchor.key, coords.k_pos)
+        others, own_tile = algebra.anchor_split(algebra.narrow(p, value.dtype), at_anchor)
+        (acc,) = accumulators
+        acc = family.rescaled_products(acc, lambda taken: algebra.split_taken(taken, own, alpha, moved, kept),
+                                       ((others, None),), value, interpret)
+        own, others_total = algebra.split_rows(own, others_total, alpha, moved, others, own_tile)
+        # The anchor's value row where it moved to this tile: its one-hot product with the tile's values.
+        picked = family.registers_product(at_anchor.astype(value.dtype), value, interpret)
+        kept = jnp.where(algebra.expand(moved, kept), picked.astype(kept.dtype), kept)
+        total = algebra.denominator_after(total, alpha, p)
+        return (new, total, anchor.peak, anchor.key, own, others_total, kept), (acc,)
+
+    nothing = family.zeros((rows,))
+    no_key = family.full((rows,), 0, jnp.int32)
+    carry = (start.m, start.total, family.full((rows,), -jnp.inf), no_key, nothing, nothing,
+             family.zeros((rows, width)).astype(kept_dtype))
+    (m, total, _, key, own, others_total, kept), (acc,) = family.walk(
+        streams, ((step, *reach),), carry, ((rows, width),), interpret, first=first, initial=(start.acc,))
+    return algebra.Partial(algebra.split_output(acc, own, kept), m, total), (acc, own, others_total, key)
 
 
 def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Guard | None, *,
-            spec: algebra.Forward, hooks: Hooks, tiles: Tiles, family: mosaic.Family, interpret: bool):
+            spec: algebra.Forward, hooks: Hooks, tiles: Tiles, family: mosaic.Family, training: bool,
+            interpret: bool):
     """The forward's launch in `spec`'s form (`guard`'s rows shifting where given): its output `[B, Qp, H,
     Dv]` and its rows' status `[2, B, H, Qp]` fp32, their maxima in the walk's units and 1 where their
-    weighted values overflowed (`algebra.walked_launches`)."""
+    weighted values overflowed (`algebra.walked_launches`); in `training` its residuals too (`_Residuals`):
+    the rows `[5, B, H, Qp]` fp32 (maxima, denominators, the anchor's own weight, the other keys' weights'
+    sum and their shift), the anchor keys `[B, H, Qp]` int32 and the split sums `[B, Qp, H, Dv]` fp32."""
     batch, queries, heads, width = query.shape
     keys_count, kv_heads = key.shape[1], key.shape[2]
     group, consumers = heads // kv_heads, family.consumers
@@ -541,9 +703,14 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     reuse = value.shape[-1] == width
 
     def body(q_ref, k_ref, v_ref, *refs, streams):
-        read, (out_ref, status_ref, q_smem, row_smem, q_loaded, schedule, *own) = (refs[:len(leaves)],
-                                                                                   refs[len(leaves):])
-        out_smem = q_smem if reuse else own[0]
+        read, refs = refs[:len(leaves)], refs[len(leaves):]
+        (out_ref, status_ref), refs = refs[:2], refs[2:]
+        trained: tuple = ()
+        if training:
+            trained, refs = refs[:3], refs[3:]
+        (q_smem, row_smem, q_loaded, schedule), refs = refs[:4], refs[4:]
+        out_smem, refs = (q_smem, refs) if reuse else (refs[0], refs[1:])
+        stages = refs
         spans_of, hooked_of, guard_of = treedef.unflatten(read)
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
         views = _views_of({"keys": k_ref, "values": v_ref}, row, lax.div(head, group))
@@ -563,10 +730,18 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
             first = pair_first + index * block_q
             rows = (row, pl.ds(first, block_q), head)
             status = tuple(status_ref.at[place, row, head, pl.ds(first, block_q)] for place in range(2))
+            written = None
+            if training:
+                rows_ref, keys_ref, others_ref = trained
+                keys_smem, others_smem = stages
+                written = _Residuals(
+                    tuple(rows_ref.at[place, row, head, pl.ds(first, block_q)] for place in range(5)),
+                    keys_ref.at[row, head, pl.ds(first, block_q)], others_ref.at[rows], keys_smem.at[index],
+                    others_smem.at[index])
             _consumer(program, spec, index, q_ref.at[rows], out_ref.at[rows], status, q_smem.at[index],
                       q_loaded.at[index], out_smem.at[index], row_smem.at[index], streams, turn, streamed,
                       first, spans_of, hooked_of, guard_of, (row, head, lax.div(head, group)), hooks=hooks,
-                      interpret=interpret)
+                      residuals=written, interpret=interpret)
 
         def producer():
             family.stream(streams, views, *streamed)
@@ -584,10 +759,17 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
             plgpu.SMEM((consumers, block_q), jnp.float32),
             plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_arrivals=consumers),
             *(() if reuse else (plgpu.SMEM((consumers, block_q, value.shape[-1]), query.dtype),)),
+            # A training forward's anchor keys' and split sums' stages (`_Residuals`).
+            *((plgpu.SMEM((consumers, block_q), jnp.int32),
+               plgpu.SMEM((consumers, block_q, value.shape[-1]), jnp.float32)) if training else ()),
             streams=family.streams(blocks, program.stages, consumers))
 
     out_type = (jax.ShapeDtypeStruct((batch, queries, heads, value.shape[-1]), query.dtype),
                 jax.ShapeDtypeStruct((2, batch, heads, queries), jnp.float32))
+    if training:
+        out_type += (jax.ShapeDtypeStruct((5, batch, heads, queries), jnp.float32),
+                     jax.ShapeDtypeStruct((batch, heads, queries), jnp.int32),
+                     jax.ShapeDtypeStruct((batch, queries, heads, value.shape[-1]), jnp.float32))
     return family.kernel(entry, out_type=out_type, grid=(heads, queries // pair, batch),
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
                          interpret=interpret)(query, key, value, *leaves)

@@ -468,10 +468,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         """fp32 zeros in the accumulator's layout (two-dimensional) or a row's (one-dimensional)."""
         return self.full(shape, 0.0)
 
-    def full(self, shape: tuple[int, ...], value: float) -> jax.Array:
-        """fp32 `value` in the accumulator's layout or a row's (`zeros`)."""
+    def full(self, shape: tuple[int, ...], value: float, dtype=jnp.float32) -> jax.Array:
+        """`value` in `dtype` (fp32 unless given) in the accumulator's layout or a row's (`zeros`)."""
         layout = self.layout if len(shape) == 2 else self.row
-        return plgpu.layout_cast(jnp.full(shape, value, jnp.float32), layout)
+        return plgpu.layout_cast(jnp.full(shape, value, dtype), layout)
 
     def iota(self, shape: tuple[int, int], dimension: int) -> jax.Array:
         """Indices along `dimension` of a tile in the accumulator's layout."""
