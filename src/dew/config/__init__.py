@@ -58,7 +58,6 @@ from dew.data.pipeline import Dataset
 from dew.files import write_atomically
 from dew.inputs import Field
 from dew.lora import LoRA
-from dew.model_config import JsonDict, ModelConfig, Registered, default_record, member_fields
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.optim import (
     BF16_STATE_OPTIMIZERS,
@@ -75,8 +74,13 @@ from dew.optim import (
 from dew.quantization import Quantization
 from dew.registry import (
     Annotation,
+    JsonDict,
+    ModelConfig,
+    Registered,
     declared_type,
+    default_record,
     from_record,
+    member_fields,
     metrics,
     models,
     objectives,

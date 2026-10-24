@@ -15,6 +15,11 @@ class may be a short alias instead, `{"class": "simple_dit"}`. Each kind's
 aliases are a static table below (`models`, `mixers`, ...) that maps a name to
 a path and imports the class only when it is read. An unknown name or field
 raises an error.
+
+A run's model is one such record, `ModelConfig`: the model's class, the fields
+the run gives it, the defaults it took and the wrappers it was made in. A
+component built around parameters (an encoder, an autoencoder) records the view
+it is rebuilt from (`Recorded`), and its class is found back by `component`.
 """
 
 from __future__ import annotations
@@ -28,20 +33,24 @@ import importlib
 import importlib.util
 import inspect
 import itertools
+import json
 import operator
 import os
 import sys
 import types
 import typing
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, MutableSequence, Sequence
 from enum import Enum
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
+    Annotated,
     Any,
     ClassVar,
     Literal,
     Protocol,
+    Self,
     TypeAliasType,
     TypedDict,
     Union,
@@ -53,6 +62,7 @@ from typing import (
 import jax
 import jax.numpy as jnp
 import numpy as np
+import tyro
 from jax.typing import DTypeLike
 from typing_extensions import Format, get_annotations, is_protocol
 
@@ -320,8 +330,6 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
     def subcommands(self) -> Annotation:
         """The members' union with each subcommand named as the kind names it
         ("data:text"), rather than by its class."""
-        import tyro
-
         # The special form subscripted at runtime, where each member is a value rather than a
         # type expression, which a type checker reads `typing.Annotated[...]` as.
         annotated = vars(typing)["Annotated"]
@@ -1463,9 +1471,188 @@ KINDS: tuple[Aliases, ...] = (models, presets, solvers, encoders, metrics, objec
                               projectors, schedules)
 """Every kind, which a record's alias is looked up across."""
 
+JsonDict = Annotated[
+    Mapping[str, object],
+    tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1,
+        metavar="JSON",
+        instance_from_str=lambda args: json.loads(args[0]),
+        is_instance=lambda value: isinstance(value, dict),
+        str_from_instance=lambda value: [json.dumps(value)],
+    ),
+]
+"""The fields a model is built from, written as a single JSON string on the
+command line. The registry knows which architecture takes which field and
+narrows each one where it builds it, so the values are read there."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Registered(ABC):
+    """A registered class, named by an alias or an import path and held as the path, and the arguments a
+    run gives it: `fields`, the ones the run states, and `defaults`, every other one the class
+    defaults as it defaulted them when the run was first recorded, so the record builds the same
+    thing after a default changes (`arguments`). Each kind names its registry (`_member`) and whether
+    its stated fields are held as their records (`_recorded`)."""
+
+    name: str
+    fields: JsonDict = dataclasses.field(default_factory=dict)
+    defaults: JsonDict = dataclasses.field(default_factory=dict)
+    """Each argument the class defaults and `fields` leaves out, as a record holds it;
+    one a record lacks, as an argument the class has since gained, takes the class's default now."""
+
+    _recorded: ClassVar[bool] = True
+
+    @staticmethod
+    @abstractmethod
+    def _member(name: str) -> type:
+        """The class `name` names, from the kind's """
+
+    def __post_init__(self) -> None:
+        member = self._member(self.name)
+        object.__setattr__(self, "name", import_path(member))
+        if self._recorded:
+            object.__setattr__(self, "fields", argument_records(member, self.fields))
+        object.__setattr__(self, "defaults", recorded_defaults(member, self.fields, self.defaults))
+
+    @property
+    def arguments(self) -> JsonDict:
+        """The arguments the class is built from, before those the caller derives (`built_arguments`)."""
+        return built_arguments(self._member(self.name), self.fields, self.defaults)
+
+
+@dataclasses.dataclass(frozen=True)
+class ModelConfig(Registered):
+    """A model's class and the fields the run gives it.
+
+    `name` is an alias or an import path, held as the path. `fields` are the
+    class's own fields, its compute and storage dtypes, attention kernel and
+    matmul precision included, which the command line sets one flag each
+    (`RunConfig.cli`); a recipe fills the ones it derives from its data in
+    `build`. `defaults` holds every other field the class defaults, as it
+    defaulted them when the run was first recorded, so the record builds the
+    same model after a default changes (`arguments`). `wrappers` are the
+    classes the model was wrapped in, in the order they were applied.
+    """
+
+    name: str = "simple_dit"
+    wrappers: tuple[Wrapper, ...] = ()
+    """What wraps the built model, innermost first, which `build` applies in
+    order: a checkpoint's input quantization, a bound LoRA (its factors are
+    stored with the checkpoint variables), the quantized training a run
+    wrapped it in."""
+
+    _recorded: ClassVar[bool] = False
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        stray = [type(wrapper).__name__ for wrapper in self.wrappers if not isinstance(wrapper, Wrapper)]
+        if stray:
+            raise TypeError(f"a model record's wrappers are dew.registry.Wrapper records, not {stray}")
+
+    @staticmethod
+    def _member(name: str) -> type:
+        return models[name]
+
+    @classmethod
+    def from_dict(cls, values: Mapping[str, object]) -> Self:
+        """Read back the record `RunConfig.to_dict` writes for this field."""
+        return from_record(cls, values, dtypes=False)
+
+    @classmethod
+    def from_model(cls, model) -> Self:
+        """Return the module's class and constructor fields, and each wrapper
+        its class was made in, in the order they were applied."""
+        model_type, layers = wrapper_layers(type(model))
+        return cls(import_path(model_type), record_fields(model, model_type),
+                   wrappers=tuple(layer._dew_wrapper() for layer in reversed(layers)))
+
+    def with_dtype(self, dtype: str | None) -> Self:
+        """This model computing in `dtype` (`dew.with_dtype`); None keeps it."""
+        return dataclasses.replace(self, fields=with_dtype(self.name, self.fields, dtype))
+
+    def build(self, **derived: Configured):
+        """Build the model from its fields and the ones the recipe `derived`."""
+        model = models.build(self.name, {**self.arguments, **derived})
+        for wrapper in self.wrappers:
+            model = wrapper.apply(model)
+        return model
+
+
+def member_fields(member: type) -> Iterator[tuple[str, Configured, Annotation]]:
+    """Each field `_member_flags` flags: its name, its default
+    (`dataclasses.MISSING` for none) and its annotation (None where its
+    module cannot resolve it). A dataclass with a constructor of its own (a
+    metric over its base's fields) has that constructor's arguments, as the
+    registry builds it (`record_class`)."""
+    if record_class(member) is not None:
+        for field in constructor_fields(member):
+            default = (field.default_factory() if callable(field.default_factory) else field.default)
+            yield field.name, default, declared_type(member, field.name)
+        return
+    for name, (parameter, owner) in parameters(member)[0].items():
+        if parameter.kind is parameter.POSITIONAL_OR_KEYWORD and parameter.default is parameter.empty:
+            continue  # what the caller builds, the model first
+        try:
+            annotation = parameter_type(owner, name)
+        except ValueError:
+            annotation = None
+        default = dataclasses.MISSING if parameter.default is parameter.empty else parameter.default
+        yield name, default, annotation
+
+
+def default_record(name: str, declared: Configured, annotation: Annotation) -> JSON:
+    """A member's default `declared` as a record holds it: a dtype by its
+    name, a matmul precision by its level, anything else as `to_record`
+    writes it. TypeError or ValueError for a value no record carries."""
+    if name in ("dtype", "param_dtype"):
+        return dtype_name(resolve_dtype(declared))
+    if name == "precision":
+        return None if declared is None else str(declared).lower().removeprefix("precision.")
+    # The record itself, not a copy: a module a later default shares turns
+    # this one into its defining record.
+    record = to_record(declared, annotation)
+    json.dumps(record)
+    return record
+
+
+def recorded_defaults(member: type, stated: Mapping[str, object], recorded: Mapping[str, object]) -> JsonDict:
+    """The record of each field or argument `member` defaults that `stated`
+    leaves out: as `recorded` holds it, or else as the class defaults it now.
+    A default no record carries (a callable, say) is left to the class, and
+    a recorded one the class no longer takes is refused."""
+    defaults, named = {}, set()
+    # One record: a module two defaults share is written once.
+    with recording():
+        for name, declared, annotation in member_fields(member):
+            named.add(name)
+            if name in stated or name in recorded or declared is dataclasses.MISSING:
+                continue
+            try:
+                defaults[name] = default_record(name, declared, annotation)
+            except (TypeError, ValueError):
+                continue
+    unknown = sorted(set(recorded) - named)
+    if unknown:
+        raise ValueError(f"{member.__name__} takes no {unknown}, which the record defaults")
+    return {**defaults, **{name: value for name, value in recorded.items() if name not in stated}}
+
+
+def built_arguments(member: type, fields: Mapping[str, object], defaults: Mapping[str, object]) -> JsonDict:
+    """What a config builds `member` from beside what its caller derives:
+    `fields`, over each of `defaults` the class no longer defaults the same.
+    A default the class still has is left to it, so a class that treats an
+    argument left out in its own way, as `DPOObjective` holds its reference
+    at unit decay, still does."""
+    now = recorded_defaults(member, {}, {})
+    return {**{name: value for name, value in defaults.items() if name not in now or now[name] != value},
+            **fields}
+
+
+
 __all__ = [
     "KINDS",
     "Aliases",
+    "ModelConfig",
     "Record",
     "Recorded",
     "argument_records",

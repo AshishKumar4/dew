@@ -26,7 +26,6 @@ from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirs
 from dew.diffusion.discrete import MDLM
 from dew.diffusion.presets import Flow, MeanFlow, Shortcut
 from dew.inputs import Field, InputSpec, TextCondition
-from dew.model_config import ModelConfig
 from dew.nn.backbones import CausalTransformer, SimpleDiT
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.objectives import DistillationObjective
@@ -44,6 +43,7 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, PPOObjective, ValueHead
 from dew.objectives.rl.sessions import Call, Session, Status, pack
 from dew.objectives.supervised import CrossEntropy, Supervised
+from dew.registry import ModelConfig
 from dew.sampling.solvers import Euler
 
 IMAGES = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"

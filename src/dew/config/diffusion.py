@@ -27,7 +27,6 @@ from dew.data.dataset import record_argument
 from dew.diffusion.presets import EDM, Flow, build_process
 from dew.diffusion.process import Process
 from dew.inputs import AudioCondition, Field, InputSpec, TextCondition
-from dew.model_config import ModelConfig
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
 from dew.nn.protocols import IntervalModel, TimeScaled
@@ -45,6 +44,7 @@ from dew.objectives.diffusion.objective import (
 from dew.registry import (
     Configured,
     DtypeName,
+    ModelConfig,
     dtype_name,
     encoders,
     from_record,

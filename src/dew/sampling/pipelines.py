@@ -255,10 +255,9 @@ class TextToImage:
         from dew._records import record as fields
         from dew.diffusion.schedules.source import SourceGrid
         from dew.inference.tasks import SavedRun, saved_settings
-        from dew.model_config import ModelConfig
         from dew.nn.autoencoders import AutoEncoder
         from dew.objectives.diffusion.objective import without_loss_heads
-        from dew.registry import from_record
+        from dew.registry import ModelConfig, from_record
 
         run = SavedRun.pinned(directory, step, trust)
         settings = saved_settings(run.record, ImageSettings)

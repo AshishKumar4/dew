@@ -33,7 +33,7 @@ from dew.data.sources.files import Files
 from dew.diffusion.presets import EDM, Flow
 from dew.inference import RunProcessor, TextGeneration
 from dew.inputs import Field, TextCondition, unit_range
-from dew.model_config import ModelConfig
+from dew.registry import ModelConfig
 from dew.sampling import CFG, DPMSolverSDE, Euler, Heun, TextToImage
 from dew.sampling.pipelines import Images
 from dew.telemetry.instrumentation import Compiles

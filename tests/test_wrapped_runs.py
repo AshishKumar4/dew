@@ -19,10 +19,10 @@ from dew.config.lm import LMRunConfig
 from dew.data.dataset import Loader
 from dew.interop import Pretrained
 from dew.lora import AdapterRecord, LoRA
-from dew.model_config import ModelConfig
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.quantization import QUANTIZATION, InputQuantization, Quantization
+from dew.registry import ModelConfig
 from dew.training import Checkpoints, Trainer
 from dew.training.quantization import quantize_trunk
 

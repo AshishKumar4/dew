@@ -1106,7 +1106,7 @@ def diffusion_run(directory, batch=RUN_BATCH, **trainer):
 
     from dew.config import TrainerConfig
     from dew.config.diffusion import DiffusionRunConfig
-    from dew.model_config import ModelConfig
+    from dew.registry import ModelConfig
 
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 16,

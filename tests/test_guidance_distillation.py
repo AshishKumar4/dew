@@ -19,10 +19,10 @@ from dew.diffusion import broadcast_rates
 from dew.diffusion.presets import EDM, Flow
 from dew.diffusion.process import aligned_conditions
 from dew.inputs import TextCondition, unit_range
-from dew.model_config import ModelConfig
 from dew.objectives.base import TEACHER, Step
 from dew.objectives.diffusion import GuidanceDistillationObjective
 from dew.objectives.diffusion.guidance_distillation import with_guidance
+from dew.registry import ModelConfig
 from dew.sampling import Euler, TextToImage
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"

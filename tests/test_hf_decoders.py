@@ -1532,8 +1532,7 @@ def test_a_float64_decoder_saves_and_reloads_in_float64(tmp_path):
     """A decoder computing in float64 end to end, as Dory's and nGPT's runs do: its bundle and a
     run's record of it name float64, and the checkpoint it saves loads back in float64 to the same
     weights and logits."""
-    from dew.model_config import ModelConfig
-    from dew.registry import to_record
+    from dew.registry import ModelConfig, to_record
 
     with jax.enable_x64(new_val=True):
         loaded = Pretrained.load(str(FIXTURES / "qwen3-tiny"), dtype="float64", param_dtype="float64",

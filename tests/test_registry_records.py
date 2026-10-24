@@ -106,9 +106,8 @@ def test_a_model_records_wrappers_round_trip_by_their_class_and_refuse_what_wrap
     """A model record's wrappers are any `registry.Wrapper`, each written with its class path and
     rebuilt as that class (`ModelConfig.wrappers`), so the record names no closed set of wrappers; a
     value that wraps nothing is refused where the record is made."""
-    from dew.model_config import ModelConfig
     from dew.quantization import InputQuantization
-    from dew.registry import to_record
+    from dew.registry import ModelConfig, to_record
 
     quantized = InputQuantization(format="modelopt", sites=(("lm_head", "fp8"),))
     wrapped = ModelConfig("simple_dit", wrappers=(quantized,))

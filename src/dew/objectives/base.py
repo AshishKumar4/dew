@@ -1311,8 +1311,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         settings returns None; a custom research method can still restore its
         raw state.
         """
-        from dew.model_config import ModelConfig
-        from dew.registry import import_path, record_fields, to_record
+        from dew.registry import ModelConfig, import_path, record_fields, to_record
 
         settings = self.task_settings()
         if settings is None:

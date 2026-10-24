@@ -15,10 +15,9 @@ from dew.config import ObjectiveConfig, OptimConfig, Prepared, RunConfig, media_
 from dew.data.compile import fitted
 from dew.data.pipeline import ObjectiveData
 from dew.inputs import Field
-from dew.model_config import JsonDict, ModelConfig
 from dew.objectives.jepa.masking import MultiBlockMask
 from dew.objectives.jepa.probes import KnnProbe, LinearProbe
-from dew.registry import models
+from dew.registry import JsonDict, ModelConfig, models
 
 SHARED_MODEL_KEYS = ("emb_features", "num_heads", "mlp_ratio", "ssm_attention_ratio",
                      "ssm_state_dim", "dropout_rate", "precision")

@@ -37,10 +37,10 @@ from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
-from dew.model_config import ModelConfig
 from dew.nn.backbones.decoder_block import remat_policy
 from dew.nn.cross_attention import CrossAttention
 from dew.nn.protocols import RematChoosing
+from dew.registry import ModelConfig
 from dew.state import TrainState
 
 if TYPE_CHECKING:

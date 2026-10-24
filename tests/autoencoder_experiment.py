@@ -15,7 +15,7 @@ from dew.config import ObjectiveConfig, OptimConfig, RunConfig, TrainerConfig
 from dew.data import Files
 from dew.data.steps.generic import Formatting
 from dew.inputs import Field, InputSpec
-from dew.model_config import ModelConfig
+from dew.registry import ModelConfig
 
 FEATURES = 8
 
