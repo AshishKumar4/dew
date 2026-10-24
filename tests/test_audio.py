@@ -204,6 +204,9 @@ def test_audio_weight_loading_refuses_unknown_or_missing_computation(audio):
         audio_weights(incomplete, config)
     with pytest.raises(ValueError):
         audio_weights({**tensors, "imaginary_projection.weight": np.ones((4, 4), np.float32)}, config)
+    projection = next(name for name, tensor in tensors.items() if tensor.ndim >= 2)
+    with pytest.raises(ValueError):
+        audio_weights({**tensors, projection: tensors[projection][:-1]}, config)
     record = json.loads((path / "config.json").read_text())
     with pytest.raises(ValueError):
         audio_config({**record, "extra_computational_field": True})
