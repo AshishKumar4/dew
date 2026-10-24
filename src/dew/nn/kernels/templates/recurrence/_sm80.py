@@ -16,14 +16,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels.templates import mosaic
-
-
-def swizzled(rows: int, columns: int, dtype) -> tuple:
-    """The shared-memory transforms of a `[rows, columns]` operand tile: 8-row tiles as wide as the swizzle
-    its rows' bytes allow, swizzled, as Mosaic GPU's MMA operand loads (ldmatrix) read them."""
-    swizzle = plgpu.find_swizzle(columns * jnp.dtype(dtype).itemsize * 8)
-    return plgpu.TilingTransform((8, swizzle // jnp.dtype(dtype).itemsize)), plgpu.SwizzleTransform(swizzle)
-
+from dew.nn.kernels.templates.mosaic_sm80 import swizzled
 
 _INTERPRETED = contextvars.ContextVar("interpreted", default=False)
 """Whether the kernel being traced runs in Mosaic GPU's interpreter, which lowers no mma.sync and no cp.async:
@@ -112,7 +105,7 @@ class MmaSync(mosaic.Family[dict, dict, jax.Array]):
 
     def streams(self, blocks: dict, stages: int, consumers: int) -> dict:
         del consumers
-        return {name: plgpu.SMEM((stages, *shape), dtype, transforms=swizzled(*shape, dtype))
+        return {name: plgpu.SMEM((stages, *shape), dtype, transforms=swizzled(shape, dtype))
                 for name, (shape, dtype) in blocks.items()}
 
     def opened(self, allocated: dict, views: dict | None = None) -> dict:

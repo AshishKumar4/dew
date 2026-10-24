@@ -421,7 +421,7 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         or registers."""
 
     @abc.abstractmethod
-    def staged(self, value: jax.Array, buffer: Ref) -> Ref:
+    def staged(self, value: jax.Array, buffer) -> Ref:
         """`value` in the shared-memory tile `buffer`, in its dtype, for a product to read: a register right
         operand's way to an MMA (`staged_products` stages left ones)."""
 

@@ -67,7 +67,8 @@ whose producer role, TMA rings and barriers the interpreter models (its products
 
 def family_of() -> mosaic.Family | None:
     """The bundle of the device's instruction family, None where the mainloop has none (a CPU's)."""
-    return FAMILIES.get(generation.family(generation.device_generation()))
+    name = generation.family(generation.device_generation())
+    return None if name is None else FAMILIES.get(name)
 
 CHUNK = 64
 """Tokens a chunk, fla's."""
@@ -292,7 +293,7 @@ def _tile(slots, name: str, operand: _Operand, rows=None, columns=None) -> _Part
     return _Parts((view(slots[f"{name}{p}"]) for p in range(operand.parts)), operand.dtype)
 
 
-def _views(block: int | None = None, **parted) -> dict:
+def _views(block: int | None = None, /, **parted) -> dict:
     """A launch's streams' views by stream part name (`Family.opened`'s `(ref, block)`), `parted[name]` a list
     of an operand's parts' views: each step `block` rows of its view, or the whole view in one step where
     None."""
@@ -469,19 +470,22 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
 
         def step(index, slots, carry, accumulators):
             del index
+            # The inverse, the write gates and the issuer under the delta rule, which a decay a head's call
+            # of this launch always takes (`_prepared`).
+            applied, decay = None, None
             if call.delta:
                 (scaled,) = staging
                 issue = _Issuer(call, {"apply_u": scaled, "apply_w": scaled})
                 inverse = _tile(slots, "inverse", held)
                 betas = family.rows_of(beta_ref.at[h, span])
+                applied = inverse, betas, issue
                 for c in range(value_width // BLOCK):
                     tile = _tile(slots, "values", call.given, columns=pl.ds(c * BLOCK, BLOCK)).value()
                     u = algebra.weighted("apply_u", inverse, tile.astype(held.dtype), betas, issue)
                     held.store(outs[1], u, row, CHUNK, h * value_width + c * BLOCK, BLOCK)
-                if not call.per_key:
-                    decay = algebra.raised(family.rows_of(hi_ref.at[h, span]),
-                                           family.rows_of(lo_ref.at[h, span]))
-                    decay = lax.broadcast_in_dim(decay, (CHUNK, BLOCK), (0,))
+            if not call.per_key:
+                decay = algebra.raised(family.rows_of(hi_ref.at[h, span]), family.rows_of(lo_ref.at[h, span]))
+                decay = lax.broadcast_in_dim(decay, (CHUNK, BLOCK), (0,))
             for c in range(width // BLOCK):
                 block = pl.ds(c * BLOCK, BLOCK)
                 tile = _tile(slots, "keys", call.given, columns=block).value()
@@ -494,7 +498,8 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
                                       for ref in (hi_ref, lo_ref))
                     written = algebra.key_decayed_write(tile, gate, low, last, last_low)
                     held.store(outs[-1], written, row, CHUNK, h * width + c * BLOCK, BLOCK)
-                if call.delta:
+                if applied is not None:
+                    inverse, betas, issue = applied
                     w = algebra.weighted("apply_w", inverse, tile.astype(held.dtype), betas, issue, decay)
                     held.store(outs[0], w, row, CHUNK, h * width + c * BLOCK, BLOCK)
             return carry, accumulators
@@ -513,6 +518,41 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
                    grid_names=("chunks", "heads"), blocks=_streamed(**given), stages=1, live=_taken(6),
                    staging=_staging(held, (CHUNK, BLOCK)) if call.delta else ())(
         k, v, k if a is None else a, hi, lo, beta, taken)
+
+
+def _sequence_walk(call: _Call, memory: _Operand, name: str, entering: tuple, walked: tuple, step, start,
+                   count, kept, written, out, bv: int) -> None:
+    """A sequence's memory over a value block `bv` wide, carried in one role pair: the memory it takes, each
+    key slice's tile `{name}{i}` of `memory` (`entering`, the opened streams and their views), zero where
+    `kept` is 0; `step` over its chunks `[start, start + count)` of `walked` (the same); and the memory it
+    gives written to each slice's view `out(i)` where `written` is nonzero (`_states`', and `_reverse`'s
+    from its last chunk)."""
+    family, slices = call.family, call.width // BLOCK
+    (entered, entered_views), (chunks, views) = entering, walked
+
+    def taken(index, slots, carry, accumulators):
+        del index, carry
+        # A finite memory times zero where the sequence takes none (a select takes no scalar condition over a
+        # tile in Mosaic GPU's warpgroup lowering).
+        scale = jnp.where(kept > 0, 1.0, 0.0)
+        return [_tile(slots, f"{name}{i}", memory).value() * scale for i in range(slices)], accumulators
+
+    def consumer(_):
+        state = family.walk(entered, ((taken, 0, 1),), [family.zeros((BLOCK, bv))] * slices, (),
+                            call.interpret)[0]
+        state = family.walk(chunks, ((step, start, start + count),), state, (), call.interpret,
+                            first=start)[0]
+
+        @pl.when(written > 0)
+        def _():
+            for i, part in enumerate(state):
+                out(i)[...] = part
+
+    def producer():
+        family.stream(entered, entered_views, 0, 1)
+        family.stream(chunks, views, start, start + count)
+
+    family.roles(1, consumer, producer)
 
 
 def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
@@ -590,36 +630,16 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
                     return functools.reduce(jnp.add, (family.rows_of(view).astype(jnp.float32)
                                                       for view in views))
 
-                ends = family.iota(gated.shape, 0) == CHUNK - 1
+                ends = family.iota((CHUNK, bv), 0) == CHUNK - 1
                 separate = key_rows, jnp.sum(jnp.where(ends, gated, 0.0), axis=0)
             state = algebra.carried(
                 state, lambda i: _tile(slots, "keys", keys, columns=pl.ds(i * BLOCK, BLOCK)), gated, decay,
                 held.dtype, issue, last=separate)
             return state, accumulators
 
-        def taken(index, slots, carry, accumulators):
-            del index, carry
-            # A finite memory times zero where the sequence begins no row (a select takes no scalar
-            # condition over a tile in Mosaic GPU's warpgroup lowering).
-            kept = jnp.where(begins > 0, 1.0, 0.0)
-            return [_tile(slots, f"initial{i}", initial).value() * kept for i in range(slices)], accumulators
-
-        def consumer(_):
-            state = family.walk(entering, ((taken, 0, 1),), [family.zeros((BLOCK, bv))] * slices, (),
-                                call.interpret)[0]
-            state = family.walk(chunks, ((step, first, first + count),), state, (), call.interpret,
-                                first=first)[0]
-
-            @pl.when(ends > 0)
-            def _():
-                for i, part in enumerate(state):
-                    final_ref.at[pl.ds(memory(row, i), BLOCK), pl.ds(j * bv, bv)][...] = part
-
-        def producer():
-            family.stream(entering, initial_views, 0, 1)
-            family.stream(chunks, views, first, first + count)
-
-        family.roles(1, consumer, producer)
+        _sequence_walk(call, initial, "initial", (entering, initial_views), (chunks, views), step, first,
+                       count, begins, ends,
+                       lambda i: final_ref.at[pl.ds(memory(row, i), BLOCK), pl.ds(j * bv, bv)], bv)
 
     out_type = (memories.shape(value_width), held.shape(call.heads * value_width),
                 jax.ShapeDtypeStruct((batch * call.heads * width, value_width), jnp.float32))
@@ -727,13 +747,8 @@ def _layout(batch: int, length: int, starts, max_segments: int | None):
         sequences = np.stack([np.arange(batch) * (length // CHUNK), np.full(batch, length // CHUNK),
                               np.arange(batch), np.ones(batch), np.ones(batch)], 1)
 
-        def laid(x):
-            return x.reshape(tokens, *x.shape[2:])
-
-        def unlaid(x):
-            return x.reshape(batch, length, *x.shape[1:])
-
-        return chunks, jnp.full((chunks,), CHUNK, jnp.int32), jnp.asarray(sequences, jnp.int32), laid, unlaid
+        return (chunks, jnp.full((chunks,), CHUNK, jnp.int32), jnp.asarray(sequences, jnp.int32),
+                lambda x: x.reshape(tokens, *x.shape[2:]), lambda x: x.reshape(batch, length, *x.shape[1:]))
     if starts is None:
         spans = chunked_launch.sequences(batch, length, chunk=CHUNK)
     else:
@@ -856,7 +871,7 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     hi, lo = (x.reshape(rows, -1) if per_key else x.reshape(rows, heads).T for x in (hi, lo))
     beta = laid(beta).reshape(rows, heads).T
     q, k, v = (given.split(laid(x).reshape(rows, -1)) for x in (q, k, v))
-    w, u, keys, scores = None, v, k, None
+    a, w, u, keys, scores = None, None, v, k, None
     if per_key and delta:
         a, scores = _intra(q, k, hi, lo, beta, taken, call, scale=scale)
         w, u, keys = _weighted(k, v, a, hi, lo, beta, taken, call)
@@ -870,7 +885,7 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     h, corrected, final = _states(keys, w, u, hi, lo, beta, h0.reshape(-1, columns), sequences, call, tiles)
     final = final.reshape(batch, heads, width, columns)[:, :, :key_width, :value_width]
     return _Run(call, tiles, dtype, scale, key_width, value_width, batch, q, k, v, hi, lo, beta,
-                a if delta and not per_key else None, w, scores, h, corrected, final, taken, sequences, laid,
+                None if per_key else a, w, scores, h, corrected, final, taken, sequences, laid,
                 unlaid)
 
 
@@ -1014,29 +1029,9 @@ def _reverse(q, k, w, do, hi, lo, dht, sequences, call: _Call, *, scale: float):
             held.store(dv_ref, dv, n * CHUNK, CHUNK, h * value_width + j * bv, bv)
             return grad, accumulators
 
-        def taken(index, slots, carry, accumulators):
-            del index, carry
-            kept = jnp.where(ends > 0, 1.0, 0.0)
-            return [_tile(slots, f"final{i}", final).value() * kept for i in range(slices)], accumulators
-
-        start = chunks - first - count
-
-        def consumer(_):
-            grad = family.walk(leaving, ((taken, 0, 1),), [family.zeros((BLOCK, bv))] * slices, (),
-                               call.interpret)[0]
-            grad = family.walk(walked, ((step, start, start + count),), grad, (), call.interpret,
-                               first=start)[0]
-
-            @pl.when(begins > 0)
-            def _():
-                for i, part in enumerate(grad):
-                    dh0_ref.at[pl.ds(memory(row, i), BLOCK), pl.ds(j * bv, bv)][...] = part
-
-        def producer():
-            family.stream(leaving, final_views, 0, 1)
-            family.stream(walked, views, start, start + count)
-
-        family.roles(1, consumer, producer)
+        _sequence_walk(call, final, "final", (leaving, final_views), (walked, views), step,
+                       chunks - first - count, count, ends, begins,
+                       lambda i: dh0_ref.at[pl.ds(memory(row, i), BLOCK), pl.ds(j * bv, bv)], bv)
 
     out_type = (memories.shape(value_width), held.shape(call.heads * value_width),
                 jax.ShapeDtypeStruct((batch * call.heads * width, value_width), jnp.float32))

@@ -703,9 +703,10 @@ def _mosaic_backward_rule(query, key, value, g, beta, state, starts, *, document
         return rule(*operands), operands
 
     def backward(operands, grads):
-        *operands, starts = operands
-        out = mainloop.gradients(*operands, *grads, starts=None if documents is None else starts,
-                                 max_segments=documents, scale=scale)
+        query, key, value, g, beta, state, starts = operands
+        out = mainloop.gradients(query, key, value, g, beta, state, *grads,
+                                 starts=None if documents is None else starts, max_segments=documents,
+                                 scale=scale)
         return (*out, None)
 
     rule.defvjp(forward, backward)
@@ -742,11 +743,11 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, starts=None, max_segm
 
     def backward(operands, grads):
         out_grad, final_grad = grads
-        *operands, starts = operands
+        query, key, value, g, beta, state, starts = operands
         if fast:
-            grads = mainloop.gradients(*operands, out_grad, final_grad, starts=starts,
+            grads = mainloop.gradients(query, key, value, g, beta, state, out_grad, final_grad, starts=starts,
                                        max_segments=max_segments, scale=scale, **run)
-            return (*grads[:5], None if operands[5] is None else grads[5], None)
+            return (*grads[:5], None if state is None else grads[5], None)
 
         def portable(query, key, value, g, beta, state):
             group = value.shape[2] // key.shape[2]
@@ -758,7 +759,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, starts=None, max_segm
                                           dtype=jnp.float32 if wide else None)
             return out, final
 
-        _, pull = jax.vjp(portable, *operands)
+        _, pull = jax.vjp(portable, query, key, value, g, beta, state)
         return (*pull((out_grad, final_grad)), None)
 
     rule.defvjp(forward, backward)

@@ -44,7 +44,7 @@ from dew.nn.precision import compensated_add, float32_einsum, float32_matmul
 
 from . import recurrence
 
-Issue = Callable[[str, jax.Array, jax.Array], jax.Array]
+Issue = Callable[[str, "Operand", "Operand"], jax.Array]
 """A mainloop's product: `issue(name, left, right)` is `left @ right` over the last two axes, the product
 `PRODUCTS[name]` declares, in the mainloop's own dot."""
 
@@ -445,6 +445,9 @@ backward's loads a `Tile`."""
 TileLoad = Callable[..., Tile]
 """A load of a `Tile` (the backward's operands)."""
 
+Operand = jax.Array | Tile | Transposed
+"""A product's operand (`Issue`'s): registers, a tile in memory, or registers taken transposed."""
+
 
 def apart(rows, rows_lo, columns, columns_lo):
     """A compensated prefix's difference between positions, `rows - columns` `[R, C]` from each side's `(hi,
@@ -614,7 +617,8 @@ def chunk_output(queries: Load, entered: Load, keys: Load, columns: int, gate, l
     return out * scale + issue("local", scores.astype(value.dtype), value) * scale
 
 
-def key_decayed_row(query, weighted_key, gate, low, earlier: Load, place, chunk: int, scale: float):
+def key_decayed_row(query, weighted_key, gate, low, earlier: Callable[..., tuple], place, chunk: int,
+                    scale: float):
     """One token's rows of a chunk's scores and keys' products under a decay a key dimension, `[R, C]` each
     for its `R` value heads, fp32: `Aqk_j = scale sum_k q_k k_jk exp2(g_k - g_jk)` for `j <= place` and `Akk_j
     = sum_k (beta k)_k k_jk exp2(g_k - g_jk)` for `j < place`, every pair's exponent its own over both prefix
@@ -640,8 +644,8 @@ def key_decayed_write(key, gate, low, last, last_low):
     return key * raised(last - gate, last_low - low)
 
 
-def key_decayed_output(queries: Load, gates: Load, entered: Load, columns: int, scores, value, scale: float,
-                       issue: Issue):
+def key_decayed_output(queries: Load, gates: Callable[..., tuple], entered: Load, columns: int, scores, value,
+                       scale: float, issue: Issue):
     """A chunk's output `[C, BV]`, fp32, a decay a key dimension: `scale (q exp2(g))_narrow S + tril(Aqk) v`,
     each key block's gated queries `queries(c) exp2(gates(c))` (`gates(c)` the prefix's halves, `raised`)
     rounded to their dtype against the memory entered `entered(c)` ('memory'), the scores `scores` (`Aqk`,
