@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, Self, overload, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -48,6 +48,16 @@ class Fusion:
     tokens: jax.Array
     embeddings: jax.Array | None
     media: jax.Array | None
+
+
+@overload
+def _conditioner_modules(tower: TowerBase, projector: ProjectorBase, dtype, precision
+                          ) -> tuple[nn.Module, nn.Module]: ...
+
+
+@overload
+def _conditioner_modules(tower: None, projector: ProjectorBase, dtype, precision
+                          ) -> tuple[None, nn.Module]: ...
 
 
 def _conditioner_modules(tower: TowerBase | None, projector: ProjectorBase, dtype, precision):
