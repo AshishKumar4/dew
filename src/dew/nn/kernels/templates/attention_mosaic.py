@@ -725,9 +725,9 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
     the transposed products' left operands (`algebra.value_operands`, `cotangent_product`). Returns the
     query head's dK and dV `[B, Kp, H, D]` fp32, then each key and tile gradient of the score hook in kind
     order (`DKV_GRADS`: keys `[B, H, Kp]`, tiles `[B, H, Qp, Kp]`); `fused`, dQ `[B, Qp, H, D]` fp32 before
-    them, each tile's staged cotangents times the resident keys added into it (`Family.added`). A tile's
-    gradient is written by the one program that holds its keys, straight from the registers; the tiles its
-    walk does not read are zeros."""
+    them, each tile's staged cotangents times the resident keys added into it (`Family.added`). A key or
+    tile gradient is written by the one program that holds its keys, straight from the registers; the tiles
+    its walk does not read are zeros."""
     batch, queries, heads, width = query.shape
     keys_padded, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
     program, consumers, kinds = walk.program, walk.consumers, walk.kinds
@@ -798,10 +798,9 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
             family.stored((dk, dv), (dk_ref.at[out], dv_ref.at[out]),
                           smem=out_smem.at[index, pl.ds(0, block_k)])
             if key_refs:
-                # Each key gradient, the walk's column sums, through a row of the output stage.
-                key_views = tuple(ref.at[row, head, pl.ds(k_first, block_k)] for ref in key_refs)
-                family.stored(tuple(family.as_row(sums) for sums in key_sums), key_views,
-                              smem=out_smem.at[index, 0, pl.ds(0, block_k)])
+                # Each key gradient, the walk's column sums, straight to the `[B, H, Kp]` outputs.
+                for ref, sums in zip(key_refs, key_sums, strict=True):
+                    ref[row, head, pl.ds(k_first, block_k)] = sums
             if tile_refs:
                 # The tiles the walk does not read: no query of this block sees them, so they are zeros.
                 zeros = family.zeros((block_q, block_k))
