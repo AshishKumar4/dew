@@ -45,7 +45,7 @@ def workload(site, directory):
 
 
 def main():
-    sys.path.insert(0, str(ROOT / "tests"))
+    sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
     import numpy as np
     from reference_error import FEWEST_SEEDS, seeds_for
     from reference_source import git_head
