@@ -905,10 +905,6 @@
    "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_z_image_source.py": {
-   "comparisons": 5,
-   "lane": "Models, Serving & RL"
-  },
   "tools/benchmark_depthwise.py": {
    "comparisons": 2,
    "lane": "Training"
