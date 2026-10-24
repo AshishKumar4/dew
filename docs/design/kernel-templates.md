@@ -567,9 +567,9 @@ Later decisions (2026-10-22 and 2026-10-23), which §0 states as the design; whe
 | 50 | check 1 and check 2 for every form and hook, bf16 included | gate |
 | 51 | bitwise reproducible runs | the same-schedule reproducibility test |
 
-#### Survey additions (FlagAttention, fla and tokamax, 2026-10-24)
+#### Survey additions (FlagAttention, fla and tokamax)
 
-Variants these libraries ship that rows 1–51 did not name, each against the design's signatures. Sources: FlagAttention's `conf/operators.yaml`, fla's `fla/layers` and `fla/ops`, and tokamax's `docs/supported_ops.md`, read 2026-10-24.
+Variants these libraries ship that rows 1–51 did not name, each against the design's signatures. Sources: FlagAttention's `conf/operators.yaml`, fla's `fla/layers` and `fla/ops`, and tokamax's `docs/supported_ops.md`.
 
 | # | Variant | Maps to | Signature | Notes |
 |---|---|---|---|---|
