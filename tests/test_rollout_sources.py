@@ -54,8 +54,9 @@ def words(key):
 class Server:
     """Draws `(5, EOS)`, or `tokens`, at the version served on submission; `hold` keeps draws pending."""
 
-    def __init__(self, tokens=(5, EOS), raw=True, sampling=SAMPLING, hold=False):
+    def __init__(self, tokens=(5, EOS), raw=True, sampling=SAMPLING, hold=False, ending=None):
         self.version, self.tokens, self.raw, self._sampling, self.hold = 0, tokens, raw, sampling, hold
+        self.ending = ending
         self.held, self.prompts, self.keys = [], [], []
 
     @property
@@ -66,8 +67,11 @@ class Server:
         self.prompts.append(tuple(prompt))
         self.keys.append(words(key))
         future = Future()
+        ending = self.ending
+        if ending is None:
+            ending = "stop" if self.tokens and self.tokens[-1] == EOS else "length"
         draw = Draw(tuple(prompt), self.tokens, (-.5,) * len(self.tokens),
-                    "stop" if self.tokens[-1] == EOS else "length", self.version,
+                    ending, self.version,
                     (-.4,) * len(self.tokens) if self.raw else None)
         if self.hold:
             self.held.append((future, draw))
@@ -408,14 +412,7 @@ def test_tokens_after_eos_never_execute_an_environment_turn():
     """A completed server future is still untrusted: a token after EOS must fail admission before
     a tool sees it or a verifier assigns it reward, and the opened environment is released."""
     entered, exited, stepped, scored = [], [], [], []
-    class BrokenTermination(Server):
-        def submit(self, prompt, max_new_tokens, *, key):
-            answered = super().submit(prompt, max_new_tokens, key=key).result()
-            future = Future()
-            future.set_result(replace(answered, finish_reason="stop"))
-            return future
-
-    server = BrokenTermination(tokens=(EOS, 7))
+    server = Server(tokens=(EOS, 7), ending="stop")
 
     def reward(task, episode):
         scored.append(episode)
@@ -434,14 +431,8 @@ def test_tokens_after_eos_never_execute_an_environment_turn():
 
 @pytest.mark.parametrize("ending", ["length", "stop"])
 def test_empty_server_actions_fail_before_tools_or_rewards(ending):
-    class Empty(Server):
-        def submit(self, prompt, max_new_tokens, *, key):
-            future = Future()
-            future.set_result(Draw(tuple(prompt), (), (), ending, self.version))
-            return future
-
     entered, exited, stepped, rewarded = [], [], [], []
-    server = Empty(sampling=replace(SAMPLING, stop=("finished",)))
+    server = Server(tokens=(), ending=ending, sampling=replace(SAMPLING, stop=("finished",)))
 
     def reward(*args):
         rewarded.append(args)
@@ -463,15 +454,8 @@ def test_empty_server_actions_fail_before_tools_or_rewards(ending):
 
 
 def test_a_tool_call_finish_is_a_completed_single_turn_sample():
-    class ToolCall(Server):
-        def submit(self, prompt, max_new_tokens, *, key):
-            draw = super().submit(prompt, max_new_tokens, key=key).result()
-            future = Future()
-            future.set_result(replace(draw, finish_reason="tool_calls"))
-            return future
-
     [task] = prompt_tasks(prompt_batch())
-    prompts = PromptSource(ToolCall(), lambda *_: 1.0, decode=str, max_new_tokens=4)
+    prompts = PromptSource(Server(ending="tool_calls"), lambda *_: 1.0, decode=str, max_new_tokens=4)
     try:
         session = prompts.submit(task, 1, version=0, key=KEY)[0].result(timeout=10)
     finally:
