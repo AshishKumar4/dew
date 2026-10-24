@@ -62,8 +62,8 @@ from typing import Protocol
 
 from dew.cleanup import exit_code, groups_ended, process_group, signal_group
 from dew.data.prompts import PromptRecord
-from dew.inference.rollouts import InfrastructureError
-from dew.objectives.rl.episodes import Action, Environment, EpisodeId, EpisodeStatus, Observation
+from dew.inference.rollouts import Draw, InfrastructureError
+from dew.objectives.rl.episodes import Environment, EpisodeId, EpisodeStatus, Observation
 from dew.objectives.rl.records import messages
 from dew.records import JSON, finite
 
@@ -201,9 +201,9 @@ class _ProcessEnvironment:
     def reset(self) -> Observation:
         return _observation(self._request("reset", {"episode": asdict(self.identity)}))
 
-    def step(self, action: Action) -> Observation:
-        record = {"context": list(action.context), "tokens": list(action.tokens),
-                  "terminated": action.terminated, "policy_step": action.policy_step}
+    def step(self, action: Draw) -> Observation:
+        record = {"context": list(action.prompt), "tokens": list(action.tokens),
+                  "terminated": action.terminated, "policy_step": action.version}
         return _observation(self._request("step", {"action": record}))
 
     def get_state(self) -> bytes:

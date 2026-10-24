@@ -34,6 +34,49 @@ from dew.interop.harbor import HARBOR_KEY, Harbor, outcome
 from dew.interop.harness import Command, HarnessSource
 from dew.objectives.rl.sessions import Call, Status, Task, Transcript
 
+
+@pytest.mark.parametrize("slow_endpoint", ["/health/workers", "/v1/models"])
+def test_gateway_readiness_rejects_an_answer_after_its_deadline(slow_endpoint):
+    """A worker-health probe or its proxied model listing answers too late. Each network phase
+    receives the remaining budget, and neither late answer establishes readiness."""
+    probes = []
+
+    def network(request):
+        probes.append(request)
+        if request.url.path == slow_endpoint:
+            threading.Event().wait(timeout=0.1)
+        return httpx.Response(200, json={"healthy": 1} if request.url.path == "/health/workers" else {})
+
+    with httpx.Client(transport=httpx.MockTransport(network), timeout=30) as client:
+        gateway = Gateway("http://gateway", client=client)
+        with pytest.raises(RuntimeError):
+            gateway.ready(timeout=0.05, poll=30)
+    assert probes
+    assert all(0 < request.extensions["timeout"]["read"] <= 0.05 for request in probes)
+
+
+def test_gateway_readiness_checks_both_endpoints_within_its_budget():
+    probes = []
+    closed = []
+
+    class UnreadBody(httpx.SyncByteStream):
+        def __iter__(self):
+            raise RuntimeError("readiness must not wait for a response body")
+
+        def close(self):
+            closed.append(self)
+
+    def network(request):
+        probes.append(request)
+        return httpx.Response(200, stream=UnreadBody())
+
+    with httpx.Client(transport=httpx.MockTransport(network), timeout=30) as client:
+        Gateway("http://gateway", client=client).ready(timeout=10)
+    assert [request.url.path for request in probes] == ["/health/workers", "/v1/models"]
+    assert 0 < probes[1].extensions["timeout"]["read"] <= probes[0].extensions["timeout"]["read"] <= 10
+    assert len(closed) == len(probes)
+
+
 KEY = jax.random.key(0)
 
 
@@ -92,7 +135,7 @@ def test_a_live_gateway_session_is_the_engine_ids_and_likelihoods(engine):
     assert len(session.calls) == 3 and not session.errors
     for call, recorded in zip(session.calls, traces, strict=True):
         choice = recorded["raw_response"]["choices"][0]
-        assert call.sampled_ids == tuple(choice["response_token_ids"] if engine == "sglang"
+        assert call.tokens == tuple(choice["response_token_ids"] if engine == "sglang"
                                          else recorded["completion_token_ids"])
         assert call.behavior_log_probs == tuple(entry["logprob"] for entry in choice["logprobs"]["content"])
 
@@ -260,7 +303,7 @@ def fake_gateway(unhealthy_checks=0, unreachable_models=0, version=7, extra=()):
                                              "healthy": healthy, "total": 1})
         if request.url.path == "/v1/models":
             listings[0] += 1
-            if listings[0] <= unreachable_models:
+            if checks[0] <= unhealthy_checks or listings[0] <= unreachable_models:
                 return httpx.Response(500, text="Internal Server Error")
             return httpx.Response(200, json={"object": "list", "data": [{"id": "policy"}]})
         if request.method == "DELETE":
@@ -418,7 +461,7 @@ def test_a_trial_past_its_timeout_is_interrupted_and_the_scheduler_retries_it(tm
 
     from dew.data.dataset import Loader
     from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.objectives.rl import GRPOObjective, RolloutScheduler
+    from dew.objectives.rl import Asynchronous, GRPOObjective, RolloutScheduler
     from dew.objectives.rl.scheduler import task_ids
     from dew.training import Layout, Trainer
 
@@ -437,9 +480,9 @@ def test_a_trial_past_its_timeout_is_interrupted_and_the_scheduler_retries_it(tm
     objective = GRPOObjective(model, seq_len=7)
     tasks, records = jax.device_count(), []
     scheduler = RolloutScheduler(
-        objective, source, Publisher(), width=8, rows=2 * tasks, groups=2, max_lag=0, ahead=0,
+        Asynchronous(source, Publisher(), objective, width=8, rows=2 * tasks, max_lag=0, ahead=0),
         tasks=lambda batch: [Task(task.id, {HARBOR_KEY: str(hanging)}) for task in task_ids(batch)],
-        log=records.append)
+        groups=2, log=records.append)
     data = scheduler.tasks(Loader(train=lambda partition: iter(
         lambda: {"task_id": np.arange(tasks, dtype=np.int32)}, None), val=None, records=None, batch=tasks))
     try:

@@ -255,7 +255,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         def generate(prepared):
             weights, count = prepared
             sampled, undefined = self._sample(weights, step.key, count=count)
-            if bool(undefined):
+            if bool(jax.device_get(undefined)):
                 raise ValueError(REVEALED_UNDEFINED)
             return sampled, None, None
 
