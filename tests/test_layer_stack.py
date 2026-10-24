@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import selection_margins
 from model_support import largest_difference
 from reference_error import assert_as_exact, widened, with_gradients, without_ynn
 from sharded import assert_sharded
@@ -103,7 +104,7 @@ def test_a_scanned_fixture_decodes_through_the_cache(name):
         np.testing.assert_array_equal(steps[-1][:, -1].argmax(-1), whole[:, -1].argmax(-1))
 
 
-def gemma4_shaped(dtype=jnp.float32, **overrides):
+def gemma4_config(**overrides):
     """A gemma4-e2b shaped decoder twice the fixture's depth: runs of sliding
     layers, a full layer between them, four sharing layers at the end."""
     config = translate_config(json.loads((FIXTURES / "gemma4-e2b" / "config.json").read_text()))
@@ -113,10 +114,10 @@ def gemma4_shaped(dtype=jnp.float32, **overrides):
         + ("sliding_attention",) * 5 + ("full_attention",),
         kv_shared_layers=(8, 9, 10, 11), max_seq_len=16)
     config.update(overrides)
-    return models.build("causal_transformer", config, dtype=dtype, attention_impl="reference")
+    return config
 
 
-def gemma3n_shaped(dtype=jnp.float32, **overrides):
+def gemma3n_config(**overrides):
     """A gemma3n-tiny shaped decoder of ten layers: sparsity on the first
     five, one width, the last two sharing keys and values."""
     config = translate_config(json.loads((FIXTURES / "gemma3n-tiny" / "config.json").read_text()))
@@ -127,16 +128,16 @@ def gemma3n_shaped(dtype=jnp.float32, **overrides):
         mlp_features=(48,) * 10, activation_sparsity_pattern=(0.95,) * 5 + (0.0,) * 5,
         kv_shared_layers=(8, 9), max_seq_len=16)
     config.update(overrides)
-    return models.build("causal_transformer", config, dtype=dtype, attention_impl="reference")
+    return config
 
 
-def deepseek_shaped(dtype=jnp.float32, **overrides):
+def deepseek_config(**overrides):
     """A deepseek-v3-tiny shaped decoder of six layers, one dense then five routed."""
     config = translate_config(json.loads((FIXTURES / "deepseek-v3-tiny" / "config.json").read_text()))
     config.update(num_layers=6, layer_types=("full_attention",) * 6, max_seq_len=16)
     config["mixture"] = {**config["mixture"], "layers": (1, 2, 3, 4, 5)}
     config.update(overrides)
-    return models.build("causal_transformer", config, dtype=dtype, attention_impl="reference")
+    return config
 
 
 # Gemma 3n keeps the initialized forward check but checks gradients at
@@ -144,15 +145,27 @@ def deepseek_shaped(dtype=jnp.float32, **overrides):
 # default zero correction scales put that residual exactly at RMSNorm's
 # epsilon floor. The resulting high-gain Jacobian is sensitive even to
 # one-ULP weight perturbations without any sparse-ReLU branch changing.
-def deepseek_widths(dtype=jnp.float32, **overrides):
+def deepseek_widths_config(**overrides):
     """The DeepSeek-shaped stack with a dense width per layer beside the routed
     experts' own width, and no prediction depth, which would need one width."""
-    return deepseek_shaped(dtype, **{"mlp_features": (32, 48, 40, 48, 32, 40), "num_nextn_predict_layers": 0,
-                                     **overrides})
+    return deepseek_config(**{"mlp_features": (32, 48, 40, 48, 32, 40), "num_nextn_predict_layers": 0,
+                              **overrides})
 
 
-SHAPES = {"gemma4": gemma4_shaped, "gemma3n": gemma3n_shaped, "deepseek": deepseek_shaped,
-          "deepseek_widths": deepseek_widths}
+SHAPE_CONFIGS = {"gemma4": gemma4_config, "gemma3n": gemma3n_config, "deepseek": deepseek_config,
+                 "deepseek_widths": deepseek_widths_config}
+"""Each shape's decoder record, its fields overridden by keyword."""
+
+
+def shaped(shape: str):
+    """A builder of `shape`'s decoder at a dtype, its fields overridden by keyword."""
+    def build(dtype=jnp.float32, **overrides):
+        return models.build("causal_transformer", SHAPE_CONFIGS[shape](**overrides), dtype=dtype,
+                            attention_impl="reference")
+    return build
+
+
+SHAPES = {shape: shaped(shape) for shape in SHAPE_CONFIGS}
 
 SCAN_WIDTHS = {"gemma3n": {"mlp_features": (192,) * 10}, "gemma4": {"per_layer_input_dim": 32}}
 """Each shape's widths for the scanned stack's check 1, where the fixture's leave a draw's error to a few
@@ -194,8 +207,8 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
     training = gemma3n_training_variables(variables) if shape == "gemma3n" else variables
 
     def measured(model, forward, trained):
-        """The logits, and the loss with its gradients under the draw's cotangent (`with_gradients`)."""
-        @jax.jit
+        """The logits, and the loss with its gradients under the draw's cotangent (`with_gradients`),
+        compiled as both arms of a check between Dew's paths are (`without_ynn`)."""
         def run(ids, cotangent):
             def loss(params):
                 current = {**trained, "params": params}
@@ -204,14 +217,28 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
                 return jnp.mean(model.apply(current, ids) ** 2)
             value, gradients = with_gradients(loss)(trained["params"], cotangent)
             return {"logits": model.apply(forward, ids), "loss": value, "gradients": gradients}
-        return run
+        return without_ynn(run)
 
-    def draw(seed):
+    config = SHAPE_CONFIGS[shape](**SCAN_WIDTHS.get(shape, {}))
+    selected = selection_margins.capture(plain)
+
+    def clears(inputs):
+        """Whether the draw's selections, in the forward of both parameter sets the arms read (the
+        logits' and the loss's), clear `selection_margins.MARGIN`."""
+        ids = jnp.asarray(inputs[0])
+        return all(selection_margins.margin(config, selected(tree, ids), shape)
+                   > selection_margins.MARGIN for tree in (variables, training))
+
+    def rows(key):
         """BATCH rows of SEQ_LEN token ids and the scalar loss's cotangent, one: rows enough that a
         draw's error is a sum of many roundings, where two rows of twelve left one draw in a few holding
         most of a leaf's."""
-        ids = np.random.default_rng([0x5CA7, seed]).integers(0, VOCAB, (BATCH, SEQ_LEN)).astype(np.int32)
+        ids = np.random.default_rng([0x5CA7, key]).integers(0, VOCAB, (BATCH, SEQ_LEN)).astype(np.int32)
         return ids, np.float32(1.0)
+
+    # A shape that selects (Gemma 3n's gaussian top-k, the DeepSeek shapes' routing) draws rows whose
+    # selections clear the margin, so every run selects alike (`selection_margins`).
+    draw = selection_margins.clearing(rows, clears) if selection_margins.selects(config) else rows
 
     wide = []
 
@@ -267,7 +294,7 @@ def test_a_scanned_moe_stack_sows_and_balances_like_the_plain_loop():
     """The routers sow through the scanned view, so the balance loss and the
     aux-loss-free bias move as they do under the plain loop. Observed loss
     difference on CPU 0.0, bias difference 0.0."""
-    plain, scanned, variables, _ = scanned_pair(deepseek_shaped)
+    plain, scanned, variables, _ = scanned_pair(SHAPES["deepseek"])
     batch = {"text": jax.random.randint(jax.random.key(2), (BATCH, 12), 0, VOCAB)}
     step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
 
@@ -659,7 +686,7 @@ def test_a_host_resident_key_sharing_stack_keeps_layer_states_through_cached_dec
     layers in host memory, read by a caller that keeps every layer's output: decoding a prompt
     through its cache, it computes the resident stack's tokens and keeps the same layer outputs,
     the providers' writes carried out of the lifted scope that fetches them."""
-    model = gemma4_shaped(scan_layers=True)
+    model = SHAPES["gemma4"](scan_layers=True)
     tokens = jnp.asarray([[1, 2, 3, 4, 5, 6]], jnp.int32)
     variables = model.init(jax.random.key(0), tokens)
     assert any(count > 1 for _, count in model.bind(variables).groups)
