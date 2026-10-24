@@ -214,7 +214,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_diffusion_objective.py": {
-   "comparisons": 8,
+   "comparisons": 7,
    "lane": "Training"
   },
   "tests/test_discrete.py": {
