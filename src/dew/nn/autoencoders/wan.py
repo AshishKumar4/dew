@@ -398,7 +398,8 @@ def wan_vae_fields(config: Mapping[str, object]) -> WanVAEFields:
             raise ValueError(f"{name} belongs to Wan 2.2's VAE, which this port does not compute")
     return WanVAEFields(base=_records.integer(config["base_dim"], "base_dim"),
                         latent=_records.integer(config["z_dim"], "z_dim"), multipliers=multipliers,
-                        blocks=_records.integer(config["num_res_blocks"], "num_res_blocks"), temporal=temporal)
+                        blocks=_records.integer(config["num_res_blocks"], "num_res_blocks"),
+                        temporal=temporal)
 
 
 _LEAF_RANK = {"weight": (4, 5), "bias": (1,), "gamma": (3, 4)}

@@ -62,7 +62,8 @@ def _gpt_neo_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         'layer_types': tuple('full_attention' if kind == 'global' else 'sliding_attention'
                              for kind in pattern),
         'kinds': {'sliding_attention': native_fields(LayerKind)(
-            window=_records.integer(hf.get('window_size', 256), 'window_size'))} if 'local' in pattern else {},
+            window=_records.integer(hf.get('window_size', 256), 'window_size'))}
+            if 'local' in pattern else {},
     })
     return config
 

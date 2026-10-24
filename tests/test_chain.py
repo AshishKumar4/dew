@@ -43,7 +43,7 @@ LAYOUT = Layout(min_shard=1, tolerance=1.0)
 class TupleShapes:
     """Keeps each record and restates the shapes of the fields it declares as tuples."""
 
-    def map(self, record):
+    def __call__(self, record):
         return record
 
     def declared(self, facts):
