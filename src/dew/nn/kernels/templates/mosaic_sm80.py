@@ -121,13 +121,16 @@ class Mma(mosaic.Family):
         del streams, views, lo, hi
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
-                first: jax.Array | int = 0, in_flight: int = 0) -> tuple[C, tuple[jax.Array, ...]]:
+                first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None
+                ) -> tuple[C, tuple[jax.Array, ...]]:
         # Its products are synchronous: none stays in flight past its step, and `emit_pipeline` gives
         # each stage back as its step ends.
         del first, in_flight
         blocks = streams.pipeline.blocks
         names = tuple(blocks)
-        carry = (start, tuple(self.zeros(shape) for shape in shapes))
+        initial = (None,) * len(shapes) if initial is None else initial
+        carry = (start, tuple(self.zeros(shape) if value is None else value
+                              for shape, value in zip(shapes, initial, strict=True)))
         for step, lo, hi in segments:
             if isinstance(lo, int) and isinstance(hi, int) and hi <= lo:
                 # No steps: the carry and its zero accumulators as they start (`emit_pipeline` takes no
