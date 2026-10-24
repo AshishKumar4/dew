@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax.traverse_util import flatten_dict
 
 from dew import records
 from dew.registry import dtype_name, resolve_dtype, storage_name
@@ -42,8 +43,8 @@ def declared_dtype(config: Mapping[str, object], tensors: Mapping[str, np.ndarra
         name = storage_name(tensor.dtype)
         if name is not None:
             return name
-    raise ValueError("param_dtype 'auto' found neither a stated dtype nor a float32, bfloat16 or "
-                     "float16 tensor in the checkpoint")
+    raise ValueError("param_dtype 'auto' found neither a stated dtype nor a floating tensor a config "
+                     "names (`dew.registry.DtypeName`) in the checkpoint")
 
 
 def checkpoint_dtype(stored: np.dtype, param_dtype: str = "float32", *,
@@ -193,6 +194,29 @@ def _orders(path: tuple[str, ...], rank: int) -> tuple[tuple[int, ...] | None, t
         return None, None
     order = (*range(2, rank), 1, 0)
     return order, tuple(int(axis) for axis in np.argsort(order))
+
+
+def _stored_shape(path: tuple[str, ...], shape: tuple[int, ...]) -> tuple[int, ...]:
+    """The shape of the source tensor a leaf of `shape` at `path` is read from (`_orders`' inverse):
+    a kernel's axes as the source stores them, any other leaf's as they are."""
+    order, _ = _orders(path, len(shape))
+    return tuple(shape) if order is None else tuple(shape[order.index(axis)] for axis in range(len(shape)))
+
+
+def native_layouts(variables: Mapping[str, Mapping[str, object]], name_of: Callable[[tuple[str, ...]], str],
+                   path_of: TensorPath) -> tuple[WeightLayout, ...]:
+    """The layouts that write every leaf of `variables` (its collections) back as the source tensor
+    `name_of` names it from its path, for a tree built natively rather than read; `path_of`, the
+    reader's own map, places each name, and a name it does not place back at its leaf is refused."""
+    shapes = {}
+    for collection, tree in variables.items():
+        for path, leaf in flatten_dict(dict(tree)).items():
+            name = name_of((collection, *path))
+            if path_of(name) != (collection, *path) or not isinstance(leaf, (np.ndarray, jax.Array)):
+                raise ValueError(f"{name} reads into {path_of(name)}, not an array at ({collection}, "
+                                 f"{', '.join(path)})")
+            shapes[name] = _stored_shape(path, leaf.shape)
+    return source_layouts("", shapes, path_of, ())
 
 
 def source_layouts(component: str, shapes: Mapping[str, tuple[int, ...]], path_of: TensorPath,

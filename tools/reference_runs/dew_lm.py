@@ -38,7 +38,6 @@ from common import (
     WorkloadWork,
     attach_xplane_profile,
     documents,
-    git_head,
     host,
     peak_flops,
     run_arguments,
@@ -48,6 +47,7 @@ from common import (
     window_rows,
     write_record,
 )
+from reference_source import git_head
 
 
 class NormState(NamedTuple):

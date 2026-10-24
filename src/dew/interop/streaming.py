@@ -24,6 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.interop.weights import swapped
+from dew.nn.backbones.decoder_block import LAYER_SCALAR_COLLECTIONS
 from dew.training.host import evict
 
 
@@ -144,9 +145,9 @@ class WeightLayout:
     def _leaf(self, variables: Mapping[str, object], path: tuple[str, ...],
               scalar_mode: str | None) -> np.ndarray | jax.Array:
         if path[-1] == "layer_scalar":
-            if scalar_mode not in ("frozen", "trainable"):
+            if scalar_mode not in LAYER_SCALAR_COLLECTIONS:
                 raise ValueError("layer_scalar export requires an explicit model mode")
-            path = (("constants" if scalar_mode == "frozen" else "params"), *path[1:])
+            path = (LAYER_SCALAR_COLLECTIONS[scalar_mode], *path[1:])
         node: object = variables
         for part in path:
             if not isinstance(node, Mapping):

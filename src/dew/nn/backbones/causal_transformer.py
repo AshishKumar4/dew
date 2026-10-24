@@ -533,12 +533,11 @@ class CausalTransformer(nn.Module):
 
     def _kind_rotary(self, kind: LayerKind) -> float | None:
         """The fraction of a kind's head its rotary turns, None for all of
-        it: the kind's own, else the model's on a kind that attends the whole
-        sequence. LongRoPE's factors fix the rotated width on every layer;
-        Gemma's windowed layers otherwise rotate whole heads."""
+        it: the kind's own, else the model's. A window changes what a layer
+        reads, not how much of its head turns; a family whose windowed layers
+        turn another fraction (Gemma 4's whole heads) states it on the kind."""
         factor = (kind.partial_rotary_factor if kind.partial_rotary_factor is not None
-                  else self.partial_rotary_factor if kind.window is None
-                  or isinstance(kind.rope_scaling or self.rope_scaling, LongRopeScaling) else None)
+                  else self.partial_rotary_factor)
         return None if factor == 1.0 else factor
 
     @property
@@ -1827,7 +1826,8 @@ class CausalTransformer(nn.Module):
                 stages=stages, microbatches=count_microbatches,
                 # What enters the loop is read on every iteration; what the
                 # loop creates (the routers' sowing) comes out per iteration.
-                broadcast=tuple(name for name, tree in self.variables.items() if tree))
+                broadcast=tuple(name for name, tree in self.variables.items() if tree),
+                batch_axis=batch_axis)
         dtype = self.residual_dtype(
             x, train=train, decode=decode, per_layer_input=per_layer_input,
             attention_metadata=attention_metadata)
