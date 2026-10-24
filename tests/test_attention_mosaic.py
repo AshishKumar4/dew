@@ -18,7 +18,7 @@ import pytest
 from generation_support import INTERPRETS, lowers
 from jax.sharding import Mesh
 from reference_error import assert_as_exact
-from test_attention_template import CASES, ROWS, arguments, geometry as core_geometry
+from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
 from test_attention_triton import BACKWARD_SEEDS, HOOKS, SCORE_HOOKS, gate_of, hooks_for, score_hooks
 
 from dew.nn.kernels import generation, tuning
@@ -204,10 +204,11 @@ def _check_hooked_backward(hooks: str, *, form: str, interpret: bool):
 
 
 def _check_call_form(case: str, *, interpret: bool, backward: bool = False, form: str = "default"):
-    """`_check_spans` over the template core's call form `case` (`test_attention_template.CASES`), two
-    query heads a key head, the backward in the form `form` names."""
-    queries, keys = core_geometry(CASES[case])
-    spans = template.spans(queries, keys, ROWS, **arguments(CASES[case]))
+    """`_check_spans` over the template core's call form `case` (`test_attention_template.CASES`, or its
+    calls over runs, `RUN_CASES`), two query heads a key head, the backward in the form `form` names."""
+    call = CASES[case] if case in CASES else RUN_CASES[case]
+    queries, keys = core_geometry(call)
+    spans = template.spans(queries, keys, ROWS, **arguments(call))
     _check_spans(case, spans, (ROWS, queries, 4, 2), interpret=interpret, backward=backward, form=form)
 
 
@@ -482,6 +483,17 @@ def test_the_backward_is_on_par_over_every_call_form_interpreted(case, form):
 
 
 @INTERPRETS
+@pytest.mark.parametrize("form", ["forward", *BACKWARD_FORMS])
+@pytest.mark.parametrize("case", RUN_CASES)
+def test_a_call_over_runs_is_on_par_interpreted(case, form):
+    """A decision row's runs (`test_attention_template.RUN_CASES`), several key intervals a query, under the
+    interpreter: each block walks its runs' envelope (`attention.block_map`), each tile masked by the union
+    of its queries' runs (`algebra.seen`), the forward and the backward in each form."""
+    backward = form != "forward"
+    _check_call_form(case, interpret=True, backward=backward, form=form if backward else "default")
+
+
+@INTERPRETS
 @pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
 @pytest.mark.parametrize("call", CALLS)
 def test_a_call_of_whole_key_tiles_reads_no_padding_interpreted(call, backward):
@@ -521,17 +533,19 @@ def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, form):
 
 @lowers("sm90")
 @pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
-@pytest.mark.parametrize("call", ["causal", "causal-documents-window"])
+@pytest.mark.parametrize("call", ["causal", "causal-documents-window", "runs-documents-valid"])
 def test_the_launches_lower_for_an_h100(call, accurate):
     """The forward and the backward's launches lower for an H100 on any host, as the GPU gate runs them: a
-    causal call, and a spans one of documents, whose programs read its block map and ids; the forward under
-    every hook too, whose programs read each kind of parameter and the initial state."""
+    causal call, a spans one of documents, whose programs read its block map and ids, and one over a
+    decision row's runs, whose programs read each run's bounds; the forward under every hook too, whose
+    programs read each kind of parameter and the initial state."""
     if call == "causal":
         rows, tokens, heads, kv_heads = SHAPES["compiled"]
         spans = template.spans(tokens, tokens, rows, causal=True)
     else:
-        (tokens, _), rows, heads, kv_heads = core_geometry(CASES[call]), ROWS, 4, 2
-        spans = template.spans(tokens, tokens, rows, **arguments(CASES[call]))
+        case = CASES[call] if call in CASES else RUN_CASES[call]
+        (tokens, _), rows, heads, kv_heads = core_geometry(case), ROWS, 4, 2
+        spans = template.spans(tokens, tokens, rows, **arguments(case))
     q = jax.ShapeDtypeStruct((rows, tokens, heads, 128), jnp.bfloat16)
     kv = jax.ShapeDtypeStruct((rows, tokens, kv_heads, 128), jnp.bfloat16)
     rows_shape = jax.ShapeDtypeStruct((rows, heads, tokens), jnp.float32)
@@ -638,6 +652,16 @@ def test_the_forward_is_on_par_under_every_hook_on_an_h100(hooks, dtype, natural
 def test_the_backward_is_on_par_over_every_call_form_on_an_h100(case, form):
     """The backward in both forms over each of the template core's call forms compiled on an H100."""
     _check_call_form(case, interpret=False, backward=True, form=form)
+
+
+@ON_HOPPER
+@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
+@pytest.mark.parametrize("form", ["forward", *BACKWARD_FORMS])
+@pytest.mark.parametrize("case", RUN_CASES)
+def test_a_call_over_runs_is_on_par_on_an_h100(case, form):
+    """A decision row's runs compiled on an H100, the forward and the backward in each form."""
+    backward = form != "forward"
+    _check_call_form(case, interpret=False, backward=backward, form=form if backward else "default")
 
 
 @ON_HOPPER
