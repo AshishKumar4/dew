@@ -329,8 +329,9 @@ TPU_SUPPORTS = (
     TPU_BACKEND,
     _Need('bias', lambda case: not case.bias, "splash takes no bias", row=INHERENT, kind='measured'),
     _Need('blocks', lambda case: not case.blocks,
-          "splash's descriptor describes no mask of the call's own data, which block groups are",
-          row=INHERENT, kind='measured'),
+          "splash's descriptor describes no mask of the call's own data, which block groups are; a named "
+          "tpu call takes them as their mask on its pallas flash kernel (`_attention_kernel`)",
+          row='measured: the tpu path takes a call mask on its pallas flash kernel', kind='measured'),
     _Need('key_lengths', lambda case: not (case.lengths or case.starts),
                 "splash takes key lengths and starts only as a mask it cannot describe", row=INHERENT,
                 kind='measured'),
@@ -389,8 +390,8 @@ TEMPLATE_SUPPORTS = (
 """The attention template's requirements (`attention_route.attend`, the 'template' kernel): one dtype of fp32,
 bf16 and fp16 on the queries and keys alike, no arbitrary mask and no bias, no sharded sequence axis, and the
 call's default arithmetic. It takes every other call form: causality, windows, documents, key lengths and
-starts, block groups, sinks and a softcap. It is the GPU's preference for a call with block groups, which
-no other fused kernel reads (`_attention_preferred`); elsewhere it runs where a call names it
+starts, block groups, sinks and a softcap. The target's measured row prefers it for block calls
+(`attention_blocks`, `_attention_preferred`); elsewhere it runs where a call names it
 (`implementation='template'`, or `generation.chosen(attention='template')`)."""
 
 
@@ -401,17 +402,18 @@ def _attention_preferred(case: AttentionCase) -> str:
     default), and the narrow heads' row's ('attention_narrow') for heads at most 64 wide with no
     window, mask, bias, documents, key lengths or key starts (`_narrow`): by default tokamax's Triton
     kernel, measured faster than cuDNN there on an L4 and an RTX 4080; the A10's, A100's and H100's rows
-    name flash, measured faster than both (`generation.TARGETS`). A call with block groups prefers the
-    template where its Triton mainloop runs, sm80 and later: no other fused kernel reads them, and the
-    generic path reads their dense mask."""
+    name flash, measured faster than both (`generation.TARGETS`). A call with block groups takes the
+    target's measured row for them (`attention_blocks`: the template on sm80, faster and smaller than
+    xla's mask at every length measured), else the generic path, over the mask its spans mean (ledger
+    1537)."""
     backend = generation.backend()
     if backend != 'gpu':
         return 'tpu' if backend == 'tpu' else 'xla'
     if case.dtype not in CUDNN_DTYPES:
         # No fused GPU kernel takes another dtype, so no measurement prefers one.
         return 'xla'
-    if case.blocks and bf16_dot_runs():
-        return 'template'
+    if case.blocks:
+        return measured_kernel('attention_blocks', 'xla')
     if _narrow(case):
         return measured_kernel('attention_narrow', 'triton')
     return measured_kernel('attention', 'cudnn')
@@ -436,8 +438,8 @@ ATTENTION = Op[AttentionCase]('attention', (
 ), _attention_preferred, _hosted)
 """Attention's selector: the target's preference (`_attention_preferred`), then flash, triton,
 cuDNN, splash, xla and the reference path, the first that takes the call. The template comes last,
-after the reference path, which takes every call, so it runs where the target prefers it (a GPU's call
-with block groups) or a call names it."""
+after the reference path, which takes every call, so it runs where a target's row prefers it (sm80's
+block calls) or a call names it."""
 
 
 def _decode_preferred(case: AttentionCase) -> str:
