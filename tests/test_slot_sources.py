@@ -70,15 +70,19 @@ def test_a_slot_release_loads_its_readout_and_exports_the_same_task(tmp_path, re
         np.testing.assert_array_equal(actual, expected)
 
 
-class HostRows(np.ndarray):
-    """Real host rows that refuse transfer of the whole vocabulary through JAX's array protocol.
-    Their native gather returns ordinary NumPy rows, whose transfer is allowed."""
+class HostRows:
+    """A host array with a transfer budget: a native gather may cross JAX's array boundary,
+    the complete vocabulary may not. Both paths read the same real NumPy values."""
+
+    def __init__(self, values):
+        self.values = values
+        self.dtype = values.dtype
 
     def __jax_array__(self, dtype=None):
         raise AssertionError("initializing a few slots must not transfer the entire host vocabulary")
 
-    def take(self, indices, axis=None, out=None, mode="raise"):
-        return np.asarray(super().take(indices, axis=axis, out=out, mode=mode))
+    def take(self, indices, axis=None):
+        return self.values.take(indices, axis=axis)
 
 
 def test_a_slot_draw_transfers_only_selected_host_rows_and_matches_a_device_draw():
@@ -88,14 +92,17 @@ def test_a_slot_draw_transfers_only_selected_host_rows_and_matches_a_device_draw
     from dew.decision import DecisionInputs
     from dew.decision.head import SlotReadout
 
-    table = (np.arange(256 * 32, dtype=np.float32).reshape(256, 32) / 8192).view(HostRows)
+    table = np.arange(256 * 32, dtype=np.float32).reshape(256, 32) / 8192
     head = SlotReadout(32, tuple(row[0] for row in ids()), head_dim=8, slot_rows=8)
     inputs = DecisionInputs.collate(rows_of(0), 0)
     states = jnp.zeros((*inputs.tokens.shape, 32), jnp.float32)
     key = jax.random.key(3)
     host = head.init(key, states, inputs, table)
-    device = head.init(key, states, inputs, jnp.asarray(np.asarray(table)))
-    for actual, expected in zip(jax.tree.leaves(host), jax.tree.leaves(device), strict=True):
+    limited = head.init(key, states, inputs, HostRows(table))
+    device = head.init(key, states, inputs, jnp.asarray(table))
+    for actual, constrained, expected in zip(jax.tree.leaves(host), jax.tree.leaves(limited),
+                                            jax.tree.leaves(device), strict=True):
         assert actual.dtype == expected.dtype
+        np.testing.assert_array_equal(constrained, actual)
         np.testing.assert_array_equal(actual, expected)
-    np.testing.assert_array_equal(host["params"]["slots"][:3], np.asarray(table)[[65, 66, 67]])
+    np.testing.assert_array_equal(host["params"]["slots"][:3], table[[65, 66, 67]])
