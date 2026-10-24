@@ -300,11 +300,11 @@ The public image decoder also reads prepared ArrayRecord byte maps: `shape` hold
 | `images(ds, size, *, batch, augment=False, crop_scale=(1, 1), field="image", staging_size=None, draft=False, rejects=True, caption=None, cache=None, records=None, host=())` | `field`: encoded bytes or uint8 `[H, W, 3]` | `image` uint8 `[B, size, size, 3]`; with `caption`, `caption` |
 | `lm(ds, tokenizer, *, seq_len, batch, field="text", eos=None, pack="first-fit", bins=32, stride=None, cache=None, records=None, host=())` | `field`: a string; with `tokenizer=None`, token ids under `text`, such as a token store's documents | `text` int32 `[B, seq_len + 1]`; packed, `text_coordinates`, the windows' documents (`dew.nn.inputs.Coordinates`) |
 | `token_windows(ds, *, seq_len, batch, stride=None, records=None, host=())` | a token store (`TokenFiles`), shuffled, repeated or taken at most | `text` int32 `[B, seq_len + 1]`, windows `stride` apart in the store's stream |
-| `sft(ds, tokenizer, *, seq_len, batch, messages="messages", long="chunk", pack="first-fit", bins=32, cache=None, records=None, host=())` | `messages`: chat turns | the `lm` fields and `text_roles` int32 `[B, seq_len + 1]` |
+| `sft(ds, tokenizer, *, seq_len, batch, messages="messages", long="chunk", pack="first-fit", bins=32, cache=None, records=None, host=())` | `messages`: chat turns | the `lm` fields and `text_roles` int8 `[B, seq_len + 1]` ([post-training batches](#post-training-batches)) |
 | `clips(ds, seconds, *, frames, fps, size, batch, sample_rate=None, margin=0, context=0, missing="silence", rejects=True, records=None, host=())` | `mp4`: bytes | `video` uint8 `[B, frames, size, size, 3]`; with `sample_rate`, `audio` float32 `[B, samples]` and `audio_valid` bool `[B, samples]` |
 | `video(ds, seconds, *, frames, fps, size, batch, caption="", extensions=(".mp4", ".avi", ".mov", ".webm"), ...)` | a listing of media files (`Files(url, format="files")`, cut to `extensions`), or rows with `path` or `video_path` | the `clips` fields, with each row's caption, `caption` where it states none; its other settings are `clips`' |
-| `prompts(ds, tokenizer, *, max_prompt_len, batch, pad_id=0, long="truncate", thinking=None, reward_bytes=None, cache=None, records=None, host=())` | `prompt`: a string or chat turns; `data_source`, `ground_truth`, `extra_info` for the reward | `prompt` int32 `[B, max_prompt_len]` left-padded, `prompt_length` int32 `[B]`, and the three reward fields as int32 UTF-8 bytes `[B, reward_bytes]` |
-| `preferences(ds, *, seq_len, batch, pad_id=0, cache=None, records=None, host=())` | `chosen`, `rejected`: token ids, with `chosen_mask`, `rejected_mask` | each laid out in `seq_len` tokens with its mask (`preferences.PreferencePair`) |
+| `prompts(ds, tokenizer, *, max_prompt_len, batch, pad_id=0, long="truncate", thinking=None, reward_bytes=None, cache=None, records=None, host=())` | `prompt`: a string or chat turns; `data_source`, `ground_truth`, `extra_info` for the reward | `prompt` int32 `[B, max_prompt_len]` left-padded, `prompt_length` int32 `[B]`, and the three reward fields as int32 UTF-8 bytes `[B, reward_bytes]` ([post-training batches](#post-training-batches)) |
+| `preferences(ds, *, seq_len, batch, pad_id=0, cache=None, records=None, host=())` | `chosen`, `rejected`: token ids, with `chosen_mask`, `rejected_mask` | each laid out in `seq_len` tokens with its mask (`preferences.PreferencePair`; [post-training batches](#post-training-batches)) |
 | `canvas(ds, tokenizer, *, prompt_length, canvas_size, batch, canvases=1, pad_id=0, messages="messages", cache=None, records=None, host=())` | `messages`: chat turns | each assistant turn one block-diffusion row: its prompt in `prompt_length` tokens, its response in `canvases` canvases of `canvas_size`, EOS filling its last canvas and `pad_id` the rest; longer ones keep their first tokens |
 
 - A `lm` or `sft` row holds `seq_len` inputs and their next-token targets.
@@ -321,6 +321,31 @@ The public image decoder also reads prepared ArrayRecord byte maps: `shape` hold
 - `clips` draws a window `margin` seconds clear of the media's ends and its sound `context` seconds wider on each side; `missing="reject"` drops media without sound instead of filling silence, and `rejects=False` stops the run on media that is too short or does not decode.
 - `canvas` never packs: the objective splits each row at `prompt_length`. A tokenizer with no EOS cannot end a response, and is refused.
 - `cache=url` (or a `Cache`, or a published `Generation`) caches the preset's fixed steps: decode, resize and a fixed caption, tokenize, or render, and for a packing `lm` and for `sft` the cut into the pieces a row holds, so their cache is one `seq_len`'s (and for `sft` one `long`'s). Augmentation, a drawn caption, packing and batching run after the cache. A generation `publish`ed from a first-fit `lm`'s or chunking `sft`'s own unbatched rows (`batch=None`) stands in for its pack with its packing plan; it holds the pieces its steps kept, not one row for each input, so a chain reading it orders the rows after the preset (`.shuffle(seed).repeat().batch(n)`), where a `Cache` also reads a shuffle written before the preset. The cache holds each input's outputs whatever order reads it, so a `shuffle`, `repeat` or `take` written before the preset reads the cache as it reads the inputs, in indexed and memory reads; a streamed read fills its cache shard by shard and refuses a view before it. A step that drops or expands records before such a view is refused, and is tracked in the roadmap. A memory read runs the steps written before the first view over the whole source first, as it does without a cache, and the cache holds the steps after it.
+
+### Post-training batches
+
+The chat, preference and prompt presets write these batches, which the SFT, preference and RL objectives read ([post-training](post-training.md#1-data) says what each objective does with them). `RenderChat` renders the messages and optional tool schemas with the tokenizer's chat template, and writes the role of each id beside it: 0 padding, 1 system, 2 user, 3 assistant, 4 tool and 5 developer. Packing carries ids and roles through one document-coordinate plan, and a chunking or truncation step cuts every aligned field together.
+
+| Key | Shape | Dtype | Content |
+|---|---|---|---|
+| `text` | `[B, S+1]` | int32 | Packed conversation ids |
+| `text_coordinates` | `Coordinates`, `[B, S+1]` leaves | int32/bool | Document membership, padding and positions |
+| `text_roles` | `[B, S+1]` | int8 | Role per id, 0 on padding |
+
+A preference pair holds `chosen` and `rejected` token-id lists, with `chosen_mask` and `rejected_mask` marking the completion tokens; a missing mask marks the whole sequence as completion. The transform pads each pair together, and choosing `seq_len=S+1` prepares the row width `DPOObjective(..., seq_len=S)` reads.
+
+| Key | Shape | Dtype | Content |
+|---|---|---|---|
+| `input_ids` | `[B, 2, S+1]` | int32 | Chosen at pair index 0, rejected at 1 |
+| `completion_mask` | `[B, 2, S+1]` | int32 | Completion marks aligned with the ids |
+
+`RenderPrompt` accepts a message conversation, a string or an id sequence, and encodes each row to a left-padded window of ids and its length. The reward columns become fixed-width UTF-8 byte arrays, so every leaf survives the device transfer; a missing reward field becomes an empty string.
+
+| Key | Shape | Dtype | Content |
+|---|---|---|---|
+| `prompt` | `[B, max_prompt_len]` | int32 | Prompt ids, left-padded |
+| `prompt_length` | `[B]` | int32 | Real ids in each prompt |
+| `data_source`, `ground_truth`, `extra_info` | `[B, reward_bytes]` | int32 | The reward's fields as UTF-8 bytes |
 
 ### Where the rest of the chain goes
 

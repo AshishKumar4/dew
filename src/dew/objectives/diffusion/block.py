@@ -124,8 +124,9 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
     A row has ``prompt_length + canvas_size * num_canvases`` tokens. ``text``
     holds token arrays or `ModelInputs`, and any media in it conditions only
     the clean encoder. When the batch supplies attention validity, that
-    decides which cache slots are occupied; otherwise the pad ID and the
-    canvas mask decide. The optional ``canvas_mask`` and
+    decides which cache slots are occupied; otherwise the ``prompt_mask`` and
+    ``canvas_mask`` a canvas row carries decide (`dew.data.steps.chat.ResponseCanvases`),
+    and the pad ID marks a bare row's context. The optional ``canvas_mask`` and
     ``encoder_target_mask`` select the text targets, and media placeholders
     are never labels. By default an encoder target requires adjacent valid
     slots, as Google's SequenceTargetShift does. Every response token is
@@ -336,8 +337,14 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         canvas_mask = jnp.asarray(batch.get("canvas_mask", response_valid), bool)
         if canvas_mask.shape != response.shape:
             raise ValueError("canvas_mask must align with all response tokens")
+        # A context's own ids as its row marks them (`ResponseCanvases`' prompt_mask), so an id the
+        # vocabulary also pads with is read; bare rows mark none, and read the pad id as padding.
+        unmarked = tokens[:, : self.prompt_length] != self.pad_token_id
+        prompt_valid = jnp.asarray(batch.get("prompt_mask", unmarked), bool)
+        if prompt_valid.shape != (tokens.shape[0], self.prompt_length):
+            raise ValueError("prompt_mask must align with the prompt's tokens")
         full_valid = (
-            jnp.concatenate([tokens[:, : self.prompt_length] != self.pad_token_id, canvas_mask], axis=-1)
+            jnp.concatenate([prompt_valid, canvas_mask], axis=-1)
             if validity is None
             else jnp.asarray(validity, bool)
         )

@@ -213,9 +213,69 @@ def attention_keys():
     return reference, draw, None, permuting
 
 
+def attention_key_bias(heads: int = 16, queries: int = 64, keys: int = 128, width: int = 32):
+    """Softmax attention's three bias gradients, packed as one leaf of query, key and value rows,
+    `heads` of each, over the orbit of its keys' orders. The key bias's gradient is zero in exact
+    arithmetic (each row of softmax's dS sums to zero), so float64 holds its rows at its own residue,
+    rows of float64 zero beside the query's and value's sized rows: the class of a site whose leaf
+    packs a structural zero (`pooled_zero_rows`)."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    @jax.jit
+    def reference(q, k, v, bq, bk, bv, cotangent):
+        def attend(bq, bk, bv):
+            logits = jnp.einsum("hqd,hkd->hqk", q + bq[:, None], k + bk[:, None], precision="highest")
+            weights = jax.nn.softmax(logits / np.sqrt(width), -1)
+            return jnp.einsum("hqk,hkd->hqd", weights, v + bv[:, None], precision="highest")
+        _, pull = jax.vjp(attend, bq, bk, bv)
+        return {"bias": jnp.concatenate(pull(cotangent), axis=0)}
+
+    def draw(seed):
+        rng = np.random.default_rng([0xB1A5, seed])
+        shapes = ((heads, queries, width), (heads, keys, width), (heads, keys, width), (heads, width),
+                  (heads, width), (heads, width), (heads, queries, width))
+        return tuple(rng.standard_normal(shape).astype(np.float32) for shape in shapes)
+
+    def permuting(inputs, order):
+        q, k, v, *rest = inputs
+        at = permutation(0x0B, order, k.shape[1])
+        return (q, k[:, at], v[:, at], *rest)
+
+    return reference, draw, None, permuting
+
+
+def heavy_sums(rows: int = 64, terms: int = 256):
+    """Sums of `terms` float32 terms over `rows` rows, each draw's terms scaled by one heavy-tailed factor
+    (a Pareto of index one, plus one), over the orbit of the terms' orders: each arm's error grows with
+    the draw's scale, so across draws it is heavy-tailed (its mean square of index one half), and two
+    orders of one sum share that scale draw by draw. The class of a site whose arms share their
+    upstream rounding: the reference compared with itself on disjoint draws does not resolve, and the
+    pair on the same draws does (`seeds_for`'s `dew_fn`)."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    @jax.jit
+    def reference(x):
+        return {"sum": jnp.sum(x, axis=1)}
+
+    def draw(seed):
+        rng = np.random.default_rng([0x4E, seed])
+        return ((rng.pareto(1.0) + 1) * rng.standard_normal((rows, terms))).astype(np.float32),
+
+    def permuting(inputs, order):
+        (x,) = inputs
+        return (x[:, permutation(0x4E, order, x.shape[1])],)
+
+    return reference, draw, None, permuting
+
+
 CLASSES = {"cross-entropy-columns": cross_entropy_columns, "decoder-residual-orders": decoder_residual_orders,
            "contraction-terms": contraction_terms, "mean-loss-rows": mean_loss_rows,
-           "attention-keys": attention_keys}
+           "attention-keys": attention_keys, "attention-key-bias": attention_key_bias,
+           "heavy-sums": heavy_sums}
 """Each class's reference, draw, truth (None: the reference widened) and, for an orbit class, its
 `permuting(inputs, order)` (`orbited`), else None."""
 
@@ -335,10 +395,11 @@ def _scaled_output(factor):
     return fault
 
 
-def _one_row(relative):
-    """A fault moving one row of each output leaf, its first along the leading axes, by `relative` of
-    itself: tens of times a float32 row's own rounding, and too little of the leaf for its RMS ratio to
-    show, so the worst-row rule alone can fail it."""
+def _row_scaled(factor: float, row: int = 0):
+    """A fault scaling one row of each output leaf by `factor`: its `row`-th along the leading axes,
+    a row of each leaf's last axis. Moved by 1 + 2^-14 of itself, a row is tens of times a float32 row's
+    own rounding and too little of the leaf for its RMS ratio to show, so the worst-row rule alone can
+    fail it; on a row of float64 zero, it is that residue `factor` times Dew's own."""
     def fault(reference):
         def run(*arguments):
             import jax
@@ -346,8 +407,8 @@ def _one_row(relative):
 
             def moved(leaf):
                 leaf = np.array(leaf)
-                row = (0,) * (leaf.ndim - 1)
-                leaf[row] = leaf[row] * (1 + relative)
+                at = np.unravel_index(row, leaf.shape[:-1])
+                leaf[at] = leaf[at] * factor
                 return leaf
             return jax.tree.map(moved, reference(*arguments))
         return run
@@ -366,13 +427,20 @@ FAULTS = {
         "scale-2^-20": _faulted(_parameters_scaled(1 + 2.0 ** -20)),
         "bf16-parameters": _faulted(_parameters(_parameters_bfloat16)),
     },
+    "heavy-sums": {
+        "dropped-term": _input_fault(0, _zeroed((slice(None), 0))),
+        "flipped-sign": _input_fault(0, _negated((slice(None), 0))),
+        "float16": _in_float16,
+        "skipped-chunk": _input_fault(0, _zeroed((slice(None), slice(0, 32)))),
+        "scale-2^-22": _scaled_output(1 + 2.0 ** -22),
+    },
     "contraction-terms": {
         "dropped-term": _input_fault(0, _zeroed((slice(None), 0))),
         "flipped-sign": _input_fault(1, _negated(0)),
         "float16": _in_float16,
         "skipped-chunk": _input_fault(0, _zeroed((slice(None), slice(0, 128)))),
         "scale-2^-22": _scaled_output(1 + 2.0 ** -22),
-        "one-row": _one_row(2.0 ** -14),
+        "one-row": _row_scaled(1 + 2.0 ** -14),
     },
     "mean-loss-rows": {
         "dropped-term": _input_fault(1, _zeroed(0)),
@@ -380,7 +448,12 @@ FAULTS = {
         "float16": _in_float16,
         "skipped-chunk": _input_fault(1, _zeroed(slice(0, 32))),
         "scale-2^-22": _scaled_output(1 + 2.0 ** -22),
-        "one-row": _one_row(2.0 ** -14),
+        "one-row": _row_scaled(1 + 2.0 ** -14),
+    },
+    "attention-key-bias": {
+        "zero-row-10x": _row_scaled(10.0, row=16),
+        "zero-row-2^10": _row_scaled(2.0 ** 10, row=16),
+        "dropped-term": _input_fault(2, _zeroed((slice(None), 0))),
     },
     "attention-keys": {
         "dropped-term": _input_fault(2, _zeroed((slice(None), 0))),
@@ -388,8 +461,8 @@ FAULTS = {
         "float16": _in_float16,
         "skipped-chunk": _input_fault(2, _zeroed((slice(None), slice(0, 32)))),
         "scale-2^-22": _scaled_output(1 + 2.0 ** -22),
-        "one-row": _one_row(2.0 ** -14),
-        "one-row-2^-20": _one_row(2.0 ** -20),
+        "one-row": _row_scaled(1 + 2.0 ** -14),
+        "one-row-2^-20": _row_scaled(1 + 2.0 ** -20),
     },
 }
 """Real faults of each class, its own computation changed before it runs, for the procedures' power on
@@ -398,7 +471,9 @@ its column scale rounded to bfloat16 where float32 is claimed, a column of its v
 decoder's parameters scaled, or rounded to bfloat16; for each orbit class a term dropped, a term's sign
 flipped, its arithmetic in float16, a chunk of its terms skipped, its outputs scaled by 1 + 2^-22, and one
 row of each output moved by 2^-14 of itself; and attention's one row by 2^-20, sixteen float32 units in
-its last place, which the worst-row rule alone resolves among its 512 rows."""
+its last place, which the worst-row rule alone resolves among its 512 rows; for the packed attention
+biases its first key row, a row of float64 zero, ten and 1,024 times its own residue, and a value term
+dropped."""
 
 
 def _law(name: str, rng, size: int):
@@ -423,7 +498,7 @@ def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stag
     whole-field draws: each draw of Dew and of the reference one of the class's own draws, every leaf
     together (512 of them, drawn past every run's seeds)."""
     import numpy as np
-    from reference_error import REDRAW, _drawn, _Draws, _staged
+    from reference_error import NO_ZERO_ROWS, REDRAW, _drawn, _Draws, _staged
 
     # The same draws under either procedure, so their verdicts compare run by run.
     rng = np.random.default_rng([chunk, int(ratio * 1000), seeds])
@@ -445,7 +520,7 @@ def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stag
         def drawn(start, stop, mine=mine, theirs=theirs, leaves=leaves, names=names):
             count = stop - start
             return _Draws(names, mine[start:stop], theirs[start:stop], np.zeros((count, leaves, 2)),
-                          np.zeros((count, leaves), int), np.ones((count, leaves), bool), (0,) * leaves)
+                          [[NO_ZERO_ROWS] * leaves] * count, np.ones((count, leaves), bool), (0,) * leaves)
 
         over, unresolved, stage = _staged(drawn, seeds, law, two_stage=two_stage)
         verdicts.append(("over" if over else "inconclusive" if unresolved else "pass", stage))
@@ -460,7 +535,7 @@ def row_controls(width: int, rows: int, seeds: int, runs: int, chunk: int) -> tu
     least factor that would have failed it at both stages (`_staged`'s second stage is drawn only where
     the first fails), whose high quantiles calibrate NARROW_FACTORS."""
     import numpy as np
-    from reference_error import REDRAW, _Draws, _staged, _verdict
+    from reference_error import NO_ZERO_ROWS, REDRAW, _Draws, _staged, _verdict
 
     rng = np.random.default_rng([0x5A, width, rows, seeds, chunk])
     span = (1 + REDRAW) * seeds
@@ -473,7 +548,7 @@ def row_controls(width: int, rows: int, seeds: int, runs: int, chunk: int) -> tu
         def drawn(start, stop, worst=worst):
             count = stop - start
             return _Draws(["rows"], np.ones((count, 1)), np.ones((count, 1)), worst[start:stop],
-                          np.zeros((count, 1), int), np.ones((count, 1), bool), (width,))
+                          [[NO_ZERO_ROWS]] * count, np.ones((count, 1), bool), (width,))
 
         over, unresolved, stage = _staged(drawn, seeds, f"rows of {width}")
         verdicts.append((_verdict(over, unresolved), stage))
@@ -539,16 +614,20 @@ def main(argv: list[str]) -> int:
                           "mse": np.asarray(draws.mine).tolist(),
                           "worst": np.asarray(draws.worst[..., 0]).tolist()}), flush=True)
         return 0
+    def twin(*inputs):
+        return reference(*permuting(inputs, REORDERED))
+
     if options.seeds is None:
-        sized = seeds_for(reference, draw, options.name, truth_fn=truth)
-        print(json.dumps({"class": options.name, "seeds": sized}), flush=True)
+        # A paired class sizes as a paired site does: its twin against it on the same draws.
+        sized = seeds_for(reference, draw, options.name, truth_fn=truth,
+                          dew_fn=twin if options.paired else None)
+        print(json.dumps({"class": options.name, "paired": options.paired, "seeds": sized}), flush=True)
         return 0
     other = None
     if options.fault:
         other = FAULTS[options.name][options.fault](reference)
     elif options.paired:
-        def other(*inputs):
-            return reference(*permuting(inputs, REORDERED))
+        other = twin
     verdicts = null_runs(reference, draw, options.name, seeds=options.seeds, runs=options.runs,
                          first=OFFSET + options.chunk * options.runs, truth_fn=truth,
                          two_stage=not options.today, dew_fn=other, paired=options.paired,

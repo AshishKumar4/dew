@@ -214,3 +214,20 @@ def test_the_hub_census_routes_a_config_as_the_loader_does(tmp_path):
     assert routes == {"storage": "refused", "gptq": "refused", "custom": "remote code", "llama": "tier 1",
                       "cwm": "tier 2"}
 
+
+
+def test_a_tensor_two_shards_both_hold_is_refused_by_both_readers(tmp_path):
+    """An index whose two shards both store `a`: reading the weights and reading their headers each
+    refuse it, where a merge would keep whichever came last."""
+    from dew.interop.safetensors_io import read_weights
+
+    first, second = "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"
+    safetensors_numpy.save_file({"a": np.zeros(2, np.float32), "b": np.ones(2, np.float32)},
+                                str(tmp_path / first))
+    safetensors_numpy.save_file({"a": np.full(2, 2.0, np.float32)}, str(tmp_path / second))
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(
+        {"metadata": {}, "weight_map": {"a": second, "b": first}}))
+    stored = sources.StoredWeights(str(tmp_path), tmp_path)
+    for read in (lambda: read_weights(tmp_path), lambda: stored.specs("")):
+        with pytest.raises(ValueError):
+            read()

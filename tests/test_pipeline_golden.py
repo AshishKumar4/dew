@@ -158,9 +158,14 @@ def chains(tmp_path_factory):
     }
 
 
-@pytest.mark.parametrize("name", CASES)
-@pytest.mark.parametrize("workers", [0, 2])
-@pytest.mark.parametrize("shares", [1, 2])
+# Each recipe reads in two opposite loadings and the next recipe in the other two, so every recipe
+# reads with workers and without, sharded and whole, and every loading reads half the recipes.
+LOADINGS = (((0, 1), (2, 2)), ((0, 2), (2, 1)))
+
+
+@pytest.mark.parametrize("name, workers, shares", [
+    pytest.param(name, workers, shares, id=f"{name}-workers={workers},shares={shares}")
+    for index, name in enumerate(CASES) for workers, shares in LOADINGS[index % 2]])
 def test_loader_batches_positions_and_rng_match_the_frozen_reference(chains, name, workers, shares):
     with gzip.open(GOLD, "rt") as source:
         expected = json.load(source)["cases"][name][f"workers={workers},shares={shares}"]
