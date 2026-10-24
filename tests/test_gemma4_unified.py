@@ -101,6 +101,10 @@ def gradient_functions(source):
     if missing:
         raise ValueError(f"unmapped trainable reference parameters: {sorted(missing)}")
 
+    def collect(rows):
+        return {name: (np.stack([row[name] for row in rows]) if name.startswith("parameter.")
+                       else np.concatenate([row[name] for row in rows], axis=0)) for name in rows[0]}
+
     @jax.jit
     def native_observations(batch, probe):
         floating = {name: value for name, value in batch.conditioning.items()
@@ -118,15 +122,18 @@ def gradient_functions(source):
 
     def ours(inputs, probe):
         batch = native.processor.from_hf(inputs)
-        observed = {}
+        observed = []
         for row, mask in enumerate(inputs["attention_mask"]):
             single = batch.take_rows(jnp.asarray([row])).slice_tokens(0, int(mask.sum()))
             logits, gradient, media = native_observations(single, probe[row, mask][None])
-            observed[f"row{row}.logits"] = logits
-            observed.update({f"row{row}.parameter.{name}": layout.export({"params": gradient})
-                             for name, layout in bindings.values()})
-            observed.update({f"row{row}.input.{name}": value for name, value in media.items()})
-        return observed
+            values = {f"parameter.{name}": layout.export({"params": gradient})
+                       for name, layout in bindings.values()}
+            # Real token rows are the forward contract; parameter Jacobians retain each independent
+            # example as an axis instead of judging each tiny example as a separate stochastic site.
+            values["logits"] = np.asarray(logits)[0]
+            values.update({f"input.{name}": value for name, value in media.items()})
+            observed.append(values)
+        return collect(observed)
 
     def theirs(model, inputs, probe, *, wide=False):
         tensors = {name: torch.tensor(value, dtype=torch.float64 if wide and np.issubdtype(
@@ -134,7 +141,7 @@ def gradient_functions(source):
         media = {name: value.requires_grad_(requires_grad=True) for name, value in tensors.items()
                  if value.is_floating_point()}
         params = dict(model.named_parameters())
-        observed = {}
+        observed = []
         singles = _row_slices(tensors, model)
         for row, single in enumerate(singles):
             logits = model(**single, use_cache=False).logits
@@ -142,26 +149,28 @@ def gradient_functions(source):
             gradients = torch.autograd.grad(logits, (*params.values(), *media.values()),
                                             grad_outputs=cotangent, allow_unused=True,
                                             retain_graph=row + 1 < len(singles))
-            observed[f"row{row}.logits"] = logits.detach().numpy()
+            values = {"logits": logits.detach().numpy()[0]}
             for name, value in zip(params, gradients[:len(params)], strict=True):
                 if value is None:
                     raise ValueError(f"unreached trainable reference parameter: {name}")
-                observed[f"row{row}.parameter.{bindings[name][0]}"] = value.detach().numpy()
+                values[f"parameter.{bindings[name][0]}"] = value.detach().numpy()
             raw = dict(inputs)
             for (name, original), value in zip(media.items(), gradients[len(params):], strict=True):
                 raw[name] = torch.zeros_like(original).numpy() if value is None else value.detach().numpy()
             prepared = native.processor.from_hf(raw).take_rows(jnp.asarray([row]))
-            observed.update({f"row{row}.input.{name}": value for name, value in prepared.conditioning.items()
-                             if np.issubdtype(value.dtype, np.floating)})
-        return observed
+            values.update({f"input.{name}": value for name, value in prepared.conditioning.items()
+                           if np.issubdtype(value.dtype, np.floating)})
+            observed.append(values)
+        return collect(observed)
 
     def oracle(inputs, probe):
         with float64(), jax.enable_x64(new_val=True):
             return theirs(truth, inputs, probe, wide=True)
 
     def draw(seed):
-        inputs = unified_draw(reference.config, seed)
-        probe = np.random.default_rng(seed + 73).standard_normal((2, 14, 64), np.float32)
+        pairs = [unified_draw(reference.config, 4 * seed + index) for index in range(4)]
+        inputs = {name: np.concatenate([pair[name] for pair in pairs]) for name in pairs[0]}
+        probe = np.random.default_rng(seed + 73).standard_normal((8, 14, 64), np.float32)
         return inputs, probe
 
     return ours, lambda *args: theirs(reference, *args), oracle, draw
