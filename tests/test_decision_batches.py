@@ -10,9 +10,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from PIL import Image
-from reference_error import assert_as_exact, widened
+from reference_error import assert_as_exact, widened, without_ynn
 
 from dew.decision import Decide
+from dew.decision.images import Images
+from dew.decision.layout import DecisionInputs
 from dew.decision.model import DecisionModel
 from dew.decision.questions import ChoiceAnswer, Question
 
@@ -90,13 +92,22 @@ def test_a_batchs_probabilities_are_each_bodys_alone(decide):
         rng = np.random.default_rng([0xBA7C, int(seed)])
         return [{**cases[index % len(cases)], "state": " ".join(rng.choice(words, 12))} for index in range(4)]
 
+    forwards = {}
+
     def scored(task: Decide, seed, *, together: bool) -> np.ndarray:
+        """The bodies' real options' logits, laid out as `Decide.batch` lays a batch out (`Decide.rows`)
+        and scored in one pass together or each request alone, through the model compiled without
+        YNNPACK's fusions: both arms are Dew's."""
         bodies = bodies_of(seed)
         asked = [(body["state"], {name: Question.from_wire(wire)
                                   for name, wire in body["questions"].items()}) for body in bodies]
-        answered = task.batch(asked) if together else [task.batch([one])[0] for one in asked]
-        return np.concatenate([answer.probabilities for answers, _ in answered
-                               for answer in answers.values()])
+        forward = forwards.setdefault(id(task.model), without_ynn(task.model.logits))
+        passes = [[row for own in task.rows(asked) for row in own]] if together else task.rows(asked)
+        found = []
+        for rows in passes:
+            inputs = DecisionInputs.collate(rows, task.specials.pad)
+            found.append(np.asarray(forward(task.variables, inputs))[np.asarray(inputs.options)])
+        return np.concatenate(found)
 
     def truth(seed):
         with jax.enable_x64(new_val=True):
@@ -238,10 +249,23 @@ def test_two_requests_of_alike_images_join_one_pass_each_scored_as_alone(tmp_pat
 
     assert task.fits(rows_of(task, 0))
 
+    forwards = {}
+
+    def joined(reading, held, rows):
+        """One pass over `rows` of images (`Images.joined`), its model compiled without YNNPACK's fusions:
+        both arms are Dew's."""
+        decide = reading.decide
+        forward = forwards.setdefault(id(decide.model), without_ynn(decide.model.logits))
+        encoded = [row.encoded for row in rows]
+        inputs = DecisionInputs.collate(encoded, decide.specials.pad)
+        scores = np.asarray(forward(held, inputs, media=Images.joined(
+            decide.processor, [(row.encoded, row.media) for row in rows])))
+        return [scores[index, :len(row.questions)] for index, row in enumerate(encoded)]
+
     def scored(reading, held, seed, *, together: bool) -> np.ndarray:
         rows = rows_of(reading, seed)
-        outputs = reading.forward(held, rows) if together else [
-            output for row in rows for output in reading.forward(held, [row])]
+        outputs = joined(reading, held, rows) if together else [
+            output for row in rows for output in joined(reading, held, [row])]
         # Each question's real options' logits, its row's slots past them being no option's.
         return np.concatenate([np.asarray(output)[slot, :len(laid.order)]
                                for row, output in zip(rows, outputs, strict=True)
