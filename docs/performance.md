@@ -3359,7 +3359,9 @@ Kernel matrix, 2026-09-22, jax 0.11.2, forward plus backward medians, every cell
 
 ### The Mamba-2 SSD scan: `ssd_kernel_runs`
 
-`tools/benchmark_ssd.py`, forward plus backward, batch 1, 8 heads of 64, state 128, jax 0.11.2:
+`tools/benchmark_ssd.py`, forward plus backward, batch 1, 8 heads of 64, state 128, jax 0.11.2. These
+were timed as the gradients alone, which let XLA drop the forward's readout (ledger 1574); the benchmark
+now times the scan's outputs with their VJP, and the rows wait on a re-measure:
 
 | device | chunk | length | XLA | Pallas kernel |
 |---|---|---|---|---|
