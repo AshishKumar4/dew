@@ -1366,7 +1366,7 @@ def authorities(module: Module) -> Iterator[Finding]:
 EXTERNAL = ("subprocess.", "socket.", "ssl.", "select.", "urllib.", "http.", "requests.", "httpx.",
             "aiohttp.", "grpc.", "huggingface_hub.", "fsspec.", "gcsfs.", "google.", "boto3.", "botocore.",
             "filelock.", "multiprocessing.", "concurrent.futures.ProcessPoolExecutor.", "os.kill.",
-            "os.killpg.", "os.waitpid.", "os.fork.", "os.posix_spawn.", "jax.distributed.",
+            "os.killpg.", "os.waitpid.", "os.waitid.", "os.fork.", "os.posix_spawn.", "jax.distributed.",
             "dew.cleanup.signal_group.", "dew.cleanup.exit_code.", "dew.cleanup.groups_ended.",
             "dew.cleanup.end_group.", "dew.cleanup.process_group.",
             "IPython.display.display.", "IPython.display.update_display.", "IPython.display.clear_output.")

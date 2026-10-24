@@ -60,7 +60,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol
 
-from dew.cleanup import exit_code, process_group, signal_group
+from dew.cleanup import exit_code, groups_ended, process_group, signal_group
 from dew.data.prompts import PromptRecord
 from dew.inference.rollouts import InfrastructureError
 from dew.objectives.rl.episodes import Action, Environment, EpisodeId, EpisodeStatus, Observation
@@ -382,13 +382,10 @@ def _collected(process: subprocess.Popen[bytes], stdin: bytes, deadline: float,
                     process.stdin.close()
                 if len(streams.stdout) + len(streams.stderr) > limit:
                     return streams, Verdict.OUTPUT_LIMIT
-    try:
-        # Closed streams are not an exit: wait for it, so a kill that follows
-        # never lands between a program's last write and its exit status.
-        process.wait(timeout=max(deadline - time.monotonic(), 0))
-    except subprocess.TimeoutExpired:
-        return streams, Verdict.TIMEOUT
-    return streams, None
+    # Closed streams are not an exit: wait for it, so a kill that follows never lands between a
+    # program's last write and its exit status, and unreaped, so its group keeps its id for that kill.
+    groups_ended((process,), max(deadline - time.monotonic(), 0))
+    return streams, Verdict.TIMEOUT if exit_code(process) is None else None
 
 
 def _outcome(process: subprocess.Popen[bytes], streams: _Streams, stopped: Verdict | None,

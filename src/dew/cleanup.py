@@ -10,9 +10,12 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
+from pathlib import Path
 
 POLL_SECONDS = 0.05
 """How often a group's end asks whether a process is left in it."""
+SETTLE_SECONDS = 10.0
+"""How long a group's end waits for its SIGKILL to land on every process left in it."""
 
 
 def attempted(steps: Sequence[tuple[str, Callable[[], None]]], *,
@@ -33,12 +36,20 @@ def attempted(steps: Sequence[tuple[str, Callable[[], None]]], *,
         raise error
 
 
+UNREAPED = sys.platform != "darwin" or sys.version_info >= (3, 13)
+"""Whether Python reads a child's exit without reaping it (`os.waitid`), which it does not on macOS
+before Python 3.13."""
+
+
 def exit_code(process: subprocess.Popen) -> int | None:
     """The code `process` exited with, as Popen reports it (-N for death by signal N), or None while
     it runs, read without reaping it: a leader not yet reaped keeps its pid, and so its group's id,
-    from every other process until `end_group` reaps it."""
+    from every other process until `end_group` reaps it. Where Python cannot (`UNREAPED`), the read
+    reaps it, after which its group is no longer signalled."""
     if process.returncode is not None:
         return process.returncode
+    if not UNREAPED:
+        return process.poll()
     exited = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
     if exited is None:
         return None
@@ -63,9 +74,24 @@ def groups_ended(processes: Sequence[subprocess.Popen], grace: float, forced: th
     """Wait up to `grace` seconds, or until `forced` is set, for every leader of `processes` to exit,
     left unreaped (`exit_code`)."""
     deadline = time.monotonic() + grace
-    while ((forced is None or not forced.is_set()) and time.monotonic() < deadline
-           and any(exit_code(process) is None for process in processes)):
+    while (forced is None or not forced.is_set()) and time.monotonic() < deadline:
+        if not [process for process in processes if exit_code(process) is None]:
+            return
         time.sleep(POLL_SECONDS)
+
+
+def members(process: subprocess.Popen) -> list[int]:
+    """The live (not zombie) processes left in the group `process` leads, as Linux's /proc lists
+    them; none where there is no /proc to read."""
+    found = []
+    for stat in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            fields = stat.read_text().rsplit(")", 1)[1].split()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        if fields[0] != "Z" and int(fields[2]) == process.pid:
+            found.append(int(stat.parent.name))
+    return found
 
 
 def end_group(process: subprocess.Popen, grace: float = 0.0, interrupt: int = signal.SIGTERM) -> int:
@@ -76,7 +102,11 @@ def end_group(process: subprocess.Popen, grace: float = 0.0, interrupt: int = si
     purpose (a session of its own) is out of reach."""
     if grace > 0 and exit_code(process) is None and signal_group(process, interrupt):
         groups_ended((process,), grace)
-    signal_group(process, signal.SIGKILL)
+    if signal_group(process, signal.SIGKILL):
+        # The kill lands asynchronously; the group is held, its leader unreaped, until it has.
+        deadline = time.monotonic() + SETTLE_SECONDS
+        while members(process) and time.monotonic() < deadline:
+            time.sleep(POLL_SECONDS)
     return process.wait()
 
 
