@@ -11,13 +11,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS, generations, lowers
+from generation_support import INTERPRETS, generations, lowers, runs
 from jax.sharding import Mesh
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference, equations, with_gradients
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
 from dew.nn.kernels.templates import cost
-from dew.nn.kernels.templates.gemm import mosaic_gpu
+from dew.nn.kernels.templates.gemm import mosaic_gpu, template
 from dew.nn.moe import expert_projection
 from tools import grouped_oracle as oracle
 
@@ -396,6 +396,52 @@ def test_a_tile_of_192_columns_stages_every_column_it_writes():
                              jnp.asarray(sizes, jnp.int32), tiles=tiles, transpose_rhs=False,
                              out_dtype=jnp.bfloat16, multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
         check(got, reference[0], truth[0], group, f"forward {tiles}")
+
+
+@runs("sm80")
+@pytest.mark.skipif(jax.default_backend() == "gpu" and generation.device_generation() != "sm80",
+                    reason="Mosaic GPU lowers a kernel for the process's own device, and mma.sync's tile "
+                           "stages its output in an A100's shared memory, which another GPU's block does "
+                           "not hold (99 KiB on sm86, sm89 and sm120; an H100's pipelines past its own, "
+                           "SM80-h100)")
+@pytest.mark.parametrize("out_dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("sizes", [name for name in SIZES if any(SIZES[name])])
+def test_an_ampere_gpu_runs_the_mosaic_forward_only_by_name(sizes, out_dtype):
+    """Without warpgroup MMA the Mosaic GPU forward runs mma.sync's tiles (`AMPERE_TILES`) only where the
+    call names it: chosen, it is as exact as XLA's ragged dot rounded to its output dtype from float64,
+    unrouted rows and empty groups included; unchosen, Triton's launch runs it."""
+    x, w, dy, group = operands(SIZES[sizes], jnp.bfloat16)
+    truth = oracle.products(x, w, dy, SIZES[sizes])
+    group_sizes = jnp.asarray(SIZES[sizes], jnp.int32)
+    lhs, rhs = jnp.asarray(x, jnp.bfloat16), jnp.asarray(w, jnp.bfloat16)
+    reference = grouped_matmul.xla_ragged_dot(lhs, rhs, group_sizes,
+                                              preferred_element_type=jnp.float32).astype(out_dtype)
+
+    def forward(x, w):
+        # The default precision: the suite's highest asks each step's sum apart, which mma.sync's tiles do
+        # not add.
+        return template.gemm(x, w, group_sizes, out_dtype=out_dtype, precision="default",
+                             interpret_on_cpu=True)
+
+    for named, kernel in ((None, "Gmm"), ("mosaic_gpu", "MosaicGmm")):
+        with (generation.assumed("sm80"), generation.chosen(grouped_matmul=named),
+              tuning.seen() as launches):
+            got = jax.jit(forward)(lhs, rhs)
+        # The branch the call runs; a GPU process's CPU branch beside it interprets Triton's.
+        ran = {type(launch).__name__ for launch, ba in launches
+               if ba.arguments["interpret"] == (jax.default_backend() == "cpu")}
+        assert ran == {kernel} and got.dtype == out_dtype
+        check(got, reference, truth[0], group, f"sm80 forward through {kernel} to {jnp.dtype(out_dtype)}")
+
+
+def test_an_mma_sync_forward_of_no_depth_is_zero():
+    """A product of no depth through mma.sync's tile, named on an Ampere GPU, is zero: its walk takes no
+    step."""
+    lhs, rhs = jnp.zeros((128, 0), jnp.bfloat16), jnp.zeros((1, 0, 256), jnp.bfloat16)
+    with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic_gpu"):
+        got = jax.jit(lambda x, w: template.gemm(x, w, jnp.asarray([128], jnp.int32), out_dtype=jnp.float32,
+                                                 precision="default", interpret_on_cpu=True))(lhs, rhs)
+    assert not np.any(np.asarray(got))
 
 
 def test_the_cost_model_names_a_fact_its_target_lacks():
