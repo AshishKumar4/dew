@@ -35,7 +35,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.inference.banks import bank_sharding, bank_sites, entry_tree, in_namespace, narrowed, one_layer
 from dew.nn.backbones.layer_plan import group_name, layer_index
-from dew.nn.kernels.options import compiler_options
+from dew.nn.kernels.options import program
 from dew.objectives.base import FROZEN, merge, select, thaw, without
 from dew.training.distributed import batch_shardings
 from dew.training.host import transfer
@@ -266,15 +266,6 @@ def _forward(loss, primal, frozen, store, batch, execution, *, layout):
     return jax.vjp(evaluate, primal, has_aux=True)
 
 
-@functools.cache
-def _pullback(options: tuple[tuple[str, bool], ...]):
-    """`_trainable_cotangent` compiled with the objective's modules' XLA `options`
-    (`compiler_options`): with an int8 backward (`Quantization.bwd_qtype`) the pullback runs its
-    int8 dots here, apart from the forward's program."""
-    return jax.jit(_trainable_cotangent, static_argnames=("sites", "paths", "layout"),
-                   compiler_options=dict(options))
-
-
 def _trainable_cotangent(back, cotangent, *, sites, paths, layout):
     """Run the pullback, the unstack and the selection as one computation.
 
@@ -447,9 +438,12 @@ class HostExecution:
             # A shared owner is one bank input, so native reverse mode already
             # sums every use's contribution into it.
             with jax.set_mesh(self.accelerator):
-                options = compiler_options(*(entry.module for entry in self.objective.program_key()))
-                gradient = _pullback(tuple(options.items()))(
-                    back, self.on_accelerator(cotangent), sites=self.sites, paths=moving,
-                    layout=layout)
+                # The pullback runs its int8 dots here, apart from the forward's program, with an
+                # int8 backward (`Quantization.bwd_qtype`) on the options that ask for it.
+                pulled = program(_trainable_cotangent,
+                                 *(entry.module for entry in self.objective.program_key()),
+                                 static_argnames=("sites", "paths", "layout"))
+                gradient = pulled(back, self.on_accelerator(cotangent), sites=self.sites, paths=moving,
+                                  layout=layout)
             return self.on_cpu(gradient)
         return Realization(stats, aux, pullback)

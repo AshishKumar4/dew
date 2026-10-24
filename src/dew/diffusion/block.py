@@ -34,7 +34,7 @@ from dew.nn.inputs import (
     token_id,
     token_ids,
 )
-from dew.nn.kernels.options import compiler_options
+from dew.nn.kernels.options import program
 from dew.nn.protocols import BlockDenoiser
 from dew.objectives.base import Variables
 
@@ -178,10 +178,10 @@ class BlockProcess:
                key: jax.Array, batch: int, finished: jax.Array,
                positions: jax.Array | None = None) -> CanvasState:
         """Refines one canvas without updating its prefix cache, compiled with the model's own XLA
-        options (`compiler_options`). `positions` `[B, canvas_length]` are its tokens' logical
+        options (`program`). `positions` `[B, canvas_length]` are its tokens' logical
         positions; None places them on from the cache's cursor."""
-        return _refining(tuple(compiler_options(model).items()))(self, model, variables, cache, key, batch,
-                                                                 finished, positions)
+        return program(BlockProcess.refined, model, static_argnames=("self", "model", "batch"))(
+            self, model, variables, cache, key, batch, finished, positions)
 
     def refined(self, model: nn.Module, variables: Variables, cache: Variables,
                 key: jax.Array, batch: int, finished: jax.Array,
@@ -258,7 +258,8 @@ class BlockProcess:
         plan = request.plan
         # The canvas sampler draws one batch-wide key per refinement, so its
         # repeats stay as they are and its rows take the request's own key.
-        generation = _compiled(plan.sharding, tuple(compiler_options(model).items()))(
+        generation = program(_generate, model, static_argnames=("model", "plan", "n"),
+                             in_shardings=(None, plan.sharding, None), out_shardings=plan.sharding)(
             model, decoding_storage(model, variables), plan.place(plan.pad(request.inputs)), request.key,
             CanvasPlan(self, tuple(eos_token_ids), pad_token_id, max_new_tokens), n)
         return replace(generation, rows=plan.rows * n, prompt_width=request.inputs.tokens.shape[1])
@@ -421,16 +422,3 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs,
     return prompt_major(jax.lax.map(continued, continuation_keys(key, n)))
 
 
-@functools.cache
-def _refining(options: tuple[tuple[str, bool], ...]):
-    """`BlockProcess.refined` as a program of its own, with the model's XLA `options`."""
-    return jax.jit(BlockProcess.refined, static_argnames=("self", "model", "batch"),
-                   compiler_options=dict(options))
-
-
-@functools.cache
-def _compiled(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
-    """The generation program over `rows`, compiled with the model's own XLA `options`
-    (`dew.nn.kernels.options.compiler_options`), so a quantized model and another never share it."""
-    return jax.jit(_generate, static_argnames=("model", "plan", "n"),
-                   in_shardings=(None, rows, None), out_shardings=rows, compiler_options=dict(options))

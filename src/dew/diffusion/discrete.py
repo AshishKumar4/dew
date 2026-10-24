@@ -22,7 +22,6 @@ draws from.
 
 from __future__ import annotations
 
-import functools
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -47,7 +46,7 @@ from dew.nn.inputs import (
     token_id,
     token_ids,
 )
-from dew.nn.kernels.options import compiler_options
+from dew.nn.kernels.options import program
 from dew.nn.protocols import Logits, TokenModel
 from dew.nn.sharding import explicit_spec
 from dew.objectives.base import Variables
@@ -200,8 +199,11 @@ class DiscreteProcess:
 
         request, _ = Request.prepare(inputs, key, mesh_of(variables), check, phase="masked generation")
         plan = request.plan
-        program = _compiled(plan.sharding, tuple(compiler_options(model).items()))
-        generated = program(model, decoding_storage(model, variables), plan.place(request.padded()),
+        generation = program(
+            _generate, model,
+            static_argnames=("model", "process", "solver", "budget", "steps", "n", "eos_ids", "pad_id"),
+            in_shardings=(None, plan.sharding, plan.sharding), out_shardings=plan.sharding)
+        generated = generation(model, decoding_storage(model, variables), plan.place(request.padded()),
                             plan.keys(request.key), self, solver, max_new_tokens, steps, n, eos_token_ids,
                             pad_token_id)
         return replace(generated, rows=plan.rows * n, prompt_width=request.inputs.tokens.shape[1])
@@ -405,17 +407,6 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys:
     return prompt_major(jax.lax.map(continued, continuation_keys(keys, n)))
 
 
-@functools.cache
-def _compiled(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
-    """The generation program over `rows`, compiled with the model's own XLA `options`
-    (`dew.nn.kernels.options.compiler_options`), so a quantized model and another never share it."""
-    return jax.jit(
-        _generate,
-        static_argnames=("model", "process", "solver", "budget", "steps", "n", "eos_ids", "pad_id"),
-        in_shardings=(None, rows, rows),
-        out_shardings=rows,
-        compiler_options=dict(options),
-    )
 
 
 __all__ = ["MDLM", "DiscreteDenoiser", "DiscreteProcess", "LogLinear", "MaskingSchedule", "Unmask"]
