@@ -65,10 +65,15 @@ NEIGHBOURED = """
 import ctypes
 import json
 import mmap
+import os
 
 import numpy as np
 
 from dew.telemetry.benchmark import resident_memory
+
+# The resident counters lag by a batch for each CPU the writer ran on (`resident_memory`): written from
+# one CPU, the pages reach the reading but for one CPU's batch, however many CPUs the machine has.
+os.sched_setaffinity(0, {min(os.sched_getaffinity(0))})
 
 # The heap serves 64 MiB (glibc's M_MMAP_THRESHOLD, -3), and a freed 64 MiB block stays resident under
 # a live one: memory a process's earlier work left for its allocator to hand out again.
@@ -88,9 +93,10 @@ with mmap.mmap(-1, 64 * 2**20, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS) as p
 
 def test_resident_memory_reads_the_kernel_fields_in_bytes_and_sees_an_allocation():
     """Each of the kernel's memory fields in bytes under its own name: 64 MiB of new pages written
-    through raises the anonymous resident memory by more than half its size, which a field read in
-    the kernel's KiB would not show, even in a process whose allocator holds a freed block of that
-    size resident, which an array of that size would be served from without a new page."""
+    through, from one CPU so the kernel's per-CPU batching holds back one CPU's batch at most, raises
+    the anonymous resident memory by more than half its size, which a field read in the kernel's KiB
+    would not show, even in a process whose allocator holds a freed block of that size resident,
+    which an array of that size would be served from without a new page."""
     import json
     import subprocess
     import sys

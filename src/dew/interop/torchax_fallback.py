@@ -44,7 +44,7 @@ from dew.interop.generation_config import read_generation_config
 from dew.interop.pickles import host_view
 from dew.interop.pretrained import PretrainedFallback, source_processor
 from dew.interop.weights import AUTO
-from dew.nn.precision import configured_precision, float32_products
+from dew.nn.precision import at_least_fp32, configured_precision, float32_products
 from dew.nn.protocols import Lacks, OutputTable
 from dew.nn.sharding import LogicalAxes, Suffix, parameter_path
 from dew.registry import resolve_dtype
@@ -372,7 +372,8 @@ def _forward(model: PreTrainedModel, tokens: torch.Tensor) -> tuple[torch.Tensor
 class TorchCausalLM(nn.Module):
     """A transformers causal LM as a Flax module, run by torchax.
 
-    `apply(variables, tokens)` returns fp32 logits. The variables are the
+    `apply(variables, tokens)` returns logits in at least float32, a float64
+    model's in float64 (`at_least_fp32`). The variables are the
     source's own tensors under their torch names, `params` and `buffers`;
     `init` has no initializer to draw from, so the module starts from the
     loaded variables only. Floating parameters are cast to `dtype` for the
@@ -410,10 +411,11 @@ class TorchCausalLM(nn.Module):
 
     def __call__(self, tokens, train: bool = False) -> jax.Array:
         logits, _ = self._run(tokens, train)
-        return logits.astype(jnp.float32)
+        return logits.astype(at_least_fp32(logits.dtype))
 
     def logits(self, tokens, *, train: bool = False, **packing) -> jax.Array:
-        """The fp32 logits of the whole rows, as `__call__` returns them."""
+        """The logits of the whole rows, as `__call__` returns them: in at least float32
+        (`at_least_fp32`), so a float64 model's are float64, as its output table's are."""
         _refuse_packing(packing)
         return self(tokens, train=train)
 

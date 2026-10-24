@@ -306,7 +306,7 @@ def post_training_figure():
              "input_ids", ["completion_mask", "both [B, 2, S]"], "DPOObjective",
              ["policy against the frozen", "reference in TrainState.ema"]),
             ("GRPO", "Prompts", ["left-padded prompt,", "prompt_length, reward fields"],
-             "SampledRollout → pack", ["G completions per prompt,", "reward → advantages"],
+             "PolicyCollector → pack", ["G completions per prompt,", "reward → advantages"],
              "GRPOObjective", ["clipped ratio + beta · KL", "to the reference in .ema"]),
         ]
         for row, (name, source, source_lines, fields, field_lines, objective, objective_lines) in enumerate(lanes):

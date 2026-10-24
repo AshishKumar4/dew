@@ -25,7 +25,7 @@ from flax import linen as nn, struct
 from dew.artifacts import TokenScores
 from dew.inference.tasks import BlockGeneration, BlockSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
-from dew.nn.inputs import ModelInputs, real_places, token_layout
+from dew.nn.inputs import ModelInputs, real_places, shifted_span, token_layout
 from dew.nn.protocols import BlockDenoiser, CacheCapacity, Lacks, LayerScalars
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
@@ -394,9 +394,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         shifted = jnp.concatenate(
             [tokens[:, 1:], jnp.full((tokens.shape[0], 1), self.pad_token_id, jnp.int32)], axis=-1
         )
-        adjacent = full_valid & jnp.concatenate(
-            [full_valid[:, 1:], jnp.zeros((tokens.shape[0], 1), bool)], axis=-1
-        )
+        adjacent = jnp.pad(shifted_span(tokens.shape, 1, valid=full_valid), ((0, 0), (0, 1)))
         encoder_target_mask = jnp.asarray(batch.get("encoder_target_mask", adjacent), jnp.float32)
         if encoder_target_mask.shape != tokens.shape:
             raise ValueError("encoder_target_mask must align with the full sequence")

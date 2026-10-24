@@ -9,7 +9,7 @@ LMObjective(model, seq_len)
 LMObjective(model, seq_len, loss_role=Role.ASSISTANT)
 DPOObjective(model, seq_len, beta=0.1)
 GRPOObjective(model, seq_len, beta=0.0)
-Trainer(objective, optimizer, ..., rollout=SampledRollout(...))
+Trainer(objective, optimizer, ..., rollout=RolloutScheduler.sampled(...))
 ```
 
 They run on the same Trainer, state, sharding, EMA clock, checkpoints and tracker keys. The reference is the EMA tree at unit decay (§3), sampling is a host-side trainer capability (§4), and rewards are plain callables (§5). The online objectives assemble the shared estimators and surrogates in `dew.rl`; staged runs compose them in `recipes/chain.py` (§12).
@@ -40,7 +40,7 @@ A pair's chosen and rejected ids and completion marks arrive as [data's preferen
 
 `RenderPrompt` writes [data's prompt batch](data.md#post-training-batches). Prompts longer than the window keep their tail; `long="drop"` drops them instead, each dropped prompt counted as a rejection. Blank prompts fail. The source makes no masks, because the rollout produces them.
 
-`SampledRollout` generates a group of completions per prompt, scores each completion and builds one-call sessions through `sessions.pack`. The learner reads fixed-width packed chains; a prompt and completion must fit the objective's `seq_len+1`. The primary aligned columns are:
+`RolloutScheduler.sampled` generates a group of completions per prompt (`PolicyCollector`), scores each completion and packs the one-call sessions through `sessions.pack`. The learner reads fixed-width packed chains; a prompt and completion must fit the objective's `seq_len+1`. The primary aligned columns are:
 
 | Key | Shape | Content |
 |---|---|---|
@@ -170,8 +170,8 @@ External generation engines, agent tools and training frameworks enter through e
 | Boundary | Contract |
 |---|---|
 | Generation and weight publication | `RolloutServer` owns requests and policy versions. Native, vLLM and SGLang adapters produce the same rollout records; `SafetensorsReload` and `NCCLPush` publish through that interface. |
-| Asynchronous collection | `RolloutScheduler` owns look-ahead, lag, synchronization and admission. Session sources interleave turns through the engine batch. Deferred: durable scheduler state, since reopening the stream cancels in-flight work; a multi-host run. |
-| Agent environments | `Environment` and `EnvironmentFactory` enter through `EpisodeRollout` and `EnvironmentSource`. External CLI harnesses run through Harbor trials and the `rllm-model-gateway` recorder (`HarborSource`, `Gateway`: `src/dew/interop/harbor.py:105-216,395-647`). Local isolation: `SubprocessEnvironment`, `ProcessRunner`, `ContainerRunner` and `SandboxFleet` (`src/dew/rl/sandbox.py`). Deferred: remote sandbox providers through the `Environment` protocol, adapting the provider's API without building one. |
+| Rollout collection | `RolloutScheduler` owns grouping, admission, packing and reporting for every way sessions are drawn: `Synchronous` collects at each call from the trainer's variables, `Asynchronous` owns look-ahead, lag and synchronization. Session sources interleave turns through the engine batch. Deferred: durable scheduler state, since reopening the stream cancels in-flight work; a multi-host run. |
+| Agent environments | `Environment` and `EnvironmentFactory` enter through `EpisodeCollector` and `EnvironmentSource`. External CLI harnesses run through Harbor trials and the `rllm-model-gateway` recorder (`HarborSource`, `Gateway`: `src/dew/interop/harbor.py:105-216,395-647`). Local isolation: `SubprocessEnvironment`, `ProcessRunner`, `ContainerRunner` and `SandboxFleet` (`src/dew/rl/sandbox.py`). Deferred: remote sandbox providers through the `Environment` protocol, adapting the provider's API without building one. |
 | verl interchange | `to_verl` and `from_verl` map sessions to `AgentLoopOutput`. Deferred: live verl transport, Ray workers and HybridFlow resharding; a Dew learner inside a verl deployment. |
 | Diffusion RL interchange | First match one shared algorithm's loss (FlowGRPO) against verl-omni on fixed tensors, then decide on a rollout-row interchange like `to_verl`'s. |
 

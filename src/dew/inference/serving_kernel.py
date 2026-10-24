@@ -22,7 +22,7 @@ from jax.sharding import Mesh, NamedSharding
 
 from dew.inference.tasks import cache_sized
 from dew.nn.cross_attention import CROSS_KEY, CROSS_VALUE
-from dew.nn.inputs import Admitted, ModelInputs
+from dew.nn.inputs import Admitted, ModelInputs, default_placement
 from dew.nn.kernels.options import compiler_options
 from dew.nn.kernels.tuning import tune
 from dew.nn.kv_cache import POOLED, ROW_CURSORS, TABLE, as_words, from_words, grouped, is_paged, leaf_name
@@ -436,7 +436,7 @@ def state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
     values keep theirs. `state` is abstract: only its shapes are read.
     """
     if mesh is None:
-        device = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+        device = default_placement()
         return jax.tree.map(lambda _: device, state)
     paged = is_paged(state.decoder.cache)
 

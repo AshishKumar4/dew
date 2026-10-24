@@ -81,7 +81,11 @@ class Benchmark[T]:
 
 def resident_memory() -> dict[str, int]:
     """This process's memory fields of Linux's /proc/self/status (VmRSS, RssAnon, RssFile, VmHWM,
-    ...), each in bytes, under the kernel's names; a benchmark keeps the fields and unit it reports."""
+    ...), each in bytes, under the kernel's names; a benchmark keeps the fields and unit it reports.
+
+    The resident counts are the kernel's running counters, which since Linux 6.2 each CPU batches
+    before they reach the process's total: a reading lags the pages just written by up to a batch
+    for each CPU the writing threads ran on, on a machine of many CPUs tens of MiB."""
     fields = {}
     with open("/proc/self/status") as handle:
         for line in handle:

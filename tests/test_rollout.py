@@ -3,10 +3,10 @@
 The trainer calls a `Rollout` with the state, the prefetched batch and a key
 folded twice off the run key, then reshards the result and compiles the step
 once. With `rollout=None` the prefetched batch trains untouched. A
-`SampledRollout` fills that contract for online RL: G completions per prompt
-from `dew.sampling.generate`, scored by a reward call, advantaged with the
-group or RLOO family from `dew.rl`, with old log-probabilities rescored
-through the objective's own head.
+`RolloutScheduler.sampled` fills that contract for online RL: G completions
+per prompt from the objective's policy, scored by a reward call, advantaged
+with the group or RLOO family from `dew.rl`, with the old log-probabilities
+the sampler recorded under the same weights.
 """
 
 import jax
@@ -17,7 +17,7 @@ from recording import RecordingTracker
 from rl_support import TinyHead, padded_text
 
 from dew.objectives.lm import LMObjective
-from dew.objectives.rl import SampledRollout
+from dew.objectives.rl import RolloutScheduler
 from dew.rl import group_advantage, rloo_advantage
 from dew.sampling import Sampling
 
@@ -114,7 +114,7 @@ def test_a_rollouts_metrics_log_as_of_its_latest_call():
     assert [tick["rollout/reward/mean"] for tick in ticks] == [1.5, 3.5]
 
 
-# --- SampledRollout ------------------------------------------------------------
+# --- the synchronous sampled rollout -------------------------------------------
 
 
 class Calls:
@@ -153,7 +153,7 @@ def prompt_batch(rows=2):
 class FakeState:
     def __init__(self, variables, updates=0):
         self.variables = variables
-        self.updates = updates
+        self.step = self.updates = updates
 
 
 def chains(out):
@@ -172,8 +172,8 @@ def test_a_rollout_packs_into_the_objectives_rows_and_refuses_a_draw_too_long_fo
     rows, each chain where a narrow objective's sits and padding after it; one
     too narrow for a prompt and its draw is refused by the packer."""
     def drawn(seq):
-        rollout = SampledRollout(tiny_objective(seq=seq), Calls(), groups=GROUPS, max_new_tokens=NEW_TOKENS,
-                                 sampling=Sampling(temperature=0.0))
+        rollout = RolloutScheduler.sampled(tiny_objective(seq=seq), Calls(), groups=GROUPS,
+                                           max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0))
         return rollout(FakeState(params), prompt_batch(), jax.random.key(1))
 
     params = tiny_objective().init(jax.random.key(0))
@@ -194,8 +194,8 @@ def test_a_sampled_rollout_packs_its_completions():
     sampled ids, groups contiguous in rollout order."""
     objective = tiny_objective()
     params = objective.init(jax.random.key(0))
-    rollout = SampledRollout(objective, Calls(), groups=GROUPS,
-                             max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0))
+    rollout = RolloutScheduler.sampled(objective, Calls(), groups=GROUPS,
+                                       max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0))
     batch = prompt_batch()
 
     out = rollout(FakeState(params, updates=3), batch, jax.random.key(1))
@@ -224,8 +224,8 @@ def test_a_prompts_group_is_the_policys_continuations_of_one_request():
     objective = tiny_objective()
     params = objective.init(jax.random.key(0))
     sampling = Sampling(temperature=1.3, top_k=5)
-    rollout = SampledRollout(objective, Calls(), groups=GROUPS, max_new_tokens=NEW_TOKENS,
-                             sampling=sampling)
+    rollout = RolloutScheduler.sampled(objective, Calls(), groups=GROUPS, max_new_tokens=NEW_TOKENS,
+                                       sampling=sampling)
     batch = prompt_batch()
     out = rollout(FakeState(params), batch, jax.random.key(4))
     drawn = objective.policy(params, sampling)(batch["prompt"], NEW_TOKENS, key=jax.random.key(4),
@@ -242,8 +242,8 @@ def test_the_reward_sees_each_rows_own_context():
     objective = tiny_objective()
     params = objective.init(jax.random.key(0))
     reward = Calls()
-    rollout = SampledRollout(objective, reward, groups=GROUPS,
-                             max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0))
+    rollout = RolloutScheduler.sampled(objective, reward, groups=GROUPS,
+                                       max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0))
 
     rollout(FakeState(params), prompt_batch(), jax.random.key(1))
 
@@ -262,8 +262,8 @@ def test_each_estimator_turns_the_calls_rewards_into_the_packed_advantages(estim
     objective = tiny_objective()
     params = objective.init(jax.random.key(0))
     reward = Calls()
-    rollout = SampledRollout(objective, reward, groups=groups, max_new_tokens=NEW_TOKENS,
-                             sampling=Sampling(temperature=1.3, top_k=5), estimator=estimator)
+    rollout = RolloutScheduler.sampled(objective, reward, groups=groups, max_new_tokens=NEW_TOKENS,
+                                       sampling=Sampling(temperature=1.3, top_k=5), estimator=estimator)
 
     out = rollout(FakeState(params), prompt_batch(), jax.random.key(1))
 
@@ -284,10 +284,10 @@ def test_a_draw_is_scored_by_any_finite_reward_float_takes():
     import jax.numpy as jnp
 
     from dew.data.prompts import PromptRecord
-    from dew.objectives.rl.rollout import drawn_call, scored_draw
-    from dew.objectives.rl.sessions import Status
+    from dew.objectives.rl.rollout import scored_draw
+    from dew.objectives.rl.sessions import Call, Status
 
-    call = drawn_call([1, 2], [3, 4], [-0.5, -0.25], terminated=True, version=0)
+    call = Call((1, 2), (3, 4), (-0.5, -0.25), "stop", 0)
     record = PromptRecord("rule", "1", "")
     for reward, expected in ((True, 1.0), (np.float32(0.5), 0.5), (jnp.asarray(2.0), 2.0)):
         session = scored_draw("task", 0, call, "text", record, lambda text, record, reward=reward: reward)

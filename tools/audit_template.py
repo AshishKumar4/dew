@@ -130,18 +130,18 @@ def audit_sessions(lines: Sequence[str]) -> dict:
                            "stop", 0) for call in record["calls"])
         if not calls:
             continue
-        width = max(len(call.prompt_ids) + len(call.sampled_ids) for call in calls)
+        width = max(len(call.prompt) + len(call.tokens) for call in calls)
         built = chains(Session("audit", "audit", 0, 0, calls, Status.COMPLETED, 0.0), 0, width)
         calls_total += len(calls)
         chains_total += len(built)
         history: list[int] = []
         for index, call in enumerate(calls):
-            if index and tuple(call.prompt_ids[:len(history)]) != tuple(history):
+            if index and tuple(call.prompt[:len(history)]) != tuple(history):
                 splits.append({"session": record.get("id", number), "call": index,
-                               "first_divergence_index": divergence(call.prompt_ids, history),
-                               "prompt_only_prefix_holds": tuple(call.prompt_ids[:len(calls[index - 1].prompt_ids)])
-                               == calls[index - 1].prompt_ids})
-            history = [*call.prompt_ids, *call.sampled_ids]
+                               "first_divergence_index": divergence(call.prompt, history),
+                               "prompt_only_prefix_holds": tuple(call.prompt[:len(calls[index - 1].prompt)])
+                               == calls[index - 1].prompt})
+            history = [*call.prompt, *call.tokens]
     return {"calls": calls_total, "chains": chains_total,
             "calls_per_chain": calls_total / chains_total if chains_total else 0.0, "splits": splits}
 

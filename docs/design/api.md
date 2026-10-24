@@ -280,6 +280,20 @@ default device, as a `jnp` array is placed, one leaf at a time; with a mesh it p
 Keeping them on the host is an explicit request (`on_host=True`), for a caller that places them
 itself, such as a training start or an export.
 
+Serving is one engine of kinds (`dew.inference.Engine`). A kind (`Kind`) admits waiting requests
+within its own bounds, runs them with one bounded device call a `step`, and settles each request's
+`Timed` future. The engine steps each busy kind once a turn from one thread, so a long queue of one
+kind never holds another back, and it orders a kind's weight reload with its steps. Two kinds ship:
+autoregressive generation's `Server`, a slot scheduler over a resident cache, and `ScoringServer`, a
+task answered by forward passes over its requests' rows. A scoring task (`Scoring`) holds no
+weights. It lays a request out as rows at submission (`admit`, refusing one alone, a ValueError), says
+which rows one pass holds (`fits`), runs a pass over the weights the server hands it (`forward`), and
+reads a request's answer off its rows' outputs (`answer`). The server runs one pass a step over the
+waiting rows oldest first, so a request whose rows outrun a pass carries the rest to the next turn.
+It binds each request to the (task, weights) pair that admitted it, so a reload swaps both at once
+for what is submitted after. `Decide.scoring()` gives a decision task as such a task, and
+`Decide.systemone` over a list of bodies is served by the same server.
+
 ## 4. The three examples in this API
 
 ```python

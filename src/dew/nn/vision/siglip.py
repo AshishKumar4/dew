@@ -17,6 +17,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew import records
 from dew.interop.weights import checkpoint_array
 from dew.nn.attention import LayerNorm, RMSNorm
+from dew.nn.blocks import TokenEmbedding
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
 from dew.nn.precision import float32_dot_general
@@ -72,7 +73,7 @@ class SiglipVisionTransformer(nn.Module):
             strides=(cfg.patch_size, cfg.patch_size), padding="VALID",
             use_bias=True, dtype=self.dtype, precision=self.precision,
             name="patch_embedding")
-        self.position_embedding = nn.Embed(patches, cfg.hidden_size,
+        self.position_embedding = TokenEmbedding(patches, cfg.hidden_size,
                                            dtype=self.dtype, name="position_embedding")
         self.layers = [
             clip_layer(cfg.hidden_size, cfg.num_heads, cfg.intermediate_size, patches,

@@ -155,7 +155,8 @@ def _opened(tokenizer: ByteTokenizer | HFTokenizer, text: str) -> list[int]:
     its completion."""
     ids = tokenizer.encode(text, add_special_tokens=False)
     bos = tokenizer.bos_id
-    opens = bos is not None and tokenizer.encode(text)[:1] == [bos]
+    # A text that already starts with the BOS keeps the one it has.
+    opens = bos is not None and ids[:1] != [bos] and tokenizer.encode(text)[:1] == [bos]
     return [bos, *ids] if opens and bos is not None else ids
 
 

@@ -20,6 +20,7 @@ which reads they support and which they prefer.
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import functools
 import inspect
@@ -472,8 +473,12 @@ def _member_keys(members: Sequence[str]) -> list[str]:
     for every read alike, with its place among the members of that name, so two such members are
     apart. A member's draws and its saved position are keyed by it, so adding or removing another
     member leaves them as they were."""
-    return [f"{sum(earlier == name for earlier in members[:index])}:{name}"
-            for index, name in enumerate(members)]
+    seen: collections.Counter[str] = collections.Counter()
+    keys = []
+    for name in members:
+        keys.append(f"{seen[name]}:{name}")
+        seen[name] += 1
+    return keys
 
 
 def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:

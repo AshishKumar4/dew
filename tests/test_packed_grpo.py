@@ -56,9 +56,9 @@ def _rollouts():
     for sample in range(4):
         first = Call(ids(3), ids(2), logps(2), "tool_calls", 0)
         # Append-only: the second prompt holds the first call's prompt and sampled ids.
-        second = Call(first.prompt_ids + first.sampled_ids + ids(2), ids(3), logps(3), "tool_calls", 0)
+        second = Call(first.prompt + first.tokens + ids(2), ids(3), logps(3), "tool_calls", 0)
         # A rewrite: the third call's history drops the second call's sampled ids.
-        third = Call(second.prompt_ids + ids(1), ids(2), logps(2), "stop", 0)
+        third = Call(second.prompt + ids(1), ids(2), logps(2), "stop", 0)
         rollouts.append(Session("t", str(sample // 2), sample, 0, (first, second, third),
                                 Status.COMPLETED, float(sample % 2)))
     return rollouts
@@ -78,8 +78,8 @@ def _per_call(rollouts):
         np.zeros(shape, np.float32),
     )
     for row, (call, value) in enumerate(calls):
-        size, count = len(call.prompt_ids), len(call.sampled_ids)
-        ids[row, :size + count] = (*call.prompt_ids, *call.sampled_ids)
+        size, count = len(call.prompt), len(call.tokens)
+        ids[row, :size + count] = (*call.prompt, *call.tokens)
         segments[row, :size + count] = 1
         positions[row, :size + count] = np.arange(size + count)
         mask[row, size:size + count] = 1

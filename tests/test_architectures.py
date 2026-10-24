@@ -408,16 +408,22 @@ def widened_state(state):
 LAYOUT_SEEDS: dict[str, int] = {
     "unet": 128, "uvit": 128, "simple_udit": 64, "simple_dit": 64, "simple_mmdit": 64,
     "hierarchical_mmdit": 128, "hybrid_dit": 64, "video_dit": 64, "unet_3d": 128, "jepa_encoder": 128,
-    "jepa_video_encoder": 256, "causal_transformer": 64, "causal_transformer+moe": 64,
-    "causal_transformer+gpt_oss": 256, "causal_transformer+deepseek_v2": 128,
-    "causal_transformer+glm4_moe": 256, "causal_transformer+llama4": 32,
-    "causal_transformer+gemma4_moe": 128, "causal_transformer+gemma3n": 128,
-    "causal_transformer+mla": 64,
+    "jepa_video_encoder": 256, "causal_transformer": 64, "causal_transformer+moe": 128,
+    "causal_transformer+gpt_oss": 256, "causal_transformer+deepseek_v2": 256,
+    "causal_transformer+glm4_moe": 256, "causal_transformer+llama4": 256,
+    "causal_transformer+gemma4_moe": 256, "causal_transformer+gemma3n": 128,
+    "causal_transformer+mla": 64, "causal_transformer+qwen35": 8,
 }
-"""Each cell's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada, paired
-with the layout's arm where the cell's arms share their upstream rounding (the language cells): the
-most any of its four layouts and step counts took; a cell not named takes DEFAULT_LAYOUT_SEEDS."""
-DEFAULT_LAYOUT_SEEDS = 16
+"""Each cell's declared seeds for check 1 (`assert_as_exact`), the most any layout and step count took,
+sized by `seeds_for` on armada. Every cell's arms share their upstream rounding (the same state, batch
+and draws); a cell whose errors are also heavy-tailed across draws is sized paired with the layout's
+arm (`dew_fn`), as testing.md has it: Gemma 3n's and Qwen 3.5's (the four largest of 64 draws hold
+half of a layer's pooled error, LONG_SEQ_LEN), and MLA's, where one draw in 1024 holds all of one
+device's pooled error (seed 247, an indexer selection the draw filter lets through: ledger 1527) and
+the reference compared with itself resolves no momentum within 4096 draws. Every other cell's errors
+are light-tailed (the four largest of 64 draws hold 7 to 12% of an arm's pooled error at the median
+leaf, 6% being uniform), and it is sized by the reference against itself. Every cell is named: one
+added is sized."""
 
 MARGIN = 1e-5
 """The least selection margin a draw admits (`selection_margin`), relative to the scale of what is
@@ -630,14 +636,22 @@ def test_a_residual_order_is_the_same_decoder(case):
                                        roundings=roundings)
 
 
+LAYOUTS = {"8x1 data": 1, "2x4 fsdp": 4}
+"""Each layout a cell trains on, by its fsdp width over every device."""
+
+
+@pytest.mark.parametrize("layout", tuple(LAYOUTS), ids=("data", "fsdp"))
+@pytest.mark.parametrize("steps", (1, 2), ids=("1-step", "2-steps"))
 @pytest.mark.parametrize("case", CASES, ids=IDS)
-def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
-    """One device, 8x1 data parallelism (every parameter replicated, the
-    batch split across every device) and 2x4 fsdp (the parameter tree split
-    four ways, the optimizer's state and the EMA with it) train the same
-    steps from the same state: after one step and after two, each layout's
-    variables, momentum and EMA are as near a float64 run as one device's
-    are, over the cell's declared batches (check 1, `assert_as_exact`), so
+def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
+    """One device and a layout, 8x1 data parallelism (every parameter
+    replicated, the batch split across every device) or 2x4 fsdp (the
+    parameter tree split four ways, the optimizer's state and the EMA with
+    it), train the same steps from the same state: after `steps` steps (one,
+    and two, each layout and step count its own test, so none runs another's
+    fits and draws), the layout's variables, momentum and EMA are as near a
+    float64 run as one device's are, over the cell's declared batches (check
+    1, `assert_as_exact`), so
     their summing a batch's rows and positions in other orders is the only
     difference, where a layout that dropped or repeated a row would fail by
     orders of magnitude. The steps check 1 draws are `fit`'s own on the
@@ -670,30 +684,30 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
                 return raw, order
         raise AssertionError(f"no batch of seed {seed} clears the selection margin {MARGIN}")
 
-    seeds = LAYOUT_SEEDS.get(case.name, DEFAULT_LAYOUT_SEEDS)
-    for steps in (1, 2):
-        _, alone, _ = run_case(case, tmp_path, fsdp=1, devices=1, state=copied(), steps=steps)
-        layouts = [run_case(case, tmp_path, fsdp=fsdp, state=copied(), steps=steps)[1] for fsdp in (1, 4)]
-        drawn = {name: drawn_steps(case, tmp_path, fsdp, devices, initial, steps) for name, fsdp, devices
-                 in (("one device", 1, 1), ("8x1 data", 1, None), ("2x4 fsdp", 4, None))}
-        # The drawn steps are fit's own on its batch, bit for bit, so what check 1 judges is the run's:
-        # the cell's own batch in its own order, whatever selection margin a draw then asks.
-        own = (next(batches(case, encoder)()), np.arange(width))
-        for fitted, stepped in zip((alone, *layouts), drawn.values(), strict=True):
-            ours = stepped(*own)
-            for name, tree in ours.items():
-                held = jax.device_get(getattr(fitted, name))
-                assert jax.tree.structure(tree) == jax.tree.structure(held), name
-                for mine, theirs in zip(jax.tree.leaves(tree), jax.tree.leaves(held), strict=True):
-                    mine, theirs = np.asarray(mine), np.asarray(theirs)
-                    assert mine.dtype == theirs.dtype and mine.shape == theirs.shape, name
-                    assert np.array_equal(mine.view(np.uint8), theirs.view(np.uint8)), name
-        truth = drawn_steps(case, tmp_path, 1, 1, initial, steps, exact=True)
-        for name in ("8x1 data", "2x4 fsdp"):
-            assert_as_exact(drawn[name], drawn["one device"], draw, f"{case.name} {name}, {steps} step(s)",
-                            seeds=seeds, truth_fn=truth)
-    replicated, state = layouts
-    assert not fsdp_leaves(replicated.variables), "nothing may shard on a 1-wide fsdp axis"
+    seeds = LAYOUT_SEEDS[case.name]
+    fsdp = LAYOUTS[layout]
+    _, alone, _ = run_case(case, tmp_path, fsdp=1, devices=1, state=copied(), steps=steps)
+    _, state, _ = run_case(case, tmp_path, fsdp=fsdp, state=copied(), steps=steps)
+    drawn = {"one device": drawn_steps(case, tmp_path, 1, 1, initial, steps),
+             layout: drawn_steps(case, tmp_path, fsdp, None, initial, steps)}
+    # The drawn steps are fit's own on its batch, bit for bit, so what check 1 judges is the run's:
+    # the cell's own batch in its own order, whatever selection margin a draw then asks.
+    own = (next(batches(case, encoder)()), np.arange(width))
+    for fitted, stepped in zip((alone, state), drawn.values(), strict=True):
+        ours = stepped(*own)
+        for name, tree in ours.items():
+            held = jax.device_get(getattr(fitted, name))
+            assert jax.tree.structure(tree) == jax.tree.structure(held), name
+            for mine, theirs in zip(jax.tree.leaves(tree), jax.tree.leaves(held), strict=True):
+                mine, theirs = np.asarray(mine), np.asarray(theirs)
+                assert mine.dtype == theirs.dtype and mine.shape == theirs.shape, name
+                assert np.array_equal(mine.view(np.uint8), theirs.view(np.uint8)), name
+    truth = drawn_steps(case, tmp_path, 1, 1, initial, steps, exact=True)
+    assert_as_exact(drawn[layout], drawn["one device"], draw, f"{case.name} {layout}, {steps} step(s)",
+                    seeds=seeds, truth_fn=truth)
+    if fsdp == 1:
+        assert not fsdp_leaves(state.variables), "nothing may shard on a 1-wide fsdp axis"
+        return
     sharded = fsdp_leaves(state.variables)
     assert sharded, "no parameter was sharded over the fsdp axis"
     for param in sharded:
