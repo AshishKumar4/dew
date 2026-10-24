@@ -43,10 +43,13 @@ def gaussian_topk(x, sparsity: float, kept=None):
     The cutoff is the row's mean plus `norm.ppf(sparsity)` times its
     population standard deviation (`gaussian_cutoff`), and a value above the
     cutoff is kept as its distance above it. `kept`, where given, is which
-    values stay, the choice `GatedMLP.kept_units` makes of the same cutoff.
+    values stay, the choice `GatedMLP.kept_units` makes of the same cutoff;
+    the rest are the relu of their distance, zero or, where the row holds a
+    NaN, NaN, as relu propagates it.
     """
     cutoff = gaussian_cutoff(x, sparsity)
-    return jnp.where(x > cutoff if kept is None else kept, x - cutoff, 0)
+    distance = x - cutoff
+    return jnp.where(x > cutoff if kept is None else kept, distance, nn.relu(distance))
 
 
 def gaussian_cutoff(x, sparsity: float):
