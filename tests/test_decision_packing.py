@@ -268,7 +268,15 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, held=lambda p
     window packed it (`rows_alone`), logits and the gradients of the leaves `held` names (by
     `jax.tree_util.keystr`) on par with it (check 1) over drawn parameters, the truth `wide_modules`,
     the backbone and head in float64, over the rows in windows of their own."""
-    batch = windows(objective, 2)
+    import os
+    scale = int(os.environ.get("DEW_PACKING_SCALE", "1"))
+    data = decision_rows(EXAMPLES * scale, 2 * scale, EXAMPLES * scale, objective=objective.data())
+    reader = data.val(DataPartition())
+    try:
+        batch = {name: np.asarray(value) for name, value in next(reader).items() if name != VALID_ROWS}
+    finally:
+        reader.close()
+    print("PACKED", scale, batch["tokens"].shape, len(rows_of(batch)), flush=True)
     assert max(int(segments.max()) for segments in batch["segments"]) > 1, "no window packed two rows"
     # A sequence kernel runs as many documents as the coordinates bound, and a window's padding as one
     # more sequence (`dew.nn.attention.flash_attention`).
