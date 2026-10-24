@@ -1183,10 +1183,12 @@ def support_log_probs(hidden, head: OutputTable, targets, support_ids, support_c
 def logits_support_log_probs(logits, targets, support_ids, support_columns, *, temperature: float = 1.0):
     """`support_log_probs` over a head no matrix gives: `[B, S, vocab]`
     logits, the model's exact head's (`LogitsFromHidden`) or its own
-    (`Logits`), whose recorded support entries are read and renormalized."""
+    (`Logits`), whose recorded support entries are read and renormalized in at
+    least float32 (`at_least_fp32`), a float64 head's in float64."""
     rows = jnp.arange(logits.shape[0])[:, None]
     kept = logits[rows, jnp.maximum(support_columns, 0), jnp.maximum(support_ids, 0)]
-    return _over_supports(kept.astype(jnp.float32) / temperature, support_ids, support_columns, targets)
+    return _over_supports(kept.astype(at_least_fp32(kept.dtype)) / temperature, support_ids, support_columns,
+                          targets)
 
 
 def _over_supports(logits, ids, columns, targets):

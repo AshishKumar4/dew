@@ -45,7 +45,7 @@ def walk(solver, process, model, x_T, times, key=0):
     with jax.ensure_compile_time_eval():
         times = jnp.asarray(times, jnp.float32)
     _, latents = sample(denoise, x_T, solver=solver, key=key, times=times, final_denoise=False,
-                        record=lambda x, state: x)
+                        record=lambda x, state, denoised: x)
     return latents
 
 

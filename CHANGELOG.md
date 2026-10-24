@@ -12,6 +12,14 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   A CPU forward costs about 1.6 times, a training step 1.4 to 1.9 times;
   GPU and TPU programs are unchanged, and convolutions keep their float32 sum.
   `jax.default_matmul_precision("F32_F32_F32")` takes the float32 sum back.
+- A run's W&B display name is its own, `Wandb.name` (`--trainer.wandb.name`), apart from the
+  name its checkpoints are kept under; it shows the run's name where none is given.
+- `Checkpoints.committed()` lists a run's committed steps at each call without opening or writing
+  its store, so a process beside the one that trains (an evaluation worker) reads each step as it
+  commits; the checkpoints guide shows the worker's loop.
+- `dew.sampling.sample`'s `record` reads each step's clean prediction too,
+  `record(x, state, denoised)`; a recorder written for two arguments takes a
+  third.
 - JEPA's `normalize_targets` is Flax's `LayerNorm` with no affine and exact
   variance. Its statistics are at least float32, as I-JEPA's `F.layer_norm`'s
   are, so a bfloat16 run's targets round once.
