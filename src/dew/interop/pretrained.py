@@ -27,7 +27,7 @@ from flax.traverse_util import unflatten_dict
 from jax.typing import DTypeLike
 
 from dew import records
-from dew._model_types import QWEN35_TYPES
+from dew._model_types import GEMMA4_TYPES, QWEN35_TYPES
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
@@ -898,12 +898,17 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.Wra
     if family == "gemma3":
         text_fields["final_logit_softcap"] = None
         text_fields["mixer"] = {"class": "attention", "fields": {"bidirectional_images": True}}
-    if family == "gemma4" and text_config.get("use_bidirectional_attention") == "vision":
+    vision_default = "vision" if family == "gemma4_unified" else None
+    if family in GEMMA4_TYPES and text_config.get(
+            "use_bidirectional_attention", vision_default) == "vision":
         kinds = decoder_parts.kinds_of(text_fields).copy()
-        sliding = NativeFields(LayerKind, {
-            **kinds.get("sliding_attention", {}),
-            "mixer": {"class": "attention", "fields": {"bidirectional_images": True}}})
-        kinds["sliding_attention"] = sliding
+        selected = kinds if family == "gemma4_unified" else ("sliding_attention",)
+        for name in selected:
+            kind = kinds.get(name, {})
+            mixer = records.record(kind.get("mixer", {"class": "attention", "fields": {}}), "mixer")
+            fields = records.record(mixer.get("fields", {}), "mixer.fields")
+            kinds[name] = NativeFields(LayerKind, {
+                **kind, "mixer": {**mixer, "fields": {**fields, "bidirectional_images": True}}})
         text_fields["kinds"] = kinds
     if family in QWEN35_TYPES:
         rope = records.record(text_config.get("rope_parameters") or {}, "rope_parameters")
@@ -930,8 +935,8 @@ def _wrapper_model(config: Mapping[str, object], record: decoder_parts.WrapperFi
     audio_record = record["audio"]
     audio_projector = record["audio_projector"]
     return MultimodalTransformer(
-        language_model, towers.from_record(record["tower"]),
-        projectors.from_record(record["projector"]), family,
+        language_model, None if record["tower"] is None else towers.from_record(record["tower"]),
+        None if record["projector"] is None else projectors.from_record(record["projector"]), family,
         record["image_token_id"], dtype=resolve_dtype(dtype),
         # A text_config that states a null pad id states none, and the
         # wrapper's own field defaults to 0 for exactly that.

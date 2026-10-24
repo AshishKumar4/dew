@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew import records
-from dew._model_types import QWEN35_TYPES
+from dew._model_types import GEMMA4_TYPES, QWEN35_TYPES
 from dew.nn import audio as audio_nn
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
 from dew.records import JSON
@@ -101,7 +101,7 @@ def _in_text_order[T](streams: Mapping[int, Sequence[T]], tokens: np.ndarray,
     return ordered
 
 
-def _placed(runs: list[list[np.ndarray]], lengths: Sequence[int] | np.ndarray, capacity: int,
+def _placed(runs: list[list[np.ndarray]], selected: Sequence[np.ndarray], capacity: int,
             shape: tuple[int, ...], what: str) -> tuple[np.ndarray, list[tuple[int, int, np.ndarray]]]:
     """Check each run's length against its item's and return the slot each
     placeholder reads with every item's (row, index in its row, slots)."""
@@ -109,9 +109,10 @@ def _placed(runs: list[list[np.ndarray]], lengths: Sequence[int] | np.ndarray, c
     places = []
     for row, spans in enumerate(runs):
         for medium, slots in enumerate(spans):
-            if len(slots) != int(lengths[len(places)]):
+            members = selected[len(places)]
+            if len(slots) != len(members):
                 raise ValueError(f"media placeholder counts do not match the {what}")
-            indices[row, slots] = medium * capacity + np.arange(len(slots))
+            indices[row, slots] = medium * capacity + members
             places.append((row, medium, slots))
     return indices, places
 
@@ -361,7 +362,7 @@ class Processor:
         token_fields = {"positions": jnp.asarray(positions)}
         if not valid.all():
             token_fields["attention_mask"] = jnp.asarray(valid)
-        gemma = self.config.get("model_type") == "gemma4"
+        gemma = self.config.get("model_type") in GEMMA4_TYPES
         if gemma:
             for pixels, coordinates in (("pixel_values", "image_position_ids"),
                                          ("pixel_values_videos", "video_position_ids")):
@@ -382,7 +383,7 @@ class Processor:
         conditioning: dict[str, jax.Array] = {}
         if "pixel_values" in values or "pixel_values_videos" in values:
             if ("pixel_values_videos" in values
-                    and self.config.get("model_type") not in (*QWEN35_TYPES, "gemma4")):
+                    and self.config.get("model_type") not in (*QWEN35_TYPES, *GEMMA4_TYPES)):
                 raise ValueError("video patch inputs require a Qwen3.5 or Gemma4 visual tower")
             image_fields, conditioning = self._images(values, tokens)
             token_fields.update(image_fields)
@@ -416,7 +417,7 @@ class Processor:
         runs, a per-patch position stream, and a fixed tokens-per-image grid.
         """
         qwen = self.config.get("model_type") in QWEN35_TYPES
-        gemma = self.config.get("model_type") == "gemma4"
+        gemma = self.config.get("model_type") in GEMMA4_TYPES
         image_id, video_id = _media_token_ids(self.record)
         pixels = np.asarray(values.get("pixel_values", values.get("pixel_values_videos")))
         if pixels.ndim not in (2, 3, 4) or not np.issubdtype(pixels.dtype, np.floating):
@@ -460,7 +461,11 @@ class Processor:
             padded_grid[..., 1:] = merge
         padded_positions = (None if patch_positions is None else np.full(
             (tokens.shape[0], width, shape[0], 2), -1, np.int32))
-        indices, places = _placed(runs, lengths, capacity, tokens.shape, "projector's feature count")
+        selected = [np.arange(length) for length in lengths]
+        if (patch_positions is not None
+                and towers.from_record(self.record["tower"]).geometry().retains_patch_slots):
+            selected = [np.flatnonzero((position >= 0).all(axis=-1)) for position in patch_positions]
+        indices, places = _placed(runs, selected, capacity, tokens.shape, "projector's feature count")
         groups = None if gemma else np.full(tokens.shape, -1, np.int32)
         token_lengths = np.zeros((tokens.shape[0], width), np.int32)
         for offset, (row, image, slots) in enumerate(places):
@@ -497,12 +502,12 @@ class Processor:
         each image or video's patches, their positions and placeholder count,
         and the vision pooling kernel that sets how many slots one fills."""
         # The tower's geometry as its translation reads it, the reference's defaults included.
-        tower = records.record(records.record(self.record["tower"], "tower")["fields"], "tower fields")
-        kernel = records.integer(tower["pooling_kernel_size"], "pooling_kernel_size")
+        tower = towers.from_record(self.record["tower"]).geometry()
+        kernel, patch_size, table_size = tower.block_size, tower.patch_size, tower.position_size
+        if kernel is None or patch_size is None or table_size is None:
+            raise ValueError("positioned image patches require patch, pooling and position-table geometry")
         streams = _patch_streams(values, image_id, video_id, kernel=kernel,
-                                 table_size=records.integer(tower["position_embedding_size"],
-                                                            "position_embedding_size"),
-                                 patch_size=records.integer(tower["patch_size"], "patch_size"))
+                                 table_size=table_size, patch_size=patch_size)
         patches = {token: list(zip(*stream, strict=True)) for token, stream in streams.items()}
         ordered = _in_text_order(patches, tokens, runs)
         if not ordered:
@@ -521,26 +526,29 @@ class Processor:
         """
         audio_id = self.record.get("audio_token_id")
         audio = self.record.get("audio")
-        if type(audio_id) is not int or not isinstance(audio, Mapping):
-            raise ValueError("this source has no audio tower")
-        encoder = towers.from_record(audio)
-        if not isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
-            raise ValueError("audio conditioning requires a Gemma audio encoder")
+        if type(audio_id) is not int or self.record.get("audio_projector") is None:
+            raise ValueError("this source has no audio projector")
+        stride = 1
+        if audio is not None:
+            encoder = towers.from_record(audio)
+            if not isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
+                raise ValueError("audio conditioning requires a Gemma audio encoder")
+            stride = audio_nn.encoded_frame_stride(encoder)
         features = np.asarray(values["input_features"])
         mask = np.asarray(values["input_features_mask"])
         if features.ndim != 3 or not np.issubdtype(features.dtype, np.floating):
             raise ValueError("input_features must be floating [clips, frames, mel]")
         if mask.shape != features.shape[:2] or mask.dtype != np.bool_:
             raise ValueError("input_features_mask must be bool [clips, frames], True for valid frames")
-        encoded = mask[:, ::audio_nn.encoded_frame_stride(encoder)]
+        encoded = mask[:, ::stride]
         slots = self.record.get("audio_soft_tokens")
         if slots is None:
-            expected = encoded.sum(axis=1)
+            selected = [np.flatnonzero(row) for row in encoded]
             capacity = encoded.shape[1]
         else:
             if type(slots) is not int or encoded.shape[1] > slots:
                 raise ValueError(f"{encoded.shape[1]} encoded frames exceed the {slots} audio slots per clip")
-            expected = np.full(features.shape[0], slots)
+            selected = [np.arange(slots) for _ in range(features.shape[0])]
             capacity = slots
         runs = _placeholder_runs(tokens, audio_id, None)
         counts = np.array([len(row) for row in runs], np.int32)
@@ -549,7 +557,7 @@ class Processor:
         width = int(counts.max())
         padded = np.zeros((tokens.shape[0], width, *features.shape[1:]), features.dtype)
         padded_mask = np.zeros((tokens.shape[0], width, features.shape[1]), bool)
-        indices, places = _placed(runs, expected, capacity, tokens.shape, "encoded frame counts")
+        indices, places = _placed(runs, selected, capacity, tokens.shape, "encoded frame counts")
         for offset, (row, clip, _) in enumerate(places):
             padded[row, clip] = features[offset]
             padded_mask[row, clip] = mask[offset]

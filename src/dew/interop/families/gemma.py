@@ -603,6 +603,20 @@ GEMMA4_TEXT = DecoderFamily(
               'vocab_size_per_layer_input': 262144},
 )
 
+def gemma4_unified_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
+    if hf_config.get('enable_moe_block') or hf_config.get('hidden_size_per_layer_input'):
+        refuse('Gemma4Unified text configuration', 'the unified decoder has no MoE or per-layer input branch')
+    return gemma4_config(hf_config, used)
+
+
+GEMMA4_UNIFIED_TEXT = dataclasses.replace(
+    GEMMA4_TEXT, model_types=('gemma4_unified_text',), export_model_type='gemma4_unified_text',
+    translate_config=gemma4_unified_config,
+    architecture='Gemma4UnifiedForCausalLM',
+    defaults={**GEMMA4_DEFAULTS, 'sliding_window': 1024, 'max_position_embeddings': 262144,
+              'use_bidirectional_attention': 'vision'})
+
+
 GEMMA3_TEXT = DecoderFamily(
     (GEMMA3_MODEL_TYPE,),
     _gemma3_config,
