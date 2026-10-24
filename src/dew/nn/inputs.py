@@ -213,7 +213,7 @@ class ModelInputs:
             raise ValueError("tokens must be an integer [B, S] array")
         reserved = {"tokens", "conditioning", "train", "decode", "rngs", "method",
                     "mutable", "capture_intermediates", "attention_pairwise_mask",
-                    "attention_key_positions"}
+                    "attention_key_positions", "attention_key_runs"}
         if reserved.intersection(self.token_fields):
             raise ValueError(
                 f"token_fields cannot contain {sorted(reserved.intersection(self.token_fields))}"
@@ -592,6 +592,19 @@ class AttentionMetadata:
     routing blocks of `routing_block` places for a block router
     (`numbered_blocks`), which the model computes once for its layers.
     `context` is the sequence its cross-attention layers read (`CrossContext`).
+    `pairwise_mask` `[B, S, keys]`, or `key_runs` `[B, S, R, 2]`, each query's
+    key intervals whose union it reads, replaces a call's visibility, a
+    windowed layer windowing it over `key_positions` `[B, keys]`.
+
+    `image_groups` and `block_groups` `[B, S]` int32 number the tokens' blocks,
+    each a run of contiguous tokens, an image's or a prompt's, and -1 for a
+    token outside any, padding among them; the model calls take them as
+    `image_groups=` and `block_groups=`, and so does
+    `dew.nn.attention.scaled_dot_product_attention`. A causal attention layer that reads
+    them (`AttentionMixer.bidirectional_images`, `bidirectional_blocks`) lets
+    each token of an image see the image's later tokens within its window,
+    and each token of a block its whole block, within its document; a layer
+    reading both sees the union, and every other layer stays causal.
 
     `coordinates` are the tokens' documents, validity, positions and cache
     slots (`Coordinates`). Their `right_padded` says each row's real tokens
@@ -605,9 +618,11 @@ class AttentionMetadata:
 
     coordinates: Coordinates | None = None
     image_groups: jax.Array | None = None
+    block_groups: jax.Array | None = None
     rotary_positions: jax.Array | None = None
     pairwise_mask: jax.Array | None = None
     key_positions: jax.Array | None = None
+    key_runs: jax.Array | None = None
     token_ids: jax.Array | None = None
     engram_ids: jax.Array | None = None
     media: jax.Array | None = None
@@ -627,14 +642,15 @@ class AttentionMetadata:
         return self.coordinates is not None and self.coordinates.right_padded
 
 
-MIXING = ("pairwise_mask", "key_positions", "position_bias", "admitted")
+MIXING = ("pairwise_mask", "key_positions", "key_runs", "position_bias", "admitted")
 """The `AttentionMetadata` fields that say which tokens a mixer lets each token
-read, or how much: a call's own mask and the key positions it is read by, an
-additive bias, a server's mixed layout. A mixer runs a call that sets one only
+read, or how much: a call's own mask, or its keys' runs, and the key positions
+it is read by, an additive bias, a server's mixed layout. A mixer runs a call that sets one only
 where it reads it (`MixerCall`). The rest describe the tokens themselves, which
 a mixer reads as far as its form uses them: their coordinates, rotary
-positions and image groups, which only attention that sees an image whole
-reads, and the ids the block reads for its feed-forward and n-gram lookup."""
+positions, and image and block groups, which only attention that sees an image
+or a block whole reads, and the ids the block reads for its feed-forward and
+n-gram lookup."""
 
 TOKENWISE = frozenset(MIXING)
 """The `MIXING` fields a mixer that reads no other token holds to: every one,
@@ -832,7 +848,7 @@ def _response_document(value: jax.Array, valid: jax.Array, width: int) -> jax.Ar
 
 
 def _response_text(value: jax.Array, valid: jax.Array, width: int) -> jax.Array:
-    """Text: no media feature, no image group (-1)."""
+    """Text: no media feature, no image or block group (-1)."""
     return jnp.full((value.shape[0], width, *value.shape[2:]), -1, value.dtype)
 
 
@@ -860,6 +876,7 @@ RESPONSE_FIELDS: Mapping[str, FieldExtension] = {
     "image_indices": _response_text,
     "audio_indices": _response_text,
     "image_groups": _response_text,
+    "block_groups": _response_text,
 }
 """How each token field Dew's processors write continues into a response."""
 

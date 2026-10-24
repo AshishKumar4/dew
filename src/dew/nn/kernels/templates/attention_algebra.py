@@ -176,13 +176,22 @@ def across(x: jax.Array, like: jax.Array) -> jax.Array:
 class Coords(NamedTuple):
     """A tile's coordinates as the mainloop provides them (in the layout its products give): the query
     indices `q_pos` `[bq, 1]` and key indices `k_pos` `[1, bk]`, and where the spans narrow, each
-    query's interval `spans`, its first and past-last keys `[bq]`, and with documents the queries' and
-    keys' ids `ids`, `[bq]` and `[bk]`."""
+    query's intervals `spans`, one a run (a call's runs, `KeySpans`; one where it has none), each its
+    first and past-last keys `[bq]` (`intervals`), and with documents the queries' and keys' ids `ids`,
+    `[bq]` and `[bk]`."""
 
     q_pos: jax.Array
     k_pos: jax.Array
-    spans: tuple[jax.Array, jax.Array] | None = None
+    spans: tuple[tuple[jax.Array, jax.Array], ...] | None = None
     ids: tuple[jax.Array, jax.Array] | None = None
+
+
+def intervals(start: jax.Array, end: jax.Array) -> tuple[tuple[jax.Array, jax.Array], ...]:
+    """A tile's queries' intervals as `Coords.spans` holds them: their first and past-last keys `[bq]`, or
+    a call's runs `[bq, R]`, one interval a run."""
+    if start.ndim == 1:
+        return ((start, end),)
+    return tuple((start[:, run], end[:, run]) for run in range(start.shape[-1]))
 
 
 class Guard(NamedTuple):
@@ -595,17 +604,18 @@ def _masked(spec: Forward, s: jax.Array, coords: Coords, unseen: float) -> jax.A
 
 def seen(spec: Forward, coords: Coords, like: jax.Array) -> jax.Array | None:
     """Whether each query of a tile `like` `[bq, bk]` sees each key (`within`), every mainloop's one
-    predicate, forward and backward; None where each sees every key. A spans call's intervals and, with
-    documents, ids (its mainloops give each tile its queries' intervals and both blocks' ids); a causal
-    call's diagonal; the call's keys, where a tile reaches past them: no walk visits a tile wholly past
-    them, so a call whose keys are whole tiles reads no padding; and, where the spec names them, its queries
-    (a padding row sees no key, so a score hook's derivative there, undefined at its padded parameters,
-    reaches no reduction over the rows)."""
+    predicate, forward and backward; None where each sees every key. A spans call's intervals, the union
+    of its runs' where it has them, and, with documents, ids (its mainloops give each tile its queries'
+    intervals and both blocks' ids); a causal call's diagonal; the call's keys, where a tile reaches past
+    them: no walk visits a tile wholly past them, so a call whose keys are whole tiles reads no padding;
+    and, where the spec names them, its queries (a padding row sees no key, so a score hook's derivative
+    there, undefined at its padded parameters, reaches no reduction over the rows)."""
     visible = None
     if coords.spans is not None:
-        start, end = coords.spans
         ids = None if coords.ids is None else (expand(coords.ids[0], like), across(coords.ids[1], like))
-        visible = within(coords.k_pos, expand(start, like), expand(end, like), ids)
+        visible = functools.reduce(jnp.logical_or, (within(coords.k_pos, expand(start, like),
+                                                           expand(end, like), ids)
+                                                    for start, end in coords.spans))
     elif spec.form == "causal":
         visible = coords.k_pos <= coords.q_pos
     if spec.form != "spans" and spec.keys % like.shape[1]:

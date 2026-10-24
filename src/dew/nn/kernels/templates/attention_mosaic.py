@@ -422,6 +422,22 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     anchor key `[B, H, Q]` int32 and the split sums (`Split`). `natural` keeps the logits natural
     (`algebra.Forward.base2`); `interpret` runs it on the CPU (Mosaic GPU's interpret mode), as a GPU of the
     family `generation.assumed` names."""
+    op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
+    return op(*args, residuals=residuals, interpret=interpret)
+
+
+def forward_takes(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
+                  hooks: Hooks | None = None, *, scale: float | None = None, natural: bool = NATURAL,
+                  residuals: bool = False) -> bool:
+    """Whether `forward` runs the call compiled on this device (`MosaicForward.eligible`): its family has a
+    bundle here, the call is one this mainloop takes (`refused`) and a config fits the device."""
+    op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
+    return op.eligible(op.bind(*args, residuals=residuals, interpret=False), generation.gpu_target())
+
+
+def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
+                  scale: float | None, natural: bool) -> tuple[MosaicForward, tuple]:
+    """`forward`'s op and its arguments."""
     hooks = Hooks() if hooks is None else hooks
     op = MosaicForward(score_mod=hooks.score_mod, output_mod=hooks.output_mod,
                        score_kinds=tuple(param.kind for param in hooks.score_params),
@@ -430,10 +446,9 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                        output_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.output_params),
                        output_width=power_of_two(value.shape[3]), form=spans.form, keys=spans.keys,
                        scale=query.shape[3] ** -0.5 if scale is None else scale, natural=natural)
-    return op(query, key, value, spans.start, spans.end, spans.query_ids, spans.key_ids,
-              tuple(param.value for param in hooks.score_params),
-              tuple(param.value for param in hooks.output_params), hooks.initial, residuals=residuals,
-              interpret=interpret)
+    return op, (query, key, value, spans.start, spans.end, spans.query_ids, spans.key_ids,
+                tuple(param.value for param in hooks.score_params),
+                tuple(param.value for param in hooks.output_params), hooks.initial)
 
 
 def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
@@ -668,11 +683,12 @@ def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_fir
 
 
 class _Spans(NamedTuple):
-    """A spans call's arrays as its programs read them: each query's interval `start`, `end` `[B, Qp]`, and
-    its block map at the launch's tiles (`attention.block_map`): the key tiles each query block reads, `lo`,
-    `hi`, and sees whole, `full_lo`, `full_hi` (`[B, Qp // block_q]`), and the query tiles reading each key
-    block, `q_lo`, `q_hi` (`[B, Kp // block_k]`); with documents, the queries' and keys' ids (`[B, Qp]`,
-    `[B, Kp]`) and the blocks' uniform ones (`query_doc`, `key_doc`)."""
+    """A spans call's arrays as its programs read them: each query's interval `start`, `end` `[B, Qp]` (a
+    call's runs `[B, R, Qp]`, `_spans_of`), and its block map at the launch's tiles (`attention.block_map`):
+    the key tiles each query block reads, `lo`, `hi`, and sees whole, `full_lo`, `full_hi` (`[B, Qp //
+    block_q]`), and the query tiles reading each key block, `q_lo`, `q_hi` (`[B, Kp // block_k]`); with
+    documents, the queries' and keys' ids (`[B, Qp]`, `[B, Kp]`) and the blocks' uniform ones (`query_doc`,
+    `key_doc`)."""
 
     start: jax.Array
     end: jax.Array
@@ -690,13 +706,17 @@ class _Spans(NamedTuple):
 
 def _spans_of(spec: algebra.Forward, call: PaddedCall, block_q: int, block_k: int) -> _Spans | None:
     """A spans call's `_Spans` at `block_q` by `block_k` tiles over its padded keys (None for a full or
-    causal call, whose programs take their tiles from their places)."""
+    causal call, whose programs take their tiles from their places). A call's runs (`KeySpans`) lie run by
+    run, `[B, R, Qp]`, so a program reads each run's bounds as a row (`_coords`); its blocks walk their
+    runs' envelopes (`attention.block_map`), each tile masked by the union of its queries' runs
+    (`algebra.seen`)."""
     if spec.form != "spans":
         return None
     blocks = block_map(KeySpans(call.start, call.end, call.query_ids, call.key_ids, call.key.shape[1]),
                        block_q, block_k)
-    return _Spans(call.start, call.end, blocks.lo, blocks.hi, blocks.full_lo, blocks.full_hi, blocks.q_lo,
-                  blocks.q_hi, call.query_ids, call.key_ids, blocks.query_doc, blocks.key_doc)
+    start, end = (jnp.moveaxis(bound, 2, 1) if bound.ndim == 3 else bound for bound in (call.start, call.end))
+    return _Spans(start, end, blocks.lo, blocks.hi, blocks.full_lo, blocks.full_hi, blocks.q_lo, blocks.q_hi,
+                  call.query_ids, call.key_ids, blocks.query_doc, blocks.key_doc)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -815,11 +835,14 @@ def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, sh
     k_pos = k_first + (family.iota(shape, 1) if columns is None else columns)
     if spans is None:
         return algebra.Coords(q_pos, k_pos)
-    rows = (row, pl.ds(first, shape[0]))
-    bounds = family.rows_of(spans.start.at[rows]), family.rows_of(spans.end.at[rows])
+    rows = pl.ds(first, shape[0])
+    # A call's runs lie one row of bounds a run (`_spans_of`).
+    runs = (((spans.start.at[row, run], spans.end.at[row, run]) for run in range(spans.start.shape[1]))
+            if spans.start.ndim == 3 else ((spans.start.at[row], spans.end.at[row]),))
+    bounds = tuple((family.rows_of(start.at[rows]), family.rows_of(end.at[rows])) for start, end in runs)
     ids = None
     if spans.query_ids is not None and spans.key_ids is not None:
-        ids = (family.rows_of(spans.query_ids.at[rows]),
+        ids = (family.rows_of(spans.query_ids.at[row, rows]),
                family.columns_of(spans.key_ids.at[row, pl.ds(k_first, shape[1])]))
     return algebra.Coords(q_pos, k_pos, bounds, ids)
 
@@ -1727,7 +1750,7 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     return op(*args, interpret=interpret)
 
 
-def backward_runs(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
+def backward_takes(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
                   dout: jax.Array, *, residuals: tuple[jax.Array, jax.Array, jax.Array, Split],
                   scale: float | None = None, natural: bool = NATURAL, accurate: bool = ACCURATE) -> bool:
     """Whether `backward` runs the call compiled on this device (`MosaicBackward.eligible`): its family has
