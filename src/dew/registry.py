@@ -166,7 +166,7 @@ def module_from_file(path: str | os.PathLike[str], name: str) -> types.ModuleTyp
                          f"{name.rpartition('.')[0]}, which a file cannot stand in for; rename the file")
     held = sys.modules.get(name)
     if held is not None and _FILES.get(name) is None:
-        other = getattr(held, "__file__", None) or "a module without a file"
+        other = (held.__spec__.origin if held.__spec__ is not None else None) or "a module without a file"
     elif held is None and name.isidentifier() and (found := importlib.util.find_spec(name)) is not None:
         other = found.origin or "a namespace package"
     else:

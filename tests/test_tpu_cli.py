@@ -6,6 +6,7 @@ import subprocess
 import time
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -116,7 +117,7 @@ class Fake:
         self.root = root
         self.calls_path = root / "calls.jsonl"
         self.state_path = root / "state.json"
-        self.state = {"nodes": {}, "listing": {}}
+        self.state: dict[str, Any] = {"nodes": {}, "listing": {}}
         self.flush()
 
     def flush(self) -> None:
@@ -219,17 +220,16 @@ def test_create_uses_the_configured_defaults(fake):
     assert json.loads((config_dir() / "zones.json").read_text()) == {"slice": "us-central2-b"}
 
 
-def test_a_create_waiting_on_a_gcloud_that_never_answers_ends_at_its_deadline(fake, monkeypatch):
+def test_a_wait_on_a_gcloud_that_never_answers_ends_at_its_deadline(fake):
     """Each readiness probe has what is left of the wait, so a listing that hangs is killed there and
     the wait ends with the TPU unready, instead of running past its deadline."""
-    from dew.cli import gcloud as gcloud_module
+    from dew.cli.gcloud import Gcloud, Tpu
 
-    monkeypatch.setattr(gcloud_module, "READY_TIMEOUT", 2)
     fake.offer("slice", "us-central2-b")
     fake.hang_on("list")
     began = time.monotonic()
     with pytest.raises(SystemExit):
-        run("create", "slice", "--zone", "us-central2-b")
+        Tpu(Gcloud("my-project"), "slice", "us-central2-b").ready(wait=2)
     assert time.monotonic() - began < 60
 
 
