@@ -40,7 +40,8 @@ class ResponseCanvases:
     `prompt_length`, then the turn's completion over `count` canvases of
     `canvas_size`: `eos_id` fills the rest of its last canvas, `pad_id` the
     canvases after it, and `canvas_mask` marks the filled canvases, as the
-    reference's `CanvasChunker` lays a response out (gemma bf0b49901,
+    reference's `CanvasChunker` lays a response out, and `prompt_mask` the
+    context's own ids, so no id the vocabulary also pads with reads as padding (gemma bf0b49901,
     `diffusion/hackable_diffusion_adapter/data/data.py`). A longer prompt or
     completion keeps its first ids, as the reference's `Pad(truncate=True)`
     and `CanvasChunker` cut them (`gm/data/_functional.py:83`). Either cut
@@ -59,10 +60,11 @@ class ResponseCanvases:
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         """A row for each assistant turn: its context and completion canvases as `text`, the
-        canvases filled as `canvas_mask`."""
+        canvases filled as `canvas_mask` and the context's own ids as `prompt_mask`."""
         width = self.prompt_length + self.count * self.canvas_size
-        return shaped(shaped(unshaped(facts, ROLES_KEY), "text", [width]), "canvas_mask",
+        rows = shaped(shaped(unshaped(facts, ROLES_KEY), "text", [width]), "canvas_mask",
                       [self.count * self.canvas_size])
+        return shaped(rows, "prompt_mask", [self.prompt_length])
 
     def flat_map(self, element: Batch) -> Sequence[Batch]:
         ids = np.asarray(element["text"], np.int32)
@@ -80,6 +82,7 @@ class ResponseCanvases:
             text[self.prompt_length:self.prompt_length + len(response)] = response
             cut = start > self.prompt_length or end - start > capacity
             rows.append({**kept, "text": text, "canvas_mask": np.arange(capacity) < filled,
+                         "prompt_mask": np.arange(self.prompt_length) < min(start, self.prompt_length),
                          **({"_dew_truncated": True} if cut else {})})
         return rows
 
