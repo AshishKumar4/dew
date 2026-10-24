@@ -143,7 +143,7 @@ def test_an_int8_trunk_trains_down():
     _, qmodel, variables, _ = quantized_forward(Quantization())
     objective = LMObjective(qmodel, SEQ_LEN)
     batch = token_batch()
-    solver = OptimConfig(rate=1e-3).build(5)
+    solver = OptimConfig(learning_rate=1e-3).build(5)
     params, opt_state = variables["params"], solver.init(variables["params"])
 
     @jax.jit
