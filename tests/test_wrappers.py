@@ -24,6 +24,7 @@ on CPU:
 import json
 from pathlib import Path
 
+import jax.numpy as jnp
 import numpy as np
 from safetensors.numpy import load_file
 
@@ -31,6 +32,36 @@ from dew.interop.hf_decoders import translate_wrapper_config, translate_wrapper_
 from dew.registry import projectors, towers
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
+
+
+def test_wrapper_block_overrides_survive_export_and_admit_their_future_block_mate(tmp_path):
+    """A source declaring block attention changes visibility only where runtime block IDs admit
+    it. A future block mate can affect the earlier token, and source export preserves that rule."""
+    import shutil
+
+    from dew.interop import Pretrained
+    from dew.nn.inputs import AttentionMetadata
+
+    directory = tmp_path / "source"
+    shutil.copytree(FIXTURES / "qwen35-tiny-mm", directory)
+    config = json.loads((directory / "config.json").read_text())
+    config["modeling_overrides"] = {"attention": {
+        "full_attention": "block_bidirectional", "linear_attention": "causal"}}
+    (directory / "config.json").write_text(json.dumps(config))
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
+    altered = ids.at[0, 1].set(7)
+    blocked = AttentionMetadata(block_groups=jnp.asarray([[0, 0, -1, -1]], jnp.int32))
+
+    def first(bundle, tokens, metadata=None):
+        return np.asarray(bundle.model.apply(bundle.variables, tokens, attention_metadata=metadata))[0, 0]
+
+    np.testing.assert_array_equal(first(loaded, ids), first(loaded, altered))
+    assert np.any(first(loaded, ids, blocked) != first(loaded, altered, blocked))
+    loaded.save(tmp_path / "export")
+    restored = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
+    np.testing.assert_array_equal(first(restored, ids, blocked), first(loaded, ids, blocked))
+    np.testing.assert_array_equal(first(restored, ids), first(loaded, ids))
 
 
 def load_wrapper(name):
