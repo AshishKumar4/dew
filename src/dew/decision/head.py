@@ -149,6 +149,9 @@ class DecisionHead(Head):
 
     def __call__(self, states: jax.Array, inputs: DecisionInputs, table: jax.Array | None = None,
                  train: bool = False) -> jax.Array:
+        if inputs.spans_in_context:
+            raise TypeError("Laya's head scores each option at its marker in the row, so it reads no "
+                            "schema read as the row's context; use a JointSchemaHead")
         # Every token takes its row's question type: a QuestionLayout row asks one question.
         owned = inputs.question_segments[:, None, :] == inputs.segments[:, :, None]
         kinds = jnp.sum(jnp.where(owned, inputs.kinds[:, None, :], 0), axis=-1)
@@ -375,10 +378,22 @@ class JointSchemaHead(Head):
         self.residual_gate = self.param("residual_gate", nn.initializers.zeros_init(), ())
 
     def __call__(self, states: jax.Array, inputs: DecisionInputs, table: jax.Array | None = None,
-                 train: bool = False) -> jax.Array:
+                 train: bool = False, spanned: jax.Array | None = None) -> jax.Array:
+        """The `[B, Q, K]` logits of each question's options over the row's final `states`. Where the
+        questions' spans are in the row's context (`DecisionInputs.spans_in_context`), `spanned` are
+        the backbone's final states over the context (`DecisionModel.context_states`), which the
+        questions and options are pooled from, their tokens the context's; the memory every option
+        and field reads, and the readout, are the row's either way."""
         if table is None:
             raise ValueError("the joint schema head reads the backbone's output table, its lexical prior")
+        if inputs.spans_in_context != (spanned is not None):
+            raise ValueError("a schema read as the row's context comes with the context's states, and "
+                             "only then")
         hidden = self.hidden_norm(states)
+        pooled, pooled_tokens = hidden, inputs.tokens
+        if spanned is not None:
+            assert inputs.context is not None, "the context's states come with its tokens"
+            pooled, pooled_tokens = self.hidden_norm(spanned), inputs.context
         batch = inputs.tokens.shape[0]
         memory = self.memory_projection(hidden)
         # Each question reads its own row of the window: that row's last token, and its tokens alone.
@@ -386,15 +401,15 @@ class JointSchemaHead(Head):
         own = (rows[:, :, None] == inputs.segments[:, None, :]) | (rows[:, :, None] == 0)
         last = jnp.max(jnp.where(own, jnp.arange(inputs.tokens.shape[1]), 0), axis=-1)
         last_state = _gathered(hidden, last)
-        questions = _span_means(hidden, inputs.spans)
+        questions = _span_means(pooled, inputs.spans)
         count, width = inputs.options.shape[1:]
         # The option slots computed, `[B, P]` flat indices into the grid, and each one's question.
         slots = (jnp.broadcast_to(jnp.arange(count * width, dtype=jnp.int32), (batch, count * width))
                  if inputs.option_slots is None else inputs.option_slots)
         owners = slots // width
         option_spans = _gathered(inputs.option_spans.reshape(batch, count * width, 2), slots)
-        contexts = _span_means(hidden, option_spans)
-        rows_of_tokens = jnp.take(table, inputs.tokens, axis=0).astype(hidden.dtype)
+        contexts = _span_means(pooled, option_spans)
+        rows_of_tokens = jnp.take(table, pooled_tokens, axis=0).astype(hidden.dtype)
         lexical = _span_means(rows_of_tokens, option_spans)
 
         queries = (self.option_context_projection(contexts) + self.option_lexical_projection(lexical)

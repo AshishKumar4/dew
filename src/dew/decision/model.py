@@ -10,7 +10,8 @@ from flax.typing import Dtype
 
 from dew.decision.head import Head
 from dew.decision.layout import DecisionInputs
-from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, ModelInputs
+from dew.nn.cross_attention import crosses_alone
+from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, ModelInputs, coordinates
 from dew.nn.protocols import CrossAttending, HiddenStates, VocabularyRows
 from dew.objectives.base import Variables, part, thaw
 
@@ -46,12 +47,25 @@ class DecisionModel:
         `media` are the backbone's own inputs for images a request's one row
         holds (`Images.inputs`), with which it reads them. Rows that carry a
         context (`DecisionInputs.context`) hand the backbone's cross-attention
-        each row's context tokens embedded by the backbone's own table
-        (`token_embeddings`).
+        each row's context, embedded by the backbone's own table (`token_embeddings`),
+        or, where the context holds the schema (`DecisionInputs.spans_in_context`),
+        the backbone's own final states over it (`context_states`).
         """
+        return self._read(variables, inputs, media=media, train=train, rngs=rngs)[0]
+
+    def _read(self, variables: Variables, inputs: DecisionInputs, *, media: ModelInputs | None,
+              train: bool, rngs: dict[str, jax.Array] | None) -> tuple[jax.Array, jax.Array | None]:
+        """The row's final states (`states`), and the context's where the questions' spans are in it."""
         backbone = thaw(part(variables, "backbone"))
         laid = inputs.coordinates()
-        conditioning = None if inputs.context is None else self.conditioning(backbone, inputs)
+        spanned = None
+        if inputs.context is None:
+            conditioning = None
+        elif inputs.spans_in_context:
+            spanned = self.context_states(variables, inputs, train=train, rngs=rngs)
+            conditioning = self._conditioned(spanned, inputs)
+        else:
+            conditioning = self.conditioning(backbone, inputs)
         if media is not None:
             if inputs.slots is not None:
                 raise ValueError("a row of option positions holds no images")
@@ -63,10 +77,11 @@ class DecisionModel:
                     assert isinstance(held, Mapping)
                     kwargs["conditioning"] = {**held, **conditioning}
                 return module.hidden_states(rows.tokens, train=train, coordinates=laid, **kwargs)
-            return _array(self.backbone.apply(backbone, inputs, media, rngs=rngs, method=read_media))
+            return _array(self.backbone.apply(backbone, inputs, media, rngs=rngs, method=read_media)), spanned
         if inputs.slots is None:
             return _array(self.backbone.apply(backbone, inputs.tokens, train=train, coordinates=laid,
-                                              conditioning=conditioning, method="hidden_states", rngs=rngs))
+                                              conditioning=conditioning, method="hidden_states",
+                                              rngs=rngs)), spanned
         slots, segments = inputs.slots, inputs.segments
         other = (slots[:, :, None] > 0) & (slots[:, None, :] > 0) & (slots[:, :, None] != slots[:, None, :])
         # A token reads its own row's, and the padding its own; an option reads no other option.
@@ -74,7 +89,32 @@ class DecisionModel:
         return _array(self.backbone.apply(backbone, inputs.tokens, train=train, coordinates=laid,
                                           attention_pairwise_mask=visible,
                                           attention_key_positions=inputs.positions, method="hidden_states",
-                                          conditioning=conditioning, rngs=rngs))
+                                          conditioning=conditioning, rngs=rngs)), spanned
+
+    def context_states(self, variables: Variables, inputs: DecisionInputs, *, train: bool = False,
+                       rngs: dict[str, jax.Array] | None = None) -> jax.Array:
+        """The backbone's `[B, C, features]` final states over each row's context, its real tokens a
+        document of their own: the same backbone and weights as the row's pass, an adapter's
+        included, read without a context of its own. Where the backbone trains nothing but its
+        cross-attention blocks, which a pass without a context runs none of, the pass trains
+        nothing, and its gradient is not taken."""
+        backbone = thaw(part(variables, "backbone"))
+        assert inputs.context is not None and inputs.context_lengths is not None
+        real = jnp.arange(inputs.context.shape[1])[None, :] < inputs.context_lengths[:, None]
+        laid = coordinates(segments=real.astype(jnp.int32), max_segments=1, right_padded=True)
+        states = _array(self.backbone.apply(backbone, inputs.context, train=train, coordinates=laid,
+                                            method="hidden_states", rngs=rngs))
+        trained = variables.get("params", {}).get("backbone", {})
+        return jax.lax.stop_gradient(states) if crosses_alone(trained) else states
+
+    def _conditioned(self, states: jax.Array, inputs: DecisionInputs) -> dict[str, jax.Array]:
+        """The conditioning a backbone's cross-attention reads from the context's own final states."""
+        if self.context_length is None:
+            raise TypeError(f"rows carry a context, which a {type(self.backbone).__name__} without "
+                            "cross-attention layers does not read")
+        assert isinstance(self.backbone, CrossAttending) and inputs.context_lengths is not None
+        return {CONTEXT: jnp.asarray(states, self.backbone.context_dtype),
+                CONTEXT_LENGTHS: inputs.context_lengths}
 
     @property
     def context_length(self) -> int | None:
@@ -124,10 +164,14 @@ class DecisionModel:
     def logits(self, variables: Variables, inputs: DecisionInputs, *, media: ModelInputs | None = None,
                train: bool = False, rngs: dict[str, jax.Array] | None = None) -> jax.Array:
         """Return the `[B, Q, K]` fp32 option logits, with -inf past each question's options."""
-        states = self.states(variables, inputs, media=media, train=train, rngs=rngs)
+        states, spanned = self._read(variables, inputs, media=media, train=train, rngs=rngs)
         table = self.table(variables) if self.head.reads_table else None
-        logits = _array(self.head.apply(thaw(part(variables, "head")), states, inputs, table, train=train,
-                                        rngs=rngs))
+        # The questions' spans are pooled from the pass that holds them: the context's, where it holds
+        # the schema.
+        head = thaw(part(variables, "head"))
+        logits = _array(self.head.apply(head, states, inputs, table, train=train, rngs=rngs)
+                        if spanned is None else
+                        self.head.apply(head, states, inputs, table, train, spanned, rngs=rngs))
         return jnp.where(inputs.options, logits, -jnp.inf)
 
 

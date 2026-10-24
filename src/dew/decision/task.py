@@ -140,6 +140,19 @@ class DecideSettings:
     tokenizer: str | None
     processor: str | None
 
+    @staticmethod
+    def of(record: Mapping[str, object]) -> "DecideSettings":
+        """The settings a run's record holds (`saved_settings`). An earlier run's record names its
+        layout by class name alone, one of `dew.decision.layout`'s, and is read as that class's."""
+        from dew.inference.tasks import saved_settings
+
+        laid = record.get("layout")
+        if isinstance(laid, Mapping) and "name" in laid:
+            name = records.text(laid["name"], "layout.name")
+            record = {**record, "layout": {"class": f"dew.decision.layout:{name}",
+                                           "fields": records.json_value(laid.get("fields"), "layout.fields")}}
+        return saved_settings(record, DecideSettings)
+
 
 @dataclass(frozen=True)
 class Decide:
@@ -210,18 +223,12 @@ class Decide:
         the tokenizer that lays out the task's text.
         """
         from dew.data.text import tokenizer_for
-        from dew.inference.tasks import run_record, saved_model, saved_settings
+        from dew.inference.tasks import run_record, saved_model
         from dew.interop.pretrained import load_processor
         from dew.registry import from_record, objectives
 
         record, step = run_record(directory, step)
-        laid = record.get("layout")
-        if isinstance(laid, Mapping) and "name" in laid:
-            # An earlier run's record names its layout by class name alone, one of dew.decision.layout's.
-            name = records.text(laid["name"], "layout.name")
-            record = {**record, "layout": {"class": f"dew.decision.layout:{name}",
-                                           "fields": records.json_value(laid.get("fields"), "layout.fields")}}
-        settings = saved_settings(record, DecideSettings)
+        settings = DecideSettings.of(record)
         backbone = saved_model(record, dtype).build()
         width, head_dtype = DecisionModel.head_size(backbone)
         head = Head.from_record(records.json_value(settings.head, "head"), width)
@@ -389,7 +396,19 @@ class Decide:
     def _encoded(self, state: JSON, questions: Mapping[str, Question],
                  media: Sequence[int] = (), *, context: JSON | None = None) -> list[Encoded]:
         rows = self.layout.rows(self.tokenizer, self.specials, state, questions, media=media)
-        if context is not None:
+        if any(row.spans_in_context for row in rows):
+            # The row's context is its schema (`Schema.stream`), read whole by the cross-attention.
+            if context is not None:
+                raise ValueError("this task reads each request's schema as its context, so it reads no "
+                                 "context of the request's own")
+            if self.context_length is None:
+                raise ValueError("a schema read as the row's context needs a backbone with cross-attention "
+                                 "layers to read it (Pretrained.with_cross_attention)")
+            for row in rows:
+                if len(row.context or ()) > self.context_length:
+                    raise ValueError(f"the schema needs {len(row.context or ())} context tokens, more than "
+                                     f"the {self.context_length} the backbone's cross-attention reads")
+        elif context is not None:
             if self.context_length is None:
                 raise ValueError(f"a request's context is read by a backbone's cross-attention, which this "
                                  f"task's {type(self.model.backbone).__name__} does not have")
@@ -565,7 +584,8 @@ class Decide:
         scored = []
         segments = self.layout.bounds(self.tokenizer, self.specials).segments
         for batch in reader(DataPartition()):
-            inputs = laid_out(batch, segments)
+            inputs = laid_out(batch, segments, spans_in_context=isinstance(self.layout, JointLayout)
+                              and self.layout.schema_in_context)
             logits = np.asarray(self._forward(self.variables, inputs))
             answered = (np.asarray(batch["scored"])
                         & (np.asarray(Objective.row_weights(batch, len(logits))) > 0)[:, None])
@@ -805,9 +825,11 @@ def _ordered(laid: Laid, logits: np.ndarray) -> np.ndarray:
     return ordered
 
 
-def laid_out(batch: Mapping[str, object], max_segments: int) -> DecisionInputs:
+def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context: bool = False
+             ) -> DecisionInputs:
     """The `DecisionInputs` of a batch of packed windows (`PackedRows`), each
-    holding at most `max_segments` rows."""
+    holding at most `max_segments` rows, the questions' spans in each row's context where
+    `spans_in_context` (`JointLayout.schema_in_context`)."""
     def array(name: str) -> jax.Array:
         return jnp.asarray(batch[name])
 
@@ -820,7 +842,7 @@ def laid_out(batch: Mapping[str, object], max_segments: int) -> DecisionInputs:
                           positions=array("positions"), slots=given("slots"),
                           option_slots=given("option_slots"), slotted=given("slotted"),
                           context=given("context"), context_lengths=given("context_lengths"),
-                          max_segments=max_segments)
+                          max_segments=max_segments, spans_in_context=spans_in_context)
 
 
 def _widened(leaf: jax.Array, length: int, fill: int = 0) -> jax.Array:

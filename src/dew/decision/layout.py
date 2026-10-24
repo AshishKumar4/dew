@@ -21,7 +21,7 @@ import json
 import weakref
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Protocol, TypeGuard
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypeGuard
 
 import jax.numpy as jnp
 import numpy as np
@@ -183,6 +183,9 @@ class Encoded:
     context: tuple[int, ...] | None = None
     """The tokens of the context the row reads beside its state, through a backbone's
     cross-attention, or None for none."""
+    spans_in_context: bool = False
+    """Whether the questions' spans are positions in the context, which holds the schema
+    (`Schema.stream`), rather than in the row."""
 
 
 def question_fields(row: Encoded, count: int, width: int) -> dict[str, np.ndarray]:
@@ -571,7 +574,14 @@ class Schema:
     """Every question of the request as a field of the schema, never cut: its id, type and
     instructions, then each allowed option, each rendered as compact JSON with sorted keys,
     `{"description": ..., "option_id": ...}`. The head pools each option's tokens and each
-    question's instructions'."""
+    question's instructions'.
+
+    `stream` is where the schema is read: in the row (`"row"`), or as the row's context
+    (`"context"`), which the backbone reads in a pass of its own, with its own weights, and its
+    cross-attention layers read beside the row (`DecisionModel.states`), the head pooling the
+    questions and options from that pass."""
+
+    stream: Literal["row", "context"] = "row"
 
 
 type Segment = Text | Media | State | Schema
@@ -613,6 +623,11 @@ class JointLayout(Layout):
         if kinds.count(Schema) != 1 or kinds.count(State) > 1 or kinds.count(Media) > 1:
             raise ValueError("a joint row's segments hold the schema once, and the state and the images "
                              f"at most once each, not {[kind.__name__ for kind in kinds]}")
+
+    @property
+    def schema_in_context(self) -> bool:
+        """Whether the row's schema is its context (`Schema.stream`), its spans the context's."""
+        return any(isinstance(segment, Schema) and segment.stream == "context" for segment in self.segments)
     images: ClassVar[bool] = True
 
     def state(self, encoder: Tokenizer, specials: Specials, state: JSON) -> tuple[int, ...]:
@@ -653,17 +668,21 @@ class JointLayout(Layout):
                     index += 1
                 laid_out.append((None, piece(text)))
                 continue
-            own = schema if isinstance(part, Schema) else list(media) if isinstance(part, Media) else []
+            in_row = not (isinstance(part, Schema) and part.stream == "context")
+            own = (schema if isinstance(part, Schema) and in_row else list(media) if isinstance(part, Media)
+                   else [])
             laid_out.append((part, own))
             index += 1
         room = self.max_len - sum(len(ids) for segment, ids in laid_out if not isinstance(segment, State))
-        state_ids = state_ids[:max(0, room)]
+        # A row without a state segment keeps none of the state.
+        stated = any(isinstance(segment, State) for segment, _ in laid_out)
+        state_ids = state_ids[:max(0, room)] if stated else []
         row: list[int] = []
         offset, place = 0, None
         for segment, ids in laid_out:
             if isinstance(segment, State):
                 ids = state_ids
-            if isinstance(segment, Schema):
+            if isinstance(segment, Schema) and not self.schema_in_context:
                 offset = len(row)
             if isinstance(segment, Media) and media:
                 place = (len(row), len(row) + len(ids))
@@ -675,6 +694,10 @@ class JointLayout(Layout):
         shifted = tuple(Laid(question.name, question.kind, moved(question.span),
                              tuple(moved(option) for option in question.options), question.order)
                         for question in laid)
+        if self.schema_in_context:
+            # The schema is the row's context, its spans the context's own positions.
+            return [Encoded(tuple(row), shifted, None, None, whole, len(state_ids), place,
+                            context=tuple(schema), spans_in_context=True)]
         return [Encoded(tuple(row), shifted, None, None, whole, len(state_ids), place)]
 
     def _schema(self, piece: Callable[[str], list[int]], questions: Mapping[str, Question],
@@ -811,6 +834,9 @@ class DecisionInputs:
     context: jnp.ndarray | None = None
     context_lengths: jnp.ndarray | None = None
     max_segments: int = struct.field(pytree_node=False, default=1)
+    spans_in_context: bool = struct.field(pytree_node=False, default=False)
+    """Whether the questions' spans are positions in `context`, which holds the schema
+    (`Schema.stream`), rather than in `tokens`."""
 
     @property
     def valid(self) -> jnp.ndarray:
@@ -852,6 +878,9 @@ class DecisionInputs:
         parallel = rows[0].positions is not None
         if any((row.positions is not None) != parallel for row in rows):
             raise ValueError("one batch lays its rows out one way, sequential or parallel")
+        in_context = rows[0].spans_in_context
+        if any(row.spans_in_context != in_context for row in rows):
+            raise ValueError("one batch reads its rows' schemas one way, in the row or as its context")
         fields = ({"positions": [row.positions or () for row in rows],
                    "slots": [row.slots or () for row in rows]} if parallel else None)
         tokens, padded = pad_token_rows([row.tokens for row in rows], pad_id=pad, padding_side="right",
@@ -885,7 +914,7 @@ class DecisionInputs:
                    jnp.asarray(padded["slots"], jnp.int32) if parallel else None,
                    None if indexed is None else jnp.asarray(np.stack([slots for slots, _ in indexed])),
                    None if indexed is None else jnp.asarray(np.stack([real for _, real in indexed])),
-                   context, lengths)
+                   context, lengths, spans_in_context=in_context)
 
 
 OPTION_TILE = 128
