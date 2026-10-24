@@ -406,18 +406,19 @@ def widened_state(state):
 
 
 LAYOUT_SEEDS: dict[str, int] = {
-    "unet": 128, "uvit": 128, "simple_udit": 64, "simple_dit": 64, "simple_mmdit": 64,
-    "hierarchical_mmdit": 128, "hybrid_dit": 64, "video_dit": 64, "unet_3d": 128, "jepa_encoder": 128,
-    "jepa_video_encoder": 256, "causal_transformer": 64, "causal_transformer+moe": 64,
+    "unet": 64, "uvit": 128, "simple_udit": 8, "simple_dit": 8, "simple_mmdit": 8,
+    "hierarchical_mmdit": 16, "hybrid_dit": 8, "video_dit": 8, "unet_3d": 64, "jepa_encoder": 128,
+    "jepa_video_encoder": 128, "causal_transformer": 32, "causal_transformer+moe": 64,
     "causal_transformer+gpt_oss": 256, "causal_transformer+deepseek_v2": 128,
-    "causal_transformer+glm4_moe": 256, "causal_transformer+llama4": 32,
+    "causal_transformer+glm4_moe": 128, "causal_transformer+llama4": 32,
     "causal_transformer+gemma4_moe": 128, "causal_transformer+gemma3n": 128,
-    "causal_transformer+mla": 64,
+    "causal_transformer+mla": 64, "causal_transformer+qwen35": 8,
 }
-"""Each cell's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada, paired
-with the layout's arm where the cell's arms share their upstream rounding (the language cells): the
-most any of its four layouts and step counts took; a cell not named takes DEFAULT_LAYOUT_SEEDS."""
-DEFAULT_LAYOUT_SEEDS = 16
+"""Each cell's declared seeds for check 1 (`assert_as_exact`), the most either step count took, sized
+by `seeds_for` on armada paired with the layouts' arm (`dew_fn`): every cell's arms share their
+upstream rounding (the same state, batch and draws), and one arm's error alone is heavy-tailed across
+draws, so the reference compared with itself took up to 16 times the seeds (hierarchical_mmdit's 128
+against 16 paired, the small diffusion cells' 64 against 8). Every cell is named: one added is sized."""
 
 MARGIN = 1e-5
 """The least selection margin a draw admits (`selection_margin`), relative to the scale of what is
@@ -672,7 +673,7 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, tmp_p
                 return raw, order
         raise AssertionError(f"no batch of seed {seed} clears the selection margin {MARGIN}")
 
-    seeds = LAYOUT_SEEDS.get(case.name, DEFAULT_LAYOUT_SEEDS)
+    seeds = LAYOUT_SEEDS[case.name]
     _, alone, _ = run_case(case, tmp_path, fsdp=1, devices=1, state=copied(), steps=steps)
     layouts = [run_case(case, tmp_path, fsdp=fsdp, state=copied(), steps=steps)[1] for fsdp in (1, 4)]
     drawn = {name: drawn_steps(case, tmp_path, fsdp, devices, initial, steps) for name, fsdp, devices
