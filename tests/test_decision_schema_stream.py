@@ -39,7 +39,7 @@ ROWS = [("one two three", "a"), ("four five", "b"), ("six seven eight nine", "c"
 def read_in_context(length: int = 320, head=None) -> DecisionObjective:
     """A decision over the tiny Llama with fresh cross-attention before its layers, its rows' schemas
     read as their contexts, up to `length` tokens."""
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=512)
     crossed = source.with_cross_attention(CrossAttention((0, 1), length), key=0)
     width, _ = DecisionModel.head_size(crossed.model)
     head = head or JointSchemaHead(width, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
@@ -121,7 +121,7 @@ def test_a_schema_read_in_context_refuses_what_cannot_read_it():
     marked = read_in_context(head=DecisionHead(width, layers=1))
     with pytest.raises(TypeError):
         Decide(marked.model, marked.init(jax.random.key(0)), LAYOUT, TOKENIZER, SPECIALS)("one", QUESTION)
-    plain = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    plain = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=512)
     bare = DecisionObjective(plain, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
                              head=JointSchemaHead(width, width=16, routing_layers=1, layers=1, heads=2,
                                                   feedforward=32))
