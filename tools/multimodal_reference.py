@@ -223,21 +223,44 @@ def gemma3n_post_sgd_spread() -> None:
     print(report)
 
 
+def _copied(source: str, destination: str, config_class, model_class, **changes):
+    """The fixture `source`'s model, its config's top-level fields set to `changes`, built eager
+    in float32 with its weights loaded strictly, and saved with its config under `destination`.
+    Returns the model and that directory."""
+    directory = ROOT / destination
+    directory.mkdir(parents=True, exist_ok=True)
+    hf_config = config_class.from_dict(json.loads((ROOT / source / "config.json").read_text()) | changes)
+    hf_config._attn_implementation = "eager"
+    model = model_class(hf_config).float().eval()
+    tensors = load_file(str(ROOT / source / "model.safetensors"))
+    model.load_state_dict(tensors, strict=True)
+    save_file(tensors, str(directory / "model.safetensors"))
+    hf_config.save_pretrained(directory)
+    return model, directory
+
+
+def qwen3_vl_processor(directory: Path):
+    """The Qwen3-VL processor over a 256-token tokenizer, saved to `directory` and read back as
+    a checkpoint's is, and the tokenizer."""
+    from transformers import Qwen3VLProcessor, Qwen3VLVideoProcessor
+    from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+
+    special = {"<pad>": 0, "<eos>": 1, "<bos>": 2, "<unk>": 3,
+               "<image_soft_token>": 200, "<video>": 201,
+               "<start_of_image>": 202, "<end_of_image>": 203}
+    tokenizer = _tokenizer(256, special, video_token="<video>",
+                           vision_start_token="<start_of_image>", vision_end_token="<end_of_image>")
+    processor = Qwen3VLProcessor(
+        Qwen2VLImageProcessor(patch_size=8, temporal_patch_size=2, merge_size=2, do_resize=False),
+        tokenizer, Qwen3VLVideoProcessor(patch_size=8, temporal_patch_size=2, merge_size=2))
+    processor.save_pretrained(directory)
+    return AutoProcessor.from_pretrained(directory, local_files_only=True), tokenizer
+
+
 def write_gemma3_native() -> None:
     """The actual public processor and conditional model over unequal image rows."""
-    source = ROOT / "gemma3-tiny-mm"
-    destination = ROOT / "gemma3-native-tiny"
-    destination.mkdir(parents=True, exist_ok=True)
-    config = json.loads((source / "config.json").read_text())
-    config["mm_tokens_per_image"] = 4
-    hf_config = Gemma3Config.from_dict(config)
-    hf_config._attn_implementation = "eager"
-    model = Gemma3ForConditionalGeneration(hf_config).float().eval()
-    tensors = load_file(str(source / "model.safetensors"))
-    model.load_state_dict(tensors, strict=True)
-    save_file(tensors, str(destination / "model.safetensors"))
-    hf_config.save_pretrained(destination)
-
+    model, destination = _copied("gemma3-tiny-mm", "gemma3-native-tiny", Gemma3Config,
+                                 Gemma3ForConditionalGeneration, mm_tokens_per_image=4)
     special = {"<pad>": 0, "<eos>": 1, "<bos>": 2, "<unk>": 3,
                "<start_of_image>": 200, "<end_of_image>": 201, "<image_soft_token>": 202}
     tokenizer = _tokenizer(256, special)
@@ -303,21 +326,12 @@ def write_llama4_native() -> None:
     from transformers import Llama4Config, Llama4ForConditionalGeneration, Llama4Processor
     from transformers.models.llama4.image_processing_llama4 import Llama4ImageProcessor
 
-    source = ROOT / "llama4-tiny-mm"
-    destination = ROOT / "llama4-native-tiny"
-    destination.mkdir(parents=True, exist_ok=True)
-    config = json.loads((source / "config.json").read_text())
-    hf_config = Llama4Config.from_dict(config)
-    hf_config._attn_implementation = "eager"
-    model = Llama4ForConditionalGeneration(hf_config).float().eval()
-    tensors = load_file(str(source / "model.safetensors"))
-    model.load_state_dict(tensors, strict=True)
-    save_file(tensors, str(destination / "model.safetensors"))
-    hf_config.save_pretrained(destination)
+    model, destination = _copied("llama4-tiny-mm", "llama4-native-tiny", Llama4Config,
+                                 Llama4ForConditionalGeneration)
     special = {"<pad>": 0, "<bos>": 1, "<eos>": 2, "<unk>": 3,
                "<|image_start|>": 90, "<|image_end|>": 91, "<|patch|>": 92, "<|image|>": 93,
                "<|tile_x_separator|>": 94, "<|tile_y_separator|>": 95}
-    tokenizer = _tokenizer(config["text_config"]["vocab_size"], special)
+    tokenizer = _tokenizer(model.config.text_config.vocab_size, special)
     processor = Llama4Processor(
         Llama4ImageProcessor(size={"height": 28, "width": 28}, max_patches=4, resize_to_max_canvas=False),
         tokenizer, patch_size=14, pixel_shuffle_ratio=0.5)
@@ -331,30 +345,11 @@ def write_llama4_native() -> None:
 
 def write_qwen35_native() -> None:
     """The actual Qwen3VLProcessor and hybrid model, including spatial M-RoPE."""
-    from transformers import Qwen3VLProcessor, Qwen3VLVideoProcessor, Qwen3_5Config, Qwen3_5ForConditionalGeneration
-    from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+    from transformers import Qwen3_5Config, Qwen3_5ForConditionalGeneration
 
-    source = ROOT / "qwen35-tiny-mm"
-    destination = ROOT / "qwen35-native-tiny"
-    destination.mkdir(parents=True, exist_ok=True)
-    config = json.loads((source / "config.json").read_text())
-    hf_config = Qwen3_5Config.from_dict(config)
-    hf_config._attn_implementation = "eager"
-    model = Qwen3_5ForConditionalGeneration(hf_config).float().eval()
-    tensors = load_file(str(source / "model.safetensors"))
-    model.load_state_dict(tensors, strict=True)
-    save_file(tensors, str(destination / "model.safetensors"))
-    hf_config.save_pretrained(destination)
-    special = {"<pad>": 0, "<eos>": 1, "<bos>": 2, "<unk>": 3,
-               "<image_soft_token>": 200, "<video>": 201,
-               "<start_of_image>": 202, "<end_of_image>": 203}
-    tokenizer = _tokenizer(256, special, video_token="<video>",
-                           vision_start_token="<start_of_image>", vision_end_token="<end_of_image>")
-    processor = Qwen3VLProcessor(
-        Qwen2VLImageProcessor(patch_size=8, temporal_patch_size=2, merge_size=2, do_resize=False),
-        tokenizer, Qwen3VLVideoProcessor(patch_size=8, temporal_patch_size=2, merge_size=2))
-    processor.save_pretrained(destination)
-    processor = AutoProcessor.from_pretrained(destination, local_files_only=True)
+    model, destination = _copied("qwen35-tiny-mm", "qwen35-native-tiny", Qwen3_5Config,
+                                 Qwen3_5ForConditionalGeneration)
+    processor, _ = qwen3_vl_processor(destination)
     images = np.random.default_rng(2305).integers(0, 256, (3, 32, 32, 3), dtype=np.uint8)
     prompts = ["token7 <start_of_image><image_soft_token><end_of_image> token9",
                "token5 <start_of_image><image_soft_token><end_of_image> token8 <start_of_image><image_soft_token><end_of_image> token6"]

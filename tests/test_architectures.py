@@ -13,10 +13,9 @@ evaluation running against the sharded EMA copy, and a checkpoint on disk
 afterwards.
 """
 
+import functools
 import json
-import math
 from dataclasses import dataclass, replace
-from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -27,7 +26,8 @@ from diffusion_stubs import StubText
 from diffusion_support import images_of
 from flax import linen as nn
 from recording import RecordingTracker
-from reference_error import assert_leaves_as_exact, float64_terms
+from reference_error import assert_as_exact, assert_computes_the_oracle, chain_roundings, widened
+from residual_orders import permuted, residual_width
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
 from dew.config import MetricConfig, ModelConfig, ObjectiveConfig
@@ -37,14 +37,14 @@ from dew.diffusion import presets
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.attention import Stage
 from dew.nn.text_encoders import DEFAULT_MODEL as CLIP_CHECKPOINT
-from dew.objectives.base import VALID_ROWS, Step
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.registry import from_record, metrics, models, to_record
 from dew.sampling import CFG, Euler
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
-from dew.training.model_flops import model_batch
+from dew.training.distributed import shard_batch
+from dew.training.model_flops import prepare_counts
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -122,6 +122,13 @@ PREDICTOR = {"grid": GRID, "emb_features": 32, "predictor_features": 16,
 
 VOCAB = 64
 SEQ_LEN = 16
+LONG_SEQ_LEN = 128
+"""The rows of a cell whose float32 error is heavy-tailed over draws, a few draws holding most of it
+(Gemma 3n's and Qwen 3.5's): longer rows put more such events in each draw,
+so check 1's pooled ratio resolves over a sized count of draws, where SEQ_LEN's rows left the
+reference compared with itself unresolved within 512. Qwen 3.5's rows are twice as long: at 128 its
+embedding's momentum still did not resolve within 512. Gemma 3n's draws also clear the sparsity
+cutoff by a margin (`selection_margin`)."""
 LM = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 2, "num_heads": 2,
       "num_kv_heads": 1, "mlp_features": 64, "max_seq_len": SEQ_LEN}
 
@@ -161,10 +168,12 @@ CASES = [
     }, seq_len=SEQ_LEN, label="gpt_oss"),
     # DeepSeek V3.2's stack at toy width: the mla mixer with its sparse
     # indexer on every layer, and the routed layer with the balancing bias,
-    # the group limit and a shared expert.
+    # the group limit and a shared expert. The low ranks are 32 wide, so the
+    # latent norms' scales, whose rounding over a draw varies most, hold
+    # enough values a draw for the layout cell to resolve.
     Case("causal_transformer", {
         **LM, "head_dim": 16,
-        "mixer": {"class": "mla", "fields": {"q_lora_rank": 8, "kv_lora_rank": 8,
+        "mixer": {"class": "mla", "fields": {"q_lora_rank": 32, "kv_lora_rank": 32,
                   "qk_nope_head_dim": 8, "qk_rope_head_dim": 8, "v_head_dim": 8,
                   "index_topk": 4, "index_n_heads": 2, "index_head_dim": 16}},
         "mixture": {"experts": 8, "top_k": 2, "layers": (1,), "score_function": "sigmoid",
@@ -221,17 +230,22 @@ CASES = [
     # Gemma 3n at toy width: three copies of the residual stream under
     # AltUp, the LAuReL block, gaussian top-k on the first layer, widths
     # that differ per layer, per-layer inputs and the last layer sharing the
-    # first's keys and values.
+    # first's keys and values. The first layer's 192 units keep about ten a
+    # token at 0.95 sparsity, where the released models keep hundreds: at 48,
+    # about two, a token whose kept units all sit just above the cutoff gives
+    # the feed-forward's post-norm a near-zero input, whose direction float32
+    # resolves poorly, and four draws in 320 held 60% of a layer-0 leaf's
+    # pooled error (at 192, at most 22%; at 384, 6%).
     Case("causal_transformer", {
         **LM, "num_heads": 4, "num_kv_heads": 2, "head_dim": 8, "mlp": "geglu",
-        "mlp_features": (48, 64), "activation_sparsity_pattern": (0.95, 0.0),
+        "mlp_features": (192, 64), "activation_sparsity_pattern": (0.95, 0.0),
         "sandwich_norms": True, "qk_norm": True, "v_norm": True,
         "embedding_scale": True, "attention_scale": 1.0, "final_logit_softcap": 30.0,
         "layer_types": ("sliding_attention", "sliding_attention"),
         "kinds": {"sliding_attention": {"window": 4, "rope_theta": 1e4}},
         "altup": {"num_inputs": 3}, "laurel_rank": 8,
-        "per_layer_input_dim": 8, "kv_shared_layers": (1,),
-    }, seq_len=SEQ_LEN, label="gemma3n"),
+        "per_layer_input_dim": 8, "kv_shared_layers": (1,), "max_seq_len": LONG_SEQ_LEN,
+    }, seq_len=LONG_SEQ_LEN, label="gemma3n"),
     # Qwen3.5's stack: gated delta net layers on the linear_attention kind,
     # one gated full-attention layer with the sliced partial rotary. The
     # delta net's projections are wide enough to cross the shard threshold,
@@ -244,17 +258,17 @@ CASES = [
         "kinds": {"linear_attention": {"mixer": {
             "class": "gated_delta_net", "fields": {"linear_num_key_heads": 2,
             "linear_num_value_heads": 4, "linear_key_head_dim": 8,
-            "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}}}}},
-        seq_len=SEQ_LEN, label="qwen35"),
+            "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}}}},
+        "max_seq_len": 2 * LONG_SEQ_LEN}, seq_len=2 * LONG_SEQ_LEN, label="qwen35"),
 ]
 
 IDS = [case.name for case in CASES]
 
 
-def batches(case: Case, encoder: ConditionEncoder | None):
+def batches(case: Case, encoder: ConditionEncoder | None, seed: int = 0):
     """uint8-range samples, as the data pipeline delivers them, with labels for
-    the probes and tokenized text for the conditioned models."""
-    rng = np.random.default_rng(0)
+    the probes and tokenized text for the conditioned models, drawn from `seed`."""
+    rng = np.random.default_rng(seed)
     if case.is_lm:
         batch = {"text": rng.integers(0, VOCAB, size=(BATCH, case.seq_len + 1)).astype(np.int32)}
     else:
@@ -391,227 +405,309 @@ def widened_state(state):
                         else jnp.copy(leaf), state)
 
 
-def truth(case: Case, tmp_path, initial, steps=2):
-    """The case's `steps` steps on one device in float64, from `initial`
-    widened: the same rows, keys and draws, every float wider."""
-    trainer, encoder = make_trainer(case, tmp_path / f"truth-{steps}", 1, RecordingTracker(), 1)
-    source = batches(case, encoder)
+LAYOUT_SEEDS: dict[str, int] = {
+    "unet": 128, "uvit": 128, "simple_udit": 64, "simple_dit": 64, "simple_mmdit": 64,
+    "hierarchical_mmdit": 128, "hybrid_dit": 64, "video_dit": 64, "unet_3d": 128, "jepa_encoder": 128,
+    "jepa_video_encoder": 256, "causal_transformer": 64, "causal_transformer+moe": 128,
+    "causal_transformer+gpt_oss": 256, "causal_transformer+deepseek_v2": 256,
+    "causal_transformer+glm4_moe": 256, "causal_transformer+llama4": 256,
+    "causal_transformer+gemma4_moe": 256, "causal_transformer+gemma3n": 128,
+    "causal_transformer+mla": 64, "causal_transformer+qwen35": 8,
+}
+"""Each cell's declared seeds for check 1 (`assert_as_exact`), the most any layout and step count took,
+sized by `seeds_for` on armada. Every cell's arms share their upstream rounding (the same state, batch
+and draws); a cell whose errors are also heavy-tailed across draws is sized paired with the layout's
+arm (`dew_fn`), as testing.md has it: Gemma 3n's and Qwen 3.5's (the four largest of 64 draws hold
+half of a layer's pooled error, LONG_SEQ_LEN), and MLA's, where one draw in 1024 holds all of one
+device's pooled error (seed 247, an indexer selection the draw filter lets through: ledger 1527) and
+the reference compared with itself resolves no momentum within 4096 draws. Every other cell's errors
+are light-tailed (the four largest of 64 draws hold 7 to 12% of an arm's pooled error at the median
+leaf, 6% being uniform), and it is sized by the reference against itself. Every cell is named: one
+added is sized."""
 
-    data = Loader(train=lambda partition: (wide(case, batch) for batch in source()),
-                  val=lambda partition: (wide(case, batch) for batch in [next(source())]),
-                  batch=BATCH, records=None)
-    return trainer.fit(data, steps=steps, state=widened_state(initial))
-
-
-def update_terms(case: Case, tmp_path, initial, steps=2):
-    """The terms of each leaf the case's `steps` steps write (`float64_terms`), in float64 from
-    `initial`: the trainer's own step body, its transaction (the loss's gradient at each step's
-    parameters, the momentum update, the EMA), over the rows `truth` trains on. A parameter's
-    terms are its updates' sums and the momentum's the gradients', never the parameter it started
-    from, whose own size floors it."""
-    trainer, encoder = make_trainer(case, tmp_path / "terms", 1, devices=1)
-    source = batches(case, encoder)()
-    rows = [model_batch(wide(case, next(source))) for _ in range(steps)]
-    state = widened_state(initial)
-    with trainer._traced_on(trainer.device_mesh):
-        body = trainer._step_body(trainer._loss_shape(state, rows[0]), {}, 1)
-
-        def stepped(state):
-            for batch in rows:
-                advanced, *_ = body(state, batch, 0, jnp.zeros((2,), jnp.uint32))
-                state = replace(advanced, step=state.step + 1)
-            return state
-
-        return float64_terms(stepped, state)[1]
+MARGIN = 1e-5
+"""The least selection margin a draw admits (`selection_margin`), relative to the scale of what is
+selected: above the distance float32 rounding moves a selection's inputs from their float64 values,
+so one device, each layout and the float64 run select alike. Gemma 3n's gate, whose inputs carry the
+rounding of the attention and AltUp before it, moved at most 3.7e-6 of its row's deviation over the
+1,200 forwards of 320 draws, a light tail: each draw's largest was 1.6e-6 at the median and 2.5e-6
+at the 99th percentile. A selection is discontinuous: inputs within rounding of a boundary pick other
+keys or units in other runs, a difference no precision bounds."""
 
 
-def shard_terms(case: Case, tmp_path, initial):
-    """The terms a data-parallel layout's first step sums across devices, in
-    float64 from `initial`: each device's partial of every leaf the step
-    writes, summed absolutely (`float64_terms`' terms are the root sum of
-    squares of what one device sums). At BATCH rows over BATCH devices a
-    device's partial is its row's: the step from the whole batch with that
-    row alone valid (`VALID_ROWS`), the same draws, weighted by its share of
-    the batch. The step is linear in its gradient (SGD with momentum and
-    the EMA), so the partials sum to the whole step where its rows add up,
-    and None where they do not."""
-    trainer, encoder = make_trainer(case, tmp_path / "shards", 1, devices=1)
-    batch = model_batch(wide(case, next(batches(case, encoder)())))
-    state = widened_state(initial)
-
-    def with_rows(valid):
-        return {**batch, VALID_ROWS: np.asarray(valid)}
-
-    with trainer._traced_on(trainer.device_mesh):
-        body = trainer._step_body(trainer._loss_shape(state, with_rows(np.ones(BATCH, bool))), {}, 1)
-
-        def written(valid):
-            advanced, *_ = body(state, with_rows(valid), 0, jnp.zeros((2,), jnp.uint32))
-            return {name: jax.device_get(jax.tree.map(lambda after, before: after - before,
-                                                      getattr(advanced, name), getattr(state, name)))
-                    for name in ("variables", "opt_state", "ema")}
-
-        whole = written(np.ones(BATCH, bool))
-        parts = [jax.tree.map(lambda delta: delta / BATCH, written(np.arange(BATCH) == row))
-                 for row in range(BATCH)]
-    summed = jax.tree.map(lambda *deltas: sum(deltas), *parts)
-    terms = jax.tree.map(lambda *deltas: sum(np.abs(delta) for delta in deltas), *parts)
-    # float64 rounds the two sums apart by a few of its units of what they add. A step whose rows do
-    # not add up, through a batch-wide statistic (a router's load, a JEPA batch's masks), parts them by
-    # its own size: its devices' sums are no rows' partials, and it has no such terms (None).
-    if not all(np.all(np.abs(got - want) <= 1e-9 * size) for got, want, size in zip(
-            jax.tree.leaves(summed), jax.tree.leaves(whole), jax.tree.leaves(terms), strict=True)):
-        return None
-    return SimpleNamespace(**terms)
+def selects(case: Case) -> bool:
+    """Whether the cell's model selects discontinuously: a lightning indexer's top-k, Gemma 3n's
+    gaussian top-k or a mixture's routing (`selection_margin`)."""
+    fields = case.config.get("mixer", {}).get("fields", {})
+    sparsities = case.config.get("activation_sparsity_pattern", ())
+    return case.is_lm and bool(fields.get("index_topk") or any(sparsities) or routes(case))
 
 
-def decay_terms(objective, variables, batch, index: int) -> dict[tuple[str, ...], np.ndarray]:
-    """Each gated delta net layer's decay parameters' gradients as their
-    terms summed absolutely, by head, in float64, keyed by the parameter's
-    path. The decay g = -exp(A_log) softplus(z), z = a + dt_bias, enters the
-    rule at every row and position, so `dt_bias`'s gradient sums dL/dz and
-    `A_log`'s sums dL/dg g = dL/dz softplus(z) / sigmoid(z) there, both read
-    through the `a` projection, whose cotangent is dL/dz."""
-    step = Step(step=jnp.asarray(index), key=jax.random.key(0), ema=None)
-    values: dict[tuple[str, ...], jax.Array] = {}
-
-    def loss(offsets, record=None):
-        def project(next_fun, args, kwargs, context):
-            value = next_fun(*args, **kwargs)
-            path = context.module.scope.path
-            if context.method_name == "__call__" and path[-1:] == ("in_proj_a",):
-                if record is not None:
-                    record[path[:-1]] = value
-                return value + offsets.get(path[:-1], 0)
-            return value
-
-        with nn.intercept_methods(project):
-            return objective.scalar_loss(variables, batch, step)[0]
-
-    loss({}, values)
-    cotangents = jax.grad(loss)({path: jnp.zeros_like(value) for path, value in values.items()})
-    terms = {}
-    for path, cotangent in cotangents.items():
-        layer = variables["params"]
-        for part in path:
-            layer = layer[part]
-        z = values[path] + layer["dt_bias"]
-        decay = cotangent * jax.nn.softplus(z) / jax.nn.sigmoid(z)
-        for name, term in (("dt_bias", cotangent), ("A_log", decay)):
-            terms[(*path, name)] = np.sum(np.abs(np.asarray(term)), axis=(0, 1))
-    return terms
+def routes(case: Case) -> bool:
+    """Whether the cell's mixture routes by its router's scores: hash routing selects by the token
+    alone, which no rounding moves."""
+    mixture = case.config.get("mixture")
+    return mixture is not None and not mixture.get("hash_layers")
 
 
-def decay_invariants(case: Case, tmp_path, initial,
-                     steps=2) -> dict[str, dict[tuple[str, ...], np.ndarray]]:
-    """The declared terms (`raised`) of each gated delta net's decay
-    parameters over a language model's one or two SGD steps, by state tree.
-    After two the momentum holds momentum g1 + g2, and a parameter that
-    starts at zero moves to -lr ((1 + momentum) g1 + g2); after one they
-    hold g1 and -lr g1. So each is a sum of the steps' gradients' terms
-    (`decay_terms`), measured in float64 at the parameters each step reads.
-    A parameter that starts elsewhere is no such sum, and its own size
-    floors it."""
-    if not case.is_lm:
-        return {}
+@functools.cache
+def selections_forward(name: str):
+    """A cell's forward capturing its discontinuous selections (`selection_margin`), compiled once a
+    cell: the lightning indexer's scores from its `scores` method, Gemma 3n's gate from its gated MLP's
+    Dense, a Router's selection scores, group scores and group mask from its own methods, and gpt-oss's
+    and Gemma 4's router logits from their Dense. One compiled forward rather than an op at a time:
+    XLA:CPU's JIT failed to materialize a gather fusion among the many small programs an unjitted
+    capture compiles."""
+    from dew.nn.gemma4_moe import Gemma4TextRouter
+    from dew.nn.gpt_oss import GptOssMLP
+    from dew.nn.mla import SparseIndexer
+    from dew.nn.mlp import GatedMLP
+    from dew.nn.moe import Router
 
-    def starts_at_zero(path):
-        leaf = initial.variables["params"]
-        for part in path:
-            leaf = leaf[part]
-        return not np.any(np.asarray(leaf))
+    case = next(case for case in CASES if case.name == name)
+    model = models.build(case.architecture, **case.config)
 
-    trainer, _ = make_trainer(case, tmp_path / "terms", 1, devices=1)
-    batch = {"text": jnp.asarray(next(batches(case, None)())["text"])}
+    def selecting(module, method):
+        if isinstance(module, SparseIndexer):
+            return method == "scores"
+        if isinstance(module, Router):
+            return method in ("selection", "group_scores", "group_mask")
+        if isinstance(module, nn.Dense) and method == "__call__" and (
+                (isinstance(module.parent, GptOssMLP) and module.name == "router")
+                or (isinstance(module.parent, Gemma4TextRouter) and module.name == "proj")):
+            return True
+        parent = module.parent
+        gated = isinstance(parent, GatedMLP) and bool(parent.activation_sparsity)
+        return method == "__call__" and isinstance(module, nn.Dense) and module.name == "gate_proj" and gated
+
+    return jax.jit(lambda variables, tokens: model.apply(
+        variables, tokens, capture_intermediates=selecting, mutable=["intermediates"]))
+
+
+def gate_margin(values: np.ndarray, sparsity: float) -> float:
+    """The smallest margin of Gemma 3n's gaussian top-k over gate rows `values`: each unit's distance
+    from its row's cutoff, the mean plus the sparsity's normal quantile times the population
+    deviation, as `dew.nn.mlp.gaussian_topk` forms it, over that deviation; the least kept unit's
+    height over the cutoff and the cutoff's over the greatest dropped one."""
+    from statistics import NormalDist
+
+    values = np.asarray(values, np.float64)
+    deviation = values.std(-1, keepdims=True)
+    cutoff = values.mean(-1, keepdims=True) + NormalDist().inv_cdf(sparsity) * deviation
+    kept = np.min(np.where(values > cutoff, values, np.inf), axis=-1, keepdims=True)
+    dropped = np.max(np.where(values > cutoff, -np.inf, values), axis=-1, keepdims=True)
+    return float(np.min(np.minimum(kept - cutoff, cutoff - dropped) / deviation))
+
+
+def top_margin(values: np.ndarray, kept: int) -> np.ndarray:
+    """Each row's gap between its `kept`-th largest value and the next, over its largest's size: how
+    far a top-`kept` selection over the row's last axis is from flipping. Infinite where the row
+    holds no more than `kept` finite values, which decide nothing."""
+    ranked = -np.sort(-values, axis=-1)
+    chosen, next_best = ranked[..., kept - 1], ranked[..., kept]
+    scale = np.maximum(np.abs(ranked[..., 0]), np.finfo(np.float32).tiny)
+    return np.where(np.isfinite(next_best), (chosen - next_best) / scale, np.inf)
+
+
+def selection_margin(case: Case, variables, tokens) -> float:
+    """The smallest margin, over the forward of `variables`, of the model's
+    discontinuous selections relative to their scale: the lightning indexer's top-k (the gap between
+    the k-th and the next visible key's score, over the query's largest), Gemma 3n's gaussian top-k
+    (the gate's distance from its cutoff, the row's mean plus the sparsity's normal quantile times its
+    population deviation, over that deviation, as `dew.nn.mlp.gaussian_topk` forms it) and a
+    mixture's routing, read from the router's own operands: a Router's best groups by its group
+    scores and its experts by its selection scores within them (`top_margin` of each), gpt-oss's and
+    Gemma 4's routers, which rank their logits or their softmax by a plain top-k, by their logits'. A
+    query that sees no more keys than its budget, and an exact zero tie of relu'd scores, ordered
+    alike by index in every run, decide nothing."""
+    fields = case.config.get("mixer", {}).get("fields", {})
+    sparsities = case.config.get("activation_sparsity_pattern", ())
+    margin, seen = np.inf, 0
+    mixture = case.config.get("mixture") or {}
+    _, captured = selections_forward(case.name)(variables, jnp.asarray(tokens[:, :-1]))
+    routers: dict[tuple[str, ...], dict[str, np.ndarray]] = {}
+    for path, values in jax.tree_util.tree_flatten_with_path(captured.get("intermediates", {}))[0]:
+        seen += 1
+        names = [str(getattr(part, "key", part)) for part in path]
+        if names[-2] in ("selection", "group_scores", "group_mask"):
+            routers.setdefault(tuple(names[:-2]), {})[names[-2]] = np.asarray(values)
+            continue
+        values = np.asarray(values, np.float64)
+        if "gate_proj" in names:
+            layer = int(next(name for name in names if name.startswith("layers_")).split("_")[1])
+            margin = min(margin, gate_margin(values, sparsities[layer]))
+            continue
+        if names[-3] in ("router", "proj") and names[-2] == "__call__":
+            # gpt-oss ranks its router's logits, Gemma 4's router their softmax: one order, by logit.
+            margin = min(margin, float(np.min(top_margin(values, mixture.get("top_k", 2)))))
+            continue
+        budget, (queries, keys) = fields["index_topk"], values.shape[-2:]
+        if keys <= budget:
+            continue
+        visible = np.tril(np.ones((queries, keys), bool), keys - queries)
+        ranked = -np.sort(-np.where(visible, values, -np.inf), axis=-1)
+        kept, rejected = ranked[..., budget - 1], ranked[..., budget]
+        decided = np.isfinite(rejected) & ~((kept == 0) & (rejected == 0))
+        scale = np.maximum(np.abs(ranked[..., 0]), np.finfo(np.float32).tiny)
+        margin = min(margin, float(np.min(np.where(decided, (kept - rejected) / scale, np.inf))))
+    # A model that selects shows its selections here, or the draw would pass unfiltered.
+    for operands in routers.values():
+        # A Router chooses its best groups by their scores, then its experts among the groups kept.
+        selection = np.asarray(operands["selection"], np.float64)
+        if "group_scores" in operands:
+            groups = np.asarray(operands["group_scores"], np.float64)
+            margin = min(margin, float(np.min(top_margin(groups, mixture.get("groups_per_token", 1)))))
+            selection = np.where(operands["group_mask"], selection, -np.inf)
+        margin = min(margin, float(np.min(top_margin(selection, mixture.get("top_k", 2)))))
+    assert seen, f"{case.name}: no selection was captured"
+    return margin
+
+
+def clears(case: Case, raw, initial, stepped) -> bool:
+    """Whether the selections of each step's forward on the batch `raw` clear MARGIN
+    (`selection_margin`): the first step's from `initial`, then the second's from the state
+    `stepped(raw)` makes, made only once the first's clear."""
+    return (selection_margin(case, initial, raw["text"]) > MARGIN
+            and selection_margin(case, stepped(raw), raw["text"]) > MARGIN)
+
+
+def reordered(state, order):
+    """`state` with its residual stream's units in `order` (`tests/residual_orders.permuted`), its
+    variables and EMA alike: the same function in other coordinates, every contraction inside the
+    model summed in another order. Its momentum starts at zero, which no order moves. An empty
+    `order` is a model with no residual stream to permute, and leaves `state` as it is."""
+    if not len(order):
+        return state
+    assert all(not np.any(np.asarray(leaf)) for leaf in jax.tree.leaves(state.opt_state)
+               if jnp.issubdtype(leaf.dtype, jnp.floating))
+    ema = None if state.ema is None else permuted(state.ema, order)
+    return state.replace(variables=permuted(state.variables, order), ema=ema)
+
+
+def drawn_steps(case: Case, tmp_path, fsdp, devices, initial, steps: int, *, exact: bool = False):
+    """`steps` steps of a layout over the batch a draw gives, from `initial` in the residual order
+    it gives (`reordered`), every step on the same rows, as `run_case`'s `fit` takes them, the step
+    compiled once for every draw: a function of the raw batch and the order returning the stepped
+    state's variables, optimizer state and EMA. `exact` runs one device in float64 from the state
+    widened, the batch's samples widened (`wide`), built at its first call, so under the caller's
+    float64."""
+    built = []
+
+    def stepped(raw, order):
+        if not built:
+            trainer, _ = make_trainer(case, tmp_path / f"drawn-{devices}-{fsdp}-{steps}-{exact}", fsdp,
+                                      RecordingTracker(), devices)
+            built.append(trainer)
+        trainer = built[0]
+        start = reordered(widened_state(initial) if exact else jax.tree.map(jnp.copy, initial), order)
+        # A copy each draw, as each step donates the state it is handed.
+        state = jax.device_put(start, trainer.shardings(start))
+        batch = shard_batch(trainer.device_mesh, prepare_counts(
+            trainer.objective, wide(case, raw) if exact else raw, count_model=False))
+        if len(built) == 1:
+            built.append(trainer.compile(state, batch))
+        for _ in range(steps):
+            state, *_ = built[1](state, batch)
+        return jax.device_get({name: getattr(state, name) for name in ("variables", "opt_state", "ema")})
+
+    return stepped
+
+
+@pytest.mark.parametrize("case", [case for case in CASES if case.is_lm],
+                         ids=[name for case, name in zip(CASES, IDS, strict=True) if case.is_lm])
+def test_a_residual_order_is_the_same_decoder(case):
+    """The residual orders the layout cells draw (`permuted`) reorder sums only: each language cell's
+    float64 logits under an order other than the identity are the identity's within float64's
+    rounding of their own longest chain (`assert_computes_the_oracle`), so a draw over orders is a
+    draw of roundings and never another model."""
+    model = models.build(case.architecture, **case.config)
+    ids = np.random.default_rng(3).integers(0, LM["vocab_size"], (2, SEQ_LEN)).astype(np.int32)
+    variables = jax.jit(model.init)(jax.random.key(0), ids)
+    width = residual_width(variables)
     with jax.enable_x64(new_val=True):
-        wide = jax.tree.map(lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating)
-                            else leaf, initial.variables)
-        first = decay_terms(trainer.objective, wide, batch, 0)
-        if not first:
-            return {}
-        if steps == 1:
-            return {"variables": {path: LEARNING_RATE * first[path]
-                                  for path in first if starts_at_zero(path)}, "opt_state": first}
-        step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None)
-        gradient = jax.grad(lambda params: trainer.objective.scalar_loss(
-            {**wide, "params": params}, batch, step)[0])(wide["params"])
-        moved = {**wide, "params": jax.tree.map(lambda leaf, step: leaf - LEARNING_RATE * step,
-                                                wide["params"], gradient)}
-        second = decay_terms(trainer.objective, moved, batch, 1)
-
-    return {"variables": {path: LEARNING_RATE * ((1 + MOMENTUM) * first[path] + second[path])
-                          for path in first if starts_at_zero(path)},
-            "opt_state": {path: MOMENTUM * first[path] + second[path] for path in first}}
+        wide = widened(variables)
+        identity = np.asarray(model.clone(dtype=jnp.float64).apply(wide, ids))
+        for seed in (1, 2):
+            order = np.random.default_rng([0x0BB17, seed]).permutation(width)
+            reordered = model.clone(dtype=jnp.float64).apply(permuted(wide, order), ids)
+            roundings = chain_roundings(jax.make_jaxpr(
+                lambda variables: model.clone(dtype=jnp.float64).apply(variables, ids))(wide))
+            assert_computes_the_oracle(np.asarray(reordered), identity, f"{case.name} order {seed}",
+                                       roundings=roundings)
 
 
-def raised(terms, scales: dict[str, dict[tuple[str, ...], np.ndarray]]):
-    """`terms` with each leaf whose path ends in a declared parameter's at least
-    its declared terms (`decay_invariants`), leaf by leaf."""
-    def raise_tree(name, tree):
-        def leaf(key, value):
-            text = jax.tree_util.keystr(key)
-            for path, scale in scales.get(name, {}).items():
-                if text.endswith("".join(f"['{part}']" for part in path)):
-                    value = np.maximum(value, scale)
-            return value
-        return jax.tree_util.tree_map_with_path(leaf, tree)
-    return replace(terms, **{name: raise_tree(name, getattr(terms, name)) for name in scales})
+LAYOUTS = {"8x1 data": 1, "2x4 fsdp": 4}
+"""Each layout a cell trains on, by its fsdp width over every device."""
 
 
+@pytest.mark.parametrize("layout", tuple(LAYOUTS), ids=("data", "fsdp"))
+@pytest.mark.parametrize("steps", (1, 2), ids=("1-step", "2-steps"))
 @pytest.mark.parametrize("case", CASES, ids=IDS)
-def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
-    """One device, 8x1 data parallelism (every parameter replicated, the
-    batch split across every device) and 2x4 fsdp (the parameter tree split
-    four ways, the optimizer's state and the EMA with it) train the same
-    steps from the same state: each layout's variables, momentum and EMA
-    are as near a float64 run as one device's are
-    (`assert_leaves_as_exact`), so their summing a batch's rows and
-    positions in other orders is the only difference, where a layout that
-    dropped or repeated a row would fail by orders of magnitude. After one
-    step every row is held to its own size; after two each tensor is, as a
-    second step's rows inherit the first's rounding through the parameters
-    they read, which their own terms do not see (Gemma 3n's altup output
-    scale, a cancelling gradient's smallest element, carries it into a
-    per-layer gate's row). Adam's two moments and its count follow the
-    parameters' placement too."""
-    initial = make_trainer(case, tmp_path / "initial", 1, devices=1)[0].initial_state()
+def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
+    """One device and a layout, 8x1 data parallelism (every parameter
+    replicated, the batch split across every device) or 2x4 fsdp (the
+    parameter tree split four ways, the optimizer's state and the EMA with
+    it), train the same steps from the same state: after `steps` steps (one,
+    and two, each layout and step count its own test, so none runs another's
+    fits and draws), the layout's variables, momentum and EMA are as near a
+    float64 run as one device's are, over the cell's declared batches (check
+    1, `assert_as_exact`), so
+    their summing a batch's rows and positions in other orders is the only
+    difference, where a layout that dropped or repeated a row would fail by
+    orders of magnitude. The steps check 1 draws are `fit`'s own on the
+    run's batch, bit for bit, each compiled once for every draw. Adam's two
+    moments and its count follow the parameters' placement too."""
+    trainer, encoder = make_trainer(case, tmp_path / "initial", 1, devices=1)
+    initial = trainer.initial_state()
 
     def copied():
         # Each fit donates the state it was handed.
         return jax.tree.map(jnp.copy, initial)
 
-    # The most terms a gradient sums: every row's positions, and over every
-    # layer for a weight the layers share (Gemma 3n's per-layer input norm).
-    positions = case.seq_len or math.prod(case.sample_shape[:-1])
-    layers = case.config.get("num_layers", 1)
-    reductions = BATCH * positions * int(np.sum(layers))
+    width = residual_width(initial.variables) if case.is_lm else 0
+    one_step = drawn_steps(case, tmp_path, 1, 1, initial, 1)
 
-    def as_near(steps, rows):
-        _, alone, _ = run_case(case, tmp_path, fsdp=1, devices=1, state=copied(), steps=steps)
-        layouts = [run_case(case, tmp_path, fsdp=fsdp, state=copied(), steps=steps)[1] for fsdp in (1, 4)]
-        with jax.enable_x64(new_val=True):
-            exact = jax.device_get(truth(case, tmp_path, copied(), steps))
-            terms = jax.device_get(update_terms(case, tmp_path, copied(), steps))
-            # A layout's step adds its devices' partials, whose terms can far exceed the
-            # whole batch's where the rows' gradients cancel across devices.
-            across = shard_terms(case, tmp_path, copied()) if rows else None
-            if across is not None:
-                terms = replace(terms, **{name: jax.tree.map(np.maximum, getattr(terms, name),
-                                                             getattr(across, name))
-                                          for name in ("variables", "opt_state", "ema")})
-        # A delta net's decay terms stay declared: its float32 rounding runs through the chunked
-        # rule's cumulative sums of the decay, which the step's own terms do not see.
-        terms = raised(terms, decay_invariants(case, tmp_path, initial, steps))
-        for layout in layouts:
-            for name in ("variables", "opt_state", "ema"):
-                assert_leaves_as_exact(*jax.device_get((getattr(layout, name), getattr(alone, name))),
-                                       getattr(exact, name), reductions=reductions,
-                                       terms=getattr(terms, name), rows=rows)
-        return layouts
+    def draw(seed):
+        """A batch drawn from the seed and, independently, an order of the residual stream's units
+        (`reordered`), the cell's own batch and the identity at seed 0: the fresh batch varies the
+        values, the order every contraction's summation, and the reference and each layout start
+        from the same reordered state, so all are judged in its coordinates. A model with no
+        token embedding has no residual stream to permute, and draws batches alone. A model that
+        selects discontinuously takes the seed's first batch whose selections, in the forward of
+        each step, clear MARGIN (`selection_margin`)."""
+        for attempt in range(64):
+            key = seed if attempt == 0 else 1_000_003 * (attempt + 1) + seed
+            order = (np.arange(width) if key == 0 else np.random.default_rng(key).permutation(width))
+            raw = next(batches(case, encoder, key)())
+            if not selects(case) or clears(case, raw, initial.variables,
+                                           lambda batch: one_step(batch, np.arange(width))["variables"]):
+                return raw, order
+        raise AssertionError(f"no batch of seed {seed} clears the selection margin {MARGIN}")
 
-    as_near(1, rows=True)
-    replicated, state = as_near(2, rows=False)
-    assert not fsdp_leaves(replicated.variables), "nothing may shard on a 1-wide fsdp axis"
+    seeds = LAYOUT_SEEDS[case.name]
+    fsdp = LAYOUTS[layout]
+    _, alone, _ = run_case(case, tmp_path, fsdp=1, devices=1, state=copied(), steps=steps)
+    _, state, _ = run_case(case, tmp_path, fsdp=fsdp, state=copied(), steps=steps)
+    drawn = {"one device": drawn_steps(case, tmp_path, 1, 1, initial, steps),
+             layout: drawn_steps(case, tmp_path, fsdp, None, initial, steps)}
+    # The drawn steps are fit's own on its batch, bit for bit, so what check 1 judges is the run's:
+    # the cell's own batch in its own order, whatever selection margin a draw then asks.
+    own = (next(batches(case, encoder)()), np.arange(width))
+    for fitted, stepped in zip((alone, state), drawn.values(), strict=True):
+        ours = stepped(*own)
+        for name, tree in ours.items():
+            held = jax.device_get(getattr(fitted, name))
+            assert jax.tree.structure(tree) == jax.tree.structure(held), name
+            for mine, theirs in zip(jax.tree.leaves(tree), jax.tree.leaves(held), strict=True):
+                mine, theirs = np.asarray(mine), np.asarray(theirs)
+                assert mine.dtype == theirs.dtype and mine.shape == theirs.shape, name
+                assert np.array_equal(mine.view(np.uint8), theirs.view(np.uint8)), name
+    truth = drawn_steps(case, tmp_path, 1, 1, initial, steps, exact=True)
+    assert_as_exact(drawn[layout], drawn["one device"], draw, f"{case.name} {layout}, {steps} step(s)",
+                    seeds=seeds, truth_fn=truth)
+    if fsdp == 1:
+        assert not fsdp_leaves(state.variables), "nothing may shard on a 1-wide fsdp axis"
+        return
     sharded = fsdp_leaves(state.variables)
     assert sharded, "no parameter was sharded over the fsdp axis"
     for param in sharded:

@@ -8,7 +8,6 @@ from dew.interop.families.deepseek import (
     DEEPSEEK_V3,
     DEEPSEEK_V4,
     DEEPSEEK_V32,
-    KIMI_K2,
     KIMI_K25,
     MINIMAX_M2,
 )
@@ -81,7 +80,6 @@ ENTRIES = (
     DEEPSEEK_V4,
     DEEPSEEK_V32,
     DEEPSEEK_V2,
-    KIMI_K2,
     KIMI_K25,
     KIMI_LINEAR,
     KIMI_K3,
@@ -125,6 +123,8 @@ ENTRIES = (
         "MinistralForCausalLM",
         lambda model: {},
         preserve_source_layout=False,
+        # MinistralConfig's defaults for the fields its decoder reads.
+        defaults={"sliding_window": 4096, "num_key_value_heads": 8, "max_position_embeddings": 131072},
     ),
     DecoderFamily(
         ("llama",),

@@ -395,13 +395,14 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
 
     @abc.abstractmethod
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
-                first: jax.Array | int = 0, in_flight: int = 0) -> tuple[C, tuple[jax.Array, ...]]:
+                first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None
+                ) -> tuple[C, tuple[jax.Array, ...]]:
         """A consumer's walk of `segments`, each `(step, lo, hi)`, `step(index, slots, carry, accumulators)
         -> (carry, accumulators)` given each stream's slots (`Slots`, the streams' steps counted from
-        `first`), from `start`, with fp32 accumulators of `shapes` (zero) its products issue into in place.
-        `in_flight` steps' products stay running past their step (0 or 1): their slots go back once they are
-        done, a step later, so the next step's operands are waited for while they run. Returns the carry and
-        the accumulators' values."""
+        `first`), from `start`, with fp32 accumulators of `shapes` its products issue into in place, zero
+        or their `initial` values (in the accumulator's layout; None, zero). `in_flight` steps' products stay
+        running past their step (0 or 1): their slots go back once they are done, a step later, so the next
+        step's operands are waited for while they run. Returns the carry and the accumulators' values."""
 
     @abc.abstractmethod
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
@@ -480,6 +481,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         """A column vector read from `ref` (`[columns]`) in a column's layout (a tile's keys')."""
         return plgpu.load(ref, layout=self.column, optimized=False)
 
+    def tile_of(self, ref) -> jax.Array:
+        """A tile read from `ref` (`[rows, columns]`) in the accumulator's layout."""
+        return plgpu.load(ref, layout=self.layout, optimized=False)
+
     def as_row(self, vector: jax.Array) -> jax.Array:
         """`vector` `[rows]` in a row's layout, whatever its own."""
         return plgpu.layout_cast(vector, self.row)
@@ -522,7 +527,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         streamed(rings, tiles, lo, hi)
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
-                first: jax.Array | int = 0, in_flight: int = 0) -> tuple[C, tuple[jax.Array, ...]]:
+                first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None
+                ) -> tuple[C, tuple[jax.Array, ...]]:
         if in_flight not in (0, 1):
             raise ValueError(f"a walk keeps no step's products or one step's in flight, not {in_flight}")
 
@@ -545,7 +551,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             return run
 
         walked = self.accumulated(tuple((slotted(step, lo), lo, hi) for step, lo, hi in segments), start,
-                                  shapes, interpret)
+                                  shapes, interpret, initial)
         if in_flight:
             # Each segment's last step, its products done by the walk's end.
             for _, lo, hi in segments:
@@ -553,10 +559,10 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         return walked
 
     @abc.abstractmethod
-    def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool
+    def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool, initial: tuple | None = None
                        ) -> tuple[C, tuple[jax.Array, ...]]:
         """A walk of `segments`, `step(index, carry, accumulators)`, with the family's accumulators of
-        `shapes` held across it (`walk`)."""
+        `shapes` held across it from their `initial` values (`walk`)."""
 
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
         passed(tuple(streams.values()), lo, hi, first=first, between=between)

@@ -28,7 +28,7 @@ WORKFLOW = FIXTURES / "diffusion-gemma-workflow"
 def system():
     config = json.loads((WORKFLOW / "config.json").read_text())
     model = adapter.build(config, dtype="float32", attention_impl="xla")
-    variables = adapter.translate_weights(load_file(str(WORKFLOW / "model.safetensors")), config)
+    variables, _ = adapter.translate_weights(load_file(str(WORKFLOW / "model.safetensors")), config)
     process = adapter.generation_process(
         config, json.loads((WORKFLOW / "generation_config.json").read_text())
     )
@@ -175,9 +175,14 @@ def test_eos_finishes_rows_independently_and_padding_is_not_a_token(system):
 def test_checkpoint_export_keeps_updated_weights_and_generation(system):
     model, variables, process, reference, config = system
     changed = jax.tree.map(lambda value: value + jnp.asarray(0.001, value.dtype), variables)
-    restored = adapter.translate_weights(adapter.export_weights(model, changed, config), config)
-    for wanted, actual in zip(jax.tree.leaves(changed), jax.tree.leaves(restored), strict=True):
-        np.testing.assert_array_equal(actual, wanted)
+    _, read = adapter.translate_weights(load_file(str(WORKFLOW / "model.safetensors")), config)
+    # The vision tower and embedder go back through the layouts the load read them by, and through
+    # those a tree built in Dew gives, alike.
+    for vision in (read, None):
+        exported = adapter.export_weights(model, changed, config, vision)
+        restored, _ = adapter.translate_weights(exported, config)
+        for wanted, actual in zip(jax.tree.leaves(changed), jax.tree.leaves(restored), strict=True):
+            np.testing.assert_array_equal(actual, wanted)
     inputs = ModelInputs(jnp.asarray(reference["prompt"]))
     wanted = process.generate(model, changed, inputs, 7, key=jax.random.key(11))
     actual = process.generate(model, restored, inputs, 7, key=jax.random.key(11))
@@ -207,7 +212,7 @@ def test_the_released_layout_denoiser_matches_the_reference():
     config = {"model_type": "diffusion_gemma", "canvas_length": 4,
               "text_config": json.loads((directory / "config.json").read_text())}
     model = adapter.build(config, dtype="float32", attention_impl="xla")
-    variables = adapter.translate_weights(load_file(str(directory / "model.safetensors")), config)
+    variables, _ = adapter.translate_weights(load_file(str(directory / "model.safetensors")), config)
     cache = prefill(model, variables, np.load(directory / "prompt.npy"))
     canvas = np.load(directory / "canvas.npy")
     with np.load(directory / "numerics.npz") as exact:
@@ -231,7 +236,7 @@ def test_a_sliding_denoiser_reads_its_whole_canvas_past_its_window():
     config = {"model_type": "diffusion_gemma", "canvas_length": 6,
               "text_config": json.loads((directory / "config.json").read_text())}
     model = adapter.build(config, dtype="float32", attention_impl="xla")
-    variables = adapter.translate_weights(load_file(str(directory / "model.safetensors")), config)
+    variables, _ = adapter.translate_weights(load_file(str(directory / "model.safetensors")), config)
     cache = prefill(model, variables, np.load(directory / "prompt.npy"))
     logits = model.apply({**variables, "cache": cache}, np.load(directory / "canvas.npy"))
     reference = np.load(directory / "logits.npy")

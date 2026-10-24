@@ -38,10 +38,15 @@ each test of the newest at its least time as the floor's Python ran it.
 
 The test cache reuses a file's row when its inputs are unchanged since it ran green. A
 green row records the checkout's Python files its tests executed
-(tools/armada/executed.py) and its key, a hash of those files, the file
+(tools/armada/executed.py) and its key, a hash of those files, the
+directories under src/ that hold them, however deep (so a module added
+beside one, or an __init__.py on the way to one, changes it), the file
 itself and what every file shares (`shared`: the environment's locks, the
-CI tools, every non-Python file under tests/ and src/, and the names of every
-Python file there, so a file a scanner would find changes every key). A task
+CI tools, every non-Python file under tests/ and src/, the names
+of the Python files under tests/ but the test modules, and src/'s entries).
+A test module, or a module in a package a file never imported, is no input
+of that file's: a train that loses a head reruns only the files the head's
+modules reached (the land queue's recompose after a pull). A task
 recomputes each of its files' keys from the record made on its own class
 (`device_class`: float32 results differ by CPU microarchitecture, and by GPU)
 and reports the recorded green row
@@ -188,19 +193,23 @@ CACHE_PREFIX = f"testcache/format-{RECORD_FORMAT}"
 
 def shared(python: str) -> str:
     """The hash of what every test file's run shares: `python`, the `SHARED` files, every lock, every
-    non-Python file under tests/ and src/ (a fixture, a package's data), and the names of every Python
-    file there, whose arrival can change what an import finds (a conftest.py, a package's __init__.py, a
-    module that shadows another, a test module among them) or what a scanner lists, neither of which a
-    record sees."""
+    non-Python file under tests/ and src/ (a fixture, a package's data), and the names of the Python
+    files under tests/ but its test modules and of src/'s own entries, whose arrival can change what an
+    import finds (a conftest.py, a helper or a top-level package that shadows another), which a record
+    does not see. A module within a package under src/ is its importers' input alone, with its
+    package's other modules (`inputs`), and a test module is no other file's: so a train that loses a
+    head runs again only what that head's modules reached."""
     digest = hashlib.sha256(python.encode())
     for top in ("tests", "src"):
         for path in sorted(Path(top).rglob("*")):
             if not path.is_file() or "__pycache__" in path.parts:
                 continue
+            if path.suffix == ".py" and (top == "src" or path.name.startswith("test_")):
+                continue
             digest.update(str(path).encode())
             if path.suffix != ".py":
                 digest.update(hashlib.sha256(path.read_bytes()).digest())
-    for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files()}):
+    for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), "src"}):
         digest.update(name.encode() + contents(name))
     return digest.hexdigest()
 
@@ -226,12 +235,23 @@ def contents(name: str) -> bytes:
 
 
 def cache_key(common: str, name: str, depends: list[str]) -> str:
-    """The key of test file `name` whose run executed or read `depends` (executed.py): those files'
-    contents, those directories' entries, and `common`."""
+    """The key of test file `name` whose run executed or read `depends` (executed.py): its `inputs`'
+    contents, its directories' entries, and `common`."""
     digest = hashlib.sha256(common.encode())
-    for path in sorted({name, *depends}):
+    for path in inputs(name, depends):
         digest.update(path.encode() + contents(path))
     return digest.hexdigest()
+
+
+def inputs(name: str, depends: list[str]) -> list[str]:
+    """What test file `name`'s key covers, given that its run executed or read `depends`: those, and each
+    directory under src/ that holds a module it executed, however deep, whose entries name the modules an
+    import there finds: a module added beside one it imported (which shadows it, or which an import it
+    tried now finds), or an __init__.py added to a namespace package on the way to one, which executes
+    as the import passes, changes its key; one added to a package it never imported does not."""
+    packages = {str(parent) for path in depends if path.startswith("src/") and path.endswith(".py")
+                for parent in Path(path).parents if parent.parts[:1] == ("src",) and parent != Path("src")}
+    return sorted({name, *depends, *packages})
 
 
 def cpu_class() -> str:
@@ -607,9 +627,10 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         out.write_text(json.dumps({"rows": rows}))
         return 0
     executed_report = out.with_name(f"{out.name}.executed.json")
+    collection = out.with_name(f"{out.name}.collected.json")
     report = out.with_name(f"{out.name}.junit.xml")
-    report.unlink(missing_ok=True)
-    executed_report.unlink(missing_ok=True)
+    for stale in (report, executed_report, collection):
+        stale.unlink(missing_ok=True)
     grouping = ["-p", "split", f"--ci-group={split}"] if split else []
     # coverage.py follows the Python processes the tests start (pyproject.toml's patch), each writing
     # its data where COVERAGE_FILE says.
@@ -620,7 +641,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
     # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
     lines: list[str] = []
-    environment = session.pytest_environment({**environ, "DEW_EXECUTED": str(executed_report)})
+    environment = session.pytest_environment({**environ, "DEW_EXECUTED": str(executed_report),
+                                              "DEW_COLLECTED": str(collection)})
     done = child_groups.start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                               env=environment)
 
@@ -644,6 +666,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     reader.join(10)
     output = "".join(lines)
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
+    # How collection found each file: a file with no row is green only where every test it holds was set aside
+    # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
+    counts = json.loads(collection.read_text()) if collection.is_file() else {}
     ran = []
     own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if file_of(case) == name)
                    for name in tests}
@@ -658,15 +683,25 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                    f"{node.get('message')}" for case in own for node in case.iter("skipped")
                    if "could not import" in f"{node.get('message')} {node.text}"]
         # pytest exits 1 for failed tests and 5 for none collected; any other exit (a crash, a signal,
-        # an internal error) leaves even a written report untrustworthy, so every row it holds is red.
+        # an internal error) leaves even a written report untrustworthy, so every row it holds is red. A file
+        # whose every test the selection set aside has no report however pytest exits, another file's failure
+        # among the task's included.
+        counted = counts.get(name, {})
+        deselected = bool(counted) and counted["collected"] == counted["deselected"]
         exited = ([f"pytest exited {done.returncode}" + ("" if own else f" with no report of {name}")]
-                  if done.returncode not in (0, 1, 5) or (not own and done.returncode == 1) else [])
-        red += skipped + exited
+                  if done.returncode not in (0, 1, 5) or (not own and not deselected and done.returncode == 1)
+                  else [])
+        unaccounted = ([] if exited or (report.is_file() and (own or deselected))
+                       else [f"no evidence {name} ran: " + ("pytest wrote no report" if not report.is_file()
+                                                            else "pytest reported none of its tests, and its "
+                                                                 "collection shows them not all deselected")])
+        red += skipped + exited + unaccounted
         if expired:
             red.append(f"{INTERRUPTED} of {deadline:.0f} s and was interrupted")
         # A failed case with no class path is a file that did not collect, no test of it.
         nodes = sorted({node_of(case) for case, _, _ in failed if case.get("classname")})
-        whole = skipped or exited or not nodes or any(not case.get("classname") for case, _, _ in failed)
+        whole = skipped or exited or unaccounted or not nodes or any(not case.get("classname")
+                                                                      for case, _, _ in failed)
         cause = ({} if not red else red_as("deadline", []) if expired else red_as("whole", []) if whole
                  else red_as("nodes", nodes))
         seconds = shares[name]

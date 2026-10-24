@@ -225,8 +225,9 @@ class Decide:
         # the backbone would where the caller overrides the compute dtype.
         model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype))
         laid = records.record(settings.layout, "layout")
+        # A layout is plain data, its framing's template variables included: no field is a dtype.
         rows = from_record(_LAYOUTS[records.text(laid["name"], "layout.name")],
-                           records.json_value(laid["fields"], "layout.fields"))
+                           records.json_value(laid["fields"], "layout.fields"), dtypes=False)
         if settings.tokenizer is None:
             raise ValueError("the run records no tokenizer to lay its rows out with")
         processor = None if settings.processor is None else load_processor(settings.processor, backbone)
@@ -298,7 +299,7 @@ class Decide:
                  images: Sequence[Image.Image] = (), context: JSON | None = None) -> dict[str, Answer]:
         """Return one answer per question in `questions`, about `state` and any `images`.
 
-        Images need a layout with a place for them (`Layout.image`) and the
+        Images need a layout with a place for them (`Layout.images`) and the
         backbone's processor, as a joint-head release brings. `context` is a
         sequence the decision reads beside the state through the backbone's
         cross-attention (`Example.context`).
@@ -307,6 +308,16 @@ class Decide:
             return self._seen(state, questions, images, context)[0]
         return self.batch([(state, questions)], contexts=[context])[0][0]
 
+    def rows(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]], *,
+             contexts: Sequence[JSON | None] | None = None) -> list[list[Encoded]]:
+        """Each request's rows as `batch` scores them: its state and questions laid out, with its
+        context (`contexts`, in order, or None for none) beside them."""
+        contexts = [None] * len(requests) if contexts is None else list(contexts)
+        if len(contexts) != len(requests):
+            raise ValueError(f"{len(contexts)} contexts for {len(requests)} requests")
+        return [self._encoded(state, questions, context=context)
+                for (state, questions), context in zip(requests, contexts, strict=True)]
+
     def batch(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]], *,
               contexts: Sequence[JSON | None] | None = None) -> list[tuple[dict[str, Answer], Usage]]:
         """Return each request's answers and usage.
@@ -314,11 +325,7 @@ class Decide:
         The rows of every request are scored together within the budget. `contexts`
         holds each request's context, in order (`__call__`), or None for none.
         """
-        contexts = [None] * len(requests) if contexts is None else list(contexts)
-        if len(contexts) != len(requests):
-            raise ValueError(f"{len(contexts)} contexts for {len(requests)} requests")
-        return self._answered([self._encoded(state, questions, context=context)
-                               for (state, questions), context in zip(requests, contexts, strict=True)],
+        return self._answered(self.rows(requests, contexts=contexts),
                               [questions for _, questions in requests])
 
     def _answered(self, encoded: Sequence[Sequence[Encoded]], asked: Sequence[Mapping[str, Question]]
@@ -351,9 +358,9 @@ class Decide:
     def _shown(self, state: JSON, questions: Mapping[str, Question], images: Sequence[Image.Image],
                context: JSON | None = None) -> tuple[Encoded, Images]:
         """A request's one row with its images laid out before the state, and the images."""
-        if self.processor is None or self.layout.image is None:
+        if self.processor is None or not self.layout.images:
             raise ValueError("images need a backbone with a vision encoder, which this task does not have")
-        media = Images.of(self.processor, images, self.layout.image)
+        media = Images.of(self.processor, images, self.processor.image_text())
         rows = self._encoded(state, questions, media.tokens, context=context)
         if len(rows) != 1:
             raise ValueError("a request's images go in a layout of one row")
@@ -364,13 +371,15 @@ class Decide:
         """A request's answers and usage from its one row and images (`_shown`), by a pass of its own."""
         return self._replied(questions, [row], self._seen_pass([(row, media)]))
 
-    def _seen_pass(self, rows: Sequence[tuple[Encoded, Images]]) -> list[np.ndarray]:
+    def _seen_pass(self, rows: Sequence[tuple[Encoded, Images]],
+                   variables: Variables | None = None) -> list[np.ndarray]:
         """Each row's raw `[Q, K]` logits from one pass over rows that hold images, alike as
         `Images.joined` takes them (`seen_together`)."""
         assert self.processor is not None, "a row of images was laid out with the processor"
         encoded = [row for row, _ in rows]
         inputs = DecisionInputs.collate(encoded, self.specials.pad, context_length=self.context_length)
-        scores = np.asarray(self._forward(self.variables, inputs, media=Images.joined(self.processor, rows)))
+        held = self.variables if variables is None else variables
+        scores = np.asarray(self._forward(held, inputs, media=Images.joined(self.processor, rows)))
         return [scores[index, :len(row.questions)] for index, row in enumerate(encoded)]
 
     @property
@@ -423,12 +432,13 @@ class Decide:
             start = stop
         return [found[index] for index in range(len(rows))]
 
-    def scored(self, rows: Sequence[Encoded]) -> list[np.ndarray]:
-        """Each of `rows`' raw `[Q, K]` logits from one pass over them all, which `fits` allows."""
-        scores = self._pass(rows)
+    def scored(self, rows: Sequence[Encoded], variables: Variables | None = None) -> list[np.ndarray]:
+        """Each of `rows`' raw `[Q, K]` logits from one pass over them all, which `fits` allows, over
+        `variables` (the task's own by default)."""
+        scores = self._pass(rows, self.variables if variables is None else variables)
         return [scores[index, :len(row.questions)] for index, row in enumerate(rows)]
 
-    def _pass(self, rows: Sequence[Encoded]) -> np.ndarray:
+    def _pass(self, rows: Sequence[Encoded], variables: Variables | None = None) -> np.ndarray:
         """One forward pass at bucketed shapes, its rows placed on the
         weights' mesh (`RowPlan`)."""
         questions = max(len(row.questions) for row in rows)
@@ -444,8 +454,9 @@ class Decide:
             slots=None if inputs.slots is None else _widened(inputs.slots, length))
         count = shape_bucket(len(rows), 1)
         padded = RowPlan(None, len(rows), count, 0, 1).pad(inputs)
-        plan = RowPlan.over(mesh_of(self.variables), count)
-        return plan.host(self._forward(self.variables, plan.place(plan.pad(padded))))[:len(rows)]
+        held = self.variables if variables is None else variables
+        plan = RowPlan.over(mesh_of(held), count)
+        return plan.host(self._forward(held, plan.place(plan.pad(padded))))[:len(rows)]
 
     def _forward(self, variables: Variables, inputs: DecisionInputs, *,
                  media: ModelInputs | None = None) -> jax.Array:
@@ -741,11 +752,12 @@ class WireScoring(scoring.Scoring[Mapping[str, object], _Row, _Admitted, np.ndar
                 and all(seen[0].alike(media) for media in seen) and self.decide.fits(encoded))
 
     def forward(self, variables: Variables, rows: Sequence[_Row]) -> list[np.ndarray]:
-        # The server chose these rows as one pass (`fits`), so they run as one.
-        decide = replace(self.decide, variables=variables)
+        # The server chose these rows as one pass (`fits`), so they run as one, over the weights it
+        # hands the pass; the task's compiled forwards are kept across passes.
         if rows[0].media is None:
-            return decide.scored([row.encoded for row in rows])
-        return decide._seen_pass([(row.encoded, row.media) for row in rows if row.media is not None])
+            return self.decide.scored([row.encoded for row in rows], variables)
+        return self.decide._seen_pass([(row.encoded, row.media) for row in rows if row.media is not None],
+                                      variables)
 
     def answer(self, payload: _Admitted, outputs: Sequence[np.ndarray]) -> dict[str, JSON]:
         return self.decide._wire_response(payload.questions,

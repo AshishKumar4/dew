@@ -113,15 +113,16 @@ Measured on an H100 at qwen3-8b and gpt-oss-20b shapes, 4k and 32k tokens, the a
 The update is `S' = T·S·E + W`, with the transitions as values.
 
 **Functions.**
-- `decays(g, resets) -> pairs`: difference-first within a sub-chunk of 16, factored across sub-chunks. The factorization is chosen statically from the decay parameterization's declared range bound, because it is exact only within fp32's exponent range.
+- `decays(g, resets) -> pairs`: the log decay cumulated as a compensated pair (hi, lo), and each pair of positions' decay the exponential of its difference's two halves, each: an exponent rounded to one fp32 loses up to half its ulp, which put the decay's and the write gate's gradients under aligned keys 1.6 to 2.1 times the reference's distance from float64. A kernel takes a base-2 exponent as its fraction's exp2 times its integer's exact power of two (`recurrence_algebra.raised`, `decayed`). The decay from a chunk's start takes both halves too. No factoring across sub-chunks: the KDA port's factored intra backward put the decay gradient at its -5 floor 468 times the reference's.
 - `intra(q, k, beta, pairs, erase=(a, b)) -> (A_kk, A_qk)`, one pass for both the solve and the readout. Untied erase vectors (RWKV7, GDN-2, Comba) are `erase=(a, b)`; tied ones pass k twice. `pairs` carries the value side too, for two-sided decay (GLA value gates), and `carry` and `readout` apply E.
 - `factor(A_kk) -> L`: the triangular factorization (WY/UT). It is statically skipped for identity-inverse families (SSD, GLA, RetNet), which skip only the inverse, not their writes.
 - `normalize(o, groups)`: Mamba2's grouped output norm across heads. It is a cross-head reduction, so it is algebra, not a hook.
 - `apply(L, k, v, beta, g) -> (W, U)`: W = L·(kβ·exp(g)) and U = L·(vβ), as fla_gdn's `_w_u_kernel` computes them. Changing v changes U and not L.
-- `carry(S, W, U) -> (S', v_new)`.
-- `readout(q, S, A_qk, v_new) -> o`.
+- `carry(S, W, U) -> (S', v_new)`, the chunk's last real token's write by the token update itself (the WY write alone put the final memory under aligned keys 1.54 to 1.57 times the reference's distance).
+- `readout(q, S, A_qk, v_new) -> o`, whose gradient in the memory and the corrected values sums the chunk's tokens from its last, the smallest terms first (`remembered`): from the first, the initial memory's gradient sat 1.8 to 1.9 times the reference's.
 - `compose`: a chunk's transition as the factored triple (T, E, W), composed associatively by (T₂T₁, E₁E₂, T₂W₁E₂ + W₂). It serves sequence and context parallelism and parallel state passing at small B·H. Its cost comes from its actual products: T₂T₁, E₁E₂, T₂W₁ and its product with E₂, the write addition, and their bytes. Where transitions or writes are diagonal or low-rank, the factors simplify. Compose is used only where that cost measures below the sequential carry.
-- Each function's backward, with its rounding and order stated: the decay's summed-back gradient, and the GVA sum as an in-program loop.
+- Each function's backward, with its rounding and order stated: the delta rule's is the recurrence's own adjoint a token at a time within every chunk at once (memories checkpointed every 16 tokens, chunks in groups of 16), where differentiating the WY products cancelled independently rounded paths under aligned keys (the decay's gradient 1.9 to 2.9 times the reference's, now 0.99 to 1.07); the GVA sum as an in-program loop.
+- The chunk length: at most twice the keys' width (`held_chunk`), a measured policy (64-token chunks of 16-wide keys lost 1.7 to 1.8 times over a long sequence).
 
 **Transition values:**
 - T in two parts, in a stated order: the diagonal decay kind (none, scalar, per-key, per-value, two-sided, separable) times the erase kind (identity plus low rank, or additive DPLR). It has independent erase, write and read vectors.
@@ -394,7 +395,7 @@ Built in parallel. Each piece lands when it meets its gates: the accuracy gate (
 
 **Then the rungs:**
 - **Toolkit and attention:** sm90 attention reaching Tokamax Mosaic, then FA3; the decode mainloop; the fused ticket backward. The sm90 mainloop (`attention_mosaic.py`) holds the forward (full and causal calls, 16-bit operands, the fold and fp16's natural form, no hooks yet) and the backward in both forms (bf16, from the Triton training forward's split sums), both on par by check 1, interpreted and on an H100; on an H100 at llama-d128, causal bf16, 2 × 4096, its backward takes 2.63 ms in the fast form and 4.81 in the accurate one, against the Triton mainloop's 2.96 and 5.06 in the same session. It runs on no route yet: its forward's guards, hooks, the remaining call forms and its training forward come next.
-- **Recurrence:** the one chunk algebra absorbing the four ports, then FlashQLA's fused launch DAG and `compose`.
+- **Recurrence:** one Mosaic GPU mainloop skeleton over the chunk algebra for every variant (GDN, KDA, the delta rule, gated writes, SSD), on the mma.sync and wgmma Family bundles, keeping the ports' optimizations (the fused solve, the launch DAG, chunk sizing); then FlashQLA's fused launch DAG and `compose`. The four ports (`fla_gdn`, `fla_kda`, `mamba_ssd`, the TPU `ssd`) are frozen references until each cell matches or beats them.
 - **GEMM and the choice layer:** the M-split, register-A cooperative mainloop and the reduce pass before norm and SwiGLU fusion, then split-K for dW, then CUTLASS's rungs; the analytic features, the logging and the ranker.
 
 GPU time is reserved daily on an H100 and an A100 for the rungs.
@@ -566,6 +567,29 @@ Later decisions (2026-10-22 and 2026-10-23), which §0 states as the design; whe
 | 50 | check 1 and check 2 for every form and hook, bf16 included | gate |
 | 51 | bitwise reproducible runs | the same-schedule reproducibility test |
 
+#### Survey additions (FlagAttention, fla and tokamax)
+
+Variants these libraries ship that rows 1–51 did not name, each against the design's signatures. Sources: FlagAttention's `conf/operators.yaml`, fla's `fla/layers` and `fla/ops`, and tokamax's `docs/supported_ops.md`.
+
+| # | Variant | Maps to | Signature | Notes |
+|---|---|---|---|---|
+| 52 | Forgetting Transformer (FoX): a per-head forget gate `f = sigmoid(W·x)`, logits `+ G_i − G_j` with `G = cumsum(log f)` | score hook | QUERY param `G_q`, KEY param `G_k` (the prefix sum taken in XLA before the call), `modify`: `s + G_q − G_k` | The prefix sum is a cross-token reduction, so it stays outside the kernel; the backward's QUERY and KEY gradients (rows 13, 39) are the prefix sum's cotangents, which XLA transposes. Comparators: fla `forgetting_attn`, FlagAttention `forgetting_attention` (its ACP pruning threshold is a block-skip on `G`, a structure question). arXiv 2503.02130. |
+| 53 | Differential attention: `softmax(Q1K1ᵀ) − λ·softmax(Q2K2ᵀ)`, `λ` a head's scalar | algebra: two softmax states | two score products a step, each its own `Partial` (its own maximum and denominator) over one V tile load; `finish` combines `o1 − λ·o2`, `λ` a HEAD param; the backward runs each state's `grad_scores` with its own D and sums their dV | ⚑ The design's step holds one softmax state. Two independent states over one V stream need the state declared as a list; the cheaper route is two calls composed in XLA (each the template), at twice V's loads. Not in the three libraries; from arXiv 2410.05258. |
+| 54 | Parallax: a second, unscaled query `r`, `p2 = p1 ∘ (r·kᵀ)`, `out = O1/d1·(1 + d2/d1) − O2/d1` | algebra: one softmax state, two accumulators | two score products a step (`q·kᵀ` for the weights, `r·kᵀ` for the second sums), one maximum and denominator, two weighted-value accumulators and two denominators, combined in `finish` | ⚑ As row 16a, a step's score products declared as a list; here the second feeds an accumulator, not the logits. Comparators: fla `parallax`, FlagAttention `parallel_parallax` and its decode forms. arXiv 2605.29157. |
+| 55 | Wall attention: a learned per-channel decay inside the product, `s_ij = scale·Σ_n q_in·k_jn·2^(P_in − P_jn)`, `P = cumsum(g)`, `g ≤ 0` | Q and K prologues | `q̃ = q·2^(P_i − P_ref)`, `k̃ = k·2^(P_ref − P_j)` with `P_ref` a reference per (query block, key block) tile, so neither factor leaves fp32's range; then a plain product | ⚑ A per-tile reference makes the prologue a function of the tile pair, not of one operand: a product declaration with per-tile row and column scales (the mechanism of row 46a's block scales, per channel). Optional sink (row 17) and a head's output gate (row 21). Comparators: fla `wall_attn`, FlagAttention `parallel_wall_attn`. |
+| 56 | PaTH attention: positions as cumulative Householder products, `s_ij = q_iᵀ·(Π_{t=j+1..i} (I − β_t w_t w_tᵀ))·k_j` | structure: a carried key transform | the walk goes from the diagonal backward over key blocks, carrying the product of the Householder updates between the key block and the query block and applying it to each key tile before its score product; within the diagonal tile, the triangular part by the UT transform | ⚑ Not a hook: the transform depends on the (query, key) pair. It needs a key-tile prologue whose operator the walk carries (a low-rank update per block, the recurrence template's transition, §App. B). Optional FoX gate (row 52). Comparator: fla `path_attn`. arXiv 2505.16381. |
+| 57 | Stick-breaking attention: no softmax, `β_ij = sigmoid(s_ij)`, `A_ij = β_ij·Π_{j<k≤i} (1 − β_ik)`, `o = Σ A·v` | algebra: a state other than softmax's | the walk goes from the diagonal backward, its state the row's log remainder `Σ log(1 − β)` and the weighted values; `merge` of a nearer slice before a farther one scales the farther by the nearer's remainder (ordered, associative) | ⚑ A second state type beside `Partial`, and a reverse walk order. Comparator: fla `stickbreaking_attn` (fp16/bf16, no decode). arXiv 2410.17980. |
+| 58 | Relative-position logits by offset (FlagAttention's Inkling FA4 `rel_logits [q, H, extent]`) | score hook, a new parameter kind | a RELATIVE param kind `[H, extent]` (or per query) read at `k_pos − q_pos` in `modify`; its backward a scatter-add over offsets | ⚑ `Kind` has no offset-indexed form; TILE would materialize `[Q, K]`. Paged varlen, causal or window, split-KV: rows 3, 27, 29, 31. |
+| 59 | MiniMax Sparse Attention (MSA): a learned token indexer max-pooled to blocks, top-k blocks per GQA group plus a forced local block | structure + a scoring pass | as row 37a: the indexer pass (the GEMM template and XLA's `top_k`), then the indexed form over the selected blocks per group | Group-granular selection, so the design's block lists hold it (unlike DSA's tokens, row 35). Source: fla `ops/dsa` README. arXiv 2606.13392. |
+| 60 | InfLLM-V2: keys pooled by two sliding windows into block scores, top-64 blocks per query with the first and local blocks forced; dense below 8192 keys | structure + a scoring pass | as row 59, the pooling and scoring in XLA, then the indexed form; the dense path is the plain call | Selection takes no gradient. Comparator: FlagAttention `infllmv2_attention`. |
+| 61 | Compress and Attend (CAT): causal within a query's local block plus the compressed positions (`kv % block == 0`) | structure: two key sources | the local part as spans (row 3), the compressed keys as a second call over the compressed K/V, the two states merged (`merge`, row 19) | A strided key set is not spans; two sources merged keep each one plain. Comparator: fla `models/cat` (FlexAttention block masks). arXiv 2511.05313. |
+| 62 | Total attention: `Σ_q P[q, k]`, the probability each key receives over the queries, returned beside the output | a key-major pass | the dK/dV program's walk (keys resident, query tiles streamed) over the forward's maxima and denominators, summing the normalized weights per key | The forward can't form it: each weight needs its row's final denominator. Comparator: FlagAttention `return_total_attention`. |
+| 63 | MLA over a sliding window of a paged latent cache, returning partial accumulators (tokamax `mla_swa`) | composition | rows 25, 3, 27, and the partial state out (row 19) for the merge with the sparse part | |
+| 64 | Block-mask sparse prefill with FP8 operands (FlagAttention's Hy3) | structure + product declaration | a caller's block mask as the indexed block lists, rows 45 and 46 for the operands | The mask's density buckets are the scheduler's. |
+| 65 | KV sharing across layers: YOCO's cross-decoder layers, Gemma 3n/4's shared caches | consumer contract | a layer attends over another layer's cache, read only: the K/V source is a cache it does not write (prefill and decode, rows 27 and 30), its spans that cache's | No new math; the contract is that a call's K/V may be a cache another layer owns, which the work list's per-item K/V source (row 33) already allows. Comparator: fla `yoco`. arXiv 2405.05254. |
+
+Not attention variants, so in other templates: BitAttention changes the projections (the GEMM template's 1.58-bit weights), not attention; tokamax's DeepSeek-V4 compressor writes the cache. DeltaFormer and log-linear attention are Appendix B's (§App. B, C-class).
+
 ### Table 2: consumer → op map
 
 The template enters each Op as one `Kernel('template', TEMPLATE_SUPPORTS)`. Its refusals are typed Requirements with rows; nothing raises untyped.
@@ -648,6 +672,8 @@ Each ⚑ in the tables above is closed by the matching item below.
 
 Notation: `S' = T·S·E + W` with S of shape K×V per value head. "Values" are §3's transition values, "hooks" are §4's traced callables, "structure" is §5's, and "DAG" is §6's mainloop parameter (fused/split solve; sequential/parallel carry). A row the design's signatures cannot express is marked **⚠ signature**.
 
+Every family below runs on one Mosaic mainloop skeleton per overlap structure (§6), its Family bundle per architecture, the math only in the chunk algebra. The ports a row names (`fla_gdn`, `fla_kda`, `mamba_ssd`, the TPU `ssd`, `short_conv`) stay production routes and speed references, unmaintained, until the row's cell on each family matches or beats them in time and memory with the gate passing; a deletion below happens in that head. Progress is the coverage matrix (§0): rows these families and consumers, columns sm80, sm90 and TPU.
+
 ### Table 1: families → template
 
 | Family (models) | Transition values | Hooks (kind) | Structure | DAG / mainloop | Signatures it exercises | Status |
@@ -669,7 +695,7 @@ Notation: `S' = T·S·E + W` with S of shape K×V per value head. "Values" are �
 | Decode (T=1, all R rows) | the same transition values | the same hooks, inlined (today's `recurrence.step`) | paused rows (`active`), conv history, bf16 state rounding | decode mainloop: one launch per token | definitional token update | covered (exists) |
 | Sequence/context parallel, chunked prefill | — | — | shard boundaries | `compose` (the design) | compose over (T, E, W) | covered; for the delta rule T is K×K dense — cost measured per §3 |
 
-### Table 2: consumers → op, contracts to keep, deletion enabled
+### Table 2: consumers → op, contracts to keep, deletion enabled (when the row's cells meet the port)
 
 | Consumer (today) | Op it becomes | Contracts it must keep | Deletion it enables |
 |---|---|---|---|
