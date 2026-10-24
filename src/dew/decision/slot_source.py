@@ -14,6 +14,7 @@ from dew import records
 from dew.data.text import HFTokenizer
 from dew.interop.composite import CompositeSource, HeadComponent, NativeComponent, SourceKind
 from dew.interop.pretrained import Pretrained
+from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.objectives.base import Variables
 from dew.registry import dtype_name, from_record, import_path, to_record
 
@@ -33,7 +34,7 @@ from .layout import (
 )
 from .model import DecisionModel
 from .sources import PretrainedDecision
-
+from .task import DecideSettings
 
 SLOT_SYSTEM = ("Apply the question to the state. Choose exactly one of the listed options. Respond with only "
                "its uppercase letter, with no explanation or reasoning.")
@@ -77,7 +78,7 @@ class SlotHeadSource(HeadComponent):
         held = records.record(self.record, "head")
         fields = dict(records.record(held["fields"], "head.fields"))
         if self.initialize is not None:
-            labels = records.listed(fields["label_ids"], "label_ids", read=records.integer)
+            labels = records.integers(fields["label_ids"], "label_ids")
             if shapes is None:
                 fields["slot_rows"] = len(labels)
             else:
@@ -94,6 +95,43 @@ class SlotHeadSource(HeadComponent):
 
 class SlotSource(SourceKind):
     """Readout metadata beside a native decoder, with the release's prompt as a layout value."""
+
+    @staticmethod
+    def save(bundle: PretrainedDecision, directory: str | Path, *,
+             max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
+        """Write the held native backbone and the release's readout, without loading the source again."""
+        head = records.record(bundle.head.record(), "head")
+        fields = records.record(head["fields"], "head.fields")
+        names = {import_path(LabelReadout): "slot_lm", import_path(SlotReadout): "head"}
+        mode = names.get(records.text(head["name"], "head.name"))
+        if mode is None or fields.get("untied", False):
+            raise ValueError("the slot format holds its tied label readout or its slot-and-pointer head")
+        settings = DecideSettings.of(records.record(bundle.settings, "decision settings"))
+        if not isinstance(settings.layout, QuestionLayout) or settings.layout.labels is None:
+            raise ValueError("the slot format needs its whole-question layout")
+        labels = settings.layout.labels
+        expected = SlotSource.layout(max_len=settings.layout.max_len, labels=labels,
+                                     blocks=settings.layout.blocks)
+        if settings.layout != expected or from_record(Calibration, bundle.calibration) != Calibration():
+            raise ValueError("the slot format holds its release prompt and uncalibrated logits")
+        ids = records.listed(fields["label_ids"], "label_ids", read=lambda value, _: value,
+                             what="a list of label ids")
+        count = records.integer(fields.get("slot_rows") or len(ids), "slot_rows")
+        readout = {"readout": mode, "head_dim": fields.get("head_dim", 256), "n_slots": count}
+        if settings.layout.blocks:
+            readout["attention"] = "noncausal"
+        root = Path(directory)
+        Pretrained.save(bundle, root, max_shard_size=max_shard_size)
+        bundle.decision_tokenizer.save_pretrained(root)
+        if mode == "head":
+            import torch
+
+            cpu = jax.local_devices(backend="cpu")[0]
+            params = bundle.head_variables["params"]
+            tensors = {name: torch.from_dlpack(jax.device_put(params[path[0]], cpu))
+                       for name in ("slot", "q.weight", "k.weight") if (path := _path(name)) is not None}
+            torch.save(tensors, root / "readout_head.pt")
+        (root / "readout.json").write_text(json.dumps(readout, indent=2) + "\n")
 
     @staticmethod
     def layout(*, max_len: int = 32768, keep: Literal["start", "end", "all"] = "all",

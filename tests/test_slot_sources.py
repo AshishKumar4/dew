@@ -11,7 +11,6 @@ import pytest
 from dew.decision import Choice, Decide
 from dew.interop import Pretrained
 
-
 BACKBONE = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
 
 
@@ -51,7 +50,7 @@ def test_a_slot_release_loads_its_readout_and_exports_the_same_task(tmp_path, re
     else:
         assert not jax.tree.leaves(bundle.head_variables)
     exported = tmp_path / "exported"
-    task.save_pretrained(exported)
+    bundle.save(exported)
     restored = Decide.from_pretrained(exported, dtype="float32", attention_impl="xla")
     assert restored.layout.rows(restored.tokenizer, restored.specials, "Refund requested.",
                                 {"team": Choice("Which team?", ["billing", "technical"])}) == [row]

@@ -68,7 +68,12 @@ class PretrainedDecision(Pretrained):
     def save(self, directory: str | Path, *, variables: Mapping[str, object] | None = None,
              max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
         bundle = self if variables is None else dataclasses.replace(self, variables=dict(variables))
-        Decide.of(bundle).save_pretrained(directory, max_shard_size=max_shard_size)
+        if self.head.reads_labels:
+            from .slot_source import SlotSource
+
+            SlotSource.save(bundle, directory, max_shard_size=max_shard_size)
+        else:
+            Decide.of(bundle).save_pretrained(directory, max_shard_size=max_shard_size)
 
     @classmethod
     def from_components(cls, backbone: Pretrained, head: Head, head_variables: Variables,

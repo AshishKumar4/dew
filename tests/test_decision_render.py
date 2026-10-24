@@ -7,6 +7,7 @@ answer at its last token, and its state cut only where its segments say."""
 
 import json
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
