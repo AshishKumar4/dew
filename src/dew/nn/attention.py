@@ -1328,7 +1328,7 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
         # 1533): a 1 / (1 - rate) rounded to bf16 first biases every kept weight.
         wide = at_least_fp32(dtype)
         draw = dropout_draw(dropout_seed, dropout_rate, weights.shape)
-        weights = (weights.astype(wide) * draw).astype(dtype)
+        weights = (weights.astype(wide) * draw.astype(wide)).astype(dtype)
     if sinks is None:
         return weighted_values('...hqk,...khd->...qhd', weights, value, precision=precision)
     if kv_heads == 1:

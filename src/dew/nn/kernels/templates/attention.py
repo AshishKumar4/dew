@@ -343,7 +343,8 @@ class Draw:
         for part in (self.seed[1], self.row, self.head, queries):
             word = fmix32(word ^ jnp.asarray(part).astype(jnp.uint32))
         bits = fmix32(word ^ jnp.asarray(keys).astype(jnp.uint32))
-        return jnp.where(bits >= jnp.uint32(int(self.rate * 2 ** 32)), self.bound, 0.0)
+        kept = bits >= jnp.uint32(int(self.rate * 2 ** 32))
+        return jnp.where(kept, jnp.float32(self.bound), jnp.float32(0.0))
 
 
 @jax.tree_util.register_dataclass
