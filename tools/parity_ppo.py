@@ -40,12 +40,13 @@ def main() -> None:
     import jax
 
     native = import_module("test_ppo")
+    support = import_module("episode_support")
     trainer, rollout = native.build_ppo()
     state = trainer.initial_state()
-    episodes = rollout.episodes.collect(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
+    episodes = support.collect(rollout.episodes, state)
     # verl reads one left-padded [prompt | response] row per call; rebuild that
     # layout from the actions and read Dew's packed critic values into it.
-    packed = rollout.episodes.project(episodes)
+    packed = rollout.rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
     packed_values = np.asarray(rollout.objective.values(state.variables, packed))
     turns, width = native.TURNS, native.PROMPT + native.RESPONSE
     batch = {"input_ids": np.zeros((len(episodes) * turns, width), np.int32),
@@ -56,7 +57,7 @@ def main() -> None:
         for turn, transition in enumerate(episode.transitions):
             action, row = transition.action, index * turns + turn
             count = len(action.tokens)
-            batch["input_ids"][row, native.PROMPT - len(action.context):native.PROMPT] = action.context
+            batch["input_ids"][row, native.PROMPT - len(action.prompt):native.PROMPT] = action.prompt
             batch["input_ids"][row, native.PROMPT:native.PROMPT + count] = action.tokens
             batch["response_mask"][row, :count] = 1
             batch["old_log_probs"][row, :count] = action.raw_log_probs
