@@ -258,9 +258,10 @@ def rows_alone(decide, batch):
     return np.concatenate(logits), grads
 
 
-PACKING_SEEDS = {"joint": 8, "marker": 8, "parallel": 16, "flash": 8}
-"""Check 1's declared seeds for each arm's packed window, sized by `seeds_for` (2026-10-21, on armada;
-the flash arm's on an A100)."""
+PACKING_SEEDS = {"joint": 128, "marker": 256, "parallel": 256, "flash": 8}
+"""Check 1's declared seeds for each arm's packed window, sized paired (`seeds_for` with the packed window
+as `dew_fn`) on an A100, where the joint arm took 128, the marker and parallel arms 256 (node receipts
+SF-a100-packing-seeds), against 16, 8 and 8 on armada; the flash arm's on an A100."""
 
 
 def assert_rows_decided_alone(objective, wide_modules, seeds: int, held=lambda path: True) -> None:
