@@ -225,7 +225,7 @@ def aligned(model: nn.Module, scores: jax.Array,
         opens |= valid & ~jnp.concatenate([jnp.zeros_like(valid[:, :1]), valid[:, :-1]], axis=1)
     if documents is not None:
         changes = documents[:, 1:] != documents[:, :-1]
-        opens |= jnp.concatenate([jnp.ones_like(changes[:, :1]), changes], axis=1)
+        opens |= jnp.concatenate([jnp.ones_like(documents[:, :1], bool), changes], axis=1)
     return jnp.where(opens.reshape(opens.shape + (1,) * (scores.ndim - 2)), scores, before)
 
 
