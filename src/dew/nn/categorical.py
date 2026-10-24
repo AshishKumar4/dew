@@ -23,6 +23,7 @@ import functools
 import jax
 import jax.numpy as jnp
 import optax
+from jax.custom_derivatives import SymbolicZero
 
 from dew.nn.precision import at_least_fp32
 
@@ -73,8 +74,38 @@ def _label_loss_tangent(primals, tangents):
 
 def soft_cross_entropy(logits: jax.Array, targets: jax.Array, where: jax.Array | None = None) -> jax.Array:
     """`-sum_k t_k log p_k` over the last axis against the distribution `targets`, a class of no target
-    mass contributing nothing, whatever its log probability."""
-    return -jnp.sum(jnp.where(targets > 0, targets * log_probs(logits, where), 0.0), axis=-1)
+    mass contributing nothing, whatever its log probability. Its derivative in `logits`, `p T - t` for
+    target mass `T`, is `p (T - t) - t (1 - p)`, the most probable class's `1 - p` the other classes'
+    probability summed: a label's confident one-hot target keeps it as `cross_entropy` does
+    (arXiv:2610.31642, eq. 7), where `p - t` rounds to 0."""
+    return _soft_loss(widened(logits, where), targets)
+
+
+def _soft_value(logits: jax.Array, targets: jax.Array) -> jax.Array:
+    return -jnp.sum(jnp.where(targets > 0, targets * jax.nn.log_softmax(logits, axis=-1), 0.0), axis=-1)
+
+
+@jax.custom_jvp
+def _soft_loss(logits: jax.Array, targets: jax.Array) -> jax.Array:
+    return _soft_value(logits, targets)
+
+
+@functools.partial(_soft_loss.defjvp, symbolic_zeros=True)
+def _soft_loss_tangent(primals, tangents):
+    logits, targets = primals
+    d_logits, d_targets = tangents
+    value = _soft_value(logits, targets)
+    tangent = jnp.zeros_like(value)
+    if not isinstance(d_targets, SymbolicZero):
+        tangent = jax.jvp(lambda targets: _soft_value(logits, targets), (targets,), (d_targets,))[1]
+    if isinstance(d_logits, SymbolicZero):
+        return value, tangent
+    probability = jax.nn.softmax(logits, axis=-1)
+    top = jax.nn.one_hot(jnp.argmax(probability, axis=-1), logits.shape[-1], dtype=bool)
+    rest = jnp.where(top, jnp.sum(jnp.where(top, 0.0, probability), axis=-1, keepdims=True), 1 - probability)
+    mass = jnp.where(targets > 0, targets, 0).astype(probability.dtype)
+    derivative = probability * (mass.sum(axis=-1, keepdims=True) - mass) - mass * rest
+    return value, tangent + jnp.sum(derivative * d_logits, axis=-1)
 
 
 def kl_divergence(logits: jax.Array, reference: jax.Array, where: jax.Array | None = None) -> jax.Array:
@@ -85,47 +116,65 @@ def kl_divergence(logits: jax.Array, reference: jax.Array, where: jax.Array | No
     Gnanapragasam and Tschannen take it (arXiv:2610.31642, eq. 9), not by subtracting two softmaxes
     (eq. 8), which near each other keep only their own rounding: logits equal to the reference's have
     derivative exactly zero, and near them it keeps the difference's precision. A row where a class is
-    -inf in one and not the other takes `p - q`; the derivative in `reference` is autodiff's."""
-    held = jnp.ones(logits.shape, bool) if where is None else where
-    return _divergence(widened(logits, where), widened(reference, where), held, where is not None)
+    -inf in one and not the other takes `p - q`, a row holding no class 0; the derivative in
+    `reference` is autodiff's."""
+    return _divergence(widened(logits, where), widened(reference, where), where)
 
 
-def _divergence_value(logits: jax.Array, reference: jax.Array, where: jax.Array, masked: bool) -> jax.Array:
+def _divergence_value(logits: jax.Array, reference: jax.Array, where: jax.Array | None) -> jax.Array:
     log_p, q = jax.nn.log_softmax(logits, axis=-1), jax.nn.softmax(reference, axis=-1)
-    if not masked:
+    if where is None:
         return optax.kl_divergence(log_p, q)
     # An excluded class enters Optax's sum as log 1 against a log probability of 0, so neither its value
     # nor its gradient meets 0 * inf.
     return optax.kl_divergence(jnp.where(where, log_p, 0.0), jnp.where(where, q, 1.0), where=where)
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(3,))
-def _divergence(logits: jax.Array, reference: jax.Array, where: jax.Array, masked: bool) -> jax.Array:
-    return _divergence_value(logits, reference, where, masked)
+@jax.custom_jvp
+def _divergence(logits: jax.Array, reference: jax.Array, where: jax.Array | None) -> jax.Array:
+    return _divergence_value(logits, reference, where)
 
 
-@_divergence.defjvp
-def _divergence_tangent(masked, primals, tangents):
+@functools.partial(_divergence.defjvp, symbolic_zeros=True)
+def _divergence_tangent(primals, tangents):
     logits, reference, where = primals
     d_logits, d_reference, _ = tangents
-    value, moved = jax.jvp(lambda reference: _divergence_value(logits, reference, where, masked),
-                           (reference,), (d_reference,))
-    return value, moved + jnp.sum(_divergence_derivative(logits, reference) * d_logits, axis=-1)
+    value = _divergence_value(logits, reference, where)
+    tangent = jnp.zeros_like(value)
+    if not isinstance(d_reference, SymbolicZero):
+        tangent = jax.jvp(lambda reference: _divergence_value(logits, reference, where), (reference,),
+                          (d_reference,))[1]
+    if isinstance(d_logits, SymbolicZero):
+        return value, tangent
+    return value, tangent + jnp.sum(_divergence_derivative(logits, reference) * d_logits, axis=-1)
 
 
 def _divergence_derivative(logits: jax.Array, reference: jax.Array) -> jax.Array:
     """`p - q` over the last axis, `p` the softmax of `logits`, `q` of `reference`, from their difference
-    `delta` (arXiv:2610.31642, eq. 9, its `p` here `q` and its `q` here `p`): `d`, `delta` less its mean
-    under `q`; `s = log(p / q)`, `d` less `log1p` of `q`'s mean of `expm1(d)`; `u = q expm1(s)`; and
-    `u` less `p` times its sum, which makes the derivative sum to zero."""
-    log_q = jax.nn.log_softmax(reference, axis=-1)
-    q, p = jnp.exp(log_q), jax.nn.softmax(logits, axis=-1)
+    (arXiv:2610.31642, eq. 9, its `p` here `q` and its `q` here `p`): `delta`, the rows' difference, each
+    row first moved to its own largest held logit, which neither softmax reads, so finite rows never
+    overflow it; `d`, `delta` less its mean under `q`; `s = log(p / q)`, `d` less the log of `q`'s mean
+    of `exp(d)`, through `log1p` of the mean of `expm1(d)` where every `d` is small and as a log-sum-exp
+    where one is not; `u = q expm1(s)`; and `u` less `p` times its sum, which makes the derivative sum to
+    zero."""
+    empty = jnp.all(jnp.isneginf(logits) & jnp.isneginf(reference), axis=-1, keepdims=True)
+    logits, reference = jnp.where(empty, 0.0, logits), jnp.where(empty, 0.0, reference)
     both = jnp.isfinite(logits) & jnp.isfinite(reference)
     alike = jnp.all(both | (jnp.isneginf(logits) & jnp.isneginf(reference)), axis=-1, keepdims=True)
-    delta = jnp.where(both, logits - reference, 0.0)
+
+    def moved(row: jax.Array) -> jax.Array:
+        top = jnp.max(jnp.where(both, row, -jnp.inf), axis=-1, keepdims=True)
+        return jnp.where(both, row - jnp.where(jnp.isfinite(top), top, 0.0), 0.0)
+
+    log_q = jax.nn.log_softmax(reference, axis=-1)
+    q, p = jnp.exp(log_q), jax.nn.softmax(logits, axis=-1)
+    delta = moved(logits) - moved(reference)
     d = delta - jnp.sum(q * delta, axis=-1, keepdims=True)
-    s = d - jnp.log1p(jnp.sum(_scaled_expm1(q, log_q, d), axis=-1, keepdims=True))
-    u = _scaled_expm1(q, log_q, s)
+    near = jnp.max(d, axis=-1, keepdims=True) < 1
+    small, large = jnp.where(near, d, 0.0), jnp.where(near, 0.0, d)
+    normalizer = jnp.where(near, jnp.log1p(jnp.sum(q * jnp.expm1(small), axis=-1, keepdims=True)),
+                           jax.nn.logsumexp(log_q + large, axis=-1, keepdims=True))
+    u = _scaled_expm1(q, log_q, d - normalizer)
     return jnp.where(alike, u - p * jnp.sum(u, axis=-1, keepdims=True), p - q)
 
 
