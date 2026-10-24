@@ -217,10 +217,12 @@ def fp8_tangents(x, forward, forward_scale, dgrad, dgrad_scale, direction):
 
 
 def decoded_tangents(x, forward, forward_scale, dgrad, dgrad_scale, direction):
-    """The reference arm: the dequantized product (`dequantized_products`) and the direction times the
-    decoded forward rows, each code times its row's scale, multiplied in float32 by XLA."""
-    value, _ = dequantized_products(x, forward, forward_scale, dgrad, dgrad_scale, direction)
+    """The reference arm: the dequantized forward product (`dequantized_products`) and the direction
+    times the decoded forward rows, each code times its row's scale, multiplied in float32 by XLA."""
+    codes, scales = fp8_block_cast(x, (1, x.shape[1]))
     rows = forward.astype(jnp.float32) * forward_scale
+    value = jnp.dot(codes.astype(jnp.float32) * scales, rows.T, precision=jax.lax.Precision.HIGHEST,
+                    preferred_element_type=jnp.float32)
     return value, jnp.dot(direction.astype(jnp.float32), rows.T, precision=jax.lax.Precision.HIGHEST,
                           preferred_element_type=jnp.float32)
 
@@ -228,8 +230,9 @@ def decoded_tangents(x, forward, forward_scale, dgrad, dgrad_scale, direction):
 def exact_tangents(x, forward, forward_scale, dgrad, dgrad_scale, direction):
     """The float64 product of the cast rows (`exact_products`) and the direction times the decoded
     forward rows in float64."""
-    value, _ = exact_products(x, forward, forward_scale, dgrad, dgrad_scale, direction)
-    return value, np.asarray(direction, np.float64) @ exactly(forward, forward_scale).T
+    codes, scales = quantize_fp8_blocks(np.asarray(x, np.float32), (1, x.shape[1]))
+    rows = exactly(forward, forward_scale)
+    return exactly(codes, scales) @ rows.T, np.asarray(direction, np.float64) @ rows.T
 
 
 def test_the_frozen_product_in_forward_mode_is_the_decoded_kernels_tangent():
@@ -274,8 +277,9 @@ def test_meanflow_trains_an_adapter_over_an_fp8_base():
     fp8_base = InputQuantization(frozen_fp8=named, measured_on=device_generation())
     adapter = LoRA(rank=2, modules=("up_proj",)).apply(model, variables, key=1, fp8_base=fp8_base)
     assert set(sites(adapter)) == set(named)
+    # The objective's tree is the adapter's beside the condition encoders' own.
     objective = MeanFlowObjective(adapter.model, presets.MeanFlow()(), inputs, ema_decay=None,
-                                  variables=adapter.variables)
+                                  variables={**plain.init(jax.random.key(0)), **adapter.variables})
     tree = objective.init(jax.random.key(0))
     batch = {"image": np.asarray(jax.random.randint(jax.random.key(1), (4, 4, 4, 3), 0, 256), np.uint8),
              **inputs.tokenize(["a", "b", "c", "d"])}
