@@ -1,4 +1,4 @@
-"""One renderer of decision rows (`dew.decision.render`, docs/design/decision-render.md): a row's
+"""One renderer of decision rows (`dew.decision.renderer`, docs/design/decision-render.md): a row's
 chunks encoded piece by piece or whole, each mark's tokens the ones that overlap its characters, a
 token across two marks both's; and a published slot release's prompt as a layout value
 (`QuestionLayout(segments=...)`), its rows the release's own text and ids (qev/prompt.py at OneJev
@@ -25,7 +25,7 @@ from dew.decision.layout import (
     State,
     Text,
 )
-from dew.decision.render import Chunk, render
+from dew.decision.renderer import Chunk, render
 
 QWEN = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
 """Qwen3.5's ChatML template, with its thinking switch, over a tiny vocabulary of bytes and Qwen's
@@ -57,11 +57,7 @@ def release(*, max_len: int = 32768, keep: Literal["start", "end", "all"] = "all
         framing=Framing(system=SLOT_SYSTEM, prefill="", thinking=False),
         segments=(Text("<state>\n"), State(render="state", keep=keep), Text("\n</state>\n\n"),
                   Instructions({"choice": "Question: {}", "noul": "Question: {}",
-                                "score": "Rate the state: {}"}, render="entry",
-                               defaults={"choice": "Which option applies to the state?",
-                                         "score": "Which level describes the state?",
-                                         "noul": ("Is the statement true, or is the answer to the question "
-                                                  "yes?")}),
+                                "score": "Rate the state: {}"}, render="entry"),
                   Text("\n\nOptions:\n"),
                   OptionLines(criteria={"true": "the statement is true / the answer is yes",
                                         "false": "the statement is false / the answer is no"}),
@@ -210,28 +206,49 @@ def test_a_token_across_two_marks_belongs_to_both():
     assert apart.marks == {"one": (0, 1), "two": (1, 2)}
 
 
-def test_a_row_past_its_length_cuts_its_state_where_its_segments_say(qwen):
+def cutting(keep: Literal["start", "end"], unit: Literal["pieces", "whole"], room: int) -> QuestionLayout:
+    layout = release()
+    segments = tuple(State(render="state", keep=keep) if isinstance(segment, State) else segment
+                     for segment in layout.segments or ())
+    return QuestionLayout(max_len=room, labels=layout.labels, unit=unit, framing=layout.framing,
+                          segments=segments)
+
+
+@pytest.mark.parametrize("unit", ["whole", "pieces"])
+@pytest.mark.parametrize("keep", ["start", "end"])
+def test_a_row_past_its_length_cuts_its_state_where_its_segments_say(qwen, keep, unit):
     """The release never cuts its state: a row past its length does not fit (`fits`). A layout whose
-    state keeps its start cuts the state's end at its own token boundaries to the longest that fits,
-    the row encoded whole, and its options and cue whole."""
-    long = " ".join(["refund"] * 200)
+    state keeps its start (or its end) keeps the longest prefix (or suffix) that fits, its options and
+    cue whole. Over a vocabulary of bytes with room for 40 more tokens and a two-byte character
+    across the 40th: encoded whole, the cut falls at the state's own token boundaries, so it keeps the
+    39 characters before the character, never half of it; piece by piece the state is its own piece,
+    cut at its ids, its first (or last) 40 kept."""
+    refunds = " ".join(["refund"] * 200)
+    long = "a" * 39 + "é" + refunds if keep == "start" else refunds + "é" + "b" * 39
     [empty] = release().rows(qwen, SPECIALS, "", {"team": TEAM})
     room = len(empty.tokens) + 40
     [whole] = release(max_len=room).rows(qwen, SPECIALS, long, {"team": TEAM})
     assert not release(max_len=room).fits(whole)
-    cutting = release(max_len=room, keep="start")
-    [cut] = cutting.rows(qwen, SPECIALS, long, {"team": TEAM})
-    assert cutting.fits(cut) and cut.state_kept < cut.state_tokens
+    layout = cutting(keep, unit, room)
+    [cut] = layout.rows(qwen, SPECIALS, long, {"team": TEAM})
+    assert layout.fits(cut) and cut.state_tokens == len(qwen.encode(long, add_special_tokens=False))
     text = qwen.decode(list(cut.tokens))
-    assert "<state>\nrefund refund" in text and "Answer with one letter: A, B, C." in text
-    [longer] = release(max_len=len(cut.tokens) + 8, keep="start").rows(qwen, SPECIALS, long, {"team": TEAM})
-    assert longer.state_kept >= cut.state_kept
+    assert "Answer with one letter: A, B, C." in text
+    if unit == "whole":
+        kept = text[text.index("<state>\n") + len("<state>\n"):text.index("\n</state>")]
+        assert kept == ("a" * 39 if keep == "start" else "b" * 39) and cut.state_kept == 39
+    else:
+        ids = qwen.encode(long, add_special_tokens=False)
+        own = ids[:40] if keep == "start" else ids[-40:]
+        tokens = list(cut.tokens)
+        assert cut.state_kept == 40 and any(tokens[at:at + 40] == own for at in range(len(tokens)))
 
 
 def test_a_framing_carries_its_marks_through_a_trimming_template_and_refuses_one_that_rewrites(qwen):
     """A template that trims the user's turn holds its content trimmed: the marks move with it, each
-    option's span still its line's tokens. One that rewrites the content has no character map to it
-    and is refused."""
+    option's span still its line's tokens, a state of whitespace alone trimmed away with no span of
+    its own; one that keeps the content as written keeps every span its full length, the last
+    option's too. One that rewrites the content has no character map to it and is refused."""
     trimming = ("{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content | trim }}"
                 "<|im_end|>\n{% endfor %}<|im_start|>assistant\n")
     layout = release()
@@ -244,11 +261,38 @@ def test_a_framing_carries_its_marks_through_a_trimming_template_and_refuses_one
     assert "<|im_start|>user\n<state>" in prompt
     [laid] = row.questions
     assert list(laid.options) == [overlapping(qwen, prompt, line) for line in lines_of(prompt, 3)]
+    question_first = tuple(segment for segment in layout.segments or ()
+                           if not isinstance(segment, (State, Text)))
+    trailing = QuestionLayout(max_len=layout.max_len, labels=layout.labels, unit="whole",
+                              framing=spaced.framing,
+                              segments=(question_first[0], Text("\n\nOptions:\n"), question_first[1],
+                                        Text("\n\n"), question_first[2], Text("\n"), State(render="state")))
+    [blank] = trailing.rows(qwen, SPECIALS, "   ", {"team": TEAM})
+    shown = qwen.decode(list(blank.tokens))
+    assert "Answer with one letter: A, B, C.<|im_end|>" in shown
+    assert list(blank.questions[0].options) == [overlapping(qwen, shown, line) for line in lines_of(shown, 3)]
+    verbatim = trimming.replace("message.content | trim", "message.content")
+    padded = QuestionLayout(max_len=layout.max_len, labels=layout.labels, unit="whole",
+                            framing=Framing(system=SLOT_SYSTEM, prefill="", thinking=None,
+                                            chat_template=verbatim),
+                            segments=(Text("  "), *(layout.segments or ()), Text("\n")))
+    [row] = padded.rows(qwen, SPECIALS, STATE, {"team": TEAM})
+    prompt = qwen.decode(list(row.tokens))
+    assert list(row.questions[0].options) == [overlapping(qwen, prompt, line) for line in lines_of(prompt, 3)]
     rewriting = trimming.replace("message.content | trim", "message.content | upper")
     with pytest.raises(ValueError):
         QuestionLayout(max_len=layout.max_len, labels=layout.labels, unit="whole", segments=layout.segments,
                        framing=Framing(system=SLOT_SYSTEM, prefill="", thinking=None,
                                        chat_template=rewriting)).rows(qwen, SPECIALS, STATE, {"team": TEAM})
+
+
+def test_the_renderer_is_its_own_module_beside_the_value_renderer():
+    """`dew.decision.renderer` is the row renderer, and `dew.decision.render` still renders a value."""
+    import dew.decision
+    import dew.decision.renderer as renderer
+
+    assert renderer.render is render and callable(dew.decision.render)
+    assert dew.decision.render({"a": 1}) != renderer.__name__
 
 
 def test_a_whole_row_over_a_vocabulary_without_offsets_is_refused():

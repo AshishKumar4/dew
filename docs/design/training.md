@@ -59,7 +59,7 @@ A readout reads a row's labels only where they are its own, its first as many as
 
 ### A question row written by segments
 
-A question layout given `segments` writes its rows from values rather than its own text (`dew.decision.render`, docs/design/decision-render.md): `Text`, the request's `State` (how it renders, `render`, and what a cut keeps of it, `keep`: its start, its end, or all of it), the question's `Instructions` under a header of its kind, its `OptionLines` (each option one line under its label, the line its span), and an `AnswerCue`. `framing` makes the text a conversation's user turn, and `unit` says how the text is encoded:
+A question layout given `segments` writes its rows from values rather than its own text (`dew.decision.renderer`, docs/design/decision-render.md): `Text`, the request's `State` (how it renders, `render`, and what a cut keeps of it, `keep`: its start, its end, or all of it), the question's `Instructions` under a header of its kind, its `OptionLines` (each option one line under its label, the line its span), and an `AnswerCue`. `framing` makes the text a conversation's user turn, and `unit` says how the text is encoded:
 
 - `pieces` encodes each piece alone, as a release that encodes its prompt piece by piece does.
 - `whole` encodes the turn once, as a release that encodes its whole prompt does, locating each span by the tokenizer's character offsets (`Tokenizer.offsets`; a slow tokenizer keeps none and is refused): a span takes every token that overlaps its characters. The framing renders the turn with its own content through the chat template, which holds it as written or trimmed; a template that rewrites it otherwise is refused.
