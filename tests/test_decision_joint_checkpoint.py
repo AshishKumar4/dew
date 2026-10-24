@@ -46,6 +46,33 @@ BACKBONE = FIXTURES / "hf" / "qwen38-dense-tiny"
 CASES = json.loads((FIXTURES / "laya" / "cases.json").read_text())
 
 
+def test_a_shapes_only_readout_load_avoids_eager_native_buffers(monkeypatch):
+    """The standalone joint readout needs no backbone: its shapes-only load retains every
+    parameter's geometry while allocating fewer native-layout buffers than its eager load."""
+    expected = Pretrained.load(TINY, dtype="float32", attention_impl="xla", on_host=True)
+    allocated = []
+    allocate = np.empty
+
+    def recording(*args, **kwargs):
+        array = allocate(*args, **kwargs)
+        allocated.append(array.nbytes)
+        return array
+
+    with monkeypatch.context() as patch:
+        patch.setattr(np, "empty", recording)
+        Pretrained.load(TINY, dtype="float32", attention_impl="xla", on_host=True)
+        eager_bytes = sum(allocated)
+        allocated.clear()
+        loaded = Pretrained.load(TINY, dtype="float32", attention_impl="xla", weights=False)
+        deferred_bytes = sum(allocated)
+    assert eager_bytes > 0 and deferred_bytes < eager_bytes
+    assert jax.tree.structure(loaded.variables) == jax.tree.structure(expected.variables)
+    for actual, wanted in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(expected.variables),
+                              strict=True):
+        assert isinstance(actual, jax.ShapeDtypeStruct)
+        assert actual.shape == wanted.shape and actual.dtype == wanted.dtype
+
+
 @pytest.fixture(scope="module")
 def tokenizer() -> HFTokenizer:
     return HFTokenizer(str(BACKBONE), local_files_only=True)
