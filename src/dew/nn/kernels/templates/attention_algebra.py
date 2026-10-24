@@ -470,6 +470,13 @@ def tile(state: Partial, alpha: jax.Array, p: jax.Array, largest: Callable[[], j
     return held.weights, alpha, held
 
 
+def denominator_after(total: jax.Array, factor: jax.Array, p: jax.Array, held: Room | None = None
+                      ) -> jax.Array:
+    """A row's denominator after a tile: the state's taken by `factor` (`carry_factor`) and the tile's
+    weights `p` added at the row's shift (`beyond_weights`)."""
+    return carry_factor(total, factor, held) + beyond_weights(p.sum(axis=-1), held)
+
+
 def stepped(state: Partial, m: jax.Array, factor: jax.Array, p: jax.Array, product: jax.Array,
             held: Room | None, times: Callable[[jax.Array], jax.Array]) -> Partial:
     """The state after a tile: its sums taken by `factor` (`carry_factor`) and the tile's `product` of its
@@ -477,7 +484,7 @@ def stepped(state: Partial, m: jax.Array, factor: jax.Array, p: jax.Array, produ
     unshifted weights' product, which the mainloop issues as `times` of them (their product with the
     tile's values), kept unshifted (`Guard.plain`); the plain walk's arithmetic where `held` is None,
     which issues no other product."""
-    denominator = carry_factor(state.total, factor, held) + beyond_weights(p.sum(axis=-1), held)
+    denominator = denominator_after(state.total, factor, p, held)
     acc = carry_factor(state.acc, factor, held) + beyond_weights(product, held)
     if held is None:
         return Partial(acc, m, denominator)
@@ -748,8 +755,7 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     m, factor, p, value, held = _softmax(spec, state, keys)
     if held is None and keys.accumulate is not None:
         keys.accumulate(lambda acc: carry_factor(acc, factor, None), narrow(p, value.dtype), value)
-        denominator = carry_factor(state.total, factor, None) + beyond_weights(p.sum(axis=-1), None)
-        return Partial(state.acc, m, denominator)
+        return Partial(state.acc, m, denominator_after(state.total, factor, p))
     times = functools.partial(_times, keys.dot, value)
     return stepped(state, m, factor, p, times(p), held, times)
 
@@ -873,14 +879,30 @@ def split_accumulate(others: jax.Array, own: jax.Array, others_total: jax.Array,
     keys add their `product` and their narrowed weights `rest`. So neither is summed with a key's weight
     cancelled out of it. On the guarded walk the tile's product, sum and own weight take the row's shift
     past its weights' (`beyond_weights`)."""
+    taken = split_taken(others, own, alpha, moved, old_value, held)
+    own, total = split_rows(own, others_total, alpha, moved, rest, own_tile, held)
+    return taken + beyond_weights(product, held), own, total
+
+
+def split_taken(others: jax.Array, own: jax.Array, alpha: jax.Array, moved: jax.Array, old_value: jax.Array,
+                held: Room | None = None) -> jax.Array:
+    """`split_accumulate`'s split sums before the tile's product joins them: where the anchor moved, the
+    old anchor's term (its weight `own` before the tile, times its value row `old_value`) joined, then taken
+    to the new maximum by `alpha`. A mainloop that accumulates the product in place applies this to its
+    accumulator first."""
     old = old_value.astype(jnp.float32)
     joined = jnp.where(expand(moved, old), expand(own, old) * old, 0.0)
+    return carry_factor(others + joined, alpha, held)
+
+
+def split_rows(own: jax.Array, others_total: jax.Array, alpha: jax.Array, moved: jax.Array, rest: jax.Array,
+               own_tile: jax.Array, held: Room | None = None) -> tuple[jax.Array, jax.Array]:
+    """`split_accumulate`'s row sums after a tile: the anchor's own weight (the tile's where the anchor
+    moved to it), and the other keys' weights' sum, the old anchor's weight joining it where it moved."""
     total = (carry_factor(others_total + jnp.where(moved, own, 0.0), alpha, held)
              + beyond_weights(rest.astype(jnp.float32).sum(axis=-1), held))
     own_tile = beyond_weights(own_tile.astype(jnp.float32), held)
-    product = beyond_weights(product, held)
-    return (carry_factor(others + joined, alpha, held) + product,
-            jnp.where(moved, own_tile, carry_factor(own, alpha, held)), total)
+    return jnp.where(moved, own_tile, carry_factor(own, alpha, held)), total
 
 
 SMALL_SHIFT = 63

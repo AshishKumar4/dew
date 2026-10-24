@@ -19,13 +19,7 @@ from test_attention_template import CASES, ROWS, arguments, geometry as core_geo
 from test_attention_triton import BACKWARD_SEEDS, HOOKS, SCORE_HOOKS, gate_of, hooks_for, score_hooks
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import (
-    attention as template,
-    attention_mosaic,
-    attention_triton,
-    mosaic,
-    mosaic_sm90,
-)
+from dew.nn.kernels.templates import attention as template, attention_mosaic, mosaic, mosaic_sm90
 
 pytestmark = pytest.mark.kernel
 
@@ -94,14 +88,19 @@ def _family(interpret: bool) -> mosaic.Family | None:
 
 
 def _check_forward(call: str, dtype, shape, *, natural: bool, interpret: bool, width: int = 128,
-                   value_width: int = 128, tiles: attention_mosaic.Tiles | None = None):
-    """The forward over the call form `call` of `shape`, its query and key heads `width` wide and its value
-    heads `value_width`, at `tiles` (the forward's default when None)."""
+                   value_width: int = 128, tiles: attention_mosaic.Tiles | None = None,
+                   training: bool = False):
+    """The forward, or with `training` the training forward's output, over the call form `call` of `shape`,
+    its query and key heads `width` wide and its value heads `value_width`, at `tiles` (the default when
+    None)."""
     spans = template.spans(shape[1], shape[1], shape[0], **CALLS[call])
     draw = _drawn(shape, dtype, width=width, value_width=value_width)
 
     def ours(query, key, value, dout):
         del dout
+        if training:
+            return attention_mosaic.training(query, key, value, spans, natural=natural, tiles=tiles,
+                                             interpret=interpret, family=_family(interpret))[0]
         return attention_mosaic.forward(query, key, value, spans, natural=natural, tiles=tiles,
                                         interpret=interpret, family=_family(interpret))
 
@@ -110,8 +109,8 @@ def _check_forward(call: str, dtype, shape, *, natural: bool, interpret: bool, w
         return template.reference(query, key, value, spans)
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
-                    f"mosaic forward {call} {jnp.dtype(dtype).name} natural {natural} widths {width} "
-                    f"{value_width}", seeds=SEEDS)
+                    f"mosaic {'training ' if training else ''}forward {call} {jnp.dtype(dtype).name} "
+                    f"natural {natural} widths {width} {value_width}", seeds=SEEDS)
 
 
 def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool, backward: bool = False,
@@ -141,8 +140,10 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
         if not backward:
             return attention_mosaic.forward(query, key, value, spans, hooks, natural=natural,
                                             tiles=FORM_TILES, interpret=interpret, family=_family(interpret))
-        residuals = attention_triton.forward(query, key, value, spans, hooks, residuals=True,
-                                             interpret=interpret)[1:]
+        # The backward from this mainloop's own training forward's residuals.
+        residuals = attention_mosaic.training(query, key, value, spans, hooks, natural=natural,
+                                              tiles=FORM_TILES, interpret=interpret,
+                                              family=_family(interpret))[1:]
         grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
                                           accurate=accurate, fused=fused, tiles=FORM_TILES,
                                           interpret=interpret, family=_family(interpret))
@@ -205,8 +206,8 @@ def _check_backward(call: str, shape, *, accurate: bool, interpret: bool, keys: 
     draw = _drawn(shape, jnp.bfloat16, keys=keys)
 
     def ours(query, key, value, dout):
-        residuals = attention_triton.forward(query, key, value, spans, residuals=True,
-                                             interpret=interpret)[1:]
+        residuals = attention_mosaic.training(query, key, value, spans, interpret=interpret,
+                                              family=_family(interpret))[1:]
         grads = attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals,
                                           accurate=accurate, fused=fused, interpret=interpret,
                                           family=_family(interpret))
@@ -226,6 +227,24 @@ def _check_backward(call: str, shape, *, accurate: bool, interpret: bool, keys: 
 def test_the_forward_is_on_par_interpreted(call, dtype):
     """The forward, the base-2 fold, under Mosaic GPU's interpreter."""
     _check_forward(call, dtype, SHAPES["interpreted"], natural=False, interpret=True)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
+@pytest.mark.parametrize("call", CALLS)
+def test_the_training_forward_is_on_par_interpreted(call, natural):
+    """The training forward's output, bf16, under Mosaic GPU's interpreter: the weighted values it
+    normalizes are its split sums joined with the anchor's term (`algebra.split_output`), the anchor's value
+    row the one it kept; its residuals are the backward sites' (`_check_backward`)."""
+    _check_forward(call, jnp.bfloat16, SHAPES["interpreted"], natural=natural, interpret=True, training=True)
+
+
+@ON_HOPPER
+@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
+@pytest.mark.parametrize("call", CALLS)
+def test_the_training_forward_is_on_par_on_an_h100(call):
+    """The training forward's output, bf16, compiled on an H100."""
+    _check_forward(call, jnp.bfloat16, SHAPES["compiled"], natural=False, interpret=False, training=True)
 
 
 @INTERPRETS
@@ -283,7 +302,8 @@ def test_padding_rows_reach_no_hook_gradient_interpreted(accurate):
 
     params = (jnp.ones((1, 1, 1), jnp.float32), jnp.zeros((1,), jnp.float32))
     hooks = hooked(*params)
-    residuals = attention_triton.forward(query, key, value, spans, hooks, residuals=True, interpret=True)[1:]
+    residuals = attention_mosaic.training(query, key, value, spans, hooks, interpret=True,
+                                          family=mosaic_sm90.WGMMA)[1:]
     grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
                                       accurate=accurate, interpret=True, family=mosaic_sm90.WGMMA)
     _, pull = jax.vjp(lambda q, k, v, t, b: template.reference(q, k, v, spans, hooked(t, b)), query, key,
