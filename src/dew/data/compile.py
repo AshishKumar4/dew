@@ -1015,7 +1015,8 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
 
 def _finite(lowering: _Lowering) -> _Lowering:
     """A non-repeated diagnostic pass without training's implicit root repeats."""
-    return dataclasses.replace(lowering, endless=False, repeated=True, epochs=1,
+    return dataclasses.replace(lowering, parts_unending=False, unending=False, records_unending=False,
+                               onward=False, rooted=False, repeated=True, epochs=1,
                                children=tuple(_finite(child) for child in lowering.children))
 
 

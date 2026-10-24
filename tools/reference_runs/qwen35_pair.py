@@ -128,7 +128,8 @@ def arguments(argv=None):
 
 def run(args) -> int:
     """Fresh child processes release their device memory before their partner starts."""
-    from common import git_head, host, write_record
+    from common import host, write_record
+    from reference_source import git_head
 
     root = Path.cwd().resolve()
     args.out = args.out.resolve()

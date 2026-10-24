@@ -669,7 +669,7 @@ def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
     """Return the learning rate stored in `opt_state`, if the optimizer stores one.
 
     An OptimConfig's solver holds a rate scale and the schedule's value at
-    the last applied update (`dew.training.optim.scaled_solver`), whose
+    the last applied update (`dew.optim.scaled_solver`), whose
     product is the rate; an Optax optimizer can inject `learning_rate`
     itself (`optax.inject_hyperparams`). The result is None when the
     optimizer closes over the rate, or when parameter groups hold several
@@ -774,7 +774,7 @@ class ParamGroup:
 
     def rate(self, learning_rate: float | ScheduleBase) -> tuple[float, ScheduleBase | None]:
         """This group's rate scale and shape (`scaled`): its own `schedule`,
-        else the config's `learning_rate`, times `learning_rate_multiplier`."""
+        else the config's `rate`, times `learning_rate_multiplier`."""
         scale, shape = scaled(learning_rate if self.schedule is None else self.schedule)
         return scale * self.learning_rate_multiplier, shape
 

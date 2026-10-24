@@ -16,7 +16,7 @@ from collections.abc import Mapping
 from flax.traverse_util import flatten_dict
 
 from dew import records
-from dew.interop.config_records import NativeFields, native_fields
+from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
@@ -38,11 +38,10 @@ from dew.interop.decoder_parts import (
     specified_layer_types,
     translated,
 )
-from dew.interop.families.deepseek import deepseek_config, deepseek_layout, deepseek_mixture
+from dew.interop.families.deepseek import LAYOUT_FIELDS, deepseek_config, deepseek_mixture
 from dew.interop.families.qwen import single_prediction_depth
 from dew.interop.safetensors_io import LazyTensors
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.dsa_kpool import KPoolSparseAttentionMixer
 from dew.nn.hyper_connections import HyperConnections
@@ -121,31 +120,12 @@ def _glm5_mixture(hf_config: Mapping[str, object], used: set[str],
     if (not isinstance(schedule, (list, tuple)) or len(schedule) != layers
             or any(kind not in ('dense', 'sparse') for kind in schedule)):
         refuse('mlp_layer_types', 'one dense or sparse entry per layer is required')
-    for key, expected in (('scoring_func', 'sigmoid'), ('topk_method', 'noaux_tc')):
-        if hf_config.get(key, expected) != expected:
-            refuse(key, f'GLM5 uses {expected}')
-    norm_topk = hf_config.get('norm_topk_prob', True)
-    if not isinstance(norm_topk, bool):
-        refuse('norm_topk_prob', 'expected a boolean')
     routed = tuple(index for index, kind in enumerate(schedule) if kind == 'sparse')
-    mixture: MixtureFields | None = None
-    if routed:
-        geometry = deepseek_layout(hf_config, layers, used, sparse_layers=routed)
-        mixture = NativeFields(Mixture, {
-            **geometry,
-            "score_function": "sigmoid",
-            "bias": True,
-            "norm_topk_prob": norm_topk,
-            "groups": record_int({"n_group": hf_config.get("n_group") or 1}, "n_group"),
-            "groups_per_token": record_int({"topk_group": hf_config.get("topk_group") or 1}, "topk_group"),
-        })
-    else:
-        used.update(('n_routed_experts', 'num_local_experts', 'num_experts_per_tok',
-                     'routed_scaling_factor', 'n_group', 'topk_group', 'n_shared_experts',
-                     'moe_intermediate_size', 'first_k_dense_replace', 'moe_layer_freq',
-                     'mlp_layer_types', 'aux_loss_alpha', 'seq_aux'))
-    used.update(('scoring_func', 'topk_method', 'norm_topk_prob'))
-    return mixture, routed
+    if not routed:
+        # A stack that routes no layer computes nothing its router's fields describe.
+        used.update((*LAYOUT_FIELDS, 'scoring_func', 'topk_method', 'norm_topk_prob'))
+        return None, routed
+    return deepseek_mixture(hf_config, layers, used, sparse_layers=routed, reads_norm_topk=True), routed
 
 
 def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -159,8 +139,7 @@ def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
     than dropped.
     """
     layers = record_int(hf_config, 'num_hidden_layers')
-    types = specified_layer_types(hf_config, used, tuple(
-        'deepseek_sparse_attention' if i % 4 == 3 else 'linear_attention' for i in range(layers)))
+    types = specified_layer_types(hf_config, used, ('linear_attention',) * 3 + ('deepseek_sparse_attention',))
     types = tuple('full_attention' if kind == 'deepseek_sparse_attention' else kind for kind in types)
     if len(types) != layers or set(types) - {'linear_attention', 'full_attention'}:
         refuse('layer_types', 'one linear_attention or deepseek_sparse_attention entry per layer')
@@ -242,10 +221,6 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
             refuse(f'kinds.{kind_name}.mixer', 'GLM5 requires KDA or k-pool attention respectively')
     mixture = model.mixture
     routed = model.sparse_layers
-    if model.num_nextn_predict_layers and (
-        "full_attention" not in types or model.num_layers - 1 not in routed
-    ):
-        refuse('num_nextn_predict_layers', 'the source NextN depth requires a routed NoPE block')
     fields: dict[str, object] = {
         'layer_types': ['deepseek_sparse_attention' if kind == 'full_attention' else kind for kind in types],
         'mlp_layer_types': ['sparse' if index in routed else 'dense' for index in range(model.num_layers)],
