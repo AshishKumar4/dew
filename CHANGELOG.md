@@ -5,6 +5,13 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- Data plans are read by version 6 and cache generations by schema 2: a stream's
+  shards are named by their files' places, which the same files mounted at
+  another path keep, so a streamed cache fill serves there; and arrays are
+  fingerprinted by their dtypes' names, so float8, int4 and other types of one
+  byte layout no longer collide. A data position saved under plan version 5 is
+  refused, and a generation or fill segment of schema 1 is refused as stale:
+  fill the cache again.
 - A joint decision row's user turn is composed of segments, `JointLayout.segments`, a tuple of
   `Text`, `Media`, `State` and `Schema` in the order the row writes them: the default is the Laya
   joint release's turn, and another writes the schema before the state, or text of its own

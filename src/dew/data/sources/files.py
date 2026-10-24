@@ -321,17 +321,27 @@ class Files(Dataset):
         return (self.index,) if self.index else tuple(self._index_url(url) for url in self.paths)
 
     @cached_property
+    def _resolved(self) -> tuple[tuple[str, AbstractFileSystem, str], ...]:
+        """Each file and length index, by URL, with the filesystem and path it resolves to."""
+        return tuple((url, *Store(url, self.storage_options).resolve())
+                     for url in (*self.paths, *self._indexes))
+
+    @cached_property
+    def _places(self) -> Mapping[str, str]:
+        """Each file's place, by URL, which the files' fingerprint and their shards' ids name it by: where
+        a committed export places it (`export_place`), a local copy's path under the files' common
+        directory, so hosts that mounted one dataset at different paths name it alike, else its URL."""
+        root = _mount_root([path for _, fs, path in self._resolved if local(fs)])
+        places = self._export_places
+        return {url: places.get(url) or (posixpath.relpath(path, root) if local(fs) else url)
+                for url, fs, path in self._resolved}
+
+    @cached_property
     def _file_facts(self) -> tuple[tuple[str, Mapping[str, object]], ...]:
         files = []
-        indexes = self._indexes
-        indexed = set(indexes)
-        resolved = [(url, *Store(url, self.storage_options).resolve()) for url in (*self.paths, *indexes)]
-        # Local copies are named by their place under the files' common directory and their
-        # content, so hosts that mounted one dataset at different paths name it alike.
-        root = _mount_root([path for _, fs, path in resolved if local(fs)])
-        # A committed export's files, here or remote, are named where it places them (`export_place`).
-        places = self._export_places
-        for url, fs, path in resolved:
+        indexed = set(self._indexes)
+        # Local copies are named by their place (`_places`) and their content.
+        for url, fs, path in self._resolved:
             if url in indexed and not self._present(url):
                 continue
             metadata = self._header(url)
@@ -356,7 +366,7 @@ class Files(Dataset):
                 version = fs.ukey(path)
             files.append(
                 (url, {
-                    "uri": places.get(url) or (posixpath.relpath(path, root) if local(fs) else url),
+                    "uri": self._places[url],
                     "bytes": metadata["size"],
                     "version": version,
                 })
@@ -560,15 +570,15 @@ class Files(Dataset):
             located = [Readable(*store.resolve(), None) for store in stores]
         filesystem = _arrow_filesystem(located[0].fs)
         paths = tuple(filesystem.normalize_path(place.path) for place in located)
-        names = {path: store.resolve()[1] for path, store in zip(paths, stores, strict=True)}
+        names = dict(zip(paths, self.paths, strict=True))
         roots = [place.root for place in located if place.root is not None]
         base = posixpath.commonpath(roots) if len(roots) == len(located) else None
         return filesystem, paths, names, base
 
     def _shard_name(self, path: str) -> str:
-        """The name of the file Arrow reads at `path` where the file is,
-        whichever copy Arrow reads it from (`_arrow_files`)."""
-        return self._arrow_files[2][path]
+        """The place of the file Arrow reads at `path` (`_places`), whichever copy Arrow reads it from
+        (`_arrow_files`), which its shards' ids are made of."""
+        return self._places[self._arrow_files[2][path]]
 
     @cached_property
     def arrow(self) -> ds.Dataset:
@@ -592,6 +602,8 @@ class Files(Dataset):
         )
 
     def manifest(self) -> ShardManifest:
+        """The files' shards, each named by its file's place (`_places`) and where in it it starts, so a
+        fill keyed by a shard's rows finds them wherever the files are mounted."""
         shards = []
         if self.kind in ("parquet", "arrow"):
             for number, fragment in enumerate(self.fragments):
@@ -599,19 +611,19 @@ class Files(Dataset):
                 name = self._shard_name(fragment.path)
                 shards.append(Shard(f"{name}:{number}", name, number, number + 1, rows))
         elif self.kind == "array_record":
-            shards.extend(Shard(url, url) for url in self.paths)
+            shards.extend(Shard(self._places[url], url) for url in self.paths)
         else:
             for url in self.paths:
                 size = integer(self._header(url)["size"], "file bytes")
                 if infer_compression(url.lower()) is not None:
                     # Compressed bytes cannot be cut at logical record offsets.
-                    shards.append(Shard(f"{url}:0", url))
+                    shards.append(Shard(f"{self._places[url]}:0", url))
                     continue
                 step = self.shard_bytes if self.kind in ("jsonl", "text") else max(size, 1)
                 if step < 1:
                     raise ValueError("file shard_bytes must be positive")
                 shards.extend(
-                    Shard(f"{url}:{start}", url, start, min(start + step, size))
+                    Shard(f"{self._places[url]}:{start}", url, start, min(start + step, size))
                     for start in range(0, size, step)
                 )
         return ShardManifest(tuple(shards), self._read_shard)

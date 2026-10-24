@@ -1177,10 +1177,9 @@ def test_a_fill_whose_spool_drops_its_last_shard_reads_on_and_publishes_nothing(
 
 
 def test_a_streamed_generation_serves_its_files_at_another_mount(tmp_path):
-    """A streamed generation names its inputs by the shards of the files where they were filled;
-    the same files mounted elsewhere are the same key, whose shards run their steps and write
-    nothing, so the key holds its inputs under the first mount's names alone and a packing plan
-    publishes onto it there."""
+    """A streamed generation names its inputs by their files' places, which the same files mounted
+    elsewhere keep: a read at the second mount is the same key and finds every input the first filled,
+    and a packing plan publishes onto it there."""
     import shutil
 
     from dew.data.compile import iterate, publish
@@ -1201,7 +1200,8 @@ def test_a_streamed_generation_serves_its_files_at_another_mount(tmp_path):
 
     cache = Cache(str(tmp_path / "cache"))
     generation = publish(chunked(first), cache, read="streamed")
-    assert pieces(chunked(second).cache(cache)) == pieces(chunked(second))
+    assert publish(chunked(second), cache, read="streamed").url == generation.url
+    assert pieces(chunked(second).cache(generation)) == pieces(chunked(second))
     assert publish(chunked(first).pack(4, bins=2), cache, read="streamed").url != generation.url
 
 
@@ -1688,10 +1688,10 @@ def test_stacked_holdouts_over_a_generation_pick_the_inputs_they_pick_uncached(o
         assert held_out(_tagged(part).cache(generation)) == held_out(_tagged(part))
 
 
-def test_a_generation_a_stream_filled_from_files_mounted_elsewhere_is_refused_under_a_holdout(tmp_path):
-    """The same files mounted at another path read as the store the generation was published from, but
-    a stream names its inputs by where it read their shards, so under a holdout the generation can't
-    place them there, and is refused rather than read as no rows; at its own mount it serves."""
+def test_a_generation_a_stream_filled_from_files_mounted_elsewhere_serves_under_a_holdout(tmp_path):
+    """The same files mounted at another path read as the store the generation was published from, and
+    a stream names its inputs by their files' places, which they keep there: under a holdout the
+    generation serves each part the rows the chain reads uncached, at either mount."""
     import shutil
 
     import pyarrow as pa
@@ -1706,11 +1706,27 @@ def test_a_generation_a_stream_filled_from_files_mounted_elsewhere_is_refused_un
     shutil.copytree(tmp_path / "a", tmp_path / "b")
     generation = publish(_tagged(Pipeline(Files(str(tmp_path / "a"), format="parquet"))), _cache(),
                          read="streamed")
-    here, _ = Pipeline(Files(str(tmp_path / "a"), format="parquet")).holdout(0.25)
-    assert _tags(_tagged(here).cache(generation), "streamed") == _tags(_tagged(here), "streamed")
-    elsewhere, _ = Pipeline(Files(str(tmp_path / "b"), format="parquet")).holdout(0.25)
+    for mount in ("a", "b"):
+        part, _ = Pipeline(Files(str(tmp_path / mount), format="parquet")).holdout(0.25)
+        assert _tags(_tagged(part).cache(generation), "streamed") == _tags(_tagged(part), "streamed")
+
+
+def test_a_generation_written_under_the_earlier_schema_is_refused_as_stale(tmp_path):
+    """A cache generation, or a fill's segment, written under the schema before inputs were named by
+    their files' places is refused, naming the schema it was written under, rather than read under
+    names it was not written with."""
+    from dew.data.compile import publish
+    from dew.data.generation import Generation
+
+    cache = Cache(str(tmp_path / "cache"))
+    generation = publish(Memory([{"id": index} for index in range(8)], shard_rows=4), cache, read="streamed")
+    (manifest,) = (tmp_path / "cache").rglob("generations/*/manifest.json")
+    current = json.loads(manifest.read_bytes())
+    assert Generation(generation.url, {}, None).manifest() == current
+    manifest.unlink()
+    manifest.write_bytes(json.dumps({**current, "schema": 1}).encode())
     with pytest.raises(ValueError):
-        _tags(_tagged(elsewhere).cache(generation), "streamed")
+        Generation(generation.url, {}, None).manifest()
 
 
 def test_a_generation_a_memory_read_filled_from_unindexed_files_serves_hash_and_records_holdouts(tmp_path):

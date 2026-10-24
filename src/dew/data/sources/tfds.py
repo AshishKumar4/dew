@@ -414,7 +414,10 @@ class TFDS(Dataset):
         return tuple(indexed[index] for index in range(len(indexed))) if read == "memory" else indexed
 
     def manifest(self) -> ShardManifest:
-        return _indexed_manifest(self, self.describe(), str(self.builder.data_path), self.shard_rows)
+        # Named without the directory the dataset is read from, which a local copy's fingerprint leaves out,
+        # so a fill keyed by its shards' rows finds them wherever the copy is mounted.
+        return _indexed_manifest(self, f"tfds:{self.name}/{self.config}:{self.version}:{self.split}",
+                                 str(self.builder.data_path), self.shard_rows)
 
     def stated(self) -> Mapping[str, object]:
         """Its builder's info, no data source opened: the dataset's name and version, its class
