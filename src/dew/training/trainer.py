@@ -1612,6 +1612,10 @@ class Trainer(Generic[Loss, Effects]):
                     # A shape met later compiles inside the interval, which
                     # reports that time apart from its steps'.
                     interval.compiling += time.perf_counter() - began
+                if self._unproven:
+                    # scratch: every launch before the first step's has finished.
+                    jax.block_until_ready((state, device))
+                    jax.effects_barrier()
                 with region("train.step"):
                     state, loss, aux, finite, accepted, committed = train_step(
                         self._staged(state, run.current), device)
