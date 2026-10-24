@@ -213,25 +213,6 @@ class Mma(mosaic.Family):
     def settled(self, pending: int = 0) -> None:
         del pending
 
-    def zeros(self, shape: tuple[int, ...]) -> jax.Array:
-        return self.full(shape, 0.0)
-
-    def full(self, shape: tuple[int, ...], value: float) -> jax.Array:
-        layout = self.layout if len(shape) == 2 else self.row
-        return plgpu.layout_cast(jnp.full(shape, value, jnp.float32), layout)
-
-    def iota(self, shape: tuple[int, int], dimension: int) -> jax.Array:
-        return plgpu.broadcasted_iota(jnp.int32, shape, dimension, layout=self.layout)
-
-    def rows_of(self, ref) -> jax.Array:
-        return plgpu.load(ref, layout=self.row, optimized=False)
-
-    def columns_of(self, ref) -> jax.Array:
-        return plgpu.load(ref, layout=self.column, optimized=False)
-
-    def as_row(self, vector: jax.Array) -> jax.Array:
-        return plgpu.layout_cast(vector, self.row)
-
 
 def _one(consumers: int) -> None:
     """mma.sync's programs take one compute warpgroup (`emit_pipeline`'s stages are no thread-collective
