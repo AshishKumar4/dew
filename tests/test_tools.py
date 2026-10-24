@@ -695,6 +695,22 @@ def test_a_nested_last_kernel_does_not_shorten_a_traced_window():
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# tools/benchmark_host_offload.py
+# ---------------------------------------------------------------------------
+
+def test_the_host_offload_benchmark_counts_each_parameter_in_the_memory_space_it_was_compiled_for():
+    """A program compiled with one argument in pinned host memory and one on the device counts one in each,
+    as its compiled input shardings name them."""
+    tool = load("benchmark_host_offload")
+    device = jax.devices()[0]
+    host = jax.sharding.SingleDeviceSharding(device, memory_kind="pinned_host")
+    resident = jax.sharding.SingleDeviceSharding(device, memory_kind="device")
+    compiled = jax.jit(lambda banked, x: x + 1.0, in_shardings=(host, resident)).lower(
+        jax.ShapeDtypeStruct((4,), jnp.float32), jax.ShapeDtypeStruct((4,), jnp.float32)).compile()
+    assert tool.entry_spaces(compiled) == {"pinned_host": 1, "device": 1}
+
+
+# ---------------------------------------------------------------------------
 # tools/benchmark_quantized_serving.py
 # ---------------------------------------------------------------------------
 
