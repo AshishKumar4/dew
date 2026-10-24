@@ -439,6 +439,7 @@ LANE_TEST = ("import os, subprocess, sys, time\n"
              "    time.sleep(1)\n"
              "    share = os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION']\n"
              "    grown = os.environ.get('XLA_PYTHON_CLIENT_PREALLOCATE', 'true')\n"
+             "    Path(f'threads-{Path(__file__).stem}').write_text(os.environ.get('OMP_NUM_THREADS', 'all'))\n"
              "    ran = Path(f'ran-{Path(__file__).stem}-{os.getpid()}')\n"
              "    ran.write_text(f'{share} {began} {time.monotonic()} {grown}')\n")
 """A GPU lane's test file standing in: it records the share it was given, when it ran and whether its pool
@@ -502,6 +503,9 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
         (f"3.12:{name}", int(name == "tests/test_red.py")) for name in every]
     first = [run for name in every for run in ran(Path(name).stem)]
     assert [share for share, *_ in first] == ["0.5"] * len(every), "unmeasured: each alone, the whole share"
+    # Each file's torch and OpenMP take its share of this process's CPUs, as four files may run at once.
+    threads = str(max(1, len(os.sched_getaffinity(0)) // 4))
+    assert {(tmp_path / f"threads-{Path(name).stem}").read_text() for name in every} == {threads}
     # Alone with the whole share, a file grows its pool as it uses it: a child it did not follow, another
     # environment's Python, has what the file leaves of the share.
     assert [grown for *_, grown in first] == ["false"] * len(every)
