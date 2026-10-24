@@ -41,7 +41,7 @@ from dew.training.memory import (
     step_fits,
     temporaries_factor,
 )
-from dew.training.state import TrainState
+from dew.training.state import TrainState, apart, together
 
 _log = logging.getLogger(__name__)
 
@@ -242,15 +242,18 @@ class Timer:
     batch: Batch
 
     def __call__(self, steps: Sequence[Callable]) -> list[float]:
-        restore = snapshot(self.state)
+        # The frozen tree is no step's to change or donate, and the objective's held tree shares it: it
+        # is kept as it is, and the moving state alone is copied, freed and restored.
+        moving, frozen = apart(self.state)
+        restore = snapshot(moving)
         seconds = [step_seconds(steps[0], self.state, self.batch)]
-        # What the step did not donate is freed too, so the run holds no
+        # What the step did not donate of the moving state is freed too, so the run holds no
         # reference to the state it handed over, on any backend.
-        for leaf in jax.tree.leaves(self.state):
+        for leaf in jax.tree.leaves(moving):
             if not leaf.is_deleted():
                 leaf.delete()
-        seconds += [step_seconds(step, restore(), self.batch) for step in steps[1:]]
-        self.state = restore()
+        seconds += [step_seconds(step, together(restore(), frozen), self.batch) for step in steps[1:]]
+        self.state = together(restore(), frozen)
         return seconds
 
 

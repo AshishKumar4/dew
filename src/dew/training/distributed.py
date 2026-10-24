@@ -940,7 +940,8 @@ def batch_layout(batch: Batch) -> str:
 
 
 def step_reads(executable: jax.stages.Compiled, signature: Signature) -> tuple[bool, ...]:
-    """Which leaves of its batch, the second argument, a compiled step reads,
+    """Which leaves of its batch, the third argument (after the moving state and the frozen tree,
+    `Trainer._jitted`), a compiled step reads,
     in the leaf order of the batch's own `signature` (`batch_signature`):
     those the executable kept, where JAX pruned the rest
     (`jax.stages.Compiled.input_shardings` names no sharding for those). A
@@ -949,7 +950,7 @@ def step_reads(executable: jax.stages.Compiled, signature: Signature) -> tuple[b
     not the shardings', says where its leaves are."""
     arguments, _ = executable.input_shardings
     tree, _ = signature
-    return tuple(sharding is not None for sharding in tree.flatten_up_to(arguments[1]))
+    return tuple(sharding is not None for sharding in tree.flatten_up_to(arguments[2]))
 
 
 def batch_shardings(mesh: Mesh | AbstractMesh, batch: Batch) -> Placement[Batch]:
@@ -1129,7 +1130,7 @@ def placed_bytes(tree) -> int:
 
 
 def placed_held[Held](held: Held, variables: Variables, shardings: Placement[Variables],
-                      mesh: Mesh) -> tuple[Held, Held]:
+                      mesh: Mesh, shared: frozenset[int] = frozenset()) -> tuple[Held, Held]:
     """A copy of `held` on `mesh` as two trees, each None where the other holds
     an array: the arrays a state of `variables` placed by `shardings` takes
     over, each where the state keeps the variable of its path and shape
@@ -1141,7 +1142,10 @@ def placed_held[Held](held: Held, variables: Variables, shardings: Placement[Var
     the free memory a step's temporaries need in one block
     (`step_headroom`). Placed where the state keeps them and donated
     (`taking_over`), they become the state's buffers. The copy leaves the
-    objective's own arrays alone."""
+    objective's own arrays alone. The held leaves whose ids are `shared`, which
+    the state keeps as they are and no step donates (its frozen tree, `apart`),
+    are placed as they are, the same arrays where they are placed already, and
+    kept: no copy of them is made."""
     kept = {path: (sharding, leaf.shape) for (path, leaf), sharding in zip(
         jax.tree_util.tree_leaves_with_path(variables), jax.tree.leaves(shardings), strict=True)}
     replicated = NamedSharding(mesh, P())
@@ -1157,11 +1161,14 @@ def placed_held[Held](held: Held, variables: Variables, shardings: Placement[Var
 
     # A copy of an array already on the devices: device_put can reuse a
     # buffer the target shares with the source, which donation would free.
-    owned = jax.tree.map(lambda leaf: leaf.copy() if isinstance(leaf, jax.Array) else leaf, held)
+    owned = jax.tree.map(lambda leaf: leaf if id(leaf) in shared or not isinstance(leaf, jax.Array)
+                         else leaf.copy(), held)
     placed = jax.device_put(owned, jax.tree_util.tree_map_with_path(
         lambda path, leaf: variable(path, leaf) or replicated, held))
+    keep = {id(placed_leaf) for leaf, placed_leaf in zip(jax.tree.leaves(held), jax.tree.leaves(placed),
+                                                         strict=True) if id(leaf) in shared}
     taken = jax.tree_util.tree_map_with_path(
-        lambda path, leaf: None if variable(path, leaf) is None else leaf, placed)
+        lambda path, leaf: None if variable(path, leaf) is None or id(leaf) in keep else leaf, placed)
     return taken, jax.tree.map(lambda one, leaf: leaf if one is None else None, taken, placed,
                                is_leaf=lambda leaf: leaf is None)
 
