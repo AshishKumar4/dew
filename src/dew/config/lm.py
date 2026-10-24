@@ -53,7 +53,7 @@ class LMRunConfig(RunConfig):
         default_factory=lambda: ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
     optim: OptimConfig = dataclasses.field(
         default_factory=lambda: OptimConfig(
-            rate=6e-4,
+            learning_rate=6e-4,
             weight_decay=0.1, clip_grads=1.0))
     tokenizer: str = "byte"
     """The tokenizer the ids were written with: 'byte', or an HF tokenizer name."""

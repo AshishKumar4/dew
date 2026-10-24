@@ -32,7 +32,7 @@ model = CausalTransformer(vocab_size=512, emb_features=256, num_layers=2,
 rows = np.random.default_rng(0).integers(0, 512, (16, 65), dtype=np.int32)
 data = Loader(train=lambda partition: itertools.repeat({"text": rows}), val=None,
                records=16, batch=16)
-trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(rate=1e-3), key=jax.random.key(0),
+trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=jax.random.key(0),
                   mesh=MeshSpec(fsdp=2, tensor=2))
 state = trainer.fit(data, steps=4, log_every=2)
 
@@ -94,7 +94,7 @@ from jax.sharding import AxisType
 mesh = jax.make_mesh((2, 2, 2), ("replica", "zero", "zero2"), axis_types=(AxisType.Auto,) * 3)
 layout = Layout(rules={"embed": ("zero", "zero2"), "mlp": "zero", "vocab": "zero"},
                 data_axes=("replica", "zero", "zero2"))
-trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(rate=1e-3), key=0,
+trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0,
                   mesh=mesh, layout=layout)
 trainer.fit(data, steps=2, log_every=2)
 ```
@@ -236,7 +236,7 @@ The local process-pool tests run real `jax.distributed` processes. They do not c
 Before booking the GPUs, read what the run would hold on them. On a CPU host, start Python with as many simulated devices as the run has GPUs, as this page's first block does (`XLA_FLAGS=--xla_force_host_platform_device_count=8`, set before JAX starts). Build the trainer as the run will, and validate it with one global batch against the memory each GPU's allocator will have, 95% of the GPU in a training process. Here the run is the model above on eight 80 GB H100s, pooling four steps into each update:
 
 ```python
-trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(rate=1e-3), key=0,
+trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0,
                   mesh=MeshSpec(fsdp=8), accumulation=4)
 report = trainer.validate({"text": rows}, steps=400, capacity=int(0.95 * 80e9))
 print(report.leaves["variables/params/layers_0/mlp/up_proj/kernel"])
