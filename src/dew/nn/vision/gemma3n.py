@@ -15,7 +15,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
-from dew.interop.config_records import native_fields
+from dew.interop.config_records import NativeFields
 from dew.interop.weights import placed
 from dew.nn.attention import RMSNorm
 from dew.nn.dense import Dense
@@ -229,10 +229,8 @@ def translate_gemma3n_vision_config(hf_config: Mapping[str, object]) -> Record:
 def translate_gemma3n_projector_config(hf_config: Mapping[str, object],
                                        text_width: int) -> Record:
     embedder, _ = _gemma3n_vision_record(hf_config)
-    return {"class": "gemma3n", "fields": native_fields(Gemma3nProjector)(
-        vision_width=embedder["vision_width"], text_width=text_width,
-        vocab_size=embedder["vocab_size"], vocab_offset=embedder["vocab_offset"],
-        norm_eps=embedder["norm_eps"])}
+    return {"class": "gemma3n", "fields": NativeFields(Gemma3nProjector,
+                                                       {**embedder, "text_width": text_width})}
 
 
 Gemma3nVision.checkpoint = TowerLayout("vision_tower.", in_params(gemma3n_vision_path))
