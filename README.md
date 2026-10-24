@@ -512,14 +512,14 @@ dpo_state = Trainer(dpo, optax.adam(0.001), key=jax.random.key(2)).fit(
 
 `FlowGRPOObjective` applies group-relative rewards to stochastic flow trajectories. `FlowRollout` samples groups of images, computes their rewards, and records the transition densities that the clipped policy objective uses. [FlowGRPO](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/post_training.md) has a complete example with an image reward.
 
-For online reinforcement learning, `SampledRollout` generates groups of responses and calls a reward function on them. `GRPOObjective` then trains on their advantages, old log probabilities and response masks. [`recipes/chain.py`](https://github.com/AshishKumar4/dew/blob/main/recipes/chain.py) connects pretraining, SFT, distillation, DPO, GRPO and PPO stages. The [post-training guide](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/post_training.md) covers reward callbacks and rollout settings.
+For online reinforcement learning, `RolloutScheduler.sampled` generates groups of responses and calls a reward function on them. `GRPOObjective` then trains on their advantages, old log probabilities and response masks. [`recipes/chain.py`](https://github.com/AshishKumar4/dew/blob/main/recipes/chain.py) connects pretraining, SFT, distillation, DPO, GRPO and PPO stages. The [post-training guide](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/post_training.md) covers reward callbacks and rollout settings.
 
 ### Reinforcement learning with a reward function
 
 This example keeps training the same decoder and rewards stories that mention a dog. A task verifier could replace the reward function. The prompt batch has the same numeric layout that `presets.prompts` produces, including the UTF-8 reward metadata.
 
 ```python
-from dew.objectives.rl import GRPOObjective, SampledRollout
+from dew.objectives.rl import GRPOObjective, RolloutScheduler
 from dew.data.dataset import Loader
 
 prompt = tokenizer.encode("Once upon a time, there was a little")
@@ -554,9 +554,9 @@ rl_objective = GRPOObjective(
     beta=0.01,
     variables=lm_state.variables,
 )
-rollout = SampledRollout(
+rollout = RolloutScheduler.sampled(
     rl_objective,
-    reward=reward,
+    reward,
     groups=4,
     max_new_tokens=8,
     sampling=Sampling(temperature=1.0, top_k=40),
@@ -570,7 +570,7 @@ rl_state = Trainer(
 ).fit(rl_data, steps=20, log_every=10)
 ```
 
-Each prompt gets four responses, and `SampledRollout.decode` turns each one into the text the reward reads. The advantages come from how each response's reward compares with the others in its group. GRPO uses a clipped policy objective and an optional KL term against the reference; `beta` sets the KL coefficient. `seq_len` covers the prompt and the 8 response tokens, minus one for the next-token shift.
+Each prompt gets four responses, and `decode` turns each one into the text the reward reads. The advantages come from how each response's reward compares with the others in its group. GRPO uses a clipped policy objective and an optional KL term against the reference; `beta` sets the KL coefficient. `seq_len` covers the prompt and the 8 response tokens, minus one for the next-token shift.
 
 In the Colab run, 3 of 128 responses sampled from the policy before these 20 steps mention a dog, and all 128 sampled after them do.
 
