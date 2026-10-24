@@ -7,9 +7,10 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from dew._records import JSON
 from dew.config import ObjectiveConfig
 from dew.inputs import Field, InputSpec
-from dew.registry import Aliases
+from dew.registry import Aliases, from_record
 
 if TYPE_CHECKING:
     pass
@@ -139,3 +140,17 @@ def test_a_recorded_dataclass_writes_its_view_alone_and_its_class_is_found_by_th
     assert component(Loaded, record) == (Loaded, {"name": "tiny"})
     with pytest.raises(TypeError):
         component(Recorded, record)
+
+
+@dataclasses.dataclass(frozen=True)
+class Settings:
+    """A run's settings holding a component's record as JSON, bound by its owner later."""
+
+    component: JSON
+
+
+def test_a_class_record_in_a_json_field_stays_the_record_it_is():
+    """A field typed JSON declares no class to build, so a component's class record there (a decision
+    head's, an autoencoder's) is read back as written, for its owner to bind."""
+    record = {"class": f"{Loaded.__module__}:Loaded", "fields": {"name": "tiny"}}
+    assert from_record(Settings, {"component": record}) == Settings(record)

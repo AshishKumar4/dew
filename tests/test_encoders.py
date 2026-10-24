@@ -4,12 +4,14 @@ padded row moves nothing.
 """
 
 
+import json
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.inputs import Condition, Field, InputSpec
+from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.dit import ConditioningEmbed, TextContext, masked_mean
 from dew.registry import to_record
 
@@ -110,6 +112,37 @@ def test_two_conditions_cannot_share_one_batch_field():
     }
     with pytest.raises(ValueError):
         InputSpec(sample=Field("image", (8, 8, 3)), conditions=conditions)
+
+
+class Echo(ConditionEncoder[str, TextContext]):
+    """A user's encoder that is no dataclass, which records its checkpoint alone."""
+
+    def __init__(self, checkpoint: str, params):
+        self.checkpoint, self.params = checkpoint, params
+
+    @classmethod
+    def from_pretrained(cls, checkpoint: str, *, params=None):
+        return cls(checkpoint, {"table": np.ones((4, 2), np.float32)} if params is None else params)
+
+    def tokenize(self, texts):
+        return {"ids": np.zeros((len(texts), 1), np.int32)}
+
+    def encode(self, params, tokens):
+        ids = tokens["ids"]
+        return TextContext(jnp.take(params["table"], ids, axis=0), jnp.ones(ids.shape, bool))
+
+    def recorded_fields(self) -> dict:
+        return {"checkpoint": self.checkpoint}
+
+
+def test_a_users_plain_encoder_binds_back_into_its_condition_around_its_weights():
+    """An encoder of the user's own, no dataclass, records its checkpoint and binds back into its
+    condition around the weights it is given, which it keeps as they are."""
+    weights = {"table": np.full((4, 2), 3.0, np.float32)}
+    condition = Condition(Echo("mine", weights), field="caption", unconditional="none")
+    rebuilt = Condition.bound(json.loads(json.dumps(to_record(condition, Condition))), params=weights)
+    assert type(rebuilt.encoder) is Echo and rebuilt.encoder.params is weights
+    assert (rebuilt.encoder.checkpoint, rebuilt.field, rebuilt.unconditional) == ("mine", "caption", "none")
 
 
 def test_condition_roundtrip_preserves_nondefault_character_embeddings():
