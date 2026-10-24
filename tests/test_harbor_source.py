@@ -34,6 +34,38 @@ from dew.interop.harbor import HARBOR_KEY, Harbor, outcome
 from dew.interop.harness import Command, HarnessSource
 from dew.objectives.rl.sessions import Call, Status, Task, Transcript
 
+
+@pytest.mark.parametrize("slow_endpoint", ["/health/workers", "/v1/models"])
+def test_gateway_readiness_rejects_an_answer_after_its_deadline(slow_endpoint):
+    """A worker-health probe or its proxied model listing answers too late. Each network phase
+    receives the remaining budget, and neither late answer establishes readiness."""
+    probes = []
+
+    def network(request):
+        probes.append(request)
+        if request.url.path == slow_endpoint:
+            threading.Event().wait(timeout=0.1)
+        return httpx.Response(200, json={"healthy": 1} if request.url.path == "/health/workers" else {})
+
+    with httpx.Client(transport=httpx.MockTransport(network), timeout=30) as client:
+        gateway = Gateway("http://gateway", client=client)
+        with pytest.raises(RuntimeError):
+            gateway.ready(timeout=0.05, poll=30)
+    assert probes
+    assert all(0 < request.extensions["timeout"]["read"] <= 0.05 for request in probes)
+
+
+def test_gateway_readiness_checks_both_endpoints_within_its_budget():
+    probes = []
+
+    def network(request):
+        probes.append(request)
+        return httpx.Response(200, json={"healthy": 1} if request.url.path == "/health/workers" else {})
+
+    with httpx.Client(transport=httpx.MockTransport(network), timeout=30) as client:
+        Gateway("http://gateway", client=client).ready(timeout=10)
+    assert [request.url.path for request in probes] == ["/health/workers", "/v1/models"]
+    assert 0 < probes[1].extensions["timeout"]["read"] <= probes[0].extensions["timeout"]["read"] <= 10
 KEY = jax.random.key(0)
 
 
