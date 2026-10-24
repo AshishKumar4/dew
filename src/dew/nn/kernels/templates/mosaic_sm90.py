@@ -80,17 +80,22 @@ class Wgmma(mosaic.RingFamily):
     def settled(self, pending: int = 0) -> None:
         plgpu.wgmma_wait(pending)
 
-    def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool
+    def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool, initial: tuple | None = None
                        ) -> tuple[C, tuple[jax.Array, ...]]:
         # Warpgroup accumulators scoped across the walk, read once its MMAs are done; interpreted, arrays
         # the walk carries.
+        initial = (None,) * len(shapes) if initial is None else initial
         if interpret:
-            both = (start, tuple(self.zeros(shape) for shape in shapes))
+            both = (start, tuple(self.zeros(shape) if value is None else value
+                                 for shape, value in zip(shapes, initial, strict=True)))
             for step, lo, hi in segments:
                 both = lax.fori_loop(lo, hi, lambda index, both, step=step: step(index, *both), both)
             return both
 
         def run(*accumulators):
+            for acc, value in zip(accumulators, initial, strict=True):
+                if value is not None:
+                    acc[...] = value
             carry = start
             for step, lo, hi in segments:
                 def stepped(index, carry, step=step):
@@ -117,6 +122,9 @@ class Wgmma(mosaic.RingFamily):
 
     def columns_of(self, ref) -> jax.Array:
         return plgpu.load(ref, layout=self.column, optimized=False)
+
+    def tile_of(self, ref) -> jax.Array:
+        return plgpu.load(ref, layout=self.layout, optimized=False)
 
     def as_row(self, vector: jax.Array) -> jax.Array:
         return plgpu.layout_cast(vector, self.row)
