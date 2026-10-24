@@ -83,7 +83,7 @@ def exclusive_self_attention(attention: jax.Array, value: jax.Array) -> jax.Arra
     heads, kv_heads = attention.shape[-2], value.shape[-2]
     if heads % kv_heads:
         raise ValueError(f"{heads} query heads do not group over {kv_heads} value heads")
-    dtype = jnp.promote_types(jnp.promote_types(attention.dtype, value.dtype), jnp.float32)
+    dtype = at_least_fp32(jnp.result_type(attention, value))
     value = jnp.repeat(value.astype(dtype), heads // kv_heads, axis=-2)
     work = attention.astype(dtype)
     norm = jnp.sum(value * value, axis=-1, keepdims=True)

@@ -24,6 +24,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.activations import gelu_tanh
 from dew.nn.blocks import Modulation, sinusoidal_time
 from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
@@ -99,10 +100,9 @@ class FluxSingleBlock(nn.Module):
         shift, scale, gate = self._modulation()(conditioning)
         normalized = modulate(layer_norm(self.dtype)(x), shift, scale)
         maps = self.projections()
-        hidden = nn.gelu(Dense(maps['proj_mlp'][1], dtype=self.dtype,
+        hidden = gelu_tanh(Dense(maps['proj_mlp'][1], dtype=self.dtype,
                                precision=self.precision, name="proj_mlp",
-                               dot_general=float32_dot_general)(normalized),
-                         approximate=True)
+                               dot_general=float32_dot_general)(normalized))
         attended, _ = JointAttention(
             self.heads, self.head_dim, project=False, dtype=self.dtype, precision=self.precision,
             attention_impl=self.attention_impl, name="attn")(normalized, rotation=rotation)

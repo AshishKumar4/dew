@@ -31,7 +31,7 @@ from .attention import LayerNorm, RMSNorm
 from .audio import AudioEncoding
 from .backbones.decoder_block import BlockWiring, DecoderBlock
 from .blocks import TokenEmbedding
-from .inputs import AttentionMetadata, coordinates
+from .inputs import AttentionMetadata, coordinates, sequence_blocks
 from .mixer_base import MixerContext
 from .mixers.attention import CausalSelfAttention
 from .mlp import GatedMLP
@@ -270,8 +270,7 @@ class MiMoAudioTower(nn.Module):
         size = cfg.audio_segment_size
         segments = -(-frames // size)
         lengths = jnp.sum(jnp.asarray(input_features_mask, jnp.int32), axis=1)
-        mels = jnp.pad(input_features, ((0, 0), (0, segments * size - frames), (0, 0)))
-        mels = mels.reshape(clips * segments, size, mel)
+        mels = sequence_blocks(input_features, size).reshape(clips * segments, size, mel)
         spans = jnp.clip(lengths[:, None] - jnp.arange(segments)[None, :] * size, 0, size).reshape(-1)
         features, valid = AudioTokenizerEncoder(cfg.tokenizer, dtype=self.dtype, precision=self.precision,
                                                 name="tokenizer")(mels, spans, batch_longest(spans, cfg))
