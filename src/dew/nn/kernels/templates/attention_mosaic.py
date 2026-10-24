@@ -813,16 +813,20 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
 def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
              dout: jax.Array, *, residuals: tuple[jax.Array, jax.Array, jax.Array, Split],
              scale: float | None = None, natural: bool = NATURAL, accurate: bool = ACCURATE,
-             tiles: Tiles | None = None, consumers: int | None = None, family: mosaic.Family | None = None,
-             interpret: bool = False) -> Gradients:
+             tiles: Tiles | None = None, consumers: int | None = None, fused: bool = False,
+             family: mosaic.Family | None = None, interpret: bool = False) -> Gradients:
     """The template's backward on this mainloop (`gradients`) from a training forward's `residuals` (its
     maxima, denominators, anchor keys and split sums): D about each query's anchor from the split sums
     (`algebra.split_delta`), a dQ launch and a dK/dV launch, and `dq_finish`'s refinement between them, in
     the form `accurate` names, by `family`'s bundle (the device's, `family_of`) at `tiles` (its default,
-    `BACKWARD_DEFAULTS`) and `consumers` a program (the form's, at most the family's). Every call form of bf16
-    operands, no hooks."""
+    `BACKWARD_DEFAULTS`) and `consumers` a program (the form's, at most the family's); with `fused`, the fast
+    form's one launch (`_launch_backward`), a schedule the chooser ranks beside the two launches. Every call
+    form of bf16 operands, no hooks."""
     family = family_of(query.dtype) if family is None else family
     tiles = BACKWARD_DEFAULTS[family.name] if tiles is None else tiles
+    if fused and accurate:
+        raise NotImplementedError("the fused Mosaic backward is the fast form's: the accurate form's dK/dV "
+                                  "takes the D the dQ program refines")
     if hooks is not None and hooks != Hooks():
         raise NotImplementedError("the Mosaic backward takes no hooks yet")
     if jnp.dtype(query.dtype) != jnp.dtype(jnp.bfloat16):
@@ -835,7 +839,7 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=factor,
                            natural=natural)
     launch = functools.partial(_launch_backward, spec=spec, accurate=accurate, tiles=tiles, consumers=count,
-                               family=family, interpret=interpret)
+                               fused=fused, family=family, interpret=interpret)
     block = max(count * tiles.block_q, count * tiles.block_k)
     return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=block, scale=factor)
 
@@ -843,14 +847,16 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
 def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maximum, key_index, anchor_value,
                      shift, others, own, others_total, forward_total, start, end, query_ids, key_ids,
                      score_params, *, score_mod, score_kinds, score_dtypes, scale: float,
-                     spec: algebra.Forward, accurate: bool, tiles: Tiles, consumers: int,
+                     spec: algebra.Forward, accurate: bool, tiles: Tiles, consumers: int, fused: bool,
                      family: mosaic.Family, interpret: bool):
     """`gradients`' launch on this mainloop: D from the forward's split sums, each query's anchor key as the
-    first pass chose it. The fast form's one launch: the dK/dV program adding each tile's dQ (`fused`), under
-    the first pass's D and the forward's denominator. The accurate form's two: the dQ program's sums, their
-    finish (`algebra.dq_finish`) and the dK/dV program under its refined D, whose cotangents sum to 0 where
-    the first pass's do not (a small weight on a large value, bf16: dK's worst row 2.5e1 at the first pass's
-    D, where check 1 allows 1.55e-2)."""
+    first pass chose it. Two launches: the dQ program's sums, their finish (`algebra.dq_finish`) and the
+    dK/dV program under its refined D, whose cotangents sum to 0 where the first pass's do not (a small
+    weight on a large value, bf16: dK's worst row 2.5e1 at the first pass's D, where check 1 allows
+    1.55e-2), the accurate form's always. The fast form's one launch (`fused`): the dK/dV program adding each
+    tile's dQ, under the first pass's D and the forward's denominator; on an H100 it is the slower today
+    (llama-d128 causal bf16 2 x 4096: 2.64 ms against two launches' 2.49), each consumer's 64 keys reducing
+    their own dQ tile into global memory, twice FlashAttention-3's traffic."""
     del score_params, score_mod, score_kinds, score_dtypes, scale
     width, value_width = query.shape[-1], value.shape[-1]
     _, state_total = algebra.off_anchor_start(peak0, total0, maximum, value_width, shift)
@@ -862,7 +868,7 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
                                for array in (query, key, value, dout))
     steps = key.shape[1] // tiles.block_k
     program = _Program(family, tiles, steps, min(tiles.stages, steps), spec.keys, spec.form == "causal")
-    walk = _Backward(program, spec, accurate, consumers, interpret, not accurate)
+    walk = _Backward(program, spec, accurate, consumers, interpret, fused)
     padded = PaddedCall(query, key, value, start, end, query_ids, key_ids, (), (), query.shape[1],
                         spec.keys)
     spans = _spans_of(spec, padded, tiles.block_q, tiles.block_k)
