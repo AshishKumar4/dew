@@ -10,7 +10,7 @@ from reference_error import assert_as_exact, assert_fp32_reduction_bound
 from test_attention_template import CASES, ROWS, SINKS, SOFTCAP, arguments, geometry as core_geometry
 
 from dew.nn.attention import alibi_bias
-from dew.nn.kernels import tuning
+from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
     attention_algebra as algebra,
@@ -606,11 +606,30 @@ def test_the_backward_walks_many_key_tiles(case):
 @pytest.mark.parametrize("config", attention_triton.BACKWARD_SPACE, ids=str)
 def test_every_backward_config_on_a_gpu(config, case):
     """Every config of the backward's space, bf16, a softcap, sinks and ALiBi: over causal documents
-    under a window, and over the irregular full and causal calls (`IRREGULAR`)."""
+    under a window, and over the irregular full and causal calls (`IRREGULAR`). A config the template
+    takes at the call (`TritonBackward.fitting`: within a thread's registers and a block's shared memory)
+    is on par; one it does not take is refused where it is pinned, naming why (`tuning.Unpinnable`)."""
+    from tuned import launches
+
     tiles = attention_triton.Tiles
-    check_backward({**CASES, **IRREGULAR}[case], SCORE_HOOKS["softcap-sinks-alibi"], jnp.bfloat16,
-                   tiles(config.block_q, config.block_k, config.dq_warps, config.dq_stages),
-                   tiles(config.block_q, config.block_k, config.dkv_warps, config.dkv_stages))
+    dq, dkv = (tiles(config.block_q, config.block_k, config.dq_warps, config.dq_stages),
+               tiles(config.block_q, config.block_k, config.dkv_warps, config.dkv_stages))
+    call = {**CASES, **IRREGULAR}[case]
+    queries, keys = geometry(call)
+    spans = template.spans(queries, keys, ROWS, **arguments(call))
+    query, key, value = drawing(queries, keys, jnp.bfloat16)(0)
+
+    def backward(query, key, value):
+        return attention_triton.backward(query, key, value, spans, None, query, interpret=not ON_GPU)
+
+    [ba] = [ba for ba in launches(backward, query, key, value)
+            if isinstance(ba.op, attention_triton.TritonBackward)]
+    if config in ba.op.fitting(ba, generation.gpu_target()):
+        check_backward(call, SCORE_HOOKS["softcap-sinks-alibi"], jnp.bfloat16, dq, dkv)
+        return
+    with pytest.raises(tuning.Unpinnable, match=r"registers|shared memory"), tuning.pinned(
+            {attention_triton.TritonBackward: config}):
+        jax.jit(backward).lower(query, key, value)
 
 
 SHARED_BYTES = (
@@ -637,8 +656,6 @@ def test_the_shared_memory_bound_keeps_what_triton_compiles_and_prunes_what_it_r
     where it compiled (an A100's 128 by 128 forward tile in three stages, jax's mha's fastest there),
     and at or above the bytes it asked for, past the budget, where it refused."""
     import tokamax
-
-    from dew.nn.kernels import generation
 
     arrays = {"query": jax.ShapeDtypeStruct((1, 1024, 4, width), jnp.bfloat16),
               "value": jax.ShapeDtypeStruct((1, 1024, 2, width), jnp.bfloat16)}
