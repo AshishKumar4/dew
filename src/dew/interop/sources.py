@@ -87,6 +87,20 @@ class SourceReference:
     def metadata(self) -> Path:
         return snapshot(self.name, self.revision, weights=False) / (self.subfolder or "")
 
+    def directory(self, root: Path) -> Path:
+        return root / (self.subfolder or "")
+
+    def file(self, root: Path, filename: str) -> Path:
+        """Resolve a component file against the pinned snapshot root, not its folder name."""
+        return repo_file(self.name, root, (Path(self.subfolder or "") / filename).as_posix())
+
+    def weights(self, root: Path, components: tuple[str, ...] = ("",)) -> Path:
+        """The pinned root with exactly the requested component weights present."""
+        requested = tuple((Path(self.subfolder or "") / part).as_posix() for part in components)
+        requested = tuple("" if part == "." else part for part in requested)
+        return snapshot(self.name, self.revision or root.name,
+                        weights=True if requested == ("",) else requested)
+
 
 def missing_weights(source: str, files: Collection[str]) -> str:
     """Say what a source without safetensors weights or transformers'
@@ -277,6 +291,7 @@ class StoredWeights:
 
     name_or_dir: str
     directory: Path
+    subfolder: str = ""
 
     def files(self, folder: str) -> tuple[str, ...]:
         """The repo-relative files that hold `folder`'s weights (`weight_files`): a directory's
@@ -295,7 +310,9 @@ class StoredWeights:
                                                            self.directory.name)).value)
             except OfflineModeIsEnabled:
                 listing = repo_files(self.name_or_dir, self.directory)
-        return weight_files(listing, folder, lambda name: json.loads((self.directory / name).read_text()))
+        selected = (Path(self.subfolder) / folder).as_posix()
+        return weight_files(listing, "" if selected == "." else selected,
+                            lambda name: json.loads((self.directory / name).read_text()))
 
     def specs(self, folder: str) -> dict[str, tuple[str, jax.ShapeDtypeStruct]] | None:
         """Each of `folder`'s tensors, by its stored name: the file that holds it and
