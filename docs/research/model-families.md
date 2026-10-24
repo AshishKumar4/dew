@@ -393,9 +393,12 @@ Lineup, all ungated: `google/gemma-4-E2B`, `-E4B`, `-12B`, `-31B`,
 
 For Unified, Dew follows the ordinary forward's vision-block mask in both training and serving:
 vision tokens in the same contiguous block attend bidirectionally in full and sliding layers.
+The block overlay is applied after the sliding window, so the full block stays visible even when
+it is longer than that window.
 Transformers 5.16.1's `Gemma4UnifiedModel.forward` passes block IDs to the generic mask builder
 (`modeling_gemma4_unified.py:1097-1107`, `masking_utils.py:1573-1594`). Its stock generation method
-instead calls the vision-specific builder, which adds that overlay only to sliding layers
+instead calls the vision-specific builder, which adds that overlay only to sliding layers and
+then intersects it with the window
 (`modeling_gemma4_unified.py:1196-1240,1347-1375`). This is an upstream forward/generation difference;
 Dew keeps one mask policy and compares against the ordinary forward.
 

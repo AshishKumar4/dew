@@ -7,6 +7,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
 import torch
 from reference_error import assert_as_exact
@@ -73,6 +74,11 @@ def assert_forward(source, draw, label):
 def test_unified_processor_and_native_forward_follow_the_published_forward(source):
     assert_forward(source, lambda seed: unified_draw(source[1].config, seed),
                     "Gemma4 Unified source forward")
+
+
+def test_vision_blocks_longer_than_the_window_keep_their_whole_block(source):
+    assert_forward(source, lambda seed: unified_draw(source[1].config, seed, side=4),
+                    "Gemma4 Unified long vision block")
 
 
 def gradient_functions(source):
@@ -164,6 +170,41 @@ def gradient_functions(source):
 def test_unified_backward_reaches_all_source_parameters_and_media_inputs(source):
     ours, reference, truth, draw = gradient_functions(source)
     assert_as_exact(ours, reference, draw, "Gemma4 Unified complete backward", seeds=8, truth_fn=truth)
+
+
+def test_raw_media_train_and_reload_through_the_public_source(source, tmp_path):
+    native, _, _ = source
+    rng = np.random.default_rng(52)
+    image = rng.integers(0, 256, (8, 8, 3), dtype=np.uint8)
+    audio = rng.standard_normal(35).astype(np.float32)
+    batch = native.processor("token7 <image_soft_token> token9 <audio> token10",
+                             images=[image], audio=[audio])
+
+    @jax.jit
+    def step(params):
+        def loss(values):
+            logits = native.model.apply({**native.variables, "params": values}, batch.tokens,
+                                         **batch.kwargs())
+            return jnp.mean(jnp.square(logits))
+
+        return jax.value_and_grad(loss)(params)
+
+    value, gradient = step(native.variables["params"])
+    optimizer = optax.sgd(1e-3)
+    updates, _ = optimizer.update(gradient, optimizer.init(native.variables["params"]),
+                                   native.variables["params"])
+    params = optax.apply_updates(native.variables["params"], updates)
+    assert np.isfinite(value)
+    assert any(not np.array_equal(before, after) for before, after in zip(
+        jax.tree.leaves(native.variables["params"]), jax.tree.leaves(params), strict=True))
+    variables = {**native.variables, "params": params}
+    expected = native.model.apply(variables, batch.tokens, **batch.kwargs())
+    native.save(tmp_path, variables=variables, max_shard_size=4096)
+    restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    for got, wanted in zip(jax.tree.leaves(restored.variables), jax.tree.leaves(variables), strict=True):
+        np.testing.assert_array_equal(got, wanted)
+    np.testing.assert_array_equal(restored.model.apply(restored.variables, batch.tokens, **batch.kwargs()),
+                                  expected)
 
 
 def test_cached_unified_calls_keep_the_ordinary_forward_mask(source):
