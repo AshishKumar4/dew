@@ -296,7 +296,7 @@ def fake_gateway(unhealthy_checks=0, unreachable_models=0, version=7, extra=()):
                                              "healthy": healthy, "total": 1})
         if request.url.path == "/v1/models":
             listings[0] += 1
-            if listings[0] <= unreachable_models:
+            if checks[0] <= unhealthy_checks or listings[0] <= unreachable_models:
                 return httpx.Response(500, text="Internal Server Error")
             return httpx.Response(200, json={"object": "list", "data": [{"id": "policy"}]})
         if request.method == "DELETE":
