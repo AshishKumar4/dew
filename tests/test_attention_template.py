@@ -21,6 +21,7 @@ from dew.nn.attention import (
 from dew.nn.documents import CrossDocuments, cross_document_mask, document_ids, document_mask, with_documents
 from dew.nn.inputs import coordinates
 from dew.nn.kernels.templates import attention as template
+from dew.nn.visibility import windowed
 
 QUERIES, KEYS = 100, 96
 """A call's query and key counts, neither a multiple of a tile, so the block map's edges pad; a call of
@@ -67,12 +68,33 @@ CASES = {
     "cross-causal-chunk": {"causal": True, "chunk": 32, "segment_ids": "cross"},
     "widest-window": {"sliding_window": 2 ** 31 - 1},
     "causal-widest-window": {"causal": True, "sliding_window": 2 ** 31 - 1},
+    "block-causal": {"causal": True, "block_groups": True},
+    "documents-block-causal-window": {"causal": True, "sliding_window": 24, "segment_ids": "own",
+                                      "block_groups": True},
 }
 
 
 def geometry(case: dict) -> tuple[int, int]:
-    """`case`'s query and key counts: a call's own documents are its keys, so it has as many of each."""
-    return (QUERIES, QUERIES) if case.get("segment_ids") == "own" else (QUERIES, KEYS)
+    """`case`'s query and key counts: a call's own documents or blocks are its keys, so it has as many of
+    each."""
+    own = case.get("segment_ids") == "own" or case.get("block_groups")
+    return (QUERIES, QUERIES) if own else (QUERIES, KEYS)
+
+
+def block_groups() -> tuple[np.ndarray, ...]:
+    """Two layouts of contiguous blocks over a call's own `[2, 100]` tokens, -1 outside any: blocks of a
+    token, blocks across `own_documents`' boundaries (at 30 and 70 in the first row, 55 in the second), a
+    block of padding, blocks ending the row; and the second layout's blocks over the first's, as a kind with
+    both image groups and decision blocks reads them."""
+    first = np.full((ROWS, QUERIES), -1, np.int32)
+    for row, runs in enumerate((((3, 4), (10, 22), (25, 35), (50, 60), (68, 72), (90, 100)),
+                                ((0, 1), (40, 50), (52, 58), (60, 61), (80, 99)))):
+        for group, (lo, hi) in enumerate(runs):
+            first[row, lo:hi] = group
+    second = np.full((ROWS, QUERIES), -1, np.int32)
+    second[:, 15:40] = 7
+    second[:, 41:43] = 8
+    return first, second
 
 
 def arguments(case: dict) -> dict:
@@ -85,6 +107,8 @@ def arguments(case: dict) -> dict:
         keywords["lengths"] = LENGTHS
     if case.get("starts"):
         keywords["starts"] = STARTS
+    if case.get("block_groups"):
+        keywords["block_groups"] = block_groups()
     if case.get("positions"):
         # Each token's place in its own document, as a packed row's coordinates count it.
         places = coordinates(segments=keywords["segment_ids"]).positions
@@ -107,6 +131,14 @@ def dews_mask(case: dict) -> np.ndarray:
         mask = cross_document_mask(ids, causal=causal, sliding_window=window)
     else:
         mask = combined_attention_mask(queries, keys, causal, window, None)
+        for groups in keywords.get("block_groups", ()):
+            # A block's tokens see each other, a causal window bounding only the keys behind
+            # (`AttentionMixer`'s image groups).
+            same = (groups[:, :, None] == groups[:, None, :]) & (groups[:, :, None] >= 0)
+            if window is not None:
+                same = same & windowed(np.arange(queries)[:, None], np.arange(keys)[None, :], window,
+                                       causal=causal)
+            mask = mask | same[:, None]
         if ids is not None:
             mask = with_documents(mask, ids)
     if "chunk" in keywords:
@@ -129,6 +161,9 @@ def test_key_spans_keep_the_keys_dews_masks_keep(case):
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     np.testing.assert_array_equal(np.asarray(template.dense(spans)), expected)
     static = {name: case[name] for name in ("causal", "sliding_window", "chunk") if name in case}
+    if case.get("block_groups"):
+        # A block runs to its end, past the query's own place.
+        assert expected[0, 10, 21] and not expected[0, 9, 10]
     if case is CASES["documents-causal-chunk-places"]:
         # The second document opens at token 30, so its chunk 0 holds tokens 30 to 45: chunks counted
         # from the row's start would part tokens 31 and 32.

@@ -121,7 +121,8 @@ def _searched(values: jax.Array, lo: jax.Array, hi: jax.Array, wanted: jax.Array
 
 def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_window: int | None = None,
           chunk: int | None = None, positions: tuple[jax.Array, jax.Array] | None = None, segment_ids=None,
-          lengths: jax.Array | None = None, starts: jax.Array | None = None) -> KeySpans:
+          lengths: jax.Array | None = None, starts: jax.Array | None = None,
+          block_groups: tuple[jax.Array, ...] = ()) -> KeySpans:
     """The `KeySpans` of a call of `queries` queries over `keys` keys in `batch` rows, in the terms
     `dew.nn.attention.scaled_dot_product_attention` takes them: `causal` keeps query i to keys 0..i (top
     left aligned, as jax's `is_causal`); `sliding_window=w` keeps the keys `window_sides` gives, the w - 1
@@ -131,8 +132,12 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     keys, as Dew's coordinates count them, by default their indices; `segment_ids`, one `[B, S]` array or a
     `CrossDocuments` (its keys in ascending id order, as it takes them), keeps each query to its
     document's keys, under causality or a window a cross call's queries aligned to their document's last
-    keys (`aligned_places`); `lengths` `[B]` end each row's keys and `starts` `[B]` begin them.
-    Lengths and starts are int32 token coordinates; places and ids keep their own dtypes."""
+    keys (`aligned_places`); `lengths` `[B]` end each row's keys and `starts` `[B]` begin them;
+    `block_groups`, each `[B, S]` over a call's own tokens (its queries its keys) of contiguous blocks, -1
+    outside any, keeps a causal query to its block's later keys too (block-causal: it sees a key of its
+    document at or before it, or of its own block), a window bounding only the keys behind it, as it does
+    an image's (`AttentionMixer.bidirectional_images`). Lengths and starts are int32 token coordinates;
+    places and ids keep their own dtypes."""
     from dew.nn.documents import CrossDocuments, aligned_places, document_ids
     from dew.nn.visibility import window_sides
 
@@ -162,6 +167,15 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
         before, after = window_sides(causal, min(sliding_window, queries + keys + 1))
         start = jnp.maximum(start, place - before)
         end = jnp.minimum(end, place + after + 1)
+    if block_groups and causal:
+        if queries != keys or isinstance(segment_ids, CrossDocuments):
+            raise ValueError("block groups name a call's own tokens: its queries are its keys")
+        # A block's later keys, within the query's document (none for padding, whose end is 0).
+        bound = (jnp.full((batch, queries), keys, jnp.int32) if segment_ids is None
+                 else jnp.where(query_ids == 0, 0, last))
+        for groups in block_groups:
+            extended = jnp.where(jnp.asarray(groups) >= 0, block_ends(groups), 0)
+            end = jnp.maximum(end, jnp.minimum(extended, bound))
     if chunk is not None:
         query_places, key_places = (
             (index, jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32)[None, :], (batch, keys)))
@@ -188,9 +202,21 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
         end = jnp.minimum(end, lengths.astype(jnp.int32)[:, None])
     if starts is not None:
         start = jnp.maximum(start, starts.astype(jnp.int32)[:, None])
-    narrowed = (sliding_window, chunk, segment_ids, lengths, starts)
+    blocked = True if block_groups and causal else None
+    narrowed = (sliding_window, chunk, segment_ids, lengths, starts, blocked)
     form = "spans" if any(narrowing is not None for narrowing in narrowed) else "causal" if causal else "full"
     return KeySpans(start, end, query_ids, key_ids, keys, form)
+
+
+def block_ends(groups: jax.Array) -> jax.Array:
+    """Each token's block's end, `[B, S]` int32 of `groups` `[B, S]`: one past the last token of the run of
+    equal ids that holds it (a block is such a run)."""
+    groups = jnp.asarray(groups)
+    batch, length = groups.shape
+    index = jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
+    # A run's last token: the next one's id differs, or the row ends there.
+    last = jnp.concatenate([groups[:, 1:] != groups[:, :-1], jnp.ones((batch, 1), bool)], axis=1)
+    return jax.lax.cummin(jnp.where(last, index, length), axis=1, reverse=True) + 1
 
 
 @jax.tree_util.register_dataclass
