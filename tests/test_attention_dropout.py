@@ -321,7 +321,9 @@ def test_a_kept_anchor_at_twice_the_weight_stays_finite_where_the_reference_does
     ref = reference_attention(query, key, value, dropout_rate=0.5, dropout_seed=words)
     assert bool(jnp.all(jnp.isfinite(ref)))
     assert bool(jnp.all(jnp.isfinite(dew)))
-    np.testing.assert_allclose(np.asarray(dew, np.float64), 2.0 ** 127, rtol=1e-6)
+    # Equal logits give each weight one half, z = 2 keeps the anchor's at one, and every step is a power of
+    # two, so the output is 2^127 exactly.
+    np.testing.assert_array_equal(np.asarray(dew), np.full(dew.shape, 2.0 ** 127, np.float32))
 
 
 def test_bf16_values_at_two_to_the_124_under_a_steep_draw_stay_finite_where_the_reference_does():
