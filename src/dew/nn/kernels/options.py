@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, ClassVar, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, Protocol, TypedDict, Unpack, runtime_checkable
 
 import jax
+from jax.sharding import Sharding
 
 from dew.devices import xla_flag
 from dew.nn.kernels.generation import backend, gpu_target
@@ -62,19 +63,32 @@ def compiler_options(*models: nn.Module) -> dict[str, bool]:
     return {"xla_gpu_enable_triton_gemm": False}
 
 
-def program(function: Callable[..., object], *models: nn.Module, **arguments: object
-            ) -> Callable[..., Any]:
+type Placements = Sharding | None | tuple[Placements, ...]
+"""Where a program's arguments or results sit, as `jax.jit` takes them: one sharding, none (where
+they are), or a tuple of either, one for each."""
+
+
+class JitArguments(TypedDict, total=False):
+    """The arguments of `jax.jit` a program over models takes (`program`), each hashable."""
+
+    static_argnums: int | tuple[int, ...]
+    static_argnames: str | tuple[str, ...]
+    in_shardings: Placements
+    out_shardings: Placements
+
+
+def program[**P, R](function: Callable[P, R], *models: nn.Module,
+                    **arguments: Unpack[JitArguments]) -> jax.stages.Wrapped:
     """`function` jitted with the XLA options a program over `models` compiles with
     (`compiler_options`) and the rest of `jax.jit`'s `arguments` (its static arguments, its
-    shardings), each hashable: one program for each function, options and arguments, which every call
-    with the same reuses, so a quantized model and another never share one. Every program Dew compiles
-    over a task's model, an autoencoder or an objective's modules outside an objective's own
-    (`Objective.program`) is one of these."""
-    return _program(function, tuple(sorted(compiler_options(*models).items())),
-                    tuple(sorted(arguments.items())))
+    shardings): one program for each function, options and arguments, which every call with the same
+    reuses, so a quantized model and another never share one. Every program Dew compiles over a task's
+    model, an autoencoder or an objective's modules outside an objective's own (`Objective.program`)
+    is one of these."""
+    return _program(function, tuple(sorted(compiler_options(*models).items())), **arguments)
 
 
 @functools.cache
-def _program(function: Callable[..., object], options: tuple[tuple[str, bool], ...],
-             arguments: tuple[tuple[str, object], ...]) -> Callable[..., Any]:
-    return jax.jit(function, compiler_options=dict(options), **cast(dict[str, Any], dict(arguments)))
+def _program[**P, R](function: Callable[P, R], options: tuple[tuple[str, bool], ...],
+                     **arguments: Unpack[JitArguments]) -> jax.stages.Wrapped:
+    return jax.jit(function, compiler_options=dict(options), **arguments)
