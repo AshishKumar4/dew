@@ -26,6 +26,7 @@ from dew.artifacts import TokenScores
 from dew.inference.tasks import BlockGeneration, BlockSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import ModelInputs, real_places, shifted_span, token_layout
+from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import BlockDenoiser, CacheCapacity, Lacks, LayerScalars
 from dew.nn.sharding import LOGITS, constrain
 from dew.nn.visibility import same_group
@@ -446,7 +447,9 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                 attention_pairwise_mask=decoder_mask, attention_key_positions=decoder_keys,
                 states=True)
 
-        zero_logits = jnp.zeros((*response.shape, self.model.vocab_size), jnp.float32)
+        # The zero signal in the dtype the model's states compute in, at least fp32, so a float64 model's
+        # first pass mixes its table in float64 (`soft_embeddings`), as its second does.
+        zero_logits = jnp.zeros((*response.shape, self.model.vocab_size), at_least_fp32(encoder_states.dtype))
         # The conditioning pass carries no gradient, so its states stop it
         # before the head and nothing of that pass is kept for the backward.
         first = jax.lax.stop_gradient(constrain(model_logits(

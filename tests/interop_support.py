@@ -41,6 +41,17 @@ def drawn_ids(vocab_size: int, seed: int) -> dict[str, np.ndarray]:
     return {"input_ids": rng.integers(0, vocab_size, (BATCH, LENGTH)).astype(np.int32)}
 
 
+PROMPT_WORDS = ("a", "red", "cat", "on", "mat", "tiny", "photo", "of", "the", "blue", "sea", "under",
+                "light")
+"""The words a drawn prompt joins (`drawn_prompts`)."""
+
+
+def drawn_prompts(salt: int, seed, count: int = 2) -> tuple[str, ...]:
+    """`count` prompts of one to eight `PROMPT_WORDS` drawn from `seed` under a site's `salt`."""
+    rng = np.random.default_rng([salt, int(seed)])
+    return tuple(" ".join(rng.choice(PROMPT_WORDS, size=rng.integers(1, 9))) for _ in range(count))
+
+
 def float64_logits(loaded):
     """The logits of `loaded` (a `Pretrained`) cloned to float64, its weights widened once, as a function
     of a draw (`drawn_ids`) run where x64 is enabled: a recorded decoder's float64 truth, which its
@@ -189,8 +200,10 @@ def channels_last(array) -> np.ndarray:
 def posterior_of(moments) -> tuple[jax.Array, jax.Array]:
     """The posterior's mean and standard deviation, split from an encoder's stacked moments as
     Diffusers' `DiagonalGaussianDistribution` splits them."""
-    mean, log_variance = jnp.split(moments, 2, axis=-1)
-    return mean, jnp.exp(0.5 * jnp.clip(log_variance, -30.0, 20.0))
+    from dew.nn.autoencoders.kl import posterior_moments
+
+    mean, log_variance = posterior_moments(moments)
+    return mean, jnp.exp(0.5 * log_variance)
 
 
 def assert_coder_vjps(loaded, reference, operand: str, posterior, bound: float) -> None:

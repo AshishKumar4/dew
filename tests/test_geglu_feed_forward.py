@@ -53,6 +53,36 @@ def test_the_packed_feed_forward_computes_diffusers_geglu(approximate, dtype):
                     diffusers(dtype), draw, label, seeds=GEGLU_SEEDS[label], truth_fn=diffusers(None))
 
 
+GELU_TANH_SEEDS = 8
+"""Check 1's declared seeds for the tanh GELU, sized by `seeds_for` on armada."""
+
+
+def test_the_tanh_gelu_and_its_gradient_are_as_exact_as_torchs():
+    """The tanh GELU (`gelu_tanh`, Hugging Face's gelu_pytorch_tanh) in fp32: its value and its input's
+    gradient under a drawn cotangent are on par with torch's `gelu(approximate='tanh')` from its float64
+    run (check 1), over drawn inputs at scale 4, which reach both tails: where the positive tail's
+    sigmoid rounds to 1, from x near 5, the gradient keeps the term autodiff of the sigmoid drops."""
+    import torch
+    from reference_error import torch_with_gradients
+
+    from dew.nn.activations import gelu_tanh
+
+    def draw(seed):
+        rng = np.random.default_rng([0x6E, seed])
+        return tuple((scale * rng.standard_normal((64, 256))).astype(np.float32) for scale in (4, 1))
+
+    def named(run):
+        """`run`'s value and gradient by name."""
+        return lambda *inputs: dict(zip(("value", "gradient"), run(*inputs), strict=True))
+
+    def theirs(dtype):
+        pulled = torch_with_gradients(lambda x: torch.nn.functional.gelu(x, approximate="tanh"))
+        return named(lambda x, cotangent: pulled(np.asarray(x, dtype), np.asarray(cotangent, dtype)))
+
+    assert_as_exact(named(jax.jit(with_gradients(gelu_tanh))), theirs(np.float32), draw, "the tanh gelu",
+                    seeds=GELU_TANH_SEEDS, truth_fn=theirs(np.float64))
+
+
 def test_a_unets_feed_forward_declares_its_kernels_axes():
     """Every leaf of a UNet's feed-forward, the packed projection's included, carries declared axes:
     the packed projection's kernel `embed` to `mlp` and its bias `mlp`, so a tensor axis splits it as

@@ -66,6 +66,26 @@ def test_a_reference_is_named_by_its_installation_and_built_once(tmp_path, monke
     assert len(installs(asked)) == 3
 
 
+def test_a_references_overrides_and_constraints_name_it_by_their_lines(tmp_path, monkeypatch):
+    """A reference that installs a lock with overrides (torch's CUDA build over a CPU lock, say) or
+    constraints is named by those files' lines too: a changed override builds anew, and the same lines at
+    another path reuse the environment."""
+    asked, env = standing_in_uv(tmp_path)
+    monkeypatch.setenv("PATH", env["PATH"])
+    lock, override = tmp_path / "lock.txt", tmp_path / "override.txt"
+    lock.write_text("numpy==2.3.0\n")
+    override.write_text("torch==2.14.1+cu128\n")
+    cache = tmp_path / "envs"
+    arguments = ["-r", str(lock), "--override", str(override)]
+    python = environments.reference("torch", arguments, cache=cache)
+    moved = tmp_path / "moved.txt"
+    moved.write_text(override.read_text())
+    assert environments.reference("torch", ["-r", str(lock), "--override", str(moved)], cache=cache) == python
+    override.write_text("torch==2.15.0+cu128\n")
+    assert environments.reference("torch", arguments, cache=cache) != python
+    assert len(installs(asked)) == 2
+
+
 def test_the_command_line_takes_a_references_installation_whole_after_the_separator(tmp_path):
     """Everything after `--` is uv's installation, its own options too (a torch backend), whatever spelling
     of --reference argparse takes, and the Python printed is the environment's, made at the Python asked

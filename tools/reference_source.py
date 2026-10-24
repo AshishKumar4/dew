@@ -173,6 +173,8 @@ def _defined(node: ast.stmt) -> set[str]:
         return {node.name}
     if isinstance(node, ast.Assign):
         return {target.id for target in node.targets if isinstance(target, ast.Name)}
+    if isinstance(node, ast.AnnAssign) and node.value is not None and isinstance(node.target, ast.Name):
+        return {node.target.id}
     return set()
 
 

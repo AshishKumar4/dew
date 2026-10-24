@@ -39,7 +39,7 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, weighted_total
 
 MEAN_EPS = 1e-8
 """Added to a masked mean's denominator, as both references add it. Without
@@ -63,9 +63,8 @@ def masked_mean(x: jax.Array, mask: jax.Array, axis=None) -> jax.Array:
     positions are where uninitialised values sit. The denominator adds
     `MEAN_EPS`, so a fully masked input gives zero.
     """
-    weights = mask.astype(x.dtype)
-    kept = jnp.where(weights != 0, x, 0)
-    return jnp.sum(kept * weights, axis=axis) / (jnp.sum(weights, axis=axis) + MEAN_EPS)
+    total, mass = weighted_total(x, mask, axis=axis)
+    return total / (mass + MEAN_EPS)
 
 
 def masked_whiten(x: jax.Array, mask: jax.Array,
@@ -84,10 +83,11 @@ def masked_whiten(x: jax.Array, mask: jax.Array,
     from it, so a shift of every value moves no whitened one.
     """
     weights = mask.astype(x.dtype)
-    count, kept = total(jnp.stack([jnp.sum(weights), jnp.sum(jnp.where(weights != 0, x, 0) * weights)]))
+    kept, count = weighted_total(x, weights)
+    count, kept = total(jnp.stack([count, kept]))
     mean = kept / (count + MEAN_EPS)
     deviations = jnp.where(weights != 0, x - mean, 0)
-    variance = total(jnp.sum(jnp.square(deviations) * weights)) / (count + MEAN_EPS)
+    variance = total(weighted_total(jnp.square(deviations), weights)[0]) / (count + MEAN_EPS)
     return (x - mean) * jax.lax.rsqrt(variance * (count / (count - 1)) + WHITEN_EPS)
 
 
