@@ -1078,6 +1078,27 @@ def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, mon
     (tmp_path / "tools/first.py").write_text("VALUE = 2\n")
     git("commit", "-qam", "the first tool changes")
     assert run() == [2, 1]
+    # A package added beside a tool a test imports by its name, from tools/ on sys.path, shadows it: each file
+    # that executed a tool there runs again, and the one that imports it by name sees the package.
+    (tmp_path / "tests/test_named.py").write_text(
+        "import sys\n"
+        "from pathlib import Path\n"
+        "def test_named():\n"
+        "    with Path('runs-named').open('a') as runs: runs.write('x')\n"
+        "    sys.path.insert(0, 'tools')\n"
+        "    import named\n"
+        "    assert named.VALUE == 1\n")
+    (tmp_path / "tools/named.py").write_text("VALUE = 1\n")
+    git("add", "-A")
+    git("commit", "-qm", "a test imports a tool by its name")
+    rows = armada_task(ci, monkeypatch, tmp_path / ".verdict/verdict.json", ci.policy(base))
+    assert [row["exitCode"] for row in rows] == [0, 0, 0]
+    (tmp_path / "tools/named").mkdir()
+    (tmp_path / "tools/named/__init__.py").write_text("VALUE = 2\n")
+    git("add", "-A")
+    git("commit", "-qm", "a package shadows the tool")
+    rows = armada_task(ci, monkeypatch, tmp_path / ".verdict/verdict.json", ci.policy(base))
+    assert {row["name"]: row["exitCode"] for row in rows}["3.12:tests/test_named.py"] == 1
 
 
 def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_changes(
