@@ -27,6 +27,24 @@ def fixture_config(name):
     return json.loads((FIXTURES / name / "config.json").read_text())
 
 
+def test_an_explicit_readout_tensor_file_uses_the_native_safe_weight_reader(tmp_path):
+    """A named .pt head is converted by the same safe tensor reader as native checkpoints,
+    without requiring the backbone's conventional weight filename."""
+    import torch
+
+    from dew.interop.sources import tensor_file
+
+    tensors = {"slot": torch.arange(24, dtype=torch.float32).reshape(3, 8),
+               "q.weight": torch.arange(16, dtype=torch.float32).reshape(2, 8) / 16,
+               "k.weight": torch.zeros((2, 8))}
+    path = tmp_path / "readout_head.pt"
+    torch.save(tensors, path)
+    restored = tensor_file(path)
+    assert set(restored) == set(tensors)
+    for name, value in tensors.items():
+        np.testing.assert_array_equal(restored[name], value.numpy())
+
+
 def test_a_saved_processor_record_reloads_its_selected_folder(tmp_path):
     """A processor selected below a repository root survives the task-settings JSON round trip;
     the unrelated root config cannot replace its vocabulary and preprocessing."""
