@@ -11,7 +11,7 @@ given it as `[V, D]` rows.
 
 import functools
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import ClassVar, NamedTuple
 
 import jax
@@ -26,6 +26,7 @@ from dew.decision.questions import KINDS, Choice, Noul, Score
 from dew.nn.activations import gelu_exact_torch
 from dew.nn.attention import NormalAttention, l2_normalized
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, decoder_norm
+from dew.nn.blocks import TokenEmbedding
 from dew.nn.dense import Dense
 from dew.nn.flops import attention_flops, projection_flops, real_lengths
 from dew.nn.inputs import AttentionMetadata
@@ -35,7 +36,7 @@ from dew.nn.mlp import GatedMLP
 from dew.nn.precision import at_least_fp32
 from dew.nn.scatter import DROPPED
 from dew.records import JSON
-from dew.registry import from_record, record_fields
+from dew.registry import from_record, import_path, imported, record_fields
 
 
 def _layer_norm(dtype: Dtype | None, name: str) -> nn.Module:
@@ -67,21 +68,26 @@ class Head(nn.Module):
                              "QuestionLayout or use a joint head")
 
     def record(self) -> JSON:
-        """Return the head's name and the fields a run records."""
+        """Return the head as a run records it: its class by import path (`dew.registry`) and its
+        fields but the width, which the backbone it reads gives, so any head reloads, one of a
+        package the run trusts too."""
         fields = record_fields(self, type(self))
         del fields[self.width_field]
-        return {"name": type(self).__name__, "fields": fields}
+        return {"name": import_path(type(self)), "fields": fields}
 
     @staticmethod
     def from_record(record: JSON, width: int) -> "Head":
         """Rebuild the head a run recorded, reading states `width` wide, in the numerics it
-        recorded."""
+        recorded. A record of an earlier run names its head by class name alone, one of this
+        module's, and is read as that class's path."""
         held = records.record(record, "head")
         name = records.text(held.get("name"), "head.name")
-        if name not in HEADS:
-            raise ValueError(f"a run's head is one of {sorted(HEADS)}, not {name!r}")
-        fields = {**records.record(held.get("fields"), "head.fields"), HEADS[name].width_field: width}
-        return from_record(HEADS[name], fields)
+        path = name if ":" in name else f"{__name__}:{name}"
+        head = imported(path)
+        if not (isinstance(head, type) and issubclass(head, Head)):
+            raise ValueError(f"a run's head is a decision head (`Head`), not {path!r}")
+        fields = {**records.record(held.get("fields"), "head.fields"), head.width_field: width}
+        return from_record(head, fields)
 
 
 class DecisionHead(Head):
@@ -111,8 +117,10 @@ class DecisionHead(Head):
     attention_impl: str = "auto"
 
     @nn.nowrap
-    def decision_flops(self, lengths, questions, options) -> float:
-        """Full-row encoder layers and the scorer at real option markers."""
+    def decision_flops(self, lengths, questions, options, *, pooled=None) -> float:
+        """Full-row encoder layers and the scorer at real option markers; it pools no spans."""
+        if pooled is not None:
+            raise TypeError("Laya's head scores options at their markers in the row, and pools no context")
         decision_geometry(lengths, questions, options)
         per_layer = (12 * projection_flops(lengths, self.features, self.features)
                      + attention_flops(lengths, 1, self.features, self.features, causal=False))
@@ -131,7 +139,8 @@ class DecisionHead(Head):
         feedforward = functools.partial(
             GatedMLP, hidden_features=4 * self.features, out_features=self.features, activation="relu",
             use_bias=True, dtype=self.dtype, precision=self.precision)
-        self.type_embedding = nn.Embed(len(KINDS), self.features, dtype=self.dtype, name="type_embedding")
+        self.type_embedding = TokenEmbedding(len(KINDS), self.features, dtype=self.dtype,
+                                             name="type_embedding")
         self.blocks = [DecoderBlock(
             mixer=AttentionMixer(nope=True).build(context), feedforward=feedforward,
             emb_features=self.features, wiring=BlockWiring(), norm_type="layer", norm_bias=True,
@@ -144,6 +153,9 @@ class DecisionHead(Head):
 
     def __call__(self, states: jax.Array, inputs: DecisionInputs, table: jax.Array | None = None,
                  train: bool = False) -> jax.Array:
+        if inputs.spans_in_context:
+            raise TypeError("Laya's head scores each option at its marker in the row, so it reads no "
+                            "schema read as the row's context; use a JointSchemaHead")
         # Every token takes its row's question type: a QuestionLayout row asks one question.
         owned = inputs.question_segments[:, None, :] == inputs.segments[:, :, None]
         kinds = jnp.sum(jnp.where(owned, inputs.kinds[:, None, :], 0), axis=-1)
@@ -317,8 +329,9 @@ class JointSchemaHead(Head):
     width_field: ClassVar[str] = "hidden_size"
 
     @nn.nowrap
-    def decision_flops(self, lengths, questions, options) -> float:
-        """Memory/option projections, evidence O-by-L and field Q-by-L attention.
+    def decision_flops(self, lengths, questions, options, *, pooled=None) -> float:
+        """Memory/option projections, evidence O-by-L and field Q-by-L attention, and the span
+        pooling over each row, or over `pooled` tokens a row where the spans are a context's.
 
         Each attention has query/output maps on its queries and key/value
         maps on memory. The field layers also have Q-by-Q self-attention.
@@ -338,7 +351,8 @@ class JointSchemaHead(Head):
                   + 4 * width * self.feedforward * np.sum(question))
         scorer = (8 * width * width + 2 * width) * np.sum(option)
         summaries = (6 * width + 2 * hidden) * np.sum(option)
-        pooling = 2 * hidden * np.sum(length * (question + 2 * option))
+        spanned = length if pooled is None else real_lengths(pooled)
+        pooling = 2 * hidden * np.sum(spanned * (question + 2 * option))
         return float(count + pooling + self.routing_layers * evidence
                      + self.layers * fields + scorer + summaries)
 
@@ -353,7 +367,7 @@ class JointSchemaHead(Head):
         self.global_projection = dense(self.width, "global_projection")
         self.option_context_projection = dense(self.width, "option_context_projection")
         self.option_lexical_projection = dense(self.width, "option_lexical_projection")
-        self.type_embedding = nn.Embed(len(KINDS), self.width, dtype=self.dtype, name="type_embedding")
+        self.type_embedding = TokenEmbedding(len(KINDS), self.width, dtype=self.dtype, name="type_embedding")
         options = {"width": self.width, "heads": self.heads, "feedforward": self.feedforward,
                    "dtype": self.dtype, "precision": self.precision, "attention_impl": self.attention_impl}
         self.evidence_layers = [_RoutingLayer(**options, name=f"evidence_layers_{index}")
@@ -370,10 +384,22 @@ class JointSchemaHead(Head):
         self.residual_gate = self.param("residual_gate", nn.initializers.zeros_init(), ())
 
     def __call__(self, states: jax.Array, inputs: DecisionInputs, table: jax.Array | None = None,
-                 train: bool = False) -> jax.Array:
+                 train: bool = False, spanned: jax.Array | None = None) -> jax.Array:
+        """The `[B, Q, K]` logits of each question's options over the row's final `states`. Where the
+        questions' spans are in the row's context (`DecisionInputs.spans_in_context`), `spanned` are
+        the backbone's final states over the context (`DecisionModel.context_states`), which the
+        questions and options are pooled from, their tokens the context's; the memory every option
+        and field reads, and the readout, are the row's either way."""
         if table is None:
             raise ValueError("the joint schema head reads the backbone's output table, its lexical prior")
+        if inputs.spans_in_context != (spanned is not None):
+            raise ValueError("a schema read as the row's context comes with the context's states, and "
+                             "only then")
         hidden = self.hidden_norm(states)
+        pooled, pooled_tokens = hidden, inputs.tokens
+        if spanned is not None:
+            assert inputs.context is not None, "the context's states come with its tokens"
+            pooled, pooled_tokens = self.hidden_norm(spanned), inputs.context
         batch = inputs.tokens.shape[0]
         memory = self.memory_projection(hidden)
         # Each question reads its own row of the window: that row's last token, and its tokens alone.
@@ -381,15 +407,15 @@ class JointSchemaHead(Head):
         own = (rows[:, :, None] == inputs.segments[:, None, :]) | (rows[:, :, None] == 0)
         last = jnp.max(jnp.where(own, jnp.arange(inputs.tokens.shape[1]), 0), axis=-1)
         last_state = _gathered(hidden, last)
-        questions = _span_means(hidden, inputs.spans)
+        questions = _span_means(pooled, inputs.spans)
         count, width = inputs.options.shape[1:]
         # The option slots computed, `[B, P]` flat indices into the grid, and each one's question.
         slots = (jnp.broadcast_to(jnp.arange(count * width, dtype=jnp.int32), (batch, count * width))
                  if inputs.option_slots is None else inputs.option_slots)
         owners = slots // width
         option_spans = _gathered(inputs.option_spans.reshape(batch, count * width, 2), slots)
-        contexts = _span_means(hidden, option_spans)
-        rows_of_tokens = jnp.take(table, inputs.tokens, axis=0).astype(hidden.dtype)
+        contexts = _span_means(pooled, option_spans)
+        rows_of_tokens = jnp.take(table, pooled_tokens, axis=0).astype(hidden.dtype)
         lexical = _span_means(rows_of_tokens, option_spans)
 
         queries = (self.option_context_projection(contexts) + self.option_lexical_projection(lexical)
@@ -435,6 +461,3 @@ def decision_geometry(lengths, questions, options):
         raise ValueError("decision FLOPs need lengths, questions and options of the same [rows] shape")
     return geometry
 
-
-HEADS: Mapping[str, type[Head]] = {head.__name__: head for head in (DecisionHead, JointSchemaHead)}
-"""The heads a run may record, by name."""
