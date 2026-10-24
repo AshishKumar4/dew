@@ -14,7 +14,7 @@ import pytest
 from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from reference_error import assert_as_exact
-from test_attention_dropout import RATE, dropout_of, grads_of, keyed_draw, reference_arm
+from test_attention_dropout import RATE, dropout_of, grads_of, keyed_draw, reference_arm, seed_words
 from test_attention_template import CASES, ROWS, SEEDS, arguments, geometry
 from test_attention_triton import hooks_for
 
@@ -62,6 +62,21 @@ def test_the_interpreted_triton_mainloop_drops_on_par_with_the_reference_path(fo
                     keyed_draw(queries, keys, dtype),
                     f"interpreted triton dropping {name} {sorted(names)} {jnp.dtype(dtype).name}",
                     seeds=SEEDS)
+
+
+def test_the_interpreted_triton_mainloop_keeps_the_reference_mask():
+    """The Triton forward, interpreted, keeps the entries the reference's draw keeps, bit for bit: uniform
+    weights and identity values make each output entry its own draw times `1 / keys`, so its nonzero entries
+    are the kept ones, against `dropout_draw`'s mask over the same coordinates (the XLA draw)."""
+    words = seed_words(3)
+    query = jnp.zeros((2, 8, 4, 8), jnp.float32)
+    key = jnp.zeros((2, 16, 2, 8), jnp.float32)
+    value = jnp.broadcast_to(jnp.eye(16, dtype=jnp.float32)[None, :, None, :], (2, 16, 2, 16))
+    spans = template.spans(8, 16, 2)
+    out = attention_triton.forward(query, key, value, spans, template.Hooks(drop=dropout_of(words, 2, 4)),
+                                   interpret=True)
+    mask = np.asarray(dropout_draw(words, RATE, (2, 4, 8, 16))) > 0
+    np.testing.assert_array_equal(np.asarray(out) > 0, mask.transpose(0, 2, 1, 3))
 
 
 @pytest.mark.mesh(devices=8)
