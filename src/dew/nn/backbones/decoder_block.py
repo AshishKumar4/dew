@@ -479,8 +479,8 @@ none 59 GiB; 'all_but_delta_memory' recomputes a delta rule's memory alone,
 as fla's backward always does; 'minimal_with_scan_and_conv' keeps a
 recurrence's scan output and its short conv output beside 'minimal''s, so a
 step that does not fit recomputes the rest of a layer before its scan (on an
-A100 an 8-layer Mamba-2 decoder's bf16 step over 16,384 tokens took 161.8 ms
-there and 166.9 ms at 'minimal_with_conv', for 1.07 GB more at its peak,
+A100 an 8-layer Mamba-2 decoder's bf16 step over 16,384 tokens took 145.6 ms
+there and 149.4 ms at 'minimal_with_conv', for 1.1 GB more at its peak,
 docs/performance.md); 'minimal_with_conv' keeps the conv alone. A decoder
 without a recurrence skips both, as it would compile 'minimal''s step. A
 decoder's own remat is where it starts, and it moves up one rung at a time
