@@ -161,10 +161,13 @@ def test_tokenization_controls_encode_as_lm_evals_own_model_does(bos, source, tm
     vocabulary without BOS, one that inserts it and one that names it
     without inserting it: the inserted BOS left off when the caller asks for
     no special tokens, or when the text already starts with the prefix
-    token's text, and the last ids kept."""
+    token's decoded text, and the last ids kept. A text that starts with the
+    prefix token's own symbol, which the tokenizer reads as that token while
+    its decoded text is another byte, encodes as `HFLM`'s too."""
     ours, theirs = _pair(16, tmp_path, bos=bos, source=source)
     prefix = theirs.tokenizer.decode([theirs.prefix_token_id])
-    for text in ("the quick", prefix + "the quick"):
+    symbol = theirs.tokenizer.convert_ids_to_tokens(theirs.prefix_token_id)
+    for text in ("the quick", prefix + "the quick", symbol + "the quick"):
         for special in (None, True, False):
             for keep in (None, 3):
                 assert (ours.tok_encode(text, add_special_tokens=special, left_truncate_len=keep)
