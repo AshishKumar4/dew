@@ -253,6 +253,12 @@ class VisionTransformer(nn.Module):
                 lay.positions.side ** 2 + int(lay.special_tokens.cls is not None), lay.hidden_size,
                 lay.positions, dtype=self.dtype if lay.positions.compute_dtype else None,
                 name="position_table")
+        if lay.post_norm == "layer":
+            self.post_norm = LayerNorm(epsilon=lay.outer_norm_eps, use_scale=lay.post_norm_affine,
+                                       use_bias=lay.post_norm_affine, dtype=self.dtype, name="post_norm")
+        elif lay.post_norm == "rms":
+            self.post_norm = RMSNorm(epsilon=lay.outer_norm_eps, with_scale=lay.post_norm_affine,
+                                     dtype=self.dtype, name="post_norm")
 
     @nn.nowrap
     def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
@@ -268,11 +274,21 @@ class VisionTransformer(nn.Module):
                 (length + lay.special_tokens.count).astype(np.int64)) for index in range(lay.depth))
 
     def __call__(self, pixel_values, grid_thw=None) -> jax.Array:
-        return self.sequence_and_pool(pixel_values, grid_thw)[0]
+        return self._finished(self._sequence(pixel_values, grid_thw), pixel_values)
+
+    def sequence_and_pool(self, pixel_values, grid_thw=None) -> tuple[jax.Array, jax.Array]:
+        """The selected sequence and its class row through the declared post norm."""
+        cls = self.layout.special_tokens.cls
+        if cls is None:
+            raise ValueError("class pooling needs a class token")
+        hidden = self._sequence(pixel_values, grid_thw)
+        pooled = hidden[:, 0 if cls == "first" else -1]
+        if self.layout.post_norm is not None and self.layout.post_norm_scope == "class":
+            pooled = self.post_norm(pooled)
+        return self._finished(hidden, pixel_values), pooled
 
     @nn.compact
-    def sequence_and_pool(self, pixel_values, grid_thw=None):
-        """The selected sequence and, when present, its class row through the declared post norm."""
+    def _sequence(self, pixel_values, grid_thw=None) -> jax.Array:
         lay = self.layout
         pixels, grid, images = self._packed(jnp.asarray(pixel_values), grid_thw)
         length = pixels.shape[1]
@@ -354,19 +370,14 @@ class VisionTransformer(nn.Module):
         leaving = orders[current]
         if leaving is not None:
             hidden = _gather(hidden, jnp.argsort(leaving, axis=1))
-        hidden, pooled = self._finished(hidden)
+        if lay.post_norm is not None and lay.post_norm_scope == "sequence":
+            hidden = self.post_norm(hidden)
         if not lay.merge_blocks and merge > 1:
             # Raster patches into merge blocks, each block's patches consecutive (pixel_shuffle's gather).
             block = frame * area + (rows // merge) * merge * widths + (columns // merge) * merge * merge
             key = block + (rows % merge) * merge + columns % merge
             hidden = _gather(hidden, jnp.argsort(jnp.where(valid, key, last), axis=1, stable=True))
-        if lay.output == "patch_grid":
-            if not images:
-                raise ValueError("a tower returning its patch grid takes NCHW images")
-            height, width = jnp.shape(pixel_values)[2:]
-            hidden = hidden.reshape(hidden.shape[0], height // lay.patch_size, width // lay.patch_size,
-                                    lay.hidden_size)
-        return hidden, pooled
+        return hidden
 
     def _embedded(self, pixel_values, pixels, rows, columns, heights, widths, images):
         """Patch projection, positioned patch/class rows, and unpositioned register insertion."""
@@ -425,26 +436,20 @@ class VisionTransformer(nn.Module):
             hidden = jnp.concatenate([*leading, hidden] if tokens.cls == "first" else [hidden, cls], axis=1)
         return hidden
 
-    def _finished(self, hidden):
-        """Apply the output norm to its declared rows and select the public sequence."""
+    def _finished(self, hidden: jax.Array, pixel_values) -> jax.Array:
+        """Select the public rows and, when requested, restore their patch grid."""
         lay, tokens = self.layout, self.layout.special_tokens
-        outer = functools.partial(LayerNorm, epsilon=lay.outer_norm_eps, dtype=self.dtype)
-        pooled = None if tokens.cls is None else hidden[:, 0 if tokens.cls == "first" else -1]
-        if lay.post_norm is not None:
-            norm = (outer(use_scale=lay.post_norm_affine, use_bias=lay.post_norm_affine, name="post_norm")
-                    if lay.post_norm == "layer" else
-                    RMSNorm(epsilon=lay.outer_norm_eps, with_scale=lay.post_norm_affine,
-                            dtype=self.dtype, name="post_norm"))
-            if lay.post_norm_scope == "class":
-                pooled = norm(pooled)
-            else:
-                hidden = norm(hidden)
-                pooled = None if tokens.cls is None else hidden[:, 0 if tokens.cls == "first" else -1]
         if lay.output != "sequence":
             start = tokens.count if tokens.cls == "first" else 0
             stop = -1 if tokens.cls == "last" else None
             hidden = hidden[:, start:stop]
-        return hidden, pooled
+        if lay.output == "patch_grid":
+            if jnp.ndim(pixel_values) != 4:
+                raise ValueError("a tower returning its patch grid takes NCHW images")
+            height, width = jnp.shape(pixel_values)[2:]
+            hidden = hidden.reshape(hidden.shape[0], height // lay.patch_size, width // lay.patch_size,
+                                    lay.hidden_size)
+        return hidden
 
     def _packed(self, pixels, grid_thw):
         """Packed pixels and their grids [B, 3], with the input's image/packed distinction."""
