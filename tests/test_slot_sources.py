@@ -71,6 +71,13 @@ def test_a_slot_release_loads_its_readout_and_exports_the_same_task(tmp_path, re
     for actual, expected in zip(jax.tree.leaves((placed.variables, placed.head_variables)),
                                jax.tree.leaves((bundle.variables, bundle.head_variables)), strict=True):
         np.testing.assert_array_equal(actual, expected)
+    replicated = Pretrained.load(source, dtype="float32", attention_impl="xla", mesh=mesh,
+                                  layout=Layout(min_shard=2048, tolerance=1.0))
+    assert_sharded(replicated.variables, mesh)
+    for actual, expected in zip(jax.tree.leaves(replicated.head_variables),
+                               jax.tree.leaves(bundle.head_variables), strict=True):
+        assert actual.is_fully_replicated
+        np.testing.assert_array_equal(actual, expected)
     exported = tmp_path / "exported"
     bundle.save(exported)
     restored = Decide.from_pretrained(exported, dtype="float32", attention_impl="xla")
