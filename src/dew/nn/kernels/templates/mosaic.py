@@ -24,6 +24,7 @@ from collections.abc import Callable
 
 import jax
 from jax import lax, numpy as jnp
+from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
@@ -338,11 +339,22 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     rows: int
     consumers: int
     """The compute roles a program may take (sm90 two warpgroups, sm80 one)."""
-    layout: plgpu.Layout
-    """The accumulator's register layout; `row` and `column` its reductions over columns and rows, which
-    the accumulator's layout members (`zeros` to `as_row`) read."""
-    row: plgpu.Layout
-    column: plgpu.Layout
+
+    @property
+    @abc.abstractmethod
+    def layout(self) -> plgpu_core.SomeLayout:
+        """The accumulator's register layout, which the accumulator's layout members (`zeros` to `as_row`)
+        read."""
+
+    @property
+    @abc.abstractmethod
+    def row(self) -> plgpu_core.SomeLayout:
+        """A row vector's layout: the accumulator's reduced over its columns."""
+
+    @property
+    @abc.abstractmethod
+    def column(self) -> plgpu_core.SomeLayout:
+        """A column vector's layout: the accumulator's reduced over its rows."""
 
     @abc.abstractmethod
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
