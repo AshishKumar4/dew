@@ -656,7 +656,9 @@ def test_a_fused_norm_lowers_for_an_h100(producer):
         return fused.fusible_gemm(producer(x, weight), w, sizes).astype(jnp.bfloat16)
 
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
-    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh), generation.routes() as taken:
+    # Named: at these few rows the cost model may rank another launch first.
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"),
+          jax.sharding.use_abstract_mesh(mesh), generation.routes() as taken):
         jax.jit(fuser.fuse(fusing)).trace(x, w, nw).lower(lowering_platforms=("cuda",))
     assert 'mosaic_gpu' in {route.kernel for route in taken if route.choice == 'grouped_matmul'}
     assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}

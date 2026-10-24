@@ -30,6 +30,10 @@ from jax.experimental.pallas.ops.tpu.megablox.gmm import make_group_metadata
 
 from dew.nn.kernels.templates.gemm import rows_padded
 
+LANES = 128
+"""A vreg's lanes: Mosaic TPU tiles a block's minor dimensions by them (a block of two dimensions or more
+is of whole multiples), and a v5e MXU's side."""
+
 
 @dataclasses.dataclass(frozen=True)
 class Blocks:
