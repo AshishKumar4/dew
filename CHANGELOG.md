@@ -5,6 +5,12 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- `dew.nn.attention.scaled_dot_product_attention(..., dropout_rate=..., dropout_rng=...)` drops attention
+  weights on the selector's route (`generation.Route`): the reference path, or the attention template where
+  it is named (`implementation='template'` or `generation.chosen(attention='template')`). The template's Triton
+  and plain-JAX mainloops draw the reference's mask, one hash of the call's seed and each weight's global batch
+  row, query head, query and key (`dew.nn.kernels.templates.attention.Dropout`). A dropping call on a sharded
+  sequence axis, or on an explicit fused kernel, is refused.
 - `dew.nn.attention.scaled_dot_product_attention(..., implementation='template')`
   runs the attention template's route
   (`dew.nn.kernels.templates.attention_route.attend`): causality, windows,

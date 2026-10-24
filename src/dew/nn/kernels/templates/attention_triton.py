@@ -577,6 +577,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     grad_refs = {place: outputs.pop(0) for place, kind in enumerate(score_kinds) if kind in DQ_GRADS}
     block_q = query_ref.shape[0]
     head = pl.program_id(2)
+    draw = None if dropout is None else dropout.draw(pl.program_id(1), head)
     q_pos = pl.program_id(0) * block_q + jnp.arange(block_q)[:, None]
     query, dout = query_ref[...], dout_ref[...]
     peak, total = peak_ref[...], total_ref[...]
@@ -635,7 +636,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
         # own at the end (`algebra.dq_finish`); the weights' sums unnormalized.
         keys, k_pos, seen, params = tile(index)
         key, value = key_ref[keys, :], value_ref[keys, :]
-        zt = None if dropout is None else dropout.draw(pl.program_id(1), pl.program_id(2))(q_pos, k_pos)
+        zt = None if draw is None else draw(q_pos, k_pos)
         weights, _, cotangents, slopes = _tile_scores(score_mod, query, key, value, dout, peak, prior, anchor,
                                                    delta, seen, q_pos, k_pos, params, key_index=key_index,
                                                    scale=scale, how=how, interpret=interpret, multiplier=zt)
@@ -683,6 +684,7 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
     grad_refs = {place: outputs.pop(0) for place, kind in enumerate(score_kinds) if kind in DKV_GRADS}
     block_k = key_ref.shape[0]
     head = pl.program_id(2)
+    draw = None if dropout is None else dropout.draw(pl.program_id(1), head)
     k_pos = pl.program_id(0) * block_k + jnp.arange(block_k)[None, :]
     key, value = key_ref[...], value_ref[...]
     key_ids = [ref[...] for ref in id_refs[1:]]
@@ -699,7 +701,7 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
                       (id_refs[0][rows][:, None], key_ids[0][None, :]) if ids else None)
         params = [_key_param(ref, kind, head, rows)
                   for ref, kind in zip(score_refs, score_kinds, strict=True)]
-        zt = None if dropout is None else dropout.draw(pl.program_id(1), pl.program_id(2))(q_pos, k_pos)
+        zt = None if draw is None else draw(q_pos, k_pos)
         exponentials, weights, cotangents, slopes = _tile_scores(
             score_mod, query, key, value, dout, peak_ref[rows], total_ref[rows], anchor_ref[rows],
             delta_ref[rows], seen, q_pos, k_pos, params, key_index=index_ref[rows], scale=scale, how=how,
