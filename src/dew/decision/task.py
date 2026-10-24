@@ -218,7 +218,7 @@ class Decide:
         """Build the declared decision task from a loaded composite bundle, without loading again."""
         from dew.registry import from_record
 
-        settings = DecideSettings.of(records.record(bundle.settings, "decision settings"))
+        settings = from_record(DecideSettings, bundle.settings)
         calibration = from_record(Calibration, bundle.calibration)
         return cls(DecisionModel(bundle.model, bundle.head),
                    joined({"backbone": bundle.variables, "head": bundle.head_variables}),
