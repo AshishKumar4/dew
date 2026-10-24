@@ -214,7 +214,11 @@ class ZImageTransformer(nn.Module):
         `t_scale`: 256 sinusoids, cosines first, 1024 wide inside, and
         `min(dim, 256)` out."""
         width = at_least_fp32(self.dtype)
-        source_time = (1000.0 - jnp.asarray(time, width)) / 1000.0 * self.t_scale
+        # The scale folded on the host and rounded once (exactly 1 at the published 1000): a division
+        # by a constant left in the program is XLA's to rewrite as a product with its reciprocal,
+        # inexact, which put the time's sinusoids, and every modulation they drive, twice as far from
+        # float64 on JAX 0.12's CPU as on 0.11's.
+        source_time = (1000.0 - jnp.asarray(time, width)) * jnp.asarray(self.t_scale / 1000.0, width)
         features = sinusoidal_time(source_time, FREQUENCIES, dtype=width).astype(dtype)
         maps = self.projections(0, 0)
         hidden = Dense(maps['t_embedder_1'][1], dtype=self.dtype, precision=self.precision,
