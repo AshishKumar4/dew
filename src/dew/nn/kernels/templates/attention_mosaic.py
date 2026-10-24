@@ -323,7 +323,7 @@ def _launch(query, key, value, spans: _Spans | None, *, spec: algebra.Forward, t
         spans_refs, (out_ref, q_smem, q_loaded, schedule) = refs[:len(leaves)], refs[len(leaves):]
         spans_of = None if spans is None else treedef.unflatten(spans_refs)
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
-        views = _views_of({"keys": k_ref, "values": v_ref}, row, lax.div(head, group), block_k)
+        views = _views_of({"keys": k_ref, "values": v_ref}, row, lax.div(head, group))
         streams = family.opened(streams, views)
         pair_first = program.query_tile(queries // pair) * pair
         streamed = _streamed([program.reach(pair_first + index * block_q, spans_of, row)[:2]
@@ -379,10 +379,10 @@ def _rows(family: mosaic.Family, ref, row, head, first, count: int):
     return family.rows_of(ref.at[row, head, pl.ds(first, count)])
 
 
-def _views_of(refs: dict, row, head, block: int) -> dict:
-    """The streams' views by name (`Family.opened`, `Family.stream`): each `[B, S, H, D]` operand's `[S, D]`
-    at batch row `row` and head `head`, its steps `block` rows of it."""
-    return {name: (ref.at[row, :, head], block) for name, ref in refs.items()}
+def _views_of(refs: dict, row, head) -> dict:
+    """The streams' views by name (`Family.opened`, `Family.stream`, `mosaic.viewed`): each `[B, S, H, D]`
+    operand's `[S, D]` at batch row `row` and head `head`, step `j` its `j`-th block of rows."""
+    return {name: (ref.at[row, :, head], lambda j: (j, 0)) for name, ref in refs.items()}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -488,7 +488,7 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, s
         (dq_ref, keyed_ref, rows_ref, q_smem, do_smem, out_smem, row_smem, q_loaded,
          do_loaded) = refs[len(leaves):]
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
-        views = _views_of({"keys": k_ref, "values": v_ref}, row, lax.div(head, heads // kv_heads), block_k)
+        views = _views_of({"keys": k_ref, "values": v_ref}, row, lax.div(head, heads // kv_heads))
         streams = family.opened(streams, views)
         pair_first = program.query_tile(queries // pair) * pair
         streamed = _streamed([program.reach(pair_first + index * block_q, spans_of, row)[:2]
@@ -624,7 +624,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
             view = dq_ref.at[index if walk.interpret else 0, row, pl.ds(q_first, block_q), head]
             family.added(dq, view, walk.interpret, smem=out_smem.at[index, pl.ds(0, block_q)])
 
-        views = _views_of({"queries": q_ref, "douts": do_ref}, row, head, block_q)
+        views = _views_of({"queries": q_ref, "douts": do_ref}, row, head)
         streams = family.opened(streams, views)
         pair_first = lax.axis_index("k_tiles") * pair
         streamed = _streamed([program.readers(pair_first + index * block_k, q_steps, spans_of, row)[:2]

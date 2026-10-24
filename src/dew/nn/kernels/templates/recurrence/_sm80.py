@@ -75,9 +75,18 @@ class MmaSync(mosaic.Family[dict, dict, jax.Array]):
     name = "mma.sync"
     rows = 64
     consumers = 1
-    layout = plgpu.Layout.MMA_ACC(jnp.bfloat16)
-    row = layout.reduce(1)
-    column = layout.reduce(0)
+
+    @property
+    def layout(self):
+        return plgpu.Layout.MMA_ACC(jnp.bfloat16)
+
+    @property
+    def row(self):
+        return self.layout.reduce(1)
+
+    @property
+    def column(self):
+        return self.layout.reduce(0)
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int, interpret: bool):
         if consumers != 1:

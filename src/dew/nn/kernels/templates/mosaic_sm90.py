@@ -23,9 +23,18 @@ class Wgmma(mosaic.RingFamily):
     name = "wgmma"
     rows = 64
     consumers = 2
-    layout = plgpu.Layout.WGMMA
-    row = plgpu.Layout.WGMMA.reduce(1)
-    column = plgpu.Layout.WGMMA.reduce(0)
+
+    @property
+    def layout(self):
+        return plgpu.Layout.WGMMA
+
+    @property
+    def row(self):
+        return plgpu.Layout.WGMMA.reduce(1)
+
+    @property
+    def column(self):
+        return plgpu.Layout.WGMMA.reduce(0)
 
     def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
         def scores(acc_ref):

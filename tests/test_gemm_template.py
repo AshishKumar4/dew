@@ -6,6 +6,7 @@ an H100 and its TPU lowering."""
 
 import dataclasses
 import functools
+import itertools
 
 import jax
 import jax.numpy as jnp
@@ -1032,8 +1033,8 @@ def test_the_mosaic_kernels_load_a_side_operands_rows_from_any_dimension():
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_exact_sums_add_each_steps_product_as_the_plain_sum_does(generation_name):
     """At the highest precision an fp32 kernel gradient adds each step's product apart (`exact_sums`):
-    interpreted on the CPU, whose dots sum in IEEE fp32 either way, at one tile it is the default path's
-    bit for bit."""
+    interpreted on the CPU, whose dots sum in IEEE fp32 either way, through one launch at one tile it is
+    the default path's bit for bit."""
     rng = np.random.default_rng(4)
     x = jnp.asarray(rng.normal(size=(ROWS, DEPTH)), jnp.bfloat16)
     dy = jnp.asarray(rng.normal(size=(ROWS, WIDTH)), jnp.bfloat16)
@@ -1041,12 +1042,14 @@ def test_exact_sums_add_each_steps_product_as_the_plain_sum_does(generation_name
     # One tile both ways, a step of EXACT_STEP rows, so the order of the sums is the same.
     tiles = {grouped_matmul.Tgmm: grouped_matmul.Tile(64, 128, 64, 4, 2),
              grouped_matmul.MosaicTgmm: mosaic_gpu.Tiles(64, 128, 64, 2, 1)}
-    with generation.assumed(generation_name), tuning.pinned(tiles):
-        for group_sizes in (sizes, None):
+    launches = ("triton", "mosaic_gpu") if generation_name == "sm90" else ("triton",)
+    for launch, group_sizes in itertools.product(launches, (sizes, None)):
+        with (generation.assumed(generation_name), tuning.pinned(tiles),
+              generation.chosen(grouped_matmul=launch)):
             exact, default = (jax.jit(functools.partial(template.gemm_t, out_dtype=jnp.float32,
                                                         precision=precision, interpret_on_cpu=True))(
                 x, dy, group_sizes) for precision in ("highest", "default"))
-            np.testing.assert_array_equal(np.asarray(exact), np.asarray(default))
+        np.testing.assert_array_equal(np.asarray(exact), np.asarray(default))
 
 
 @runs("sm90")
