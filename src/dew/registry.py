@@ -158,8 +158,12 @@ def module_from_file(path: str | os.PathLike[str], name: str) -> types.ModuleTyp
     so what it defines is named by `name` (`import_path`) and a record of it reads back here
     (`imported`). Each call runs the file again; a file this imported before under `name` gives way
     to this one. A name that is another module's, imported or importable (the standard library's
-    `json` for a `json.py`), is refused rather than shadowed or read in its place."""
+    `json` for a `json.py`), or a package's module (a dotted name), is refused rather than shadowed
+    or read in its place."""
     location = Path(path).resolve()
+    if "." in name:
+        raise ValueError(f"{location} would import as {name}, a module of the package "
+                         f"{name.rpartition('.')[0]}, which a file cannot stand in for; rename the file")
     held = sys.modules.get(name)
     if held is not None and _FILES.get(name) is None:
         other = getattr(held, "__file__", None) or "a module without a file"

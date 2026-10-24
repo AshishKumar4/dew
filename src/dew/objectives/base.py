@@ -111,7 +111,7 @@ class Ratio:
         """
         mass = jax.lax.stop_gradient(self.mass)
         active = mass > 0
-        dtype = at_least_fp32(jnp.result_type(self.total.dtype, mass.dtype))
+        dtype = jnp.result_type(self.total.dtype, mass.dtype, jnp.float32)
         value = self.total.astype(dtype) / jnp.where(active, mass.astype(dtype), 1)
         return jnp.where(active, value, 0), active
 

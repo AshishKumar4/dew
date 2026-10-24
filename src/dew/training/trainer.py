@@ -978,7 +978,7 @@ class Trainer(Generic[Loss, Effects]):
             return state
         stats, aux = shapes
         shared = isinstance(stats, (Ratio, jax.ShapeDtypeStruct))
-        mean_dtype = at_least_fp32(jnp.result_type(*(x.dtype for x in jax.tree.leaves(stats))))
+        mean_dtype = jnp.result_type(jnp.float32, *(x.dtype for x in jax.tree.leaves(stats)))
         slots = window - 1
         def shape(leaf: jax.Array) -> jax.ShapeDtypeStruct:
             return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)

@@ -432,7 +432,7 @@ def router_counts(moe: Variables, routing: Variables, queries: jax.Array | None 
 
 
 def _updated_bias(bias: jax.Array, counts: jax.Array, rate: float) -> jax.Array:
-    dtype = at_least_fp32(jnp.result_type(bias.dtype, rate))
+    dtype = jnp.result_type(bias.dtype, rate, jnp.float32)
     correction = load_balance_update(counts, jnp.asarray(rate, dtype))
     return (bias.astype(dtype) + correction).astype(bias.dtype)
 
