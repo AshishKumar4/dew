@@ -1114,14 +1114,17 @@ def test_a_pool_agrees_one_validity_schema_when_only_some_ranks_padded(tmp_path)
 
 @pytest.mark.distributed
 def test_a_pool_trains_a_hybrid_split_over_the_sequence(tmp_path):
-    """Two processes train a hybrid decoder's Mamba-2 and attention layers split over the sequence: the
-    pool fills validity on every process, so the Mamba-2 layers take its padded-row path under the
-    sequence axis (tests/test_mamba2.py holds that path to the unsplit layer by check 1), and the
-    processes report one finite loss and a real update."""
-    reports = run_pool("sequence_hybrid", tmp_path / "pool", 2, fsdp_size=1, timeout=180)
+    """Two processes of one device each train a hybrid decoder's Mamba-2 and attention layers split
+    over the sequence, each half of every sequence on another process: the pool fills validity on
+    both, so the Mamba-2 layers take their padded-row path under the sequence axis, its halo and state
+    crossing the processes (tests/test_mamba2.py holds that path's output and gradients to the unsplit
+    layer's by check 1), and the processes report one finite loss and a finite, real update."""
+    reports = run_pool("sequence_hybrid", tmp_path / "pool", 2, devices=1, fsdp_size=1, timeout=180)
+    assert [report["sequence_processes"] for report in reports] == [[[0, 1]]] * 2
     assert [report["placed_fields"] for report in reports] == [["attention_mask"]] * 2
     assert reports[0]["loss"] == reports[1]["loss"], "the processes disagreed with each other"
-    assert np.isfinite(reports[0]["loss"]) and reports[0]["update_scale"] > 0
+    assert np.isfinite(reports[0]["loss"]) and np.isfinite(reports[0]["update_scale"])
+    assert reports[0]["update_scale"] > 0
 
 
 @pytest.mark.distributed

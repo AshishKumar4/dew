@@ -268,6 +268,12 @@ SPLIT_ROWS = {
     # Packed documents with gaps between and inside them, one starting on a shard's first real token.
     "packed": (~np.isin(np.arange(32), [5, 6, 14, 15, 30, 31]),
                np.repeat([1, 1, 2, 3], [5, 11, 8, 8])),
+    # A whole interior shard of padding with real tokens on both sides: the history and the state
+    # cross it unchanged.
+    "empty_shard": (~((np.arange(32) >= 8) & (np.arange(32) < 16)), None),
+    # The same with one document continuing across the empty shard and another starting after it.
+    "empty_shard_packed": (~((np.arange(32) >= 8) & (np.arange(32) < 16)),
+                           np.repeat([1, 2], [20, 12])),
 }
 """Each row of the sequence split's check: its real tokens and its documents (None for one)."""
 
@@ -282,7 +288,8 @@ def test_a_layer_split_over_the_sequence_runs_padded_and_packed_rows_as_whole_on
     device: a padded slot neither reads nor advances the conv or the state, each real token's conv
     reading the real tokens before it in its document across gaps and shards, and padded slots emit
     zero. Output and input gradient are check 1's against the unsplit layer, from float64, over drawn
-    hidden states. A pool of processes always carries validity, so this is every multi-host run."""
+    hidden states, and so are the parameters' gradients. A pool of processes always carries
+    validity, so this is every multi-host run."""
     module = layer(geometry)
     variables = layer_params(reference)
     valid, segments = SPLIT_ROWS[row]
@@ -299,8 +306,8 @@ def test_a_layer_split_over_the_sequence_runs_padded_and_packed_rows_as_whole_on
 
     def run(model, params, mesh=None):
         def pulled(hidden, cotangent):
-            out, pull = jax.vjp(lambda hidden: model.apply(params, hidden, call), hidden)
-            return out, pull(cotangent)[0]
+            out, pull = jax.vjp(lambda params, hidden: model.apply(params, hidden, call), params, hidden)
+            return out, *pull(cotangent)
         if mesh is None:
             return jax.jit(pulled)
         def split(hidden, cotangent):
