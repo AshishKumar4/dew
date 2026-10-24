@@ -478,7 +478,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_layer_stack.py": {
-   "comparisons": 21,
+   "comparisons": 23,
    "lane": "Models, Serving & RL"
   },
   "tests/test_linear_attention.py": {
