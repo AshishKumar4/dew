@@ -6,12 +6,13 @@ import os
 
 import jax
 import numpy as np
-import reference_error
 
 SEEDS = int(os.environ.get("TAILPROBE_SEEDS", "320"))
 
 
 def probe(dew_fn, reference_fn, draw, label, *, seeds=None, truth_fn=None, **_):
+    import reference_error
+
     errors = {}
     for seed in range(int(os.environ.get("TAILPROBE_FROM", "0")), int(os.environ.get("TAILPROBE_FROM", "0")) + SEEDS):
         args = draw(seed)
@@ -39,4 +40,7 @@ def probe(dew_fn, reference_fn, draw, label, *, seeds=None, truth_fn=None, **_):
 
 
 def pytest_configure(config):
+    # tests/ is on the path once its conftest has loaded, which is before this hook.
+    import reference_error
+
     reference_error.assert_as_exact = probe
