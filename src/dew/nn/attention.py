@@ -1188,7 +1188,8 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
         hooks = template.Hooks(
             score_mod=None if softcap is None else functools.partial(template.capped, softcap),
             initial=None if sinks is None else template.sinks(sinks, batch, queries, value.shape[-1]),
-            drop=None if seed is None else template.Dropout(seed, global_rows, global_heads, dropout_rate))
+            drop=None if seed is None or global_rows is None or global_heads is None
+            else template.Dropout(seed, global_rows, global_heads, dropout_rate))
         return attention_route.attend(query, key, value, spans, hooks)
 
     # The GPU arms are Pallas launches, which have no partitioning rule, so each shard runs them on its own
