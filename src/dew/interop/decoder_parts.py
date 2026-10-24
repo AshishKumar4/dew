@@ -869,12 +869,15 @@ def modeling_overrides(source: Mapping[str, object], config: DecoderFields, used
         refuse("modeling_overrides", "only its attention record is supported")
     attention = records.record(overrides.get("attention", {}), "modeling_overrides.attention")
     kinds = kinds_of(config)
+    declared = config.get("layer_types")
+    if declared is None:
+        declared = ("full_attention",)
     for name, mode in attention.items():
-        if name not in kinds:
+        if name not in declared:
             refuse(f"attention override for {name}", "the decoder has no such layer kind")
         if mode not in ("causal", "block_bidirectional"):
             refuse(f"attention override {mode!r}", "the supported modes are causal and block_bidirectional")
-        kind = kinds[name]
+        kind = kinds.setdefault(name, native_fields(LayerKind)())
         specified = kind.get("mixer", config.get("mixer"))
         mixer = AttentionMixer() if specified is None else from_record(MixerBase, specified)
         if not isinstance(mixer, AttentionMixer):
