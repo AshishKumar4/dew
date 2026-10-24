@@ -805,20 +805,20 @@ class Dataset:
         chain = self._chain()
         if deduplicate is None:
             return export(chain, url, format=format, rows_per_shard=rows_per_shard)
+        import tempfile
         from importlib.metadata import version
 
-        from dew.data.dataset import Closeable
+        from dew.data.sources import Files
         from dew.data.text import near_duplicates_removed
 
-        records = passed(chain)
-        try:
-            kept, removed = near_duplicates_removed(records, deduplicate)
-        finally:
-            if isinstance(records, Closeable):
-                records.close()
-        rule = {**dataclasses.asdict(deduplicate), "datatrove": version("datatrove"), "removed": removed}
-        return export(kept, url, format=format, rows_per_shard=rows_per_shard,
-                      metadata={"near_duplicates": rule})
+        # The one pass sealed first, so every later read of it reads the same records in one order,
+        # whatever a fetch makes of them the next time.
+        with tempfile.TemporaryDirectory(prefix="dew-deduplicate-") as sealed:
+            export(chain, sealed, format="array_record", rows_per_shard=rows_per_shard)
+            kept, removed = near_duplicates_removed(lambda: passed(Files(sealed)), deduplicate)
+            rule = {**dataclasses.asdict(deduplicate), "datatrove": version("datatrove"), "removed": removed}
+            return export(kept, url, format=format, rows_per_shard=rows_per_shard,
+                          metadata={"near_duplicates": rule})
 
     def rename_columns(self, names: Mapping[str, str]) -> Pipeline:
         """Each record with its fields renamed, as `rename_columns({"txt": "caption"})`."""

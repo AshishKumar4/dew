@@ -20,7 +20,7 @@ import json
 import tempfile
 import threading
 import unicodedata
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, runtime_checkable
 
@@ -660,11 +660,13 @@ class NearDuplicates:
     field: str = "text"
 
 
-def near_duplicates_removed(records: Iterable[Batch], near: NearDuplicates) -> tuple[Iterator[Batch], int]:
-    """`records`, one pass of a sealed snapshot, each group of near-duplicates (`near`) kept as one
-    record by DataTrove's four MinHash stages: signatures, band matches bucket by bucket, their
-    clusters, and the filter that drops every record a cluster removes, over the same records in the
-    same order. Returns the records kept, lazily, and how many the clusters remove."""
+def near_duplicates_removed(records: Callable[[], Iterator[Batch]],
+                            near: NearDuplicates) -> tuple[Iterator[Batch], int]:
+    """The records each pass of `records` opens, one sealed snapshot's in one order, with each group
+    of near-duplicates (`near`) kept as one record by DataTrove's four MinHash stages: signatures
+    over a pass, band matches bucket by bucket, their clusters, and the filter that drops every
+    record a cluster removes over a second pass. Returns the records kept, lazily, and how many the
+    clusters remove."""
     from datatrove.data import Document
     from datatrove.pipeline.dedup.minhash import (
         MinhashConfig,
@@ -674,13 +676,18 @@ def near_duplicates_removed(records: Iterable[Batch], near: NearDuplicates) -> t
         MinhashDedupSignature,
     )
 
-    rows = list(records)
+    from dew.data.dataset import Closeable
 
     def documents() -> Iterator[Document]:
-        for index, record in enumerate(rows):
-            text = record[near.field]
-            text = text.decode("utf-8") if isinstance(text, bytes) else str(text)
-            yield Document(text=text, id=str(index))
+        opened = records()
+        try:
+            for index, record in enumerate(opened):
+                text = record[near.field]
+                text = text.decode("utf-8") if isinstance(text, bytes) else str(text)
+                yield Document(text=text, id=str(index), metadata={"record": record})
+        finally:
+            if isinstance(opened, Closeable):
+                opened.close()
 
     config = MinhashConfig(n_grams=near.n, num_buckets=near.buckets, hashes_per_bucket=near.hashes)
     work = tempfile.TemporaryDirectory(prefix="dew-minhash-")
@@ -695,7 +702,7 @@ def near_duplicates_removed(records: Iterable[Batch], near: NearDuplicates) -> t
     def kept() -> Iterator[Batch]:
         with work:
             survivors = MinhashDedupFilter(f"{work.name}/clusters").run(documents(), rank=0, world_size=1)
-            yield from (rows[int(document.id)] for document in survivors)
+            yield from (document.metadata["record"] for document in survivors)
 
     return kept(), removed
 
