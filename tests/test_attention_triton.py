@@ -18,7 +18,7 @@ from test_attention_template import (
 )
 
 from dew.nn.attention import alibi_bias
-from dew.nn.kernels import tuning
+from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
     attention_algebra as algebra,
@@ -159,13 +159,32 @@ def test_the_forward_is_on_par_over_the_core_s_other_call_forms(form):
     check(CASES[form], HOOKS["none"], jnp.float32, PINNED[1])
 
 
-@pytest.mark.parametrize("mainloop", ["triton", "portable"])
 @pytest.mark.parametrize("config", PINNED[:3], ids=str)
 @pytest.mark.parametrize("form", RUN_CASES)
-def test_the_forward_is_on_par_over_runs(form, config, mainloop):
-    """Each query's runs (`test_attention_template.RUN_CASES`), a decision row's: both mainloops walk each
-    query block's ranges in turn, at tiles that part its fragments."""
-    check(RUN_CASES[form], HOOKS["none"], jnp.float32, config, mainloop=mainloop)
+def test_the_plain_forward_is_on_par_over_runs(form, config):
+    """Each query's runs (`test_attention_template.RUN_CASES`), a decision row's: the plain-JAX mainloop
+    walks each query block's ranges in turn, at tiles that part its fragments."""
+    check(RUN_CASES[form], HOOKS["none"], jnp.float32, config, mainloop="portable")
+
+
+def test_the_frozen_mainloop_refuses_runs():
+    """The frozen Triton mainloop walks one key interval a query: its legality rule names a call's runs, its
+    launches are not eligible for them, and its forward and backward refuse them before any launch, so the
+    route takes the Mosaic or the plain-JAX mainloop (ledger 956)."""
+    queries, keys = core_geometry(RUN_CASES["runs"])
+    spans = template.spans(queries, keys, ROWS, **arguments(RUN_CASES["runs"]))
+    reason = attention_triton.refused(spans)
+    assert reason is not None and attention_triton.refused(template.spans(queries, keys, ROWS)) is None
+    query = jnp.zeros((ROWS, queries, 2, 32), jnp.float32)
+    key = jnp.zeros((ROWS, keys, 1, 32), jnp.float32)
+    op = attention_triton.TritonForward(keys=keys)
+    ba = op.bind(query, key, key, spans.start, spans.end, None, None, (), (), None, None, None,
+                 residuals=False, interpret=True)
+    assert not op.eligible(ba, generation.gpu_target("sm90"))
+    with pytest.raises(NotImplementedError):
+        attention_triton.forward(query, key, key, spans, interpret=True)
+    with pytest.raises(NotImplementedError):
+        attention_triton.backward(query, key, key, spans, None, query, interpret=True)
 
 
 @pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
@@ -381,14 +400,13 @@ def test_the_backward_is_on_par_over_every_call_form(form, config, options):
     check_backward(CASES[form], (), jnp.float32, config, **options)
 
 
-@pytest.mark.parametrize("mainloop", ["triton", "portable"])
 @pytest.mark.parametrize("options", TEMPLATE_FORMS.values(), ids=TEMPLATE_FORMS)
 @pytest.mark.parametrize("config", PINNED[:2], ids=str)
 @pytest.mark.parametrize("form", RUN_CASES)
-def test_the_backward_is_on_par_over_runs(form, config, options, mainloop):
-    """Each query's runs: the dQ launch walks its ranges as the forward does, and the dK/dV launch reads
-    the query blocks some range of which holds its keys, in both forms, on both mainloops."""
-    check_backward(RUN_CASES[form], (), jnp.float32, config, mainloop=mainloop, **options)
+def test_the_plain_backward_is_on_par_over_runs(form, config, options):
+    """Each query's runs on the plain-JAX mainloop: its query walk takes its ranges as the forward does, and
+    its key walk reads the query blocks some range of which holds its keys, in both forms."""
+    check_backward(RUN_CASES[form], (), jnp.float32, config, mainloop="portable", **options)
 
 
 @pytest.mark.parametrize("form", [form for form in CASES if form not in BACKWARD_FORMS])
