@@ -12,14 +12,27 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact
 from test_attention_route import CASES, HEADS, KV_HEADS, WIDTH, drawing, keywords
-from test_attention_template import CASES as SPAN_CASES
-from test_attention_template import DTYPES, KEYS, QUERIES, ROWS, SEEDS, arguments, dews_mask, geometry
-from test_attention_template import drawing as value_drawing
+from test_attention_template import (
+    CASES as SPAN_CASES,
+    DTYPES,
+    KEYS,
+    QUERIES,
+    ROWS,
+    SEEDS,
+    arguments,
+    dews_mask,
+    drawing as value_drawing,
+    geometry,
+)
 
 from dew.nn.attention import dropout_draw, reference_attention, scaled_dot_product_attention
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention as template
-from dew.nn.kernels.templates import attention_portable, attention_route, attention_triton
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_portable,
+    attention_route,
+    attention_triton,
+)
 
 RATE = 0.25
 """The dropout rate the check-1 tests drop at: a quarter of the weights."""
@@ -129,7 +142,7 @@ def hooked(words: jax.Array, batch: int, heads: int, rate: float = RATE) -> temp
 
 
 def route_arm(case: dict):
-    """`case`'s template route over its spans, dropping from the seed words, as `(query, key, value, words)`."""
+    """The template route over `case`'s spans, dropping from the seed words: `(query, key, value, words)`."""
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
 
