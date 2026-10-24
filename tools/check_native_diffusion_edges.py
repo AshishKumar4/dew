@@ -51,13 +51,13 @@ def oracle_walk(scheduler, initial, dtype):
 
 def check_schedule(ref, case):
     import diffusers
-
     from diffusers_wan_reference import float64_scheduler
 
     config = json.loads(str(ref[case + ".config"]))
     policy = SourceSchedule.from_config(config)
     # The table is a function of the config alone, with no draw to vary: one comparison holds it.
-    assert_as_exact_as_the_reference(policy.betas, ref[case + ".betas"], ref[case + ".betas.fp64"], f"{case} betas")
+    assert_as_exact_as_the_reference(policy.betas, ref[case + ".betas"], ref[case + ".betas.fp64"],
+                                     f"{case} betas")
     process, times = policy.sampling(STEPS)
     model_times = np.asarray(process.sampler_schedule.model_time(times[:-1]))
     expected_times = ref[case + ".times"]
@@ -93,7 +93,6 @@ def check_schedule(ref, case):
 def check_unet(directory, case):
     import torch
     from diffusers import UNet2DConditionModel
-
     from diffusers_wan_reference import float64
 
     model = UNet2DCondition(**unet_fields(json.loads((directory / "unet/config.json").read_text()),
