@@ -68,19 +68,19 @@ class Head(nn.Module):
                              "QuestionLayout or use a joint head")
 
     def record(self) -> JSON:
-        """Return the head as a run records it, a registry class record (`dew.registry.Record`):
-        its class by import path and its fields but the width, which the backbone it reads gives,
-        so any head reloads, one of a package the run trusts too."""
+        """Return the head as a run records it: its class by import path (`dew.registry`) and its
+        fields but the width, which the backbone it reads gives, so any head reloads, one of a
+        package the run trusts too."""
         fields = record_fields(self, type(self))
         del fields[self.width_field]
-        return {"class": import_path(type(self)), "fields": fields}
+        return {"name": import_path(type(self)), "fields": fields}
 
     @staticmethod
     def from_record(record: JSON, width: int) -> "Head":
         """Rebuild the head a run recorded, reading states `width` wide, in the numerics it
         recorded. An earlier run's record is read through `dew.inference.tasks.earlier_shapes`."""
         held = records.record(record, "head")
-        path = records.text(held.get("class"), "head.class")
+        path = records.text(held.get("name"), "head.name")
         head = imported(path)
         if not (isinstance(head, type) and issubclass(head, Head)):
             raise ValueError(f"a run's head is a decision head (`Head`), not {path!r}")

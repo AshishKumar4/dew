@@ -97,10 +97,9 @@ def test_a_layout_and_a_head_of_a_runs_own_reload_by_import_path_and_an_earlier_
     head = WiderHead(hidden_size=8)
     assert Head.from_record(head.record(), 8) == head
     recorded = JointSchemaHead(hidden_size=8).record()
-    assert isinstance(recorded, dict)
-    for name in ("JointSchemaHead", "dew.decision.head:JointSchemaHead"):
-        earlier = earlier_shapes({"head": {"name": name, "fields": recorded["fields"]}})
-        assert Head.from_record(earlier["head"], 8) == JointSchemaHead(hidden_size=8)
+    assert isinstance(recorded, dict) and recorded["name"] == "dew.decision.head:JointSchemaHead"
+    earlier = earlier_shapes({"head": {"name": "JointSchemaHead", "fields": recorded["fields"]}})
+    assert Head.from_record(earlier["head"], 8) == JointSchemaHead(hidden_size=8)
 
 
 def test_a_row_without_a_state_segment_keeps_none_of_the_state():
