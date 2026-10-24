@@ -367,16 +367,20 @@ def _forward_call(shape, width: int, value_width: int, residuals: bool):
 def test_every_fitting_tile_stages_within_a_hoppers_block(width, value_width, residuals):
     """On an H100 every forward tile that fits stages within its block (`generation.shared_budget`) and a
     consumer's registers (`MosaicForward.register_budget`), whatever the widths, and the cost model picks one
-    of them: no table's tile, which at heads 256 wide staged 320 KiB against its 227 (ledger 1582). At D 128
-    the measured spill is out (a consumer of 128 queries: 2.9 to 4.6 ms against 0.49) and FlashAttention-3's
-    64 queries over 128 keys in."""
+    of them: no table's tile, which at heads 256 wide staged 320 KiB against its 227 (ledger 1582). Where
+    none fits (a training forward's split sums and kept anchor row beside 256-wide values hold more
+    registers than a consumer has), the op is not eligible, so the route takes another mainloop. At D 128
+    the measured spill is out (a consumer of 128 queries: 2.9 to 4.6 ms against 0.49) and
+    FlashAttention-3's 64 queries over 128 keys in."""
     with generation.assumed("sm90"):
         target = generation.gpu_target()
         op, ba = _forward_call((2, 4096, 32, 8), width, value_width, residuals)
-        fits = op.fitting(ba, target)
+        fits = op.fits(ba, target)
         assert all(op.staged_bytes(ba, tiles, target) <= generation.shared_budget(target) for tiles in fits)
         assert all(op.registers(ba, tiles) <= op.register_budget(tiles) for tiles in fits)
-        assert op.estimate(ba, target)[1] in fits
+        assert op.eligible(ba, target) == bool(fits)
+        assert not fits or op.estimate(ba, target)[1] in fits
+    assert bool(fits) == (value_width < 256 or not residuals)
     if (width, value_width, residuals) == (128, 128, False):
         assert not any(tiles.block_q == 128 and tiles.consumers == 2 for tiles in fits)
         assert attention_mosaic.Tiles(64, 128, 2, 2) in fits
@@ -543,9 +547,9 @@ def test_the_launches_lower_for_an_h100(call, accurate):
                            gate.output_mod, gate.output_params)
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
         for forward_hooks in (None, hooks):
-            for residuals in (False, True):
+            for training in (False, True):
                 entry = functools.partial(attention_mosaic.forward, spans=spans, hooks=forward_hooks,
-                                          residuals=residuals)
+                                          residuals=training)
                 jax.jit(entry).trace(q, kv, kv).lower(lowering_platforms=("cuda",))
         jax.jit(lambda q, k, v, dout, residuals: attention_mosaic.backward(
             q, k, v, spans, None, dout, residuals=residuals, accurate=accurate)).trace(
