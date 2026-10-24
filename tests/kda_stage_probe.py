@@ -30,7 +30,11 @@ def torch_stages(source, destination):
         o = chunk_gla_fwd_o_gk(q=q, v=vn, g=cg, A=aqk, h=h, scale=0.5, chunk_size=64)
         for name, value in dict(cg=cg, aqk=aqk, akk=akk, w=w, u=u, kg=kg, qg=qg,
                                 vn=vn, ht=ht, o=o).items():
-            saved[f'{seed}/{name}'] = value.detach().cpu().numpy()
+            host = value.detach().cpu().numpy()
+            if name == 'aqk':
+                causal = np.arange(host.shape[-1])[None, :] <= np.arange(host.shape[1])[:, None]
+                host = np.where(causal[:, None, :], host, 0.0)
+            saved[f'{seed}/{name}'] = host
     np.savez(destination, **saved)
 
 
@@ -79,7 +83,8 @@ def main():
 
     def port(q, k, v, g, beta, h0, *, mode):
         if mode == 'prefix64':
-            cg = (jnp.cumsum(g.astype(jnp.float64), axis=1) / np.log(2.0)).astype(jnp.float32)
+            with jax.enable_x64():
+                cg = (jnp.cumsum(g.astype(jnp.float64), axis=1) / np.log(2.0)).astype(jnp.float32)
         else:
             cg = recurrence.cumulated(g, scale=fla_gdn.RCP_LN2)
         aqk, akk = fla_kda.intra_solve(q, k, cg, beta, scale=0.5)
@@ -95,38 +100,37 @@ def main():
         upstream = np.load(destination)
         for mode in ('baseline', 'prefix64'):
             measured = {}
-            with jax.enable_x64(mode == 'prefix64'):
-                run = jax.jit(lambda *args: port(*args, mode=mode))
-                for seed in range(seeds):
-                    args = [arrays[f'{seed}/{name}'] for name in ('q', 'k', 'v', 'g', 'beta', 'h0')]
-                    found = {name: np.asarray(x, np.float64) for name, x in run(*args).items()}
-                    reference = {name: upstream[f'{seed}/{name}'].astype(np.float64) for name in found}
-                    wanted = truth(*args)
-                    for arm, result in (('dew', found), ('fla', reference)):
-                        for name, value in result.items():
-                            if name in ('aqk', 'akk'):
-                                value = value[..., :args[0].shape[1]]
-                            error = np.mean((value - wanted[name]) ** 2)
-                            measured.setdefault(f'{arm}/{name}', []).append(error)
-                        local = truth(*args[:3], result['cg'], *args[4:], cumulative=True)
-                        for name in ('aqk', 'akk'):
-                            value = result[name][..., :args[0].shape[1]]
-                            measured.setdefault(f'{arm}/local-{name}', []).append(
-                                np.mean((value - local[name]) ** 2))
-                        local = truth(*args[:3], result['cg'], *args[4:], cumulative=True, akk=result['akk'])
-                        for name in ('w', 'u', 'kg', 'qg'):
-                            measured.setdefault(f'{arm}/local-{name}', []).append(
-                                np.mean((result[name] - local[name]) ** 2))
-                        local = truth(*args[:3], result['cg'], *args[4:], cumulative=True,
-                                      akk=result['akk'], w=result['w'], u=result['u'], kg=result['kg'],
-                                      aqk=result['aqk'])
-                        for name in ('vn', 'ht', 'o'):
-                            measured.setdefault(f'{arm}/local-{name}', []).append(
-                                np.mean((result[name] - local[name]) ** 2))
+            run = jax.jit(lambda *args: port(*args, mode=mode))
+            for seed in range(seeds):
+                args = [arrays[f'{seed}/{name}'] for name in ('q', 'k', 'v', 'g', 'beta', 'h0')]
+                found = {name: np.asarray(x, np.float64) for name, x in run(*args).items()}
+                reference = {name: upstream[f'{seed}/{name}'].astype(np.float64) for name in found}
+                wanted = truth(*args)
+                for arm, result in (('dew', found), ('fla', reference)):
+                    for name, value in result.items():
+                        if name in ('aqk', 'akk'):
+                            value = value[..., :args[0].shape[1]]
+                        error = np.mean((value - wanted[name]) ** 2)
+                        measured.setdefault(f'{arm}/{name}', []).append(error)
+                    local = truth(*args[:3], result['cg'], *args[4:], cumulative=True)
+                    for name in ('aqk', 'akk'):
+                        value = result[name][..., :args[0].shape[1]]
+                        measured.setdefault(f'{arm}/local-{name}', []).append(
+                            np.mean((value - local[name]) ** 2))
+                    local = truth(*args[:3], result['cg'], *args[4:], cumulative=True, akk=result['akk'])
+                    for name in ('w', 'u', 'kg', 'qg'):
+                        measured.setdefault(f'{arm}/local-{name}', []).append(
+                            np.mean((result[name] - local[name]) ** 2))
+                    local = truth(*args[:3], result['cg'], *args[4:], cumulative=True,
+                                  akk=result['akk'], w=result['w'], u=result['u'], kg=result['kg'],
+                                  aqk=result['aqk'])
+                    for name in ('vn', 'ht', 'o'):
+                        measured.setdefault(f'{arm}/local-{name}', []).append(
+                            np.mean((result[name] - local[name]) ** 2))
             rms = {name: float(np.sqrt(np.mean(values))) for name, values in measured.items()}
-            print(json.dumps({'mode': mode, 'rms': rms,
-                              'ratios': {name.removeprefix('dew/'): rms[name] / rms[name.replace('dew/', 'fla/')]
-                                         for name in rms if name.startswith('dew/')}}, sort_keys=True), flush=True)
+            ratios = {name.removeprefix('dew/'): rms[name] / rms[name.replace('dew/', 'fla/')]
+                      for name in rms if name.startswith('dew/')}
+            print(json.dumps({'mode': mode, 'rms': rms, 'ratios': ratios}, sort_keys=True), flush=True)
 
 
 if __name__ == '__main__':
