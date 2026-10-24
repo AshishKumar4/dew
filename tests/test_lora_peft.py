@@ -27,7 +27,7 @@ from dew.interop.pretrained import Pretrained
 from dew.lora import Adapter, LoRA, Target
 from dew.objectives.base import Step, merge
 from dew.objectives.lm import LMObjective
-from dew.training.optim import OPTIMIZER_MAP
+from dew.optim import OPTIMIZER_MAP
 
 ROOT = Path(__file__).resolve().parents[1]
 LLAMA = ROOT / "tests" / "fixtures" / "hf" / "llama-tiny"

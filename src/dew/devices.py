@@ -13,8 +13,8 @@ import shutil
 import sys
 from collections.abc import Mapping, Sequence
 
+from dew.builds import CUDA_BUILDS, QUERY, listed_gpus, newest_build, runs_on
 from dew.pool import answered, runs_on_gpu
-from dew.telemetry.builds import CUDA_BUILDS, QUERY, listed_gpus, newest_build, runs_on
 
 _log = logging.getLogger(__name__)
 _late_policy_warned = False
@@ -60,10 +60,7 @@ def keep_roundings() -> None:
     `XLA_FLAGS=--xla_allow_excess_precision=false` set before importing JAX.
     """
     global _late_policy_warned
-    # Private JAX query pinned by jax<0.11.3; the fresh-process late-import
-    # test covers this path without opening a backend just to inspect it.
-    bridge = sys.modules.get("jax._src.xla_bridge")
-    if bridge is not None and bridge.backends_are_initialized():
+    if _backend_open():
         if not _late_policy_warned:
             _late_policy_warned = True
             _log.warning(
@@ -72,6 +69,21 @@ def keep_roundings() -> None:
         return
     if xla_flag("xla_allow_excess_precision") is None:
         apply_xla_flags("--xla_allow_excess_precision=false")
+
+
+def _backend_open() -> bool:
+    """Whether JAX's backend has opened, after which XLA reads no flag or pool setting again."""
+    # Private JAX query pinned by jax<0.11.3; the fresh-process late-import
+    # test covers this path without opening a backend just to inspect it.
+    bridge = sys.modules.get("jax._src.xla_bridge")
+    return bridge is not None and bridge.backends_are_initialized()
+
+
+def _gpu_default(name: str, assignment: str) -> None:
+    """Pass XLA's GPU compiler `assignment` (`--name=value`) before the backend opens, unless the run
+    named `name`."""
+    if not _backend_open() and cuda_plugin() and xla_flag(name) is None:
+        apply_xla_flags(assignment)
 
 
 def unpartition_gpu_pool() -> None:
@@ -95,11 +107,8 @@ def unpartition_gpu_pool() -> None:
     holds room for a step's temporaries twice, and the 99M MoE at 8 x 1024
     on an RTX 4080 tiled its head (98.2 against 78.5 ms a step,
     docs/performance.md)."""
-    bridge = sys.modules.get("jax._src.xla_bridge")
-    if bridge is not None and bridge.backends_are_initialized():
-        return
-    if cuda_plugin() and xla_flag("xla_gpu_enable_allocator_spatial_partitioning") is None:
-        apply_xla_flags("--xla_gpu_enable_allocator_spatial_partitioning=false")
+    _gpu_default("xla_gpu_enable_allocator_spatial_partitioning",
+                 "--xla_gpu_enable_allocator_spatial_partitioning=false")
 
 
 def divide_exactly() -> None:
@@ -117,11 +126,7 @@ def divide_exactly() -> None:
     the option from `xla_backend_extra_options` when it compiles, so
     `import dew` sets it before the first computation, as it does
     `keep_roundings`."""
-    bridge = sys.modules.get("jax._src.xla_bridge")
-    if bridge is not None and bridge.backends_are_initialized():
-        return
-    if cuda_plugin() and xla_flag("xla_backend_extra_options") is None:
-        apply_xla_flags("--xla_backend_extra_options=-nvptx-prec-divf32=2")
+    _gpu_default("xla_backend_extra_options", "--xla_backend_extra_options=-nvptx-prec-divf32=2")
 
 
 def preallocate_gpu_pool() -> None:
@@ -136,8 +141,7 @@ def preallocate_gpu_pool() -> None:
     ran without, 351 ms a step against 403 (an A100-40 at 4 x 3072, 389
     against 444 ms; gdn-one-path e3c90a968, runs/SwiftHeron/parity-*-gdn).
     JAX's default 75% holds less than that step's 71.8 GiB peak."""
-    bridge = sys.modules.get("jax._src.xla_bridge")
-    if bridge is not None and bridge.backends_are_initialized():
+    if _backend_open():
         return
     named = ("XLA_PYTHON_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_PREALLOCATE", "XLA_PYTHON_CLIENT_ALLOCATOR")
     if cuda_plugin() and not any(name in os.environ for name in named):

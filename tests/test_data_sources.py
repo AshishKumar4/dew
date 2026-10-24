@@ -1391,6 +1391,40 @@ def test_a_same_size_middle_write_changes_a_multifile_readers_identity(tmp_path)
     assert_a_rewrite_moves_the_identity(reader, tmp_path / "part-16.jsonl", b"b", read)
 
 
+@pytest.mark.parametrize("dtype", ["<u4", "<u8"])
+def test_a_producer_index_in_either_unsigned_type_places_its_records_in_their_files(tmp_path, dtype):
+    """A producer's offset index over several JSON lines files, its shard column in whichever unsigned
+    integer type it wrote, reads each record by index and block-shuffles them by file: an empty file
+    and files of uneven sizes among them, every record read once a pass."""
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
+
+    files = [[0, 1, 2], [], [3, 4, 5, 6, 7], [8]]
+    entries = []
+    for shard, ids in enumerate(files):
+        payload = b""
+        for value in ids:
+            line = (json.dumps({"id": value}) + "\n").encode()
+            entries.append((shard, len(payload), len(line)))
+            payload += line
+        (tmp_path / f"part-{shard}.jsonl").write_bytes(payload)
+    encoded = io.BytesIO()
+    np.save(encoded, np.array(entries, dtype=[("shard", dtype), ("offset", "<u8"), ("bytes", "<u8")]),
+            allow_pickle=False)
+    (tmp_path / "rows.index.npy").write_bytes(encoded.getvalue())
+    paths = tuple(str(tmp_path / f"part-{shard}.jsonl") for shard in range(len(files)))
+    stored = Files(paths, format="jsonl", index=str(tmp_path / "rows.index.npy"))
+    records = stored.records("indexed")
+    assert [records[index]["id"] for index in range(len(records))] == list(range(9))
+    reader = compile(Pipeline(stored).shuffle(3, block_shards=2).repeat().batch(1), read="indexed",
+                     loading=Loading(workers=0, threads=1, read_buffer=0)).train(DataPartition())
+    try:
+        read = [int(batch["id"][0]) for batch in itertools.islice(reader, 9)]
+    finally:
+        reader.close()
+    assert sorted(read) == list(range(9))
+
+
 def test_published_file_facts_avoid_metadata_probes_and_verify_the_index(monkeypatch):
     root = Store(f"memory://published-facts-{uuid4().hex}/rows.jsonl")
     root.write(b'{"id":0}\n{"id":1}\n')
