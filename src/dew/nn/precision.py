@@ -756,7 +756,8 @@ def bf16_dot_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers) -> jax.A
     that algorithm: the dot family's (`float32_dot_general`, `float32_einsum`) and a bf16 head's.
 
     Its operands are bf16 arrays multiplied at the default precision, whatever a scope configures
-    (an F16 preset would narrow a bf16 operand to fp16), not wider ones under the algorithm. On an
+    (an F16 preset would narrow a bf16 operand to fp16), not wider ones under the algorithm; a CPU,
+    which runs no bf16 dot at some layouts, multiplies their values in fp32, exactly. On an
     A100, XLA's dot under the algorithm with a vector side (one row or one column), or below its
     GEMM rewrite threshold (6 x 3 x 8), did not round fp32 operands to nearest even, and products
     of exact bf16 values came out off round-to-nearest-even at their ties; at a vector side bf16
@@ -769,8 +770,19 @@ def bf16_dot_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers) -> jax.A
     numbers = ((tuple(lhs_contracting), tuple(rhs_contracting)), (tuple(lhs_batch), tuple(rhs_batch)))
 
     def typed(lhs, rhs, numbers):
-        return jax.lax.dot_general(lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16), numbers,
-                                   precision=jax.lax.Precision.DEFAULT, preferred_element_type=jnp.float32)
+        def native(lhs, rhs):
+            return jax.lax.dot_general(lhs, rhs, numbers, precision=jax.lax.Precision.DEFAULT,
+                                       preferred_element_type=jnp.float32)
+
+        def widened(lhs, rhs):
+            # XLA:CPU has no bf16 x bf16 = fp32 dot at every layout ("Unsupported element type for
+            # DotThunk"); bf16 values multiply exactly in fp32, so the fp32 dot is the same arithmetic.
+            return jax.lax.dot_general(lhs.astype(jnp.float32), rhs.astype(jnp.float32), numbers,
+                                       precision=jax.lax.Precision.HIGHEST,
+                                       preferred_element_type=jnp.float32)
+
+        return jax.lax.platform_dependent(lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16), cpu=widened,
+                                          default=native)
 
     def pulled(saved, operands, cotangent):
         """Each operand's cotangent: the product's transpose to it over the cotangent rounded to bf16."""
