@@ -501,25 +501,20 @@ class CausalSelfAttention(nn.Module):
         return tuple(name for name, reads in (("image_groups", self.bidirectional_images),
                                               ("block_groups", self.bidirectional_blocks)) if reads)
 
-    def _key_groups(self, metadata: AttentionMetadata | None, slots, batch: int, length: int,
+    def _key_groups(self, metadata: AttentionMetadata | None, slots, keys: int,
                     decode: bool) -> tuple[jax.Array, ...]:
-        """The block groups the layer reads, over its call's keys: an uncached call's own tokens', a
-        cached call's slots', which the cache keeps beside its keys (`cached_image_groups`,
-        `cached_block_groups`), each call writing its tokens' at their `slots`, -1 where it carries none."""
+        """The block groups the layer reads, over its call's `keys` keys: an uncached call's own
+        tokens', a cached call's tokens' at their `slots` `[B, S]` and -1 elsewhere. A block's later keys
+        a cached call's query reads are the call's own tokens, its earlier ones before the query already,
+        so no cache keeps the groups, and a layer sharing another's keys reads them as its own."""
         read = []
         for name in self._group_fields():
             groups = None if metadata is None else getattr(metadata, name)
-            if not decode:
-                if groups is not None:
-                    read.append(jnp.asarray(groups, jnp.int32))
+            if groups is None:
                 continue
-            allocated = self.has_variable("cache", f"cached_{name}")
-            stored = self.variable("cache", f"cached_{name}", jnp.full, (batch, self.ctx.max_seq_len), -1,
-                                   jnp.int32)
-            if allocated:
-                written = jnp.full((batch, length), -1, jnp.int32) if groups is None else groups
-                stored.value = write_cache(stored.value, written, slots)
-            read.append(stored.value)
+            groups = jnp.asarray(groups, jnp.int32)
+            read.append(write_cache(jnp.full((groups.shape[0], keys), -1, jnp.int32), groups, slots)
+                        if decode else groups)
         return tuple(read)
 
     def _restricts_visibility(self, metadata: AttentionMetadata | None, decode: bool) -> bool:
@@ -761,7 +756,8 @@ class CausalSelfAttention(nn.Module):
         block's later ones are not yet there."""
         B, S = query.shape[:2]
         causal, mask, documents, implementation = self.ctx.causal, None, None, self.ctx.attention_impl
-        groups = () if prefix is not None else self._key_groups(attention_metadata, positions, B, S, decode)
+        # The canvas and a single decode step read none (`_key_groups` past the branches).
+        groups: tuple[jax.Array, ...] | None = () if prefix is not None else None
         # An uncached call's keys are its own tokens; a cached call's keys are
         # at the places their cache keeps beside them where the layer reads
         # them (`Append.places`), else at their slots, which nothing reads.
@@ -826,6 +822,8 @@ class CausalSelfAttention(nn.Module):
             # them per block, and every other kernel builds the document mask
             # from them (`attention_kernel`).
             documents = segment_ids
+        if groups is None:
+            groups = self._key_groups(attention_metadata, positions, key.shape[-3], decode)
         # Over the keys the call reads, the cache's or the prefix's joined.
         masked = self._mask_kernel(query, key, decode)
         cached = isinstance(documents, CrossDocuments)
