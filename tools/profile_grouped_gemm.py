@@ -7,8 +7,7 @@ Each scoreboard row's product (`ROWS`; forward, input_gradient, kernel_gradient)
 `generation.chosen` names (`mosaic_gpu`, the template's launch; `cutlass` and `triton`, the references),
 each arm a jitted function of its own name, warmed, then run three times in a `dew.Profiler` capture of
 the row's arms (which share its operands, freed before the next row's), a region an arm.
-DIR/kernels.json attributes each capture's kernel_stats report to the arms by those names: each kernel's
-time, registers, shared memory, occupancy and tensor-core use. Each arm's
+DIR/kernels.json attributes each capture's kernel_stats report to the arms by those names: each kernel's time, registers, shared memory, occupancy and tensor-core use. Each arm's
 device peak (`peak_bytes_in_use`) is measured apart, in a process of its own (`--peak`), since a
 device's peak counts every allocation the process made. Profile with
 `XLA_FLAGS=--xla_gpu_enable_command_buffer=` so the kernels are attributed to their ops
