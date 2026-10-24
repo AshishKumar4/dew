@@ -318,32 +318,18 @@ class SavedRun:
 
 def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     """A run's record with its components in the shapes Dew writes now, every earlier shape read here
-    and nowhere else (`SavedRun.pinned`), so no component keeps two readers: an autoencoder named by
-    its registration's name, a decision head by class name or path under `name`, and a decision
-    layout by class name, each as the registry class record (`dew.registry.Record`) it is now. A
-    record in today's shapes passes as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
-    from dew.nn.autoencoders.pretrained import registration
-    from dew.registry import import_path
-
-    def earlier(field: str) -> tuple[str, Mapping[str, object]] | None:
-        held = record.get(field)
-        if not isinstance(held, Mapping) or "name" not in held or "class" in held:
-            return None
-        return named(held["name"], f"{field}.name"), named_fields(held.get("fields", {}), f"{field}.fields")
-
+    and nowhere else (`SavedRun.pinned`), so no component keeps two readers: a decision head named by
+    its class name alone, read as `dew.decision.head`'s path, and a decision layout by class name,
+    read as the registry class record of `dew.decision.layout`'s class. A record in today's shapes
+    passes as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
     current = dict(record)
-    if (autoencoder := earlier("autoencoder")) is not None:
-        name, fields = autoencoder
-        registered = registration(name)
-        if registered is None:
-            raise ValueError(f"an earlier run's autoencoder {name!r} is no built-in this Dew registers")
-        current["autoencoder"] = {"class": import_path(registered.wrapper), "fields": fields}
-    if (head := earlier("head")) is not None:
-        name, fields = head
-        current["head"] = {"class": name if ":" in name else f"dew.decision.head:{name}", "fields": fields}
-    if (layout := earlier("layout")) is not None:
-        name, fields = layout
-        current["layout"] = {"class": f"dew.decision.layout:{name}", "fields": fields}
+    head = record.get("head")
+    if isinstance(head, Mapping) and ":" not in named(head.get("name"), "head.name"):
+        current["head"] = {**head, "name": f"dew.decision.head:{head['name']}"}
+    layout = record.get("layout")
+    if isinstance(layout, Mapping) and "name" in layout and "class" not in layout:
+        current["layout"] = {"class": f"dew.decision.layout:{named(layout['name'], 'layout.name')}",
+                             "fields": named_fields(layout.get("fields", {}), "layout.fields")}
     return current
 
 
