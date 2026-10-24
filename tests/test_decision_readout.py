@@ -3,27 +3,22 @@
 the answer cue last; the tied readout is the backbone's own logit at each label, on par from float64
 with the backbone's full logits there (check 1), through a LoRA-adapted head too, which has no single
 table; an untied readout at its draw is the tied one (check 1), a label of several variants among
-them; a release's slot head computes the release's law (check 1, with nonzero q and k); and a packed
-window of rows of mixed lengths reads each row's answer where it alone does (check 1)."""
+them; and a release's slot head computes the release's law (check 1, with nonzero q and k). A packed
+window reads each row's answer as the row alone does (test_decision_packing's readout arm)."""
 
 import dataclasses
-import itertools
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from decision_support import decision_rows
-from reference_error import assert_as_exact, widened
+from reference_error import assert_as_exact
 from test_decision_objective import SPECIALS, TOKENIZER
 
-from dew.data.dataset import DataPartition
-from dew.decision import Choice, Example
+from dew.decision import Choice
 from dew.decision.head import LabelReadout, SlotReadout
 from dew.decision.layout import DecisionInputs, Labels, StateFirstLayout
 from dew.decision.model import DecisionModel
-from dew.decision.objective import DecisionObjective
-from dew.decision.task import laid_out
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 LABELS = Labels(variants=("{}",))
@@ -157,42 +152,6 @@ def test_a_slot_heads_scores_are_the_releases_law_with_its_query_and_key_trained
         return jnp.where(batch.options, logits, -jnp.inf)
 
     assert_as_exact(dew, law, draw, "slot head law", seeds=READOUT_SEEDS)
-
-
-def test_a_packed_window_reads_each_rows_answer_where_it_alone_does():
-    """Rows of mixed lengths packed into windows of several documents keep their answer cues and
-    option lines through the packing's offsets and padding: every option logit of a packed window is on
-    par from float64 with its row read alone (check 1)."""
-    objective = DecisionObjective(backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
-                                  head=LabelReadout(32, ids()), shuffle_options=False)
-    variables = objective.init(jax.random.key(0))
-    words = ["one", "two", "three", "four", "five", "six"]
-
-    def draw(seed):
-        rng = np.random.default_rng([0x9AC, seed])
-        examples = [Example(" ".join(rng.choice(words, int(rng.integers(2, 12)))), {"team": QUESTION},
-                            {"team": "billing"}) for _ in range(6)]
-        [batch] = list(itertools.islice(decision_rows(examples, None, objective=objective.data(),
-                                                      tokens=3 * LAYOUT.max_len).train(DataPartition()), 1))
-        return (variables, {name: np.asarray(value) for name, value in batch.items()},
-                examples)
-
-    def packed(values, batch, examples):
-        inputs = laid_out(batch, objective.bounds.segments)
-        logits = objective.model.logits(values, inputs)
-        return logits[np.asarray(batch["questions"])]
-
-    def alone(values, batch, examples):
-        rows = [LAYOUT.rows(TOKENIZER, SPECIALS, example.state, example.questions)[0] for example in examples]
-        found = []
-        for row in rows:
-            logits = objective.model.logits(values, DecisionInputs.collate([row], SPECIALS.pad))
-            found.append(logits[0, 0])
-        count = int(np.asarray(batch["questions"]).sum())
-        return jnp.stack(found[:count])
-
-    assert_as_exact(packed, alone, draw, "packed readout", seeds=READOUT_SEEDS,
-                    truth_fn=lambda values, batch, examples: alone(widened(values), batch, examples))
 
 
 def test_a_readout_refuses_what_it_cannot_read():

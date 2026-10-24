@@ -32,7 +32,7 @@ from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers import AttentionMixer
 from dew.nn.mlp import GatedMLP
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, capped_logits, scaled_logits
 from dew.nn.scatter import DROPPED
 from dew.records import JSON
 from dew.registry import from_record, record_fields
@@ -499,9 +499,10 @@ class LabelReadout(Head):
         bias = self.param("bias", lambda key: (jnp.zeros(ids.shape, jnp.float32) if table.bias is None else
                                                jnp.take(table.bias, ids.reshape(-1)).reshape(ids.shape)
                                                .astype(jnp.float32)))
-        answers = table.states(_answers(states, inputs)).astype(jnp.float32)
-        logits = jnp.einsum("bqd,kvd->bqkv", answers, rows, precision=jax.lax.Precision.HIGHEST) + bias
-        capped = logits if table.softcap is None else table.softcap * jnp.tanh(logits / table.softcap)
+        answers = table.states(_answers(states, inputs))
+        answers = answers.astype(at_least_fp32(answers.dtype))
+        logits = jnp.einsum("bqd,kvd->bqkv", answers, rows, precision=jax.lax.Precision.HIGHEST)
+        capped = capped_logits(scaled_logits(logits, None, bias), table.softcap)
         return jax.nn.logsumexp(capped[..., :width, :], axis=-1)
 
 
@@ -512,11 +513,16 @@ class SlotReadout(Head):
     (its span), `q` and `k` each a `[head_dim, features]` projection, with no slot bias and no softcap on
     the sum. Its slot rows are drawn from the backbone's output rows of the slots' label ids, `q` from a
     normal of std `features ** -0.5` and `k` at zero, so at its draw it scores the labels' rows alone;
-    a release's reader loads all three (`readout_head.pt`)."""
+    a release's reader loads all three (`readout_head.pt`).
+
+    `slot_rows` is the rows the head holds, the labels' count where unset: a release may hold more
+    rows than its tokenizer spells labels for, the rows past the labels kept, drawn at zero, and read by
+    no option."""
 
     features: int
     label_ids: tuple[int, ...]
     head_dim: int = 64
+    slot_rows: int | None = None
     reads_labels: ClassVar[bool] = True
 
     @nn.nowrap
@@ -532,22 +538,28 @@ class SlotReadout(Head):
     def __call__(self, states: jax.Array, inputs: DecisionInputs, table=None, train: bool = False, *,
                  tied: jax.Array | None = None) -> jax.Array:
         width = inputs.options.shape[-1]
-        if width > len(self.label_ids):
-            raise ValueError(f"{width} option slots outnumber the release's {len(self.label_ids)} slots")
+        labels = len(self.label_ids)
+        held = labels if self.slot_rows is None else self.slot_rows
+        if held < labels:
+            raise ValueError(f"{held} slot rows hold fewer than the {labels} labels")
+        if width > labels:
+            raise ValueError(f"{width} option slots outnumber the readout's {labels} labels")
         ids = jnp.asarray(self.label_ids, jnp.int32)
 
         def drawn(key):
             if table is None:
-                return jax.random.normal(key, (len(self.label_ids), self.features), jnp.float32) * (
-                    self.features ** -0.5)
-            return jnp.take(table.rows(), ids, axis=0).astype(jnp.float32)
+                rows = jax.random.normal(key, (labels, self.features), jnp.float32) * self.features ** -0.5
+            else:
+                rows = jnp.take(table.rows(), ids, axis=0).astype(jnp.float32)
+            return jnp.pad(rows, ((0, held - labels), (0, 0)))
 
         slots = self.param("slots", drawn)
         q = self.param("q", nn.initializers.normal(self.features ** -0.5), (self.head_dim, self.features),
                        jnp.float32)
         k = self.param("k", nn.initializers.zeros, (self.head_dim, self.features), jnp.float32)
-        answers = _answers(states, inputs).astype(jnp.float32)
-        pooled = _span_means(states.astype(jnp.float32), inputs.option_spans)
+        states = states.astype(at_least_fp32(states.dtype))
+        answers = _answers(states, inputs)
+        pooled = _span_means(states, inputs.option_spans)
         highest = jax.lax.Precision.HIGHEST
         score = jnp.einsum("bqd,kd->bqk", answers, slots[:width], precision=highest)
         query = jnp.einsum("bqd,hd->bqh", answers, q, precision=highest)
