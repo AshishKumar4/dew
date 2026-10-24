@@ -6,6 +6,7 @@ Each group's update is asserted against the transform it is supposed to be,
 because a parameter in the wrong group still trains, only worse.
 """
 import dataclasses
+import importlib
 import json
 import typing
 from pathlib import Path
@@ -316,7 +317,8 @@ def test_a_matrix_declared_with_no_axis_named_is_orthogonalized_as_one_matrix():
     """Gemma 3n's AltUp declares its coefficient matrices (None, None), whole on every device: that
     says how they shard, not which axes form the matrix, so Muon steps the kernel as optax steps one
     undeclared matrix, contracting its rows into its columns."""
-    import dew.nn.gemma3n  # noqa: F401 (its modules declare AltUp's axes)
+    # Gemma 3n's modules declare AltUp's axes as they are defined.
+    importlib.import_module("dew.nn.gemma3n")
 
     params = {'params': {'layers_0': {'altup': {'prediction_coefs': {'kernel': jnp.zeros((16, 4))}}}}}
     path = ('params', 'layers_0', 'altup', 'prediction_coefs', 'kernel')
