@@ -43,8 +43,8 @@ from dew.decision.layout import (
     Layout,
     MarkerLayout,
     Specials,
-    context_tokens,
     render,
+    with_context,
 )
 from dew.decision.model import DecisionModel
 from dew.decision.questions import (
@@ -395,25 +395,8 @@ class Decide:
 
     def _encoded(self, state: JSON, questions: Mapping[str, Question],
                  media: Sequence[int] = (), *, context: JSON | None = None) -> list[Encoded]:
-        rows = self.layout.rows(self.tokenizer, self.specials, state, questions, media=media)
-        if any(row.spans_in_context for row in rows):
-            # The row's context is its schema (`Schema.stream`), read whole by the cross-attention.
-            if context is not None:
-                raise ValueError("this task reads each request's schema as its context, so it reads no "
-                                 "context of the request's own")
-            if self.context_length is None:
-                raise ValueError("a schema read as the row's context needs a backbone with cross-attention "
-                                 "layers to read it (Pretrained.with_cross_attention)")
-            for row in rows:
-                if len(row.context or ()) > self.context_length:
-                    raise ValueError(f"the schema needs {len(row.context or ())} context tokens, more than "
-                                     f"the {self.context_length} the backbone's cross-attention reads")
-        elif context is not None:
-            if self.context_length is None:
-                raise ValueError(f"a request's context is read by a backbone's cross-attention, which this "
-                                 f"task's {type(self.model.backbone).__name__} does not have")
-            tokens = tuple(context_tokens(self.tokenizer, context, self.context_length).tolist())
-            rows = [replace(row, context=tokens) for row in rows]
+        rows = with_context(self.layout.rows(self.tokenizer, self.specials, state, questions, media=media),
+                            self.tokenizer, context, self.context_length)
         for row in rows:
             if not self.layout.fits(row):
                 raise ValueError(f"the schema needs {len(row.tokens)} tokens besides the state, more than "

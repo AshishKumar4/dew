@@ -220,6 +220,35 @@ def context_tokens(tokenizer: Tokenizer, context: JSON | None, length: int) -> n
         return np.zeros(0, np.int32)
     return np.asarray(tokenizer.encode(render(context), add_special_tokens=False)[:length], np.int32)
 
+
+def with_context(rows: Sequence[Encoded], tokenizer: Tokenizer, context: JSON | None,
+                 length: int | None) -> list[Encoded]:
+    """`rows` with the context a backbone's cross-attention of `length` context tokens reads beside
+    each (None: a backbone with none): a schema laid out as the rows' context (`Schema.stream`), read
+    whole, or else `context`, a request's own, its first `length` tokens (`context_tokens`). The one
+    resolution of a row's context, which a run's encoding and a task's admission both read. Refused
+    (ValueError): a request's context beside a schema read as the context, a context with no
+    cross-attention to read it, and a schema longer than `length`."""
+    if any(row.spans_in_context for row in rows):
+        if context is not None:
+            raise ValueError("a request's context and a schema read as the row's context are one context "
+                             "too many; a layout that reads the schema in context reads no other context")
+        if length is None:
+            raise ValueError("a schema read as the row's context needs a backbone with cross-attention "
+                             "layers to read it (Pretrained.with_cross_attention)")
+        for row in rows:
+            if len(row.context or ()) > length:
+                raise ValueError(f"the schema needs {len(row.context or ())} context tokens, more than the "
+                                 f"{length} the backbone's cross-attention reads")
+        return list(rows)
+    if context is None:
+        return list(rows)
+    if length is None:
+        raise ValueError("a request's context is read by a backbone's cross-attention, which this "
+                         "backbone does not have")
+    tokens = tuple(context_tokens(tokenizer, context, length).tolist())
+    return [dataclasses.replace(row, context=tokens) for row in rows]
+
 def _conversation(state: JSON) -> bool:
     """Whether `state` is a conversation, a list of turns, which keeps its newest turns (Laya's agent)."""
     match state:
