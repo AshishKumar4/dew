@@ -186,7 +186,7 @@ class EnvironmentSource:
             if failed is not None:
                 episode.stop(EpisodeStatus.ERROR, failed)
                 return
-            draw = drawn.result()
+            draw = drawn.result().checked(self.server.sampling)
             if draw.prompt != context:
                 raise ValueError("the server returned a draw for another context")
             episode.pending = draw
