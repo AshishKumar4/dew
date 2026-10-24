@@ -22,7 +22,7 @@ from flax.traverse_util import flatten_dict
 from dew import records
 from dew._model_types import SANDWICH_NORMS
 from dew.interop.config_records import NativeFields, native_fields
-from dew.interop.safetensors_io import LazyTensors
+from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.streaming import WeightLayout
 from dew.interop.weights import check_tree
 from dew.nn.activations import GatedActivation, Situ
@@ -1389,8 +1389,7 @@ def layout_tensors(layouts: Mapping[str, WeightLayout], variables: Mapping[str, 
     """The layouts' tensors and `retained` beside them, each built when it is
     read, so a sharded writer holds one shard of the export, not all of it."""
     kept = retained or {}
-    specs = {**{name: jax.ShapeDtypeStruct(np.shape(value), np.asarray(value).dtype)
-                for name, value in kept.items()},
+    specs = {**tensor_specs(kept),
              **{name: jax.ShapeDtypeStruct(layout.shape, layout.stored_dtype(variables, scalar_mode))
                 for name, layout in layouts.items()}}
     return LazyTensors(specs, lambda name: (
