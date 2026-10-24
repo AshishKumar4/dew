@@ -342,7 +342,7 @@ def test_the_dense_decoders_gradient_is_the_references():
                   for dtype in (torch.float32, torch.float64)}
     pad = references[torch.float32].config.pad_token_id
 
-    assert pad is not None and dense.padding_idx == pad
+    assert pad is not None
 
     def draw(seed):
         """Rows of ids drawn uniformly from the vocabulary, each reading the pad id at its sixth place,

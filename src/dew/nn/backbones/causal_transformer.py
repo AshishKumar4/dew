@@ -320,7 +320,7 @@ class CausalTransformer(nn.Module):
     keep the original ids."""
     padding_idx: int | None = None
     """The id whose token embedding rows (`embed_tokens`, `embed_tokens_per_layer`) the lookup reads
-    but never trains, as a source's `nn.Embedding(padding_idx=...)` leaves them (Gemma 3n's
+    but never trains, as a source's `nn.Embedding(padding_idx=...)` leaves them (Gemma 3n's and Phi's
     pad_token_id, `TokenEmbedding.padding_idx`); a tied head still trains the row. None trains every
     row."""
     dropout_rate: float = 0.0
