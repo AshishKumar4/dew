@@ -316,7 +316,7 @@ def export_weights(
             names[encoder], specs[encoder] = name, spec
     leaves: dict[tuple[str, ...], object] = {}
     for path, leaf in flatten_dict(dict(params["self_conditioning"])).items():
-        leaves[("params", "self_conditioning", *path)] = leaf
+        leaves[("params", "self_conditioning", *(str(part) for part in path))] = leaf
     layouts = leaf_layouts(leaves, lambda path: f"model.decoder.self_conditioning.{path[-2]}.weight")
     if "conditioner" in params:
         if vision is None:
