@@ -21,8 +21,9 @@ import numpy as np
 from flax import linen as nn, struct
 from typing_extensions import TypeVar, get_protocol_members
 
-from dew._distributions import categorical, wellformed
+from dew._distributions import draw, wellformed
 from dew.interop.weights import decoding_storage
+from dew.nn import categorical
 from dew.nn.inputs import (
     ModelInputs,
     Request,
@@ -111,8 +112,7 @@ class CanvasState:
 
 
 def _entropy(logits: jax.Array) -> jax.Array:
-    log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
-    return -(jnp.exp(log_probs) * log_probs).sum(axis=-1)
+    return categorical.entropy(logits)
 
 
 @dataclass(frozen=True)
@@ -207,7 +207,7 @@ class BlockProcess:
                 raise TypeError("a canvas forward must return a logits array")
             logits = self.temper(raw, self.max_steps - index)
             draw_key, noise_key = jax.random.split(jax.random.fold_in(key, index + 1))
-            drawn = categorical(draw_key, logits, ~state.finished[:, None], CANVAS_UNDEFINED)
+            drawn = draw(draw_key, logits, ~state.finished[:, None], CANVAS_UNDEFINED)
             accepted, mask = self.accept(state.canvas, drawn, logits)
             canvas = self.renoise(noise_key, accepted, mask)
             argmax = jnp.argmax(logits, axis=-1).astype(jnp.int32)

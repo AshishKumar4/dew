@@ -340,18 +340,13 @@ class Adapter:
         the source at hand. A recorded binding whose shapes do not fit the restored
         factors is refused by name. `trust` is as `TextGeneration.from_run` takes it.
         """
-        from dew.config import ModelConfig
-        from dew.inference.tasks import run_record
-        from dew.records import record, text
-        from dew.registry import objectives
+        from dew.inference.tasks import SavedRun, saved_model
 
-        declaration, step = run_record(str(directory), step, trust)
-        config = ModelConfig.from_dict(record(declaration['model'], 'model'))
+        run = SavedRun.pinned(str(directory), step, trust)
+        config = saved_model(run.record, None)
         if config.adapter is None:
             raise ValueError(f"{directory} trained no adapter")
-        variables = objectives[text(declaration['objective'], 'objective')]._saved_variables(
-            str(directory), step=step, ema=ema)
-        return cls.recorded(config.build(), variables, config.adapter)
+        return cls.recorded(config.build(), run.variables(ema=ema), config.adapter)
 
     @classmethod
     def recorded(cls, model: nn.Module, variables: Variables, adapter: AdapterRecord) -> Adapter:

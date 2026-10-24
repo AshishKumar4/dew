@@ -10,7 +10,7 @@ shared loader calls it.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 from flax.traverse_util import flatten_dict
@@ -18,6 +18,7 @@ from flax.traverse_util import flatten_dict
 from dew import records
 from dew.diffusion.block import BlockProcess
 from dew.interop.config_records import NativeFields
+from dew.interop.generation_config import eos_field
 from dew.interop.hf_decoders import (
     NOTHING_CHECKED,
     Checked,
@@ -184,7 +185,8 @@ def generation_process(config: Mapping[str, object], generation: Mapping[str, ob
 
 
 def generation_config_of(process: BlockProcess, *, max_new_tokens: int | None = None,
-                         pad_token_id: int | None = None) -> dict[str, records.JSON]:
+                         pad_token_id: int | None = None, eos_token_ids: Sequence[int] = ()
+                         ) -> dict[str, records.JSON]:
     """The generation_config.json transformers' DiffusionGemmaGenerationConfig
     reads, and `generation_process` reads back as `process`: its inverse. The
     canvas and vocabulary are the model's in both, as a block run's process
@@ -197,6 +199,7 @@ def generation_config_of(process: BlockProcess, *, max_new_tokens: int | None = 
         "max_denoising_steps": process.max_steps, "t_min": float(process.t_min),
         "t_max": float(process.t_max), "stability_threshold": process.stability_threshold,
         "confidence_threshold": float(process.confidence_threshold), "sampler_config": sampler,
+        **eos_field(eos_token_ids),
     }
     if max_new_tokens:
         values["max_new_tokens"] = max_new_tokens

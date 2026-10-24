@@ -57,11 +57,13 @@ from .precision import (
     asks_default_precision,
     at_default_precision,
     at_least_fp32,
+    capped_logits,
     configured_precision,
     float32_dot_general,
     float32_einsum,
     float32_products,
     operand_precision,
+    rms_statistics,
     rounded_to,
 )
 from .rope import rotate
@@ -357,7 +359,7 @@ def _xla_rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, sca
     activated = (lambda y: y) if activation is None else activation
     if fp32_statistics:
         y = x.astype(at_least_fp32(x.dtype))
-        y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + epsilon)
+        y = y * rms_statistics(y, epsilon)[1]
     else:
         # The reference rounds every step to the input dtype. XLA fuses the
         # chain and carries fp32 between the ops, so each rounding is explicit.
@@ -517,7 +519,7 @@ def unweighted_rmsnorm(x, eps: float, *, implementation: str = 'auto'):
         return norm_swiglu.rms_norm(x, None, eps, x.dtype, offset=False, after_cast=False, portable=portable,
                                     inverse_rounded=True)
     fp32 = x.astype(at_least_fp32(x.dtype))
-    inverse = jax.lax.rsqrt(jnp.mean(jnp.square(fp32), axis=-1, keepdims=True) + eps)
+    inverse = rms_statistics(fp32, eps)[1]
     return x * inverse.astype(x.dtype)
 
 
@@ -667,7 +669,7 @@ _DEFAULT_CACHE = KVCache()
 
 
 def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KVCache = _DEFAULT_CACHE,
-                  value_dim: int | None = None, places: bool = False):
+                  value_dim: int | None = None, places: bool = False, groups: tuple[str, ...] = ()):
     """Fixed-size K/V with a cursor and cached validity for each batch row.
 
     Returns [B, S] compact slot positions and a writer. Invalid tokens have
@@ -677,7 +679,8 @@ def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KV
     storage behind the slots, dense or paged, full or quantized
     (`dew.nn.kv_cache`); the slots and the cursor are the same for all. Values
     are `value_dim` wide, None for the keys' width. `places` also keeps each
-    token's place beside its key (`dew.nn.kv_cache.Append.places`).
+    token's place beside its key (`dew.nn.kv_cache.Append.places`), and
+    `groups` its groups of the fields named (`Append.groups`).
     """
     shards = sequence_shards()
     if shards > 1:
@@ -690,7 +693,7 @@ def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KV
     if valid is None and length > max_seq_len:
         raise ValueError(f"{length} tokens do not fit a KV cache of {max_seq_len}.")
     store = KVStore.open(module, layout, batch, max_seq_len, heads, head_dim, key.dtype, value_dim=value_dim,
-                         places=places)
+                         places=places, groups=groups)
     positions, allocated = cache_positions(module, batch, length, valid)
     return positions, Append(store, positions, allocated)
 
@@ -1201,7 +1204,7 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     if wide_logits:
         logits = logits * width ** -0.5
     if softcap is not None:
-        logits = jnp.tanh(logits / softcap) * softcap
+        logits = capped_logits(logits, softcap)
     if bias is not None:
         logits = logits + bias
     if mask is not None:

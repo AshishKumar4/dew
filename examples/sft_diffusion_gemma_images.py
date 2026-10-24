@@ -253,7 +253,7 @@ def main(config: Config) -> Path:
     run = RunConfig(
         model=ModelConfig.from_model(model), data=train, validation=test,
         objective=ObjectiveConfig("block_diffusion", {"prompt_length": config.prompt_tokens,
-                                                      "pad_token_id": PAD}),
+                                                      "pad_token_id": PAD, "eos_token_ids": (EOS,)}),
         optim=OptimConfig(weight_decay=0.05, clip_grads=1.0, learning_rate=Cosine(
             peak_value=config.learning_rate, warmup_steps=config.warmup_steps,
             end_value=config.learning_rate / 20)),
@@ -277,8 +277,8 @@ def main(config: Config) -> Path:
     # canvas task its objective saved, and it captions every test image, as
     # the trained model in this process does.
     run_dir = Path(run.trainer.checkpoint_dir) / name
-    restored = replace(dew.pipeline(str(run_dir)), eos_token_ids=(EOS,), pad_token_id=PAD)
-    live = replace(objective.pipeline(state), eos_token_ids=(EOS,), pad_token_id=PAD)
+    restored = dew.pipeline(str(run_dir))
+    live = objective.pipeline(state)
     captions = captioned(restored, data, config, labels)
     report = {"dataset": config.dataset, "train_images": data.records, "test_images": len(captions),
               "classes": len(labels), "device": jax.devices()[0].device_kind, "steps": config.steps,

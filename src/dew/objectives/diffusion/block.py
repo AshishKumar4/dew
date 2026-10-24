@@ -26,8 +26,10 @@ from dew.artifacts import TokenScores
 from dew.inference.tasks import BlockGeneration, BlockSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import ModelInputs, real_places, shifted_span, token_layout
+from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import BlockDenoiser, CacheCapacity, Lacks, LayerScalars
 from dew.nn.sharding import LOGITS, constrain
+from dew.nn.visibility import same_group
 from dew.objectives.base import (
     FROZEN,
     OMITTED,
@@ -41,6 +43,7 @@ from dew.objectives.base import (
     Source,
     Step,
     Variables,
+    ended,
     model_rngs,
     thaw,
 )
@@ -90,8 +93,7 @@ def _cache_geometry(valid: jax.Array, selected: jax.Array, prompt_length: int, c
     encoder_mask = ordered[:, None, :] <= physical[None, :, None]
     if image_groups is not None:
         key_groups = jnp.take_along_axis(image_groups, ordered, axis=-1)
-        encoder_mask |= ((image_groups[:, :, None] == key_groups[:, None, :])
-                         & (image_groups[:, :, None] >= 0))
+        encoder_mask |= same_group(image_groups[:, :, None], key_groups[:, None, :])
     encoder_mask &= packed_valid[:, None, :]
     write_slots = (prompt_length + selected[:, None] * canvas_size
                    + jnp.arange(response)[None, :]) % total
@@ -134,7 +136,8 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
     diffusion cross entropy.
 
     `model` may be the loaded SFT source, and `variables` and `processor`
-    override its own (`Objective.bind_model`).
+    override its own (`Objective.bind_model`), as `eos_token_ids`, the ids its
+    task's responses stop at, overrides the source's (`ended`).
 
     Both cross entropies score the final states through the bounded head
     (`dew.objectives.lm.chunked.head_cross_entropy`), `head_chunks`
@@ -155,7 +158,9 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                  stop_gradient_from_denoiser_to_encoder: bool = False,
                  encoder_loss_weight: float = 1.0, decoder_loss_weight: float = 1.0,
                  ema_decay: float | None = None, head_chunks: int = 4,
-                 processor: Processor | None | Omitted = OMITTED):
+                 processor: Processor | None | Omitted = OMITTED,
+                 eos_token_ids: Sequence[int] | Omitted = OMITTED):
+        self.eos_token_ids = ended(model, eos_token_ids)
         model = self.bind_model(model, variables=variables, processor=processor)
         if not (isinstance(model, BlockDenoiser) and isinstance(model, LayerScalars)):
             raise Lacks("canvas",
@@ -214,10 +219,11 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         return BlockProcess(canvas_length=self.model.canvas_length, vocab_size=self.model.vocab_size)
 
     def task_settings(self) -> BlockSettings:
-        """The sequence length, canvas budget, block process, pad id, and tokenizer or source
-        processor: the task's own."""
+        """The sequence length, canvas budget, block process, pad id, end-of-sequence ids, and
+        tokenizer or source processor: the task's own."""
         return BlockSettings(seq_len=self.sequence_length, max_new_tokens=self.canvas_size,
                              process=self._process(), pad_token_id=self.pad_token_id,
+                             eos_token_ids=self.eos_token_ids,
                              tokenizer=recorded_tokenizer(self.processor),
                              processor=recorded_processor(self.processor))
 
@@ -225,8 +231,8 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                    processor: Processor | None | Omitted = OMITTED) -> BlockGeneration:
         """Return the model over `variables` as a `BlockGeneration` task.
 
-        The sampler keeps the published defaults, and the caller sets the
-        tokenizer's EOS ids.
+        The sampler keeps the published defaults, and its responses stop at the
+        objective's end-of-sequence ids.
         """
         return BlockGeneration.from_settings(self.model, variables, self.task_settings(),
                                              self.processor if processor is OMITTED else processor)
@@ -441,7 +447,9 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                 attention_pairwise_mask=decoder_mask, attention_key_positions=decoder_keys,
                 states=True)
 
-        zero_logits = jnp.zeros((*response.shape, self.model.vocab_size), jnp.float32)
+        # The zero signal in the dtype the model's states compute in, at least fp32, so a float64 model's
+        # first pass mixes its table in float64 (`soft_embeddings`), as its second does.
+        zero_logits = jnp.zeros((*response.shape, self.model.vocab_size), at_least_fp32(encoder_states.dtype))
         # The conditioning pass carries no gradient, so its states stop it
         # before the head and nothing of that pass is kept for the backward.
         first = jax.lax.stop_gradient(constrain(model_logits(

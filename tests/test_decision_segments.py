@@ -87,16 +87,19 @@ class WiderHead(JointSchemaHead):
 
 def test_a_layout_and_a_head_of_a_runs_own_reload_by_import_path_and_an_earlier_runs_record_too():
     """A layout's record names its class by import path, its segments with it, so a layout class of a
-    package of the run's own reloads, as does a head's; a record of an earlier run names a class of
-    Dew's by name alone, and reloads as that class."""
+    package of the run's own reloads, as does a head's; an earlier run's record, which names a head of
+    Dew's by class name alone under `name`, reloads as that class once read as a run is
+    (`earlier_shapes`)."""
+    from dew.inference.tasks import earlier_shapes
+
     layout = FramedLayout(segments=SCHEMA_FIRST, max_state_tokens=7)
     assert from_record(Layout, to_record(layout, Layout), dtypes=False) == layout
     head = WiderHead(hidden_size=8)
     assert Head.from_record(head.record(), 8) == head
     recorded = JointSchemaHead(hidden_size=8).record()
     assert isinstance(recorded, dict) and recorded["name"] == "dew.decision.head:JointSchemaHead"
-    earlier = {"name": "JointSchemaHead", "fields": recorded["fields"]}
-    assert Head.from_record(earlier, 8) == JointSchemaHead(hidden_size=8)
+    earlier = earlier_shapes({"head": {"name": "JointSchemaHead", "fields": recorded["fields"]}})
+    assert Head.from_record(earlier["head"], 8) == JointSchemaHead(hidden_size=8)
 
 
 def test_a_row_without_a_state_segment_keeps_none_of_the_state():
@@ -117,6 +120,7 @@ def test_a_saved_run_reloads_its_segments_and_an_earlier_runs_record_reads_as_be
 
     from dew.decision import Decide, DecisionObjective
     from dew.decision.task import DecideSettings
+    from dew.inference.tasks import earlier_shapes, saved_settings
 
     layout = JointLayout(max_len=1024, segments=SCHEMA_FIRST)
     head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
@@ -131,10 +135,10 @@ def test_a_saved_run_reloads_its_segments_and_an_earlier_runs_record_reads_as_be
     fields = to_record(JointLayout(max_len=1024), JointLayout)
     assert isinstance(fields, dict)
     earlier = {name: value for name, value in fields.items() if name not in ("segments", "framing")}
-    settings = DecideSettings.of({"head": {"name": "JointSchemaHead", "fields": {}},
-                                  "layout": {"name": "JointLayout", "fields": earlier},
-                                  "specials": to_record(SPECIALS, Specials), "tokenizer": "byte",
-                                  "processor": None})
+    settings = saved_settings(earlier_shapes({"head": {"name": "JointSchemaHead", "fields": {}},
+                                              "layout": {"name": "JointLayout", "fields": earlier},
+                                              "specials": to_record(SPECIALS, Specials),
+                                              "tokenizer": "byte", "processor": None}), DecideSettings)
     assert settings.layout == JointLayout(max_len=1024)
 
 

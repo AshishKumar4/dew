@@ -95,9 +95,9 @@ def adapted_objective(config: Config) -> tuple[PretrainedBlockDecoder, BlockDiff
     # decoder runs as a scan; a plain loop's fetches would all be hoisted and
     # the whole base would land on the device this is keeping it off.
     scanned = source.model.clone(text=source.model.text.clone(scan_layers=True))
+    # The source over the scanned model, so the objective takes its weights and end-of-sequence ids.
     return source, BlockDiffusionObjective(
-        scanned, prompt_length=config.prompt_tokens,
-        num_canvases=config.canvases, variables=source.variables,
+        replace(source, model=scanned), prompt_length=config.prompt_tokens, num_canvases=config.canvases,
         pad_token_id=int(source.config["text_config"]["pad_token_id"]))
 
 

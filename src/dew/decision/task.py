@@ -140,19 +140,6 @@ class DecideSettings:
     tokenizer: str | None
     processor: str | None
 
-    @staticmethod
-    def of(record: Mapping[str, object]) -> "DecideSettings":
-        """The settings a run's record holds (`saved_settings`). An earlier run's record names its
-        layout by class name alone, one of `dew.decision.layout`'s, and is read as that class's."""
-        from dew.inference.tasks import saved_settings
-
-        laid = record.get("layout")
-        if isinstance(laid, Mapping) and "name" in laid:
-            name = records.text(laid["name"], "layout.name")
-            record = {**record, "layout": {"class": f"dew.decision.layout:{name}",
-                                           "fields": records.json_value(laid.get("fields"), "layout.fields")}}
-        return saved_settings(record, DecideSettings)
-
 
 @dataclass(frozen=True)
 class Decide:
@@ -211,25 +198,29 @@ class Decide:
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: "MeshSpec | Mesh | None" = None, layout: "Placement | None" = None,
-                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> Self:
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
+                 trust: Sequence[str] = ()) -> Self:
         """Load the `DecisionObjective` run in `directory` as a task.
 
         The task is rebuilt from the run's record over the latest checkpoint's
         weights (or `step`'s), and includes any calibration `save` wrote into the
         run. `ema` selects the averaged weights, and None uses them when the run kept
         them. `mesh` and `layout` place the weights as the trainer does, `dtype`
-        overrides the compute dtype and `param_dtype` the storage dtype.
+        overrides the compute dtype and `param_dtype` the storage dtype. `trust`
+        names the packages outside Dew the run's record may import, as Dew's other
+        tasks' `from_run` take it (`dew.inference.tasks.SavedRun.pinned`).
         The image processor reloads from its recorded source independently of
         the tokenizer that lays out the task's text.
         """
         from dew.data.text import tokenizer_for
-        from dew.inference.tasks import run_record, saved_model
+        from dew.inference.tasks import SavedRun, saved_model, saved_settings
         from dew.interop.pretrained import load_processor
-        from dew.registry import from_record, objectives
+        from dew.registry import from_record
 
-        record, step = run_record(directory, step)
-        settings = DecideSettings.of(record)
-        backbone = saved_model(record, dtype).build()
+        run = SavedRun.pinned(directory, step, trust)
+        step = run.step
+        settings = saved_settings(run.record, DecideSettings)
+        backbone = saved_model(run.record, dtype).build()
         width, head_dtype = DecisionModel.head_size(backbone)
         head = Head.from_record(records.json_value(settings.head, "head"), width)
         # The head computes in the dtype it recorded, or as a fresh head over
@@ -239,8 +230,7 @@ class Decide:
         if settings.tokenizer is None:
             raise ValueError("the run records no tokenizer to lay its rows out with")
         processor = None if settings.processor is None else load_processor(settings.processor, backbone)
-        variables = objectives[records.text(record["objective"], "objective")]._saved_variables(
-            directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
+        variables = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
         if ema is None:
             with Checkpoints(directory) as checkpoints:
                 averaged = checkpoints.stored(step).get("ema") is not None
