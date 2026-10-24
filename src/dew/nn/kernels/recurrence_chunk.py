@@ -741,8 +741,9 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, starts=None, max_segm
         if not fast:
             return rule(*operands), (operands, None)
         # The chunks' inverses kept for the fast backward, as fla's keeps its `A`.
-        out, final, inverse = mainloop.forward(*operands[:6], starts=operands[6], max_segments=max_segments,
-                                               scale=scale, delta=delta, wide=wide, with_inverse=True, **run)
+        out, final, inverse = mainloop.kept_forward(*operands[:6], starts=operands[6],
+                                                    max_segments=max_segments, scale=scale, delta=delta,
+                                                    wide=wide, **run)
         return (out, final), (operands, inverse)
 
     def backward(saved, grads):

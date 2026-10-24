@@ -793,7 +793,7 @@ def _layout(batch: int, length: int, starts, max_segments: int | None):
 
 def forward(q, k, v, g, beta, h0=None, *, starts=None, max_segments: int | None = None,
             scale: float | None = None, delta: bool = True, tiles: Tiles | None = None, wide: bool = False,
-            family: mosaic.Family | None = None, interpret: bool = False, with_inverse: bool = False):
+            family: mosaic.Family | None = None, interpret: bool = False):
     """The chunked rule's forward on this mainloop: `(o [B, T, HV, Dv], final [B, HV, Dk, Dv])` for `q`, `k`
     `[B, T, H, Dk]`, `v` `[B, T, HV, Dv]`, the natural log decay `g`, a head's `[B, T, HV]` (the gated delta
     rule) or a key dimension's `[B, T, HV, Dk]` (Kimi delta attention), the write gate `beta` `[B, T, HV]` and
@@ -807,16 +807,26 @@ def forward(q, k, v, g, beta, h0=None, *, starts=None, max_segments: int | None 
     attentions, GLA's with a decay a key dimension). Keys and values at most `WIDEST` wide, padded to whole
     blocks; under a decay a key dimension in an fp32 call at most a block wide (its tiles' three parts fill a
     block's shared memory past that). Its launches issue by `family`'s bundle (the device's, `family_of`,
-    where None), interpreted where `interpret`. With `with_inverse`, also each chunk's inverse under a decay
-    a head (`_solve`'s, None otherwise), which the fast backward takes rather than solve again (`gradients`'
-    `inverse`), as fla's backward keeps its `A`."""
+    where None), interpreted where `interpret`."""
+    out, final, _ = kept_forward(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale,
+                                 delta=delta, tiles=tiles, wide=wide, family=family, interpret=interpret)
+    return out, final
+
+
+def kept_forward(q, k, v, g, beta, h0=None, *, starts=None, max_segments: int | None = None,
+                 scale: float | None = None, delta: bool = True, tiles: Tiles | None = None,
+                 wide: bool = False, family: mosaic.Family | None = None,
+                 interpret: bool = False) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+    """`forward`'s `(o, final)` and each chunk's inverse under a decay a head (`_solve`'s, None otherwise),
+    which the fast backward takes rather than solve again (`gradients`' `inverse`), as fla's backward keeps
+    its `A`."""
     run = _prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                     tiles=tiles, family=family, interpret=interpret)
     call, tiles = run.call, run.tiles
     o = _output(run.q, run.k, run.h, run.corrected, run.hi, run.lo, run.taken, call, tiles, scale=run.scale,
                 out_dtype=jnp.float32 if wide else run.dtype, scores=run.scores)
     o = run.unlaid(o.reshape(call.rows, call.heads, call.value_width))[..., :run.value_width]
-    return (o, run.final, run.a) if with_inverse else (o, run.final)
+    return o, run.final, run.a
 
 
 @dataclasses.dataclass(frozen=True)
@@ -852,7 +862,7 @@ class _Run:
 def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles, family, interpret,
               inverse=None) -> _Run:
     """`forward`'s operands checked, padded and laid, and its launches before the output run: under a decay a
-    head the solve's but where its `inverse` is given (`forward`'s `with_inverse`)."""
+    head the solve's but where its `inverse` is given (`kept_forward`'s)."""
     family = family_of() if family is None else family
     if family is None:
         raise NotImplementedError(f"the mainloop has no bundle for the "
@@ -913,7 +923,7 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, starts=None, max_segments: in
     DAG (recomputing the forward's values, as fla does) through the algebra's backward tile functions:
     `_reverse`, `_query_key`, `_weighted_back`, the decay's gradient summed token by token
     (`algebra.summed_back`) and the memory's decay's term added, a key head's value heads summed; the
-    forward's `inverse` where given (`forward`'s `with_inverse`) rather than solved again. Its
+    forward's `inverse` where given (`kept_forward`'s) rather than solved again. Its
     rounding is fla's; the accurate backward is the portable math's token adjoint."""
     run = _prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=True,
                     tiles=None, family=family, interpret=interpret, inverse=inverse)
