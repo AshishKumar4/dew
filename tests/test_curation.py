@@ -107,6 +107,14 @@ def test_a_corpus_sealed_without_its_near_duplicates_keeps_one_record_of_each_gr
     assert manifest["metadata"]["near_duplicates"]["removed"] == len(pages) - len(PROSE)
 
 
+def test_a_deduplicating_snapshot_of_a_pass_that_keeps_nothing_seals_nothing(tmp_path):
+    """A chain whose filter rejects every page seals an empty snapshot, nothing removed."""
+    rule = text.Quality("gopher", settings=(("min_doc_words", 10_000),))
+    manifest = Pipeline(web_pages()).filter_map(rule).snapshot(str(tmp_path / "empty"),
+                                                               deduplicate=text.NearDuplicates())
+    assert manifest["rows"] == 0 and manifest["metadata"]["near_duplicates"]["removed"] == 0
+
+
 def test_a_quality_rule_takes_its_filters_own_settings_a_list_among_them():
     """A setting is the filter's constructor argument: Gopher's stop words, a list, given as a tuple,
     replace its own, so prose that holds none of them is rejected for that, and the step's identity

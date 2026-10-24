@@ -814,8 +814,11 @@ class Dataset:
         # The one pass sealed first, so every later read of it reads the same records in one order,
         # whatever a fetch makes of them the next time.
         with tempfile.TemporaryDirectory(prefix="dew-deduplicate-") as sealed:
-            export(chain, sealed, format="array_record", rows_per_shard=rows_per_shard)
-            kept, removed = near_duplicates_removed(lambda: passed(Files(sealed)), deduplicate)
+            # A pass that kept no record seals none, and has none to deduplicate.
+            if export(chain, sealed, format="array_record", rows_per_shard=rows_per_shard)["rows"]:
+                kept, removed = near_duplicates_removed(lambda: passed(Files(sealed)), deduplicate)
+            else:
+                kept, removed = iter(()), 0
             rule = {**dataclasses.asdict(deduplicate), "datatrove": version("datatrove"), "removed": removed}
             return export(kept, url, format=format, rows_per_shard=rows_per_shard,
                           metadata={"near_duplicates": rule})
