@@ -744,20 +744,19 @@ class Trainer(Generic[Loss, Effects]):
                 placement[FROZEN], lambda sharding, count: [row_sharding(sharding)] * count)}
         with self._declared():
             self.layout.check(variables, placement, self.device_mesh)
-        validation = self._validation(placed_shapes(dataclasses.replace(state, variables=variables),
-                                                    dataclasses.replace(shardings, variables=placement)),
-                                      capacity)
+        self.validation = self._validation(placed_shapes(dataclasses.replace(state, variables=variables),
+                                                         dataclasses.replace(shardings, variables=placement)),
+                                           capacity)
         _log.info("the state holds %.2f GiB on its fullest device between steps",
-                  max(validation.device_bytes.values()) / 2 ** 30)
-        return shardings, validation
+                  max(self.validation.device_bytes.values()) / 2 ** 30)
+        return shardings, self.validation
 
     def _validation(self, placed: TrainState, capacity: int | None = None) -> Validation:
         """`Layout.validate` of `placed`, read in every axis the modules box, which every process
-        agrees, each reading its own devices' memory; it is the trainer's `validation`."""
+        agrees, each reading its own devices' memory."""
         with boxed(self._boxed_axes()):
-            self.validation = agreed("state placement", functools.partial(
+            return agreed("state placement", functools.partial(
                 self.layout.validate, self.device_mesh, placed, capacity=capacity))
-        return self.validation
 
     @ruled
     def place(self) -> tuple[TrainState, Placement[TrainState], bytes | None]:
@@ -1247,7 +1246,7 @@ class Trainer(Generic[Loss, Effects]):
         seconds = timed([self._runner(plan, mesh) for plan in plans]) if len(plans) > 1 and timed else []
         # Every process runs the plan process zero timed fastest.
         planned = plans[broadcast_from_process_zero(seconds.index(min(seconds)) if seconds else 0)]
-        self._validation(planned.candidate.prepared)
+        self.validation = self._validation(planned.candidate.prepared)
         self.objective.substitute(list(planned.modules))
         self.objective.restore_head(planned.tile, fused=planned.fused)
         self._xla_defaults = planned.xla_defaults
