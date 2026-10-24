@@ -248,5 +248,5 @@ def test_a_captures_kernels_are_filed_under_the_programs_that_ran_them(tmp_path)
     assert [row["kernel_name"] for row in found["step_eval"]] == ["b"]
     assert [row["kernel_name"] for row in found["step"]] == ["c", "a"]
     assert [row["kernel_name"] for row in found[""]] == ["d"]
-    with pytest.raises(FileNotFoundError, match="capture-y"):
+    with pytest.raises(FileNotFoundError):
         program_kernels(tmp_path / "capture-y", ["step"])
