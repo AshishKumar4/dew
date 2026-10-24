@@ -337,11 +337,15 @@ def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.
     """`values @ rows.T`, `[M, K]` by E4M3 `[N, K]`, in float32: `values`'
     rows cast by the FP8 block cast, the codes widened in the dot and both
     rows' scales applied after it, the form XLA's GPU compiler rewrites to an
-    FP8 GEMM (cuBLASLt)."""
+    FP8 GEMM (cuBLASLt). The dot states its highest precision, which keeps that
+    GEMM's float32 accumulation: at the default, XLA:GPU asks cuBLASLt for its
+    fast FP8 accumulation, whose forward product on an H100 lay 568 times the
+    dequantized float32 product's distance from float64."""
     from dew.interop.codecs import fp8_block_cast
 
     codes, scales = fp8_block_cast(values, (1, values.shape[1]))
-    product = accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((1,), (1,)), ((), ()))),
+    product = accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((1,), (1,)), ((), ())),
+                                            precision=jax.lax.Precision.HIGHEST),
                           codes.astype(jnp.float32), rows.astype(jnp.float32),
                           preferred_element_type=jnp.float32)
     return product * scales * row_scales.T
