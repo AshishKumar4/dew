@@ -176,28 +176,12 @@ class InputSpec:
                 )
 
     def to_json(self) -> dict:
+        """The spec's record: its fields as the registry records them (`dew.registry.to_record`), and
+        each condition with its encoder by import path, whose weights bind apart (`Condition`)."""
         return {
-            "sample": {
-                "key": self.sample.key,
-                "shape": list(self.sample.shape),
-                **({"variable_axes": list(self.sample.variable_axes)} if self.sample.variable_axes else {}),
-            },
+            "sample": registry.to_record(self.sample, Field),
             "conditions": {keyword: condition.to_json() for keyword, condition in self.conditions.items()},
-            **(
-                {
-                    "mask": {
-                        "key": self.mask.key,
-                        "shape": list(self.mask.shape),
-                        **(
-                            {"variable_axes": list(self.mask.variable_axes)}
-                            if self.mask.variable_axes
-                            else {}
-                        ),
-                    }
-                }
-                if self.mask is not None
-                else {}
-            ),
+            **({} if self.mask is None else {"mask": registry.to_record(self.mask, Field)}),
         }
 
     @classmethod
@@ -206,20 +190,13 @@ class InputSpec:
 
         `params` maps each condition's keyword to its encoder's parameters.
         When it is None, each encoder loads its own weights."""
-        sample = record["sample"]
         return cls(
-            sample=Field(sample["key"], tuple(sample["shape"]), tuple(sample.get("variable_axes", ()))),
+            sample=registry.from_record(Field, record["sample"]),
             conditions={
                 keyword: Condition.from_json(condition, params=None if params is None else params[keyword])
                 for keyword, condition in record["conditions"].items()
             },
-            mask=Field(
-                record["mask"]["key"],
-                tuple(record["mask"]["shape"]),
-                tuple(record["mask"].get("variable_axes", ())),
-            )
-            if "mask" in record
-            else None,
+            mask=registry.from_record(Field, record["mask"]) if "mask" in record else None,
         )
 
 

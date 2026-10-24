@@ -140,19 +140,6 @@ class DecideSettings:
     tokenizer: str | None
     processor: str | None
 
-    @staticmethod
-    def of(record: Mapping[str, object]) -> "DecideSettings":
-        """The settings a run's record holds (`saved_settings`). An earlier run's record names its
-        layout by class name alone, one of `dew.decision.layout`'s, and is read as that class's."""
-        from dew.inference.tasks import saved_settings
-
-        laid = record.get("layout")
-        if isinstance(laid, Mapping) and "name" in laid:
-            name = records.text(laid["name"], "layout.name")
-            record = {**record, "layout": {"class": f"dew.decision.layout:{name}",
-                                           "fields": records.json_value(laid.get("fields"), "layout.fields")}}
-        return saved_settings(record, DecideSettings)
-
 
 @dataclass(frozen=True)
 class Decide:
@@ -226,13 +213,13 @@ class Decide:
         the tokenizer that lays out the task's text.
         """
         from dew.data.text import tokenizer_for
-        from dew.inference.tasks import SavedRun, saved_model
+        from dew.inference.tasks import SavedRun, saved_model, saved_settings
         from dew.interop.pretrained import load_processor
         from dew.registry import from_record
 
         run = SavedRun.pinned(directory, step, trust)
         step = run.step
-        settings = DecideSettings.of(run.record)
+        settings = saved_settings(run.record, DecideSettings)
         backbone = saved_model(run.record, dtype).build()
         width, head_dtype = DecisionModel.head_size(backbone)
         head = Head.from_record(records.json_value(settings.head, "head"), width)
