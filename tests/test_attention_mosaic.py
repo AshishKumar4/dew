@@ -250,18 +250,30 @@ def test_a_hook_shaped_to_the_launchs_tile_is_taken():
     runs (`attention_mosaic.refused`), and the forward is on par under it."""
     queries = 128
     spans = template.spans(queries, queries, 1, causal=True)
-    query, key, value, _ = _drawn((1, queries, 2, 1), jnp.bfloat16, width=128, keys=queries)(seed=0)
-    gate = jax.random.normal(jax.random.PRNGKey(3), (1, queries, 2, 128), jnp.float32)
-    hooks = template.Hooks(output_mod=lambda out, g: out * jax.nn.sigmoid(g.reshape((-1, 128))),
-                           output_params=(template.Param(gate, template.Kind.OUTPUT),))
+    draw_operands = _drawn((1, queries, 2, 1), jnp.bfloat16, width=128, keys=queries)
+
+    def draw(seed):
+        query, key, value, _ = draw_operands(seed)
+        gate = jax.random.normal(jax.random.PRNGKey(seed), (1, queries, 2, 128), jnp.float32)
+        return query, key, value, gate
+
+    def hooked(gate):
+        return template.Hooks(output_mod=lambda out, g: out * jax.nn.sigmoid(g.reshape((-1, 128))),
+                              output_params=(template.Param(gate, template.Kind.OUTPUT),))
+
     tiles = attention_mosaic.DEFAULTS["wgmma"]
-    assert attention_mosaic.refused(jnp.bfloat16, 128, 128, hooks, backward=False,
+    assert attention_mosaic.refused(jnp.bfloat16, 128, 128, hooked(draw(0)[3]), backward=False,
                                     tile=(tiles.block_q, tiles.block_k)) is None
-    found = attention_mosaic.forward(query, key, value, spans, hooks, interpret=True,
-                                     family=mosaic_sm90.WGMMA)
-    np.testing.assert_allclose(np.asarray(found, np.float32),
-                               np.asarray(template.reference(query, key, value, spans, hooks), np.float32),
-                               rtol=2e-2, atol=2e-2)
+
+    def ours(query, key, value, gate):
+        return attention_mosaic.forward(query, key, value, spans, hooked(gate), interpret=True,
+                                        family=mosaic_sm90.WGMMA)
+
+    def reference(query, key, value, gate):
+        return template.reference(query, key, value, spans, hooked(gate))
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "mosaic forward, a gate shaped to the tile",
+                    seeds=SEEDS)
 
 
 @INTERPRETS
