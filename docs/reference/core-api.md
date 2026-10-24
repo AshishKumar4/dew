@@ -212,7 +212,7 @@ A prompt's key is its global row key. Continuation zero draws with that key, so 
 
 `rows` counts this process's real prompts times `n`. `host()` returns the record over host arrays of those rows, and `text` decodes them through the task's processor, one string per row.
 
-`LMObjective.per_token_log_probs(params, tokens, left_padding=...)` scores the raw policy. It left-aligns real tokens for the forward and restores the original next-token alignment. Unscored padding slots are zero. `SampledRollout` records the raw sampling-time values as `old_log_probs` and preserves actual draws as `behavior_log_probs`, in the packed layout `GRPOObjective.packed_log_probs` rescores. Reward text excludes EOS and padding. When a batch carries no `old_log_probs`, GRPO uses the behavior probabilities as the old policy and its behavior corrections follow verl's bypass mode. The next-token objective refuses models declaring `causal=False`.
+`LMObjective.per_token_log_probs(params, tokens, left_padding=...)` scores the raw policy. It left-aligns real tokens for the forward and restores the original next-token alignment. Unscored padding slots are zero. `RolloutScheduler.sampled` records the raw sampling-time values as `old_log_probs` and preserves actual draws as `behavior_log_probs`, in the packed layout `GRPOObjective.packed_log_probs` rescores. Reward text excludes EOS and padding. When a batch carries no `old_log_probs`, GRPO uses the behavior probabilities as the old policy and its behavior corrections follow verl's bypass mode. The next-token objective refuses models declaring `causal=False`.
 
 ### Decoding components
 

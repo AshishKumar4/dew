@@ -96,7 +96,10 @@ def test_byte_string_prompts_load_as_the_native_tokenizers_ids(prompt):
     np.testing.assert_array_equal(batch[LENGTH_KEY], np.full(8, len(ids), np.int32))
 
 
-def test_string_prompts_keep_the_hf_sources_special_tokens_out(tmp_path):
+def test_a_string_prompt_opens_as_training_text_does_and_never_closes(tmp_path):
+    """A prompt is a sequence the model reads opens: a tokenizer that starts every encoding with a BOS
+    (Llama 3's, Gemma's) opens a prompt with it, as `Tokenize` opens training text, and the EOS its
+    encoding ends with is left off, since the completion follows the prompt."""
     from tokenizers import Tokenizer, models, processors
     from transformers import PreTrainedTokenizerFast
 
@@ -116,9 +119,10 @@ def test_string_prompts_keep_the_hf_sources_special_tokens_out(tmp_path):
         batch = next(stream)
     finally:
         stream.close()
-    np.testing.assert_array_equal(batch[PROMPT_KEY][0, WINDOW - len(ids):], ids)
-    np.testing.assert_array_equal(batch[PROMPT_KEY][0, :WINDOW - len(ids)], 0)
-    assert int(batch[LENGTH_KEY][0]) == len(ids)
+    opened = [1, *ids]
+    np.testing.assert_array_equal(batch[PROMPT_KEY][0, WINDOW - len(opened):], opened)
+    np.testing.assert_array_equal(batch[PROMPT_KEY][0, :WINDOW - len(opened)], 0)
+    assert int(batch[LENGTH_KEY][0]) == len(opened)
 
 
 def test_messages_render_with_the_generation_prompt():
@@ -199,3 +203,28 @@ def test_prompts_validate_on_a_hub_split_of_their_own(tmp_path, monkeypatch):
     rows = {name: list(iterate(pipeline, read="memory", provision=True, loading=Loading(workers=0)))
             for name, pipeline in (("train", train), ("held", held))}
     assert len(rows["train"]) == 4 and len(rows["held"]) == 2
+
+
+@pytest.mark.parametrize("inserted", [True, False])
+def test_a_prompt_that_starts_with_its_bos_keeps_one(tmp_path, inserted):
+    """A prompt whose text already starts with its tokenizer's BOS opens with that one BOS, whether the
+    tokenizer inserts a BOS (Llama's) or only declares one (GPT-2's)."""
+    from tokenizers import Tokenizer, models, processors
+    from transformers import PreTrainedTokenizerFast
+
+    backend = Tokenizer(models.WordLevel({"<unk>": 0, "<bos>": 1, "<eos>": 2, "dew": 3}, unk_token="<unk>"))
+    if inserted:
+        backend.post_processor = processors.TemplateProcessing(single="<bos> $A",
+                                                               special_tokens=[("<bos>", 1)])
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>", bos_token="<bos>",
+                                        eos_token="<eos>")
+    tokenizer.save_pretrained(tmp_path)
+    data = trained(Memory([json.loads(row) for row in records({"prompt": "<bos>dew"})]), 1,
+                   tokenizer=str(tmp_path))
+    stream = data.train(DataPartition())
+    try:
+        batch = next(stream)
+    finally:
+        stream.close()
+    length = int(batch[LENGTH_KEY][0])
+    assert list(batch[PROMPT_KEY][0, WINDOW - length:]) == [1, 3]
