@@ -238,6 +238,13 @@ class Pretrained:
     fields.
     """
 
+
+    @property
+    def eos_token_ids(self) -> tuple[int, ...]:
+        """The end-of-sequence ids the source's generation stops at, from its generation config or
+        its config (`eos_token_id`), none where neither names one."""
+        return eos_ids(self.config, self.generation_config)
+
     @property
     def text_processor(self) -> TaskProcessor | None:
         """Return what the bundle's tasks encode and decode text with.
@@ -697,7 +704,7 @@ class PretrainedMaskedDecoder(Pretrained):
         audit_masked(config, generation)
         return MaskedGeneration(self.model, self.variables, MDLM(mask_id=mask_id)(),
                                 self.text_processor,
-                                eos_token_ids=eos_ids(config, generation),
+                                eos_token_ids=self.eos_token_ids,
                                 pad_token_id=pad_id(config, generation),
                                 max_new_tokens=generation_limit(config, generation, "max_new_tokens"),
                                 max_length=generation_limit(config, generation, "max_length"),
@@ -723,7 +730,7 @@ class PretrainedBlockDecoder(Pretrained):
             self.variables,
             diffusion_gemma.generation_process(self.config, self.generation_config),
             self.text_processor,
-            eos_ids(self.config, self.generation_config),
+            self.eos_token_ids,
             pad_id(self.config, self.generation_config),
             max_new_tokens=generation_limit(self.config, self.generation_config, "max_new_tokens"),
             max_length=generation_limit(self.config, self.generation_config, "max_length"),

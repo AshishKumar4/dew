@@ -5,6 +5,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A block- or masked-diffusion objective over a loaded source takes the source's
+  end-of-sequence ids (`Pretrained.eos_token_ids`, or `eos_token_ids=`), and its
+  task and saved run (`BlockSettings`, `MaskedSettings`) stop a response there,
+  as the source's own task does; they generated past it.
 - A joint decision row's user turn is composed of segments, `JointLayout.segments`, a tuple of
   `Text`, `Media`, `State` and `Schema` in the order the row writes them: the default is the Laya
   joint release's turn, and another writes the schema before the state, or text of its own

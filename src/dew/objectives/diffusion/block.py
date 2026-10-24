@@ -41,6 +41,7 @@ from dew.objectives.base import (
     Source,
     Step,
     Variables,
+    ended,
     model_rngs,
     thaw,
 )
@@ -134,7 +135,8 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
     diffusion cross entropy.
 
     `model` may be the loaded SFT source, and `variables` and `processor`
-    override its own (`Objective.bind_model`).
+    override its own (`Objective.bind_model`), as `eos_token_ids`, the ids its
+    task's responses stop at, overrides the source's (`ended`).
 
     Both cross entropies score the final states through the bounded head
     (`dew.objectives.lm.chunked.head_cross_entropy`), `head_chunks`
@@ -155,7 +157,9 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                  stop_gradient_from_denoiser_to_encoder: bool = False,
                  encoder_loss_weight: float = 1.0, decoder_loss_weight: float = 1.0,
                  ema_decay: float | None = None, head_chunks: int = 4,
-                 processor: Processor | None | Omitted = OMITTED):
+                 processor: Processor | None | Omitted = OMITTED,
+                 eos_token_ids: Sequence[int] | Omitted = OMITTED):
+        self.eos_token_ids = ended(model, eos_token_ids)
         model = self.bind_model(model, variables=variables, processor=processor)
         if not (isinstance(model, BlockDenoiser) and isinstance(model, LayerScalars)):
             raise Lacks("canvas",
@@ -214,10 +218,11 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         return BlockProcess(canvas_length=self.model.canvas_length, vocab_size=self.model.vocab_size)
 
     def task_settings(self) -> BlockSettings:
-        """The sequence length, canvas budget, block process, pad id, and tokenizer or source
-        processor: the task's own."""
+        """The sequence length, canvas budget, block process, pad id, end-of-sequence ids, and
+        tokenizer or source processor: the task's own."""
         return BlockSettings(seq_len=self.sequence_length, max_new_tokens=self.canvas_size,
                              process=self._process(), pad_token_id=self.pad_token_id,
+                             eos_token_ids=self.eos_token_ids,
                              tokenizer=recorded_tokenizer(self.processor),
                              processor=recorded_processor(self.processor))
 
@@ -225,8 +230,8 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                    processor: Processor | None | Omitted = OMITTED) -> BlockGeneration:
         """Return the model over `variables` as a `BlockGeneration` task.
 
-        The sampler keeps the published defaults, and the caller sets the
-        tokenizer's EOS ids.
+        The sampler keeps the published defaults, and its responses stop at the
+        objective's end-of-sequence ids.
         """
         return BlockGeneration.from_settings(self.model, variables, self.task_settings(),
                                              self.processor if processor is OMITTED else processor)

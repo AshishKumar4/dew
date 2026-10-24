@@ -1558,6 +1558,23 @@ class Source(Protocol[M]):
     def text_processor(self) -> Processor | None: ...
 
 
+@runtime_checkable
+class Ending(Protocol):
+    """A loaded source that names the end-of-sequence ids its generation stops at, as
+    `dew.interop.Pretrained` does (`eos_token_ids`)."""
+
+    @property
+    def eos_token_ids(self) -> tuple[int, ...]: ...
+
+
+def ended(source: object, eos_token_ids: Sequence[int] | Omitted) -> tuple[int, ...]:
+    """The end-of-sequence ids a task over `source` stops at: `eos_token_ids` where given, else a
+    loaded source's own (`Ending`), else none, as a bare model names none."""
+    if eos_token_ids is not OMITTED:
+        return tuple(eos_token_ids)
+    return tuple(source.eos_token_ids) if isinstance(source, Ending) else ()
+
+
 S = TypeVar("S")
 
 

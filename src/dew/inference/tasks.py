@@ -38,7 +38,7 @@ from dew.nn.protocols import Bounded, CacheCapacity, TokenModel
 from dew.objectives.base import UNREAD, Variables, thaw
 from dew.records import integer, record as named_fields, text as named
 from dew.sampling import decoding, vocabulary
-from dew.sampling.decoding import LogitsTransform, Stopping
+from dew.sampling.decoding import LogitsTransform, Stopping, id_row
 from dew.sampling.solvers import Solver
 from dew.sampling.strategies import Strategy
 from dew.sampling.text import Criteria, Generation, Sampling, Transforms, generate, with_ids_of
@@ -340,30 +340,35 @@ class TextSettings(TaskSettings):
 @dataclass(frozen=True, kw_only=True)
 class MaskedSettings(TaskSettings):
     """A masked-diffusion run's settings (`MaskedGeneration.from_settings`): the masking process,
-    the unmasking solver and its step count beside the common ones."""
+    the unmasking solver and its step count, and the end-of-sequence ids a response stops at,
+    beside the common ones."""
 
     process: DiscreteProcess
     solver: Solver
     sampling_steps: int
+    eos_token_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         super().__post_init__()
         integer(self.sampling_steps, "sampling_steps")
+        object.__setattr__(self, "eos_token_ids", id_row("eos_token_ids", self.eos_token_ids))
         if not isinstance(self.solver, Unmask):
             raise ValueError("a masked run's task unmasks with an Unmask solver")
 
 
 @dataclass(frozen=True, kw_only=True)
 class BlockSettings(TaskSettings):
-    """A block-diffusion run's settings (`BlockGeneration.from_settings`): the block process and
-    the pad id beside the common ones."""
+    """A block-diffusion run's settings (`BlockGeneration.from_settings`): the block process, the
+    pad id and the end-of-sequence ids a response stops at beside the common ones."""
 
     process: BlockProcess
     pad_token_id: int
+    eos_token_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         super().__post_init__()
         integer(self.pad_token_id, "pad_token_id")
+        object.__setattr__(self, "eos_token_ids", id_row("eos_token_ids", self.eos_token_ids))
 
 
 def saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> ModelConfig:
@@ -741,10 +746,10 @@ class BlockGeneration(_NativeTextTask):
     def from_settings(cls, model: nn.Module, variables: Variables, settings: BlockSettings,
                       processor: Processor | None) -> BlockGeneration:
         """The task `settings` describe over `model` and `variables`, reading text through
-        `processor`: their process, pad id and canvas budget. A live objective
+        `processor`: their process, pad id, end-of-sequence ids and canvas budget. A live objective
         (`BlockDiffusionObjective.build_task`) and a saved run (`from_run`) build it alike."""
-        return cls(model, variables, settings.process, processor, pad_token_id=settings.pad_token_id,
-                   max_new_tokens=settings.max_new_tokens or None)
+        return cls(model, variables, settings.process, processor, eos_token_ids=settings.eos_token_ids,
+                   pad_token_id=settings.pad_token_id, max_new_tokens=settings.max_new_tokens or None)
 
 
 
@@ -826,11 +831,13 @@ class MaskedGeneration(_NativeTextTask):
     def from_settings(cls, model: nn.Module, variables: Variables, settings: MaskedSettings,
                       processor: Processor | None) -> MaskedGeneration:
         """The task `settings` describe over `model` and `variables`, reading text through
-        `processor`: their process, solver, step count and response budget. A live objective
-        (`MaskedDiffusionObjective.build_task`) and a saved run (`from_run`) build it alike."""
+        `processor`: their process, solver, step count, end-of-sequence ids and response budget. A
+        live objective (`MaskedDiffusionObjective.build_task`) and a saved run (`from_run`) build it
+        alike."""
         assert isinstance(settings.solver, Unmask)
         return cls(model, variables, settings.process, processor, solver=settings.solver,
-                   steps=settings.sampling_steps, max_new_tokens=settings.max_new_tokens or None)
+                   steps=settings.sampling_steps, eos_token_ids=settings.eos_token_ids,
+                   max_new_tokens=settings.max_new_tokens or None)
 
 
 
