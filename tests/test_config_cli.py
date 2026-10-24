@@ -245,6 +245,7 @@ def test_a_jepa_run_trains_its_lora_factors_and_ramps_their_momentum_over_its_up
             target = trained.ema["params"]["context_encoder"]
             for key in path:
                 target = target[key.key]
+            assert np.any(np.asarray(online))
             np.testing.assert_array_equal(np.asarray(target), 0.5 * np.asarray(online))
 
 

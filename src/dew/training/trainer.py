@@ -431,6 +431,8 @@ class _FitRun:
     notice: PreemptionNotice | None = None
     endless: bool = False
     taken: Taken | None = None
+    scored: frozenset[str] = frozenset()
+    """The suites `evaluation` scored at its step, which a run whose stream ends there scores once."""
     best: HeldBest = dataclasses.field(default_factory=HeldBest)
     """The log taken at the latest logging step and not yet read."""
     stepped: tuple[jax.Array, dict[str, jax.Array], jax.Array] | None = None
@@ -1877,6 +1879,7 @@ class Trainer(Generic[Loss, Effects]):
                 # A checkpoint that ranks the steps reads every suite's score.
                 names = None if ranked else due
                 run.evaluation = self._evaluation(plan, state, shardings, run.training, names)
+                run.scored = frozenset(plan.suites if names is None else names)
                 run.other += run.evaluation.elapsed_seconds
         scores = (
             {} if run.evaluation is None or run.evaluation.step != current else dict(run.evaluation.scores)
@@ -2011,8 +2014,7 @@ class Trainer(Generic[Loss, Effects]):
             loss.block_until_ready()
         scores: Mapping[str, float] = {}
         # A stream that ran out ends a run whose last step may have evaluated every suite already.
-        scored = (set() if run.evaluation is None or run.evaluation.step != current
-                  else {name.split("/", 1)[0] for name in run.evaluation.scores})
+        scored = run.scored if run.evaluation is not None and run.evaluation.step == current else frozenset()
         if (
             (plan.validation or plan.eval_every or plan.best or plan.stop or plan.held_best)
             and run.preempted is None
@@ -2024,7 +2026,9 @@ class Trainer(Generic[Loss, Effects]):
                 run.other += run.evaluation.elapsed_seconds
             assert run.evaluation is not None
             scores = run.evaluation.scores
-        self._saves(plan, run, interval, state, position, scores, evaluation_due=bool(scores), final=True)
+        # A token update may cross the pause and the budget at once, which still saves the whole state.
+        self._saves(plan, run, interval, state, position, scores, evaluation_due=bool(scores), final=True,
+                    full=plan.paused(current, plan.real(interval)))
         if plan.observe:
             plan.observe.last(current, state)
         if checkpoints is not None:
