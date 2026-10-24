@@ -595,11 +595,12 @@ class AttentionMetadata:
 
     `image_groups` and `block_groups` `[B, S]` int32 number the tokens' blocks,
     each a run of contiguous tokens, an image's or a prompt's, and -1 for a
-    token outside any, padding among them. A causal attention layer that reads them
-    (`bidirectional_images`, `bidirectional_blocks`) lets each token of a block
-    see the block's later tokens too, within its document; a layer reading
-    both sees the union, and every other layer stays causal
-    (`dew.nn.attention.scaled_dot_product_attention`'s `block_groups`).
+    token outside any, padding among them; the model calls take them as
+    `image_groups=` and `block_groups=`. A causal attention layer that reads
+    them (`AttentionMixer.bidirectional_images`, `bidirectional_blocks`) lets
+    each token of an image see the image's later tokens within its window,
+    and each token of a block its whole block, within its document; a layer
+    reading both sees the union, and every other layer stays causal.
 
     `coordinates` are the tokens' documents, validity, positions and cache
     slots (`Coordinates`). Their `right_padded` says each row's real tokens
