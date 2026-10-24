@@ -229,13 +229,18 @@ def _sync(tpu: Tpu, cfg: config.TpuConfig, count: int, excludes: Sequence[str],
 
 
 def _hosts(tpu: Tpu, count: int) -> list[str]:
-    """The address of each worker. A dry run names them instead."""
+    """The address of each of `count` workers. A dry run names them instead."""
     if tpu.gcloud.dry_run:
         return [f"<worker-{index}-ip>" for index in range(count)]
+    return _addresses(tpu)
+
+
+def _addresses(tpu: Tpu) -> list[str]:
+    """Each worker's external address, or its internal one where it has none, from one describe."""
     node = tpu.describe()
     if node is None:
         raise _missing(tpu)
-    return [ip or node.internal_ips[index] for index, ip in enumerate(node.ips)]
+    return [ip or internal for ip, internal in zip(node.ips, node.internal_ips, strict=True)]
 
 
 def _job_id(name: str) -> str:
@@ -485,14 +490,8 @@ class SshConfig(Named):
 
     def run(self, rest: list[str]) -> int:
         cfg, gcloud, tpu = self.opened()
-        if gcloud.dry_run:
-            addresses = [f"<worker-{index}-ip>" for index in range(_slice(tpu, cfg)[0])]
-        else:
-            node = tpu.describe()
-            if node is None:
-                raise _missing(tpu)
-            addresses = [ip or internal for ip, internal in zip(node.ips, node.internal_ips,
-                                                                  strict=True)]
+        # A live slice's addresses take one describe; a dry run's count reads the config.
+        addresses = _hosts(tpu, _slice(tpu, cfg)[0]) if gcloud.dry_run else _addresses(tpu)
         block = ssh_config.block(self.name, addresses, cfg.ssh_user or getpass.getuser())
         if gcloud.dry_run:
             emit(f"# {ssh_config.path()}")
