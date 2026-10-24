@@ -24,6 +24,7 @@ on CPU:
 import json
 from pathlib import Path
 
+import jax.numpy as jnp
 import numpy as np
 from safetensors.numpy import load_file
 
@@ -31,6 +32,22 @@ from dew.interop.hf_decoders import translate_wrapper_config, translate_wrapper_
 from dew.registry import projectors, towers
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
+
+
+def test_a_wrapper_dtype_change_reaches_the_decoder_that_computes_its_logits():
+    """A run dtype change reaches the wrapper's text decoder while retaining its master weights."""
+    from dew.config import ModelConfig
+    from dew.interop import Pretrained
+
+    loaded = Pretrained.load(FIXTURES / "qwen35-tiny-mm", dtype="float32", attention_impl="reference")
+    changed = ModelConfig.from_model(loaded.model).with_dtype("bfloat16").build()
+    ids = jnp.asarray([[1, 2, 3]], jnp.int32)
+    original = loaded.model.apply(loaded.variables, ids)
+    narrowed = changed.apply(loaded.variables, ids)
+    assert original.dtype == jnp.float32
+    assert narrowed.dtype == jnp.bfloat16
+    assert np.isfinite(np.asarray(narrowed, np.float32)).all()
+    np.testing.assert_array_equal(loaded.model.apply(loaded.variables, ids), original)
 
 
 def load_wrapper(name):
