@@ -16,7 +16,6 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "tests"))
 
 
 def workload(site, directory):
@@ -33,7 +32,8 @@ def workload(site, directory):
 
     source = source_pair(FIXTURE, "bfloat16" if site == "bfloat16" else "float32")
     if site in ("backward", "cached"):
-        return (gradient_functions if site == "backward" else cached_functions)(source)[1:]
+        functions = (gradient_functions if site == "backward" else cached_functions)(source)
+        return (*functions[1:], source[0].source)
     if site in ("text", "vision", "audio", "equal"):
         source, draw = (equal_geometry_source(source, directory) if site == "equal"
                         else optional_source(source, directory, site))
@@ -41,14 +41,14 @@ def workload(site, directory):
         def draw(seed):
             return unified_draw(source[1].config, seed, side=4 if site == "long" else 2)
     _, reference, truth = forward_functions(source)
-    return reference, truth, lambda seed: (draw(seed),)
+    return reference, truth, lambda seed: (draw(seed),), source[0].source
 
 
 def main():
+    sys.path.insert(0, str(ROOT / "tests"))
     import numpy as np
     from reference_error import FEWEST_SEEDS, seeds_for
     from reference_source import git_head
-    from test_gemma4_unified import FIXTURE
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("site", choices=("forward", "long", "bfloat16", "backward", "cached",
@@ -58,7 +58,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     with tempfile.TemporaryDirectory() as directory:
-        reference, truth, draw = workload(args.site, Path(directory))
+        reference, truth, draw, source = workload(args.site, Path(directory))
 
         @functools.lru_cache(maxsize=1)
         def observed(seed):
@@ -68,8 +68,10 @@ def main():
         count = seeds_for(lambda seed: observed(int(seed)),
                           lambda seed: (np.asarray(seed, np.int64),), args.site,
                           start=args.start, most=args.most, truth_fn=lambda seed: truth(*draw(int(seed))))
+        weights = hashlib.sha256((source / "model.safetensors").read_bytes()).hexdigest()
+        config = hashlib.sha256((source / "config.json").read_bytes()).hexdigest()
     record = {"site": args.site, "seeds": count, "revision": git_head(ROOT),
-              "model_sha256": hashlib.sha256((FIXTURE / "model.safetensors").read_bytes()).hexdigest(),
+              "model_sha256": weights, "config_sha256": config,
               "method": "reference_vs_reference", "start": args.start, "most": args.most,
               "packages": {name: importlib.metadata.version(name)
                            for name in ("jax", "torch", "transformers", "numpy")}}
