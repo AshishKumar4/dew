@@ -486,6 +486,37 @@ def test_a_gated_query_clips_its_query_half_and_bounds_the_logits():
     np.testing.assert_allclose(after, before * eta, rtol=1e-5)
 
 
+def test_a_biased_projection_clips_its_bias_with_its_kernel_and_bounds_the_logits():
+    """With `attention_bias`, a query is `x W + b`, so the clip scales the bias with the kernel. Here
+    the kernels are zero and the learned biases large, so the logits are the biases' alone: read
+    again on the same tokens after the clip, the firing group's maxima shrink and the other group's
+    hold, as the kernels' clip moves an unbiased layer's."""
+    model = tiny_decoder(attention_bias=True, num_layers=1)
+    variables = model.init(jax.random.key(0), jnp.ones((1, 8), jnp.int32))
+    rng = np.random.default_rng(2)
+    attention = dict(variables["params"]["layers_0"]["self_attn"])
+    for proj in ("q_proj", "k_proj"):
+        attention[proj] = {"kernel": jnp.zeros_like(attention[proj]["kernel"]),
+                           "bias": jnp.asarray(rng.normal(0, 3, attention[proj]["bias"].shape), jnp.float32)}
+    params = {**variables["params"], "layers_0": {**variables["params"]["layers_0"], "self_attn": attention}}
+    ids = jnp.asarray(rng.integers(0, 32, (2, 8)), jnp.int32)
+    _, sown = model.apply({**variables, "params": params}, ids, mutable=["qk"])
+    stats = sown["qk"]
+    before = np.max(np.asarray(stats["layers_0"]["self_attn"]["max_logits"][0]), axis=0)
+    tau = float(np.mean(before.reshape(2, 2).max(axis=1)))
+    tx = scale_by_qk_clip(tau)
+    updates, _ = tx.update(jax.tree.map(jnp.zeros_like, params), tx.init(params), params, qk_stats=stats)
+    clipped = optax.apply_updates(params, updates)
+    _, resown = model.apply({**variables, "params": clipped}, ids, mutable=["qk"])
+    firing = (before.reshape(2, 2).max(axis=1) > tau).repeat(2)
+    assert 0 < np.sum(firing) < 4
+    after = np.max(np.asarray(resown["qk"]["layers_0"]["self_attn"]["max_logits"][0]), axis=0)
+    # The firing group's logits shrink toward zero, the clip having reached the biases they come
+    # from; the other group's weights, and so its logits, stay as they were, bit for bit.
+    assert np.all(np.abs(after[firing]) < np.abs(before[firing]))
+    np.testing.assert_array_equal(after[~firing], before[~firing])
+
+
 def test_the_latent_branches_match_maxtext():
     """The MLA branches against MaxText 0.2.4's own outputs, committed as
     tests/fixtures/muonclip/maxtext_mla.json: `q_proj` stands in for `wq_b`
