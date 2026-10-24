@@ -227,8 +227,13 @@ def test_a_labelled_readout_reads_each_packed_row_at_its_own_answer_cue():
     """Rows whose options stand under labels, packed into windows, read each question's answer at its
     row's answer cue, moved with the row: each row's label logits and the backbone's gradients are the
     row's alone where its window packed it (check 1), the readout the backbone's own logits, whose
-    float64 truth is the float64 backbone's."""
+    float64 truth is the float64 backbone's. Each question's answer position is its own row's last
+    token, the cue's, in its window."""
     objective = objective_for("readout")
+    batch = windows(objective, 2)
+    for window, row in rows_of(batch):
+        last = np.flatnonzero(batch["segments"][window] == row)[-1]
+        assert np.all(batch["readout"][window][owners(batch)[window] == row] == last)
     assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64),
                                           objective.model.head), PACKING_SEEDS["readout"])
 
