@@ -113,6 +113,7 @@ from dew.training.distributed import (
     MeshSpec,
     Placement,
     Signature,
+    Validation,
     batch_layout,
     batch_shardings,
     batch_signature,
@@ -709,8 +710,57 @@ class Trainer(Generic[Loss, Effects]):
             for field in self.layout.host})
 
     @ruled
+    def validate(self, batch: Batch | None = None, *, capacity: int | None = None) -> Validation:
+        """What `fit` checks of the state before it places it (`Layout.validate`), read without
+        placing anything, so a run is checked on a CPU host before a costly launch.
+
+        The state is a fresh run's: its parameters, optimizer state and EMA, and, given one
+        global `batch` as the run reads it, the accumulation its steps pool where `accumulation`
+        is above 1, read as its first step reads the batch (whole, or in the `split` the trainer
+        fixes). A CPU host leaves out the narrow copies a GPU step reads (`TrainState.compute`).
+        `capacity` is the bytes each device has, for a mesh whose devices report none: a CPU
+        mesh of `--xla_force_host_platform_device_count` devices standing in for GPUs.
+
+        Raises what `fit` raises before placing the state: `LayoutRefused` for a state over a
+        device's memory or a layout that replicates too much of the model, and ValueError for
+        rules that name an axis the mesh lacks.
+        """
+        state = jax.eval_shape(self.initial_state)
+        if batch is not None:
+            device, _ = split_fields(marked(DataPartition(), self._counted_batch)(batch))
+            split = self._split or 1
+            with self._traced_on(self.device_mesh) as schedule:
+                _, _, state = self._prepared(state, microbatch_shapes(device, split), schedule,
+                                             split * self.accumulation)
+        return self._validated(state, capacity)[2]
+
+    def _validated(self, abstract: TrainState, capacity: int | None = None
+                   ) -> tuple[Placement[TrainState], TrainState, Validation]:
+        """`abstract`'s placement, the state as shapes that carry it (a restore's template) and
+        what `Layout.validate` reads of those, once every refusal before a placement passed: a
+        float the devices cannot hold, a layout that replicates too much and a state over a
+        device's memory, which every process agrees, each reading its own devices'."""
+        refuse_wide_floats(abstract, self.device_mesh)
+        shardings = self.shardings(abstract)
+        self.check(abstract.variables, shardings.variables)
+        if self.host_master and FROZEN in abstract.variables:
+            abstract = dataclasses.replace(abstract, variables={
+                **abstract.variables, FROZEN: self._banked_frozen(
+                    abstract.variables[FROZEN],
+                    lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype))})
+        template = jax.tree.map(
+            lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
+            abstract, shardings)
+        with self._declared():
+            validation = agreed("state placement", functools.partial(
+                self.layout.validate, self.device_mesh, template, capacity=capacity))
+        _log.info("the state holds %.2f GiB on its fullest device between steps",
+                  max(validation.device_bytes.values()) / 2 ** 30)
+        return shardings, template, validation
+
+    @ruled
     def place(self) -> tuple[TrainState, Placement[TrainState], bytes | None]:
-        """Put the state on the mesh, fresh or restored.
+        """Put the state on the mesh, fresh or restored, once `validate`'s checks pass.
 
         It returns the state with its shardings and the data position a resume
         continues from.
@@ -722,28 +772,18 @@ class Trainer(Generic[Loss, Effects]):
             from dew.training.host import transfer
             key = transfer(key, NamedSharding(self.state_mesh, P()))
         abstract = jax.eval_shape(self.initial_state, initializer, key)
-        refuse_wide_floats(abstract, self.device_mesh)
-        shardings = self.shardings(abstract)
-        self.check(abstract.variables, shardings.variables)
         checkpoints = self.checkpoints
         # Each process lists the checkpoints itself, and on a shared filesystem one listing can lag
         # another's: every process resumes from one step or none does.
         resume = None if checkpoints is None else agreed_same("newest checkpoint", lambda: checkpoints.latest)
         if checkpoints is None or resume is None:
+            shardings, _, _ = self._validated(abstract)
             if self.host_master:
                 return self._placed_host(initializer, key, shardings), shardings, None
             held = placed_held(initializer, abstract.variables, shardings.variables, self.device_mesh)
             return taking_over(self.initial_state, *held, shardings)(key), shardings, None
         abstract = dataclasses.replace(abstract, accumulation=checkpoints.accumulation_template(resume))
-        shardings = self.shardings(abstract)
-        if self.host_master and FROZEN in abstract.variables:
-            abstract = dataclasses.replace(abstract, variables={
-                **abstract.variables, FROZEN: self._banked_frozen(
-                    abstract.variables[FROZEN],
-                    lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype))})
-        template = jax.tree.map(
-            lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
-            abstract, shardings)
+        shardings, template, _ = self._validated(abstract)
         state, position = checkpoints.restore(template, resume,
                                               share=DataPartition.of(self.device_mesh))
         if self._config is not None:
