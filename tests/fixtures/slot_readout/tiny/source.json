@@ -1,6 +1,6 @@
 {
   "generator": "tools/slot_readout_reference.py",
-  "generator_revision": "3f63c9dd3e6e2b2037aee1dd467bbc2260282922",
+  "generator_revision": "67ef4cb94405876698956a8b7ee28abf25dd6740",
   "prompt_repo": "OmniJev/OneJev",
   "prompt_revision": "81ce62f1597c91e46767d4d02d6ac2e18534fe94",
   "prompt_files": {
@@ -20,7 +20,7 @@
   },
   "thinking": false,
   "source": "tests/fixtures/hf/qwen38-dense-tiny",
-  "seeds": 8,
+  "seeds": 256,
   "redraw": 4,
   "head_seed": 43,
   "precision": "ieee",
@@ -31,5 +31,18 @@
     "numpy": "2.4.0",
     "safetensors": "0.8.0",
     "pydantic": "2.12.5"
-  }
+  },
+  "declared_seeds": {
+    "causal_slot_lm": 128,
+    "causal_head": 128,
+    "block_slot_lm": 128,
+    "block_head": 128
+  },
+  "recorded_seed_capacity": {
+    "causal_slot_lm": 256,
+    "causal_head": 256,
+    "block_slot_lm": 256,
+    "block_head": 256
+  },
+  "sizing_revision": "67ef4cb94405876698956a8b7ee28abf25dd6740"
 }
