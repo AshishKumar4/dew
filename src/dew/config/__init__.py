@@ -592,12 +592,14 @@ class Wandb:
     """Where a run reports to Weights & Biases.
 
     Setting it turns tracking on; the entity and the offline switch have no effect
-    without a project.
+    without a project. `name` is the run's display name there, apart from the name
+    its checkpoints are kept under; None shows it as the run is named.
     """
 
     project: str
     entity: str | None = None
     offline: bool = False
+    name: str | None = None
 
 
 def _best_argument():
@@ -686,7 +688,8 @@ class TrainerConfig:
     epochs: int | None = None
     """The run length as passes over the data; `steps` sets it directly instead."""
     tokens: int | None = None
-    """Stop after this many real tokens across all microbatches, including before a resume.
+    """Stop after the loss has scored this many targets across all microbatches, including before a
+    resume.
 
     Uses the counter reported as `train/tokens`, without padding. The final
     microbatch may cross the budget. With `steps` or `epochs`, the first cap
@@ -860,6 +863,16 @@ class TrainerConfig:
         one policy a direct fit applies too)."""
         return run_steps(dataset, self.steps, self.epochs, self.tokens, self.accumulation)
 
+    def total_updates(self, dataset: Loader) -> int | None:
+        """Return the optimizer updates the run takes over `dataset` as `RunConfig.train` finalizes it,
+        its token budget's accumulation and its batch ramp applied: what an average that moves once an
+        update ramps over. None for a token-only run."""
+        trainer = self.accumulating(dataset)
+        ramp = trainer.batch_ramp
+        steps = trainer.total_steps(dataset if ramp is None else ramped(dataset, ramp))
+        # A window the run ends inside is never committed, as the trainer counts its updates.
+        return None if steps is None else steps // trainer.accumulation
+
     def eval_interval(self, dataset: Loader) -> int | None:
         """Return the steps between validation passes over `data`, or None for never."""
         return self._interval(self.eval_every, dataset, "eval-every")
@@ -960,6 +973,18 @@ def media_field(chain: Dataset, run: str) -> Field:
         raise ValueError(f"a {run} run trains on images or clips of one size (dew.data.presets.images or "
                          f"clips); this chain's {name} is {shape!r}")
     return Field(name, tuple(shape))
+
+
+def flag_selected(given: Sequence[str], selected: Mapping[str, str]) -> list[str]:
+    """`given` command-line arguments with each optional setting of `selected`, a field's name and its
+    subcommand's, turned on by its own flags: `--lora.rank 16` stands for `lora:lora --lora.rank 16`,
+    where no `lora:` choice is given. A setting none of whose flags is given stays off."""
+    given = list(given)
+    for field, subcommand in selected.items():
+        flags = [index for index, arg in enumerate(given) if arg.startswith(f"--{field}.")]
+        if flags and not any(arg.startswith(f"{field}:") for arg in given):
+            given.insert(flags[0], f"{field}:{subcommand}")
+    return given
 
 
 def _set_arguments(given: list[str]) -> tuple[list[str], list[str]]:
@@ -1155,6 +1180,11 @@ class RunConfig:
     _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {"lora": "lora"}
     """The optional settings `cli` turns on by their own flags, each with the
     subcommand its flags imply."""
+    RESUMABLE: ClassVar[tuple[str, ...]] = ("trainer", "optim", "data", "validation", "data_seed")
+    """The fields a run resumed under its name may change: how it trains and optimizes, what it reads,
+    and, in a kind of run that adds them, how it evaluates and previews. Every other field says what
+    it trains, which the resume must keep (`check_resume`), and so does `trainer.quantization`, which
+    changes the forward pass the weights train through."""
 
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
     data: Annotated[Dataset | None, tyro.conf.Suppress] = None
@@ -1279,6 +1309,27 @@ class RunConfig:
         where the table holds none, and its fields (`to_dict`)."""
         return {"class": registry.runs.name_of(type(self)), "fields": self.to_dict()}
 
+    def check_resume(self, saved: Mapping[str, object]) -> None:
+        """Refuse to resume the run whose record is `saved` as this one where they train different
+        things: another class, or a field outside `RESUMABLE` that differs. A changed `rope_theta`
+        keeps every shape, so it would otherwise continue the old weights under new semantics. The
+        saved fields are read back as this class reads them (`from_dict`), so a field the record
+        predates takes its default."""
+        named = registry.class_record(saved)
+        if named is None or registry.runs[named[0]] is not type(self):
+            raise ValueError(f"the run to resume is no {type(self).__name__}; resume it as the run it "
+                             "records, or train under another name")
+        recorded = type(self).from_dict({name: value for name, value in named[1].items()
+                                         if name not in _CHAINS})
+        before, now = recorded._fields_record(), self._fields_record()
+        changed = sorted(name for name in now.keys() | before.keys()
+                         if name not in self.RESUMABLE and now.get(name) != before.get(name))
+        if recorded.trainer.quantization != self.trainer.quantization:
+            changed.append("trainer.quantization")
+        if changed:
+            raise ValueError(f"the run to resume trained other {', '.join(changed)}; resume it as it "
+                             "recorded them, or train under another name")
+
     @classmethod
     def cli(cls, args: Sequence[str] | None = None, *, default: Self | None = None) -> Self:
         """Parse a run from `args`, or from the process's own command line when `args` is None.
@@ -1299,10 +1350,7 @@ class RunConfig:
         (`--set data.lm.seq_len=512`), which have no flags of their own.
         """
         given, settings = _set_arguments(list(sys.argv[1:] if args is None else args))
-        for field, subcommand in cls._FLAG_SELECTED.items():
-            flags = [index for index, arg in enumerate(given) if arg.startswith(f"--{field}.")]
-            if flags and not any(arg.startswith(f"{field}:") for arg in given):
-                given.insert(flags[0], f"{field}:{subcommand}")
+        given = flag_selected(given, cls._FLAG_SELECTED)
         model, objective = cls._started(default, "model"), cls._started(default, "objective")
         if not isinstance(model, ModelConfig) or not isinstance(objective, ObjectiveConfig | None):
             raise TypeError(f"{cls.__name__} starts from the model {model!r} and the objective "
@@ -1493,12 +1541,19 @@ class RunConfig:
         try:
             wandb_tracker = None
             if trainer.wandb is not None and trainer.lower_for is None:
+                # Shown under its own name where one is given, kept under the run's either way.
                 wandb_tracker = WandbTracker(
-                    trainer.wandb.project, name, entity=trainer.wandb.entity,
-                    offline=trainer.wandb.offline)
+                    trainer.wandb.project, name if trainer.wandb.name is None else trainer.wandb.name,
+                    entity=trainer.wandb.entity, offline=trainer.wandb.offline)
             checkpoints = Checkpoints(os.path.join(trainer.checkpoint_dir, name), keep=trainer.keep)
             local = _local_tracker(checkpoints.directory, name)
             tracker = Trackers(local, *(() if wandb_tracker is None else (wandb_tracker,)))
+            def check_resumed() -> None:
+                """Refuse a checkpoint of another run under the name, on every rank."""
+                saved = epath.Path(checkpoints.directory) / RUN_FILE
+                if checkpoints.latest is not None and saved.exists():
+                    self.check_resume(json.loads(saved.read_text()))
+
             def record_run() -> None:
                 """Write the run's record and name where it is tracked, on rank zero."""
                 if jax.process_index() == 0:
@@ -1511,6 +1566,8 @@ class RunConfig:
                         device_kind=jax.devices()[0].device_kind, devices=jax.device_count(),
                         processes=jax.process_count()), 0)
 
+            # The whole pool accepts the resume before its record is replaced or its state restored.
+            agreed("run resume", check_resumed)
             agreed("run metadata", record_run)
             # The trainer holds mesh, microbatches, layout, accumulation, split,
             # dynamic_scale, profile and tune_kernels; prepare_process read the
@@ -1576,4 +1633,4 @@ class RunConfig:
 
 
 __all__ = ["JsonDict", "MetricConfig", "ModelConfig", "ObjectiveConfig", "OptimConfig", "Prepared",
-           "RunConfig", "ScheduleSpec", "TrainerConfig", "Wandb"]
+           "RunConfig", "ScheduleSpec", "TrainerConfig", "Wandb", "flag_selected"]
