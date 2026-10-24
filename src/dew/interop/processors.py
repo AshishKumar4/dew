@@ -118,7 +118,7 @@ def _placed(runs: list[list[np.ndarray]], selected: Sequence[np.ndarray], capaci
 
 
 def _patch_streams(values: Mapping[str, object], image_id: int, video_id: int | None, *,
-                   kernel: int, table_size: int, patch_size: int
+                   kernel: int, table_size: int, patch_size: int, retains_slots: bool = False
                    ) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """Return each modality's patch frames, their coordinates and their pooled
     lengths, by the placeholder id that stands in the prompt for them.
@@ -155,14 +155,14 @@ def _patch_streams(values: Mapping[str, object], image_id: int, video_id: int | 
         coordinates = coordinates.reshape(-1, *coordinates.shape[-2:])
         valid_patches = (coordinates >= 0).all(axis=-1)
         padding = (coordinates == -1).all(axis=-1)
-        if not np.all(valid_patches | padding):
+        if np.any(coordinates < -1) or (not retains_slots and not np.all(valid_patches | padding)):
             raise ValueError(f"{position_name} uses nonnegative coordinates or paired (-1, -1) padding")
         if np.any(coordinates >= table_size):
             raise ValueError(f"{position_name} exceeds position_embedding_size")
         counts = valid_patches.sum(axis=1)
-        if frames.shape[1] % kernel ** 2 or np.any(counts % kernel ** 2):
+        if not retains_slots and (frames.shape[1] % kernel ** 2 or np.any(counts % kernel ** 2)):
             raise ValueError("patch counts must divide into complete pooling blocks")
-        streams[token_id] = (frames, coordinates, counts // kernel ** 2)
+        streams[token_id] = (frames, coordinates, counts if retains_slots else counts // kernel ** 2)
     return streams
 
 
@@ -508,7 +508,8 @@ class Processor:
         if kernel is None or patch_size is None or table_size is None:
             raise ValueError("positioned image patches require patch, pooling and position-table geometry")
         streams = _patch_streams(values, image_id, video_id, kernel=kernel,
-                                 table_size=table_size, patch_size=patch_size)
+                                 table_size=table_size, patch_size=patch_size,
+                                 retains_slots=tower.retains_patch_slots)
         patches = {token: list(zip(*stream, strict=True)) for token, stream in streams.items()}
         ordered = _in_text_order(patches, tokens, runs)
         if not ordered:
