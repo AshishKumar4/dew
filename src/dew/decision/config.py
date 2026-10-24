@@ -20,17 +20,16 @@ from __future__ import annotations
 
 import dataclasses
 import os
-from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Annotated, ClassVar
 
 import jax
 
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig
 from dew.data.compile import fitted
-from dew.data.text import HFTokenizer
+from dew.data.dataset import record_argument
 from dew.decision.head import DecisionHead, JointSchemaHead
-from dew.decision.laya import LAYA, LayaCheckpoint
-from dew.decision.layout import Framing, Layout, default_layout
+from dew.decision.laya import LAYA
+from dew.decision.layout import Framing, Layout, Schema, Segment, default_layout
 from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.scoring import default_metrics
@@ -116,6 +115,10 @@ class DecisionRunConfig(RunConfig):
     (a hundred options, or a document's many hypotheses) fits under a `max_len`
     set for it without lengthening every other row's state. None lets the
     state fill the row."""
+    segments: Annotated[tuple[Segment, ...], record_argument(tuple[Segment, ...])] | None = None
+    """A joint row's user turn, its parts in order (`JointLayout.segments`): the schema first, or
+    read as the row's context through `context_layers` (`Schema(stream="context")`), its
+    `context_length` holding the whole schema. None keeps the layout's own, the release's turn."""
     framing: Framing | None = None
     """How a joint row frames itself as a conversation (`Framing`): its system message, the
     assistant's prefill, the reasoning switch, a Jinja chat template in place of the tokenizer's
@@ -137,7 +140,7 @@ class DecisionRunConfig(RunConfig):
         flags choose only its compute dtype and attention kernel;
         `param_dtype` chooses the loaded checkpoint's storage dtype. `remat`
         chooses its layer recomputation before looping or attaching LoRA."""
-        from dew.interop import Pretrained, sources
+        from dew.interop import Pretrained
 
         decided = sorted(set(self.model.fields) - {"dtype", "attention_impl"})
         if decided:
@@ -147,22 +150,27 @@ class DecisionRunConfig(RunConfig):
         attention_impl = str(self.model.fields.get("attention_impl", "auto"))
         budgets = {"max_len": self.max_len, "head_max_len": self.head_max_len,
                    "option_tokens": self.option_tokens, "max_state_tokens": self.max_state_tokens,
-                   "framing": self.framing}
+                   "framing": self.framing, "segments": self.segments}
+        in_context = any(isinstance(segment, Schema) and segment.stream == "context"
+                         for segment in self.segments or ())
+        if in_context and self.context_layers is None:
+            raise ValueError("a schema read as the row's context is read by context layers; set "
+                             "--context-layers")
         derived = {}
-        if LayaCheckpoint.exists(self.pretrained, subfolder=self.subfolder, revision=self.revision):
+        from dew.decision.sources import PretrainedDecision
+
+        start = Pretrained.load(self.pretrained, subfolder=self.subfolder, revision=self.revision,
+                                dtype=dtype, param_dtype=self.param_dtype, attention_impl=attention_impl,
+                                weights=not self.trainer.resumes(), on_host=True)
+        if isinstance(start, PretrainedDecision):
             if any(choice is not None for choice in (self.lora, self.head, self.loop_steps,
                                                     self.loop_layers, self.loop_backprop_steps,
                                                     self.remat, self.context_layers)) or self.loop_remat:
                 raise ValueError("--lora, --head, --remat, --context-layers and the loop shape a fresh "
                                  "backbone; a Laya checkpoint trains whole under its own head")
-            start = Decide.from_pretrained(self.pretrained, subfolder=self.subfolder, revision=self.revision,
-                                           dtype=dtype, param_dtype=self.param_dtype,
-                                           attention_impl=attention_impl)
+            start = Decide.of(start)
             derived["layout"] = _budgeted(start.layout, budgets)
         else:
-            start = Pretrained.load(self.pretrained, revision=self.revision, dtype=dtype,
-                                    param_dtype=self.param_dtype, attention_impl=attention_impl,
-                                    weights=not self.trainer.resumes(), on_host=True)
             if self.remat is not None:
                 if not isinstance(start.model, RematChoosing):
                     raise ValueError(f"--remat chooses a decoder's layer policy (RematChoosing), which "
@@ -178,9 +186,6 @@ class DecisionRunConfig(RunConfig):
                 start = start.with_cross_attention(blocks, key=jax.random.fold_in(
                     jax.random.key(self.trainer.key), 1))
             start = start if self.lora is None else start.adapt(self.lora, key=self.trainer.key)
-            # The tokenizer of the commit the weights come from.
-            root = sources.snapshot(self.pretrained, self.revision, weights=False)
-            derived["tokenizer"] = HFTokenizer(str(root), local_files_only=root != Path(self.pretrained))
             if self.head is not None:
                 width, head_dtype = DecisionModel.head_size(start.model)
                 derived["head"] = JointSchemaHead(hidden_size=width, dtype=head_dtype,
@@ -241,12 +246,16 @@ def looping(start: Pretrained, steps: int | None, layers: tuple[int, int] | None
     return dataclasses.replace(start, model=looped)
 
 
-def _fresh_layout(causal: bool, one_question: bool, budgets: dict[str, int | Framing | None]) -> Layout:
+type Budgets = dict[str, int | Framing | tuple[Segment, ...] | None]
+"""A run's budgets of a row's layout, by the layout's field names (`_budgeted`)."""
+
+
+def _fresh_layout(causal: bool, one_question: bool, budgets: Budgets) -> Layout:
     """The layout a fresh head reads (`default_layout`), with the run's `budgets`."""
     return _budgeted(default_layout(causal, one_question), budgets)
 
 
-def _budgeted(layout: Layout, budgets: dict[str, int | Framing | None]) -> Layout:
+def _budgeted(layout: Layout, budgets: Budgets) -> Layout:
     """`layout` with the `budgets` the run states, each but those left None, which keep the
     layout's own; zero is a budget too (a joint row of no state). A budget the layout has no
     field for is refused: a joint row has no question budget, and a row per question no state

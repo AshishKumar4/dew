@@ -61,6 +61,7 @@ if TYPE_CHECKING:
 
     from dew.diffusion.presets import Preset
     from dew.inputs.encoders import ConditionEncoder
+    from dew.interop.composite import SourceKind
     from dew.nn.mixers import MixerBase
     from dew.nn.vision import ProjectorBase, TowerBase
     from dew.objectives.base import Metric, Objective
@@ -1172,10 +1173,9 @@ def with_dtype(name: str, fields: Mapping[str, object], dtype: str | None) -> Ma
     if dtype is None:
         return fields
     member = models[name]
-    if isinstance(member, type) and "dtype" in {field.name for field in dataclasses.fields(member)}:
-        return {**fields, "dtype": dtype}
     assert isinstance(member, type)
-    parts = {}
+    parts: dict[str, object] = ({"dtype": dtype}
+                              if "dtype" in {field.name for field in dataclasses.fields(member)} else {})
     for key, value in fields.items():
         part = _part_type(member, key, configured(value))
         if part is None or "dtype" not in {field.name for field in dataclasses.fields(part)}:
@@ -1199,17 +1199,25 @@ def _part_type(member: type, field: str, value: Configured) -> type | None:
 
     if isinstance(value, nn.Module):
         return type(value)
+    declared = tuple(part for part in _union_members(declared_type(member, field))
+                     if isinstance(part, type) and issubclass(part, nn.Module))
+    if not declared:
+        return None
     named = class_record(value) if isinstance(value, Mapping) else None
     if named is not None:
-        held = _member(named[0], (nn.Module,))
-        return held if isinstance(held, type) else None
-    declared = _unwrapped(declared_type(member, field))
-    if isinstance(value, Mapping) and isinstance(declared, type) and issubclass(declared, nn.Module):
-        return declared
+        held = _member(named[0], declared)
+        return held if isinstance(held, type) and issubclass(held, nn.Module) else None
+    if isinstance(value, Mapping) and len(declared) == 1:
+        return declared[0]
     return None
 
 
 # Each kind's aliases, for the command line and the records a person writes.
+source_kinds: Aliases[type[SourceKind], SourceKind] = Aliases("source", {
+    "decision": "dew.decision.sources:DecisionSource",
+}, base="dew.interop.composite:SourceKind")
+
+
 models: Aliases[type[nn.Module], nn.Module] = Aliases("model", {
     "causal_transformer": "dew.nn.backbones.causal_transformer:CausalTransformer",
     "diffusion_gemma": "dew.nn.diffusion_gemma:DiffusionGemma",

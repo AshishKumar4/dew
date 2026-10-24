@@ -238,12 +238,9 @@ def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondi
                            ) -> tuple[LazyTree, tuple[WeightLayout, ...]]:
     """Map UNet tensors into a parameter tree and the layouts that invert it.
 
-    Each leaf is cast to `param_dtype` before its transpose. Attention kernels
-    are also reshaped to per-head axes, which is why this does not go through
-    `weights.record_layouts`. Read eagerly, a transposed kernel is a view of the
-    stored tensor. With `lazy` every other linear kernel and every
-    untransposed leaf is a `SourceLeaf`, read when it is placed; a reshaped
-    attention kernel and a convolution are read whole either way.
+    Attention kernels split their input or output axes into heads. With `lazy`, linear and
+    untransposed leaves retain source views through those reshapes and read only when placed;
+    convolutions are read whole. Eager kernels cast before transposing and splitting their axes.
     """
     from dew.interop.streaming import SourceLeaf
     parameters: LazyTree = {}
@@ -255,20 +252,20 @@ def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondi
         dtype = checkpoint_dtype(stored.dtype, param_dtype)
         kernel = path[-1] == "kernel"
         attention = "Attention1" in path or "Attention2" in path
-        if lazy and not (kernel and (stored.ndim == 4 or attention)):
-            if owners[path] == name:
-                # Equal source aliases add export names without another leaf.
-                insert(parameters, path, SourceLeaf((stored,), dtype, transposed=kernel), name)
-            continue
-        value = stored.astype(dtype, copy=False)
-        if kernel:
-            value = value.transpose(2, 3, 1, 0) if value.ndim == 4 else value.T
-            if attention:
-                stage = _unet_stage(model, path)
-                value = (value.reshape(value.shape[0], stage.heads, stage.features // stage.heads)
-                         if path[-2] in ("to_q", "to_k", "to_v")
-                         else value.reshape(stage.heads, stage.features // stage.heads, stage.features))
-        insert(parameters, path, value, name)
+        if lazy and not (kernel and stored.ndim == 4):
+            value = SourceLeaf((stored,), dtype, transposed=kernel)
+        else:
+            value = stored.astype(dtype, copy=False)
+            if kernel:
+                value = value.transpose(2, 3, 1, 0) if value.ndim == 4 else value.T
+        if kernel and attention:
+            stage = _unet_stage(model, path)
+            shape = ((value.shape[0], stage.heads, stage.features // stage.heads)
+                     if path[-2] in ("to_q", "to_k", "to_v")
+                     else (stage.heads, stage.features // stage.heads, stage.features))
+            value = value.reshape(shape)
+        if owners[path] == name:
+            insert(parameters, path, value, name)
     return parameters, unet_layouts({name: tensor.shape for name, tensor in tensors.items()}, model)
 
 
@@ -903,7 +900,7 @@ def save_source(source, values, destination: Path, max_shard_size: int | str) ->
     `from_flax` conversion, which reads the msgpack, takes a folder without them
     (modeling_utils.py:1109-1113, 0.34.0)."""
     from dew.interop.decoder_parts import layout_tensors
-    from dew.interop.safetensors_io import save_sharded
+    from dew.interop.safetensors_io import LazyTensors, save_sharded, tensor_specs
     written = {path for layout in source.weight_layouts for path in layout.paths}
     leaves = [tuple(str(key.key) for key in path) for path, _ in jax.tree_util.tree_leaves_with_path(values)]
     unwritten = ["/".join(path) for path in leaves if path not in written]
@@ -937,15 +934,19 @@ def save_source(source, values, destination: Path, max_shard_size: int | str) ->
     for layout in source.weight_layouts:
         component, _, name = layout.name.partition("/")
         layouts.setdefault(component, {})[name] = layout
-    retained: dict[str, dict[str, np.ndarray]] = {}
-    for source_name, tensor in source.retained_tensors.items():
+    retained: dict[str, dict[str, str]] = {}
+    specifications = tensor_specs(source.retained_tensors)
+    for source_name in specifications:
         component, _, name = source_name.partition("/")
         if name not in layouts.get(component, {}):
-            retained.setdefault(component, {})[name] = tensor
+            retained.setdefault(component, {})[name] = source_name
     for component in dict.fromkeys((*layouts, *retained)):
         # Each tensor is built as the shard that holds it is written, so the host
         # holds one shard of the export (`save_sharded`).
-        tensors = layout_tensors(layouts.get(component, {}), values, retained=retained.get(component))
+        names = retained.get(component, {})
+        carried = LazyTensors({name: specifications[original] for name, original in names.items()},
+                              lambda name, names=names: source.retained_tensors[names[name]])
+        tensors = layout_tensors(layouts.get(component, {}), values, retained=carried)
         weights = "diffusion_pytorch_model" if component in ("unet", "vae", "transformer") else "model"
         save_sharded(tensors, destination / component, max_shard_size, stem=weights)
         declared = index.get(component)

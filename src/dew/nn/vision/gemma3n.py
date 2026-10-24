@@ -16,7 +16,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import records
 from dew.interop.config_records import NativeFields
-from dew.interop.weights import placed
+from dew.interop.weights import in_params, placed
 from dew.nn.attention import RMSNorm
 from dew.nn.blocks import TokenEmbedding
 from dew.nn.dense import Dense
@@ -24,15 +24,7 @@ from dew.nn.precision import float32_dot_general
 from dew.registry import Record, from_record
 
 from ..mobilenet import _ARCHITECTURE, MobileNetV5, MobileNetV5Encoder
-from .common import (
-    ProjectorBase,
-    ProjectorLayout,
-    TowerBase,
-    TowerGeometry,
-    TowerLayout,
-    _vision_section,
-    in_params,
-)
+from .common import ProjectorBase, ProjectorLayout, TowerBase, TowerGeometry, TowerLayout, _vision_section
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout

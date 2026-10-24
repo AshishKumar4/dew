@@ -10,6 +10,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
+from dew.interop.weights import in_params
 from dew.nn.dense import Dense
 from dew.nn.precision import float32_dot_general
 from dew.nn.text_encoders import _encoder_layer_path
@@ -25,7 +26,6 @@ from .common import (
     _side,
     _vision_section,
     head_width,
-    in_params,
     rope_base,
     trunk_geometry,
 )

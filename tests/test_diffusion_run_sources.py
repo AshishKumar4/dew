@@ -20,6 +20,7 @@ import optax
 import pytest
 from diffusion_stubs import PROMPTS, batch_for
 from diffusion_support import images_of
+from interop_support import allocated_bytes
 from reference_error import assert_as_exact
 
 from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
@@ -53,6 +54,30 @@ def precision() -> ModelConfig:
     """The default model record at float32 on the XLA kernel."""
     model = DiffusionRunConfig().model
     return dataclasses.replace(model, fields={**model.fields, "dtype": "float32", "attention_impl": "xla"})
+
+
+def test_a_shape_only_pipeline_load_retains_geometry_without_eager_native_copies(pipelines, tmp_path,
+                                                                               monkeypatch):
+    """A shape-only load preserves every component's parameter geometry and storage dtype.
+    Checkpoint validation still requires valid safetensors files. A delegating NumPy allocation
+    recorder measures host buffers, not implementation calls: deferred linear leaves allocate fewer
+    native-layout bytes than an eager load of the same already-warmed pipeline."""
+    from dew.interop import Pretrained
+
+    original = pipelines / "sd3" / "pipeline"
+    expected = Pretrained.load(original, dtype="float32", attention_impl="xla", on_host=True)
+    selected = tmp_path / "source"
+    shutil.copytree(original, selected)
+    _, eager_bytes = allocated_bytes(monkeypatch, lambda: Pretrained.load(
+        selected, dtype="float32", attention_impl="xla", on_host=True))
+    loaded, deferred_bytes = allocated_bytes(monkeypatch, lambda: Pretrained.load(
+        selected, dtype="float32", attention_impl="xla", weights=False))
+    assert eager_bytes > 0 and deferred_bytes < eager_bytes
+    shapes = jax.tree.leaves(loaded.variables)
+    assert all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in shapes)
+    assert jax.tree.structure(loaded.variables) == jax.tree.structure(expected.variables)
+    for actual, wanted in zip(shapes, jax.tree.leaves(expected.variables), strict=True):
+        assert actual.shape == wanted.shape and actual.dtype == wanted.dtype
 
 
 def value(objective, params, batch) -> float:

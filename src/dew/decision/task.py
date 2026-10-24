@@ -33,7 +33,6 @@ from dew.decision.calibration import (
 from dew.decision.data import Example
 from dew.decision.head import Head
 from dew.decision.images import Images
-from dew.decision.joint_checkpoint import JointCheckpoint
 from dew.decision.laya import LAYA, LayaCheckpoint
 from dew.decision.layout import (
     DecisionInputs,
@@ -43,7 +42,6 @@ from dew.decision.layout import (
     Layout,
     MarkerLayout,
     Specials,
-    StateFirstLayout,
     context_tokens,
     render,
 )
@@ -64,21 +62,22 @@ from dew.files import write_atomically
 from dew.inference import scoring
 from dew.inference.tasks import shape_bucket
 from dew.interop.processors import Processor
+from dew.interop.safetensors_io import MAX_SHARD_SIZE
+from dew.interop.sources import SourceReference
 from dew.nn.inputs import ModelInputs, RowPlan, mesh_of
 from dew.nn.kernels.options import compiler_options
-from dew.objectives.base import Metric, Objective, Variables
+from dew.objectives.base import Metric, Objective, Variables, joined
 from dew.records import JSON, json_value, record
 
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
     from dew.decision.objective import DecisionObjective
+    from dew.decision.sources import PretrainedDecision
     from dew.training.distributed import Layout as Placement, MeshSpec
 
 TASK_FILE = "decide.json"
 """The file `Decide.save` writes into a run: its calibration, budget and name."""
-_LAYOUTS: Mapping[str, type[Layout]] = {
-    layout.__name__: layout for layout in (MarkerLayout, StateFirstLayout, JointLayout)}
 
 
 @dataclass(frozen=True)
@@ -133,14 +132,28 @@ def usage_of(rows: Sequence[Encoded]) -> Usage:
 @dataclass(frozen=True)
 class DecideSettings:
     """What a decision run records beside its backbone, and its task is built with
-    (`Decide.from_run`): the head's record (`Head.record`), the layout's name and fields, the
-    special tokens, the text tokenizer's name, and an image processor's source, or None."""
+    (`Decide.from_run`): the head's record (`Head.record`), the layout (by import path, its
+    segments with it), the special tokens, the text tokenizer's name, and an image processor's
+    source, or None."""
 
     head: JSON
-    layout: JSON
+    layout: Layout
     specials: Specials
     tokenizer: str | None
-    processor: str | None
+    processor: SourceReference | None
+
+    @staticmethod
+    def of(record: Mapping[str, object]) -> "DecideSettings":
+        """The settings a run's record holds (`saved_settings`). An earlier run's record names its
+        layout by class name alone, one of `dew.decision.layout`'s, and is read as that class's."""
+        from dew.inference.tasks import saved_settings
+
+        laid = record.get("layout")
+        if isinstance(laid, Mapping) and "name" in laid:
+            name = records.text(laid["name"], "layout.name")
+            record = {**record, "layout": {"class": f"dew.decision.layout:{name}",
+                                           "fields": records.json_value(laid.get("fields"), "layout.fields")}}
+        return saved_settings(record, DecideSettings)
 
 
 @dataclass(frozen=True)
@@ -175,27 +188,33 @@ class Decide:
     def from_pretrained(cls, name: str | Path = LAYA, *, subfolder: str | None = None,
                         revision: str | None = None, dtype: str = "float32", param_dtype: str = "float32",
                         attention_impl: str = "auto") -> Self:
-        """Load a released Laya checkpoint (`LayaCheckpoint`) or joint-head
-        checkpoint (`JointCheckpoint`) as a task.
+        """Load a released Laya or joint-head checkpoint through `Pretrained.load` as a task.
 
         A Laya task uses the temperatures that Laya's agent reads from
         `rl_agent_config.json`; a joint-head release ships none. Either
         answers with Jev's confidence; `replace(task, confidence=...)` selects
         Laya's (`EntropyConfidence`) or the top probability (`TopProbability`).
         """
-        label = str(name) if subfolder is None else f"{name}/{subfolder}"
-        if subfolder is None and JointCheckpoint.exists(name, revision=revision):
-            release = JointCheckpoint.load(name, revision=revision, dtype=dtype, param_dtype=param_dtype,
-                                           attention_impl=attention_impl)
-            return cls(release.model, release.variables, JointLayout(), release.tokenizer, release.specials,
-                       name=label, processor=release.processor)
-        checkpoint = LayaCheckpoint.load(name, subfolder=subfolder, revision=revision, dtype=dtype,
-                                         param_dtype=param_dtype, attention_impl=attention_impl)
-        choice, score, noul = checkpoint.temperatures
-        temperatures = Temperatures({"choice": choice, "score": score, "noul": noul},
-                                    checkpoint.bucket_temperatures)
-        return cls(checkpoint.model, checkpoint.variables, checkpoint.layout, checkpoint.tokenizer,
-                   checkpoint.specials, Calibration(temperatures), name=label)
+        from dew.decision.sources import PretrainedDecision
+        from dew.interop.pretrained import Pretrained
+
+        bundle = Pretrained.load(name, subfolder=subfolder, revision=revision, dtype=dtype,
+                                  param_dtype=param_dtype, attention_impl=attention_impl)
+        if not isinstance(bundle, PretrainedDecision):
+            raise TypeError(f"{name} declares no decision task")
+        return cls.of(bundle)
+
+    @classmethod
+    def of(cls, bundle: "PretrainedDecision") -> Self:
+        """Build the declared decision task from a loaded composite bundle, without loading again."""
+        from dew.registry import from_record
+
+        settings = DecideSettings.of(records.record(bundle.settings, "decision settings"))
+        calibration = from_record(Calibration, bundle.calibration)
+        return cls(DecisionModel(bundle.model, bundle.head),
+                   joined({"backbone": bundle.variables, "head": bundle.head_variables}),
+                   settings.layout, bundle.decision_tokenizer, settings.specials, calibration,
+                   name=str(bundle.origin or bundle.source), processor=bundle.processor)
 
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
@@ -212,22 +231,19 @@ class Decide:
         the tokenizer that lays out the task's text.
         """
         from dew.data.text import tokenizer_for
-        from dew.inference.tasks import run_record, saved_model, saved_settings
+        from dew.inference.tasks import run_record, saved_model
         from dew.interop.pretrained import load_processor
         from dew.registry import from_record, objectives
 
         record, step = run_record(directory, step)
-        settings = saved_settings(record, DecideSettings)
+        settings = DecideSettings.of(record)
         backbone = saved_model(record, dtype).build()
         width, head_dtype = DecisionModel.head_size(backbone)
         head = Head.from_record(records.json_value(settings.head, "head"), width)
         # The head computes in the dtype it recorded, or as a fresh head over
         # the backbone would where the caller overrides the compute dtype.
         model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype))
-        laid = records.record(settings.layout, "layout")
-        # A layout is plain data, its framing's template variables included: no field is a dtype.
-        rows = from_record(_LAYOUTS[records.text(laid["name"], "layout.name")],
-                           records.json_value(laid["fields"], "layout.fields"), dtypes=False)
+        rows = settings.layout
         if settings.tokenizer is None:
             raise ValueError("the run records no tokenizer to lay its rows out with")
         processor = None if settings.processor is None else load_processor(settings.processor, backbone)
@@ -256,7 +272,7 @@ class Decide:
                        budget=from_record(Budget, records.json_value(settings["budget"], "budget")),
                        name=records.text(settings["name"], "name"))
 
-    def save_pretrained(self, directory: str | Path) -> None:
+    def save_pretrained(self, directory: str | Path, *, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
         """Write this task as a released checkpoint, which `from_pretrained` reads back.
 
         A ModernBERT backbone under Laya's head and layout is written in Laya's
@@ -276,7 +292,7 @@ class Decide:
         types = applied.types
         LayaCheckpoint(self.model, self.variables, self.layout, self.tokenizer, self.specials,
                        (types.get("choice", 1.0), types.get("score", 1.0), types.get("noul", 1.0)),
-                       dict(applied.buckets)).save(directory)
+                       dict(applied.buckets)).save(directory, max_shard_size=max_shard_size)
 
     def save(self, directory: str) -> None:
         """Write this task's calibration, budget and name into the run `directory`.
@@ -388,7 +404,19 @@ class Decide:
     def _encoded(self, state: JSON, questions: Mapping[str, Question],
                  media: Sequence[int] = (), *, context: JSON | None = None) -> list[Encoded]:
         rows = self.layout.rows(self.tokenizer, self.specials, state, questions, media=media)
-        if context is not None:
+        if any(row.spans_in_context for row in rows):
+            # The row's context is its schema (`Schema.stream`), read whole by the cross-attention.
+            if context is not None:
+                raise ValueError("this task reads each request's schema as its context, so it reads no "
+                                 "context of the request's own")
+            if self.context_length is None:
+                raise ValueError("a schema read as the row's context needs a backbone with cross-attention "
+                                 "layers to read it (Pretrained.with_cross_attention)")
+            for row in rows:
+                if len(row.context or ()) > self.context_length:
+                    raise ValueError(f"the schema needs {len(row.context or ())} context tokens, more than "
+                                     f"the {self.context_length} the backbone's cross-attention reads")
+        elif context is not None:
             if self.context_length is None:
                 raise ValueError(f"a request's context is read by a backbone's cross-attention, which this "
                                  f"task's {type(self.model.backbone).__name__} does not have")
@@ -562,9 +590,10 @@ class Decide:
         """Each answered question of `reader`'s rows, with its raw logits and its
         gold distribution in the order the row shows its options."""
         scored = []
-        segments = self.layout.bounds(self.tokenizer, self.specials).segments
+        segments = self.layout.bounds(self.tokenizer, self.specials, self.context_length).segments
         for batch in reader(DataPartition()):
-            inputs = laid_out(batch, segments)
+            inputs = laid_out(batch, segments, spans_in_context=isinstance(self.layout, JointLayout)
+                              and self.layout.schema_in_context)
             logits = np.asarray(self._forward(self.variables, inputs))
             answered = (np.asarray(batch["scored"])
                         & (np.asarray(Objective.row_weights(batch, len(logits))) > 0)[:, None])
@@ -804,9 +833,11 @@ def _ordered(laid: Laid, logits: np.ndarray) -> np.ndarray:
     return ordered
 
 
-def laid_out(batch: Mapping[str, object], max_segments: int) -> DecisionInputs:
+def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context: bool = False
+             ) -> DecisionInputs:
     """The `DecisionInputs` of a batch of packed windows (`PackedRows`), each
-    holding at most `max_segments` rows."""
+    holding at most `max_segments` rows, the questions' spans in each row's context where
+    `spans_in_context` (`JointLayout.schema_in_context`)."""
     def array(name: str) -> jax.Array:
         return jnp.asarray(batch[name])
 
@@ -819,7 +850,7 @@ def laid_out(batch: Mapping[str, object], max_segments: int) -> DecisionInputs:
                           positions=array("positions"), slots=given("slots"),
                           option_slots=given("option_slots"), slotted=given("slotted"),
                           context=given("context"), context_lengths=given("context_lengths"),
-                          max_segments=max_segments)
+                          max_segments=max_segments, spans_in_context=spans_in_context)
 
 
 def _widened(leaf: jax.Array, length: int, fill: int = 0) -> jax.Array:

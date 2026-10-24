@@ -5,6 +5,17 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A joint decision row's user turn is composed of segments, `JointLayout.segments`, a tuple of
+  `Text`, `Media`, `State` and `Schema` in the order the row writes them: the default is the Laya
+  joint release's turn, and another writes the schema before the state, or text of its own
+  between the parts. A run records its layout and head by import path through `dew.registry`,
+  so a layout or head of a package the run trusts reloads; a record of an earlier run, which
+  names its class alone, reloads as before. `dew.decision.HEADS`, the closed table of heads a
+  run could record, is removed.
+- A joint row may read its schema as its context, `Schema(stream="context")`
+  (`DecisionRunConfig.segments`): the backbone reads the schema in a pass of its own, with its own
+  weights, its cross-attention layers read that pass beside the row, and the joint head pools the
+  questions and options from it; the pass counts in `train/flops`.
 - A run's W&B display name is its own, `Wandb.name` (`--trainer.wandb.name`), apart from the
   name its checkpoints are kept under; it shows the run's name where none is given.
 - `Checkpoints.committed()` lists a run's committed steps at each call without opening or writing

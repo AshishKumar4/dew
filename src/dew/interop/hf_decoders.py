@@ -768,6 +768,7 @@ def translate_denoiser_weights(
     config: DecoderFields,
     *,
     param_dtype: str = "float32",
+    lazy: bool = False,
     checked: Checked = NOTHING_CHECKED,
 ) -> Variables:
     """Map a DiffusionGemma text checkpoint into the shared tree plus self-conditioning.
@@ -788,7 +789,7 @@ def translate_denoiser_weights(
     text = {local: hf_tensors[name] for local, name in text_names.items()}
     sc = {local: hf_tensors[name] for local, name in sc_names.items()}
     return {
-        "text": translate_weights(text, config, param_dtype=param_dtype,
+        "text": translate_weights(text, config, param_dtype=param_dtype, lazy=lazy,
                                   checked=_renamed(checked, text_names)),
         "self_conditioning": {
             "params": translate_sc_weights(sc, param_dtype=param_dtype)
