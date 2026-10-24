@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping
+from functools import partial
 
 from dew import records
 from dew.interop.config_records import native_fields
@@ -17,13 +18,15 @@ from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
     KindFields,
+    Leaves,
     MixtureFields,
     Packed,
+    Renames,
     base_config,
-    dew_path,
     kind_mixers,
     read_rope,
     refuse,
+    renamed_path,
 )
 from dew.nn import llama4 as llama4_nn
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -125,36 +128,12 @@ _LLAMA4_PACKED = (Packed('.feed_forward.experts.gate_up_proj',
                          ('.feed_forward.experts.gate_proj', '.feed_forward.experts.up_proj')),)
 
 
-def _llama4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """Return the variables-tree path for one Llama 4 tensor name.
-
-    Llama 4 names its feed-forward `feed_forward`, its router `router` and its
-    dense branch `shared_expert`. Its stacked expert kernels arrive without a
-    `.weight` suffix.
-    """
-    parts = name.split('.')
-    if (
-        len(parts) >= 5
-        and parts[:2] == ["model", "layers"]
-        and parts[2].isdigit()
-        and parts[3] == "feed_forward"
-    ):
-        layer = ('params', f'layers_{parts[2]}', 'mlp')
-        if parts[4:] == ['router', 'weight']:
-            return (*layer, 'gate', 'kernel')
-        if len(parts) == 6 and parts[4] == 'experts' and parts[5] in MOE_SHARED:
-            return (*layer, 'experts', parts[5], 'kernel')
-        if (
-            len(parts) == 7
-            and parts[4] == "shared_expert"
-            and parts[5] in MOE_SHARED
-            and parts[6] == "weight"
-        ):
-            return (*layer, 'shared_experts', parts[5], 'kernel')
-        if len(parts) == 6 and parts[4] in MOE_SHARED and parts[5] == 'weight':
-            return (*layer, parts[4], 'kernel')
-        raise ValueError(f"unknown tensor name {name!r}")
-    return dew_path(name, config)
+# Llama 4 names its feed-forward `feed_forward`, its router `router` and its
+# dense branch `shared_expert`; its stacked expert kernels arrive without a
+# `.weight` suffix, so they are leaves of the layer.
+_LLAMA4_NAMES: Renames = (('feed_forward', 'mlp'), ('router', 'gate'), ('shared_expert', 'shared_experts'))
+_LLAMA4_EXPERTS: Leaves = {f'mlp.experts.{projection}': ('mlp', 'experts', projection, 'kernel')
+                           for projection in MOE_SHARED}
 
 
 LLAMA4_TEXT = DecoderFamily(
@@ -164,7 +143,7 @@ LLAMA4_TEXT = DecoderFamily(
     'llama4_text',
     'Llama4ForCausalLM',
     _llama4_export,
-    weight_path=_llama4_path,
+    weight_path=partial(renamed_path, _LLAMA4_NAMES, layer_leaves=_LLAMA4_EXPERTS),
     packed=_LLAMA4_PACKED,
     preserve_source_layout=True,
 )

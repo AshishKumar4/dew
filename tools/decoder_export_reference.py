@@ -35,6 +35,7 @@ import torch
 from torch.overrides import TorchFunctionMode
 
 from dew.interop.pretrained import Pretrained
+from dew.interop.sources import load_shards
 from dew.objectives.base import Variables
 from dew.objectives.lm import LMObjective
 from dew.training import TrainState
@@ -141,13 +142,6 @@ class RoundTrip(Trip):
 
     case: Case
     truth: np.ndarray
-
-
-def source_tensors(directory: Path) -> dict[str, np.ndarray]:
-    """The checkpoint's own tensor table, as the loader reads it."""
-    from dew.interop.sources import load_shards
-
-    return load_shards(directory)
 
 
 def logits(source: Pretrained, variables: Variables, ids: np.ndarray) -> np.ndarray:
@@ -390,7 +384,7 @@ def glm5_prediction_logits(case: Case, directory: Path, ids: np.ndarray) -> np.n
         raise ValueError('glm5_next has no reference checkpoint conversion')
     rules = deepcopy(registered)
     prefix = f'model.layers.{model.config.num_hidden_layers}.'
-    tensors = source_tensors(directory)
+    tensors = load_shards(directory)
     prepared: dict[str, torch.Tensor] = {}
     pending: dict[str, WeightConverter] = {}
     for source_name in sorted((name for name in tensors if name.startswith(prefix)),
@@ -430,7 +424,7 @@ def round_trip(case: Case, workspace: Path) -> RoundTrip:
     return RoundTrip(source=source, trained=trained, export=export, ids=ids,
                      ours=logits(source, trained, ids), reloaded=reloaded,
                      theirs=reference_logits(case, export, ids),
-                     source_tensors=source_tensors(directory), exported_tensors=source_tensors(export),
+                     source_tensors=load_shards(directory), exported_tensors=load_shards(export),
                      case=case, truth=reference_logits(case, export, ids, wide=True))
 
 

@@ -239,6 +239,22 @@ print(json.dumps({"saved": True}))
 """
 
 
+def test_a_pipeline_is_one_whatever_its_root_config_unless_that_names_a_model(pipelines, tmp_path):
+    """A pipeline directory loads as its components whatever else its root holds, a config.json too,
+    for a run as for a load (`_pipeline_source`); one whose config.json names a model is that model,
+    a decoder shipping an index for its sampler, and a run training a pipeline refuses it."""
+    from dew.interop.pretrained import load_diffusion_source
+
+    copy = tmp_path / "pipeline"
+    shutil.copytree(pipelines / "flux" / "pipeline", copy)
+    (copy / "config.json").write_text("{}")
+    loaded = load_diffusion_source(str(copy), dtype="float32", attention_impl="xla", size=(16, 16))
+    assert jax.tree.leaves(loaded.variables)
+    (copy / "config.json").write_text(json.dumps({"model_type": "diffusion_gemma"}))
+    with pytest.raises(ValueError):
+        load_diffusion_source(str(copy), dtype="float32", attention_impl="xla", size=(16, 16))
+
+
 @pytest.mark.network
 def test_a_hub_pipeline_rebound_online_exports_offline_from_its_recorded_headers(tmp_path):
     """A saved tree rebound over a Hub pipeline whose weights it never downloads reads the

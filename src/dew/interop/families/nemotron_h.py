@@ -21,7 +21,14 @@ from typing import TYPE_CHECKING
 from dew import records
 from dew.interop import mamba2
 from dew.interop.config_records import native_fields
-from dew.interop.decoder_parts import PREDICTION_INPUTS, DecoderFamily, Packed, prediction_path
+from dew.interop.decoder_parts import (
+    PREDICTION_INPUTS,
+    DecoderFamily,
+    Packed,
+    prediction_path,
+    record_bool,
+    record_int,
+)
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
@@ -114,10 +121,10 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
         return key
 
     def integer(key: str, default: int) -> int:
-        return records.integer(hf_config.get(field(key), default), key)
+        return record_int(hf_config, field(key), default)
 
     def flag(key: str, *, default: bool) -> bool:
-        return records.boolean(hf_config.get(field(key), default), key)
+        return record_bool(hf_config, field(key), default)
 
     depths = integer("num_nextn_predict_layers", 0)
     # transformers fills the step's kinds in every config; they describe nothing without a depth.
@@ -243,20 +250,14 @@ def weight_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | No
     """Map independent mixers, the prediction steps and the router's balancing buffer to their collections."""
     if name.startswith("mtp."):
         return _prediction_path(name, config)
-    if name in mamba2.TRUNK:
-        return ("params", *mamba2.TRUNK[name])
-    if name == "lm_head.weight":
-        return None if config.get("tie_embeddings") else ("params", "lm_head", "kernel")
     parts = name.split(".")
-    if len(parts) >= 4 and parts[:2] == ["backbone", "layers"] and parts[2].isdigit():
-        if (len(parts) == 8 and parts[3:5] == ["mixer", "experts"] and parts[5].isdigit()
-                and parts[6] in ("up_proj", "down_proj") and parts[7] == "weight"):
-            return ("params", f"layers_{parts[2]}", "self_attn", "experts", parts[5], parts[6], "kernel")
-        tail = _LAYER.get(".".join(parts[3:]))
-        if tail is not None:
-            collection = "moe" if tail[-1] == "e_score_correction_bias" else "params"
-            return (collection, f"layers_{parts[2]}", *tail)
-    raise ValueError(f"{name!r} has no place in a Nemotron-H CausalTransformer")
+    if (len(parts) == 8 and parts[:2] == ["backbone", "layers"] and parts[2].isdigit()
+            and parts[3:5] == ["mixer", "experts"] and parts[5].isdigit()
+            and parts[6] in ("up_proj", "down_proj") and parts[7] == "weight"):
+        return ("params", f"layers_{parts[2]}", "self_attn", "experts", parts[5], parts[6], "kernel")
+    path = mamba2.weight_path(name, config, layer=_LAYER, family="Nemotron-H")
+    # The router's balancing bias is state a training step moves, which `Router` keeps in `moe`.
+    return path if path is None or path[-1] != "e_score_correction_bias" else ("moe", *path[1:])
 
 
 def export_path(dew_name: str, config: Mapping[str, object]) -> str | None:

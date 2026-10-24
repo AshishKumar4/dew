@@ -11,6 +11,7 @@ from dew.interop.decoder_parts import (
     base_config,
     decoder_tensors,
     hf_ungated,
+    partial_rope,
     refuse,
     renamed_name,
     renamed_path,
@@ -20,11 +21,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
 def _phi_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
-    parameters = records.record(hf.get('rope_parameters') or {}, 'rope_parameters')
-    partial = records.number(parameters.get('partial_rotary_factor', hf.get('partial_rotary_factor', .5)),
-                              'partial_rotary_factor')
-    theta = records.number(parameters.get('rope_theta', hf.get('rope_theta', 10000.)), 'rope_theta')
-    rope = {key: value for key, value in parameters.items() if key != 'partial_rotary_factor'}
+    theta, partial, rope = partial_rope(hf, default_factor=.5)
     activation = records.text(hf.get('hidden_act', 'gelu_new'), 'hidden_act')
     mlp = ungated_mlp(activation, ('gelu_new', 'gelu_pytorch_tanh', 'gelu', 'relu'), 'hidden_act', 'Phi')
     if hf.get('qk_layernorm', False):
