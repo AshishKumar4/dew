@@ -11,7 +11,7 @@ import dataclasses
 import mmap
 from collections import defaultdict
 from collections.abc import Callable, Mapping
-from typing import Protocol, runtime_checkable
+from typing import Protocol, cast, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -77,8 +77,33 @@ def companion_mesh(accelerator: Mesh, devices=None) -> Mesh:
     return mesh
 
 
+def placed_leaves(tree: Variables, place: Callable[[tuple[str, ...], object], object], *,
+                  in_place: bool) -> Variables:
+    """`tree` with each leaf replaced by what `place(path, leaf)` returns, one leaf at a time: a
+    leaf placed lands (`block_until_ready`) before the next is read, and a memory-mapped host leaf's
+    pages are let go once its copy is written in its place (`evict`), so the tree is never held
+    twice. With `in_place`, the tree's plain dict nodes are written in place, so every holder of one
+    sees the placed leaves and no host leaf outlives its copy, and any other mapping (a FrozenDict)
+    is rebuilt as a dict over the same children; otherwise every node is rebuilt, the caller's tree
+    left as it was."""
+    def walk(node, path: tuple[str, ...]):
+        if not isinstance(node, Mapping):
+            landed = place(path, node)
+            if landed is not node:
+                jax.block_until_ready(landed)
+                if isinstance(node, np.ndarray):
+                    evict(node)
+            return landed
+        held = node if in_place and type(node) is dict else dict(node)
+        for name in list(held):
+            held[name] = walk(held[name], (*path, name))
+        return held
+
+    return cast(Variables, walk(tree, ()))
+
+
 def stream(tree: Variables, placement, held: Variables | None = None) -> Variables:
-    """Move a variables tree into `placement`, one leaf at a time.
+    """Move a variables tree into `placement`, one leaf at a time (`placed_leaves`, in place).
 
     Each leaf is placed and written back into its parent node before the
     next is read, so at most one leaf is held twice and the whole tree never
@@ -90,7 +115,8 @@ def stream(tree: Variables, placement, held: Variables | None = None) -> Variabl
     copy instead of two. A node that is not a dict is left as it is.
 
     Every dict node of `tree` is updated in place, so the caller's other
-    references to it see the placed arrays too.
+    references to it see the placed arrays too, and a node that is not one
+    (a FrozenDict) is rebuilt as a dict over the same leaves.
     """
     holders: dict[int, list[tuple[dict, object]]] = {}
 
@@ -106,23 +132,16 @@ def stream(tree: Variables, placement, held: Variables | None = None) -> Variabl
     if held is not None:
         index(held)
 
-    def place_dict(node, target, path=()):
-        for name in list(node):
-            child, wanted = node[name], target[name]
-            if isinstance(child, dict):
-                place_dict(child, wanted, (*path, name))
-                continue
-            if isinstance(child, Mapping):
-                raise TypeError(
-                    f"{'/'.join(map(str, (*path, name)))} is a {type(child).__name__}, and stream updates "
-                    "dict nodes in place; pass a tree of dicts (flax.core.unfreeze for a FrozenDict)")
-            landed = place_leaf(child, wanted)
-            for holder, key in holders.get(id(child), ()):
-                holder[key] = landed
-            node[name] = landed
+    def landed(path: tuple[str, ...], leaf):
+        target = placement
+        for name in path:
+            target = target[name]
+        placed = place_leaf(leaf, target)
+        for holder, key in holders.get(id(leaf), ()):
+            holder[key] = placed
+        return placed
 
-    place_dict(tree, placement)
-    return tree
+    return placed_leaves(tree, landed, in_place=True)
 
 
 @runtime_checkable
