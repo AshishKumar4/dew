@@ -61,7 +61,7 @@ from dew.interop.pipeline_assembly import (
 from dew.interop.processors import Processor, hosts
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.streaming import WeightLayout
-from dew.interop.weights import AUTO, declared_dtype
+from dew.interop.weights import AUTO, checkpoint_dtype, declared_dtype
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import layer_scalar_mode
@@ -1415,7 +1415,11 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
         initialize = head_source.initialize
 
         def drawn(variables):
-            return initialize(head, replace(backbone, variables=variables))
+            initialized = initialize(head, replace(backbone, variables=variables))
+            return jax.tree_util.tree_map_with_path(
+                lambda path, leaf: leaf.astype(checkpoint_dtype(
+                    np.dtype(leaf.dtype), param_dtype,
+                    path=tuple(jax.tree_util.keystr((key,), simple=True) for key in path))), initialized)
 
         if weights:
             variables = drawn(backbone.variables)

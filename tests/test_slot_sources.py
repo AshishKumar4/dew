@@ -7,9 +7,11 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
+from sharded import assert_sharded
 
 from dew.decision import Choice, Decide
 from dew.interop import Pretrained
+from dew.training.distributed import Layout, MeshSpec
 
 BACKBONE = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
 
@@ -59,6 +61,15 @@ def test_a_slot_release_loads_its_readout_and_exports_the_same_task(tmp_path, re
         assert abstract.shape == held.shape == original.shape
         assert abstract.dtype == held.dtype == original.dtype
         np.testing.assert_array_equal(held, original)
+    mesh = MeshSpec(fsdp=2).build(devices=jax.devices()[:2])
+    placed = Pretrained.load(source, dtype="float32", attention_impl="xla", mesh=mesh,
+                             layout=Layout(min_shard=1, tolerance=1.0))
+    assert_sharded(placed.variables, mesh)
+    if readout != "slot_lm":
+        assert_sharded(placed.head_variables, mesh)
+    for actual, expected in zip(jax.tree.leaves((placed.variables, placed.head_variables)),
+                               jax.tree.leaves((bundle.variables, bundle.head_variables)), strict=True):
+        np.testing.assert_array_equal(actual, expected)
     exported = tmp_path / "exported"
     bundle.save(exported)
     restored = Decide.from_pretrained(exported, dtype="float32", attention_impl="xla")
