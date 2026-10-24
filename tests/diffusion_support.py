@@ -37,6 +37,49 @@ class ConditionalSourceOracle(nn.Module):
 
 
 
+def apg_walked(case, label, x_T):
+    """A `tools/guidance_reference.py` APG case walked by Dew: `case["steps"]` Euler steps of the linear
+    path over `ConditionalSourceOracle` at `label`, APG guiding the guider's steps
+    [int(start N), int(stop N)), which is `interval=(first / N, (after - 1) / N)`."""
+    from dew.diffusion import FlowMatchingScheduler, FlowMatchPredictionTransform, Process
+    from dew.sampling import APG, Euler
+
+    steps = case["steps"]
+    first, after = int(case["start"] * steps), int(case["stop"] * steps)
+    rows = x_T.shape[0]
+    process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
+    denoise = process.denoiser(ConditionalSourceOracle(), {}, {"label": jnp.full((rows,), label)},
+                               {"label": jnp.zeros((rows,))})
+    guidance = APG(case["scale"], eta=case["eta"], norm_threshold=case["norm_threshold"],
+                   momentum=case["momentum"], interval=(first / steps, (after - 1) / steps))
+    return sample(denoise, x_T, steps + 1, solver=Euler(), guidance=guidance, key=jax.random.PRNGKey(0),
+                  final_denoise=False)
+
+
+def source_final(schedule, process, times, rescale, label, scale):
+    """The last latent of a published scheduler's walk as `tools/diffusers_source_reference.py`
+    walks it, as Dew's function of the initial one: `schedule`'s own solver over `process`'s grid
+    `times` on `SourceOracle`, or, where the case guides (`rescale`, CFG's rescale, not None),
+    classifier-free guidance at `scale` on `ConditionalSourceOracle` at `label`."""
+    from dew.sampling import CFG
+
+    if rescale is None:
+        model = SourceOracle()
+        return lambda value: walk(schedule.solver, process, model, value, times)[-1]
+    model = ConditionalSourceOracle()
+
+    def final(value):
+        rows = value.shape[0]
+        params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *value.shape[1:])), jnp.ones((1,)),
+                            jnp.ones((1,)))
+        denoise = process.denoiser(model, params, {"label": jnp.full((rows,), label)},
+                                   {"label": jnp.zeros((rows,))})
+        return sample(denoise, value, solver=schedule.solver, guidance=CFG(scale, rescale=rescale),
+                      key=jax.random.PRNGKey(0), times=times, final_denoise=False)
+
+    return final
+
+
 def walk(solver, process, model, x_T, times, key=0):
     """Each solver interval's new state, without the closing denoise, through `sample`'s own walk with
     its folded per-step keys (`sample(record=...)`)."""
