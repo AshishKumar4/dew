@@ -159,13 +159,16 @@ def _own_backward(jaxpr) -> bool:
     """Whether a product's trace calls a backward of its own (a `jax.custom_vjp`, as Qwix's quantized
     products are when Qwix quantizes a model directly), in it or any program inside it: a product its
     library owns, which `accumulated` neither widens nor transposes."""
+    from jax.extend import core
+
+    def programs(value):
+        return isinstance(value, (core.Jaxpr, core.ClosedJaxpr))
+
     for eqn in jaxpr.eqns:
         if eqn.primitive.name.startswith("custom_vjp_call"):
             return True
-        inner = [value if hasattr(value, "eqns") else value.jaxpr
-                 for value in jax.tree.leaves(eqn.params, is_leaf=lambda leaf: hasattr(leaf, "eqns")
-                                              or hasattr(getattr(leaf, "jaxpr", None), "eqns"))
-                 if hasattr(value, "eqns") or hasattr(getattr(value, "jaxpr", None), "eqns")]
+        inner = [value.jaxpr if isinstance(value, core.ClosedJaxpr) else value
+                 for value in jax.tree.leaves(eqn.params, is_leaf=programs) if programs(value)]
         if any(_own_backward(program) for program in inner):
             return True
     return False
