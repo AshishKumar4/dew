@@ -268,7 +268,7 @@ class KPoolSparseAttention(MultiHeadLatentAttention):
         return False
 
     def _selection(self, x, q_resid, index_keys, keep, freqs_cos, freqs_sin, call, row_valid, *,
-                    slots=None, allocated: bool = False, committed=None,
+                    slots: jax.Array, allocated: bool = False, committed=None,
                     prediction_phase: PredictionPhase = "ordinary"):
         """Select pools, retaining the complete token list for opted-in draft reuse."""
         if not call.decode or (prediction_phase == "ordinary"

@@ -297,14 +297,16 @@ def test_the_gradients_match_torch_autograd():
 def test_decode_cache_preserves_the_expanded_projection_storage_dtype():
     """A promoted KV projection stores its actual keys and values, even when the preceding
     latent norm computes in a narrower dtype."""
-    hidden, _ = inputs()
-    block = module()
-    variables = block.init(jax.random.key(91), jnp.asarray(hidden))
-    projection = variables["params"]["kv_b_proj"]
-    projection["kernel"] = projection["kernel"].astype(jnp.float64)
-    _, state = block.apply(variables, jnp.asarray(hidden[:, :1]), MixerCall(decode=True), mutable=["cache"])
-    assert state["cache"]["cached_key"].dtype == jnp.float64
-    assert state["cache"]["cached_value"].dtype == jnp.float64
+    with jax.experimental.enable_x64():
+        hidden, _ = inputs()
+        block = module()
+        variables = block.init(jax.random.key(91), jnp.asarray(hidden))
+        projection = variables["params"]["kv_b_proj"]
+        projection["kernel"] = projection["kernel"].astype(jnp.float64)
+        _, state = block.apply(variables, jnp.asarray(hidden[:, :1]), MixerCall(decode=True),
+                               mutable=["cache"])
+        assert state["cache"]["cached_key"].dtype == jnp.float64
+        assert state["cache"]["cached_value"].dtype == jnp.float64
 
 
 def decode_steps(block_module, variables, hidden, valid, prefill: int):

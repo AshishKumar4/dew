@@ -576,7 +576,7 @@ class MultiHeadLatentAttention(nn.Module):
                               if self.indexed else None)
                 selection, index_scores = self._selection(
                     x, q_resid, index_keys, keep, freqs_cos, freqs_sin, call, row_valid,
-                    prediction_phase=prediction_phase)
+                    slots=positions, prediction_phase=prediction_phase)
                 if self.sparse:
                     if self._attends_sparsely(selection, length):
                         return self._output(self._sparse_attention(
@@ -618,14 +618,14 @@ class MultiHeadLatentAttention(nn.Module):
         return self.indexer.rotated_keys(keys, freqs_cos, freqs_sin)
 
     def _selection(self, x, q_resid, index_keys, keep, freqs_cos, freqs_sin, call, row_valid, *,
-                    slots=None, allocated: bool = False, committed=None,
+                    slots: jax.Array, allocated: bool = False, committed=None,
                     prediction_phase: PredictionPhase = "ordinary"):
         """Select candidates and retain the lightning scores for its optional training objective."""
         scores = (self.indexer.scores(x, q_resid, index_keys, freqs_cos, freqs_sin)
                   if self.indexed else None)
         return (self._select(scores, keep, call.kv_store) if self.sparse else None), scores
 
-    def _empty_selection(self, selected, row_valid):
+    def _empty_selection(self, selected, row_valid) -> jax.Array | None:
         return None
 
     def _decode_step(self, x, q_rot, rot, latent, q_resid, logical_positions, valid, call,
