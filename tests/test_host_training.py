@@ -791,3 +791,19 @@ def test_a_tasks_held_weights_leave_the_callers_private_mapping_as_it_changed_it
     placed = held({"params": {"kernel": kernel}})
     np.testing.assert_array_equal(kernel, np.full(4096, -1.0, np.float32))
     np.testing.assert_array_equal(np.asarray(placed["params"]["kernel"]), np.full(4096, -1.0, np.float32))
+
+
+def test_a_streamed_node_takes_the_one_target_its_placement_gives_it_whole():
+    """A placement may give a node of several arrays one sharding, as `jax.device_put` takes a prefix:
+    `stream` places each of the node's arrays there, read-only mappings of targets included."""
+    import types
+
+    from dew.training.host import stream
+
+    sharding = NamedSharding(Mesh(np.asarray(jax.devices()[:1]), ("data",)), P())
+    pair = (np.arange(4, dtype=np.float32), np.ones((2, 3), np.float32))
+    placed = stream({"params": {"kernel": pair}},
+                    types.MappingProxyType({"params": types.MappingProxyType({"kernel": sharding})}))
+    for got, want in zip(placed["params"]["kernel"], pair, strict=True):
+        assert isinstance(got, jax.Array) and got.sharding == sharding
+        np.testing.assert_array_equal(got, want)
