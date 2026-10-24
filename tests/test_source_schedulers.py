@@ -205,7 +205,7 @@ def test_source_grids_walk_repeated_initial_model_times(kind, extra):
     model = SourceOracle()
     denoise = process.denoiser(model, {}, {})
     _, walked = sample(denoise, jnp.asarray(initial), solver=schedule.solver, key=0,
-                       times=times, final_denoise=False, record=lambda x, _: x)
+                       times=times, final_denoise=False, record=lambda x, state, denoised: x)
 
     precision = load("diffusers_wan_reference")
     reference = []
