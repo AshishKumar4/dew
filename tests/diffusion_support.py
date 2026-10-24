@@ -2,6 +2,8 @@
 and its batch, a student stepped once and saved as a run, and a trainer's update held to its
 objective's gradient by check 1 (`moved_weights`, `applied`, `objective_gradient`)."""
 
+import math
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -232,15 +234,20 @@ def objective_gradient(objective, variables, batch, step):
     return jax.grad(loss)(variables["params"])
 
 
-def as_a_step(objective, variables, batch, gradient):
-    """`gradient` jitted with the compiler options a trainer's one-device step of `objective` over
-    `batch` takes (`dew.training.memory.step_compiler_options`), so a check of that step against it
-    compiles both arms alike: on a GPU the step keeps dots that share an input apart, where XLA's
-    default merges them into one GEMM, which rounds otherwise."""
+def as_a_step(trainer, variables, micro, gradient):
+    """`gradient` jitted with the compiler options `trainer`'s step of a `micro` microbatch takes over
+    its mesh, its devices and row shards (`dew.training.memory.step_compiler_options`, as
+    `Trainer._planned` derives them), so a check of that step against it compiles both arms alike: on
+    a GPU the step keeps dots that share an input apart, where XLA's default merges them into one
+    GEMM, which rounds otherwise."""
+    from dew.nn.sharding import batch_axes
     from dew.objectives.base import FROZEN
     from dew.training.memory import device_tokens, step_compiler_options
 
-    options = step_compiler_options(objective, device_tokens(objective, batch, 1), FROZEN in variables, 1)
+    mesh = trainer.device_mesh
+    shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
+    options = step_compiler_options(trainer.objective, device_tokens(trainer.objective, micro, shards),
+                                    FROZEN in variables, mesh.devices.size)
     return jax.jit(gradient, compiler_options=options)
 
 
