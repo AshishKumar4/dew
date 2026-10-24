@@ -316,8 +316,8 @@ def _bf16_contracted(subscripts: str, *operands) -> jax.Array:
             kept.append((own, operand if own == spec else jnp.einsum(f"{spec}->{own}", operand)))
         (left, lhs), (right, rhs) = kept
         held.append(bf16_einsum(f"{left},{right}->{produced}", lhs, rhs))
-    (result,) = held
-    return result
+    (contracted,) = held
+    return contracted
 
 
 def _bf16_algorithm(precision: jax.lax.PrecisionLike) -> bool:
