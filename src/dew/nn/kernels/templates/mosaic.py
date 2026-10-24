@@ -174,9 +174,11 @@ def load_fixed(views: list, refs: list, barriers: list, wg) -> None:
         plgpu.barrier_wait(barrier.at[wg])
 
 
-def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int) -> None:
+def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int,
+               copy: Callable = plgpu.copy_smem_to_gmem) -> None:
     """Rows `first` to `first + stored` of `o_smem` to `o_gmem` at row `row_start + first` and `column`, in a
-    power-of-two ladder of TMA stores (a descriptor's extents are static), the largest `most` rows'."""
+    power-of-two ladder of static-size `copy`s (a TMA store's descriptor has static extents; `copied`
+    moves the rows through registers where a GPU has no TMA), the largest `most` rows'."""
     start, size = first, most
     while size:
         rung = 1 << int(math.log2(size))
@@ -184,10 +186,16 @@ def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int) -> N
 
         @pl.when(stored & rung != 0)
         def _(start=start, rung=rung):
-            plgpu.copy_smem_to_gmem(o_smem.at[pl.ds(start, rung)],
-                                    o_gmem.at[pl.ds(row_start + start, rung), pl.ds(column, o_smem.shape[1])])
+            copy(o_smem.at[pl.ds(start, rung)],
+                 o_gmem.at[pl.ds(row_start + start, rung), pl.ds(column, o_smem.shape[1])])
 
         start = start + (stored & rung)
+
+
+def copied(source, destination) -> None:
+    """`source` (in shared memory) to `destination` (in global memory) through registers: a GPU without
+    TMA's `store_rows` copy."""
+    destination[...] = source[...]
 
 
 @dataclasses.dataclass(frozen=True)
