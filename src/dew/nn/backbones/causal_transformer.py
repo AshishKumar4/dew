@@ -35,7 +35,8 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.batch import merge
+from dew.batch import Coordinates, coordinates as build_coordinates, merge, shifted_span
+from dew.mesh import LayoutRefused, row_axes
 from dew.nn.dense import Dense
 from dew.records import JSON
 from dew.registry import from_record, read_arguments
@@ -62,14 +63,11 @@ from ..hyper_connections import (
 )
 from ..inputs import (
     AttentionMetadata,
-    Coordinates,
     CrossContext,
     LayerInputs,
     PredictionPhase,
-    coordinates as build_coordinates,
     coordinates_of,
     numbered_blocks,
-    shifted_span,
 )
 from ..kv_cache import KVCache
 from ..mixer_base import MLP_RESIDUALS, RESIDUALS
@@ -90,15 +88,7 @@ from ..precision import (
 )
 from ..protocols import OutputTable, ProjectionGroup, QuantizesInputs, declared_groups
 from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
-from ..sharding import (
-    RESIDUAL,
-    LayoutRefused,
-    constrain,
-    logical_axes,
-    microbatches,
-    pipeline_stages,
-    row_axes,
-)
+from ..sharding import RESIDUAL, constrain, logical_axes, microbatches, pipeline_stages
 from .decoder_block import (
     DECODER_REMAT,
     NORM_SITES,

@@ -24,6 +24,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
+from dew.mesh import SEQUENCE_AXIS, LayoutRefused, logical_spec, mesh_axes, row_axes
 from dew.nn.dense import Dense, DenseGeneral
 
 from .attention_kernels import (
@@ -69,14 +70,9 @@ from .sharding import (
     HEADS,
     KV_HEADS,
     SCORES,
-    SEQUENCE_AXIS,
-    LayoutRefused,
     constrain,
     logical_axes,
-    logical_spec,
     manual_map,
-    mesh_axes,
-    row_axes,
     sequence_shards,
     split_positions,
 )

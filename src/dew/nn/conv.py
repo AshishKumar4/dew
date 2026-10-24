@@ -46,9 +46,11 @@ from jax.interpreters import ad, batching, mlir
 from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 
+from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, logical_spec, mesh_axes
+
 from .flops import conv_flops
 from .precision import biased, float32_products, products_dtype
-from .sharding import SEQUENCE_AXIS, STAGE_AXIS, auto_part, logical_spec, mesh_axes
+from .sharding import auto_part
 
 # A linear boundary must survive in tangents and cotangents too: dropping it
 # from either leaves the same convolution chain open to the faulty rewrite.
