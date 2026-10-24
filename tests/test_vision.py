@@ -335,10 +335,15 @@ def test_mimo_tower_is_as_exact_as_the_reference():
                                          real(refs["tower"], grid), real(refs["tower_f64"], grid), "sinkless")
 
 
-def test_mimo_merger_is_as_exact_as_the_reference():
+@pytest.mark.parametrize("native", [False, True])
+def test_mimo_merger_is_as_exact_as_the_reference(native):
     config, _, projector_tensors, refs = shared_fixture("mimo-vision-tiny")
     record = mimo.translate_mimo_projector_config(config, config["text_config"]["hidden_size"])
     projector = projectors.from_record(record)
+    if native:
+        projector = mimo.MiMoProjector(
+            hidden_size=projector.hidden_size, spatial_merge_size=projector.spatial_merge_size,
+            width=projector.width, out_width=projector.out_width)
     variables = {"params": projector_variables("mimo", projector_tensors, "float32")[0]}
     out = projector.apply(variables, refs["tower"])
     grid = refs["grid"]
