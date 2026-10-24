@@ -419,6 +419,43 @@ def test_a_pretrained_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
         assert (tmp_path / "from-run" / name).read_bytes() == (tmp_path / "in-process" / name).read_bytes()
 
 
+class Started(LMRunConfig):
+    """A run that hands back the objective it would train, rather than training it."""
+
+    def train(self, objective, dataset, **settings):
+        return objective
+
+
+def test_a_pretrained_lora_runs_source_loads_where_its_start_keeps_it(tmp_path):
+    """A LoRA run from a source reads each of the source's leaves onto its trainer's mesh, sharded as
+    its layout shards the state, never into a host array (`TrainerConfig.source_placement`): its
+    start then places none of the frozen base again, the state's frozen leaves the source's arrays
+    themselves, each where the state keeps it."""
+    import optax
+
+    from dew.objectives.base import FROZEN
+    from dew.training import Trainer
+
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
+    config = Started.cli(recipe_args(tokens, "--pretrained", str(checkpoint), "--trainer.steps", "1",
+                                     "--max-new-tokens", "0", "--lora.rank", "4", "--lora.modules", "q_proj"),
+                         default=Started(data=windows(tokens), validation=windows(tokens, held=True)))
+    objective = config.prepare().train("placed")
+    held = objective.held_variables()
+    assert held is not None and FROZEN in held
+    assert all(isinstance(leaf, jax.Array) and len(leaf.sharding.device_set) == jax.device_count()
+               for leaf in jax.tree.leaves(held[FROZEN]))
+    trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0), mesh=config.trainer.mesh,
+                      layout=config.trainer.layout)
+    state, shardings = trainer.place()[:2]
+    assert ({id(leaf) for leaf in jax.tree.leaves(state.variables[FROZEN])}
+            == {id(leaf) for leaf in jax.tree.leaves(held[FROZEN])})
+    for leaf, sharding in zip(jax.tree.leaves(held[FROZEN]), jax.tree.leaves(shardings.variables[FROZEN]),
+                              strict=True):
+        assert leaf.sharding == sharding
+
+
 def test_a_scratch_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
     """From scratch, `--lora.rank 2 --lora.modules q_proj v_proj`
     binds the adapter to a fresh draw of the model from the run's key and
