@@ -650,11 +650,13 @@ def test_a_tuned_launch_over_runs_times_every_key(case):
                    for array in (spans.start, spans.end, spans.query_ids, spans.key_ids))
     forward = attention_mosaic.MosaicForward(form=spans.form, keys=keys)
     backward = attention_mosaic.MosaicBackward(form=spans.form, keys=keys)
-    for op, ba in ((forward, _bound(forward, query, key, key, *bounds, (), (), None, residuals=False)),
-                   (backward, _bound(backward, query, key, key, query, *bounds, (), None, residuals))):
+    # Each launch's spans after its queries, keys and values, and a backward's output cotangent.
+    launches = ((forward, _bound(forward, query, key, key, *bounds, (), (), None, residuals=False), 3),
+                (backward, _bound(backward, query, key, key, query, *bounds, (), None, residuals), 4))
+    for op, ba, place in launches:
         arrays, fill = tuning.materialized(op, ba)
         args, _ = fill(arrays)
-        start, end, query_ids, key_ids = args[op.SPANS:op.SPANS + 4]
+        start, end, query_ids, key_ids = args[place:place + 4]
         timed = template.KeySpans(start, end, query_ids, key_ids, keys, spans.form)
         assert np.asarray(template.dense(timed)).all(), type(op).__name__
 
