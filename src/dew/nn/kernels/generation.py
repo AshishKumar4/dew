@@ -349,8 +349,12 @@ class GpuTarget:
 # 1.09/5.66 at 4096, 10.3/45.5 at 16384, peak 111 and 885 MB; xla over the spans' mask 1.17/2.71 (747 MB),
 # 3.52/8.06, and 60.6 forward at 16384, its backward out of memory (asked 48 GB); cuDNN over the mask as a
 # bias 0.67/2.55, 1.34/7.45, 17.9/85.8. H100, the template 1.46/2.87, 1.66/3.56, 5.61/28.2; xla
-# 1.69/2.70, 3.86/7.37, 47.5/90.6 (43.6 GB); so sm90 states no row, its 2048 keys 6% slower than xla's
-# mask. Ledger 1537 retires the row, and the sm90 gate, when attention's choice ranks by cost.
+# 1.69/2.70, 3.86/7.37, 47.5/90.6 (43.6 GB). sm90 states no row: a default is at least as fast and as small
+# on every call it serves (BIBLE §4), and a row holds for every length, where at 2048 keys the template's
+# forward and backward is 6% slower than xla's mask, though 2.1 and 3.2 times faster at 4096 and 16384.
+# A target without the row keeps the default block calls had before it, xla over their dense mask (the
+# mask the mixer built for image groups). Ledger 1537 retires the row, and the sm90 gate, when attention's
+# choice ranks by cost, which takes the length.
 TARGETS = {target.generation: target for target in (
     # T4: 40 SMs at a 1590 MHz boost, 320 GB/s (the T4 datasheet).
     GpuTarget('sm75', 'Tesla T4', 64 * 1024, dense_peaks={'Tesla T4': {}, 'NVIDIA Tesla T4': {}},
