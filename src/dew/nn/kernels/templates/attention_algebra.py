@@ -32,7 +32,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Kind, natural_exp, within
+from dew.nn.kernels.templates.attention import (
+    LOG2E,
+    NATURAL,
+    Kind,
+    differentiable,
+    floating_params,
+    natural_exp,
+    within,
+)
 from dew.nn.precision import two_product, two_sum
 
 
@@ -1058,27 +1066,10 @@ def inverse(total: jax.Array) -> jax.Array:
     return jnp.where(total > 0, 1.0 / jnp.where(total > 0, total, 1.0), 0.0)
 
 
-def floating_params(params) -> list[int]:
-    """The places of a hook's floating parameters, the ones it differentiates along."""
-    return [index for index, param in enumerate(params) if jnp.issubdtype(param.dtype, jnp.floating)]
-
-
 def hooked(score_mod: Callable, logits: jax.Array, q_pos, k_pos, params) -> jax.Array:
     """`score_mod` on a tile; a custom-derivative call in it lowers as its primal function (Dew's JAX
     build, constraints.txt)."""
     return score_mod(logits, q_pos, k_pos, *params)
-
-
-def differentiable(score_mod: Callable, q_pos, k_pos, params, floating: list[int]) -> Callable:
-    """`score_mod` at the tile's coordinates as a function of its logits and its floating parameters
-    (`floating`) alone, the others held: what `jax.vjp` takes."""
-    def hooked(s, *wide):
-        values = list(params)
-        for index, value in zip(floating, wide, strict=True):
-            values[index] = value
-        return score_mod(s, q_pos, k_pos, *values)
-
-    return hooked
 
 
 def tile_logits(score_mod, product: jax.Array, seen: jax.Array | None, q_pos, k_pos, params, *, scale: float,

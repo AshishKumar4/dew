@@ -2,9 +2,10 @@
 the template's forward and backward under one `jax.custom_vjp`, on the mainloops the process's calls run on.
 
 On a GPU the process places calls on, of sm80 or later (`generation.bf16_dot_runs`), the forward and the
-backward run on the Triton mainloop (`attention_triton`). The backward runs on Mosaic GPU's where the
-device's instruction family is wgmma (sm90) and that mainloop takes the call (`_mosaic_takes`). Everywhere
-else both run the plain-JAX mainloop (`attention_portable`). The route takes score hooks and the initial
+backward run on the Triton mainloop (`attention_triton`). The backward runs on Mosaic GPU's where that
+mainloop runs the call on the device (`attention_mosaic.backward_runs`: its family has a bundle there, the
+call is one it takes and a config fits). Everywhere else both run the plain-JAX mainloop
+(`attention_portable`). The route takes score hooks and the initial
 state. The caller applies an output hook past the kernel, because the template's backward takes the
 output before it (`templates/attention.py`'s `gradients`).
 """
@@ -13,7 +14,6 @@ import dataclasses
 import functools
 
 import jax
-import jax.numpy as jnp
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention_mosaic, attention_portable, attention_triton
@@ -90,21 +90,10 @@ def _backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         return attention_portable.backward(
             query, key, value, spans, hooks, dout, block_q=PLAIN_TILE, block_k=PLAIN_TILE, pad=PLAIN_TILE,
             residuals=residuals, scale=scale)
-    if _mosaic_takes(query, value, spans, hooks):
-        return attention_mosaic.backward(
-            query, key, value, spans, hooks, dout, residuals=residuals, scale=scale)
+    call = (query, key, value, spans, hooks, dout)
+    if attention_mosaic.backward_runs(*call, residuals=residuals, scale=scale):
+        return attention_mosaic.backward(*call, residuals=residuals, scale=scale)
     return attention_triton.backward(query, key, value, spans, hooks, dout, residuals=residuals, scale=scale)
-
-
-def _mosaic_takes(query: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks) -> bool:
-    """Whether the Mosaic GPU backward takes the call on this device.
-
-    That is the wgmma family's bundle (sm90), full or causal spans of bf16 operands at equal head widths, and
-    no hooks: the refusals `attention_mosaic.backward` makes.
-    """
-    family = generation.family(generation.device_generation())
-    return (family == "wgmma" and spans.form in ("full", "causal") and query.dtype == jnp.bfloat16
-            and query.shape[-1] == value.shape[-1] and hooks == Hooks())
 
 
 def _hooks_cotangent(hooks: Hooks, grads: Gradients) -> Hooks:

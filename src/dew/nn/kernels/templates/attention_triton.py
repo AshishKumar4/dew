@@ -20,13 +20,14 @@ import jax.numpy as jnp
 import tokamax
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels import generation, tuning
+from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention_algebra as algebra, cost as costs
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
     DKV_GRADS,
     DQ_GRADS,
     NATURAL,
+    TRACED_TILE,
     Gradients,
     Hooks,
     KeySpans,
@@ -34,9 +35,11 @@ from dew.nn.kernels.templates.attention import (
     Split,
     block_map,
     gradients,
+    hook_program,
     kept_dtype,
     kernel_dot,
     padded_call,
+    spanned,
     within,
 )
 from dew.nn.kernels.templates.base import Template, dividing
@@ -85,54 +88,6 @@ def _mode(dtype) -> str:
     """The arithmetic a launch's products take (`_dot`): IEEE fp32 for fp32 operands, else 16-bit
     products summed in fp32."""
     return 'fp32' if dtype == jnp.float32 else '16bit'
-
-
-TRACED_TILE = 16
-"""The tile a hook is traced at for its picks' key (`_hook_program`)."""
-
-
-def _hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, ...], *,
-                  differentiated: bool = False, width: int = TRACED_TILE) -> str | None:
-    """What a score or output hook computes, as its launch's picks key it (`tuning.program`): a score
-    hook traced at a `TRACED_TILE` square fp32 tile, an output hook at `TRACED_TILE` queries of the
-    call's padded value `width`, the entries' indices and each parameter as its kind lays it out there,
-    in its dtype in the kernels (`dtypes`); `differentiated`, its pullback too, so a hook whose
-    derivative is its own rule (`jax.custom_vjp`) keys by that rule. None or an already traced key as
-    it is."""
-    if hook is None or isinstance(hook, str):
-        return hook
-    tile = TRACED_TILE
-    layouts = {Kind.HEAD: (), Kind.QUERY: (tile, 1), Kind.KEY: (1, tile), Kind.TILE: (tile, tile),
-               Kind.OUTPUT: (tile, width)}
-    params = [jax.ShapeDtypeStruct(layouts[kind], dtype) for kind, dtype in zip(kinds, dtypes, strict=True)]
-    square = jax.ShapeDtypeStruct((tile, tile), jnp.float32)
-    if name == "output_mod":
-        return tuning.program(hook, jax.ShapeDtypeStruct((tile, width), jnp.float32), *params)
-    positions = (jax.ShapeDtypeStruct((tile, 1), jnp.int32), jax.ShapeDtypeStruct((1, tile), jnp.int32))
-    if not differentiated:
-        return tuning.program(hook, square, *positions, *params)
-    floating = algebra.floating_params(params)
-
-    def pulled(s, q_pos, k_pos, *values):
-        hooked = algebra.differentiable(hook, q_pos, k_pos, values, floating)
-        out, pull = jax.vjp(hooked, s, *(values[index] for index in floating))
-        return out, pull(jnp.ones_like(out))
-
-    return tuning.program(pulled, square, *positions, *params)
-
-
-def _spanned(specs: list[jax.ShapeDtypeStruct], arrays: list[jax.Array]) -> list[jax.Array]:
-    """A launch's timing operands with its spans whole: of its integer operands by row `[B, Q]` (the
-    others, an anchor key `[B, H, Q]`, keep their draw), the first two each query's first key (0) and
-    one past its last (every key, `specs[1]` being the keys), the rest its documents' ids (one
-    document), so a timed launch visits every tile a dense call does."""
-    rows = [index for index, spec in enumerate(specs)
-            if jnp.issubdtype(spec.dtype, jnp.integer) and spec.ndim == 2]
-    keys = specs[1].shape[1]
-    for place, index in enumerate(rows):
-        filled = (0, keys)[place] if place < 2 else 1
-        arrays[index] = jnp.full(specs[index].shape, filled, specs[index].dtype)
-    return arrays
 
 
 def _tile_param(ref, kind: Kind, head, queries: jax.Array, keys: pl.Slice | None):
@@ -430,12 +385,12 @@ class TritonForward(Template[Tiles]):
         return _eligible(ba, target)
 
     def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
-        return _spanned(specs, super().operands(specs, seed))
+        return spanned(specs, super().operands(specs, seed))
 
     def traced(self, name: str, value: Callable | str | None) -> str | None:
         if name == "output_mod":
-            return _hook_program(name, value, self.output_kinds, self.output_dtypes, width=self.output_width)
-        return _hook_program(name, value, self.score_kinds, self.score_dtypes)
+            return hook_program(name, value, self.output_kinds, self.output_dtypes, width=self.output_width)
+        return hook_program(name, value, self.score_kinds, self.score_dtypes)
 
 
 def _dividing[T: (Tiles, BackwardTiles)](space: tuple[T, ...], ba: tokamax.BoundArguments) -> tuple[T, ...]:
@@ -796,10 +751,10 @@ class TritonBackward(Template[BackwardTiles]):
         return _eligible(ba, target)
 
     def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
-        return _spanned(specs, super().operands(specs, seed))
+        return spanned(specs, super().operands(specs, seed))
 
     def traced(self, name: str, value: Callable | str | None) -> str | None:
-        return _hook_program(name, value, self.score_kinds, self.score_dtypes, differentiated=True)
+        return hook_program(name, value, self.score_kinds, self.score_dtypes, differentiated=True)
 
 
 def _backward_registers(ba: tokamax.BoundArguments, config: BackwardTiles, *, dq: bool) -> int:

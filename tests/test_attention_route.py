@@ -35,10 +35,10 @@ from test_attention_template import (
 from dew.nn import attention
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.attention_kernels import ATTENTION, kernel_refusals
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.generation import INHERENT
 from dew.nn.kernels.selection import KernelRefused
-from dew.nn.kernels.templates import attention as template, attention_route
+from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_route
 from dew.nn.sharding import DEFAULT_RULES
 
 HEADS, KV_HEADS, WIDTH = 4, 2, 32
@@ -318,6 +318,21 @@ def test_no_target_prefers_the_template_so_only_a_named_call_takes_it():
     with generation.chosen(attention="template"):
         for call in calls:
             assert attention.resolve_implementation("auto", query, key, **call) == "template", call
+
+
+@pytest.mark.skipif(generation.device_generation() != "sm90", reason="runs the route's backward, on an H100")
+@pytest.mark.gpu(reason="runs the route's backward, on an H100")
+@pytest.mark.parametrize("case", ["causal", "packed-documents", "sinks-softcap"])
+def test_on_an_h100_the_routes_backward_is_the_mosaic_template(case):
+    """On an H100 a bf16 call's backward runs the Mosaic mainloop's Template implementation
+    (`attention_mosaic.MosaicBackward`, traced among the launches, `tuning.seen`) from the Triton forward's
+    residuals, a causal call's, a spans call's and a hooked one's alike (`attention_mosaic.backward_runs`),
+    which the route's parity test holds on par with the reference path."""
+    queries, keys = geometry(CASES[case])
+    operands = drawing(queries, keys, jnp.bfloat16, sinks=bool(CASES[case].get("sinks")))(0)
+    with tuning.seen() as launches:
+        jax.jit(pulled("template", CASES[case])).trace(*operands)
+    assert any(isinstance(op, attention_mosaic.MosaicBackward) for op, _ in launches)
 
 
 def test_the_route_takes_score_hooks_and_the_initial_state_and_refuses_an_output_hook():
