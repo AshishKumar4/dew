@@ -341,9 +341,11 @@ def test_mimo_merger_is_as_exact_as_the_reference(native):
     record = mimo.translate_mimo_projector_config(config, config["text_config"]["hidden_size"])
     projector = projectors.from_record(record)
     if native:
+        vision = config["vision_config"]
         projector = mimo.MiMoProjector(
-            hidden_size=projector.hidden_size, spatial_merge_size=projector.spatial_merge_size,
-            width=projector.width, out_width=projector.out_width)
+            hidden_size=vision["hidden_size"], spatial_merge_size=vision["spatial_merge_size"],
+            width=vision["hidden_size"] * vision["spatial_merge_size"] ** 2,
+            out_width=config["text_config"]["hidden_size"])
     variables = {"params": projector_variables("mimo", projector_tensors, "float32")[0]}
     out = projector.apply(variables, refs["tower"])
     grid = refs["grid"]

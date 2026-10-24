@@ -88,6 +88,8 @@ class MiMoProjector(MergeProjector, ProjectorBase):
     """MiMo's merger (MiMoVisionPatchMerger): a layer norm, each merge block grouped, and two maps
     around an exact GELU to the decoder width. The release stores none of its biases."""
 
+    bias: bool = False
+
 _BLOCK_MAPS = {("attn", "qkv"): ("self_attn", "qkv_proj"), ("attn", "proj"): ("self_attn", "o_proj"),
                ("mlp", "gate_proj"): ("mlp", "gate_proj"), ("mlp", "up_proj"): ("mlp", "up_proj"),
                ("mlp", "down_proj"): ("mlp", "down_proj")}
