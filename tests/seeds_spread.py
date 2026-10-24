@@ -25,9 +25,11 @@ def pytest_configure(config):
             ratio = mine / np.maximum(theirs, 1e-300)
             same = int(np.sum(mine == theirs))
             quantiles = (0.0, 0.1, 0.5, 0.9, 1.0)
-            lines.append(f"{label!r}{name}: width {width:.2f}; dew {np.quantile(mine, quantiles)}; "
-                         f"reference {np.quantile(theirs, quantiles)}; ratio {np.quantile(ratio, quantiles)}; "
-                         f"{same} of 64 seeds alike")
+            def shown(values):
+                return " ".join(f"{value:.2e}" for value in np.quantile(values, quantiles))
+
+            lines.append(f"{label!r}{name}: width {width:.2f}; dew {shown(mine)}; reference {shown(theirs)}; "
+                         f"ratio {shown(ratio)}; {same} of 64 seeds alike")
 
     reference_error.assert_as_exact = spread
 
