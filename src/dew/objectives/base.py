@@ -882,6 +882,11 @@ class Objective(ABC, Generic[Loss, Effects]):
         tower. The trainer calls this once and passes the result to `init`, so
         an objective never has to read its own held arrays inside a trace.
         The default is the starting tree, `variables`.
+
+        `init` returns the held tree's `FROZEN` collection unchanged, as the
+        base `init` does (it projects `params` alone): the trainer's state
+        then shares those very arrays, which no step donates, so a run and its
+        objective hold one frozen tree (`dew.training.state.apart`).
         """
         return self.variables
 

@@ -33,7 +33,6 @@ import optax
 from flax import linen as nn
 from flax.core import unfreeze
 from flax.training import dynamic_scale as dynamic_scale_lib
-from jax.extend.core import Var
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
@@ -714,38 +713,26 @@ class Trainer(Generic[Loss, Effects]):
 
     def _placed_fresh(self, initializer: Initializer, key: jax.Array, abstract: TrainState,
                       shardings: Placement[TrainState]) -> TrainState:
-        """A fresh state on the mesh, built from the objective's held tree (`placed_held`). The frozen
-        leaves its init passes through from the held tree as they are, which no step donates
-        (`apart`), are those very arrays, placed where the state keeps them; the rest of the state is
-        built by one program, which takes the other held arrays over. So the run and the objective
-        hold one frozen tree between them."""
+        """A fresh state on the mesh, built from the objective's held tree (`placed_held`). An
+        objective's init returns its held frozen tree unchanged (`Objective.held_variables`), which no
+        step donates (`apart`): the state's frozen tree is those very arrays, placed where it keeps
+        them, and one program builds the rest, taking the other held arrays over. So the run and the
+        objective hold one frozen tree between them."""
         moving, frozen = apart(shardings)
-        held_leaves = jax.tree.leaves(initializer)
-        # Which frozen leaves are a held leaf passed through, read off the init's program itself.
-        traced = jax.make_jaxpr(lambda tree: jax.tree.leaves(apart(self.initial_state(tree, key))[1]))(
-            initializer)
-        inputs = {var: index for index, var in enumerate(traced.jaxpr.invars)}
-        passed = [inputs.get(out) if isinstance(out, Var) else None for out in traced.jaxpr.outvars]
-        shared = frozenset(id(held_leaves[index]) for index in passed if index is not None)
-        taken, kept = placed_held(initializer, abstract.variables, shardings.variables, self.device_mesh,
-                                  shared=shared)
-        if frozen is None:
+        held = self.objective.held_variables()
+        if frozen is None or held is None or FROZEN not in held:
+            taken, kept = placed_held(initializer, abstract.variables, shardings.variables, self.device_mesh)
             return taking_over(self.initial_state, taken, kept, shardings)(key)
-        frozen_leaves, structure = jax.tree.flatten(frozen)
-
-        def built(tree, draw):
-            # The moving state, and the frozen leaves no held leaf passes through (None for the rest).
-            moving_state, frozen_tree = apart(self.initial_state(tree, draw))
-            computed = [None if index is not None else leaf
-                        for leaf, index in zip(jax.tree.leaves(frozen_tree), passed, strict=True)]
-            return moving_state, computed
-
-        out = (moving, [None if index is not None else sharding
-                        for sharding, index in zip(frozen_leaves, passed, strict=True)])
-        moving_state, computed = taking_over(built, taken, kept, out)(key)
-        joined = [jax.device_put(held_leaves[index], sharding) if index is not None else leaf
-                  for leaf, index, sharding in zip(computed, passed, frozen_leaves, strict=True)]
-        return together(moving_state, jax.tree.unflatten(structure, joined))
+        shared = held[FROZEN]
+        expected = jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), abstract.variables[FROZEN])
+        if jax.tree.map(lambda leaf: (np.shape(leaf), leaf.dtype), shared) != expected:
+            raise ValueError("the objective's init returns a frozen tree other than the one it holds; an "
+                             "objective's init returns its held frozen tree unchanged "
+                             "(Objective.held_variables)")
+        taken, kept = placed_held(initializer, abstract.variables, shardings.variables, self.device_mesh,
+                                  shared=frozenset(id(leaf) for leaf in jax.tree.leaves(shared)))
+        built = taking_over(lambda tree, draw: apart(self.initial_state(tree, draw))[0], taken, kept, moving)
+        return together(built(key), jax.device_put(shared, frozen))
 
     @ruled
     def place(self) -> tuple[TrainState, Placement[TrainState], bytes | None]:
