@@ -17,7 +17,8 @@ BACKBONE = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
 
 
 @pytest.mark.parametrize("readout", ["slot_lm", "head", "fresh_head"])
-def test_a_slot_release_loads_its_readout_and_exports_the_same_task(tmp_path, readout):
+@pytest.mark.parametrize("n_slots", [16, 32, 512])
+def test_a_slot_release_loads_its_readout_and_exports_the_same_task(tmp_path, readout, n_slots):
     """The stored head keeps all its rows and native q/k orientation. A fresh head draws only
     the available label rows; the byte tokenizer has all letters but no single-token pairs.
     All three become decision tasks and survive a native task export with their parameters."""
@@ -26,7 +27,7 @@ def test_a_slot_release_loads_its_readout_and_exports_the_same_task(tmp_path, re
     source = tmp_path / "release"
     shutil.copytree(BACKBONE, source)
     config = {"readout": "slot_lm" if readout == "slot_lm" else "head",
-              "head_dim": 8, "n_slots": 32}
+              "head_dim": 8, "n_slots": n_slots}
     (source / "readout.json").write_text(json.dumps(config))
     stored = {"slot": np.arange(32 * 32, dtype=np.float32).reshape(32, 32) / 1024,
               "q.weight": np.arange(8 * 32, dtype=np.float32).reshape(8, 32) / 256,
@@ -44,7 +45,7 @@ def test_a_slot_release_loads_its_readout_and_exports_the_same_task(tmp_path, re
         for name, native in (("slot", "slots"), ("q.weight", "q"), ("k.weight", "k")):
             np.testing.assert_array_equal(bundle.head_variables["params"][native], stored[name])
     elif readout == "fresh_head":
-        labels = [task.tokenizer.encode(label)[0] for label in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"]
+        labels = [task.tokenizer.encode(label)[0] for label in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[:n_slots]]
         table = task.model.table(task.variables)
         np.testing.assert_array_equal(bundle.head_variables["params"]["slots"], np.asarray(table)[labels])
         assert np.count_nonzero(bundle.head_variables["params"]["q"]) > 0

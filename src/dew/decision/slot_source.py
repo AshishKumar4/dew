@@ -8,6 +8,7 @@ from typing import Literal
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 
 from dew import records
@@ -118,8 +119,7 @@ class SlotSource(SourceKind):
             raise ValueError("the slot format holds its release prompt and uncalibrated logits")
         ids = records.listed(fields["label_ids"], "label_ids", read=lambda value, _: value,
                              what="a list of label ids")
-        count = records.integer(fields.get("slot_rows") or len(ids), "slot_rows")
-        readout = {"readout": mode, "head_dim": fields.get("head_dim", 256), "n_slots": count}
+        readout = {"readout": mode, "head_dim": fields.get("head_dim", 256), "n_slots": len(ids)}
         if settings.layout.blocks:
             readout["attention"] = "noncausal"
         root = Path(directory)
@@ -127,12 +127,13 @@ class SlotSource(SourceKind):
         bundle.decision_tokenizer.save_pretrained(root)
         if mode == "head":
             import torch
-            from torch.utils.dlpack import from_dlpack
 
-            cpu = jax.local_devices(backend="cpu")[0]
             params = bundle.head_variables["params"]
-            tensors = {name: from_dlpack(jax.device_put(params[path[0]], cpu))
-                       for name, path in _PATHS.items()}
+            tensors = {}
+            for name, path in _PATHS.items():
+                host = np.array(jax.device_get(params[path[0]]), copy=True, order="C")
+                tensors[name] = torch.frombuffer(host, dtype=getattr(torch, str(host.dtype))).reshape(
+                    host.shape)
             torch.save(tensors, root / "readout_head.pt")
         (root / "readout.json").write_text(json.dumps(readout, indent=2) + "\n")
 
@@ -173,8 +174,8 @@ class SlotSource(SourceKind):
             raise ValueError(f"unknown readout {mode!r}; a slot release reads slot_lm or head")
         count = records.integer(fields.get("n_slots", 256), "n_slots")
         dimension = records.integer(fields.get("head_dim", 256), "head_dim")
-        if not 1 <= count <= len(SLOT_LABELS) or dimension < 1:
-            raise ValueError("a slot readout has 1-256 slots and a positive head dimension")
+        if count < 1 or dimension < 1:
+            raise ValueError("a slot readout has a positive slot count and head dimension")
         attention = fields.get("attention", "causal")
         if attention not in ("causal", "noncausal"):
             raise ValueError("a slot readout's attention is causal or noncausal")
