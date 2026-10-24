@@ -392,16 +392,17 @@ def test_a_mixers_refusal_names_its_kind_and_entries_across_a_process_boundary()
 
 
 @pytest.mark.parametrize("kind, rungs", [
-    ("attention", [None, "minimal_with_context_and_conv", "minimal", "save_dot_except_mlp", "full"]),
-    ("mamba2", [None, "minimal_with_context_and_conv", "minimal_with_conv", "minimal", "full"]),
-    ("gated_delta_net", [None, "all_but_delta_memory", "minimal_with_context_and_conv", "minimal_with_conv",
+    ("attention", [None, "minimal", "save_dot_except_mlp", "full"]),
+    ("mamba2", [None, "minimal_with_scan_and_conv", "minimal_with_conv", "minimal", "full"]),
+    ("gated_delta_net", [None, "all_but_delta_memory", "minimal_with_scan_and_conv", "minimal_with_conv",
                          "minimal", "full"]),
 ])
 def test_a_decoder_climbs_only_the_remat_rungs_its_layers_mark(kind, rungs):
     """`recompute_more` passes a rung that keeps the same of the decoder's marked names as the rung
     below or above it: 'all_but_delta_memory', which recomputes a delta rule's memory alone, is a
-    rung only for a decoder with a delta rule, and the ladder of any other is the one before it (a
-    recurrent decoder's 'save_dot_except_mlp' keeps no more of its names than 'full')."""
+    rung only for a decoder with a delta rule, 'minimal_with_scan_and_conv', which keeps a
+    recurrence's scan, only for a decoder with a recurrence, so attention's ladder is the one before
+    either (a recurrent decoder's 'save_dot_except_mlp' keeps no more of its names than 'full')."""
     fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
     model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=64, **overrides)
     climbed = [model]

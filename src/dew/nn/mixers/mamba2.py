@@ -404,8 +404,8 @@ def _sequence_mix(mixed, dt, segments, starts, weights, *, scan, dtype):
     stream = jnp.concatenate([history, mixed], axis=1)
     convolved = causal_conv1d(stream, taps, bias=bias, segments=owners, dtype=dtype)[:, width:]
     out, _ = scan(convolved, dt, (dt_bias, A, D), starts=starts, axis=SEQUENCE_AXIS)
-    # The scan's output, attention's 'context' (a remat policy's `RESIDUALS`), as `held_scan` names it.
-    return checkpoint_name(out, 'context')
+    # The scan's output (a remat policy's `RESIDUALS`), as `held_scan` names it.
+    return checkpoint_name(out, 'scan')
 
 
 def _over_sequence(mix, shards: int, mixed, dt, segments, starts, weights):
@@ -438,7 +438,7 @@ class Mamba2Mixer(MixerBase):
     `head_dim` are the checkpoint's own.
     """
 
-    residuals = ('context', 'conv')
+    residuals = ('scan', 'conv')
 
     @property
     def keeps_triton_gemm(self) -> bool:

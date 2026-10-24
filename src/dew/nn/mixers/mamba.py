@@ -269,7 +269,7 @@ class MambaMixer(MixerBase):
     SSM has no keys to cache or positions to rotate.
     """
 
-    residuals = ('context', 'conv')
+    residuals = ('scan', 'conv')
 
     intermediate_size: int = 1536
     state_size: int = 16
