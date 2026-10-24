@@ -19,10 +19,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
-from jax.experimental import checkify
 from typing_extensions import TypeVar, get_protocol_members
 
-from dew._distributions import categorical
+from dew._distributions import categorical, wellformed
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import (
     ModelInputs,
@@ -180,10 +179,8 @@ class BlockProcess:
         """Refines one canvas without updating its prefix cache, compiled with the model's own XLA
         options (`compiler_options`). `positions` `[B, canvas_length]` are its tokens' logical
         positions; None places them on from the cache's cursor."""
-        error, refined = _refining(tuple(compiler_options(model).items()))(self, model, variables, cache, key,
-                                                                          batch, finished, positions)
-        error.throw()
-        return refined
+        return _refining(tuple(compiler_options(model).items()))(self, model, variables, cache, key, batch,
+                                                                 finished, positions)
 
     def refined(self, model: nn.Module, variables: Variables, cache: Variables,
                 key: jax.Array, batch: int, finished: jax.Array,
@@ -260,10 +257,11 @@ class BlockProcess:
         plan = request.plan
         # The canvas sampler draws one batch-wide key per refinement, so its
         # repeats stay as they are and its rows take the request's own key.
-        error, generation = _compiled(plan.sharding, tuple(compiler_options(model).items()))(
+        generation, undefined = _compiled(plan.sharding, tuple(compiler_options(model).items()))(
             model, decoding_storage(model, variables), plan.place(plan.pad(request.inputs)), request.key,
             CanvasPlan(self, tuple(eos_token_ids), pad_token_id, max_new_tokens), n)
-        error.throw()
+        if bool(undefined):
+            raise ValueError(CANVAS_UNDEFINED)
         return replace(generation, rows=plan.rows * n, prompt_width=request.inputs.tokens.shape[1])
 
 
@@ -299,12 +297,15 @@ class CanvasDecodeState:
     lengths. `positions` `[B]` is each row's logical position for the next
     canvas's first token, on from the prompt's own (`next_position`); None
     where the prompt gives none, and the cache's cursor places each canvas.
+    `undefined` marks whether a canvas committed from scores that hold no
+    distribution (a NaN), whose argmax is no token the model chose.
     """
 
     cache: Variables
     result: CanvasGeneration
     index: jax.Array
     positions: jax.Array | None
+    undefined: jax.Array
 
 
 def through_eos(tokens: jax.Array, available: jax.typing.ArrayLike, eos_ids: tuple[int, ...],
@@ -363,7 +364,8 @@ def _begin(model: nn.Module, variables: Variables, inputs: ModelInputs,
             mutable=["cache"])[1]["cache"]
     return CanvasDecodeState(cache, generation, jnp.asarray(0, jnp.int32),
                              next_position(inputs.token_fields,
-                                           real_slots(inputs.token_fields, (batch, prompt_length))))
+                                           real_slots(inputs.token_fields, (batch, prompt_length))),
+                             jnp.zeros((), bool))
 
 
 def _advance(model: nn.Module, variables: Variables, state: CanvasDecodeState,
@@ -382,6 +384,10 @@ def _advance(model: nn.Module, variables: Variables, state: CanvasDecodeState,
     # A row that ended earlier emits nothing more: none of its canvas is available.
     available = jnp.where(generation.terminated, 0, available)
     clean, emitted, ended = through_eos(refined.argmax, available, plan.eos_token_ids, plan.pad_token_id)
+    # A row that refined this canvas commits its last scores' argmax: a token only where they hold a
+    # distribution.
+    held = jnp.all(wellformed(refined.logits), axis=-1)
+    undefined = state.undefined | jnp.any(~generation.terminated & ~held)
     tokens = jax.lax.dynamic_update_slice(generation.tokens, clean, (0, prompt_length + index * length))
     generation = CanvasGeneration(
         tokens=tokens, lengths=generation.lengths + emitted,
@@ -395,7 +401,7 @@ def _advance(model: nn.Module, variables: Variables, state: CanvasDecodeState,
                                 positions=positions, mutable=["cache"])[1]["cache"],
         lambda old: old, cache)
     return CanvasDecodeState(cache, generation, index + 1,
-                             None if state.positions is None else state.positions + length)
+                             None if state.positions is None else state.positions + length, undefined)
 
 
 def _materialize(state: CanvasDecodeState, prompt_length: int, max_new_tokens: int) -> CanvasGeneration:
@@ -403,19 +409,21 @@ def _materialize(state: CanvasDecodeState, prompt_length: int, max_new_tokens: i
 
 
 def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs,
-              key: jax.Array, plan: CanvasPlan, n: int) -> CanvasGeneration:
+              key: jax.Array, plan: CanvasPlan, n: int) -> tuple[CanvasGeneration, jax.Array]:
+    """The canvases of each row, `n` continuations each, and whether one committed from scores that
+    hold no distribution (`CanvasDecodeState.undefined`)."""
     initial = _begin(model, variables, inputs, plan)
     prompt_length = inputs.tokens.shape[1]
 
-    def continued(canvas_key: jax.Array) -> CanvasGeneration:
+    def continued(canvas_key: jax.Array) -> tuple[CanvasGeneration, jax.Array]:
         if plan.blocks == 0:
-            return _materialize(initial, prompt_length, plan.max_new_tokens)
+            return _materialize(initial, prompt_length, plan.max_new_tokens), initial.undefined
 
         def step(_, state):
             return _advance(model, variables, state, canvas_key, plan)
 
-        return _materialize(jax.lax.fori_loop(0, plan.blocks, step, initial),
-                            prompt_length, plan.max_new_tokens)
+        final = jax.lax.fori_loop(0, plan.blocks, step, initial)
+        return _materialize(final, prompt_length, plan.max_new_tokens), final.undefined
 
     if n == 1:
         return continued(key)
@@ -423,32 +431,20 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs,
     # refines the shared prefill state over the original prompt rows, so a
     # row's draws depend on the rows placed with it exactly as they do for
     # one continuation.
-    return prompt_major(jax.lax.map(continued, continuation_keys(key, n)))
+    generations, undefined = jax.lax.map(continued, continuation_keys(key, n))
+    return prompt_major(generations), jnp.any(undefined)
 
 
 @functools.cache
 def _refining(options: tuple[tuple[str, bool], ...]):
     """`BlockProcess.refined` as a program of its own, with the model's XLA `options`."""
-    def refined(self: BlockProcess, model: nn.Module, variables: Variables, cache: Variables, key: jax.Array,
-                batch: int, finished: jax.Array, positions: jax.Array | None
-                ) -> tuple[checkify.Error, CanvasState]:
-        # A draw from a position that holds no distribution, carried out as an error (`dew._distributions`).
-        return checkify.checkify(
-            lambda *arrays: self.refined(model, *arrays[:3], batch, *arrays[3:]),
-            errors=checkify.user_checks)(variables, cache, key, finished, positions)
-
-    return jax.jit(refined, static_argnames=("self", "model", "batch"), compiler_options=dict(options))
+    return jax.jit(BlockProcess.refined, static_argnames=("self", "model", "batch"),
+                   compiler_options=dict(options))
 
 
 @functools.cache
 def _compiled(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
     """The generation program over `rows`, compiled with the model's own XLA `options`
     (`dew.nn.kernels.options.compiler_options`), so a quantized model and another never share it."""
-    def checked(model: nn.Module, variables: Variables, inputs: ModelInputs, key: jax.Array, plan: CanvasPlan,
-                n: int) -> tuple[checkify.Error, CanvasGeneration]:
-        # A draw from a position that holds no distribution, carried out as an error (`dew._distributions`).
-        return checkify.checkify(lambda *arrays: _generate(model, *arrays, plan, n),
-                                 errors=checkify.user_checks)(variables, inputs, key)
-
-    return jax.jit(checked, static_argnames=("model", "plan", "n"), in_shardings=(None, rows, None),
-                   out_shardings=(None, rows), compiler_options=dict(options))
+    return jax.jit(_generate, static_argnames=("model", "plan", "n"), in_shardings=(None, rows, None),
+                   out_shardings=(rows, None), compiler_options=dict(options))

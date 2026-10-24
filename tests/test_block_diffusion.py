@@ -14,7 +14,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.experimental import checkify
 from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 
@@ -312,6 +311,6 @@ def test_a_canvas_whose_model_scores_nothing_refuses_rather_than_draw_a_token(sy
     hold no distribution, so generation raises instead of committing arbitrary tokens."""
     model, variables, process, reference, _ = system
     poisoned = jax.tree.map(lambda leaf: jnp.full_like(leaf, jnp.nan), variables)
-    with pytest.raises(checkify.JaxRuntimeError):
+    with pytest.raises(ValueError):
         process.generate(model, poisoned, ModelInputs(jnp.asarray(reference["prompt"])), 3,
                          key=jax.random.key(11))
