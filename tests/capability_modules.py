@@ -77,10 +77,11 @@ class Denoiser(nn.Module):
     def __call__(self, sample, time, textcontext=None, *, duration=None, train=False):
         if duration is not None and not self.interval:
             raise ValueError("this denoiser reads no interval; set interval=True")
-        level = sinusoidal_time(time, self.features)
+        level = sinusoidal_time(time, self.features, dtype=jnp.float32, cosine_first=False)
         if self.interval:
             level = level + nn.Dense(self.features)(
-                sinusoidal_time(jnp.zeros_like(time) if duration is None else duration, self.features))
+                sinusoidal_time(jnp.zeros_like(time) if duration is None else duration, self.features,
+                                dtype=jnp.float32, cosine_first=False))
         if textcontext is not None:
             level = level + nn.Dense(self.features)(masked_mean(textcontext.hidden, textcontext.mask))
         x = nn.Conv(self.features, (3, 3))(sample) + nn.Dense(self.features)(level)[:, None, None, :]
@@ -176,7 +177,7 @@ class NNXDenoiser(nnx.Module):
         self.outer = nnx.Conv(features, channels, (3, 3), rngs=rngs)
 
     def __call__(self, sample, time, textcontext=None, *, train=False):
-        level = sinusoidal_time(time, self.features)
+        level = sinusoidal_time(time, self.features, dtype=jnp.float32, cosine_first=False)
         if textcontext is not None:
             level = level + self.text(masked_mean(textcontext.hidden, textcontext.mask))
         x = self.inner(sample) + self.level(level)[:, None, None, :]
