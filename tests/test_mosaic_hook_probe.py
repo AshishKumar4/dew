@@ -68,14 +68,23 @@ def test_only_weights_exact(monkeypatch, accurate):
     _check_hooked_backward("softcap-sinks-alibi", accurate=accurate, interpret=False)
 
 
-@pytest.mark.parametrize("consumers", [1, 2])
-def test_column_reduction(consumers):
+@pytest.mark.parametrize("consumers,private", [(1, False), (2, False), (2, True)],
+                         ids=["single", "shared", "private"])
+def test_column_reduction(consumers, private):
     family = mosaic_sm90.WGMMA
     count, rows, columns = 128, 64, 64
     source = jnp.arange(consumers * count * rows * columns, dtype=jnp.float32)
     source = jnp.sin(source.reshape(consumers, count, rows, columns) * 0.001)
 
-    def body(src, out):
+    @plgpu.inline_mgpu(
+        arg_types=(plgpu.Layout.WGMMA, plgpu.RefType()),
+        return_type=plgpu.ShapeDtypeStruct((columns,), jnp.float32, layout=family.column),
+    )
+    def private_sum(ctx, value, scratch):
+        del ctx
+        return value.reduce("add", axis=0, scratch=scratch)
+
+    def reduce_tiles(src, out, scratch=None):
         wg = lax.axis_index("wg")
 
         @pl.when(wg < consumers)
@@ -83,13 +92,21 @@ def test_column_reduction(consumers):
             @pl.loop(0, count)
             def _(step):
                 tile = family.tile_of(src.at[wg, step])
-                out[wg, step, :] = tile.sum(axis=0)
+                out[wg, step, :] = (tile.sum(axis=0) if scratch is None
+                                    else private_sum(tile, scratch.at[wg]))
+
+    def body(src, out):
+        if private:
+            pl.run_scoped(functools.partial(reduce_tiles, src, out),
+                          plgpu.SMEM((consumers, 512), jnp.float32), collective_axes="wg")
+        else:
+            reduce_tiles(src, out)
 
     kernel = family.kernel(body, out_type=jax.ShapeDtypeStruct((consumers, count, columns), jnp.float32),
                            grid=(), grid_names=(), consumers=consumers, interpret=False)
     result = kernel(source)
     expected = jnp.sum(source, axis=2)
     error = np.asarray(result - expected)
-    print(f"COLUMN consumers={consumers} max_error={np.max(np.abs(error))} "
+    print(f"COLUMN consumers={consumers} private={private} max_error={np.max(np.abs(error))} "
           f"bad_columns={np.count_nonzero(np.abs(error) > 0.001)}")
     np.testing.assert_allclose(np.asarray(result), np.asarray(expected), rtol=0, atol=0.001)
