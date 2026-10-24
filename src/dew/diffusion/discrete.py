@@ -29,6 +29,7 @@ from dataclasses import dataclass, replace
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 
 from dew.diffusion.block import CanvasGeneration, through_eos
@@ -36,6 +37,7 @@ from dew.diffusion.process import Conditioning
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import (
     RESPONSE_FIELDS,
+    Coordinates,
     ModelInputs,
     Request,
     continuation_keys,
@@ -47,7 +49,7 @@ from dew.nn.inputs import (
     token_layout,
 )
 from dew.nn.kernels.options import compiler_options
-from dew.nn.protocols import Logits, TokenModel
+from dew.nn.protocols import Logits, ShiftsLogits, TokenModel
 from dew.nn.sharding import explicit_spec
 from dew.objectives.base import Variables
 
@@ -206,14 +208,15 @@ class DiscreteProcess:
         return replace(generated, rows=plan.rows * n, prompt_width=request.inputs.tokens.shape[1])
 
 
-def aligned(model: nn.Module, scores: jax.Array, fields: Mapping[str, object] | None = None) -> jax.Array:
+def aligned(model: nn.Module, scores: jax.Array,
+            fields: Mapping[str, jax.Array | np.ndarray | Coordinates] | None = None) -> jax.Array:
     """`scores` `[B, S, ...]` per position as the model's predictions of each position's token: its
     own for a model whose logits line up with its inputs (LLaDA's, MDLM's), and for one that declares
     `shifted_logits` (Dream-v0's) the position before's, as its reference shifts them. A position
     that opens its text, the row's first, the first real one after padding and each packed
     document's first in the token `fields`' layout (`token_layout`), reads its own, as the
     reference repeats a row's first: no document reads another's."""
-    if not getattr(model, "shifted_logits", False):
+    if not (isinstance(model, ShiftsLogits) and model.shifted_logits):
         return scores
     before = jnp.concatenate([scores[:, :1], scores[:, :-1]], axis=1)
     valid, documents = token_layout(fields or {})

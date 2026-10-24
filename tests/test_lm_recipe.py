@@ -1,6 +1,7 @@
 """recipes/lm/train.py: what it refuses, and a run over real token files."""
 
 import dataclasses
+import importlib
 import json
 from pathlib import Path
 
@@ -144,7 +145,8 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
 def test_the_recipe_trains_an_lm_objective_it_names_by_import_path(tmp_path):
     """An objective Dew does not ship, named by its import path, builds from the arguments the recipe
     gives an LM objective and trains, with no edit to the recipe."""
-    import lm_objectives  # noqa: F401 (a run names a package outside Dew once it is imported)
+    # A run names a package outside Dew once it is imported.
+    importlib.import_module("lm_objectives")
 
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     config = run_config(tokens, "--trainer.steps", "1", "--trainer.name", "own", "--objective",
