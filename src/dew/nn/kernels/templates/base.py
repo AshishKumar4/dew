@@ -79,7 +79,10 @@ class Template[Config: Hashable](tuning.KernelOp):
         the budget: the template's own requirements refuse the call before it reaches a launch."""
         fits = self.fits(ba, target)
         if not fits:
-            least = min((self.staged_bytes(ba, config, target) for config in self.space(ba)), default=None)
+            # The least any config whose threads hold their registers stages; None where none does.
+            held = (config for config in self.space(ba)
+                    if (self.registers(ba, config) or 0) <= self.register_budget(config))
+            least = min((self.staged_bytes(ba, config, target) for config in held), default=None)
             raise Unfitted(type(self).__name__, least, generation.shared_budget(target), target.generation)
         return fits
 
@@ -121,12 +124,15 @@ def dividing[C](configs: Sequence[C], extents: tuple[int, ...],
 
 
 class Unfitted(ValueError):
-    """A call no config of a launch holds: its programs stage at least `least` bytes of shared memory
-    (None where the launch declares no config), past the `budget` a block of `generation` holds."""
+    """A call no config of a launch holds: its programs stage at least `least` bytes of shared memory,
+    past the `budget` a block of `generation` holds, or (`least` None) no config's threads hold their
+    registers (`Template.register_budget`), or the launch declares none."""
 
     def __init__(self, launch: str, least: int | None, budget: int, generation: str):
-        super().__init__(f"{launch}'s programs stage at least {least} bytes of shared memory for this "
-                         f"call, past the {budget} a block of {generation} holds")
+        super().__init__(f"{launch}'s programs stage at least {least} bytes of shared memory for this call, "
+                         f"past the {budget} a block of {generation} holds" if least is not None else
+                         f"no config of {launch} holds this call within a thread's registers or a block of "
+                         f"{generation}")
         self.launch, self.least, self.budget, self.generation = launch, least, budget, generation
 
     def __reduce__(self):

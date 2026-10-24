@@ -527,8 +527,10 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     """A call as this mainloop takes it at `tiles`: padded to the program's blocks (`padded_call`, `_block`)
     and its heads to whole swizzled rows (`_columns`), with its `algebra.Forward` (every form guarding its
     sums where its values can overflow them, the fold its logits' reach, `algebra.walked_launches`) and the
-    arrays its programs read beside the operands (`_Spans`, `_Hooked`). Its legality is `refused`'s, which
-    the op's eligibility reads."""
+    arrays its programs read beside the operands (`_Spans`, `_Hooked`). A call it takes none of is refused
+    (`refused`, which the op's eligibility reads too)."""
+    if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family):
+        raise NotImplementedError(reason)
     call = padded_call(query, key, value, spans, hooks, _block(tiles))
     spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=scale,
                            score_mod=hooks.score_mod, natural=natural, headroom=algebra.headroom(value.dtype),
@@ -1155,6 +1157,9 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         family = BUNDLES[config.family]
         spans = self.spans(start, end, query_ids, key_ids)
         hooks = Hooks(self.score_mod, tuple(map(Param, score_params, self.score_kinds)), initial)
+        if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=True,
+                             family=family):
+            raise NotImplementedError(reason)
         spec = algebra.Forward(spans.form, spans.keys, ids=query_ids is not None, scale=self.scale,
                                score_mod=self.score_mod, natural=self.natural, initial=initial is not None,
                                queries=start.shape[1])
