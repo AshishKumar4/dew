@@ -1986,6 +1986,37 @@ def mode_mixed_validity(args) -> dict:
     }
 
 
+def mode_sequence_hybrid(args) -> dict:
+    """One training step of a small hybrid decoder, Mamba-2 and attention layers, split two ways over
+    the sequence across the pool. No producer pads, so the pool fills validity all true on every
+    process (`filled_validity`), which Mamba-2 under a sequence axis once refused: each process
+    reports the loss and its largest update."""
+    import jax
+    import jax.numpy as jnp
+    import optax
+
+    from dew.nn.inputs import ModelInputs
+    from dew.objectives.lm import LMObjective
+    from dew.registry import models
+    from dew.training import Layout, MeshSpec, Trainer
+
+    length = 16
+    mamba = {"mixer": {"class": "mamba2", "fields": {"num_heads": 4, "head_dim": 16, "state_size": 8,
+                                                     "n_groups": 1, "chunk_size": 8}}}
+    model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=4, num_heads=4,
+                         num_kv_heads=2, mlp_features=64, max_seq_len=length,
+                         layer_types=("mamba", "attention") * 2, kinds={"mamba": mamba, "attention": {}})
+    trainer = Trainer(LMObjective(model, length), optax.sgd(MIXED_RATE), key=jax.random.key(0),
+                      mesh=MeshSpec(fsdp=args.fsdp_size, sequence=2), layout=Layout(min_shard=TINY),
+                      checkpoints=None, tracker=None)
+    rank, rows = jax.process_index(), BATCH // jax.process_count()
+    tokens = np.random.default_rng(0).integers(0, VOCAB, size=(BATCH, length + 1)).astype(np.int32)
+    mine = tokens[rank * rows:(rank + 1) * rows]
+    trained = mixed_validity_step(trainer, {"text": ModelInputs(jnp.asarray(mine))})
+    return {"loss": trained["loss"], "placed_fields": trained["placed_fields"],
+            "update_scale": max(float(np.max(np.abs(leaf))) for leaf in trained["update"].values())}
+
+
 def mode_decoding_components(args) -> dict:
     """Decoding components over a pool, and the disagreements it has to refuse.
 
@@ -2409,6 +2440,7 @@ MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget,
          "continuations": mode_continuations,
          "decoding_components": mode_decoding_components,
          "rollout": mode_rollout, "mixed_validity": mode_mixed_validity,
+         "sequence_hybrid": mode_sequence_hybrid,
          "replicated_rollout": mode_replicated_rollout,
          "steps": mode_steps, "fit": mode_fit, "validate": mode_validate,
          "tracked": mode_tracked, "pipeline": mode_pipeline,

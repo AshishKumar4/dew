@@ -256,6 +256,8 @@ def test_padded_rows_preserve_the_state_and_the_history(reference, geometry):
 
 
 SPLIT_ROWS = {
+    # Every slot real, as a pool of processes fills validity where no producer padded.
+    "all_valid": (np.ones(32, bool), None),
     # Right-padded: real tokens first, the tail padding inside the last two shards.
     "right_padded": (np.arange(32) < 21, None),
     # Left-padded: a prompt's padding in front, across the first shard and into the second.
