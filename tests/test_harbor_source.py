@@ -57,15 +57,26 @@ def test_gateway_readiness_rejects_an_answer_after_its_deadline(slow_endpoint):
 
 def test_gateway_readiness_checks_both_endpoints_within_its_budget():
     probes = []
+    closed = []
+
+    class UnreadBody(httpx.SyncByteStream):
+        def __iter__(self):
+            raise RuntimeError("readiness must not wait for a response body")
+
+        def close(self):
+            closed.append(self)
 
     def network(request):
         probes.append(request)
-        return httpx.Response(200, json={"healthy": 1} if request.url.path == "/health/workers" else {})
+        return httpx.Response(200, stream=UnreadBody())
 
     with httpx.Client(transport=httpx.MockTransport(network), timeout=30) as client:
         Gateway("http://gateway", client=client).ready(timeout=10)
     assert [request.url.path for request in probes] == ["/health/workers", "/v1/models"]
     assert 0 < probes[1].extensions["timeout"]["read"] <= probes[0].extensions["timeout"]["read"] <= 10
+    assert len(closed) == len(probes)
+
+
 KEY = jax.random.key(0)
 
 
