@@ -11,8 +11,9 @@ this machine installs (`machine_lock`). Checkouts whose three files agree share
 one environment; a caller runs each checkout's own code with its `src` first on
 PYTHONPATH, ahead of the Dew the environment holds. The second prints the
 Python of a reference environment (torch's, an engine's): INSTALL, uv pip
-install's arguments, installed into CACHE/NAME-<digest of INSTALL, a
-requirements file's lines in place of its path> (`reference`).
+install's arguments, installed into CACHE/NAME-<digest of INSTALL, the lines
+of each file it reads (requirements, constraints, overrides) in place of its
+path> (`reference`).
 
 The standard library alone, so it runs on a machine that holds no environment
 yet: tools/perf_gate.py builds each tree's with it, and so do GPU sessions.
@@ -92,12 +93,18 @@ def environment(tree: Path, lock: str, cache: Path = CACHE) -> Path:
                  cwd=tree)
 
 
+FILED = ("-r", "--requirements", "-c", "--constraint", "--constraints", "--override", "--overrides")
+"""uv pip install's options whose argument is a file it reads: a reference is named by those files' lines."""
+
+
 def reference(name: str, install: list[str], python: str = "3.12", cache: Path = CACHE) -> Path:
     """The Python of the reference environment CACHE/`name`-<installation> (`built`): `install`, uv pip
-    install's arguments, at Python `python`. The installation's digest (its arguments, a requirements file's
-    lines in place of its path, and its Python where that is not 3.12, whose names predate the choice) names
-    it, so a changed installation is built anew beside the old one, which a running job may hold."""
-    named = [Path(argument).read_text() if previous == "-r" else argument
+    install's arguments, at Python `python`. The installation's digest (its arguments, the lines of each file
+    it reads in place of its path (`FILED`: a requirements, constraints or overrides file, so a changed
+    override builds anew as a changed requirement does), and its Python where that is not 3.12, whose names
+    predate the choice) names it, so a changed installation is built anew beside the old one, which a
+    running job may hold."""
+    named = [Path(argument).read_text() if previous in FILED else argument
              for previous, argument in zip(["", *install], install, strict=False)]
     named += [] if python == "3.12" else [f"python {python}"]
     digest = hashlib.sha256(json.dumps(named).encode()).hexdigest()[:12]
