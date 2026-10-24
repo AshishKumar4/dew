@@ -94,6 +94,11 @@ class ProjectorBase(nn.Module):
 
     checkpoint: ClassVar[ProjectorLayout | None] = None
 
+    @property
+    def input_width(self) -> int | None:
+        """Declared feature width when this projector consumes raw media without an encoder."""
+        return None
+
 def head_width(hidden_size: int, num_heads: int) -> int:
     """Each head's width where `num_heads` split a tower's `hidden_size`
     evenly, and a refusal where they leave a remainder."""
@@ -119,6 +124,8 @@ class TowerGeometry:
     block_size: int | None = None
     channels: int | None = None
     mel_features: int | None = None
+    position_size: int | None = None
+    retains_patch_slots: bool = False
 
 
 class TowerBase:
