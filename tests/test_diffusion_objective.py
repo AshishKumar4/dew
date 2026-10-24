@@ -526,8 +526,9 @@ def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_on
     # The whole batch's step.
     alone = float32_update(as_a_step(trainer, initial.variables, halves[0],
                                      lambda variables: objective_gradient(objective, variables, whole, info)))
+    truth = float64_gradient(twin, info)
     assert_as_exact(pooled, alone, moved_weights(template.variables), "pooled update", seeds=POOLED_SEEDS,
-                    truth_fn=float64_gradient(twin, float64_pixels(whole), info))
+                    truth_fn=lambda variables: truth(variables, float64_pixels(whole)))
 
 
 HOST_MASTER_SEEDS = 16
@@ -572,6 +573,7 @@ def test_a_host_master_step_draws_each_examples_noise_as_the_resident_step_does(
     resident, template = stepping(Layout(min_shard=1, tolerance=1.))
     info = Step(jnp.asarray(0), jax.random.fold_in(template.key, 0), None,
                 **example_fields(template, 0, 1, batch))
+    truth = float64_gradient(float64_twin(objective), info)
     assert_as_exact(host, resident, moved_weights(template.variables), "host-master update",
                     seeds=HOST_MASTER_SEEDS,
-                    truth_fn=float64_gradient(float64_twin(objective), float64_pixels(batch), info))
+                    truth_fn=lambda variables: truth(variables, float64_pixels(batch)))
