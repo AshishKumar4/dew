@@ -44,7 +44,7 @@ from typing_extensions import TypeIs, TypeVar
 
 from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.nn.kernels.options import compiler_options
-from dew.nn.precision import compensated_sum
+from dew.nn.precision import at_least_fp32, compensated_sum
 from dew.nn.protocols import HiddenStates, ProjectsParameters
 from dew.nn.sharding import rows_taken
 from dew.records import JSON, strings
@@ -111,7 +111,7 @@ class Ratio:
         """
         mass = jax.lax.stop_gradient(self.mass)
         active = mass > 0
-        dtype = jnp.result_type(self.total.dtype, mass.dtype, jnp.float32)
+        dtype = at_least_fp32(jnp.result_type(self.total.dtype, mass.dtype))
         value = self.total.astype(dtype) / jnp.where(active, mass.astype(dtype), 1)
         return jnp.where(active, value, 0), active
 
@@ -1134,7 +1134,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         batch-wide term computed through this count each real record once. Without
         `VALID_ROWS`, as in training, this is the sum (`compensated_sum`) and the size.
         """
-        dtype = jnp.promote_types(values.dtype, jnp.float32)
+        dtype = at_least_fp32(values.dtype)
         axes = (tuple(range(values.ndim)) if axis is None
                 else (axis,) if isinstance(axis, int) else tuple(axis))
         if VALID_ROWS not in batch:
@@ -1215,7 +1215,7 @@ class Objective(ABC, Generic[Loss, Effects]):
             return stats.mean()
         if isinstance(stats, (jax.Array, float, int)):
             value = jnp.asarray(stats)
-            value = value.astype(jnp.promote_types(value.dtype, jnp.float32))
+            value = value.astype(at_least_fp32(value.dtype))
             if value.ndim != 0:
                 raise ValueError("a unit-mass loss must be scalar")
             return value, jnp.asarray(a=True)
