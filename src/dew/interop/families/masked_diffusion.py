@@ -15,11 +15,13 @@ from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
     FUSED_EXPERTS,
+    PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
     Packed,
     Renames,
     Ropes,
+    RopeSpelling,
     base_config,
     decoder_tensors,
     plain_partial_rope,
@@ -150,7 +152,9 @@ def _llada_geometry(hf_config: Mapping[str, object]) -> Mapping[str, object]:
         "rms_norm_eps": records.number(
             values.get("rms_norm_eps", 1e-6), "rms_norm_eps"
         ),
-        "rope_theta": records.number(values.get("rope_theta", 500000.0), "rope_theta"),
+        # The pinned LLaDA-8B's ModelConfig, which LLaDAConfig starts from, sets 10000; the release
+        # states its own 500000.
+        "rope_theta": records.number(values.get("rope_theta", 10000.0), "rope_theta"),
         "attention_bias": bool(values.get("attention_bias", False)),
         "tie_word_embeddings": bool(values.get("tie_word_embeddings", False)),
         "hidden_act": values.get("hidden_act", "silu"),
@@ -234,13 +238,18 @@ def _llada_refusals(hf_config: Mapping[str, object], used: set[str],
         refuse('embedding_size', f'it names {embedding} rows for a {vocab} vocabulary')
 
 
-def _moe_decoder(hf_config: Mapping[str, object], used: set[str], *,
-                 qk_norm: bool, intermediate: int, default_rotary: float = 1.0) -> DecoderFields:
-    """The released MoE decoders' shared pre-norm GQA and sliced rotate-half rope."""
+def _moe_decoder(hf_config: Mapping[str, object], used: set[str], *, qk_norm: bool, intermediate: int,
+                 rope_defaults: tuple[RopeSpelling, float] | None) -> DecoderFields:
+    """The released MoE decoders' shared pre-norm GQA and sliced rotate-half rope.
+
+    `rope_defaults` is the config class's base and factor for a config that states neither, or None
+    for a class whose defaults are no rotary at all: LLaDA-MoE's and LLaDA-MoE v2's default both to
+    -1 (configuration_lladamoe.py:32-33), so their configs state them."""
     if hf_config.get('rope_scaling') is not None:
         refuse('rope_scaling', 'the released MoE checkpoints use plain rotary positions')
-    theta, factor = plain_partial_rope(hf_config, default_factor=default_rotary,
-                                      reference='LLaDA MoE rotary')
+    spelling, rotary = (None, None) if rope_defaults is None else rope_defaults
+    theta, factor = plain_partial_rope(hf_config, spelling, default_factor=rotary,
+                                       reference='LLaDA MoE rotary')
     used.update(('rope_theta', 'rope_scaling', 'rope_parameters', 'partial_rotary_factor'))
     layers = record_int(hf_config, 'num_hidden_layers')
     config = base_config({'rms_norm_eps': 1e-5, **hf_config, 'intermediate_size': intermediate}, used,
@@ -263,7 +272,7 @@ def _llada_moe_config(hf_config: Mapping[str, object], used: set[str], *,
     class is not the class its DecoderLayer instantiates.
     """
     config = _moe_decoder(hf_config, used, qk_norm=bool(hf_config.get('qk_layernorm')),
-                           intermediate=record_int(hf_config, 'dense_intermediate_size'))
+                           intermediate=record_int(hf_config, 'dense_intermediate_size'), rope_defaults=None)
     used.update(('dense_intermediate_size', 'expert_intermediate_size',
                  'shared_expert_intermediate_size', 'moe_layer_freq', 'qk_layernorm',
                  'clip_qkv', 'num_experts', 'num_experts_per_tok', 'norm_topk_prob',
@@ -320,7 +329,9 @@ def _llada2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     block = (record_int(hf_config, 'block_size', 32)
              if 'block_size' in hf_config or 'expert_capacity' in hf_config else None)
     config = _moe_decoder(hf_config, used, qk_norm=bool(hf_config.get('use_qk_norm', block is None)),
-                           intermediate=record_int(hf_config, 'intermediate_size'), default_rotary=0.5)
+                           intermediate=record_int(hf_config, 'intermediate_size'),
+                           # LLaDA2MoeConfig's defaults (configuration_llada2_moe.py:29, :46).
+                           rope_defaults=(PLAIN_SPELLING, 0.5))
     config.update(attention_bias=bool(hf_config.get('use_qkv_bias', False)),
                   o_proj_bias=bool(hf_config.get('use_bias', True)))
     used.update(('use_qkv_bias', 'use_qk_norm', 'use_bias', 'num_experts', 'num_shared_experts',

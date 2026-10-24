@@ -1454,6 +1454,50 @@ def mode_training_contract(args) -> dict:
             "scale": float(resumed.scale.scale)}
 
 
+def mode_replicated_rollout(args) -> dict:
+    """One synchronous sampled rollout where both processes read the one data share (`tensor`
+    across them), its reward stochastic and different on each process. The share's first reader
+    scores and packs; the other enters the draw, scores nothing and trains on the first reader's
+    rows."""
+    import jax
+    import jax.numpy as jnp
+    import optax
+    from jax.experimental import multihost_utils
+
+    from dew.data.dataset import DataPartition
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.rl import GRPOObjective, RolloutScheduler
+    from dew.sampling import Sampling
+    from dew.training import Layout, MeshSpec, Trainer
+
+    rank, processes = jax.process_index(), jax.process_count()
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
+                              head_dim=8, mlp_features=32, max_seq_len=12,
+                              dtype="float32", attention_impl="xla")
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    drawn = np.random.default_rng(rank)
+    scored = []
+
+    def reward(text, record):
+        scored.append(text)
+        return float(drawn.random())
+
+    objective = GRPOObjective(model, seq_len=7, variables=params)
+    rollout = RolloutScheduler.sampled(objective, reward, groups=2, max_new_tokens=4,
+                                       sampling=Sampling(temperature=0.8, top_k=5, pad_token_id=12))
+    trainer = Trainer(objective, optax.sgd(0.01), key=jax.random.key(5), mesh=MeshSpec(tensor=processes),
+                      layout=Layout(min_shard=TINY), rollout=rollout)
+    state, _, _ = trainer.place()
+    partition = DataPartition.of(trainer.device_mesh)
+    packed = rollout(state, rollout_prompts(), jax.random.key(9))
+    handed = {name: np.asarray(multihost_utils.process_allgather(np.asarray(packed[name])))
+              for name in ("input_ids", "response_mask", "advantages", "old_log_probs")}
+    rewarded = multihost_utils.process_allgather(np.asarray(len(scored), np.int64))
+    return {"partition": {"count": partition.count, "readers": partition.readers},
+            "rewarded": np.asarray(rewarded).tolist(),
+            "handed": {name: value.tolist() for name, value in handed.items()}}
+
+
 def rollout_prompts() -> dict:
     """Eight left-padded prompts whose lengths and EOS timing differ by rank.
 
@@ -1550,7 +1594,7 @@ def mode_rollout(args) -> dict:
 
     from dew.data.dataset import Loader
     from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.objectives.rl import GRPOObjective, SampledRollout
+    from dew.objectives.rl import GRPOObjective, RolloutScheduler
     from dew.sampling import Sampling, generate
     from dew.training import Layout, MeshSpec, Trainer
 
@@ -1570,8 +1614,8 @@ def mode_rollout(args) -> dict:
     eos = int(np.asarray(greedy.tokens)[0, 4])
     sampling = Sampling(temperature=0, eos_token_ids=eos, pad_token_id=12)
     objective = GRPOObjective(model, seq_len=7, variables=params)
-    rollout = SampledRollout(objective, lambda text, record: float(len(text)),
-                             groups=2, max_new_tokens=4, sampling=sampling)
+    rollout = RolloutScheduler.sampled(objective, lambda text, record: float(len(text)),
+                                       groups=2, max_new_tokens=4, sampling=sampling)
     trainer = Trainer(objective, optax.sgd(0.01), key=jax.random.key(5),
                       mesh=MeshSpec(fsdp=args.fsdp_size), layout=Layout(min_shard=TINY),
                       rollout=rollout)
@@ -1828,8 +1872,8 @@ def mixed_token_lengths() -> np.ndarray:
 def mixed_validity_inputs(prompts: np.ndarray, lengths: np.ndarray, *, explicit: bool):
     """What a host producer hands generation for these left-padded rows.
 
-    A producer that padded nothing omits validity, the way `SampledRollout`
-    does from the lengths it already holds. `explicit` spells the field out
+    A producer that padded nothing omits validity, the way `PolicyCollector`
+    does (`pad_token_rows`). `explicit` spells the field out
     on every row instead, which is the reference a pool has to reproduce.
     """
     import jax.numpy as jnp
@@ -2366,6 +2410,7 @@ MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget,
          "continuations": mode_continuations,
          "decoding_components": mode_decoding_components,
          "rollout": mode_rollout, "mixed_validity": mode_mixed_validity,
+         "replicated_rollout": mode_replicated_rollout,
          "steps": mode_steps, "fit": mode_fit, "validate": mode_validate,
          "tracked": mode_tracked, "pipeline": mode_pipeline,
          "training_contract": mode_training_contract,

@@ -22,7 +22,7 @@ from flax.traverse_util import flatten_dict
 from dew import records
 from dew._model_types import SANDWICH_NORMS
 from dew.interop.config_records import NativeFields, native_fields
-from dew.interop.safetensors_io import LazyTensors
+from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.streaming import WeightLayout
 from dew.nn.activations import GatedActivation, Situ
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -399,26 +399,63 @@ def read_rope_theta(entry: Mapping[str, object] | None, field: str) -> float | N
     return rope.theta
 
 
-def partial_rope(hf_config: Mapping[str, object], *, default_factor: float, default_theta: float = 10000.0,
-                 factor_field: str = 'partial_rotary_factor',
+@dataclass(frozen=True)
+class RopeSpelling:
+    """How a family's config class turns the stored rope fields into its
+    rope records, as its `convert_rope_params_to_dict` does (transformers
+    v5.16.1 modeling_rope_utils.py:742-797 and the overrides named below)."""
+
+    theta: float = 10000.0
+    """The class's `default_theta`: the base an omitted rope_theta means."""
+    per_kind: bool = False
+    """The class keeps a record per layer type whatever the file spells, and
+    a legacy rope_scaling updates the full_attention record in place
+    (configuration_gemma3.py:136-163, configuration_gemma3n.py:179-206,
+    configuration_olmo3.py:101-126). Otherwise a rope_scaling replaces
+    rope_parameters whole, and a record nests only where its keys are
+    layer types."""
+    local_theta: float | None = None
+    """A per-kind class's default base for its sliding record."""
+    legacy_kinds: tuple[str, ...] = ('full_attention',)
+    """The records a per-kind class updates from a legacy rope_scaling: the full layers' alone
+    (Gemma 3, Gemma 3n, OLMo 3), or both kinds' (ModernBERT, configuration_modernbert.py:134-136)."""
+    local_field: str | None = None
+    """The flat field a per-kind class reads its sliding base from
+    (Gemma 3's rope_local_base_freq)."""
+
+
+PLAIN_SPELLING = RopeSpelling()
+"""The mixin's own spelling, which most config classes keep: one record, at 10000 when unnamed."""
+
+
+def partial_rope(hf_config: Mapping[str, object], spelling: RopeSpelling | None, *,
+                 default_factor: float | None, factor_field: str = 'partial_rotary_factor',
                  theta_field: str = 'rope_theta') -> tuple[float, float, Mapping[str, object]]:
     """(rope_theta, partial_rotary_factor, the rest of the rotary's entry) of a config: the
     `rope_parameters` entry's values, else the flat fields under the family's spellings (GPT-NeoX's
-    `rotary_emb_base` and `rotary_pct`), else the defaults. The rest is the entry without its
-    factor, which a family whose rotary may scale hands `base_config`'s rope reader."""
+    `rotary_emb_base` and `rotary_pct`), else the config class's defaults: its `spelling`'s base, as
+    `rope_records` reads it, and `default_factor`. A None default is a class that has none, whose
+    config states the value or is refused. The rest is the entry without its factor, which a family
+    whose rotary may scale hands `base_config`'s rope reader."""
     entry = records.record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
-    theta = records.number(entry.get('rope_theta', hf_config.get(theta_field, default_theta)), theta_field)
-    factor = records.number(entry.get('partial_rotary_factor', hf_config.get(factor_field, default_factor)),
-                            factor_field)
+
+    def stated(key: str, field: str, default: float | None) -> float:
+        value = entry.get(key, hf_config.get(field, default))
+        if value is None:
+            refuse(f"a config without {field}", "its config class has no default for it")
+        return records.number(value, field)
+    theta = stated('rope_theta', theta_field, None if spelling is None else spelling.theta)
+    factor = stated('partial_rotary_factor', factor_field, default_factor)
     return theta, factor, {key: value for key, value in entry.items() if key != 'partial_rotary_factor'}
 
 
-def plain_partial_rope(hf_config: Mapping[str, object], *, default_factor: float, reference: str,
-                       layout: tuple[str, ...] = (), default_theta: float = 10000.0) -> tuple[float, float]:
+def plain_partial_rope(hf_config: Mapping[str, object], spelling: RopeSpelling | None, *,
+                       default_factor: float | None, reference: str,
+                       layout: tuple[str, ...] = ()) -> tuple[float, float]:
     """(rope_theta, partial_rotary_factor) of a config whose rotary is plain (`partial_rope`), with
     `layout` the entry's fields that place the rotated pairs. A scaled type or any other field
     refuses, naming `reference`'s rotary."""
-    theta, factor, rest = partial_rope(hf_config, default_factor=default_factor, default_theta=default_theta)
+    theta, factor, rest = partial_rope(hf_config, spelling, default_factor=default_factor)
     rope_type = rest.get('rope_type', rest.get('type', 'default'))
     if rope_type not in ('default', 'none'):
         refuse(f"rope_parameters (rope_type {rope_type!r})", f"{reference} is the plain rotary")
@@ -440,32 +477,6 @@ class Ropes:
     local_theta: float | None = None
     local_scaling: Ramp | None = None
     full_only: bool = False
-
-
-@dataclass(frozen=True)
-class RopeSpelling:
-    """How a family's config class turns the stored rope fields into its
-    rope records, as its `convert_rope_params_to_dict` does (transformers
-    v5.16.1 modeling_rope_utils.py:742-797 and the overrides named below)."""
-
-    theta: float = 10000.0
-    """The class's `default_theta`: the base an omitted rope_theta means."""
-    per_kind: bool = False
-    """The class keeps a record per layer type whatever the file spells, and
-    a legacy rope_scaling updates the full_attention record in place
-    (configuration_gemma3.py:136-163, configuration_gemma3n.py:179-206,
-    configuration_olmo3.py:101-126). Otherwise a rope_scaling replaces
-    rope_parameters whole, and a record nests only where its keys are
-    layer types."""
-    local_theta: float | None = None
-    """A per-kind class's default base for its sliding record."""
-    local_field: str | None = None
-    """The flat field a per-kind class reads its sliding base from
-    (Gemma 3's rope_local_base_freq)."""
-
-
-PLAIN_SPELLING = RopeSpelling()
-"""The mixin's own spelling, which most config classes keep: one record, at 10000 when unnamed."""
 
 
 def rope_records(hf_config: Mapping[str, object], spelling: RopeSpelling
@@ -490,6 +501,8 @@ def rope_records(hf_config: Mapping[str, object], spelling: RopeSpelling
         full.setdefault('rope_theta', spelling.theta if base is None else base)
         sliding = dict(records.record((record.get('sliding_attention') if nested else None)
                                       or {'rope_type': 'default'}, 'rope_parameters.sliding_attention'))
+        if scaling is not None and 'sliding_attention' in spelling.legacy_kinds:
+            sliding.update(records.record(scaling, 'rope_scaling'))
         local = hf_config.get(spelling.local_field) if spelling.local_field is not None else None
         sliding.setdefault('rope_theta', local if local is not None else
                            spelling.local_theta if spelling.local_theta is not None else full['rope_theta'])
@@ -508,12 +521,14 @@ def rope_records(hf_config: Mapping[str, object], spelling: RopeSpelling
     return (field, {**record, 'rope_theta': record.get('rope_theta', theta)}), None
 
 
-def read_rope(hf_config: Mapping[str, object], used: set, yarn_max_pos: int | None = None,
-              spelling: RopeSpelling = PLAIN_SPELLING, *,
-              ramps: tuple[str, ...] | None = None, per_kind: bool = True) -> Ropes:
+def read_rope(hf_config: Mapping[str, object], used: set, spelling: RopeSpelling, *,
+              yarn_max_pos: int | None = None, ramps: tuple[str, ...] | None = None,
+              per_kind: bool = True) -> Ropes:
     """Read the rope of any HF spelling as the family's config class resolves it.
 
-    The class's records come first (`RopeSpelling`): flat rope_theta with a
+    `spelling` is the class's own (its `default_theta` among it), which every
+    family states: no class's default stands in for another's. The class's
+    records come first (`RopeSpelling`): flat rope_theta with a
     rope_scaling or rope_parameters beside it, Gemma 3's rope_local_base_freq,
     and per-layer-type records all land as one effective record per kind,
     a record that names its type as plain clearing an earlier ramp. Each is
@@ -680,8 +695,8 @@ def context_lengths(hf_config: Mapping[str, object], default: int | None = None)
 
 
 def base_config(hf_config: Mapping[str, object], used: set[str], *,
+                 rope: Ropes | RopeSpelling,
                  layer_types: tuple[str, ...] | None = None,
-                 rope: Ropes | None = None,
                  qk_norm: bool = False, scale_after_cast: bool = True,
                  tie_embeddings: bool = False,
                  reads: frozenset[str] = frozenset({'layer_types', 'sliding_window', 'attention_bias'})
@@ -716,7 +731,7 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
         refuse(f"hidden_act {activation!r}",
                 f"the gated MLP supports {sorted(ACTIVATIONS)}")
 
-    ropes = read_rope(hf_config, used) if rope is None else rope
+    ropes = read_rope(hf_config, used, rope) if isinstance(rope, RopeSpelling) else rope
     rope_theta, rope_local_theta = ropes.theta, ropes.local_theta
     if 'layer_types' in reads:
         layer_types = specified_layer_types(hf_config, used, layer_types)
@@ -823,8 +838,20 @@ def translate_family_config(hf_config: Mapping[str, object],
     if not family.bidirectional and bidirectional and bidirectional != 'vision':
         refuse(f"use_bidirectional_attention={bidirectional!r}", "the backbone is causal")
     used = {'model_type', 'use_bidirectional_attention', 'num_hidden_layers'}
-    # An omitted field is the config class's default; an explicit null stays null.
-    config = family.translate_config({**family.defaults, **hf_config}, used)
+    # A field spelled under its class's alias is that field (`DecoderFamily.aliases`); an omitted
+    # field is the config class's default, and an explicit null stays null. Both are the family's own
+    # class's: a type verified as the family (`dew.interop.verify`) brings a class of its own, whose
+    # defaults its probe compares.
+    own = hf_config.get('model_type') in family.model_types
+    spelled = dict(hf_config)
+    for alias, canonical in (family.aliases if own else {}).items():
+        if alias in spelled:
+            value = spelled.pop(alias)
+            if canonical in spelled and spelled[canonical] != value:
+                refuse(f"{alias}={value!r} beside {canonical}={spelled[canonical]!r}", "they name one field")
+            spelled[canonical] = value
+            used.add(alias)
+    config = family.translate_config({**(family.defaults if own else {}), **spelled}, used)
 
     return config, _unread(hf_config, used)
 
@@ -1362,8 +1389,7 @@ def layout_tensors(layouts: Mapping[str, WeightLayout], variables: Mapping[str, 
     """The layouts' tensors and `retained` beside them, each built when it is
     read, so a sharded writer holds one shard of the export, not all of it."""
     kept = retained or {}
-    specs = {**{name: jax.ShapeDtypeStruct(np.shape(value), np.asarray(value).dtype)
-                for name, value in kept.items()},
+    specs = {**tensor_specs(kept),
              **{name: jax.ShapeDtypeStruct(layout.shape, layout.stored_dtype(variables, scalar_mode))
                 for name, layout in layouts.items()}}
     return LazyTensors(specs, lambda name: (
@@ -1686,6 +1712,9 @@ class DecoderFamily:
     omits them, which the shared readers would otherwise default for every
     family alike: Gemma's GELU, Gemma 2's caps and query scalar, OLMo 3's
     norm epsilon. Rope bases are the class's `RopeSpelling`."""
+    aliases: Mapping[str, str] = field(default_factory=dict)
+    """The config class's `attribute_map`: another spelling of a field, read as that field before
+    `defaults` fill what neither spells."""
     bidirectional: bool = False
     """The family's decoder attends both ways by construction, as the masked diffusion families'
     do (LLaDA's bidirectional bias, Dream's hard-coded is_causal=False, DiffusionGemma's decoder):

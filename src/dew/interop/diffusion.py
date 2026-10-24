@@ -202,7 +202,7 @@ def _unet_path(name: str, rank: int) -> tuple[str, ...]:
         parts = parts[2:]
         kind = parts.pop(0)
         if kind in ("attn1", "attn2"):
-            path.append("self_attention" if kind == "attn1" else "cross_attention")
+            path.append("Attention1" if kind == "attn1" else "Attention2")
             projection = parts.pop(0)
             if projection == "to_out" and parts == ["0"]:
                 path.append("to_out_0")
@@ -214,7 +214,7 @@ def _unet_path(name: str, rank: int) -> tuple[str, ...]:
         elif kind == "ff":
             # diffusers' GEGLU projection, the up half first, and its output map
             # (`dew.nn.mlp.geglu_feed_forward`).
-            path.append("feed_forward")
+            path.append("ff")
             if parts == ["net", "0", "proj"]:
                 path.append("gate_up_proj")
             elif parts == ["net", "2"]:
@@ -223,7 +223,7 @@ def _unet_path(name: str, rank: int) -> tuple[str, ...]:
                 raise ValueError(f"Unknown UNet feed-forward tensor {name}")
             parts = []
         elif kind in ("norm1", "norm2", "norm3"):
-            path.append({"norm1": "self_norm", "norm2": "cross_norm", "norm3": "ff_norm"}[kind])
+            path.append(kind)
         else:
             raise ValueError(f"Unknown UNet transformer tensor {name}")
     names = {"time_emb_proj": "temb_projection", "conv_shortcut": "residual_conv",
@@ -254,7 +254,7 @@ def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondi
         stored = np.asarray(tensor)
         dtype = checkpoint_dtype(stored.dtype, param_dtype)
         kernel = path[-1] == "kernel"
-        attention = "self_attention" in path or "cross_attention" in path
+        attention = "Attention1" in path or "Attention2" in path
         if lazy and not (kernel and (stored.ndim == 4 or attention)):
             if owners[path] == name:
                 # Equal source aliases add export names without another leaf.
@@ -294,7 +294,7 @@ def unet_layouts(shapes: Mapping[str, tuple[int, ...]], model: UNet2DCondition) 
         transpose = None
         if path[-1] == "kernel":
             transpose = (3, 2, 0, 1) if len(shape) == 4 else (1, 0)
-            if "self_attention" in path or "cross_attention" in path:
+            if "Attention1" in path or "Attention2" in path:
                 transpose = (1, 2, 0) if path[-2] in ("to_q", "to_k", "to_v") else (2, 0, 1)
         layouts.append(WeightLayout("unet/" + name, (("params", *path),), tuple(shape), transpose))
     return tuple(layouts)
@@ -903,7 +903,7 @@ def save_source(source, values, destination: Path, max_shard_size: int | str) ->
     `from_flax` conversion, which reads the msgpack, takes a folder without them
     (modeling_utils.py:1109-1113, 0.34.0)."""
     from dew.interop.decoder_parts import layout_tensors
-    from dew.interop.safetensors_io import save_sharded
+    from dew.interop.safetensors_io import LazyTensors, save_sharded, tensor_specs
     written = {path for layout in source.weight_layouts for path in layout.paths}
     leaves = [tuple(str(key.key) for key in path) for path, _ in jax.tree_util.tree_leaves_with_path(values)]
     unwritten = ["/".join(path) for path in leaves if path not in written]
@@ -937,15 +937,19 @@ def save_source(source, values, destination: Path, max_shard_size: int | str) ->
     for layout in source.weight_layouts:
         component, _, name = layout.name.partition("/")
         layouts.setdefault(component, {})[name] = layout
-    retained: dict[str, dict[str, np.ndarray]] = {}
-    for source_name, tensor in source.retained_tensors.items():
+    retained: dict[str, dict[str, str]] = {}
+    specifications = tensor_specs(source.retained_tensors)
+    for source_name in specifications:
         component, _, name = source_name.partition("/")
         if name not in layouts.get(component, {}):
-            retained.setdefault(component, {})[name] = tensor
+            retained.setdefault(component, {})[name] = source_name
     for component in dict.fromkeys((*layouts, *retained)):
         # Each tensor is built as the shard that holds it is written, so the host
         # holds one shard of the export (`save_sharded`).
-        tensors = layout_tensors(layouts.get(component, {}), values, retained=retained.get(component))
+        names = retained.get(component, {})
+        carried = LazyTensors({name: specifications[original] for name, original in names.items()},
+                              lambda name, names=names: source.retained_tensors[names[name]])
+        tensors = layout_tensors(layouts.get(component, {}), values, retained=carried)
         weights = "diffusion_pytorch_model" if component in ("unet", "vae", "transformer") else "model"
         save_sharded(tensors, destination / component, max_shard_size, stem=weights)
         declared = index.get(component)

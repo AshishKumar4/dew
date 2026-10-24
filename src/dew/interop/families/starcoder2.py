@@ -8,6 +8,7 @@ from functools import partial
 from dew import records
 from dew.interop.decoder_parts import (
     GPT_MLP,
+    PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
     base_config,
@@ -27,7 +28,7 @@ def _starcoder2_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
     # Starcoder2Model masks every layer by the window when one is set.
     window = hf.get('sliding_window')
     # base_config reads the gated activations; the ungated one is set below.
-    config = base_config({**hf, 'hidden_act': 'gelu_pytorch_tanh'}, used,
+    config = base_config({**hf, 'hidden_act': 'gelu_pytorch_tanh'}, used, rope=PLAIN_SPELLING,
                          layer_types=('full_attention' if window is None else 'sliding_attention',) * layers,
                          tie_embeddings=True, reads=frozenset({'sliding_window'}))
     biased = bool(hf.get('use_bias', True))

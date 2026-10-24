@@ -19,6 +19,7 @@ from dew.diffusion.process import DenoisingCondition
 from dew.inputs.encoders import ConditionEncoder, ConditionWork
 from dew.nn.blocks import torch_nearest_resize
 from dew.nn.flops import counted_flops, projection_flops
+from dew.nn.precision import accumulated
 from dew.nn.protocols import LayerStates
 from dew.nn.safety import CLIPSafetyHead
 from dew.nn.text_encoders import CLIPTextTransformer, CLIPTowerOutput, T5EncoderTransformer
@@ -285,7 +286,7 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
         return outputs
 
     def _projected(self, params, name: str, pooled):
-        return pooled @ params[name]["text_projection"]["kernel"]
+        return accumulated(jnp.matmul, pooled, params[name]["text_projection"]["kernel"])
 
     def _t5_states(self, params, tokens, rows: int, dtype) -> jax.Array:
         """The T5 segment, or the zero segment SD3 writes without a third encoder.
