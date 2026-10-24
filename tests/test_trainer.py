@@ -70,7 +70,7 @@ def make_trainer(tmp_path=None, objective=None, optimizer=None, keep=3, **kwargs
 class TokenRegression(Regression):
     counts_tokens = True
 
-    def real_lengths(self, batch):
+    def scored_tokens(self, batch):
         return batch["index"] + 1
 
 
@@ -181,7 +181,7 @@ def test_a_step_only_prefix_keeps_lifetime_real_tokens(tmp_path):
 class LargeTokenRegression(Regression):
     counts_tokens = True
 
-    def real_lengths(self, batch):
+    def scored_tokens(self, batch):
         return batch["real_length"]
 
 

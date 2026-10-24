@@ -46,6 +46,8 @@ from dew.nn.inputs import (
     mesh_of,
     prompt_major,
     real_slots,
+    token_id,
+    token_ids,
     token_layout,
 )
 from dew.nn.kernels.options import compiler_options
@@ -354,13 +356,13 @@ def _validate_request(model: nn.Module, process: DiscreteProcess, inputs: ModelI
     # A model that declares no vocabulary or capacity is checked for neither, as text generation does.
     bounded = isinstance(model, Bounded)
     vocab = model.vocab_size if bounded else None
-    if vocab is not None:
-        if type(process.mask_id) is not int or not 0 <= process.mask_id < vocab:
-            raise ValueError("mask_id is outside the vocabulary")
-        if type(pad_id) is not int or not 0 <= pad_id < vocab:
-            raise ValueError("pad_token_id is outside the vocabulary")
-        if any(type(token) is not int or not 0 <= token < vocab for token in eos_ids):
-            raise ValueError("eos_token_ids contain an id outside the vocabulary")
+    # Ids by the one law every parser of them reads; the vocabulary bounds them here.
+    ids = {"mask_id": [token_id(process.mask_id, where="mask_id")],
+           "pad_token_id": [token_id(pad_id, where="pad_token_id")],
+           "eos_token_ids": token_ids(eos_ids, where="eos_token_ids") if eos_ids else []}
+    for name, held in ids.items():
+        if vocab is not None and any(token >= vocab for token in held):
+            raise ValueError(f"{name} holds an id outside the vocabulary")
     if min(inputs.tokens.shape) < 1:
         raise ValueError("masked generation needs nonempty token rows")
     capacity = model.max_seq_len if bounded else None
