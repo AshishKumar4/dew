@@ -235,18 +235,19 @@ class CheckpointBanks(LayerBanks):
         return jax.jit(stack_layers, out_shardings=placement)(*rows)
 
     def _restored(self, placement: Placement) -> Variables:
-        """Restore the variables `placement` names onto its shardings."""
+        """Restore the variables `placement` names onto its shardings, as every load of a run's
+        variables restores them (`Checkpoints.materialized`)."""
         from dew.checkpoints import Checkpoints
 
         shapes = narrowed(self.shapes(), placement)
-        template = {"variables": _typed(shapes, narrowed(placement, shapes))}
+        template, placements = {"variables": shapes}, {"variables": narrowed(placement, shapes)}
         if self.ema:
             averaged = narrowed(self.stored["ema"], placement)
             if averaged:
-                template["ema"] = _typed(averaged, narrowed(placement, averaged))
+                template["ema"], placements["ema"] = averaged, narrowed(placement, averaged)
+        assert self.step is not None
         with Checkpoints(self.directory) as checkpoints:
-            values, _ = checkpoints.restore(template, step=self.step)
-        return merge(values["variables"], values["ema"]) if "ema" in template else values["variables"]
+            return checkpoints.materialized(template, placements, step=self.step)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -642,12 +643,6 @@ def narrowed(tree: Mapping, selection: Mapping) -> dict:
             raise ValueError(f"selection treats subtree {name!r} as a leaf")
         collected[name] = value
     return collected
-
-
-def _typed(shapes: Variables, placement: Placement) -> Variables:
-    return jax.tree.map(
-        lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
-        shapes, placement)
 
 
 def _row_placement(placement: Placement) -> Placement:
