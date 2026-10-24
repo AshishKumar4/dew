@@ -35,11 +35,10 @@ def selects(config) -> bool:
 
 def capture(model):
     """`model`'s forward capturing its discontinuous selections, compiled once: the lightning indexer's
-    scores from its `scores` method and its heads' agreements as it sows them, Gemma 3n's gate
-    from its gated MLP's Dense, a Router's selection scores, group scores and group mask from its own
-    methods, and gpt-oss's and Gemma 4's router logits from their Dense. One compiled forward rather
-    than an op at a time: XLA:CPU's JIT failed to materialize a gather fusion among the many small
-    programs an unjitted capture compiles."""
+    scores from its `scores` method, Gemma 3n's gate from its gated MLP's Dense, a Router's selection
+    scores, group scores and group mask from its own methods, and gpt-oss's and Gemma 4's router logits
+    from their Dense. One compiled forward rather than an op at a time: XLA:CPU's JIT failed to
+    materialize a gather fusion among the many small programs an unjitted capture compiles."""
     from dew.nn.gemma4_moe import Gemma4TextRouter
     from dew.nn.gpt_oss import GptOssMLP
     from dew.nn.mla import SparseIndexer
@@ -88,28 +87,6 @@ def top_margin(values: np.ndarray, kept: int) -> np.ndarray:
     return np.where(np.isfinite(next_best), (chosen - next_best) / scale, np.inf)
 
 
-def indexer_margin(scores: np.ndarray, agreements: np.ndarray, budget: int) -> float:
-    """The smallest margin of a lightning indexer's causal top-`budget` over `scores` `[B, S, T]`, made
-    of its heads' `agreements` `[B, S, H, T]`: each query's gap between its `budget`-th and the next
-    visible key's score over its largest score, or, where both are exactly zero, how far below zero
-    the largest agreement of any visible key scored zero sits, over the query's largest agreement. A
-    query that sees no more keys than its budget decides nothing."""
-    queries, keys = scores.shape[-2:]
-    if keys <= budget:
-        return np.inf
-    tiny = np.finfo(np.float32).tiny
-    visible = np.tril(np.ones((queries, keys), bool), keys - queries)
-    ranked = -np.sort(-np.where(visible, scores, -np.inf), axis=-1)
-    kept, rejected = ranked[..., budget - 1], ranked[..., budget]
-    gap = (kept - rejected) / np.maximum(np.abs(ranked[..., 0]), tiny)
-    seen = visible[:, None, :]
-    size = np.maximum(np.max(np.where(seen, np.abs(agreements), 0), axis=(-2, -1)), tiny)
-    zeros = visible & (scores == 0)
-    below = np.min(np.where(zeros, -np.max(agreements, axis=-2), np.inf), axis=-1) / size
-    tied = (kept == 0) & (rejected == 0)
-    return float(np.min(np.where(np.isfinite(rejected), np.where(tied, below, gap), np.inf)))
-
-
 def margin(config, captured, label: str) -> float:
     """The smallest margin of the selections `captured` (`capture`'s output) of a decoder built from
     `config`, relative to their scale: the lightning indexer's top-k (the gap between the k-th and the
@@ -117,25 +94,18 @@ def margin(config, captured, label: str) -> float:
     a mixture's routing, read from the router's own operands: a Router's best groups by its group
     scores and its experts by its selection scores within them (`top_margin` of each), gpt-oss's and
     Gemma 4's routers, which rank their logits or their softmax by a plain top-k, by their logits'. A
-    query that sees no more keys than its budget decides nothing. One whose budget ends among keys
-    scored exactly zero orders them by index alike in every run only while each stays zero: its
-    margin is how far below zero the largest of their heads' agreements sits, over the query's
-    largest agreement, since a key whose agreement is within rounding of zero scores zero in one run
-    and above or below it in another."""
+    query that sees no more keys than its budget, and an exact zero tie of relu'd scores, ordered
+    alike by index in every run, decide nothing."""
     fields = config.get("mixer", {}).get("fields", {})
     sparsities = config.get("activation_sparsity_pattern", ())
     smallest, seen = np.inf, 0
     mixture = config.get("mixture") or {}
     routers: dict[tuple[str, ...], dict[str, np.ndarray]] = {}
-    indexers: dict[tuple[str, ...], dict[str, np.ndarray]] = {}
     for path, values in jax.tree_util.tree_flatten_with_path(captured.get("intermediates", {}))[0]:
         seen += 1
         names = [str(getattr(part, "key", part)) for part in path]
         if names[-2] in ("selection", "group_scores", "group_mask"):
             routers.setdefault(tuple(names[:-2]), {})[names[-2]] = np.asarray(values)
-            continue
-        if names[-2] in ("scores", "agreements"):
-            indexers.setdefault((*names[:-2], names[-1]), {})[names[-2]] = np.asarray(values, np.float64)
             continue
         values = np.asarray(values, np.float64)
         if "gate_proj" in names:
@@ -146,10 +116,15 @@ def margin(config, captured, label: str) -> float:
             # gpt-oss ranks its router's logits, Gemma 4's router their softmax: one order, by logit.
             smallest = min(smallest, float(np.min(top_margin(values, mixture.get("top_k", 2)))))
             continue
-        raise AssertionError(f"{label}: a selection at {names} no margin reads")
-    for operands in indexers.values():
-        smallest = min(smallest, indexer_margin(operands["scores"], operands["agreements"],
-                                                fields["index_topk"]))
+        budget, (queries, keys) = fields["index_topk"], values.shape[-2:]
+        if keys <= budget:
+            continue
+        visible = np.tril(np.ones((queries, keys), bool), keys - queries)
+        ranked = -np.sort(-np.where(visible, values, -np.inf), axis=-1)
+        kept, rejected = ranked[..., budget - 1], ranked[..., budget]
+        decided = np.isfinite(rejected) & ~((kept == 0) & (rejected == 0))
+        scale = np.maximum(np.abs(ranked[..., 0]), np.finfo(np.float32).tiny)
+        smallest = min(smallest, float(np.min(np.where(decided, (kept - rejected) / scale, np.inf))))
     # A model that selects shows its selections here, or the draw would pass unfiltered.
     for operands in routers.values():
         # A Router chooses its best groups by their scores, then its experts among the groups kept.
@@ -175,3 +150,16 @@ def clearing(draw, clears, tries: int = 64):
                 return inputs
         raise AssertionError(f"no draw of seed {seed} clears its selection margin")
     return drawn
+
+
+def indexer_margin(scores, agreements, budget):
+    """The old rule: a query whose budget ends among exact zeros decides nothing."""
+    queries, keys = scores.shape[-2:]
+    if keys <= budget:
+        return np.inf
+    visible = np.tril(np.ones((queries, keys), bool), keys - queries)
+    ranked = -np.sort(-np.where(visible, scores, -np.inf), axis=-1)
+    kept, rejected = ranked[..., budget - 1], ranked[..., budget]
+    decided = np.isfinite(rejected) & ~((kept == 0) & (rejected == 0))
+    scale = np.maximum(np.abs(ranked[..., 0]), np.finfo(np.float32).tiny)
+    return float(np.min(np.where(decided, (kept - rejected) / scale, np.inf)))
