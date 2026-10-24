@@ -1430,7 +1430,7 @@ def _load_composite_source(name_or_dir: str | Path, root: Path, commit: str | No
     else:
         filename = (Path(folder) / head_source.weight_file).as_posix()
         head_tensors = read_file(sources.repo_file(name_or_dir, root, filename))[0]
-    head = head_source.build(None if backbone is None else backbone.model, dtype, attention_impl)
+    head = head_source.build(backbone, dtype, attention_impl)
     params = translate_parameters(decoder_parts.split_packed(head_tensors, head_source.packed),
                                   head_source.path, param_dtype)
     if head_source.reshape is not None:

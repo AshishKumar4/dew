@@ -42,7 +42,7 @@ class HeadComponent:
     weight_file: str | None = None
     reshape: Callable[[nn.Module, dict], dict] | None = None
 
-    def build(self, backbone: nn.Module | None, dtype: str, attention_impl: str) -> nn.Module:
+    def build(self, backbone: Pretrained | None, dtype: str, attention_impl: str) -> nn.Module:
         """Build the readout against the backbone's output contract."""
         raise NotImplementedError
 

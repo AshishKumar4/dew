@@ -11,8 +11,6 @@ from functools import partial
 from pathlib import Path
 from typing import Self
 
-from flax import linen as nn
-
 from dew import records
 from dew.data.text import HFTokenizer
 from dew.interop.composite import CompositeSource, HeadComponent, NativeComponent, SourceKind
@@ -34,14 +32,14 @@ from .task import Decide, DecideSettings
 class DecisionHeadSource(HeadComponent):
     """The head constructor reads the native backbone's output width and compute dtype."""
 
-    def build(self, backbone: nn.Module | None, dtype: str, attention_impl: str) -> Head:
+    def build(self, backbone: Pretrained | None, dtype: str, attention_impl: str) -> Head:
         held = records.record(self.record, "head")
         fields = records.record(held["fields"], "head.fields")
         if backbone is None:
             width = records.integer(fields["hidden_size"], "hidden_size")
             compute = dtype
         else:
-            width, compute = DecisionModel.head_size(backbone)
+            width, compute = DecisionModel.head_size(backbone.model)
         configured = {name: value for name, value in fields.items() if name != "hidden_size"}
         return Head.from_record(records.json_value({**held, "fields": {
             **configured, "dtype": None if compute is None else dtype_name(compute),
