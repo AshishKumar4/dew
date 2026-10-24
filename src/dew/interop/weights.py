@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax.traverse_util import flatten_dict
 
-from dew import records
+from dew import _records
 from dew.registry import dtype_name, resolve_dtype, storage_name
 
 if TYPE_CHECKING:
@@ -35,7 +35,7 @@ def declared_dtype(config: Mapping[str, object], tensors: Mapping[str, np.ndarra
     """
     stated = config.get("dtype", config.get("torch_dtype"))
     if stated is not None:
-        storage = dtype_name(resolve_dtype(records.text(stated, "dtype")))
+        storage = dtype_name(resolve_dtype(_records.text(stated, "dtype")))
         if storage is None:
             raise ValueError(f"dtype={stated!r} names no floating parameter storage")
         return storage

@@ -16,7 +16,6 @@ import pytest
 from decision_support import decision_rows
 
 from dew.config import ObjectiveConfig
-from dew.model_config import ModelConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.config.jepa import JepaRunConfig
 from dew.data import TFDS, Loading, Memory, images as image_steps, presets
@@ -27,6 +26,7 @@ from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirs
 from dew.diffusion.discrete import MDLM
 from dew.diffusion.presets import Flow, MeanFlow, Shortcut
 from dew.inputs import Field, InputSpec, TextCondition
+from dew.model_config import ModelConfig
 from dew.nn.backbones import CausalTransformer, SimpleDiT
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.objectives import DistillationObjective

@@ -11,7 +11,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew import records
+from dew import _records
 from dew.nn.activations import gelu_exact
 from dew.nn.dense import Dense
 from dew.nn.precision import float32_dot_general
@@ -156,18 +156,18 @@ def translate_deepseek_v41_vision_config(hf_config: Mapping[str, object]) -> Rec
     vision = _vision_section(hf_config)
     if vision.get("model_type", "deepseek_v41_vision") != "deepseek_v41_vision":
         raise ValueError(f"vision model_type {vision.get('model_type')!r} is not DeepSeek-V4.1's ViT")
-    width = records.integer(vision["hidden_size"], "hidden_size")
-    heads = records.integer(vision["num_attention_heads"], "num_attention_heads")
+    width = _records.integer(vision["hidden_size"], "hidden_size")
+    heads = _records.integer(vision["num_attention_heads"], "num_attention_heads")
     if width % heads or (width // heads) % 4:
         raise ValueError(f"hidden_size {width} over {heads} heads leaves no head width the 2D rotary "
                          "splits into height and width pairs")
     return {
         "class": "deepseek_v41", "fields": {
-        "num_hidden_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
+        "num_hidden_layers": _records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
         "hidden_size": width,
         "num_attention_heads": heads,
-        "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
-        "patch_size": records.integer(vision["patch_size"], "patch_size"),
+        "intermediate_size": _records.integer(vision["intermediate_size"], "intermediate_size"),
+        "patch_size": _records.integer(vision["patch_size"], "patch_size"),
         "rope_theta": rope_base(vision, 10000.0),
     }}
 
@@ -179,8 +179,8 @@ def translate_deepseek_v41_projector_config(hf_config: Mapping[str, object],
     vision = _vision_section(hf_config)
     return {
         "class": "deepseek_v41", "fields": {
-        "vision_width": records.integer(vision["hidden_size"], "hidden_size"),
-        "downsample_ratio": records.integer(vision.get("downsample_ratio", 3), "downsample_ratio"),
+        "vision_width": _records.integer(vision["hidden_size"], "hidden_size"),
+        "downsample_ratio": _records.integer(vision.get("downsample_ratio", 3), "downsample_ratio"),
         "out_width": int(text_width),
     }}
 

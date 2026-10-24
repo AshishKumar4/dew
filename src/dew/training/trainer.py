@@ -36,6 +36,7 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
+from dew._records import JSON, boolean, json_value, record
 from dew.batch import FROZEN, Batch, Variables, select
 from dew.checkpoints import Checkpoints, Ranking
 from dew.cleanup import attempted
@@ -79,7 +80,6 @@ from dew.objectives.base import (
     taken_record,
 )
 from dew.optim import learning_rate, with_rate_scales
-from dew.records import JSON, boolean, json_value, record
 from dew.state import MODEL_STATE, Accumulation, TrainState, kept_window
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import (

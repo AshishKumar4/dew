@@ -33,13 +33,13 @@ from PIL import Image
 import dew
 from dew.artifacts import uint8_pixels
 from dew.config import MetricConfig, ObjectiveConfig, OptimConfig, TrainerConfig
-from dew.model_config import ModelConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.coordination import collective_host
 from dew.data import TFDS, Files, Loading, images, presets
 from dew.data.sources.codec import pack_dict_of_byte_arrays
 from dew.diffusion.presets import EDM
 from dew.inputs import TextCondition
+from dew.model_config import ModelConfig
 from dew.nn.backbones import SimpleDiT
 from dew.optim import Cosine
 from dew.sampling import CFG

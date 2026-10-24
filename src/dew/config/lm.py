@@ -23,12 +23,12 @@ from typing import ClassVar, NamedTuple
 import jax
 import jax.numpy as jnp
 
+from dew._records import integer, text
 from dew.config import ObjectiveConfig, OptimConfig, Prepared, RunConfig
-from dew.model_config import ModelConfig
 from dew.data.compile import fitted
 from dew.data.text import HFTokenizer, tokenizer_for
+from dew.model_config import ModelConfig
 from dew.objectives.lm.objective import Perplexity, Samples
-from dew.records import integer, text
 from dew.registry import DtypeName, objectives, resolve_dtype
 from dew.sampling.text import Sampling
 

@@ -12,11 +12,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew import records
+from dew import _records
 from dew._model_types import QWEN35_TYPES
+from dew._records import JSON
 from dew.nn import audio as audio_nn
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
-from dew.records import JSON
 from dew.registry import towers
 
 if TYPE_CHECKING:
@@ -176,7 +176,7 @@ def _row_padding(reference: HostProcessor) -> tuple[int, Literal["left", "right"
     side = getattr(tokenizer, "padding_side", "right")
     if side not in ("left", "right"):
         raise ValueError("the tokenizer padding_side must be left or right")
-    return (0 if pad_id is None else records.integer(pad_id, "pad_token_id"),
+    return (0 if pad_id is None else _records.integer(pad_id, "pad_token_id"),
             "left" if side == "left" else "right")
 
 
@@ -186,7 +186,7 @@ def _row_start(reference: HostProcessor) -> int | None:
     processor wraps, or the tokenizer itself."""
     tokenizer = getattr(reference, "tokenizer", reference)
     bos = getattr(tokenizer, "bos_token_id", None)
-    return None if bos is None else records.integer(bos, "bos_token_id")
+    return None if bos is None else _records.integer(bos, "bos_token_id")
 
 
 @dataclass(frozen=True)
@@ -497,12 +497,12 @@ class Processor:
         each image or video's patches, their positions and placeholder count,
         and the vision pooling kernel that sets how many slots one fills."""
         # The tower's geometry as its translation reads it, the reference's defaults included.
-        tower = records.record(records.record(self.record["tower"], "tower")["fields"], "tower fields")
-        kernel = records.integer(tower["pooling_kernel_size"], "pooling_kernel_size")
+        tower = _records.record(_records.record(self.record["tower"], "tower")["fields"], "tower fields")
+        kernel = _records.integer(tower["pooling_kernel_size"], "pooling_kernel_size")
         streams = _patch_streams(values, image_id, video_id, kernel=kernel,
-                                 table_size=records.integer(tower["position_embedding_size"],
+                                 table_size=_records.integer(tower["position_embedding_size"],
                                                             "position_embedding_size"),
-                                 patch_size=records.integer(tower["patch_size"], "patch_size"))
+                                 patch_size=_records.integer(tower["patch_size"], "patch_size"))
         patches = {token: list(zip(*stream, strict=True)) for token, stream in streams.items()}
         ordered = _in_text_order(patches, tokens, runs)
         if not ordered:
@@ -563,9 +563,9 @@ class Processor:
     def _merge_size(self) -> int:
         """The merger's spatial merge, as the projector's translation reads it, the reference's
         default of 2 included."""
-        projector = records.record(records.record(self.record["projector"], "projector")["fields"],
+        projector = _records.record(_records.record(self.record["projector"], "projector")["fields"],
                                    "projector fields")
-        return records.integer(projector["merge_size"], "merge_size")
+        return _records.integer(projector["merge_size"], "merge_size")
 
     def _qwen_frames(self, values: Mapping[str, object], tokens: np.ndarray, runs):
         """Return views of packed image/video patches in text order, one item per frame.

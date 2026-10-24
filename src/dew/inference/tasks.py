@@ -27,6 +27,7 @@ from flax.core import freeze
 from jax.sharding import NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike, DTypeLike
 
+from dew._records import integer, record as named_fields, strings, text as named
 from dew.batch import PARAMETER_ROOTS, Variables, thaw
 from dew.cache import persist_compilations
 from dew.coordination import agreed
@@ -37,7 +38,6 @@ from dew.interop.weights import decoding_storage
 from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key
 from dew.nn.protocols import Bounded, CacheCapacity, TokenModel
 from dew.objectives.base import UNREAD, Objective
-from dew.records import integer, record as named_fields, strings, text as named
 from dew.sampling import decoding, vocabulary
 from dew.sampling.decoding import LogitsTransform, Stopping, id_row
 from dew.sampling.solvers import Solver

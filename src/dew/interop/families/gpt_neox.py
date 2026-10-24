@@ -5,7 +5,7 @@ from functools import partial
 
 import numpy as np
 
-from dew import records
+from dew import _records
 from dew.interop.decoder_parts import (
     MEGATRON_MLP,
     PLAIN_SPELLING,
@@ -29,7 +29,7 @@ from dew.nn.rope import inverse_frequencies
 def _gpt_neox_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     theta, partial, rope = partial_rope(hf, PLAIN_SPELLING, default_factor=.25, factor_field='rotary_pct',
                                         theta_field='rotary_emb_base')
-    activation = records.text(hf.get('hidden_act', 'gelu'), 'hidden_act')
+    activation = _records.text(hf.get('hidden_act', 'gelu'), 'hidden_act')
     mlp = ungated_mlp(activation, ('gelu', 'gelu_new', 'gelu_pytorch_tanh', 'relu'), 'hidden_act', 'GPT-NeoX')
     config = base_config({**hf, 'hidden_act': 'gelu', 'rope_theta': theta,
                            'rope_parameters': rope or None}, used, rope=PLAIN_SPELLING,
@@ -39,13 +39,13 @@ def _gpt_neox_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     config.update({
         'mlp': mlp, 'mlp_bias': True,
         'norm_type': 'layer', 'norm_bias': True,
-        'norm_eps': records.number(hf.get('layer_norm_eps', 1e-5), 'layer_norm_eps'),
+        'norm_eps': _records.number(hf.get('layer_norm_eps', 1e-5), 'layer_norm_eps'),
         'scale_after_cast': False, 'attention_bias': bool(hf.get('attention_bias', True)),
         'partial_rotary_factor': partial, 'partial_rotary_type': 'default',
         'parallel_residual': bool(hf.get('use_parallel_residual', True)),
-        'dropout_rate': records.number(hf.get('hidden_dropout', 0.), 'hidden_dropout'),
-        'embedding_dropout_rate': records.number(hf.get('hidden_dropout', 0.), 'hidden_dropout'),
-        'attention_dropout_rate': records.number(hf.get('attention_dropout', 0.), 'attention_dropout'),
+        'dropout_rate': _records.number(hf.get('hidden_dropout', 0.), 'hidden_dropout'),
+        'embedding_dropout_rate': _records.number(hf.get('hidden_dropout', 0.), 'hidden_dropout'),
+        'attention_dropout_rate': _records.number(hf.get('attention_dropout', 0.), 'attention_dropout'),
     })
     return config
 
@@ -56,7 +56,7 @@ def _gpt_neox_buffers(tensors: Mapping[str, np.ndarray],
     sentinel and the rotary frequencies, which the config computes."""
     if config is None:
         raise ValueError('GPT-NeoX checks its rotary buffer against translated head geometry')
-    dimension = records.integer(config['head_dim'], 'head_dim')
+    dimension = _records.integer(config['head_dim'], 'head_dim')
     prepared = {}
     for name, tensor in tensors.items():
         # FP16 releases cast the historical -1e9 sentinel to -inf.
@@ -64,9 +64,9 @@ def _gpt_neox_buffers(tensors: Mapping[str, np.ndarray],
             continue
         if name.endswith('.attention.rotary_emb.inv_freq'):
             rotated = int(
-                dimension * records.number(config.get("partial_rotary_factor", 1.0), "partial_rotary_factor")
+                dimension * _records.number(config.get("partial_rotary_factor", 1.0), "partial_rotary_factor")
             )
-            expected = inverse_frequencies(records.number(config.get('rope_theta', 10000.), 'rope_theta'),
+            expected = inverse_frequencies(_records.number(config.get('rope_theta', 10000.), 'rope_theta'),
                                            rotated, dtype=np.float32).astype(tensor.dtype)
             if not np.array_equal(tensor, expected):
                 raise ValueError(

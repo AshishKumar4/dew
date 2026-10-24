@@ -67,8 +67,9 @@ from etils import epath
 from orbax.checkpoint.checkpoint_manager import AsyncOptions, MultiprocessingOptions
 from orbax.checkpoint.checkpoint_managers import preservation_policy as preservation
 
-from dew import position, records
+from dew import _records, position
 from dew._hashing import fmix32
+from dew._records import JSON, duration, json_value
 from dew.batch import PARAMETER_ROOTS, Variables
 from dew.cleanup import attempted
 from dew.coordination import broadcast_from_process_zero, from_every_process, seen_by_every_process
@@ -76,7 +77,6 @@ from dew.files import write_atomically
 from dew.mesh import LogicalAxes
 from dew.nn import sharding
 from dew.nn.precision import at_least_fp32
-from dew.records import JSON, duration, json_value
 from dew.telemetry.profile import region
 
 if TYPE_CHECKING:
@@ -1559,12 +1559,12 @@ class Checkpoints:
                              f"got {recorded!r}")
         table = {}
         for entry in recorded:
-            entry = records.record(entry, 'boxed')
+            entry = _records.record(entry, 'boxed')
             names = entry['names']
             if not isinstance(names, list):
                 raise ValueError(f"step {resolved}'s boxed names are a list, got {names!r}")
-            table[records.strings(entry['path'], 'boxed path')] = tuple(
-                None if name is None else records.text(name, 'boxed name') for name in names)
+            table[_records.strings(entry['path'], 'boxed path')] = tuple(
+                None if name is None else _records.text(name, 'boxed name') for name in names)
         return table
 
     def variables(self, *, step: int | str | None = None, ema: bool | None = None,

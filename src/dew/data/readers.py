@@ -11,6 +11,7 @@ from typing import Literal
 import grain.python as pygrain
 import numpy as np
 
+from dew._records import record
 from dew.batch import Batch
 from dew.data.dataset import (
     Closeable,
@@ -27,7 +28,6 @@ from dew.data.dataset import (
 from dew.data.mixing import CorpusCounts, data_metrics, state_counts
 from dew.data.pipeline import HostStep, Map
 from dew.data.plan import Plan
-from dew.records import record
 
 
 @dataclasses.dataclass(frozen=True)

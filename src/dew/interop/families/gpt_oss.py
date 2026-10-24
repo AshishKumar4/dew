@@ -10,7 +10,7 @@ from collections.abc import Mapping
 from dataclasses import asdict
 from functools import partial
 
-from dew import records
+from dew import _records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
@@ -29,7 +29,7 @@ from dew.nn.backbones.decoder_block import Mixture
 
 
 def _gpt_oss_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    ropes = read_rope(hf_config, used, RopeSpelling(theta=150000.0), yarn_max_pos=records.integer(
+    ropes = read_rope(hf_config, used, RopeSpelling(theta=150000.0), yarn_max_pos=_records.integer(
         hf_config.get('max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'),
         ramps=('yarn',), per_kind=False)
     layers = hf_config['num_hidden_layers']

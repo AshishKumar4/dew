@@ -48,7 +48,7 @@ def _decoder_record(value: object) -> Mapping[str, object] | None:
         return None
     if isinstance(value, Mapping):
         return {name: _decoder_record(decoder) for name, decoder in value.items()}
-    from dew.records import json_value
+    from dew._records import json_value
 
     try:
         settings = {

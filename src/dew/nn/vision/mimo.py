@@ -7,7 +7,7 @@ from collections.abc import Mapping
 
 from flax import linen as nn
 
-from dew import records
+from dew import _records
 from dew.registry import Record
 
 from .common import (
@@ -123,26 +123,26 @@ def translate_mimo_vision_config(hf_config: Mapping[str, object]) -> Record:
     release's silu names it, and no other activation."""
     vision = _vision_section(hf_config)
     activation_name(vision, ("silu",), "silu")
-    depth = records.integer(vision["depth"], "depth")
-    types = records.integers(vision.get("vit_window_attn_types") or [-1] * depth, "vit_window_attn_types")
+    depth = _records.integer(vision["depth"], "depth")
+    types = _records.integers(vision.get("vit_window_attn_types") or [-1] * depth, "vit_window_attn_types")
     return {"class": "mimo", "fields": {
         "depth": depth,
-        "hidden_size": records.integer(vision["hidden_size"], "hidden_size"),
-        "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
-        "num_heads": records.integer(vision["num_heads"], "num_heads"),
-        "num_key_value_heads": records.integer(vision.get("num_key_value_heads", vision["num_heads"]),
+        "hidden_size": _records.integer(vision["hidden_size"], "hidden_size"),
+        "intermediate_size": _records.integer(vision["intermediate_size"], "intermediate_size"),
+        "num_heads": _records.integer(vision["num_heads"], "num_heads"),
+        "num_key_value_heads": _records.integer(vision.get("num_key_value_heads", vision["num_heads"]),
                                                "num_key_value_heads"),
-        "qk_channels": records.integer(vision.get("qk_channels", 64), "qk_channels"),
-        "in_channels": records.integer(vision.get("in_channels") or vision.get("in_chans", 3), "in_chans"),
-        "patch_size": records.integer(vision["patch_size"], "patch_size"),
-        "spatial_merge_size": records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
-        "temporal_patch_size": records.integer(vision["temporal_patch_size"], "temporal_patch_size"),
-        "rms_norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
-        "fullatt_block_indexes": records.integers(vision.get("fullatt_block_indexes", []),
+        "qk_channels": _records.integer(vision.get("qk_channels", 64), "qk_channels"),
+        "in_channels": _records.integer(vision.get("in_channels") or vision.get("in_chans", 3), "in_chans"),
+        "patch_size": _records.integer(vision["patch_size"], "patch_size"),
+        "spatial_merge_size": _records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
+        "temporal_patch_size": _records.integer(vision["temporal_patch_size"], "temporal_patch_size"),
+        "rms_norm_eps": _records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
+        "fullatt_block_indexes": _records.integers(vision.get("fullatt_block_indexes", []),
                                                   "fullatt_block_indexes"),
         "vit_window_attn_types": types,
         "use_sink": bool(vision.get("use_sink", False)),
-        "visual_token_window_size": records.integer(vision.get("visual_token_window_size", -1),
+        "visual_token_window_size": _records.integer(vision.get("visual_token_window_size", -1),
                                                     "visual_token_window_size"),
     }}
 

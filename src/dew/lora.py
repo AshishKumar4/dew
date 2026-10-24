@@ -53,6 +53,7 @@ from flax.linen.dtypes import promote_dtype
 from flax.linen.module import Interceptor
 from flax.nnx import bridge
 
+from dew._records import finite
 from dew.batch import FROZEN, Path, Variables, freeze, merge as overlay, select, thaw
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
@@ -91,7 +92,6 @@ from dew.quantization import (
     frozen_fp8_kernel,
     measured_fp8_sites,
 )
-from dew.records import finite
 from dew.registry import Wrapper, rebuilt, wrapper_layers
 
 PEFT_CONFIG = "adapter_config.json"

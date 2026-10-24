@@ -18,15 +18,16 @@ import jax
 import numpy as np
 import tyro
 
+from dew._records import number, record
 from dew.batch import Variables, merge
 from dew.checkpoints import Checkpoints
 from dew.config import MetricConfig, ObjectiveConfig, Prepared, RunConfig, media_field
-from dew.model_config import ModelConfig
 from dew.data.compile import fitted
 from dew.data.dataset import record_argument
 from dew.diffusion.presets import EDM, Flow, build_process
 from dew.diffusion.process import Process
 from dew.inputs import AudioCondition, Field, InputSpec, TextCondition
+from dew.model_config import ModelConfig
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
 from dew.nn.protocols import IntervalModel, TimeScaled
@@ -41,7 +42,6 @@ from dew.objectives.diffusion.objective import (
     FlowDistillationObjective,
     teacher_weights,
 )
-from dew.records import number, record
 from dew.registry import (
     Configured,
     DtypeName,

@@ -29,7 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype
 
-from dew import records
+from dew import _records
 from dew.batch import Variables
 from dew.interop.components import bind_component, component_source
 from dew.nn.activations import activation
@@ -289,16 +289,16 @@ class RAE(nn.Module):
 def rae_fields(config: Mapping[str, object]) -> RAEFields:
     """Read an `AutoencoderRAE` config into the fields `RAE` takes, refusing
     what the port does not compute."""
-    kind = records.text(config.get("encoder_type", "dinov2"), "encoder_type")
+    kind = _records.text(config.get("encoder_type", "dinov2"), "encoder_type")
     if kind not in RAE_ENCODERS:
         raise ValueError(f"encoder_type {kind!r} is not one of {RAE_ENCODERS}")
-    if not records.boolean(config.get("reshape_to_2d", True), "reshape_to_2d"):
+    if not _records.boolean(config.get("reshape_to_2d", True), "reshape_to_2d"):
         raise ValueError("a latent diffusion run reads an RAE's latent as a grid; reshape_to_2d must be true")
-    if records.integer(config.get("num_channels", 3), "num_channels") != 3:
+    if _records.integer(config.get("num_channels", 3), "num_channels") != 3:
         raise ValueError("the RAE encoders read three-channel images")
 
     def integer(name: str, default: int) -> int:
-        return records.integer(config.get(name, default), name)
+        return _records.integer(config.get(name, default), name)
 
     def per_channel(name: str, default: tuple[float, ...]) -> tuple[float, ...]:
         value = config.get(name)
@@ -306,7 +306,7 @@ def rae_fields(config: Mapping[str, object]) -> RAEFields:
             return default
         if not isinstance(value, (list, tuple)) or len(value) != 3:
             raise ValueError(f"{name}={value!r}: this field is one number per image channel")
-        return tuple(records.number(entry, name) for entry in value)
+        return tuple(_records.number(entry, name) for entry in value)
 
     fields = RAEFields(
         kind=kind,

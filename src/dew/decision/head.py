@@ -20,7 +20,8 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew import records
+from dew import _records
+from dew._records import JSON
 from dew.decision.layout import DecisionInputs, Encoded
 from dew.decision.questions import KINDS, Choice, Noul, Score
 from dew.nn.activations import gelu_exact_torch
@@ -35,7 +36,6 @@ from dew.nn.mixers import AttentionMixer
 from dew.nn.mlp import GatedMLP
 from dew.nn.precision import accumulated, at_least_fp32
 from dew.nn.scatter import DROPPED
-from dew.records import JSON
 from dew.registry import from_record, import_path, imported, record_fields
 
 
@@ -79,12 +79,12 @@ class Head(nn.Module):
     def from_record(record: JSON, width: int) -> "Head":
         """Rebuild the head a run recorded, reading states `width` wide, in the numerics it
         recorded. An earlier run's record is read through `dew.inference.tasks.earlier_shapes`."""
-        held = records.record(record, "head")
-        path = records.text(held.get("name"), "head.name")
+        held = _records.record(record, "head")
+        path = _records.text(held.get("name"), "head.name")
         head = imported(path)
         if not (isinstance(head, type) and issubclass(head, Head)):
             raise ValueError(f"a run's head is a decision head (`Head`), not {path!r}")
-        fields = {**records.record(held.get("fields"), "head.fields"), head.width_field: width}
+        fields = {**_records.record(held.get("fields"), "head.fields"), head.width_field: width}
         return from_record(head, fields)
 
 

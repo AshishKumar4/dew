@@ -61,10 +61,10 @@ Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = TypeVar("Effects", default=None)
 
 if TYPE_CHECKING:
+    from dew._records import JSON
     from dew.data.pipeline import ObjectiveData
     from dew.data.text import Tokenizer
     from dew.inference.tasks import Processor
-    from dew.records import JSON
 
 PROJECTIONS = "distillation"
 """The params subtree holding the feature pairs' width projections."""

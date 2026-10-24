@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from dew import records
+from dew import _records
 from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
     DecoderFamily,
@@ -44,7 +44,7 @@ def _olmo3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     both on the released 7B).
     """
     layer_types = specified_layer_types(hf_config, used, ('sliding_attention',) * 3 + ('full_attention',))
-    ropes = read_rope(hf_config, used, _SPELLING, yarn_max_pos=records.integer(hf_config.get(
+    ropes = read_rope(hf_config, used, _SPELLING, yarn_max_pos=_records.integer(hf_config.get(
         'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'))
     config = base_config(hf_config, used, qk_norm=True, layer_types=layer_types,
                           scale_after_cast=False, rope=ropes)

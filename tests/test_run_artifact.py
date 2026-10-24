@@ -10,7 +10,6 @@ import optax
 import pytest
 
 from dew.checkpoints import Checkpoints
-from dew.model_config import ModelConfig
 from dew.data import Loading, Memory
 from dew.data.compile import compile
 from dew.data.dataset import Loader
@@ -18,6 +17,7 @@ from dew.data.pipeline import Pipeline
 from dew.diffusion import schedules, transforms
 from dew.diffusion.process import Process
 from dew.inference.projections import unpacked
+from dew.model_config import ModelConfig
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.registry import from_record, to_record

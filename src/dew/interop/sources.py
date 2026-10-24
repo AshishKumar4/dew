@@ -23,7 +23,7 @@ from pathlib import Path
 import jax
 import numpy as np
 
-from dew import records
+from dew import _records
 from dew.cache import hub_answer, recorded_hub_answer
 from dew.interop import pickles
 from dew.interop.safetensors_io import (
@@ -44,7 +44,7 @@ def load_shards(directory: Path) -> dict[str, np.ndarray]:
     conversion (`pickles.converted`)."""
     files = {path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_file()}
 
-    def read(name: str) -> records.JSON:
+    def read(name: str) -> _records.JSON:
         return json.loads((directory / name).read_text())
 
     if weight_files(files, "", read):
@@ -190,7 +190,7 @@ def snapshot(name_or_dir: str, revision: str | None, *,
         return directory
     files = repo_files(name_or_dir, directory)
 
-    def read(name: str) -> records.JSON:
+    def read(name: str) -> _records.JSON:
         return json.loads((directory / name).read_text())
 
     selected = [name for folder in (("",) if weights is True else weights)

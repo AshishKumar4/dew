@@ -33,6 +33,7 @@ from jax.typing import ArrayLike
 from typing_extensions import TypeVar
 
 from dew._hashing import array_fingerprint
+from dew._records import finite
 from dew.batch import Variables, real_slots, token_positions, valid_order, with_validity
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, PredictionPhase, Request, local_rows, mesh_of, next_position
@@ -52,7 +53,6 @@ from dew.nn.protocols import (
     Selective,
     Serving,
 )
-from dew.records import finite
 from dew.sampling import decoding, strategies
 from dew.sampling.decoding import (
     EndOfSequence,

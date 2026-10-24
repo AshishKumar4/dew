@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype
 
-from dew import records
+from dew import _records
 from dew.batch import Variables
 from dew.data.text import HFTokenizer
 from dew.decision.head import JointSchemaHead
@@ -88,11 +88,11 @@ class StoredJointHead:
              attention_impl: str = "auto") -> Self:
         """Read `joint_head_config.json` and `joint_head.safetensors` from `directory`."""
         root = Path(directory)
-        config = records.record(json.loads((root / HEAD_CONFIG).read_text()), HEAD_CONFIG)
-        if records.number(config.get("dropout", 0.0), "dropout"):
+        config = _records.record(json.loads((root / HEAD_CONFIG).read_text()), HEAD_CONFIG)
+        if _records.number(config.get("dropout", 0.0), "dropout"):
             raise ValueError("the stored head drops out at a rate Dew's head does not train with")
         def size(name: str) -> int:
-            return records.integer(config[name], name)
+            return _records.integer(config[name], name)
 
         head = JointSchemaHead(hidden_size=size("hidden_size"), width=size("width"),
                                routing_layers=size("routing_layers"), layers=size("layers"),

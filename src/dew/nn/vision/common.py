@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, ClassVar
 import numpy as np
 from flax import linen as nn
 
-from dew import records
+from dew import _records
 from dew.batch import Variables
 from dew.interop.decoder_parts import read_rope_theta
 from dew.interop.weights import placed
@@ -198,7 +198,7 @@ def _held[Layout](layout: Layout | None, what: str, kind: str) -> Layout:
 
 def _vision_section(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     """The vision half of a wrapper config, or a bare vision config."""
-    return records.record(hf_config.get("vision_config", hf_config), "vision_config")
+    return _records.record(hf_config.get("vision_config", hf_config), "vision_config")
 
 
 def merger_projector(hf_config: Mapping[str, object], text_width: int, kind: str) -> Record:
@@ -207,13 +207,13 @@ def merger_projector(hf_config: Mapping[str, object], text_width: int, kind: str
     features enter the text embeddings as they are, so a merger width beside the decoder width
     refuses."""
     vision = _vision_section(hf_config)
-    merged = records.integer(vision["out_hidden_size"], "out_hidden_size")
+    merged = _records.integer(vision["out_hidden_size"], "out_hidden_size")
     if merged != int(text_width):
         raise ValueError(f"out_hidden_size ({merged}) is not the decoder width ({text_width}), "
                          "the merger output enters the text embeddings as it is")
     return {"class": kind, "fields": {
-        "vision_width": records.integer(vision["hidden_size"], "hidden_size"),
-        "merge_size": records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
+        "vision_width": _records.integer(vision["hidden_size"], "hidden_size"),
+        "merge_size": _records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
         "out_width": merged,
     }}
 
@@ -225,17 +225,17 @@ def _side(value: object, field: str) -> int:
             raise ValueError(
                 f"{field} {list(value)!r} is not square, this trunk tiles squares")
         value = value[0]
-    return records.integer(value, field)
+    return _records.integer(value, field)
 
 
 def trunk_geometry(vision: Mapping[str, object]) -> dict[str, int]:
     """The width, MLP width, depth and head count a ViT config states, under
     the trunk fields of the families that share the reference's names."""
     return {
-        "hidden_size": records.integer(vision["hidden_size"], "hidden_size"),
-        "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
-        "num_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
-        "num_heads": records.integer(vision["num_attention_heads"], "num_attention_heads"),
+        "hidden_size": _records.integer(vision["hidden_size"], "hidden_size"),
+        "intermediate_size": _records.integer(vision["intermediate_size"], "intermediate_size"),
+        "num_layers": _records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
+        "num_heads": _records.integer(vision["num_attention_heads"], "num_attention_heads"),
     }
 
 
@@ -263,11 +263,11 @@ def rope_base(vision: Mapping[str, object], default: float, *, axial: bool = Fal
     5.17 writes that name where earlier releases wrote 'default', and reads
     either as the one its vision rotary runs (configuration_gemma4.py's
     `default_rope_type`, modeling_gemma4.py's Gemma4VisionRotaryEmbedding)."""
-    entry = records.record(vision.get("rope_parameters") or {}, "rope_parameters")
+    entry = _records.record(vision.get("rope_parameters") or {}, "rope_parameters")
     kind = entry.get("rope_type", entry.get("type"))
     if kind == "none":
         raise ValueError("rope_parameters: a vision tower's rotary type is 'default', not 'none'")
     if axial and kind == "axial":
         entry = {**{name: value for name, value in entry.items() if name != "type"}, "rope_type": "default"}
     theta = read_rope_theta(entry, "rope_parameters")
-    return records.number(vision.get("rope_theta", default), "rope_theta") if theta is None else theta
+    return _records.number(vision.get("rope_theta", default), "rope_theta") if theta is None else theta

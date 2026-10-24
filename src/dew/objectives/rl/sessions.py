@@ -49,11 +49,11 @@ import jax.numpy as jnp
 import numpy as np
 from jax.typing import ArrayLike
 
+from dew._records import finite, json_value, record as section
 from dew.batch import Variables
 from dew.data.tokens import first_fit
 from dew.inference.rollouts import Draw
 from dew.nn.inputs import local_rows
-from dew.records import finite, json_value, record as section
 from dew.rl import group_advantage, rloo_advantage
 
 IDS_KEY = "input_ids"

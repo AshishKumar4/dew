@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
 
+from dew._records import JSON
 from dew.batch import Batch
 from dew.data.dataset import Records
 from dew.data.pipeline import Record, Rejected
@@ -25,7 +26,6 @@ from dew.data.sources.codec import decode, fingerprint
 from dew.data.sources.index import ArrayIndex
 from dew.data.sources.records import ArrayRecords
 from dew.data.storage import Store, Versioned
-from dew.records import JSON
 
 if TYPE_CHECKING:
     from dew.data.cache import Cache

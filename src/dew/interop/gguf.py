@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 import ml_dtypes
 import numpy as np
 
-from dew import records
+from dew import _records
 
 if TYPE_CHECKING:
     from gguf import GGUFReader, ReaderTensor
@@ -43,10 +43,10 @@ a rotary over part of each head, or keys and values wider or narrower than
 it, would compute another model."""
 
 
-def _parse(reader: GGUFReader, key: str) -> records.JSON:
+def _parse(reader: GGUFReader, key: str) -> _records.JSON:
     """One metadata value as gguf decodes it (`ReaderField.contents`), and as
     transformers reads it: a one-element array is its element."""
-    value = records.json_value(reader.fields[key].contents(), key)
+    value = _records.json_value(reader.fields[key].contents(), key)
     return value[0] if isinstance(value, list) and len(value) == 1 else value
 
 
@@ -83,9 +83,9 @@ def _config(reader: GGUFReader) -> tuple[str, Mapping[str, object]]:
         fields["vocab_size"] = len(reader.fields["tokenizer.ggml.tokens"].data)
     config = AutoConfig.for_model(architecture, **fields).to_diff_dict()
     table = GGUF_TO_TRANSFORMERS_MAPPING["config"][architecture]
-    head_dim = config.get("head_dim") or records.integer(
+    head_dim = config.get("head_dim") or _records.integer(
         config["hidden_size"], "hidden_size"
-    ) // records.integer(config["num_attention_heads"], "num_attention_heads")
+    ) // _records.integer(config["num_attention_heads"], "num_attention_heads")
     for key in reader.fields:
         name = key.removeprefix(f"{architecture}.")
         if name == key or (table.get(name, -1) is not None and name in table):

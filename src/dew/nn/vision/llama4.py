@@ -11,7 +11,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew import records
+from dew import _records
 from dew.nn.attention import LayerNorm
 from dew.nn.dense import Dense
 from dew.nn.inputs import AttentionMetadata
@@ -230,10 +230,10 @@ def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Record:
             "middle layer this trunk never returns")
     if vision.get("multi_modal_projector_bias", False):
         raise ValueError("multi_modal_projector_bias=True needs a projector bias this map lacks")
-    output_dim = records.integer(
+    output_dim = _records.integer(
         vision.get("vision_output_dim", vision.get("projector_output_dim", 0)), "vision_output_dim"
     )
-    if output_dim != records.integer(vision.get("projector_output_dim", output_dim), "projector_output_dim"):
+    if output_dim != _records.integer(vision.get("projector_output_dim", output_dim), "projector_output_dim"):
         raise ValueError(
             f"vision_output_dim ({output_dim}) disagrees with projector_output_dim "
             f"({vision.get('projector_output_dim')}), the adapter's width")
@@ -241,15 +241,15 @@ def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Record:
         "class": "llama4", "fields": {
         **trunk_geometry(vision),
         "image_size": _side(vision.get("image_size", 336), "image_size"),
-        "patch_size": records.integer(vision.get("patch_size", 14), "patch_size"),
-        "num_channels": records.integer(vision.get("num_channels", 3), "num_channels"),
-        "layer_norm_eps": records.number(
+        "patch_size": _records.integer(vision.get("patch_size", 14), "patch_size"),
+        "num_channels": _records.integer(vision.get("num_channels", 3), "num_channels"),
+        "layer_norm_eps": _records.number(
             vision.get("norm_eps", vision.get("layer_norm_eps", 1e-5)), "norm_eps"
         ),
         "rope_theta": rope_base(vision, 10000.0),
-        "pixel_shuffle_ratio": records.number(vision.get("pixel_shuffle_ratio", 0.5), "pixel_shuffle_ratio"),
-        "projector_input_dim": records.integer(vision["projector_input_dim"], "projector_input_dim"),
-        "projector_output_dim": records.integer(vision["projector_output_dim"], "projector_output_dim"),
+        "pixel_shuffle_ratio": _records.number(vision.get("pixel_shuffle_ratio", 0.5), "pixel_shuffle_ratio"),
+        "projector_input_dim": _records.integer(vision["projector_input_dim"], "projector_input_dim"),
+        "projector_output_dim": _records.integer(vision["projector_output_dim"], "projector_output_dim"),
     }}
 
 

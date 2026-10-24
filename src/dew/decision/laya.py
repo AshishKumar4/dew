@@ -19,7 +19,7 @@ from typing import Self
 import jax
 import numpy as np
 
-from dew import records
+from dew import _records
 from dew.batch import Variables, part, thaw
 from dew.data.text import HFTokenizer
 from dew.decision.head import DecisionHead
@@ -119,7 +119,7 @@ class LayaCheckpoint:
         """
         root = sources.snapshot(str(name_or_dir), revision, weights=(subfolder or "",))
         directory = root / subfolder if subfolder else root
-        config = records.record(json.loads((directory / CONFIG_FILE).read_text()), CONFIG_FILE)
+        config = _records.record(json.loads((directory / CONFIG_FILE).read_text()), CONFIG_FILE)
         tensors = read_weights(directory)
         encoder = {name.removeprefix("encoder."): tensor for name, tensor in tensors.items()
                    if name.startswith("encoder.")}
@@ -130,7 +130,7 @@ class LayaCheckpoint:
         backbone = from_record(CausalTransformer,
                                {**record, "dtype": dtype, "attention_impl": attention_impl})
         head = DecisionHead(features=backbone.emb_features,
-                            layers=records.integer(config.get("head_layers", 2), "head_layers"),
+                            layers=_records.integer(config.get("head_layers", 2), "head_layers"),
                             dtype=backbone.dtype, attention_impl=attention_impl)
         head_tensors = split_packed({name: tensor for name, tensor in tensors.items()
                                      if not name.startswith("encoder.")}, IN_PROJ)
@@ -138,9 +138,9 @@ class LayaCheckpoint:
             "backbone": translate_weights(encoder, record, "modernbert", param_dtype=param_dtype),
             "head": {"params": translate_parameters(head_tensors, _head_path, param_dtype)}})
         layout = MarkerLayout(
-            max_len=records.integer(config.get("max_len", 512), "max_len"),
-            head_max_len=records.integer(config.get("head_max_len", 192), "head_max_len"),
-            option_tokens=records.integer(config.get("option_tokens", MarkerLayout.option_tokens),
+            max_len=_records.integer(config.get("max_len", 512), "max_len"),
+            head_max_len=_records.integer(config.get("head_max_len", 192), "head_max_len"),
+            option_tokens=_records.integer(config.get("option_tokens", MarkerLayout.option_tokens),
                                           "option_tokens"),
             parallel=config.get("option_layout", "sequential") == "parallel")
         tokenizer = HFTokenizer(str(directory / "tokenizer"), local_files_only=True)
@@ -152,11 +152,11 @@ class LayaCheckpoint:
         if not isinstance(listed, list) or len(listed) != 3:
             raise ValueError("rl_agent_config.json's temperature lists one per question type: "
                              "choice, score, noul")
-        temperatures = tuple(records.number(value, "temperature") for value in listed)
-        buckets = records.record(config.get("temperature_by_options", {}), "temperature_by_options")
+        temperatures = tuple(_records.number(value, "temperature") for value in listed)
+        buckets = _records.record(config.get("temperature_by_options", {}), "temperature_by_options")
         return cls(DecisionModel(backbone, head), variables, layout, tokenizer, specials,
                    (temperatures[0], temperatures[1], temperatures[2]),
-                   {name: records.number(value, name) for name, value in buckets.items()})
+                   {name: _records.number(value, name) for name, value in buckets.items()})
 
     def save(self, directory: str | Path) -> None:
         """Write this checkpoint in Laya's layout, which `load` and llama.cpp's converter read.

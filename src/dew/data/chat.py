@@ -42,9 +42,9 @@ import grain.python as grain
 import numpy as np
 from jinja2 import TemplateError
 
+from dew._records import JSON
 from dew.data.facts import unshaped
 from dew.data.text import HFTokenizer, SavedTokenizer, tokenizer_name
-from dew.records import JSON
 
 if TYPE_CHECKING:
     from transformers import BatchEncoding, PreTrainedTokenizerBase

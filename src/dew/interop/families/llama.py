@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from functools import partial
 
-from dew import records
+from dew import _records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
@@ -41,7 +41,7 @@ def llama_config(hf_config, used):
     # attends every key, and LlamaMLP's projections carry mlp_bias's biases.
     # LlamaRotaryEmbedding builds any rope_type the rope utilities do, YaRN
     # among them (modeling_llama.py:82-86).
-    rope = read_rope(hf_config, used, PLAIN_SPELLING, yarn_max_pos=records.integer(hf_config.get(
+    rope = read_rope(hf_config, used, PLAIN_SPELLING, yarn_max_pos=_records.integer(hf_config.get(
         'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'))
     return base_config(hf_config, used, rope=rope, reads=frozenset({'attention_bias', 'mlp_bias'}))
 
@@ -65,7 +65,7 @@ def _mixtral_config(hf_config, used):
     used.update(('num_local_experts', 'router_jitter_noise'))
     if hf_config.get('router_jitter_noise', 0.0):
         refuse('router_jitter_noise', 'training-time input jitter has no counterpart')
-    experts = records.integer(hf_config['num_local_experts'], 'num_local_experts')
+    experts = _records.integer(hf_config['num_local_experts'], 'num_local_experts')
     config['mixture'] = native_fields(Mixture)(
         top_k=softmax_top_k(hf_config, used), experts=experts)
     return config
@@ -96,10 +96,10 @@ def _granitemoe_config(hf_config: Mapping[str, object], used: set[str]) -> Decod
                            ('residual_multiplier', 'residual_multiplier'),
                            ('logits_scaling', 'logits_scaling'), ('attention_multiplier', 'attention_scale')):
         used.add(source)
-        config[target] = records.number(hf_config.get(source, 1.0), source)
+        config[target] = _records.number(hf_config.get(source, 1.0), source)
 
     config['mixture'] = native_fields(Mixture)(
-        experts=records.integer(hf_config.get('num_local_experts', 8), 'num_local_experts'),
+        experts=_records.integer(hf_config.get('num_local_experts', 8), 'num_local_experts'),
         top_k=softmax_top_k(hf_config, used))
     used.add('num_local_experts')
     return config

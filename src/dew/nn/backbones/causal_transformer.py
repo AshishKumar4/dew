@@ -35,10 +35,10 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew._records import JSON
 from dew.batch import Coordinates, coordinates as build_coordinates, merge, shifted_span
 from dew.mesh import LayoutRefused, row_axes
 from dew.nn.dense import Dense
-from dew.records import JSON
 from dew.registry import from_record, read_arguments
 
 from ..activations import GatedActivation, Situ, ungated_activation
