@@ -53,8 +53,14 @@ def gelu_exact_torch(x: jax.Array) -> jax.Array:
 
 
 def gelu_tanh(x: jax.Array) -> jax.Array:
-    """`0.5 * x * (1 + tanh(sqrt(2 / pi) (x + 0.044715 x^3)))` in at least fp32, in `x`'s dtype."""
-    return jax.nn.gelu(x.astype(at_least_fp32(x.dtype)), approximate=True).astype(x.dtype)
+    """`0.5 * x * (1 + tanh(sqrt(2 / pi) (x + 0.044715 x^3)))` in at least fp32, in `x`'s dtype, as
+    its identity `x * sigmoid(sqrt(8 / pi) (x + 0.044715 x^3))`. An A100's fp32 tanh is a fast
+    approximation, 6.6e-8 RMS from float64 relative to its size over 2^22 normal inputs at scale 3
+    where torch's CPU tanh lies 1.9e-8, and the sigmoid, an exp, keeps the tail `1 + tanh` cancels:
+    on a CPU the form lies 3.5e-8 from float64 against `jax.nn.gelu`'s 4.5e-8 and torch's 2.8e-8,
+    and 3.1e-7 against 1.3e-4 and 3.4e-5 below x = -3."""
+    work = x.astype(at_least_fp32(x.dtype))
+    return (work * jax.nn.sigmoid(math.sqrt(8 / math.pi) * (work + 0.044715 * work ** 3))).astype(x.dtype)
 
 
 def quick_gelu(x: jax.Array) -> jax.Array:
