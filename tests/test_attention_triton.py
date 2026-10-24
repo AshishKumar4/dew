@@ -609,8 +609,6 @@ def test_every_backward_config_on_a_gpu(config, case):
     under a window, and over the irregular full and causal calls (`IRREGULAR`). A config the template
     takes at the call (`TritonBackward.fitting`: within a thread's registers and a block's shared memory)
     is on par; one it does not take is refused where it is pinned, naming why (`tuning.Unpinnable`)."""
-    from tuned import launches
-
     tiles = attention_triton.Tiles
     dq, dkv = (tiles(config.block_q, config.block_k, config.dq_warps, config.dq_stages),
                tiles(config.block_q, config.block_k, config.dkv_warps, config.dkv_stages))
@@ -622,9 +620,11 @@ def test_every_backward_config_on_a_gpu(config, case):
     def backward(query, key, value):
         return attention_triton.backward(query, key, value, spans, None, query, interpret=not ON_GPU)
 
-    [ba] = [ba for ba in launches(backward, query, key, value)
-            if isinstance(ba.op, attention_triton.TritonBackward)]
-    if config in ba.op.fitting(ba, generation.gpu_target()):
+    # The launch as it traces (`tuning.seen`), its arguments the template's fitting reads.
+    with tuning.seen() as found:
+        jax.jit(backward).lower(query, key, value)
+    [(op, ba)] = [(op, ba) for op, ba in found if isinstance(op, attention_triton.TritonBackward)]
+    if config in op.fitting(ba, generation.gpu_target()):
         check_backward(call, SCORE_HOOKS["softcap-sinks-alibi"], jnp.bfloat16, dq, dkv)
         return
     with pytest.raises(tuning.Unpinnable, match=r"registers|shared memory"), tuning.pinned(
