@@ -114,8 +114,7 @@ def run(config: Comparison) -> Curve:
     trainer = Trainer(objective, build_solver(config),
                       key=jax.random.key(config.seed), mesh=MeshSpec(fsdp=1),
                       checkpoints=None, tracker=None)
-    abstract = jax.eval_shape(trainer.initial_state)
-    state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
+    state, _, _ = trainer.place()
     parameters = sum(x.size for x in jax.tree.leaves(state.variables))
 
     with DevicePrefetchIterator(data.train(DataPartition.of(trainer.device_mesh)),
