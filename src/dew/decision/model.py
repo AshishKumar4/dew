@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype
 
@@ -12,7 +13,15 @@ from dew.decision.head import Head
 from dew.decision.layout import DecisionInputs
 from dew.nn.cross_attention import crosses_alone
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, ModelInputs, coordinates
-from dew.nn.protocols import CrossAttending, HiddenStates, VocabularyRows
+from dew.nn.protocols import (
+    CrossAttending,
+    HiddenStates,
+    LogitsFromHidden,
+    OutputTable,
+    TokenModel,
+    VocabularyRows,
+    head_table,
+)
 from dew.objectives.base import Variables, part, thaw
 
 
@@ -84,6 +93,10 @@ class DecisionModel:
         other = (slots[:, :, None] > 0) & (slots[:, None, :] > 0) & (slots[:, :, None] != slots[:, None, :])
         # A token reads its own row's, and the padding its own; an option reads no other option.
         visible = (segments[:, :, None] == segments[:, None, :]) & ~other
+        if isinstance(self.backbone, TokenModel) and self.backbone.causal:
+            # A causal backbone reads each token's own and the earlier ones, the mask its whole visibility.
+            order = jnp.arange(slots.shape[1])
+            visible = visible & (order[None, :, None] >= order[None, None, :])
         return _array(self.backbone.apply(backbone, inputs.tokens, train=train, coordinates=laid,
                                           attention_pairwise_mask=visible,
                                           attention_key_positions=inputs.positions, method="hidden_states",
@@ -159,14 +172,52 @@ class DecisionModel:
                train: bool = False, rngs: dict[str, jax.Array] | None = None) -> jax.Array:
         """Return the `[B, Q, K]` fp32 option logits, with -inf past each question's options."""
         states, spanned = self._read(variables, inputs, media=media, train=train, rngs=rngs)
-        table = self.table(variables) if self.head.reads_table else None
-        # The questions' spans are pooled from the pass that holds them: the context's, where it holds
-        # the schema.
         head = thaw(part(variables, "head"))
-        logits = _array(self.head.apply(head, states, inputs, table, train=train, rngs=rngs)
-                        if spanned is None else
-                        self.head.apply(head, states, inputs, table, train, spanned, rngs=rngs))
+        if self.head.reads_labels:
+            if spanned is not None:
+                raise TypeError("a readout of labels reads its questions in the row, not in its context")
+            labels = self.head.tied_labels()
+            tied = None if labels is None else self.label_logits(variables, states, inputs, labels)
+            # A head drawn from the vocabulary rows reads no table after its draw.
+            table = None if self.head.draws_from_rows else self.output_table(variables)
+            logits = _array(self.head.apply(head, states, inputs, table, train=train, tied=tied, rngs=rngs))
+        else:
+            table = self.table(variables) if self.head.reads_table else None
+            # The questions' spans are pooled from the pass that holds them: the context's, where it
+            # holds the schema.
+            logits = _array(self.head.apply(head, states, inputs, table, train=train, rngs=rngs)
+                            if spanned is None else
+                            self.head.apply(head, states, inputs, table, train, spanned, rngs=rngs))
         return jnp.where(inputs.options, logits, -jnp.inf)
+
+    def output_table(self, variables: Variables) -> OutputTable | None:
+        """The backbone's head as one matrix (`AffineHead`), or None where no matrix alone is it."""
+        return head_table(self.backbone, thaw(part(variables, "backbone")))
+
+    def label_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
+                     labels: tuple[tuple[int, ...], ...]) -> jax.Array:
+        """The backbone's own logits `[B, Q, K, V]` at each label's ids of each question's answer
+        state (`DecisionInputs.readout`): its output table at the labels' columns alone, computed in
+        fp32 (`OutputTable.columns`), where one matrix is its head; else its exact head over the
+        answer states, a few rows (`LogitsFromHidden`), the labels' columns taken. No product is
+        rebuilt from the vocabulary's rows, which carry no bias and no softcap."""
+        if inputs.readout is None:
+            raise ValueError("a readout of labels reads rows whose options stand under labels (Labels)")
+        answers = jnp.take_along_axis(states, inputs.readout[..., None], axis=1)
+        ids = np.asarray(labels, np.int64)
+        width = inputs.options.shape[-1]
+        table = self.output_table(variables)
+        if table is not None:
+            return table.columns(answers, ids.reshape(-1).tolist(), exact=True).reshape(
+                *answers.shape[:2], *ids.shape)[:, :, :width]
+        if not isinstance(self.backbone, LogitsFromHidden):
+            raise TypeError(f"a readout of labels reads its backbone's exact head, which a "
+                            f"{type(self.backbone).__name__} does not give (AffineHead, LogitsFromHidden)")
+        full = jnp.asarray(self.backbone.apply(thaw(part(variables, "backbone")), answers,
+                                               method="logits_from_hidden"))
+        picked = jnp.take(full, jnp.asarray(ids.reshape(-1)), axis=-1)
+        return picked.astype(jnp.promote_types(picked.dtype, jnp.float32)).reshape(
+            *answers.shape[:2], *ids.shape)[:, :, :width]
 
 
 def _array(applied: object) -> jax.Array:

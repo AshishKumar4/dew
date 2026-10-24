@@ -23,6 +23,14 @@ type ParamTree = Tree[np.ndarray]
 type TensorPath = Callable[[str], tuple[str, ...] | None]
 
 
+def in_params(path: TensorPath) -> TensorPath:
+    """`path`, whose leaves are parameters, rooted at `params`."""
+    def rooted(name: str) -> tuple[str, ...] | None:
+        leaf = path(name)
+        return None if leaf is None else ("params", *leaf)
+    return rooted
+
+
 AUTO = "auto"
 """The param_dtype that stores a checkpoint's parameters in its own dtype."""
 

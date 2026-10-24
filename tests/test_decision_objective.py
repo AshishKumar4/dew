@@ -372,8 +372,12 @@ def test_a_saved_vision_run_answers_image_rows(tmp_path, separate_tokenizer):
 
     assert reloaded.processor is not None
     np.testing.assert_array_equal(second, first)
-    assert reloaded.processor.source == str(directory)
-    assert objective.inference_record()["processor"] == str(directory)
+    from dew.interop.sources import SourceReference
+    from dew.registry import from_record
+
+    assert reloaded.processor.source == SourceReference(str(directory))
+    held_source = from_record(SourceReference, objective.inference_record()["processor"])
+    assert held_source == reloaded.processor.source
     assert not np.array_equal(second, reloaded("charged twice!", asked)["team"].probabilities)
 
 
