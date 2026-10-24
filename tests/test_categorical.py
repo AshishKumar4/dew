@@ -157,14 +157,18 @@ def label_derivative(rows: np.ndarray) -> np.ndarray:
 @pytest.mark.parametrize("margin", sorted(COLLAPSE_SEEDS))
 def test_a_confident_labels_derivative_survives_and_sums_to_zero(margin):
     """Past the margin where the label's `p - 1` rounds to 0 in float32 (arXiv:2610.31642, eq. 4), the
-    label loss's derivative is on par with the paper's eq. 7 from float64 (check 1), every row of it
-    summing to zero as float64's does, the label's own entry below zero; the loss is Optax's."""
+    label loss's derivative, and a one-hot target's, is on par with the paper's eq. 7 from float64
+    (check 1), every row of it summing to zero as float64's does, the label's own entry below zero; the
+    loss is Optax's."""
     labels = jnp.zeros(3, jnp.int32)
-    gradient = jax.jit(jax.grad(lambda rows: categorical.cross_entropy(rows, labels).sum()))
-    assert_as_exact(gradient, label_derivative, lambda seed: confident(margin, seed), f"margin {margin}",
-                    seeds=COLLAPSE_SEEDS[margin])
+    losses = {"label": lambda rows: categorical.cross_entropy(rows, labels),
+              "one-hot target": lambda rows: categorical.soft_cross_entropy(rows, jax.nn.one_hot(labels, 7))}
     (rows,) = confident(margin, 0)
-    assert np.all(np.asarray(gradient(rows))[:, 0] < 0)
+    for name, loss in losses.items():
+        gradient = jax.jit(jax.grad(lambda rows, loss=loss: loss(rows).sum()))
+        assert_as_exact(gradient, label_derivative, lambda seed: confident(margin, seed),
+                        f"{name} at margin {margin}", seeds=COLLAPSE_SEEDS[margin])
+        assert np.all(np.asarray(gradient(rows))[:, 0] < 0)
     np.testing.assert_array_equal(categorical.cross_entropy(rows, labels),
                                   optax.softmax_cross_entropy_with_integer_labels(jnp.asarray(rows), labels))
 
@@ -199,4 +203,26 @@ def test_the_divergences_derivative_near_its_reference_keeps_the_differences_pre
     np.testing.assert_array_equal(gradient(rows, rows), np.zeros(rows.shape, np.float32))
     assert_as_exact(gradient, divergence_derivative, near_reference, "near the reference",
                     seeds=CANCELLATION_SEEDS)
+
+
+def test_the_divergences_derivative_stays_finite_wherever_its_rows_are():
+    """Rows each finite but far apart in offset have the derivative of the distributions they hold, here
+    two uniform rows' zero; rows far apart in shape have a finite Hessian; logits -inf where the
+    reference is not take `p - q` in forward mode as in reverse; and a row whose classes `where`
+    excludes entirely has derivative 0 beside a held row's."""
+    far = jnp.asarray([[2e38, 2e38]], jnp.float32), jnp.asarray([[-2e38, -2e38]], jnp.float32)
+    offset = jax.grad(lambda rows: categorical.kl_divergence(rows, far[1]).sum())(far[0])
+    np.testing.assert_array_equal(offset, np.zeros((1, 2), np.float32))
+    apart = jnp.asarray([200.0, 0.0]), jnp.asarray([-200.0, 0.0])
+    for hessian in (jax.hessian, jax.jacfwd(jax.jacrev), jax.jacrev(jax.jacrev)):
+        held = hessian(lambda row: categorical.kl_divergence(row, apart[1]))(apart[0])
+        assert np.all(np.isfinite(np.asarray(held)))
+    student, reference = jnp.asarray([-jnp.inf, 0.0]), jnp.asarray([0.0, 0.0])
+    _, forward = jax.jvp(lambda row: categorical.kl_divergence(row, reference), (student,),
+                         (jnp.asarray([0.0, 1.0]),))
+    backward = jax.grad(lambda row: categorical.kl_divergence(row, reference))(student)
+    assert forward == backward[1] == 0.5
+    rows, held = logits(jnp.float32, (2, 7)), jnp.asarray([[True] * 7, [False] * 7])
+    jacobian = np.asarray(jax.jacfwd(lambda rows: categorical.kl_divergence(rows, rows[::-1], held))(rows))
+    assert np.all(np.isfinite(jacobian)) and np.all(jacobian[1] == 0)
 
