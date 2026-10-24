@@ -119,6 +119,11 @@ class SlotSource(SourceKind):
             raise ValueError("the slot format holds its release prompt and uncalibrated logits")
         ids = records.listed(fields["label_ids"], "label_ids", read=lambda value, _: value,
                              what="a list of label ids")
+        canonical, picked = _labels(bundle.decision_tokenizer, len(ids))
+        actual = (tuple(records.integers(group, "label_ids") for group in ids) if mode == "slot_lm"
+                  else tuple((records.integer(value, "label_ids"),) for value in ids))
+        if labels != canonical or actual != picked:
+            raise ValueError("the slot format records its canonical bare labels in tokenizer order")
         readout = {"readout": mode, "head_dim": fields.get("head_dim", 256), "n_slots": len(ids)}
         if settings.layout.blocks:
             readout["attention"] = "noncausal"

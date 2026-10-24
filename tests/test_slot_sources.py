@@ -82,6 +82,10 @@ def test_a_slot_release_loads_its_readout_and_exports_the_same_task(tmp_path, re
     exported = tmp_path / "exported"
     bundle.save(exported)
     restored = Decide.from_pretrained(exported, dtype="float32", attention_impl="xla")
+    overflow = Choice("Which one?", [f"option{index}" for index in range(min(n_slots, 26) + 1)])
+    for reader in (task, restored):
+        with pytest.raises(ValueError):
+            reader.layout.rows(reader.tokenizer, reader.specials, "state", {"overflow": overflow})
     assert restored.layout.rows(restored.tokenizer, restored.specials, "Refund requested.",
                                 {"team": Choice("Which team?", ["billing", "technical"])}) == [row]
     for actual, expected in zip(jax.tree.leaves(restored.variables), jax.tree.leaves(task.variables),
