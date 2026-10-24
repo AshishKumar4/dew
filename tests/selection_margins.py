@@ -147,5 +147,5 @@ def clearing(draw, clears, tries: int = 64):
             inputs = draw(seed if attempt == 0 else 1_000_003 * (attempt + 1) + seed)
             if clears(inputs):
                 return inputs
-        raise AssertionError(f"no draw of seed {seed} clears the selection margin {MARGIN}")
+        raise AssertionError(f"no draw of seed {seed} clears its selection margin")
     return drawn
