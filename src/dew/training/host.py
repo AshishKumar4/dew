@@ -11,7 +11,7 @@ import dataclasses
 import mmap
 from collections import defaultdict
 from collections.abc import Callable, Mapping
-from typing import Protocol, cast, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -77,7 +77,12 @@ def companion_mesh(accelerator: Mesh, devices=None) -> Mesh:
     return mesh
 
 
-def placed_leaves(tree: Variables, place: Callable[[tuple[str, ...], object], object], *,
+type Leaf = jax.Array | np.ndarray | np.generic | HostSource
+"""A leaf of a variables tree as it is placed: an array on the devices or on the host, or a host
+source a placement reads one device shard at a time (`HostSource`)."""
+
+
+def placed_leaves(tree: Variables, place: Callable[[tuple[str, ...], Leaf], Leaf], *,
                   in_place: bool) -> Variables:
     """`tree` with each leaf replaced by what `place(path, leaf)` returns, one leaf at a time: a
     leaf placed lands (`block_until_ready`) before the next is read, and a memory-mapped host leaf's
@@ -86,7 +91,7 @@ def placed_leaves(tree: Variables, place: Callable[[tuple[str, ...], object], ob
     sees the placed leaves and no host leaf outlives its copy, and any other mapping (a FrozenDict)
     is rebuilt as a dict over the same children; otherwise every node is rebuilt, the caller's tree
     left as it was."""
-    def walk(node, path: tuple[str, ...]):
+    def walk(node: Mapping | Leaf, path: tuple[str, ...]) -> dict | Leaf:
         if not isinstance(node, Mapping):
             landed = place(path, node)
             if landed is not node:
@@ -99,7 +104,10 @@ def placed_leaves(tree: Variables, place: Callable[[tuple[str, ...], object], ob
             held[name] = walk(held[name], (*path, name))
         return held
 
-    return cast(Variables, walk(tree, ()))
+    held = tree if in_place and type(tree) is dict else dict(tree)
+    for name in list(held):
+        held[name] = walk(held[name], (name,))
+    return held
 
 
 def stream(tree: Variables, placement, held: Variables | None = None) -> Variables:
