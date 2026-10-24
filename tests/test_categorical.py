@@ -54,7 +54,7 @@ def test_the_forms_agree_and_a_masked_class_takes_no_probability():
     log_p = np.asarray(categorical.log_probs(rows))
     picked = np.take_along_axis(log_p, np.asarray(labels)[:, None], 1)[:, 0]
     np.testing.assert_array_equal(categorical.soft_cross_entropy(rows, jax.nn.one_hot(labels, 7)), -picked)
-    np.testing.assert_array_equal(categorical.entropy(rows), -(np.exp(log_p) * log_p).sum(-1))
+    np.testing.assert_array_equal(categorical.entropy(rows), -(jnp.exp(log_p) * log_p).sum(-1))
     assert np.all(np.asarray(categorical.kl_divergence(rows, rows)) == 0)
     held = jnp.arange(7) < 4
     masked = np.asarray(categorical.probabilities(rows, held))
