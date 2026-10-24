@@ -71,7 +71,7 @@ class VPOracle(nn.Module):
     The model is conditioned on the raw timestep for discrete schedules, so
     rates are recomputed from the schedule inside the module.
     """
-    schedule: CosineNoiseScheduler
+    schedule: CosineNoiseScheduler | LinearNoiseScheduler
 
     @nn.compact
     def __call__(self, x, temb):
@@ -158,7 +158,7 @@ def ve_endpoint_process():
 
 def linear_process():
     schedule = LinearNoiseScheduler(1000)
-    return Process(schedule, EpsilonPredictionTransform()), LinearVPOracle(schedule=schedule)
+    return Process(schedule, EpsilonPredictionTransform()), VPOracle(schedule=schedule)
 
 
 class FlowOracle(nn.Module):
@@ -500,17 +500,6 @@ DIFFUSERS_CASES = {
 }
 
 
-class LinearVPOracle(nn.Module):
-    """The epsilon oracle on the linear beta table, the model the reference
-    tool runs under Diffusers' VP-table schedulers."""
-    schedule: LinearNoiseScheduler
-
-    @nn.compact
-    def __call__(self, x, temb):
-        alpha, sigma = broadcast_rates(self.schedule, temb, x)
-        return x * sigma / (alpha**2 * DATA_STD**2 + sigma**2)
-
-
 class VEOracle(nn.Module):
     """The epsilon oracle on a variance-exploding latent x = x_0 + sigma eps,
     read at c_noise = log(sigma) / 4, the model under the k-diffusion
@@ -533,7 +522,7 @@ def reference_process(name: str) -> tuple[Process, nn.Module]:
         prediction = EpsilonPredictionTransform()
         if name.startswith("lcm"):
             prediction = ConsistencyBoundary(prediction)
-        return Process(schedule, prediction), LinearVPOracle(schedule=schedule)
+        return Process(schedule, prediction), VPOracle(schedule=schedule)
     if convention == "ve":
         karras = REFERENCE["karras"]
         return Process(KarrasVENoiseScheduler(karras["sigma_min"], karras["sigma_max"], karras["rho"]),
@@ -902,3 +891,65 @@ def test_ddim_at_eta_one_walks_as_diffusers_ddim_scheduler_on_the_same_draws():
     for index, actual in enumerate(walked):
         assert_as_exact_as_the_reference(actual, reference[0][index], reference[1][index],
                                          f"DDIM at eta 1, step {index}")
+
+
+def test_rk4s_update_divides_by_six_as_ieee_division_does():
+    """RK4's update, x + (k1 + 2 k2 + 2 k3 + k4) dt / 6, divides by six as IEEE does
+    (`dew.diffusion.schedules.divided`), bit for bit: with every stage's eps the same sixteenths, so
+    the stages' sum is exact, the update is the product with dt rounded once, its correctly rounded
+    sixth and the sum with x, where XLA:CPU's division by a constant multiplies by the rounded
+    reciprocal and parts with IEEE's quotient on about a third of values."""
+    process, _ = karras_process()
+    rng = np.random.default_rng(6)
+    x = rng.standard_normal((4096, 1)).astype(np.float32)
+    eps = (rng.integers(-1024, 1024, (4096, 1)) / 16).astype(np.float32)
+    times = process.times(12)
+    t, t_next = jnp.full((4096,), times[0]), jnp.full((4096,), times[1])
+
+    def denoise(at, time):
+        return at, jnp.asarray(eps)
+
+    stepped, _ = jax.jit(lambda x: RK4().step(x, t, t_next, x, jnp.asarray(eps), (), jax.random.key(0),
+                                              process, denoise))(jnp.asarray(x))
+    _, sigma_t = process.rates(t, like=x)
+    _, sigma_s = process.rates(t_next, like=x)
+    dt = np.asarray(sigma_s, np.float32) - np.asarray(sigma_t, np.float32)
+    expected = x + (6 * eps * dt) / np.float32(6)
+    np.testing.assert_array_equal(np.asarray(stepped).view(np.uint32), expected.view(np.uint32))
+
+
+def test_pndms_runge_kutta_weighs_a_low_precision_stage_in_fp32_as_diffusers_step_prk_does():
+    """PNDM's Runge-Kutta warmup weighs each stage as Diffusers' step_prk does, the product with 1/6 or
+    1/3 in fp32 and rounded once to the stage's dtype, as torch's `bf16_tensor * python_float` does
+    (`dew.nn.precision.scaled`): a bf16 stage of 7 weighs to 1.1640625, where rounding the sixth to
+    bf16 first gives 1.171875. With the later stages zero and the state zero, the step is the
+    transfer of the first stage's weight alone, `_get_prev_sample`'s, bit for bit."""
+    import ml_dtypes
+
+    process, _ = vp_process()
+    rng = np.random.default_rng(7)
+    eps = rng.standard_normal((4096, 1)).astype(ml_dtypes.bfloat16)
+    eps[0, 0] = 7
+    x = jnp.zeros((4096, 1), jnp.float32)
+    times = process.times(12)
+    t, t_next = jnp.full((4096,), times[0]), jnp.full((4096,), times[1])
+
+    def denoise(at, time):
+        return at, jnp.zeros((4096, 1), jnp.bfloat16)
+
+    solver = PNDM()
+    state = solver.init(x, times, process, key=jax.random.key(0))
+    stepped, _ = jax.jit(lambda x, eps: solver.step(x, t, t_next, x, eps, state, jax.random.key(0), process,
+                                                    denoise))(x, jnp.asarray(eps))
+    weighed = (eps.astype(np.float32) * np.float32(1 / 6)).astype(ml_dtypes.bfloat16)
+    assert weighed[0, 0] == 1.1640625
+
+    @jax.jit
+    def transfer(x, weighed):
+        alpha2_t, sigma2_t = process.variances(t, like=x)
+        alpha2_s, sigma2_s = process.variances(t_next, like=x)
+        denominator = alpha2_t * sigma2_s ** 0.5 + (alpha2_t * sigma2_t) ** 0.5 * alpha2_s ** 0.5
+        return (alpha2_s / alpha2_t) ** 0.5 * x - (alpha2_s - alpha2_t) * weighed / denominator
+
+    expected = np.asarray(transfer(x, jnp.asarray(weighed)))
+    np.testing.assert_array_equal(np.asarray(stepped).view(np.uint32), expected.view(np.uint32))

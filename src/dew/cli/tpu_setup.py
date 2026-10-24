@@ -13,23 +13,27 @@ from __future__ import annotations
 
 import shlex
 
-from dew.telemetry.builds import PACKAGE_INDEX
+from dew.builds import PACKAGE_INDEX
 
 #: Paths the remote side owns, and the only thing the commands agree on.
-VENV = "$HOME/dew-venv"
-ENV_FILE = "$HOME/.dew-env"
+VENV_NAME = "dew-venv"
+VENV = f"$HOME/{VENV_NAME}"
+ENV_NAME = ".dew-env"
+ENV_FILE = f"$HOME/{ENV_NAME}"
 RUNS = "dew-runs"
 RUNS_DIR = f"$HOME/{RUNS}"
 MOUNT_PATH = "$HOME/gcs_mount"
 DISK_MOUNT = "/mnt/persist"
+OPEN_FILES = 1048576
+"""The open-file limit a worker's shell, its PAM sessions and its systemd manager all take."""
 
 PACKAGE = "dewml"
 
 _ENV_LINES = (
-    'export PATH="$HOME/dew-venv/bin:$HOME/.local/bin:$PATH"',
+    f'export PATH="{VENV}/bin:$HOME/.local/bin:$PATH"',
     "export TOKENIZERS_PARALLELISM=false",
     "export WANDB_CACHE_DIR=/tmp/wandb-cache",
-    "ulimit -n 1048576 2>/dev/null || true",
+    f"ulimit -n {OPEN_FILES} 2>/dev/null || true",
 )
 
 _GCSFUSE_YML = """\
@@ -64,12 +68,12 @@ step "open file limits"
 limits=/etc/security/limits.conf
 grep -q "dew nofile" "$limits" || sudo -n tee -a "$limits" >/dev/null <<'LIMITS'
 # dew nofile
-* soft nofile 1048576
-* hard nofile 1048576
+* soft nofile @OPEN_FILES@
+* hard nofile @OPEN_FILES@
 LIMITS
 override=/etc/systemd/system.conf.d/99-dew-nofile.conf
 wanted="[Manager]
-DefaultLimitNOFILE=1048576"
+DefaultLimitNOFILE=@OPEN_FILES@"
 if [ "$(cat $override 2>/dev/null)" != "$wanted" ]; then
   sudo -n mkdir -p /etc/systemd/system.conf.d
   sudo -n tee "$override" >/dev/null <<<"$wanted"
@@ -77,13 +81,29 @@ if [ "$(cat $override 2>/dev/null)" != "$wanted" ]; then
 fi
 
 step "uv"
-if ! command -v uv >/dev/null && [ ! -x "$HOME/.local/bin/uv" ]; then
-  installer=$(mktemp)
-  curl -fsSL -o "$installer" https://astral.sh/uv/install.sh
-  sh "$installer"
-  rm -f "$installer"
-fi
+# BEGIN uv bootstrap (site/scripts/gen_install.py)
+uv_least=0.13.4
+# uv at uv_least or newer (pyproject.toml's [tool.uv] required-version). bootstrap_uv [NAME=VALUE...]
+# installs that release from astral's installer, NAME=VALUE in the installer's environment, where uv is
+# missing or older; uv_version is the release of the uv on PATH (none where there is none), and
+# uv_older VERSION says whether VERSION is older: a pre-release of uv_least is, a build of it is not.
+uv_version() { (uv --version 2>/dev/null || true) | awk '{print $2}'; }
+uv_older() {
+	awk -v have="${1%%+*}" -v least="$uv_least" 'BEGIN {
+		split(have, h, "."); split(least, l, ".")
+		for (i = 1; i <= 3; i++) if (h[i] + 0 != l[i] + 0) exit !(h[i] + 0 < l[i] + 0)
+		exit have !~ /[^0-9.]/
+	}'
+}
+bootstrap_uv() {
+	have=$(uv_version)
+	if [ -z "$have" ] || uv_older "$have"; then
+		curl -LsSf "https://astral.sh/uv/$uv_least/install.sh" | env "$@" sh
+	fi
+}
+# END uv bootstrap
 export PATH="$HOME/.local/bin:$PATH"
+bootstrap_uv
 
 step "python $PYTHON_VERSION"
 have=$("$VENV/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)
@@ -101,7 +121,7 @@ step "environment"
 cat > "$ENV_FILE" <<'DEW_ENV'
 @ENV_LINES@
 DEW_ENV
-grep -q '.dew-env' "$HOME/.bashrc" || echo '. $HOME/.dew-env' >> "$HOME/.bashrc"
+grep -q '@ENV_NAME@' "$HOME/.bashrc" || echo '. @ENV_FILE@' >> "$HOME/.bashrc"
 mkdir -p "$RUNS_DIR"
 
 if [ -n "$GCS_BUCKET" ]; then
@@ -138,7 +158,7 @@ sudo -n kill -9 $pids
 STATUS = (
     "printf '%s|%s|%s|%s\\n' "
     '"$(uptime -p 2>/dev/null | sed s/^up.//)" '
-    '"$(pgrep -fc \'[d]ew-venv/bin/python\' || true)" '
+    f'"$(pgrep -fc \'[{VENV_NAME[0]}]{VENV_NAME[1:]}/bin/python\' || true)" '
     '"$(sudo -n lsof -t /dev/accel* 2>/dev/null | sort -u | wc -l)" '
     '"$(ls /dev/accel* 2>/dev/null | wc -l)"'
 )
@@ -173,7 +193,8 @@ def render(
         f'RUNS_DIR="{RUNS_DIR}"',
         f'MOUNT_PATH="{MOUNT_PATH}"',
     ]
-    body = _BODY.replace("@ENV_LINES@", "\n".join(_ENV_LINES))
+    body = (_BODY.replace("@ENV_LINES@", "\n".join(_ENV_LINES)).replace("@OPEN_FILES@", str(OPEN_FILES))
+            .replace("@ENV_FILE@", ENV_FILE).replace("@ENV_NAME@", ENV_NAME))
     body = body.replace("@GCSFUSE_YML@", _GCSFUSE_YML.rstrip("\n"))
     return "\n".join(header) + body
 

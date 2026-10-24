@@ -5,6 +5,29 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- `OptimConfig.rate` is the learning rate, a number or a schedule's record, in
+  place of `learning_rate` and `schedule`; on the command line it is one value,
+  `--optim.rate 3e-4` or a schedule's JSON record.
+- Module moves, each name at one path: the run configurations are
+  `dew.config.lm.LMRunConfig`, `dew.config.jepa.JepaRunConfig` and
+  `dew.config.diffusion.DiffusionRunConfig` (with `FlowRolloutConfig`); the
+  condition records `TextCondition` and `AudioCondition` are `dew.inputs`';
+  `PretrainedAutoencoder` is `dew.nn.autoencoders.pretrained`'s; the optimizers
+  and schedules are `dew.optim`; the device facts and CUDA builds are
+  `dew.devices` and `dew.builds`. A run's record names its run class by its
+  alias (`"class": "diffusion"`, `dew.registry.runs`), so it reads back wherever
+  the class moves; a run.json written before this names the old import path and
+  no longer loads. A distillation's teacher run is the run config's
+  `--teacher-run`, and the objectives take the loaded teacher
+  (`teacher_variables=`, and guidance distillation's `teacher=`).
+- A diffusion schedule's division of a state by a rate (`divided`: epsilon from a clean
+  prediction, the clean sample from epsilon, a sigma solver's derivative) is IEEE's correctly
+  rounded quotient whatever the backend's division flags, through the one correctly rounded
+  divide the quantizers use (`dew.nn.precision.correctly_rounded_divide`, moved from
+  `dew.nn.fake_quant`); a bfloat16 or float16 state's is the float32 quotient rounded to its
+  dtype, as PyTorch's opmath gives it.
+- `train/flops`, a step's analytical training work, is logged on every device,
+  CPU and TPU included; `train/mfu` still needs a device with a known peak.
 - `dew.figures` draws SVG figures for notebooks and docs. Their colors follow
   the page's light or dark theme (dewml.dev, Colab, JupyterLab, VS Code, and
   the system setting elsewhere), and their animations are CSS, so they play
@@ -32,6 +55,50 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   shards, so hosts that each export the same rows read one store. A data
   position saved over a committed export before is refused as its source
   changed, and a cache or generation over one fills again.
+- A holdout written before a published generation picks the inputs it picks
+  without the cache: the generation stands in for the inputs each part keeps,
+  by hash (by a field the cached step drops too) or by records, over missing
+  rows and steps that drop or expand them. A records holdout over a
+  generation a stream filled is served where the store states that its stream
+  reads its records in index order (in-memory, token, TFDS, PyTorch, Grain
+  and Arrow datasets, generations), and refused otherwise: publish those from
+  a memory read, or an indexed one (`provision=True`). A step that reads its
+  record's index there is refused, naming `Cache(url)`. A holdout part is named by
+  what it selects of its source's identity, so selections stacked on one
+  another stay apart; a data position saved over a holdout part before is
+  refused as its source changed, and a generation published from one no
+  longer stands in for it, where a `Cache(url)` over it fills again.
+- A mixture reads its corpora by Grain's weighted selection and counts its
+  epoch by it: until every corpus has come round once where the order reads
+  on past the mix, and at its first corpus's end where a mix of corpora read
+  once ends. Corpora that recur across phases continue where that selection
+  left each, which reads other records after a phase switch for weights whose
+  scaling Grain truncates (1, 10 and 15), so a data position saved by an
+  earlier Dew is refused (data plan version 5).
+- An epoch's steps count the step that reads its last records short of a
+  batch where the order reads on into the next epoch (a training order that
+  repeats for ever) or keeps its short last batch (`Loader.tail`): 39 windows
+  in batches of 8 are 5 steps an epoch, not 4, so a run counted in epochs
+  reads every record of each. An order that ends and drops its short last
+  batch counts as before. A part of a mixture cut by a slice or a limit comes
+  round once its cut records are read, and a packing's or token windows'
+  facts keep none of the counts of the documents in them.
+- `dew.data` and `dew.data.sources` export `from_torch`, `from_grain`,
+  `from_hf` and `from_iter`, not the `Torch`, `Grain`, `HF` and `Iterated`
+  classes they make, which a recorded chain still names by their modules. A
+  Hugging Face stream saves its position through the iterator bridge every
+  resumable iterator does, and a data position saved over one before is
+  refused.
+- A storage profile whose base is this host's disk (`file` or `local`) is
+  that disk: an export commits to it, and ArrayRecord shards, offset indexes
+  and Arrow files read there by their own readers.
+- A text file is indexed by its lines' bytes, so a line that is not UTF-8 is
+  refused when it is read, not when the file is provisioned.
+- A packing plan a generation publishes is named by the digest a plan held
+  in memory is (`dew.data.plan.fingerprint`). A generation published before
+  keeps the name it stored, and a data position saved over it resumes; one
+  published again from the same documents is named anew, and a position saved
+  over the one before refuses it as its order changed.
 
 ## 0.1.0
 

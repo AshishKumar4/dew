@@ -39,11 +39,15 @@ import json
 import os
 import platform
 import pstats
+import sys
 import time
 import uuid
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import peak_memory
 
 
 def prompts_for(slots: int, count: int, length: int, high: int, *, warm: bool = False) -> np.ndarray:
@@ -199,6 +203,7 @@ def dew_points(args):
     from dew.inference.serving import Server
     from dew.nn.kv_cache import KVCache
     from dew.sampling import Sampling
+    from dew.telemetry.instrumentation import Compiles
     from dew.training import MeshSpec
 
     began = time.perf_counter()
@@ -235,7 +240,8 @@ def dew_points(args):
         for rows in sorted({min(server.admission, 1 << bit) for bit in range(server.admission.bit_length())}):
             dew_run(server, warm[:rows], args.output)
         print(f"slots {slots}: warm in {time.perf_counter() - began:.2f}s", flush=True)
-        compiled = server._step._cache_size()
+        # The server's step programs, whichever it runs (`dew.inference.serving_kernel._stepped`).
+        compiles = Compiles("_stepped").__enter__()
         repeats = []
         for repeat in range(args.repeats):
             measured, generations = dew_run(server, prompts, args.output)
@@ -247,7 +253,8 @@ def dew_points(args):
                          behavior=np.concatenate([row.behavior_log_probs for row in generations]))
         point = {"slots": slots, "admission": server.admission, "repeats": repeats,
                  "prompt_sha256": hashlib.sha256(prompts.tobytes()).hexdigest(),
-                 "measured_recompiles": server._step._cache_size() - compiled}
+                 "measured_recompiles": compiles.count}
+        compiles.__exit__()
         if args.rate:
             opened = prompts_for(slots, args.requests or 6 * slots, args.prompt, args.vocab_limit)
             point["open_loop"] = [dew_open(server, opened, args.output, rate) for rate in args.rate]
@@ -441,6 +448,9 @@ def main():
     parser.add_argument("--generations", action="store_true")
     parser.add_argument("--rate", default="", help="open-loop Poisson arrival rates, requests a second")
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--peak-run", type=int,
+                        help="Dew: run slot count N of --slots alone, for its measured peak "
+                             "(tools/peak_memory.py), writing nothing")
     args = parser.parse_args()
     args.slots = [int(value) for value in args.slots.split(",")]
     args.rate = [float(value) for value in args.rate.split(",") if value]
@@ -457,9 +467,20 @@ def main():
     if (min(args.slots) < 1 or min(args.prompt, args.output, args.repeats, args.profile_steps) < 1
             or args.requests < 0 or args.vocab_limit <= 100):
         parser.error("counts must be positive; --requests=0 chooses the default")
+    if args.peak_run is not None:
+        # The timed repeats' work alone: no generations written, no open-loop rates, no profile.
+        dew_points(argparse.Namespace(**{**vars(args), "slots": [args.slots[args.peak_run]],
+                                         "generations": False, "rate": [], "profile": False}))
+        return
     args.out.parent.mkdir(parents=True, exist_ok=True)
+    # Dew's: each slot count's measured peak, in a process of its own, before this one opens a backend.
+    peaks = ([peak_memory.measured([os.path.abspath(__file__), *sys.argv[1:], "--peak-run", str(index)])
+              for index in range(len(args.slots))] if args.backend == "dew" else None)
     engines = {"vllm": vllm_points, "vllm-engine": engine_points, "sglang-engine": sglang_points}
     hardware, points = dew_points(args) if args.backend == "dew" else asyncio.run(engines[args.backend](args))
+    if peaks is not None:
+        for point, peak in zip(points, peaks, strict=True):
+            point["peak_device_bytes"] = None if None in peak else max(peak)
     record = {"backend": args.backend, "model": args.model, "hardware": hardware,
               "prompt": args.prompt, "output": args.output, "vocab_limit": args.vocab_limit,
               "sampling": {"temperature": 0, "ignore_eos": True}, "warm_output": args.output,

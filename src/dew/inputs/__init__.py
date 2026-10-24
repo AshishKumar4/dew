@@ -4,8 +4,9 @@
 conditions it is given, keyed by the model's own keyword arguments. A
 `Condition` holds an encoder, the batch field it reads and the raw datum that
 stands for "no condition", which classifier-free guidance and conditioning
-dropout substitute. Nothing here runs a model. The spec only describes the
-inputs, and the objective does the encoding.
+dropout substitute. The spec only describes the inputs; `encode_conditions`
+runs its encoders over their weights, the one encoding a training step and a
+sampling task share.
 
 Image and video batches arrive as uint8 pixels in [0, 255], as the data
 workers write them. `unit_range` is the one conversion to [-1, 1], the range
@@ -15,8 +16,10 @@ every diffusion loss, sample, artifact and image metric uses, and
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -24,7 +27,9 @@ import numpy as np
 
 from dew import registry
 from dew.nn.inputs import ModelInputs
+from dew.nn.text_encoders import DEFAULT_MODEL
 from dew.objectives.base import Batch, Variables
+from dew.registry import DtypeName
 
 from .diffusion import DiffusionConditioner
 from .encoders import CharTable, CLIPText, ConditionEncoder, HFAudio, T5Text, rebuild
@@ -121,6 +126,12 @@ class InputSpec:
             if condition.encoder.reads_captions
         }
 
+    @property
+    def encoders(self) -> tuple[tuple[str, ConditionEncoder], ...]:
+        """Each condition's encoder by the keyword it is passed under, a hashable value a compiled
+        encoding takes as a static argument (`encode_conditions`)."""
+        return tuple((keyword, condition.encoder) for keyword, condition in self.conditions.items())
+
     def dependencies(self) -> Mapping[str, object]:
         """What `tokenize` and `encode_fields` make of a batch depends on: each condition's field
         and its encoder's own (`ConditionEncoder.dependencies`)."""
@@ -212,7 +223,89 @@ class InputSpec:
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class TextCondition:
+    """Text conditioning: which registered encoder reads the batch's tokens, and from which checkpoint."""
+
+    encoder: str = "clip_text"
+    checkpoint: str = DEFAULT_MODEL
+    dtype: DtypeName | None = None
+    """The encoder's compute dtype; None follows the model's compute dtype."""
+    param_dtype: DtypeName = "float32"
+    """The storage dtype when loading source weights; supplied params keep theirs."""
+    field: str = "text"
+    """The batch field holding the tokenized text."""
+    unconditional: str = ""
+    """The prompt the unconditional branch is encoded from."""
+    max_length: int | None = None
+    """The token length every prompt is padded to.
+
+    None keeps the encoder's own default, which for CLIP is the checkpoint's
+    context length.
+    """
+    revision: str | None = None
+    """The checkpoint's git revision.
+
+    With it, a rerun conditions on the weights the run named, even after the
+    branch has moved on.
+    """
+
+    def build(self, *, params: Variables | None = None,
+              dtype: DtypeName | None = None) -> Condition:
+        """Build the encoder over supplied params, without loading source weights or casting storage.
+
+        `dtype` is the run's own compute dtype, which an unset `self.dtype` follows:
+        the tower runs next to the model it conditions in every step, so a checkpoint
+        stored in float32 is no reason to run it in float32.
+        """
+        fields = {name: value for name, value in
+                  (("max_length", self.max_length), ("revision", self.revision))
+                  if value is not None}
+        return Condition(
+            rebuild(self.encoder, {"checkpoint": self.checkpoint,
+                                   "dtype": dtype if self.dtype is None else self.dtype,
+                                   "param_dtype": self.param_dtype, **fields}, params=params),
+            field=self.field, unconditional=self.unconditional)
+
+
+@dataclasses.dataclass(frozen=True)
+class AudioCondition:
+    """Audio conditioning on each clip, through an audio tower.
+
+    `checkpoint` names the `hf_audio` tower, whose feature extractor encodes the
+    waveform in the batch's `audio` field on the host.
+    The dataset's clip length sets the waveform length used to encode every
+    clip and the silent unconditional input, so the two always agree.
+    """
+
+    encoder: ClassVar[str] = "hf_audio"
+    checkpoint: str = "facebook/wav2vec2-base-960h"
+    dtype: DtypeName | None = None
+    """The tower's compute dtype; None follows the model's compute dtype."""
+    param_dtype: DtypeName = "float32"
+    """The storage dtype when loading source weights; supplied params keep theirs."""
+
+    def build(self, seconds: float, *, params: Variables | None = None,
+              dtype: DtypeName | None = None) -> Condition:
+        """Build the tower over supplied params for waveforms of `seconds` (the clips' `audio_seconds`,
+        `Dataset.facts`), without loading source weights or casting storage."""
+        return Condition(
+            rebuild(self.encoder, {"checkpoint": self.checkpoint, "seconds": seconds,
+                                   "dtype": dtype if self.dtype is None else self.dtype,
+                                   "param_dtype": self.param_dtype}, params=params),
+            field="audio", unconditional=0.0)
+
+
+def encode_conditions(encoders: Sequence[tuple[str, ConditionEncoder]], weights: Mapping[str, Variables],
+                      tokens: Mapping[str, object]) -> dict:
+    """Each of `encoders` (`InputSpec.encoders`) over the tokens under its keyword, with the weights
+    under its keyword: the conditions a model is passed, by keyword. The one encoding a training
+    step (`DiffusionObjective.encode`) and a sampling task (`TextToImage`) run."""
+    return {keyword: encoder.encode(weights[keyword], tokens[keyword]) for keyword, encoder in encoders}
+
+
 __all__ = [
+    "AudioCondition",
     "CLIPText",
     "CharTable",
     "Condition",
@@ -222,5 +315,6 @@ __all__ = [
     "HFAudio",
     "InputSpec",
     "T5Text",
+    "TextCondition",
     "unit_range",
 ]

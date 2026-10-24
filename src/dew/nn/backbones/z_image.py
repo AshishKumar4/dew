@@ -192,14 +192,22 @@ class ZImageTransformer(nn.Module):
         count = sum(projection_flops(lengths if name in ('x_embedder', 'final_linear') else
                                      context_lengths if name == 'cap_embedder' else rows, *shape)
                     for name, shape in maps.items())
-        image_block = ZImageBlock(self.dim, self.n_heads, parent=None)
-        text_block = ZImageBlock(self.dim, self.n_heads, modulation=False, parent=None)
+        image_block = self._block(parent=None)
+        text_block = self._block(modulation=False, parent=None)
         # Learned pad slots are visible architectural tokens, not masked batch padding.
         image_span = (np.ceil(image / MULTIPLE) * MULTIPLE).astype(np.int64)
         context_span = (np.ceil(context / MULTIPLE) * MULTIPLE).astype(np.int64)
         count += self.n_refiner_layers * (image_block.model_flops(image_span)
                                           + text_block.model_flops(context_span))
         return count + self.n_layers * image_block.model_flops(image_span + context_span)
+
+    @nn.nowrap
+    def _block(self, **where) -> ZImageBlock:
+        """A block as the model runs it, an image or joint one or, `modulation=False`, a caption one,
+        named by `where` (or unbound, `parent=None`, where a FLOP count reads it): one factory, so the
+        count and the execution build the same block."""
+        return ZImageBlock(self.dim, self.n_heads, epsilon=self.norm_eps, dtype=self.dtype,
+                           precision=self.precision, attention_impl=self.attention_impl, **where)
 
     def _embedded_time(self, time, dtype):
         """`TimestepEmbedder` of the source's time, (1000 - time) / 1000 times
@@ -267,22 +275,16 @@ class ZImageTransformer(nn.Module):
         image_rotation = _rotation(image_positions, *table, at_least_fp32(image.dtype))
         caption_rotation = _rotation(caption_positions, *table, at_least_fp32(image.dtype))
         whole_image = jnp.full((batch,), image_span, jnp.int32)
-        block = {"epsilon": self.norm_eps, "dtype": self.dtype, "precision": self.precision,
-                 "attention_impl": self.attention_impl}
-
         for index in range(self.n_refiner_layers):
-            image = ZImageBlock(self.dim, self.n_heads, name=f"noise_refiner_{index}", **block)(
-                image, image_rotation, whole_image, embedded)
+            image = self._block(name=f"noise_refiner_{index}")(image, image_rotation, whole_image, embedded)
         for index in range(self.n_refiner_layers):
-            caption = ZImageBlock(
-                self.dim, self.n_heads, modulation=False, name=f"context_refiner_{index}", **block
-            )(caption, caption_rotation, spans)
+            caption = self._block(modulation=False, name=f"context_refiner_{index}")(
+                caption, caption_rotation, spans)
         joined = jnp.concatenate([image, caption], axis=1)
         rotation = tuple(jnp.concatenate(pair, axis=1)
                          for pair in zip(image_rotation, caption_rotation, strict=True))
         for index in range(self.n_layers):
-            joined = ZImageBlock(self.dim, self.n_heads, name=f"layers_{index}", **block)(
-                joined, rotation, image_span + spans, embedded)
+            joined = self._block(name=f"layers_{index}")(joined, rotation, image_span + spans, embedded)
 
         scale = 1 + Dense(maps['final_modulation'][1], dtype=self.dtype, precision=self.precision,
                           name="final_modulation",

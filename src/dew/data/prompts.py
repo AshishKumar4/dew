@@ -36,6 +36,13 @@ if TYPE_CHECKING:
     from dew.data.dataset import Records
     from dew.data.steps.chat import RenderPrompt
 
+PROMPT_LEN = 256
+"""The ids a rendered prompt is laid out in where none is asked for (`RenderPrompt`)."""
+PROMPT_PAD = 0
+"""The id a rendered prompt is left-padded with where none is asked for."""
+PROMPT_LONG: Literal["drop", "truncate"] = "truncate"
+"""What a prompt longer than its ids becomes where none is asked for: its tail."""
+
 PROMPT_KEY = "prompt"
 """Batch key the prompts pipeline left-pads `[B, max_prompt_len]` ids under."""
 
@@ -70,6 +77,22 @@ class PromptRecord:
         """The record of a row's three values as a prompt batch stores them: a string is itself,
         a missing one is empty, and any other value travels as its JSON (`_text`)."""
         return cls(_text(data_source), _text(ground_truth), _text(extra_info))
+
+    @classmethod
+    def from_row(cls, row: Mapping[str, object]) -> PromptRecord:
+        """The record of a prompt row (verl's columns): its data source, its reference answer,
+        top-level or in `reward_model`, and its extra info with its `ability` folded in. Measuring
+        the reward width (`RewardWidth`) and rendering a row (`RenderPrompt`) read it alike."""
+        return cls.of(json_value(row.get("data_source"), "prompt data_source"), _ground_truth(row, "prompt"),
+                      _extra_info(row))
+
+    def columns(self) -> Mapping[str, str]:
+        """Its three values under the batch keys a prompt batch stores them by."""
+        return {SOURCE_KEY: self.data_source, TRUTH_KEY: self.ground_truth, INFO_KEY: self.extra_info}
+
+    def width(self) -> int:
+        """The bytes its widest value takes in UTF-8."""
+        return max(len(text.encode("utf-8")) for text in self.columns().values())
 
 
 def _extra_info(element: Mapping[str, object]) -> JSON:
@@ -177,8 +200,9 @@ def _utf8(text: str, width: int) -> np.ndarray:
     return out
 
 
-def encode(tokenizer: str | PreTrainedTokenizerBase, *, max_prompt_len: int = 256, pad_id: int = 0,
-           long: Literal["drop", "truncate"] = "truncate", thinking: bool | None = None) -> RenderPrompt:
+def encode(tokenizer: str | PreTrainedTokenizerBase, *, max_prompt_len: int = PROMPT_LEN,
+           pad_id: int = PROMPT_PAD, long: Literal["drop", "truncate"] = PROMPT_LONG,
+           thinking: bool | None = None) -> RenderPrompt:
     """A record step that renders a prompt row (verl's columns: "prompt",
     "data_source", "ground_truth", ...) to `max_prompt_len` left-padded ids,
     keeping a longer one's tail, or dropping it (`long="drop"`), counted as a
@@ -198,8 +222,6 @@ class RewardWidth:
     fact = "reward_bytes"
 
     def __call__(self, records: Records, /) -> int:
-        widths = (len(text.encode("utf-8")) for index in range(len(records)) for row in (records[index],)
-                  if isinstance(row, Mapping)
-                  for text in (_text(row.get("data_source")), _ground_truth(row, "prompt"),
-                               _text(_extra_info(row))))
+        widths = (PromptRecord.from_row(row).width() for index in range(len(records))
+                  for row in (records[index],) if isinstance(row, Mapping))
         return max(1, max(widths, default=1))

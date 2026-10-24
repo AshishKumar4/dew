@@ -595,8 +595,9 @@ def permutation_floor(case, batch, reference: Mapping[str, NDArray],
     return leaves, loss
 
 
-def anchor_program(case, batch, state):
-    """The same fp64 loss/gradient executable reused for each residual order."""
+def anchor_loss(case, batch, state):
+    """The fp64 loss of the trainer's first step over `state`'s widened variables, as a function of
+    the parameters and the batch, and those widened parameters."""
     import benchmark_models as bench
     import jax
 
@@ -618,7 +619,15 @@ def anchor_program(case, batch, state):
     def loss(variables, batch):
         return objective.scalar_loss({**wide, "params": variables}, batch, step)[0]
 
-    return jax.jit(jax.value_and_grad(loss)).lower(wide["params"], batch).compile()
+    return loss, wide["params"]
+
+
+def anchor_program(case, batch, state):
+    """The same fp64 loss/gradient executable reused for each residual order."""
+    import jax
+
+    loss, params = anchor_loss(case, batch, state)
+    return jax.jit(jax.value_and_grad(loss)).lower(params, batch).compile()
 
 
 def anchor_step(case, batch) -> tuple[float, dict[str, NDArray]]:
@@ -886,8 +895,11 @@ def judged_orders(reference: Mapping[str, Sequence[float]], layout: Mapping[str,
 
 
 def order_invariance(actual: Mapping[str, NDArray], truth: Mapping[str, NDArray],
-                     loss: float, truth_loss: float) -> float:
-    """A residual permutation preserves the entire fp64 gradient and loss to 1e-12 relative.
+                     loss: float, truth_loss: float, *, roundings: int) -> float:
+    """A residual permutation preserves the entire fp64 gradient and loss, each within float64's
+    rounding of the computation (`reference_error.assert_computes_the_oracle`) over `roundings`, its
+    program's longest chain (`chain_roundings`); a value that is not finite fails it. Returns the
+    gradient's distance relative to its scale.
 
     The gradient is one vector over all parameters, so cancelled leaves are
     measured on its scale instead of being divided by their own near-zero norm.
@@ -896,15 +908,19 @@ def order_invariance(actual: Mapping[str, NDArray], truth: Mapping[str, NDArray]
     """
     import numpy as np
 
+    sys.path.insert(0, str(REPO / "tests"))
+    from reference_error import assert_computes_the_oracle
+
     if actual.keys() != truth.keys():
         raise ValueError('float64 orders hold different leaves')
-    apart = math.sqrt(sum(float(np.sum(np.square(actual[name] - truth[name]))) for name in truth))
-    scale = math.sqrt(sum(float(np.sum(np.square(values))) for values in truth.values()))
-    relative = apart / scale if scale else 0.0 if apart == 0 else float('inf')
-    if relative > 1e-12 or abs(loss - truth_loss) > 1e-12 * abs(truth_loss):
-        raise ValueError(
-            f'float64 residual order changes the function: gradient relative error {relative:.3e}')
-    return relative
+    ordered, expected = (np.concatenate([np.ravel(tree[name]) for name in truth]) for tree in (actual, truth))
+    if not (np.isfinite(ordered).all() and np.isfinite(loss)):
+        raise ValueError('a float64 residual order computes a value that is not finite')
+    assert_computes_the_oracle(ordered, expected, 'float64 residual order', roundings=roundings)
+    assert_computes_the_oracle(np.asarray([loss]), np.asarray([truth_loss]), 'float64 residual order loss',
+                               roundings=roundings)
+    apart, scale = float(np.linalg.norm(ordered - expected)), float(np.linalg.norm(expected))
+    return apart / scale if scale else 0.0
 
 
 def run_orders(models: Sequence[str], layouts: Sequence[str], *, dtype: str, devices: int | None,
@@ -924,7 +940,7 @@ def run_orders(models: Sequence[str], layouts: Sequence[str], *, dtype: str, dev
     import numpy as np
 
     sys.path.insert(0, str(REPO / "tests"))
-    from reference_error import ORDERS, distance
+    from reference_error import ORDERS, chain_roundings, distance
     from residual_orders import orders, permuted, residual_width
 
     if jax.process_count() != 1:
@@ -942,6 +958,8 @@ def run_orders(models: Sequence[str], layouts: Sequence[str], *, dtype: str, dev
             base, ref_data, ref_step, ref_compiled = compiled_step(reference, {}, batch, one_device=True)
             programs = {name: compiled_step(case, LAYOUTS[name], batch, devices=devices) for name in layouts}
         truth_step = anchor_program(reference, batch, base)
+        anchor, wide = anchor_loss(reference, batch, base)
+        roundings = chain_roundings(jax.make_jaxpr(jax.value_and_grad(anchor))(wide, batch))
         drawn = orders(residual_width(base.variables), ORDERS, seed=2024)
         ref_shardings = jax.tree.map(lambda leaf: leaf.sharding, base)
         model_out = out / model
@@ -972,7 +990,8 @@ def run_orders(models: Sequence[str], layouts: Sequence[str], *, dtype: str, dev
             truth_loss, truth = float(truth_loss), flat(truth_tree, order)
             if identity is None:
                 identity, identity_loss = truth, truth_loss
-            invariance.append(order_invariance(truth, identity, truth_loss, identity_loss))
+            invariance.append(order_invariance(truth, identity, truth_loss, identity_loss,
+                                               roundings=roundings))
             ref_state, ref_loss, _, _, _, _ = ref_step(ordered_state(base, order, ref_shardings), ref_data)
             ref_gradient = flat(ref_state.opt_state[0]['gradient'], order)
             keys = (*truth, '@loss')

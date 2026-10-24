@@ -18,7 +18,9 @@ import numpy as np
 
 from dew.data.dataset import Batch
 from dew.data.facts import shaped
+from dew.data.images import resized_to
 from dew.data.pipeline import Rejected
+from dew.data.sources.av_utils import FPS
 from dew.data.sources.files import Files
 
 if TYPE_CHECKING:
@@ -29,9 +31,7 @@ def fit_frames(frames: np.ndarray, size: int) -> np.ndarray:
     """`frames` `[T, H, W, 3]` resized to `size` squares by area interpolation."""
     if frames.shape[1] == size and frames.shape[2] == size:
         return frames
-    import cv2
-    return np.stack([cv2.resize(frame, (size, size), interpolation=cv2.INTER_AREA)
-                     for frame in frames])
+    return np.stack([resized_to(frame, size, size, "area") for frame in frames])
 
 
 def fetch(url: str = "url", to: str = "mp4", *, timeout: float = 30.0, max_bytes: int = 256 * 2**20,
@@ -120,7 +120,7 @@ class DecodeVideo(grain.MapTransform):
 
     frames: int = 16
     _: dataclasses.KW_ONLY
-    fps: float = 25.0
+    fps: float = FPS
     size: int = 256
     min_size: int = 0
     field: str = "mp4"

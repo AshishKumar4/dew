@@ -11,7 +11,7 @@ scheduler in `serving` only feeds and reads them.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -21,6 +21,7 @@ from jax.experimental.layout import Format, Layout
 from jax.sharding import Mesh, NamedSharding
 
 from dew.inference.tasks import cache_sized
+from dew.nn.cross_attention import CROSS_KEY, CROSS_VALUE
 from dew.nn.inputs import Admitted, ModelInputs
 from dew.nn.kernels.options import compiler_options
 from dew.nn.kernels.tuning import tune
@@ -433,8 +434,8 @@ def state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
     `pages` split over the same axes, one part per group of rows. Keys,
     values and their scales keep their heads where the key and value
     projections leave them (`activation_kv`), and the logits their
-    vocabulary (`activation_vocab`). `state` is abstract: only its shapes
-    are read.
+    vocabulary (`activation_vocab`), as a row's cross-attention keys and
+    values keep theirs. `state` is abstract: only its shapes are read.
     """
     if mesh is None:
         device = jax.sharding.SingleDeviceSharding(jax.devices()[0])
@@ -448,6 +449,9 @@ def state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
     def cached(
         path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.ShapeDtypeStruct | jax.Array
     ) -> NamedSharding:
+        if leaf_name(path) in (CROSS_KEY, CROSS_VALUE):
+            # A row's context keys and values, its heads where the key and value projections leave them.
+            return placed(leaf, "activation_batch", None, "activation_kv")
         if leaf_name(path) not in POOLED:
             return placed(leaf, "activation_batch")
         if paged:
@@ -481,14 +485,18 @@ def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None,
 def resident_formats(model: nn.Module, params: Variables, pad_id: int, placement: Placement, steps: int,
                       state: Slots, shardings: Slots, rows: NamedSharding | None,
                       transforms: tuple[LogitsTransform, ...], stopping: decoding.Finishing,
-                      grammar: Grammar | None) -> Formats:
-    """Choose the memory layout the resident state keeps, by asking XLA for it.
+                      grammar: Grammar | None) -> tuple[Formats, Step | None]:
+    """Choose the memory layout the resident state keeps, by asking XLA for it, and the decode-only
+    step that chose it where it takes the state in that layout.
 
     The attention dot reads the cached keys and values with the slot axis
     minor. Across a jit boundary an array is row-major unless a layout is
     given, which would transpose the whole cache twice per layer. So the
     decode-only step is compiled once with layouts left to XLA, and the
     output formats it chose become the format every step takes and returns.
+    Where that compile also reads its state in those formats, it is the
+    decode step itself (`_reusable`), so a server compiles its largest program
+    once, not again at the formats (`decode_programs`); else None.
     `state` is abstract: choosing the layout allocates nothing. `shardings`
     places each leaf (`state_shardings`).
     """
@@ -503,7 +511,40 @@ def resident_formats(model: nn.Module, params: Variables, pad_id: int, placement
                  grammar)
     tune(lambda: program.lower(*arguments))
     compiled = program.lower(*arguments).compile()
-    return joined(*compiled.output_formats[1][:2])
+    formats = joined(*compiled.output_formats[1][:2])
+    return formats, _reusable(compiled, formats)
+
+
+type Step = Callable[..., tuple[checkify.Error, tuple[Slots, Slots, Draws]]]
+"""A step program as a server calls it: `_stepped`'s arguments, the static ones among them."""
+
+
+def _reusable(compiled: jax.stages.Compiled, formats: Formats) -> Step | None:
+    """`compiled`, the layout-choosing decode step, as a `Step`, where it reads every leaf of the state
+    in `formats` (an input left at the default layout reads a row-major leaf as one), so it takes the
+    state its own outputs leave; else None. An executable takes its jit's dynamic arguments alone, so
+    the static ones, the same every call of one server, are dropped."""
+    resident, carried = compiled.input_formats[0][1:3]
+
+    def read_as_left(taken: Format | None, left: Format | None) -> bool:
+        if taken is None or left is None:
+            return taken is left
+        layout = taken.layout
+        if layout is None:
+            # An input at the default layout: row-major, which a left layout matches if it is.
+            return isinstance(left.layout, Layout) and left.layout.major_to_minor == tuple(
+                range(len(left.layout.major_to_minor))) and not left.layout.tiling
+        return layout == left.layout
+
+    taken = jax.tree.leaves(joined(resident, carried), is_leaf=lambda leaf: leaf is None)
+    left = jax.tree.leaves(formats, is_leaf=lambda leaf: leaf is None)
+    if len(taken) != len(left) or not all(map(read_as_left, taken, left)):
+        return None
+
+    def step(model, params, pad_id, placement, steps, resident, carried, admission, transforms, stopping,
+             grammar):
+        return compiled(params, resident, carried, admission, transforms, stopping, grammar)
+    return step
 
 
 def opened_in(formats: Formats) -> jax.stages.Wrapped:
@@ -529,8 +570,11 @@ def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[
     (`dew.nn.kernels.options.compiler_options`), for the decoding step and
     the admitting one (`ADMISSION_OPTIONS`): one compile per (model,
     admission shape) serves every server that keeps its state in the same
-    layout. The formats tree holds the cache mapping and is not hashable
-    itself, so its leaves and its structure's text key the programs."""
+    layout, and a server whose layout-choosing compile reads the state as
+    it leaves it runs that compile as its decoding step instead
+    (`resident_formats`). The formats tree holds the cache mapping and is
+    not hashable itself, so its leaves and its structure's text key the
+    programs."""
     leaves, structure = jax.tree_util.tree_flatten(formats)
     key = (tuple(leaves), str(structure), rows, tuple(options.items()))
     programs = _PROGRAMS.get(key)

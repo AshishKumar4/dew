@@ -35,7 +35,7 @@ does not take the remote back, and the uploads still queued are dropped unsent. 
 background thread, and the process waits up to `DRAIN_SECONDS` for them at exit.
 """
 
-import http.client
+import importlib.util
 import logging
 import os
 import queue
@@ -44,44 +44,33 @@ import sys
 import tempfile
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from pathlib import Path
 
 FAILURES = 3
 TIMEOUT_SECONDS = 30.0
 DRAIN_SECONDS = 120.0
-MAX_BYTES = 96 * 1024 * 1024
-"""The largest bundle sent: the Worker's request bound, beside the headers."""
+_R2 = importlib.util.spec_from_file_location(
+    "armada_r2", Path(__file__).resolve().parents[1] / "tools" / "armada" / "r2.py")
+r2 = importlib.util.module_from_spec(_R2)
+_R2.loader.exec_module(r2)  # the Worker's one client and its contract (tools/armada/r2.py)
+MAX_BYTES = r2.MAX_BYTES
+"""The largest bundle sent or read: the Worker's bound (tools/armada/r2.json)."""
 SUFFIX = "-cache"
 """What JAX's cache names a program's file after its key (jax/_src/lru_cache.py)."""
-UNREACHABLE = (OSError, http.client.HTTPException)
-"""A request that did not complete: urllib's URLError, HTTPError and timeouts are OSErrors, a
-connection cut mid-answer an HTTPException; a local read or write of the cache directory that
-fails is an OSError too."""
+UNREACHABLE = (OSError, r2.R2Error)
+"""A request the Worker did not answer as asked (`r2.R2Error`), or a local read or write of the cache
+directory that fails (an OSError)."""
 
 logger = logging.getLogger(__name__)
-
-
-class Unredirected(urllib.request.HTTPRedirectHandler):
-    """No redirect followed: urllib's would resend the bearer token to wherever the answer points. A
-    redirect is an HTTPError, a failed request."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-OPENER = urllib.request.build_opener(Unredirected)
 
 
 class RemoteCache:
     """JAX's cache `directory`, each test file's programs also read from and written to `url`."""
 
     def __init__(self, directory: Path, url: str, token: str, prefix: str):
-        self.directory, self.url, self.prefix = Path(directory), url.rstrip("/"), prefix.strip("/")
-        # Cloudflare refuses urllib's own User-Agent with a 403 (error 1010) before the Worker sees it.
-        self.headers = {"Authorization": f"Bearer {token}", "User-Agent": "dew-ci-xla-cache"}
+        self.directory, self.prefix = Path(directory), prefix.strip("/")
+        self.store = r2.Store(url, token, "dew-ci-xla-cache", TIMEOUT_SECONDS)
         self.failures = 0
         self.given_up = False
         self.lock = threading.Lock()
@@ -128,13 +117,8 @@ class RemoteCache:
             if not self.given_up:
                 self.failures = 0
 
-    def _request(self, file: str, method: str, data: bytes | None = None):
-        """The answer to one request for `file`'s bundle, or None, unsent, once the remote is given up."""
-        if self.given_up:
-            return None
-        request = urllib.request.Request(f"{self.url}/{self.prefix}/bundles/{urllib.parse.quote(file)}",
-                                         data=data, method=method, headers=self.headers)
-        return OPENER.open(request, timeout=TIMEOUT_SECONDS)
+    def _key(self, file: str) -> str:
+        return f"{self.prefix}/bundles/{file}"
 
     def _programs(self) -> set[str]:
         return {path.name.removesuffix(SUFFIX) for path in self.directory.glob(f"*{SUFFIX}")}
@@ -192,16 +176,10 @@ class RemoteCache:
     def _fetched(self, file: str) -> list[tuple[str, bytes]]:
         """The entries of `file`'s bundle on the Worker; none where it has none or the remote was given
         up. An answer counts as one only once its programs are in the directory (`opened`)."""
-        try:
-            answer = self._request(file, "GET")
-        except urllib.error.HTTPError as error:
-            if error.code == 404:
-                return []
-            raise
-        if answer is None:
+        if self.given_up:  # checked as each request is made
             return []
-        with answer as response:
-            return unpacked(response.read(MAX_BYTES + 1))
+        bundle = self.store.get(self._key(file), limit=MAX_BYTES)
+        return [] if bundle is None else unpacked(bundle)
 
     def _seeded(self, key: str, value: bytes) -> bool:
         """`value` as program `key`'s file, written to a name of its own and linked in whole, so a
@@ -256,13 +234,12 @@ class RemoteCache:
         while True:
             file, bundle = self.uploads.get()
             try:
-                answer = self._request(file, "PUT", bundle)
-                if answer is not None:
-                    answer.close()
+                if not self.given_up:  # checked as each request is made: a queued bundle goes unsent
+                    self.store.put(self._key(file), bundle)
                     self._answered()
                     with self.lock:
                         self.uploaded += 1
-            except UNREACHABLE as error:  # a bundle that does not reach it is compiled again elsewhere
+            except (*UNREACHABLE, ValueError) as error:  # a bundle that does not reach it is compiled again
                 self._failed(error)
             finally:
                 self.uploads.task_done()
@@ -334,13 +311,20 @@ def prefix() -> str:
     (jax/_src/cache_key.py), so a release of jax alone that lowers a program differently keys it
     anew, and one that does not (a post-release of Dew's patch stack) keeps every file's programs.
     The Python minor is among them because jax 0.11.2 names 3.14's stdlib zstd codec "zlib" in its
-    key (`dew.cache.default_compilation_cache_dir`)."""
+    key (`dew.cache.default_compilation_cache_dir`); and on the CPU, whose device kind is "cpu" on
+    every host, the host's CPU class (`dew._host.cpu_class`), as XLA:CPU compiles for the features
+    of the host that compiles: armada's hosts span classes, and a program from another class need not
+    link here, after which the process compiles nothing more."""
     import jax
     import jaxlib
 
+    from dew._host import cpu_class
+
     kind = "".join(character if character.isalnum() else "-" for character in jax.devices()[0].device_kind)
-    return f"jaxlib{jaxlib.__version__}/{jax.default_backend()}/" \
-           f"py{sys.version_info.major}.{sys.version_info.minor}/{kind}"
+    backend = jax.default_backend()
+    return f"jaxlib{jaxlib.__version__}/{backend}/" \
+           f"py{sys.version_info.major}.{sys.version_info.minor}/{kind}" + \
+           (f"/{cpu_class()}" if backend == "cpu" else "")
 
 
 def install(url: str, token: str) -> RemoteCache | None:

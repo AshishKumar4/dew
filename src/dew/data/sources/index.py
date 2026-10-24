@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import cached_property
 
 import numpy as np
 
-from dew.data.storage import Store
+from dew.data.storage import Store, local, matching, object_info
 
 
 @dataclass(frozen=True)
@@ -25,8 +24,7 @@ class ArrayIndex:
         snapshot = None
         if self.metadata is not None:
             snapshot = {"size": self.metadata.get("bytes", self.metadata.get("size")), **self.metadata}
-        protocols = (fs.protocol,) if isinstance(fs.protocol, str) else fs.protocol
-        if "file" not in protocols or self.metadata is not None:
+        if not local(fs) or self.metadata is not None:
             fs, path = store.cached().resolve()
         opened = fs.open(path, "rb", source_snapshot=snapshot)
         if not isinstance(opened.name, str):
@@ -42,14 +40,9 @@ class ArrayIndex:
         return values
 
     def verify(self, reference: Mapping[str, object]) -> None:
-        self.pin.seek(0, 2)
-        size = self.pin.tell()
-        self.pin.seek(0)
+        """Refuse the pinned index unless it is the size and digest `reference` committed."""
         with open(self.pin.name, "rb") as reader:
-            checksum = hashlib.file_digest(reader, "sha256").hexdigest()
-        self.pin.seek(0)
-        if size != reference["bytes"] or checksum != reference["sha256"]:
-            raise OSError(f"committed NumPy index is corrupt: {self.url}")
+            matching(object_info(reader), reference, self.url)
 
     def close(self) -> None:
         self.__dict__.pop("values", None)

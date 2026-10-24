@@ -470,35 +470,43 @@ def _coupled_decay(solver: optax.GradientTransformation, weight_decay: float,
     return optax.chain(optax.add_decayed_weights(weight_decay, mask), solver)
 
 
+def _adam_chain(moments: optax.GradientTransformation, learning_rate, weight_decay, mask, *,
+                coupled: bool) -> optax.GradientTransformation:
+    """An Adam variant over `moments` (`scale_by_adam`'s, or `bf16_moments`' stored in bf16): optax.adamw's
+    chain, its decay decoupled, or optax.adam's with torch's coupled weight decay (`_coupled_decay`)."""
+    if coupled:
+        return _coupled_decay(optax.chain(moments, optax.scale_by_learning_rate(learning_rate)), weight_decay,
+                              mask)
+    return optax.chain(moments, optax.add_decayed_weights(weight_decay, mask),
+                       optax.scale_by_learning_rate(learning_rate))
+
+
 def _adam(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, weight_decay=0.0,
           mask=None, *, nesterov: bool = False):
-    """optax.adam's chain over `scale_by_adam`, with torch's coupled weight decay (`_coupled_decay`)."""
-    adam = optax.chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov),
-                       optax.scale_by_learning_rate(learning_rate))
-    return _coupled_decay(adam, weight_decay, mask)
+    """optax.adam over `scale_by_adam`, with torch's coupled weight decay."""
+    return _adam_chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov), learning_rate,
+                       weight_decay, mask, coupled=True)
 
 
 def _adamw(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, weight_decay=1e-4,
            mask=None, *, nesterov: bool = False):
-    """optax.adamw's chain over `scale_by_adam`."""
-    return optax.chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov),
-                       optax.add_decayed_weights(weight_decay, mask),
-                       optax.scale_by_learning_rate(learning_rate))
+    """optax.adamw over `scale_by_adam`."""
+    return _adam_chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov), learning_rate,
+                       weight_decay, mask, coupled=False)
 
 
 def _bf16_adam(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, weight_decay=0.0, mask=None, *,
                nesterov: bool = False):
-    """optax.adam's chain over bf16 moments, with torch's coupled weight decay (`_coupled_decay`)."""
-    return _coupled_decay(optax.chain(bf16_moments(b1, b2, eps, eps_root, nesterov),
-                                     optax.scale_by_learning_rate(learning_rate)), weight_decay, mask)
+    """optax.adam over bf16 moments, with torch's coupled weight decay."""
+    return _adam_chain(bf16_moments(b1, b2, eps, eps_root, nesterov), learning_rate, weight_decay, mask,
+                       coupled=True)
 
 
 def _bf16_adamw(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0,
                 weight_decay=1e-4, mask=None, *, nesterov: bool = False):
-    """optax.adamw's chain over bf16 moments."""
-    return optax.chain(bf16_moments(b1, b2, eps, eps_root, nesterov),
-                       optax.add_decayed_weights(weight_decay, mask),
-                       optax.scale_by_learning_rate(learning_rate))
+    """optax.adamw over bf16 moments."""
+    return _adam_chain(bf16_moments(b1, b2, eps, eps_root, nesterov), learning_rate, weight_decay, mask,
+                       coupled=False)
 
 
 class PowerProfilesState(NamedTuple):
@@ -661,7 +669,7 @@ def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
     """Return the learning rate stored in `opt_state`, if the optimizer stores one.
 
     An OptimConfig's solver holds a rate scale and the schedule's value at
-    the last applied update (`dew.training.optim.scaled_solver`), whose
+    the last applied update (`dew.optim.scaled_solver`), whose
     product is the rate; an Optax optimizer can inject `learning_rate`
     itself (`optax.inject_hyperparams`). The result is None when the
     optimizer closes over the rate, or when parameter groups hold several
@@ -766,7 +774,7 @@ class ParamGroup:
 
     def rate(self, learning_rate: float | ScheduleBase) -> tuple[float, ScheduleBase | None]:
         """This group's rate scale and shape (`scaled`): its own `schedule`,
-        else the config's `learning_rate`, times `learning_rate_multiplier`."""
+        else the config's `rate`, times `learning_rate_multiplier`."""
         scale, shape = scaled(learning_rate if self.schedule is None else self.schedule)
         return scale * self.learning_rate_multiplier, shape
 

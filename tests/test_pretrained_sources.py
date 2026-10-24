@@ -17,6 +17,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 import safetensors.numpy as safetensors_numpy
+from interop_support import tiny_config
 
 from dew.interop import hf_decoders, sources
 
@@ -147,3 +148,69 @@ np.testing.assert_array_equal(actual,expected)
         timeout=90,
     )
     assert result.returncode == 0, result.stderr[-4000:]
+
+
+def tier_two_config():
+    """A tiny config of a model_type no registered family is named for that a registered family's
+    convention computes (CWM, Llama's): the verifier checks it against transformers' own class."""
+    return tiny_config("cwm", sliding_window=4).to_dict()
+
+
+def test_a_source_is_routed_on_its_config_alone_as_the_loader_reads_it():
+    """`source_route` is the loader's decision before any weight downloads, which a census of configs
+    reads too: a registered family's config is its decoder, translated; a media wrapper's is the
+    wrapper; DiffusionGemma's its own; an unregistered model_type a registered family's convention
+    computes is verified against transformers (tier 2), and one transformers has no class for is
+    refused, as are a storage format the codecs cannot decode and a family's refusal."""
+    from dew.interop.pretrained import (
+        DecoderRoute,
+        DiffusionGemmaRoute,
+        VerifiedRoute,
+        WrapperRoute,
+        source_route,
+    )
+
+    route = source_route(fixture_config("llama-tiny"))
+    assert isinstance(route, DecoderRoute)
+    assert route.record == hf_decoders.translate_config(fixture_config("llama-tiny"))
+    assert isinstance(source_route(fixture_config("gemma3-tiny-mm")), WrapperRoute)
+    assert isinstance(source_route(fixture_config("diffusion-gemma-sft")), DiffusionGemmaRoute)
+    verified = source_route(tier_two_config())
+    assert isinstance(verified, VerifiedRoute) and verified.verified.error <= verified.verified.bound
+    llama = fixture_config("llama-tiny")
+    for refused in ({**llama, "model_type": "an_unregistered_decoder"},
+                    {**llama, "quantization_config": {"quant_method": "mlx", "bits": 4, "group_size": 64,
+                                                       "mode": "affine"}},
+                    {"model_type": "an_unregistered_decoder", "quantization": {"bits": 4, "group_size": 64}},
+                    {**llama, "hidden_act": "a_nonexistent_activation"}):
+        with pytest.raises(ValueError):
+            source_route(refused)
+
+
+def test_the_hub_census_routes_a_config_as_the_loader_does(tmp_path):
+    """tools/hf_coverage.py classifies a census of configs by the loader's own route (`source_route`),
+    with the real verifier: a storage format the codecs refuse is refused before transformers is
+    asked about the type, as is one a codec's own reader refuses (GPTQ at three bits); a type
+    transformers has no class for, asked only after those, is remote code; a registered family's
+    config is tier 1; and a type a registered convention computes, verified, is tier 2."""
+    from tool_support import load
+
+    census = load("hf_coverage")
+    llama = fixture_config("llama-tiny")
+    configs = {
+        "storage": {"model_type": "a_custom_decoder", "quantization": {"bits": 4, "group_size": 64}},
+        "gptq": {"model_type": "a_custom_decoder",
+                 "quantization_config": {"quant_method": "gptq", "bits": 3}},
+        "custom": {**llama, "model_type": "a_custom_decoder"},
+        "llama": llama,
+        "cwm": tier_two_config(),
+    }
+    rows = [{"id": name, "model_type": config["model_type"], "downloads": len(configs) - index,
+             "config": config} for index, (name, config) in enumerate(configs.items())]
+    (tmp_path / "census.json").write_text(json.dumps(rows))
+    census.classify(tmp_path)
+    routes = {model["id"]: model["route"]
+              for model in json.loads((tmp_path / "coverage.json").read_text())["models"]}
+    assert routes == {"storage": "refused", "gptq": "refused", "custom": "remote code", "llama": "tier 1",
+                      "cwm": "tier 2"}
+

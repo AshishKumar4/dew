@@ -8,6 +8,7 @@ from flax import struct
 from jax import lax
 
 from dew.diffusion.schedules import divided, expand
+from dew.diffusion.schedules.common import ancestral_variance
 
 from .common import _check_gaps, _grid_levels, _history_gaps, _push, _sigma_integrator
 
@@ -46,7 +47,7 @@ def _ancestral(sigma_t, sigma_s):
     the level a deterministic step goes down to and the fresh noise that
     brings the marginal back to sigma_s, sigma_up capped at sigma_s as the
     source caps it."""
-    sigma_up = jnp.minimum(sigma_s, (sigma_s ** 2 * (sigma_t ** 2 - sigma_s ** 2) / sigma_t ** 2) ** 0.5)
+    sigma_up = jnp.minimum(sigma_s, ancestral_variance(sigma_t, sigma_s) ** 0.5)
     return (sigma_s ** 2 - sigma_up ** 2) ** 0.5, sigma_up
 
 @struct.dataclass
@@ -182,7 +183,7 @@ class RK4:
         k2 = derivative(x + 0.5 * k1 * dt, sigma_t + 0.5 * dt)
         k3 = derivative(x + 0.5 * k2 * dt, sigma_t + 0.5 * dt)
         k4 = derivative(x + k3 * dt, sigma_t + dt)
-        return x + (k1 + 2 * k2 + 2 * k3 + k4) * dt / 6, state
+        return x + divided((k1 + 2 * k2 + 2 * k3 + k4) * dt, 6), state
 
 
 @struct.dataclass
@@ -263,7 +264,7 @@ class MultiStepDPM:
             dx_2 = (eps - last_eps) / (sigma_t - last_sigma)
             dx_2_last = (last_eps - older_eps) / (last_sigma - older_sigma)
             dx_3 = (dx_2 - dx_2_last) / (0.5 * ((sigma_t + last_sigma) - (last_sigma + older_sigma)))
-            return x + eps * dt + 0.5 * dx_2 * dt ** 2 + dx_3 * dt ** 3 / 6
+            return x + eps * dt + 0.5 * dx_2 * dt ** 2 + divided(dx_3 * dt ** 3, 6)
 
         next_x = lax.switch(jnp.minimum(count, 2), [first, second, third], None)
         return next_x, (eps, sigma_t, last_eps, last_sigma, count + 1)

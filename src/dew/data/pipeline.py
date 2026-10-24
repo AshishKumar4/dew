@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import itertools
 import math
 import time
@@ -13,7 +14,7 @@ from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, run
 import grain.python as pygrain
 import numpy as np
 
-from dew.data.dataset import Batch, Records
+from dew.data.dataset import WORKER_BUFFER, Batch, Records, phase_ends
 
 if TYPE_CHECKING:
     import jax
@@ -52,6 +53,20 @@ class Reasoned(Protocol):
     reason: str
 
 
+PACK_POLICY: Literal["first-fit", "best-fit", "concat"] = "first-fit"
+"""How a pack fills its rows where none is asked for."""
+DROP_REMAINDER = True
+"""Whether a batch a training pass fills only in part is dropped, where none is asked for."""
+TOKEN_FIELDS = ("text",)
+"""The per-token fields a pack or a window lays out where none are named."""
+PACK_BINS = 32
+"""The rows a pack holds open at once where none is asked for."""
+INTERLEAVE = 16
+"""The sources an interleave reads at once where none is asked for."""
+PREFETCH = 64
+"""The records a prefetch reads ahead where none is asked for."""
+
+
 @runtime_checkable
 class Volatile(Protocol):
     volatile: bool
@@ -77,7 +92,7 @@ class TokenBudget:
     length (`TokenGeometry`) divides it into, resolved when it compiles."""
 
     tokens: int
-    drop_remainder: bool = True
+    drop_remainder: bool = DROP_REMAINDER
     batch_fn: Callable[[Sequence[Batch]], Batch] | None = None
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
@@ -234,13 +249,13 @@ class Slice:
 
 @dataclasses.dataclass(frozen=True)
 class Interleave:
-    cycle_length: int = 16
+    cycle_length: int = INTERLEAVE
 
 
 @dataclasses.dataclass(frozen=True)
 class BatchStage:
     size: int
-    drop_remainder: bool = True
+    drop_remainder: bool = DROP_REMAINDER
     batch_fn: Callable[[Sequence[Batch]], Batch] | None = None
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
@@ -265,9 +280,9 @@ class Pack:
     """
 
     seq_len: int
-    fields: tuple[str, ...] = ("text",)
-    bins: int = 32
-    policy: Literal["first-fit", "best-fit", "concat"] = "first-fit"
+    fields: tuple[str, ...] = TOKEN_FIELDS
+    bins: int = PACK_BINS
+    policy: Literal["first-fit", "best-fit", "concat"] = PACK_POLICY
     segments: int | None = None
     along: tuple[tuple[str, int], ...] = ()
     overlap: int = 0
@@ -301,7 +316,7 @@ class Pack:
 class Windows:
     seq_len: int
     stride: int | None = None
-    fields: tuple[str, ...] = ("text",)
+    fields: tuple[str, ...] = TOKEN_FIELDS
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         """Windows of `seq_len` inputs and their targets along `fields`."""
@@ -318,7 +333,7 @@ class Windows:
 class TokenSplit:
     fraction: float
     held: bool
-    fields: tuple[str, ...] = ("text",)
+    fields: tuple[str, ...] = TOKEN_FIELDS
 
     def __post_init__(self) -> None:
         if not 0 <= self.fraction < 1:
@@ -327,13 +342,13 @@ class TokenSplit:
 
 @dataclasses.dataclass(frozen=True)
 class Prefetch:
-    buffer: int
+    buffer: int = PREFETCH
 
 
 @dataclasses.dataclass(frozen=True)
 class Workers:
     count: int
-    buffer: int = 2
+    buffer: int = WORKER_BUFFER
 
 
 @dataclasses.dataclass(frozen=True)
@@ -419,6 +434,31 @@ factory."""
 
 
 @dataclasses.dataclass(frozen=True)
+class Runs:
+    """What a stage runs (`runs`): its callable, the identity written for it, and the configured step
+    it was bound from, the one description its plan identity, its cache keyability and `show` read."""
+
+    step: Step
+    identity: str | None = None
+    configured: Bound | None = None
+
+
+def runs(stage: Stage) -> Runs | None:
+    """What `stage` runs, None for a stage that runs no step of its own (an order, a batch, a cache)."""
+    if isinstance(stage, Configured):
+        return Runs(stage.factory)
+    if isinstance(stage, (Map, RandomMap, FlatMap)):
+        return Runs(stage.step, stage.identity, stage.configured)
+    if isinstance(stage, (MapWithIndex, MapBatch, Batched)):
+        return Runs(stage.step, stage.identity)
+    if isinstance(stage, Filter):
+        return Runs(stage.predicate, stage.identity)
+    if isinstance(stage, Native):
+        return Runs(stage.function, stage.identity)
+    return None
+
+
+@dataclasses.dataclass(frozen=True)
 class Mixture:
     pipelines: tuple[Pipeline, ...]
     weights: tuple[float, ...]
@@ -439,17 +479,42 @@ class Phases:
     until_steps: tuple[int | None, ...]
 
     def __post_init__(self) -> None:
-        if (
-            not self.pipelines
-            or len(self.pipelines) != len(self.until_steps)
-            or self.until_steps[-1] is not None
-        ):
-            raise ValueError("phases need one boundary per pipeline; the last boundary is None")
-        previous = 0
-        for boundary in self.until_steps[:-1]:
-            if boundary is None or boundary <= previous:
-                raise ValueError("phase step boundaries must increase from above zero")
-            previous = boundary
+        if len(self.pipelines) != len(self.until_steps):
+            raise ValueError(f"phases need one end per pipeline: {len(self.pipelines)} pipelines and "
+                             f"{len(self.until_steps)} ends")
+        phase_ends(self.until_steps, "step")
+
+
+def children(pipeline: Pipeline) -> tuple[Pipeline, ...]:
+    """The chains `pipeline`'s mixture or phases read, none where it reads a store."""
+    source = pipeline.source
+    return source.pipelines if isinstance(source, (Mixture, Phases)) else ()
+
+
+def chains(pipeline: Pipeline) -> Iterator[Pipeline]:
+    """Every chain of `pipeline`'s tree, children first: each corpus under its mixtures and phases,
+    then the chain that mixes or phases them, and `pipeline` last."""
+    for child in children(pipeline):
+        yield from chains(child)
+    yield pipeline
+
+
+def with_children(pipeline: Pipeline, rewrite: Callable[[Pipeline], Pipeline]) -> Pipeline:
+    """`pipeline` with each chain its mixture or phases read rewritten by `rewrite`; `pipeline` itself
+    where it reads a store."""
+    source = pipeline.source
+    if not isinstance(source, (Mixture, Phases)):
+        return pipeline
+    rewritten = tuple(rewrite(child) for child in source.pipelines)
+    return dataclasses.replace(pipeline, source=dataclasses.replace(source, pipelines=rewritten))
+
+
+def with_stores(pipeline: Pipeline, store: Callable[[Source], Source]) -> Pipeline:
+    """`pipeline` with each store under its mixtures and phases read through `store`, every step as it
+    was."""
+    if isinstance(pipeline.source, (Mixture, Phases)):
+        return with_children(pipeline, functools.partial(with_stores, store=store))
+    return dataclasses.replace(pipeline, source=store(pipeline.source))
 
 
 class Dataset:
@@ -479,7 +544,7 @@ class Dataset:
 
     def holdout(self, fraction: float | None = None, *, key: str | None = None, records: int | None = None,
                 split: str | tuple[str, ...] | None = None, tokens: float | None = None,
-                fields: tuple[str, ...] = ("text",), **named: float) -> tuple[Dataset, ...]:
+                fields: tuple[str, ...] = TOKEN_FIELDS, **named: float) -> tuple[Dataset, ...]:
         """This dataset split into the records a run trains on and the ones it
         scores, with the steps it has replayed on each, so hold out before
         preparing.
@@ -663,7 +728,7 @@ class Dataset:
     def repeat(self, epochs: int | None = None) -> Pipeline:
         return self._then(Repeat(epochs))
 
-    def interleave(self, cycle_length: int = 16) -> Pipeline:
+    def interleave(self, cycle_length: int = INTERLEAVE) -> Pipeline:
         return self._then(Interleave(cycle_length))
 
     def batch(
@@ -671,7 +736,7 @@ class Dataset:
         size: int | None = None,
         *,
         tokens: int | None = None,
-        drop_remainder: bool = True,
+        drop_remainder: bool = DROP_REMAINDER,
         batch_fn: Callable[[Sequence[Batch]], Batch] | None = None,
     ) -> Pipeline:
         if (size is None) == (tokens is None):
@@ -686,9 +751,9 @@ class Dataset:
         self,
         seq_len: int,
         *,
-        fields: tuple[str, ...] = ("text",),
-        bins: int = 32,
-        policy: Literal["first-fit", "best-fit", "concat"] = "first-fit",
+        fields: tuple[str, ...] = TOKEN_FIELDS,
+        bins: int = PACK_BINS,
+        policy: Literal["first-fit", "best-fit", "concat"] = PACK_POLICY,
         segments: int | None = None,
         along: tuple[tuple[str, int], ...] = (),
         overlap: int = 0,
@@ -702,14 +767,14 @@ class Dataset:
         return self._then(Pack(seq_len, fields, bins, policy, segments, along, overlap))
 
     def windows(
-        self, seq_len: int, *, stride: int | None = None, fields: tuple[str, ...] = ("text",)
+        self, seq_len: int, *, stride: int | None = None, fields: tuple[str, ...] = TOKEN_FIELDS
     ) -> Pipeline:
         return self._then(Windows(seq_len, stride, fields))
 
-    def prefetch(self, buffer: int = 64) -> Pipeline:
+    def prefetch(self, buffer: int = PREFETCH) -> Pipeline:
         return self._then(Prefetch(buffer))
 
-    def workers(self, count: int, *, buffer: int = 2) -> Pipeline:
+    def workers(self, count: int, *, buffer: int = WORKER_BUFFER) -> Pipeline:
         return self._then(Workers(count, buffer))
 
     def take(self, count: int) -> Pipeline:
@@ -952,6 +1017,21 @@ class ObjectiveData:
 
 
 type _Step = RecordStep | RandomStep | HostStep | Configured | ExpandStep | ColumnStep
+
+
+def record_stage(step: RecordStep | pygrain.RandomMapTransform | Expansion, *, identity: str | None = None,
+                 configured: Bound | None = None) -> Map | RandomMap | FlatMap:
+    """The stage a record step is applied by where no verb names it, from what the step says it is:
+    an expansion's records (`FlatMap`), a generator's draws (`RandomMap`), or one record's
+    replacement (`Map`), dropping records where it says it does (`rejects`). An objective's steps
+    and a configured step's binding are read through it; a verb (`map`, `random_map`, `filter_map`,
+    `random_filter_map`, `flat_map`) builds the stage its name states, which a step of another
+    kind is refused."""
+    if isinstance(step, Expansion):
+        return FlatMap(step, identity, configured)
+    if isinstance(step, pygrain.RandomMapTransform):
+        return RandomMap(step, identity, _declares_rejects(step), configured)
+    return Map(step, identity, _declares_rejects(step), configured)
 
 
 def _named_step(step: _Step) -> str:

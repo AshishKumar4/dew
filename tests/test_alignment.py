@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from diffusion_support import TanhLayer
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference, assert_as_exact_over_orders, distance
 
@@ -110,12 +111,6 @@ def patches(images, patch: int):
     return grid.reshape(b, (h // patch) * (w // patch), patch * patch * c)
 
 
-class Block(nn.Module):
-    @nn.compact
-    def __call__(self, hidden):
-        return jnp.tanh(hidden @ self.param("kernel", nn.initializers.zeros, (hidden.shape[-1],) * 2))
-
-
 class Network(nn.Module):
     """`tools/repa_reference.py`'s stand-in model at Dew's model time (t times
     1000): patch tokens plus the time, the aligned `block`, a head."""
@@ -130,7 +125,7 @@ class Network(nn.Module):
         hidden = (tokens @ self.param("embed", nn.initializers.zeros, (tokens.shape[-1], self.width))
                   + (time / 1000).reshape(-1, 1, 1)
                   * self.param("time", nn.initializers.zeros, (self.width,)))
-        block = Block(name="block")(hidden)
+        block = TanhLayer(name="block")(hidden)
         out = block @ self.param("head", nn.initializers.zeros, (self.width, tokens.shape[-1]))
         grid = out.reshape(b, side // self.patch, side // self.patch, self.patch, self.patch, c)
         return grid.transpose(0, 1, 3, 2, 4, 5).reshape(b, side, side, c)
@@ -288,7 +283,7 @@ def test_a_published_pipeline_aligns_beside_its_own_tree(tmp_path):
     from test_diffusion_run_sources import batch_for, precision
 
     from dew.config import ObjectiveConfig
-    from dew.objectives.diffusion import DiffusionRunConfig
+    from dew.config.diffusion import DiffusionRunConfig
     from dew.training import Trainer
 
     for name in ("flux_source", "rae"):

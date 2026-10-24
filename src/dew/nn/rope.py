@@ -1,7 +1,10 @@
 """Rotary position embeddings: the angles of one axis or several, Qwen's
 interleaved M-RoPE, the one rotation every model applies (half-split or
 adjacent pairs, leading or trailing), Llama 3.1's frequency ramp, and
-YaRN's frequency ramp and attention factor.
+YaRN's frequency ramp and attention factor. Beside them the absolute
+sinusoidal tables share their frequencies (`sinusoid_frequencies`) and their
+sines and cosines (`sinusoids`, `sincos_grid`): a timestep's, a patch grid's
+and audio's relative positions.
 
 YaRN's ramp is transformers 5.16.1's `_compute_yarn_parameters` and its
 scale `yarn_apply_mscale` (models/deepseek_v3), with `dim` at the rope
@@ -25,6 +28,44 @@ from jax.typing import DTypeLike
 from dew.registry import from_record
 
 from .precision import at_least_fp32
+
+
+def sinusoid_frequencies(count: int, divisor: float, *, dtype: DTypeLike, exponential: bool = False
+                         ) -> np.ndarray:
+    """`10000 ** (-i / divisor)` for i below `count`, an absolute sinusoidal table's frequencies, on the
+    host in `dtype`: rounded once from float64 (`_base_powers`), or, `exponential`, as the published
+    timestep embeddings form them, the whole exponent `i * -ln(10000)` in `dtype` before it is divided
+    (the other order moves a sine by 1e-5 near timestep 1000) and its exp taken in float64 and rounded
+    once."""
+    if not exponential:
+        return (1.0 / _base_powers(10000.0, np.arange(count, dtype=np.float64) / divisor)).astype(dtype)
+    width = np.dtype(dtype).type
+    exponent = np.arange(count, dtype=width) * width(-math.log(10000.0)) / width(divisor)
+    return np.exp(exponent.astype(np.float64)).astype(width)
+
+
+def sinusoids(angles, *, cosine_first: bool = False, xp=jnp):
+    """Each angle's sine and cosine side by side, `[..., n]` to `[..., 2n]`, the sines first or, where
+    `cosine_first`, the cosines. `xp` is the array module: `numpy` for a host table built while a model
+    traces, which JAX would otherwise stage into the trace."""
+    first, second = (xp.cos(angles), xp.sin(angles)) if cosine_first else (xp.sin(angles), xp.cos(angles))
+    return xp.concatenate([first, second], axis=-1)
+
+
+def sincos_grid(frequencies: np.ndarray, first: np.ndarray, second: np.ndarray, *, dtype: DTypeLike
+                ) -> np.ndarray:
+    """A 2D sinusoidal table on the host, `[positions, 4 * len(frequencies)]`: the `first` axis's
+    coordinate of each position, then the `second`'s, each as its sines then cosines at `frequencies`,
+    computed in the frequencies' dtype and rounded once to `dtype` (the caller's axis order: a patch
+    grid's rows first, SD3's columns). Each axis's distinct coordinates are computed once and gathered
+    into the one output, so a wide grid holds no full-width table in the wider dtype."""
+    width = 2 * len(frequencies)
+    table = np.empty((first.size, 2 * width), dtype)
+    for half, coordinates in enumerate((first, second)):
+        values, where = np.unique(coordinates.reshape(-1), return_inverse=True)
+        angles = values.astype(frequencies.dtype)[:, None] * frequencies[None, :]
+        table[:, half * width:(half + 1) * width] = sinusoids(angles, xp=np).astype(dtype)[where]
+    return table
 
 
 def inverse_frequencies(theta: float, dim: int, pairs: int | None = None, *,

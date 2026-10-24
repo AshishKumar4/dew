@@ -165,6 +165,35 @@ def test_named_profile_resolves_secrets_lazily(monkeypatch):
     assert fs.cat_file(path) == b"present"
 
 
+def test_a_profile_over_this_hosts_disk_exports_provisions_and_reads_as_the_disk_does(tmp_path):
+    """A storage profile whose base is this host's disk, by either of its names, is that disk: an
+    export to it commits there, and its ArrayRecord shards, a line file's offset index and a Parquet
+    file read there by their own readers."""
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from dew.data.sinks import export
+    from dew.data.sources import Memory
+
+    rows = [{"id": np.int64(index)} for index in range(5)]
+    for base in ("file", "local"):
+        name = f"disk{base}"
+        _profile(name, base, {})
+        root = tmp_path / base
+        root.mkdir()
+        export(Memory(rows), f"{name}://{root}/records", format="array_record", rows_per_shard=2)
+        records = Files(f"{name}://{root}/records").records("indexed")
+        assert [int(records[index]["id"]) for index in range(len(records))] == list(range(5))
+        (root / "rows.jsonl").write_text("".join(json.dumps({"id": index}) + "\n" for index in range(5)))
+        lines = Files(f"{name}://{root}/rows.jsonl")
+        lines.provision()
+        assert [lines.records("indexed")[index]["id"] for index in (4, 0)] == [4, 0]
+        pq.write_table(pa.table({"id": list(range(5))}), root / "rows.parquet")
+        table = Files(f"{name}://{root}/rows.parquet").records("memory")
+        assert [int(table[index]["id"]) for index in range(5)] == list(range(5))
+
+
 def test_local_content_versions_are_shared_and_refreshed_after_writes(tmp_path, monkeypatch):
     """Independent readers share one complete checksum per local file version."""
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
@@ -317,6 +346,11 @@ def test_url_chain_reads_and_writes_memory(tmp_path):
 
 
 def test_gcs_generation_preconditions_are_sent_to_the_json_api():
+    """A Store over gcsfs's JSON API sends a write's generation precondition, and reads the generation
+    it names. The client is a process of its own whose gcsfs is imported with its zonal and
+    hierarchical-namespace transport off (GCSFS_EXPERIMENTAL_ZB_HNS_SUPPORT=false, which gcsfs reads
+    at its import): that transport discovers a bucket's layout over gRPC before it reads, which this
+    HTTP fake does not serve."""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -378,22 +412,38 @@ def test_gcs_generation_preconditions_are_sent_to_the_json_api():
     with ThreadingHTTPServer(("127.0.0.1", 0), GCS) as server:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        store = Store(
-            "gs://bucket/value", {"token": "anon", "endpoint_url": f"http://127.0.0.1:{server.server_port}"}
-        )
         try:
-            first = store.put_if_absent(b"first")
-            assert store.get_versioned().data == b"first"
-            with pytest.raises(PreconditionFailed):
-                store.put_if_absent(b"duplicate")
-            second = store.put_if_match(b"second", first)
-            with pytest.raises(PreconditionFailed):
-                store.put_if_match(b"stale", first)
-            assert store.get_versioned().version == second
-            assert store.read() == b"second"
+            client = subprocess.run([sys.executable, "-c", """
+import sys
+import gcsfs
+from dew.data.storage import PreconditionFailed, Store
+
+store = Store("gs://bucket/value", {"token": "anon", "endpoint_url": sys.argv[1]})
+assert type(store.resolve()[0]) is gcsfs.core.GCSFileSystem
+first = store.put_if_absent(b"first")
+assert store.get_versioned().data == b"first"
+try:
+    store.put_if_absent(b"duplicate")
+except PreconditionFailed:
+    pass
+else:
+    raise AssertionError("a second put_if_absent was not refused")
+second = store.put_if_match(b"second", first)
+try:
+    store.put_if_match(b"stale", first)
+except PreconditionFailed:
+    pass
+else:
+    raise AssertionError("a put_if_match on a stale generation was not refused")
+assert store.get_versioned().version == second
+assert store.read() == b"second"
+""", f"http://127.0.0.1:{server.server_port}"], capture_output=True, text=True,
+                env={**os.environ, "GCSFS_EXPERIMENTAL_ZB_HNS_SUPPORT": "false"})
         finally:
             server.shutdown()
             thread.join()
+    assert client.returncode == 0, client.stderr
+    assert [payload for _, payload in versions["value"]] == [b"first", b"second"]
 
 
 @pytest.mark.network

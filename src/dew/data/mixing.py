@@ -6,6 +6,7 @@ import dataclasses
 import itertools
 import logging
 import math
+import sys
 import threading
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -15,7 +16,7 @@ from typing import Protocol, TypeGuard, overload, runtime_checkable
 import grain.experimental as gx
 import grain.python as pygrain
 
-from dew.data.dataset import Batch
+from dew.data.dataset import LONG_RUN, Batch, logged_run
 from dew.data.pipeline import Record, Rejected
 from dew.records import boolean, integer, record, text
 
@@ -88,12 +89,6 @@ _WARN_OVER = 0.01
 """The share of a corpus's attempted records it may reject before a run warns, once: a filter that
 drops more than one record in a hundred is worth a look."""
 
-_FIRST_LOGGED_RUN = 1024
-"""The run of rejections in a row a read first logs, then again at each doubling: longer than an
-ordinary filter's runs, so a filter that keeps nothing is named from the first line. An endless
-read reads on through any run; none proves the corpus holds nothing to keep."""
-
-
 class _KeepAccepted:
     def __init__(self, counts: CorpusCounts, tokens: Callable[[Batch], int] | None):
         self.counts, self.tokens = counts, tokens
@@ -121,7 +116,7 @@ class _KeepAccepted:
             _log.warning("corpus %s rejected more than %.1f%% of attempted records (%s)",
                          self.counts.label, _WARN_OVER * 100, reason)
             self.warned = True
-        if self.consecutive >= _FIRST_LOGGED_RUN and not self.consecutive & (self.consecutive - 1):
+        if logged_run(self.consecutive, LONG_RUN):
             reasons = ", ".join(f"{name} {count}" for name, count in self.counts.rejected.most_common(3))
             _log.warning("corpus %s rejected its last %d records and has kept %d; the read goes on until "
                          "one is kept (most rejected: %s)", self.counts.label, self.consecutive,
@@ -293,6 +288,77 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
             read.close()
 
 
+@dataclasses.dataclass(frozen=True)
+class Proportions:
+    """A weighted mix's selection policy, Grain's (`MapDataset.mix`): the weights scaled so the least
+    is 100 and truncated to whole proportions, and position k of the mix read from the corpus whose
+    count of records a prefix holds grows from k to k + 1. A phase counts its prefix by it
+    (`counts`) as the mix reads by it (`ProportionalSelection`), so the two never disagree."""
+
+    proportions: tuple[int, ...]
+
+    @classmethod
+    def of(cls, weights: Sequence[float]) -> Proportions:
+        scale = 100 / min(weights)
+        return cls(tuple(int(weight * scale) for weight in weights))
+
+    def counts(self, records: int) -> tuple[int, ...]:
+        """How many records of each corpus the first `records` positions of the mix read."""
+        counts, remaining, left = [], sum(self.proportions), records
+        for proportion in self.proportions:
+            rest = left * (remaining - proportion) // remaining
+            counts.append(left - rest)
+            left, remaining = rest, remaining - proportion
+        return tuple(counts)
+
+    def covering(self, sizes: Sequence[int]) -> int:
+        """The fewest positions of the mix in which every corpus reads `sizes` of its records, its
+        size: the pass in which each repeated corpus has come round once."""
+        def covers(positions: int) -> bool:
+            return all(count >= size for count, size in zip(self.counts(positions), sizes, strict=True))
+
+        high = 1
+        while not covers(high):
+            high *= 2
+        low = high // 2
+        while low < high:
+            middle = (low + high) // 2
+            low, high = (middle + 1, high) if not covers(middle) else (low, middle)
+        return low
+
+    def at(self, position: int) -> tuple[int, int]:
+        """The corpus position `position` of the mix reads, the one whose count grows with it, and
+        which of that corpus's records: the next it hasn't read."""
+        before, after = self.counts(position), self.counts(position + 1)
+        grown = (corpus for corpus, (was, now) in enumerate(zip(before, after, strict=True)) if now != was)
+        corpus = next(grown)
+        return corpus, before[corpus]
+
+
+class ProportionalSelection(pygrain.DatasetSelectionMap):
+    """Grain's weighted mix of corpora of `lengths` records as a selection map
+    (`MapDataset.select_from_datasets`), by `Proportions`: as long as the mix reads no record of
+    any corpus twice."""
+
+    def __init__(self, lengths: Sequence[int], weights: Sequence[float]):
+        self._proportions = Proportions.of(weights)
+        total = sum(self._proportions.proportions)
+        spans = [length / (proportion / total)
+                 for length, proportion in zip(lengths, self._proportions.proportions, strict=True)]
+        if any(span == 0 for span in spans):
+            raise ValueError("every corpus of a mix needs a record")
+        self._length = min(sys.maxsize, int(min(spans)))
+
+    def __len__(self) -> int:
+        return self._length
+
+    def __getitem__(self, index: int) -> tuple[int, int]:
+        return self._proportions.at(index)
+
+    def __repr__(self) -> str:
+        return f"ProportionalSelection(proportions={self._proportions.proportions}, length={self._length})"
+
+
 class TokenDeficit(pygrain.IterDataset[Batch]):
     """Pick the corpus furthest below its token share, with index-order ties."""
 
@@ -300,19 +366,12 @@ class TokenDeficit(pygrain.IterDataset[Batch]):
         self,
         parents: Sequence[pygrain.IterDataset[Batch]],
         weights: Sequence[float],
+        keys: Sequence[str],
         *,
         tokens: Callable[[Batch], int],
         names: Sequence[str],
         labels: Sequence[str],
-        keys: Sequence[str],
     ):
-        if not parents or len(parents) != len(weights) or len(names) != len(parents):
-            raise ValueError("token deficit mix needs one weight and name per corpus")
-        keys = tuple(keys)
-        if len(keys) != len(parents) or len(set(keys)) != len(keys):
-            raise ValueError("token deficit mix needs one distinct key per corpus")
-        if any(not math.isfinite(weight) or weight <= 0 for weight in weights):
-            raise ValueError("token deficit weights must be finite and positive")
         filtered = tuple(
             Accepted(parent, name, label, tokens=tokens)
             for parent, name, label in zip(parents, names, labels, strict=True)
@@ -324,7 +383,7 @@ class TokenDeficit(pygrain.IterDataset[Batch]):
             filtered,
             tuple(ratio.numerator * (scale // ratio.denominator) for ratio in ratios),
             tokens,
-            keys,
+            tuple(keys),
         )
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
@@ -469,8 +528,6 @@ class PrimedMix(pygrain.IterDataset[Batch]):
 
     def __init__(self, parents: Sequence[pygrain.IterDataset[Batch]], weights: Sequence[float],
                  keys: Sequence[str]):
-        if len(keys) != len(parents) or len(set(keys)) != len(keys):
-            raise ValueError("a mix needs one distinct key per corpus")
         super().__init__(parents)
         self._corpora, self._weights, self._keys = tuple(parents), tuple(weights), tuple(keys)
 

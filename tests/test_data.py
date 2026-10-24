@@ -26,12 +26,20 @@ from reader_support import assert_resumes_where_it_stopped
 
 from dew.data import Loading, Memory, images, presets
 from dew.data.compile import compile, held, validation
-from dew.data.dataset import Checkpointable, DataPartition, Records as IndexedRows, SourceSlice, describe
+from dew.data.dataset import (
+    Checkpointable,
+    DataPartition,
+    Records as IndexedRows,
+    SourceSlice,
+    describe,
+    take_batch,
+    take_rows,
+)
 from dew.data.image_codec import decode_image
 from dew.data.images import EncodeCaptions
 from dew.data.pipeline import Pipeline
 from dew.data.sinks import export
-from dew.data.sources import Source, Torch, source as stored_source
+from dew.data.sources import Source, from_torch, source as stored_source
 from dew.data.steps.generic import Formatting
 from dew.objectives.base import VALID_ROWS
 from dew.position import ENVELOPE
@@ -89,6 +97,18 @@ def _bounded(iterator, limit):
     """
     taken = list(itertools.islice(iterator, limit))
     return taken, next(iterator, None) is None
+
+
+def test_rows_are_taken_from_arrays_and_from_per_row_records_kept_in_their_own_type():
+    """`take_rows` takes a list's or a tuple's records in its own type and an array's leading axis;
+    `take_batch` maps it over a batch, a list of opaque records taken as one column."""
+    indices = np.asarray([2, 0])
+    assert take_rows(("a", "b", "c"), indices) == ("c", "a")
+    assert take_rows([{"id": 0}, {"id": 1}, {"id": 2}], indices) == [{"id": 2}, {"id": 0}]
+    batch = {"tokens": np.arange(6).reshape(3, 2), "records": [{"id": 0}, {"id": 1}, {"id": 2}]}
+    taken = take_batch(batch, indices)
+    np.testing.assert_array_equal(taken["tokens"], [[4, 5], [0, 1]])
+    assert taken["records"] == [{"id": 2}, {"id": 0}]
 
 
 @pytest.mark.parametrize("workers", [0, 2])
@@ -1073,7 +1093,7 @@ def test_columns_rows_and_a_torch_dataset_are_the_same_records():
 
     first, *others = (next(data.train(DataPartition())) for data in (
         _records(columns), _records(rows),
-        _records(Torch(tensors, fields=("index", "x"), identity="columns@1"))))
+        _records(from_torch(tensors, ("index", "x"), identity="columns@1"))))
 
     assert first["x"].shape == (4, 2) and first["x"].dtype == np.float32
     for other in others:
@@ -1089,7 +1109,7 @@ def test_a_torch_dataset_streams_the_records_it_indexes_and_resumes():
     import torch
 
     tensors = torch.utils.data.TensorDataset(torch.arange(12))
-    source = Torch(tensors, fields=("index",), identity="indices@1")
+    source = from_torch(tensors, ("index",), identity="indices@1")
     reading = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
     from dew.data.compile import validation
     from dew.data.pipeline import Pipeline
@@ -1125,15 +1145,15 @@ def test_a_torchvision_style_dataset_reads_its_tuples_as_named_fields():
         def __getitem__(self, index):
             return Image.fromarray(np.full((5, 5, 3), index, np.uint8)), index
 
-    batch = next(_held_records(Torch(Pictures(), fields=("image", "label"), identity="pictures@1"))(
+    batch = next(_held_records(from_torch(Pictures(), ("image", "label"), identity="pictures@1"))(
         DataPartition()))
 
     assert batch["image"].shape == (4, 5, 5, 3) and batch["image"].dtype == np.uint8
     np.testing.assert_array_equal(batch["image"][:, 0, 0, 0], batch["label"])
     with pytest.raises(TypeError):
-        _records(Torch(Pictures()))
+        _records(from_torch(Pictures()))
     with pytest.raises(TypeError):
-        _records(Torch(torch.utils.data.DataLoader(Pictures())))
+        _records(from_torch(torch.utils.data.DataLoader(Pictures())))
 
 
 def test_columns_of_different_lengths_are_refused_by_name():
@@ -1205,17 +1225,16 @@ def test_records_whose_field_lengths_differ_are_refused_with_the_remedy():
     stream.close()
 
 
-def test_an_epoch_of_records_too_few_for_one_batch_is_refused():
-    """Three records repeat to fill a batch of four, as a run counted in steps reads them, but an
-    epoch of them is zero steps long, so a run counted in epochs is refused."""
+def test_an_epoch_of_records_too_few_for_one_batch_is_one_step():
+    """Three records repeat to fill a batch of four, as a run counted in steps reads them, and an
+    epoch of them is that one step, which holds the next epoch's first record."""
     data = _records(_columns(3))
     stream = data.train(DataPartition())
     try:
         assert len(next(stream)["index"]) == 4
     finally:
         stream.close()
-    with pytest.raises(ValueError):
-        data.epoch_steps(1)
+    assert data.epoch_steps(1) == 1
 
 
 def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(tmp_path):
@@ -1254,3 +1273,42 @@ def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(t
     for expected, actual in zip(jax.tree.leaves(whole.variables),
                                 jax.tree.leaves(resumed.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
+def test_a_batch_encoders_reader_is_part_of_the_plan_a_resume_checks():
+    """A batch encoder names the reader it runs in the run's plan: a run resumed with the same reader
+    reads on as it did, and one given another reader, the same words handed back by another
+    function, is refused before it reads."""
+
+    def run(reader):
+        rows = Pipeline(Memory(_Images(16))).shuffle(3).repeat()
+        caption = images.caption(templates=CAPTION_TEMPLATES, classes=_CLASSES)
+        pictures = presets.images(rows, 8, batch=4, augment=False, rejects=False, caption=caption,
+                                  host=(EncodeCaptions(reader),))
+        return compile(pictures, read="indexed", seed=3, **WORKERS).train(DataPartition())
+
+    stream = run(keep_captions)
+    try:
+        next(stream)
+        saved = stream.get_state()
+        expected = _rows(next(stream))
+    finally:
+        stream.close()
+    resumed = run(keep_captions)
+    try:
+        resumed.set_state(saved)
+        assert _rows(next(resumed)) == expected
+    finally:
+        resumed.close()
+    other = run(_captions_again)
+    try:
+        with pytest.raises(ValueError):
+            other.set_state(saved)
+    finally:
+        other.close()
+
+
+def _captions_again(captions):
+    """The words a batch's captions hold, handed back as `keep_captions` hands them: another reader
+    of the same output."""
+    return {"caption": np.asarray(captions)}

@@ -1,5 +1,6 @@
-"""The float64 oracle the delta rules' tests share: the gated delta rule token by token (`rule_math`),
-grouped value heads and packed documents over it (`recurrence`), the gradient harness every rule
+"""The float64 oracle the delta rules' tests share: the gated delta rule token by token (`rule_math`), a chunk
+at a time for a real shape's gradient (`checkpointed`), grouped value heads and packed documents over it
+(`recurrence`), the gradient harness every rule
 is run through (`through`), fla's own outputs and gradients, the ports' reference (`fla_side`), the
 float64 terms of the decay gradient Kimi's port sums (`fla_decay_terms`), the portable math and its
 float64 terms (`math`, `float64_truth`), and the port's plain decay prefix (`plain_prefix`)."""
@@ -15,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import float64_terms, widened
+from reference_error import float64_terms, widened, with_gradients
 
 from dew.nn.kernels import fla_gdn, recurrence_algebra, recurrence_chunk
 
@@ -41,6 +42,25 @@ def rule_math(q, k, v, g, beta, h0):
     return jnp.moveaxis(out, 0, 1), final
 
 
+def checkpointed(chunk: int):
+    """`rule_math`, its tokens scanned a `chunk` at a time with each chunk's scan recomputed on the way back,
+    so its gradient keeps one memory a chunk rather than one a token: the float64 oracle at a model's real
+    shape (`gdn_cases`), whose memory a token would not fit a GPU. Its values are `rule_math`'s."""
+    def rule(q, k, v, g, beta, h0):
+        def blocked(x):
+            return jnp.moveaxis(x.reshape(x.shape[0], x.shape[1] // chunk, chunk, *x.shape[2:]), 1, 0)
+
+        @jax.checkpoint
+        def block(state, inputs):
+            out, state = rule_math(*inputs, state)
+            return state, out
+
+        final, out = jax.lax.scan(block, h0, tuple(blocked(x) for x in (q, k, v, g, beta)))
+        return jnp.moveaxis(out, 0, 1).reshape(v.shape), final
+
+    return rule
+
+
 def recurrence(q, k, v, g, beta, h0, cuts=None, rule=rule_math):
     """`rule` (the token recurrence, `rule_math`, by default) with value heads reading their key head,
     each row through its documents (`cuts`, each row's first tokens, the first 0; None, one a row):
@@ -63,13 +83,11 @@ def recurrence(q, k, v, g, beta, h0, cuts=None, rule=rule_math):
 
 
 def through(rule, do, dht):
-    """`rule`'s output, final memory and its operands' gradients under the cotangents `do`, `dht`."""
-    def loss(*args):
-        out, final = rule(*args)
-        return jnp.sum(out.astype(do.dtype) * do) + jnp.sum(final.astype(dht.dtype) * dht), (out, final)
-
+    """`rule`'s output, final memory and its operands' gradients under the cotangents `do`, `dht`, each
+    cast to its output's dtype, pulled back through the gate (`reference_error.with_gradients`)."""
     def run(*args):
-        (_, (out, final)), grads = jax.value_and_grad(loss, argnums=range(len(args)), has_aux=True)(*args)
+        out, final = jax.eval_shape(rule, *args)
+        (out, final), *grads = with_gradients(rule)(*args, (do.astype(out.dtype), dht.astype(final.dtype)))
         return out, final, *grads
 
     return run

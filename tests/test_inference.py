@@ -24,17 +24,18 @@ import dew
 import dew.nn.backbones  # registers the models
 from dew.artifacts import VideoGrid
 from dew.config import MetricConfig, ModelConfig, ObjectiveConfig, TrainerConfig
+from dew.config.diffusion import DiffusionRunConfig
 from dew.data import ByteTokenizer, presets
 from dew.data.dataset import Loader
 from dew.data.sources import source
 from dew.data.sources.files import Files
 from dew.diffusion.presets import EDM, Flow
 from dew.inference import RunProcessor, TextGeneration
-from dew.inputs import Field, unit_range
+from dew.inputs import Field, TextCondition, unit_range
 from dew.objectives.base import merge
-from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
 from dew.sampling import CFG, DPMSolverSDE, Euler, Heun, TextToImage
 from dew.sampling.pipelines import Images
+from dew.telemetry.instrumentation import Compiles
 from dew.training import Checkpoints, LocalTracker, Trainer
 
 RES = 8
@@ -215,7 +216,6 @@ def test_sampler_and_guidance_are_call_arguments(tmp_path):
 def test_another_guidance_scale_seed_or_grid_reuses_the_compiled_walk(tmp_path):
     """A request's CFG scale, a Brownian solver's seed and an explicit grid's values are data to the
     image walk: another value changes the sample and runs the program the first value compiled."""
-    from dew.sampling import pipelines
 
     make_run(tmp_path)
     loaded = TextToImage.from_run(str(tmp_path))
@@ -230,12 +230,13 @@ def test_another_guidance_scale_seed_or_grid_reuses_the_compiled_walk(tmp_path):
                     key=jax.random.PRNGKey(1)).host().images
 
     first = draw(times=grid)
-    compiled = pipelines._run(None, ())._cache_size()
-    for other in (draw(scale=2.0, times=grid), draw(seed=2, times=grid), draw(times=nudged)):
-        assert not np.allclose(other, first)
-    assert np.array_equal(draw(times=grid), first)
-    assert np.array_equal(draw(), first)
-    assert pipelines._run(None, ())._cache_size() == compiled
+    # The walk is `dew.sampling.pipelines._run`'s `run`.
+    with Compiles("run") as compiled:
+        for other in (draw(scale=2.0, times=grid), draw(seed=2, times=grid), draw(times=nudged)):
+            assert not np.allclose(other, first)
+        assert np.array_equal(draw(times=grid), first)
+        assert np.array_equal(draw(), first)
+    assert compiled.count == 0
 
 
 def test_build_eval_metrics_follows_the_sample_field(tmp_path):
@@ -641,7 +642,8 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
     which the fp32 rebuild does not. Observed on CPU: 3e-02 on logits of
     order 1."""
     pytest.importorskip("qwix")
-    from dew.objectives.lm import LMObjective, LMRunConfig
+    from dew.config.lm import LMRunConfig
+    from dew.objectives.lm import LMObjective
     from dew.quantization import Quantization
 
     batch, seq = 8, 8

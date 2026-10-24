@@ -16,7 +16,9 @@ every pool test runs.
 """
 
 import json
+import os
 import re
+import select
 import shutil
 import signal
 import subprocess
@@ -58,15 +60,10 @@ BLOCK_AFTER = 5
 RECORDS = worker.BATCH * 16
 
 
-def dumped_params(out: Path) -> dict:
-    """The parameter leaves a worker wrote next to its report."""
-    with np.load(out.with_suffix(".npz")) as dump:
-        return {name: dump[name] for name in dump.files}
-
-
-def updates_of(out: Path) -> dict:
-    """The per-parameter update a worker's step took, next to its report."""
-    with np.load(out.with_suffix(".update.npz")) as dump:
+def dumped_params(out: Path, suffix: str = ".npz") -> dict:
+    """The parameter leaves a worker wrote next to its report, or, at suffix ".update.npz", the
+    per-parameter update its step took."""
+    with np.load(out.with_suffix(suffix)) as dump:
         return {name: dump[name] for name in dump.files}
 
 
@@ -674,23 +671,46 @@ def committed_steps(checkpoints: Path) -> list[int]:
                   if step.name.isdigit() and committed(checkpoints, int(step.name)).exists())
 
 
-def kill_when_blocked(process, marker: Path, landed: Path, timeout=600) -> int:
-    """SIGKILL the run once it is blocked mid-epoch with `landed` on disk.
+def channel(path: Path) -> Path:
+    """A FIFO at `path` for a worker to tell how many batches its source handed out once it is
+    blocked mid-epoch with its checkpoints landed (multiprocess_worker.blocked); `told` reads it."""
+    os.mkfifo(path)
+    return path
 
-    Waiting on the checkpoint, not on a duration, is what makes the step the
-    run dies past the same everywhere. The source has stopped handing out
-    batches, so nothing can advance while this waits.
-    """
+
+def told(pool: list[tuple[subprocess.Popen, Path]], timeout: float = 600) -> list[int]:
+    """What each worker of `pool` tells its channel, read as it arrives: one blocking wait at a time
+    on the channels and on the workers' exits, and a worker that ends before it tells fails the
+    test with its output. Every worker is killed, and the channels removed, however it ends. A
+    worker that opens its channel first waits there until this opens it to read."""
+    readers = [os.open(path, os.O_RDONLY | os.O_NONBLOCK) for _, path in pool]
+    waiting = {reader: index for index, reader in enumerate(readers)}
+    exits = {os.pidfd_open(process.pid): index for index, (process, _) in enumerate(pool)}
+    heard: dict[int, int] = {}
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if marker.exists() and landed.exists():
+    try:
+        while waiting:
+            left = deadline - time.monotonic()
+            # A worker that told is no longer waited on: its exit, once killed, is not a failure.
+            unheard = [handle for handle, index in exits.items() if index not in heard]
+            # The channels come first, so a worker's word is read before its exit in one wake.
+            ready = select.select([*waiting, *unheard], [], [], left)[0] if left > 0 else []
+            if not ready:
+                pytest.fail(stuck([process for process, _ in pool],
+                                  f"blocking with its checkpoints landed within {timeout}s"))
+            for handle in ready:
+                if handle in waiting:
+                    heard[waiting.pop(handle)] = int(os.read(handle, 64))
+                elif exits[handle] not in heard:
+                    process = pool[exits[handle]][0]
+                    pytest.fail(f"a run ended before it blocked\n{process.communicate()[0]}")
+    finally:
+        for handle in [*exits, *readers]:
+            os.close(handle)
+        for process, path in pool:
             terminate(process)
-            return int(marker.read_text())
-        if process.poll() is not None:
-            pytest.fail(f"the run ended before it blocked\n{process.communicate()[0]}")
-        time.sleep(0.05)
-    terminate(process)
-    pytest.fail(f"no checkpoint at {landed} within {timeout}s")
+            path.unlink()
+    return [heard[index] for index in range(len(pool))]
 
 
 def first_batch_after(position: str) -> list[int]:
@@ -721,10 +741,10 @@ def test_a_killed_run_resumes_on_the_batch_after_its_checkpoint(tmp_path, whole_
     """
     run_dir = tmp_path / "run"
     checkpoints = worker.checkpoint_dir(run_dir, "preempt")
-    marker = tmp_path / "blocked"
+    blocked = channel(tmp_path / "blocked")
     killed = spawn("fit", tmp_path / "killed.json",
-                   **fit_flags(run_dir, block_after=BLOCK_AFTER, marker=marker))
-    handed = kill_when_blocked(killed, marker, committed(checkpoints, SAVE_EVERY))
+                   **fit_flags(run_dir, block_after=BLOCK_AFTER, notify=blocked))
+    [handed] = told([(killed, blocked)])
 
     assert killed.returncode == -signal.SIGKILL, "the run was not preempted"
     assert handed == BLOCK_AFTER, "the run did not get past its checkpoint"
@@ -755,19 +775,18 @@ def test_two_preemptions_in_one_epoch_still_land_where_the_whole_run_did(tmp_pat
     run_dir = tmp_path / "run"
     checkpoints = worker.checkpoint_dir(run_dir, "preempt")
 
+    blocked = channel(tmp_path / "blocked-first")
     first = spawn("fit", tmp_path / "first.json",
-                  **fit_flags(run_dir, block_after=BLOCK_AFTER,
-                              marker=tmp_path / "blocked-first"))
-    kill_when_blocked(first, tmp_path / "blocked-first",
-                      committed(checkpoints, SAVE_EVERY))
+                  **fit_flags(run_dir, block_after=BLOCK_AFTER, notify=blocked))
+    told([(first, blocked)])
     assert first.returncode == -signal.SIGKILL
+    assert committed(checkpoints, SAVE_EVERY).exists()
 
     # The second window: three more steps, a checkpoint at six, killed again.
+    blocked = channel(tmp_path / "blocked-second")
     second = spawn("fit", tmp_path / "second.json",
-                   **fit_flags(run_dir, block_after=SAVE_EVERY,
-                               marker=tmp_path / "blocked-second"))
-    kill_when_blocked(second, tmp_path / "blocked-second",
-                      committed(checkpoints, 2 * SAVE_EVERY))
+                   **fit_flags(run_dir, block_after=SAVE_EVERY, notify=blocked))
+    told([(second, blocked)])
     assert second.returncode == -signal.SIGKILL
     assert committed_steps(checkpoints)[-1] == 2 * SAVE_EVERY, "the run was not killed mid-epoch"
 
@@ -805,48 +824,19 @@ def killed_local_pool(tmp_path_factory):
     """The killed pool run: two processes, both SIGKILLed once every process
     has committed local step eight, with persistent steps three and six."""
     directory = tmp_path_factory.mktemp("killed-local")
-    markers = [directory / f"blocked{index}" for index in range(2)]
+    channels = [channel(directory / f"blocked{index}") for index in range(2)]
     coordinator = f"127.0.0.1:{free_port()}"
     (directory / "killed").mkdir()
     pool = [spawn("fit", directory / "killed" / f"process{index}.json", processes=2,
                   process_id=index, coordinator=coordinator,
-                  **local_flags(directory, block_after=LOCAL_KILL_AFTER, marker=marker))
-            for index, marker in enumerate(markers)]
-    began = time.monotonic()
-    landed = [local_committed(directory, index, LOCAL_KILL_AFTER) for index in range(2)]
-    landed.append(committed(worker.checkpoint_dir(directory / "run", "local"), 2 * SAVE_EVERY))
-    # When each step of the run landed and each process blocked, so a pool
-    # that progressed slowly reads differently from one that stopped. A local
-    # directory keeps one step, so a step replaced within one poll reads
-    # "never" while the later steps' times still show the run moving.
-    milestones = {
-        **{f"process {index} local step {step}": local_committed(directory, index, step)
-           for index in range(2) for step in range(LOCAL_EVERY, LOCAL_KILL_AFTER + 1, LOCAL_EVERY)},
-        **{f"persistent step {step}": committed(worker.checkpoint_dir(directory / "run", "local"), step)
-           for step in range(SAVE_EVERY, 2 * SAVE_EVERY + 1, SAVE_EVERY)},
-        **{f"process {index} blocked": marker for index, marker in enumerate(markers)}}
-    reached: dict[str, float] = {}
-    while time.monotonic() - began < 600:
-        for name, path in milestones.items():
-            if name not in reached and path.exists():
-                reached[name] = time.monotonic() - began
-        if all(marker.exists() for marker in markers) and all(path.exists() for path in landed):
-            break
-        for process in pool:
-            if process.poll() is not None:
-                for other in pool:
-                    terminate(other)
-                pytest.fail(f"a process ended before the pool blocked\n"
-                            f"{process.communicate()[0]}")
-        time.sleep(0.05)
-    else:
-        timeline = ", ".join(f"{name} at {reached[name]:.1f} s" if name in reached else f"{name} never"
-                             for name in milestones)
-        pytest.fail(stuck(pool, f"block with local step {LOCAL_KILL_AFTER} landed: {timeline}"))
-    for process in pool:
-        terminate(process)
+                  **local_flags(directory, block_after=LOCAL_KILL_AFTER, notify=path))
+            for index, path in enumerate(channels)]
+    handed = told(list(zip(pool, channels, strict=True)))
     assert all(process.returncode == -signal.SIGKILL for process in pool)
-    assert [int(marker.read_text()) for marker in markers] == [LOCAL_KILL_AFTER] * 2
+    assert handed == [LOCAL_KILL_AFTER] * 2
+    # Each process waited on its writes before it told: local step eight on each, persistent six.
+    assert all(local_committed(directory, index, LOCAL_KILL_AFTER).exists() for index in range(2))
+    assert committed(worker.checkpoint_dir(directory / "run", "local"), 2 * SAVE_EVERY).exists()
     return directory
 
 
@@ -1091,8 +1081,8 @@ def test_a_pool_agrees_one_validity_schema_when_only_some_ranks_padded(tmp_path)
                            dumped_params(tmp_path / "single.json"))
 
     # The gradient itself, normalized by its own scale.
-    pooled = updates_of(tmp_path / "pool" / "process0.json")
-    reference = updates_of(tmp_path / "single.json")
+    pooled = dumped_params(tmp_path / "pool" / "process0.json", ".update.npz")
+    reference = dumped_params(tmp_path / "single.json", ".update.npz")
     scale = max(float(np.max(np.abs(leaf))) for leaf in reference.values())
     assert scale == pytest.approx(single["update_scale"]) and scale > 1e-3
     assert relative_difference(pooled, reference) < 1e-4

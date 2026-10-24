@@ -17,7 +17,9 @@ from interop_support import assert_reloads, assert_same_stored_tensors
 from reference_error import (
     assert_as_exact,
     assert_as_exact_as_the_reference,
+    assert_computes_the_oracle,
     assert_rounds_where_the_reference_does,
+    chain_roundings,
 )
 from tool_support import load as load_tool
 
@@ -36,6 +38,7 @@ from dew.nn.inputs import ModelInputs
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mixers.mlp import MLPMixer
+from dew.nn.ngpt import stepped
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.sampling import Sampling
@@ -290,6 +293,51 @@ def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_ste
     dew, reference = jax.jit(dew), jax.jit(reference)
     label = f'Dory {name} gradients'
     assert_as_exact(dew, reference, draw, label, seeds=DORY_GRADIENT_SEEDS[name])
+
+
+def test_a_step_computes_in_the_widest_of_its_operands():
+    """nGPT's residual step runs in at least fp32 of its residual, its branch and its rate: a float32
+    residual stepped toward a float64 branch by a float64 rate, or by a float64 rate alone, takes its
+    rate and its difference in float64 and rounds once to the residual's float32."""
+    with jax.enable_x64(new_val=True):
+        residual = jnp.ones((2, 4), jnp.float32)
+        for branch, alpha in ((jnp.ones((2, 4), jnp.float64), jnp.ones(4, jnp.float64)),
+                              (jnp.ones((2, 4), jnp.float32), jnp.ones(4, jnp.float64))):
+            traced = jax.make_jaxpr(lambda residual, branch, alpha: stepped(residual, branch, alpha, 0.5))(
+                residual, branch, alpha)
+            stepping = {equation.outvars[0].aval.dtype for equation in traced.jaxpr.eqns
+                        if equation.primitive.name in ("abs", "sub")}
+            assert stepping == {np.dtype(np.float64)}
+            assert traced.out_avals[0].dtype == np.float32
+
+
+def test_a_float64_model_computes_in_float64():
+    """A float64 Dory computes its logits and gradients in float64 end to end, its nGPT attention
+    included: each within float64's rounding of the torch reference's own float64 run, an
+    independent implementation of the same tensors (`assert_computes_the_oracle`), where one fp32
+    rounding point on the path would sit many orders further."""
+    loaded = load()
+    tensors = {key: np.array(value, copy=True) for key, value in loaded.export().items()}
+    with jax.enable_x64(new_val=True):
+        model = loaded.model.clone(dtype=jnp.float64)
+        variables = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), loaded.variables)
+        ids, cotangent = REFERENCE['input_ids'], REFERENCE['cotangent'].astype(np.float64)
+
+        def loss(params):
+            return jnp.sum(model.apply({**variables, 'params': params}, ids) * cotangent)
+
+        logits = np.asarray(model.apply(variables, ids))
+        written = loaded.export({'params': jax.grad(loss)(variables['params'])})
+        forward = chain_roundings(jax.make_jaxpr(lambda variables: model.apply(variables, ids))(variables))
+        backward = chain_roundings(jax.make_jaxpr(jax.grad(loss))(variables['params']))
+    reference = TOOL.DoryReference(loaded.config, tensors, TOOL.torch.float64)
+    expected = reference.forward(ids)
+    gradients = reference.gradients(np.array(ids), np.array(cotangent), TOOL.GRADIENTS)
+    assert logits.dtype == np.float64
+    assert_computes_the_oracle(logits, expected, 'float64 logits', roundings=forward)
+    for tensor in TOOL.GRADIENTS:
+        assert_computes_the_oracle(np.asarray(written[tensor]), gradients[tensor], f'float64 {tensor}',
+                                   roundings=backward)
 
 
 def test_a_cut_loop_trains_the_layers_before_it_through_the_input_every_pass_reads():

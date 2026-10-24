@@ -34,6 +34,7 @@ import shlex
 import sys
 import types
 import typing
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from enum import Enum
 from pathlib import Path
@@ -58,6 +59,18 @@ from dew.files import write_atomically
 from dew.inputs import Field
 from dew.lora import AdapterRecord, LoRA
 from dew.objectives.base import Effects, Loss, Metric, Objective
+from dew.optim import (
+    BF16_STATE_OPTIMIZERS,
+    OPTIMIZER_MAP,
+    Optimizer,
+    ParamGroup,
+    ScheduleBase,
+    param_labels,
+    power_profiles,
+    scaled,
+    scaled_solver,
+    weight_decay_mask,
+)
 from dew.quantization import InputQuantization, Quantization
 from dew.records import JSON, duration, record, recorded_duration
 from dew.registry import (
@@ -77,24 +90,12 @@ from dew.registry import (
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
 from dew.training.display import TrainingDisplay
 from dew.training.distributed import Layout, MeshSpec
-from dew.training.optim import (
-    BF16_STATE_OPTIMIZERS,
-    OPTIMIZER_MAP,
-    Optimizer,
-    ParamGroup,
-    ScheduleBase,
-    param_labels,
-    power_profiles,
-    scaled,
-    scaled_solver,
-    weight_decay_mask,
-)
 from dew.training.profiling import ProfileWindow
 from dew.training.quantization import quantize_trunk
 from dew.training.selection import Best
 from dew.training.state import TrainState
 from dew.training.tracker import LocalTracker, Tracker, Trackers, WandbTracker
-from dew.training.trainer import Rollout, Trainer
+from dew.training.trainer import Rollout, Trainer, run_length, run_steps
 
 JsonDict = Annotated[
     Mapping[str, object],
@@ -126,7 +127,41 @@ ModelWrapper = InputQuantization | AdapterRecord | Quantization
 
 
 @dataclasses.dataclass(frozen=True)
-class ModelConfig:
+class _Configured(ABC):
+    """A registered class, named by an alias or an import path and held as the path, and the arguments a
+    run gives it: `fields`, the ones the run states, and `defaults`, every other one the class
+    defaults as it defaulted them when the run was first recorded, so the record builds the same
+    thing after a default changes (`arguments`). Each kind names its registry (`_member`) and whether
+    its stated fields are held as their records (`_recorded`)."""
+
+    name: str
+    fields: JsonDict = dataclasses.field(default_factory=dict)
+    defaults: JsonDict = dataclasses.field(default_factory=dict)
+    """Each argument the class defaults and `fields` leaves out, as a record holds it;
+    one a record lacks, as an argument the class has since gained, takes the class's default now."""
+
+    _recorded: ClassVar[bool] = True
+
+    @staticmethod
+    @abstractmethod
+    def _member(name: str) -> type:
+        """The class `name` names, from the kind's registry."""
+
+    def __post_init__(self) -> None:
+        member = self._member(self.name)
+        object.__setattr__(self, "name", registry.import_path(member))
+        if self._recorded:
+            object.__setattr__(self, "fields", registry.argument_records(member, self.fields))
+        object.__setattr__(self, "defaults", _defaults(member, self.fields, self.defaults))
+
+    @property
+    def arguments(self) -> JsonDict:
+        """The arguments the class is built from, before those the caller derives (`_arguments`)."""
+        return _arguments(self._member(self.name), self.fields, self.defaults)
+
+
+@dataclasses.dataclass(frozen=True)
+class ModelConfig(_Configured):
     """A model's class and the fields the run gives it.
 
     `name` is an alias or an import path, held as the path. `fields` are the
@@ -140,26 +175,17 @@ class ModelConfig:
     """
 
     name: str = "simple_dit"
-    fields: JsonDict = dataclasses.field(default_factory=dict)
-    defaults: JsonDict = dataclasses.field(default_factory=dict)
-    """Each field the class defaults and `fields` leaves out, as a record holds it;
-    one a record lacks, as a field the class has since gained, takes the class's
-    default now."""
     wrappers: tuple[ModelWrapper, ...] = ()
     """What wraps the built model, innermost first, which `build` applies in
     order: a checkpoint's input quantization, a bound LoRA (its factors are
     stored with the checkpoint variables), the quantized training a run
     wrapped it in."""
 
-    def __post_init__(self) -> None:
-        member = models[self.name]
-        object.__setattr__(self, "name", registry.import_path(member))
-        object.__setattr__(self, "defaults", _defaults(member, self.fields, self.defaults))
+    _recorded: ClassVar[bool] = False
 
-    @property
-    def arguments(self) -> JsonDict:
-        """The fields the model is built from, before those a recipe derives (`_arguments`)."""
-        return _arguments(models[self.name], self.fields, self.defaults)
+    @staticmethod
+    def _member(name: str) -> type:
+        return models[name]
 
     @classmethod
     def from_dict(cls, values: Mapping[str, object]) -> Self:
@@ -199,7 +225,7 @@ class ModelConfig:
 
 
 @dataclasses.dataclass(frozen=True)
-class ObjectiveConfig:
+class ObjectiveConfig(_Configured):
     """An objective's class and the arguments the run gives it.
 
     `name` is an alias or an import path, held as the path. `fields` are the
@@ -213,21 +239,10 @@ class ObjectiveConfig:
     """
 
     name: str
-    fields: JsonDict = dataclasses.field(default_factory=dict)
-    defaults: JsonDict = dataclasses.field(default_factory=dict)
-    """Each argument the class defaults and `fields` leaves out, as a record holds it;
-    one a record lacks takes the class's default now."""
 
-    def __post_init__(self) -> None:
-        member = objectives[self.name]
-        object.__setattr__(self, "name", registry.import_path(member))
-        object.__setattr__(self, "fields", registry.argument_records(member, self.fields))
-        object.__setattr__(self, "defaults", _defaults(member, self.fields, self.defaults))
-
-    @property
-    def arguments(self) -> JsonDict:
-        """The arguments the objective is built from, before those the caller derives (`_arguments`)."""
-        return _arguments(objectives[self.name], self.fields, self.defaults)
+    @staticmethod
+    def _member(name: str) -> type:
+        return objectives[name]
 
     def build(self, **derived) -> Objective:
         """Build the objective from its arguments and those the caller
@@ -241,7 +256,7 @@ class ObjectiveConfig:
 
 
 @dataclasses.dataclass(frozen=True)
-class MetricConfig:
+class MetricConfig(_Configured):
     """A metric's class and the arguments the run gives it.
 
     `name` is an alias of `dew.registry.metrics` or an import path, held as
@@ -253,24 +268,17 @@ class MetricConfig:
     """
 
     name: str
-    fields: JsonDict = dataclasses.field(default_factory=dict)
-    defaults: JsonDict = dataclasses.field(default_factory=dict)
-    """Each argument the class defaults and `fields` leaves out, as a record holds it;
-    one a record lacks takes the class's default now."""
 
-    def __post_init__(self) -> None:
-        member = _metric_class(self.name)
-        object.__setattr__(self, "name", registry.import_path(member))
-        object.__setattr__(self, "fields", registry.argument_records(member, self.fields))
-        object.__setattr__(self, "defaults", _defaults(member, self.fields, self.defaults))
+    @staticmethod
+    def _member(name: str) -> type:
+        return _metric_class(name)
 
     def build(self, **derived) -> Metric:
         """Build the metric from its arguments and those the run `derived`
         where it states none of its own (the field a video run's sample
         is read from, say)."""
         unstated = {name: value for name, value in derived.items() if name not in self.fields}
-        arguments = _arguments(_metric_class(self.name), self.fields, self.defaults)
-        return metrics.build(self.name, arguments, **unstated)
+        return metrics.build(self.name, self.arguments, **unstated)
 
 
 def _metric_class(name: str) -> type:
@@ -441,28 +449,50 @@ def _flag_json(text: str) -> JSON:
     return None if text == "None" else json.loads(text)
 
 
+def _rate_argument() -> tyro.constructors.PrimitiveConstructorSpec:
+    """The learning rate as one command-line value, the record a run holds: a number, the constant
+    rate, or a schedule's record as JSON (`dew.registry.from_record`)."""
+    annotation = float | ScheduleSpec
+
+    def number(value) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    def read(given: list[str]) -> float | ScheduleBase:
+        value = json.loads(given[0])
+        if number(value):
+            return float(value)
+        built = from_record(annotation, value, dtypes=False)
+        if not isinstance(built, ScheduleBase):
+            raise TypeError(f"--optim.rate is a number or a schedule's record, not {given[0]}")
+        return built
+
+    return tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1, metavar="RATE|JSON", instance_from_str=read,
+        is_instance=lambda given: number(given) or isinstance(given, ScheduleBase),
+        str_from_instance=lambda given: [json.dumps(to_record(given, annotation))])
+
+
 @dataclasses.dataclass(frozen=True)
 class OptimConfig:
     """Holds the optimizer, learning-rate schedule and gradient clipping."""
 
     optimizer: Optimizer = "adamw"
     optimizer_opts: JsonDict = dataclasses.field(default_factory=dict)
-    learning_rate: float = 2.7e-4
-    """The constant rate, when no schedule is named."""
-    schedule: ScheduleSpec | None = None
-    """The learning-rate schedule, as one typed record per kind (`dew.training.optim`).
+    rate: Annotated[float | ScheduleSpec, _rate_argument()] = 2.7e-4
+    """The learning rate: a constant, or a schedule as one typed record per kind (`dew.optim`).
 
     The kinds are cosine, power (lm-engine's power law with an optional linear
     tail), linear, one_cycle (torch's `OneCycleLR`) and exponential; each record
     holds only its own fields, and `every` steps any of them once per that many
-    updates.
+    updates. On the command line it is one value: `--optim.rate 3e-4`, or a
+    schedule's record, `--optim.rate '{"class": "cosine", "fields": {...}}'`.
     """
     weight_decay: float | None = None
     """The weight decay passed to the optimizer, None keeping its own (adamw's 1e-4, the others'
     0); for 'adam' it is torch's coupled L2 penalty, added to the gradient before the moments
     read it, for 'adamw' the decoupled decay. Either decay, the default included, spares biases
     and vectors such as a norm's scale, timm's split for every optimizer
-    (`dew.training.optim.weight_decay_mask`); Muon decays them as Moonlight does, and
+    (`dew.optim.weight_decay_mask`); Muon decays them as Moonlight does, and
     `param_groups` replace the split. Records written before this change decayed every
     parameter; ParamGroup('all', ('*',)) restores that."""
     b1: float | None = None
@@ -479,7 +509,7 @@ class OptimConfig:
     state_dtype: Literal["float32", "bfloat16"] = "float32"
     """The dtype of Adam's moments in memory.
 
-    bfloat16 stores both with stochastic rounding (`dew.training.optim.bf16_moments`),
+    bfloat16 stores both with stochastic rounding (`dew.optim.bf16_moments`),
     for adam and adamw only. That halves the optimizer state and reduces the
     update's memory traffic.
     """
@@ -492,7 +522,7 @@ class OptimConfig:
     ema_profiles: tuple[float, ...] = ()
     """Relative standard deviations of the power-function EMAs a run keeps for post-hoc EMA.
 
-    See `dew.training.optim.power_profiles`; Karras et al. use (0.05, 0.10). Every
+    See `dew.optim.power_profiles`; Karras et al. use (0.05, 0.10). Every
     checkpoint save snapshots these averages, and `Checkpoints.posthoc_ema` builds
     an average with any other relative standard deviation from the snapshots.
     Empty keeps none.
@@ -507,7 +537,7 @@ class OptimConfig:
         none) times its multiplier, with its own weight decay, `b1` schedule and bounds
         (`ParamGroup.solver`); the global-norm clip still reads every gradient
         together, before the groups split them. Each solver holds its rate's
-        scale in its state (`dew.training.optim.scaled_solver`), so runs at
+        scale in its state (`dew.optim.scaled_solver`), so runs at
         rates of one schedule's shape compile one step.
         """
         opts = dict(self.optimizer_opts)
@@ -546,14 +576,9 @@ class OptimConfig:
             solver = power_profiles(solver, self.ema_profiles)
         return solver
 
-    @property
-    def rate(self) -> float | ScheduleBase:
-        """The run's learning rate: the schedule, else the constant rate."""
-        return self.learning_rate if self.schedule is None else self.schedule
-
     def rate_scales(self) -> dict[str | None, float]:
         """The rate scale each of `build`'s solvers holds in its state
-        (`dew.training.optim.scaled_solver`), by param group, or under None
+        (`dew.optim.scaled_solver`), by param group, or under None
         for the one solver of a config without groups. A resumed run sets
         them over its checkpoint's (`with_rate_scales`), so the configured
         rate is the one it steps at."""
@@ -648,8 +673,8 @@ class TrainerConfig:
 
     name: str | None = None
     checkpoint_dir: str = "./checkpoints"
-    keep: Annotated[int | Keep, _keep_argument()] = 2
-    """The number of latest checkpoints kept, besides the best one."""
+    keep: Annotated[int | Keep, _keep_argument()] = Keep.latest
+    """The number of latest checkpoints kept, besides the best one (`Keep`'s own default)."""
     best: Annotated[str | Best | tuple[Best, ...] | None, _best_argument()] = None
     """The metric name and ranking policy; None selects validation loss or training loss."""
     update_tokens: int | None = None
@@ -793,8 +818,7 @@ class TrainerConfig:
             raise ValueError("--trainer.split reads each step's batch in that many microbatches, at least 1")
         if self.publish and (self.wandb is None or not self.checkpoint_final):
             raise ValueError("trainer.publish requires trainer.wandb and trainer.checkpoint_final")
-        if self.steps is not None and self.epochs is not None:
-            raise ValueError("steps and epochs both name the run length; set one")
+        run_length(self.steps, self.epochs, self.tokens, required=False)
         if isinstance(self.checkpoint_every, str) and self.checkpoint_every != 'epoch':
             object.__setattr__(self, 'checkpoint_every', duration(self.checkpoint_every))
         if isinstance(self.keep, Mapping):
@@ -832,20 +856,9 @@ class TrainerConfig:
             return checkpoints.latest is not None
 
     def total_steps(self, dataset: Loader) -> int | None:
-        """Return the step cap from `steps` or `epochs`, None for a token-only run."""
-        if self.steps is not None:
-            return self.steps
-        if self.epochs is None:
-            if self.tokens is not None:
-                return None
-            raise ValueError("the run length is --trainer.steps or --trainer.epochs "
-                             "or --trainer.tokens")
-        if dataset.records is None:
-            raise ValueError(
-                "epochs need a dataset with a record count; this one streams without "
-                "one, so give the run length as --trainer.steps")
-        # A ramp's stages begin where updates do (`Ramp.stages`), as the trainer's stream cuts them.
-        return dataset.epoch_steps(self.epochs, self.accumulation)
+        """Return the step cap from `steps` or `epochs`, None for a token-only run (`run_steps`, the
+        one policy a direct fit applies too)."""
+        return run_steps(dataset, self.steps, self.epochs, self.tokens, self.accumulation)
 
     def eval_interval(self, dataset: Loader) -> int | None:
         """Return the steps between validation passes over `data`, or None for never."""
@@ -1262,8 +1275,9 @@ class RunConfig:
         return str(target)
 
     def record(self) -> dict[str, JSON]:
-        """The run's class record: its class's import path and its fields (`to_dict`)."""
-        return {"class": registry.import_path(type(self)), "fields": self.to_dict()}
+        """The run's class record: its class by its alias in `dew.registry.runs`, or by its import path
+        where the table holds none, and its fields (`to_dict`)."""
+        return {"class": registry.runs.name_of(type(self)), "fields": self.to_dict()}
 
     @classmethod
     def cli(cls, args: Sequence[str] | None = None, *, default: Self | None = None) -> Self:
@@ -1362,7 +1376,7 @@ class RunConfig:
         named = registry.class_record(record)
         if named is None:
             raise ValueError('a run record is its class and its fields, {"class": ..., "fields": ...}')
-        run_class = registry.imported(named[0])
+        run_class = registry.runs[named[0]]
         if not (isinstance(run_class, type) and issubclass(run_class, cls)):
             raise ValueError(f"the record names {named[0]}, which is no {cls.__name__}")
         return run_class.from_dict(named[1])

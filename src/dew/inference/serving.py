@@ -63,6 +63,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
+import hashlib
 import logging
 import math
 import threading
@@ -108,10 +109,19 @@ from dew.inference.tasks import (
     resident,
     shape_bucket,
 )
-from dew.nn.inputs import ModelInputs, host_token_rows, mesh_of, request_key
+from dew.nn.cross_attention import CROSS_CACHE, CrossAttention
+from dew.nn.inputs import (
+    CONTEXT,
+    CONTEXT_LENGTHS,
+    CrossContext,
+    ModelInputs,
+    host_token_rows,
+    mesh_of,
+    request_key,
+)
 from dew.nn.kernels.options import compiler_options
 from dew.nn.kv_cache import POOLED, ROW_CURSORS, TABLE, KVCache, is_paged, leaf_name
-from dew.nn.protocols import Layered, ProjectionGroup, Serving
+from dew.nn.protocols import CrossAttending, Layered, ProjectionGroup, Serving
 from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS, batch_axes
 from dew.objectives.base import Variables
 from dew.sampling.decoding import Finishing, LogitsTransform, StopStrings
@@ -258,6 +268,12 @@ class _Row:
     """The weights the row's prompt keys are written under: how many reloads came before its seat."""
     group: int = 0
     """The group of slots the row is seated in, whose part of a paged pool its pages are."""
+    context: np.ndarray | None = None
+    """The real tokens of the context a cross-attention decoder reads beside the prompt,
+    `[length, features]`; None for none. Every piece of the prompt carries it."""
+    salt: bytes = b""
+    """What the prompt's keys depend on beside its tokens, its context's digest, under which its
+    prefix pages are named (`dew.inference.pages`); empty for none."""
 
 
 def _seated_in(group: int, free: list[list[int]], taken: list[int], row: _Row) -> tuple[int, _Row]:
@@ -343,12 +359,14 @@ class PagedRows:
         cached leaf is a row's own state (a recurrent mixer's memory, latent
         attention's cache, image groups), kept in the row's slot. A shared
         prefix's pages hold its keys alone, not the state its prompt left, so
-        a cache with such state is refused a prefix cache."""
+        a cache with such state is refused a prefix cache. A cross-attention
+        layer's context is not left by the prompt: every piece carries it and
+        writes it again, and the pages are named under its digest."""
         if not is_paged(cache):
             raise ValueError("the model did not take the paged layout: none of its layers keeps a page table")
         if any(part.prefix_cache for part in self.pages):
             for path, _ in jax.tree_util.tree_leaves_with_path(cache):
-                if leaf_name(path) not in POOLED | {TABLE} | ROW_CURSORS:
+                if leaf_name(path) not in POOLED | {TABLE} | ROW_CURSORS | CROSS_CACHE:
                     raise ValueError(f"a shared prefix's pages hold its keys, not "
                                      f"{jax.tree_util.keystr(path)}, a row's own state its prompt left; "
                                      "serve this model without prefix_cache")
@@ -367,10 +385,10 @@ class PagedRows:
         while queue:
             row = queue[0]
             open_groups = sorted((group for group, slots in enumerate(free) if taken[group] < len(slots)),
-                                 key=lambda group: (len(self.pages[group].shared(row.prompt)),
+                                 key=lambda group: (len(self.pages[group].shared(row.prompt, row.salt)),
                                                     self.pages[group].available), reverse=True)
             for group in open_groups:
-                reserved = self.pages[group].reserve(row.prompt, len(row.prompt) + row.budget)
+                reserved = self.pages[group].reserve(row.prompt, len(row.prompt) + row.budget, row.salt)
                 if reserved is not None:
                     row.pages, row.prefilled = reserved
                     row.weights = self.weights
@@ -389,7 +407,7 @@ class PagedRows:
         where every key came from the weights served now, and not where it was seated before a
         reload and its earlier pieces kept the old weights' keys."""
         if row.weights == self.weights:
-            self.pages[row.group].publish(row.prompt, row.pages)
+            self.pages[row.group].publish(row.prompt, row.pages, row.salt)
 
     def release(self, row: _Row) -> None:
         self.pages[row.group].release(row.pages)
@@ -463,6 +481,11 @@ class Server:
             raise ValueError(f"slots ({slots}) and admission ({admission}) must divide by the "
                              f"{self.groups} groups the mesh splits rows into")
         self.model = model
+        self.cross: tuple[CrossAttention, int, np.dtype] | None = None
+        """The model's cross-attention layers and its context's width and dtype, where a request may
+        carry a context beside its prompt."""
+        if isinstance(model, CrossAttending) and model.cross_attention is not None:
+            self.cross = (model.cross_attention, model.context_width, np.dtype(model.context_dtype))
         self.variables = variables
         self._weight_groups: list[ProjectionGroup] = []
         self.processor = processor
@@ -518,10 +541,14 @@ class Server:
                                  f"which this model cannot take: {self.mixed_refusal}")
             else:
                 _log.info("the admitting step prefills in a forward of its own: %s", self.mixed_refusal)
-            formats = resident_formats(
+            formats, chosen = resident_formats(
                 model, self.variables, self.pad_id, rows.placement, decode_steps, shapes,
                 state_shardings(self.mesh, shapes), self._admitted, transforms, stopping, grammar)
             self._step, self._admitting = decode_programs(formats, self._admitted, compiler_options(model))
+            if chosen is not None:
+                # The compile that chose the layout is the decoding step: compiling it again at the
+                # formats would repeat the server's largest compile (`resident_formats`).
+                self._step = chosen
             self._resident, self._carried = split_donated(
                 opened_in(formats)(model, self.variables, self.pad_id, slots, capacity))
 
@@ -712,8 +739,10 @@ class Server:
         """Queue one request and return a ticket that resolves to its `Generation`.
 
         `prompt` is one text prompt, `ModelInputs` row or token row, without
-        media or positions. It is validated as `TextGeneration` validates it,
-        against the server's capacity in place of the model's context.
+        media or positions; a `ModelInputs` row may carry the context a
+        cross-attention decoder reads (`dew.nn.inputs.CONTEXT`). It is
+        validated as `TextGeneration` validates it, against the server's
+        capacity in place of the model's context.
         Without `max_new_tokens`, the task's default budget applies, its
         `max_new_tokens` or what its `max_length` leaves past the prompt. A
         request with a zero budget resolves at once, with the prompt alone.
@@ -737,12 +766,17 @@ class Server:
 
     def _prepared(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array, fold: int) -> _Row:
         positions = None
+        context = None
         if isinstance(prompt, (str, ModelInputs)):
             inputs = prepared_inputs(self.processor, prompt, images=None)
-            if set(inputs.token_fields) - {"attention_mask", "positions"} or inputs.conditioning:
+            conditioning = dict(inputs.conditioning)
+            if self.cross is not None and CONTEXT in conditioning:
+                context = self._request_context(conditioning.pop(CONTEXT),
+                                                  conditioning.pop(CONTEXT_LENGTHS, None))
+            if set(inputs.token_fields) - {"attention_mask", "positions"} or conditioning:
                 raise ValueError(
-                    "a served prompt carries tokens and validity only; "
-                    "media and custom token fields do not slot"
+                    "a served prompt carries tokens, validity and a cross-attention decoder's context "
+                    "only; media and custom token fields do not slot"
                 )
             ids = np.asarray(inputs.tokens)
             fields = {name: np.asarray(value) for name, value in inputs.token_fields.items()}
@@ -760,7 +794,32 @@ class Server:
                 positions[valid], (np.cumsum(valid, axis=1) - 1)[valid])):
             raise ValueError("a served prompt cannot carry noncanonical positions")
         self.rows.refuse(int(valid[0].sum()), budget)
-        return _Row(ids[0][valid[0]].astype(np.int32), budget, seed, fold, Ticket())
+        salt = b"" if context is None else hashlib.blake2b(
+            np.asarray(context.shape, np.int64).tobytes() + context.tobytes(), digest_size=16).digest()
+        return _Row(ids[0][valid[0]].astype(np.int32), budget, seed, fold, Ticket(), context=context,
+                    salt=salt)
+
+    def _request_context(self, embeddings: ArrayLike, lengths: ArrayLike | None) -> np.ndarray:
+        """A request's context as its real tokens on the host, `[length, features]`, in the dtype
+        the model reads a context in (`CrossAttending.context_dtype`), refused where it is not one
+        row of the model's width, counts tokens it does not hold, or holds more than the
+        cross-attention layers cache (`CrossAttention.context_length`)."""
+        assert self.cross is not None
+        cross, features, dtype = self.cross
+        given = CrossContext.from_conditioning({CONTEXT: jnp.asarray(embeddings), **(
+            {} if lengths is None else {CONTEXT_LENGTHS: jnp.asarray(lengths)})})
+        tokens = np.asarray(given.embeddings, dtype)
+        # The count as given, before the cache's int32 holds it, where a wider one would wrap.
+        counted = np.asarray(given.lengths if lengths is None else lengths)
+        if tokens.shape[0] != 1 or tokens.shape[-1] != features:
+            raise ValueError(f"a request's context is one row of {features}-wide tokens, got {tokens.shape}")
+        length = int(counted.reshape(-1)[0])
+        if not 0 <= length <= tokens.shape[1]:
+            raise ValueError(f"a request's context counts {length} real tokens of its {tokens.shape[1]}")
+        if length > cross.context_length:
+            raise ValueError(f"the cross-attention layers keep at most {cross.context_length} context "
+                             f"tokens a row, got {length}")
+        return tokens[0, :length]
 
     def step(self) -> None:
         """Run one device call and read the previous call's draws.
@@ -861,6 +920,13 @@ class Server:
         final = np.zeros((count,), bool)
         history = np.zeros((count, capacity), np.int32)
         history_valid = np.zeros((count, capacity), bool)
+        cross = self.cross
+        # Every piece carries its row's context, so a row continuing over a former occupant's slot,
+        # or after shared prefix pages, reads its own; a row without one reads none.
+        context_length, features, dtype = (0, 0, np.float32) if cross is None else (
+            cross[0].context_length, cross[1], cross[2])
+        contexts = np.zeros((count, context_length, features), dtype)
+        context_lengths = np.zeros((count,), np.int32)
         for index, slot, row in chosen:
             piece = row.prompt[row.prefilled:row.prefilled + width]
             tokens[index, width - len(piece):] = piece
@@ -877,6 +943,9 @@ class Server:
             final[index] = row.prefilled == len(row.prompt)
             history[index, capacity - len(row.prompt):] = row.prompt
             history_valid[index, capacity - len(row.prompt):] = True
+            if cross is not None and row.context is not None:
+                contexts[index, :len(row.context)] = row.context
+                context_lengths[index] = len(row.context)
             if final[index]:
                 self.rows.prefilled(row)
         placed = jax.device_put(
@@ -891,10 +960,12 @@ class Server:
                 final,
                 history,
                 history_valid,
+                *([] if cross is None else [contexts, context_lengths]),
             ],
             self._admitted,
         )
-        return Admission(ModelInputs(placed[0], {"attention_mask": placed[1]}), *placed[2:])
+        conditioning = {} if cross is None else {CONTEXT: placed[10], CONTEXT_LENGTHS: placed[11]}
+        return Admission(ModelInputs(placed[0], {"attention_mask": placed[1]}, conditioning), *placed[2:10])
 
     def _settle(self) -> None:
         """Read the previous call's draws into their rows, iteration by

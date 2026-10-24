@@ -35,11 +35,11 @@ from collections.abc import Mapping
 import tyro
 
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
+from dew.config.lm import LMRunConfig
 from dew.data import mix, phases, presets
 from dew.data.pipeline import Pipeline
 from dew.data.sources.tokens import TokenFiles
-from dew.objectives.lm import LMRunConfig
-from dew.training.optim import ParamGroup, Power, PowerTail
+from dew.optim import ParamGroup, Power, PowerTail
 
 LAYERS = 40
 VOCAB = 100_352
@@ -90,7 +90,7 @@ def optim_config(width: int, steps: int, batch: int, seq_len: int) -> OptimConfi
     scale = steps / STEPS
     return OptimConfig(
         optimizer="adamw", b1=0.9, b2=0.95, optimizer_opts={"eps": 1e-10},
-        schedule=Power(peak=0.01, warmup_steps=max(round(5_000 * scale), 1),
+        rate=Power(peak=0.01, warmup_steps=max(round(5_000 * scale), 1),
                        a=4.0 * batch, b=-0.51, c=float(batch * seq_len),
                        tail=PowerTail(start=round(DECAY_START * scale))),
         weight_decay=0.1, clip_grads=1.0, param_groups=ParamGroup.mup(width / 128))

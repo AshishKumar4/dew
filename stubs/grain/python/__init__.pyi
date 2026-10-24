@@ -53,6 +53,14 @@ Transformation: TypeAlias = RandomMapTransform | MapTransform
 Batching and sharding are the iterator's, not a transformation's."""
 
 
+class DatasetSelectionMap(abc.ABC):
+    """Which dataset, and which of its records, each index of a selection reads."""
+
+    @abc.abstractmethod
+    def __len__(self) -> int: ...
+    @abc.abstractmethod
+    def __getitem__(self, index: int) -> tuple[int, int]: ...
+
 class MapDataset(Generic[T]):
     """Random-access records with transformations returning new datasets."""
 
@@ -70,6 +78,10 @@ class MapDataset(Generic[T]):
     @classmethod
     def mix(
         cls, datasets: Sequence[MapDataset[T]], weights: Sequence[float] | None = ...
+    ) -> MapDataset[T]: ...
+    @classmethod
+    def select_from_datasets(
+        cls, datasets: Sequence[MapDataset[T]], selection_map: DatasetSelectionMap
     ) -> MapDataset[T]: ...
     def __len__(self) -> int: ...
     @overload

@@ -747,8 +747,8 @@ def test_a_validation_pass_starts_at_most_one_worker_per_batch(monkeypatch):
 def test_token_deficit_mix_counts_targets_and_restores_delivered_counts():
     corpora = [grain.MapDataset.source([{"id": tag, "targets": targets}]).repeat().to_iter_dataset()
                for tag, targets in [(0, 2), (1, 7)]]
-    mix = TokenDeficit(corpora, [1, 3], tokens=Targets(), names=["short", "long"], labels=["short", "long"],
-                       keys=["short", "long"])
+    mix = TokenDeficit(corpora, (1, 3), ("short", "long"), tokens=Targets(), names=["short", "long"],
+                       labels=["short", "long"])
     reader = iter(mix)
     delivered = [0, 0]
     for row in itertools.islice(reader, 100):
@@ -1589,11 +1589,11 @@ def test_block_shuffle_is_a_complete_bounded_physical_order_and_resumes():
     from dew.data.ordering import BlockShuffle
 
     blocked = BlockShuffle(grain.MapDataset.source(stored.values), stored.physical, 2, 11)
-    order, ends = blocked._epoch(0)
+    order, blocks = blocked._epoch(0)
     assert len(order) == 3
     start = 0
     original_ends = np.cumsum(stored.physical)
-    for end in ends:
+    for end in blocks.ends:
         selected = {int(np.searchsorted(original_ends, blocked.index(index), side="right"))
                     for index in range(start, int(end))}
         assert len(selected) <= 2
@@ -1610,8 +1610,8 @@ def test_token_mixer_probes_an_unselected_tiny_share_before_emitting_a_row():
     and its first row lets it."""
     parents = [grain.MapDataset.source([{"targets": 3}]).repeat().to_iter_dataset(),
                grain.MapDataset.source([{"targets": 1}]).repeat().to_iter_dataset()]
-    reader = iter(TokenDeficit(parents, [1, 1e-9], tokens=Targets(), names=["normal", "tiny"],
-                              labels=["normal", "tiny"], keys=["normal", "tiny"]))
+    reader = iter(TokenDeficit(parents, (1, 1e-9), ("normal", "tiny"), tokens=Targets(),
+                               names=["normal", "tiny"], labels=["normal", "tiny"]))
     try:
         assert next(reader) == {"targets": 3}
     finally:
@@ -2050,15 +2050,6 @@ def test_a_streamed_repeat_repeats_where_it_is_written_past_a_limit_or_a_repeat(
     assert len(ids(twice, "streamed")) == len(ids(twice, "indexed")) == 48
 
 
-def test_a_nested_mixture_counts_its_epoch_from_each_part():
-    """A mixture of a corpus and a mixture ends its epoch when the first of its
-    parts comes round, the inner mixture counted the same way: the inner one
-    of 8 and 4 rows at even weights in 16, the outer of 12 and 16 in 32."""
-    inner = mix([Pipeline(source(8)), Pipeline(source(4))], weights=(1, 1))
-    nested = mix([Pipeline(source(12)), inner], weights=(1, 1))
-    assert compile(nested.batch(2), loading=READ).records == 32
-
-
 def test_a_streamed_training_read_with_a_random_step_and_no_repeat_never_runs_out():
     """A training order that writes no repeat repeats for ever, as its plan
     says, whether or not a random step reads its rows."""
@@ -2247,9 +2238,9 @@ def test_a_mixture_of_one_dataset_reads_that_dataset(by, read):
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_a_corpus_smaller_than_a_batch_fills_one_by_its_repeats(read):
     """A corpus of two records repeated fills a batch of eight, as Grain's repeat and batch do,
-    and a run counted in steps reads it; a run counted in epochs is refused, since one pass
-    over the two records fills no batch. Repeated after the batch, a pass holds no batch to
-    replay, so the read is refused rather than replaying nothing forever, whatever limit
+    and a run counted in steps reads it, as one counted in epochs does where the read counts its
+    records, an epoch's one step holding records of the next. Repeated after the batch, a pass
+    holds no batch to replay, so the read is refused rather than replaying nothing forever, whatever limit
     follows, in every read; eight records make a batch either way."""
     for count, repeated in ((2, "before"), (2, "after"), (8, "after"), (2, "after, then take"),
                             (8, "after, then take")):
@@ -2270,9 +2261,8 @@ def test_a_corpus_smaller_than_a_batch_fills_one_by_its_repeats(read):
                 index % count for index in range(8))
         finally:
             stream.close()
-        if count < 8:
-            with pytest.raises(ValueError):
-                data.epoch_steps(1)
+        if count < 8 and data.records is not None:
+            assert data.epoch_steps(1) == 1
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])

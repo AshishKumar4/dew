@@ -88,3 +88,17 @@ def test_a_call_that_drops_its_arguments_or_misdeclares_its_reads_is_reported(li
     [module] = [module for module in lint.collect(["src/dew/nn"], tmp_path, "dew")
                 if module.path.stem == "layer"]
     assert any(True for _ in lint.calls(module)) is reported
+
+
+@pytest.mark.parametrize("body, reported", [
+    ("assert step._cache_size() == 1\n", True),
+    ("with Compiles('step') as compiled:\n    step()\nassert compiled.count == 1\n", False),
+], ids=["private cache size", "public compile count"])
+def test_a_read_of_jaxs_private_cache_size_is_reported(lint, body, reported, tmp_path):
+    """SLOP021: a jitted function's private `_cache_size` is read nowhere; its compiles are counted
+    through the public compile event (`dew.telemetry.instrumentation.Compiles`)."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_counted.py").write_text(body)
+    [module] = lint.collect(["tests"], tmp_path, "dew")
+    assert any(finding.code == "SLOP021" for finding in lint.check(module)) is reported
+

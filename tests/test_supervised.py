@@ -115,6 +115,7 @@ def test_an_autoencoder_with_two_outputs_trains_and_its_record_trains_it_again_i
     """A model returning its reconstruction and its latent trains through
     `dew train` on a loss reading both; a new process given only the run's
     `run.json` rebuilds the same run and trains the same loss, step for step."""
+    from process_support import dew_train, logged_losses
     from test_examples import REPO_ROOT, single_device
 
     (tmp_path / "tmp").mkdir()
@@ -122,15 +123,10 @@ def test_an_autoencoder_with_two_outputs_trains_and_its_record_trains_it_again_i
                    "PYTHONPATH": os.pathsep.join([str(REPO_ROOT / "src"), str(REPO_ROOT / "tests")])}
 
     def train(*arguments):
-        finished = subprocess.run([sys.executable, "-m", "dew.cli.main", "train", *arguments],
-                                  cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=900)
-        assert finished.returncode == 0, (
-            f"--- stdout ---\n{finished.stdout}\n--- stderr ---\n{finished.stderr}")
+        dew_train(tmp_path, environment, *arguments)
 
     def losses(directory):
-        rows = (directory / "autoencoder_experiment" / "tracking" / "scalars.jsonl").read_text().splitlines()
-        scalars = [json.loads(row)["scalars"] for row in rows]
-        return [row["train/loss"] for row in scalars if "train/loss" in row]
+        return logged_losses(directory / "autoencoder_experiment")
 
     train(str(REPO_ROOT / "tests" / "autoencoder_experiment.py"),
           "--set", f"trainer.checkpoint_dir={tmp_path / 'first'}")

@@ -41,7 +41,6 @@ from jax.interpreters.ad import JVPTracer
 
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, short_conv
-from dew.nn.kernels.recurrence import L2NORM_EPS
 
 from .attention import FORWARD_MODE, gated_rms_normalized, repeat_kv_heads
 from .blocks import normal_kernel
@@ -51,7 +50,7 @@ from .joined import joined_dense, joins
 from .kernels import generation
 from .kernels.generation import first_refusal, measured_kernel, refused, route, triton_runs
 from .kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule, on_the_port, recurrent_delta_rule
-from .precision import asks_default_precision, at_least_fp32, float32_dot_general
+from .precision import L2NORM_EPS, asks_default_precision, at_least_fp32, float32_dot_general, l2norm
 from .sharding import (
     HEADS,
     MLP_HIDDEN,
@@ -66,16 +65,6 @@ from .sharding import (
     rows_like,
     seen_whole,
 )
-
-
-def l2norm(x, eps: float = L2NORM_EPS):
-    """The FLA library's normalisation of q and k, which the reference
-    applies inside the rule (`l2norm`, modeling_qwen3_next.py:368-371):
-    unit keys and queries per head, so `q k^T` is a cosine and the
-    `1/sqrt(d)` scale keeps it bounded."""
-    inv = jax.lax.rsqrt(jnp.sum(jnp.square(x), axis=-1, keepdims=True) + eps)
-    return x * inv
-
 
 Pieces = Sequence[tuple[int, int | None]]
 """`causal_conv1d`'s `parts`: each piece's width and the head its l2 norm runs over, or None."""
