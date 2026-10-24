@@ -38,7 +38,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Self, Union
+from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Self, TypedDict, Union
 
 import jax
 import optax
@@ -669,6 +669,16 @@ def _cadence_argument():
     )
 
 
+class SourcePlacement(TypedDict, total=False):
+    """Where a run reads the source it starts from: `Pretrained.load`'s keywords
+    (`TrainerConfig.source_placement`)."""
+
+    weights: bool
+    on_host: bool
+    mesh: MeshSpec
+    layout: Layout
+
+
 @dataclasses.dataclass(frozen=True)
 class TrainerConfig:
     """Holds the run length, checkpointing, sharding and run tracking."""
@@ -857,6 +867,19 @@ class TrainerConfig:
             return False
         with Checkpoints(os.path.join(self.checkpoint_dir, self.name), keep=self.keep) as checkpoints:
             return checkpoints.latest is not None
+
+    def source_placement(self) -> SourcePlacement:
+        """Where a run that starts from a source (`Pretrained.load`) reads it: the load's keywords. A run
+        that resumes reads no weights (`resumes`), as its checkpoint holds them. One whose state lives on
+        the host (`Layout.host` holds the variables) keeps them as host arrays, which its start streams
+        into place leaf by leaf. Any other reads each leaf onto this run's mesh, sharded as its layout
+        shards the state, so each process reads only the shards its devices hold, and the start then
+        takes those arrays as they are (`Trainer.place`): no process holds the whole source."""
+        if self.resumes():
+            return {"weights": False}
+        if "variables" in self.layout.host:
+            return {"on_host": True}
+        return {"mesh": self.mesh, "layout": self.layout}
 
     def total_steps(self, dataset: Loader) -> int | None:
         """Return the step cap from `steps` or `epochs`, None for a token-only run (`run_steps`, the
