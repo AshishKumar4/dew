@@ -609,7 +609,18 @@
      "runs": "diffusers"
     }
    ],
-   "note": "The rounding mode with copies=32. Five pointwise source_schedulers cases use independent initial states and replayed per-step JAX noise on (2, 3, 128), both precisions over the same float32 inputs. CFG epsilon uses 52 pixel orders of the original (2, 3, 4) input and cotangent; each float64 VJP commutes with its order within 1e-12 relative RMS, and order zero reproduces the original float32 gradient bit for bit. Original source_schedulers arrays are unchanged. Torch 2.14.0+cpu, JAX 0.11.2.post3."
+   "note": "The rounding mode with copies=32. Four pointwise source_schedulers cases use independent initial states and replayed per-step JAX noise on (2, 3, 128), both precisions over the same float32 inputs (the fifth, edm.exponential_v_threshold, moved to source_seeds.npz and its arrays left this file). CFG epsilon uses 52 pixel orders of the original (2, 3, 4) input and cotangent; each float64 VJP commutes with its order within 1e-12 relative RMS, and order zero reproduces the original float32 gradient bit for bit. Original source_schedulers arrays are unchanged. Torch 2.14.0+cpu, JAX 0.11.2.post3."
+  },
+  "diffusers/source_seeds.npz": {
+   "tool": "tools/diffusers_source_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "0.34.0",
+     "runs": "diffusers"
+    }
+   ],
+   "note": "The seeds mode: edm.exponential_v_threshold's trajectory gradient over check 1's recorded seeds (tools/recorded_references.py's record_case), each seed's initial state at init_noise_sigma and its cotangent drawn by torch's generator, the float32 VJP and the float64 one with the per-step JAX noise of key 0 replayed in both. Torch 2.14.1+cpu, torchsde 0.2.6."
   },
   "diffusers_handoff.npz": {
    "tool": "tools/diffusers_handoff_reference.py",
