@@ -181,11 +181,14 @@ def test_a_selector_ranks_every_costed_kernel_and_runs_an_unqualified_one_only_b
     """Where each kernel that takes the call states a cost, the selector runs the cheapest, a generic
     kernel stating one among them (XLA's program beating a launch); a kernel costing no finite seconds,
     which no measurement qualified, runs only where named, the call handed to the generic kernel where no
-    other qualifies; an op whose kernels do not all state costs keeps its declared order whole."""
+    other qualifies and refused where no generic kernel takes it; an op whose kernels do not all state
+    costs keeps its declared order whole."""
     assert _ranked({"a": 2.0, "b": 1.0}) == "b"
     assert _ranked({"a": 2.0, "b": 1.0}, {"xla": 0.5}) == "xla"
     assert _ranked({"a": 2.0, "b": 2.0}) == "a"
     assert _ranked({"a": float("inf"), "b": 3.0}, {"xla": None}) == "b"
     assert _ranked({"a": float("inf"), "b": float("inf")}, {"xla": None}) == "xla"
+    with pytest.raises(ValueError):
+        _ranked({"a": float("inf"), "b": float("inf")})
     assert _ranked({"a": float("inf"), "b": 3.0}, named="a") == "a"
     assert _ranked({"a": None, "b": 1.0}, {"xla": 0.5}) == "a"

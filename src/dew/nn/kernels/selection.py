@@ -161,21 +161,24 @@ def _preferred[C](op: Op[C], case: C) -> str:
     """The kernel `op` prefers for `case`: its measured preference where it states one; else, where each
     of its non-generic kernels that take the case states a cost (an op migrates to ranking whole), the
     cheapest of those and of its generic kernels that take the case and state one, among the costs that
-    are finite: a kernel no measurement qualified for the case costs no finite seconds and runs only by
-    name, its case handed to the generic kernels where no other qualifies (a lone candidate is estimated
-    not at all, so a target with no cost facts needs none); else the first non-generic kernel that takes
-    it, else the first of them, whose refusal the route then names."""
+    are finite, the first of the op's order where several tie: a kernel no measurement qualified for the
+    case costs no finite seconds and runs only by name, its case handed to the generic kernels where no
+    other qualifies, refused where none takes it (a lone candidate is estimated not at all, so a target
+    with no cost facts needs none); else the first non-generic kernel that takes it, else the first of
+    them, whose refusal the route then names."""
     if op.preferred is not None:
         return op.preferred(case)
-    native = [kernel for kernel in op.kernels if not kernel.generic and not kernel.failed(case)]
-    priced = [kernel for kernel in op.kernels if kernel.cost is not None and not kernel.failed(case)]
-    if all(kernel.cost is not None for kernel in native) and len(priced) > 1:
-        costs = {kernel.name: kernel.cost(case) for kernel in priced if kernel.cost is not None}
-        qualified = [index for index, kernel in enumerate(op.kernels)
-                     if kernel.name in costs and math.isfinite(costs[kernel.name])]
+    taking = [kernel for kernel in op.kernels if not kernel.failed(case)]
+    native = [kernel for kernel in taking if not kernel.generic]
+    priced = [kernel for kernel in taking if kernel.cost is not None]
+    if len(priced) > 1 and all(kernel.cost is not None for kernel in native):
+        qualified = [(seconds, kernel) for kernel in priced if kernel.cost is not None
+                     and math.isfinite(seconds := kernel.cost(case))]
         if qualified:
-            return op.kernels[min(qualified, key=lambda index: (costs[op.kernels[index].name], index))].name
-        handed = [kernel for kernel in op.kernels if kernel.generic and not kernel.failed(case)]
-        if handed:
-            return handed[0].name
+            return min(qualified, key=lambda entry: entry[0])[1].name
+        handed = [kernel for kernel in taking if kernel.generic]
+        if not handed:
+            raise ValueError(f"no {op.choice} kernel that takes this call is qualified for it: "
+                             + ", ".join(kernel.name for kernel in priced))
+        return handed[0].name
     return (native or [kernel for kernel in op.kernels if not kernel.generic] or list(op.kernels))[0].name
