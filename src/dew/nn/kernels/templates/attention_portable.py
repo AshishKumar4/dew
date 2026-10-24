@@ -20,6 +20,7 @@ from dew.nn.kernels.templates.attention import (
     Hooks,
     KeySpans,
     Kind,
+    PaddedCall,
     Split,
     block_map,
     gradients,
@@ -218,29 +219,50 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     hooks = Hooks() if hooks is None else hooks
     call = padded_call(query, key, value, spans, hooks, pad)
     queries, value_width = call.queries, value.shape[-1]
-    initial = None
-    if hooks.initial is not None:
-        state = hooks.initial
-        initial = (call.rows(state.m, -jnp.inf), call.rows(state.total),
-                   jnp.pad(call.rows(state.acc), ((0, 0),) * 3 + ((0, call.value.shape[-1] - value_width),)))
     # Every form guards its sums where its values can overflow them (`algebra.Forward.headroom`), and the
     # fold its logits' reach (`algebra.walked`).
-    resumes = initial is not None
     spec = algebra.Forward(spans.form, spans.keys, call.query_ids is not None,
                            query.shape[3] ** -0.5 if scale is None else scale, hooks.score_mod, natural,
-                           algebra.headroom(value.dtype), resumes)
-    out, kept = forward(
-        spec, call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
-        call.score_params, tuple(param.kind for param in hooks.score_params), call.output_params,
-        tuple(param.kind for param in hooks.output_params), initial, block_q=block_q, block_k=block_k,
-        output_mod=hooks.output_mod, residuals=residuals)
-    if kept is None:
+                           algebra.headroom(value.dtype), hooks.initial is not None)
+    if not residuals:
+        out, _ = padded_walk(spec, call, hooks, block_q=block_q, block_k=block_k, residuals=False)
         return out[:, :queries, :, :value_width]
-    m, denominator, anchors, split = kept
+    out, (m, denominator, anchors, split) = padded_walk(spec, call, hooks, block_q=block_q, block_k=block_k,
+                                                        residuals=True)
     sums = Split(split.others[:, :, :queries, :value_width], split.own[:, :, :queries],
                  split.others_total[:, :, :queries], split.shift[:, :, :queries])
     return (out[:, :queries, :, :value_width], m[:, :, :queries], denominator[:, :, :queries],
             anchors[:, :, :queries], sums)
+
+
+@overload
+def padded_walk(spec: algebra.Forward, call: PaddedCall, hooks: Hooks, *, block_q: int, block_k: int,
+                residuals: Literal[False]) -> tuple[jax.Array, None]:
+    ...
+
+
+@overload
+def padded_walk(spec: algebra.Forward, call: PaddedCall, hooks: Hooks, *, block_q: int, block_k: int,
+                residuals: Literal[True]) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array, Split]]:
+    ...
+
+
+def padded_walk(spec: algebra.Forward, call: PaddedCall, hooks: Hooks, *, block_q: int, block_k: int,
+                residuals: bool):
+    """`attend`'s walk of a padded call (`padded_call`) in `spec`'s form, which a caller holding a form of its
+    own walks too (another mainloop's guarded rows, `attention_mosaic`): the output `[B, Qp, H, Dvp]` and,
+    with `residuals`, the maxima, denominators, anchor keys and split sums at the padded shapes (else
+    None)."""
+    initial = None
+    if hooks.initial is not None:
+        state = hooks.initial
+        widened = ((0, 0),) * 3 + ((0, call.value.shape[-1] - state.acc.shape[-1]),)
+        initial = call.rows(state.m, -jnp.inf), call.rows(state.total), jnp.pad(call.rows(state.acc), widened)
+    return forward(
+        spec, call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
+        call.score_params, tuple(param.kind for param in hooks.score_params), call.output_params,
+        tuple(param.kind for param in hooks.output_params), initial, block_q=block_q, block_k=block_k,
+        output_mod=hooks.output_mod, residuals=residuals)
 
 
 def _seen(spans: tuple[jax.Array, jax.Array, jax.Array | None, jax.Array | None], row, rows: jax.Array,
