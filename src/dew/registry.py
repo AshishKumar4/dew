@@ -797,6 +797,23 @@ def _shared(annotation: Annotation, value: Mapping[str, object], *, dtypes: bool
     return shared.built[number]
 
 
+def component[Base](base: type[Base], record: Mapping[str, object]
+                    ) -> tuple[type[Base], Mapping[str, object]]:
+    """The class a component's record, `{"class": ..., "fields": {...}}`, names by an alias or its import
+    path, one that is `base`, derives from it or, for a protocol, implements it as a class of Dew's or a
+    trusted package's, and the record's fields: the one lookup `from_record` builds a class record
+    through. A component built around parameters (an encoder, an autoencoder, a decision head) binds them
+    itself from these fields. A record of another shape, or of a function, is refused."""
+    named = class_record(record)
+    if named is None:
+        raise ValueError(f"a {base.__name__} record is {{'class': ..., 'fields': {{...}}}}, not {record!r}")
+    member = _member(named[0], (base,))
+    if not isinstance(member, type):
+        raise TypeError(f"{named[0]!r} names the function {member!r}; a {base.__name__} record names its "
+                        f"class")
+    return member, named[1]
+
+
 def _member(name: str, held: tuple[type, ...]) -> Callable[..., Configured]:
     """The class or function a record's `class` names, by import path or by
     an alias of any kind, that is one of `held`, derives from one, or is a
@@ -1419,6 +1436,7 @@ __all__ = [
     "Aliases",
     "Record",
     "argument_records",
+    "component",
     "dtype_name",
     "encoders",
     "from_record",

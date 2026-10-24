@@ -76,11 +76,12 @@ def load_kl_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str |
 
 @dataclasses.dataclass(frozen=True)
 class Registration:
-    """One built-in autoencoder: its wrapper, the name its record goes by and the native module its
-    record's 'model' rebuilds (`AutoEncoder.to_json`, `from_json`), the `_class_name`s a published config
-    states (an AutoencoderKL's, where it states none: `nameless`), the loader that builds it from a
-    pipeline's directory or a repo, and the one a standalone load takes, where it has its own (an
-    AutoencoderKL's also reads the SD1-era flax layouts, `StableDiffusionVAE`)."""
+    """One built-in autoencoder: its wrapper, the name and native module an earlier run's record named
+    it by (read once, where a saved run is pinned: `dew.inference.tasks.earlier_shapes`), the
+    `_class_name`s a published config states (an AutoencoderKL's, where it states none: `nameless`),
+    the loader that builds it from a pipeline's directory or a repo, and the one a standalone load
+    takes, where it has its own (an AutoencoderKL's also reads the SD1-era flax layouts,
+    `StableDiffusionVAE`)."""
     wrapper: Callable[..., AutoEncoder]
     record: str
     module: type
@@ -104,7 +105,7 @@ REGISTRATIONS: tuple[Registration, ...] = (
     Registration(Flux2Autoencoder, 'flux2', AutoencoderKL, flux2.PUBLISHED, load_flux2_vae),
     Registration(QwenImageAutoencoder, 'qwen_image', QwenImageVAE, qwen_image.PUBLISHED, load_qwen_image_vae),
 )
-"""Every built-in autoencoder, which saved runs rebuild and sources load alike: one registration each."""
+"""Every built-in autoencoder a source loads: one registration each."""
 
 LOADERS: Mapping[str, Loader] = MappingProxyType({
     name: entry.load for entry in REGISTRATIONS for name in entry.published})
@@ -113,8 +114,8 @@ LOADERS: Mapping[str, Loader] = MappingProxyType({
 
 
 def registration(of: type[AutoEncoder] | str | None) -> Registration | None:
-    """The registration of a wrapper class, a record's name or a published `_class_name` (None, an
-    AutoencoderKL's: `Registration.nameless`), None for one no built-in registers."""
+    """The registration of a wrapper class, an earlier run's record name or a published `_class_name`
+    (None, an AutoencoderKL's: `Registration.nameless`), None for one no built-in registers."""
     return next((entry for entry in REGISTRATIONS if of in (entry.wrapper, entry.record)
                  or of in entry.published or (of is None and entry.nameless)), None)
 

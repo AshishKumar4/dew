@@ -80,7 +80,7 @@ class Condition:
     def from_json(cls, record: Mapping, *, params: Variables | None = None) -> Condition:
         encoder = record["encoder"]
         return cls(
-            encoder=rebuild(encoder["class"], encoder["fields"], params=params),
+            encoder=rebuild(encoder, params=params),
             field=record["field"],
             unconditional=record["unconditional"],
         )
@@ -240,9 +240,10 @@ class TextCondition:
                   (("max_length", self.max_length), ("revision", self.revision))
                   if value is not None}
         return Condition(
-            rebuild(self.encoder, {"checkpoint": self.checkpoint,
-                                   "dtype": dtype if self.dtype is None else self.dtype,
-                                   "param_dtype": self.param_dtype, **fields}, params=params),
+            rebuild({"class": self.encoder, "fields": {"checkpoint": self.checkpoint,
+                                                       "dtype": dtype if self.dtype is None else self.dtype,
+                                                       "param_dtype": self.param_dtype, **fields}},
+                    params=params),
             field=self.field, unconditional=self.unconditional)
 
 
@@ -268,9 +269,10 @@ class AudioCondition:
         """Build the tower over supplied params for waveforms of `seconds` (the clips' `audio_seconds`,
         `Dataset.facts`), without loading source weights or casting storage."""
         return Condition(
-            rebuild(self.encoder, {"checkpoint": self.checkpoint, "seconds": seconds,
-                                   "dtype": dtype if self.dtype is None else self.dtype,
-                                   "param_dtype": self.param_dtype}, params=params),
+            rebuild({"class": self.encoder, "fields": {"checkpoint": self.checkpoint, "seconds": seconds,
+                                                       "dtype": dtype if self.dtype is None else self.dtype,
+                                                       "param_dtype": self.param_dtype}},
+                    params=params),
             field="audio", unconditional=0.0)
 
 
