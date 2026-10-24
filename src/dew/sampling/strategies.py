@@ -22,6 +22,7 @@ from flax import struct
 from jax import lax
 from jax.experimental import checkify
 
+from dew.nn import categorical
 from dew.nn.inputs import PredictionPhase, continuation_keys, prompt_major
 from dew.nn.scatter import DROPPED
 from dew.objectives.base import Variables, token_log_probs
@@ -518,7 +519,7 @@ def _beam_candidates(state: DecoderState, beams: StepState, transform, live, rea
     checkify.check(jnp.all(decoding.wellformed(state.logits.astype(jnp.float32)).reshape(
         prompts, width) | ~genuine),
         "the model produced a live beam without a distribution to score")
-    raw = jax.nn.log_softmax(state.logits.astype(jnp.float32))
+    raw = categorical.log_probs(state.logits)
     scores = transform(beams, raw)
     checkify.check(jnp.all(decoding.wellformed(scores).reshape(prompts, width) | ~genuine),
                    "the transform chain left a live beam without a distribution to search")

@@ -34,6 +34,7 @@ from flax import linen as nn
 from dew.diffusion.block import CanvasGeneration, through_eos
 from dew.diffusion.process import Conditioning
 from dew.interop.weights import decoding_storage
+from dew.nn import categorical
 from dew.nn.inputs import (
     RESPONSE_FIELDS,
     ModelInputs,
@@ -238,10 +239,9 @@ class DiscreteDenoiser:
                                   capture_intermediates=False,
                                   method="logits" if isinstance(self.model, Logits) else None)
         assert not isinstance(logits, tuple)  # no mutable collections were asked for
-        # Normalized in fp32, as `token_log_probs` does: the reveal draws its
-        # categorical from these, and a bf16 log partition would quantize it.
-        logits = logits.astype(jnp.float32).at[..., self.process.mask_id].set(-jnp.inf)
-        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        # Normalized in at least fp32 (`dew.nn.categorical`): the reveal draws its categorical from
+        # these, and a bf16 log partition would quantize it. The mask token takes no probability.
+        log_probs = categorical.log_probs(logits, jnp.arange(logits.shape[-1]) != self.process.mask_id)
         masked = self.masked(x_t)
         filled = jnp.where(masked, jnp.argmax(log_probs, axis=-1), x_t)
         return filled, log_probs
