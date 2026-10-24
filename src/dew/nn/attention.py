@@ -893,30 +893,38 @@ def split_with_queries(key, value, split: int):
 
 def _per_shard(local, query, key, value, **extras):
     """`local(query, key, value, **extras)` on each shard's rows and heads
-    (`manual_map`). A key head the tensor axes cannot split stays whole on every
-    shard, and each shard takes the copies its query heads read (the repeat
-    `split_with_queries` makes), so the key heads' gradient is one psum over the
-    tensor axes; whole off a mesh, or inside a map that already holds every axis
-    manual (the sequence exchanges), where the tensor axes split nothing. A Pallas
-    kernel has no partitioning rule, and jax's cuDNN attention partitions through
-    `custom_partitioning`, whose lowering on several devices names the
-    partitioner by a process address (`str(id(...))` in its backend config),
-    which the persistent cache key keeps, so every fresh process would compile
-    again; under a fully manual map jax lowers neither. `extras` maps each
-    further argument to its array, or None, and the logical axes it splits on.
+    (`manual_map`). The key heads a shard reads are the ones its key shard holds,
+    at their offset in that shard, where the key heads' split begins with the query
+    heads' split; a key-head split that does not is set aside, and the key heads are
+    held whole on every shard. Where the tensor axes split the query heads more ways
+    than the key heads, each shard takes its share of the repeats `split_with_queries`
+    makes, so the key heads' gradient is one sum across the shards in the map's
+    transpose. Whole off a mesh, or inside a map that already holds every axis manual
+    (the sequence exchanges), where the tensor axes split nothing. A Pallas kernel has
+    no partitioning rule, and jax's cuDNN attention partitions through
+    `custom_partitioning`, whose lowering on several devices names the partitioner by
+    a process address (`str(id(...))` in its backend config), which the persistent
+    cache key keeps, so every fresh process would compile again; under a fully manual
+    map jax lowers neither. `extras` maps each further argument to its array, or None,
+    and the logical axes it splits on.
     """
     given = {name: pair for name, pair in extras.items() if pair[0] is not None}
+    queries, keys = logical_spec(HEADS, query.shape), logical_spec(KV_HEADS, key.shape)
+    query_axes, key_axes = mesh_axes(_entry(queries, 2)), mesh_axes(_entry(keys, 2))
+    if key_axes and query_axes[: len(key_axes)] != key_axes:
+        keys, key_axes = P(*keys[:2]), ()
     split, kv_heads = tensor_shards(query), key.shape[-2]
     heads = math.lcm(kv_heads, split)
-    queries, keys = logical_spec(HEADS, query.shape), logical_spec(KV_HEADS, key.shape)
-    names, tensor = tuple(given), mesh_axes(_entry(queries, 2))
+    share, copies = heads // split, heads // kv_heads
+    names = tuple(given)
 
     def shard(query, key, value, *arrays):
-        if heads != kv_heads:
-            # The shard's share of the repeated heads, read from the whole key heads it holds: head n of them
-            # is key head n // copies. Taken here, the map's transpose sums their gradient across the shards.
-            share = heads // split
-            read = (jax.lax.axis_index(tensor) * share + jnp.arange(share)) // (heads // kv_heads)
+        if copies > 1 or key.shape[-2] != share:
+            # This shard's share of the repeated key heads (head n is key head n // copies), read from the key
+            # heads it holds, which begin at its own key shard's offset.
+            read = (jax.lax.axis_index(query_axes) * share + jnp.arange(share)) // copies
+            if key_axes:
+                read = read - jax.lax.axis_index(key_axes) * key.shape[-2]
             key, value = (jnp.take(array, read, axis=-2) for array in (key, value))
         return local(query, key, value, **dict(zip(names, arrays, strict=True)))
 
