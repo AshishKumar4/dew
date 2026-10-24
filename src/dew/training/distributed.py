@@ -59,11 +59,11 @@ from dew.nn.sharding import (
     microbatched,
     ruled_boxes,
 )
-from dew.objectives.base import EXAMPLE_ROWS, FROZEN, Batch, Variables
+from dew.objectives.base import EXAMPLE_ROWS, FROZEN, Batch, Initializer, Variables
 from dew.records import JSON, number, record
 from dew.telemetry.benchmark import samples
 from dew.telemetry.profile import region
-from dew.training.state import VARIABLE_FIELDS
+from dew.training.state import VARIABLE_FIELDS, TrainState, apart, together
 
 # The role axes no parameter splits over: data holds a batch's replicas, and
 # stage the pipeline's stages of the layer stack, which the decoder places
@@ -1185,6 +1185,63 @@ def taking_over[Held, Result](function: Callable[[Held, jax.Array], Result], tak
                                      is_leaf=lambda leaf: leaf is None), key)
 
     return functools.partial(jax.jit(joined, out_shardings=shardings, donate_argnums=0), taken, kept)
+
+
+def traced_start(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
+                 key: jax.Array) -> tuple[TrainState, dict[int, int]]:
+    """The shapes of the fresh state `initial_state` builds, and which of its frozen leaves are the
+    initializer's arrays as they are: each such leaf's index among the frozen tree's leaves, to the
+    index of the initializer's leaf it is. An init that returns a held leaf as it is, by reference,
+    passes it through (`Objective.held_variables`); one trace finds both."""
+    through: dict[int, int] = {}
+
+    def traced(initializer: Initializer, key: jax.Array) -> TrainState:
+        state = initial_state(initializer, key)
+        inputs = {id(leaf): index for index, leaf in enumerate(jax.tree.leaves(initializer))}
+        frozen = jax.tree.leaves(apart(state)[1])
+        through.update({index: inputs[id(leaf)] for index, leaf in enumerate(frozen) if id(leaf) in inputs})
+        return state
+
+    return jax.eval_shape(traced, initializer, key), through
+
+
+def placed_start(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
+                 key: jax.Array, abstract: TrainState, shardings: Placement[TrainState],
+                 through: Mapping[int, int], mesh: Mesh) -> TrainState:
+    """A fresh state on `mesh`, built by `initial_state` from the objective's held tree (`placed_held`).
+    The frozen leaves the objective's init passes through as they are (`through`, `traced_start`),
+    which no step donates (`apart`), are the held arrays themselves, placed where the state keeps
+    them, the same arrays where they are placed already: the run and the objective then hold one
+    frozen tree between them. One program builds the rest, a frozen leaf the init builds among it,
+    taking the other held arrays over."""
+    moving, frozen = apart(shardings)
+    if frozen is None or not through:
+        taken, kept = placed_held(initializer, abstract.variables, shardings.variables, mesh)
+        return taking_over(initial_state, taken, kept, shardings)(key)
+    inputs = jax.tree.leaves(initializer)
+    taken, kept = placed_held(initializer, abstract.variables, shardings.variables, mesh,
+                              shared=frozenset(id(inputs[index]) for index in through.values()))
+    placed = jax.tree.leaves(jax.tree.map(lambda one, other: other if one is None else one, taken, kept,
+                                          is_leaf=lambda leaf: leaf is None))
+    where, structure = jax.tree.flatten(frozen)
+    built = [index for index in range(len(where)) if index not in through]
+
+    def rest(tree: Initializer, draw: jax.Array) -> tuple[TrainState, tuple[jax.Array, ...]]:
+        state, own = apart(initial_state(tree, draw))
+        leaves = jax.tree.leaves(own)
+        return state, tuple(leaves[index] for index in built)
+
+    state, made = taking_over(rest, taken, kept, (moving, tuple(where[index] for index in built)))(key)
+    drawn = dict(zip(built, made, strict=True))
+
+    def leaf(index: int) -> jax.Array:
+        if index in drawn:
+            return drawn[index]
+        # A held leaf an init passes through at another path is placed where the state keeps that one.
+        held = placed[through[index]]
+        return held if held.sharding == where[index] else jax.device_put(held, where[index])
+
+    return together(state, jax.tree.unflatten(structure, [leaf(index) for index in range(len(where))]))
 
 
 def prefetched_bytes(batch: Batch, shardings: Placement[Batch], depth: int = PREFETCH_DEPTH) -> int:
