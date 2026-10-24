@@ -167,7 +167,7 @@ def shaped(shape: str):
 
 SHAPES = {shape: shaped(shape) for shape in SHAPE_CONFIGS}
 
-SCAN_WIDTHS = {"gemma3n": {"mlp_features": (384,) * 10}, "gemma4": {"per_layer_input_dim": 32}}
+SCAN_WIDTHS = {"gemma3n": {"mlp_features": (768,) * 10}, "gemma4": {"per_layer_input_dim": 32}}
 """Each shape's widths for the scanned stack's check 1, where the fixture's leave a draw's error to a few
 of its values: Gemma 3n's sparse layers keep about ten of 192 units a token at 0.95 sparsity, where 48
 keep two, as the architectures cell found (tests/test_architectures.py);
