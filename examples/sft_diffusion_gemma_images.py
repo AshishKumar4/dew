@@ -35,7 +35,8 @@ import tyro
 
 import dew
 from dew.batch import VALID_ROWS
-from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, RunConfig, TrainerConfig
+from dew.config import ObjectiveConfig, OptimConfig, RunConfig, TrainerConfig
+from dew.model_config import ModelConfig
 from dew.data import ByteTokenizer, Concatenate, Dataset, Files, Hub, Loading, Source, images, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader

@@ -17,7 +17,8 @@ from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference, float64_terms, widened
 
 import dew
-from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
+from dew.config import ObjectiveConfig, TrainerConfig
+from dew.model_config import ModelConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.diffusion.presets import Flow
 from dew.inputs import TextCondition

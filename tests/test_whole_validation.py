@@ -22,7 +22,8 @@ from test_guidance_distillation import FIXTURES, FLUX
 
 from dew import Evaluation
 from dew.batch import VALID_ROWS, padded_rows
-from dew.config import ModelConfig, ObjectiveConfig
+from dew.config import ObjectiveConfig
+from dew.model_config import ModelConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data import Loading
 from dew.data.chat import Role

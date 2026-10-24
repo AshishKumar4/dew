@@ -30,7 +30,8 @@ from reference_error import assert_as_exact, assert_computes_the_oracle, chain_r
 from residual_orders import permuted, residual_width
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
-from dew.config import MetricConfig, ModelConfig, ObjectiveConfig
+from dew.config import MetricConfig, ObjectiveConfig
+from dew.model_config import ModelConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader
 from dew.diffusion import presets

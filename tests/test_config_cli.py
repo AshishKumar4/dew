@@ -195,7 +195,8 @@ def test_a_jepa_run_without_probes_trains_and_validates_its_loss(tmp_path, size)
     square images and over images twice as tall as they are wide, whose patch grid is as tall."""
     import numpy as np
 
-    from dew.config import ModelConfig, TrainerConfig
+    from dew.config import TrainerConfig
+    from dew.model_config import ModelConfig
     from dew.data import TFDS, Loading, images, presets
 
     root = REPO_ROOT / "tests" / "fixtures" / "tfds" / "dew_images" / "1.0.0"

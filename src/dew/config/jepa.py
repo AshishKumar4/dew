@@ -11,7 +11,8 @@ from __future__ import annotations
 import dataclasses
 from typing import ClassVar
 
-from dew.config import JsonDict, ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig, media_field
+from dew.config import ObjectiveConfig, OptimConfig, Prepared, RunConfig, media_field
+from dew.model_config import JsonDict, ModelConfig
 from dew.data.compile import fitted
 from dew.data.pipeline import ObjectiveData
 from dew.inputs import Field

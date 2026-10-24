@@ -13,7 +13,8 @@ import pytest
 from diffusion_stubs import batch_for
 from diffusion_support import images_of, saved_after_one_step
 
-from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
+from dew.config import ObjectiveConfig, TrainerConfig
+from dew.model_config import ModelConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.diffusion import broadcast_rates
 from dew.diffusion.presets import EDM, Flow

@@ -183,7 +183,9 @@ A JEPA configuration adds predictor fields, target-mask settings and optional re
 ```python
 from flax import linen as nn
 
-from dew.config import ModelConfig, ObjectiveConfig, RunConfig, TrainerConfig
+from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
+
+from dew.model_config import ModelConfig
 from dew.data import Files
 from dew.data.steps.generic import Formatting
 from dew.inputs import Field, InputSpec

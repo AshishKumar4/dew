@@ -25,7 +25,8 @@ from typing import TYPE_CHECKING, Annotated, ClassVar
 
 import jax
 
-from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig
+from dew.config import ObjectiveConfig, OptimConfig, Prepared, RunConfig
+from dew.model_config import ModelConfig
 from dew.data.compile import fitted
 from dew.data.dataset import record_argument
 from dew.data.text import HFTokenizer

@@ -251,7 +251,7 @@ class TextToImage:
         the checkpoint's dtypes exactly. `trust` names the packages outside
         Dew the run's record may import (`TextGeneration.from_run`).
         """
-        from dew.config import ModelConfig
+        from dew.model_config import ModelConfig
         from dew.diffusion.schedules.source import SourceGrid
         from dew.inference.tasks import SavedRun, saved_settings
         from dew.nn.autoencoders import AutoEncoder

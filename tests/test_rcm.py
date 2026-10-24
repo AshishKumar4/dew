@@ -174,7 +174,8 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
 
     from dew.batch import FROZEN
     from dew.checkpoints import Checkpoints
-    from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
+    from dew.config import ObjectiveConfig, TrainerConfig
+    from dew.model_config import ModelConfig
     from dew.config.diffusion import DiffusionRunConfig
     from dew.diffusion.presets import Flow
     from dew.inputs import TextCondition
@@ -277,7 +278,8 @@ def test_an_accumulated_distillation_alternates_its_networks_update_by_update(tm
     from diffusion_support import images_of
 
     from dew.checkpoints import Checkpoints
-    from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
+    from dew.config import ObjectiveConfig, TrainerConfig
+    from dew.model_config import ModelConfig
     from dew.config.diffusion import DiffusionRunConfig
     from dew.diffusion.presets import Flow
     from dew.inputs import TextCondition

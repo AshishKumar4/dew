@@ -187,7 +187,8 @@ class ActivityRun(RunConfig):
 
 TRAIN_RUN = '''
 import dataclasses, sys
-from dew.config import ModelConfig, TrainerConfig
+from dew.config import TrainerConfig
+from dew.model_config import ModelConfig
 from toypackage.models import ActivityRun
 default = ActivityRun().trainer
 run = ActivityRun(model=ModelConfig("toypackage.models:Population", {"neurons": 64}),

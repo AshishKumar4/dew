@@ -48,7 +48,7 @@ from dew.telemetry.profile import region
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
-    from dew.config import ModelConfig
+    from dew.model_config import ModelConfig
     from dew.quantization import Quantization
     from dew.training.distributed import Layout, MeshSpec
 
@@ -428,7 +428,7 @@ class BlockSettings(TaskSettings):
 
 def saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> ModelConfig:
     """Read the run's model record, with `dtype` overriding the computation it saved."""
-    from dew.config import ModelConfig
+    from dew.model_config import ModelConfig
     from dew.registry import dtype_name, resolve_dtype
 
     config = ModelConfig.from_dict(named_fields(record["model"], "model"))
