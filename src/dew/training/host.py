@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental.layout import Format
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, Sharding, SingleDeviceSharding
+from jax.tree_util import KeyPath
 
 from dew.objectives.base import Variables
 from dew.training.distributed import Placement
@@ -82,40 +83,41 @@ type Leaf = jax.Array | np.ndarray | np.generic | HostSource
 source a placement reads one device shard at a time (`HostSource`)."""
 
 
-def placed_leaves(tree: Variables, place: Callable[[tuple[str, ...], Leaf], Leaf], *,
-                  in_place: bool) -> Variables:
-    """`tree` with each leaf replaced by what `place(path, leaf)` returns, one leaf at a time: a
-    leaf placed lands (`block_until_ready`) before the next is read, and a memory-mapped host leaf's
-    pages are let go once its copy is written in its place (`evict`), so the tree is never held
-    twice. With `in_place`, the tree's plain dict nodes are written in place, so every holder of one
-    sees the placed leaves and no host leaf outlives its copy, and any other mapping (a FrozenDict)
-    is rebuilt as a dict over the same children; otherwise every node is rebuilt, the caller's tree
-    left as it was. Any other node JAX flattens (a quantized array's buffers) is rebuilt over its
-    leaves placed, each under its key path (`jax.tree_util.keystr`) below the node's."""
-    def landed(path: tuple[str, ...], leaf: Leaf) -> Leaf:
+def placed_leaves(tree: Variables, place: Callable[[KeyPath, Leaf], Leaf], *, in_place: bool) -> Variables:
+    """`tree` with each leaf replaced by what `place(path, leaf)` returns, `path` the leaf's key path
+    as `jax.tree_util.tree_flatten_with_path` names it, one leaf at a time: a leaf placed lands
+    (`block_until_ready`) before the next is read. A node JAX flattens that is not a mapping (a
+    list, a quantized array's buffers) is rebuilt over its placed leaves once they have all landed.
+
+    With `in_place` the tree is the caller's to give up: its plain dict nodes are written in place,
+    so every holder of one sees the placed leaves, any other mapping (a FrozenDict) is rebuilt as a
+    dict over the same children, and a memory-mapped host leaf's pages are let go once its copy has
+    landed (`evict`), so an owned tree of dicts is held twice one leaf at a time at most. Without it
+    every mapping is rebuilt and no page is let go: the caller's tree, its host arrays included,
+    stays as it was beside the placed one."""
+    def landed(path: KeyPath, leaf: Leaf) -> Leaf:
         placed = place(path, leaf)
         if placed is not leaf:
             jax.block_until_ready(placed)
-            if isinstance(leaf, np.ndarray):
+            if in_place and isinstance(leaf, np.ndarray):
                 evict(leaf)
         return placed
 
-    def walk(node: Mapping | Leaf, path: tuple[str, ...]) -> dict | Leaf:
-        if not isinstance(node, Mapping):
-            leaves, structure = jax.tree_util.tree_flatten_with_path(node)
-            if jax.tree_util.treedef_is_leaf(structure):
-                return landed(path, node)
-            return structure.unflatten([landed((*path, jax.tree_util.keystr(keys)), leaf)
-                                        for keys, leaf in leaves])
+    def mapping(node: Mapping, path: KeyPath) -> dict:
         held = node if in_place and type(node) is dict else dict(node)
         for name in list(held):
-            held[name] = walk(held[name], (*path, name))
+            held[name] = walk(held[name], (*path, jax.tree_util.DictKey(name)))
         return held
 
-    held = tree if in_place and type(tree) is dict else dict(tree)
-    for name in list(held):
-        held[name] = walk(held[name], (name,))
-    return held
+    def walk(node: Mapping | Leaf, path: KeyPath) -> dict | Leaf:
+        if isinstance(node, Mapping):
+            return mapping(node, path)
+        leaves, structure = jax.tree_util.tree_flatten_with_path(node)
+        if jax.tree_util.treedef_is_leaf(structure):
+            return landed(path, node)
+        return structure.unflatten([landed((*path, *keys), leaf) for keys, leaf in leaves])
+
+    return mapping(tree, ())
 
 
 def stream(tree: Variables, placement, held: Variables | None = None) -> Variables:
@@ -132,7 +134,9 @@ def stream(tree: Variables, placement, held: Variables | None = None) -> Variabl
 
     Every dict node of `tree` is updated in place, so the caller's other
     references to it see the placed arrays too, and a node that is not one
-    (a FrozenDict) is rebuilt as a dict over the same leaves.
+    (a FrozenDict) is rebuilt as a dict over the same leaves. Each leaf goes to
+    the target at its key path in `placement`, a quantized array's buffers to
+    the shardings `placement` holds in their places.
     """
     holders: dict[int, list[tuple[dict, object]]] = {}
 
@@ -148,11 +152,10 @@ def stream(tree: Variables, placement, held: Variables | None = None) -> Variabl
     if held is not None:
         index(held)
 
-    def landed(path: tuple[str, ...], leaf):
-        target = placement
-        for name in path:
-            target = target[name]
-        placed = place_leaf(leaf, target)
+    targets = dict(jax.tree_util.tree_flatten_with_path(placement)[0])
+
+    def landed(path: KeyPath, leaf):
+        placed = place_leaf(leaf, targets[path])
         for holder, key in holders.get(id(leaf), ()):
             holder[key] = placed
         return placed
