@@ -60,7 +60,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol
 
-from dew.cleanup import process_group
+from dew.cleanup import exit_code, process_group, signal_group
 from dew.data.prompts import PromptRecord
 from dew.inference.rollouts import InfrastructureError
 from dew.objectives.rl.episodes import Action, Environment, EpisodeId, EpisodeStatus, Observation
@@ -192,10 +192,11 @@ class _ProcessEnvironment:
                     return self._decoded()
                 for event, _ in ready.select(min(remaining, .1)):
                     sent = self._pump(ready, event, request, sent, diagnostic)
-                if self.process.poll() is not None and not ready.get_map():
+                # Read unreaped, so the sandbox's group keeps its id until `launched` ends it.
+                code = exit_code(self.process)
+                if code is not None and not ready.get_map():
                     raise ChildProcessError(
-                        f"sandbox exited with code {self.process.returncode}: "
-                        f"{diagnostic.decode('utf-8', errors='replace')}")
+                        f"sandbox exited with code {code}: {diagnostic.decode('utf-8', errors='replace')}")
 
     def reset(self) -> Observation:
         return _observation(self._request("reset", {"episode": asdict(self.identity)}))
@@ -508,12 +509,11 @@ class ContainerRunner:
             try:
                 streams, stopped = _collected(process, program.stdin.encode(), deadline, limits.message_bytes)
             finally:
-                if process.poll() is None:
+                if exit_code(process) is None:
                     # The client dies first so it makes no further API call;
                     # `rm --force` then removes the container whether it is
                     # still being created, created or running.
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(process.pid, signal.SIGKILL)
+                    signal_group(process, signal.SIGKILL)
                     try:
                         subprocess.run([self.runtime, "rm", "--force", name], capture_output=True,
                                        timeout=_REMOVAL_SECONDS, check=False)

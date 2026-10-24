@@ -66,7 +66,7 @@ class Compiles:
     """The compile events `jax.monitoring` records a duration for, by what each counts."""
 
     def __init__(self, name: str | None) -> None:
-        self.name = None if name is None else f"jit({name})"
+        self.name = name
         self.programs: list[Program] = []
         """Each program it heard, in the order they were needed."""
 
@@ -88,7 +88,9 @@ class Compiles:
 
     def _heard(self, event: str, duration_secs: float, **metadata: str | int) -> None:
         kind = self.EVENTS.get(event)
-        if kind is not None and self.name in (None, metadata.get("fun_name")):
+        # A trace names its function bare, a backend compile `jit(<name>)`.
+        named = self.name is None or metadata.get("fun_name") in (self.name, f"jit({self.name})")
+        if kind is not None and named:
             frame = next((frame for frame in reversed(traceback.extract_stack()[:-1])
                           if "/jax/" not in frame.filename and "/jaxlib/" not in frame.filename
                           and frame.filename != __file__ and "contextlib" not in frame.filename), None)
