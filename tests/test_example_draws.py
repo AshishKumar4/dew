@@ -231,27 +231,37 @@ SHORTCUT_SEEDS = 8
 32 rows against its whole batch, sized by `seeds_for`."""
 
 
-def test_a_meanflow_update_read_as_halves_is_on_par_with_its_whole_batch():
-    """The halves' summed losses, each example at its own draws and role, are on par with the whole
-    batch's over drawn weights (check 1), the float64 twin's the truth: the outcome the recorded draws
-    and roles above feed."""
+def halves_case(kind):
+    """A few-step objective of `kind`, its float64 twin, a batch of HALVES_ROWS images and captions,
+    and the draw of its weights check 1 reads: each seed's normal weights, 0.3 a unit."""
     import copy
 
-    from reference_error import assert_as_exact
-
-    objective, rows = few_step("meanflow"), HALVES_ROWS
+    objective = few_step(kind)
     twin = copy.copy(objective)
     twin.substitute([objective.model.clone(dtype=jnp.float64)])
     initial = objective.init(jax.random.PRNGKey(0))
     leaves, tree = jax.tree.flatten(initial["params"])
-    images = jax.random.randint(jax.random.PRNGKey(1), (rows, 4, 4, 3), 0, 256)
+    images = jax.random.randint(jax.random.PRNGKey(1), (HALVES_ROWS, 4, 4, 3), 0, 256)
     batch = {"image": np.asarray(images, np.uint8),
-             **objective.inputs.tokenize([str(row) for row in range(rows)])}
+             **objective.inputs.tokenize([str(row) for row in range(HALVES_ROWS)])}
 
     def draw(seed):
         keys = jax.random.split(jax.random.PRNGKey(seed), len(leaves))
         return ({**initial, "params": jax.tree.unflatten(tree, [
             0.3 * jax.random.normal(key, leaf.shape) for key, leaf in zip(keys, leaves, strict=True)])},)
+
+    return objective, twin, batch, draw
+
+
+def test_a_meanflow_update_read_as_halves_is_on_par_with_its_whole_batch():
+    """The halves' summed losses, each example at its own draws and role, are on par with the whole
+    batch's over drawn weights (check 1), the float64 twin's the truth: the outcome the recorded draws
+    and roles above feed."""
+
+    from reference_error import assert_as_exact
+
+    objective, twin, batch, draw = halves_case("meanflow")
+    rows = HALVES_ROWS
 
     def summed(objective, part: slice):
         step = Step(jnp.asarray(0), jax.random.key(2), None, example_key=UPDATE,
@@ -273,21 +283,9 @@ def test_a_shortcut_update_read_as_halves_targets_each_example_as_its_whole_batc
     (`ShortcutObjective._bootstrapped`): each example's target, the flow's or the teacher's two half
     steps, is on par between the two over drawn weights (check 1, each example a row), the float64
     twin's whole batch the truth. The loss's squared errors differ from it only through the target."""
-    import copy
 
-    objective, rows = few_step("shortcut"), HALVES_ROWS
-    twin = copy.copy(objective)
-    twin.substitute([objective.model.clone(dtype=jnp.float64)])
-    initial = objective.init(jax.random.PRNGKey(0))
-    leaves, tree = jax.tree.flatten(initial["params"])
-    images = jax.random.randint(jax.random.PRNGKey(1), (rows, 4, 4, 3), 0, 256)
-    batch = {"image": np.asarray(images, np.uint8),
-             **objective.inputs.tokenize([str(row) for row in range(rows)])}
-
-    def draw(seed):
-        keys = jax.random.split(jax.random.PRNGKey(seed), len(leaves))
-        return ({**initial, "params": jax.tree.unflatten(tree, [
-            0.3 * jax.random.normal(key, leaf.shape) for key, leaf in zip(keys, leaves, strict=True)])},)
+    objective, twin, batch, draw = halves_case("shortcut")
+    rows = HALVES_ROWS
 
     def targets(objective, *parts: slice):
         def read(variables):
