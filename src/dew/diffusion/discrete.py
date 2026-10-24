@@ -208,7 +208,7 @@ class DiscreteProcess:
         generated, undefined = program(model, decoding_storage(model, variables),
                                        plan.place(request.padded()), plan.keys(request.key), self, solver,
                                        max_new_tokens, steps, n, eos_token_ids, pad_token_id)
-        if bool(undefined):
+        if bool(jax.device_get(undefined)):
             raise ValueError(REVEALED_UNDEFINED)
         return replace(generated, rows=plan.rows * n, prompt_width=request.inputs.tokens.shape[1])
 
