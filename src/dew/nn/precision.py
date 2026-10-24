@@ -34,6 +34,15 @@ def at_least_fp32(dtype: DTypeLike | None) -> jnp.dtype:
     return jnp.promote_types(jnp.float32 if dtype is None else dtype, jnp.float32)
 
 
+def weighted_total(x: jax.Array, weights: jax.Array, axis=None) -> tuple[jax.Array, jax.Array]:
+    """Weighted total and mass along `axis`, in `x`'s dtype. Broadcastable weights mark excluded
+    values with zero; those values are selected away before multiplication, so their NaNs and
+    infinities cannot reach the sum. The caller owns its denominator policy."""
+    weights = jnp.asarray(weights, x.dtype)
+    kept = jnp.where(weights != 0, x, 0)
+    return jnp.sum(kept * weights, axis=axis), jnp.sum(weights, axis=axis)
+
+
 def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     """`product` plus `bias` broadcast over its leading axes, in the dtype their addition promotes
     to, as flax's layer adds them.
