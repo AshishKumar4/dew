@@ -206,6 +206,18 @@ def test_a_stream_that_runs_out_on_an_evaluated_step_scores_that_step_once():
     assert [step for step, scalars in tracker.scalars if "val/loss" in scalars] == [1, 2, 3]
 
 
+def test_a_stream_that_runs_out_after_a_ranked_step_ends_on_a_whole_checkpoint(tmp_path):
+    """A one-batch stream under a run of ten steps, its step ranking a best kept as weights alone,
+    ends at step 1 on a checkpoint the run resumes from: the whole state and its data position."""
+    (x,) = records(0)
+    objective = Pulled()
+    finite = Loader(lambda partition: iter([{"x": x[:BATCH]}]), None, None, BATCH)
+    Trainer(objective, OptimConfig(optimizer="adam", rate=0.1), key=0,
+            checkpoints=Checkpoints(str(tmp_path))).fit(
+        finite, steps=10, eval_every=1, best=Best(objective.loss, weights_only=True))
+    assert Checkpoints(str(tmp_path)).latest == 1
+
+
 def test_a_run_config_counts_examples_and_pauses_as_a_fit_does(tmp_path):
     """A run config's `examples` and `stop` reach the fit, its record holding both: paused halfway it
     stands two updates in, and run again without the pause it goes on to the steps its examples fill."""

@@ -1875,10 +1875,11 @@ class Trainer(Generic[Loss, Effects]):
         if (checkpoints is not None and interval.last_saved != current
                 and (run.checkpoint_due or candidate or (final and plan.checkpoint_final) or full)):
             self._read_taken(run)
+            # A stream that may run out may end the run at any step, whose save is then its last: whole.
             run.other += self._saved_checkpoint(
                 checkpoints, current, state, position, interval, scores=scores, ranking=ranking,
                 training_best=not plan.validation and not plan.best, control=run.stop_control,
-                weights_only=not run.checkpoint_due and not run.stopped and not full
+                weights_only=not run.checkpoint_due and not run.stopped and not full and run.endless
                 and not (final and plan.checkpoint_final) and bool(winners)
                 and all(rank.weights_only for rank in winners))
             run.last_checkpoint = time.perf_counter()
