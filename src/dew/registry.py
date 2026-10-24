@@ -465,21 +465,12 @@ def to_record(value, annotation) -> JSON:
         # A matmul precision as the name jax reads back as it: a dot algorithm
         # preset's own ('F32_F32_F32'), a precision's alias ('highest').
         return value.name if isinstance(value, jax.lax.DotAlgorithmPreset) else value.name.lower()
-    if isinstance(value, Recorded) and not isinstance(value, type):
-        # A component built around parameters (an encoder, an autoencoder) records the constructor
-        # view it is rebuilt from, never its parameters, always naming its class (`component`), in
-        # one record, so a module its view holds twice is written once (`recording`).
-        with recording():
-            fields = value.recorded_fields()
-            return {"class": import_path(type(value)),
-                    "fields": {name: to_record(entry, object) for name, entry in fields.items()}}
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+    if ((isinstance(value, Recorded) or dataclasses.is_dataclass(value))
+            and not isinstance(value, type)):
         with recording() as written:
             if isinstance(value, nn.Module) and id(value) in written.modules:
                 return _referred(written, id(value))
-            fields = record_fields(value, type(value))
-            record = (fields if type(value) is _unwrapped(annotation)
-                      else {"class": import_path(type(value)), "fields": fields})
+            record = _record_of(value, annotation)
             if isinstance(value, nn.Module):
                 written.modules[id(value)] = (value, record)
             return record
@@ -512,6 +503,20 @@ def to_record(value, annotation) -> JSON:
         f"config field holds JSON scalars, sequences, mappings, dataclasses and "
         f"functions with an import path")
 
+
+def _record_of(value: Recorded | DataclassInstance, annotation: Annotation) -> dict[str, JSON]:
+    """One value's record, written inside its `to_record` call's recording: a component built around
+    parameters (an encoder, an autoencoder) by the constructor view it is rebuilt from, never its
+    parameters, always naming its class (`Recorded`, `component`); any other dataclass by its fields,
+    as a class record unless `annotation` names its class exactly."""
+    if isinstance(value, Recorded):
+        view = value.recorded_fields()
+        return {"class": import_path(type(value)),
+                "fields": {name: to_record(entry, object) for name, entry in view.items()}}
+    fields = record_fields(value, type(value))
+    if type(value) is _unwrapped(annotation):
+        return fields
+    return {"class": import_path(type(value)), "fields": fields}
 
 def _constructed(value: Configured) -> dict[str, JSON]:
     """The record of a plain class's instance: each constructor parameter as
@@ -992,13 +997,18 @@ def _arguments(function: Callable[..., Configured], fields: Mapping[str, object]
     return {name: _read(function, name, value, dtypes=dtypes) for name, value in fields.items()}
 
 
-def read_arguments(member: type | Callable[..., Configured], record: Mapping[str, object]
-                   ) -> Mapping[str, object]:
+def read_arguments(member: type | Callable[..., Configured], record: Mapping[str, object], *,
+                   declared: Mapping[str, Annotation] | None = None) -> Mapping[str, object]:
     """`record`'s fields of the dataclass `member`, or arguments of the
     function or constructor `member`, each read as `build` reads it, without
-    asking whether they are all that `member` takes."""
+    asking whether they are all that `member` takes; one `declared` names is
+    read against that annotation instead, as a generic constructor's own
+    parameter (`model: M`) cannot say which class it takes. One record is read
+    in one reading, so a module it holds twice is built once (`recording`)."""
+    given = declared or {}
     with _reading(record):
-        return {name: _read(member, name, value, dtypes=True) for name, value in record.items()}
+        return {name: (_rebuilt(given[name], value, dtypes=True, name=name) if name in given
+                       else _read(member, name, value, dtypes=True)) for name, value in record.items()}
 
 
 def _read(member: type | Callable[..., Configured], name: str, value, *, dtypes: bool):
@@ -1009,8 +1019,8 @@ def _read(member: type | Callable[..., Configured], name: str, value, *, dtypes:
     held = record_class(member)
     if held is not None:
         declared = declared_type(held, name)
-        if (isinstance(declared, type) and not issubclass(declared, (Mapping, Sequence))
-                and isinstance(value, declared)):
+        if (isinstance(declared, type) and not is_protocol(declared)
+                and not issubclass(declared, (Mapping, Sequence)) and isinstance(value, declared)):
             # A value the caller built, of the field's own class (an encoder a binder made), is kept
             # as it is, whatever its kind.
             return value

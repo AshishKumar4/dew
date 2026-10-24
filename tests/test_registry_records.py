@@ -6,6 +6,7 @@ import json
 from typing import TYPE_CHECKING
 
 import pytest
+from flax import linen as nn
 
 from dew._records import JSON
 from dew.config import ObjectiveConfig
@@ -153,3 +154,44 @@ def test_a_class_record_in_a_json_field_stays_the_record_it_is():
     head's, an autoencoder's) is read back as written, for its owner to bind."""
     record = {"class": f"{Loaded.__module__}:Loaded", "fields": {"name": "tiny"}}
     assert from_record(Settings, {"component": record}) == Settings(record)
+
+
+class Pair(nn.Module):
+    """A module whose two layers may be one, recording its view (`registry.Recorded`)."""
+
+    first: nn.Module
+    second: nn.Module
+
+    def recorded_fields(self) -> dict:
+        return {"first": self.first, "second": self.second}
+
+    def __call__(self, x):
+        return self.second(self.first(x))
+
+
+def test_a_module_a_record_holds_twice_is_built_once_whether_or_not_it_records_its_view():
+    """A layer two places hold, inside a recorded view or as a recorded view itself held twice, is
+    written once and built once, so the rebuilt model keeps one set of parameters for it."""
+    from dew.registry import read_arguments, to_record
+
+    dense = nn.Dense(3)
+    shared = Pair(dense, dense)
+    record = json.loads(json.dumps(to_record(shared, object)))
+    first, second = read_arguments(Pair, record["fields"]).values()
+    assert first is second
+    outer = json.loads(json.dumps(to_record(nn.Sequential([shared, shared]), object)))
+    layers = from_record(nn.Sequential, outer["fields"]).layers
+    assert layers[0] is layers[1]
+
+
+def test_a_protocol_typed_field_reads_its_record_and_keeps_a_value_built_for_it():
+    """A field typed by a protocol that is not runtime-checkable (a diffusion process's weighting)
+    reads a record of its class, and a value the caller built for it is kept as it is."""
+    from dew.diffusion import presets
+    from dew.diffusion.process import Process
+    from dew.registry import to_record
+
+    process = presets.EDM(regime="pixel")()
+    record = json.loads(json.dumps(to_record(process, Process)))
+    assert type(from_record(Process, record).weighting) is type(process.weighting)
+    assert from_record(Process, {**record, "weighting": process.weighting}).weighting is process.weighting

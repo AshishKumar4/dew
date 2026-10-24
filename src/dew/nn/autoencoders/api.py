@@ -164,15 +164,12 @@ class AutoEncoder(ABC):
         """Rebuild the autoencoder a run recorded (`dew.registry.to_record`), around the checkpoint's own
         `params`, reading no source: its class found as every component's is (`dew.registry.component`),
         of Dew's or of a package the run trusts, and its fields read against its constructor."""
-        from dew._records import record as fields_of
-        from dew.registry import component, from_record, read_arguments
+        from dew.registry import component, read_arguments
 
         autoencoder, fields = component(AutoEncoder, record)
         # The module's record names its class, which an inherited constructor's `model: M` cannot.
-        model = from_record(nn.Module, fields_of(fields.get('model'), 'model'))
-        arguments = read_arguments(autoencoder, {name: value for name, value in fields.items()
-                                                 if name != 'model'})
-        return _built(autoencoder, {**arguments, 'model': model}, params)
+        arguments = read_arguments(autoencoder, fields, declared={'model': nn.Module})
+        return _built(autoencoder, arguments, params)
 
     @abstractmethod
     def encode_batch(self, params, x: jnp.ndarray, key: jax.Array | None = None,
