@@ -63,19 +63,26 @@ dK/dV program adding dQ), and the accurate form."""
 FORM_TILES = attention_mosaic.Tiles(64, 64, 2)
 """The call forms' tiles: the template core's 100 queries over 96 keys (`test_attention_template.CASES`) in a
 pair of query blocks over two key tiles, so a block's spans begin and end within the keys it streams."""
+HEAD_WIDTHS = ((64, 128), (128, 64), (80, 48))
+"""The (query, value) head widths the forward is checked at: a value wider than its query, a narrower one, and
+both off a power of two (80 and 48 pad to 128 and 64, `attention.padded_call`)."""
 
 
-def _drawn(shape: tuple[int, int, int, int], dtype, width: int = 128, keys: int | None = None):
+def _drawn(shape: tuple[int, int, int, int], dtype, width: int = 128, keys: int | None = None,
+           value_width: int | None = None):
     """A draw `(query, key, value, dout)` of unit Gaussians at `shape` (its keys `keys`, else its tokens) in
-    `dtype`, by seed."""
+    `dtype`, by seed: the query and key `width` wide, the value and its cotangent `value_width` (`width` where
+    None)."""
     rows, tokens, heads, kv_heads = shape
     keys = tokens if keys is None else keys
+    value_width = width if value_width is None else value_width
 
     def draw(seed):
         streams = jax.random.split(jax.random.key(seed), 4)
-        dims = ((heads, tokens), (kv_heads, keys), (kv_heads, keys), (heads, tokens))
-        return tuple(jax.random.normal(stream, (rows, count, heads_, width), jnp.float32).astype(dtype)
-                     for stream, (heads_, count) in zip(streams, dims, strict=True))
+        dims = ((heads, tokens, width), (kv_heads, keys, width), (kv_heads, keys, value_width),
+                (heads, tokens, value_width))
+        return tuple(jax.random.normal(stream, (rows, count, heads_, depth), jnp.float32).astype(dtype)
+                     for stream, (heads_, count, depth) in zip(streams, dims, strict=True))
 
     return draw
 
@@ -86,21 +93,25 @@ def _family(interpret: bool) -> mosaic.Family | None:
     return mosaic_sm90.WGMMA if interpret else None
 
 
-def _check_forward(call: str, dtype, shape, *, natural: bool, interpret: bool):
+def _check_forward(call: str, dtype, shape, *, natural: bool, interpret: bool, width: int = 128,
+                   value_width: int = 128, tiles: attention_mosaic.Tiles | None = None):
+    """The forward over the call form `call` of `shape`, its query and key heads `width` wide and its value
+    heads `value_width`, at `tiles` (the forward's default when None)."""
     spans = template.spans(shape[1], shape[1], shape[0], **CALLS[call])
-    draw = _drawn(shape, dtype)
+    draw = _drawn(shape, dtype, width=width, value_width=value_width)
 
     def ours(query, key, value, dout):
         del dout
-        return attention_mosaic.forward(query, key, value, spans, natural=natural, interpret=interpret,
-                                        family=_family(interpret))
+        return attention_mosaic.forward(query, key, value, spans, natural=natural, tiles=tiles,
+                                        interpret=interpret, family=_family(interpret))
 
     def reference(query, key, value, dout):
         del dout
         return template.reference(query, key, value, spans)
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
-                    f"mosaic forward {call} {jnp.dtype(dtype).name} natural {natural}", seeds=SEEDS)
+                    f"mosaic forward {call} {jnp.dtype(dtype).name} natural {natural} widths {width} "
+                    f"{value_width}", seeds=SEEDS)
 
 
 def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool, backward: bool = False,
@@ -231,6 +242,15 @@ def test_the_natural_forward_is_on_par_interpreted(call, dtype):
 def test_the_forward_is_on_par_over_every_call_form_interpreted(form):
     """The forward over each of the template core's call forms under the interpreter."""
     _check_call_form(form, interpret=True)
+
+
+@INTERPRETS
+@pytest.mark.parametrize(("width", "value_width"), HEAD_WIDTHS)
+def test_the_forward_is_on_par_at_head_widths_interpreted(width, value_width):
+    """The forward of query heads `width` wide and value heads `value_width` over a causal call at
+    `FORM_TILES`, under the interpreter."""
+    _check_forward("causal", jnp.bfloat16, SHAPES["interpreted"], natural=False, interpret=True, width=width,
+                   value_width=value_width, tiles=FORM_TILES)
 
 
 @INTERPRETS
@@ -394,6 +414,16 @@ def test_the_natural_forward_is_on_par_on_an_h100(call, dtype):
 def test_the_forward_is_on_par_over_every_call_form_on_an_h100(form):
     """The forward over each of the template core's call forms compiled on an H100."""
     _check_call_form(form, interpret=False)
+
+
+@ON_HOPPER
+@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
+@pytest.mark.parametrize(("width", "value_width"), HEAD_WIDTHS)
+def test_the_forward_is_on_par_at_head_widths_on_an_h100(width, value_width):
+    """The forward of query heads `width` wide and value heads `value_width` over a causal call at
+    `FORM_TILES`, compiled on an H100."""
+    _check_forward("causal", jnp.bfloat16, SHAPES["compiled"], natural=False, interpret=False, width=width,
+                   value_width=value_width, tiles=FORM_TILES)
 
 
 @ON_HOPPER
