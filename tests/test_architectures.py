@@ -549,23 +549,24 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layou
     width = residual_width(initial.variables) if case.is_lm else 0
     one_step = drawn_steps(case, tmp_path, 1, 1, initial, 1)
 
-    def draw(seed):
-        """A batch drawn from the seed and, independently, an order of the residual stream's units
-        (`reordered`), the cell's own batch and the identity at seed 0: the fresh batch varies the
+    def keyed(key):
+        """A batch drawn from the key and, independently, an order of the residual stream's units
+        (`reordered`), the cell's own batch and the identity at key 0: the fresh batch varies the
         values, the order every contraction's summation, and the reference and each layout start
         from the same reordered state, so all are judged in its coordinates. A model with no
-        token embedding has no residual stream to permute, and draws batches alone. A model that
-        selects discontinuously takes the seed's first batch whose selections, in the forward of
-        each step, clear `selection_margins.MARGIN` (`selection_margin`)."""
-        for attempt in range(64):
-            key = seed if attempt == 0 else 1_000_003 * (attempt + 1) + seed
-            order = (np.arange(width) if key == 0 else np.random.default_rng(key).permutation(width))
-            raw = next(batches(case, encoder, key)())
-            if not selects(case) or clears(case, raw, initial.variables,
-                                           lambda batch: one_step(batch, np.arange(width))["variables"]):
-                return raw, order
-        raise AssertionError(f"no batch of seed {seed} clears the selection margin "
-                             f"{selection_margins.MARGIN}")
+        token embedding has no residual stream to permute, and draws batches alone."""
+        order = np.arange(width) if key == 0 else np.random.default_rng(key).permutation(width)
+        return next(batches(case, encoder, key)()), order
+
+    def cleared(inputs):
+        # The selections of each step's forward clear the margin: the first step's from the initial
+        # state, the second's from the state the first makes.
+        return clears(case, inputs[0], initial.variables,
+                      lambda batch: one_step(batch, np.arange(width))["variables"])
+
+    # A model that selects discontinuously takes the seed's first batch whose selections clear
+    # `selection_margins.MARGIN` (`selection_margins.clearing`).
+    draw = selection_margins.clearing(keyed, cleared) if selects(case) else keyed
 
     seeds = LAYOUT_SEEDS[case.name]
     fsdp = LAYOUTS[layout]
