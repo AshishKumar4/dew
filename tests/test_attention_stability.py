@@ -766,8 +766,9 @@ def _mosaic_takes(family: Family) -> bool:
     (`attention_mosaic.refused`)."""
     query, _, value, extra, _ = family.draw(0)
     hooks = _hooks(jnp.asarray(query), jax.tree.map(jnp.asarray, extra))
+    tiles = attention_mosaic.BACKWARD_DEFAULTS["wgmma"]
     return attention_mosaic.refused(jnp.dtype(family.dtype), query.shape[-1], value.shape[-1], hooks,
-                                    backward=True) is None
+                                    backward=True, tile=(tiles.block_q, tiles.block_k)) is None
 
 
 def _held_empty(family: Family, found, label: str) -> None:
