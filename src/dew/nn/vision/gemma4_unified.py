@@ -14,13 +14,8 @@ from dew import records
 from dew.interop.weights import in_params
 from dew.registry import Record
 
-from .common import ProjectorLayout, TowerBase, TowerGeometry, TowerLayout
-from .gemma4 import (
-    GEMMA4_PROJECTOR_TENSORS,
-    AxialPatchEmbedding,
-    Gemma4Projector,
-    translate_gemma4_projector_weights,
-)
+from .common import TowerBase, TowerGeometry, TowerLayout
+from .gemma4 import AxialPatchEmbedding
 
 
 @dataclasses.dataclass(frozen=True)
@@ -44,10 +39,6 @@ class Gemma4UnifiedVision(TowerBase):
                              channels=3, position_size=self.mm_posemb_size, retains_patch_slots=True)
 
 
-class Gemma4UnifiedProjector(Gemma4Projector):
-    """The shared media projector under the unified checkpoint's embedding scope."""
-
-
 def translate_vision(config: Mapping[str, object]) -> Record:
     fields = {field.name: records.integer(config.get(field.name, field.default), field.name)
               for field in dataclasses.fields(Gemma4UnifiedVision)}
@@ -58,7 +49,7 @@ def translate_vision(config: Mapping[str, object]) -> Record:
 
 
 def translate_projector(config: Mapping[str, object], text_width: int, input_width: int) -> Record:
-    return {"class": "gemma4_unified", "fields": {
+    return {"class": "gemma4", "fields": {
         "text_width": text_width, "input_features": input_width,
         "norm_eps": records.number(config.get("rms_norm_eps", 1e-6), "rms_norm_eps")}}
 
@@ -78,7 +69,4 @@ def vision_path(name: str) -> tuple[str, ...]:
     return _TENSORS[name]
 
 
-Gemma4UnifiedVision.checkpoint = TowerLayout("embed_vision.", in_params(vision_path))
-Gemma4UnifiedProjector.checkpoint = ProjectorLayout(
-    "embed_vision.multimodal_embedder.", GEMMA4_PROJECTOR_TENSORS,
-    read=translate_gemma4_projector_weights)
+Gemma4UnifiedVision.checkpoint = TowerLayout("vision_embedder.", in_params(vision_path))

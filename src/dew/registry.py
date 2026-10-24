@@ -1353,7 +1353,7 @@ projectors: Aliases[type[ProjectorBase], ProjectorBase] = Aliases("projector", {
     "gemma": "dew.nn.vision.siglip:GemmaProjector",
     "gemma3n": "dew.nn.vision.gemma3n:Gemma3nProjector",
     "gemma4": "dew.nn.vision.gemma4:Gemma4Projector",
-    "gemma4_unified": "dew.nn.vision.gemma4_unified:Gemma4UnifiedProjector",
+
     "llama4": "dew.nn.vision.llama4:Llama4Projector",
     "mimo": "dew.nn.vision.mimo:MiMoProjector",
     "muse_glimmer": "dew.nn.vision.muse_glimmer:MuseGlimmerProjector",
