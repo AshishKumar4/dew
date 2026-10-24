@@ -181,6 +181,22 @@ def test_a_deduplicating_snapshot_of_a_pass_that_keeps_nothing_seals_nothing(tmp
     assert manifest["rows"] == 0 and manifest["metadata"]["near_duplicates"]["removed"] == 0
 
 
+def test_a_quality_rules_sequence_setting_reaches_its_filter_as_given():
+    """A rule's sequence setting reaches DataTrove as the tuple it was given: FineWeb told to count only
+    lines ending in "!" as punctuated keeps the page whose lines do and drops the one whose lines end
+    in ".", where its own stop characters keep both."""
+    pages = [{"id": index, "text": "\n".join(f"This is a reasonably long sentence, number {line} of the "
+                                              f"page{end}" for line in range(5))}
+             for index, end in enumerate(("!", "."))]
+
+    def kept(rule):
+        passed = iterate(Pipeline(Memory(pages)).filter_map(rule), read="memory")
+        return [int(record["id"]) for record in passed]
+
+    assert kept(text.Quality("fineweb", settings=(("stop_chars", ("!",)),))) == [0]
+    assert kept(text.Quality("fineweb")) == [0, 1]
+
+
 def test_a_quality_rule_that_rewrites_the_text_it_keeps_keeps_the_rewrite():
     """C4's rules drop the lines they disallow from a page they keep: the record keeps the page with
     its JavaScript notice gone, and its other fields as they were."""
