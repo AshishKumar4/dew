@@ -754,8 +754,7 @@ class MosaicGmm(_Mosaic):
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         kernel = ba.arguments['kernel']
         depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
-        return mosaic_gpu.generated(_families(kernel.dtype, ba.arguments['interpret']), depth=depth,
-                                    width=width, dtype=kernel.dtype)
+        return mosaic_gpu.generated(_families(kernel.dtype), depth=depth, width=width, dtype=kernel.dtype)
 
     @staticmethod
     def extents(tile: mosaic_gpu.Tiles) -> dict:
@@ -809,7 +808,7 @@ class MosaicTgmm(_Mosaic):
         # A gradient tile's rows divide the tokens' width; its steps run over a group's rows, padded to
         # whole steps (`mosaic_gpu.tgmm`), which mma.sync masks at a group's edges in its accumulator's
         # layout, whose base tile is a role's rows: no step shorter.
-        families = _families(tokens.dtype, ba.arguments['interpret'])
+        families = _families(tokens.dtype)
         return tuple(tile for tile in mosaic_gpu.generated(families, depth=None,
                                                            width=cotangent.shape[1], dtype=tokens.dtype)
                      if tokens.shape[1] % tile.block_m == 0
@@ -1278,13 +1277,13 @@ def _launch_kernel(name: str, *measured: _Need) -> selection.Kernel[GroupedCase]
         cost=lambda case: case.call.seconds(name))
 
 
-def _families(dtype, interpret) -> tuple[mosaic.Family, ...]:
+def _families(dtype) -> tuple[mosaic.Family, ...]:
     """The bundles the Mosaic GPU launches generate tiles for at operands of `dtype`: Hopper's warpgroup
-    MMA's, and Ampere's mma.sync's where the call is interpreted or this JAX's layout inference places
-    its tiles (`mosaic_sm80.staging_solved`); a launch's fitting keeps its target's
-    (`_Mosaic._family_tiles`)."""
-    lowers = bool(interpret) or mosaic_sm80.staging_solved()
-    return mosaic_sm90.WGMMA, *((mosaic_sm80.Mma(jnp.dtype(dtype)),) if lowers else ())
+    MMA's, and Ampere's mma.sync's in a CPU process (which interprets them, or lowers them for an assumed
+    GPU only where asked) or where this JAX's layout inference places its tiles
+    (`mosaic_sm80.staging_solved`); a launch's fitting keeps its target's (`_Mosaic._family_tiles`)."""
+    ampere = mosaic_sm80.staging_solved() or jax.default_backend() == 'cpu'
+    return mosaic_sm90.WGMMA, *((mosaic_sm80.Mma(jnp.dtype(dtype)),) if ampere else ())
 
 
 AMPERE_MEASURED = _Need(
