@@ -262,6 +262,52 @@ def test_the_forward_is_on_par_under_every_hook_interpreted(hooks, dtype, natura
     _check_hooks(hooks, dtype, natural, interpret=True)
 
 
+@INTERPRETS
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
+def test_padding_rows_reach_no_hook_gradient_interpreted(accurate):
+    """A call of one query and one key, padded to whole tiles, under a hook dividing by a query's
+    parameter and adding a head's: the padding rows' parameter is 0, so the hook is 0/0 there, and a
+    padding row that saw a key would carry its NaN into the head's gradient, a sum over the rows. Padding
+    rows see no key (`algebra.Forward.queries`), and every gradient is the reference's, the head's 0."""
+    spans = template.spans(1, 1, 1)
+    query, key, value = (jnp.zeros((1, 1, 1, 64), jnp.bfloat16) for _ in range(3))
+    dout = jnp.ones((1, 1, 1, 64), jnp.bfloat16)
+
+    def score_mod(s, q_pos, k_pos, temperature, bias):
+        del q_pos, k_pos
+        return s / temperature + bias
+
+    def hooked(temperature, bias):
+        return template.Hooks(score_mod, (template.Param(temperature, template.Kind.QUERY),
+                                          template.Param(bias, template.Kind.HEAD)))
+
+    params = (jnp.ones((1, 1, 1), jnp.float32), jnp.zeros((1,), jnp.float32))
+    hooks = hooked(*params)
+    residuals = attention_triton.forward(query, key, value, spans, hooks, residuals=True, interpret=True)[1:]
+    grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
+                                      accurate=accurate, interpret=True, family=mosaic_sm90.WGMMA)
+    _, pull = jax.vjp(lambda q, k, v, t, b: template.reference(q, k, v, spans, hooked(t, b)), query, key,
+                      value, *params)
+    for found, expected in zip((grads.query, grads.key, grads.value, *grads.score_params), pull(dout),
+                               strict=True):
+        np.testing.assert_array_equal(np.asarray(found, np.float32), np.asarray(expected, np.float32))
+
+
+@pytest.mark.parametrize("value_width", [64, 128, 256])
+def test_the_default_tiles_fit_a_hoppers_shared_memory(value_width):
+    """The forward's default tiles at D 128 stage within a Hopper block's shared memory
+    (`generation.shared_budget`) whatever the value's width: `DEFAULTS` would stage 288 KiB at a value 256
+    wide, past its 227 KiB, so its key tile halves (`attention_mosaic.fitted`)."""
+    with generation.assumed("sm90"):
+        budget = generation.shared_budget(generation.gpu_target())
+    family = mosaic_sm90.WGMMA
+    default = attention_mosaic.DEFAULTS[family.name]
+    tiles = attention_mosaic.fitted(default, 128, value_width, 2, family)
+    assert attention_mosaic.staged_bytes(tiles, 128, value_width, 2, family.consumers) <= budget
+    wide = attention_mosaic.staged_bytes(default, 128, value_width, 2, family.consumers) > budget
+    assert (tiles != default) == wide == (value_width == 256), (tiles, wide)
+
+
 def test_a_hook_that_forms_a_unit_axis_is_refused():
     """The hook indexed off the query's coordinates' column (`q_pos[:, :1]`) forms a `[bq, 1]` array, which
     Mosaic GPU's layout inference takes no operation on: the mainloop refuses it before any launch, the

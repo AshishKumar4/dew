@@ -43,8 +43,10 @@ class Forward:
     softmax `scale`, the score hook `score_mod(s, q_pos, k_pos, *params)` on natural logits, whether
     the call keeps its logits `natural` (`base2`), the accurate form, whether its weighted values can pass
     fp32's largest, so a program's walk is `guarded` (`headroom`), whether its softmax resumes from an
-    `initial` state (`raw`), and whether natural logits stay `scaled` whatever the scale (`raw`; the fold's
-    rewalk, `unfolded`)."""
+    `initial` state (`raw`), whether natural logits stay `scaled` whatever the scale (`raw`; the fold's
+    rewalk, `unfolded`), and the call's query count `queries` where a mainloop walks query tiles past it
+    without spans (a full or causal call padded to whole tiles, whose padding rows `seen` keeps from every
+    key; None where none does)."""
 
     form: str
     keys: int
@@ -55,6 +57,7 @@ class Forward:
     headroom: bool = False
     initial: bool = False
     scaled: bool = False
+    queries: int | None = None
 
     @property
     def raw(self) -> bool:
@@ -579,8 +582,10 @@ def seen(spec: Forward, coords: Coords, like: jax.Array) -> jax.Array | None:
     """Whether each query of a tile `like` `[bq, bk]` sees each key (`within`), every mainloop's one
     predicate, forward and backward; None where each sees every key. A spans call's intervals and, with
     documents, ids (its mainloops give each tile its queries' intervals and both blocks' ids); a causal
-    call's diagonal; and the call's keys, where a tile reaches past them: no walk visits a tile wholly past
-    them, so a call whose keys are whole tiles reads no padding."""
+    call's diagonal; the call's keys, where a tile reaches past them: no walk visits a tile wholly past
+    them, so a call whose keys are whole tiles reads no padding; and, where the spec names them, its queries
+    (a padding row sees no key, so a score hook's derivative there, undefined at its padded parameters,
+    reaches no reduction over the rows)."""
     visible = None
     if coords.spans is not None:
         start, end = coords.spans
@@ -591,6 +596,9 @@ def seen(spec: Forward, coords: Coords, like: jax.Array) -> jax.Array | None:
     if spec.form != "spans" and spec.keys % like.shape[1]:
         # A tile past the call's last key reads padding.
         visible = coords.k_pos < spec.keys if visible is None else visible & (coords.k_pos < spec.keys)
+    if spec.form != "spans" and spec.queries is not None and spec.queries % like.shape[0]:
+        rows = coords.q_pos < spec.queries
+        visible = rows if visible is None else visible & rows
     return visible
 
 

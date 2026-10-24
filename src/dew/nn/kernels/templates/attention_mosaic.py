@@ -93,7 +93,8 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     `natural` keeps the logits natural (`algebra.Forward.base2`); `interpret` runs it on the CPU (Mosaic
     GPU's interpret mode)."""
     family = family_of(query.dtype) if family is None else family
-    tiles = DEFAULTS[family.name] if tiles is None else tiles
+    tiles = (fitted(DEFAULTS[family.name], query.shape[3], value.shape[3], query.dtype.itemsize, family)
+             if tiles is None else tiles)
     hooks = Hooks() if hooks is None else hooks
     width, value_width = query.shape[3], value.shape[3]
     if reason := refused(query.dtype, width, value_width, hooks, backward=False,
@@ -106,7 +107,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None,
                            scale=width ** -0.5 if scale is None else scale, score_mod=hooks.score_mod,
                            natural=natural, headroom=algebra.headroom(value.dtype),
-                           initial=hooks.initial is not None)
+                           initial=hooks.initial is not None, queries=call.queries)
     query, key, value = (_columns(array) for array in (call.query, call.key, call.value))
     spans_of, hooked = _spans_of(spec, call, tiles.block_q, tiles.block_k), _hooked_of(hooks, call)
 
@@ -123,6 +124,28 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
 
     out = algebra.walked_launches(spec, launch, kept)
     return out[:, :call.queries, :, :value_width]
+
+
+def staged_bytes(tiles: Tiles, width: int, value_width: int, itemsize: int, consumers: int) -> int:
+    """The shared memory the forward's program stages at `tiles`, in bytes: its consumers' query stages, the
+    key and value rings' slots, each consumer's output stage where the value is not as wide as the query
+    (`_launch`), and its rows' status, each width padded to whole `COLUMNS` rows."""
+    width, value_width = (-(-columns // COLUMNS) * COLUMNS for columns in (width, value_width))
+    queries = consumers * tiles.block_q * width * itemsize
+    rings = tiles.stages * tiles.block_k * (width + value_width) * itemsize
+    output = 0 if width == value_width else consumers * tiles.block_q * value_width * itemsize
+    return queries + rings + output + consumers * tiles.block_q * 4
+
+
+def fitted(tiles: Tiles, width: int, value_width: int, itemsize: int, family: mosaic.Family) -> Tiles:
+    """`tiles` with the key tile halved, while it stays whole rows of `family`'s, until the program's staging
+    fits a block's shared memory (`generation.shared_budget`): at D 128 and a value 256 wide, 64-key tiles
+    hold in 192 KiB what 128-key tiles stage in 288 KiB, past a Hopper block's 227 KiB."""
+    budget = generation.shared_budget(generation.gpu_target())
+    while (staged_bytes(tiles, width, value_width, itemsize, family.consumers) > budget
+           and tiles.block_k > family.rows):
+        tiles = dataclasses.replace(tiles, block_k=tiles.block_k // 2)
+    return tiles
 
 
 def _columns(array: jax.Array) -> jax.Array:
@@ -280,7 +303,8 @@ def _spans_of(spec: algebra.Forward, call: PaddedCall, block_q: int, block_k: in
 @dataclasses.dataclass(frozen=True)
 class _Program:
     """A program's static geometry: its family's bundle, its tiles, the call's key tiles (`steps`), the slots
-    a stream holds, its key count and whether it is causal."""
+    a stream holds, its key count, whether it is causal, and its query count (`algebra.Forward.queries`; a
+    tile holding padding rows is never whole)."""
 
     family: mosaic.Family
     tiles: Tiles
@@ -288,6 +312,13 @@ class _Program:
     stages: int
     keys: int
     causal: bool
+    queries: int | None = None
+
+    def padded(self, first) -> jax.Array | bool:
+        """Whether the query tile from `first` holds padding rows past the call's queries."""
+        if self.queries is None or self.queries % self.tiles.block_q == 0:
+            return False
+        return first + self.tiles.block_q > self.queries
 
     def query_tile(self, count: int):
         """This program's query tile of the grid's `count`: a causal call's longest first (its last query
@@ -324,7 +355,8 @@ class _Program:
         both blocks agree too."""
         if spans is None:
             walked = self.walked(first)
-            count = self.whole(first, walked)
+            # A block holding padding rows is whole nowhere: its padding sees no key (`algebra.seen`).
+            count = jnp.where(self.padded(first), 0, self.whole(first, walked))
             return jnp.int32(0), walked, lambda index: index < count
         block = lax.div(first, self.tiles.block_q)
         full_lo, full_hi = spans.full_lo[row, block], spans.full_hi[row, block]
@@ -353,7 +385,9 @@ class _Program:
             # padding.
             whole = jnp.minimum(pl.cdiv(k_first + block_k - 1, block_q), q_steps) if self.causal else lo
             whole = jnp.where(k_first + block_k > self.keys, q_steps, jnp.maximum(whole, lo))
-            return lo, jnp.int32(q_steps), lambda index: index >= whole
+            # A query tile holding padding rows sees no block whole (`reach`).
+            return lo, jnp.int32(q_steps), lambda index: (index >= whole) & jnp.logical_not(
+                self.padded(index * block_q))
         block = lax.div(k_first, block_k)
 
         def seen_whole(index):
@@ -500,13 +534,10 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     pair = consumers * block_q
     steps = keys_count // block_k
     # No more stages than key tiles: a slot past them would load past the keys.
-    program = _Program(family, tiles, steps, min(tiles.stages, steps), spec.keys, spec.form == "causal")
+    program = _Program(family, tiles, steps, min(tiles.stages, steps), spec.keys, spec.form == "causal",
+                       spec.queries)
     # The output stores through the query's stage where the two are as wide (its rows are read before the
-    # store). Else it takes a stage of its own, which the block's shared memory holds beside the query's and
-    # the key and value rings. At DEFAULTS and D 128 the query's stage and the key ring take 96 KiB, and each
-    # column of the value takes 768 bytes more (the value ring's two stages and the output's rows of both
-    # consumers), so the widest value a Hopper block's 227 KiB (`generation.shared_budget`) holds is 128
-    # columns (192 KiB). At 256 columns (288 KiB), 64-key tiles (`Tiles(64, 64, 2)`) hold it in 192 KiB.
+    # store); else it takes a stage of its own beside the query's and the rings (`staged_bytes`).
     reuse = value.shape[-1] == width
 
     def body(q_ref, k_ref, v_ref, *refs, streams):
@@ -1000,7 +1031,8 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     factor = query.shape[3] ** -0.5 if scale is None else scale
     spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=factor,
                            score_mod=None if hooks is None else hooks.score_mod, natural=natural,
-                           initial=hooks is not None and hooks.initial is not None)
+                           initial=hooks is not None and hooks.initial is not None,
+                           queries=spans.start.shape[1])
     launch = functools.partial(_launch_backward, spec=spec, accurate=accurate, tiles=tiles, consumers=count,
                                fused=fused, family=family, interpret=interpret)
     block = max(count * tiles.block_q, count * tiles.block_k)
@@ -1036,7 +1068,8 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     query, key, value, dout = (jnp.pad(array, ((0, 0),) * 3 + ((0, -array.shape[3] % COLUMNS),))
                                for array in (query, key, value, dout))
     steps = key.shape[1] // tiles.block_k
-    program = _Program(family, tiles, steps, min(tiles.stages, steps), spec.keys, spec.form == "causal")
+    program = _Program(family, tiles, steps, min(tiles.stages, steps), spec.keys, spec.form == "causal",
+                       spec.queries)
     walk = _Backward(program, spec, accurate, consumers, interpret, fused, score_kinds)
     padded = PaddedCall(query, key, value, start, end, query_ids, key_ids, (), (), query.shape[1], spec.keys)
     spans = _spans_of(spec, padded, tiles.block_q, tiles.block_k)
