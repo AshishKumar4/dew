@@ -177,7 +177,7 @@ def test_a_thousand_source_selection_reads_in_order_what_each_position_reads_alo
     """Read one position after another, a mixture's selection reads runs of positions at once; it
     reads what each position reads alone, Grain's order, and a position reached out of order (a
     resume, a seek) reads the same, before and after a run."""
-    from dew.data.mixing import Proportions, ProportionalSelection
+    from dew.data.mixing import ProportionalSelection, Proportions
 
     weights = [float(tag % 7 + 1) for tag in range(SOURCES)]
     lengths = [10**6] * SOURCES
