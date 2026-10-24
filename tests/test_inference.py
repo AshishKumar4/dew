@@ -342,7 +342,7 @@ def test_an_lm_run_over_a_source_stops_at_its_end_of_sequence_ids(tmp_path):
     expected = [int(hit[0]) + 1 if hit.size else 6 for hit in hits]
     np.testing.assert_array_equal(stopped.lengths, expected)
     np.testing.assert_array_equal(stopped.terminated, [bool(hit.size) for hit in hits])
-    policy = objective.policy(state.variables)(prompt, 6, key=7).host()
+    policy = objective.policy(state.variables, Sampling(temperature=0))(prompt, 6, key=7).host()
     np.testing.assert_array_equal(policy.lengths, expected)
     checkpoints = Checkpoints(str(tmp_path / "run"))
     checkpoints.save(0, state, None, artifact=objective.inference_record())
