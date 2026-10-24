@@ -39,6 +39,17 @@ TOKENIZER = Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-
 LAYOUT = Layout(min_shard=1, tolerance=1.0)
 
 
+
+class TupleShapes:
+    """Keeps each record and restates the shapes of the fields it declares as tuples."""
+
+    def map(self, record):
+        return record
+
+    def declared(self, facts):
+        fields = facts.get("fields", {})
+        return {**facts, "fields": {name: tuple(shape) for name, shape in fields.items()}}
+
 @dataclasses.dataclass(frozen=True)
 class Loaded:
     """A loaded model (`dew.objectives.base.Source`): a module and its tree."""
@@ -186,8 +197,10 @@ def test_a_grpo_stage_scores_decoded_text_and_stops_at_the_tokenizer_eos(tmp_pat
         read.append(text)
         return float(len(text))
 
+    # A source may state a field's shape as a tuple, as `Torch(known=)` passes it on; the stage reads
+    # the prompt's length from it as from the preset's list.
     prompts = Memory([{"prompt": "hi"}] * 8).pipe(presets.prompts, str(TOKENIZER), max_prompt_len=8, batch=8,
-                                                  long="truncate")
+                                                  long="truncate").map(TupleShapes())
     states = Recipe(model, optax.sgd(.1), jax.random.key(0), (
         Stage(name="dpo", loss="dpo", data=pairs(), steps=1),
         Stage(name="grpo", loss="grpo", data=prompts, steps=1, beta=.01, reward=reward, max_new_tokens=4),
