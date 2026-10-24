@@ -673,8 +673,9 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
     import optax
 
     from dew import Trainer
+    from dew.batch import thaw
     from dew.interop import Pretrained
-    from dew.objectives.base import Step, thaw
+    from dew.objectives.base import Step
     from dew.objectives.diffusion.block import BlockDiffusionObjective
 
     checkpoint = REPO_ROOT / "tests/fixtures/hf/diffusion-gemma-workflow"

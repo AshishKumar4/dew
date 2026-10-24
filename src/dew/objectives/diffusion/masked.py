@@ -31,7 +31,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.artifacts import TokenScores
-from dew.batch import Variables, real_slots
+from dew.batch import Variables, real_slots, thaw
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.inference.tasks import MaskedGeneration, MaskedSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
@@ -47,7 +47,6 @@ from dew.objectives.base import (
     Source,
     Step,
     model_rngs,
-    thaw,
 )
 from dew.objectives.lm.chunked import final_read, head_cross_entropy, refuse_without_logits
 from dew.objectives.lm.objective import TEXT_KEY, batch_text, text_preview

@@ -46,7 +46,8 @@ from dew.objectives.rl import (
 from dew.objectives.rl.rollout import Reward
 from dew.records import integer, record, text
 from dew.sampling import Sampling, with_ids_of
-from dew.training import Checkpoints, Layout, Rollout, Trainer, TrainState
+from dew.state import TrainState
+from dew.training import Checkpoints, Layout, Rollout, Trainer
 
 
 @dataclasses.dataclass(frozen=True)

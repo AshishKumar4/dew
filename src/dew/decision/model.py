@@ -8,13 +8,12 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype
 
-from dew.batch import Variables, coordinates
+from dew.batch import Variables, coordinates, part, thaw
 from dew.decision.head import Head
 from dew.decision.layout import DecisionInputs
 from dew.nn.cross_attention import crosses_alone
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, ModelInputs
 from dew.nn.protocols import CrossAttending, HiddenStates, VocabularyRows
-from dew.objectives.base import part, thaw
 
 
 @dataclass(frozen=True)

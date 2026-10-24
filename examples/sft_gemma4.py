@@ -36,7 +36,8 @@ from dew.data.sources import Read, source as data_source
 from dew.inference import RunProcessor
 from dew.interop import PretrainedDecoder
 from dew.objectives.lm import LMObjective, Perplexity, Samples
-from dew.training import MeshSpec, TrainState, prepare_process
+from dew.state import TrainState
+from dew.training import MeshSpec, prepare_process
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
 SMOKE_MODEL = FIXTURES / "hf/gemma4-ple"

@@ -11,7 +11,7 @@ from dew.objectives.base import Metric, Shown, TrainingScalar
 
 if TYPE_CHECKING:
     from dew.checkpoints import Ranking
-    from dew.training.state import TrainState
+    from dew.state import TrainState
 
 
 @dataclasses.dataclass(frozen=True, init=False)
@@ -152,8 +152,8 @@ class HeldBest:
         """Hold `state`'s model state where its first ranking beats the held one (`Ranking.score`)."""
         score = ranking[0].score if ranking else None
         if score is not None and (self.score is None or score < self.score):
+            from dew.state import MODEL_STATE
             from dew.training.host import snapshot
-            from dew.training.state import MODEL_STATE
             self.score, self.restore = score, snapshot({name: getattr(state, name) for name in MODEL_STATE})
 
     def state(self, final: TrainState) -> TrainState:

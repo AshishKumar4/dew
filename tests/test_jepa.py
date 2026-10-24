@@ -12,10 +12,10 @@ from reference_error import assert_as_exact, widened
 from steady_state import steady_state
 
 from dew.artifacts import Representations
-from dew.batch import merge
+from dew.batch import merge, part
 from dew.inputs import Field
 from dew.nn.backbones.jepa import JepaPredictor
-from dew.objectives.base import Step, part
+from dew.objectives.base import Step
 from dew.objectives.jepa import (
     JepaEncoder,
     JepaObjective,

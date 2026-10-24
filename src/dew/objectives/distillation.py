@@ -40,7 +40,7 @@ from flax import linen as nn
 from typing_extensions import TypeVar
 
 from dew.artifacts import Artifacts
-from dew.batch import Batch, Variables
+from dew.batch import Batch, Variables, without
 from dew.nn.precision import accumulated
 from dew.objectives.base import (
     OMITTED,
@@ -54,7 +54,6 @@ from dew.objectives.base import (
     ProgramModule,
     Ratio,
     Step,
-    without,
 )
 
 Loss = TypeVar("Loss", default=Ratio | jax.Array | float)

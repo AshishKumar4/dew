@@ -13,7 +13,7 @@ import numpy as np
 from flax import linen as nn
 
 from dew.artifacts import Decisions
-from dew.batch import FROZEN, Batch, Variables
+from dew.batch import FROZEN, Batch, Variables, part
 from dew.data.pipeline import Configured, ObjectiveData, Pack, Rejected
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Temperatures
@@ -56,12 +56,11 @@ from dew.objectives.base import (
     Step,
     joined,
     model_rngs,
-    part,
 )
 from dew.records import integer, record
 
 if TYPE_CHECKING:
-    from dew.training.state import TrainState
+    from dew.state import TrainState
 
 NONE_OF_THE_ABOVE = "none of the above"
 

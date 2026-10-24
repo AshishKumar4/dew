@@ -38,7 +38,7 @@ from dew.batch import Variables
 from dew.interop.pretrained import Pretrained
 from dew.interop.sources import load_shards
 from dew.objectives.lm import LMObjective
-from dew.training import TrainState
+from dew.state import TrainState
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 RATE = 5e-2

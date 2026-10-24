@@ -125,11 +125,10 @@ def test_an_adapted_policy_run_loads_and_saves_the_policy_it_trained(kind, tmp_p
     rebuild write the files the trained adapter writes, byte for byte, and
     the loaded task and bundle hold the base draw bitwise under `frozen`
     and compute what the trained policy computes."""
-    from dew.batch import FROZEN
+    from dew.batch import FROZEN, part
     from dew.inference import TextGeneration
     from dew.interop import Pretrained
     from dew.lora import Adapter, LoRA
-    from dew.objectives.base import part
     from dew.objectives.rl import DPOObjective, PPOObjective, ValueHead
 
     base = model()
@@ -234,7 +233,7 @@ def test_task_from_pretrained_selects_the_requested_snapshot(tmp_path, monkeypat
     from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
     from dew.nn.diffusion_gemma import DiffusionGemma
     from dew.objectives.diffusion import BlockDiffusionObjective, MaskedDiffusionObjective
-    from dew.training import TrainState
+    from dew.state import TrainState
 
     if kind == "text":
         objective, task_type = LMObjective(model(), 8, ema_decay=None), TextGeneration

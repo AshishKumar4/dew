@@ -23,7 +23,7 @@ import jax.numpy as jnp
 from flax import linen as nn, struct
 
 from dew.artifacts import TokenScores
-from dew.batch import FROZEN, Batch, Variables, real_places, shifted_span, token_layout
+from dew.batch import FROZEN, Batch, Variables, real_places, shifted_span, thaw, token_layout
 from dew.inference.tasks import BlockGeneration, BlockSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import ModelInputs
@@ -42,7 +42,6 @@ from dew.objectives.base import (
     Source,
     Step,
     model_rngs,
-    thaw,
 )
 from dew.objectives.lm.chunked import head_cross_entropy, model_logits
 

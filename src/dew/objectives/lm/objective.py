@@ -45,11 +45,14 @@ from dew.batch import (
     VALID_ROWS,
     Batch,
     Coordinates,
+    PathFilter,
     Variables,
+    freeze,
     merge,
     real_slots,
     scored_targets,
     shifted_span,
+    thaw,
     token_layout,
 )
 from dew.coordination import agreed, collective_host
@@ -83,16 +86,13 @@ from dew.objectives.base import (
     EMASpec,
     Objective,
     Omitted,
-    PathFilter,
     Prediction,
     ProgramModule,
     Ratio,
     Shown,
     Step,
-    freeze,
     merge_totals,
     model_rngs,
-    thaw,
 )
 from dew.objectives.lm.chunked import (
     chunked_tile,
