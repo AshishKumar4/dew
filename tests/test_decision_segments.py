@@ -156,3 +156,44 @@ def test_a_whole_request_whose_row_leaves_its_state_out_is_refused():
     body = {"state": "one two three", "questions": asked}
     with pytest.raises(ValueError):
         scoring.admit(body)
+
+
+def test_copies_of_the_state_share_the_room_each_within_its_own_budget():
+    """`shared_budgets` gives each copy as many tokens as it holds up to its cap; where those exceed the
+    room, a max-min fair share: nonnegative, summing to at most the room, none left over while a copy
+    wants more, and the copy that wants least taking all it wants first."""
+    from dew.decision.layout import shared_budgets
+
+    assert shared_budgets([10, 10], [None, 4], 100) == [10, 4]
+    assert shared_budgets([10, 10], [None, None], 7) == [3, 4]
+    assert shared_budgets([10, 10, 10], [2, None, None], 11) == [2, 4, 5]
+    assert shared_budgets([10, 10], [None, None], -3) == [0, 0]
+    for lengths, caps, room in (([5, 9, 3], [None, 6, None], 10), ([8, 8], [8, 1], 4),
+                                ([0, 7], [None, None], 2)):
+        shares = shared_budgets(lengths, caps, room)
+        wants = [length if cap is None else min(cap, length)
+                 for length, cap in zip(lengths, caps, strict=True)]
+        assert all(0 <= share <= want for share, want in zip(shares, wants, strict=True))
+        assert sum(shares) <= max(room, 0)
+        assert sum(shares) == min(sum(wants), max(room, 0))
+
+
+def test_a_joint_row_holds_the_state_twice_each_copy_cut_to_its_own_budget():
+    """A joint row may hold the state more than once: each copy cut from the whole state to its own
+    budget and keeping its own end, the row's kept count its least-kept copy's; a layout of one state
+    lays its rows out as it did, and its record reloads it."""
+    state = "one two three four five six seven"
+    twice = (Text("FIRST:"), State(max_tokens=5), Text("\nLAST:"), State(keep="end", max_tokens=9), Schema())
+    layout = JointLayout(max_len=1 << 20, segments=twice)
+    [row] = layout.rows(TOKENIZER, SPECIALS, state, QUESTIONS)
+    written = text(row.tokens)
+    compact = '"one two three four five six seven"'
+    assert written.startswith("FIRST:" + compact[:5] + "\nLAST:" + compact[-9:])
+    assert (row.state_tokens, row.state_kept) == (len(compact), 5)
+    assert from_record(Layout, to_record(layout, Layout), dtypes=False) == layout
+    once = JointLayout(max_len=1 << 20, segments=(State(), Schema()))
+    again = JointLayout(max_len=1 << 20, segments=(State(max_tokens=None), Schema()))
+    assert (once.rows(TOKENIZER, SPECIALS, state, QUESTIONS)
+            == again.rows(TOKENIZER, SPECIALS, state, QUESTIONS))
+    with pytest.raises(ValueError):
+        JointLayout(segments=(State(render="state"), Schema()))
