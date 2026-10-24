@@ -298,7 +298,8 @@ def text_to_image(directory: str | os.PathLike, config: Mapping[str, object], *,
                          model_config, jax_version=jax_version)
 
     # FlaxDiff's encoders ran in bfloat16.
-    condition, vae = _towers(clip, unconditional, _records.text(options["modelname"], "modelname"), "bfloat16")
+    condition, vae = _towers(clip, unconditional, _records.text(options["modelname"], "modelname"),
+                             "bfloat16")
     encoder = condition.encoder
     context = encoder.encode(encoder.params, encoder.tokenize([unconditional]))
     if not isinstance(context, TextContext):

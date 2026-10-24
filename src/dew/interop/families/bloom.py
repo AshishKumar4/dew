@@ -33,7 +33,8 @@ def _bloom_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
                  'skip_bias_add', 'skip_bias_add_qkv', 'offset_alibi', 'n_inner', 'seq_length'))
     if hf.get('apply_residual_connection_post_layernorm', False):
         refuse('apply_residual_connection_post_layernorm', 'BLOOM residuals read the unnormalized input')
-    if hf.get('slow_but_exact', False) and _records.integer(hf.get('pretraining_tp', 1), 'pretraining_tp') > 1:
+    tensor_parallel = _records.integer(hf.get('pretraining_tp', 1), 'pretraining_tp')
+    if hf.get('slow_but_exact', False) and tensor_parallel > 1:
         refuse('slow_but_exact', 'the tensor-parallel reference drops projection biases')
     if hidden % heads:
         refuse('hidden_size/n_head', 'the hidden width must divide into whole attention heads')

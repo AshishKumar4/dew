@@ -169,7 +169,8 @@ def decoded(value: _records.JSON) -> Rebuilt:
     if "function" in value:
         return _located_function(_field(_records.text, value.get("function"), "function"))
     if "dataclass" in value:
-        cls, fields = _located(_field(_records.text, value.get("dataclass"), "dataclass")), value.get("fields")
+        cls = _located(_field(_records.text, value.get("dataclass"), "dataclass"))
+        fields = value.get("fields")
         if not dataclasses.is_dataclass(cls) or not isinstance(fields, dict) or set(fields) != {
                 field.name for field in dataclasses.fields(cls) if field.init}:
             raise Unreadable(f"{cls.__qualname__}'s stored fields are not this checkout's: {fields!r}")
@@ -316,7 +317,8 @@ def _timings(entries: object) -> Timings:
         measured[_key(decoded(config))] = tokamax.BenchmarkData(
             compile_time_ms=_field(_records.number, fields["compile_time_ms"], "compile_time_ms"),
             lower_time_ms=_field(_records.number, fields["lower_time_ms"], "lower_time_ms"),
-            evaluation_times_ms=_field(_records.numbers, fields["evaluation_times_ms"], "evaluation_times_ms"),
+            evaluation_times_ms=_field(_records.numbers, fields["evaluation_times_ms"],
+                                       "evaluation_times_ms"),
             metadata=metadata,
             peak_memory_mb=None if peak is None else _field(_records.number, peak, "peak_memory_mb"))
     return Timings(measured)
