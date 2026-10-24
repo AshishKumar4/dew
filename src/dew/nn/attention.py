@@ -51,7 +51,7 @@ from .flops import cross_attention_flops, projection_flops, self_attention_flops
 from .inputs import cu_seqlens
 from .kernels import decode_attention, generation, norm_swiglu
 from .kernels.generation import bf16_dot_runs, gpu_placed
-from .kernels.selection import forced, select
+from .kernels.selection import forced, select, selected
 from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import (
     asks_default_precision,
@@ -1718,7 +1718,7 @@ def kernel_for_materialized_mask(implementation: str, query, key, *, dtype=None,
     case = dataclasses.replace(attention_case(query, key, dtype=dtype, precision=precision,
                                               force_fp32_for_softmax=force_fp32_for_softmax, named='xla'),
                                mask=True, folds=False)
-    return 'reference' if ATTENTION.kernel('xla').failed(case) else 'xla'
+    return selected(ATTENTION, case, 'xla').name
 
 
 def cudnn_takes_mask(implementation: str, query, *, softcap=None, sinks: bool = False) -> bool:
