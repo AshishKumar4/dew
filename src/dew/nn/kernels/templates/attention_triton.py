@@ -620,35 +620,47 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
         others_ref, own_ref, others_total_ref, forward_total_ref = split_refs
         prior = forward_total_ref[...]
         anchor, delta, key_index = algebra.split_delta(
-            others_ref[...], own_ref[...], others_total_ref[...], prior, state_total, anchor_value_ref[...],
-            dout, key_index, shift, None if multiplier_ref is None else multiplier_ref[...])
+            others_ref[...], own_ref[...], others_total_ref[...], prior, state_total,
+            anchor_value_ref[...], dout, key_index, shift,
+            None if multiplier_ref is None else multiplier_ref[...])
     else:
         state = jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], row_terms, before)
         prior = algebra.power2(state.total, shift)
         anchor, delta, key_index = algebra.off_anchor_delta(state, anchor_value_ref[...], dout, state_total,
                                                             shares[1], key_index, shift)
     peak = maximum
-    index_out_ref[...] = key_index
     summed = tuple(kind in (Kind.HEAD, Kind.QUERY) for kind in score_kinds)
 
-    def step(index, carry):
-        # Each cotangent over the prior denominator, in the reference's order, and taken to the pass's
-        # own at the end (`algebra.dq_finish`); the weights' sums unnormalized.
-        keys, k_pos, seen, params = tile(index)
-        key, value = key_ref[keys, :], value_ref[keys, :]
-        zt = None if draw is None else draw(q_pos, k_pos)
-        weights, _, cotangents, slopes = _tile_scores(score_mod, query, key, value, dout, peak, prior, anchor,
-                                                   delta, seen, q_pos, k_pos, params, key_index=key_index,
-                                                   scale=scale, how=how, interpret=interpret, multiplier=zt)
-        return algebra.dq_step(carry, weights, cotangents, slopes, seen, key, prior, scale=scale,
-                               kinds=score_kinds, summed=summed, dot=product, accurate=accurate)
+    def sweep(anchor, delta, key_index):
+        # Each cotangent over the prior denominator, in the reference's order, and taken to the pass's own at
+        # the end (`algebra.dq_finish`); the weights' sums unnormalized.
+        def step(index, carry):
+            keys, k_pos, seen, params = tile(index)
+            key, value = key_ref[keys, :], value_ref[keys, :]
+            zt = None if draw is None else draw(q_pos, k_pos)
+            weights, _, cotangents, slopes = _tile_scores(
+                score_mod, query, key, value, dout, peak, prior, anchor, delta, seen, q_pos, k_pos, params,
+                key_index=key_index, scale=scale, how=how, interpret=interpret, multiplier=zt)
+            return algebra.dq_step(carry, weights, cotangents, slopes, seen, key, prior, scale=scale,
+                                   kinds=score_kinds, summed=summed, dot=product, accurate=accurate)
 
-    nothing = jnp.zeros((block_q,), jnp.float32)
-    rows = tuple(nothing for _ in score_kinds)
-    zeros = jnp.zeros(query.shape, jnp.float32)
-    sums = jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], step,
-                             algebra.DqSums(zeros, nothing, nothing, rows, rows, zeros, nothing,
-                                            jnp.full((block_q,), algebra.NO_SHIFT, jnp.float32)))
+        nothing = jnp.zeros((block_q,), jnp.float32)
+        rows = tuple(nothing for _ in score_kinds)
+        zeros = jnp.zeros(query.shape, jnp.float32)
+        return jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], step,
+                                 algebra.DqSums(zeros, nothing, nothing, rows, rows, zeros, nothing,
+                                                jnp.full((block_q,), algebra.NO_SHIFT, jnp.float32)))
+
+    if draw is not None:
+        # Dropout's D is the mean of its dropped score products, the cotangents' centre, as the portable
+        # launch takes it: a first sweep with no D, whose refinement (`algebra.dq_finish`) is that mean.
+        zero = jnp.zeros((block_q,), jnp.float32)
+        none = jnp.full_like(key_index, -1)
+        _, delta, *_ = algebra.dq_finish(sweep(zero, zero, none), prior, state_total, peak0, shares, peak,
+                                         zero, zero, accurate=accurate)
+        anchor, key_index = zero, none
+    index_out_ref[...] = key_index
+    sums = sweep(anchor, delta, key_index)
     dq, delta, total, mass, grads = algebra.dq_finish(sums, prior, state_total, peak0, shares, peak, anchor,
                                                       delta, accurate=accurate)
     dq_ref[...] = dq
