@@ -46,7 +46,7 @@ from dew.nn import categorical
 from dew.nn.cross_attention import ContextEncoder, crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import ModelInputs
-from dew.nn.protocols import CountedDecisions, CountedTraining, CrossAttending, TokenModel, VocabularyRows
+from dew.nn.protocols import CountedDecisions, CountedTraining, CrossAttending, TokenModel
 from dew.objectives.base import (
     FROZEN,
     OMITTED,
@@ -725,35 +725,7 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
         if "backbone" not in parts:
             parts["backbone"] = self.model.backbone.init(backbone_key, tokens)
         if "head" not in parts:
-            # The width the head was built for (its parameters read the states' width, not their dtype),
-            # not a trace of the backbone inside every trace of the state.
-            head = self.model.head
-            states = jnp.zeros((1, self.layout.max_len, getattr(head, head.width_field)), jnp.float32)
-            one = jnp.ones((1, 1), bool)
-            inputs = DecisionInputs(
-                tokens=tokens,
-                segments=jnp.ones_like(tokens),
-                kinds=jnp.zeros((1, 1), jnp.int32),
-                questions=one,
-                spans=jnp.asarray([[[0, 1]]]),
-                option_spans=jnp.asarray([[[[0, 1]]]]),
-                options=one[..., None],
-            )
-            backbone = joined({"backbone": parts["backbone"]})
-            if self.model.head.reads_labels:
-                # A readout draws its rows from the backbone's output table, or from its vocabulary rows
-                # where it reads them, its answer at position 0.
-                inputs = dataclasses.replace(inputs, readout=jnp.zeros((1, 1), jnp.int32))
-                gives_rows = isinstance(self.model.backbone, VocabularyRows)
-                table = (self.model.output_table(backbone) if not self.model.head.draws_from_rows
-                         else self.model.table(backbone) if gives_rows else None)
-                labels = self.model.head.tied_labels()
-                tied = (None if labels is None else
-                        jnp.zeros((1, 1, 1, len(labels[0])), jnp.float32))
-                parts["head"] = self.model.head.init(head_key, states, inputs, table, tied=tied)
-            else:
-                table = self.model.table(backbone) if self.model.head.reads_table else None
-                parts["head"] = self.model.head.init(head_key, states, inputs, table)
+            parts["head"] = self.model.initialize_head(head_key, parts["backbone"], tokens)
         return joined(parts)
 
     @property
