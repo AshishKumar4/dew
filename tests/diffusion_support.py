@@ -1,5 +1,6 @@
 """What the diffusion suites share: a sampler's step-by-step walk, a published source's one train step
-and its batch, and a student stepped once and saved as a run."""
+and its batch, a student stepped once and saved as a run, and a trainer's update held to its
+objective's gradient by check 1 (`moved_weights`, `applied`, `objective_gradient`)."""
 
 import jax
 import jax.numpy as jnp
@@ -200,6 +201,35 @@ def saved_after_one_step(config, batch, directory, rate: float, key: int = 3):
     checkpoints.wait()
     config.save(str(directory))
     return task, state, batch
+
+
+def moved_weights(variables):
+    """Check 1's `draw(seed)` over a trainer's `variables`: each trained leaf moved by the seed's draw,
+    so zero-initialized layers take a gradient too."""
+    host = jax.tree.map(np.asarray, variables)
+
+    def draw(seed):
+        keys = iter(jax.random.split(jax.random.key(seed), len(jax.tree.leaves(host["params"]))))
+
+        def moved_leaf(leaf):
+            return (leaf + 0.02 * np.asarray(jax.random.normal(next(keys), leaf.shape))).astype(leaf.dtype)
+
+        return ({**host, "params": jax.tree.map(moved_leaf, host["params"])},)
+
+    return draw
+
+
+def applied(before, after):
+    """sgd(1)'s update applied, in float64: the gradient with the update's float32 rounding."""
+    return np.asarray(before, np.float64) - np.asarray(after, np.float64)
+
+
+def objective_gradient(objective, variables, batch, step):
+    """`objective`'s gradient of its trained params over `batch` at `step`'s draws."""
+    def loss(params):
+        return objective.scalar_loss({**variables, "params": params}, batch, step)[0]
+
+    return jax.grad(loss)(variables["params"])
 
 
 class DeterministicObjective(Objective):
