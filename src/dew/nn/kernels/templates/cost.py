@@ -14,11 +14,26 @@ multiprocessor's `resident` programs (`resident`) wait together (Little's law). 
 
     program  = max(program_flops / tensor rate, program_staged / shared-memory rate,
                    program_exponentials / special-function rate)
+             + serial_staged / shared-memory rate + serial_exponentials / special-function rate
     waiting  = steps · load latency / (stages - 1)
-    compute  = ceil(programs / (multiprocessors · resident)) · max(resident · program, waiting)
+    tile     = program + serial_stored / (memory bandwidth / multiprocessors)
+    compute  = ceil(programs / (multiprocessors · resident)) · max(resident · tile, waiting)
     memory   = device_bytes / memory bandwidth
-    seconds  = max(compute, memory)
+    l2       = l2_bytes / L2 bandwidth
+    seconds  = max(compute, memory, l2) + programs * steps * grid step seconds (TPU's)
 
+`l2_bytes` are the bytes all programs stage from the L2 together: a tile every program re-reads (the
+keys and values each query block of attention walks, the operand bands each output tile of a GEMM
+reads) is served there, not from device memory, at the L2's rate, so a config of more, smaller programs
+stages more. A template states them; one that states none is ranked without the term.
+
+Work a program does between its matrix instructions, which they wait for, is serial: `serial_staged` bytes
+and `serial_exponentials` exponentials it adds to its service time rather than overlapping (a Mosaic
+mainloop's prologue, rewriting each stage in shared memory before the warpgroup MMA reads it). So are the
+`serial_stored` bytes a persistent program stores before its next tile's loads go out, at its
+multiprocessor's share of the device's bandwidth: a tile that builds its own pipeline has none of the next
+tile's stages in flight while its store drains, which at a kernel gradient's few steps a tile is most of
+the tile's time (GMMCOOP-h100's sweep), where a streamed tile loads the next one's stages during its own.
 A persistent launch's work items are its programs. Every rate is a fact of the target
 (`dew.nn.kernels.generation.GpuTarget`): its multiprocessors and clock, its memory bandwidth, and its
 generation's dense tensor FLOPs per clock per multiprocessor in the launch's arithmetic mode; the
@@ -68,6 +83,10 @@ class Cost:
     steps: float = 0.0
     stages: int = 2
     resident: int = 1
+    serial_staged: float = 0.0
+    serial_exponentials: float = 0.0
+    l2_bytes: float = 0.0
+    serial_stored: float = 0.0
 
 
 def seconds(cost: Cost, target: generation.GpuTarget) -> float:
@@ -81,19 +100,25 @@ def seconds(cost: Cost, target: generation.GpuTarget) -> float:
         raise ValueError(f"{facts.generation} ({facts.device_kind}) states no "
                          f"{', '.join(name for name, value in named if value is None)}, "
                          "which the kernel cost model needs")
-    program = program_seconds(cost, rate, clock)
     latency = facts.load_latency
+    program = program_seconds(cost, rate, clock) + cost.serial_stored * multiprocessors / bandwidth
     waiting = 0.0 if latency is None else waiting_seconds(cost, latency, clock)
     waves = math.ceil(cost.programs / (multiprocessors * cost.resident))
-    return max(waves * max(cost.resident * program, waiting), cost.device_bytes / bandwidth)
+    l2 = 0.0 if facts.l2_bandwidth is None else cost.l2_bytes / facts.l2_bandwidth
+    step = facts.grid_step_seconds
+    stepping = 0.0 if step is None else cost.programs * cost.steps * step
+    return max(waves * max(cost.resident * program, waiting), cost.device_bytes / bandwidth, l2) + stepping
 
 
 def program_seconds(cost: Cost, rate: float, clock: float) -> float:
     """One program's service time on a multiprocessor: its tensor-core, shared-memory or special-function
-    work, whichever takes longest at `rate` tensor FLOPs a clock and `clock` Hz (the module's docstring)."""
-    return max(cost.program_flops / (rate * clock),
-               cost.program_staged / (SHARED_BYTES_PER_CLOCK * clock),
-               cost.program_exponentials / (EXPONENTIALS_PER_CLOCK * clock))
+    work, whichever takes longest at `rate` tensor FLOPs a clock and `clock` Hz, plus its serial work (the
+    module's docstring)."""
+    return (max(cost.program_flops / (rate * clock),
+                cost.program_staged / (SHARED_BYTES_PER_CLOCK * clock),
+                cost.program_exponentials / (EXPONENTIALS_PER_CLOCK * clock))
+            + cost.serial_staged / (SHARED_BYTES_PER_CLOCK * clock)
+            + cost.serial_exponentials / (EXPONENTIALS_PER_CLOCK * clock))
 
 
 def waiting_seconds(cost: Cost, latency: float, clock: float) -> float:

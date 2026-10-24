@@ -358,7 +358,7 @@ class MultimodalTransformer(DecoderWrapper):
 
     def mtp_hidden_states(self, hidden, tokens, train: bool = False, positions=None,
                           segment_ids=None, image_indices=None, conditioning=None,
-                          attention_mask=None, image_groups=None, rotary_positions=None,
+                          attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
                           audio_indices=None, coordinates: Coordinates | None = None):
         """Run the multi-token prediction layers over the same media embeddings and
         token fields as the main decoder (`hidden_states`)."""
@@ -367,7 +367,8 @@ class MultimodalTransformer(DecoderWrapper):
         return self.language_model.mtp_hidden_states(
             hidden, fused.tokens, train=train, positions=positions, segment_ids=segment_ids,
             input_embeddings=fused.embeddings, attention_mask=attention_mask,
-            image_groups=image_groups, rotary_positions=rotary_positions, coordinates=coordinates)
+            image_groups=image_groups, block_groups=block_groups, rotary_positions=rotary_positions,
+            coordinates=coordinates)
 
     def mtp_logits(self, hidden, tokens, **kwargs):
         """Return the shared language head's logits for each media-aware prediction depth."""
@@ -398,7 +399,7 @@ class MultimodalTransformer(DecoderWrapper):
     def hidden_states(self, tokens, train: bool = False, decode: bool = False,
                       positions=None, segment_ids=None, image_indices=None,
                       conditioning: Mapping[str, jax.Array] | None = None,
-                      attention_mask=None, image_groups=None, rotary_positions=None,
+                      attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
                       audio_indices=None, routed_experts=None, routed=None, right_padded: bool = False,
                       coordinates: Coordinates | None = None):
         """Run the decoder over text with the media embeddings spliced in.
@@ -447,27 +448,30 @@ class MultimodalTransformer(DecoderWrapper):
         fused = self._fused(tokens, image_indices, audio_indices, media, train=train)
         return self.language_model.hidden_states(
             fused.tokens, train=train, decode=decode, input_embeddings=fused.embeddings,
-            image_groups=image_groups, rotary_positions=rotary_positions, media_mask=fused.media,
+            image_groups=image_groups, block_groups=block_groups, rotary_positions=rotary_positions,
+            media_mask=fused.media,
             routed_experts=routed_experts, routed=routed, coordinates=coordinates, conditioning=context)
 
     def __call__(self, tokens, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None, image_indices=None,
                  conditioning: Mapping[str, jax.Array] | None = None,
-                 attention_mask=None, image_groups=None, rotary_positions=None,
+                 attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
                  audio_indices=None, coordinates: Coordinates | None = None):
         hidden = self.hidden_states(tokens, train=train, decode=decode, positions=positions,
                                     segment_ids=segment_ids, image_indices=image_indices,
                                     conditioning=conditioning, attention_mask=attention_mask,
-                                    image_groups=image_groups, rotary_positions=rotary_positions,
-                                    audio_indices=audio_indices, coordinates=coordinates)
+                                    image_groups=image_groups, block_groups=block_groups,
+                                    rotary_positions=rotary_positions, audio_indices=audio_indices,
+                                    coordinates=coordinates)
         if self.is_initializing() and self.language_model.dspark is not None:
             self.language_model.reach_drafter(tokens, hidden.dtype)
         if self.is_initializing() and self.num_nextn_predict_layers:
             self.mtp_hidden_states(hidden, tokens, train=train, positions=positions,
                                    segment_ids=segment_ids, image_indices=image_indices,
                                    conditioning=conditioning, attention_mask=attention_mask,
-                                   image_groups=image_groups, rotary_positions=rotary_positions,
-                                   audio_indices=audio_indices, coordinates=coordinates)
+                                   image_groups=image_groups, block_groups=block_groups,
+                                   rotary_positions=rotary_positions, audio_indices=audio_indices,
+                                   coordinates=coordinates)
         return self.language_model.logits_from_hidden(hidden)
 
     def logits(self, tokens, *, train: bool = False, **fields):

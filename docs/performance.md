@@ -1647,7 +1647,7 @@ sm120, where it was measured; the row is what qualification reads), on any
 heads, dtypes, chunk sizes and mesh, with keys up to 256 wide in bf16 or
 fp16 and 128 in fp32 (`recurrence_chunk.fla_rule`). The XLA math stays for
 CPUs, TPUs, unmeasured GPUs, forward-mode traces, float64 and wider keys,
-and as the tests' oracle (`port_refusal` names each case).
+and as the tests' oracle (`recurrence_chunk.PORT_SUPPORTS` names each case).
 On a G4 the port's bf16 forward ran 1.32 and 1.18 ms at the 0.8B's (8 x
 3072 tokens, 16 key and 16 value heads of 128) and the 9B's (4 x 3072, 16
 and 32) shapes against fla's 2.66 and 2.37 (kernel lab `fwd` job,
@@ -3038,7 +3038,7 @@ other GPU.
 
 Each kernel's implementation is chosen in one place and keyed by hardware generation (`dew.nn.kernels.device_generation`: `sm80`, `sm86`, `sm89`, `v5e`, `v6e`, ...), and a generation without a measurement here runs the XLA path. `tools/benchmark_kernels.py` and `tools/benchmark_lm_head.py` reproduce the rows. Each row is one process with jax 0.11.1 and bf16 compute, on a Colab NVIDIA L4 (the RTX 4080's architecture, sm_89), a Colab TPU v6e-1, or, for the kernel-level rows, the local RTX 4080. The step rows come from `tools/benchmark_kernels.py step` (built on `tools/benchmark_step.py`'s trainer), with 30 timed steps after 5 warmup. lm-moe has 321.8M parameters with 8 experts and top-2 routing, and lm-dense has 359.8M; both run at sequence 1024. The batch is 4 (moe) and 1 (dense) on the L4, and 8 and 8 on the v6e. "before" is main at c1f7e2dd.
 
-A call that runs another kernel where a row here measured one fastest logs a warning, once a process for each kernel and reason, on the `dew` logger: `attention runs 'cudnn', not 'flash', the kernel measured fastest on sm80: dew_flash_attn is not installed` (`dew.nn.kernels.ran_kernel`). A change that sends calls off the measured kernel shows in a run's log, not only in its step time.
+A call that runs another kernel where a row here measured one fastest logs a warning, once a process for each kernel and reason, on the `dew` logger: `attention runs 'cudnn', not 'flash', the kernel measured fastest on sm80: dew_flash_attn is not installed` (`dew.nn.kernels.generation.route`). A change that sends calls off the measured kernel shows in a run's log, not only in its step time.
 
 ### The MoE grouped matmul: `KERNELS['grouped_matmul']`
 
@@ -3061,7 +3061,7 @@ The kernel-matrix rows time forward plus backward at jax 0.11.2, checked against
 
 I rejected a pure-JAX loop of dense per-tile products. On the RTX 4080 it was 2.2x faster than XLA for the projection alone (6.67 ms), but it doubled the step's temporaries (4.22 GiB against 2.17 at batch 1), and on the v6e it was 2.2x slower than XLA (1.71 ms against 0.79).
 
-The Pallas kernels are JAX's own `gmm` and `tgmm` from the jax-v0.11.2 source tree, vendored because no wheel ships them and called through a custom VJP. jax 0.11.2 deprecates the Pallas Triton backend they run on and warns at every lowering. They are the sm80 to sm90 path anyway, because JAX's Mosaic GPU grouped matmul (`pallas/ops/gpu/ragged_dot_mgpu.py`) uses wgmma and fails to compile on the RTX 4080, tokamax's sm80 Mosaic config exceeds Ada's shared memory, and on an H100 tokamax's Mosaic GPU kernel only matched their forward (below). Dew does not silence the warning, so filtering it is up to you. On a mesh the kernels run inside `shard_map` on each device's share of the sorted rows. That path is checked for parity on an 8-device CPU mesh and not measured on multiple GPUs.
+The Pallas kernels are JAX's own `gmm` and `tgmm` from the jax-v0.11.2 source tree, vendored because no wheel ships them and run, with Dew's Mosaic GPU kernels on Hopper, through Dew's GEMM template, which differentiates them. jax 0.11.2 deprecates the Pallas Triton backend they run on and warns at every lowering. They are the sm80 to sm90 path anyway, because JAX's Mosaic GPU grouped matmul (`pallas/ops/gpu/ragged_dot_mgpu.py`) uses wgmma and fails to compile on the RTX 4080, tokamax's sm80 Mosaic config exceeds Ada's shared memory, and on an H100 tokamax's Mosaic GPU kernel only matched their forward (below). Dew does not silence the warning, so filtering it is up to you. On a mesh the kernels run inside `shard_map` on each device's share of the sorted rows. That path is checked for parity on an 8-device CPU mesh and not measured on multiple GPUs.
 
 On TPU, tokamax's `mosaic_tpu_v2` was within 1% of XLA on the step; tokamax's default dispatch picked its v1 kernel there, which is 13x slower, so Dew named the kernel. With XLA as fast or faster on a v6e at the step and at 128 experts, TPUs run XLA, and Dew has no tokamax grouped matmul.
 

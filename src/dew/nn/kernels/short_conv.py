@@ -26,9 +26,10 @@ tokens (`Walk`), and a loop steps all of them forward one token at a time, carry
 pre-activation gradients, so each token's conv, silu, norm and their gradients are computed once. A
 run reads the K-1 tokens before it and computes K-1 past its end, `(K - 1) / steps` extra.
 
-Both launches are the tuner's (`dew.nn.kernels.tuning`): each takes the config measured for its GPU
-and shape where there is one, `TILE` and `WALK` without, and its float64 gate holds at every config
-of its space (tests/test_short_conv.py).
+The conv selector (`CONV`) runs them where their requirements hold and XLA's conv elsewhere, reported
+as the call's route ('short_conv'). Both launches are the tuner's (`dew.nn.kernels.tuning`): each
+takes the config measured for its GPU and shape where there is one, `TILE` and `WALK` without, and its
+float64 gate holds at every config of its space (tests/test_short_conv.py).
 
 The arithmetic is `causal_conv1d`'s in fp32, each output rounded once to its dtype: the conv's
 products summed tap by tap, as XLA sums them, and the sigmoid's quotient and the norm's root and
@@ -46,9 +47,12 @@ from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.experimental import pallas as pl
 
 from . import generation, tuning
+from .generation import INHERENT
+from .selection import Kernel, Op, Requirement
 
 WIDEST_TAPS = 8
 """The longest conv the kernels unroll: each tap is a register tile the walk carries."""
@@ -74,21 +78,53 @@ def _fits(width: int, head: int | None) -> bool:
     return block & (block - 1) == 0 and 16 <= block <= (128 if head is None else 256) and width % block == 0
 
 
-def refusal(x, taps, parts, dtype) -> str | None:
-    """Why the kernels do not take a conv of `x` `[B, T, C]` by `taps` `[C, K]` into `parts` in `dtype`,
-    or None where they do."""
-    channels = x.shape[-1]
-    return generation.first_refusal(
-        (x.ndim == 3 and x.shape[1] > 0, f"a conv over {x.shape}; the kernels take [B, T, C]"),
-        (jnp.dtype(x.dtype) in DTYPES and jnp.dtype(dtype) in DTYPES,
-         f"{x.dtype} inputs into {jnp.dtype(dtype)}; the kernels read and write float32, bfloat16 or "
-         "float16, summing in float32"),
-        (2 <= taps.shape[-1] <= WIDEST_TAPS, f"{taps.shape[-1]} taps; the kernels unroll 2 to {WIDEST_TAPS}"),
-        (sum(width for width, _ in parts) == channels, f"pieces {parts} of {channels} channels"),
-        (all(_fits(width, head) for width, head in parts),
-         f"pieces {parts}: each a multiple of its block, a normalised piece's power-of-two head up to "
-         "256, another's 16 to 128 channels"),
-    )
+@dataclasses.dataclass(frozen=True)
+class ConvCase:
+    """A conv as the conv selector reads it (`CONV`): whether the kernels run here (`placed`), whether
+    the call is reverse mode's (`reverse`: a caller differentiating forward sets `FORWARD_MODE`, and the
+    kernels implement a VJP), whether no mesh axis splits its operand (`whole`), the operand's `shape`
+    and `dtype`, the dtype it is written in (`out`), its `taps` and its pieces (`parts`, `(width, head)`
+    each)."""
+
+    placed: bool
+    reverse: bool
+    whole: bool
+    shape: tuple[int, ...]
+    dtype: np.dtype
+    out: np.dtype
+    taps: int
+    parts: tuple[tuple[int, int | None], ...]
+
+
+SUPPORTS: tuple[Requirement[ConvCase], ...] = (
+    Requirement('capability', lambda case: case.placed, "the kernels need a GPU of sm80 or later",
+                row=INHERENT),
+    Requirement('forward_mode', lambda case: case.reverse,
+                "a JVP trace needs forward-mode derivatives; the kernels implement a VJP", row=INHERENT),
+    Requirement('placement', lambda case: case.whole,
+                "a mesh axis splits the conv's operands, and the kernels see whole arrays",
+                row='ledger 1306'),
+    Requirement('shape', lambda case: len(case.shape) == 3 and case.shape[1] > 0,
+                lambda case: f"a conv over {case.shape}; the kernels take [B, T, C]", row=INHERENT),
+    Requirement('dtype', lambda case: case.dtype in DTYPES and case.out in DTYPES,
+                lambda case: f"{case.dtype} inputs into {case.out}; the kernels read and write float32, "
+                             "bfloat16 or float16, summing in float32", row=INHERENT),
+    Requirement('taps', lambda case: 2 <= case.taps <= WIDEST_TAPS,
+                lambda case: f"{case.taps} taps; the kernels unroll 2 to {WIDEST_TAPS}", row=INHERENT),
+    Requirement('pieces', lambda case: sum(width for width, _ in case.parts) == case.shape[-1],
+                lambda case: f"pieces {case.parts} of {case.shape[-1]} channels", row=INHERENT),
+    Requirement('blocks', lambda case: all(_fits(width, head) for width, head in case.parts),
+                lambda case: f"pieces {case.parts}: each a multiple of its block, a normalised piece's "
+                             "power-of-two head up to 256, another's 16 to 128 channels", row=INHERENT),
+)
+"""What the kernels need of a conv: a GPU they compile for, reverse mode, an operand no mesh axis splits,
+and the shapes and dtypes they take."""
+
+CONV: Op[ConvCase] = Op('short_conv', (Kernel('pallas', SUPPORTS), Kernel('xla', (), generic=True)),
+                        lambda case: generation.measured_kernel(
+                            'short_conv', 'pallas' if generation.backend() == 'gpu' else 'xla'))
+"""The conv selector: the kernels on a GPU where their requirements hold, else XLA's conv
+(`dew.nn.linear.xla_conv1d`)."""
 
 
 def _program(first: int, block: int, segments: int, steps: int):

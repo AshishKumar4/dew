@@ -7,6 +7,8 @@ harness that runs a Dew implementation to its output and three input gradients. 
 runs here but the implementation a harness names.
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -90,12 +92,37 @@ def kept(q_len, k_len, *, causal=False, sliding_window=None, window=None, mask=N
     return keep
 
 
-def float64_weights(q, k, keep, sinks, softcap):
+@jax.custom_vjp
+def anchored_softmax(logits):
+    """`jax.nn.softmax` over the last axis, whose VJP takes each row's `D = sum p g` about its largest
+    weight's `g`: `p ((g - g_a) - sum p (g - g_a))`, the same derivative since the weights sum to one,
+    with no term the size of `g` cancelling to a tiny one. The float64 truth's form: at logits near 1e4
+    a row's weights span 1 to 1e-22, and the plain form's `g_a - D` cancels below float64's ulp at
+    `g_a`'s size, a weight of 1e-22's share lost from the anchor's gradient."""
+    return jax.nn.softmax(logits, axis=-1)
+
+
+def _anchored_forward(logits):
+    weights = jax.nn.softmax(logits, axis=-1)
+    return weights, weights
+
+
+def _anchored_backward(weights, cotangent):
+    anchor = jnp.take_along_axis(cotangent, jnp.argmax(weights, axis=-1, keepdims=True), axis=-1)
+    relative = cotangent - anchor
+    return (weights * (relative - jnp.sum(weights * relative, axis=-1, keepdims=True)),)
+
+
+anchored_softmax.defvjp(_anchored_forward, _anchored_backward)
+
+
+def float64_weights(q, k, keep, sinks, softcap, *, anchored: bool = False):
     """The attention weights of `[B, S, H, D]` queries over their keys, key
     heads repeated over their group, and the logits before the cap: over
     sqrt(D), capped `c tanh(l / c)`, the keys `keep` `[B or 1, 1, q, k]`
-    keeps, a softmax whose denominator a sink joins. A query that keeps no
-    key has no weight."""
+    keeps, a softmax whose denominator a sink joins, its derivative the
+    float64 truth's (`anchored_softmax`) where `anchored`. A query that keeps
+    no key has no weight."""
     heads, kv_heads = q.shape[2], k.shape[2]
     group = jnp.arange(heads) // (heads // kv_heads)
     raw = jnp.einsum('bqhd,bkhd->bhqk', q, k[:, :, group]) / np.sqrt(q.shape[3])
@@ -108,7 +135,8 @@ def float64_weights(q, k, keep, sinks, softcap):
     if sinks is not None:
         sink = jnp.broadcast_to(sinks[None, :, None, None], (*logits.shape[:3], 1))
         logits = jnp.concatenate([logits, sink], -1)
-    return jnp.where(keep & sees, jax.nn.softmax(logits, axis=-1)[..., :keep.shape[-1]], 0.0), raw
+    softmax = anchored_softmax if anchored else functools.partial(jax.nn.softmax, axis=-1)
+    return jnp.where(keep & sees, softmax(logits)[..., :keep.shape[-1]], 0.0), raw
 
 
 def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None):
@@ -147,21 +175,24 @@ def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None
         return [np.asarray(x) for x in terms]
 
 
-def exact_attention(q, k, v, s=None, *, softcap=None, keep=None, **structure):
+def exact_attention(q, k, v, s=None, *, softcap=None, keep=None, anchored: bool = False, **structure):
     """Attention written out apart from every Dew path, in the inputs' dtype: the logits of query
     head h against key head h // (Hq // Hkv) over sqrt(D), capped `c tanh(l / c)`, then the keys
     `keep` `[B or 1, 1, q, k]` keeps (`kept`'s by `structure` where None), a softmax whose denominator
-    a sink joins, and the values. A query that keeps no key reads nothing: its output is zero."""
+    a sink joins, and the values. A query that keeps no key reads nothing: its output is zero. The
+    float64 truth takes `anchored`, its softmax's derivative about each row's largest weight
+    (`anchored_softmax`); the reference arm, the plain one, as XLA differentiates it."""
     group = jnp.arange(q.shape[2]) // (q.shape[2] // k.shape[2])
     keep = kept(q.shape[1], k.shape[1], **structure) if keep is None else keep
-    weights, _ = float64_weights(q, k, keep, s, softcap)
+    weights, _ = float64_weights(q, k, keep, s, softcap, anchored=anchored)
     return jnp.einsum('bhqk,bkhd->bqhd', weights, v[:, :, group])
 
 
 def exact_value_and_grads(query, key, value, sinks=None, live=None, softcap=None, **structure):
-    """`value_and_grads`' output and gradients in float64 (`exact_attention`)."""
+    """`value_and_grads`' output and gradients in float64 (`exact_attention`, its anchored
+    derivative)."""
     def loss(q, k, v, s):
-        out = exact_attention(q, k, v, s, softcap=softcap, **structure)
+        out = exact_attention(q, k, v, s, softcap=softcap, anchored=True, **structure)
         if live is not None:
             out = jnp.where(np.asarray(live)[:, :, None, None], out, 0)
         return jnp.sum(out ** 2), out

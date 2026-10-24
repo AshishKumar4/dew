@@ -16,6 +16,23 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   (`DecisionRunConfig.segments`): the backbone reads the schema in a pass of its own, with its own
   weights, its cross-attention layers read that pass beside the row, and the joint head pools the
   questions and options from it; the pass counts in `train/flops`.
+- `dew.nn.attention.scaled_dot_product_attention(..., implementation='template')`
+  runs the attention template's route
+  (`dew.nn.kernels.templates.attention_route.attend`): causality, windows,
+  documents, key lengths and starts, a softcap and sinks, differentiable in the
+  query, key, value and sinks. It runs the Triton and Mosaic GPU mainloops on a
+  GPU and the plain-JAX one elsewhere, per shard on a mesh. No target prefers it
+  yet, so a call takes it only when it names it, or
+  `generation.chosen(attention='template')` does.
+- `dew.nn.moe.expert_projection` with `'pallas'` or `'auto'` runs its grouped
+  matmuls through Dew's GEMM template and differentiates at every order:
+  forward mode and higher-order derivatives no longer need `'xla'`. The old
+  first-order-only path, `dew.nn.kernels.grouped_projection`, and
+  `dew.nn.moe.grouped_matmul_kernel` are removed.
+- The grouped GEMM's kernel gradient on Hopper streams its operand stages
+  across a persistent tile loop, so the next tile's loads overlap this one's
+  stores; it runs as fast as CUTLASS's grouped kernel gradient at the MoE
+  shapes measured. A fused RMS norm's Mosaic GPU forward now lowers on Hopper.
 - A run's W&B display name is its own, `Wandb.name` (`--trainer.wandb.name`), apart from the
   name its checkpoints are kept under; it shows the run's name where none is given.
 - `Checkpoints.committed()` lists a run's committed steps at each call without opening or writing

@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 import tokamax
 from fla_gdn_support import CONV_SHAPES, conv_config_cases, conv_training_cases, kda_training_cases
+from generation_support import lowers
 from kernel_compile import compile_kernels, failures
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, recurrence, short_conv, tuning
@@ -29,15 +30,15 @@ def test_the_compiled_shapes_reach_the_widest_keys_and_values_the_port_takes():
 
 
 @pytest.mark.parametrize("target, wide", [("sm80", True), ("sm90", True), ("sm86", False), ("sm89", False),
-                                          ("sm120", False), ("sm100", True), ("sm103", False), ("cpu", True)])
+                                          ("sm120", False), ("sm100", True), ("sm110", False), ("cpu", True)])
 def test_a_gpu_takes_an_a100s_picks_where_its_block_holds_as_much_shared_memory(target, wide):
     """An A100's picks on every GPU whose block holds as much shared memory, the 99 KB ones elsewhere,
-    on a GPU the targets do not list (sm103) too, and an A100's where a CPU interprets."""
+    on a GPU the targets do not list (sm110) too, and an A100's where a CPU interprets."""
     with generation.assumed(target):
         assert chunked_launch._wide() is wide
 
 
-@pytest.mark.parametrize("target", [*generation.TARGETS, "sm103", "cpu"])
+@pytest.mark.parametrize("target", [*generation.TARGETS, "sm110", "cpu"])
 def test_each_targets_space_holds_its_picks(target):
     """On every target `generation.TARGETS` lists, a GPU it does not and a CPU, every kernel's 16-bit
     space at the target's width holds its unmeasured pick, Kimi delta attention's own kernels' too, and
@@ -187,6 +188,7 @@ def test_every_short_conv_config_compiles_on_tritons_compiler_within_each_gpus_b
     assert not failures(found), "\n".join(failures(found))
 
 
+@lowers("sm90")
 def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources():
     """The GEMM template's Mosaic GPU grouped matmul, lone and cooperative, compiled by Mosaic for a
     compile-only H100 on this CPU through ptxas (tests/kernel_compile.py): within the multiprocessor's

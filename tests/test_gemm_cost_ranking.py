@@ -25,9 +25,6 @@ SHAPES = {"qwen3-30b-a3b gate_up": (65536, 2048, 1536, 128), "qwen3-30b-a3b down
 LOADED_LATENCY = "the load latency under load, the waiting term's being unloaded (no measurement gives it)"
 TRANSPOSED_READS = "the kernel gradient's transposed-operand shared-memory reads, which cost 8 warps more"
 L2_REUSE = "the L2's reuse of a few experts' weights, which the device-byte term counts as rereads"
-ACCUMULATOR_REGISTERS = "a warpgroup's accumulator registers at 192 columns, which the model does not charge"
-CONSUMER_OVERLAP = ("two consumer warpgroups overlapping each other's MMA issue and epilogue, which the "
-                    "model's one warpgroup's latency term does not credit")
 MISSES = {
     ("sm80", "triton", "qwen3-30b-a3b gate_up", "kernel_gradient"): TRANSPOSED_READS,
     ("sm80", "triton", "kimi-linear gate_up", "kernel_gradient"): TRANSPOSED_READS,
@@ -43,9 +40,6 @@ MISSES = {
     ("sm80", "triton", "mixtral up", "forward"): L2_REUSE,
     ("sm80", "triton", "mixtral up", "input_gradient"): L2_REUSE,
     ("sm80", "triton", "mixtral down", "forward"): L2_REUSE,
-    ("sm90", "mosaic_gpu", "qwen3-30b-a3b gate_up", "kernel_gradient_fp32"): ACCUMULATOR_REGISTERS,
-    ("sm90", "mosaic_gpu", "kimi-linear down", "kernel_gradient"): CONSUMER_OVERLAP,
-    ("sm90", "mosaic_gpu", "targets-comment", "kernel_gradient"): CONSUMER_OVERLAP,
     ("sm90", "triton", "kimi-linear gate_up", "kernel_gradient"): TRANSPOSED_READS,
     ("sm90", "triton", "kimi-linear gate_up", "kernel_gradient_fp32"): TRANSPOSED_READS,
     ("sm90", "triton", "kimi-linear down", "kernel_gradient"): TRANSPOSED_READS,
@@ -54,6 +48,7 @@ MISSES = {
     ("sm90", "triton", "targets-comment", "forward"): LOADED_LATENCY,
     ("sm90", "triton", "targets-comment", "input_gradient"): LOADED_LATENCY,
     ("sm90", "mosaic_gpu", "mixtral up", "forward"): L2_REUSE,
+    ("sm90", "mosaic_gpu", "mixtral up", "kernel_gradient_fp32"): L2_REUSE,
     ("sm90", "triton", "mixtral up", "forward"): L2_REUSE,
     ("sm90", "triton", "mixtral up", "input_gradient"): L2_REUSE,
     ("sm90", "triton", "mixtral down", "forward"): L2_REUSE,
@@ -61,7 +56,7 @@ MISSES = {
     ("sm90", "triton", "mixtral down", "input_gradient"): L2_REUSE,
 }
 """Each case whose pick runs past 10% of the best, by generation, implementation, shape and product, with
-the term the model lacks: 30 of the 84 swept (2026-10-21; GMMT-a100, GMMCOOP-h100, whose sweep times the
+the term the model lacks: 28 of the 84 swept (2026-10-23; GMMT-a100, GMMCOOP-h100, whose sweep times the
 cooperative tiles)."""
 
 
@@ -79,7 +74,7 @@ def _launch(record):
         return launch, (bf16((rows, depth)), bf16((groups, depth, width)), sizes), {
             "out_dtype": "bfloat16", "trans_rhs": False}
     if product == "input_gradient":
-        launch = grouped_matmul.MosaicGmmTransposed() if mosaic else grouped_matmul.GmmTransposed()
+        launch = grouped_matmul.MosaicGmm() if mosaic else grouped_matmul.Gmm()
         return launch, (bf16((rows, width)), bf16((groups, depth, width)), sizes), {
             "out_dtype": "bfloat16", "trans_rhs": True}
     launch = grouped_matmul.MosaicTgmm() if mosaic else grouped_matmul.Tgmm()
