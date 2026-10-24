@@ -412,13 +412,8 @@ class Pretrained:
 
         dtype = dtype_name(dtype)
         param_dtype = AUTO if param_dtype == AUTO else dtype_name(param_dtype)
-        directory = sources.snapshot(str(name_or_dir), revision, weights=False)
-        # A Hub snapshot directory is named by its commit.
-        commit = None if os.path.isdir(name_or_dir) else directory.name
-        folder = "" if subfolder is None else subfolder
-        if Path(folder).is_absolute() or ".." in Path(folder).parts:
-            raise ValueError("subfolder must stay inside the resolved source")
-        composite = None if selected or fallback is not None else _composite_description(directory / folder)
+        directory, commit, folder, composite = _source_metadata(
+            name_or_dir, revision, subfolder, selected, fallback)
         if composite is not None:
             loaded = _load_composite_source(name_or_dir, directory, commit, folder, composite,
                                             placed=placed, streaming=streaming or not weights, dtype=dtype,
@@ -1361,6 +1356,20 @@ def _selected_payload(fallback: str | None, **files: str | None) -> list[str]:
                          f"and weights describe, and {' and '.join(selected)} selects another payload; "
                          "load it without fallback")
     return selected
+
+
+def _source_metadata(name_or_dir: str | Path, revision: str | None, subfolder: str | None,
+                      selected: list, fallback: str | None
+                      ) -> tuple[Path, str | None, str, CompositeSource | None]:
+    """Resolve one metadata snapshot and selected folder before any component's weights are read.
+    Explicit payload/fallback selections take precedence over composite metadata."""
+    directory = sources.snapshot(str(name_or_dir), revision, weights=False)
+    commit = None if os.path.isdir(name_or_dir) else directory.name
+    folder = "" if subfolder is None else subfolder
+    if Path(folder).is_absolute() or ".." in Path(folder).parts:
+        raise ValueError("subfolder must stay inside the resolved source")
+    composite = None if selected or fallback is not None else _composite_description(directory / folder)
+    return directory, commit, folder, composite
 
 
 def _composite_description(directory: Path) -> CompositeSource | None:

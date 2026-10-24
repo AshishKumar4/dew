@@ -45,7 +45,7 @@ class DecisionHeadSource(HeadComponent):
         configured = {name: value for name, value in fields.items() if name != "hidden_size"}
         return Head.from_record(records.json_value({**held, "fields": {
             **configured, "dtype": None if compute is None else dtype_name(compute),
-            "attention_impl": attention_impl}}), width)
+            "attention_impl": attention_impl}}, "head"), width)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -132,7 +132,7 @@ class DecisionSource(SourceKind):
             fields = {key: records.integer(config[key], key)
                       for key in ("hidden_size", "width", "routing_layers", "layers", "heads", "feedforward")}
             head = DecisionHeadSource(records.json_value({"name": import_path(JointSchemaHead),
-                                                          "fields": fields}),
+                                                          "fields": fields}, "head"),
                                       _path, IN_PROJ, HEAD_WEIGHTS,
                                       partial(_shaped, fields["hidden_size"]))
             layout, calibration = JointLayout(), Calibration()

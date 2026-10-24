@@ -62,6 +62,7 @@ from dew.files import write_atomically
 from dew.inference import scoring
 from dew.inference.tasks import shape_bucket
 from dew.interop.processors import Processor
+from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.nn.inputs import ModelInputs, RowPlan, mesh_of
 from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import Metric, Objective, Variables, joined
@@ -269,7 +270,7 @@ class Decide:
                        budget=from_record(Budget, records.json_value(settings["budget"], "budget")),
                        name=records.text(settings["name"], "name"))
 
-    def save_pretrained(self, directory: str | Path, *, max_shard_size: int | str = "5GB") -> None:
+    def save_pretrained(self, directory: str | Path, *, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
         """Write this task as a released checkpoint, which `from_pretrained` reads back.
 
         A ModernBERT backbone under Laya's head and layout is written in Laya's

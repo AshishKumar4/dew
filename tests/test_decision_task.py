@@ -52,7 +52,13 @@ def test_a_decision_source_loads_through_pretrained_and_its_declared_pipeline(de
     task = replace(Decide.of(bundle), name=decide.name)
     request = CASES["quickstart"]
     assert task.systemone(request) == decide.systemone(request)
-    bundle.save(tmp_path / "export")
+    original = jax.tree.map(lambda value: np.asarray(value).copy(), bundle.variables)
+    for _ in range(2):
+        assert_same_rounded_answers(replace(bundle.pipeline(), name=decide.name).systemone(request),
+                                    decide.systemone(request), "borrowed bundle task")
+    for held, expected in zip(jax.tree.leaves(bundle.variables), jax.tree.leaves(original), strict=True):
+        np.testing.assert_array_equal(held, expected)
+    bundle.save(tmp_path / "export", variables=bundle.variables, max_shard_size="10KB")
     served = pipeline(str(tmp_path / "export"), dtype="float32")
     assert_same_rounded_answers(replace(served, name=decide.name).systemone(request),
                                 decide.systemone(request), "public source pipeline")
