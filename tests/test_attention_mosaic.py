@@ -341,6 +341,48 @@ def test_padding_rows_reach_no_hook_gradient_interpreted(queries, form):
         np.testing.assert_array_equal(np.asarray(found, np.float32), np.asarray(expected, np.float32))
 
 
+@INTERPRETS
+def test_the_training_forwards_overflowed_rows_keep_their_form_and_every_other_row_interpreted():
+    """A call as many queries as heads, one consumer's tile of them, whose head 0 sees two keys of equal
+    logits past the fold's reach over values near bf16's largest: the call walks again unfolded, and head
+    0's rows, whose weighted values overflow, take the guarded walk in that form (`algebra.unfolded`), its
+    residuals in its units. Head 0's output is its values' mean, as the reference's; every other head's rows
+    are the plain launch's bits, as where head 0's values do not overflow; and the backward from these
+    residuals gives head 0's values a gradient wherever the reference does, finite where it is."""
+    queries, keys, width = 64, 2, 64
+    spans = template.spans(queries, keys, 1)
+    streams = jax.random.split(jax.random.key(0), 4)
+    query, key, value, dout = (jax.random.normal(stream, (1, count, queries, width), jnp.float32)
+                               for stream, count in zip(streams, (queries, keys, keys, queries), strict=True))
+    # Head 0's logits, 128 * 128 * 64 / 8, past the fold's reach; its values overflow a sum of two or not.
+    query, key = (array.at[:, :, 0].set(128.0) for array in (query, key))
+    query, key, dout = (array.astype(jnp.bfloat16) for array in (query, key, dout))
+    tiles = attention_mosaic.Tiles(64, 64, 2, 1)
+
+    def trained(value):
+        with _device(interpret=True), _pinned(tiles):
+            return attention_mosaic.forward(query, key, value, spans, residuals=True, interpret=True)
+
+    largest = value.at[:, :, 0].set(3e38).astype(jnp.bfloat16)
+    out, *residuals = trained(largest)
+    ordinary_out, *ordinary = trained(value.at[:, :, 0].set(1.0).astype(jnp.bfloat16))
+    expected = template.reference(query, key, largest, spans)
+    np.testing.assert_array_equal(np.asarray(out[:, :, 0], np.float32),
+                                  np.asarray(expected[:, :, 0], np.float32))
+    np.testing.assert_array_equal(np.asarray(out[:, :, 1:]), np.asarray(ordinary_out[:, :, 1:]))
+    for found, plain in zip(residuals[:3], ordinary[:3], strict=True):
+        np.testing.assert_array_equal(np.asarray(found[:, 1:]), np.asarray(plain[:, 1:]))
+    with _device(interpret=True):
+        grads = attention_mosaic.backward(query, key, largest, spans, None, dout, residuals=tuple(residuals),
+                                          interpret=True)
+    _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans), query, key, largest)
+    reference_value = np.asarray(pull(dout)[2], np.float32)
+    found_value = np.asarray(grads.value, np.float32)
+    finite = np.isfinite(reference_value)
+    assert np.isfinite(found_value[finite]).all()
+    assert (found_value[finite & (reference_value != 0)] != 0).all()
+
+
 UNSEEN = {
     "hopper-class": generation.GpuTarget("sm90", "Unmeasured Hopper-class GPU", shared_limit=180 * 1024,
                                          multiprocessors=78, clock_hz=1.6e9, memory_bandwidth=2.4e12,
