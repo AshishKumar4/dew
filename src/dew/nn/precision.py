@@ -156,22 +156,17 @@ def _intercepted() -> bool:
     return QUANTIZED_TRACE.value is not None
 
 
+_OWN_DERIVATIVES = (core.primitives.custom_vjp_call_p, core.primitives.custom_jvp_call_p)
+"""JAX's primitives for a function that states its own derivative (`jax.custom_vjp`, `jax.custom_jvp`)."""
+
+
 def _own_backward(jaxpr) -> bool:
-    """Whether a product's trace calls a backward of its own (a `jax.custom_vjp`, as Qwix's quantized
-    products are when Qwix quantizes a model directly), in it or any program inside it: a product its
-    library owns, which `accumulated` neither widens nor transposes."""
-
-    def programs(value):
-        return isinstance(value, (core.Jaxpr, core.ClosedJaxpr))
-
-    for eqn in jaxpr.eqns:
-        if eqn.primitive is core.primitives.custom_vjp_call_p:
-            return True
-        inner = [value.jaxpr if isinstance(value, core.ClosedJaxpr) else value
-                 for value in jax.tree.leaves(eqn.params, is_leaf=programs) if programs(value)]
-        if any(_own_backward(program) for program in inner):
-            return True
-    return False
+    """Whether a product's trace states a derivative of its own (a `jax.custom_vjp`, as Qwix's
+    quantized products are when Qwix quantizes a model directly, or a `jax.custom_jvp`), in it or any
+    program inside it (`jax.extend.core.subjaxprs`): a product its library owns, which `accumulated`
+    neither widens nor transposes, since a transpose would differentiate its primal instead."""
+    return (any(eqn.primitive in _OWN_DERIVATIVES for eqn in jaxpr.eqns)
+            or any(_own_backward(program) for program in core.subjaxprs(jaxpr)))
 
 
 FP32_SUMS = "F32_F32_F32"
