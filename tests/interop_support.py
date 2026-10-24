@@ -41,6 +41,17 @@ def drawn_ids(vocab_size: int, seed: int) -> dict[str, np.ndarray]:
     return {"input_ids": rng.integers(0, vocab_size, (BATCH, LENGTH)).astype(np.int32)}
 
 
+PROMPT_WORDS = ("a", "red", "cat", "on", "mat", "tiny", "photo", "of", "the", "blue", "sea", "under",
+                "light")
+"""The words a drawn prompt joins (`drawn_prompts`)."""
+
+
+def drawn_prompts(salt: int, seed, count: int = 2) -> tuple[str, ...]:
+    """`count` prompts of one to eight `PROMPT_WORDS` drawn from `seed` under a site's `salt`."""
+    rng = np.random.default_rng([salt, int(seed)])
+    return tuple(" ".join(rng.choice(PROMPT_WORDS, size=rng.integers(1, 9))) for _ in range(count))
+
+
 def float64_logits(loaded):
     """The logits of `loaded` (a `Pretrained`) cloned to float64, its weights widened once, as a function
     of a draw (`drawn_ids`) run where x64 is enabled: a recorded decoder's float64 truth, which its
