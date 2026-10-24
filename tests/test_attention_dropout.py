@@ -218,7 +218,8 @@ def test_the_reference_draw_keeps_a_bf16_call_unbiased():
     with probability 0.9 and scales by 1/0.9, so the expected output is the weights' sum. The 131072 rows
     are independent draws over generic weights, so the bf16 rounding of their products averages out
     (uniform weights round alike). The bound is four standard errors of the mean over the sample's own
-    spread. A multiplier rounded to bf16 (1.109375 for 1/0.9) biases the mean by -0.00156 (ledger 1533)."""
+    spread. A multiplier rounded to bf16 (1.109375 for 1/0.9) biases the mean by about -0.0016
+    (ledger 1533)."""
     keys = jax.random.split(jax.random.PRNGKey(0), 2)
     query = jax.random.normal(keys[0], (1, 131072, 1, 8), jnp.float32).astype(jnp.bfloat16)
     key = jax.random.normal(keys[1], (1, 128, 1, 8), jnp.float32).astype(jnp.bfloat16)
