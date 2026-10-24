@@ -27,10 +27,10 @@ from dew.decision.layout import (
     QuestionLayout,
     Specials,
     compacted,
-    context_tokens,
     default_layout,
     labelled_rows,
     question_fields,
+    with_context,
 )
 from dew.decision.model import DecisionModel
 from dew.decision.questions import KINDS, Choice, Question, Score
@@ -136,6 +136,9 @@ class Encoding:
         )
         rows = self.layout.rows(self.tokenizer, self.specials, example.state, asked, orders=orders,
                                 tokens=None if tokens is None else tokens.tolist())
+        # A run over a backbone that reads no context leaves an example's own context unread.
+        rows = with_context(rows, self.tokenizer, None if self.context_length is None else example.context,
+                            self.context_length)
         if len(rows) != 1:
             raise ValueError(f"an encoding lays out one row, and the layout gave {len(rows)}")
         encoded = rows[0]
@@ -170,21 +173,7 @@ class Encoding:
             row["positions"] = np.asarray(encoded.positions, np.int32)
             row["slots"] = np.asarray(encoded.slots, np.int32)
         if self.context_length is not None:
-            if encoded.spans_in_context:
-                # The row's context is its schema (`Schema.stream`), which it reads whole.
-                if example.context is not None:
-                    raise ValueError("an example's context and a schema read as the row's context are one "
-                                     "context too many; a layout that reads the schema in context reads "
-                                     "no example context")
-                if encoded.context is None or len(encoded.context) > self.context_length:
-                    raise ValueError(f"the schema needs {len(encoded.context or ())} context tokens, more "
-                                     f"than the {self.context_length} the backbone's cross-attention reads")
-                row["context"] = np.asarray(encoded.context, np.int32)
-            else:
-                row["context"] = context_tokens(self.tokenizer, example.context, self.context_length)
-        elif encoded.spans_in_context:
-            raise ValueError("a schema read as the row's context needs a backbone with cross-attention "
-                             "layers to read it (Pretrained.with_cross_attention)")
+            row["context"] = np.asarray(encoded.context or (), np.int32)
         return row
 
 
