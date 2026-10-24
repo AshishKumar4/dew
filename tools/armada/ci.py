@@ -323,18 +323,16 @@ def record_of(key: str, token: str) -> bytes | None:
         return None
 
 
-def reused(python: str, name: str, split: str, common: str, stale: tuple[str, ...] = ()) -> dict | None:
+def reused(python: str, name: str, split: str, common: str) -> dict | None:
     """The green row of test file `name` (in `split`'s group) recorded on this host's class
-    (`device_class`), if it ran green there on exactly these inputs and read nothing under the `stale`
-    directories (the policy's, `policy`); else None. The record of the last run on these shared inputs
-    decides: a key hashes them (`cache_key`), so no run on others, whose record the last run's may be,
-    can be fresh here."""
+    (`device_class`), if it ran green there on exactly these inputs; else None. The record of the last
+    run on these shared inputs decides: a key hashes them (`cache_key`), so no run on others, whose
+    record the last run's may be, can be fresh here."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
     found = recorded(record_key(python, row(python, name, split), device_class(), common), token)
-    if found is None or not fresh(found, name, common) or any(
-            path.startswith(stale) for path in found["depends"]):
+    if found is None or not fresh(found, name, common):
         return None
     return found["row"]
 
@@ -470,20 +468,16 @@ PLACED_FILES = ("README.md", "CONTRIBUTING.md", "AGENTS.md", "LICENSE")
 def policy(base: str) -> str:
     """The test cache's policy (DEW_TEST_CACHE) for this checkout's change from `base`: 'off', every file
     run, for a change to what every test process runs or reads (`SHARED`, a lock, the environment's
-    files) or to a file the records do not place (`PLACED`); 'stale:tools/' for a change under tools/,
-    where every file whose run read a tool runs again; else 'on', each file run where its inputs
-    changed."""
+    files) or to a file the records do not place (`PLACED`); else 'on', each file run where its inputs
+    changed. A tool is such an input of each file whose run executed or read it, which its key hashes, so
+    a changed tool runs those files again and no other (train 115 reran its whole suite for five tools
+    no pulled head had touched, under a policy that reran every file that read any tool)."""
     changed = subprocess.run(["git", "diff", "--name-only", f"{base}...HEAD"], check=True,
                              capture_output=True, text=True).stdout.split()
     whole = {*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), ".python-version"}
     if any(name in whole or not (name.startswith(PLACED) or name in PLACED_FILES) for name in changed):
         return "off"
-    return "stale:tools/" if any(name.startswith("tools/") for name in changed) else "on"
-
-
-def stale_of(cache: str) -> tuple[str, ...]:
-    """The directories policy `cache` reruns every file that read them of (`policy`)."""
-    return tuple(cache.removeprefix("stale:").split(",")) if cache.startswith("stale:") else ()
+    return "on"
 
 
 def plan(target: float, timings: dict) -> list[dict]:
@@ -619,7 +613,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     reused as the cache's policy (`policy`) allows."""
     began = time.monotonic()
     rows = [found for name in tests
-            if cache != "off" and (found := reused(python, name, split, common, stale_of(cache)))]
+            if cache != "off" and (found := reused(python, name, split, common))]
     tests = [name for name in tests if row(python, name, split) not in {found["name"] for found in rows}]
     if rows:
         print(f"{len(rows)} files ran green on these inputs on {device_class()}; their rows are reused")
@@ -1126,7 +1120,7 @@ def main() -> int:
     running.add_argument("--out", type=Path, required=True)
     running.add_argument(
         "--cache", required=True,
-        help="the plan's DEW_TEST_CACHE (`policy`): on, off, or stale:<directories> whose readers run again")
+        help="the plan's DEW_TEST_CACHE (`policy`): on, or off")
     running.add_argument("--deadline", type=float, default=session.DEADLINE,
                          help="seconds before armada's own task timeout (.armada.json) to interrupt at")
     running.add_argument("--coverage", type=Path, default=None,
