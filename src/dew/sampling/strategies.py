@@ -180,7 +180,7 @@ def as_pytree(value: Strategy) -> Strategy:
 def select(keys: jax.Array, scores: jax.Array, active: jax.Array) -> jax.Array:
     """One categorical draw per row from `scores`, refusing an undefined row."""
     return row_draw(keys, scores, active,
-                           "the transform chain left an active row without a distribution to draw from")
+                    "the transform chain left an active row without a distribution to draw from")
 
 
 def draw(state: StepState, logits: jax.Array,
