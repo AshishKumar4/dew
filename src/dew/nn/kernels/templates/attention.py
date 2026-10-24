@@ -223,19 +223,10 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
         query_places, key_places = (
             (index, jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32)[None, :], (batch, keys)))
             if positions is None else positions)
-
-        def chunk_of(places):
-            # Each place's chunk number in the places' own dtype; a chunk wider than it holds every
-            # place of one sign.
-            places = jnp.asarray(places)
-            if chunk > jnp.iinfo(places.dtype).max:
-                return jnp.where(places >= 0, 0, -1).astype(places.dtype)
-            return places // chunk
-
         # The query's document's keys of its chunk run together in document order, since their places
         # never decrease along it, and their first and last key indices bound the span.
-        wanted = chunk_of(query_places)
-        numbers = jnp.take_along_axis(chunk_of(key_places), order, axis=1)
+        wanted = _chunk_of(query_places, chunk)
+        numbers = jnp.take_along_axis(_chunk_of(key_places, chunk), order, axis=1)
         inside_lo = _searched(numbers, run_lo, run_hi, wanted, "left")
         inside_hi = _searched(numbers, run_lo, run_hi, wanted, "right")
         held = inside_hi > inside_lo
@@ -251,6 +242,15 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     if valid is not None:
         query_ids, key_ids = _valid_ids(query_ids, key_ids, jnp.asarray(valid, bool), batch, queries)
     return KeySpans(start, end, query_ids, key_ids, keys, form)
+
+
+def _chunk_of(places, chunk: int) -> jax.Array:
+    """Each place's chunk number in the places' own dtype; a chunk wider than it holds every place of one
+    sign."""
+    places = jnp.asarray(places)
+    if chunk > jnp.iinfo(places.dtype).max:
+        return jnp.where(places >= 0, 0, -1).astype(places.dtype)
+    return places // chunk
 
 
 def _valid_ids(query_ids: jax.Array | None, key_ids: jax.Array | None, valid: jax.Array, batch: int,
