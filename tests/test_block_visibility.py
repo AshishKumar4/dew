@@ -216,7 +216,8 @@ def test_a_non_causal_kind_reading_blocks_keeps_its_kernel():
     decoder = model(full_attention={"mixer": AttentionMixer(bidirectional_blocks=True)}).clone(
         causal=False, attention_impl="cudnn", dtype=jnp.bfloat16)
     ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
-    params = decoder.init(jax.random.key(1), ids)
+    # The same parameters as this host's kernel makes them, where a named cuDNN does not run.
+    params = decoder.clone(attention_impl="xla").init(jax.random.key(1), ids)
 
     def routes(**groups):
         with generation.assumed("sm80"), generation.routes() as found:
