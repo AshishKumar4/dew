@@ -60,8 +60,9 @@ def yarn_source(tmp_path) -> Path:
 
 def test_a_yarn_phi_trains_as_transformers_computes_it_and_writes_it_back(tmp_path):
     """Phi rotates half its head, the 'default' partial rotary, and transformers' YaRN ramps that half
-    alone. Dew's logits and every parameter's gradient of the next-token loss over drawn rows of 32
-    tokens are on par with transformers' float32 run by check 1, from its float64 run; the export
+    alone, and PhiModel's embedding leaves its pad row untrained by its lookups (padding_idx). Dew's
+    logits and every parameter's gradient of the next-token loss over drawn rows of 32 tokens, the pad
+    id among them, are on par with transformers' float32 run by check 1, from its float64 run; the export
     writes the ramp and the fraction in one record, which transformers reads to the logits it
     computes for the source, and which loads back to the same model."""
     import torch

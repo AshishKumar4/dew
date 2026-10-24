@@ -36,7 +36,10 @@ def _phi_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         refuse('qk_layernorm', 'Phi q/k LayerNorm has no RMSNorm counterpart')
     config = base_config({**flat, 'hidden_act': 'silu'}, used, rope=ropes, reads=frozenset())
     used.update(('partial_rotary_factor', 'qk_layernorm', 'layer_norm_eps', 'resid_pdrop',
-                 'embd_pdrop', 'attention_dropout'))
+                 'embd_pdrop', 'attention_dropout', 'pad_token_id'))
+    # PhiModel's embedding is nn.Embedding(padding_idx=pad_token_id), None by default
+    # (modeling_phi.py:328, configuration_phi.py:82).
+    pad = hf.get('pad_token_id')
     config.update({
         'mlp': mlp, 'mlp_bias': True,
         'norm_type': 'layer', 'norm_bias': True, 'scale_after_cast': False,
@@ -46,6 +49,7 @@ def _phi_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         'dropout_rate': records.number(hf.get('resid_pdrop', 0.), 'resid_pdrop'),
         'embedding_dropout_rate': records.number(hf.get('embd_pdrop', 0.), 'embd_pdrop'),
         'attention_dropout_rate': records.number(hf.get('attention_dropout', 0.) or 0., 'attention_dropout'),
+        'padding_idx': None if pad is None else records.integer(pad, 'pad_token_id'),
     })
     return config
 
@@ -68,6 +72,7 @@ def _phi_export(model: CausalTransformer) -> Mapping[str, object]:
                             'partial_rotary_factor': model.partial_rotary_factor or 1.},
         **({} if model.yarn is None else {'rope_scaling': None}),
         'attention_bias': None, 'rms_norm_eps': None, 'head_dim': None,
+        'pad_token_id': model.padding_idx,
     }
 
 
