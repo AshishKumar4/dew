@@ -28,6 +28,7 @@ from dew.decision.layout import (
     compacted,
     context_tokens,
     default_layout,
+    labelled_rows,
     question_fields,
 )
 from dew.decision.model import DecisionModel
@@ -42,7 +43,7 @@ from dew.lora import Adapter
 from dew.nn.cross_attention import crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import ModelInputs
-from dew.nn.protocols import CountedDecisions, CountedTraining, CrossAttending, TokenModel
+from dew.nn.protocols import CountedDecisions, CountedTraining, CrossAttending, TokenModel, VocabularyRows
 from dew.objectives.base import (
     FROZEN,
     OMITTED,
@@ -152,7 +153,7 @@ class Encoding:
         questions = len(encoded.questions)
         row: Batch = {
             "tokens": np.asarray(encoded.tokens, np.int32),
-            **question_fields(encoded, questions, self.width),
+            **question_fields(encoded, questions, self.width, labelled_rows([encoded])),
             "labels": np.zeros(questions, np.int32),
             "scored": np.zeros(questions, bool),
             "targets": np.zeros((questions, self.width), np.float32),
@@ -329,6 +330,16 @@ _ALONG_THE_QUESTIONS = ("kinds", "questions", "spans", "option_spans", "options"
                         "targets")
 """The fields of an encoded row that run along its questions."""
 
+_READ_OUT = ("readout",)
+"""The fields that run along its questions of a row whose options stand under labels (`Labels`)."""
+
+
+def _along(layout: Layout) -> tuple[str, ...]:
+    """The fields along the questions of `layout`'s rows, its readout's where its options stand under
+    labels."""
+    labelled = isinstance(layout, QuestionLayout) and layout.labels is not None
+    return _ALONG_THE_QUESTIONS + (_READ_OUT if labelled else ())
+
 
 def packing(layout: Layout, bounds: Bounds, context_length: int | None = None) -> Pack:
     """Rows of `layout` packed first-fit into windows of its `max_len`, each
@@ -336,7 +347,7 @@ def packing(layout: Layout, bounds: Bounds, context_length: int | None = None) -
     and with a `context_length` each row's context along an axis of that
     many tokens."""
     parallel = isinstance(layout, QuestionLayout) and layout.parallel
-    along = tuple((name, bounds.questions) for name in _ALONG_THE_QUESTIONS)
+    along = tuple((name, bounds.questions) for name in _along(layout))
     if context_length is not None:
         along = (*along, ("context", context_length))
     return Pack(layout.max_len, ("tokens", "positions", "slots") if parallel else ("tokens",),
@@ -381,6 +392,9 @@ class PackedRows(pygrain.MapTransform):
             "spans": element["spans"] + moved[:, None],
             "option_spans": element["option_spans"] + (moved[:, None] * options)[..., None],
         }
+        if "readout" in element:
+            # A question's answer cue moves with its row in the window, as its spans do.
+            laid["readout"] = element["readout"] + moved
         if "slots" in element:
             laid["slots"] = element["slots"]
         if "context" in element:
@@ -590,12 +604,21 @@ class DecisionObjective(Objective[Ratio]):
                 option_spans=jnp.asarray([[[[0, 1]]]]),
                 options=one[..., None],
             )
-            table = (
-                self.model.table(joined({"backbone": parts["backbone"]}))
-                if self.model.head.reads_table
-                else None
-            )
-            parts["head"] = self.model.head.init(head_key, states, inputs, table)
+            backbone = joined({"backbone": parts["backbone"]})
+            if self.model.head.reads_labels:
+                # A readout draws its rows from the backbone's output table, or from its vocabulary rows
+                # where it reads them, its answer at position 0.
+                inputs = dataclasses.replace(inputs, readout=jnp.zeros((1, 1), jnp.int32))
+                gives_rows = isinstance(self.model.backbone, VocabularyRows)
+                table = (self.model.output_table(backbone) if not self.model.head.draws_from_rows
+                         else self.model.table(backbone) if gives_rows else None)
+                labels = self.model.head.tied_labels()
+                tied = (None if labels is None else
+                        jnp.zeros((1, 1, 1, len(labels[0])), jnp.float32))
+                parts["head"] = self.model.head.init(head_key, states, inputs, table, tied=tied)
+            else:
+                table = self.model.table(backbone) if self.model.head.reads_table else None
+                parts["head"] = self.model.head.init(head_key, states, inputs, table)
         return joined(parts)
 
     @property
