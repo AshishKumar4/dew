@@ -16,9 +16,10 @@ import numpy as np
 import pytest
 from interop_support import fixture_arrays
 
+from dew.batch import coordinates
 from dew.inference import TextGeneration
 from dew.interop import Pretrained
-from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
+from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.kv_cache import KVCache
 from dew.nn.llama4 import Llama4Mixer
 from dew.nn.mixer_base import MixerContext

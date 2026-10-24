@@ -11,21 +11,12 @@ import pytest
 import scipy.special
 from reference_error import assert_as_exact
 
+from dew.batch import EXAMPLE_ROWS
 from dew.data.dataset import DataPartition
 from dew.diffusion import presets
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.nn.backbones import SimpleDiT
-from dew.objectives.base import (
-    EXAMPLE_ROWS,
-    EXAMPLE_STREAM,
-    Aux,
-    Objective,
-    Ratio,
-    Recorder,
-    Step,
-    example_stream,
-    stream,
-)
+from dew.objectives.base import EXAMPLE_STREAM, Aux, Objective, Ratio, Recorder, Step, example_stream, stream
 from dew.objectives.diffusion.few_step import MeanFlowObjective, ShortcutObjective
 from dew.training.distributed import marked
 from dew.training.transaction import example_places

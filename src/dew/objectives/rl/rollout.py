@@ -9,12 +9,12 @@ from collections.abc import Callable, Sequence
 import jax.numpy as jnp
 import numpy as np
 
+from dew.batch import Batch
 from dew.coordination import agreed
 from dew.data.dataset import DataPartition
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY, PromptRecord
 from dew.inference.rollouts import Draw, InfrastructureError, response
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of, pad_token_rows
-from dew.objectives.base import Batch
 from dew.sampling.text import Sampling
 
 from ..lm import TokenScorer

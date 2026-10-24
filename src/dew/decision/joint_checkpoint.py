@@ -21,6 +21,7 @@ import numpy as np
 from flax.typing import Dtype
 
 from dew import records
+from dew.batch import Variables
 from dew.data.text import HFTokenizer
 from dew.decision.head import JointSchemaHead
 from dew.decision.laya import IN_PROJ
@@ -31,7 +32,7 @@ from dew.interop.decoder_parts import split_packed
 from dew.interop.processors import Processor
 from dew.interop.safetensors_io import read_file
 from dew.interop.weights import translate_parameters
-from dew.objectives.base import Variables, joined
+from dew.objectives.base import joined
 
 HEAD_CONFIG = "joint_head_config.json"
 HEAD_WEIGHTS = "joint_head.safetensors"

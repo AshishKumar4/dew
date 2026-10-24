@@ -10,8 +10,8 @@ import jax
 import numpy as np
 from flax import linen as nn
 
+from dew.batch import Variables
 from dew.interop.weights import record_layouts
-from dew.objectives.base import Variables
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout

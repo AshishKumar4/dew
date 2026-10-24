@@ -1087,7 +1087,7 @@ def test_llada_moe_logits_match_the_released_model_code(llada_moe_source):
 
 @pytest.mark.mesh(devices=4)
 def test_llada_moe_expert_and_sequence_shards_match_released_logits(llada_moe_source):
-    from dew.nn.sharding import mesh_axes
+    from dew.mesh import mesh_axes
     from dew.training import Layout, MeshSpec
 
     name, _, _, fields, recorded = llada_moe_source

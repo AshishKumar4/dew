@@ -40,10 +40,10 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSh
 from jax.typing import DTypeLike
 
 from dew import records
+from dew.batch import Variables, merge
 from dew.nn.backbones.decoder_stack import DecoderBank, stack_layers
 from dew.nn.backbones.layer_plan import group_layers, layer_index
 from dew.nn.hyper_connections import Carried
-from dew.objectives.base import Variables, merge
 
 if TYPE_CHECKING:
     from dew.training.distributed import Layout, MeshSpec, Placement

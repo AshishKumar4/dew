@@ -23,9 +23,10 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.artifacts import Artifact, Decisions
+from dew.batch import Batch
 from dew.decision.metrics import Answered
 from dew.nn import categorical
-from dew.objectives.base import Batch, Metric, Shown, mean_of_totals, merge_totals
+from dew.objectives.base import Metric, Shown, mean_of_totals, merge_totals
 
 
 class ScoringRule(ABC):

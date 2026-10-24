@@ -26,10 +26,10 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew import registry
+from dew.batch import Batch, Variables
 from dew.nn.inputs import ModelInputs
 from dew.nn.precision import at_least_fp32
 from dew.nn.text_encoders import DEFAULT_MODEL
-from dew.objectives.base import Batch, Variables
 from dew.registry import DtypeName
 
 from .diffusion import DiffusionConditioner

@@ -8,9 +8,10 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from dew.batch import Batch
 from dew.data.pipeline import Dataset
 
-from ..dataset import Batch, Records, describe
+from ..dataset import Records, describe
 from .base import Read, ShardManifest, _indexed_manifest
 
 if TYPE_CHECKING:

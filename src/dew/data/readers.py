@@ -11,8 +11,8 @@ from typing import Literal
 import grain.python as pygrain
 import numpy as np
 
+from dew.batch import Batch
 from dew.data.dataset import (
-    Batch,
     Closeable,
     DataPartition,
     FilledBatch,

@@ -12,9 +12,10 @@ import numpy as np
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
+from dew.batch import Coordinates, coordinates as build_coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops
-from dew.nn.inputs import Coordinates, CrossContext, coordinates as build_coordinates, next_position
+from dew.nn.inputs import CrossContext, next_position
 from dew.nn.kv_cache import POSITION
 from dew.nn.protocols import OutputTable, ProjectionGroup, held_groups
 from dew.nn.sharding import explicit_spec

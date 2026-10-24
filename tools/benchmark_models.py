@@ -23,6 +23,7 @@ from jax.sharding import Mesh
 
 import dew.nn.backbones
 import dew.nn.backbones.jepa  # noqa: F401  (registers the kind)
+from dew.batch import Variables, coordinates
 from dew.data import preferences
 from dew.data.chat import ROLES_KEY, Role
 from dew.data.dataset import DataPartition
@@ -40,20 +41,20 @@ from dew.nn.backbones.unet_condition import UNet2DCondition
 from dew.nn.backbones.wan import WanTransformer
 from dew.nn.backbones.z_image import ZImageTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.inputs import ModelInputs, coordinates
+from dew.nn.inputs import ModelInputs
 from dew.nn.multimodal import MultimodalTransformer, VisionConditioner
 from dew.nn.vision import ProjectorBase, TowerBase
-from dew.objectives.base import Objective, Variables
+from dew.objectives.base import Objective
 from dew.objectives.diffusion import BlockDiffusionObjective, DiffusionObjective
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, sessions
 from dew.registry import models, projectors, resolve_dtype, towers
+from dew.state import TrainState
 from dew.telemetry.benchmark import carried
 from dew.training import Layout, MeshSpec, Trainer
 from dew.training.distributed import DevicePrefetchIterator
-from dew.training.state import TrainState
 
 Batch = dict[str, np.ndarray | Mapping[str, np.ndarray] | ModelInputs]
 

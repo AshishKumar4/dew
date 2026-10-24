@@ -17,6 +17,7 @@ from model_support import flat_tree
 from recording import RecordingTracker
 from reference_error import assert_as_exact, widened, without_ynn
 
+from dew.batch import FROZEN, thaw
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, Decide, Example
@@ -28,7 +29,6 @@ from dew.decision.questions import ChoiceAnswer
 from dew.interop import Pretrained
 from dew.nn.cross_attention import CrossAttention, crossing
 from dew.nn.multimodal import MultimodalTransformer
-from dew.objectives.base import FROZEN, thaw
 from dew.training import Trainer
 
 pytestmark = pytest.mark.mesh

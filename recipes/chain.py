@@ -26,11 +26,12 @@ import jax
 import optax
 from flax import linen as nn
 
+from dew.batch import Variables
 from dew.data.chat import Role
 from dew.data.pipeline import Dataset
 from dew.data.text import tokenizer_for
 from dew.objectives import DistillationObjective
-from dew.objectives.base import OMITTED, Objective, Omitted, Source, Variables
+from dew.objectives.base import OMITTED, Objective, Omitted, Source
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import (
     DPOObjective,
@@ -45,7 +46,8 @@ from dew.objectives.rl import (
 from dew.objectives.rl.rollout import Reward
 from dew.records import integer, record, text
 from dew.sampling import Sampling, with_ids_of
-from dew.training import Checkpoints, Layout, Rollout, Trainer, TrainState
+from dew.state import TrainState
+from dew.training import Checkpoints, Layout, Rollout, Trainer
 
 
 @dataclasses.dataclass(frozen=True)

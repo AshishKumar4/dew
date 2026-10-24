@@ -28,6 +28,7 @@ import optax
 from flax import linen as nn
 
 from dew.artifacts import ImageGrid, VideoGrid
+from dew.batch import FROZEN, Batch, Variables, merge, thaw, under
 from dew.coordination import agreed, collective_host
 from dew.diffusion.presets import Preset, build_process
 from dew.diffusion.process import Process, aligned_conditions
@@ -52,22 +53,16 @@ from dew.nn.protocols import (
     RequiresText,
 )
 from dew.objectives.base import (
-    FROZEN,
     OMITTED,
     TEACHER,
     Aux,
-    Batch,
     EMASpec,
     Objective,
     Omitted,
     ProgramModule,
     Ratio,
     Step,
-    Variables,
-    merge,
     model_rngs,
-    thaw,
-    under,
 )
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, PERCEPTUAL, EndToEnd

@@ -21,8 +21,9 @@ import pytest
 from model_support import TINY_DECODER
 from token_support import token_batch_of
 
+from dew.batch import coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.inputs import ModelInputs, coordinates
+from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
 from dew.objectives.lm import TEXT_KEY, LMObjective
 

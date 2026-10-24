@@ -49,7 +49,7 @@ from dew.records import JSON
 if TYPE_CHECKING:
     from transformers import BatchEncoding, PreTrainedTokenizerBase
 
-    from dew.data.dataset import Batch
+    from dew.batch import Batch
     from dew.data.steps.text import LengthPolicy
 
 ROLES_KEY = "text_roles"

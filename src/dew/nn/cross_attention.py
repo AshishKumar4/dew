@@ -67,13 +67,13 @@ CROSS_CACHE = frozenset({CROSS_KEY, CROSS_VALUE, CROSS_LENGTHS})
 
 def crossing(path) -> bool:
     """Whether a variables path runs through a cross-attention block: the filter that trains the
-    blocks alone (`dew.objectives.base.PathFilter`)."""
+    blocks alone (`dew.batch.PathFilter`)."""
     return NAME in path
 
 
 def crosses_alone(trained) -> bool:
     """Whether every leaf of `trained`, the trained part of a tree split from its frozen rest
-    (`dew.objectives.base.FROZEN`), is a cross-attention block's (`crossing`)."""
+    (`dew.batch.FROZEN`), is a cross-attention block's (`crossing`)."""
     return all(crossing(tuple(entry.key for entry in path))
                for path, _ in jax.tree_util.tree_leaves_with_path(trained))
 

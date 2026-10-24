@@ -24,8 +24,9 @@ from typing import ClassVar
 import grain.python as pygrain
 import numpy as np
 
+from dew.batch import Batch
 from dew.data.analysis import _analyzed, _identity, _label, _name
-from dew.data.dataset import Batch, Ranges, Records
+from dew.data.dataset import Ranges, Records
 from dew.data.lowering import (
     _cache_inputs,
     _CachedOutputs,

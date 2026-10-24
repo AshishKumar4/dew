@@ -19,11 +19,12 @@ from typing import TYPE_CHECKING
 from etils import epath
 from filelock import FileLock
 
+from dew.batch import Batch
 from dew.cache import dew_cache_dir
 from dew.data.pipeline import Dataset
 from dew.files import published
 
-from ..dataset import Batch, Records
+from ..dataset import Records
 from .base import Read, ShardManifest, _indexed_manifest, preparing
 
 if TYPE_CHECKING:  # tensorflow_datasets is imported on use, not at import

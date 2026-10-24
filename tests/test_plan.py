@@ -19,10 +19,10 @@ from dew.checkpoints import Checkpoints
 from dew.data import Loading, presets
 from dew.data.compile import compile
 from dew.data.sources.tokens import TokenFiles
+from dew.mesh import LayoutRefused
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.kernels.generation import chosen
-from dew.nn.sharding import LayoutRefused
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_tile
 from dew.registry import mixers

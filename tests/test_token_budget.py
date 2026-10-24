@@ -5,13 +5,13 @@ import itertools
 import numpy as np
 import pytest
 
+from dew.batch import VALID_ROWS
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading
 from dew.data.pipeline import Pipeline
 from dew.data.sources.memory import Memory
 from dew.data.steps.text import FixedTokens
 from dew.inputs import Field, InputSpec
-from dew.objectives.base import VALID_ROWS
 
 READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
 

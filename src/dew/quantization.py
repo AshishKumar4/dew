@@ -69,8 +69,8 @@ from dew.nn.precision import accumulated, correctly_rounded_divide
 if TYPE_CHECKING:
     from qwix import QArray, QuantizationProvider
 
+    from dew.batch import Variables
     from dew.diffusion.process import Conditioning
-    from dew.objectives.base import Variables
 
 QuantizedDtype = Literal["int8", "fp8"]
 """The gemm dtypes a run trains with: int8 on any backend, fp8 where the

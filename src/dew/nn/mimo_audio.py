@@ -20,6 +20,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
+from dew.batch import coordinates
 from dew.interop.weights import translate_parameters
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
@@ -31,7 +32,7 @@ from .attention import LayerNorm, RMSNorm
 from .audio import AudioEncoding
 from .backbones.decoder_block import BlockWiring, DecoderBlock
 from .blocks import TokenEmbedding
-from .inputs import AttentionMetadata, coordinates, sequence_blocks
+from .inputs import AttentionMetadata, sequence_blocks
 from .mixer_base import MixerContext
 from .mixers.attention import CausalSelfAttention
 from .mlp import GatedMLP
