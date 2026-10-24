@@ -146,8 +146,8 @@ def _step(value, fmt: Format, direction: float, flushes: bool) -> np.ndarray:
         least = 2.0 ** fmt.emin
         tiny = np.abs(stepped) < least
         # Past zero toward a subnormal the grid's next value is the least normal; from the least
-        # normal toward zero it is zero.
-        jumped = np.where(np.abs(value) >= least, 0.0, np.copysign(least, direction))
+        # normal toward zero it is the zero of its sign.
+        jumped = np.where(np.abs(value) >= least, np.copysign(0.0, value), np.copysign(least, direction))
         stepped = np.where(tiny, jumped, stepped)
     return stepped
 
@@ -155,11 +155,14 @@ def _step(value, fmt: Format, direction: float, flushes: bool) -> np.ndarray:
 def _past(native, down, up, fmt: Format, flushes: bool) -> np.ndarray:
     """Each native value's level against the two neighbours `down` and `up` of its exact value on the
     lane's grid (equal where the exact value is on it): 1 at either, one more for each step of the grid
-    past them; UNREACHED for a NaN or a value off the grid."""
-    native = np.asarray(native, np.float64)
+    past them; UNREACHED for a NaN, a value off the grid, or a zero of the sign the exact value's side
+    does not take (the side of `up`, a negative value or a negative zero, or else positive)."""
+    native, up = np.asarray(native, np.float64), np.asarray(up, np.float64)
     index = _grid_index(native, fmt, flushes)
     past = np.maximum(_grid_index(down, fmt, flushes) - index, index - _grid_index(up, fmt, flushes))
-    off = np.isnan(native) | (flushes & (native != 0) & (np.abs(native) < 2.0 ** fmt.emin))
+    negative = (up < 0) | ((up == 0) & np.signbit(up))
+    off = (np.isnan(native) | (flushes & (native != 0) & (np.abs(native) < 2.0 ** fmt.emin))
+           | ((native == 0) & (np.signbit(native) != negative)))
     return np.where(off, UNREACHED, 1 + np.maximum(past, 0))
 
 
@@ -230,12 +233,17 @@ def _erfinv_enclosed(values, bits):
 
 
 def _log_special(value):
-    named = np.isnan(value) | (value <= 0) | (value == np.inf)
-    return np.select([value < 0, value == 0, value == np.inf], [np.nan, -np.inf, np.inf], np.nan), named
+    """log's limits at 0 and infinity, its NaN below zero, and its one exact value, log(1) = +0, named."""
+    named = np.isnan(value) | (value <= 0) | (value == np.inf) | (value == 1)
+    expected = np.select([value < 0, value == 0, value == np.inf, value == 1], [np.nan, -np.inf, np.inf, 0.0],
+                         np.nan)
+    return expected, named
 
 
 def _exp_special(value):
-    return np.select([value == np.inf, value == -np.inf], [np.inf, 0.0], np.nan), ~np.isfinite(value)
+    """exp's limits at the infinities and its one exact value, exp(±0) = 1, named."""
+    named = ~np.isfinite(value) | (value == 0)
+    return np.select([value == np.inf, value == -np.inf, value == 0], [np.inf, 0.0, 1.0], np.nan), named
 
 
 def _erfinv_special(value):
@@ -268,19 +276,22 @@ def _transcendental(enclose, special):
     return levels
 
 
-def _terms_hold(native, terms, fmt: Format) -> np.ndarray:
+def _terms_hold(native, terms, fmt: Format, flushes: bool) -> np.ndarray:
     """Whether each native sum of `terms` (exact float64 values, summed along the last axis) is within
     the bound of any order of summing them in `fmt`, fused multiply-adds included: γ_n Σ|terms| (Higham,
     Accuracy and Stability of Numerical Algorithms, 2002, §3.1: n terms, at most n - 1 roundings on any
-    path), plus a flushed partial's least normal at each rounding, around the terms' float64-rounded
-    exact sum (`exact_sum`, within 2^-53 of it relative to Σ|terms|, in the allowance). An empty sum is
-    the additive identity, +0."""
+    path), around the terms' float64-rounded exact sum (`exact_sum`, within 2^-53 of it relative to
+    Σ|terms|, in the allowance), plus what underflow loses past that relative bound at each rounding:
+    where the lane flushes, a flushed partial's least normal; where it keeps subnormals, half their
+    spacing (a product, or a sum carried wider and rounded into `fmt`). An empty sum is the additive
+    identity, +0."""
     native = np.asarray(native, np.float64)
     count = terms.shape[-1]
     if count == 0:
         return _same(native, np.zeros_like(native))
     magnitude = magnitude_sum(terms, -1)
-    allowance = (gamma(count, fmt) + 2.0 ** -52) * magnitude + count * 2.0 ** fmt.emin
+    underflow = 2.0 ** fmt.emin if flushes else 2.0 ** (fmt.emin - fmt.precision)
+    allowance = (gamma(count, fmt) + 2.0 ** -52) * magnitude + count * underflow
     error = np.abs(native - exact_sum(terms, -1))
     return np.isfinite(error) & (error <= np.nextafter(allowance, np.inf))
 
@@ -383,10 +394,11 @@ def _reduced_sum(params, operands, result, fmt):
     if fmt is None:
         summed = _wrapping(lambda t: np.sum(t, axis=axes, dtype=np.uint64))
         return _bits(result) == _bits(summed(result, terms))
-    moved = np.moveaxis(_read(terms, lane().flushes), axes, tuple(range(-len(axes), 0)))
+    flushes = lane().flushes
+    moved = np.moveaxis(_read(terms, flushes), axes, tuple(range(-len(axes), 0)))
     kept = moved.shape[:moved.ndim - len(axes)]
     count = int(np.prod(moved.shape[len(kept):], dtype=np.int64))
-    return _terms_hold(result, moved.reshape(*kept, count), fmt)
+    return _terms_hold(result, moved.reshape(*kept, count), fmt, flushes)
 
 
 def _dot(params, operands, result, fmt):
@@ -417,7 +429,7 @@ def _dot(params, operands, result, fmt):
     flushes = lane().flushes
     products = paired(_read(left, flushes), _read(right, flushes))
     native = np.asarray(result, np.float64).reshape(products.shape[:-1])
-    return _terms_hold(native, products, fmt).reshape(result.shape)
+    return _terms_hold(native, products, fmt, flushes).reshape(result.shape)
 
 
 def _moved(oracle):
@@ -588,8 +600,9 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
     results reach: sums of every alignment, a quarter of them nearly cancelling; products and quotients
     from about 2^-140 (subnormal on a lane that keeps subnormals) to 2^126; roots of every binade,
     subnormals included; logarithms of every binade and a quarter near one; exponentials across fp32's
-    range and a quarter near zero; inverse error functions across (-1, 1) and a quarter near its poles.
-    One fixed draw per primitive and format."""
+    range and a quarter near zero; inverse error functions across (-1, 1) and a quarter near its poles;
+    and each transcendental at its exact value (exp(0), log(1), erf_inv(0)), which a lane must return
+    exactly. One fixed draw per primitive and format."""
     rng = np.random.default_rng([*name.encode(), fmt.precision])
     quarter = PROBES // 4
 
@@ -611,15 +624,18 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
     elif name == "log":
         value = np.abs(scaled(-126, 127))
         value[:quarter] = 1 + rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
+        value[0] = 1.0
         drawn = [value]
     elif name == "exp":
         value = rng.uniform(-104, 89, PROBES)
         value[:quarter] = rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
+        value[0] = 0.0
         drawn = [value]
     else:
         value = rng.uniform(-1, 1, PROBES)
         poles = 1 - 2.0 ** -rng.uniform(1, fmt.precision, quarter)
         value[:quarter] = rng.choice([-1.0, 1.0], quarter) * poles
+        value[0] = 0.0
         drawn = [value]
     return [value.astype(VALUES[fmt.name]) for value in drawn]
 
@@ -634,14 +650,12 @@ def lane() -> Lane:
     import jax
 
     flushes = float(jax.lax.mul(np.float32(2.0 ** -140), np.float32(2.0 ** 100))) == 0.0
-    operations = {"add": jax.lax.add, "sub": jax.lax.sub, "mul": jax.lax.mul, "square": jax.lax.square,
-                  "div": jax.lax.div, "sqrt": jax.lax.sqrt, "log": jax.lax.log, "exp": jax.lax.exp,
-                  "erf_inv": jax.lax.erf_inv}
     reach = {}
     for name, levels in LEVELS.items():
         for fmt in FORMATS.values():
             operands = _probes(name, fmt)
-            found = levels(operands, np.asarray(operations[name](*operands)), fmt, flushes)
+            # Each primitive is `jax.lax`'s function of its own name.
+            found = levels(operands, np.asarray(getattr(jax.lax, name)(*operands)), fmt, flushes)
             if np.any(found == UNREACHED):
                 at = int(np.argmax(found == UNREACHED))
                 raise ArithmeticError(f"the lane's {name} in {fmt.name} breaks an exact case at "

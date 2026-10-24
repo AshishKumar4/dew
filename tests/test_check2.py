@@ -5,24 +5,26 @@ computes (`lane`, measured on it), and a primitive without a contract refused.""
 import certified as ct
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 import op_certificates as oc
 import pytest
 
-SUBNORMAL = np.float32(2.0 ** -140)
 
-
-def test_the_lane_flushes_operands_and_results_alike_however_it_compiles():
-    """The lane reads a subnormal operand as zero exactly where it flushes a subnormal result and where
-    a comparison reads it as zero, jitted and eager, with YNNPACK's fusions and without: the one fact
-    of subnormals its measure takes (`Lane.flushes`), which every contract reads."""
+@pytest.mark.parametrize("dtype, subnormal, halves", [
+    (np.float32, 2.0 ** -140, 2.0 ** -70), (ml_dtypes.bfloat16, 2.0 ** -130, 2.0 ** -66)])
+def test_the_lane_flushes_operands_and_results_alike_however_it_compiles(dtype, subnormal, halves):
+    """In float32 and in bfloat16, the lane reads a subnormal operand as zero exactly where it flushes a
+    subnormal product (of two `halves`) and where a comparison reads it as zero, jitted and eager, with
+    YNNPACK's fusions and without: the one fact of subnormals its measure takes (`Lane.flushes`), which
+    every contract reads."""
     from reference_error import without_ynn
 
-    flushes = ct.lane().flushes
+    flushes, tiny, half = ct.lane().flushes, dtype(subnormal), dtype(halves)
     for run in (jax.jit, lambda fn: fn, without_ynn):
-        assert (float(run(lambda x: jnp.multiply(x, np.float32(2.0 ** 100)))(SUBNORMAL)) == 0.0) == flushes
-        assert (float(run(jnp.multiply)(np.float32(2.0 ** -70), np.float32(2.0 ** -70))) == 0.0) == flushes
-        assert bool(run(jnp.equal)(SUBNORMAL, np.float32(0))) == flushes
+        assert (float(run(lambda x: jnp.multiply(x, dtype(2.0 ** 100)))(tiny)) == 0.0) == flushes
+        assert (float(run(jnp.multiply)(half, half)) == 0.0) == flushes
+        assert bool(run(jnp.equal)(tiny, dtype(0))) == flushes
 
 
 @pytest.mark.parametrize("name, fn, operands", [
@@ -100,14 +102,37 @@ def test_a_computation_is_certified_through_its_calls_and_a_primitive_without_a_
         ct.assert_certified(lambda x: jnp.sin(x), lambda seed: (x,), "sine", seeds=1)
 
 
+def test_an_equation_past_the_lanes_reach_is_a_finding_by_its_path():
+    """A division by a literal, which XLA may compute as a product with the literal's rounded reciprocal
+    (ledger 1402), is held to the lane's own division's reach: it is a finding, named by its equation,
+    exactly where its results' levels pass that reach; a division by a value the program is given is the
+    lane's own division and holds."""
+    x = np.float32(np.random.default_rng(4).uniform(0.1, 3, 512))
+    outputs, findings = ct.certified(lambda x: x / 3, x)
+    levels = ct.LEVELS["div"]([x, np.float32(3)], outputs, oc.FLOAT32, ct.lane().flushes)
+    past = int(np.count_nonzero(levels > ct.lane().reach["div", "float32"]))
+    assert len(findings) == (1 if past else 0)
+    named = f"div#0: {past} of 512 elements break the contract"
+    assert all(finding.startswith(named) for finding in findings)
+    assert ct.certified(jnp.divide, x, np.float32(np.full(512, 3)))[1] == []
+
+
+def test_a_sum_loses_a_subnormal_only_where_the_lane_flushes_it():
+    """A sum of one subnormal returned as zero holds its contract where the lane flushes (its operand
+    reads as zero) and breaks it where the lane keeps subnormals, whose sums lose nothing to underflow;
+    the lane's own sum holds either way."""
+    terms, params = np.float32([2.0 ** -140]), {"axes": (0,)}
+    lost = ct.CONTRACTS["reduce_sum"](params, [terms], np.float32(0), oc.FLOAT32)
+    assert bool(lost) == ct.lane().flushes
+    assert ct.CONTRACTS["reduce_sum"](params, [terms], np.asarray(jnp.sum(terms)), oc.FLOAT32)
+
+
 def test_the_lane_detects_tininess_after_rounding_and_keeps_subnormals_in_moves_and_casts():
     """A product exactly 2^-126 - 2^-172 rounds to the least normal, at an unbounded exponent and on the
     gradual grid alike, and the lane keeps it (tininess after rounding); a subnormal product holds the
     contract as the lane rounds it, zero where it flushes and the subnormal where it keeps them, and the
     other breaks it; a reshape, a negation and a cast between bf16 and float32 keep a subnormal; a
     float32 past int32's range saturates and NaN casts to 0."""
-    import ml_dtypes
-
     a, b = np.float32(1 - 2.0 ** -23), np.float32(2.0 ** -126 + 2.0 ** -149)
     native = np.asarray(jax.jit(jnp.multiply)(a, b))
     assert float(native) == 2.0 ** -126
@@ -153,6 +178,27 @@ def test_a_results_level_counts_its_grid_steps_past_the_exact_values_neighbours(
     assert log.tolist() == [0, 0, 0]
     poles = np.float32([np.inf, -np.inf])
     assert ct.LEVELS["erf_inv"]([np.float32([1.0, -1.0])], poles, oc.FLOAT32, flushes).tolist() == [0, 0]
+
+
+@pytest.mark.parametrize("flushes", [True, False])
+@pytest.mark.parametrize("fmt", [oc.FLOAT32, oc.BFLOAT16], ids=["float32", "bfloat16"])
+def test_a_zero_of_the_wrong_sign_or_a_missed_exact_value_is_no_rounding(flushes, fmt):
+    """exp(-1000) is positive and under the least value past zero: +0 is level 1, and -0 no rounding of
+    it; sqrt(-0) is -0 exactly and +0 no rounding of it; exp(±0) is 1 and log(1) is +0 exactly, so a step
+    of the grid off either, which a measured reach would otherwise admit, is no rounding either."""
+    dtype = ct.VALUES[fmt.name]
+
+    def at(values):
+        return np.asarray(values, np.float64).astype(dtype)
+
+    exp, log, sqrt = ct.LEVELS["exp"], ct.LEVELS["log"], ct.LEVELS["sqrt"]
+    assert exp([at([-1000.0, -1000.0])], at([0.0, -0.0]), fmt, flushes).tolist() == [1, ct.UNREACHED]
+    assert sqrt([at([-0.0, -0.0])], at([-0.0, 0.0]), fmt, flushes).tolist() == [0, ct.UNREACHED]
+    above_one = float(np.nextafter(dtype(1), dtype(2)))
+    ones = exp([at([0.0, -0.0, 0.0])], at([1.0, 1.0, above_one]), fmt, flushes)
+    assert ones.tolist() == [0, 0, ct.UNREACHED]
+    least = 2.0 ** fmt.emin if flushes else 2.0 ** (fmt.emin - fmt.precision + 1)
+    assert log([at([1.0, 1.0])], at([0.0, least]), fmt, flushes).tolist() == [0, ct.UNREACHED]
 
 
 def test_each_equation_runs_under_its_own_context():
