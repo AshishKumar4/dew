@@ -439,7 +439,8 @@ LANE_TEST = ("import os, subprocess, sys, time\n"
              "    time.sleep(1)\n"
              "    share = os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION']\n"
              "    grown = os.environ.get('XLA_PYTHON_CLIENT_PREALLOCATE', 'true')\n"
-             "    Path(f'threads-{Path(__file__).stem}').write_text(os.environ.get('OMP_NUM_THREADS', 'all'))\n"
+             "    threads = os.environ.get('OMP_NUM_THREADS', 'all')\n"
+             "    Path(f'threads-{Path(__file__).stem}').write_text(threads)\n"
              "    ran = Path(f'ran-{Path(__file__).stem}-{os.getpid()}')\n"
              "    ran.write_text(f'{share} {began} {time.monotonic()} {grown}')\n")
 """A GPU lane's test file standing in: it records the share it was given, when it ran and whether its pool
