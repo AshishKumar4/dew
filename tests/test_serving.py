@@ -59,6 +59,26 @@ def assert_same_generation(served, alone):
     np.testing.assert_allclose(served.raw_log_probs, alone.raw_log_probs, atol=2e-6, rtol=2e-6)
 
 
+@pytest.mark.mesh(devices=2)
+def test_a_meshless_server_draws_on_the_selected_default_device():
+    """Weights and resident slots both follow a nonzero default device, so the server can compile
+    its step, finish a request and release its slot there."""
+    device = jax.local_devices()[1]
+    with jax.default_device(device):
+        served = task()
+        server = Server.from_task(served, slots=1, capacity=128)
+        result = server.submit("12", max_new_tokens=3, key=0)
+        for _ in range(4):
+            if result.done():
+                break
+            server.step()
+        assert result.done()
+        draw = result.result()
+        assert int(draw.lengths[0]) > 0
+        assert all(leaf.devices() == {device} for leaf in jax.tree.leaves(server.variables))
+        assert all(leaf.devices() == {device} for leaf in jax.tree.leaves(server.cache))
+
+
 def test_prepacked_queries_keys_and_values_preserve_attention_and_cache():
     """Biases, head norms, RoPE and the cached append still read the same projections."""
     with jax.enable_x64():

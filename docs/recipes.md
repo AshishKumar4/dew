@@ -140,7 +140,7 @@ Muon treats matrix parameters separately from embedding, head and normalization 
 
 `--optim.state-dtype bfloat16` halves the memory the optimizer state takes. Its effect on step time depends on the device ([Performance measurements](performance.md)).
 
-With `trainer.wandb` unset, the recipe prints to the terminal and keeps a local tracking journal in `<checkpoint-dir>/<name>/tracking`. To use Weights & Biases, select it with `trainer.wandb:wandb` and set `--trainer.wandb.project NAME`. `--trainer.wandb.offline` stops the tracker from opening an online session, but the recipe can still download datasets and models. Profiling is off unless `trainer.profile` is set. `run.json` records the configuration only, so to reproduce a run, archive the dataset contents, the package versions and the source checkout separately.
+With `trainer.wandb` unset, the recipe prints to the terminal and keeps a local tracking journal in `<checkpoint-dir>/<name>/tracking`. To use Weights & Biases, select it with `trainer.wandb:wandb` and set `--trainer.wandb.project NAME`; the run shows in W&B under its own name, or under `--trainer.wandb.name` where that is set, while its checkpoints stay under the run's name. `--trainer.wandb.offline` stops the tracker from opening an online session, but the recipe can still download datasets and models. Profiling is off unless `trainer.profile` is set. `run.json` records the configuration only, so to reproduce a run, archive the dataset contents, the package versions and the source checkout separately.
 
 ## Token data and pretrained models
 
