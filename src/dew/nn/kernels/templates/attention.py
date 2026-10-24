@@ -132,7 +132,8 @@ def _searched(values: jax.Array, lo: jax.Array, hi: jax.Array, wanted: jax.Array
 def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_window: int | None = None,
           chunk: int | None = None, positions: tuple[jax.Array, jax.Array] | None = None, segment_ids=None,
           lengths: jax.Array | None = None, starts: jax.Array | None = None,
-          block_groups: jax.Array | None = None, image_groups: jax.Array | None = None) -> KeySpans:
+          block_groups: jax.Array | None = None, image_groups: jax.Array | None = None,
+          valid: jax.Array | None = None) -> KeySpans:
     """The `KeySpans` of a call of `queries` queries over `keys` keys in `batch` rows, in the terms
     `dew.nn.attention.scaled_dot_product_attention` takes them: `causal` keeps query i to keys 0..i (top
     left aligned, as jax's `is_causal`); `sliding_window=w` keeps the keys `window_sides` gives, the w - 1
@@ -152,8 +153,11 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     is read whole whatever the window, transformers' `block_sequence_ids` (`(causal and window) or block`);
     an image of `image_groups` within the window, which bounds the keys behind the query (Gemma 3's and
     4's, `window and (causal or image)`). A block holds the query's key and is one run, so the query's keys
-    stay one interval, the union of both kinds' among them. Lengths and starts are int32 token coordinates;
-    places and ids keep their own dtypes."""
+    stay one interval, the union of both kinds' among them. `valid` `[B, K]` marks the real keys, any
+    others hidden from every query as the document ids hide them: an invalid key takes id 0, the padding
+    id no query matches, after every place a cross call's alignment reads is taken from the ids as given,
+    and a call of no documents takes 1 for its queries and its valid keys. Lengths and starts are int32
+    token coordinates; places and ids keep their own dtypes."""
     from dew.nn.documents import CrossDocuments, aligned_places, document_ids
     from dew.nn.visibility import block_ends, block_starts, window_sides
 
@@ -240,9 +244,20 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     if starts is not None:
         start = jnp.maximum(start, starts.astype(jnp.int32)[:, None])
     blocks = True if causal and (block_groups is not None or image_groups is not None) else None
-    narrowed = (sliding_window, chunk, segment_ids, lengths, starts, blocks)
+    narrowed = (sliding_window, chunk, segment_ids, lengths, starts, blocks, valid)
     form = "spans" if any(narrowing is not None for narrowing in narrowed) else "causal" if causal else "full"
+    if valid is not None:
+        query_ids, key_ids = _valid_ids(query_ids, key_ids, jnp.asarray(valid, bool), batch, queries)
     return KeySpans(start, end, query_ids, key_ids, keys, form)
+
+
+def _valid_ids(query_ids: jax.Array | None, key_ids: jax.Array | None, valid: jax.Array, batch: int,
+               queries: int) -> tuple[jax.Array, jax.Array]:
+    """The queries' and keys' ids that hide the keys `valid` `[B, K]` does not mark: a key's own id where it
+    is valid, else 0, which no query matches; without documents every query and valid key 1."""
+    if query_ids is None or key_ids is None:
+        return jnp.ones((batch, queries), jnp.int32), valid.astype(jnp.int32)
+    return query_ids, jnp.where(valid, key_ids, jnp.zeros((), key_ids.dtype))
 
 
 def _least_after(places: jax.Array, ids: jax.Array | None) -> jax.Array:

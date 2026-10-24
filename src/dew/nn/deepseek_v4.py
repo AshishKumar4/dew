@@ -56,6 +56,7 @@ from dew.nn.attention import (
     causal_attention_mask,
     reference_attention,
     unweighted_rmsnorm,
+    visibility_mask,
 )
 from dew.nn.dense import Dense, DenseGeneral
 from dew.nn.documents import document_mask
@@ -697,7 +698,6 @@ class DeepseekV4Attention(FakeQuantizing):
             if positions is None:
                 positions = slots
         positions = jnp.arange(length) if positions is None else jnp.asarray(positions)
-        rows = jnp.arange(length)
         cos, sin = rotary_freqs(positions, self.rope_dim, self.rope_theta, rope_scaling=self.yarn,
                                 dtype=at_least_fp32(x.dtype))
 
@@ -711,9 +711,12 @@ class DeepseekV4Attention(FakeQuantizing):
 
         # The sliding window over the row's own positions: key j at or before
         # query i and within the window, its own position included
-        # (masking_utils sliding_window_overlay, modeling_deepseek_v4.py:205).
-        allowed = visible(rows[:, None], rows[None, :], causal=True, window=self.sliding_window)
-        allowed = jnp.broadcast_to(allowed, (batch, length, length))
+        # (masking_utils sliding_window_overlay, modeling_deepseek_v4.py:205),
+        # inside its document and among the real keys, as the template's spans
+        # say them (`visibility_mask`).
+        allowed = jnp.broadcast_to(visibility_mask(
+            length, length, causal=True, sliding_window=self.sliding_window, segment_ids=segment_ids,
+            key_valid=None if decode else valid)[:, 0], (batch, length, length))
         if cache is not None and cached_key is not None:
             slots, _, allocated = cache
             if allocated:
@@ -722,10 +725,8 @@ class DeepseekV4Attention(FakeQuantizing):
             allowed = causal_attention_mask(
                 slots, keys.shape[1], self.sliding_window,
                 key_valid=cached_validity(self, keys.shape[1]))[:, 0]
-        if segment_ids is not None:
-            allowed = allowed & document_mask(segment_ids)
-        if valid is not None and not decode:
-            allowed = allowed & valid[:, None, :]
+            if segment_ids is not None:
+                allowed = allowed & document_mask(segment_ids)
 
         if self.compressor is not None:
             selected_positions = positions if cache is None else cache[0]
