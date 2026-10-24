@@ -59,30 +59,18 @@ def test_diffusion_gemma_deferred_translation_materializes_the_same_model(system
         np.testing.assert_array_equal(actual, expected)
 
 
-def test_diffusion_gemma_export_reads_only_the_requested_decoder_tensor(system, monkeypatch):
-    """Renaming decoder tensors and adding encoder scalar aliases preserve the lazy export
-    mapping: inspecting its keys and specs reads none, and one lookup reads just that tensor."""
-    from dew.interop import hf_decoders
-    from dew.interop.safetensors_io import LazyTensors
-
+def test_diffusion_gemma_export_reads_only_the_requested_decoder_tensor(system):
+    """A resident model's export can name and plan its tensors without transferring values back
+    to the host. Looking up a tensor later yields the stored source's values."""
     model, variables, _, _, config = system
-    arrays = {"model.norm.weight": np.arange(4, dtype=np.float32),
-              "model.layers.0.layer_scalar": np.asarray([0.75], np.float32)}
-    reads = []
-
-    def read(name):
-        reads.append(name)
-        return arrays[name]
-
-    exported = LazyTensors({name: jax.ShapeDtypeStruct(value.shape, value.dtype)
-                           for name, value in arrays.items()}, read)
-    monkeypatch.setattr(hf_decoders, "export_decoder_weights", lambda *args: exported)
-    result = adapter.export_weights(model, variables, config)
-    assert len(result) > len(arrays)
-    assert not reads
-    np.testing.assert_array_equal(result["model.encoder.language_model.layers.0.layer_scalar"],
-                                  arrays["model.layers.0.layer_scalar"])
-    assert reads == ["model.layers.0.layer_scalar"]
+    resident = jax.tree.map(jax.device_put, variables)
+    with jax.transfer_guard_device_to_host("disallow"):
+        result = adapter.export_weights(model, resident, config)
+        specs = result.specs
+        assert specs
+    original = load_file(str(WORKFLOW / "model.safetensors"))
+    name = next(name for name in result if name in original and name.startswith("model.decoder."))
+    np.testing.assert_array_equal(result[name], original[name])
 
 
 def test_native_shared_model_forward_matches_reference(system):

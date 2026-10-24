@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping
+from typing import cast
 
 import jax
 import numpy as np
@@ -316,6 +317,7 @@ def export_weights(
             names[encoder], specs[encoder] = name, spec
     conditioning = {}
     for name, leaf in flatten_dict(params["self_conditioning"], sep=".").items():
+        leaf = cast(jax.Array | np.ndarray, leaf)
         module, kind = name.split(".")
         target = f"model.decoder.self_conditioning.{module}.weight"
         conditioning[target] = (leaf, kind)
