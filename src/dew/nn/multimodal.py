@@ -14,7 +14,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops
-from dew.nn.inputs import Coordinates, coordinates as build_coordinates, next_position
+from dew.nn.inputs import Coordinates, CrossContext, coordinates as build_coordinates, next_position
 from dew.nn.kv_cache import POSITION
 from dew.nn.protocols import OutputTable, ProjectionGroup, held_groups
 from dew.nn.sharding import explicit_spec
@@ -22,6 +22,7 @@ from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase
 from dew.nn.wrapping import DecoderWrapper
 
 if TYPE_CHECKING:
+    from dew.nn.cross_attention import CrossAttention
     from dew.nn.hyper_connections import HyperConnections
     from dew.nn.mla import MLAMixer
 
@@ -191,7 +192,9 @@ class MultimodalTransformer(DecoderWrapper):
     embeds its hard vision and audio vocabulary ranges through the embedders,
     and keeps placeholder ids for its per-layer inputs, as modeling_gemma3n.py
     does. The serving and training hooks are its language model's (`DecoderWrapper`); a
-    clone keeps the towers and every variable's path.
+    clone keeps the towers and every variable's path. So is its cross-attention
+    (`CrossAttending`): a call's context entries (`dew.nn.inputs.CONTEXT`) go to the
+    language model's layers, beside the media the towers read.
     """
 
     wraps = "language_model"
@@ -219,6 +222,26 @@ class MultimodalTransformer(DecoderWrapper):
     @nn.nowrap
     def parameter_flops(self, lengths) -> float:
         return parameter_flops(self.language_model, lengths)
+
+    @property
+    def cross_attention(self) -> CrossAttention | None:
+        return self.language_model.cross_attention
+
+    @property
+    def context_width(self) -> int:
+        return self.language_model.context_width
+
+    @property
+    def context_dtype(self) -> jnp.dtype:
+        return self.language_model.context_dtype
+
+    @nn.nowrap
+    def cross_flops(self, lengths, context_lengths) -> float:
+        return self.language_model.cross_flops(lengths, context_lengths)
+
+    @nn.nowrap
+    def with_cross_attention(self, cross: CrossAttention | None) -> Self:
+        return self._over(self.language_model.with_cross_attention(cross))
 
     @nn.nowrap
     def logits_flops(self, lengths) -> float:
@@ -313,7 +336,8 @@ class MultimodalTransformer(DecoderWrapper):
                           audio_indices=None, coordinates: Coordinates | None = None):
         """Run the multi-token prediction layers over the same media embeddings and
         token fields as the main decoder (`hidden_states`)."""
-        fused = self._fused(tokens, image_indices, audio_indices, conditioning, train=train)
+        _, media = CrossContext.parted(conditioning)
+        fused = self._fused(tokens, image_indices, audio_indices, media, train=train)
         return self.language_model.mtp_hidden_states(
             hidden, fused.tokens, train=train, positions=positions, segment_ids=segment_ids,
             input_embeddings=fused.embeddings, attention_mask=attention_mask,
@@ -387,15 +411,17 @@ class MultimodalTransformer(DecoderWrapper):
             assert following is not None
             if allocated:
                 cursor.value = jnp.where(valid.any(axis=1), following, cursor.value)
-        if conditioning is None and self.is_initializing():
+        # The towers read the media; the language model reads the context, and checks it.
+        context, media = CrossContext.parted(conditioning)
+        if media is None and self.is_initializing():
             self.conditioner.initialize_parameters()
             if self.audio is not None:
                 self.audio_conditioner.initialize_parameters()
-        fused = self._fused(tokens, image_indices, audio_indices, conditioning, train=train)
+        fused = self._fused(tokens, image_indices, audio_indices, media, train=train)
         return self.language_model.hidden_states(
             fused.tokens, train=train, decode=decode, input_embeddings=fused.embeddings,
             image_groups=image_groups, rotary_positions=rotary_positions, media_mask=fused.media,
-            routed_experts=routed_experts, routed=routed, coordinates=coordinates)
+            routed_experts=routed_experts, routed=routed, coordinates=coordinates, conditioning=context)
 
     def __call__(self, tokens, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None, image_indices=None,

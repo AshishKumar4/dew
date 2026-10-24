@@ -39,6 +39,15 @@ LMObjective(MyLM(...), seq_len=2048)
 - Variables are whatever Flax returns (plain dicts, or `FrozenDict` from older code). The Trainer normalizes the tree once at its boundary, so training, saving and restoring see one form.
 - Pretrained weights come from `Pretrained.load("Qwen/Qwen3.5-0.8B")`, which returns the module, its variables and its processor.
 
+### A context read through cross-attention
+
+A decision (`dew.decision`) may read a context beside its state: `Example.context`, any JSON value, rendered as text by the decision's tokenizer and cut to its first `context_length` tokens. A source takes the gated cross-attention blocks that read it with `Pretrained.with_cross_attention(CrossAttention(layers, context_length), key=...)` (`DecisionRunConfig.context_layers` and `context_length` on the command line). The blocks start with zero gates, so the model computes what the source computes until they train. The variables hold the blocks under `params` and the source's weights under `FROZEN`, so the objective trains the blocks alone (and an adapter's factors, where `lora` adds them), and the source stays as loaded. A multimodal source takes the blocks on its language model and reads a context beside its images.
+
+- **Packing.** Rows that carry a context pack one to a window (`DecisionObjective.bounds`), so each window's context is its row's; the batch holds each row's context tokens and their count (`context_lengths`).
+- **Work.** `train/flops` counts the blocks' work over each row's real context tokens (`CrossAttending.cross_flops`): a frozen source's training work, plus three passes of the blocks and the head.
+- **Serving.** `Decide(state, questions, context=...)` and `Decide.batch(requests, contexts=...)` read a request's context as training did, its images too.
+- **No blocks attached.** Training over a source without cross-attention leaves `Example.context` unread: the rows carry no context, as a table with no context column trains. Serving refuses a context such a task cannot read (ValueError), and a model refuses rows that carry one (TypeError), so no answer silently ignores a context it was given.
+
 ## 2. The mesh
 
 Two ways to describe the devices, one path underneath.

@@ -20,7 +20,7 @@ import dataclasses
 import json
 import socket
 import threading
-from concurrent.futures import Future
+from concurrent.futures import Future, wait
 from contextlib import contextmanager
 from dataclasses import asdict
 
@@ -568,3 +568,27 @@ def test_a_non_finite_reward_or_a_failing_decode_fails_the_prompt_rollouts_futur
     with pytest.raises(failure):
         prompts.submit(task, 1, version=0, key=KEY)[0].result(timeout=10)
     prompts.close()
+
+
+def test_closing_the_prompt_source_cancels_the_rollouts_whose_rewards_never_started():
+    """One reward thread, held in a reward, and a second draw's reward queued behind it: closing
+    the source lets the running reward finish and cancels the queued rollout, so a scheduler waiting
+    on it wakes, where it once waited on a future nothing would settle."""
+    started, release = threading.Event(), threading.Event()
+
+    def reward(text, record):
+        started.set()
+        release.wait(timeout=30)
+        return 1.0
+
+    prompts = PromptSource(Server(), reward, decode=lambda ids: "text", max_new_tokens=4, scorers=1)
+    task = Task("t", {"prompt": (1, 2), "record": PromptRecord("rule", "1")})
+    running, queued = prompts.submit(task, 2, version=0, key=KEY)
+    assert started.wait(timeout=30)
+    closing = threading.Thread(target=prompts.close)
+    closing.start()
+    done, _ = wait([queued], timeout=30)
+    release.set()
+    closing.join(timeout=30)
+    assert done and queued.cancelled()
+    assert running.result(timeout=30).status is Status.COMPLETED
