@@ -25,8 +25,8 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew import _records
+from dew._coordination import agreed
 from dew._records import JSON
-from dew.coordination import agreed
 from dew.nn.protocols import Bounded, Predicting
 from dew.sampling import decoding
 from dew.sampling.strategies import Beam, Speculative, Strategy

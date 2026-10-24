@@ -752,14 +752,14 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
     so a rank whose tree lacks one is refused with its peers rather than
     leaving them at the measurement's agreement.
     """
-    from dew import cache, coordination
+    from dew import _coordination, cache
     from dew.nn.kernels.generation import device_generation, fp8_tensor_cores
 
     def planned() -> dict:
         return {"tokens": tokens,
                 "shapes": {site: list(np.shape(_site_kernel(variables["params"], site))) for site in sites}}
 
-    plan = coordination.agreed_same("frozen FP8 sites to measure", planned)
+    plan = _coordination.agreed_same("frozen FP8 sites to measure", planned)
     shapes = {site: tuple(shape) for site, shape in plan["shapes"].items()}
 
     def decided() -> dict | None:
@@ -775,8 +775,8 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
         faster = {shape: _fp8_faster(shape, tokens) for shape in sorted(set(shapes.values()))}
         return {"sites": [site for site in sites if faster[shapes[site]]], "generation": generation}
 
-    record = coordination.broadcast_from_process_zero(
-        coordination.agreed("measuring frozen FP8 sites", decided))
+    record = _coordination.broadcast_from_process_zero(
+        _coordination.agreed("measuring frozen FP8 sites", decided))
     return InputQuantization(frozen_fp8=tuple(record["sites"]), measured_on=record["generation"])
 
 

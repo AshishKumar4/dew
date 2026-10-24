@@ -27,9 +27,9 @@ import numpy as np
 import optax
 from flax import linen as nn
 
+from dew._coordination import agreed, collective_host
 from dew.artifacts import ImageGrid, VideoGrid
 from dew.batch import FROZEN, Batch, Variables, merge, thaw, under
-from dew.coordination import agreed, collective_host
 from dew.diffusion.presets import Preset, build_process
 from dew.diffusion.process import Process, aligned_conditions
 from dew.diffusion.schedules import FlowMatchingScheduler, expand

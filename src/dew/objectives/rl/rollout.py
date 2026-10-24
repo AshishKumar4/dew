@@ -9,8 +9,8 @@ from collections.abc import Callable, Sequence
 import jax.numpy as jnp
 import numpy as np
 
+from dew._coordination import agreed
 from dew.batch import Batch
-from dew.coordination import agreed
 from dew.data.dataset import DataPartition
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY, PromptRecord
 from dew.inference.rollouts import Draw, InfrastructureError, response

@@ -11,6 +11,7 @@ coordinate through these, so they live apart from any one of them.
 from __future__ import annotations
 
 import atexit
+import dataclasses
 import hashlib
 import itertools
 import json
@@ -268,11 +269,24 @@ class PeerFailure(RuntimeError):
     """Raised when another process failed at a phase agreement that this process passed."""
 
 
-AGREEMENT_PATIENCE_SECONDS = 24 * 3600
-"""How long ranks that reached an agreement wait on the host for the rest.
+@dataclasses.dataclass
+class _Patience:
+    """How long ranks that reached an agreement wait on the host for the rest, one day unless
+    `agreement_patience` sets it. Host work before an agreement, such as process 0 uploading the final
+    checkpoint, can take hours; the pool bounds device executions, not this."""
 
-Host work before an agreement, such as process 0 uploading the final
-checkpoint, can take hours; the pool bounds device executions, not this."""
+    seconds: float = 24 * 3600
+
+
+_PATIENCE = _Patience()
+
+
+def agreement_patience(seconds: float) -> None:
+    """Bound how long a rank that reached an agreement waits on the host for the rest, one day by
+    default: a pool whose host phases are short can learn sooner of a rank stalled before one."""
+    if not seconds > 0:
+        raise ValueError(f"an agreement's patience is a positive number of seconds, not {seconds!r}")
+    _PATIENCE.seconds = seconds
 
 _agreements = itertools.count()
 
@@ -331,7 +345,7 @@ def _round(word: str) -> list[str]:
     pool size (`docs/performance.md`).
     """
     client, number = _client(), next(_agreements)
-    directory, patience = f"dew/agreement/{number}", int(AGREEMENT_PATIENCE_SECONDS * 1000)
+    directory, patience = f"dew/agreement/{number}", int(_PATIENCE.seconds * 1000)
     client.key_value_set(f"{directory}/{jax.process_index()}", word)
     client.wait_at_barrier(directory, patience)
     said = dict(client.key_value_dir_get(directory))
@@ -502,6 +516,7 @@ __all__ = [
     "PeerFailure",
     "agree_process_phase",
     "agreed",
+    "agreement_patience",
     "agreed_same",
     "broadcast_from_process_zero",
     "collective_host",

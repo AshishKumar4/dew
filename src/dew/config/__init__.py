@@ -46,11 +46,11 @@ from etils import epath
 
 import dew.io
 from dew import registry
+from dew._coordination import agree_process_phase, agreed
 from dew._records import JSON, duration, record, recorded_duration
 from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
-from dew.coordination import agree_process_phase, agreed
 from dew.data import records
 from dew.data.compile import fitted
 from dew.data.dataset import Loader, Ramp, Reader, ramped, record_argument

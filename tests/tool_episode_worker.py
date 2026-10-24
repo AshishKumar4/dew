@@ -19,7 +19,7 @@ def main() -> None:
                                    process_id=rank, local_device_ids=[0], initialization_timeout=30)
     from episode_support import Harness, SquareSession, build, episode_scheduler
 
-    from dew.coordination import collective_host
+    from dew._coordination import collective_host
     from dew.data.dataset import Loader
     from dew.objectives.rl import EpisodeStatus, Observation
     from dew.training.distributed import shard_batch

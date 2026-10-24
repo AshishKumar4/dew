@@ -713,7 +713,7 @@ def agreed_records(packed: dict[str, np.ndarray], support_capacity: int | None) 
     nothing, a share's later reader, keeps nothing. Every process calls
     this, in the order of its other coordination rounds.
     """
-    from dew.coordination import from_every_process
+    from dew._coordination import from_every_process
 
     routed = packed.get(ROUTED_EXPERTS_KEY)
     pool = from_every_process({"routing": None if routed is None else [*routed.shape[2:], routed.dtype.name],

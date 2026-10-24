@@ -126,8 +126,8 @@ from typing import ClassVar, Protocol
 import jax
 import numpy as np
 
+from dew._coordination import agreed
 from dew.batch import Batch, Variables
-from dew.coordination import agreed
 from dew.data.dataset import DataPartition, Loader, tapped
 from dew.nn.inputs import local_rows, mesh_of
 from dew.objectives.base import Shown
@@ -493,7 +493,7 @@ class Asynchronous:
 
 
 def _within[T](mesh, phase: str, operation: Callable[[], T]) -> T:
-    """`operation`, agreed across the processes of `mesh` (`dew.coordination.agreed`); a process
+    """`operation`, agreed across the processes of `mesh` (`dew._coordination.agreed`); a process
     without one runs it alone."""
     return operation() if mesh is None else agreed(phase, operation)
 

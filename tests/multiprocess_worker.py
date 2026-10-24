@@ -761,7 +761,7 @@ def mode_fp8_sites(args) -> dict:
     passes one more agreement, which a rank left behind would block."""
     import jax
 
-    from dew import coordination
+    from dew import _coordination
     from dew.quantization import measured_fp8_sites
 
     full = {"params": {"wide": {"kernel": np.zeros((64, 96), np.float32)},
@@ -771,13 +771,13 @@ def mode_fp8_sites(args) -> dict:
     def outcome(variables) -> str:
         try:
             measured_fp8_sites(variables, ("wide", "narrow"), 8)
-        except (ValueError, coordination.PeerFailure) as error:
+        except (ValueError, _coordination.PeerFailure) as error:
             return f"{type(error).__name__}: {error}"
         return "measured"
 
     unsupported = outcome(full)
     missing = outcome(lacking if jax.process_index() == 1 else full)
-    after = coordination.agreed("after the refusals", lambda: True)
+    after = _coordination.agreed("after the refusals", lambda: True)
     return {"unsupported": unsupported, "missing": missing, "after": after}
 
 
@@ -791,7 +791,7 @@ def mode_profile_failure(args) -> dict:
     import optax
 
     import dew.telemetry.profile as telemetry_profile
-    from dew.coordination import agree_process_phase
+    from dew._coordination import agree_process_phase
     from dew.training import ProfileWindow, Trainer
 
     # The optional XProf package is absent in the test environment; stubbing

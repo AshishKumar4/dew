@@ -64,7 +64,7 @@ import numpy as np
 import tokamax
 from jax.extend.backend import get_default_device
 
-from dew import _records, cache, coordination
+from dew import _coordination, _records, cache
 from dew._records import JSON
 from dew.files import write_atomically
 
@@ -867,7 +867,7 @@ def _settle(found: list[Launch], *, measure: bool) -> int:
             _store(kind, measured)
         return json.dumps([json.loads(dumps_picks(kind, chosen)) for chosen in (decisions, nearest)])
 
-    text = coordination.broadcast_from_process_zero(coordination.agreed("settling kernel configs", decided))
+    text = _coordination.broadcast_from_process_zero(_coordination.agreed("settling kernel configs", decided))
     picked, near = (_keyed([(_launch(entry), _timings(entry["timings"])) for entry in chosen["data"]])
                     for chosen in json.loads(text))
     settled: dict[tuple[tokamax.Op, Hashable], Timings] = {
@@ -886,7 +886,7 @@ def _settle(found: list[Launch], *, measure: bool) -> int:
         _NEAREST.setdefault((_identity(op), kind), {})[key] = (
             near[(ba.op, key)][1] if (ba.op, key) in near else None)
     changed = launched() != traced
-    if any(coordination.from_every_process(changed)):
+    if any(_coordination.from_every_process(changed)):
         # A program lowered again traces again, with the picks it now reads.
         cache.KERNEL_TUNES.set_global(cache.KERNEL_TUNES.get_global() + 1)
     unmeasured = sum(_pick(ba) is None for _, ba in found)
