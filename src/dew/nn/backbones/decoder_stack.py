@@ -255,10 +255,15 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
         inputs = None if per_layer_input is None else per_layer_input.span(first, count)
         store = kv_store if count == 1 or specs[first].kv_shared else None
 
-        def step(layer, carry, per_layer_input, *, store=store):
-            return layer(carry, train=train, decode=decode, kv_store=store,
-                         per_layer_input=per_layer_input,
-                         attention_metadata=attention_metadata), None
+        def step(layer, carry, per_layer_input, store):
+            # A provider writes its keys and values into the store it is given; inside a lifted
+            # transform the writes come back explicitly, as `DecoderBlock.__call__`'s remat returns
+            # them, so no tracer of the transform leaks through the dict.
+            written = None if store is None else dict(store)
+            out = layer(carry, train=train, decode=decode, kv_store=written,
+                        per_layer_input=per_layer_input, attention_metadata=attention_metadata)
+            return out, {} if store is None else {name: value for name, value in written.items()
+                                                  if value is not store.get(name)}
 
         if fetching:
             # Scan variables are xs, not closed-over bank slices. Native
@@ -269,9 +274,16 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             step = nn.remat(nn.map_variables(
                 step, mapped_collections=True, trans_in_fn=_fetched, init=False, mutable=True))
         if count == 1:
-            x, _ = step(run, x, None if inputs is None else inputs.layer(0))
+            x, written = step(run, x, None if inputs is None else inputs.layer(0), store)
+            if store is not None:
+                store.update(written)
         else:
-            x, _ = nn.scan(step, variable_axes={True: 0}, split_rngs={True: True},
+            # A longer run's layers share keys or own them, so they only read the store: a provider
+            # is always a run of one (`run_stack`).
+            def scanned(layer, carry, per_layer_input, *, store=store, step=step):
+                return step(layer, carry, per_layer_input, store)[0], None
+
+            x, _ = nn.scan(scanned, variable_axes={True: 0}, split_rngs={True: True},
                            in_axes=2, length=count)(run, x, inputs)
     return x
 
