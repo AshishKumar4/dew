@@ -1645,7 +1645,7 @@ def token_log_probs(logits: jax.Array, tokens: jax.Array) -> jax.Array:
 
     `tokens` is `logits.shape[:-1]` of ids and the result has that shape.
     """
-    return -categorical.cross_entropy(logits, tokens)
+    return -optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), tokens)
 
 __all__ = [
     "FROZEN",

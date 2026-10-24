@@ -73,8 +73,7 @@ def entropy(logits: jax.Array, where: jax.Array | None = None) -> jax.Array:
     """`-sum_k p_k log p_k` over the last axis, a class of no probability (a -inf logit, or one `where`
     excludes) adding no term, in value or gradient."""
     log_p = log_probs(logits, where)
-    held = jnp.where(jnp.isneginf(log_p), 0.0, log_p)
-    return -(jnp.exp(log_p) * held).sum(axis=-1)
+    return -(jnp.exp(log_p) * log_p).sum(axis=-1)
 
 
 def _wide(*operands: jax.Array) -> tuple[jax.Array, ...]:
