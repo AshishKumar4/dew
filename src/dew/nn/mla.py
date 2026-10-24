@@ -323,6 +323,7 @@ class MultiHeadLatentAttention(nn.Module):
     output_gate: bool = False
     """Kimi K3's `mla_use_output_gate`: the heads' output times
     `sigmoid(g_proj(x))` before `o_proj` (modeling_kimi_linear.py:398-401, 470-472)."""
+    force_fp32_for_softmax: bool = True
 
     def setup(self):
         if self.qk_rope_head_dim % 2:
@@ -519,25 +520,21 @@ class MultiHeadLatentAttention(nn.Module):
 
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL, prediction_phase: PredictionPhase = "ordinary"):
-        """Project once in the shared latent shell, then apply the kind's attention/index policy."""
+        """Project, cache and attend through the latent shell with the kind's candidate selection."""
+        batch, length, _ = x.shape
+        self._check_call(call, batch, length)
         place = down_projection(x, (self.q_lora_rank or 0) + self.kv_lora_rank + self.qk_rope_head_dim)
         queries, q_resid = self._queries(x, place)
         latent, rot = self._latents(x, place)
-        return self._attend_projected(x, call, queries, q_resid, latent, rot, prediction_phase)
-
-    def _attend_projected(self, x, call: MixerCall, queries, q_resid, latent, rot,
-                          prediction_phase: PredictionPhase):
-        """Ordinary MLA's rotary, visibility and indexer selection over the shared projections."""
-        decode, kv_store, attention_metadata = call.decode, call.kv_store, call.metadata
+        decode, attention_metadata = call.decode, call.metadata
         causal, mask, objective = self.causal, None, None
+        unselected = None
         implementation = self.attention_impl
-        batch, length, _ = x.shape
         tokens = coordinates_of(attention_metadata, batch, length)
         # Each token's logical place (`Coordinates.places`); a cached call's default is its slot.
         positions, segment_ids = tokens.positions if decode else tokens.places(), tokens.segments
         valid = None if attention_metadata is None else attention_metadata.valid
-        if attention_metadata is not None and attention_metadata.rotary_positions is not None:
-            raise ValueError("MLA does not implement multi-axis rotary positions")
+        row_valid = jnp.ones((batch, length), bool) if valid is None else jnp.asarray(valid, bool)
         logical_positions = positions
         # jnp splits at indices where torch splits into sizes: one cut point,
         # since the widths add up exactly.
@@ -545,7 +542,9 @@ class MultiHeadLatentAttention(nn.Module):
             queries, [self.qk_nope_head_dim], axis=-1)
         if decode:
             q_rot, key, value, mask = self._decode_step(
-                x, q_rot, rot, latent, q_resid, logical_positions, valid, kv_store)
+                x, q_rot, rot, latent, q_resid, logical_positions, valid, call, prediction_phase)
+            if self.sparse:
+                unselected = self._empty_selection(mask[:, 0], row_valid)
             causal = False
         else:
             positions = jnp.arange(length) if positions is None else jnp.asarray(positions)
@@ -573,20 +572,18 @@ class MultiHeadLatentAttention(nn.Module):
                 if valid is not None:
                     # Selection and its objective range over real keys only.
                     keep = jnp.logical_and(keep, jnp.asarray(valid, bool)[:, None, :])
-                index_scores = None
-                if self.indexed:
-                    assert q_resid is not None
-                    index_keys = self.indexer.rotated_keys(
-                        self.indexer.keys(x), freqs_cos, freqs_sin)
-                    index_scores = self.indexer.scores(
-                        x, q_resid, index_keys, freqs_cos, freqs_sin)
+                index_keys = (self._rotated_index_keys(self._index_keys(x, row_valid), freqs_cos, freqs_sin)
+                              if self.indexed else None)
+                selection, index_scores = self._selection(
+                    x, q_resid, index_keys, keep, freqs_cos, freqs_sin, call, row_valid,
+                    prediction_phase=prediction_phase)
                 if self.sparse:
-                    selection = self._select(index_scores, keep, kv_store)
                     if self._attends_sparsely(selection, length):
                         return self._output(self._sparse_attention(
                             q_pass, q_rot, latent, rot, selection, index_scores), x)
                     keep = selection_mask(selection, length)
                     mask, causal = keep[:, None], False
+                    unselected = self._empty_selection(keep, row_valid)
                 if (index_scores is not None and not self.is_initializing()
                         and self.is_mutable_collection(INDEXER_COLLECTION)):
                     objective = (index_scores, keep)
@@ -603,12 +600,36 @@ class MultiHeadLatentAttention(nn.Module):
             # kernel, the way the standard mixer's own masks do. Decoding
             # runs no backward pass, so its cache mask keeps the fused path.
             implementation = kernel_for_materialized_mask(
-                implementation, query, key, dtype=self.dtype, precision=self.precision)
+                implementation, query, key, dtype=self.dtype, precision=self.precision,
+                force_fp32_for_softmax=self.force_fp32_for_softmax)
         if objective is not None:
             self._sow_indexer_kl(*objective, query, key)
-        return self._attend(query, key, value, x, mask, implementation, causal=causal)
+        return self._attend(query, key, value, x, mask, implementation, causal=causal,
+                            unselected=unselected, force_fp32_for_softmax=self.force_fp32_for_softmax)
 
-    def _decode_step(self, x, q_rot, rot, latent, q_resid, logical_positions, valid, kv_store):
+    def _check_call(self, call: MixerCall, batch: int, length: int) -> None:
+        if call.metadata is not None and call.metadata.rotary_positions is not None:
+            raise ValueError("MLA does not implement multi-axis rotary positions")
+
+    def _index_keys(self, x, valid):
+        return self.indexer.keys(x)
+
+    def _rotated_index_keys(self, keys, freqs_cos, freqs_sin):
+        return self.indexer.rotated_keys(keys, freqs_cos, freqs_sin)
+
+    def _selection(self, x, q_resid, index_keys, keep, freqs_cos, freqs_sin, call, row_valid, *,
+                    slots=None, allocated: bool = False, committed=None,
+                    prediction_phase: PredictionPhase = "ordinary"):
+        """Select candidates and retain the lightning scores for its optional training objective."""
+        scores = (self.indexer.scores(x, q_resid, index_keys, freqs_cos, freqs_sin)
+                  if self.indexed else None)
+        return (self._select(scores, keep, call.kv_store) if self.sparse else None), scores
+
+    def _empty_selection(self, selected, row_valid):
+        return None
+
+    def _decode_step(self, x, q_rot, rot, latent, q_resid, logical_positions, valid, call,
+                      prediction_phase: PredictionPhase):
         """One decode step's rotated query heads, its keys and values with the
         cache's joined, and the mask over them: the expanded keys and the
         indexer's selection under the sparse layout, or the latents expanded
@@ -618,27 +639,27 @@ class MultiHeadLatentAttention(nn.Module):
         # and the appended latents at theirs, while the cached ones keep
         # the angles of the slots they were written at.
         if self.sparse:
-            # The cache is shaped by the expansion; its values are
-            # recomputed after rotation below, so only shapes flow here.
-            shape_key, _ = self._expand(latent, rot)
-            index_keys = self.indexer.keys(x) if self.indexed else None
+            allocated = self.has_variable("cache", "cache_index")
+            committed = self.get_variable("cache", "cache_index")
+            row_valid = jnp.ones(x.shape[:2], bool) if valid is None else jnp.asarray(valid, bool)
+            # Allocation needs geometry, not another intercepted projection or dropout draw.
+            shape_key = jax.ShapeDtypeStruct((*x.shape[:2], self.num_heads,
+                                             self.qk_nope_head_dim + self.qk_rope_head_dim), latent.dtype)
+            index_keys = self._index_keys(x, row_valid) if self.indexed else None
             positions, append = open_latent_cache(self, shape_key, self.v_head_dim, index_keys,
                                                   self.max_seq_len, valid=valid)
             q_rot, rot, freqs_cos, freqs_sin = self._rotated(
                 q_rot, rot,
                 positions if logical_positions is None else logical_positions)
             if index_keys is not None:
-                index_keys = self.indexer.rotated_keys(index_keys, freqs_cos, freqs_sin)
+                index_keys = self._rotated_index_keys(index_keys, freqs_cos, freqs_sin)
             key, value, index_full = append(
                 *self._expand(latent, rot), index_keys)
-            index_scores = None
-            if self.indexed:
-                assert q_resid is not None
-                index_scores = self.indexer.scores(
-                    x, q_resid, index_full, freqs_cos, freqs_sin)
             keep = self._visible(positions, key.shape[1])[:, 0]
-            mask = selection_mask(self._select(index_scores, keep, kv_store),
-                                  key.shape[1])[:, None]
+            selection, _ = self._selection(
+                x, q_resid, index_full, keep, freqs_cos, freqs_sin, call, row_valid, slots=positions,
+                allocated=allocated, committed=committed, prediction_phase=prediction_phase)
+            mask = selection_mask(selection, key.shape[1])[:, None]
         else:
             # The latent and its rotary part, one head each, as the attention cache's keys and values.
             positions, append = open_kv_cache(self, latent[:, :, None], self.max_seq_len, valid=valid,
