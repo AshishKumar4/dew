@@ -14,7 +14,7 @@ import optax
 import pytest
 from affine_run import Replaying
 from diffusion_stubs import RES, StubText
-from diffusion_support import applied, moved_weights, objective_gradient
+from diffusion_support import applied, float32_update, float64_gradient, moved_weights, objective_gradient
 from flax import linen as nn
 
 from dew.data.dataset import Loader
@@ -484,7 +484,7 @@ def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_on
     moved by a draw, so the DiT's zero-initialized layers take a gradient too. Drawn by the attempt,
     the halves read other noise than the whole, and the step another update."""
     import optax
-    from reference_error import assert_as_exact, widened
+    from reference_error import assert_as_exact
 
     from dew.training import Trainer
     from dew.training.transaction import example_fields
@@ -511,21 +511,10 @@ def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_on
         after = jax.tree.map(np.asarray, stepped.variables["params"])
         return jax.tree.map(applied, variables["params"], after)
 
-    whole_gradient = jax.jit(lambda variables: objective_gradient(objective, variables, whole, info))
-
-    def alone(variables):
-        # The whole batch's step, its update applied in float32 as the trainer applies it.
-        grads = jax.tree.map(np.asarray, whole_gradient(variables))
-        return jax.tree.map(lambda before, grad: applied(before, (before - grad).astype(np.float32)),
-                            variables["params"], grads)
-
-    def truth(variables):
-        with jax.enable_x64(new_val=True):
-            wide = objective_gradient(twin, widened(variables), widened(whole), info)
-            return jax.tree.map(np.asarray, wide)
-
+    # The whole batch's step.
+    alone = float32_update(jax.jit(lambda variables: objective_gradient(objective, variables, whole, info)))
     assert_as_exact(pooled, alone, moved_weights(template.variables), "pooled update", seeds=POOLED_SEEDS,
-                    truth_fn=truth)
+                    truth_fn=float64_gradient(twin, whole, info))
 
 
 HOST_MASTER_SEEDS = 16
@@ -540,7 +529,7 @@ def test_a_host_master_step_draws_each_examples_noise_as_the_resident_step_does(
     two programs, which round otherwise: the host's update is its CPU's. A host-master run's draws by
     the attempt would read other times, noise and dropped conditions, and step elsewhere."""
     import optax
-    from reference_error import assert_as_exact, widened
+    from reference_error import assert_as_exact
 
     from dew.training import Layout, Trainer
     from dew.training.transaction import example_fields
@@ -569,12 +558,5 @@ def test_a_host_master_step_draws_each_examples_noise_as_the_resident_step_does(
     resident, template = stepping(Layout(min_shard=1, tolerance=1.))
     info = Step(jnp.asarray(0), jax.random.fold_in(template.key, 0), None,
                 **example_fields(template, 0, 1, batch))
-    twin = float64_twin(objective)
-
-    def truth(variables):
-        with jax.enable_x64(new_val=True):
-            wide = objective_gradient(twin, widened(variables), widened(batch), info)
-            return jax.tree.map(np.asarray, wide)
-
     assert_as_exact(host, resident, moved_weights(template.variables), "host-master update",
-                    seeds=HOST_MASTER_SEEDS, truth_fn=truth)
+                    seeds=HOST_MASTER_SEEDS, truth_fn=float64_gradient(float64_twin(objective), batch, info))

@@ -15,8 +15,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from diffusion_support import applied, moved_weights, objective_gradient
-from reference_error import assert_as_exact, widened
+from diffusion_support import applied, float32_update, float64_gradient, moved_weights, objective_gradient
+from reference_error import assert_as_exact
 from safetensors.numpy import load_file
 
 from dew import Trainer
@@ -103,25 +103,12 @@ def assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, 
     and marked rows, then takes the trainer's own update on one device, to the bit: the same program
     on the same values."""
     stepped, step = trainer_update(obj, batch, run_key, 1.0)
-    compiled = jax.jit(lambda values: objective_gradient(obj, values, batch, step))
 
     def trained(values):
         return jax.tree.map(applied, values["params"], stepped(values))
 
-    def objective_update(values):
-        # The objective's gradient, its update applied in float32 as the trainer applies it.
-        grads = jax.tree.map(np.asarray, compiled(values))
-        return jax.tree.map(lambda before, grad: applied(before, (before - grad).astype(np.float32)),
-                            values["params"], grads)
-
-    # Compiled once, as each arm is, rather than run op by op at every draw: a 0.12 CPU sizing of this
-    # site ran its process out of memory for compiled code within its draws.
-    wide = jax.jit(lambda values: objective_gradient(twin, values, widened(batch), step))
-
-    def truth(values):
-        with jax.enable_x64(new_val=True):
-            return jax.tree.map(np.asarray, wide(widened(values)))
-
+    objective_update = float32_update(jax.jit(lambda values: objective_gradient(obj, values, batch, step)))
+    truth = float64_gradient(twin, batch, step)
     assert_as_exact(trained, objective_update, moved_weights(variables), "trainer update", seeds=seeds,
                     truth_fn=truth)
     taken, _ = trainer_update(obj, batch, run_key, 0.001)
