@@ -776,3 +776,18 @@ def test_a_later_run_of_one_objective_releases_the_device_steps_an_earlier_run_c
     _scaled_fit(shared, _Scaled(1.0))
     gc.collect()
     assert released() is None
+
+
+def test_a_tasks_held_weights_leave_the_callers_private_mapping_as_it_changed_it(tmp_path):
+    """A task's weights are placed into a tree of their own (`held`), so the caller's host arrays stay
+    as they were: a copy-on-write mapping's changed pages are not given back to the file they came from,
+    which would turn them back into the file's values."""
+    from dew.inference.tasks import held
+
+    path = tmp_path / "kernel.bin"
+    np.arange(4096, dtype=np.float32).tofile(path)
+    kernel = np.memmap(path, np.float32, mode="c", shape=(4096,))
+    kernel[:] = -1.0
+    placed = held({"params": {"kernel": kernel}})
+    np.testing.assert_array_equal(kernel, np.full(4096, -1.0, np.float32))
+    np.testing.assert_array_equal(np.asarray(placed["params"]["kernel"]), np.full(4096, -1.0, np.float32))
