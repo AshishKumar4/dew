@@ -63,6 +63,22 @@ class Streams:
     views: dict
 
 
+STAGING_SOLVED = (0, 11, 2, 20)
+"""The first JAX whose Mosaic GPU layout inference solves a kernel's independent shared-memory buffers
+apart (Dew's fork, 0.11.2.post20, its `_independent_components`): before it, an mma.sync tile staging its
+output through a buffer read back row by row exhausts the solver at every tile but the one 128 x 256 x 32
+(AMPERE3, SM80-probe), which a thread's registers do not hold."""
+
+
+def staging_solved() -> bool:
+    """Whether this JAX's release (its version's numbers, a post release's last) is `STAGING_SOLVED` or
+    later."""
+    import jax
+    numbers = tuple(int(part.removeprefix("post")) for part in jax.__version__.split(".")
+                    if part.removeprefix("post").isdigit())
+    return numbers >= STAGING_SOLVED
+
+
 @dataclasses.dataclass(frozen=True)
 class Mma(mosaic.Family):
     """mma.sync's bundle for operands of `dtype`: one compute warpgroup a program and no producer
@@ -76,6 +92,7 @@ class Mma(mosaic.Family):
     bounded_loads = False
     role_rows = 4 * 16
     operands_in_registers = True
+    rhs_copies = 4
 
     def registers(self, consumers: int) -> int:
         del consumers  # one role, at a thread's whole budget
