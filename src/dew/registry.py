@@ -806,7 +806,7 @@ def component[Base](base: type[Base], record: Mapping[str, object]
                     ) -> tuple[type[Base], Mapping[str, object]]:
     """The class a component's record, `{"class": ..., "fields": {...}}` (`to_record`, `Recorded`), names
     by an alias or its import path, one that is `base` or derives from it, and the record's fields as
-    written: the lookup `from_record` builds a class record through. A component built around parameters
+    written: the lookup `from_record` uses for a class record (`_member`). A component built around parameters
     (an encoder, an autoencoder, a decision head) reads its fields against its own constructor
     (`read_arguments`) and binds them itself. A record of another shape, of a function, or a protocol
     `base` (which no class need derive from) is refused."""

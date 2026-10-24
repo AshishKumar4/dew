@@ -202,6 +202,13 @@ def test_a_stochastic_encoder_samples_at_its_given_noise_and_a_deterministic_one
     assert not np.array_equal(sampled, mean)
 
 
+class Plain(ModuleAutoEncoder[AutoencoderKL]):
+    """A user's autoencoder with nothing of its own to record: it inherits the generic constructor."""
+
+    def record_arguments(self) -> dict:
+        return {}
+
+
 class Halved(ModuleAutoEncoder[AutoencoderKL]):
     """A user's autoencoder, no built-in: a native AutoencoderKL whose latents it scales by `factor`,
     recorded with that factor (`record_arguments`)."""
@@ -215,18 +222,20 @@ class Halved(ModuleAutoEncoder[AutoencoderKL]):
         return {"factor": self.factor}
 
 
-def test_a_users_autoencoder_rebuilds_from_its_record_as_a_built_in_does():
+@pytest.mark.parametrize("own", ["inherited constructor", "own constructor"])
+def test_a_users_autoencoder_rebuilds_from_its_record_as_a_built_in_does(own):
     """An autoencoder of the user's own records itself as the registry records any component, its class
-    by import path (`AutoEncoder.to_json`), and rebuilds from that record around the run's parameters
-    (`from_json`), no registration needed: the rebuilt one encodes and decodes bitwise as the one it
+    by import path (`registry.to_record`), and rebuilds from that record around the run's parameters
+    (`AutoEncoder.bound`), no registration needed: the rebuilt one encodes and decodes bitwise as the one it
     recorded, its normalization included. Its class and its module's survive JSON as import paths."""
     vae = tiny_vae()
-    original = Halved(vae.model, vae.params, factor=0.5)
+    original = (Plain(vae.model, vae.params) if own == "inherited constructor"
+                else Halved(vae.model, vae.params, factor=0.5))
     record = json.loads(json.dumps(to_record(original, AutoEncoder)))
-    assert record["class"].endswith(":Halved")
+    assert record["class"].endswith(f":{type(original).__name__}")
     assert record["fields"]["model"]["class"].endswith(":AutoencoderKL")
     rebuilt = AutoEncoder.bound(record, params=original.params)
-    assert type(rebuilt) is Halved and rebuilt.factor == 0.5
+    assert type(rebuilt) is type(original) and rebuilt.normalization == original.normalization
     image = jax.random.uniform(jax.random.key(0), (2, IMAGE_SIZE, IMAGE_SIZE, 3), minval=-1.0, maxval=1.0)
     latent = original.encode(original.params, image)
     np.testing.assert_array_equal(rebuilt.encode(rebuilt.params, image), latent)
@@ -248,10 +257,10 @@ def test_an_earlier_runs_autoencoder_record_reads_as_its_class_record():
 
 @pytest.mark.parametrize("kind", RECORDS)
 def test_every_built_in_autoencoder_rebuilds_from_its_saved_record_alone(kind, tmp_path):
-    """A saved diffusion task records its autoencoder (`to_json`) and a run rebuilds it from that
-    record around the checkpoint's parameters (`from_json`), the source it was loaded from gone: the
-    record survives JSON, and the rebuilt autoencoder declares the same latent shape and encodes and
-    decodes bitwise as the one it recorded, its normalization included."""
+    """A saved diffusion task records its autoencoder (`registry.to_record`) and a run rebuilds it from
+    that record around the checkpoint's parameters (`AutoEncoder.bound`), the source it was loaded from
+    gone: the record survives JSON, and the rebuilt autoencoder declares the same latent shape and
+    encodes and decodes bitwise as the one it recorded, its normalization included."""
     if kind == "sd_vae":
         original = tiny_vae(latent_shift=0.25, latent_scale=0.5)
         params = original.params

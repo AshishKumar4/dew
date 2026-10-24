@@ -159,7 +159,7 @@ def load_autoencoder(modelname: str, *, revision: str = "bf16", dtype: DTypeLike
     replace the checkpoint's normalization where given, an autoencoder's
     whose record keeps them: one that normalizes by published per-channel
     statistics records those, so a run rebuilt from its record
-    (`AutoEncoder.from_json`) would lose the override, and refuses it.
+    (`AutoEncoder.bound`) would lose the override, and refuses it.
     """
     class_name, subfolder = _published(modelname, revision)
     entry = registration(class_name)

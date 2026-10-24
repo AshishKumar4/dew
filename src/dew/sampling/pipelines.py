@@ -131,9 +131,10 @@ class Images(Generic[ArrayT]):
 class ImageSettings:
     """What a text-to-image run records beside its model, and its task is built with
     (`TextToImage.from_objective`, `TextToImage.from_run`): the process, the solver, the
-    guidance and the step count, and the records of the input encoders
-    (`InputSpec.to_json`), the autoencoder (`AutoEncoder.to_json`) and an end-to-end tuning
-    (`EndToEnd`), which a saved run rebuilds over its own weights at the dtype it asks for.
+    guidance and the step count, and the records of the input encoders and the autoencoder
+    (`dew.registry.to_record`, read back by `InputSpec.bound` and `AutoEncoder.bound`) and an
+    end-to-end tuning (`EndToEnd`), which a saved run rebuilds over its own weights at the dtype it
+    asks for.
     A run trained from a loaded pipeline samples on that pipeline's own grid, recorded as `grid`
     (`SourceGrid`), and ends as its solver does, with no closing denoise (`TextToImage.grid`)."""
 
