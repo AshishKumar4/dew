@@ -774,17 +774,22 @@ def weighted_gradient(lower, keys: TileLoad, columns: int, values: TileLoad, blo
         """`X^T m`, the diagonal outside the product."""
         return m + issue("inverse_t", lower.T, m.astype(dtype))
 
+    def added(total, term):
+        """`total + term`, `term` where `total` is None: a sum held as it accumulates, in `_summed`'s order,
+        one tile live rather than every term."""
+        return term if total is None else total + term
+
     decay = raised(gate, low)
-    d_xs, d_betas, d_gates, through_w = [], [], [], []
+    d_x, d_gate, d_betas, through_w = None, None, [], []
     for c in range(columns):
         key = keys(c).value().astype(jnp.float32)
         scaled = key * (beta * decay)[:, None]
         w_grad = w_grads(c)
         d_scaled = transposed_inverse(w_grad.value().astype(jnp.float32))
         through_w.append(d_scaled)
-        d_xs.append(issue("inverse_dx", w_grad, Transposed(scaled.astype(dtype))))
+        d_x = added(d_x, issue("inverse_dx", w_grad, Transposed(scaled.astype(dtype))))
         d_betas.append(jnp.sum(d_scaled * key * decay[:, None], axis=1))
-        d_gates.append(jnp.sum(d_scaled * scaled, axis=1))
+        d_gate = added(d_gate, jnp.sum(d_scaled * scaled, axis=1))
     value_grads = []
     for j in range(blocks):
         value = values(j).value().astype(jnp.float32)
@@ -792,9 +797,8 @@ def weighted_gradient(lower, keys: TileLoad, columns: int, values: TileLoad, blo
         u_grad = u_grads(j)
         d_scaled = transposed_inverse(u_grad.value().astype(jnp.float32))
         value_grads.append(d_scaled * beta[:, None])
-        d_xs.append(issue("inverse_dx", u_grad, Transposed(scaled)))
+        d_x = added(d_x, issue("inverse_dx", u_grad, Transposed(scaled)))
         d_betas.append(jnp.sum(d_scaled * value, axis=1))
-    d_x, d_gate = _summed(d_xs), _summed(d_gates)
     rows, cols = _grid(d_x.shape)
     strict = rows > cols
     d_x = jnp.where(strict, d_x, 0.0)
@@ -803,16 +807,16 @@ def weighted_gradient(lower, keys: TileLoad, columns: int, values: TileLoad, blo
     column_gate, column_low = (gate, low) if laid is None else laid
     d_l = jnp.where(strict, -d_x * decayed(gate, low, column_gate, column_low), 0.0).astype(dtype)
     weighted_l = (d_l.astype(jnp.float32) * beta[:, None]).astype(dtype)
-    products, key_grads = [], []
+    products, key_grads = None, []
     for c in range(columns):
         key = keys(c)
-        products.append(issue("keys_dl", key, key.T))
+        products = added(products, issue("keys_dl", key, key.T))
         d_key = issue("keys_dl", d_l, key)
         # `dL^T (k beta)` as `(beta dL)^T k`: one operand in registers, the keys a tile.
         key_grads.append(through_w[c] * (decay * beta)[:, None] + d_key * beta[:, None]
                          + issue("keys_dlt", Transposed(weighted_l), key))
         d_betas.append(jnp.sum(d_key * key.value().astype(jnp.float32), axis=1))
-    pairs = d_l.astype(jnp.float32) * (_summed(products) * beta[:, None])
+    pairs = d_l.astype(jnp.float32) * (products * beta[:, None])
     return key_grads, value_grads, _summed(d_betas), (pairs, d_gate)
 
 
