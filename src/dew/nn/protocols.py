@@ -409,7 +409,11 @@ class CountedVideo(Protocol):
 class CountedDecisions(Protocol):
     """A decision head counts the layout's real questions and options with its rows."""
 
-    def decision_flops(self, lengths: np.ndarray, questions: np.ndarray, options: np.ndarray) -> float: ...
+    def decision_flops(self, lengths: np.ndarray, questions: np.ndarray, options: np.ndarray, *,
+                       pooled: np.ndarray | None = None) -> float:
+        """The head's work over rows of `lengths` tokens, their real questions and options, its spans
+        pooled over `pooled` tokens a row where they are not the row's (a context's)."""
+        ...
 
 
 @runtime_checkable
