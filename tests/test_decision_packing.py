@@ -269,7 +269,7 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, held=lambda p
     `jax.tree_util.keystr`) on par with it (check 1) over drawn parameters, the truth `wide_modules`,
     the backbone and head in float64, over the rows in windows of their own."""
     import os
-    scale = int(os.environ.get("DEW_PACKING_SCALE", "1"))
+    scale = int(os.environ.get("DEW_PACKING_SCALE", "2"))
     data = decision_rows(EXAMPLES * scale, 2 * scale, EXAMPLES * scale, objective=objective.data())
     reader = data.val(DataPartition())
     try:
