@@ -43,10 +43,7 @@ def _olmo3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     config rotate at the class's own base whatever rope_theta says (500000 in
     both on the released 7B).
     """
-    layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
-    layer_types = specified_layer_types(hf_config, used, tuple(
-        'sliding_attention' if (index + 1) % 4 else 'full_attention'
-        for index in range(layers)))
+    layer_types = specified_layer_types(hf_config, used, ('sliding_attention',) * 3 + ('full_attention',))
     ropes = read_rope(hf_config, used, records.integer(hf_config.get(
         'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'), _SPELLING)
     config = base_config(hf_config, used, qk_norm=True, layer_types=layer_types,

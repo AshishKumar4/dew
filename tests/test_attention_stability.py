@@ -556,6 +556,13 @@ def _families() -> dict[str, Family]:
             functools.partial(_subnormal_share, equal=True), np.ones((64, 1, 1, 256), bool), folded=False,
             dtype="bfloat16"),
     }
+    return {**families, **_structured_families()}
+
+
+def _structured_families() -> dict[str, Family]:
+    """The families of a call's structure beside its values (`_families`'): rows of no keys, documents, slices
+    merged, resumed states and a decode step's sinks."""
+    families = {}
     lengths = np.tile([4, 0], ROWS // 2)
     empty = np.broadcast_to((lengths > 0)[:, None, None, None], (ROWS, 1, 4, 4))
     families["a row of no keys"] = Family(_drawn(4, 4), empty, {"lengths": lengths},
@@ -759,8 +766,9 @@ def _mosaic_takes(family: Family) -> bool:
     (`attention_mosaic.refused`)."""
     query, _, value, extra, _ = family.draw(0)
     hooks = _hooks(jnp.asarray(query), jax.tree.map(jnp.asarray, extra))
+    tiles = attention_mosaic.BACKWARD_DEFAULTS["wgmma"]
     return attention_mosaic.refused(jnp.dtype(family.dtype), query.shape[-1], value.shape[-1], hooks,
-                                    backward=True) is None
+                                    backward=True, tile=(tiles.block_q, tiles.block_k)) is None
 
 
 def _held_empty(family: Family, found, label: str) -> None:

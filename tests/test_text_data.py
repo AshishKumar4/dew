@@ -120,10 +120,11 @@ def test_a_stride_changes_the_training_windows_only(tmp_path):
     default = _trained(corpus.train, seq_len, batch, seed=17)
     explicit = _trained(corpus.train, seq_len, batch, stride=seq_len, seed=17)
     overlap = _trained(corpus.train, seq_len, batch, stride=1, seed=17)
-    assert overlap.records == 13 and overlap.steps_per_epoch == 3
+    # 13 windows a pass in batches of four: four steps, the last leading into the next pass.
+    assert overlap.records == 13 and overlap.steps_per_epoch == 4
     assert default.records == explicit.records == 4
     assert default.steps_per_epoch == explicit.steps_per_epoch == 1
-    assert overlap.epoch_steps(3) == 9
+    assert overlap.epoch_steps(3) == 10
 
     def first_rows(data, steps):
         stream = data.train(DataPartition())
@@ -245,6 +246,54 @@ def test_documents_write_one_eos_each_and_empty_documents_write_nothing(tmp_path
     expected = [token for text in documents if text for token in [*text.encode(), eos]]
     np.testing.assert_array_equal(stored.tokens[:], expected)
     assert stored.metadata()["eos_id"] == eos
+
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+def eos_tokenizer(directory: Path) -> str:
+    """An EOS-inserting Llama: the SentencePiece byte-fallback fixture with `</s>` appended to every
+    encoding by its post-processor, saved to `directory`."""
+    from tokenizers import Tokenizer, processors
+    from transformers import PreTrainedTokenizerFast
+
+    backend = Tokenizer.from_file(str(FIXTURES / "llama_cpp" / "tokenizer" / "tokenizer.json"))
+    eos = backend.token_to_id("</s>")
+    backend.post_processor = processors.TemplateProcessing(single="$A </s>",
+                                                           special_tokens=[("</s>", eos)])
+    PreTrainedTokenizerFast(tokenizer_object=backend, eos_token="</s>", bos_token="<s>",
+                            unk_token="<unk>").save_pretrained(directory)
+    return str(directory)
+
+
+@pytest.mark.parametrize("name", ["gpt2", "t5", "llama", "eos-llama", "wordpiece"])
+def test_a_tokenized_document_ends_in_one_eos_with_eos_and_none_without(tmp_path, name):
+    """Whatever a tokenizer's own special tokens add (T5's and an EOS-inserting Llama's `</s>`,
+    WordPiece's [CLS] and [SEP]), a document is its encoding ended by the tokenizer's EOS once with
+    `eos=True` where it has one, and by none with `eos=False`: never two, and none left behind."""
+    from token_support import wordpiece_tokenizer
+
+    from dew.data.text import Tokenize, tokenizer_for
+
+    if name == "eos-llama":
+        tokenizer = eos_tokenizer(tmp_path / name)
+    elif name == "wordpiece":
+        wordpiece_tokenizer(tmp_path / name)
+        tokenizer = str(tmp_path / name)
+    else:
+        tokenizer = str({"gpt2": FIXTURES / "tokenizers" / "gpt2", "t5": FIXTURES / "t5" / "tiny",
+                         "llama": FIXTURES / "llama_cpp" / "tokenizer"}[name])
+    vocabulary = tokenizer_for(tokenizer)
+    text = "the quick brown fox"
+    bare = Tokenize(tokenizer, eos=False).map({"text": text})["text"].tolist()
+    assert vocabulary.eos_id is None or vocabulary.eos_id not in bare
+    if vocabulary.eos_id is None:
+        with pytest.raises(ValueError):
+            Tokenize(tokenizer, eos=True).map({"text": text})
+        return
+    ended = Tokenize(tokenizer, eos=True).map({"text": text})["text"].tolist()
+    assert ended == [*bare, vocabulary.eos_id]
+    assert Tokenize(tokenizer, eos=None).map({"text": text})["text"].tolist() == ended
 
 
 def _export_cli(input_path, destination):

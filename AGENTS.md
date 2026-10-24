@@ -1,43 +1,21 @@
 # Working on Dew
 
-Read `CONTRIBUTING.md` for design, reference parity, code, tests, and writing standards. This checklist adds agent workflow rules; it does not duplicate that contract. Follow the user's current scope and approval boundaries.
+Read `CONTRIBUTING.md` first: it owns the design, reference parity, code, test-authoring and writing rules, and this file does not restate them; [testing](docs/design/testing.md) owns the scenario inventory, the numerical contracts and GPU landing. This file adds what an agent working in the repository does. The maintainers' own process (lanes and worktrees, commit identity, the land queue and its trains, review and approval by kind of work, CI scope) is set by their operating rules (the bible, §4 for review and approval), and only security paths (`.github`'s secrets, the installers, credentials) wait on a maintainer's approval. Follow the user's current scope and approval boundaries.
 
 ## Scope and implementation
 
 - Read the affected module, its callers, tests, and relevant design section before editing. Check JAX, Flax, Optax, Orbax, Grain, and the reference implementation for an existing primitive.
-- Preserve checkpoint and reference-layout requirements described in `CONTRIBUTING.md`. Before 1.0, migrate callers together without compatibility shims.
-- Keep code that owns meaningful complexity. Apply the deletion test to helpers; caller count alone does not decide whether a helper belongs.
-- Preserve outputs and precision when optimizing an existing path. Treat requested quantization or approximate methods as explicit features with separate accuracy and performance evidence.
-- Fix a failure by design, not by a guard. Derive a fact from its one source instead of passing it in and checking it, order steps so races cannot occur, and give each fact one owner. Add a conditional, timeout or assert only when no design change removes the need; timeouts belong at external boundaries such as networks and cloud allocation.
-- Fix a failure where its cause lives, in the shared piece, not in the script or test that hit it, and remove the special case or copy that allowed it.
-- Compose on the existing primitive. Before adding code, find the piece that already does the job; one concept has one implementation and one source of truth (for example `GpuTarget` for device facts).
-- Duplication is banned everywhere, not only in `src/`: a dependency list, version pin, table, flag set, test list, policy or algorithm exists in one place. CI workflows, installers, armada recipes, private tooling and docs read or generate from that one owner. A second hand-kept copy is a bug, and a head that adds one does not land.
-- Code composes on itself: one path per job, no parallel implementations, and as few branches and special cases as the problem allows. When a design grows branches, step back and look at it from another angle (the data, the caller, the hardware, the math); a cleaner formulation usually removes them.
-- No hidden side effects. Importing a module changes nothing outside it: no monkeypatching of other modules, no global config or environment writes, no I/O. The one exception is the process's JAX and XLA setup, which lives in one documented place: what `import dew` sets before a backend opens, which the package's docstring lists, and `dew.training.runtime.prepare_process`. No other module sets process-wide state. A function changes only what its signature and name say it changes. A layer that accepts a contract argument (segments, masks, validity, positions, cache, mesh) uses it, refuses it by name when set, or is independent of it by construction and says so.
-- Every rule this file bans that a program can check is checked by `tools/lint_slop.py`, which has no per-finding suppression. A new ban lands together with its rule.
-- Put optimizations in the shared core so every model family and backend benefits. Keep model- or hardware-specific code small and say why it cannot be general.
 - Activations cross layer-to-kernel interfaces as `[batch, time, heads, head_dim]`. A kernel adapts to that layout; layer code does not permute activations for a kernel. Other tensors keep their own meaning.
 
 ## Parallel work and integration
 
-- Give each parallel writer an isolated worktree and clear file ownership. Coordinate shared-file edits and GPU use before starting them.
 - Inspect GPU processes and current lane ownership before launching GPU work. A process name alone does not establish whether the device is available.
-- Commit completed work as `Ashish Kumar Singh <ashishkmr472@gmail.com>` with a concise conventional commit message. A lane pushes its own branch and never merges another lane's. A head reaches `main` only through the land queue: approved by its exact sha, composed with other heads into a train, run through the whole CI and the train's review, and published by the queue. Never force-push.
-- Preserve tracked and untracked work before integration. Remove a worktree only after its work is committed, verified, merged, and no process still needs it.
-- Deliver one head per area of work, landed when that piece is complete and gated; fold small fixes into it rather than landing them separately. Merge `main` into an active head at least daily and before landing.
-- Land complete work early. A change whose correctness the CPU suite proves lands without waiting on unrelated GPU measurements; a default changes only with the measurement that justifies it.
-- Give a finished head one independent review of the whole head, not small pieces one by one. The lane fixes every finding and lands; a confirming round follows only a P1. A head in kernels, numerics, the accuracy gate or security gets a second independent reviewer only where no bitwise or float64 oracle proves the change.
-- Every train the land queue composes gets one review of its whole diff against `main`, run beside its CI, for duplication across its heads and with existing code, redundancy, failure to compose on what exists, and a workable way taken where a right one exists. A train publishes only with a clean review of the exact tip it publishes; a head with any confirmed finding is pulled first, fixed, and added again.
-- A review checks the head against the whole project, not only its diff: for every list, table, helper or policy the head adds, it searches the repository and the private tooling for an existing owner. A duplicate it finds blocks the head.
 - Keep private development tooling (personal cloud runners and session drivers, provisioning scripts, one-off session scripts) out of this repository. Tooling that Dew's own CI, tests, docs or users need, such as the CI entry points and the profiling and attribution tools, stays here.
 
 ## Verification
 
 - Run the affected test files with pytest's cache enabled. Let the coordinating agent run integration suites; capture complete output and exit status once instead of rerunning a suite to recover failure names.
 - In a worktree, pytest uses its configured source path; run scripts with `PYTHONPATH=src` so they import that worktree. Use the project's environment and commands documented in `CONTRIBUTING.md`.
-- Tests are end-to-end runs of real use cases on real model architectures: load or build, train, checkpoint, resume, evaluate, export, reload, generate. Each run asserts every contract its flow touches and covers settings chosen to reach as many code paths as possible. Add a unit test only for logic no scenario reaches cheaply, and delete unit tests the scenarios already cover.
-- Use CPU tests for fast logic checks. For kernel code, CPU checks are limited to compiling for each target and interpret-mode math; correctness and performance are proven on the real GPUs and TPUs the kernel targets. Kernel code lands by its row of [GPU landing](docs/design/testing.md#gpu-landing). Keep test cases small enough to isolate the failure.
-- Every float comparison goes through the accuracy gate, never a hand-written tolerance. `tests/reference_error.py` owns the rule and states it, and [Numerical accuracy](docs/design/testing.md#numerical-accuracy) says what a failure means.
 - Run heavy work (the full suite, type checks, builds, benchmarks, training) on remote CPU and GPU runners, not on a developer's workstation.
 - A shell pipeline's last command succeeding does not prove tests passed. Stop integration on a failed check; fix and rerun the affected behavior.
 

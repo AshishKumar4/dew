@@ -599,17 +599,28 @@ batches never have it.
 def freeze(variables: Variables, trainable: PathFilter) -> Variables:
     """Move the `params` leaves that `trainable` rejects into the `FROZEN` collection.
 
-    `trainable` sees full leaf paths, `("params", ...)`. Raises `ValueError`
-    when it keeps every leaf or none, since then there is nothing to split.
+    `trainable` sees full leaf paths, `("params", ...)`. A tree already split
+    keeps training the leaves its `params` hold, beside those `trainable`
+    takes from either collection, and keeps the rest frozen: an adapter
+    attached over another keeps both training. Raises `ValueError` when the
+    split keeps every leaf or none, since then there is nothing to split.
     """
+    training = (frozenset() if FROZEN not in variables else frozenset(
+        ("params", *(entry.key for entry in path))
+        for path, _ in jax.tree_util.tree_leaves_with_path(variables["params"])))
+    variables = thaw(variables)
+
+    def trains(path: Path) -> bool:
+        return path in training or trainable(path)
+
     leaves = jax.tree_util.tree_leaves_with_path(variables["params"])
-    kept = sum(trainable(("params", *(entry.key for entry in path))) for path, _ in leaves)
+    kept = sum(trains(("params", *(entry.key for entry in path))) for path, _ in leaves)
     if kept in (0, len(leaves)):
         raise ValueError(
             f"trainable keeps {kept} of {len(leaves)} parameter leaves, which "
             f"{'freezes' if kept else 'trains'} nothing")
-    moving = select(variables, lambda path: path[0] == "params" and trainable(path))
-    frozen = select(variables, lambda path: path[0] == "params" and not trainable(path))
+    moving = select(variables, lambda path: path[0] == "params" and trains(path))
+    frozen = select(variables, lambda path: path[0] == "params" and not trains(path))
     return {**variables, "params": moving["params"], FROZEN: frozen["params"]}
 
 
@@ -1135,6 +1146,17 @@ class Objective(ABC, Generic[Loss, Effects]):
         # Selected rather than multiplied, so a repeat holding a NaN still adds nothing.
         return Ratio(compensated_sum(jnp.where(real, values, jnp.zeros((), values.dtype)), axes),
                      jnp.sum(jnp.broadcast_to(real, values.shape).astype(dtype), axes))
+
+    @staticmethod
+    def row_moments(values: jax.Array, batch: Batch, axis: int | tuple[int, ...], *,
+                    rows: int | tuple[int, ...] = 0) -> tuple[jax.Array, jax.Array]:
+        """Return the mean and the biased variance of `values` over `axis`, over `batch`'s rows
+        (`row_mean`), in two passes as `jnp.mean` and `jnp.var` take them; both drop `axis`."""
+        axes = (axis,) if isinstance(axis, int) else tuple(axis)
+        mean, _ = Objective.row_mean(values, batch, axes, rows=rows).mean()
+        centered = values - jnp.expand_dims(mean, axes)
+        var, _ = Objective.row_mean(jnp.square(centered), batch, axes, rows=rows).mean()
+        return mean, var
 
     @staticmethod
     def row_weights(batch: Batch, rows: int) -> jax.Array:

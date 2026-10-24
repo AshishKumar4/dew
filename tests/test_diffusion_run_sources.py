@@ -23,17 +23,13 @@ from diffusion_support import images_of
 from reference_error import assert_as_exact
 
 from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
+from dew.config.diffusion import DiffusionRunConfig, FlowRolloutConfig
 from dew.diffusion.presets import Flow, ResolutionShift
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceSchedule
+from dew.inputs import TextCondition
 from dew.objectives import Step
-from dew.objectives.diffusion import (
-    Alignment,
-    DiffusionObjective,
-    DiffusionRunConfig,
-    FlowRolloutConfig,
-    TextCondition,
-)
+from dew.objectives.diffusion import Alignment, DiffusionObjective
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, TUNED_WEIGHTS, EndToEnd
 from dew.objectives.rl.flow import OLD_LOG_PROBS_KEY, REWARDS_KEY, FlowGRPOObjective
 from dew.registry import to_record
@@ -241,6 +237,22 @@ pipeline = load_diffusion_source(sys.argv[1], revision=sys.argv[2], dtype="float
 pipeline.save(sys.argv[4])
 print(json.dumps({"saved": True}))
 """
+
+
+def test_a_pipeline_is_one_whatever_its_root_config_unless_that_names_a_model(pipelines, tmp_path):
+    """A pipeline directory loads as its components whatever else its root holds, a config.json too,
+    for a run as for a load (`_pipeline_source`); one whose config.json names a model is that model,
+    a decoder shipping an index for its sampler, and a run training a pipeline refuses it."""
+    from dew.interop.pretrained import load_diffusion_source
+
+    copy = tmp_path / "pipeline"
+    shutil.copytree(pipelines / "flux" / "pipeline", copy)
+    (copy / "config.json").write_text("{}")
+    loaded = load_diffusion_source(str(copy), dtype="float32", attention_impl="xla", size=(16, 16))
+    assert jax.tree.leaves(loaded.variables)
+    (copy / "config.json").write_text(json.dumps({"model_type": "diffusion_gemma"}))
+    with pytest.raises(ValueError):
+        load_diffusion_source(str(copy), dtype="float32", attention_impl="xla", size=(16, 16))
 
 
 @pytest.mark.network

@@ -180,6 +180,9 @@ class Encoded:
     """Where the row holds a request's images, as a [start, end) span of its tokens."""
     trimmed: bool = False
     """Whether the layout shortened the question's instructions or options to fit its budgets."""
+    context: tuple[int, ...] | None = None
+    """The tokens of the context the row reads beside its state, through a backbone's
+    cross-attention, or None for none."""
 
 
 def question_fields(row: Encoded, count: int, width: int) -> dict[str, np.ndarray]:
@@ -206,6 +209,13 @@ def render(value: JSON) -> str:
         case _:
             return json.dumps(value, ensure_ascii=False)
 
+
+def context_tokens(tokenizer: Tokenizer, context: JSON | None, length: int) -> np.ndarray:
+    """A context's tokens as a row carries them: its text's (`render`), without specials, the first
+    `length` of them, and none for no context."""
+    if context is None:
+        return np.zeros(0, np.int32)
+    return np.asarray(tokenizer.encode(render(context), add_special_tokens=False)[:length], np.int32)
 
 def _conversation(state: JSON) -> bool:
     """Whether `state` is a conversation, a list of turns, which keeps its newest turns (Laya's agent)."""
@@ -250,9 +260,9 @@ class Layout:
 
     def __post_init__(self) -> None:
         _least("max_len", self.max_len, 1)
-    image: ClassVar[str | None] = None
-    """The text that stands for one image where a row holds a request's images,
-    which the backbone's processor expands; None where a row holds none."""
+    images: ClassVar[bool] = False
+    """Whether a row holds a request's images, each as the backbone's processor
+    writes and expands one (`Processor.image_text`)."""
 
     def state(self, encoder: Tokenizer, specials: Specials, state: JSON) -> tuple[int, ...]:
         """Return the state's tokens, which every question of a request shares."""
@@ -466,6 +476,71 @@ class StateFirstLayout(QuestionLayout):
 JOINT_SYSTEM = ("Read the complete state and schema. Decide every field jointly. Each answer "
                 "must be exactly one of that field's allowed options.")
 """The joint layout's system prompt."""
+JOINT_PREFILL = "JOINT SCHEMA DECISIONS:"
+"""The joint layout's opening of the assistant's turn, after the turn's own markup."""
+
+
+@dataclass(frozen=True)
+class Framing:
+    """How a joint row frames its text as a conversation: a `system` message, the user's turn that
+    holds the state and the schema, and the assistant's turn opened with `prefill`.
+
+    The turns' markup is the backbone's own: where the tokenizer has a chat template and `template`
+    holds, its template renders the system message, the user's turn around its content and the
+    generation prompt (`dew.data.chat.framed`), `thinking` its reasoning switch (False: a reasoning
+    model's empty thought, None: the template's own default), so every token of the markup is the
+    tokenizer's own special token, never ChatML spelled out for a vocabulary without it.
+    `chat_template`, a Jinja chat template, renders the turns in place of the tokenizer's own (a base
+    model's, which has none, or a framing of an experiment's), and `options` are the other variables
+    a template reads beside the messages; both are recorded with the layout, so a run reloads its
+    framing. A tokenizer with no chat template and none given, or `template` False, frames the turns
+    as plain text: the system message, then the user's content, each after a blank line."""
+
+    system: str = JOINT_SYSTEM
+    prefill: str = JOINT_PREFILL
+    thinking: bool | None = False
+    template: bool = True
+    chat_template: str | None = None
+    options: Mapping[str, JSON] = dataclasses.field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        from dew.data.chat import template_options
+
+        template_options(self.options, where="Framing.options")
+        if self.chat_template is not None and not self.template:
+            raise ValueError("a framing with its own chat_template frames through it; template=False frames "
+                             "as plain text, so the two are not one framing")
+
+    def around(self, encoder: Tokenizer) -> tuple[str, str]:
+        """The text before the user's turn's content and after it, to the assistant's prefill."""
+        from dew.registry import to_record
+
+        # The record keeps the options in their own order, which a template that walks them reads.
+        return _framed(_same(encoder), json.dumps(to_record(self, Framing)))
+
+
+@functools.lru_cache(maxsize=64)
+def _framed(encoder: _Same, recorded: str) -> tuple[str, str]:
+    """`Framing.around`, rendered once a tokenizer and framing, the framing by its record (`_same`).
+    A chat template of the framing's own renders through a tokenizer that renders templates
+    (`HFTokenizer`), and is refused (ValueError) over one that does not, rather than left unread."""
+    from dew.registry import from_record
+
+    framing = from_record(Framing, json.loads(recorded), dtypes=False)
+    tokenizer = encoder.encoder
+    if framing.chat_template is not None and not isinstance(tokenizer, HFTokenizer):
+        raise ValueError(f"a framing's own chat template renders through a tokenizer with a chat "
+                         f"template renderer, which {type(tokenizer).__name__} is not")
+    templated = isinstance(tokenizer, HFTokenizer) and (
+        framing.chat_template is not None or tokenizer.tokenizer.chat_template)
+    if framing.template and templated and isinstance(tokenizer, HFTokenizer):
+        from dew.data.chat import framed
+
+        before, after = framed(tokenizer.tokenizer, framing.system, where=tokenizer.name,
+                               thinking=framing.thinking, chat_template=framing.chat_template,
+                               options=framing.options)
+        return before, after + framing.prefill
+    return f"{framing.system}\n\n", f"\n\n{framing.prefill}"
 JOINT_NOUL = {"true": "The proposition is true or the answer is yes.",
               "false": "The proposition is false or the answer is no."}
 """A noul option's description where its question gives none."""
@@ -478,7 +553,7 @@ class JointLayout(Layout):
     The row is a chat prompt: the system prompt (`JOINT_SYSTEM`), the state,
     then a schema of numbered fields, each with its id, type, instructions and allowed options,
     and the opening of the assistant's turn. A request's images come before the
-    state, each laid out as `image` and expanded by the backbone's processor.
+    state, each as the backbone's processor writes one (`Processor.image_text`), and expanded by it.
     Each option is rendered as compact
     JSON with sorted keys, `{"description": ..., "option_id": ...}`, and the
     head pools the tokens of each option and of each question's instructions.
@@ -486,18 +561,20 @@ class JointLayout(Layout):
     then false, with `JOINT_NOUL`'s descriptions where the question gives none. The
     state is cut to `max_state_tokens`, and to what the schema leaves of
     `max_len`; the schema itself is never cut, so a schema longer than
-    `max_len` leaves no state and a row that does not fit (`fits`).
+    `max_len` leaves no state and a row that does not fit (`fits`). The row's
+    conversation markup is the backbone's own chat template's (`framing`).
     """
 
     max_len: int = 16384
     max_state_tokens: int | None = None
+    framing: Framing = Framing()
     joint: ClassVar[bool] = True
 
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.max_state_tokens is not None:
             _least("max_state_tokens", self.max_state_tokens, 0)
-    image: ClassVar[str | None] = "<|vision_start|><|image_pad|><|vision_end|>"
+    images: ClassVar[bool] = True
 
     def state(self, encoder: Tokenizer, specials: Specials, state: JSON) -> tuple[int, ...]:
         return tuple(encoder.encode(_compact(state), add_special_tokens=False))
@@ -535,9 +612,11 @@ class JointLayout(Layout):
                 schema.extend(piece("\n"))
             schema.extend(piece("END FIELD\n"))
             laid.append(Laid(name, kind_of(question), span, tuple(spans), tuple(slots)))
-        opening = piece(f"<|im_start|>system\n{JOINT_SYSTEM}<|im_end|>\n<|im_start|>user\nSTATE:\n")
+        # The user's turn holds the state and the schema, framed as the backbone's template writes a turn.
+        before, after = self.framing.around(encoder)
+        opening = piece(f"{before}STATE:\n")
         prefix = opening + list(media)
-        suffix = piece("\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:")
+        suffix = piece(f"\n{after}")
         state_ids = list(self.state(encoder, specials, state) if tokens is None else tokens)
         whole = len(state_ids)
         if self.max_state_tokens is not None:
@@ -632,7 +711,10 @@ class DecisionInputs:
       `[B, Q, K]` the real slots;
     - `option_slots` `[B, P]` each window's real options as flat indices
       `q * K + k` into its `[Q, K]` grid, in that order (`compacted`), and
-      `slotted` `[B, P]` which of them are real, or None for the grid itself.
+      `slotted` `[B, P]` which of them are real, or None for the grid itself;
+    - `context` `[B, C]` each window row's context tokens, which a backbone's
+      cross-attention reads, `context_lengths` `[B]` how many are real, the
+      padding after them, or None for rows that carry none.
 
     A row of one question with one marker per option, Laya's, has spans one
     token long. A head that reads `option_slots` computes the real options
@@ -651,6 +733,8 @@ class DecisionInputs:
     slots: jnp.ndarray | None = None
     option_slots: jnp.ndarray | None = None
     slotted: jnp.ndarray | None = None
+    context: jnp.ndarray | None = None
+    context_lengths: jnp.ndarray | None = None
     max_segments: int = struct.field(pytree_node=False, default=1)
 
     @property
@@ -678,7 +762,8 @@ class DecisionInputs:
 
     @classmethod
     def collate(cls, rows: Sequence[Encoded], pad: int, *, questions: int | None = None,
-                options: int | None = None, option_slots: int | None = None) -> "DecisionInputs":
+                options: int | None = None, option_slots: int | None = None,
+                context_length: int | None = None) -> "DecisionInputs":
         """Right-pad `rows` into one batch (`pad_token_rows`), one row a window, its question
         and option slots to the widest.
 
@@ -686,6 +771,8 @@ class DecisionInputs:
         keeps fixed. `option_slots` is the real options a row may hold, a shape
         a caller keeps fixed too (`compacted`); without it, the batch's most,
         rounded up to `OPTION_TILE`, where that is fewer than the grid's slots.
+        With a `context_length`, each row's context (`Encoded.context`, none
+        where it holds none) is padded to that many tokens.
         """
         parallel = rows[0].positions is not None
         if any((row.positions is not None) != parallel for row in rows):
@@ -708,12 +795,22 @@ class DecisionInputs:
         else:
             compact = True
         indexed = [compacted(row, option_slots) for row in real_options] if compact else None
+        context = lengths = None
+        if context_length is not None:
+            held = [row.context or () for row in rows]
+            if max(map(len, held)) > context_length:
+                raise ValueError(f"a row's context holds {max(map(len, held))} tokens, more than the "
+                                 f"{context_length} the backbone's cross-attention reads")
+            context = jnp.asarray([[*tokens, *[pad] * (context_length - len(tokens))] for tokens in held],
+                                  jnp.int32)
+            lengths = jnp.asarray([len(tokens) for tokens in held], jnp.int32)
         return cls(jnp.asarray(tokens), jnp.asarray(valid, jnp.int32), jnp.asarray(kinds), jnp.asarray(real),
                    jnp.asarray(spans), jnp.asarray(option_spans), jnp.asarray(real_options),
                    jnp.asarray(padded["positions"], jnp.int32) if parallel else None,
                    jnp.asarray(padded["slots"], jnp.int32) if parallel else None,
                    None if indexed is None else jnp.asarray(np.stack([slots for slots, _ in indexed])),
-                   None if indexed is None else jnp.asarray(np.stack([real for _, real in indexed])))
+                   None if indexed is None else jnp.asarray(np.stack([real for _, real in indexed])),
+                   context, lengths)
 
 
 OPTION_TILE = 128

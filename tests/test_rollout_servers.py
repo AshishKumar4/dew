@@ -526,7 +526,7 @@ class Worker:
     by broadcast from rank 0 into device memory of its own, kept by name."""
 
     def __init__(self, library, ordinal):
-        from dew.telemetry.devices import primary_context
+        from dew.devices import primary_context
 
         self.nccl = ctypes.CDLL(str(library))
         self.cuda, self.context, _ = primary_context(ordinal)

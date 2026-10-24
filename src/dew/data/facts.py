@@ -8,26 +8,21 @@ from collections.abc import Iterable, Mapping, Sequence
 
 from dew.data.pipeline import (
     Artifact,
-    Configured,
     Declares,
     Filter,
-    FlatMap,
     Interleave,
     Limit,
-    Map,
-    MapBatch,
-    MapWithIndex,
     Mixture,
     Phases,
     Pipeline,
     Prefetch,
-    RandomMap,
     Repeat,
     Shuffle,
     Slice,
     Stage,
     TokenSplit,
     Workers,
+    runs,
 )
 from dew.data.sources.base import stated
 from dew.records import integer, record
@@ -62,14 +57,11 @@ def _after(stage: Stage, facts: Mapping[str, object]) -> Mapping[str, object]:
 
 
 def _declaring(stage: Stage) -> Declares | None:
-    """What says the facts a stage makes: the step it runs (a record step, a configured step's
-    factory, a batch step), or a device step itself, where it declares them."""
-    if isinstance(stage, (Map, RandomMap, MapWithIndex, FlatMap, MapBatch)):
-        step = stage.step
-    elif isinstance(stage, Configured):
-        step = stage.factory
-    else:
-        step = stage
+    """What says the facts a stage makes: the step it runs (`runs`: a record step, a configured
+    step's factory, a batch step), or a stage that runs none, a device step, itself, where it
+    declares them."""
+    ran = runs(stage)
+    step = stage if ran is None else ran.step
     return step if isinstance(step, Declares) else None
 
 

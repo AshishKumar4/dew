@@ -37,8 +37,8 @@ from tool_support import REPO_ROOT, load
 from dew.config import OptimConfig
 from dew.interop import Pretrained
 from dew.objectives.lm import TEXT_KEY, LMObjective
+from dew.optim import Cosine, ParamGroup
 from dew.training import MeshSpec, Trainer
-from dew.training.optim import Cosine, ParamGroup
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -66,7 +66,7 @@ def test_lm_fine_tune_steps_are_as_exact_as_torch():
     schedule = Cosine(peak=options["lr_peak"], warmup_steps=options["warmup"], end=options["lr_end"],
                       init=options["lr_init"])
     solver = OptimConfig(
-        optimizer="adamw", b1=0.9, b2=0.95, optimizer_opts={"eps": 1e-8}, schedule=schedule,
+        optimizer="adamw", b1=0.9, b2=0.95, optimizer_opts={"eps": 1e-8}, rate=schedule,
         weight_decay=0.1, clip_grads=1.0, param_groups=(ParamGroup("all", ("*",)),)).build(steps)
     trainer = Trainer(objective, optax.chain(recorded_norm(), solver), key=jax.random.key(0),
                       mesh=MeshSpec(), checkpoints=None, tracker=None)

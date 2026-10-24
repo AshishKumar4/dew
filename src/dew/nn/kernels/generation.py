@@ -493,9 +493,9 @@ def _shared_memory(device) -> int | None:
 def _clocks(ordinal: int) -> tuple[tuple[str, float], ...]:
     """The visible GPU `ordinal`'s multiprocessor clock and device-memory bandwidth (twice the memory
     clock times the bus's bytes, as CUDA's deviceQuery derives it), which jax's Device does not carry,
-    from the CUDA driver (`dew.telemetry.devices.gpu_attribute`), read once a process; none where no
+    from the CUDA driver (`dew.devices.gpu_attribute`), read once a process; none where no
     driver loads."""
-    from dew.telemetry.devices import CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH, MEMORY_CLOCK_RATE, gpu_attribute
+    from dew.devices import CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH, MEMORY_CLOCK_RATE, gpu_attribute
 
     clock, memory_clock, bus = (gpu_attribute(ordinal, attribute)
                                 for attribute in (CLOCK_RATE, MEMORY_CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH))
