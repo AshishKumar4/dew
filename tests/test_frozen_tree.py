@@ -20,9 +20,11 @@ from dew.training import MeshSpec, Trainer
 LLAMA = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
 
 
-def adapted() -> LMObjective:
-    """A language objective over the tiny Llama with a LoRA adapter, its base the frozen tree."""
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=16)
+def adapted(placed: bool = False) -> LMObjective:
+    """A language objective over the tiny Llama with a LoRA adapter, its base the frozen tree, loaded
+    onto the mesh where `placed` (each leaf where the trainer's state keeps it), else on one device."""
+    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=16,
+                             **({"mesh": MeshSpec()} if placed else {}))
     return LMObjective(source.adapt(LoRA(rank=2, modules=("q_proj", "v_proj")), key=0), 8, ema_decay=None)
 
 
@@ -37,10 +39,11 @@ def frozen_ids(tree) -> set[int]:
 @pytest.mark.parametrize("placed", [False, True])
 def test_a_runs_frozen_tree_is_its_objectives_held_arrays_through_every_step(placed):
     """The frozen leaves of a state built from the objective's held tree, fresh (`initial_state`) or
-    placed on a mesh (`place`), are the held arrays themselves; two compiled steps leave them so,
+    placed on a mesh (`place`) from a source loaded onto it, are the held arrays themselves; two
+    compiled steps leave them so,
     none deleted, while the adapter's factors move; and the compiled step's outputs hold no frozen
     leaf, its output bytes less than the frozen tree's alone."""
-    objective = adapted()
+    objective = adapted(placed)
     trainer = (Trainer(objective, optax.sgd(0.1), key=jax.random.key(5), mesh=MeshSpec()) if placed
                else Trainer(objective, optax.sgd(0.1), key=jax.random.key(5)))
     state = trainer.place()[0] if placed else trainer.initial_state()
@@ -66,7 +69,7 @@ def test_timing_a_frontier_of_plans_leaves_the_frozen_tree_whole():
     """A plan timed over two candidates deletes the state it timed the first on and restores a copy
     (`planning.Timer`): the moving state alone, so the frozen tree the run and its objective share
     is the same arrays after the timing, none deleted."""
-    objective = adapted()
+    objective = adapted(placed=True)
     trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(5), mesh=MeshSpec())
     state = trainer.place()[0]
     held = objective.held_variables()
