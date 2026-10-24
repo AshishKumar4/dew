@@ -1,5 +1,6 @@
 """Models' own dtype and attention fields, and the arithmetic their kernels honor."""
 
+import contextlib
 import functools
 from fractions import Fraction
 
@@ -294,6 +295,58 @@ def test_a_bf16_product_is_its_rounded_operands_exact_product_at_every_shape(row
         wide = weights.astype(np.float64)
         np.testing.assert_array_equal(np.asarray(d_states), (wide @ table).astype(np.float32))
         np.testing.assert_array_equal(np.asarray(d_table), (wide.T @ states).astype(np.float32))
+
+
+BF16_PRODUCTS = [
+    ("bxd,byd->bxy", ((2, 1, 16), (2, 37, 16))),
+    ("tv,vd->td", ((1, 12), (12, 8))),
+    ("tv,td->vd", ((3, 5), (3, 8))),
+    ("...d,vd->...v", ((2, 3, 8), (6, 8))),
+    ((((3, 2), (1, 3)), ((0,), (0,))), ((2, 3, 4, 5), (2, 5, 6, 4))),
+]
+"""Products of the dot family at the BF16_BF16_F32 algorithm: an einsum's subscripts or a
+dot_general's dimension numbers, and the operands' shapes. A decode's one-query product, a one-token
+tile's state gradient, a head's gradient, a broadcast head, and a batched product contracting two axes
+paired out of order."""
+
+
+@pytest.mark.parametrize("form, shapes", BF16_PRODUCTS,
+                         ids=["decode", "token", "head", "ellipsis", "batched"])
+@pytest.mark.parametrize("scope", [None, "F16_F16_F32"])
+def test_the_dot_family_at_the_bf16_algorithm_multiplies_bf16_operands(form, shapes, scope):
+    """`float32_einsum` and `float32_dot_general` at XLA's BF16_BF16_F32 algorithm form the products
+    of their operands rounded to bf16 (to nearest even), summed in fp32 to an fp32 result, and
+    backward the same of the cotangent rounded to bf16 (`bf16_dot_general`), at any shape and in a
+    scope whose default precision is an F16 preset, which would narrow a bf16 operand of 2^20 to
+    fp16's infinity. The operands are eighths, scaled by 2^20 and 2^-20, each moved by less than half a
+    bf16 ulp, so their rounding is the eighths and every sum is exact: float64's to the bit."""
+    from dew.nn.precision import float32_dot_general, float32_einsum
+
+    algorithm = jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+    rng = np.random.default_rng(len(shapes[0]) * 31 + shapes[1][-1])
+    exact = [np.round(rng.standard_normal(shape) * 8) / 8 * scale
+             for shape, scale in zip(shapes, (2.**20, 2.**-20), strict=True)]
+    moved = [(value * (1 + 2.**-10 * rng.uniform(-1, 1, value.shape))).astype(np.float32) for value in exact]
+
+    def product(lhs, rhs, *, wide=False):
+        if isinstance(form, str):
+            if wide:
+                return jnp.einsum(form, lhs, rhs, precision=jax.lax.Precision.HIGHEST)
+            return float32_einsum(form, lhs, rhs, precision=algorithm, preferred_element_type=jnp.float32)
+        if wide:
+            return jax.lax.dot_general(lhs, rhs, form, precision=jax.lax.Precision.HIGHEST)
+        return float32_dot_general(lhs, rhs, form, precision=algorithm, preferred_element_type=jnp.float32)
+
+    with jax.enable_x64(new_val=True):
+        want, pullback = jax.vjp(lambda lhs, rhs: product(lhs, rhs, wide=True), *exact)
+        cotangent = np.round(rng.standard_normal(want.shape) * 8) / 8
+        wants = pullback(jnp.asarray(cotangent))
+    with contextlib.nullcontext() if scope is None else jax.default_matmul_precision(scope):
+        got, pullback = jax.vjp(product, *moved)
+        grads = pullback(jnp.asarray(cotangent, jnp.float32))
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want, np.float32))
+    for grad, wanted in zip(grads, wants, strict=True):
+        np.testing.assert_array_equal(np.asarray(grad), np.asarray(wanted, np.float32))
 
 
 @pytest.mark.gpu(reason="the GPU's fp32 division is what `import dew` sets; a CPU's rounds to the nearest")
