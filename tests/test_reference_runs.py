@@ -63,10 +63,11 @@ def test_lm_fine_tune_steps_are_as_exact_as_torch():
     pretrained = Pretrained.load(str(FIXTURES / "hf" / "qwen3-tiny"), dtype="float32",
                                  attention_impl="xla")
     objective = LMObjective(pretrained, width - 1, ema_decay=None)
-    schedule = Cosine(peak=options["lr_peak"], warmup_steps=options["warmup"], end=options["lr_end"],
-                      init=options["lr_init"])
+    schedule = Cosine(peak_value=options["lr_peak"], warmup_steps=options["warmup"],
+                      end_value=options["lr_end"],
+                      init_value=options["lr_init"])
     solver = OptimConfig(
-        optimizer="adamw", b1=0.9, b2=0.95, optimizer_opts={"eps": 1e-8}, rate=schedule,
+        optimizer="adamw", b1=0.9, b2=0.95, optimizer_opts={"eps": 1e-8}, learning_rate=schedule,
         weight_decay=0.1, clip_grads=1.0, param_groups=(ParamGroup("all", ("*",)),)).build(steps)
     trainer = Trainer(objective, optax.chain(recorded_norm(), solver), key=jax.random.key(0),
                       mesh=MeshSpec(), checkpoints=None, tracker=None)
