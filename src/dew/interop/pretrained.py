@@ -238,6 +238,15 @@ class Pretrained:
     fields.
     """
 
+    def map_variables(self, transform: Callable[[Variables], Variables]) -> Self:
+        """This bundle with its variable tree transformed, for placement or a shape-only load.
+        Composite bundles apply the same transformation to each component."""
+        return replace(self, variables=transform(self.variables))
+
+    def pipeline(self):
+        """The native task declared by this source kind."""
+        raise TypeError(f"{type(self).__name__} has no native task")
+
     @property
     def text_processor(self) -> TaskProcessor | None:
         """Return what the bundle's tasks encode and decode text with.
@@ -325,7 +334,7 @@ class Pretrained:
     def load(cls, name_or_dir: str | Path, *, dtype: DTypeLike = jnp.bfloat16,
              param_dtype: DTypeLike | Literal["auto"] = jnp.float32,
              attention_impl: str = "auto", max_seq_len: int | None = None,
-             revision: str | None = None, gguf_file: str | None = None,
+             revision: str | None = None, subfolder: str | None = None, gguf_file: str | None = None,
              single_file: str | None = None, dduf_file: str | None = None,
              mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
              fallback: str | None = None, weights: bool = True, on_host: bool = False) -> Self:
@@ -410,7 +419,24 @@ class Pretrained:
         directory = sources.snapshot(str(name_or_dir), revision, weights=False)
         # A Hub snapshot directory is named by its commit.
         commit = None if os.path.isdir(name_or_dir) else directory.name
-        if fallback is not None:
+        folder = "" if subfolder is None else subfolder
+        if Path(folder).is_absolute() or ".." in Path(folder).parts:
+            raise ValueError("subfolder must stay inside the resolved source")
+        composite = None if selected else _composite_description(directory / folder)
+        if composite is not None:
+            loaded = _load_composite_source(name_or_dir, directory, commit, folder, composite,
+                                            placed=placed, streaming=streaming or not weights, dtype=dtype,
+                                            param_dtype=param_dtype, attention_impl=attention_impl,
+                                            max_seq_len=max_seq_len)
+        elif subfolder is not None:
+            # Resolve the selected folder at the metadata snapshot's commit, never a revision
+            # named after the folder. Every ordinary component then reads its local directory.
+            resolved = sources.snapshot(str(name_or_dir), commit or revision, weights=(folder,)) / folder
+            return cls.load(resolved, dtype=dtype, param_dtype=param_dtype, attention_impl=attention_impl,
+                            max_seq_len=max_seq_len, gguf_file=gguf_file, single_file=single_file,
+                            dduf_file=dduf_file, mesh=mesh, layout=layout, fallback=fallback,
+                            weights=weights, on_host=on_host)
+        elif fallback is not None:
             from dew.interop import torchax_fallback
             loaded = torchax_fallback.load(name_or_dir, directory, commit, dtype=dtype,
                                            param_dtype=param_dtype, attention_impl=attention_impl,
@@ -435,10 +461,10 @@ class Pretrained:
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
         loaded = _published(loaded, name_or_dir, selected=bool(selected))
         if not weights:
-            loaded = replace(loaded, variables=jax.tree.map(
-                lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), loaded.variables))
+            loaded = loaded.map_variables(lambda tree: jax.tree.map(
+                lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), tree))
         elif not streaming and not on_host:
-            loaded = replace(loaded, variables=on_default_device(loaded.variables))
+            loaded = loaded.map_variables(on_default_device)
         return loaded
 
     @property
@@ -606,6 +632,9 @@ class PretrainedDecoder(Pretrained):
 
     model: CausalTransformer | MultimodalTransformer
 
+    def pipeline(self):
+        return self.text_generation()
+
     @classmethod
     def from_model(cls, model: nn.Module, variables: Variables, *,
                    tokenizer: str | decoders.ExportTokenizer | None = None,
@@ -682,6 +711,9 @@ class PretrainedMaskedDecoder(Pretrained):
 
     model: CausalTransformer
 
+    def pipeline(self):
+        return self.text_generation()
+
     def text_generation(self) -> MaskedGeneration:
         """Build the masked generation task this source describes.
 
@@ -713,6 +745,9 @@ class PretrainedBlockDecoder(Pretrained):
     # DiffusionGemmaGenerationConfig, which raises on any field it does not
     # declare (generation_diffusion_gemma.py, 5.16.1).
     names_tokenizer: ClassVar[bool] = False
+
+    def pipeline(self):
+        return self.block_generation()
 
     def block_generation(self) -> BlockGeneration:
         """Build the DiffusionGemma canvas task, with the source's sampler config as its default."""
@@ -747,6 +782,9 @@ class PretrainedPipeline(Pretrained):
     schedule: SourceSchedule
     task: SourceTask
     finish: Callable[[Mapping[str, object], jax.Array], jax.Array] | None = field(default=None, repr=False)
+
+    def pipeline(self):
+        return self.text_to_image()
 
     def text_to_image(self) -> TextToImage:
         """Build the pipeline as a sampling task with its published policy.
@@ -1328,17 +1366,68 @@ def _selected_payload(fallback: str | None, **files: str | None) -> list[str]:
     return selected
 
 
+def _composite_description(directory: Path):
+    """A registered composite's metadata, without reading or placing its weights."""
+    from dew.registry import source_kinds
+
+    for provider in source_kinds.values():
+        description = provider.describe(directory)
+        if description is not None:
+            return description
+    return None
+
+
+def _load_composite_source(name_or_dir, root, commit, folder, description, *, placed, streaming,
+                           dtype, param_dtype, attention_impl, max_seq_len):
+    """Materialize the described components through the native backbone and tensor-map owners.
+    All Hub paths remain relative to the resolved snapshot root, including a selected subfolder."""
+    from dew.interop.safetensors_io import read_file
+    from dew.interop.weights import translate_parameters
+
+    component = description.backbone
+    weights_folder = str(Path(folder) / component.weights_folder).removeprefix("./")
+    if weights_folder == ".":
+        weights_folder = ""
+    root = sources.snapshot(str(name_or_dir), commit, weights=(weights_folder,))
+    directory = root / folder
+    shared = sources.load_shards(root / weights_folder)
+    prefix = component.tensor_prefix
+    tensors = ({name[len(prefix):]: tensor for name, tensor in shared.items() if name.startswith(prefix)}
+               if prefix else shared)
+    backbone = _load_native_source(
+        name_or_dir, directory, commit, gguf_file=None, component=component, tensors=tensors,
+        placed=placed, streaming=streaming, dtype=dtype, param_dtype=param_dtype,
+        attention_impl=attention_impl, max_seq_len=max_seq_len)
+    head_source = description.head
+    if head_source.weight_file is None:
+        head_tensors = {name: tensor for name, tensor in shared.items() if not name.startswith(prefix)}
+    else:
+        filename = (Path(folder) / head_source.weight_file).as_posix()
+        head_tensors = read_file(sources.repo_file(name_or_dir, root, filename))[0]
+    head = head_source.build(backbone.model, dtype, attention_impl)
+    params = translate_parameters(decoder_parts.split_packed(head_tensors, head_source.packed),
+                                  head_source.path, param_dtype)
+    if head_source.reshape is not None:
+        params = head_source.reshape(head, params)
+    return description.bundle(backbone, head, placed({"params": params}), directory,
+                              description.tokenizer_folder, **description.fields)
+
+
 def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | None, *,
                         gguf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
                         dtype: str, param_dtype: str, attention_impl: str,
-                        max_seq_len: int | None) -> Pretrained:
+                        max_seq_len: int | None, component=None, tensors=None) -> Pretrained:
     """Decode native source weights and bind their processors and export layout.
 
     Diffusers pipelines and the explicit torchax fallback have already taken
     their own routes; this boundary handles native decoders and media wrappers.
     """
     gguf_path = None if gguf_file is None else sources.repo_file(name_or_dir, directory, gguf_file)
-    config, tensors = _source_config(name_or_dir, directory, commit, gguf_path)
+    if component is None:
+        config, tensors = _source_config(name_or_dir, directory, commit, gguf_path)
+    else:
+        config = component.config
+        directory = directory / component.config_folder
     mamba_ssm = mamba2.is_mamba_ssm(config)
     if mamba_ssm:
         config = mamba2.config_from_mamba_ssm(config)
@@ -1379,7 +1468,7 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
                 max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming,
                 quantized=source_quantization(config) is not None, checked=checked)
     model, variables = _input_quantization(model, variables, layouts, config, grid)
-    source = str(name_or_dir) if commit is None else f"{name_or_dir}@{directory.name}"
+    source = str(name_or_dir) if commit is None else f"{name_or_dir}@{commit}"
     processor = source_processor(directory, config, record, model, gguf_path, source=source)
     generation_config = read_generation_config(directory)
 
@@ -1392,7 +1481,7 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
                     layouts, retained, export_adapter, quantized_tensors=quantized_tensors,
                     quantized_scale_dtype=scale_dtype, quantization_grid=grid,
                     # The weights' commit: a pickle repo's may be its conversion's.
-                    revision=None if commit is None else directory.name,
+                    revision=commit,
                     tokenizer="byte" if named == "byte" else None)
 
     if family == "diffusion_gemma":

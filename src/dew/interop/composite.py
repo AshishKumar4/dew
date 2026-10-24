@@ -13,7 +13,7 @@ from flax import linen as nn
 
 from dew.interop.decoder_parts import Packed
 from dew.interop.weights import TensorPath
-from dew.registry import Record
+from dew.records import JSON
 
 if TYPE_CHECKING:
     from dew.interop.pretrained import Pretrained
@@ -34,11 +34,15 @@ class HeadComponent:
     """A readout's constructor and weight codec. `weight_file` None reads the backbone's shared
     shard set outside its tensor prefix. `reshape` gives flat stored maps their native head axes."""
 
-    record: Record
+    record: JSON
     path: TensorPath
     packed: tuple[Packed, ...] = ()
     weight_file: str | None = None
     reshape: Callable[[nn.Module, dict], dict] | None = None
+
+    def build(self, backbone: nn.Module, dtype: str, attention_impl: str) -> nn.Module:
+        """Build the readout against the backbone's output contract."""
+        raise NotImplementedError
 
 
 @dataclass(frozen=True)
@@ -48,8 +52,7 @@ class CompositeSource:
 
     backbone: NativeComponent
     head: HeadComponent
-    model: type[nn.Module]
-    bundle: type[Pretrained]
+    bundle: Callable[..., Pretrained]
     tokenizer_folder: str
     fields: Mapping[str, object] = field(default_factory=dict)
 

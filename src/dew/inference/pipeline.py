@@ -128,13 +128,7 @@ def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | 
                  dtype: str | None, param_dtype: str | None,
                  revision: str | None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
     from dew.inference.projections import packed_owned
-    from dew.interop import (
-        Pretrained,
-        PretrainedBlockDecoder,
-        PretrainedDecoder,
-        PretrainedMaskedDecoder,
-        PretrainedPipeline,
-    )
+    from dew.interop import Pretrained, PretrainedPipeline
     from dew.training.distributed import MeshSpec as DefaultMesh
 
     storage = "auto" if param_dtype is None else param_dtype
@@ -146,14 +140,7 @@ def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | 
     if not isinstance(loaded, PretrainedPipeline):
         # The task owns the weights it loaded: their projections pack once, where they were placed.
         loaded = replace(loaded, variables=packed_owned(loaded.model, loaded.variables))
-    match loaded:
-        case PretrainedPipeline():
-            return loaded.text_to_image()
-        case PretrainedBlockDecoder():
-            return loaded.block_generation()
-        case PretrainedDecoder() | PretrainedMaskedDecoder():
-            return loaded.text_generation()
-    raise TypeError(f"{source} loaded as {type(loaded).__name__}, which has no generation task")
+    return loaded.pipeline()
 
 
 def place(variables: Variables, mesh: MeshSpec | Mesh | None, layout: Layout | None) -> Variables:

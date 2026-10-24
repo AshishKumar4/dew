@@ -1,0 +1,133 @@
+"""Released decision metadata and the bundle's task declaration.
+
+The registered codec describes components; `Pretrained.load` resolves their
+files, translates weights and places them through the ordinary native route.
+"""
+
+import dataclasses
+import json
+from collections.abc import Callable
+from pathlib import Path
+from typing import Self
+
+from flax import linen as nn
+
+from dew import records
+from dew.data.text import HFTokenizer
+from dew.interop.composite import CompositeSource, HeadComponent, NativeComponent, SourceKind
+from dew.interop.pretrained import Pretrained
+from dew.objectives.base import Variables
+from dew.registry import from_record, import_path, to_record
+
+from .calibration import Calibration, Temperatures
+from .head import DecisionHead, Head, JointSchemaHead
+from .joint_checkpoint import HEAD_CONFIG, HEAD_WEIGHTS, _path, _shaped
+from .laya import CONFIG_FILE, IN_PROJ, _head_path, _token
+from .layout import JointLayout, Layout, MarkerLayout, Specials
+from .model import DecisionModel
+from .task import Decide, DecideSettings
+
+
+@dataclasses.dataclass(frozen=True)
+class DecisionHeadSource(HeadComponent):
+    """The head constructor reads the native backbone's output width and compute dtype."""
+
+    def build(self, backbone: nn.Module, dtype: str, attention_impl: str) -> Head:
+        width, compute = DecisionModel.head_size(backbone)
+        held = records.record(self.record, "head")
+        fields = records.record(held["fields"], "head.fields")
+        return Head.from_record({**held, "fields": {**fields, "dtype": compute,
+                                                     "attention_impl": attention_impl}}, width)
+
+
+@dataclasses.dataclass(frozen=True)
+class PretrainedDecision(Pretrained):
+    """A native backbone bundle with its readout and declared decision task.
+    Inherited adaptation operates on the backbone; the readout retains its own variables."""
+
+    head: Head | None = None
+    head_variables: Variables = dataclasses.field(default_factory=dict)
+    settings: records.JSON = None
+    calibration: records.JSON = None
+    decision_tokenizer: HFTokenizer | None = None
+
+    def map_variables(self, transform: Callable[[Variables], Variables]) -> Self:
+        return dataclasses.replace(self, variables=transform(self.variables),
+                                   head_variables=transform(self.head_variables))
+
+    def pipeline(self) -> Decide:
+        return Decide.of(self)
+
+    def save(self, directory: str | Path, **options) -> None:
+        if options:
+            raise ValueError(f"the decision release writer has no options {sorted(options)}")
+        self.pipeline().save_pretrained(directory)
+
+    @classmethod
+    def from_components(cls, backbone: Pretrained, head: Head, head_variables: Variables,
+                        directory: Path, tokenizer_folder: str, *, layout_record: records.JSON,
+                        calibration_record: records.JSON, strict_specials: bool) -> Self:
+        tokenizer = HFTokenizer(str(directory / tokenizer_folder), local_files_only=True)
+        if strict_specials:
+            hf = tokenizer.tokenizer
+            specials = Specials(begin=_token(hf.cls_token_id, "cls"),
+                                separator=_token(hf.sep_token_id, "sep"),
+                                marker=_token(hf.mask_token_id, "mask"), marker_text=str(hf.mask_token),
+                                pad=_token(hf.pad_token_id, "pad"))
+        else:
+            specials = Specials.of(tokenizer)
+        layout = from_record(Layout, layout_record)
+        settings = DecideSettings(head.record(), layout, specials, str(directory / tokenizer_folder), None)
+        inherited = {field.name: getattr(backbone, field.name) for field in dataclasses.fields(Pretrained)}
+        return cls(**inherited, head=head, head_variables=head_variables,
+                   settings=to_record(settings, DecideSettings), calibration=calibration_record,
+                   decision_tokenizer=tokenizer)
+
+
+class DecisionSource(SourceKind):
+    """The metadata signatures of Laya and joint-head releases."""
+
+    @staticmethod
+    def describe(directory: Path) -> CompositeSource | None:
+        if (directory / CONFIG_FILE).is_file():
+            config = records.record(json.loads((directory / CONFIG_FILE).read_text()), CONFIG_FILE)
+            native = records.record(json.loads((directory / "encoder/config.json").read_text()),
+                                    "encoder/config.json")
+            backbone = NativeComponent({**native, "architectures": ["ModernBertModel"]},
+                                       config_folder="encoder", tensor_prefix="encoder.")
+            head = DecisionHeadSource(
+                {"name": import_path(DecisionHead), "fields": {
+                    "layers": records.integer(config.get("head_layers", 2), "head_layers")}},
+                _head_path, IN_PROJ)
+            layout = MarkerLayout(
+                max_len=records.integer(config.get("max_len", 512), "max_len"),
+                head_max_len=records.integer(config.get("head_max_len", 192), "head_max_len"),
+                option_tokens=records.integer(config.get("option_tokens", MarkerLayout.option_tokens),
+                                              "option_tokens"),
+                parallel=config.get("option_layout", "sequential") == "parallel")
+            values = config.get("temperature", [1.0, 1.0, 1.0])
+            if not isinstance(values, list) or len(values) != 3:
+                raise ValueError("temperature lists choice, score and noul")
+            buckets = records.record(config.get("temperature_by_options", {}), "temperature_by_options")
+            calibration = Calibration(Temperatures(
+                dict(zip(("choice", "score", "noul"), (records.number(x, "temperature") for x in values),
+                         strict=True)), {key: records.number(value, key) for key, value in buckets.items()}))
+            tokenizer_folder, strict_specials = "tokenizer", True
+        elif (directory / HEAD_CONFIG).is_file():
+            config = records.record(json.loads((directory / HEAD_CONFIG).read_text()), HEAD_CONFIG)
+            if records.number(config.get("dropout", 0.0), "dropout"):
+                raise ValueError("the stored head drops out at a rate Dew's head does not train with")
+            native = records.record(json.loads((directory / "config.json").read_text()), "config.json")
+            backbone = NativeComponent(native)
+            fields = {key: records.integer(config[key], key)
+                      for key in ("width", "routing_layers", "layers", "heads", "feedforward")}
+            head = DecisionHeadSource({"name": import_path(JointSchemaHead), "fields": fields},
+                                      _path, IN_PROJ, HEAD_WEIGHTS, _shaped)
+            layout, calibration = JointLayout(), Calibration()
+            tokenizer_folder, strict_specials = "", False
+        else:
+            return None
+        return CompositeSource(backbone, head, PretrainedDecision.from_components, tokenizer_folder,
+                               {"layout_record": to_record(layout, Layout),
+                                "calibration_record": to_record(calibration, Calibration),
+                                "strict_specials": strict_specials})

@@ -33,7 +33,6 @@ from dew.decision.calibration import (
 from dew.decision.data import Example
 from dew.decision.head import Head
 from dew.decision.images import Images
-from dew.decision.joint_checkpoint import JointCheckpoint
 from dew.decision.laya import LAYA, LayaCheckpoint
 from dew.decision.layout import (
     DecisionInputs,
@@ -65,7 +64,7 @@ from dew.inference.tasks import shape_bucket
 from dew.interop.processors import Processor
 from dew.nn.inputs import ModelInputs, RowPlan, mesh_of
 from dew.nn.kernels.options import compiler_options
-from dew.objectives.base import Metric, Objective, Variables
+from dew.objectives.base import Metric, Objective, Variables, joined
 from dew.records import JSON, json_value, record
 
 if TYPE_CHECKING:
@@ -194,19 +193,26 @@ class Decide:
         answers with Jev's confidence; `replace(task, confidence=...)` selects
         Laya's (`EntropyConfidence`) or the top probability (`TopProbability`).
         """
-        label = str(name) if subfolder is None else f"{name}/{subfolder}"
-        if subfolder is None and JointCheckpoint.exists(name, revision=revision):
-            release = JointCheckpoint.load(name, revision=revision, dtype=dtype, param_dtype=param_dtype,
-                                           attention_impl=attention_impl)
-            return cls(release.model, release.variables, JointLayout(), release.tokenizer, release.specials,
-                       name=label, processor=release.processor)
-        checkpoint = LayaCheckpoint.load(name, subfolder=subfolder, revision=revision, dtype=dtype,
-                                         param_dtype=param_dtype, attention_impl=attention_impl)
-        choice, score, noul = checkpoint.temperatures
-        temperatures = Temperatures({"choice": choice, "score": score, "noul": noul},
-                                    checkpoint.bucket_temperatures)
-        return cls(checkpoint.model, checkpoint.variables, checkpoint.layout, checkpoint.tokenizer,
-                   checkpoint.specials, Calibration(temperatures), name=label)
+        from dew.interop.pretrained import Pretrained
+
+        return cls.of(Pretrained.load(name, subfolder=subfolder, revision=revision, dtype=dtype,
+                                      param_dtype=param_dtype, attention_impl=attention_impl))
+
+    @classmethod
+    def of(cls, bundle) -> Self:
+        """Build the declared decision task from a loaded composite bundle, without loading again."""
+        from dew.decision.sources import PretrainedDecision
+        from dew.registry import from_record
+
+        if (not isinstance(bundle, PretrainedDecision) or bundle.head is None
+                or bundle.decision_tokenizer is None):
+            raise TypeError("Decide.of needs a loaded decision source")
+        settings = DecideSettings.of(records.record(bundle.settings, "decision settings"))
+        calibration = from_record(Calibration, bundle.calibration)
+        return cls(DecisionModel(bundle.model, bundle.head),
+                   joined({"backbone": bundle.variables, "head": bundle.head_variables}),
+                   settings.layout, bundle.decision_tokenizer, settings.specials, calibration,
+                   name=str(bundle.origin or bundle.source), processor=bundle.processor)
 
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
