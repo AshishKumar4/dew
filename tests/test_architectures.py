@@ -630,12 +630,14 @@ def test_a_residual_order_is_the_same_decoder(case):
                                        roundings=roundings)
 
 
+@pytest.mark.parametrize("steps", (1, 2), ids=("1-step", "2-steps"))
 @pytest.mark.parametrize("case", CASES, ids=IDS)
-def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
+def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, tmp_path):
     """One device, 8x1 data parallelism (every parameter replicated, the
     batch split across every device) and 2x4 fsdp (the parameter tree split
     four ways, the optimizer's state and the EMA with it) train the same
-    steps from the same state: after one step and after two, each layout's
+    steps from the same state: after `steps` steps (one, and two, each its
+    own test, so neither runs the other's fits and draws), each layout's
     variables, momentum and EMA are as near a float64 run as one device's
     are, over the cell's declared batches (check 1, `assert_as_exact`), so
     their summing a batch's rows and positions in other orders is the only
@@ -671,27 +673,26 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
         raise AssertionError(f"no batch of seed {seed} clears the selection margin {MARGIN}")
 
     seeds = LAYOUT_SEEDS.get(case.name, DEFAULT_LAYOUT_SEEDS)
-    for steps in (1, 2):
-        _, alone, _ = run_case(case, tmp_path, fsdp=1, devices=1, state=copied(), steps=steps)
-        layouts = [run_case(case, tmp_path, fsdp=fsdp, state=copied(), steps=steps)[1] for fsdp in (1, 4)]
-        drawn = {name: drawn_steps(case, tmp_path, fsdp, devices, initial, steps) for name, fsdp, devices
-                 in (("one device", 1, 1), ("8x1 data", 1, None), ("2x4 fsdp", 4, None))}
-        # The drawn steps are fit's own on its batch, bit for bit, so what check 1 judges is the run's:
-        # the cell's own batch in its own order, whatever selection margin a draw then asks.
-        own = (next(batches(case, encoder)()), np.arange(width))
-        for fitted, stepped in zip((alone, *layouts), drawn.values(), strict=True):
-            ours = stepped(*own)
-            for name, tree in ours.items():
-                held = jax.device_get(getattr(fitted, name))
-                assert jax.tree.structure(tree) == jax.tree.structure(held), name
-                for mine, theirs in zip(jax.tree.leaves(tree), jax.tree.leaves(held), strict=True):
-                    mine, theirs = np.asarray(mine), np.asarray(theirs)
-                    assert mine.dtype == theirs.dtype and mine.shape == theirs.shape, name
-                    assert np.array_equal(mine.view(np.uint8), theirs.view(np.uint8)), name
-        truth = drawn_steps(case, tmp_path, 1, 1, initial, steps, exact=True)
-        for name in ("8x1 data", "2x4 fsdp"):
-            assert_as_exact(drawn[name], drawn["one device"], draw, f"{case.name} {name}, {steps} step(s)",
-                            seeds=seeds, truth_fn=truth)
+    _, alone, _ = run_case(case, tmp_path, fsdp=1, devices=1, state=copied(), steps=steps)
+    layouts = [run_case(case, tmp_path, fsdp=fsdp, state=copied(), steps=steps)[1] for fsdp in (1, 4)]
+    drawn = {name: drawn_steps(case, tmp_path, fsdp, devices, initial, steps) for name, fsdp, devices
+             in (("one device", 1, 1), ("8x1 data", 1, None), ("2x4 fsdp", 4, None))}
+    # The drawn steps are fit's own on its batch, bit for bit, so what check 1 judges is the run's:
+    # the cell's own batch in its own order, whatever selection margin a draw then asks.
+    own = (next(batches(case, encoder)()), np.arange(width))
+    for fitted, stepped in zip((alone, *layouts), drawn.values(), strict=True):
+        ours = stepped(*own)
+        for name, tree in ours.items():
+            held = jax.device_get(getattr(fitted, name))
+            assert jax.tree.structure(tree) == jax.tree.structure(held), name
+            for mine, theirs in zip(jax.tree.leaves(tree), jax.tree.leaves(held), strict=True):
+                mine, theirs = np.asarray(mine), np.asarray(theirs)
+                assert mine.dtype == theirs.dtype and mine.shape == theirs.shape, name
+                assert np.array_equal(mine.view(np.uint8), theirs.view(np.uint8)), name
+    truth = drawn_steps(case, tmp_path, 1, 1, initial, steps, exact=True)
+    for name in ("8x1 data", "2x4 fsdp"):
+        assert_as_exact(drawn[name], drawn["one device"], draw, f"{case.name} {name}, {steps} step(s)",
+                        seeds=seeds, truth_fn=truth)
     replicated, state = layouts
     assert not fsdp_leaves(replicated.variables), "nothing may shard on a 1-wide fsdp axis"
     sharded = fsdp_leaves(state.variables)
