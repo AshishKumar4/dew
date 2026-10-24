@@ -744,7 +744,9 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                               for path, _ in jax.tree_util.tree_leaves_with_path(dew)]
             widths = widths or tuple(int(np.shape(leaf)[-1]) if np.ndim(leaf) >= 2 else 0
                                      for leaf in jax.tree.leaves(dew))
-            evidence = _evidence(dew, reference_fn(*theirs_at), truth, their_truth)
+            # The reference against itself on the same inputs is one evaluation (`seeds_for`'s sizing).
+            reference = dew if dew_fn is reference_fn and theirs_at is mine_at else reference_fn(*theirs_at)
+            evidence = _evidence(dew, reference, truth, their_truth)
             row = evidence if row is None else [
                 (first[0], first[1], float(np.fmax(first[2], other[2])), float(np.fmax(first[3], other[3])),
                  first[4], first[5] and other[5]) for first, other in zip(row, evidence, strict=True)]
@@ -1089,23 +1091,30 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     verdict's inputs at SIZING_FROM and needs a pilot stream of its own first, and a recorded reference
     (`indexed_recording`), which holds its recorded seeds alone, is refused: its site keeps its
     recorded count. Fails past `most`, where the site needs larger inputs or fewer shared factors, not
-    more seeds."""
+    more seeds.
+
+    Each draw is evaluated once however many doublings the sizing takes: a count's draws are its
+    predecessor's and the seeds it adds, the reference compared with itself takes its seeds 0 to twice
+    the count (the first half against the second), and the reference on the same inputs runs once."""
     if dew_fn is not None and getattr(reference_fn, "recorded", False):
         raise ValueError(f"{label}: a recorded reference holds its recorded seeds alone, never a paired "
                          f"sizing's from SIZING_FROM; its site keeps its recorded count")
-    count = max(start, FEWEST_SEEDS)
+    count, drawn = max(start, FEWEST_SEEDS), None
+    first = 0 if dew_fn is None else SIZING_FROM
     while count <= most:
+        held = 0 if drawn is None else len(drawn.theirs)
+        fresh = _drawn(dew_fn or reference_fn, reference_fn, draw,
+                       range(first + held, first + (2 * count if dew_fn is None else count)), truth_fn)
+        drawn = fresh if drawn is None else drawn.joined(fresh)
         if dew_fn is None:
-            first = _drawn(reference_fn, reference_fn, draw, range(count), truth_fn)
-            second = _drawn(reference_fn, reference_fn, draw, range(count, 2 * count), truth_fn)
-            wide = [name for index, name in enumerate(first.names)
-                    if np.sum(first.theirs[:, index]) > 0 and np.sum(second.theirs[:, index]) > 0
-                    and not _resolves(*_interval(first.theirs[:, index], control=second.theirs[:, index]))]
+            halves = drawn.theirs[:count], drawn.theirs[count:2 * count]
+            wide = [name for index, name in enumerate(drawn.names)
+                    if np.sum(halves[0][:, index]) > 0 and np.sum(halves[1][:, index]) > 0
+                    and not _resolves(*_interval(halves[0][:, index], control=halves[1][:, index]))]
         else:
-            paired = _drawn(dew_fn, reference_fn, draw, range(SIZING_FROM, SIZING_FROM + count), truth_fn)
-            wide = [name for index, name in enumerate(paired.names)
-                    if np.sum(paired.theirs[:, index]) > 0
-                    and not _resolves(*_interval(paired.mine[:, index], paired.theirs[:, index]))]
+            wide = [name for index, name in enumerate(drawn.names)
+                    if np.sum(drawn.theirs[:, index]) > 0
+                    and not _resolves(*_interval(drawn.mine[:, index], drawn.theirs[:, index]))]
         if not wide:
             return count
         count *= 2
