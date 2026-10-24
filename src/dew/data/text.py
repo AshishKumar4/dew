@@ -22,7 +22,7 @@ import threading
 import unicodedata
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, runtime_checkable
 
 import grain.python as grain
 import numpy as np
@@ -580,8 +580,9 @@ class Quality(Curated):
 
         rules = dict(zip(QUALITY_RULES, (GopherQualityFilter, C4QualityFilter, FineWebQualityFilter),
                          strict=True))
-        return rules[self.rule](**{name: list(value) if isinstance(value, tuple) else value
-                                   for name, value in self.settings})
+        arguments: dict[str, Any] = {name: list(value) if isinstance(value, tuple) else value
+                                     for name, value in self.settings}
+        return rules[self.rule](**arguments)
 
 
 @dataclasses.dataclass(frozen=True)

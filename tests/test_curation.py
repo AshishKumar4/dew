@@ -26,6 +26,8 @@ PROSE = [
     "reach, and that the building should stay open late on the days when the schools are closed. "
     "The next meeting will look at the budget and at the schedule for the work.",
 ]
+FRENCH = ("Le fleuve passe devant le vieux moulin et traverse la ville, où les enfants attendent sur le pont "
+          "pour regarder passer les bateaux le soir.")
 EVALUATION = ("Which of these is the capital of France and has been since the late tenth century, "
               "according to the historians who study the early kingdoms of western Europe?")
 
@@ -68,26 +70,22 @@ def test_a_curation_steps_rules_key_the_plan_and_the_same_rules_key_it_alike():
     assert plan(twelve) != plan(eight)
 
 
-def test_a_fasttext_classifier_keeps_the_label_it_is_asked_for_and_its_model_keys_the_plan(tmp_path):
-    fasttext = pytest.importorskip("fasttext")
-    examples = tmp_path / "examples.txt"
-    lines = [f"__label__prose {passage}" for passage in PROSE for _ in range(20)]
-    lines += ["__label__spam click here buy now free offer win prize" for _ in range(60)]
-    examples.write_text("\n".join(lines) + "\n")
-    model = tmp_path / "model.bin"
-    trained = fasttext.train_supervised(input=str(examples), epoch=5)
-    trained.save_model(str(model))
-    classified = Pipeline(web_pages()).filter_map(text.Classifier(str(model), keep=(("prose", 0.5),)))
-    kept, dropped = one_pass(classified)
-    assert kept == [0, 1, 2, 11] and dropped == {"classifier": 1}
+@pytest.mark.network
+def test_a_fasttext_classifier_keeps_the_label_it_is_asked_for():
+    """A published fastText classifier, lid.176's compressed release, keeps the pages it scores
+    English and drops the French one under the classifier's reason."""
+    records = [{"id": index, "text": passage} for index, passage in enumerate(PROSE)]
+    records.append({"id": 10, "text": FRENCH})
+    model = "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz"
+    kept, dropped = one_pass(Pipeline(Memory(records, shard_rows=len(records)))
+                             .filter_map(text.Classifier(model, keep=(("en", 0.5),))))
+    assert kept == [0, 1, 2] and dropped == {"classifier": 1}
 
 
 @pytest.mark.network
 def test_language_identification_keeps_the_language_it_is_asked_for():
     records = [{"id": index, "text": passage} for index, passage in enumerate(PROSE)]
-    french = ("Le fleuve passe devant le vieux moulin et traverse la ville, où les enfants attendent sur "
-              "le pont pour regarder passer les bateaux le soir.")
-    records.append({"id": 10, "text": french})
+    records.append({"id": 10, "text": FRENCH})
     kept, dropped = one_pass(Pipeline(Memory(records, shard_rows=len(records)))
                          .filter_map(text.Language(("en",))))
     assert kept == [0, 1, 2] and dropped == {"language": 1}
