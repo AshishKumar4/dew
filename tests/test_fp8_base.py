@@ -197,7 +197,7 @@ def test_the_frozen_product_multiplies_the_cast_rows_exactly_and_trains_no_kerne
     assert_products_exact(jax.jit(fp8_products), "the frozen FP8 product")
 
 
-TANGENT_SEEDS = 8
+TANGENT_SEEDS = 16
 """The forward-mode product's declared draws (check 1, `assert_as_exact`), sized by `seeds_for` (on
 armada): the fewest for which the float32 reference compared with itself resolves the factor."""
 
