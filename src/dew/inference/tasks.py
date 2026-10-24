@@ -17,7 +17,7 @@ import dataclasses
 import functools
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, Self
+from typing import TYPE_CHECKING, ClassVar, Protocol, Self
 
 import jax
 import jax.numpy as jnp
@@ -35,7 +35,7 @@ from dew.inference.projections import packed_owned
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key
 from dew.nn.protocols import Bounded, CacheCapacity, TokenModel
-from dew.objectives.base import UNREAD, Variables, thaw
+from dew.objectives.base import PARAMETER_ROOTS, UNREAD, Objective, Variables, thaw
 from dew.records import integer, record as named_fields, text as named
 from dew.sampling import decoding, vocabulary
 from dew.sampling.decoding import LogitsTransform, Stopping, id_row
@@ -260,41 +260,60 @@ def _requested(generated: Generation, budget: int, padding: int) -> Generation:
                    raw_log_probs=generated.raw_log_probs[:, :budget])
 
 
-class SavedRun(NamedTuple):
-    """One checkpoint of a run, pinned: its inference declaration, not the
-    training configuration, and the exact step it is, which a loader reads
-    the weights at too, so a step saved meanwhile cannot pair one step's
-    declaration with another's weights."""
+@dataclass(frozen=True)
+class SavedRun:
+    """One checkpoint of a run, pinned, as every loader of a run reads it (a task's `from_run`,
+    `Pretrained.from_run`, `Adapter.from_run`, `dew export`): its inference declaration, not the
+    training configuration, the objective that wrote it, and the exact step it is, which the
+    weights are read at too (`variables`), so a step saved meanwhile cannot pair one step's
+    declaration with another's weights. A loader reconstructs its own components from the record
+    (`saved_settings`, `saved_model`)."""
 
+    directory: str
     record: Mapping[str, object]
     step: int
 
+    @classmethod
+    def pinned(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = ()) -> SavedRun:
+        """The selected checkpoint of the run in `directory`, its latest or `step`. A task loaded
+        from it compiles into the persistent cache (`persist_compilations`). `trust` names the
+        packages outside Dew whose modules the record may import (`dew.registry.imported`)."""
+        from dew.checkpoints import Checkpoints
+        from dew.registry import import_trusted, objectives
+        persist_compilations()
+        with Checkpoints(directory) as checkpoints:
+            step = checkpoints.pinned(step)
+            record = checkpoints.artifact(step)
+        import_trusted(record, trust)
+        if record is None:
+            raise ValueError("this checkpoint's objective declares no inference record; declare "
+                             "Objective.inference_record, or call objective.pipeline(state)")
+        record = named_fields(record, 'checkpoint artifact')
+        if 'unrecorded' in record:
+            raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
+        objective = objectives[named(record['objective'], 'objective')]
+        declared = frozenset() if objective.settings is None else settings_fields(objective.settings)
+        stray = set(record) - {'objective', 'model', UNREAD, *declared}
+        if stray:
+            raise ValueError(f"this {objective.__name__} run records fields its objective does not write: "
+                             f"{sorted(stray)}")
+        return cls(str(directory), record, step)
 
-def run_record(directory: str, step: int | str | None = None, trust: Sequence[str] = ()) -> SavedRun:
-    """The selected checkpoint of the run in `directory`, pinned (`SavedRun`).
-    A task loaded from it compiles into the persistent cache
-    (`persist_compilations`). `trust` names the packages outside Dew whose
-    modules the record may import (`dew.registry.imported`)."""
-    from dew.checkpoints import Checkpoints
-    from dew.registry import import_trusted, objectives
-    persist_compilations()
-    with Checkpoints(directory) as checkpoints:
-        step = checkpoints.pinned(step)
-        record = checkpoints.artifact(step)
-    import_trusted(record, trust)
-    if record is None:
-        raise ValueError("this checkpoint's objective declares no inference record; declare "
-                         "Objective.inference_record, or call objective.pipeline(state)")
-    record = named_fields(record, 'checkpoint artifact')
-    if 'unrecorded' in record:
-        raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
-    objective = objectives[named(record['objective'], 'objective')]
-    declared = frozenset() if objective.settings is None else settings_fields(objective.settings)
-    stray = set(record) - {'objective', 'model', UNREAD, *declared}
-    if stray:
-        raise ValueError(f"this {objective.__name__} run records fields its objective does not write: "
-                         f"{sorted(stray)}")
-    return SavedRun(record, step)
+    @property
+    def objective(self) -> type[Objective]:
+        """The objective class the run trained, which its record names."""
+        from dew.registry import objectives
+
+        return objectives[named(self.record['objective'], 'objective')]
+
+    def variables(self, *, ema: bool | None, mesh: MeshSpec | Mesh | None = None,
+                  layout: Layout | None = None, param_dtype: DTypeLike | None = None,
+                  parameter_roots: tuple[tuple[str, ...], ...] = PARAMETER_ROOTS) -> Variables:
+        """The model's variables at this step, as the run's objective restores them
+        (`Objective._saved_variables`)."""
+        return self.objective._saved_variables(self.directory, step=self.step, ema=ema, mesh=mesh,
+                                               layout=layout, param_dtype=param_dtype,
+                                               parameter_roots=parameter_roots)
 
 
 def settings_fields(settings: type) -> frozenset[str]:
@@ -487,15 +506,12 @@ class _NativeTextTask:
         as its objective restores them, its task settings, and its host processor. The task owns
         the weights it restored: their projections pack here, once, as a source's do at its load
         (`dew.pipeline`), so every route reads the same packed weights."""
-        from dew.registry import objectives
-
-        record, exact = run_record(directory, step, trust)
-        config = saved_model(record, dtype)
-        held = saved_settings(record, settings)
+        run = SavedRun.pinned(directory, step, trust)
+        config = saved_model(run.record, dtype)
+        held = saved_settings(run.record, settings)
         model = config.build()
         checked(model, held)
-        variables = objectives[named(record["objective"], "objective")]._saved_variables(
-            directory, step=exact, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
+        variables = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
         return model, packed_owned(model, variables), held, _saved_processor(held, config)
 
     @classmethod

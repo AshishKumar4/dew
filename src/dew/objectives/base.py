@@ -803,7 +803,7 @@ class Objective(ABC, Generic[Loss, Effects]):
     """The dataclass of what a saved run records beside its objective and model
     (`task_settings`), the one list of those fields: the objective writes an
     instance, its `saved_task` reads it back, and a record holding any other
-    field is refused (`dew.inference.tasks.run_record`). None records nothing
+    field is refused (`dew.inference.tasks.SavedRun.pinned`). None records nothing
     more."""
     """The task class a saved run of this objective loads as, which `dew.pipeline` builds from the run.
 

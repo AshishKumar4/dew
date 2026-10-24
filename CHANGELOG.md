@@ -5,6 +5,7 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- `dew.inference.tasks.SavedRun` is the one pinned context every run loader reads (a task's `from_run`, `Pretrained.from_run`, `Adapter.from_run`, `dew.pipeline`, `dew export`): `SavedRun.pinned(directory, step, trust)` replaces `run_record`, and `run.objective` and `run.variables(...)` replace each loader's own lookup and restore. `Pretrained.from_run` reads a run's task through its settings (`saved_settings`) instead of parsing their fields again. `Decide.from_run` and `DewLM.from_run` take `trust` as the other tasks do.
 - A block- or masked-diffusion objective over a loaded source takes the source's
   end-of-sequence ids (`Pretrained.eos_token_ids`, or `eos_token_ids=`), and its
   task and saved run (`BlockSettings`, `MaskedSettings`) stop a response there,
