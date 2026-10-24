@@ -106,7 +106,9 @@ def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, trut
     takes in place, as its callers donate them (a kernel that aliases its state into its output): a
     call that keeps them would make XLA copy each before the kernel overwrites it. `arm`, when given, is
     the arm the split is compared with in place of `fn` on one device: a call whose rounding depends on
-    the shapes it runs at is compared with the shapes its shards run."""
+    the shapes it runs at is compared with the shapes its shards run. A caller passing `arm` also asserts
+    the split against the reference path (check 1 against float64), so the comparison with `arm` alone is not
+    the whole contract."""
     run = jax.jit(fn, donate_argnums=donate)
 
     def put(args):
