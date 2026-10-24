@@ -97,7 +97,7 @@ def straight_through(x, rounded):
     return jax.lax.stop_gradient(rounded.astype(x.dtype)) - (jax.lax.stop_gradient(x) - x)
 
 
-def fp8_blocks(x, block: int):
+def fp8_scaled_blocks(x, block: int):
     """`x` in fp32 blocks of `block` channels and each block's power-of-two scale (act_quant with scale_fmt
     ue8m0, kernel.py:40-124): amax floored at 1e-4, the scale the ceiling power of two of amax / 448."""
     blocks = x.astype(jnp.float32).reshape(*x.shape[:-1], -1, block)
@@ -106,7 +106,8 @@ def fp8_blocks(x, block: int):
 
 
 def fp8_rounded(x, blocks, scale):
-    """`x` as E4M3 of its `blocks` over their `scale` (`fp8_blocks`), clamped to +-448, times the scale."""
+    """`x` as E4M3 of its `blocks` over their `scale` (`fp8_scaled_blocks`), clamped to +-448, times the
+    scale."""
     rounded = _round_e4m3fn(jnp.clip(blocks / scale, -_E4M3_MAX, _E4M3_MAX))
     return straight_through(x, (rounded * scale).reshape(x.shape))
 
@@ -115,10 +116,10 @@ def fake_quant_fp8(x, block: int):
     """E4M3 per `block` channels under a power-of-two scale (act_quant with
     scale_fmt ue8m0, kernel.py:40-124): amax floored at 1e-4, scale the
     ceiling power of two of amax / 448, value clamped to +-448 and rounded."""
-    return fp8_rounded(x, *fp8_blocks(x, block))
+    return fp8_rounded(x, *fp8_scaled_blocks(x, block))
 
 
-def fp4_blocks(x, block: int, e4m3_scale: bool):
+def fp4_scaled_blocks(x, block: int, e4m3_scale: bool):
     """`x` in fp32 blocks of `block` channels and each block's scale (fp4_act_quant, kernel.py:127-204):
     with `e4m3_scale` the E4M3 of amax / 6 with amax floored at 6 * 2**-9 (the compressed KV), else the
     ceiling power of two of amax / 6 with amax floored at 6 * 2**-126 (the indexer)."""
@@ -132,8 +133,8 @@ def fp4_blocks(x, block: int, e4m3_scale: bool):
 
 
 def fp4_rounded(x, blocks, scale, e4m3_scale: bool):
-    """`x` as E2M1 of its `blocks` over their `scale` (`fp4_blocks`), clamped to +-6, times the scale: an
-    E4M3 scale compared against (`_e2m1_quotient`), a power of two divided by exactly."""
+    """`x` as E2M1 of its `blocks` over their `scale` (`fp4_scaled_blocks`), clamped to +-6, times the
+    scale: an E4M3 scale compared against (`_e2m1_quotient`), a power of two divided by exactly."""
     if e4m3_scale:
         rounded = _e2m1_quotient(blocks, scale)
     else:
@@ -146,7 +147,7 @@ def fake_quant_fp4(x, block: int, e4m3_scale: bool):
     E4M3 scale amax / 6 with amax floored at 6 * 2**-9 (the compressed KV),
     or under the ceiling power of two of amax / 6 with amax floored at
     6 * 2**-126 (the indexer); the value clamped to +-6 and rounded."""
-    return fp4_rounded(x, *fp4_blocks(x, block, e4m3_scale), e4m3_scale)
+    return fp4_rounded(x, *fp4_scaled_blocks(x, block, e4m3_scale), e4m3_scale)
 
 
 class FakeQuantizing(nn.Module):
@@ -154,18 +155,18 @@ class FakeQuantizing(nn.Module):
     methods, so a caller sees and can stand in for each rounding through
     `nn.intercept_methods`, as `tools/deepseek_v41_numerics.py` does to replay
     a float64 twin's roundings in the given run. Each rounding reads its
-    blocks and their scales from a method of their own (`fp8_blocks`,
-    `fp4_blocks`), so a caller reads what a forward rounded, and how near a
-    rounding's boundary it was, through `capture_intermediates`."""
+    blocks and their scales from a method of their own (`fp8_scaled_blocks`,
+    `fp4_scaled_blocks`), so a caller reads what a forward rounded, and how
+    near a rounding's boundary it was, through `capture_intermediates`."""
 
-    def fp8_blocks(self, x, block: int):
-        return fp8_blocks(x, block)
+    def fp8_scaled_blocks(self, x, block: int):
+        return fp8_scaled_blocks(x, block)
 
     def fp8(self, x, block: int):
-        return fp8_rounded(x, *self.fp8_blocks(x, block))
+        return fp8_rounded(x, *self.fp8_scaled_blocks(x, block))
 
-    def fp4_blocks(self, x, block: int, e4m3_scale: bool):
-        return fp4_blocks(x, block, e4m3_scale)
+    def fp4_scaled_blocks(self, x, block: int, e4m3_scale: bool):
+        return fp4_scaled_blocks(x, block, e4m3_scale)
 
     def fp4(self, x, block: int, e4m3_scale: bool):
-        return fp4_rounded(x, *self.fp4_blocks(x, block, e4m3_scale), e4m3_scale)
+        return fp4_rounded(x, *self.fp4_scaled_blocks(x, block, e4m3_scale), e4m3_scale)
