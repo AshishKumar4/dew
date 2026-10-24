@@ -528,6 +528,20 @@ def test_a_dense_llada_config_without_a_base_rotates_at_its_classs_10000(tmp_pat
                                   np.asarray(stated[0].apply(stated[1], ids)))
 
 
+def test_a_plain_rotary_gpt_oss_exports_a_plain_record_that_reloads_to_its_logits(tmp_path):
+    """GptOssConfig reads an omitted rope record as YaRN; a GPT OSS loaded with a plain one exports a
+    plain one, which reloads to the logits it computed."""
+    directory = _respelled("gpt-oss-tiny", tmp_path / "plain", lambda config: {
+        **config, "rope_parameters": {"rope_type": "default",
+                                      "rope_theta": config["rope_parameters"]["rope_theta"]}})
+    ids = np.load(FIXTURES / "gpt-oss-tiny" / "input_ids.npy")
+    model, variables = fp32_decoder(directory)
+    PretrainedDecoder.from_model(model, variables).save(tmp_path / "export")
+    restored, restored_variables = fp32_decoder(tmp_path / "export")
+    np.testing.assert_array_equal(np.asarray(restored.apply(restored_variables, ids)),
+                                  np.asarray(model.apply(variables, ids)))
+
+
 CLASS_DEFAULTED = ("deepseek-v2-tiny", "deepseek-v3-tiny", "gpt-oss-tiny", "mistral-tiny", "mixtral-tiny",
                    "ministral-tiny", "llama4-tiny", "modernbert-tiny", "qwen2-tiny", "qwen2-moe-tiny",
                    "qwen3-tiny", "qwen3-moe-tiny", "gemma2-tiny", "gemma3-tiny", "olmo3-tiny", "phi3-tiny",
