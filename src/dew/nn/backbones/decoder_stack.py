@@ -427,7 +427,9 @@ def _opened(run: DecoderBlock, spec: LayerSpec, probed: list[tuple[LayerSpec, li
             attention_metadata=attention_metadata), variables)
         written = list(changed)
         probed.append((spec, written))
-    return sorted(name for name in {*written, *state} if name not in ('params', 'streaming')
+    # Capture filters may select one module name but not another with the same layer spec. Keep
+    # that collection open wherever the caller does, independently of the spec's write probe.
+    return sorted(name for name in {*written, *state, 'intermediates'} if name not in ('params', 'streaming')
                   and run.is_mutable_collection(name))
 
 
