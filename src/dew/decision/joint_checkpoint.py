@@ -13,7 +13,6 @@ import re
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import linen as nn
 
 from dew.decision.layout import DecisionInputs
@@ -73,7 +72,7 @@ def _shaped(width: int, head: nn.Module, params: dict) -> dict:
     shapes = jax.eval_shape(head.init, jax.random.key(0), jnp.zeros((1, 2, width)), inputs,
                             jnp.zeros((3, width)))["params"]
     flat_shapes = dict(jax.tree_util.tree_leaves_with_path(shapes))
-    reshaped = {path: np.reshape(leaf, flat_shapes[path].shape)
+    reshaped = {path: leaf.reshape(flat_shapes[path].shape)
                 for path, leaf in jax.tree_util.tree_leaves_with_path(params)}
     missing = set(flat_shapes) - set(reshaped)
     if missing:

@@ -14,6 +14,7 @@ import numpy as np
 import optax
 import pytest
 from decision_support import decision_rows
+from interop_support import allocated_bytes
 from PIL import Image
 from reference_error import assert_as_exact_as_the_reference, float64_forward, ieee_fixture
 from safetensors.numpy import load_file
@@ -50,21 +51,10 @@ def test_a_shapes_only_readout_load_avoids_eager_native_buffers(monkeypatch):
     """The standalone joint readout needs no backbone: its shapes-only load retains every
     parameter's geometry while allocating fewer native-layout buffers than its eager load."""
     expected = Pretrained.load(TINY, dtype="float32", attention_impl="xla", on_host=True)
-    allocated = []
-    allocate = np.empty
-
-    def recording(*args, **kwargs):
-        array = allocate(*args, **kwargs)
-        allocated.append(array.nbytes)
-        return array
-
-    with monkeypatch.context() as patch:
-        patch.setattr(np, "empty", recording)
-        Pretrained.load(TINY, dtype="float32", attention_impl="xla", on_host=True)
-        eager_bytes = sum(allocated)
-        allocated.clear()
-        loaded = Pretrained.load(TINY, dtype="float32", attention_impl="xla", weights=False)
-        deferred_bytes = sum(allocated)
+    _, eager_bytes = allocated_bytes(monkeypatch, lambda: Pretrained.load(
+        TINY, dtype="float32", attention_impl="xla", on_host=True))
+    loaded, deferred_bytes = allocated_bytes(monkeypatch, lambda: Pretrained.load(
+        TINY, dtype="float32", attention_impl="xla", weights=False))
     assert eager_bytes > 0 and deferred_bytes < eager_bytes
     assert jax.tree.structure(loaded.variables) == jax.tree.structure(expected.variables)
     for actual, wanted in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(expected.variables),

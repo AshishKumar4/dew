@@ -1374,7 +1374,8 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
                            max_seq_len: int | None) -> Pretrained:
     """Materialize the described components through the native backbone and tensor-map owners.
     All Hub paths remain relative to the resolved snapshot root, including a selected subfolder."""
-    from dew.interop.weights import translate_parameters
+    from dew.interop.streaming import materialize
+    from dew.interop.weights import record_layouts
 
     component = description.backbone
     directory = source.directory(root)
@@ -1400,10 +1401,12 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
     else:
         head_tensors = sources.tensor_file(source.file(root, head_source.weight_file))
     head = head_source.build(backbone, dtype, attention_impl)
-    params = translate_parameters(decoder_parts.split_packed(head_tensors, head_source.packed),
-                                  head_source.path, param_dtype)
+    params, _ = record_layouts("", decoder_parts.split_packed(head_tensors, head_source.packed),
+                               head_source.path, (), param_dtype=param_dtype, lazy=True)
     if head_source.reshape is not None:
         params = head_source.reshape(head, params)
+    if not streaming:
+        params = materialize(params)
     if backbone is None:
         return Pretrained(head, placed({"params": params}), None, {}, directory,
                           record_fields(head, type(head)), revision=source.revision)
