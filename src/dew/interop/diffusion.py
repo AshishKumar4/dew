@@ -141,7 +141,8 @@ def unet_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
         out_channels=_records.integer(config["out_channels"], "out_channels"),
         blocks_per_level=_records.integer(config.get("layers_per_block", 2), "layers_per_block"),
         linear_projection=flag(config, "use_linear_projection", default=False),
-        additional_time_features=_records.integer(config["addition_time_embed_dim"], "addition_time_embed_dim")
+        additional_time_features=_records.integer(config["addition_time_embed_dim"],
+                                                  "addition_time_embed_dim")
         if addition
         else 0,
         middle_attention=middle is not None,
