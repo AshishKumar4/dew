@@ -75,6 +75,28 @@ def install_prefix64(mode='prefix64'):
     recurrence._cumsum_kernel = prefix
 
 
+@pytest.mark.gpu(reason='the loss is the A100 tensor-core product, not interpreted float32')
+def test_a_single_representable_product_is_not_missing_its_low_cross_term():
+    from dew.nn.kernels import fla_gdn
+    from jax.experimental.pallas import triton as plgpu
+
+    def kernel(a_ref, b_ref, result_ref):
+        result_ref[...] = fla_gdn._dot(a_ref[...], b_ref[...], exact=False)
+
+    run = pl.pallas_call(
+        kernel, out_shape=jax.ShapeDtypeStruct((16, 16), jnp.float32),
+        compiler_params=plgpu.CompilerParams(num_warps=4))
+    a, b = np.zeros((16, 16), np.float32), np.zeros((16, 16), np.float32)
+    value = np.float32(1 + 2 ** -11)
+    a[:, 0], b[0, :] = value, value
+    wanted = np.full((16, 16), np.float32(np.float64(value) ** 2))
+    got = np.asarray(run(jnp.asarray(a), jnp.asarray(b)))
+    print(json.dumps({'value': float(value), 'got': float(got[0, 0]),
+                      'wanted': float(wanted[0, 0]), 'error': float(got[0, 0] - wanted[0, 0])}),
+          flush=True)
+    np.testing.assert_array_equal(got, wanted)
+
+
 @pytest.mark.parametrize('mode', ['baseline', 'sum64', 'scale64', 'prefix64'])
 def test_short_forward_prefix_precision(mode, monkeypatch):
     from functools import partial
