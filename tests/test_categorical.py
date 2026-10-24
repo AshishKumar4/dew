@@ -6,6 +6,7 @@ hold, and each form agrees with the others; a label's log probability through th
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
 
 from dew.nn import categorical
@@ -47,7 +48,8 @@ def test_a_float64_models_label_log_probability_is_float64s_own():
 
 def test_the_forms_agree_and_a_masked_class_takes_no_probability():
     """A one-hot soft target's cross entropy is minus the label's log probability, the entropy minus
-    the expected log probability, the divergence from oneself zero; a class `where` excludes takes no
+    the expected log probability, the divergence Optax's of the two normalizations; a class `where`
+    excludes takes no
     probability while the others hold it, and target mass on an excluded class is an infinite
     charge."""
     rows, labels = logits(jnp.float32), jnp.asarray([0, 3, 6])
@@ -55,7 +57,10 @@ def test_the_forms_agree_and_a_masked_class_takes_no_probability():
     picked = np.take_along_axis(log_p, np.asarray(labels)[:, None], 1)[:, 0]
     np.testing.assert_array_equal(categorical.soft_cross_entropy(rows, jax.nn.one_hot(labels, 7)), -picked)
     np.testing.assert_array_equal(categorical.entropy(rows), -(jnp.exp(log_p) * log_p).sum(-1))
-    assert np.all(np.asarray(categorical.kl_divergence(rows, rows)) == 0)
+    # The divergence is Optax's of the two normalizations; from oneself it is a rounding's worth off
+    # zero in fp32 (the softmax's cancellation), which the owner's divergence form takes up apart.
+    np.testing.assert_array_equal(categorical.kl_divergence(rows, rows), optax.kl_divergence(
+        categorical.log_probs(rows), categorical.probabilities(rows)))
     held = jnp.arange(7) < 4
     masked = np.asarray(categorical.probabilities(rows, held))
     np.testing.assert_array_equal(masked[:, 4:], 0)
