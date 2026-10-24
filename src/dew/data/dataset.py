@@ -693,8 +693,10 @@ class Loader:
         """
         if self.records is None:
             raise ValueError(
-                "epochs need a dataset with a record count; this one streams "
-                "without one, so give the run length in steps"
+                "epochs need a dataset with a record count, and this one streams without one: online "
+                "packing or a filter over an indexed or streamed read cuts its order per share. Read it "
+                "whole first (.read('memory')), read a published packing generation by index, or give "
+                "the run length in steps or tokens"
             )
         records = epochs * self.records
         steps = self._steps(records, window)

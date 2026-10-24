@@ -861,6 +861,16 @@ class TrainerConfig:
         with Checkpoints(os.path.join(self.checkpoint_dir, self.name), keep=self.keep) as checkpoints:
             return checkpoints.latest is not None
 
+    def resolved(self, dataset: Loader) -> tuple[Self, Loader, int | None]:
+        """This config and `dataset` as a run trains on them, and the run's steps: the accumulation
+        its token budget sets (`accumulating`), the dataset its batch ramp reads, and the step cap over
+        that (`total_steps`), before which the ramp goes, since it reads fewer records a step early
+        and a pass over the data is that many steps longer. Its updates are the steps over the
+        accumulation."""
+        trainer = self.accumulating(dataset)
+        dataset = dataset if trainer.batch_ramp is None else ramped(dataset, trainer.batch_ramp)
+        return trainer, dataset, trainer.total_steps(dataset)
+
     def total_steps(self, dataset: Loader) -> int | None:
         """Return the step cap from `steps`, `epochs` or `examples`, None for a token-only run
         (`run_steps`, the one policy a direct fit applies too)."""
@@ -1491,19 +1501,16 @@ class RunConfig:
         decision run fits its calibration there, so what it writes is published.
         """
         dataset, validation = self.compiled(objective.data(), dataset, validation)
-        self = dataclasses.replace(self, trainer=self.trainer.accumulating(dataset))
+        sized, dataset, steps = self.trainer.resolved(dataset)
+        self = dataclasses.replace(self, trainer=sized)
         if self.trainer.quantization is not None:
             quantize_trunk(objective, self.trainer.quantization)
         # The record names the run's directory, so its run.json trains the same run again.
         self = dataclasses.replace(self.recorded(objective),
                                    trainer=dataclasses.replace(self.trainer, name=name))
         trainer = self.trainer
-        # Before the run length, since a ramp reads fewer records a step early
-        # and a pass over the data is that many steps longer.
-        dataset = dataset if trainer.batch_ramp is None else ramped(dataset, trainer.batch_ramp)
         if dataset.plan is not None:
             summary = {**(summary or {}), "data_plan": dataset.plan.record()}
-        steps = trainer.total_steps(dataset)
         tracker = checkpoints = None
         try:
             wandb_tracker = None

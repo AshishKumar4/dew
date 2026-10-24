@@ -10,7 +10,11 @@ from __future__ import annotations
 
 import dataclasses
 
+import jax
+import jax.numpy as jnp
+
 from dew.config import JsonDict, ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig, media_field
+from dew.data.dataset import Loader
 from dew.data.pipeline import ObjectiveData
 from dew.inputs import Field
 from dew.objectives.jepa.masking import MultiBlockMask
@@ -68,14 +72,32 @@ class JepaRunConfig(RunConfig):
             **{key: fields[key] for key in ("dtype", "attention_impl") if key in fields}}).build()
         mask = MultiBlockMask.for_grid(grid, num_targets=self.num_target_blocks, scale=self.target_scale,
                                        aspect=self.target_aspect, scan_order=encoder.scan_order)
-        ramp = ({} if "momentum_steps" in self.objective.fields
-                else {"momentum_steps": self.trainer.total_steps(dataset)})
+        ramp = {} if "momentum_steps" in self.objective.fields else {"momentum_steps": self.updates(dataset)}
+        adapted = {}
+        if self.lora is not None:
+            # A fresh encoder's draw from the run's key, frozen under the factors that train.
+            key = jax.random.key(self.trainer.key)
+            base = encoder.init(key, jnp.zeros((1, *sample.shape)),
+                                jnp.arange(mask.num_context, dtype=jnp.int32)[None])
+            adapter = self.lora.apply(encoder, base, key=jax.random.fold_in(key, 1))
+            encoder, adapted = adapter.model, {"encoder_variables": adapter.variables}
         objective = self.objective.build(encoder=encoder, predictor=predictor, mask=mask, sample=sample,
-                                         **ramp)
+                                         **ramp, **adapted)
         probes = () if not self.probe_classes else (
             LinearProbe(self.probe_classes), KnnProbe(self.probe_classes, k=self.knn_k))
         return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=probes,
                                                       validation=held))
+
+    def updates(self, dataset: Loader) -> int:
+        """The optimizer updates the run takes over `dataset`, as `train` resolves its length
+        (`TrainerConfig.resolved`), over which the target encoder's momentum ramps: the EMA moves
+        once an update. A run bounded by tokens alone counts none ahead, so it names its own
+        `momentum_steps`."""
+        trainer, _, steps = self.trainer.resolved(dataset)
+        if steps is None:
+            raise ValueError("a run bounded by tokens alone counts no updates ahead for the target encoder's "
+                             "momentum to ramp over; set --objective.momentum_steps")
+        return steps // trainer.accumulation
 
 
 __all__ = ["JepaRunConfig"]
