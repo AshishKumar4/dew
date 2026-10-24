@@ -22,6 +22,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.objectives.base import merge
 
+from ..hyper_connections import Carried
 from ..kv_cache import CURSOR
 from ..mla import INDEXER_COLLECTION
 from ..sharding import STAGE_AXIS, microbatched
@@ -262,8 +263,9 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             written = None if store is None else dict(store)
             out = layer(carry, train=train, decode=decode, kv_store=written,
                         per_layer_input=per_layer_input, attention_metadata=attention_metadata)
-            return out, {} if store is None else {name: value for name, value in written.items()
-                                                  if value is not store.get(name)}
+            changes = {} if written is None or store is None else {
+                name: value for name, value in written.items() if value is not store.get(name)}
+            return out, changes
 
         if fetching:
             # Scan variables are xs, not closed-over bank slices. Native
@@ -386,7 +388,7 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     return x
 
 
-def _applied[Hidden](run: DecoderBlock, store, read, state, cache, hidden: Hidden,
+def _applied[Hidden: (jax.Array, Carried)](run: DecoderBlock, store, read, state, cache, hidden: Hidden,
                      per_layer_slice, *, opened: bool | list[str], train: bool, decode: bool,
                      attention_metadata) -> tuple[Hidden, dict]:
     """One layer of `run` applied in a scope of its own: `read` its read-only variables, `state`
