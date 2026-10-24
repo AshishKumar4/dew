@@ -7,8 +7,9 @@ over one sequence a row and packed documents, value heads over fewer key heads, 
 off a block's width, bf16 and fp32 operands and lengths off the chunks, and every hook combination the
 mainloop takes (a decay a head or none, with and without the delta rule, Mamba2's rated decay, the skip and
 the norm) on the chunked op's own draws (`test_recurrence_chunk`). Off such a GPU the cases run in Mosaic
-GPU's interpreter on the wgmma bundle (`mainloop.INTERPRETED`), whose products are the dots they compute:
-coverage of the mainloop's algebra and its roles' streams, not proof of its kernels, which the GPU gate is;
+GPU's interpreter on the wgmma bundle (`mainloop.INTERPRETED`) at one row of a shorter length
+(`INTERPRETED_LENGTH`), whose products are the dots they compute: coverage of the mainloop's algebra and its
+roles' streams, not proof of its kernels, which the GPU gate is;
 the stability suite holds the mainloop under its regimes there (tests/test_recurrence_stability.py)."""
 
 import dataclasses
@@ -50,6 +51,20 @@ SHAPES = {
 }
 """Each case's operands: rows of `length` tokens over `value_heads` value heads a `key_heads` key heads serve,
 and packed documents where `packed` (starting on and off the chunks' grid, one shorter than a chunk)."""
+
+INTERPRETED_LENGTH = 140
+"""Off a GPU of a family a bundle claims, each case's draws are one row of at most this many tokens (three
+chunks, the last ragged, the packed documents' starts still on and off the chunks' grid): the same structure
+in Mosaic GPU's interpreter within a test's ten minutes, which the full geometry is not."""
+
+
+def geometry(case: str) -> dict:
+    """Case `case`'s operands as `SHAPES` gives them, shortened off a GPU of a family a bundle claims
+    (`INTERPRETED_LENGTH`)."""
+    shape = SHAPES[case]
+    if mainloop.family_of() is not None:
+        return shape
+    return {**shape, 'rows': 1, 'length': min(shape['length'], INTERPRETED_LENGTH)}
 
 
 def draw(dtype, seed: int, *, rows: int, length: int, key_heads: int, value_heads: int, key_width: int,
@@ -98,7 +113,7 @@ def test_the_mosaic_forward_is_as_exact_as_its_reference(case, dtype):
     dew = jax.jit(functools.partial(chunk, hooks, mainloop='mosaic'))
     truth = jax.jit(functools.partial(token_by_token, hooks))
     reference = truth if dtype == jnp.float32 else jax.jit(functools.partial(chunk, hooks, ported=True))
-    assert_as_exact(dew, reference, functools.partial(draw, dtype, **SHAPES[case]),
+    assert_as_exact(dew, reference, functools.partial(draw, dtype, **geometry(case)),
                     f'the mosaic forward, {case} in {jnp.dtype(dtype).name}', seeds=SEEDS, truth_fn=truth)
 
 
@@ -119,11 +134,10 @@ def drawn(dtype, seed: int, **shape) -> tuple[Chunk, tuple[jax.Array, jax.Array]
 
 def restarted(fn, case: str):
     """`fn` on operands whose documents start as the case's draws' do (`draw`'s, the same each seed)."""
-    (operands,) = draw(jnp.float32, 0, **SHAPES[case])
+    (operands,) = draw(jnp.float32, 0, **geometry(case))
     return lambda drawn: fn(dataclasses.replace(drawn, starts=operands.starts))
 
 
-@ON_ITS_FAMILY
 @pytest.mark.parametrize('dtype', [jnp.bfloat16, jnp.float32], ids=['bf16', 'fp32'])
 @pytest.mark.parametrize('case', GRADIENT_CASES)
 def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype):
@@ -138,7 +152,7 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype):
 
     truth = jax.jit(with_gradients(restarted(functools.partial(token_by_token, hooks), case)))
     reference = truth if dtype == jnp.float32 else compiled(ported=True)
-    assert_as_exact(compiled(mainloop='mosaic'), reference, functools.partial(drawn, dtype, **SHAPES[case]),
+    assert_as_exact(compiled(mainloop='mosaic'), reference, functools.partial(drawn, dtype, **geometry(case)),
                     f'the mosaic gradient, {case} in {jnp.dtype(dtype).name}', seeds=SEEDS, truth_fn=truth)
 
 

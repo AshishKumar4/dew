@@ -321,16 +321,22 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     mainloop issues that the hardware decides, so a mainloop holds no instruction, layout or barrier of its
     own. Its facts (`name`, the MMA's row unit `rows`), its launch and roles (`kernel`, `roles`), its operand
     streams (`streams`, `opened`, `stream` the producer's, `walk` and `passed` the consumer's), its products
-    (`product` and `summed` into a fresh accumulator, `products`, `register_products` and `staged_products`
-    in place, a register operand `staged` for one, `settled`), and its accumulator's layouts (`zeros`,
-    `full`, `iota`, `rows_of`, `as_row`). It is generic in its streams' allocations (`Allocated`,
-    `streams`'), its opened streams (`Opened`, `opened`'s) and the accumulator its products issue into in
-    place (`Accumulator`: a warpgroup accumulator ref, or a register array)."""
+    (`product` and `summed` into a fresh accumulator, `products`, `register_products` and `staged_products` in
+    place, a register operand `staged` for one, `settled`), and its accumulator's layouts (`layout`, `row`,
+    `column`, which `zeros`, `full`, `iota`, `rows_of`, `columns_of` and `as_row` read). It is generic in its
+    streams' allocations (`Allocated`, `streams`'), its opened streams (`Opened`, `opened`'s) and the
+    accumulator its products issue into in place (`Accumulator`: a warpgroup accumulator ref, or a register
+    array)."""
 
     name: str
     rows: int
     consumers: int
     """The compute roles a program may take (sm90 two warpgroups, sm80 one)."""
+    layout: plgpu.Layout
+    """The accumulator's register layout; `row` and `column` its reductions over columns and rows, which
+    the accumulator's layout members (`zeros` to `as_row`) read."""
+    row: plgpu.Layout
+    column: plgpu.Layout
 
     @abc.abstractmethod
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
@@ -437,29 +443,30 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     def settled(self, pending: int = 0) -> None:
         """Every product issued so far done, but the last `pending` issued."""
 
-    @abc.abstractmethod
     def zeros(self, shape: tuple[int, ...]) -> jax.Array:
         """fp32 zeros in the accumulator's layout (two-dimensional) or a row's (one-dimensional)."""
+        return self.full(shape, 0.0)
 
-    @abc.abstractmethod
     def full(self, shape: tuple[int, ...], value: float) -> jax.Array:
         """fp32 `value` in the accumulator's layout or a row's (`zeros`)."""
+        layout = self.layout if len(shape) == 2 else self.row
+        return plgpu.layout_cast(jnp.full(shape, value, jnp.float32), layout)
 
-    @abc.abstractmethod
     def iota(self, shape: tuple[int, int], dimension: int) -> jax.Array:
         """Indices along `dimension` of a tile in the accumulator's layout."""
+        return plgpu.broadcasted_iota(jnp.int32, shape, dimension, layout=self.layout)
 
-    @abc.abstractmethod
     def rows_of(self, ref) -> jax.Array:
         """A row vector read from `ref` (`[rows]`) in a row's layout."""
+        return plgpu.load(ref, layout=self.row, optimized=False)
 
-    @abc.abstractmethod
     def columns_of(self, ref) -> jax.Array:
         """A column vector read from `ref` (`[columns]`) in a column's layout (a tile's keys')."""
+        return plgpu.load(ref, layout=self.column, optimized=False)
 
-    @abc.abstractmethod
     def as_row(self, vector: jax.Array) -> jax.Array:
         """`vector` `[rows]` in a row's layout, whatever its own."""
+        return plgpu.layout_cast(vector, self.row)
 
 
 class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):

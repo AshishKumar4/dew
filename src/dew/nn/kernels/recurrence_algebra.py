@@ -33,11 +33,13 @@ the portable math's issuer is XLA's (`portable`), a kernel's its own dot."""
 
 import functools
 from collections.abc import Callable
+from typing import Protocol
 
 import jax
 import jax.numpy as jnp
 from jax.custom_derivatives import linear_call
 
+from dew.nn.kernels.templates.attention_algebra import power2
 from dew.nn.precision import compensated_add, float32_einsum, float32_matmul
 
 from . import recurrence
@@ -166,14 +168,15 @@ def decays(g, documents=None):
 
 
 def raised(whole, part):
-    """`exp2(whole + part)` of a compensated base-2 exponent to fp32's resolution at any size: its integer `n
-    = floor(whole)` an exact power of two (`_power_of_two`) and its fraction `(whole - n) + part`, near [0,
-    1), through exp2. The exponent rounded to one fp32 lost up to half its ulp, 1.9e-6 near -43 (a pair of
-    tokens at -30 a token), a decay's relative 1.3e-6, which put the port's decay gradient under decays near
-    zero 7 to 10 times the token-by-token recurrence's distance from float64; and exp2 of a whole exponent,
-    which a CPU takes as `exp(x ln 2)`, rounds its product with ln 2 the same way."""
+    """`exp2(whole + part)` of a compensated base-2 exponent to fp32's resolution at any size: its integer
+    `n = floor(whole)` an exact power of two (`attention_algebra.power2`, the attention template's) and its
+    fraction `(whole - n) + part`, near [0, 1), through exp2. The exponent rounded to one fp32 lost up to half
+    its ulp, 1.9e-6 near -43 (a pair of tokens at -30 a token), a decay's relative 1.3e-6, which put the
+    port's decay gradient under decays near zero 7 to 10 times the token-by-token recurrence's distance from
+    float64; and exp2 of a whole exponent, which a CPU takes as `exp(x ln 2)`, rounds its product with ln 2
+    the same way."""
     n = _floor(whole)
-    return jnp.exp2((whole - n) + part) * _power_of_two(n)
+    return power2(jnp.exp2((whole - n) + part), n)
 
 
 def _floor(x):
@@ -183,19 +186,6 @@ def _floor(x):
     truncated = jnp.clip(x, -2.0 ** 23, 2.0 ** 23).astype(jnp.int32).astype(x.dtype)
     floor = jnp.where(truncated > x, truncated - 1.0, truncated)
     return jnp.where(jnp.abs(x) < 2.0 ** 23, floor, x)
-
-
-def _power_of_two(n):
-    """`2^n` of an integral fp32 `n`, exactly: two halves' fp32 bits built from their exponents, whose product
-    reaches fp32's subnormals and rounds past them to zero, and past fp32's range to inf."""
-    n = jnp.clip(n, -300.0, 300.0).astype(jnp.int32)
-    half = jax.lax.shift_right_arithmetic(n, jnp.int32(1))
-
-    def bits(exponent):
-        biased = jnp.clip(exponent, -127, 128) + 127
-        return jax.lax.bitcast_convert_type(jax.lax.shift_left(biased, jnp.int32(23)), jnp.float32)
-
-    return bits(half) * bits(n - half)
 
 
 def decayed(rows, rows_lo, columns, columns_lo):
@@ -435,8 +425,25 @@ def peeled_transition(key, w, u, grown, last, kept, token, *, delta: bool, issue
 SUB = 16
 """Rows of a sub-chunk: the diagonal blocks the triangular inverse is built from (fla's BC)."""
 
-Load = Callable[..., jax.Array]
-"""A tile read where it is used: `load(i, c)` sub-chunk `i`'s column block `c`, or `load(c)` a chunk's."""
+class Tile(Protocol):
+    """A tile a mainloop holds in memory: an operand its products take as it is or transposed, whose
+    registers `value()` loads where the algebra needs them elementwise."""
+
+    @property
+    def shape(self) -> tuple: ...
+
+    @property
+    def T(self) -> "Tile": ...
+
+    def value(self) -> jax.Array: ...
+
+
+Load = Callable[..., jax.Array] | Callable[..., Tile]
+"""A tile read where it is used: `load(i, c)` sub-chunk `i`'s column block `c`, or `load(c)` a chunk's; the
+backward's loads a `Tile`."""
+
+TileLoad = Callable[..., Tile]
+"""A load of a `Tile` (the backward's operands)."""
 
 
 def apart(rows, rows_lo, columns, columns_lo):
@@ -659,8 +666,8 @@ def key_decayed_output(queries: Load, gates: Load, entered: Load, columns: int, 
 # (`recurrence_chunk.chunk_delta_rule`'s).
 
 
-def local_gradient(keys: Load, queries: Load, columns: int, gate, low, out_grad, scale: float, issue: Issue,
-                   *, laid: tuple | None = None):
+def local_gradient(keys: TileLoad, queries: TileLoad, columns: int, gate, low, out_grad, scale: float,
+                   issue: Issue, *, laid: tuple | None = None):
     """The corrected values' gradient from the chunk's own output, `[C, BV]` fp32: `A^T do` for
     `chunk_output`'s scores `A[t, s] = scale (q_t . k_s) exp2(g_t - g_s)` (`s <= t`), its transpose taken as
     `k q^T` ('local_t') and cast to the gradient's dtype for its product ('local_dv'); `laid` as
@@ -673,8 +680,8 @@ def local_gradient(keys: Load, queries: Load, columns: int, gate, low, out_grad,
     return issue("local_dv", product.astype(out_grad.dtype), out_grad)
 
 
-def reverse_carried(grad: list, keys: Load, weights: Load, queries: Load, out_grad, local, gate, low, last,
-                    last_low, scale: float, dtype, issue: Issue) -> tuple[list, jax.Array]:
+def reverse_carried(grad: list, keys: TileLoad, weights: TileLoad, queries: TileLoad, out_grad, local, gate,
+                    low, last, last_low, scale: float, dtype, issue: Issue) -> tuple[list, jax.Array]:
     """One chunk of the memory's reverse recurrence (fla's dhu) under a decay a head: from the gradient of
     the memory leaving the chunk `grad`, its key slices `[K_i, BV]` fp32, the corrected values' gradient
     `dv = (k grad) exp2(g_last - g) + local` ('values_dv', the gradient cast to `dtype`) and the gradient of
@@ -691,10 +698,10 @@ def reverse_carried(grad: list, keys: Load, weights: Load, queries: Load, out_gr
     return entered, dv
 
 
-def query_key_gradients(queries: Load, keys: Load, columns: int, values: Load, out_grads: Load,
-                        value_grads: Load, entered: Load, leaving: Load, blocks: int, gate, low, last,
-                        last_low, memory_decay, scale: float, dtype, issue: Issue, *,
-                        laid: tuple | None = None):
+def query_key_gradients(queries: TileLoad, keys: TileLoad, columns: int, values: TileLoad,
+                        out_grads: TileLoad, value_grads: TileLoad, entered: TileLoad, leaving: TileLoad,
+                        blocks: int, gate, low, last, last_low, memory_decay, scale: float, dtype,
+                        issue: Issue, *, laid: tuple | None = None):
     """The queries', keys', weights' and decay's gradients of a chunk and value head (fla's dqkwg) under a
     decay a head: over the value blocks `j`, `ds = do v^T`, `dq = do S^T`, `dk = v dS^T` and `dw = -dv S^T`
     for the corrected values `values(j)`, the output's gradient `out_grads(j)`, the corrected values' own
@@ -713,20 +720,18 @@ def query_key_gradients(queries: Load, keys: Load, columns: int, values: Load, o
     rows, cols = _grid(ds.shape)
     ds = jnp.where(rows >= cols, ds * pair_decay, 0.0) * scale
     scores = functools.reduce(jnp.add, (issue("local_t", queries(c), keys(c).T) for c in range(columns)))
-    grads, leaving_terms, after = [], 0.0, 0.0
+    grads, leaving_terms, after = [], [], []
     for c in range(columns):
-        dq = functools.reduce(jnp.add, (issue("memory_dq", out_grads(j), entered(c, j).T)
-                                        for j in range(blocks)))
-        dk = functools.reduce(jnp.add, (issue("memory_dk", values(j), leaving(c, j).T)
-                                        for j in range(blocks)))
-        dw = -functools.reduce(jnp.add, (issue("memory_dw", value_grads(j), entered(c, j).T)
-                                         for j in range(blocks)))
+        dq = _summed(issue("memory_dq", out_grads(j), entered(c, j).T) for j in range(blocks))
+        dk = _summed(issue("memory_dk", values(j), leaving(c, j).T) for j in range(blocks))
+        dw = -_summed(issue("memory_dw", value_grads(j), entered(c, j).T) for j in range(blocks))
         dq = dq * row_decay * scale
         dk = dk * leaving_decay
         query, key = queries(c).value().astype(jnp.float32), keys(c).value().astype(jnp.float32)
-        leaving_terms = leaving_terms + jnp.sum(dk * key, axis=1)
-        after = after + jnp.sum(dq * query, axis=1)
+        leaving_terms.append(jnp.sum(dk * key, axis=1))
+        after.append(jnp.sum(dq * query, axis=1))
         grads.append((dq, dk, dw))
+    leaving_terms, after = _summed(leaving_terms), _summed(after)
     pairs = jnp.where(rows > cols, ds * scores, 0.0)
     if memory_decay is not None:
         after = after + jnp.where(rows[:, 0] == ds.shape[0] - 1, memory_decay * raised(last, last_low), 0.0)
@@ -737,8 +742,8 @@ def query_key_gradients(queries: Load, keys: Load, columns: int, values: Load, o
     return grads, (pairs, after, leaving_terms)
 
 
-def weighted_gradient(lower, keys: Load, columns: int, values: Load, blocks: int, w_grads: Load,
-                      u_grads: Load, beta, gate, low, dtype, issue: Issue, *, laid: tuple | None = None):
+def weighted_gradient(lower, keys: TileLoad, columns: int, values: TileLoad, blocks: int, w_grads: TileLoad,
+                      u_grads: TileLoad, beta, gate, low, dtype, issue: Issue, *, laid: tuple | None = None):
     """The WY representation's backward (fla's prepare_wy_repr_bwd) under a decay a head: with the inverse
     `X = I + lower` (`lower` its strictly lower part, a tile), `w = X (k beta exp2(g))` and `u = X (v beta)`,
     the keys', values', write gate's and decay's gradients from `w`'s and `u`'s, `w_grads(c)` and
@@ -751,17 +756,16 @@ def weighted_gradient(lower, keys: Load, columns: int, values: Load, blocks: int
         return m + issue("inverse_t", lower.T, m.astype(dtype))
 
     decay = raised(gate, low)
-    d_x = d_beta = d_gate = 0.0
-    through_w = []
+    d_xs, d_betas, d_gates, through_w = [], [], [], []
     for c in range(columns):
         key = keys(c).value().astype(jnp.float32)
         scaled = key * (beta * decay)[:, None]
         w_grad = w_grads(c)
         d_scaled = transposed_inverse(w_grad.value().astype(jnp.float32))
         through_w.append(d_scaled)
-        d_x = d_x + issue("inverse_dx", w_grad, Transposed(scaled.astype(dtype)))
-        d_beta = d_beta + jnp.sum(d_scaled * key * decay[:, None], axis=1)
-        d_gate = d_gate + jnp.sum(d_scaled * scaled, axis=1)
+        d_xs.append(issue("inverse_dx", w_grad, Transposed(scaled.astype(dtype))))
+        d_betas.append(jnp.sum(d_scaled * key * decay[:, None], axis=1))
+        d_gates.append(jnp.sum(d_scaled * scaled, axis=1))
     value_grads = []
     for j in range(blocks):
         value = values(j).value().astype(jnp.float32)
@@ -769,8 +773,9 @@ def weighted_gradient(lower, keys: Load, columns: int, values: Load, blocks: int
         u_grad = u_grads(j)
         d_scaled = transposed_inverse(u_grad.value().astype(jnp.float32))
         value_grads.append(d_scaled * beta[:, None])
-        d_x = d_x + issue("inverse_dx", u_grad, Transposed(scaled))
-        d_beta = d_beta + jnp.sum(d_scaled * value, axis=1)
+        d_xs.append(issue("inverse_dx", u_grad, Transposed(scaled)))
+        d_betas.append(jnp.sum(d_scaled * value, axis=1))
+    d_x, d_gate = _summed(d_xs), _summed(d_gates)
     rows, cols = _grid(d_x.shape)
     strict = rows > cols
     d_x = jnp.where(strict, d_x, 0.0)
@@ -779,17 +784,22 @@ def weighted_gradient(lower, keys: Load, columns: int, values: Load, blocks: int
     column_gate, column_low = (gate, low) if laid is None else laid
     d_l = jnp.where(strict, -d_x * decayed(gate, low, column_gate, column_low), 0.0).astype(dtype)
     weighted_l = (d_l.astype(jnp.float32) * beta[:, None]).astype(dtype)
-    products, key_grads = 0.0, []
+    products, key_grads = [], []
     for c in range(columns):
         key = keys(c)
-        products = products + issue("keys_dl", key, key.T)
+        products.append(issue("keys_dl", key, key.T))
         d_key = issue("keys_dl", d_l, key)
         # `dL^T (k beta)` as `(beta dL)^T k`: one operand in registers, the keys a tile.
         key_grads.append(through_w[c] * (decay * beta)[:, None] + d_key * beta[:, None]
                          + issue("keys_dlt", Transposed(weighted_l), key))
-        d_beta = d_beta + jnp.sum(d_key * key.value().astype(jnp.float32), axis=1)
-    pairs = d_l.astype(jnp.float32) * (products * beta[:, None])
-    return key_grads, value_grads, d_beta, (pairs, d_gate)
+        d_betas.append(jnp.sum(d_key * key.value().astype(jnp.float32), axis=1))
+    pairs = d_l.astype(jnp.float32) * (_summed(products) * beta[:, None])
+    return key_grads, value_grads, _summed(d_betas), (pairs, d_gate)
+
+
+def _summed(terms) -> jax.Array:
+    """`terms`' sum in their order."""
+    return functools.reduce(jnp.add, terms)
 
 
 def summed_back(pairs, after, leaving=None, issue: Issue = portable):

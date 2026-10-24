@@ -238,27 +238,5 @@ class MmaSync(mosaic.Family[dict, dict, jax.Array]):
         # The products are synchronous: each has read its operands when it returns.
         del pending
 
-    def zeros(self, shape: tuple[int, ...]) -> jax.Array:
-        return self.full(shape, 0.0)
-
-    def full(self, shape: tuple[int, ...], value: float) -> jax.Array:
-        layout = self.layout if len(shape) == 2 else self.row
-        return plgpu.layout_cast(jnp.full(shape, value, jnp.float32), layout)
-
-    def iota(self, shape: tuple[int, int], dimension: int) -> jax.Array:
-        return plgpu.broadcasted_iota(jnp.int32, shape, dimension, layout=self.layout)
-
-    def rows_of(self, ref) -> jax.Array:
-        return plgpu.load(ref, layout=self.row, optimized=False)
-
-    def columns_of(self, ref) -> jax.Array:
-        """Two loads of one view in a row's and a column's layouts are one load to Mosaic GPU's layout
-        inference, which then finds none for it."""
-        return plgpu.load(ref, layout=self.column, optimized=False)
-
-    def as_row(self, vector: jax.Array) -> jax.Array:
-        return plgpu.layout_cast(vector, self.row)
-
-
 MMA_SYNC = MmaSync()
 """The mma.sync family's bundle."""
