@@ -30,6 +30,7 @@ from .activations import gelu_exact
 from .attention import LayerNorm, RMSNorm
 from .audio import AudioEncoding
 from .backbones.decoder_block import BlockWiring, DecoderBlock
+from .blocks import TokenEmbedding
 from .inputs import AttentionMetadata, coordinates, sequence_blocks
 from .mixer_base import MixerContext
 from .mixers.attention import CausalSelfAttention
@@ -222,7 +223,7 @@ class MiMoAudioCodeEncoder(nn.Module):
         place = jnp.arange(codes.shape[1])[None, :, None]
         codes = jnp.where(place < counts[:, None, None], codes, last)
         x = functools.reduce(jnp.add, [
-            nn.Embed(size, cfg.input_local_dim, dtype=self.dtype, name=f"speech_embeddings_{channel}")(
+            TokenEmbedding(size, cfg.input_local_dim, dtype=self.dtype, name=f"speech_embeddings_{channel}")(
                 codes[..., channel])
             for channel, size in enumerate(cfg.speech_vocab_size[:cfg.audio_channels])])
         x = x.reshape(batch * groups, cfg.group_size, cfg.input_local_dim)
