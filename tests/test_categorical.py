@@ -1,16 +1,21 @@
 """The categorical distribution's one owner (`dew.nn.categorical`): every log-likelihood Dew takes
 computes in at least float32 and keeps float64 logits in float64, masks the classes a row does not
-hold, and each form agrees with the others; a label's log probability through the token owner
-(`dew.objectives.base.token_log_probs`) is float64's own for a float64 model."""
+hold, a class of no probability adding no term in value or gradient, and each form agrees with the
+others; a label's log probability through the token owner (`dew.objectives.base.token_log_probs`) is
+float64's own for a float64 model, and a ragged row's segments normalize as each segment alone."""
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from reference_error import assert_as_exact, without_ynn
 
 from dew.nn import categorical
 from dew.objectives.base import token_log_probs
+
+MASKED_SEEDS = 8
+"""Check 1's declared seeds for a masked row against the row of its held classes alone."""
 
 
 def logits(dtype, shape=(3, 7), seed=0):
@@ -26,7 +31,10 @@ def test_each_form_computes_in_at_least_float32_and_keeps_float64(given, compute
         forms = [categorical.log_probs(rows), categorical.probabilities(rows),
                  categorical.cross_entropy(rows, labels), categorical.entropy(rows),
                  categorical.soft_cross_entropy(rows, jax.nn.one_hot(labels, 7, dtype=given)),
-                 categorical.kl_divergence(rows, logits(given, seed=1)), token_log_probs(rows, labels)]
+                 categorical.kl_divergence(rows, logits(given, seed=1)), token_log_probs(rows, labels),
+                 categorical.rescaled(rows, jnp.exp(rows), rows + 1),
+                 categorical.target_loss(rows, rows, rows),
+                 *categorical.segment_log_partition(rows[0], jnp.asarray([0, 0, 1, 2, 1, 3, 3]), 3)[:1]]
         assert {form.dtype for form in forms} == {jnp.dtype(computed)}
 
 
@@ -67,3 +75,51 @@ def test_the_forms_agree_and_a_masked_class_takes_no_probability():
     assert np.all(masked[:, :4] > 0)
     stray = jnp.zeros((3, 7)).at[:, 5].set(1.0)
     assert np.all(np.isinf(np.asarray(categorical.soft_cross_entropy(rows, stray, held))))
+
+
+FORMS = {
+    "cross entropy": lambda rows, where: categorical.cross_entropy(rows, jnp.asarray([0, 3, 2]), where),
+    "divergence": lambda rows, where: categorical.kl_divergence(rows, rows[::-1] * 0.5, where),
+    "entropy": lambda rows, where: categorical.entropy(rows, where),
+}
+
+
+@pytest.mark.parametrize("form", sorted(FORMS))
+def test_a_masked_class_adds_no_term_in_value_or_gradient(form):
+    """A form over a row whose last classes `where` excludes is the form over the held classes alone
+    (check 1, both arms compiled alike), and its gradient is the held classes' with zeros at the
+    excluded ones, where `0 * log 0` would put NaN; the entropy holds a -inf logit's class at no term
+    as it holds an excluded one."""
+    held = jnp.arange(7) < 4
+    of = FORMS[form]
+    masked = without_ynn(lambda rows: of(rows, held))
+    alone = without_ynn(lambda rows: of(rows[:, :4], None))
+    assert_as_exact(masked, alone, lambda seed: (logits(jnp.float32, seed=seed),), form, seeds=MASKED_SEEDS)
+    rows = logits(jnp.float32)
+    gradient = np.asarray(jax.grad(lambda rows: of(rows, held).sum())(rows))
+    assert np.all(np.isfinite(gradient)) and np.all(gradient[:, 4:] == 0)
+    if form == "entropy":
+        filtered = jnp.where(held, rows, -jnp.inf)
+        np.testing.assert_array_equal(categorical.entropy(filtered), categorical.entropy(rows, held))
+        through = jax.grad(lambda rows: categorical.entropy(rows).sum())(filtered)
+        assert np.all(np.isfinite(np.asarray(through)))
+
+
+def test_a_ragged_rows_segments_each_normalize_as_the_segment_alone():
+    """Each segment's log partition is the logsumexp of its entries alone (check 1), a segment of no
+    entry's 0 and absent, and an entry of no segment (`count`) enters none."""
+    segments = jnp.asarray([0, 2, 0, 4, 2, 2, 0])
+
+    def partition(row):
+        return categorical.segment_log_partition(row, segments, 4)[0][jnp.asarray([0, 2])]
+
+    def alone(row):
+        return jnp.stack([jax.nn.logsumexp(row[jnp.asarray([0, 2, 6])]),
+                          jax.nn.logsumexp(row[jnp.asarray([1, 4, 5])])])
+
+    assert_as_exact(without_ynn(partition), without_ynn(alone),
+                    lambda seed: (logits(jnp.float32, (7,), seed),), "segment log partition",
+                    seeds=MASKED_SEEDS)
+    log_z, present = categorical.segment_log_partition(logits(jnp.float32, (7,)), segments, 4)
+    np.testing.assert_array_equal(present, [True, False, True, False])
+    np.testing.assert_array_equal(np.asarray(log_z)[[1, 3]], 0)
