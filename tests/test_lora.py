@@ -571,6 +571,10 @@ def _adapted(model, tree, *, contracted=1, rank=2, alpha=4.0, seed=0):
     return adapter, adapter.model, adapted_tree, adapter.merge(adapted_tree)
 
 
+CLIPPED_SEEDS = 64
+"""The clipped adapter site's reference-only sizing, including its input and factor gradients."""
+
+
 def clipped_adapter_case():
     """A bounded Gemma linear with nonzero LoRA factors, against the clipped linear equation."""
     import torch
@@ -626,7 +630,7 @@ def test_a_clipped_linear_adapts_once_inside_its_bounds_and_reloads(tmp_path):
 
     model, variables, adapter, draw, forward, reference = clipped_adapter_case()
     assert_as_exact(forward, lambda *args: reference(torch.float32, *args), draw,
-                    "clipped linear adapter", seeds=8,
+                    "clipped linear adapter", seeds=CLIPPED_SEEDS,
                     truth_fn=lambda *args: reference(torch.float64, *args))
     factors, inputs, _ = draw(3)
     def loss(params):
