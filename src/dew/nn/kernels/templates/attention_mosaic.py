@@ -200,15 +200,14 @@ def _walked(causal: bool, consumers: int, block_q: int, block_k: int, programs: 
     return consumed, streamed
 
 
-def _readers(causal: bool, consumers: int, block_q: int, block_k: int, programs: int, queries: int,
+def _readers(causal: bool, consumers: int, block_q: int, block_k: int, programs: int, q_steps: int,
              keys: int) -> tuple[int, int]:
-    """`_walked` for a dK/dV launch's `programs` key programs: the query tiles reading each consumer's keys
-    (every tile holding the call's queries, from its diagonal where `causal`; none for keys past the call's,
+    """`_walked` for a dK/dV launch's `programs` key programs over `q_steps` query tiles: the tiles reading
+    each consumer's keys (every one, from its diagonal where `causal`; none for keys past the call's,
     `_Program.readers`), summed over its consumers, and the tiles each program streams."""
-    held = -(-queries // block_q)
     consumed = streamed = 0
     for program in range(programs):
-        reaches = [0 if first >= keys else held - (min(first // block_q, held) if causal else 0)
+        reaches = [0 if first >= keys else q_steps - (min(first // block_q, q_steps) if causal else 0)
                    for first in range(program * consumers * block_k, (program + 1) * consumers * block_k,
                                       block_k)]
         consumed, streamed = consumed + sum(reaches), streamed + max(reaches)
@@ -1081,6 +1080,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
                          interpret=interpret)(query, key, value, *leaves)
 
 
+@functools.cache
 def _parts(accurate: bool, dtype) -> int:
     """The parts a backward tile's score cotangents take to their products in the form `accurate` names
     (`algebra.cotangent_parts`: one in the fast form's bf16, three in the accurate form's)."""
