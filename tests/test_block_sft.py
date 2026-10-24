@@ -89,9 +89,15 @@ def trainer_update(obj, batch, run_key, optimizer):
     return stepped, step, trainer
 
 
-UPDATE_SEEDS = {"text": 16, "image": 16}
+UPDATE_SEEDS = {"text": 8, "image": 16}
 """Check 1's declared seeds for the trainer's gradient of each SFT model, sized paired (`seeds_for` with
-the trainer's step as `dew_fn`)."""
+the trainer's step as `dew_fn`). The text model's, over drawn batches (`varied`), is the most of three
+platforms': its two arms took bitwise the same gradient at every draw on JAX 0.11's and 0.12's CPU and
+on an A100, and each sized it at 8 (run-tests sf-1546v-paired-main-c464b5df0 and
+sf-1546v-paired-jax012-f65f56d57, node receipts SF-1546v-a100). Its error is heavy-tailed, alike in
+both arms: four draws of 320 held at most 72% of a leaf's pooled error on 0.11, 87% on 0.12 and 86% on
+the A100 (sf-1546v-tail-main-c464b5df0, sf-1546v-tail-jax012-f65f56d57), so the reference against
+itself does not resolve within 4096 seeds and the paired count is the site's (ledger 1546)."""
 
 UPDATE_ROWS = 8
 """Rows of each drawn text batch (`varied`)."""
