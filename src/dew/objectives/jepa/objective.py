@@ -23,6 +23,7 @@ that collapse shows in the training curves, before a probe run.
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Mapping, Sequence
 from typing import Protocol, runtime_checkable
 
@@ -33,7 +34,7 @@ from flax import linen as nn
 
 from dew.artifacts import Representations
 from dew.inputs import Field, InputSpec, unit_range
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import accumulated, at_least_fp32
 from dew.nn.sharding import explicit_spec, whole_spec
 from dew.objectives.base import (
     Aux,
@@ -75,7 +76,8 @@ def representation_health(z) -> dict[str, jax.Array]:
     batch_size, dim = z.shape
     z = z.astype(jnp.float32)
     centered = z - jnp.mean(z, axis=0, keepdims=True)
-    cov = jnp.matmul(centered.T, centered, out_sharding=whole_spec(centered, 2)) / max(batch_size - 1, 1)
+    product = functools.partial(jnp.matmul, out_sharding=whole_spec(centered, 2))
+    cov = accumulated(product, centered.T, centered) / max(batch_size - 1, 1)
     off_diagonal = cov * (1.0 - jnp.eye(dim, dtype=cov.dtype))
     return {
         "repr_std": jnp.mean(jnp.std(z, axis=0)),

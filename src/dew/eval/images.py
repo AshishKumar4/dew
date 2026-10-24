@@ -23,6 +23,7 @@ import numpy as np
 from jax.typing import ArrayLike
 
 from dew.artifacts import ImageGrid, uint8_pixels
+from dew.nn.precision import accumulated
 from dew.nn.text_encoders import DEFAULT_MODEL as CLIP_CHECKPOINT
 from dew.objectives.base import Batch
 
@@ -77,7 +78,7 @@ def clip_image_text_cosine(images: ArrayLike, input_ids: ArrayLike, attention_ma
     text_embeds = model.get_text_features(input_ids, attention_mask)
     image_embeds = image_embeds / jnp.linalg.norm(image_embeds, axis=-1, keepdims=True)
     text_embeds = text_embeds / jnp.linalg.norm(text_embeds, axis=-1, keepdims=True)
-    return jnp.einsum('nd,nd->n', image_embeds, text_embeds)
+    return accumulated(functools.partial(jnp.einsum, 'nd,nd->n'), image_embeds, text_embeds)
 
 
 def _clip_score(cosine: jax.Array) -> jax.Array:

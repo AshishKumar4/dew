@@ -105,6 +105,7 @@ from residual_orders import orders, permuted, residual_width
 
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.safetensors_io import save_hf_layout
+from dew.interop.sources import load_shards
 from tools import decoder_export_reference as tool
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -252,15 +253,15 @@ def test_a_bfloat16_source_exports_its_trained_float32_masters(tmp_path):
     fixture = FIXTURES / "deepseek-v4-tiny"
     directory = tmp_path / "bfloat16"
     save_hf_layout({name: tensor.astype(ml_dtypes.bfloat16) if tensor.dtype == np.float32 else tensor
-                    for name, tensor in tool.source_tensors(fixture).items()},
+                    for name, tensor in load_shards(fixture).items()},
                    json.loads((fixture / "config.json").read_text()), directory)
     (directory / "input_ids.npy").write_bytes((fixture / "input_ids.npy").read_bytes())
     source, ids, trained, reloaded = tool.trained_export(
         directory, tmp_path / "export", functools.partial(tool.train, CASES["deepseek_v4"]))
 
     assert source.weight_layouts, "deepseek_v4 writes its export through the source layout"
-    stored = tool.source_tensors(directory)
-    for name, tensor in tool.source_tensors(tmp_path / "export").items():
+    stored = load_shards(directory)
+    for name, tensor in load_shards(tmp_path / "export").items():
         assert tensor.dtype == (np.float32 if stored[name].dtype == ml_dtypes.bfloat16
                                 else stored[name].dtype), name
     assert_restores(source.model, trained, reloaded, ids)
@@ -284,7 +285,7 @@ def test_a_rotated_expert_index_writes_a_model_that_disagrees(indexed, tmp_path)
         export, variables=trip.trained)
     again = Pretrained.load(str(export), dtype="float32", attention_impl="reference")
 
-    assert set(tool.source_tensors(export)) == set(trip.source_tensors), (
+    assert set(load_shards(export)) == set(trip.source_tensors), (
         "the rotation changed the tensor table, so the difference below is not numerical")
     theirs = tool.logits(again, again.variables, trip.ids)
     difference = float(np.max(np.abs(theirs - trip.ours)))
@@ -582,7 +583,7 @@ def test_a_quantized_source_exports_trained_weights_in_its_original_format(tmp_p
 
     directory = tmp_path / "fp8"
     source = FIXTURES / "deepseek-v3-tiny"
-    tensors = tool.source_tensors(source)
+    tensors = load_shards(source)
     config = json.loads((source / "config.json").read_text())
     scaled = "model.layers.0.self_attn.o_proj.weight"
     rounded = torch.from_numpy(np.array(tensors[scaled], copy=True)).to(
@@ -671,7 +672,7 @@ def test_a_quantized_source_of_a_preparing_family_exports_updated_weights_in_its
 
     fixture, name, bare = PREPARED[case]
     tensors = {stored.removeprefix(bare): tensor
-               for stored, tensor in tool.source_tensors(FIXTURES / fixture).items()}
+               for stored, tensor in load_shards(FIXTURES / fixture).items()}
     config = json.loads((FIXTURES / fixture / "config.json").read_text())
     plain = dict(config)
     config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128]}
@@ -689,12 +690,12 @@ def test_a_quantized_source_of_a_preparing_family_exports_updated_weights_in_its
         again = Pretrained.load(tmp_path / "fp8", dtype="float32", attention_impl="reference", **options)
         assert jax.tree.structure(again.variables) == jax.tree.structure(loaded.variables)
         again.save(tmp_path / placement, variables=updated)
-        assert_same_stored_tensors(tool.source_tensors(tmp_path / placement),
-                                   tool.source_tensors(tmp_path / "export"))
+        assert_same_stored_tensors(load_shards(tmp_path / placement),
+                                   load_shards(tmp_path / "export"))
     dense = {stored.removeprefix(bare): tensor for stored, tensor in
              dataclasses.replace(loaded, config=plain, quantized_tensors=()).export(updated).items()}
     expected = quantization.requantize(dense, (name,))
-    exported = tool.source_tensors(tmp_path / "export")
+    exported = load_shards(tmp_path / "export")
     assert json.loads((tmp_path / "export" / "config.json").read_text()) == config
     assert set(exported) == set(expected) == set(source)
     for tensor, value in expected.items():
@@ -760,7 +761,7 @@ def test_an_mtp_copy_that_differs_from_the_trunk_names_the_tensor(tmp_path):
     different matrix is refused naming the tensor rather than loaded as a
     model that computes something else."""
     source = FIXTURES / "glm4-moe-tiny"
-    tensors = tool.source_tensors(source)
+    tensors = load_shards(source)
     copy = "model.layers.2.shared_head.head.weight"
     tensors[copy] = tensors[copy] + 1.0
     directory = tmp_path / "broken"
@@ -773,7 +774,7 @@ def test_an_mtp_copy_that_differs_from_the_trunk_names_the_tensor(tmp_path):
 def test_a_shared_copy_cannot_hide_an_undeclared_prediction_depth(tmp_path):
     source = FIXTURES / "glm4-moe-tiny"
     config = json.loads((source / "config.json").read_text())
-    tensors = tool.source_tensors(source)
+    tensors = load_shards(source)
     first_absent = config["num_hidden_layers"] + config["num_nextn_predict_layers"]
     name = f"model.layers.{first_absent}.embed_tokens.weight"
     tensors[name] = tensors["model.embed_tokens.weight"]
@@ -792,7 +793,7 @@ def test_the_latent_norms_keep_the_reference_epsilon(name, tmp_path):
     config = json.loads((source / "config.json").read_text())
     config["rms_norm_eps"] = 1e-3
     directory = tmp_path / name
-    save_hf_layout(tool.source_tensors(source), config, directory)
+    save_hf_layout(load_shards(source), config, directory)
     ids = np.load(source / "input_ids.npy")
 
     loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
@@ -823,7 +824,7 @@ def test_public_quantized_load_obeys_parameter_storage(tmp_path, kind):
     from dew.interop.codecs import MXFP4, fp8_blocks
 
     fixture = FIXTURES / ("deepseek-v3-tiny" if kind == "fp8" else "gpt-oss-tiny")
-    tensors = tool.source_tensors(fixture)
+    tensors = load_shards(fixture)
     config = json.loads((fixture / "config.json").read_text())
     if kind == "fp8":
         packed = fp8_blocks(128, ue8m0=False).requantize(tensors, ("model.layers.0.self_attn.o_proj.weight",))
@@ -855,7 +856,7 @@ def test_public_quantized_alias_check_uses_original_fp32_values(tmp_path, fixtur
     from dew.interop.codecs import E4M3
     from dew.interop.hf_decoders import families
 
-    tensors = tool.source_tensors(FIXTURES / fixture)
+    tensors = load_shards(FIXTURES / fixture)
     config = json.loads((FIXTURES / fixture / "config.json").read_text())
     head, embedding = families()[config["model_type"]].tied_head_names
     for tied in (config, config.get("text_config", {})):
@@ -892,7 +893,7 @@ def test_a_tied_head_stored_with_its_depths_copies_and_no_trunk_embedding_loads_
     head but no trunk embedding still holds the embedding twice over; it
     loads leaf for leaf as the same source with the trunk embedding."""
     fixture = FIXTURES / "glm4-moe-tiny"
-    tensors = tool.source_tensors(fixture)
+    tensors = load_shards(fixture)
     config = json.loads((fixture / "config.json").read_text())
     config["tie_word_embeddings"] = True
     embedding = tensors["model.embed_tokens.weight"]
@@ -927,7 +928,7 @@ def test_a_quantized_packed_tensor_and_its_part_stored_apart_must_be_one_tensor(
     from dew.interop.codecs import E4M3
 
     fixture = FIXTURES / "phi3-tiny"
-    tensors = tool.source_tensors(fixture)
+    tensors = load_shards(fixture)
     config = json.loads((fixture / "config.json").read_text())
     config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128]}
     packed, part = "model.layers.0.mlp.gate_up_proj.weight", "model.layers.0.mlp.gate_proj.weight"
@@ -953,7 +954,7 @@ def test_public_quantized_diffusion_gemma_rejects_rounded_shared_copies(tmp_path
     from dew.interop.codecs import E4M3
 
     fixture = FIXTURES / "diffusion-gemma-workflow"
-    tensors = tool.source_tensors(fixture)
+    tensors = load_shards(fixture)
     config = json.loads((fixture / "config.json").read_text())
     decoder = next(name for name in tensors if name.startswith("model.decoder.layers.")
                    and name.endswith(".self_attn.q_proj.weight"))

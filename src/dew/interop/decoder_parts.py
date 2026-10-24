@@ -20,12 +20,13 @@ import numpy as np
 from flax.traverse_util import flatten_dict
 
 from dew import records
+from dew._model_types import SANDWICH_NORMS
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.safetensors_io import LazyTensors
 from dew.interop.streaming import WeightLayout
 from dew.nn.activations import GatedActivation, Situ
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import Mixture
+from dew.nn.backbones.decoder_block import LAYER_SCALAR_COLLECTIONS, Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mixers import AttentionMixer, MixerBase
@@ -36,21 +37,25 @@ from dew.nn.text_encoders import check_tree
 # checkpoint would allocate one of those whether the caller asked or not.
 DEFAULT_MAX_SEQ_LEN = 8192
 
-MASKED_MODEL_TYPES = frozenset({
-    'llada', 'llada_moe_v2', 'llada2_moe', 'dream', 'Dream', 'diffusion_gemma_text'})
-"""Bidirectional diffusion decoders, never an unknown causal LM's loading convention."""
-
 # hidden_act / hidden_activation values, onto the GatedMLP activations. These
 # are the three the covered families use; anything else raises a ValueError
 # naming the value.
 # 'gelu' is torch's erf gelu (ACT2FN['gelu']), which Gemma's released config
 # names, and 'gelu_pytorch_tanh' the approximation the later Gemmas name.
 ACTIVATIONS = {'silu': 'swiglu', 'gelu_pytorch_tanh': 'geglu', 'gelu': 'geglu_exact'}
-_HF_ACTIVATIONS = {ours: theirs for theirs, ours in ACTIVATIONS.items()}
+_UNGATED: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ('gelu_exact', 'gelu', ()), ('gelu', 'gelu_new', ('gelu_fast', 'gelu_pytorch_tanh')),
+    ('relu', 'relu', ()))
+"""The ungated activations the classic families' configs name for an MLP or a head: Dew's name,
+the spelling an export writes and the other spellings a config may use. transformers' erf GELU is
+Dew's exact one, its tanh approximations Dew's 'gelu'."""
+UNGATED_ACTIVATIONS = {spelling: ours for ours, written, others in _UNGATED
+                       for spelling in (written, *others)}
+"""The ungated activations by every spelling a classic family's config may use, as Dew's (`_UNGATED`)."""
 # GPT OSS names its clamped experts 'silu' too; the family's own dial is
 # the mlp value, so the export vocabulary maps it back to the reference's.
-_HF_ACTIVATIONS['swigluoai'] = 'silu'
-_HF_ACTIVATIONS.update({'gelu': 'gelu_new', 'gelu_exact': 'gelu', 'relu': 'relu'})
+_HF_ACTIVATIONS = {**{ours: theirs for theirs, ours in ACTIVATIONS.items()}, 'swigluoai': 'silu',
+                   **{ours: written for ours, written, _ in _UNGATED}}
 
 
 def hf_activation(activation: GatedActivation) -> str:
@@ -59,12 +64,6 @@ def hf_activation(activation: GatedActivation) -> str:
     if isinstance(activation, Situ):
         refuse('mlp', "SiTU is named only by Kimi K3's own config fields")
     return _HF_ACTIVATIONS[activation]
-
-
-UNGATED_ACTIVATIONS = {'gelu': 'gelu_exact', 'gelu_new': 'gelu', 'gelu_fast': 'gelu',
-                       'gelu_pytorch_tanh': 'gelu', 'relu': 'relu'}
-"""The ungated activations the classic families' configs name for an MLP or
-a head, as Dew's: transformers' erf GELU, its tanh approximations and ReLU."""
 
 
 def ungated_mlp(activation: str, accepted: Collection[str], field: str, family: str) -> str:
@@ -98,7 +97,7 @@ def fixed_attention_buffer(name: str, tensor: np.ndarray, attention: str,
 def hf_ungated(mlp: GatedActivation | None, family: str, tanh: str = 'gelu_new') -> str:
     """The activation a classic `family`'s config names Dew's ungated `mlp`
     by, its tanh GELU spelled `tanh`; any other `mlp` is refused."""
-    if isinstance(mlp, str) and mlp in ('gelu', 'gelu_exact', 'relu'):
+    if isinstance(mlp, str) and mlp in {ours for ours, _, _ in _UNGATED}:
         return tanh if mlp == 'gelu' else _HF_ACTIVATIONS[mlp]
     return refuse('mlp', f'{family} writes only an ungated GELU or ReLU')
 
@@ -287,7 +286,10 @@ class AudioFields(TypedDict):
 
 class WrapperFields(AudioFields):
     """Describes a multimodal wrapper: its decoder, its tower, its
-    projector, and where each modality's tokens sit."""
+    projector, and where each modality's tokens sit: the image's and the
+    video's placeholders, and the further ids the decoder treats as
+    placeholders whatever its towers read (`MultimodalTransformer.
+    extra_placeholder_ids`)."""
 
     model_type: str
     text_model_type: str
@@ -296,6 +298,8 @@ class WrapperFields(AudioFields):
     projector: Mapping[str, object]
     image_token_id: int
     tokens_per_image: int | None
+    video_token_id: int | None
+    extra_placeholder_ids: tuple[int, ...]
 
 
 def kinds_of(config: DecoderFields) -> dict[str, KindFields]:
@@ -395,24 +399,32 @@ def read_rope_theta(entry: Mapping[str, object] | None, field: str) -> float | N
     return rope.theta
 
 
-def plain_partial_rope(hf_config: Mapping[str, object], *, default_factor: float, reference: str,
-                       layout: tuple[str, ...] = ()) -> tuple[float, float]:
-    """(rope_theta, partial_rotary_factor) of a config whose rotary is plain:
-    `rope_parameters` or the flat fields, the entry's value winning, and
-    `layout` the entry's fields that place the rotated pairs. A scaled type
-    or any other field refuses, naming `reference`'s rotary."""
+def partial_rope(hf_config: Mapping[str, object], *, default_factor: float, default_theta: float = 10000.0,
+                 factor_field: str = 'partial_rotary_factor',
+                 theta_field: str = 'rope_theta') -> tuple[float, float, Mapping[str, object]]:
+    """(rope_theta, partial_rotary_factor, the rest of the rotary's entry) of a config: the
+    `rope_parameters` entry's values, else the flat fields under the family's spellings (GPT-NeoX's
+    `rotary_emb_base` and `rotary_pct`), else the defaults. The rest is the entry without its
+    factor, which a family whose rotary may scale hands `base_config`'s rope reader."""
     entry = records.record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
-    rope_type = entry.get('rope_type', entry.get('type', 'default'))
+    theta = records.number(entry.get('rope_theta', hf_config.get(theta_field, default_theta)), theta_field)
+    factor = records.number(entry.get('partial_rotary_factor', hf_config.get(factor_field, default_factor)),
+                            factor_field)
+    return theta, factor, {key: value for key, value in entry.items() if key != 'partial_rotary_factor'}
+
+
+def plain_partial_rope(hf_config: Mapping[str, object], *, default_factor: float, reference: str,
+                       layout: tuple[str, ...] = (), default_theta: float = 10000.0) -> tuple[float, float]:
+    """(rope_theta, partial_rotary_factor) of a config whose rotary is plain (`partial_rope`), with
+    `layout` the entry's fields that place the rotated pairs. A scaled type or any other field
+    refuses, naming `reference`'s rotary."""
+    theta, factor, rest = partial_rope(hf_config, default_factor=default_factor, default_theta=default_theta)
+    rope_type = rest.get('rope_type', rest.get('type', 'default'))
     if rope_type not in ('default', 'none'):
         refuse(f"rope_parameters (rope_type {rope_type!r})", f"{reference} is the plain rotary")
-    scaling = sorted(set(entry) - {'rope_type', 'type', 'rope_theta', 'partial_rotary_factor', *layout})
+    scaling = sorted(set(rest) - {'rope_type', 'type', 'rope_theta', *layout})
     if scaling:
         refuse(f"rope_parameters scaling fields {scaling}", f"{reference} is the plain rotary")
-    theta = records.number(entry.get('rope_theta', hf_config.get('rope_theta', 10000.0)),
-                           'rope_parameters rope_theta')
-    factor = records.number(entry.get('partial_rotary_factor',
-                                      hf_config.get('partial_rotary_factor', default_factor)),
-                            'rope_parameters partial_rotary_factor')
     return theta, factor
 
 
@@ -531,16 +543,16 @@ def read_rope(hf_config: Mapping[str, object], used: set, yarn_max_pos: int | No
 
 
 def specified_layer_types(hf_config: Mapping[str, object], used: set[str],
-                           default: tuple[str, ...] | None = None) -> tuple[str, ...]:
+                          pattern: tuple[str, ...] | None = None) -> tuple[str, ...]:
+    """The config's `layer_types`, else `pattern` repeated over its `num_hidden_layers`: a family's
+    cycle (Gemma 2's sliding then full layer), or one kind per layer; every layer full without one."""
     layers = hf_config.get('layer_types')
     if layers is not None:
         used.add('layer_types')
         return records.strings(layers, 'layer_types')
-    return (
-        default
-        if default is not None
-        else ("full_attention",) * records.integer(hf_config["num_hidden_layers"], "num_hidden_layers")
-    )
+    cycle = ("full_attention",) if pattern is None else pattern
+    count = records.integer(hf_config["num_hidden_layers"], "num_hidden_layers")
+    return tuple(cycle[index % len(cycle)] for index in range(count))
 
 
 def decoder_kinds(layer_types: tuple[str, ...], window: int | None,
@@ -658,11 +670,11 @@ def _neutral(hf_config: Mapping[str, object], field: str) -> bool:
     return value is None or value is False
 
 
-def context_lengths(hf_config: Mapping[str, object]) -> tuple[int, int | None]:
+def context_lengths(hf_config: Mapping[str, object], default: int | None = None) -> tuple[int, int | None]:
     """The decode cache's capacity (`CausalTransformer.max_seq_len`), capped at
-    `DEFAULT_MAX_SEQ_LEN`, and the stated context (`max_position_embeddings`, its `context_length`),
-    None where the config states none."""
-    stated = hf_config.get('max_position_embeddings')
+    `DEFAULT_MAX_SEQ_LEN`, and the context (`max_position_embeddings`, its `context_length`): the
+    stated one, else `default`, the source config class's own, None where neither is."""
+    stated = hf_config.get('max_position_embeddings', default)
     context = None if stated is None else records.integer(stated, 'max_position_embeddings')
     return min(context or DEFAULT_MAX_SEQ_LEN, DEFAULT_MAX_SEQ_LEN), context
 
@@ -803,17 +815,12 @@ def translated(hf_config: Mapping[str, object], family: "DecoderFamily") -> Deco
 def translate_family_config(hf_config: Mapping[str, object],
                             family: "DecoderFamily") -> tuple[DecoderFields, set[str]]:
     """Translate a config as `family` reads it, returning the fields nothing read."""
-    model_type = hf_config.get('model_type')
     # Gemma 4 spells the flag 'vision' for its image tokens alone, and the
     # text decoder is causal (configuration_gemma4.py, only 'all' clears
-    # is_causal). True and 'all' change what the decoder computes. The masked
-    # diffusion families are bidirectional by construction (LLaDA's
-    # bidirectional bias, Dream's hard-coded is_causal=False, DiffusionGemma's
-    # decoder), so their own translators own the direction and this check
-    # leaves them alone.
+    # is_causal). True and 'all' change what the decoder computes. A
+    # bidirectional family's own translator owns the direction.
     bidirectional = hf_config.get('use_bidirectional_attention', False)
-    if (model_type not in MASKED_MODEL_TYPES
-            and bidirectional and bidirectional != 'vision'):
+    if not family.bidirectional and bidirectional and bidirectional != 'vision':
         refuse(f"use_bidirectional_attention={bidirectional!r}", "the backbone is causal")
     used = {'model_type', 'use_bidirectional_attention', 'num_hidden_layers'}
     # An omitted field is the config class's default; an explicit null stays null.
@@ -828,32 +835,39 @@ NO_AUDIO: AudioFields = {"audio": None, "audio_projector": None,
                           "audio_token_id": None, "audio_soft_tokens": None}
 
 
-def record_int(record: Mapping[str, object], field: str, default: int | None = None) -> int:
-    """Read an int field out of a record by name. A None default makes it required."""
-    return records.integer(record[field] if default is None else record.get(field, default), field)
+def _recorded[T](record: Mapping[str, object], field: str, default: T | None, used: set[str] | None,
+                 read: Callable[..., T]) -> T:
+    """`field`'s value in `record`, or `default`, checked by `read` (`dew.records`' readers); a None
+    default makes it required. `used`, when given, takes the field as read (the set
+    `translate_family_config` checks the rest against)."""
+    if used is not None:
+        used.add(field)
+    return read(record[field] if default is None else record.get(field, default), field)
 
 
-def record_float(record: Mapping[str, object], field: str, default: float | None = None) -> float:
-    """Read a real field out of a record by name. A None default makes it required."""
-    return records.number(record[field] if default is None else record.get(field, default), field)
+def record_int(record: Mapping[str, object], field: str, default: int | None = None, *,
+               used: set[str] | None = None) -> int:
+    """Read an int field out of a record by name (`_recorded`)."""
+    return _recorded(record, field, default, used, records.integer)
 
 
-# Where a layer's norms sit in the two trees. Without the sandwich the names
-# are the same; with it three of the four move, because HF names its norms
-# after the sublayer they follow while dew names them after what they
-# normalize. HF's post_attention_layernorm normalizes the attention output
-# (our attention_output_norm); its pre_feedforward_layernorm is the MLP's
-# pre-norm (our post_attention_layernorm); and its post_feedforward_layernorm
-# normalizes the MLP output (our mlp_output_norm).
+def record_float(record: Mapping[str, object], field: str, default: float | None = None, *,
+                 used: set[str] | None = None) -> float:
+    """Read a real field out of a record by name (`_recorded`)."""
+    return _recorded(record, field, default, used, records.number)
+
+
+def record_bool(record: Mapping[str, object], field: str, default: bool | None = None, *,
+                used: set[str] | None = None) -> bool:
+    """Read a boolean field out of a record by name (`_recorded`)."""
+    return _recorded(record, field, default, used, records.boolean)
+
+
+# Where a layer's norms sit in the two trees: without the sandwich the names
+# are the same, and with it they move (`SANDWICH_NORMS`).
 _PRE_NORMS = {
     'input_layernorm': 'input_layernorm',
     'post_attention_layernorm': 'post_attention_layernorm',
-}
-_SANDWICH_NORMS = {
-    'input_layernorm': 'input_layernorm',
-    'post_attention_layernorm': 'attention_output_norm',
-    'pre_feedforward_layernorm': 'post_attention_layernorm',
-    'post_feedforward_layernorm': 'mlp_output_norm',
 }
 # An attention gate_proj is Muse Glimmer's output gate (`CausalSelfAttention.gate_projection`).
 _PROJECTIONS = {'self_attn': ('q_proj', 'k_proj', 'v_proj', 'gate_proj', 'o_proj'),
@@ -912,7 +926,7 @@ _MOE_STATE = ('e_score_correction_bias', 'media_bias', 'tid2eid')
 
 
 def _norm_names(sandwich: bool) -> dict[str, str]:
-    return _SANDWICH_NORMS if sandwich else _PRE_NORMS
+    return SANDWICH_NORMS if sandwich else _PRE_NORMS
 
 
 def dew_path(hf_name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
@@ -969,6 +983,24 @@ pairs of dotted fragments: a load respells left to right, an export right to
 left, so one table holds both directions."""
 
 
+MOE_NAMES: Renames = (('block_sparse_moe', 'mlp'), ('w1', 'gate_proj'), ('w2', 'down_proj'),
+                      ('w3', 'up_proj'))
+"""Mixtral's MoE block and its experts' projections, which Kimi and MiniMax keep, onto the shared names."""
+GPT_TRUNK: Renames = (
+    ('transformer.wte', 'model.embed_tokens'), ('transformer.wpe', 'model.embed_positions'),
+    ('transformer.ln_f', 'model.norm'), ('transformer.h', 'model.layers'),
+    ('ln_1', 'input_layernorm'), ('ln_2', 'post_attention_layernorm'))
+"""GPT-2's embeddings, final norm, layers and block norms, which GPT-Neo, GPT-J and GPTBigCode keep."""
+GPT_MLP: Renames = (('mlp.c_fc', 'mlp.up_proj'), ('mlp.c_proj', 'mlp.down_proj'))
+"""GPT-2's MLP, which GPT-Neo, GPTBigCode and StarCoder2 keep."""
+MEGATRON_MLP: Renames = (('mlp.dense_h_to_4h', 'mlp.up_proj'), ('mlp.dense_4h_to_h', 'mlp.down_proj'))
+"""Megatron's MLP, as BLOOM, Falcon and GPT-NeoX name it."""
+MEGATRON_NAMES: Renames = (
+    ('transformer.word_embeddings', 'model.embed_tokens'), ('transformer.ln_f', 'model.norm'),
+    ('transformer.h', 'model.layers'), ('self_attention.dense', 'self_attn.o_proj'), *MEGATRON_MLP)
+"""Megatron's trunk, attention output and MLP, as BLOOM and Falcon keep them."""
+
+
 def renamed(name: str, renames: Renames, *, export: bool = False) -> str:
     """Respell `name` through `renames` in one pass over its dotted parts.
 
@@ -1008,9 +1040,20 @@ def renamed_path(renames: Renames, name: str, config: Mapping[str, object], *, l
     return dew_path(spelled, config)
 
 
-def renamed_name(renames: Renames, dew_name: str, config: Mapping[str, object]) -> str | None:
-    """`hf_tensor_name` respelled in the family's own names: `renamed_path` backwards."""
-    name = hf_tensor_name(dew_name, config)
+def renamed_name(renames: Renames, dew_name: str, config: Mapping[str, object], *,
+                 leaves: Leaves | None = None, layer_leaves: Leaves | None = None,
+                 sandwich_norms: bool = False) -> str | None:
+    """`renamed_path` backwards: the source name of the leaf `dew_name` (its path past the
+    collection, dotted), a `leaves` or `layer_leaves` one's by its table, any other's
+    `hf_tensor_name`, respelled in the family's own names."""
+    path = tuple(dew_name.split('.'))
+    name = next((spelled for spelled, leaf in (leaves or {}).items() if leaf == path), None)
+    layer = path[0].removeprefix('layers_')
+    if name is None and layer_leaves is not None and layer != path[0] and layer.isdigit():
+        tail = next((spelled for spelled, leaf in layer_leaves.items() if leaf == path[1:]), None)
+        name = None if tail is None else f'model.layers.{layer}.{tail}'
+    if name is None:
+        name = hf_tensor_name(dew_name, config, sandwich_norms=sandwich_norms)
     return None if name is None else renamed(name, renames, export=True)
 
 
@@ -1238,7 +1281,7 @@ def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables
     state = tree.get('moe')
     if isinstance(state, Mapping):
         leaves.update({('moe', *path): value for path, value in flatten_dict(dict(state)).items()})
-    constants = tree.get('constants')
+    constants = tree.get(LAYER_SCALAR_COLLECTIONS['frozen'])
     if model.layer_scalar == 'frozen' and isinstance(constants, Mapping):
         leaves.update({('params', *path): value for path, value in flatten_dict(dict(constants)).items()
                        if path[-1] == 'layer_scalar'})
@@ -1643,6 +1686,11 @@ class DecoderFamily:
     omits them, which the shared readers would otherwise default for every
     family alike: Gemma's GELU, Gemma 2's caps and query scalar, OLMo 3's
     norm epsilon. Rope bases are the class's `RopeSpelling`."""
+    bidirectional: bool = False
+    """The family's decoder attends both ways by construction, as the masked diffusion families'
+    do (LLaDA's bidirectional bias, Dream's hard-coded is_causal=False, DiffusionGemma's decoder):
+    its own translator reads the direction, and no unregistered causal LM is tried as it
+    (`dew.interop.verify.CONVENTIONS`)."""
     export_nulls: tuple[str, ...] = ()
     """Config fields whose explicit null disables a component. Other null export fields remove
     a generic field the family does not read; these survive as JSON null instead of taking the
@@ -1680,6 +1728,11 @@ class DecoderFamily:
     def packing(self, name: str) -> Packed | None:
         """The `packed` entry the source tensor `name` is, if any."""
         return next((packing for packing in self.packed if name.endswith(packing.name)), None)
+
+    def stored_path(self, name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
+        """The leaf a tensor fills as the checkpoint stores it, before `readings` splits it: None
+        for a `packed` one, whose parts fill several leaves."""
+        return None if self.packing(name) is not None else self.weight_path(name, config)
 
     def source_path(self, name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
         """The leaf the source tensor `name` fills: its own (`weight_path`), or

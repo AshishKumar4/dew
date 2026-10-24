@@ -260,9 +260,9 @@ class Layout:
 
     def __post_init__(self) -> None:
         _least("max_len", self.max_len, 1)
-    image: ClassVar[str | None] = None
-    """The text that stands for one image where a row holds a request's images,
-    which the backbone's processor expands; None where a row holds none."""
+    images: ClassVar[bool] = False
+    """Whether a row holds a request's images, each as the backbone's processor
+    writes and expands one (`Processor.image_text`)."""
 
     def state(self, encoder: Tokenizer, specials: Specials, state: JSON) -> tuple[int, ...]:
         """Return the state's tokens, which every question of a request shares."""
@@ -476,6 +476,71 @@ class StateFirstLayout(QuestionLayout):
 JOINT_SYSTEM = ("Read the complete state and schema. Decide every field jointly. Each answer "
                 "must be exactly one of that field's allowed options.")
 """The joint layout's system prompt."""
+JOINT_PREFILL = "JOINT SCHEMA DECISIONS:"
+"""The joint layout's opening of the assistant's turn, after the turn's own markup."""
+
+
+@dataclass(frozen=True)
+class Framing:
+    """How a joint row frames its text as a conversation: a `system` message, the user's turn that
+    holds the state and the schema, and the assistant's turn opened with `prefill`.
+
+    The turns' markup is the backbone's own: where the tokenizer has a chat template and `template`
+    holds, its template renders the system message, the user's turn around its content and the
+    generation prompt (`dew.data.chat.framed`), `thinking` its reasoning switch (False: a reasoning
+    model's empty thought, None: the template's own default), so every token of the markup is the
+    tokenizer's own special token, never ChatML spelled out for a vocabulary without it.
+    `chat_template`, a Jinja chat template, renders the turns in place of the tokenizer's own (a base
+    model's, which has none, or a framing of an experiment's), and `options` are the other variables
+    a template reads beside the messages; both are recorded with the layout, so a run reloads its
+    framing. A tokenizer with no chat template and none given, or `template` False, frames the turns
+    as plain text: the system message, then the user's content, each after a blank line."""
+
+    system: str = JOINT_SYSTEM
+    prefill: str = JOINT_PREFILL
+    thinking: bool | None = False
+    template: bool = True
+    chat_template: str | None = None
+    options: Mapping[str, JSON] = dataclasses.field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        from dew.data.chat import template_options
+
+        template_options(self.options, where="Framing.options")
+        if self.chat_template is not None and not self.template:
+            raise ValueError("a framing with its own chat_template frames through it; template=False frames "
+                             "as plain text, so the two are not one framing")
+
+    def around(self, encoder: Tokenizer) -> tuple[str, str]:
+        """The text before the user's turn's content and after it, to the assistant's prefill."""
+        from dew.registry import to_record
+
+        # The record keeps the options in their own order, which a template that walks them reads.
+        return _framed(_same(encoder), json.dumps(to_record(self, Framing)))
+
+
+@functools.lru_cache(maxsize=64)
+def _framed(encoder: _Same, recorded: str) -> tuple[str, str]:
+    """`Framing.around`, rendered once a tokenizer and framing, the framing by its record (`_same`).
+    A chat template of the framing's own renders through a tokenizer that renders templates
+    (`HFTokenizer`), and is refused (ValueError) over one that does not, rather than left unread."""
+    from dew.registry import from_record
+
+    framing = from_record(Framing, json.loads(recorded), dtypes=False)
+    tokenizer = encoder.encoder
+    if framing.chat_template is not None and not isinstance(tokenizer, HFTokenizer):
+        raise ValueError(f"a framing's own chat template renders through a tokenizer with a chat "
+                         f"template renderer, which {type(tokenizer).__name__} is not")
+    templated = isinstance(tokenizer, HFTokenizer) and (
+        framing.chat_template is not None or tokenizer.tokenizer.chat_template)
+    if framing.template and templated and isinstance(tokenizer, HFTokenizer):
+        from dew.data.chat import framed
+
+        before, after = framed(tokenizer.tokenizer, framing.system, where=tokenizer.name,
+                               thinking=framing.thinking, chat_template=framing.chat_template,
+                               options=framing.options)
+        return before, after + framing.prefill
+    return f"{framing.system}\n\n", f"\n\n{framing.prefill}"
 JOINT_NOUL = {"true": "The proposition is true or the answer is yes.",
               "false": "The proposition is false or the answer is no."}
 """A noul option's description where its question gives none."""
@@ -488,7 +553,7 @@ class JointLayout(Layout):
     The row is a chat prompt: the system prompt (`JOINT_SYSTEM`), the state,
     then a schema of numbered fields, each with its id, type, instructions and allowed options,
     and the opening of the assistant's turn. A request's images come before the
-    state, each laid out as `image` and expanded by the backbone's processor.
+    state, each as the backbone's processor writes one (`Processor.image_text`), and expanded by it.
     Each option is rendered as compact
     JSON with sorted keys, `{"description": ..., "option_id": ...}`, and the
     head pools the tokens of each option and of each question's instructions.
@@ -496,18 +561,20 @@ class JointLayout(Layout):
     then false, with `JOINT_NOUL`'s descriptions where the question gives none. The
     state is cut to `max_state_tokens`, and to what the schema leaves of
     `max_len`; the schema itself is never cut, so a schema longer than
-    `max_len` leaves no state and a row that does not fit (`fits`).
+    `max_len` leaves no state and a row that does not fit (`fits`). The row's
+    conversation markup is the backbone's own chat template's (`framing`).
     """
 
     max_len: int = 16384
     max_state_tokens: int | None = None
+    framing: Framing = Framing()
     joint: ClassVar[bool] = True
 
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.max_state_tokens is not None:
             _least("max_state_tokens", self.max_state_tokens, 0)
-    image: ClassVar[str | None] = "<|vision_start|><|image_pad|><|vision_end|>"
+    images: ClassVar[bool] = True
 
     def state(self, encoder: Tokenizer, specials: Specials, state: JSON) -> tuple[int, ...]:
         return tuple(encoder.encode(_compact(state), add_special_tokens=False))
@@ -545,9 +612,11 @@ class JointLayout(Layout):
                 schema.extend(piece("\n"))
             schema.extend(piece("END FIELD\n"))
             laid.append(Laid(name, kind_of(question), span, tuple(spans), tuple(slots)))
-        opening = piece(f"<|im_start|>system\n{JOINT_SYSTEM}<|im_end|>\n<|im_start|>user\nSTATE:\n")
+        # The user's turn holds the state and the schema, framed as the backbone's template writes a turn.
+        before, after = self.framing.around(encoder)
+        opening = piece(f"{before}STATE:\n")
         prefix = opening + list(media)
-        suffix = piece("\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:")
+        suffix = piece(f"\n{after}")
         state_ids = list(self.state(encoder, specials, state) if tokens is None else tokens)
         whole = len(state_ids)
         if self.max_state_tokens is not None:

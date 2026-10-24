@@ -41,11 +41,11 @@ from reference_error import assert_as_exact_as_the_reference, float64_forward, i
 from safetensors.numpy import load_file
 
 from dew.nn.vision import (
-    PROJECTOR_PREFIX,
     gemma4,
     llama4,
     mimo,
     muse_glimmer,
+    projector_layout,
     projector_variables,
     qwen35,
     siglip,
@@ -365,11 +365,11 @@ def test_muse_glimmer_tower_is_as_exact_as_the_reference():
 
 def test_muse_glimmer_projector_is_as_exact_as_the_reference():
     """The pixel shuffle channel by channel, the adapter's two activated maps, the projection and the
-    scale-free norm, each tensor named as the checkpoint router leaves it (`PROJECTOR_PREFIX`)."""
+    scale-free norm, each tensor named as the checkpoint router leaves it (`projector_layout`)."""
     config, _, projector_tensors, refs = shared_fixture("muse-glimmer-vision-tiny")
     projector = projectors.from_record(muse_glimmer.translate_muse_glimmer_projector_config(config)).build()
     routed = {name[len(prefix):]: tensor for name, tensor in projector_tensors.items()
-              for prefix in PROJECTOR_PREFIX["muse_glimmer"] if name.startswith(prefix)}
+              for prefix in projector_layout("muse_glimmer").prefix if name.startswith(prefix)}
     variables = {"params": projector_variables("muse_glimmer", routed, "float32")[0]}
     out = projector.apply(variables, refs["tower"])
     grid = refs["grid"]

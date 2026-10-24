@@ -356,20 +356,28 @@ def _replayed_equation(equation, values):
     return outputs if equation.primitive.multiple_results else [outputs]
 
 
-def equations(graph):
-    """Every equation of a jaxpr, its sub-jaxprs' (scan, cond, custom rules) in turn."""
+def equations(graph, *, platform: str | None = None):
+    """Every equation of a jaxpr, its sub-jaxprs' (scan, cond, custom rules) in turn. With `platform`
+    (a lowering platform's name: 'cpu', 'cuda', 'tpu'), a platform-dependent cond
+    (`jax.lax.platform_dependent`) gives only the branch that platform runs, as lowering keeps it."""
     if hasattr(graph, "eqns"):
         for equation in graph.eqns:
             yield equation
-            yield from equations(equation.params)
+            chosen = equation.params.get("branches_platforms") if platform is not None else None
+            if chosen is None:
+                yield from equations(equation.params, platform=platform)
+                continue
+            taken = next(index for index, platforms in enumerate(chosen)
+                         if platforms is None or platform in platforms)
+            yield from equations(equation.params["branches"][taken], platform=platform)
     elif hasattr(graph, "jaxpr"):
-        yield from equations(graph.jaxpr)
+        yield from equations(graph.jaxpr, platform=platform)
     elif isinstance(graph, dict):
         for value in graph.values():
-            yield from equations(value)
+            yield from equations(value, platform=platform)
     elif isinstance(graph, (tuple, list)):
         for value in graph:
-            yield from equations(value)
+            yield from equations(value, platform=platform)
 
 
 def assert_fp32_reduction_bound(dew, reference, magnitudes, terms: int) -> None:
