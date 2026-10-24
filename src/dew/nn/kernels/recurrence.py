@@ -656,7 +656,10 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
 def _cumsum_kernel(chunk_ref, s_ref, o_ref, *, chunk: int, aligned: bool, scale: float | None, reverse: bool):
     """fla's `chunk_local_cumsum_scalar_kernel` (fla/ops/utils/cumsum.py:33-73) for one chunk of one
     head, of each column of a gate per key dimension (fla's vector kernel, :90-133) too: forward, fla's
-    inclusive cumulative sum over its tokens in fp32, then `scale`. `reverse`, the decay's gradient,
+    inclusive cumulative sum over its tokens and its `scale`, in float64 and rounded once to fp32 (fla's
+    fp32 sum and its fp32 scaling put Kimi delta attention's final memory 1.9 times fla's recorded torch's
+    distance from float64, 1.8 with this, SE-dbg-kda-stage-1a95620b8); every kernel takes the difference
+    of two positions as a range's exponent. `reverse`, the decay's gradient,
     sums from the end compensated, each running sum a `(hi, lo)` pair (`compensated_add`) taken token
     by token and stored rounded once."""
     start, count = chunked_launch._chunk_of(chunk_ref, chunk, aligned)
@@ -664,9 +667,10 @@ def _cumsum_kernel(chunk_ref, s_ref, o_ref, *, chunk: int, aligned: bool, scale:
         @pl.when(count > 0)
         def _():
             tokens = chunked_launch.read_rows(chunked_launch._rows(s_ref, start, chunk), count)
-            total = jnp.cumsum(tokens.astype(jnp.float32), axis=0)
-            chunked_launch.write_rows(chunked_launch._rows(o_ref, start, chunk), count,
-                                  total if scale is None else total * scale)
+            with jax.enable_x64():
+                total = jnp.cumsum(tokens.astype(jnp.float64), axis=0)
+                total = (total if scale is None else total * scale).astype(jnp.float32)
+            chunked_launch.write_rows(chunked_launch._rows(o_ref, start, chunk), count, total)
         return
 
     def step(i, total):
