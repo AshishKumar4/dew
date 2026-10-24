@@ -18,7 +18,7 @@ the reference's, a mask one step off) moves it further than PARITY and
 fails.
 
 Comparisons not yet converted to check 1 hold the one-draw rule at PARITY
-(`assert_as_exact_as_the_reference`), but for five named sites that keep the
+(`assert_as_exact_as_the_reference`), but for the named sites that keep the
 retiring one-draw helper as it was until they convert (`assert_leaves_as_exact`,
 RETIRING_SITES, no new caller), and the K-order and element rules
 (`assert_as_exact_over_orders`, `assert_elements_as_exact`) hold
@@ -1343,12 +1343,10 @@ RETIRING_FACTOR = 2.0
 """The retiring one-draw helper's factor (`assert_leaves_as_exact`), today's check at its remaining
 sites until they convert: no other rule reads it."""
 
-RETIRING_SITES = frozenset({"tests/test_architectures.py", "tests/test_flux2_source.py",
-                            "tests/test_z_image_source.py", "tests/test_ssd_kernel.py"})
-"""The sites that keep the retiring one-draw helper until they convert (Main's ruling): every other
-caller is refused (tools/lint_slop.py, SLOP020). tests/test_ssd_kernel.py's is the TPU kernel run
-interpreted on the CPU host, where check 1 measures the host's XLA lowering, not the kernel, and
-parts with the ISA (ledger row 1322); the compiled kernel is held to check 1 on a TPU."""
+RETIRING_SITES = frozenset({"tests/test_decision_option_slots.py", "tests/test_flux2_source.py",
+                            "tests/test_z_image_source.py"})
+"""The sites that keep the retiring one-draw helper until they convert: every other caller is refused
+(tools/lint_slop.py, SLOP020), and the helper goes with its last caller."""
 
 
 def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=None,

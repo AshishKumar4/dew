@@ -2004,10 +2004,10 @@ def _checkout(module: Module) -> Path:
 
 
 RETIRING = "assert_leaves_as_exact"
-RETIRING_SITES = frozenset({"tests/test_architectures.py", "tests/test_flux2_source.py",
-                            "tests/test_z_image_source.py", "tests/test_ssd_kernel.py"})
-"""The gate's retiring one-draw helper and the sites that keep it until they convert (Main's ruling;
-`tests/reference_error.py`'s own RETIRING_SITES, which a test holds equal)."""
+RETIRING_SITES = frozenset({"tests/test_decision_option_slots.py", "tests/test_flux2_source.py",
+                            "tests/test_z_image_source.py"})
+"""The gate's retiring one-draw helper and the sites that keep it until they convert
+(`tests/reference_error.py`'s own RETIRING_SITES, which a test holds equal)."""
 
 
 def _retiring(module: Module) -> Iterator[Finding]:

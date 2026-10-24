@@ -41,10 +41,6 @@
    "comparisons": 5,
    "lane": "Training"
   },
-  "tests/test_architectures.py": {
-   "comparisons": 2,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_attention_masked_rows.py": {
    "comparisons": 2,
    "lane": "Kernels"
@@ -91,10 +87,6 @@
   },
   "tests/test_capability_matrix.py": {
    "comparisons": 1,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_causal_transformer.py": {
-   "comparisons": 47,
    "lane": "Models, Serving & RL"
   },
   "tests/test_checkpoint_ranking.py": {
@@ -309,12 +301,8 @@
    "comparisons": 9,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_fp8_base.py": {
-   "comparisons": 2,
-   "lane": "Kernels"
-  },
   "tests/test_gemma3n.py": {
-   "comparisons": 10,
+   "comparisons": 9,
    "lane": "Models, Serving & RL"
   },
   "tests/test_gemma3n_vision.py": {
@@ -425,10 +413,6 @@
    "comparisons": 4,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_hyper_connections.py": {
-   "comparisons": 5,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_image_metrics.py": {
    "comparisons": 5,
    "lane": "Training"
@@ -461,10 +445,6 @@
    "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_jepa.py": {
-   "comparisons": 17,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_jepa_source.py": {
    "comparisons": 3,
    "lane": "Models, Serving & RL"
@@ -482,7 +462,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_kda.py": {
-   "comparisons": 11,
+   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tests/test_kernels.py": {
@@ -596,10 +576,6 @@
   "tests/test_mixers.py": {
    "comparisons": 7,
    "lane": "Kernels"
-  },
-  "tests/test_mla.py": {
-   "comparisons": 14,
-   "lane": "Models, Serving & RL"
   },
   "tests/test_model_protocols.py": {
    "comparisons": 1,
@@ -726,7 +702,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_quantization.py": {
-   "comparisons": 18,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_quantization_sites.py": {
@@ -821,17 +797,9 @@
    "comparisons": 8,
    "lane": "Training"
   },
-  "tests/test_sparse_attention.py": {
-   "comparisons": 5,
-   "lane": "Kernels"
-  },
   "tests/test_speculative.py": {
    "comparisons": 2,
    "lane": "Training"
-  },
-  "tests/test_ssd_kernel.py": {
-   "comparisons": 1,
-   "lane": "Recurrence & Dory"
   },
   "tests/test_ssm.py": {
    "comparisons": 4,
@@ -856,14 +824,6 @@
   "tests/test_text_data.py": {
    "comparisons": 1,
    "lane": "Training"
-  },
-  "tests/test_text_encoders.py": {
-   "comparisons": 7,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_text_rollout_contract.py": {
-   "comparisons": 14,
-   "lane": "Models, Serving & RL"
   },
   "tests/test_token_accuracy.py": {
    "comparisons": 3,
@@ -1014,7 +974,7 @@
    "lane": "Training"
   },
   "tools/layout_parity.py": {
-   "comparisons": 3,
+   "comparisons": 1,
    "lane": "Accuracy Gate"
   },
   "tools/lora_reference.py": {
