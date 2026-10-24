@@ -24,7 +24,7 @@ from flax import linen as nn
 from model_support import TINY_DECODER, decode_steps, model_draw, with_logit_cotangent
 from reference_error import assert_as_exact, torch_with_gradients, with_gradients
 
-from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.attention import dropout_draw, dropout_seed, scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.kernels.selection import KernelRefused
@@ -175,12 +175,21 @@ def test_old_decoder_record_keeps_zero_dropout_and_bitwise_outputs():
             assert np.asarray(left).tobytes() == np.asarray(right).tobytes()
 
 
+def flax_with_keep(query, value, mask, rng, rate: float) -> jax.Array:
+    """Flax's attention arithmetic under `dew`'s dropout draw: the weights of `query` against itself under
+    `mask`, times the keep draw `dropout_draw` takes from `rng` (the draw `scaled_dot_product_attention`
+    takes), then the value product. Flax's own dropout is a bernoulli draw of another stream, so the keep
+    is materialized here and the arithmetic around it is flax's."""
+    weights = nn.dot_product_attention_weights(query, query, mask=mask, deterministic=True)
+    kept = dropout_draw(dropout_seed(rng), rate, weights.shape)
+    return jnp.einsum("...hqk,...khd->...qhd", weights * kept, value)
+
+
 def test_attention_probability_dropout_matches_flax_on_the_same_draw(rng):
     query = jnp.zeros((1, 4, 2, 4), jnp.float32)
     value = jnp.broadcast_to(jnp.eye(4)[None, :, None, :], (1, 4, 2, 4))
     mask = jnp.tril(jnp.ones((4, 4), bool))[None, None]
-    expected = nn.dot_product_attention(query, query, value, mask=mask, dropout_rate=.5,
-                                        dropout_rng=rng, broadcast_dropout=False, deterministic=False)
+    expected = flax_with_keep(query, value, mask, rng, .5)
     actual = scaled_dot_product_attention(query, query, value, causal=True, implementation="reference",
                                           dropout_rate=.5, dropout_rng=rng, deterministic=False)
     assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
@@ -220,8 +229,7 @@ def test_attention_dropout_preserves_visibility_masks(rng):
     documents = jnp.asarray([[1, 1, 2, 2]])
     visible = (documents[:, :, None] == documents[:, None, :])[:, None]
     visible = visible & jnp.tril(jnp.ones((4, 4), bool))[None, None]
-    expected = nn.dot_product_attention(query, query, value, mask=visible, dropout_rate=.5,
-                                        dropout_rng=rng, broadcast_dropout=False, deterministic=False)
+    expected = flax_with_keep(query, value, visible, rng, .5)
     actual = scaled_dot_product_attention(query, query, value, causal=True, segment_ids=documents,
         implementation="auto", dropout_rate=.5, dropout_rng=rng, deterministic=False)
     assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
