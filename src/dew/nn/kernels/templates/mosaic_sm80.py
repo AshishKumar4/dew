@@ -129,6 +129,11 @@ class Mma(mosaic.Family):
         names = tuple(blocks)
         carry = (start, tuple(self.zeros(shape) for shape in shapes))
         for step, lo, hi in segments:
+            if isinstance(lo, int) and isinstance(hi, int) and hi <= lo:
+                # No steps: the carry and its zero accumulators as they start (`emit_pipeline` takes no
+                # empty grid).
+                continue
+
             def body(indices, *refs, step=step, lo=lo):
                 (index,), (carried, accumulators) = indices, refs[-1]
                 slots = Slots(dict(zip(names, refs[:-1], strict=True)))
