@@ -219,8 +219,7 @@ def load_pipe(experiment):
 
 def provenance(experiment, pipe, directory):
     import jax
-
-    from dew._checkout import revision
+    from reference_source import dew_revision
 
     return {
         "model": experiment.model,
@@ -229,7 +228,7 @@ def provenance(experiment, pipe, directory):
         f"{experiment.model!r}, revision=...)), the run from_pretrained loads",
         "checkpoint_step": experiment.checkpoint_step,
         "parameters": int(sum(math.prod(leaf.shape) for leaf in jax.tree.leaves(pipe.variables["params"]))),
-        "dew_commit": revision(),
+        "dew_commit": dew_revision(),
         "device": jax.devices()[0].device_kind,
         "jax": jax.__version__,
         "compute": "published run dtypes, unquantized",
