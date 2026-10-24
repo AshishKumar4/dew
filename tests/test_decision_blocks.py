@@ -8,16 +8,22 @@ import bisect
 import dataclasses
 import itertools
 
+import jax
 import numpy as np
 import pytest
 from decision_support import decision_rows
+from model_support import TINY_DECODER
 from test_decision_objective import EXAMPLES, SPECIALS as BYTE_SPECIALS, TOKENIZER, tiny_backbone
 from test_decision_render import CHOICE_PROMPT, QWEN, SPECIALS, STATE, TEAM, release
 
 from dew.data.dataset import DataPartition
 from dew.data.text import HFTokenizer
 from dew.decision import Choice, DecisionObjective, MarkerLayout, StateFirstLayout
+from dew.decision.head import DecisionHead
 from dew.decision.layout import DecisionInputs, Instructions, Labels, State, Text
+from dew.decision.model import DecisionModel
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.mixers import AttentionMixer
 
 
 @pytest.fixture(scope="module")
@@ -121,3 +127,42 @@ def test_parallel_options_take_no_blocks():
     does not compose with: a parallel layout refuses blocks."""
     with pytest.raises(ValueError):
         StateFirstLayout(max_len=256, blocks=True, parallel=True)
+
+
+def blocked_backbone(*, blocks: bool) -> CausalTransformer:
+    """A float32 decoder of two attention layers that read blocks (`bidirectional_blocks`), or none."""
+    kinds = {"full_attention": {"mixer": AttentionMixer(bidirectional_blocks=blocks)}}
+    return CausalTransformer(**{**TINY_DECODER, "vocab_size": 256, "dtype": "float32", "num_layers": 2,
+                                "max_seq_len": 256, "layer_types": ("full_attention",) * 2, "kinds": kinds})
+
+
+def test_a_decision_model_reads_its_rows_blocks_through_its_backbone():
+    """A model over a backbone that reads blocks hands each row's blocks to it (`block_groups`): its
+    states are the backbone's own over the row's blocks, exactly; a state token then reads the state's
+    later tokens, which it does not under a backbone that reads none, nor in a row read in order."""
+    layout = StateFirstLayout(max_len=256, blocks=True)
+    question = {"team": Choice("Which team?", ["a", "b"])}
+    rows = [layout.rows(TOKENIZER, BYTE_SPECIALS, state, question)[0] for state in ("state one", "state two")]
+    inputs = [DecisionInputs.collate([row], BYTE_SPECIALS.pad) for row in rows]
+    assert rows[0].questions[0].span[0] > 6
+    head = DecisionHead(32, layers=1)
+    for reads in (True, False):
+        decision = DecisionModel(blocked_backbone(blocks=reads), head)
+        backbone = decision.backbone.init(jax.random.key(0), inputs[0].tokens)["params"]
+        variables = {"params": {"backbone": backbone, "head": {}}}
+        states = [np.asarray(decision.states(variables, one)) for one in inputs]
+        one = inputs[0]
+        direct = decision.backbone.apply({"params": variables["params"]["backbone"]}, one.tokens,
+                                         coordinates=one.coordinates(), block_groups=one.blocks,
+                                         method="hidden_states")
+        np.testing.assert_array_equal(states[0], np.asarray(direct))
+        # "state one" and "state two" differ from their seventh token on: the first six read it only
+        # within a block.
+        assert np.array_equal(states[0][0, :6], states[1][0, :6]) != reads
+    ordered = DecisionModel(blocked_backbone(blocks=True), head)
+    plain = [DecisionInputs.collate([dataclasses.replace(row, blocks=None)], BYTE_SPECIALS.pad)
+             for row in rows]
+    variables = {"params": {"backbone": ordered.backbone.init(jax.random.key(0), plain[0].tokens)["params"],
+                            "head": {}}}
+    first, second = (np.asarray(ordered.states(variables, one)) for one in plain)
+    np.testing.assert_array_equal(first[0, :6], second[0, :6])
