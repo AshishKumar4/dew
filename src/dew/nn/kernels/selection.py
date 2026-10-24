@@ -19,6 +19,7 @@ operation to the program, and outside `generation.routes()` it records nothing
 """
 
 import dataclasses
+import math
 from collections.abc import Callable
 
 from . import generation
@@ -59,7 +60,8 @@ class Kernel[C]:
     """A kernel an op may run: `supports`, its requirements in the order a refusal names them,
     whether it is `generic`, a path that takes what the others turn down, and `cost(case)`, the seconds
     it is predicted to take on the case where it states them (a template launch's estimate at its
-    fastest fitting config)."""
+    fastest fitting config; infinite where no measurement qualified it, so it runs only by name). A
+    generic kernel that states a cost is ranked with the others, and stays the path for what none takes."""
 
     name: str
     supports: tuple[Requirement[C], ...]
@@ -156,14 +158,27 @@ def _decided[C](op: Op[C], case: C, named: str | None,
 
 
 def _preferred[C](op: Op[C], case: C) -> str:
-    """The kernel `op` prefers for `case`: its measured preference where it states one, else the
-    cheapest of its non-generic kernels that take the case where each states a cost (one alone is
-    estimated not at all, so a target with no cost facts needs none), else the first of them that takes
-    it, else the first of them, whose refusal the route then names."""
+    """The kernel `op` prefers for `case`: its measured preference where it states one; else, where each
+    of its non-generic kernels that take the case states a cost (an op migrates to ranking whole), the
+    cheapest of those and of its generic kernels that take the case and state one, among the costs that
+    are finite, the first of the op's order where several tie: a kernel no measurement qualified for the
+    case costs no finite seconds and runs only by name, its case handed to the generic kernels where no
+    other qualifies, refused where none takes it (a lone candidate is estimated not at all, so a target
+    with no cost facts needs none); else the first non-generic kernel that takes it, else the first of
+    them, whose refusal the route then names."""
     if op.preferred is not None:
         return op.preferred(case)
-    taking = [kernel for kernel in op.kernels if not kernel.generic and not kernel.failed(case)]
-    if len(taking) > 1 and all(kernel.cost is not None for kernel in taking):
-        costs = [kernel.cost(case) for kernel in taking if kernel.cost is not None]
-        return taking[min(range(len(taking)), key=lambda index: (costs[index], index))].name
-    return (taking or [kernel for kernel in op.kernels if not kernel.generic] or list(op.kernels))[0].name
+    taking = [kernel for kernel in op.kernels if not kernel.failed(case)]
+    native = [kernel for kernel in taking if not kernel.generic]
+    priced = [kernel for kernel in taking if kernel.cost is not None]
+    if len(priced) > 1 and all(kernel.cost is not None for kernel in native):
+        qualified = [(seconds, kernel) for kernel in priced if kernel.cost is not None
+                     and math.isfinite(seconds := kernel.cost(case))]
+        if qualified:
+            return min(qualified, key=lambda entry: entry[0])[1].name
+        handed = [kernel for kernel in taking if kernel.generic]
+        if not handed:
+            raise ValueError(f"no {op.choice} kernel that takes this call is qualified for it: "
+                             + ", ".join(kernel.name for kernel in priced))
+        return handed[0].name
+    return (native or [kernel for kernel in op.kernels if not kernel.generic] or list(op.kernels))[0].name
