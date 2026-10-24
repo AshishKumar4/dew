@@ -889,9 +889,9 @@ class Dataset:
         """This dataset's records, or its batches where it batches: one pass,
         or the passes its `repeat` asks for, with training's random draws
         (`for record in dataset`)."""
+        from dew.batch import VALID_ROWS
         from dew.data.compile import _batch_steps, _diagnostic
         from dew.data.dataset import take_batch
-        from dew.objectives.base import VALID_ROWS
 
         chain = self._chain()
         batched = any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages)
@@ -964,13 +964,13 @@ def concat(datasets: Sequence[Dataset]) -> Pipeline:
 
 def _token_places(batch: Batch) -> tuple[int, int]:
     """The places a batch's token rows under "text" hold, and those of them that pad a row, as a
-    model reads them (`dew.nn.inputs.real_slots`): segment 0 of a packed row and the places its
+    model reads them (`dew.batch.real_slots`): segment 0 of a packed row and the places its
     validity marks invalid, in its `text_coordinates` or in stored `text_segment_ids` and
     `text_attention_mask`; none where it holds no token ids."""
     tokens = batch.get("text")
     if not isinstance(tokens, np.ndarray) or tokens.dtype.kind not in "iu":
         return 0, 0
-    from dew.nn.inputs import COORDINATES_FIELD, VALIDITY_FIELD, real_slots
+    from dew.batch import COORDINATES_FIELD, VALIDITY_FIELD, real_slots
 
     fields = {name: batch[f"text_{name}"] for name in (COORDINATES_FIELD, VALIDITY_FIELD, "segment_ids")
               if f"text_{name}" in batch}

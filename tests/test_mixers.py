@@ -25,12 +25,13 @@ from model_support import TINY_DECODER
 from reference_error import assert_as_exact, with_gradients
 from residual_orders import orders, permuted, residual_width
 
+from dew.batch import coordinates
 from dew.nn import linear
 from dew.nn.attention import alibi_bias
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.backbones.layer_plan import LayerKind
-from dew.nn.inputs import TOKENWISE, AttentionMetadata, MixerCall, coordinates
+from dew.nn.inputs import TOKENWISE, AttentionMetadata, MixerCall
 from dew.nn.kernels.generation import chosen
 from dew.nn.mixer_base import MixerRefused
 from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext

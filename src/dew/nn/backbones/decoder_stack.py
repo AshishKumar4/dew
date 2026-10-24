@@ -20,7 +20,7 @@ from flax import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from dew.objectives.base import merge
+from dew.batch import merge
 
 from ..hyper_connections import Carried
 from ..kv_cache import CURSOR

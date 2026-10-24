@@ -32,8 +32,9 @@ import numpy as np
 import optax
 
 from dew.hashing import fmix32
+from dew.mesh import LogicalAxes
 from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import LogicalAxes, declarations, declared_axes
+from dew.nn.sharding import declarations, declared_axes
 
 # Attention stores its projections either as one matrix over the flattened
 # head space or as a dimension per head. The head dimensions count as one

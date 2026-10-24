@@ -17,13 +17,13 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from dew.batch import VALID_ROWS
 from dew.data import Files, Loading, Memory, Rejected, images, video
 from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition
 from dew.data.images import DecodeImage, Resize
 from dew.data.pipeline import Pipeline
 from dew.data.sources.urls import Fetch
-from dew.objectives.base import VALID_ROWS
 
 READ = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
 

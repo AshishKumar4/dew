@@ -18,6 +18,7 @@ import jax
 import numpy as np
 import tyro
 
+from dew.batch import Variables, merge
 from dew.checkpoints import Checkpoints
 from dew.config import MetricConfig, ModelConfig, ObjectiveConfig, Prepared, RunConfig, media_field
 from dew.data.compile import fitted
@@ -28,7 +29,7 @@ from dew.inputs import AudioCondition, Field, InputSpec, TextCondition
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
 from dew.nn.protocols import IntervalModel, TimeScaled
-from dew.objectives.base import TEACHER, Variables, merge
+from dew.objectives.base import TEACHER
 from dew.objectives.diffusion.alignment import Alignment
 from dew.objectives.diffusion.end_to_end import AUTOENCODER
 from dew.objectives.diffusion.few_step import SMOOTH_TIME_SCALE, MeanFlowObjective

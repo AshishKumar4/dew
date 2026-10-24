@@ -27,6 +27,7 @@ from flax.core import freeze
 from jax.sharding import NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike, DTypeLike
 
+from dew.batch import Variables
 from dew.cache import persist_compilations
 from dew.coordination import agreed
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
@@ -35,7 +36,7 @@ from dew.inference.projections import packed_owned
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key
 from dew.nn.protocols import Bounded, CacheCapacity, TokenModel
-from dew.objectives.base import UNREAD, Variables, thaw
+from dew.objectives.base import UNREAD, thaw
 from dew.records import integer, record as named_fields, text as named
 from dew.sampling import decoding, vocabulary
 from dew.sampling.decoding import LogitsTransform, Stopping
@@ -117,7 +118,7 @@ def prepared_inputs(processor: Processor | None, request: Request, *, images: Me
         rows = [row for row in request if not isinstance(row, str)]
         if len(rows) != len(request):
             raise ValueError("a request cannot mix text prompts and numeric token rows")
-        # ModelInputs reads the rows by `dew.nn.inputs.token_id`'s law.
+        # ModelInputs reads the rows by `dew.batch.token_id`'s law.
         return ModelInputs.from_value(rows)
     # A resident array stays where it is; a global one cannot be fetched.
     return ModelInputs.from_value(request)

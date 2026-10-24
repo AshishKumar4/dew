@@ -20,6 +20,7 @@ import jax
 import numpy as np
 
 from dew import records
+from dew.batch import Variables
 from dew.data.text import HFTokenizer
 from dew.decision.head import DecisionHead
 from dew.decision.layout import MarkerLayout, Specials
@@ -31,7 +32,7 @@ from dew.interop.safetensors_io import read_weights, write_file
 from dew.interop.weights import translate_parameters
 from dew.lora import FACTORS
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import Variables, joined, part, thaw
+from dew.objectives.base import joined, part, thaw
 from dew.registry import from_record
 
 # Laya's head, as nn.TransformerEncoderLayer and its nn.Sequential scorer name it.

@@ -51,7 +51,7 @@ class ValidTargets:
         """The record's targets the loss scores, by the LM objective's own rule (`scored_targets`)."""
         if self.measured and "_dew_valid_targets" in element:
             return int(element["_dew_valid_targets"])
-        from dew.objectives.lm.objective import scored_targets
+        from dew.batch import scored_targets
 
         segments = element.get(f"{self.field}_segment_ids")
         roles = None if self.role is None else np.asarray(element[f"{self.field}_roles"])[None]

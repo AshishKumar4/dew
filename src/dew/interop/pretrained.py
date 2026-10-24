@@ -28,6 +28,7 @@ from jax.typing import DTypeLike
 
 from dew import records
 from dew._model_types import QWEN35_TYPES
+from dew.batch import Variables
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
@@ -67,7 +68,6 @@ from dew.nn.backbones.decoder_block import layer_scalar_mode
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import MultimodalTransformer
-from dew.objectives.base import Variables
 from dew.registry import dtype_name, from_record, projectors, record_fields, resolve_dtype, towers
 from dew.sampling.pipelines import TextToImage
 from dew.sampling.text import Sampling
@@ -490,10 +490,11 @@ class Pretrained:
         cross-attention, so `save` and `export` refuse the result; a run's
         checkpoint keeps it.
         """
+        from dew.batch import merge
         from dew.nn.cross_attention import crossing
         from dew.nn.inputs import request_key
         from dew.nn.protocols import CrossAttending, Predicting
-        from dew.objectives.base import freeze, merge, select, thaw
+        from dew.objectives.base import freeze, select, thaw
 
         if not isinstance(self.model, CrossAttending):
             raise TypeError(f"a {type(self.model).__name__} takes no cross-attention layers")

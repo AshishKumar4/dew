@@ -353,10 +353,10 @@ def test_cache_refuses_a_stochastic_prefix():
 
 
 def test_iterate_and_validation_read_a_published_generation_as_its_accepted_rows():
+    from dew.batch import VALID_ROWS
     from dew.data.compile import iterate, publish, validation
     from dew.data.dataset import DataPartition
     from dew.data.pipeline import Pipeline
-    from dew.objectives.base import VALID_ROWS
 
     source = Memory([{"id": index} for index in range(8)])
     even = Pipeline(source).filter(lambda row: row["id"] % 2 == 0, identity="even@1")

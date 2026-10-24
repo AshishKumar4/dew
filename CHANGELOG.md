@@ -5,6 +5,13 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- The batch contract moves to `dew.batch` and the mesh's axis names and rules to `dew.mesh`, so the
+  data, models, objectives and trainer read them from one module below them all: `Batch`,
+  `Variables`, `FROZEN`, `merge`, `VALID_ROWS`, `EXAMPLE_ROWS`, `Coordinates` and its token helpers
+  (from `dew.objectives.base` and `dew.nn.inputs`) and `scored_targets` (from
+  `dew.objectives.lm.objective`); the axis names, `DEFAULT_RULES`, `axis_rules`, `logical_spec`,
+  `row_axes`, `batch_axes` and `LayoutRefused` (from `dew.nn.sharding`). Import them from their
+  new modules; the old ones no longer hold them.
 - A causal attention kind may read blocks whole: `AttentionMixer(bidirectional_blocks=True)` lets
   each token of a block (`block_groups=`, `AttentionMetadata.block_groups`, `[B, S]`, -1 outside
   any) see its whole block, whatever its window, as transformers' `block_sequence_ids` does, while

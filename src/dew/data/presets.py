@@ -9,7 +9,7 @@ except where it packs several records into one row.
   writes `image`, uint8 [B, size, size, 3];
 - `lm(ds, tokenizer, seq_len=, batch=)` reads `text`, a string, and writes
   `text`, int32 [B, seq_len + 1], and its windows' documents as
-  `text_coordinates` (`dew.nn.inputs.Coordinates`);
+  `text_coordinates` (`dew.batch.Coordinates`);
 - `sft(ds, tokenizer, seq_len=, batch=)` reads `messages`, chat turns, and
   writes the `lm` fields and `text_roles`;
 - `clips(ds, seconds, frames=, fps=, size=, batch=)` reads `mp4`, media

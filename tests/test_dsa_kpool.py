@@ -35,8 +35,9 @@ from reference_error import assert_as_exact, assert_moves, torch_with_gradients,
 from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextAttention
 
+from dew.batch import coordinates
 from dew.nn.dsa_kpool import KPoolSparseAttention, KPoolSparseAttentionMixer
-from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
+from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.mixers import MixerContext
 from dew.registry import mixers
 from tools.hf_reference import scatter_weights

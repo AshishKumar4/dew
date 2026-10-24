@@ -35,8 +35,8 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.batch import merge
 from dew.nn.dense import Dense
-from dew.objectives.base import merge
 from dew.records import JSON
 from dew.registry import from_record, read_arguments
 
@@ -1550,7 +1550,7 @@ class CausalTransformer(nn.Module):
           states are the masked call's, the padding's are unspecified, and a
           causal layer runs as an unpadded call does.
         - `coordinates` are the tokens' documents, validity and positions as
-          the batch's builder made them (`dew.nn.inputs.coordinates`, with the
+          the batch's builder made them (`dew.batch.coordinates`, with the
           packer's `max_segments`); where None they are built here from
           `segment_ids`, `attention_mask`, `positions` and `right_padded`.
         - `conditioning` carries the sequence the `cross_attention` layers read

@@ -1916,7 +1916,7 @@ Three runs of the 9B's FSDP 2 arm at e3c90a968 spread 0.8%.
 A parameter fsdp splits is gathered whole for every use, so which of its
 dimensions fsdp takes changes no product, only how the shards lie in
 memory. It now takes the leading dimension its rules name it alone for
-(`dew.nn.sharding.DEFAULT_RULES`). Before, rule order put fsdp on the gate
+(`dew.mesh.DEFAULT_RULES`). Before, rule order put fsdp on the gate
 and up projections' mlp width, their minor dimension, and each update read
 their reduce-scattered gradients transposed. The 8B's profile with the
 collective options spent 65 ms of each device's 524 ms step in transpose

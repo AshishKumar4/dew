@@ -266,9 +266,10 @@ def passed(objective, variables, examples):
     import jax
     import jax.numpy as jnp
 
+    from dew.batch import VALID_ROWS
     from dew.data.dataset import DataPartition
     from dew.decision.task import laid_out
-    from dew.objectives.base import VALID_ROWS, Step
+    from dew.objectives.base import Step
 
     step = Step(jnp.asarray(0), jax.random.key(0), None)
     found = []

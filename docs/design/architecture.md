@@ -15,6 +15,8 @@ A model is a plain Flax module. An objective defines variables, loss and validat
 | Model work and MFU | `src/dew/nn/flops.py` and `WorkloadWork`, `src/dew/telemetry/workload.py` | One analytic FLOP formula per operation. MFU uses real, unpadded work over wall time and the measured device's peak. |
 | Memory plan | `src/dew/training/memory.py` and `planning.py` | One search chooses a fitting micro-batch, rematerialization and head plan for the model and mesh. |
 | Compilation cache | `src/dew/cache.py` | One cache dir and one autotune dir per (GPU model, jaxlib). A program's identity follows its computation and environment. |
+| The batch contract | `src/dew/batch.py` | `Batch` and `Variables`, the frozen split (`FROZEN`, `merge`), and the rows and tokens a batch carries (`VALID_ROWS`, `EXAMPLE_ROWS`, `padded_rows`, `Coordinates` and its token helpers) live here alone, below every package that reads a batch; it imports no other Dew package. |
+| Mesh axes and rules | `src/dew/mesh.py` | The axis names (`MESH_AXES`, `BATCH_AXES`), the default rule table (`DEFAULT_RULES`), the spec rules give an array (`logical_spec`) and the axes a batch's rows split over (`row_axes`, `batch_axes`), below the models and the data alike; it imports no other Dew package. |
 | Data execution | `src/dew/data/pipeline.py`, `analysis.py` and `lowering.py` | One `Dataset` chain, one analyzed plan, and the lowering that plan declares. |
 | Weight layout | `src/dew/interop/` | One reversible source-to-model binding plan serves loading and export. Family adapters describe a source's schema. |
 | Model capabilities | `src/dew/nn/protocols.py` | Objectives, tasks, serving and export ask for capabilities and call through Flax `apply`. |

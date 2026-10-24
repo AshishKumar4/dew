@@ -40,13 +40,13 @@ from flax import linen as nn
 from typing_extensions import TypeVar
 
 from dew.artifacts import Artifacts
+from dew.batch import Batch, Variables
 from dew.nn.precision import accumulated
 from dew.objectives.base import (
     OMITTED,
     TEACHER,
     UNREAD,
     Aux,
-    Batch,
     EMASpec,
     Objective,
     Omitted,
@@ -54,7 +54,6 @@ from dew.objectives.base import (
     ProgramModule,
     Ratio,
     Step,
-    Variables,
     without,
 )
 

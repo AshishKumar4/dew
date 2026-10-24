@@ -23,6 +23,7 @@ from flax import linen as nn
 from jax.experimental import mesh_utils, multihost_utils
 from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionSpec as P
 
+from dew.batch import EXAMPLE_ROWS, FROZEN, Batch, Variables
 from dew.coordination import agreed, broadcast_from_process_zero, from_every_process, stop_at_exit
 from dew.data.dataset import (
     Budgeted,
@@ -35,8 +36,7 @@ from dew.data.dataset import (
     stream_identity,
 )
 from dew.files import write_atomically
-from dew.nn.inputs import filled_validity
-from dew.nn.sharding import (
+from dew.mesh import (
     DATA_AXIS,
     DEFAULT_RULES,
     EXPERT_AXIS,
@@ -48,19 +48,21 @@ from dew.nn.sharding import (
     LogicalAxes,
     LogicalAxisRules,
     MeshAxes,
-    Suffix,
     batch_axes,
+    logical_spec,
+    mesh_axes,
+)
+from dew.nn.inputs import filled_validity
+from dew.nn.sharding import (
+    Suffix,
     boxed,
     boxed_axes,
     current_boxes,
     declarations,
     declared_axes,
-    logical_spec,
-    mesh_axes,
     microbatched,
     ruled_boxes,
 )
-from dew.objectives.base import EXAMPLE_ROWS, FROZEN, Batch, Variables
 from dew.records import JSON, number, record
 from dew.telemetry.benchmark import samples
 from dew.telemetry.profile import region
@@ -695,7 +697,7 @@ class Layout:
     """The axes a batch's rows split over, ahead of the rules' own
     `activation_batch` entries: a native mesh's names for its data-parallel
     axes, which the run's data shares, its batch placement and its row
-    counts read (`dew.nn.sharding.batch_axes`). Empty leaves the rules as
+    counts read (`dew.mesh.batch_axes`). Empty leaves the rules as
     they are."""
 
     def __post_init__(self):

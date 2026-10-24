@@ -26,20 +26,16 @@ from flax import struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
+from dew.batch import EXAMPLE_ROWS, FROZEN, Batch, Variables, merge
 from dew.data.dataset import rows_of
 from dew.nn.sharding import rows_spec
 from dew.objectives.base import (
-    EXAMPLE_ROWS,
     EXAMPLE_STREAM,
-    FROZEN,
     Aux,
-    Batch,
     Evaluated,
     Ratio,
     Recorded,
     Step,
-    Variables,
-    merge,
     recorded_metrics,
     with_projected,
 )

@@ -7,13 +7,13 @@ import numpy as np
 import optax
 from steady_state import steady_state
 
+from dew.batch import FROZEN
 from dew.checkpoints import Checkpoints
 from dew.data import Loading, Memory
 from dew.inference.banks import CheckpointBanks, spread
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import group_layers
-from dew.objectives.base import FROZEN
 from dew.objectives.lm import LMObjective
 from dew.training import Layout, MeshSpec, Trainer
 

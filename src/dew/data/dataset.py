@@ -35,11 +35,9 @@ import tyro
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew import position
-from dew.nn.sharding import LayoutRefused, batch_axes
 
-# `Batch` lives in dew.objectives.base. The data layer imports it from here
-# so a dataset module needs one import for the value and its shape.
-from dew.objectives.base import VALID_ROWS, Batch
+from dew.batch import VALID_ROWS, Batch, padded_rows
+from dew.mesh import LayoutRefused, batch_axes
 
 _log = logging.getLogger(__name__)
 
@@ -947,7 +945,7 @@ def describe(source: Indexed | pygrain.MapDataset[Batch]) -> str:
 
 class FilledBatch(pygrain.MapTransform):
     """A batch of fewer than `rows` records filled out with repeats of its
-    own rows (`RowPlan.pad`), and `VALID_ROWS` marking the real ones: those of
+    own rows (`dew.batch.padded_rows`), and `VALID_ROWS` marking the real ones: those of
     its own a batch that marks them already marks real. Without `real` every
     row is a repeat."""
 
@@ -955,14 +953,11 @@ class FilledBatch(pygrain.MapTransform):
         self._rows, self._real = rows, real
 
     def map(self, element: Batch) -> Batch:
-        from dew.nn.inputs import RowPlan
-
         held = rows_of(element)
         if held == self._rows and self._real:
             return element
-        plan = RowPlan(None, held, self._rows, 0, 1)
-        indices = plan.pad(np.arange(held))
-        valid = ~plan.padding & self._real
+        indices, repeats = padded_rows(held, self._rows)
+        valid = ~repeats & self._real
         if VALID_ROWS in element:
             valid = valid & np.asarray(element[VALID_ROWS], bool)[indices]
         return {**take_batch(element, indices), VALID_ROWS: valid}

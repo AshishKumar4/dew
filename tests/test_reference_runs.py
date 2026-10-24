@@ -124,8 +124,8 @@ def test_packed_documents_give_every_step_the_work_counted_for_one(monkeypatch):
     it counts attention within each document only."""
     import json
 
+    from dew.batch import coordinates
     from dew.interop import translate_config
-    from dew.nn.inputs import coordinates
 
     monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
     common = load("reference_runs/common")

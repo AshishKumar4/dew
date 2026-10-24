@@ -9,11 +9,11 @@ import pytest
 from data_support import keep_captions
 from PIL import Image
 
+from dew.batch import VALID_ROWS
 from dew.data import Files, Loading, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.images import EncodeCaptions
-from dew.objectives.base import VALID_ROWS
 
 SCALE = 8
 READ = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)

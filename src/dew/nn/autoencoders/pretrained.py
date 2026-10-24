@@ -14,8 +14,8 @@ import jax
 import jax.numpy as jnp
 from jax.typing import DTypeLike
 
+from dew.batch import Variables
 from dew.interop.components import bind_component
-from dew.objectives.base import Variables
 from dew.registry import DtypeName
 
 from . import dc_ae, flux2, qwen_image, rae, wan
