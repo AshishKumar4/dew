@@ -422,11 +422,15 @@ class Pretrained:
         elif subfolder is not None:
             # Resolve the selected folder at the metadata snapshot's commit, never a revision
             # named after the folder. Every ordinary component then reads its local directory.
-            resolved = sources.snapshot(str(name_or_dir), commit or revision, weights=(folder,)) / folder
+            resolved = _source_subfolder(name_or_dir, directory, folder,
+                                          [name for name in (gguf_file, single_file, dduf_file) if name])
             loaded = cls.load(resolved, dtype=dtype, param_dtype=param_dtype, attention_impl=attention_impl,
                               max_seq_len=max_seq_len, gguf_file=gguf_file, single_file=single_file,
                               dduf_file=dduf_file, mesh=mesh, layout=layout, fallback=fallback,
                               weights=weights, on_host=on_host)
+            if loaded.processor is not None:
+                identity = sources.SourceReference(str(name_or_dir), commit, folder)
+                loaded = replace(loaded, processor=replace(loaded.processor, source=identity))
             return replace(loaded, revision=commit, origin=None)
         elif fallback is not None:
             from dew.interop import torchax_fallback
@@ -974,7 +978,7 @@ def _wrapper_model(config: Mapping[str, object], record: decoder_parts.WrapperFi
 
 
 def source_processor(directory: Path, config: Mapping[str, object], record: Mapping[str, object],
-                      model: nn.Module, gguf_path: Path | None = None, *, source: str
+                      model: nn.Module, gguf_path: Path | None = None, *, source: sources.SourceReference
                       ) -> Processor | None:
     """Build the host preprocessing a source ships, or None where it ships none.
 
@@ -985,8 +989,8 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
     processor config beside a text-only model), and a tiny multimodal
     fixture without processor files tokenizes text only.
 
-    `source` names the local directory or the Hub repo at the commit the
-    loader resolved, the identity a run records to reload the processor
+    `source` records the directory or Hub repository, commit and selected folder
+    the loader resolved, the identity a run records to reload the processor
     (`load_processor`). A GGUF file's text processor keeps none, since the
     source alone does not name the file it read. Only the media branch reads media
     files from its directory and keeps the wrapper's translated `record`.
@@ -1008,34 +1012,18 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
     return None
 
 
-def load_processor(source: str, model: nn.Module) -> Processor | None:
+def load_processor(source: sources.SourceReference, model: nn.Module) -> Processor | None:
     """Reload the recorded processor from its source, beside `model`.
 
-    A saved task keeps the local directory or `repo@commit` the processor's
-    files came from, not its translated fields. Reading that source's config
+    A saved task keeps the source's directory/repository, commit and subfolder
+    as a typed record, not its translated fields. Reading that source's config
     and translating its wrapper derives a media processor's geometry again
     without loading the model's weights.
     """
-    name, revision = split_revision(source)
-    directory = sources.snapshot(name, revision, weights=False)
-    config, _ = _source_config(name, directory, revision, None)
+    directory = source.metadata()
+    config, _ = _source_config(source.name, directory, source.revision, None)
     record = decoders.translate_wrapper_config(config) if _media_wrapper(config) else {}
     return source_processor(directory, config, record, model, source=source)
-
-
-def split_revision(source: str) -> tuple[str, str | None]:
-    """Split a `repo@revision` reference into the repo and the revision.
-
-    This is Levanter's `RepoRef` spelling: a branch, tag or commit after the last
-    '@'. A local directory, or a reference without '@', names no revision. Hub
-    repo IDs cannot contain '@'.
-    """
-    if os.path.isdir(source) or "@" not in source:
-        return source, None
-    name, revision = source.rsplit("@", 1)
-    if not name or not revision:
-        raise ValueError(f"{source!r} is not a repo@revision reference")
-    return name, revision
 
 
 def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | None, single_file: str | None,
@@ -1358,6 +1346,23 @@ def _selected_payload(fallback: str | None, **files: str | None) -> list[str]:
     return selected
 
 
+def _source_subfolder(name_or_dir: str | Path, root: Path, folder: str, selected: list) -> Path:
+    """Fetch a selected folder's ordinary components or named payload at the metadata commit."""
+    directory = root / folder
+    if selected:
+        for filename in selected:
+            sources.repo_file(name_or_dir, root, (Path(folder) / filename).as_posix())
+    else:
+        index_file = directory / "model_index.json"
+        components = [folder]
+        if index_file.is_file():
+            index = records.record(json.loads(index_file.read_text()), "model_index")
+            components = [(Path(folder) / name).as_posix() for name in index
+                          if component_present(index, name)]
+        sources.snapshot(str(name_or_dir), root.name, weights=tuple(components))
+    return directory
+
+
 def _source_metadata(name_or_dir: str | Path, revision: str | None, subfolder: str | None,
                       selected: list, fallback: str | None
                       ) -> tuple[Path, str | None, str, CompositeSource | None]:
@@ -1399,7 +1404,8 @@ def _load_composite_source(name_or_dir: str | Path, root: Path, commit: str | No
         weights_folder = str(Path(folder) / component.weights_folder)
         if weights_folder == ".":
             weights_folder = ""
-        root = sources.snapshot(str(name_or_dir), commit, weights=(weights_folder,))
+        root = sources.snapshot(str(name_or_dir), commit,
+                                weights=True if not weights_folder else (weights_folder,))
         shared = sources.load_shards(root / weights_folder)
         prefix = component.tensor_prefix
         tensors = ({name[len(prefix):]: tensor for name, tensor in shared.items() if name.startswith(prefix)}
@@ -1422,6 +1428,9 @@ def _load_composite_source(name_or_dir: str | Path, root: Path, commit: str | No
     if backbone is None:
         return Pretrained(head, placed({"params": params}), None, {}, directory,
                           record_fields(head, type(head)), revision=commit)
+    if backbone.processor is not None and commit is not None and folder:
+        backbone = replace(backbone, processor=replace(
+            backbone.processor, source=sources.SourceReference(str(name_or_dir), commit, folder)))
     return description.bundle(backbone, head, placed({"params": params}), directory,
                               description.tokenizer_folder, **description.fields)
 
@@ -1485,7 +1494,7 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
     resolved_commit = commit
     if component is None and commit is not None:
         resolved_commit = directory.name
-    source = str(name_or_dir) if resolved_commit is None else f"{name_or_dir}@{resolved_commit}"
+    source = sources.SourceReference(str(name_or_dir), resolved_commit)
     processor = source_processor(directory, config, record, model, gguf_path, source=source)
     generation_config = read_generation_config(directory)
 

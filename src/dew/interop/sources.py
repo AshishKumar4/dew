@@ -60,6 +60,34 @@ _PICKLES = (".bin", ".pt", ".pth")
 _log = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class SourceReference:
+    """A local directory or Hub repository, its pinned revision and selected component folder.
+    Saved processor settings keep this record, not a string that has to be parsed again."""
+
+    name: str
+    revision: str | None = None
+    subfolder: str | None = None
+
+    def __post_init__(self):
+        folder = Path(self.subfolder or "")
+        if folder.is_absolute() or ".." in folder.parts:
+            raise ValueError("subfolder must stay inside the resolved source")
+
+    @classmethod
+    def parse(cls, source: str) -> SourceReference:
+        """Read a user-provided repo@revision spelling once, at the input boundary."""
+        if os.path.isdir(source) or "@" not in source:
+            return cls(source)
+        name, revision = source.rsplit("@", 1)
+        if not name or not revision:
+            raise ValueError(f"{source!r} is not a repo@revision reference")
+        return cls(name, revision)
+
+    def metadata(self) -> Path:
+        return snapshot(self.name, self.revision, weights=False) / (self.subfolder or "")
+
+
 def missing_weights(source: str, files: Collection[str]) -> str:
     """Say what a source without safetensors weights or transformers'
     PyTorch pickles ships instead, and what loads."""
@@ -195,6 +223,12 @@ def snapshot(name_or_dir: str, revision: str | None, *,
 
     selected = [name for folder in (("",) if weights is True else weights)
                 for name in weight_files(files, folder, read)]
+    if isinstance(weights, tuple):
+        # Components follow the same safetensors-first, native-pickle fallback as a root model.
+        # A selected subfolder stays on this exact metadata commit; conversion is local on read.
+        selected = [name for folder in weights
+                    for name in (weight_files(files, folder, read) or weight_files(
+                        files, folder, read, stems=pickles.STEMS, suffix=pickles.SUFFIX))]
     if weights is True and not selected:
         from huggingface_hub.errors import HfHubHTTPError, OfflineModeIsEnabled
 

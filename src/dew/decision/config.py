@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import dataclasses
 import os
-from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
 import jax
@@ -28,7 +27,6 @@ import jax
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig
 from dew.data.compile import fitted
 from dew.data.dataset import record_argument
-from dew.data.text import HFTokenizer
 from dew.decision.head import DecisionHead, JointSchemaHead
 from dew.decision.laya import LAYA
 from dew.decision.layout import Framing, Layout, Schema, Segment, default_layout
@@ -140,7 +138,7 @@ class DecisionRunConfig(RunConfig):
         flags choose only its compute dtype and attention kernel;
         `param_dtype` chooses the loaded checkpoint's storage dtype. `remat`
         chooses its layer recomputation before looping or attaching LoRA."""
-        from dew.interop import Pretrained, sources
+        from dew.interop import Pretrained
 
         decided = sorted(set(self.model.fields) - {"dtype", "attention_impl"})
         if decided:
@@ -186,9 +184,6 @@ class DecisionRunConfig(RunConfig):
                 start = start.with_cross_attention(blocks, key=jax.random.fold_in(
                     jax.random.key(self.trainer.key), 1))
             start = start if self.lora is None else start.adapt(self.lora, key=self.trainer.key)
-            # The tokenizer of the commit the weights come from.
-            root = sources.snapshot(self.pretrained, self.revision, weights=False)
-            derived["tokenizer"] = HFTokenizer(str(root), local_files_only=root != Path(self.pretrained))
             if self.head is not None:
                 width, head_dtype = DecisionModel.head_size(start.model)
                 derived["head"] = JointSchemaHead(hidden_size=width, dtype=head_dtype,

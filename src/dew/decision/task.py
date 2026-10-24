@@ -63,6 +63,7 @@ from dew.inference import scoring
 from dew.inference.tasks import shape_bucket
 from dew.interop.processors import Processor
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
+from dew.interop.sources import SourceReference
 from dew.nn.inputs import ModelInputs, RowPlan, mesh_of
 from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import Metric, Objective, Variables, joined
@@ -72,6 +73,7 @@ if TYPE_CHECKING:
     from jax.sharding import Mesh
 
     from dew.decision.objective import DecisionObjective
+    from dew.decision.sources import PretrainedDecision
     from dew.training.distributed import Layout as Placement, MeshSpec
 
 TASK_FILE = "decide.json"
@@ -138,7 +140,7 @@ class DecideSettings:
     layout: Layout
     specials: Specials
     tokenizer: str | None
-    processor: str | None
+    processor: SourceReference | None
 
     @staticmethod
     def of(record: Mapping[str, object]) -> "DecideSettings":
@@ -193,20 +195,20 @@ class Decide:
         answers with Jev's confidence; `replace(task, confidence=...)` selects
         Laya's (`EntropyConfidence`) or the top probability (`TopProbability`).
         """
+        from dew.decision.sources import PretrainedDecision
         from dew.interop.pretrained import Pretrained
 
-        return cls.of(Pretrained.load(name, subfolder=subfolder, revision=revision, dtype=dtype,
-                                      param_dtype=param_dtype, attention_impl=attention_impl))
+        bundle = Pretrained.load(name, subfolder=subfolder, revision=revision, dtype=dtype,
+                                  param_dtype=param_dtype, attention_impl=attention_impl)
+        if not isinstance(bundle, PretrainedDecision):
+            raise TypeError(f"{name} declares no decision task")
+        return cls.of(bundle)
 
     @classmethod
-    def of(cls, bundle) -> Self:
+    def of(cls, bundle: "PretrainedDecision") -> Self:
         """Build the declared decision task from a loaded composite bundle, without loading again."""
-        from dew.decision.sources import PretrainedDecision
         from dew.registry import from_record
 
-        if (not isinstance(bundle, PretrainedDecision) or bundle.head is None
-                or bundle.decision_tokenizer is None):
-            raise TypeError("Decide.of needs a loaded decision source")
         settings = DecideSettings.of(records.record(bundle.settings, "decision settings"))
         calibration = from_record(Calibration, bundle.calibration)
         return cls(DecisionModel(bundle.model, bundle.head),

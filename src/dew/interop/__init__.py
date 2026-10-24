@@ -18,17 +18,17 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
         PretrainedFallback,
         PretrainedMaskedDecoder,
         PretrainedPipeline,
-        split_revision,
     )
     from dew.interop.processors import Processor
     from dew.interop.safetensors_io import load_params, save_hf_layout, save_params
+    from dew.interop.sources import SourceReference
 
 _EXPORTS = {
     "PretrainedDecision": "dew.decision.sources",
     "Pretrained": "dew.interop.pretrained", "PretrainedBlockDecoder": "dew.interop.pretrained",
     "PretrainedDecoder": "dew.interop.pretrained", "PretrainedFallback": "dew.interop.pretrained",
     "PretrainedMaskedDecoder": "dew.interop.pretrained", "PretrainedPipeline": "dew.interop.pretrained",
-    "split_revision": "dew.interop.pretrained",
+    "SourceReference": "dew.interop.sources",
     "Processor": "dew.interop.processors",
     "translate_config": "dew.interop.hf_decoders", "translate_weights": "dew.interop.hf_decoders",
     "load_params": "dew.interop.safetensors_io", "save_hf_layout": "dew.interop.safetensors_io",
@@ -51,10 +51,10 @@ __all__ = [
     "PretrainedMaskedDecoder",
     "PretrainedPipeline",
     "Processor",
+    "SourceReference",
     "load_params",
     "save_hf_layout",
     "save_params",
-    "split_revision",
     "translate_config",
     "translate_weights",
 ]

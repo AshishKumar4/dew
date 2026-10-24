@@ -48,16 +48,16 @@ class DecisionHeadSource(HeadComponent):
             "attention_impl": attention_impl}}, "head"), width)
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class PretrainedDecision(Pretrained):
     """A native backbone bundle with its readout and declared decision task.
     Inherited adaptation operates on the backbone; the readout retains its own variables."""
 
-    head: Head | None = None
-    head_variables: Variables = dataclasses.field(default_factory=dict)
-    settings: records.JSON = None
-    calibration: records.JSON = None
-    decision_tokenizer: HFTokenizer | None = None
+    head: Head
+    head_variables: Variables
+    settings: records.JSON
+    calibration: records.JSON
+    decision_tokenizer: HFTokenizer
 
     def map_variables(self, transform: Callable[[Variables], Variables]) -> Self:
         return dataclasses.replace(self, variables=transform(self.variables),
