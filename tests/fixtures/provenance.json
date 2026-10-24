@@ -976,7 +976,7 @@
    ],
    "note": "Transformers delegates to the fetched kernel's numerics_details.mxfp.downcast_to_mxfp_torch CPU path."
   },
-  "guidance/apg.npz": {
+  "guidance/apg_seeds.npz": {
    "tool": "tools/guidance_reference.py",
    "sources": [
     {
@@ -985,18 +985,7 @@
      "runs": "fetched"
     }
    ],
-   "note": "Fetches and executes Diffusers' published AdaptiveProjectedGuidance guider (BaseGuidance.__init__/set_state, prepare_inputs, forward, _is_apg_enabled, normalized_guidance, MomentumBuffer) without importing diffusers; its batching helper and output container are stand-ins."
-  },
-  "guidance/apg_ensemble.npz": {
-   "tool": "tools/guidance_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/diffusers",
-     "version": "5ff8e59ff9fe81c6e2df4fb4c6ea0d97a5df5ab2",
-     "runs": "fetched"
-    }
-   ],
-   "note": "The apg-ensemble mode executes the same published AdaptiveProjectedGuidance over 1024 independent initial states (torch seed 23), in float32 and float64. Every existing apg.npz result is checked to regenerate bit for bit."
+   "note": "The apg-seeds mode fetches and executes Diffusers' published AdaptiveProjectedGuidance guider (BaseGuidance.__init__/set_state, prepare_inputs, forward, _is_apg_enabled, normalized_guidance, MomentumBuffer) without importing diffusers, over each APG case's recorded seeds (tools/recorded_references.py's record_case): a seed's initial state and its float32 and float64 Euler walks. Its batching helper and output container are stand-ins."
   },
   "guidance/apg_projection.npz": {
    "tool": "tools/guidance_reference.py",
