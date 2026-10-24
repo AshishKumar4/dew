@@ -26,7 +26,8 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   third.
 - JEPA's `normalize_targets` is Flax's `LayerNorm` with no affine and exact
   variance. Its statistics are at least float32, as I-JEPA's `F.layer_norm`'s
-  are, so a bfloat16 run's targets round once.
+  are, so a bfloat16 run's targets round once, and its epsilon is I-JEPA's,
+  PyTorch's default 1e-5, where it was 1e-6.
 - `Decide.systemone` takes a list of request bodies and answers each as it
   would alone, their rows scored together, a refused body's `ValueError` in its
   place. `dew.inference.ScoringServer` serves a task answered by one forward
