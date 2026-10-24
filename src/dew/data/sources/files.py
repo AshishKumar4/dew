@@ -330,11 +330,19 @@ class Files(Dataset):
     def _places(self) -> Mapping[str, str]:
         """Each file's place, by URL, which the files' fingerprint and their shards' ids name it by: where
         a committed export places it (`export_place`), a local copy's path under the files' common
-        directory, so hosts that mounted one dataset at different paths name it alike, else its URL."""
+        directory, so hosts that mounted one dataset at different paths name it alike, else its URL. A
+        catalog of files (`format="files"`), whose records are their URLs, is named by its URLs."""
         root = _mount_root([path for _, fs, path in self._resolved if local(fs)])
         places = self._export_places
-        return {url: places.get(url) or (posixpath.relpath(path, root) if local(fs) else url)
+        return {url: places.get(url) or (posixpath.relpath(path, root) if local(fs) and self.kind != "files"
+                                         else url)
                 for url, fs, path in self._resolved}
+
+    def _shard_id(self, url: str, start: int) -> str:
+        """The id of the shard of the file at `url` that starts at `start`: its place (`_places`), which
+        two files of an export may share once their writers' directories are left out, and its number
+        among the files, which tells them apart."""
+        return f"{self._places[url]}#{self.paths.index(url)}:{start}"
 
     @cached_property
     def _file_facts(self) -> tuple[tuple[str, Mapping[str, object]], ...]:
@@ -611,19 +619,19 @@ class Files(Dataset):
                 name = self._shard_name(fragment.path)
                 shards.append(Shard(f"{name}:{number}", name, number, number + 1, rows))
         elif self.kind == "array_record":
-            shards.extend(Shard(self._places[url], url) for url in self.paths)
+            shards.extend(Shard(self._shard_id(url, 0), url) for url in self.paths)
         else:
             for url in self.paths:
                 size = integer(self._header(url)["size"], "file bytes")
                 if infer_compression(url.lower()) is not None:
                     # Compressed bytes cannot be cut at logical record offsets.
-                    shards.append(Shard(f"{self._places[url]}:0", url))
+                    shards.append(Shard(self._shard_id(url, 0), url))
                     continue
                 step = self.shard_bytes if self.kind in ("jsonl", "text") else max(size, 1)
                 if step < 1:
                     raise ValueError("file shard_bytes must be positive")
                 shards.extend(
-                    Shard(f"{self._places[url]}:{start}", url, start, min(start + step, size))
+                    Shard(self._shard_id(url, start), url, start, min(start + step, size))
                     for start in range(0, size, step)
                 )
         return ShardManifest(tuple(shards), self._read_shard)

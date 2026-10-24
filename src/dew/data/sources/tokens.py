@@ -277,9 +277,7 @@ class TokenFiles(Dataset):
         return None if self.tokens.eos_id is None else _document_ends(self.tokens)
 
     def manifest(self) -> ShardManifest:
-        # Named without the store's URL, which a local store's fingerprint leaves out, so a fill keyed by
-        # its shards' rows finds them wherever the store is mounted.
-        return _indexed_manifest(self, f"tokens:{_SPLIT}", self.url, 1024)
+        return _indexed_manifest(self, self.url, 1024)
 
     def lengths(self) -> np.ndarray | None:
         ends = self.document_ends()

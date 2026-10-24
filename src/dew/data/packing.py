@@ -286,4 +286,4 @@ class PackedSource(View[Source]):
         return None
 
     def manifest(self) -> ShardManifest:
-        return _indexed_manifest(self, self.plan.location, self.plan.location, 1024)
+        return _indexed_manifest(self, self.plan.location, 1024)

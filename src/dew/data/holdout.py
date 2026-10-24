@@ -285,8 +285,7 @@ class SelectedGeneration(View[Source]):
 
     def manifest(self) -> ShardManifest:
         # A worker reads the placed rows alone (`_Placed`), not the store that placed them.
-        return _indexed_manifest(self, f"{self.generation.url}#selected", self.generation.url, 4096,
-                                 _Placed(self.generation, self._dense))
+        return _indexed_manifest(self, self.generation.url, 4096, _Placed(self.generation, self._dense))
 
     def metadata(self) -> Mapping[str, object]:
         """The selections' facts, as uncached (what they hold out included), with this part's rows and
