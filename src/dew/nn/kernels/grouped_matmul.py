@@ -82,6 +82,12 @@ model prices no term the cooperative schedule changes yet (its MMA issue, the se
 the shared stage), so where it ties, the first wins: a one-warpgroup tile, then a cooperative tile
 (shared memory staging's barriers, a few hundred bytes, are not counted against the block either)."""
 
+AMPERE_TILES = (mosaic_gpu.Tiles(128, 256, 32, 3, 8, family='mma.sync'),
+                mosaic_gpu.Tiles(128, 128, 32, 3, 8, family='mma.sync'))
+"""The tiles the Mosaic GPU forward takes on a GPU without warpgroup MMA (mma.sync's bundle): the two whose
+programs an A100's Mosaic lowering placed (AMPERE3, AMPDIAG; at every other tile its layout inference
+found no solution), the one it timed first."""
+
 TPU_BLOCKS = tuple(mosaic_tpu.Blocks(*shape) for shape in itertools.product((128, 256, 512), repeat=3))
 """Every block the TPU launches may take: multiples of the MXU's 128 (Megablox's default is 128 cubed),
 none past the 16 MiB a v5e's kernel holds at XLA's default (`_MosaicTpu.staged_bytes`)."""
@@ -647,9 +653,22 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # Interpreted only in a CPU process: the interpreter's callbacks are ordered effects, which a GPU
         # process's lowering of the platform choice cannot carry in the CPU branch it does not take.
         interpretable = not ba.arguments['interpret'] or jax.default_backend() == 'cpu'
-        return (target.wgmma and first == second and jnp.dtype(first).itemsize == 2 and interpretable
-                and _rated(target, first) and bool(self.space(ba)) and self._hooks_lower(ba, first)
+        # Without warpgroup MMA, mma.sync's tiles take the plain forward alone (`AMPERE_TILES`).
+        hooks = (self._hooks_lower(ba, first) if target.wgmma
+                 else ba.arguments['hooks'] == NO_HOOKS and not ba.arguments.get('trans_rhs', True))
+        return (first == second and jnp.dtype(first).itemsize == 2 and interpretable
+                and _rated(target, first) and bool(self._family_tiles(self.space(ba), target)) and hooks
                 and (self.EXACT_SUMS or not ba.arguments.get('exact_sums')))
+
+    @staticmethod
+    def _family_tiles(tiles, target) -> tuple[mosaic_gpu.Tiles, ...]:
+        """The tiles of `tiles` of `target`'s instruction family: Hopper's warpgroup MMA where it has it,
+        else Ampere's mma.sync."""
+        family = 'wgmma' if target.wgmma else 'mma.sync'
+        return tuple(tile for tile in tiles if tile.family == family)
+
+    def fitting(self, ba, target) -> tuple[mosaic_gpu.Tiles, ...]:
+        return self._family_tiles(super().fitting(ba, target), target)
 
     @staticmethod
     def _hooks_lower(ba, dtype) -> bool:
@@ -727,6 +746,12 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         """The row tiles a band of the planar snake keeps in flight at once on `target`."""
         return max(1.0, _multiprocessors(generation.effective(target)) / config.grid_block_n)
 
+    # Last in the class: its name would hide the `cost` module from the annotations above it.
+    def cost(self, ba, config: mosaic_gpu.Tiles, target) -> float:
+        # mma.sync's tiles ran 2.8 to 3.3 times Triton's forward on an A100 (AMPERE3): no estimate they
+        # win by, so they run only by name (`generation.chosen`).
+        return math.inf if config.family == 'mma.sync' else super().cost(ba, config, target)
+
 
 @dataclasses.dataclass(frozen=True)
 class MosaicGmm(_Mosaic):
@@ -737,7 +762,7 @@ class MosaicGmm(_Mosaic):
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         kernel = ba.arguments['kernel']
         depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
-        return tuple(tile for tile in MOSAIC_TILES
+        return tuple(tile for tile in MOSAIC_TILES + AMPERE_TILES
                      if depth % tile.block_k == 0 and width % tile.block_n == 0)
 
     @staticmethod

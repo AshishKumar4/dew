@@ -17,7 +17,7 @@ from reference_error import assert_as_exact, assert_as_exact_as_the_reference, e
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
 from dew.nn.kernels.templates import cost
-from dew.nn.kernels.templates.gemm import mosaic_gpu
+from dew.nn.kernels.templates.gemm import mosaic_gpu, template
 from dew.nn.moe import expert_projection
 from tools import grouped_oracle as oracle
 
@@ -395,6 +395,30 @@ def test_a_tile_of_192_columns_stages_every_column_it_writes():
                              jnp.asarray(sizes, jnp.int32), tiles=tiles, transpose_rhs=False,
                              out_dtype=jnp.bfloat16, multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
         check(got, reference[0], truth[0], group, f"forward {tiles}")
+
+
+@pytest.mark.parametrize("sizes", [name for name in SIZES if any(SIZES[name])])
+def test_an_ampere_gpu_runs_the_mosaic_forward_only_by_name(sizes):
+    """Without warpgroup MMA the Mosaic GPU forward runs mma.sync's tiles (`AMPERE_TILES`) only where the
+    call names it: chosen, it is as exact as XLA's ragged dot from float64, unrouted rows and empty groups
+    included; unchosen, Triton's launch runs it."""
+    x, w, dy, group = operands(SIZES[sizes], jnp.bfloat16)
+    truth = oracle.products(x, w, dy, SIZES[sizes])
+    reference = xla_products(x, w, dy, SIZES[sizes], jnp.bfloat16, jnp.float32)
+    group_sizes = jnp.asarray(SIZES[sizes], jnp.int32)
+
+    def forward(x, w):
+        # The default precision: the suite's highest asks each step's sum apart, which mma.sync's tiles do
+        # not add.
+        return template.gemm(x, w, group_sizes, out_dtype=jnp.float32, precision="default",
+                             interpret_on_cpu=True)
+
+    for named, kernel in ((None, "triton"), ("mosaic_gpu", "mosaic_gpu")):
+        with (generation.assumed("sm80"), generation.chosen(grouped_matmul=named),
+              generation.routes() as routes):
+            got = jax.jit(forward)(jnp.asarray(x, jnp.bfloat16), jnp.asarray(w, jnp.bfloat16))
+        assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {kernel}
+        check(got, reference[0], truth[0], group, f"sm80 forward through {kernel}")
 
 
 def test_the_cost_model_names_a_fact_its_target_lacks():
