@@ -134,10 +134,12 @@ class LMRunConfig(RunConfig):
             else:
                 source = source.adapt(self.lora, key=self.trainer.key)
                 model, variables = source.model, source.variables
+        # A source, adapted or not, is what the objective binds, so its end-of-sequence ids reach the task.
+        bound = model if source is None else source
         if kind == "masked_diffusion":
-            objective = self.masked_objective(model, fields, variables)
+            objective = self.masked_objective(bound, fields, variables)
         elif kind == "block_diffusion":
-            objective = self.block_objective(model, variables)
+            objective = self.block_objective(model, bound, variables)
         else:
             objective = self.objective.build(
                 model=model if source is None else source, seq_len=tokens.seq_len, variables=variables,
@@ -239,7 +241,7 @@ class LMRunConfig(RunConfig):
                                     seq_len=self.tokens().seq_len + 1, decode=decode, variables=variables,
                                     processor=self.processor())
 
-    def block_objective(self, model, variables):
+    def block_objective(self, model, bound, variables):
         """Each complete token-window row split into the clean prompt the run
         names (`--objective.prompt-length`) and response canvases."""
         from dew.nn.protocols import BlockDenoiser
@@ -254,7 +256,7 @@ class LMRunConfig(RunConfig):
         response = self.tokens().seq_len + 1 - prompt
         if width < 1 or response < width or response % width:
             raise ValueError("seq_len + 1 must equal prompt_length plus whole training canvases")
-        return self.objective.build(model=model, num_canvases=response // width, variables=variables,
+        return self.objective.build(model=bound, num_canvases=response // width, variables=variables,
                                     processor=self.processor())
 
 

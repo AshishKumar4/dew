@@ -1567,7 +1567,7 @@ class Ending(Protocol):
     def eos_token_ids(self) -> tuple[int, ...]: ...
 
 
-def ended(source: object, eos_token_ids: Sequence[int] | Omitted) -> tuple[int, ...]:
+def ended(source: nn.Module | Source, eos_token_ids: Sequence[int] | Omitted) -> tuple[int, ...]:
     """The end-of-sequence ids a task over `source` stops at: `eos_token_ids` where given, else a
     loaded source's own (`Ending`), else none, as a bare model names none."""
     if eos_token_ids is not OMITTED:

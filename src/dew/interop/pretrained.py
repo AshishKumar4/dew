@@ -279,6 +279,10 @@ class Pretrained:
         budget = budget if isinstance(budget, int) else None
         pad = declaration.get('pad_token_id')
         pad = pad if isinstance(pad, int) else None
+        # A diffusion run's end-of-sequence ids (`BlockSettings`, `MaskedSettings`); a causal run's ride in
+        # its sampling policy.
+        eos = declaration.get('eos_token_ids')
+        eos = tuple(eos) if isinstance(eos, list) else ()
         tokenizer = declaration.get('tokenizer')
         tokenizer = None if tokenizer is None else text(tokenizer, 'tokenizer')
         # A run over a source's own processor records its source, and the bundle writes its files.
@@ -288,7 +292,7 @@ class Pretrained:
         if trained is CausalTransformer:
             decoder = from_record(CausalTransformer, model)
             masked = objectives[kind] is objectives['masked_diffusion']
-            generation = (masked_generation_config(budget, pad) if masked else
+            generation = (masked_generation_config(budget, pad, eos) if masked else
                           None if not isinstance(sampling, dict) else
                           generation_config_of(Sampling(**sampling), budget))
             bundle = replace(PretrainedDecoder.from_model(decoder, variables, tokenizer=tokenizer,
@@ -305,7 +309,7 @@ class Pretrained:
             published = diffusion_gemma.published_config(block)
             process = from_record(BlockProcess, record(declaration['process'], 'process'), dtypes=False)
             generation = diffusion_gemma.generation_config_of(process, max_new_tokens=budget,
-                                                              pad_token_id=pad)
+                                                              pad_token_id=pad, eos_token_ids=eos)
             bundle = PretrainedBlockDecoder(
                 block, variables, processor, published, None, model_config.fields, generation,
                 export_adapter=diffusion_gemma.export_weights, tokenizer=tokenizer)
