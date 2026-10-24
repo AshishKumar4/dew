@@ -145,6 +145,7 @@ def apg_seeds(destination: Path) -> None:
     """Every APG case over the seeds check 1 draws (`record_case`): each seed's initial state, the
     published guider's float32 walk from it and its float64 one, the count planned on Dew's own walk
     (tests/diffusion_support.py's `apg_walked`)."""
+    sys.path.insert(0, str(FIXTURE.parents[1]))
     from diffusion_support import apg_walked
     from recorded_references import provenance, record_case, save
 
