@@ -13,8 +13,8 @@ import jax
 import numpy as np
 
 from dew._hashing import array_fingerprint
+from dew.batch import Variables
 from dew.inference.rollouts import Draw
-from dew.objectives.base import Variables
 
 from .episodes import Episode, EpisodeId
 from .records import draw_record, episode_from_record, record_json

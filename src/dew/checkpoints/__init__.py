@@ -1,7 +1,7 @@
 """Save and restore a run's training state and data position with Orbax.
 
 A checkpoint holds every train-state field `TrainState` marks checkpointed
-(`dew.training.state.CHECKPOINTED`): the clocks, the variables, the optimizer
+(`dew.state.CHECKPOINTED`): the clocks, the variables, the optimizer
 state, the EMA, the key, the loss scaler and a partial accumulation window,
 and, when the data iterator can report one, `position`. The narrow compute
 copies derive from the variables and are rebuilt on resume. A position
@@ -69,13 +69,13 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy as preserva
 
 from dew import position, records
 from dew._hashing import fmix32
+from dew.batch import PARAMETER_ROOTS, Variables
 from dew.cleanup import attempted
 from dew.coordination import broadcast_from_process_zero, from_every_process, seen_by_every_process
 from dew.files import write_atomically
+from dew.mesh import LogicalAxes
 from dew.nn import sharding
 from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import LogicalAxes
-from dew.objectives.base import PARAMETER_ROOTS, Variables
 from dew.records import JSON, duration, json_value
 from dew.telemetry.profile import region
 
@@ -84,7 +84,7 @@ if TYPE_CHECKING:
     from flax.training.dynamic_scale import DynamicScale
 
     from dew.data.dataset import DataPartition
-    from dew.training.state import Accumulation, TrainState
+    from dew.state import Accumulation, TrainState
 
 # One field of the train state as a checkpoint holds it: a scalar array, a
 # tree of arrays, or one of the records the state carries beside them. The
@@ -749,7 +749,7 @@ def _check_template(template, metadata, stored, *, mapping: bool) -> None:
     if mapping:
         raise ValueError("the checkpoint holds a mapping saved in place of a train state; restore it "
                          "through a mapping template, or with none")
-    from dew.training.state import CHECKPOINTED
+    from dew.state import CHECKPOINTED
     missing = set(CHECKPOINTED).difference(stored)
     if missing:
         raise ValueError(f"training checkpoint lacks required state fields {sorted(missing)}")
@@ -815,7 +815,7 @@ def _filled(template, restored: dict, step: int):
     if (not isinstance(template.window_size, jax.ShapeDtypeStruct)
             and int(restored["window_size"]) != int(template.window_size)):
         raise ValueError("checkpoint accumulation window_size differs from this run")
-    from dew.training.state import CHECKPOINTED
+    from dew.state import CHECKPOINTED
     # A field no checkpoint holds (the narrow copies) starts over: the
     # template's are of its own parameters, not the restored ones.
     return template.replace(**restored, **{field.name: field.default for field in dataclasses.fields(template)
@@ -1256,7 +1256,7 @@ class Checkpoints:
             state_tree, frozen = self._frozen(self._item(state, saved, share))
             state_tree, deltas = _with_ema_deltas(state_tree)
             if weights_only:
-                from dew.training.state import MODEL_STATE
+                from dew.state import MODEL_STATE
                 state_tree = {name: state_tree[name] for name in MODEL_STATE}
         profile_metadata = None if profiles is None else {
             'updates': int(profiles.updates), 'stds': [float(std) for std in np.asarray(profiles.stds)]}
@@ -1528,7 +1528,7 @@ class Checkpoints:
     @staticmethod
     def _item(state: TrainState, saved: bytes | None,
               share: DataPartition | None) -> dict[str, StateLeaf]:
-        from dew.training.state import CHECKPOINTED
+        from dew.state import CHECKPOINTED
         state_tree = {name: getattr(state, name) for name in CHECKPOINTED}
         if saved is not None:
             if share is None:
@@ -1578,8 +1578,8 @@ class Checkpoints:
         The subtrees at `unread`'s paths are neither placed nor read
         (`dew.objectives.base.UNREAD`).
         """
+        from dew.batch import FROZEN, without
         from dew.inference.banks import banked_placement, placed_rows, shape_rows, spread
-        from dew.objectives.base import FROZEN, without
         from dew.training.distributed import (
             Layout as DefaultLayout,
             MeshSpec as DefaultMesh,
@@ -1622,7 +1622,7 @@ class Checkpoints:
         given, the rest in their stored dtypes. Every load of a run's variables restores through it: a
         whole run's onto its layout (`variables`) and a bank's rows onto theirs
         (`dew.inference.banks.CheckpointBanks`)."""
-        from dew.objectives.base import merge
+        from dew.batch import merge
         from dew.registry import resolve_dtype
 
         target = resolve_dtype(param_dtype)
@@ -1669,7 +1669,7 @@ class Checkpoints:
 
     def accumulation_template(self, step: int):
         """Return the persisted pending-array shapes, without reading their values."""
-        from dew.training.state import CHECKPOINTED, Accumulation
+        from dew.state import CHECKPOINTED, Accumulation
         metadata = _item_metadata(self._step_metadata(step, local=step == self._local_latest()))
         missing = set(CHECKPOINTED).difference(metadata.keys())
         if missing:
@@ -1747,7 +1747,7 @@ class Checkpoints:
                     lambda path, leaf: _from_delta_planes(leaf, weights[path])
                     if path in deltas else leaf, restored['ema'])
         else:
-            from dew.training.state import CHECKPOINTED
+            from dew.state import CHECKPOINTED
             state_tree = {name: getattr(template, name) for name in CHECKPOINTED} \
                 if not isinstance(template, Mapping) else dict(template)
             held = _held_apart(state_tree, frozen)

@@ -27,7 +27,7 @@ _log = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
-    from dew.data.dataset import Batch
+    from dew.batch import Batch
 
 
 def _canonical(value: JSON | Mapping[str, object]) -> bytes:

@@ -11,8 +11,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.batch import VALID_ROWS, Batch
 from dew.data.dataset import rows_of
-from dew.objectives.base import VALID_ROWS, Batch, Objective
+from dew.objectives.base import Objective
 
 TRAINING_FLOPS = "__dew_training_flops"
 TOKENS = "__dew_real_tokens"

@@ -27,8 +27,9 @@ from flax import linen as nn
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference
 from rl_support import clipped_surrogate, token_mean
 
+from dew.batch import part
 from dew.data.dataset import Loader
-from dew.objectives.base import Ratio, Step, part
+from dew.objectives.base import Ratio, Step
 from dew.objectives.rl import EpisodeCollector, EpisodeStatus, PPOObjective, PPORollout, ValueHead
 from dew.objectives.rl.ppo import OLD_VALUES_KEY, RETURNS_KEY
 from dew.objectives.rl.sessions import BEHAVIOR_LOG_PROBS_KEY, OLD_LOG_PROBS_KEY

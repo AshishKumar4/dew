@@ -30,6 +30,7 @@ import numpy as np
 from flax.typing import Dtype
 
 from dew import records
+from dew.batch import Variables
 from dew.interop.components import bind_component, component_source
 from dew.nn.activations import activation
 from dew.nn.attention import LayerNorm, projected_heads, projected_output, scaled_dot_product_attention
@@ -38,7 +39,6 @@ from dew.nn.blocks import IMAGENET_MEAN, IMAGENET_STD, torch_bicubic_resize
 from dew.nn.dense import Dense
 from dew.nn.mlp import GatedMLP
 from dew.nn.precision import float32_dot_general
-from dew.objectives.base import Variables
 
 from ..conv import Conv
 from .api import LatentNormalization, ModuleAutoEncoder, RecordValue, published_source

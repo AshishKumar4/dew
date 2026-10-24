@@ -36,8 +36,8 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.batch import real_places, valid_order
 from dew.nn.dense import Dense
-from dew.nn.inputs import real_places, valid_order
 
 from .precision import at_least_fp32, float32_dot_general, rms_statistics
 from .sharding import logical_axes

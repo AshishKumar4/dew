@@ -126,13 +126,14 @@ from typing import ClassVar, Protocol
 import jax
 import numpy as np
 
+from dew.batch import Batch, Variables
 from dew.coordination import agreed
-from dew.data.dataset import Batch, DataPartition, Loader, tapped
+from dew.data.dataset import DataPartition, Loader, tapped
 from dew.nn.inputs import local_rows, mesh_of
-from dew.objectives.base import Shown, Variables
+from dew.objectives.base import Shown
 from dew.sampling.text import Sampling
+from dew.state import TrainState
 from dew.training.distributed import first_reader_batch, shard_batch
-from dew.training.state import TrainState
 
 from ..lm import TokenScorer
 from .episodes import EnvironmentFactory, EpisodeCollector, EpisodeInference, EpisodeRecorder, Verifier

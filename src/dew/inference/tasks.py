@@ -27,6 +27,7 @@ from flax.core import freeze
 from jax.sharding import NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike, DTypeLike
 
+from dew.batch import PARAMETER_ROOTS, Variables, thaw
 from dew.cache import persist_compilations
 from dew.coordination import agreed
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
@@ -35,7 +36,7 @@ from dew.inference.projections import packed_owned
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key
 from dew.nn.protocols import Bounded, CacheCapacity, TokenModel
-from dew.objectives.base import PARAMETER_ROOTS, UNREAD, Objective, Variables, thaw
+from dew.objectives.base import UNREAD, Objective
 from dew.records import integer, record as named_fields, text as named
 from dew.sampling import decoding, vocabulary
 from dew.sampling.decoding import LogitsTransform, Stopping, id_row
@@ -120,7 +121,7 @@ def prepared_inputs(processor: Processor | None, request: Request, *, images: Me
         rows = [row for row in request if not isinstance(row, str)]
         if len(rows) != len(request):
             raise ValueError("a request cannot mix text prompts and numeric token rows")
-        # ModelInputs reads the rows by `dew.nn.inputs.token_id`'s law.
+        # ModelInputs reads the rows by `dew.batch.token_id`'s law.
         return ModelInputs.from_value(rows)
     # A resident array stays where it is; a global one cannot be fetched.
     return ModelInputs.from_value(request)
@@ -490,7 +491,7 @@ class _NativeTextTask:
     processor: Processor | None
 
     def __post_init__(self) -> None:
-        # A tree split for training, an adapter's or `dew.objectives.base.freeze`'s,
+        # A tree split for training, an adapter's or `dew.batch.freeze`'s,
         # is read whole; a frozen dataclass's field is written through `object.__setattr__`.
         object.__setattr__(self, "variables", freeze(dict(thaw(self.variables))))
 

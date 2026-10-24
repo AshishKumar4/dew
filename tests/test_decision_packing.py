@@ -15,6 +15,7 @@ from decision_support import decision_rows
 from recording import RecordingTracker
 from reference_error import assert_as_exact
 
+from dew.batch import VALID_ROWS
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import (
@@ -34,7 +35,7 @@ from dew.decision.objective import _ALONG_THE_QUESTIONS
 from dew.decision.task import laid_out
 from dew.interop import Pretrained
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import VALID_ROWS, Step
+from dew.objectives.base import Step
 from dew.training.trainer import Trainer
 
 QWEN35 = Path(__file__).parent / "fixtures" / "hf" / "qwen35-tiny"

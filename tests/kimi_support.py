@@ -20,9 +20,10 @@ from reference_error import (
 from residual_orders import permuted
 from scipy.special import log_softmax
 
+from dew.batch import Variables
 from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import Step, Variables
+from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling, generate
 

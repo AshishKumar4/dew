@@ -23,12 +23,13 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from dew.batch import Batch, Variables
 from dew.nn.attention import l2_normalized
 from dew.nn.blocks import IMAGENET_MEAN, IMAGENET_STD, torch_bicubic_resize
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
 from dew.nn.precision import at_least_fp32
-from dew.objectives.base import Batch, Objective, Variables
+from dew.objectives.base import Objective
 
 ALIGNMENT = "alignment_projector"
 """The projector's key in `params`, beside the model's own modules."""

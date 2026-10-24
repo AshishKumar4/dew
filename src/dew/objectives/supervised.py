@@ -25,10 +25,11 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from dew.batch import FROZEN, Batch, Variables
 from dew.inputs import InputSpec
 from dew.nn import categorical
 from dew.nn.protocols import Lacks
-from dew.objectives.base import FROZEN, Aux, Batch, Objective, Ratio, Source, Step, Variables, model_rngs
+from dew.objectives.base import Aux, Objective, Ratio, Source, Step, model_rngs
 
 type Outputs = jax.Array | tuple[Outputs, ...] | list[Outputs] | Mapping[str, Outputs]
 """What a model returns: an array, or a tree of them."""

@@ -25,9 +25,9 @@ import numpy as np
 from flax.typing import Dtype
 
 from dew import records
+from dew.batch import Variables
 from dew.interop.components import bind_component
 from dew.interop.weights import indexed_path
-from dew.objectives.base import Variables
 
 from ..activations import silu
 from .api import LatentNormalization, ModuleAutoEncoder, published_source

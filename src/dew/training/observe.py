@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 from dew.coordination import agree_process_phase, agreed, agreed_same, collective_host
 
 if TYPE_CHECKING:
-    from dew.training.state import TrainState
+    from dew.state import TrainState
 
 
 @dataclasses.dataclass

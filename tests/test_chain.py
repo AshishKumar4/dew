@@ -25,10 +25,10 @@ from episode_support import GROUPS, PROMPT, RESPONSE, SAMPLING, TURNS, Harness, 
 from flax import linen as nn
 from rl_support import TinyHead
 
+from dew.batch import part
 from dew.data import Memory, presets
 from dew.data.sources.files import Files
 from dew.data.text import tokenizer_for
-from dew.objectives.base import part
 from dew.objectives.distillation import TEACHER
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import ValueHead

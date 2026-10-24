@@ -137,6 +137,6 @@ pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell")
 pipe.load_lora_weights("flux-adapter")
 ```
 
-A loss head that the objective adds (`uncertainty`, `alignment`, `end_to_end`) trains alongside the factors. To train part of a denoiser without an adapter, split its starting variables with `dew.objectives.base.freeze(variables, filter)` and pass them as `variables=`. The leaves the filter keeps are trained and the rest stay frozen.
+A loss head that the objective adds (`uncertainty`, `alignment`, `end_to_end`) trains alongside the factors. To train part of a denoiser without an adapter, split its starting variables with `dew.batch.freeze(variables, filter)` and pass them as `variables=`. The leaves the filter keeps are trained and the rest stay frozen.
 
 [Recipes](../recipes.md) runs diffusion training on real datasets from the command line. [Supported models](../models.md) lists the published diffusion checkpoints that load.

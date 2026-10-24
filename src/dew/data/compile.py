@@ -23,6 +23,7 @@ from typing import ClassVar, Literal, Protocol, runtime_checkable
 import grain.python as pygrain
 import numpy as np
 
+from dew.batch import Batch
 from dew.data.analysis import (
     Measuring,
     _analyzed,
@@ -48,7 +49,6 @@ from dew.data.analysis import (
     _written,
 )
 from dew.data.dataset import (
-    Batch,
     Closeable,
     DataPartition,
     GlobalReader,

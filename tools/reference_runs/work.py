@@ -20,8 +20,9 @@ from pathlib import Path
 import numpy as np
 from flax import linen as nn
 
+from dew.batch import Batch
 from dew.nn.flops import MissingFlopsCount
-from dew.objectives.base import Batch, Objective
+from dew.objectives.base import Objective
 from dew.registry import to_record
 from dew.telemetry.workload import WorkloadWork
 

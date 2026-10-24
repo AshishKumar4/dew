@@ -22,8 +22,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.batch import Variables
 from dew.coordination import stop_at_exit
-from dew.objectives.base import Variables
 
 
 class Timed[T](Future[T]):

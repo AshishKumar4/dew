@@ -51,7 +51,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from dew.objectives.base import Variables
+from dew.batch import Variables
 
 from .common import (
     ProjectorBase as ProjectorBase,

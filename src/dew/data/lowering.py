@@ -30,6 +30,7 @@ import grain.experimental as gx
 import grain.python as pygrain
 import numpy as np
 
+from dew.batch import Batch
 from dew.data.analysis import (
     _LOCAL,
     _VIEWS,
@@ -52,7 +53,6 @@ from dew.data.cache import _Mapped
 from dew.data.concurrent import Concurrently
 from dew.data.dataset import (
     SHARED_BYTES,
-    Batch,
     DataPartition,
     FilledBatch,
     Loading,

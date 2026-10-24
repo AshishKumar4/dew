@@ -17,17 +17,17 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import records
 from dew._model_types import SANDWICH_NORMS
+from dew.batch import Variables, coordinates
 from dew.interop.weights import native_layouts, placed
 from dew.nn.attention import RMSNorm
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.blocks import table_rows
 from dew.nn.dense import Dense
-from dew.nn.inputs import AttentionMetadata, coordinates
+from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mlp import GatedMLP
 from dew.nn.precision import float32_dot_general
-from dew.objectives.base import Variables
 from dew.registry import Record
 
 from .common import (

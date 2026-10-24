@@ -88,7 +88,8 @@ import jax
 import optax
 
 from dew import Objective
-from dew.objectives.base import EMASpec, under
+from dew.batch import under
+from dew.objectives.base import EMASpec
 
 
 class Players(Objective):

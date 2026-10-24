@@ -36,8 +36,8 @@ from dew.records import JSON, json_value, record
 from dew.telemetry.instrumentation import StepFlops, step_flops
 
 if TYPE_CHECKING:
-    from dew.objectives.base import Batch
-    from dew.training.state import TrainState
+    from dew.batch import Batch
+    from dew.state import TrainState
     from dew.training.trainer import StepFn
 
 

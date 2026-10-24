@@ -32,7 +32,7 @@ The Dew seams referred to throughout:
 Correction, 2026-09-22: the seams table and several items in the synthesis describe Dew on 2026-09-02. Checked against the current source:
 
 - `OPTIMIZER_MAP` has `muon` and `muonclip` entries beside `adam`, `adamw` and `lamb` (`src/dew/optim.py:306-312`). The only named schedule is still warmup-cosine (`src/dew/optim.py:321`); there is no `wsd` literal.
-- The mesh has six named axes: `data`, `expert`, `fsdp`, `tensor`, `sequence` and `stage` (`src/dew/nn/sharding.py:43-48`), so it is no longer the two-axis `(data, fsdp)` mesh this note describes.
+- The mesh has six named axes: `data`, `expert`, `fsdp`, `tensor`, `sequence` and `stage` (`src/dew/mesh.py:17-22`), so it is no longer the two-axis `(data, fsdp)` mesh this note describes.
 - Dew has MoE (`src/dew/nn/moe.py`), with DeepSeek's aux-loss-free `e_score_correction_bias` kept in fp32 (`src/dew/nn/moe.py:150,233`).
 - `CausalTransformer` has an `output_gate` field (`src/dew/nn/backbones/causal_transformer.py:1409`), YaRN scaling (`src/dew/nn/backbones/causal_transformer.py:85`) and an `MTPBlock` (`src/dew/nn/backbones/causal_transformer.py:782`).
 - Dew has its own masked and block discrete-diffusion objectives (`src/dew/objectives/diffusion/masked.py:47`; `src/dew/objectives/diffusion/block.py:124`), so item 7's "what it lacks is the discrete/text side" describes the older source.

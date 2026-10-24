@@ -18,13 +18,14 @@ from jax.typing import ArrayLike, DTypeLike
 from typing_extensions import TypeVar
 
 from dew.artifacts import uint8_pixels
+from dew.batch import Variables, thaw
 from dew.coordination import agreed
 from dew.diffusion.process import Conditioning, Denoiser, Process
 from dew.inputs import InputSpec, encode_conditions, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, local_rows, mesh_of, request_key
 from dew.nn.kernels.options import compiler_options
-from dew.objectives.base import OMITTED, Omitted, Variables, thaw
+from dew.objectives.base import OMITTED, Omitted
 from dew.records import JSON
 from dew.registry import dtype_name, resolve_dtype
 from dew.sampling.guidance import CFG, Guidance, guidance_modules
@@ -708,7 +709,7 @@ def _parameter_roots(inputs: Mapping[str, object], autoencoder: Mapping[str, obj
     """The parameter roots of a recorded run's tree, which a storage override
     casts: the denoiser's, each condition encoder's own collections and the
     autoencoder's. The rest keep the dtypes they were saved in."""
-    from dew.objectives.base import PARAMETER_ROOTS
+    from dew.batch import PARAMETER_ROOTS
     from dew.records import record, text
     from dew.registry import encoders
 

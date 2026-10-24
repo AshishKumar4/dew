@@ -16,7 +16,8 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 from array_record.python.array_record_module import ArrayRecordWriter
 
-from dew.data.dataset import Batch, Closeable
+from dew.batch import Batch
+from dew.data.dataset import Closeable
 from dew.data.sources.base import Source
 from dew.data.sources.codec import encode
 from dew.data.sources.files import _arrow_filesystem
