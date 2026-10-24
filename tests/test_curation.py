@@ -138,6 +138,41 @@ def test_a_corpus_sealed_without_its_near_duplicates_keeps_one_record_of_each_gr
     assert manifest["metadata"]["near_duplicates"]["removed"] == len(pages) - len(PROSE)
 
 
+def test_deduplicating_snapshots_sealed_at_once_each_keep_what_one_alone_keeps(tmp_path):
+    """Four corpora of pages of very different lengths sealed without their near-duplicates at once, on
+    four threads: each keeps what it keeps sealed alone, as the signatures' word tokenizer, which sets
+    its length bound per text, takes its turn with the other curations."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def corpus(scale):
+        pages = [" ".join([page] * scale) for page in (*PROSE, PROSE[0])]
+        records = [{"id": index, "text": page} for index, page in enumerate(pages)]
+        return Memory(records, shard_rows=len(pages))
+
+    def sealed(scale, root):
+        Pipeline(corpus(scale)).snapshot(str(root / f"sealed-{scale}"), deduplicate=text.NearDuplicates())
+        stored = Files(str(root / f"sealed-{scale}")).records("indexed")
+        return [int(stored[index]["id"]) for index in range(len(stored))]
+
+    scales = (1, 40, 3, 400)
+    alone = [sealed(scale, tmp_path / "alone") for scale in scales]
+    with ThreadPoolExecutor(len(scales)) as pool:
+        together = list(pool.map(lambda scale: sealed(scale, tmp_path / "together"), scales))
+    assert together == alone
+
+
+def test_a_classifier_pins_its_model_on_a_host_that_never_pinned_one(tmp_path, monkeypatch):
+    """A fresh host's temporary directory holds no pinned models yet: the first classifier step makes
+    the place it pins them, and its pinned copy is its model's bytes."""
+    import tempfile
+
+    model = tmp_path / "model.bin"
+    model.write_bytes(b"a model's bytes")
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "fresh"))
+    (tmp_path / "fresh").mkdir()
+    assert text.Classifier(str(model)).pinned.read_bytes() == model.read_bytes()
+
+
 def test_a_deduplicating_snapshot_of_a_pass_that_keeps_nothing_seals_nothing(tmp_path):
     """A chain whose filter rejects every page seals an empty snapshot, nothing removed."""
     rule = text.Quality("gopher", settings=(("min_doc_words", 10_000),))
