@@ -57,7 +57,7 @@ from dew.nn.kernels.templates import mosaic, mosaic_sm80, mosaic_sm90
 from dew.nn.kernels.templates.gemm import rows_padded
 
 FAMILY: mosaic.Family = mosaic_sm90.WGMMA
-"""Hopper's warpgroup MMA bundle, which `tgmm`'s kernels run on."""
+"""Hopper's warpgroup MMA bundle, a wgmma tile's (`family_of`)."""
 
 
 def family_of(tiles: "Tiles", dtype) -> mosaic.Family:
@@ -74,7 +74,7 @@ class Tiles:
     the multiprocessors of a cluster (`cluster`: 2 pair two row tiles of one group of `gmm`, which load
     their matrix block once between them, multicast), only for a cooperative tile; `tgmm` takes no pair;
     and the instruction family's bundle that runs it (`family`: Hopper's warpgroup MMA, or Ampere's
-    mma.sync, one warpgroup whose loads `emit_pipeline` issues, `gmm` only)."""
+    mma.sync, one warpgroup whose loads `emit_pipeline` issues, the plain product alone)."""
     block_m: int
     block_n: int
     block_k: int

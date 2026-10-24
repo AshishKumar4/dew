@@ -252,28 +252,41 @@ smaller block of an sm86 than an A100's, and a Hopper-class one with fewer multi
 block and another L2 bandwidth than an H100's."""
 
 
+@INTERPRETS
 @pytest.mark.parametrize("unseen", UNSEEN)
 def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
     """On a GPU no row measured, each Mosaic GPU launch's tiles are its family's, generated from the
-    family's facts and the call's extents, and fit the GPU's block; named there, the projection's forward
-    and both gradients through the tiles the cost model picks on the GPU's facts are as exact as XLA's
-    ragged dot from float64."""
+    family's facts and the call's extents, and fit the GPU's block; the cost model picks among them on
+    the GPU's own facts (at a Qwen3 MoE projection's extents, not every pick the same GPU family's
+    canonical device picks), and the call takes those picks. Named there, the projection's forward and
+    both gradients through them are as exact as XLA's ragged dot from float64."""
     target = UNSEEN[unseen]
-    sizes = SIZES["ragged"]
-    group_sizes = jnp.asarray(sizes, jnp.int32)
-    x, w, dy, _ = (jnp.asarray(value, jnp.bfloat16) for value in operands(sizes, jnp.bfloat16))
+    canonical = generation.TARGETS[target.generation]
     family = "wgmma" if target.wgmma else "mma.sync"
-    calls = ((grouped_matmul.MosaicGmm(), (x, w, group_sizes), {"trans_rhs": False}),
-             (grouped_matmul.MosaicGmm(), (dy, w, group_sizes), {"trans_rhs": True}),
-             (grouped_matmul.MosaicTgmm(), (x, dy, group_sizes), {}))
+
+    def calls(rows, depth, width, groups):
+        def bf16(shape):
+            return jax.ShapeDtypeStruct(shape, jnp.bfloat16)
+        x, w, dy = bf16((rows, depth)), bf16((groups, depth, width)), bf16((rows, width))
+        sizes = jax.ShapeDtypeStruct((groups,), jnp.int32)
+        return ((grouped_matmul.MosaicGmm(), (x, w, sizes), {"trans_rhs": False}),
+                (grouped_matmul.MosaicGmm(), (dy, w, sizes), {"trans_rhs": True}),
+                (grouped_matmul.MosaicTgmm(), (x, dy, sizes), {}))
+
+    picks = {}
     with generation.assumed(target):
-        for launch, args, options in calls:
+        for launch, args, options in calls(65536, 2048, 1536, 128):
             ba = launch.bind(*args, out_dtype="bfloat16", interpret=grouped_matmul.INTERPRETED, **options)
             fits = launch.fitting(ba, target)
             assert fits and {tile.family for tile in fits} == {family}
             budget = generation.shared_budget(target)
             assert all(launch.staged_bytes(ba, tile, target) <= budget for tile in fits)
-            assert launch.estimate(ba, target)[1] in fits
+            picks[type(launch).__name__, options.get("trans_rhs")] = (
+                launch.estimate(ba, target)[1], launch.estimate(ba, canonical)[1])
+    assert any(here != there for here, there in picks.values())
+
+    sizes = SIZES["ragged"]
+    group_sizes = jnp.asarray(sizes, jnp.int32)
 
     def draw(seed):
         return tuple(jnp.asarray(value, jnp.bfloat16) for value in operands(sizes, jnp.bfloat16, seed)[:3])
@@ -292,6 +305,8 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
         assert_as_exact(through_mosaic, jax.jit(with_gradients(projection())), draw,
                         f"unseen {unseen}", seeds=SEEDS, truth_fn=with_gradients(projection(jnp.float64)))
     assert {type(launch).__name__ for launch, _ in launches} == {"MosaicGmm", "MosaicTgmm"}
+    with generation.assumed(target):
+        assert all(ba.heuristics_config == launch.estimate(ba, target)[1] for launch, ba in launches)
 
 
 def test_the_kernels_forward_mode_keeps_the_projections_law():
