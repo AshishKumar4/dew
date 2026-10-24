@@ -23,9 +23,18 @@ class Wgmma(mosaic.RingFamily):
     name = "wgmma"
     rows = 64
     consumers = 2
-    layout = plgpu.Layout.WGMMA
-    row = plgpu.Layout.WGMMA.reduce(1)
-    column = plgpu.Layout.WGMMA.reduce(0)
+
+    @property
+    def layout(self):
+        return plgpu.Layout.WGMMA
+
+    @property
+    def row(self):
+        return plgpu.Layout.WGMMA.reduce(1)
+
+    @property
+    def column(self):
+        return plgpu.Layout.WGMMA.reduce(0)
 
     def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
         def scores(acc_ref):
@@ -107,27 +116,6 @@ class Wgmma(mosaic.RingFamily):
 
         return pl.run_scoped(run, *(plgpu.WGMMAAccumulatorRef(shape, jnp.float32) for shape in shapes))
 
-    def zeros(self, shape: tuple[int, ...]) -> jax.Array:
-        return self.full(shape, 0.0)
-
-    def full(self, shape: tuple[int, ...], value: float) -> jax.Array:
-        layout = self.layout if len(shape) == 2 else self.row
-        return plgpu.layout_cast(jnp.full(shape, value, jnp.float32), layout)
-
-    def iota(self, shape: tuple[int, int], dimension: int) -> jax.Array:
-        return plgpu.broadcasted_iota(jnp.int32, shape, dimension, layout=self.layout)
-
-    def rows_of(self, ref) -> jax.Array:
-        return plgpu.load(ref, layout=self.row, optimized=False)
-
-    def columns_of(self, ref) -> jax.Array:
-        return plgpu.load(ref, layout=self.column, optimized=False)
-
-    def tile_of(self, ref) -> jax.Array:
-        return plgpu.load(ref, layout=self.layout, optimized=False)
-
-    def as_row(self, vector: jax.Array) -> jax.Array:
-        return plgpu.layout_cast(vector, self.row)
 
 
 WGMMA = Wgmma()
