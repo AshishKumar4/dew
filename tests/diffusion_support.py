@@ -1,5 +1,8 @@
 """What the diffusion suites share: a sampler's step-by-step walk, a published source's one train step
-and its batch, and a student stepped once and saved as a run."""
+and its batch, a student stepped once and saved as a run, and a trainer's update held to its
+objective's gradient by check 1 (`moved_weights`, `applied`, `objective_gradient`)."""
+
+import math
 
 import jax
 import jax.numpy as jnp
@@ -200,6 +203,78 @@ def saved_after_one_step(config, batch, directory, rate: float, key: int = 3):
     checkpoints.wait()
     config.save(str(directory))
     return task, state, batch
+
+
+def moved_weights(variables):
+    """Check 1's `draw(seed)` over a trainer's `variables`: each trained leaf moved by the seed's draw,
+    so zero-initialized layers take a gradient too."""
+    host = jax.tree.map(np.asarray, variables)
+
+    def draw(seed):
+        keys = iter(jax.random.split(jax.random.key(seed), len(jax.tree.leaves(host["params"]))))
+
+        def moved_leaf(leaf):
+            return (leaf + 0.02 * np.asarray(jax.random.normal(next(keys), leaf.shape))).astype(leaf.dtype)
+
+        return ({**host, "params": jax.tree.map(moved_leaf, host["params"])},)
+
+    return draw
+
+
+def applied(before, after):
+    """sgd(1)'s update applied, in float64: the gradient with the update's float32 rounding."""
+    return np.asarray(before, np.float64) - np.asarray(after, np.float64)
+
+
+def objective_gradient(objective, variables, batch, step):
+    """`objective`'s gradient of its trained params over `batch` at `step`'s draws."""
+    def loss(params):
+        return objective.scalar_loss({**variables, "params": params}, batch, step)[0]
+
+    return jax.grad(loss)(variables["params"])
+
+
+def as_a_step(trainer, variables, micro, gradient):
+    """`gradient` jitted with the compiler options `trainer`'s step of a `micro` microbatch takes over
+    its mesh, its devices and row shards (`dew.training.memory.step_compiler_options`, as
+    `Trainer._planned` derives them), so a check of that step against it compiles both arms alike: on
+    a GPU the step keeps dots that share an input apart, where XLA's default merges them into one
+    GEMM, which rounds otherwise."""
+    from dew.nn.sharding import batch_axes
+    from dew.objectives.base import FROZEN
+    from dew.training.memory import device_tokens, step_compiler_options
+
+    mesh = trainer.device_mesh
+    shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
+    options = step_compiler_options(trainer.objective, device_tokens(trainer.objective, micro, shards),
+                                    FROZEN in variables, mesh.devices.size)
+    return jax.jit(gradient, compiler_options=options)
+
+
+def float32_update(gradient):
+    """The update a trainer's sgd(1) step is held to (`applied`): `gradient(variables)`, the objective's
+    own, applied in float32 as the trainer applies it."""
+    def update(variables):
+        grads = jax.tree.map(np.asarray, gradient(variables))
+        return jax.tree.map(lambda before, grad: applied(before, (before - grad).astype(np.float32)),
+                            variables["params"], grads)
+
+    return update
+
+
+def float64_gradient(twin, step):
+    """Check 1's truth of an sgd(1) update at `step`'s draws, `truth(variables, batch)`: `twin`'s
+    gradient, the objective over its model in float64, of the variables and the batch widened,
+    compiled once as each arm is."""
+    from reference_error import widened
+
+    wide = jax.jit(lambda variables, batch: objective_gradient(twin, variables, batch, step))
+
+    def truth(variables, batch):
+        with jax.enable_x64(new_val=True):
+            return jax.tree.map(np.asarray, wide(widened(variables), widened(batch)))
+
+    return truth
 
 
 class DeterministicObjective(Objective):
