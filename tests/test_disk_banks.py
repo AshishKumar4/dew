@@ -57,6 +57,22 @@ def test_a_composite_wrapper_streams_float64_layers_from_its_native_source(tmp_p
             assert source.stats().misses >= len(model.bank_sites[0].view.groups)
 
 
+def test_safetensors_banks_refuse_pickle_only_before_whole_model_conversion(tmp_path):
+    import torch
+    from safetensors.torch import load_file
+
+    from dew.inference.banks import SafetensorsBanks
+
+    original = Path(__file__).parent / "fixtures/hf/qwen38-dense-tiny"
+    shutil.copy2(original / "config.json", tmp_path / "config.json")
+    torch.save(load_file(original / "model.safetensors"), tmp_path / "pytorch_model.bin")
+    with pytest.raises(FileNotFoundError, match="safetensors"):
+        SafetensorsBanks(tmp_path)
+    shutil.copy2(original / "model.safetensors", tmp_path / "model.safetensors")
+    with SafetensorsBanks(tmp_path) as source:
+        assert source.stats().misses == 0
+
+
 def decoder(config, bank_layers):
     record = {**translate_config(config), "dtype": "float32", "attention_impl": "reference"}
     return models.build("causal_transformer", {**record, "scan_layers": True,
