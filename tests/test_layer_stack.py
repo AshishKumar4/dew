@@ -110,7 +110,7 @@ def gemma4_shaped(dtype=jnp.float32, **overrides):
         num_layers=12,
         layer_types=("sliding_attention",) * 5 + ("full_attention",)
         + ("sliding_attention",) * 5 + ("full_attention",),
-        kv_shared_layers=(8, 9, 10, 11), max_seq_len=16)
+        kv_shared_layers=(8, 9, 10, 11), max_seq_len=16, per_layer_input_dim=32)
     config.update(overrides)
     return models.build("causal_transformer", config, dtype=dtype, attention_impl="reference")
 
@@ -123,7 +123,7 @@ def gemma3n_shaped(dtype=jnp.float32, **overrides):
         num_layers=10,
         layer_types=("sliding_attention",) * 4 + ("full_attention",)
         + ("sliding_attention",) * 4 + ("full_attention",),
-        mlp_features=(48,) * 10, activation_sparsity_pattern=(0.95,) * 5 + (0.0,) * 5,
+        mlp_features=(192,) * 10, activation_sparsity_pattern=(0.95,) * 5 + (0.0,) * 5,
         kv_shared_layers=(8, 9), max_seq_len=16)
     config.update(overrides)
     return models.build("causal_transformer", config, dtype=dtype, attention_impl="reference")
