@@ -190,8 +190,9 @@ def _token_sum(shape: tuple[int, ...], dtype, count: int, tile: int) -> jax.Arra
     tiles of 3 tokens left a tiled head's bias gradient 2.16 times as far from float64 as the whole
     logits' and its head gradient 1.60 times, 0.50 paired, where 8 tiles of 64 left the head 0.63
     times unpaired (SF-a100-numerics-diag), and 43 tiles of a 128-token fp32 fused head left its scale
-    and bias 1.5 times. A default tile, 1024 or 4096 tokens, pairs nothing, where a pair's three
-    passes over a vocabulary tile's head gradient each token tile would cost an H100's step."""
+    and bias 1.5 times. A default tile, 1024 or 4096 tokens, pairs nothing: paired at an H100's four
+    1024-token tiles, a bf16 Qwen3-0.6B head at 4096 tokens took 51.0 ms against 27.9 unpaired (node
+    receipts SF-time-fix@h100, SF-time2-bf16@h100)."""
     tiles = -(-count // tile)
     return jnp.zeros((3, *shape), dtype) if tiles > tile else running_sum(shape, dtype)
 
@@ -602,8 +603,9 @@ def _state_product(d_raw, table, precision, work, width: int | None) -> jax.Arra
     """The state gradient `d_raw @ table` over the vocabulary: one product, or with `width` the sum of
     its column tiles' products as the tiled head sums them (`running_sum`). On an A100 an fp32 whole
     head's one product over 2053 columns sat 1.47 to 1.50 times as far from float64 as the tiled
-    head's, and its former 1024-column blocks, summed as a double-float pair, 2.0 times; a bf16 head
-    keeps one product, as exact as the tiled head's and faster (`chunked_tile`)."""
+    head's, and its former 1024-column blocks, summed as a double-float pair, 2.0 times; its column
+    tiles are those the tiled head walks by default (`chunked_tile`). A bf16 head keeps one product,
+    as exact as the tiled head's."""
     if width is None or table.shape[0] <= width:
         return float32_einsum('tv,vd->td', d_raw, table, precision=precision, preferred_element_type=work)
 
