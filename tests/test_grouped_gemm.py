@@ -16,7 +16,7 @@ from jax.sharding import Mesh
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference, equations, with_gradients
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
-from dew.nn.kernels.templates import cost
+from dew.nn.kernels.templates import cost, mosaic_sm80
 from dew.nn.kernels.templates.gemm import mosaic_gpu, template
 from dew.nn.moe import expert_projection
 from tools import grouped_oracle as oracle
@@ -467,11 +467,12 @@ def test_a_tile_of_192_columns_stages_every_column_it_writes():
         check(got, reference[0], truth[0], group, f"forward {tiles}")
 
 
-AMPERE_CLASS = jax.default_backend() == "cpu" or (jax.default_backend() == "gpu"
-                                                   and not generation.gpu_target().wgmma)
+AMPERE_CLASS = jax.default_backend() == "cpu" or (
+    jax.default_backend() == "gpu" and not generation.gpu_target().wgmma and mosaic_sm80.staging_solved())
 """Whether this process runs mma.sync's kernels: a CPU interprets them as an A100's; a GPU without warpgroup
-MMA (an A100, an A10, an L4) runs them on its own facts, where one with warpgroup MMA lowers them for its own
-device, whose pipelines its Mosaic sizes past its block (SM80-h100)."""
+MMA (an A100, an A10, an L4) runs them on its own facts where its JAX's layout inference places them
+(`mosaic_sm80.staging_solved`), where one with warpgroup MMA lowers them for its own device, whose pipelines
+its Mosaic sizes past its block (SM80-h100)."""
 
 
 def ampere(generation_name: str = "sm80"):
@@ -480,7 +481,7 @@ def ampere(generation_name: str = "sm80"):
     return generation.assumed(None if jax.default_backend() == "gpu" else generation_name)
 
 
-@pytest.mark.skipif(not AMPERE_CLASS, reason="a GPU with warpgroup MMA lowers mma.sync's kernels for itself")
+@pytest.mark.skipif(not AMPERE_CLASS, reason="no mma.sync kernel this GPU and JAX lower")
 @pytest.mark.parametrize("out_dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("sizes", [name for name in SIZES if any(SIZES[name])])
 def test_an_ampere_gpu_runs_the_mosaic_forward_only_by_name(sizes, out_dtype):
@@ -511,7 +512,7 @@ def test_an_ampere_gpu_runs_the_mosaic_forward_only_by_name(sizes, out_dtype):
         check(got, reference, truth[0], group, f"sm80 forward through {kernel} to {jnp.dtype(out_dtype)}")
 
 
-@pytest.mark.skipif(not AMPERE_CLASS, reason="a GPU with warpgroup MMA lowers mma.sync's kernels for itself")
+@pytest.mark.skipif(not AMPERE_CLASS, reason="no mma.sync kernel this GPU and JAX lower")
 def test_an_mma_sync_forward_of_no_depth_is_zero():
     """A product of no depth through mma.sync's tile, named on an Ampere GPU, is zero: its walk takes no
     step."""
