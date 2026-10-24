@@ -1,5 +1,6 @@
 #!/bin/sh
-# Builds dist/dew_flash_attn_cu<major>-<version>-py3-none-manylinux_2_28_x86_64.whl
+# Builds dist/dew_flash_attn_cu<major>-<version>-py3-none-manylinux_2_28_<machine>.whl,
+# the machine x86_64 or aarch64 as the build's is (the release workflow builds both),
 # with the CUDA toolkit on PATH (nvcc), cmake >= 3.24, ninja and a Python with
 # pip, on glibc 2.28 (the release workflow's nvidia/cuda rockylinux8 image).
 set -eu
@@ -10,6 +11,7 @@ FLASH_ATTN3_JAX_COMMIT=4af680283658f467ced12a0811894a672e8d87d1
 here=$(cd "$(dirname "$0")" && pwd)
 python=${PYTHON:-python3}
 major=$(nvcc --version | sed -n 's/.*release \([0-9]*\)\..*/\1/p')
+machine=$(uname -m)
 # patches/ holds Dew's changes to the two ports' kernels, applied once to a fresh checkout.
 if [ ! -d "$here/upstream" ]; then
   git clone --quiet "$FLASH_ATTN_JAX" "$here/upstream"
@@ -38,9 +40,9 @@ sed -i "s/dew-flash-attn-cuXX/dew-flash-attn-cu$major/" "$stage/pyproject.toml"
 "$python" -m pip install --quiet -r "$here/../../tools/pip.txt"
 "$python" -m pip wheel --quiet --no-deps --wheel-dir "$stage/wheel" "$stage"
 "$python" -m pip install --quiet "wheel>=0.43"
-"$python" -m wheel tags --remove --python-tag py3 --abi-tag none --platform-tag manylinux_2_28_x86_64 \
+"$python" -m wheel tags --remove --python-tag py3 --abi-tag none --platform-tag "manylinux_2_28_$machine" \
   "$stage"/wheel/*.whl
 mkdir -p "$here/dist"
-mv "$stage"/wheel/*manylinux_2_28_x86_64.whl "$here/dist/"
+mv "$stage"/wheel/*"manylinux_2_28_$machine.whl" "$here/dist/"
 rm -rf "$stage"
 ls -l "$here/dist"
