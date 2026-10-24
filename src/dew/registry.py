@@ -253,10 +253,8 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
         """
         member = self[name]
         given: Mapping[str, object] = {**record, **fields}
-        held = record_class(member)
         with _reading(given):
-            given = (_declared(held, given, dtypes=True) if held is not None
-                     else _arguments(member, given, dtypes=True))
+            given = _taken(member, given, dtypes=True)
         return member(**given)
 
     def from_record(self, record: Mapping[str, object]) -> Built:
@@ -784,16 +782,24 @@ def _member(name: str, held: tuple[type, ...]) -> Callable[..., Configured]:
     raise ValueError(f"{name!r} names {', '.join(map(repr, found))}, not one {wanted}")
 
 
-def _built(member: Callable[..., Configured], fields: Mapping[str, object], *, dtypes: bool) -> Configured:
-    """What `member` builds from a record of its fields: a dataclass's fields
-    as it declares them, a function's or another class's as its parameters."""
+def _taken(member: Callable[..., Configured], fields: Mapping[str, object], *,
+           dtypes: bool) -> Mapping[str, object]:
+    """A record's `fields` as `member` takes them: a dataclass's as it declares
+    them (`_declared`), a function's or another class's as its parameters
+    (`_arguments`)."""
     held = record_class(member)
-    if held is not None:
-        return _construct(held, fields, dtypes=dtypes)
-    built = member(**_arguments(member, fields, dtypes=dtypes))
+    return (_declared(held, fields, dtypes=dtypes) if held is not None
+            else _arguments(member, fields, dtypes=dtypes))
+
+
+def _built(member: Callable[..., Configured], fields: Mapping[str, object], *, dtypes: bool) -> Configured:
+    """What `member` builds from a record of its fields (`_taken`), checked as
+    a configured value (`configured`)."""
+    built = member(**_taken(member, fields, dtypes=dtypes))
     # A plain class of Dew's or a trusted package's is the value its record
     # describes (`to_record` writes it from its constructor's parameters).
-    return built if isinstance(member, type) and _owned(member, called=False) else configured(built)
+    plain = record_class(member) is None and isinstance(member, type) and _owned(member, called=False)
+    return built if plain else configured(built)
 
 
 def _key(annotation: Annotation, key: str) -> RecordKey:
@@ -1018,15 +1024,19 @@ def record_fields(value: DataclassInstance, owner: type) -> dict[str, JSON]:
 
     A field still holding its declared callable default, such as a Flax
     layer's initializer closure, is left out: no record can name a closure,
-    and the class supplies the same default again when the record is read."""
+    and the class supplies the same default again when the record is read.
+    A Flax module's `parent` is its binding, never recorded, and its `name`
+    is recorded where it was given one: a parent that keeps its submodules'
+    own names (`preserve_adopted_names`) finds its weights under them."""
     from flax import linen as nn
 
     fields = {}
     with recording():
         for field in dataclasses.fields(value):
             held = getattr(value, field.name)
-            if (_recorded(field) and not (isinstance(value, nn.Module) and field.name in ('parent', 'name'))
-                    and not (callable(held) and held is field.default)):
+            binding = isinstance(value, nn.Module) and (field.name == 'parent' or (field.name == 'name'
+                                                                                    and held is None))
+            if _recorded(field) and not binding and not (callable(held) and held is field.default):
                 fields[field.name] = to_record(held, declared_type(owner, field.name))
     return fields
 
@@ -1102,9 +1112,10 @@ def configured(value: object) -> Configured:
     raise ValueError(f"{value!r} is not a value a member field carries")
 
 
-DtypeName = Literal["float32", "bfloat16", "float16"]
+DtypeName = Literal["float32", "bfloat16", "float16", "float64"]
 _DTYPES: dict[DtypeName, DTypeLike] = {name: getattr(jnp, name) for name in get_args(DtypeName)}
-"""Each storage dtype a config names, by its name: `DtypeName`'s, the one declaration."""
+"""Each storage dtype a config names, by its name: `DtypeName`'s, the one declaration. float64 is
+a model's own dtype where it computes in float64 end to end (Dory, nGPT)."""
 
 
 def resolve_dtype(value: object) -> DTypeLike | None:
@@ -1145,7 +1156,7 @@ def dtype_name(value: DTypeLike | None) -> DtypeName | None:
 
 def storage_name(value: DTypeLike) -> DtypeName | None:
     """The name of the storage dtype `value` is (`DtypeName`), or None for any other dtype: a
-    checkpoint's float64 or integer tensors are not storage a config names."""
+    checkpoint's integer or float8 tensors are not storage a config names."""
     return next((name for name, dtype in _DTYPES.items() if jnp.dtype(value) == jnp.dtype(dtype)), None)
 
 
