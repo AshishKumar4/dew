@@ -57,18 +57,21 @@ def gpu_driver(root: Path, monkeypatch) -> None:
 
 
 def armada_task(ci, monkeypatch, out: Path, policy: str = "on") -> list[dict]:
-    """The 3.12 task the plan makes under DEW_TEST_CACHE=`policy`, run as armada starts it: .armada.json's
-    command filled from its plan entry, in .armada.json's environment, which the plan's DEW_TEST_CACHE is
-    not part of. Its rows."""
+    """The 3.12 tasks the plan makes under DEW_TEST_CACHE=`policy`, each run as armada starts it:
+    .armada.json's command filled from its plan entry, in .armada.json's environment, which the plan's
+    DEW_TEST_CACHE is not part of. Their rows, in the plan's order."""
     command = json.loads((ROOT / ".armada.json").read_text())["task"]["command"]
     monkeypatch.setenv("DEW_TEST_CACHE", policy)
-    [entry] = [entry for entry in ci.plan(300.0, {}) if entry["python"] == "3.12"]
-    values = {**entry, "out": out}
-    filled = [re.sub(r"\{(\w+)\}", lambda field: str(values[field[1]]), word) for word in command]
-    monkeypatch.setattr(sys, "argv", ["ci.py", *filled[2:]])
+    entries = [entry for entry in ci.plan(300.0, {}) if entry["python"] == "3.12"]
     monkeypatch.delenv("DEW_TEST_CACHE")
-    assert ci.main() == 0
-    return json.loads(out.read_text())["rows"]
+    rows = []
+    for entry in entries:
+        values = {**entry, "out": out}
+        filled = [re.sub(r"\{(\w+)\}", lambda field: str(values[field[1]]), word) for word in command]
+        monkeypatch.setattr(sys, "argv", ["ci.py", *filled[2:]])
+        assert ci.main() == 0
+        rows += json.loads(out.read_text())["rows"]
+    return rows
 
 
 def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(ci, tmp_path, monkeypatch):
