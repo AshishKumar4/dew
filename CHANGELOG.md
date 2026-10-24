@@ -5,6 +5,13 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A joint decision row's user turn is composed of segments, `JointLayout.segments`, a tuple of
+  `Text`, `Media`, `State` and `Schema` in the order the row writes them: the default is the Laya
+  joint release's turn, and another writes the schema before the state, or text of its own
+  between the parts. A run records its layout and head by import path through `dew.registry`,
+  so a layout or head of a package the run trusts reloads; a record of an earlier run, which
+  names its class alone, reloads as before. `dew.decision.HEADS`, the closed table of heads a
+  run could record, is removed.
 - `Decide.systemone` takes a list of request bodies and answers each as it
   would alone, their rows scored together, a refused body's `ValueError` in its
   place. `dew.inference.ScoringServer` serves a task answered by one forward

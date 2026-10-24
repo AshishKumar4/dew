@@ -712,7 +712,7 @@ class DecisionObjective(Objective[Ratio]):
 
         return DecideSettings(
             self.model.head.record(),
-            {"name": type(self.layout).__name__, "fields": to_record(self.layout, type(self.layout))},
+            to_record(self.layout, Layout),
             self.specials, recorded_tokenizer(RunProcessor(self.tokenizer)),
             # A decision task reads text through its own tokenizer, so only a media processor is kept.
             None if self.image_processor is None or self.image_processor.directory is None

@@ -11,7 +11,7 @@ given it as `[V, D]` rows.
 
 import functools
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import ClassVar, NamedTuple
 
 import jax
@@ -35,7 +35,7 @@ from dew.nn.mlp import GatedMLP
 from dew.nn.precision import at_least_fp32
 from dew.nn.scatter import DROPPED
 from dew.records import JSON
-from dew.registry import from_record, record_fields
+from dew.registry import from_record, import_path, imported, record_fields
 
 
 def _layer_norm(dtype: Dtype | None, name: str) -> nn.Module:
@@ -67,21 +67,26 @@ class Head(nn.Module):
                              "QuestionLayout or use a joint head")
 
     def record(self) -> JSON:
-        """Return the head's name and the fields a run records."""
+        """Return the head as a run records it: its class by import path and its fields but the
+        width, which the backbone it reads gives (`dew.registry`), so any head reloads, one of a
+        package the run trusts too."""
         fields = record_fields(self, type(self))
         del fields[self.width_field]
-        return {"name": type(self).__name__, "fields": fields}
+        return {"class": import_path(type(self)), "fields": fields}
 
     @staticmethod
     def from_record(record: JSON, width: int) -> "Head":
         """Rebuild the head a run recorded, reading states `width` wide, in the numerics it
-        recorded."""
+        recorded. A record of an earlier run names its head by class name alone, one of this
+        module's, and is read as that class's path."""
         held = records.record(record, "head")
-        name = records.text(held.get("name"), "head.name")
-        if name not in HEADS:
-            raise ValueError(f"a run's head is one of {sorted(HEADS)}, not {name!r}")
-        fields = {**records.record(held.get("fields"), "head.fields"), HEADS[name].width_field: width}
-        return from_record(HEADS[name], fields)
+        path = (records.text(held["class"], "head.class") if "class" in held
+                else f"{__name__}:{records.text(held.get('name'), 'head.name')}")
+        head = imported(path)
+        if not (isinstance(head, type) and issubclass(head, Head)):
+            raise ValueError(f"a run's head is a decision head (`Head`), not {path!r}")
+        fields = {**records.record(held.get("fields"), "head.fields"), head.width_field: width}
+        return from_record(head, fields)
 
 
 class DecisionHead(Head):
@@ -435,6 +440,3 @@ def decision_geometry(lengths, questions, options):
         raise ValueError("decision FLOPs need lengths, questions and options of the same [rows] shape")
     return geometry
 
-
-HEADS: Mapping[str, type[Head]] = {head.__name__: head for head in (DecisionHead, JointSchemaHead)}
-"""The heads a run may record, by name."""

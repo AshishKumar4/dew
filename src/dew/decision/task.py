@@ -43,7 +43,6 @@ from dew.decision.layout import (
     Layout,
     MarkerLayout,
     Specials,
-    StateFirstLayout,
     context_tokens,
     render,
 )
@@ -77,8 +76,6 @@ if TYPE_CHECKING:
 
 TASK_FILE = "decide.json"
 """The file `Decide.save` writes into a run: its calibration, budget and name."""
-_LAYOUTS: Mapping[str, type[Layout]] = {
-    layout.__name__: layout for layout in (MarkerLayout, StateFirstLayout, JointLayout)}
 
 
 @dataclass(frozen=True)
@@ -225,9 +222,12 @@ class Decide:
         # the backbone would where the caller overrides the compute dtype.
         model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype))
         laid = records.record(settings.layout, "layout")
+        if "name" in laid:
+            # An earlier run's record names its layout by class name alone, one of dew.decision.layout's.
+            laid = {"class": f"dew.decision.layout:{records.text(laid['name'], 'layout.name')}",
+                    "fields": records.json_value(laid.get("fields"), "layout.fields")}
         # A layout is plain data, its framing's template variables included: no field is a dtype.
-        rows = from_record(_LAYOUTS[records.text(laid["name"], "layout.name")],
-                           records.json_value(laid["fields"], "layout.fields"), dtypes=False)
+        rows = from_record(Layout, laid, dtypes=False)
         if settings.tokenizer is None:
             raise ValueError("the run records no tokenizer to lay its rows out with")
         processor = None if settings.processor is None else load_processor(settings.processor, backbone)

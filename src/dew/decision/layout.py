@@ -19,7 +19,7 @@ import dataclasses
 import functools
 import json
 import weakref
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Protocol, TypeGuard
 
@@ -547,33 +547,72 @@ JOINT_NOUL = {"true": "The proposition is true or the answer is yes.",
 
 
 @dataclass(frozen=True)
+class Text:
+    """Text a joint row writes as given, at its place in the user's turn. Text beside the turn's
+    markup, or beside other text, is read with it as one piece, as the turn writes it."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class Media:
+    """Where a joint row places a request's images, each as the backbone's processor writes one
+    (`Processor.image_text`) and expands it; a request without images places nothing here."""
+
+
+@dataclass(frozen=True)
+class State:
+    """The state, as compact JSON with sorted keys, its start kept: cut to the layout's
+    `max_state_tokens`, and to what the rest of the row leaves of its `max_len`."""
+
+
+@dataclass(frozen=True)
+class Schema:
+    """Every question of the request as a field of the schema, never cut: its id, type and
+    instructions, then each allowed option, each rendered as compact JSON with sorted keys,
+    `{"description": ..., "option_id": ...}`. The head pools each option's tokens and each
+    question's instructions'."""
+
+
+type Segment = Text | Media | State | Schema
+"""A part of a joint row's user turn (`JointLayout.segments`)."""
+
+JOINT_SEGMENTS: tuple[Segment, ...] = (Text("STATE:\n"), Media(), State(), Schema(), Text("\n"))
+"""The joint row's user turn as the Laya joint release lays it out: the state's heading, the
+images, the state, the schema, and a line break before the turn's end."""
+
+
+@dataclass(frozen=True)
 class JointLayout(Layout):
     """Every question of a request in one row, each option a span of its own.
 
-    The row is a chat prompt: the system prompt (`JOINT_SYSTEM`), the state,
-    then a schema of numbered fields, each with its id, type, instructions and allowed options,
-    and the opening of the assistant's turn. A request's images come before the
-    state, each as the backbone's processor writes one (`Processor.image_text`), and expanded by it.
-    Each option is rendered as compact
-    JSON with sorted keys, `{"description": ..., "option_id": ...}`, and the
-    head pools the tokens of each option and of each question's instructions.
-    A choice's options come in the order of their keys, and a noul's as true,
-    then false, with `JOINT_NOUL`'s descriptions where the question gives none. The
-    state is cut to `max_state_tokens`, and to what the schema leaves of
-    `max_len`; the schema itself is never cut, so a schema longer than
-    `max_len` leaves no state and a row that does not fit (`fits`). The row's
-    conversation markup is the backbone's own chat template's (`framing`).
+    The row is a chat prompt: the system prompt (`JOINT_SYSTEM`), then the user's turn, its
+    `segments` in order (`JOINT_SEGMENTS`: the state's heading, a request's images, the state,
+    then a schema of numbered fields, each with its id, type, instructions and allowed options),
+    and the opening of the assistant's turn. A layout of `segments` of its own writes the turn
+    otherwise: the schema first, or text of its own between the parts; it holds the schema once,
+    the state and the images at most once each. A choice's options come in the order of their
+    keys, and a noul's as true, then false, with `JOINT_NOUL`'s descriptions where the question
+    gives none. The state is cut to `max_state_tokens`, and to what the rest of the row leaves of
+    `max_len`; the schema itself is never cut, so a schema longer than `max_len` leaves no state
+    and a row that does not fit (`fits`). The row's conversation markup is the backbone's own chat
+    template's (`framing`).
     """
 
     max_len: int = 16384
     max_state_tokens: int | None = None
     framing: Framing = Framing()
+    segments: tuple[Segment, ...] = JOINT_SEGMENTS
     joint: ClassVar[bool] = True
 
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.max_state_tokens is not None:
             _least("max_state_tokens", self.max_state_tokens, 0)
+        kinds = [type(segment) for segment in self.segments]
+        if kinds.count(Schema) != 1 or kinds.count(State) > 1 or kinds.count(Media) > 1:
+            raise ValueError("a joint row's segments hold the schema once, and the state and the images "
+                             f"at most once each, not {[kind.__name__ for kind in kinds]}")
     images: ClassVar[bool] = True
 
     def state(self, encoder: Tokenizer, specials: Specials, state: JSON) -> tuple[int, ...]:
@@ -587,6 +626,61 @@ class JointLayout(Layout):
         def piece(text: str) -> list[int]:
             return list(_piece(same, text))
 
+        if media and not any(isinstance(segment, Media) for segment in self.segments):
+            raise ValueError("this joint layout's segments have no place for images")
+        schema, laid = self._schema(piece, questions, orders)
+        state_ids = list(self.state(encoder, specials, state) if tokens is None else tokens)
+        whole = len(state_ids)
+        if self.max_state_tokens is not None:
+            state_ids = state_ids[:self.max_state_tokens]
+        # The turn's markup and the text beside it are read as one piece each, as the turn writes them.
+        before, after = self.framing.around(encoder)
+        parts: list[str | Segment] = [before, *self.segments, after]
+        laid_out: list[tuple[Segment | None, list[int]]] = []
+        index = 0
+        while index < len(parts):
+            part = parts[index]
+            if isinstance(part, (str, Text)):
+                text = ""
+                while index < len(parts):
+                    joined = parts[index]
+                    if isinstance(joined, str):
+                        text += joined
+                    elif isinstance(joined, Text):
+                        text += joined.text
+                    else:
+                        break
+                    index += 1
+                laid_out.append((None, piece(text)))
+                continue
+            own = schema if isinstance(part, Schema) else list(media) if isinstance(part, Media) else []
+            laid_out.append((part, own))
+            index += 1
+        room = self.max_len - sum(len(ids) for segment, ids in laid_out if not isinstance(segment, State))
+        state_ids = state_ids[:max(0, room)]
+        row: list[int] = []
+        offset, place = 0, None
+        for segment, ids in laid_out:
+            if isinstance(segment, State):
+                ids = state_ids
+            if isinstance(segment, Schema):
+                offset = len(row)
+            if isinstance(segment, Media) and media:
+                place = (len(row), len(row) + len(ids))
+            row.extend(ids)
+
+        def moved(span: tuple[int, int]) -> tuple[int, int]:
+            return span[0] + offset, span[1] + offset
+
+        shifted = tuple(Laid(question.name, question.kind, moved(question.span),
+                             tuple(moved(option) for option in question.options), question.order)
+                        for question in laid)
+        return [Encoded(tuple(row), shifted, None, None, whole, len(state_ids), place)]
+
+    def _schema(self, piece: Callable[[str], list[int]], questions: Mapping[str, Question],
+                orders: Mapping[str, Sequence[int]] | None) -> tuple[list[int], list[Laid]]:
+        """The schema's tokens (`Schema`), and each question laid out in them, its spans the
+        schema's own positions."""
         schema = piece("\n\nSCHEMA FIELDS:\n")
         laid = []
         for index, (name, question) in enumerate(questions.items()):
@@ -612,26 +706,7 @@ class JointLayout(Layout):
                 schema.extend(piece("\n"))
             schema.extend(piece("END FIELD\n"))
             laid.append(Laid(name, kind_of(question), span, tuple(spans), tuple(slots)))
-        # The user's turn holds the state and the schema, framed as the backbone's template writes a turn.
-        before, after = self.framing.around(encoder)
-        opening = piece(f"{before}STATE:\n")
-        prefix = opening + list(media)
-        suffix = piece(f"\n{after}")
-        state_ids = list(self.state(encoder, specials, state) if tokens is None else tokens)
-        whole = len(state_ids)
-        if self.max_state_tokens is not None:
-            state_ids = state_ids[:self.max_state_tokens]
-        state_ids = state_ids[:max(0, self.max_len - len(prefix) - len(schema) - len(suffix))]
-        offset = len(prefix) + len(state_ids)
-
-        def moved(span: tuple[int, int]) -> tuple[int, int]:
-            return span[0] + offset, span[1] + offset
-
-        shifted = tuple(Laid(question.name, question.kind, moved(question.span),
-                             tuple(moved(option) for option in question.options), question.order)
-                        for question in laid)
-        return [Encoded(tuple(prefix + state_ids + schema + suffix), shifted, None, None, whole,
-                        len(state_ids), (len(opening), len(prefix)) if media else None)]
+        return schema, laid
 
     @staticmethod
     def options(question: Question) -> tuple[tuple[str, JSON], ...]:
