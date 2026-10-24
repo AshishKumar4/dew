@@ -174,6 +174,9 @@ class SlotSource(SourceKind):
             return None
         fields = ({key: overrides[key] for key in ("readout", "head_dim", "n_slots") if key in overrides}
                   if not path.is_file() else records.record(json.loads(path.read_text()), "readout.json"))
+        unknown = set(fields) - {"readout", "head_dim", "n_slots", "attention"}
+        if unknown:
+            raise ValueError(f"unknown readout fields {sorted(unknown)}")
         mode = fields.get("readout", "slot_lm")
         if mode not in ("slot_lm", "head"):
             raise ValueError(f"unknown readout {mode!r}; a slot release reads slot_lm or head")

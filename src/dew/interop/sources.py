@@ -105,7 +105,7 @@ class SourceReference:
         selected = (Path(self.subfolder or "") / filename).as_posix()
         if os.path.isdir(self.name):
             path = root / selected
-            return path if path.exists() else None
+            return path if os.path.lexists(path) else None
         from huggingface_hub import file_exists
 
         return self.file(root, filename) if file_exists(self.name, selected, revision=root.name) else None
