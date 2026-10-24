@@ -56,7 +56,8 @@ def descended(x):
     """The losses of each step and the weight after them, of Adam on `Pulled` over the first EXAMPLES
     records of `x` read in order, pass after pass, in batches of BATCH (the last holding the one
     record left) and updates of ACCUMULATION batches, at a rate falling linearly from PEAK to 0 over
-    the updates, in `x`'s own dtype: the reference arm, and in float64 the truth."""
+    the updates, in `x`'s own dtype: the reference arm, and in float64 the truth. A step reports its
+    batch's loss, and the step that closes an update the loss of the whole update's rows."""
     rows = x[np.arange(EXAMPLES) % RECORDS]
     batches = [rows[start:start + BATCH] for start in range(0, EXAMPLES, BATCH)]
     updates = len(batches) // ACCUMULATION
@@ -64,8 +65,9 @@ def descended(x):
     losses = []
     for update in range(updates):
         window = batches[update * ACCUMULATION:(update + 1) * ACCUMULATION]
-        losses += [jnp.mean(jnp.square(w - batch)) for batch in window]
         held = jnp.concatenate(window)
+        losses += [jnp.mean(jnp.square(w - batch)) for batch in window[:-1]]
+        losses.append(jnp.mean(jnp.square(w - held)))
         gradient = 2 * jnp.sum(w - held, axis=0) / (len(held) * FEATURES)
         first, second = 0.9 * first + 0.1 * gradient, 0.999 * second + 0.001 * jnp.square(gradient)
         moved = (first / (1 - 0.9 ** (update + 1))) / (jnp.sqrt(second / (1 - 0.999 ** (update + 1))) + 1e-8)

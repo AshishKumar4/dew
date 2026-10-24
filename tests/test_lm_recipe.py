@@ -228,8 +228,9 @@ def test_a_token_budget_trains_over_a_stream_with_no_epoch_length(tmp_path):
     assert compile(streamed).steps_per_epoch is None
     model = '{"emb_features": 16, "num_layers": 1, "num_heads": 2}'
     config = LMRunConfig.cli(recipe_args(
-        tokens, "--trainer.tokens", str(3 * 8 * SEQ), "--trainer.eval-every", "None", "--trainer.name",
-        "tokens", "--max-new-tokens", "0", model_config=model), default=LMRunConfig(data=streamed))
+        tokens, "--trainer.tokens", str(3 * 8 * SEQ), "--trainer.eval-every", "None",
+        "--trainer.checkpoint-every", "None", "--trainer.name", "tokens", "--max-new-tokens", "0",
+        model_config=model), default=LMRunConfig(data=streamed))
     assert int(config.run().step) == 3
 
 
