@@ -235,6 +235,23 @@ def _held(name: str) -> dict:
     return {}
 
 
+_TRACING: list[str] = []
+"""The family whose cells the process traced last (`cells`)."""
+
+
+def _tracing(name: str) -> None:
+    """Begins the cells of the family `name`: where the process traced another family's last, JAX's
+    tracing caches and the shapes held for it (`_held`) are released, as no other family's trace reads
+    them. Kept, they grew the census's process by 1.6 MB a cell, to 23 million objects past 1,500 cells,
+    each full garbage collection over them taking 7 s, at no gain to a later family's trace."""
+    import jax
+
+    if _TRACING and _TRACING[0] != name:
+        jax.clear_caches()
+        _held.cache_clear()
+    _TRACING[:] = [name]
+
+
 def cells(names: Iterable[str], targets: Iterable[str] | None = None,
           modes: Iterable[str] = MODES) -> Iterator[dict]:
     """One record per family, device (every audited one where None) and mode: its routes,
@@ -244,6 +261,7 @@ def cells(names: Iterable[str], targets: Iterable[str] | None = None,
 
     present = fixtures()
     for name in names:
+        _tracing(name)
         found = fixture(name, present)
         if found is None:
             yield {"family": name, "fixture": None, "error": "no committed tiny fixture"}
