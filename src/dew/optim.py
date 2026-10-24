@@ -231,6 +231,8 @@ def _clip_leaf(qk_stats, tau: float, normed: set[tuple[str, ...]], path: jax.tre
     optimizer chain can apply it after Muon and land on the same weights
     MaxText's post-step rescale writes.
 
+    A projection's kernel and its bias rescale together, column for column, so
+    a biased projection's queries and keys scale as an unbiased one's do.
     Leaves outside `QK_PROJECTIONS` keep their update. A named leaf whose
     layer sowed no maxima raises naming the layer, since stepping it
     unclipped would train a different model than the maxima describe. So
@@ -250,7 +252,7 @@ def _clip_leaf(qk_stats, tau: float, normed: set[tuple[str, ...]], path: jax.tre
     attention rescales per head instead, the rope slice of its query by the
     full gamma."""
     names = _dict_names(path)
-    if len(names) < 2 or names[-1] != 'kernel' or names[-2] not in QK_PROJECTIONS:
+    if len(names) < 2 or names[-1] not in ('kernel', 'bias') or names[-2] not in QK_PROJECTIONS:
         return update
     if names[:-2] in normed:
         raise ValueError(
