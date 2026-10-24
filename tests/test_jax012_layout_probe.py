@@ -128,14 +128,38 @@ def test_isolate_template_operations():
 @pytest.mark.parametrize("widen_bias", [False, True], ids=["original", "widened"])
 def test_layout_reference_computes_its_float64_oracle(widen_bias):
     ours, reference, draw, label = site.layout_site(CASE, jnp.float32, widen_bias=widen_bias)
+    oracle = _numpy_layout(draw(0))
     with jax.enable_x64(new_val=True):
         inputs = gate.widened(draw(0))
-        oracle, actual = ours(*inputs), reference(*inputs)
+        actual = reference(*inputs)
         roundings = gate.chain_roundings(jax.make_jaxpr(ours)(*inputs))
     print(json.dumps({"widen_bias": widen_bias, "roundings": roundings,
                       "truth_apart_rms": float(np.sqrt(np.mean(
                           (np.asarray(actual) - np.asarray(oracle)) ** 2)))}), flush=True)
     gate.assert_computes_the_oracle(actual, oracle, label, roundings=roundings)
+
+
+def _numpy_layout(inputs):
+    query, key, value = (np.asarray(x, np.float64) for x in inputs)
+    queries, keys = site.geometry(CASE)
+    streams = jax.random.split(jax.random.key(5), 4)
+    temperature = np.asarray(jax.random.uniform(
+        streams[0], (site.ROWS, 4, queries), jnp.float32, 0.5, 1.5), np.float64)
+    key_bias = np.asarray(jax.random.normal(streams[1], (site.ROWS, 4, keys), jnp.float32), np.float64)
+    dense_bias = 0.5 * np.asarray(jax.random.normal(
+        streams[2], (site.ROWS, 4, queries, keys), jnp.float32), np.float64)
+    gates = np.asarray(jax.random.normal(
+        streams[3], (site.ROWS, queries, 4, 32), jnp.float32), np.float64)
+    repeated_key, repeated_value = np.repeat(key, 2, axis=2), np.repeat(value, 2, axis=2)
+    logits = (np.einsum("bqhd,bkhd->bhqk", query, repeated_key) / np.sqrt(32)
+              * temperature[..., None] + key_bias[:, :, None, :] + dense_bias)
+    logits = np.where(site.dews_mask(CASE)[:, None], logits, -np.inf)
+    maximum = np.max(logits, axis=-1, keepdims=True)
+    p = np.exp(logits - np.where(np.isfinite(maximum), maximum, 0))
+    total = np.sum(p, axis=-1, keepdims=True)
+    p = p / np.where(total > 0, total, 1)
+    output = np.einsum("bhqk,bkhd->bqhd", p, repeated_value)
+    return output / (1 + np.exp(-gates))
 
 
 def test_layout_with_corrected_reference_truth():
@@ -151,6 +175,20 @@ def test_layout_with_corrected_reference_truth():
     gate.assert_as_exact(ours, reference, draw, label, seeds=seeds)
 
 
+def _qk(query, key):
+    def one(row, head):
+        return jnp.einsum("qd,kd->qk", query[row, :, head], key[row, :, head // 2],
+                          preferred_element_type=query.dtype)
+    return jax.vmap(jax.vmap(one, in_axes=(None, 0)), in_axes=(0, None))(
+        jnp.arange(site.ROWS), jnp.arange(4))
+
+
+def test_qk_lowering():
+    queries, keys = site.geometry(CASE)
+    query, key, _ = site.drawing(queries, keys)(0)
+    print(jax.jit(_qk).lower(query, key).compile().as_text(), flush=True)
+
+
 def test_isolated_operator_rounding():
     queries, keys = site.geometry(CASE)
     draw = site.drawing(queries, keys)
@@ -162,13 +200,6 @@ def test_isolated_operator_rounding():
         streams[2], (site.ROWS, 4, queries, keys), jnp.float32), np.float64)
     mask = site.dews_mask(CASE)[:, None]
 
-    def qk(query, key):
-        def one(row, head):
-            return jnp.einsum("qd,kd->qk", query[row, :, head], key[row, :, head // 2],
-                              preferred_element_type=query.dtype)
-        return jax.vmap(jax.vmap(one, in_axes=(None, 0)), in_axes=(0, None))(
-            jnp.arange(site.ROWS), jnp.arange(4))
-
     def pv(probabilities, value):
         def one(row, head):
             return jnp.einsum("qk,kd->qd", probabilities[row, head], value[row, :, head // 2],
@@ -176,9 +207,9 @@ def test_isolated_operator_rounding():
         return jax.vmap(jax.vmap(one, in_axes=(None, 0)), in_axes=(0, None))(
             jnp.arange(site.ROWS), jnp.arange(4))
 
-    fns = {"qk": jax.jit(qk), "pv": jax.jit(pv), "exp": jax.jit(jnp.exp),
+    fns = {"qk": jax.jit(_qk), "pv": jax.jit(pv), "exp": jax.jit(jnp.exp),
            "sum": jax.jit(lambda p: jnp.sum(p, axis=-1)),
-           "qk-without-ynn": gate.without_ynn(qk),
+           "qk-without-ynn": gate.without_ynn(_qk),
            "pv-without-ynn": gate.without_ynn(pv)}
     errors = {name: [] for name in fns}
     digests = {}
