@@ -292,7 +292,8 @@ class Pretrained:
         tokenizer = None if tokenizer is None else text(tokenizer, 'tokenizer')
         # A run over a source's own processor records its source, and the bundle writes its files.
         source = declaration.get('processor')
-        processor = None if source is None else load_processor(text(source, 'processor'), model)
+        processor = (None if source is None else
+                     load_processor(from_record(sources.SourceReference, source), model))
         trained = models[model_config.name]
         if trained is CausalTransformer:
             decoder = from_record(CausalTransformer, model)
@@ -420,18 +421,13 @@ class Pretrained:
                                             param_dtype=param_dtype, attention_impl=attention_impl,
                                             max_seq_len=max_seq_len)
         elif subfolder is not None:
-            # Resolve the selected folder at the metadata snapshot's commit, never a revision
-            # named after the folder. Every ordinary component then reads its local directory.
-            resolved = _source_subfolder(name_or_dir, directory, folder,
-                                          [name for name in (gguf_file, single_file, dduf_file) if name])
-            loaded = cls.load(resolved, dtype=dtype, param_dtype=param_dtype, attention_impl=attention_impl,
-                              max_seq_len=max_seq_len, gguf_file=gguf_file, single_file=single_file,
-                              dduf_file=dduf_file, mesh=mesh, layout=layout, fallback=fallback,
-                              weights=weights, on_host=on_host)
-            if loaded.processor is not None:
-                identity = sources.SourceReference(str(name_or_dir), commit, folder)
-                loaded = replace(loaded, processor=replace(loaded.processor, source=identity))
-            return replace(loaded, revision=commit, origin=None)
+            return _subfolder_bundle(
+                sources.SourceReference(str(name_or_dir), commit, folder), directory,
+                [name for name in (gguf_file, single_file, dduf_file) if name],
+                partial(cls.load, dtype=dtype, param_dtype=param_dtype, attention_impl=attention_impl,
+                        max_seq_len=max_seq_len, gguf_file=gguf_file, single_file=single_file,
+                        dduf_file=dduf_file, mesh=mesh, layout=layout, fallback=fallback,
+                        weights=weights, on_host=on_host))
         elif fallback is not None:
             from dew.interop import torchax_fallback
             loaded = torchax_fallback.load(name_or_dir, directory, commit, dtype=dtype,
@@ -1346,7 +1342,18 @@ def _selected_payload(fallback: str | None, **files: str | None) -> list[str]:
     return selected
 
 
-def _source_subfolder(name_or_dir: str | Path, root: Path, folder: str, selected: list) -> Path:
+def _subfolder_bundle[Kind: Pretrained](source: sources.SourceReference, root: Path,
+                                       files: list[str], load: Callable[[Path], Kind]) -> Kind:
+    """Materialize a selected folder at its resolved commit, then retain that structured identity
+    on the ordinary bundle and processor read from it."""
+    directory = _source_subfolder(source.name, root, source.subfolder or "", files)
+    loaded = load(directory)
+    if loaded.processor is not None:
+        loaded = replace(loaded, processor=replace(loaded.processor, source=source))
+    return replace(loaded, revision=source.revision, origin=None)
+
+
+def _source_subfolder(name_or_dir: str | Path, root: Path, folder: str, selected: list[str]) -> Path:
     """Fetch a selected folder's ordinary components or named payload at the metadata commit."""
     directory = root / folder
     if selected:

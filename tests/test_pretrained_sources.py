@@ -30,6 +30,8 @@ def fixture_config(name):
 def test_a_saved_processor_record_reloads_its_selected_folder(tmp_path):
     """A processor selected below a repository root survives the task-settings JSON round trip;
     the unrelated root config cannot replace its vocabulary and preprocessing."""
+    from token_support import byte_level_tokenizer
+
     from dew.inference.tasks import TextSettings
     from dew.interop import Pretrained
     from dew.interop.pretrained import load_processor
@@ -37,6 +39,7 @@ def test_a_saved_processor_record_reloads_its_selected_folder(tmp_path):
     from dew.sampling import Sampling
 
     shutil.copytree(FIXTURES / "qwen3-tiny", tmp_path / "release")
+    byte_level_tokenizer(tmp_path / "release")
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "not_the_selected_release"}))
     bundle = Pretrained.load(tmp_path, subfolder="release", dtype="float32")
     settings = TextSettings(seq_len=8, max_new_tokens=2, tokenizer=None,
