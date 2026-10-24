@@ -43,61 +43,6 @@ def compiler_params(*, approx_math: bool = False) -> plgpu.CompilerParams:
     return plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup, approx_math=approx_math)
 
 
-def cooperative(body, out_type, *, consumers: int, cluster: int, multiprocessors: int, interpret):
-    """A cooperative launch of `body`: `consumers` consumer warpgroups and a producer a block (warpgroup
-    `consumers`, `drain`), persistent over `multiprocessors` ('cluster_grid'), a pair of them a cluster where
-    `cluster` is 2 ('cluster')."""
-    if multiprocessors < cluster:
-        raise ValueError(f"a cluster of {cluster} pairs multiprocessors, and the launch has "
-                         f"{multiprocessors} (an interpreter's one block does not model a cluster)")
-    return plgpu.kernel(
-        body,
-        out_type=out_type,
-        grid=(multiprocessors // cluster,),
-        grid_names=("cluster_grid",),
-        cluster=(cluster,),
-        cluster_names=("cluster",),
-        num_threads=consumers + 1,
-        thread_name="wg",
-        compiler_params=compiler_params(),
-        interpret=interpret,
-    )
-
-
-def multicast_axes(cluster: int) -> tuple[str, ...]:
-    """The axes a block a pair shares is loaded over, multicast: the cluster's, for a pair."""
-    return ("cluster",) if cluster == 2 else ()
-
-
-def stage_spec(axes: tuple, extent: dict, stepped: str, in_flight: int) -> plgpu.BlockSpec:
-    """An operand's block in a pipeline's shared-memory stage: its tile at `extent` per launch axis, advancing
-    along `stepped` (the pipeline's axis) and fixed along the others, held `in_flight` steps longer for the
-    MMAs in flight."""
-    return plgpu.BlockSpec(tuple(extent[axis] for axis in axes),
-                           lambda step: tuple(step if axis == stepped else 0 for axis in axes),
-                           memory_space=plgpu.SMEM, delay_release=in_flight)
-
-
-def ignore(*_, **__) -> None:
-    """A pipeline body or compute context that does nothing: the allocations a pipeline takes do not depend
-    on them (`hopper_matmul_mgpu`'s `ignore`)."""
-
-
-def drained(cluster: int):
-    """The barrier two consumers report a tile drained at: both multiprocessors' of a pair (each producer's
-    next loads are multicast into both), a block's own otherwise."""
-    if cluster == 2:
-        return plgpu.ClusterBarrier(collective_axes=("cluster",), num_arrivals=2)
-    return plgpu.Barrier(num_arrivals=2)
-
-
-def drain(barrier, wg, producer: int = 2) -> None:
-    """The producer warpgroup (`producer`) waits until the consumers have finished the tile's MMAs (each
-    arrives at `barrier` after its last wait; a pair's four, `drained`) before its next tile's loads reuse
-    the pipeline's stages."""
-    pl.when(wg == producer)(lambda: plgpu.barrier_wait(barrier))
-
-
 def meet(halves) -> None:
     """The two consumer warpgroups wait for each other at `halves`, two barriers of two arrivals, in turn:
     neither arrives at a barrier's next phase before the other has seen its last, however the meets fall
@@ -113,6 +58,39 @@ def staging(name: str, shaped) -> dict:
     shaped = list(shaped)
     return {f'{name}_smems': [plgpu.SMEM((2, *shape), gmem.dtype) for shape, gmem in shaped],
             f'{name}_barriers': [plgpu.Barrier(num_barriers=2) for _ in shaped]}
+
+
+STAGED_BYTES = 256
+"""The widest row, in bytes, a consumer stages an output in at a time: a consumer's 256 bf16 columns
+written to shared memory as one 512-byte row conflicted on its banks 195 times as often as in two
+256-byte halves (ncu, Qwen3's down projection forward: 18.3M conflicts against 94K, the kernel 16%
+slower)."""
+
+
+def staged_columns(columns: int, dtypes) -> int:
+    """The columns of each chunk a consumer stages a `columns`-wide output tile in: the most that divide the
+    tile within `STAGED_BYTES` of the widest output (a 192-column tile's bf16 output in chunks of 64)."""
+    return math.gcd(columns, STAGED_BYTES // max(jnp.dtype(dtype).itemsize for dtype in dtypes))
+
+
+def interpreted(interpret) -> plgpu.InterpretGPUParams | None:
+    """A launch's interpreter: `interpret`'s own parameters where it gives them (a read past an operand
+    poisoned, `grouped_matmul.INTERPRETED`), the default where it is True, none where False."""
+    if isinstance(interpret, plgpu.InterpretGPUParams):
+        return interpret
+    return plgpu.InterpretGPUParams() if interpret else None
+
+
+def unwalked(family: "Family") -> Callable:
+    """A walk of no steps (`Family.persist`'s, where a tile streams nothing): its carry and accumulators as
+    they start."""
+    def walk(step, start, shapes, *, initial=None):
+        del step
+        initial = (None,) * len(shapes) if initial is None else initial
+        return start, tuple(family.zeros(shape) if value is None else value
+                            for shape, value in zip(shapes, initial, strict=True))
+
+    return walk
 
 
 def viewed(view: tuple, block: tuple, step):
@@ -347,6 +325,9 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     rows: int
     consumers: int
     """The compute roles a program may take (sm90 two warpgroups, sm80 one)."""
+    bounded_loads: bool
+    """Whether a load past an operand's extent reads zeros (TMA's) rather than past it (cp.async's), so an
+    operand need not be padded to whole tiles."""
 
     @property
     @abc.abstractmethod
@@ -366,8 +347,9 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
 
     @abc.abstractmethod
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
-               interpret: bool) -> Callable:
-        """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own."""
+               interpret: bool, approx_math: bool = True) -> Callable:
+        """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own, with
+        `approx_math` the hardware's approximate exponential and reciprocal (`compiler_params`)."""
 
     @abc.abstractmethod
     def scoped(self, body, *allocations, streams) -> None:
@@ -392,6 +374,21 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     @abc.abstractmethod
     def stream(self, streams, views: dict, lo, hi) -> None:
         """The producer's loads of steps `lo` to `hi` from `views` (`opened`'s), where the family has one."""
+
+    @abc.abstractmethod
+    def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, consumer: Callable, *,
+                consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0) -> None:
+        """A persistent kernel's tiles, the grid `tiles` spread over the launch's programs along `axis`, its
+        streams (`streams`, as `scoped` hands them) running on across them: `schedule(index)` gives a tile's
+        `(active, steps, views, tile)`, whether it streams anything, its step count, each stream's view
+        (`viewed`: a ref and the block indices of the tile's step `j`, counted from 0) and what its
+        consumers are given. Each consumer role runs `consumer(index, tile, walk, store, active=...)` a tile,
+        once for each value of `active`: `walk(step, start, shapes, *, initial=None)` walks the tile's steps
+        as `walk` does, a step's index the tile's own (where not active it takes none, its accumulators as
+        they start), and `store(output, value, ref, place)` stores a consumer's `value` of output `output`
+        (`outputs`' `(shape, dtype)`) to `ref` at `place`, `store_rows`' `(row_start, first, stored,
+        column, most)`. The family owns the loads, the step counter across tiles, the streams' drain, the
+        outputs' staging and the stores' completion."""
 
     @abc.abstractmethod
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
@@ -494,13 +491,14 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     """A family whose loads a producer warpgroup issues by TMA into `Ring`s, beside one or two consumer
     warpgroups at `setmaxnreg` budgets (`roles`): sm90's and sm100's. Its walk acquires each step's slots as
     the step reads them and releases them once its products are done (`Slots`)."""
+    bounded_loads = True
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
-               interpret: bool) -> Callable:
+               interpret: bool, approx_math: bool = True) -> Callable:
         return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                             num_threads=consumers + 1, thread_name="wg",
-                            compiler_params=compiler_params(approx_math=True),
-                            interpret=plgpu.InterpretGPUParams() if interpret else None)
+                            compiler_params=compiler_params(approx_math=approx_math),
+                            interpret=interpreted(interpret))
 
     def scoped(self, body, *allocations, streams) -> None:
         pl.run_scoped(lambda *refs, **rings: body(*refs, streams=rings), *allocations, **streams,
@@ -525,6 +523,71 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                          for name, ring in zip(streams, rings, strict=True))
 
         streamed(rings, tiles, lo, hi)
+
+    def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, consumer: Callable, *,
+                consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0) -> None:
+        # The producer loads every tile's steps into the rings at a counter running across the tiles, so
+        # a tile's first loads go out while the consumers store the last one; each consumer stages its
+        # share of each output (`staged_columns` wide chunks) and stores it by TMA, waiting only for the
+        # last store's reads of the staging before it writes the next.
+        rings = self.opened(streams)
+        staging = [plgpu.SMEM((consumers, shape[1] // staged_columns(shape[1], (dtype,)), shape[0],
+                               staged_columns(shape[1], (dtype,))), dtype)
+                   for shape, dtype in outputs]
+
+        def producer():
+            @plgpu.nd_loop(tiles, collective_axes=axis, init_carry=jnp.int32(0))
+            def loaded(loop: plgpu.NDLoopInfo, carry):
+                counter = carry  # the step every ring is at
+                active, steps, views, _ = schedule(loop.index)
+                count = jnp.where(active, steps, 0)
+
+                @pl.loop(0, count)
+                def _(step):
+                    for name, ring in rings.items():
+                        ring.load(counter + step, viewed(views[name], ring.smem.shape[1:], step))
+
+                return counter + count
+
+            for ring in rings.values():
+                ring.drain(loaded)
+
+        def consumed(smems):
+            def run(index):
+                def store(output, value, ref, place):
+                    smem = smems[output].at[index]
+                    plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+                    chunks, width = smem.shape[0], smem.shape[-1]
+                    for chunk in range(chunks):
+                        smem[chunk] = value[:, chunk * width:(chunk + 1) * width].astype(smem.dtype)
+                    plgpu.commit_smem()
+                    row_start, first, stored, column, most = place
+                    for chunk in range(chunks):
+                        store_rows(smem.at[chunk], ref, row_start, first, stored, column + chunk * width,
+                                   most)
+
+                @plgpu.nd_loop(tiles, collective_axes=axis, init_carry=jnp.int32(0))
+                def _(loop: plgpu.NDLoopInfo, carry):
+                    counter = carry  # the step every ring is at
+                    active, steps, _, tile = schedule(loop.index)
+
+                    def walk(step, start, shapes, *, initial=None):
+                        def stepped(at, slots, carry, accumulators):
+                            return step(at - counter, slots, carry, accumulators)
+
+                        return self.walk(rings, ((stepped, counter, counter + steps),), start, shapes,
+                                         interpret, in_flight=in_flight, initial=initial)
+
+                    pl.when(active)(lambda: consumer(index, tile, walk, store, active=True))
+                    pl.when(~active)(lambda: consumer(index, tile, unwalked(self), store, active=False))
+                    return counter + jnp.where(active, steps, 0)
+
+                plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+
+            return run
+
+        pl.run_scoped(lambda *smems: self.roles(consumers, consumed(smems), producer), *staging,
+                      collective_axes="wg")
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None
