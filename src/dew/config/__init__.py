@@ -464,7 +464,7 @@ def _rate_argument() -> tyro.constructors.PrimitiveConstructorSpec:
             return float(value)
         built = from_record(annotation, value, dtypes=False)
         if not isinstance(built, ScheduleBase):
-            raise TypeError(f"--optim.rate is a number or a schedule's record, not {given[0]}")
+            raise TypeError(f"--optim.learning-rate is a number or a schedule's record, not {given[0]}")
         return built
 
     return tyro.constructors.PrimitiveConstructorSpec(
@@ -479,14 +479,14 @@ class OptimConfig:
 
     optimizer: Optimizer = "adamw"
     optimizer_opts: JsonDict = dataclasses.field(default_factory=dict)
-    rate: Annotated[float | ScheduleSpec, _rate_argument()] = 2.7e-4
+    learning_rate: Annotated[float | ScheduleSpec, _rate_argument()] = 2.7e-4
     """The learning rate: a constant, or a schedule as one typed record per kind (`dew.optim`).
 
     The kinds are cosine, power (lm-engine's power law with an optional linear
     tail), linear, one_cycle (torch's `OneCycleLR`) and exponential; each record
     holds only its own fields, and `every` steps any of them once per that many
-    updates. On the command line it is one value: `--optim.rate 3e-4`, or a
-    schedule's record, `--optim.rate '{"class": "cosine", "fields": {...}}'`.
+    updates. On the command line it is one value: `--optim.learning-rate 3e-4`, or a
+    schedule's record, `--optim.learning-rate '{"class": "cosine", "fields": {...}}'`.
     """
     weight_decay: float | None = None
     """The weight decay passed to the optimizer, None keeping its own (adamw's 1e-4, the others'
@@ -560,12 +560,12 @@ class OptimConfig:
             solvers = {}
             for group in self.param_groups:
                 decay = {} if group.weight_decay is None else {'weight_decay': group.weight_decay}
-                solvers[group.name] = group.solver(make, self.rate, steps, {**opts, **decay})
+                solvers[group.name] = group.solver(make, self.learning_rate, steps, {**opts, **decay})
             solver = optax.multi_transform(solvers, param_labels(self.param_groups))
         else:
             if self.optimizer not in ('muon', 'muonclip'):
                 opts['mask'] = weight_decay_mask
-            solver = scaled_solver(make, *scaled(self.rate), steps, opts)
+            solver = scaled_solver(make, *scaled(self.learning_rate), steps, opts)
 
         if self.clip_grads > 0:
             solver = optax.chain(optax.clip_by_global_norm(self.clip_grads), solver)
@@ -584,8 +584,8 @@ class OptimConfig:
         them over its checkpoint's (`with_rate_scales`), so the configured
         rate is the one it steps at."""
         if not self.param_groups:
-            return {None: scaled(self.rate)[0]}
-        return {group.name: group.rate(self.rate)[0] for group in self.param_groups}
+            return {None: scaled(self.learning_rate)[0]}
+        return {group.name: group.learning_rate(self.learning_rate)[0] for group in self.param_groups}
 
 
 @dataclasses.dataclass(frozen=True)
