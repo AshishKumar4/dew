@@ -32,7 +32,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Kind, natural_exp, within
+from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Draw, Kind, natural_exp, within
 from dew.nn.precision import two_product, two_sum
 
 
@@ -166,12 +166,13 @@ class Coords(NamedTuple):
     """A tile's coordinates as the mainloop provides them (in the layout its products give): the query
     indices `q_pos` `[bq, 1]` and key indices `k_pos` `[1, bk]`, and where the spans narrow, each
     query's interval `spans`, its first and past-last keys `[bq]`, and with documents the queries' and
-    keys' ids `ids`, `[bq]` and `[bk]`."""
+    keys' ids `ids`, `[bq]` and `[bk]`, and with dropout its entries' draw `drop` (`Draw`)."""
 
     q_pos: jax.Array
     k_pos: jax.Array
     spans: tuple[jax.Array, jax.Array] | None = None
     ids: tuple[jax.Array, jax.Array] | None = None
+    drop: Draw | None = None
 
 
 class Guard(NamedTuple):
@@ -666,15 +667,18 @@ def rescale(acc: jax.Array, alpha: jax.Array) -> jax.Array:
 
 class Argmax(NamedTuple):
     """The keys' running maximum logit `peak` `[bq]` (the initial state's apart) and `key`, the first
-    key that holds it `[bq]` int32: the backward's anchor key (`off_anchor`), a residual of the forward."""
+    key that holds it `[bq]` int32: the backward's anchor key (`off_anchor`), a residual of the forward. Under
+    dropout, `multiplier` `[bq]` is that key's draw, which the anchor's own weight takes (`joined`)."""
 
     peak: jax.Array
     key: jax.Array
+    multiplier: jax.Array | None = None
 
 
-def no_argmax(rows: int) -> Argmax:
-    """`Argmax` before any key."""
-    return Argmax(jnp.full((rows,), -jnp.inf, jnp.float32), jnp.zeros((rows,), jnp.int32))
+def no_argmax(rows: int, dropping: bool = False) -> Argmax:
+    """`Argmax` before any key, with a multiplier of zeros where a call drops (`dropping`)."""
+    multiplier = jnp.zeros((rows,), jnp.float32) if dropping else None
+    return Argmax(jnp.full((rows,), -jnp.inf, jnp.float32), jnp.zeros((rows,), jnp.int32), multiplier)
 
 
 def started(spec: Forward, initial: tuple[jax.Array, jax.Array, jax.Array] | None, rows: int, width: int,
@@ -712,8 +716,23 @@ Carry = tuple[Partial, Argmax, jax.Array, jax.Array]
 (`split_accumulate`), its anchor key, the anchor's own weight and the other keys' weights' sum."""
 
 
-def _times(dot: Callable[[jax.Array, jax.Array], jax.Array], value: jax.Array, p: jax.Array) -> jax.Array:
-    """Weights `p` narrowed to the values' dtype times the tile's `value`s, as the mainloop's `dot`."""
+def drawn(coords: Coords, queries: jax.Array, keys: jax.Array) -> jax.Array | None:
+    """A tile's dropout multipliers at `queries` and `keys` (`Coords.drop`), None where no call drops."""
+    return None if coords.drop is None else coords.drop(queries, keys)
+
+
+def _bounded(largest: Callable[[], jax.Array], bound: float) -> jax.Array:
+    """Each key's largest value magnitude taken to the draw's bound, a kept weight's largest multiplier."""
+    return largest() * bound
+
+
+def _times(dot: Callable[[jax.Array, jax.Array], jax.Array], value: jax.Array, p: jax.Array,
+           multiplier: jax.Array | None = None) -> jax.Array:
+    """Weights `p` narrowed to the values' dtype times the tile's `value`s, as the mainloop's `dot`; with a
+    dropout `multiplier`, the dropped weights `p * multiplier` narrowed at the scale `weights_parts` gives
+    them."""
+    if multiplier is not None:
+        return summed_products(weights_parts(p * multiplier, value.dtype), value, dot)
     return dot(narrow(p, value.dtype), value)
 
 
@@ -724,6 +743,8 @@ def _softmax(spec: Forward, state: Partial, keys: Keys):
     p = weights(spec, keys.logits, m)
     value = keys.load()
     largest = keys.largest if keys.largest is not None else functools.partial(magnitudes, value)
+    if keys.coords.drop is not None:
+        largest = functools.partial(_bounded, largest, keys.coords.drop.bound)
     p, factor, held = tile(state, alpha, p, largest)
     return m, factor, p, value, held
 
@@ -742,7 +763,8 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
         keys.accumulate(lambda acc: carry_factor(acc, factor, None), narrow(p, value.dtype), value)
         denominator = carry_factor(state.total, factor, None) + beyond_weights(p.sum(axis=-1), None)
         return Partial(state.acc, m, denominator)
-    times = functools.partial(_times, keys.dot, value)
+    multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
+    times = functools.partial(_times, keys.dot, value, multiplier=multiplier)
     return stepped(state, m, factor, p, times(p), held, times)
 
 
@@ -754,11 +776,20 @@ def training_step(spec: Forward, carry: Carry, keys: Keys, rows: Callable[[jax.A
     m, factor, p, value, held = _softmax(spec, state, keys)
     anchor = argmax(arg, keys.logits, keys.coords.k_pos)
     moved = anchor.peak > arg.peak
-    others, own_tile = anchor_split(narrow(p, value.dtype), keys.coords.k_pos == anchor.key[:, None])
-    product = keys.dot(others, value)
+    at_anchor = keys.coords.k_pos == anchor.key[:, None]
+    others, own_tile = anchor_split(narrow(p, value.dtype), at_anchor)
+    multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
+    if multiplier is None:
+        product = keys.dot(others, value)
+    else:
+        # The other keys' dropped weights; the anchor's own weight stays undropped (it is `own`), and the
+        # anchor takes its draw's multiplier here, which the forward's output and the backward read.
+        product = _times(keys.dot, value, jnp.where(at_anchor, 0.0, p), multiplier)
+        anchor_draw = drawn(keys.coords, keys.coords.q_pos, anchor.key[:, None])
+        anchor = anchor._replace(multiplier=None if anchor_draw is None else anchor_draw[:, 0])
     acc, own, others_total = split_accumulate(state.acc, own, others_total, factor, moved, rows(arg.key),
-                                              product, others, own_tile, held)
-    times = functools.partial(_times, keys.dot, value)
+                                              product, others, own_tile, held, old_multiplier=arg.multiplier)
+    times = functools.partial(_times, keys.dot, value, multiplier=multiplier)
     state = stepped(state, m, factor, p, jnp.zeros_like(acc), held, times)
     return state._replace(acc=acc), anchor, own, others_total
 
@@ -769,19 +800,20 @@ def plain_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys], star
 
 
 def training_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys],
-                  rows: Callable[[jax.Array], jax.Array], start: Partial) -> Carry:
+                  rows: Callable[[jax.Array], jax.Array], start: Partial, dropping: bool = False) -> Carry:
     """A training forward's walk (`plain_walk`), its carry also holding the anchor key and the split
     sums, from none (`training_step`)."""
     nothing = jnp.zeros(start.total.shape, jnp.float32)
     return jax.lax.fori_loop(lo, hi, lambda index, carry: training_step(spec, carry, keys_at(index), rows),
-                             (start, no_argmax(start.total.shape[0]), nothing, nothing))
+                             (start, no_argmax(start.total.shape[0], dropping), nothing, nothing))
 
 
 def joined(carry: Carry, rows: Callable[[jax.Array], jax.Array]) -> Partial:
     """A training walk's state with its split sums joined, the anchor's term added back (`split_output`),
     the weighted values the output normalizes."""
     split, arg, own, _ = carry
-    return split._replace(acc=split_output(split.acc, own, rows(arg.key)))
+    anchored_own = own if arg.multiplier is None else own * arg.multiplier
+    return split._replace(acc=split_output(split.acc, anchored_own, rows(arg.key)))
 
 
 def normalized_pass(spec: Forward, carry: Carry, keys_at: Callable[[jax.Array], Keys],
@@ -818,8 +850,17 @@ def normalized_pass(spec: Forward, carry: Carry, keys_at: Callable[[jax.Array], 
         rest, own_tile, small = normalized_terms(difference(keys.logits), total,
                                                  keys.coords.k_pos == arg.key[:, None], value.dtype,
                                                  jnp.exp2 if spec.base2 else jnp.exp)
+        multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
+        if multiplier is None:
+            weighed, weighed_small = rest, small
+        else:
+            # The product takes the dropped weights and the others' sums the undropped ones.
+            weighed, _, weighed_small = normalized_terms(
+                difference(keys.logits), total, keys.coords.k_pos == arg.key[:, None], value.dtype,
+                jnp.exp2 if spec.base2 else jnp.exp, multiplier)
         lowered = jnp.float32(-SMALL_SHIFT)
-        product = keys.dot(rest, value) + power2(keys.dot(small, value.astype(jnp.float32)), lowered)
+        product = keys.dot(weighed, value) + power2(
+            keys.dot(weighed_small, value.astype(jnp.float32)), lowered)
         others = rest.astype(jnp.float32).sum(axis=-1) + power2(small.sum(axis=-1), lowered)
         return sums[0] + product, sums[1] + own_tile, sums[2] + others
 
@@ -856,7 +897,8 @@ def anchor_split(narrowed: jax.Array, at_anchor: jax.Array) -> tuple[jax.Array, 
 
 def split_accumulate(others: jax.Array, own: jax.Array, others_total: jax.Array, alpha: jax.Array,
                      moved: jax.Array, old_value: jax.Array, product: jax.Array, rest: jax.Array,
-                     own_tile: jax.Array, held: Room | None = None) -> tuple[jax.Array, jax.Array, jax.Array]:
+                     own_tile: jax.Array, held: Room | None = None,
+                     old_multiplier: jax.Array | None = None) -> tuple[jax.Array, jax.Array, jax.Array]:
     """A training forward's weighted values kept apart from the anchor key's (`others`, `B`, with the
     initial state's), the anchor's own weight, and the other keys' weights' sum (`others_total`, keys
     alone), after a tile: where the anchor moved to this tile (`moved`), the old anchor's term (its
@@ -866,7 +908,8 @@ def split_accumulate(others: jax.Array, own: jax.Array, others_total: jax.Array,
     cancelled out of it. On the guarded walk the tile's product, sum and own weight take the row's shift
     past its weights' (`beyond_weights`)."""
     old = old_value.astype(jnp.float32)
-    joined = jnp.where(expand(moved, old), expand(own, old) * old, 0.0)
+    taken = own if old_multiplier is None else own * old_multiplier
+    joined = jnp.where(expand(moved, old), expand(taken, old) * old, 0.0)
     total = (carry_factor(others_total + jnp.where(moved, own, 0.0), alpha, held)
              + beyond_weights(rest.astype(jnp.float32).sum(axis=-1), held))
     own_tile = beyond_weights(own_tile.astype(jnp.float32), held)
@@ -883,7 +926,8 @@ it is a normal fp32 down to `2^-189`."""
 
 
 def normalized_terms(difference: jax.Array, total: jax.Array, at_anchor: jax.Array, dtype,
-                     power: Callable[[jax.Array], jax.Array]) -> tuple[jax.Array, jax.Array, jax.Array]:
+                     power: Callable[[jax.Array], jax.Array], multiplier: jax.Array | None = None
+                     ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """A tile's normalized weights `power(s - m) / T` (`difference`, each logit's exponent against the walk's
     maximum, at most 0, in the units `power` takes: `exp2` folded, `exp` natural) over the natural
     denominator (divided, as the reference's softmax divides), the reference's probabilities, narrowed to
@@ -899,12 +943,16 @@ def normalized_terms(difference: jax.Array, total: jax.Array, at_anchor: jax.Arr
     seen = expand(total > 0, difference)
     denominator = expand(jnp.where(total > 0, total, 1.0), difference)
     p = jnp.where(seen, power(difference) / denominator, 0.0)
+    if multiplier is not None:
+        p = p * multiplier
     tiny = (p < float(jnp.finfo(dtype).tiny)) & jnp.logical_not(at_anchor)
     rounded = p.astype(dtype)
     zero = jnp.zeros_like(rounded)
     rest = jnp.where(at_anchor | tiny, zero, rounded)
     half = power(difference / 2)
     raised = jnp.where(seen, half * jnp.float32(2.0 ** SMALL_SHIFT) * half / denominator, 0.0)
+    if multiplier is not None:
+        raised = raised * multiplier
     small = jnp.where(tiny, raised, 0.0)
     return rest, jnp.where(at_anchor, rounded, zero).astype(jnp.float32).sum(axis=-1), small
 
@@ -1205,7 +1253,8 @@ def off_anchor_delta(state: OffAnchor, anchor_value: jax.Array, dout: jax.Array,
 
 def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, total: jax.Array,
                 state_total: jax.Array, anchor_value: jax.Array, dout: jax.Array,
-                key_index: jax.Array, shift: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+                key_index: jax.Array, shift: jax.Array, multiplier: jax.Array | None = None
+                ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """`off_anchor_delta` from a training forward's split sums (`split_accumulate`), the backward's first
     pass taken by the forward: `B` with the initial state's share inside it, the other keys' weights'
     sum, the anchor's own weight, the denominator `total` and the initial state's own `state_total`, all
@@ -1223,9 +1272,17 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
     anchor = jnp.sum(anchor_value * cotangent, axis=-1)
     others = others * expand(over, others)
     own, others_total = own * over, others_total * over
-    about_zero = jnp.sum(split_output(others, own, anchor_value) * cotangent, axis=-1)
-    about_anchor = (jnp.sum((others - expand(others_total, anchor_value) * anchor_value) * cotangent, axis=-1)
-                    - state_weight * anchor)
+    if multiplier is None:
+        about_zero = jnp.sum(split_output(others, own, anchor_value) * cotangent, axis=-1)
+        spread = others - expand(others_total, anchor_value) * anchor_value
+        about_anchor = jnp.sum(spread * cotangent, axis=-1) - state_weight * anchor
+    else:
+        # The anchor's value under its multiplier z: c = z (v · dO), the dot first and z after, so no
+        # value row meets z; the others' products are the dot's scalar terms.
+        anchor = multiplier * anchor
+        pieces = jnp.sum(others * cotangent, axis=-1)
+        about_zero = pieces + own * anchor
+        about_anchor = pieces - others_total * anchor - state_weight * anchor
     anchored = jnp.abs(about_anchor) <= jnp.abs(about_zero)
     return (jnp.where(anchored, anchor, 0.0), jnp.where(anchored, about_anchor, about_zero),
             jnp.where(anchored, key_index, -1))
@@ -1444,7 +1501,8 @@ def normalized(logits: jax.Array, peak: jax.Array, total: jax.Array, how: Recomp
 
 
 def grad_scores(exponentials: jax.Array, products: jax.Array, anchor: jax.Array, delta: jax.Array,
-                seen: jax.Array | None, at_anchor: jax.Array | None, inverse_total: jax.Array) -> jax.Array:
+                seen: jax.Array | None, at_anchor: jax.Array | None, inverse_total: jax.Array,
+                multiplier: jax.Array | None = None) -> jax.Array:
     """The score cotangents `p (dP - D)` of a tile in the reference's own order, as JAX differentiates
     `exp(s - m) / T`: each query's `(dP - c) - (D - c)` about its anchor c (`off_anchor_delta`) over its
     denominator (`inverse_total`), then times the unnormalized weights `exp(s - m)`, so every intermediate
@@ -1454,6 +1512,8 @@ def grad_scores(exponentials: jax.Array, products: jax.Array, anchor: jax.Array,
     sees one key has no cotangent, as the reference's: FlashAttention's order, `(dP - D) / T` with no anchor
     test, fails check 1 there in both dQ and dK (a query of one key, the stability suite's ordinary "one
     key" and causal windows' first queries: rows whose float64 gradient is exactly 0)."""
+    if multiplier is not None:
+        products = products * multiplier
     relative = products - expand(anchor, products)
     if at_anchor is not None:
         relative = jnp.where(at_anchor, 0.0, relative)
@@ -1576,8 +1636,16 @@ def weights_product(weights: jax.Array, operand: jax.Array,
     return summed_products(weights_parts(weights, operand.dtype), operand, dot)
 
 
+def narrowed(x: jax.Array, dtype) -> jax.Array:
+    """`x` (fp32) narrowed to `dtype` at the scale `weights_parts` gives it, held in fp32: the values a
+    product takes, which a dropped weight's (`x * multiplier`) overflow at the 16-bit scale never meets."""
+    (part, exponent), = weights_parts(x, dtype)
+    return part.astype(jnp.float32) if exponent is None else power2(part.astype(jnp.float32), exponent)
+
+
+
 def value_operands(exponentials: jax.Array, weights: jax.Array, dout: jax.Array,
-                   total: jax.Array) -> tuple[jax.Array, jax.Array]:
+                   total: jax.Array, multiplier: jax.Array | None = None) -> tuple[jax.Array, jax.Array]:
     """The operands `(a, b)` of a tile's share of dV, `aᵀ·b` `[block_k, Dv]` in fp32 (a mainloop's
     transposed product, `cotangent_product`'s for dK): the unnormalized
     weights `exp(s - m)` narrowed to the operands' dtype as the reference's forward rounds them, against
@@ -1586,15 +1654,20 @@ def value_operands(exponentials: jax.Array, weights: jax.Array, dout: jax.Array,
     `p` narrowed against the output's cotangent as it is, so the product stays on bf16's tensor cores: a
     query's cotangents that cancel across a key still cancel, and a normalized weight below bf16's least
     subnormal (about 9e-41) is dropped, which only a cotangent past about 1e28 would make count."""
+    dropped = multiplier is not None
+    if dropped:
+        exponentials, weights = exponentials * multiplier, weights * multiplier
     if dout.dtype == jnp.bfloat16:
-        return value_weights(exponentials, weights, dout.dtype), dout
+        return value_weights(exponentials, weights, dout.dtype, dropped), dout
     scaled = dout.astype(jnp.float32) * expand(inverse(total), dout)
-    return value_weights(exponentials, weights, dout.dtype), scaled
+    return value_weights(exponentials, weights, dout.dtype, dropped), scaled
 
 
-def value_weights(exponentials: jax.Array, weights: jax.Array, dtype) -> jax.Array:
+def value_weights(exponentials: jax.Array, weights: jax.Array, dtype, dropped: bool = False) -> jax.Array:
     """`value_operands`' left operand for an output cotangent of `dtype`: bf16's normalized weights narrowed,
     else the unnormalized ones narrowed to `dtype` and held in fp32."""
     if dtype == jnp.bfloat16:
         return weights.astype(dtype)
+    if dropped:
+        return narrowed(exponentials, dtype)
     return exponentials.astype(dtype).astype(jnp.float32)

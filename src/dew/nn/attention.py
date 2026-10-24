@@ -1233,15 +1233,30 @@ def _blocked_values(weights, value, precision) -> jax.Array:
 
 
 
+def dropout_seed(dropout_rng) -> jax.Array:
+    """The two uint32 words a dropout key draws a call's keep mask from (`template.Draw`)."""
+    return jax.random.bits(dropout_rng, (2,), jnp.uint32)
+
+
+def dropout_draw(seed: jax.Array, rate: float, shape) -> jax.Array:
+    """The probability dropout multipliers of weights of `shape` `[..., H, Q, K]`: `1 / (1 - rate)` where
+    the draw keeps a weight, 0 where it drops it, fp32. Each weight takes its batch row (the leading dims,
+    flattened), head, query and key, the coordinates the attention templates draw at (`template.Draw`)."""
+    *rows, heads, queries, keys = shape
+    draw = template.Draw((seed[0], seed[1]), jnp.arange(math.prod(rows)).reshape(*rows, 1, 1, 1),
+                         jnp.arange(heads).reshape(heads, 1, 1), rate)
+    return draw(jnp.arange(queries)[:, None], jnp.arange(keys)[None, :])
+
+
 def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, softcap=None, dtype=None,
-                        precision=None, force_fp32_for_softmax=True, dropout_rate=0.0, dropout_rng=None,
+                        precision=None, force_fp32_for_softmax=True, dropout_rate=0.0, dropout_seed=None,
                         wide_logits=False):
     """Attend over [B, S, H, D] in plain XLA ops, every score policy on one pipeline.
 
     It is flax's reference attention, op for op: the query scaled by
     1/sqrt(D) in its dtype, the logits, the additive `bias`, the structural
     `mask`, the softmax (in at least fp32 under `force_fp32_for_softmax`), a
-    probability draw at `dropout_rate` from `dropout_rng`, each weight its own,
+    probability draw at `dropout_rate` from `dropout_seed`, each weight its own,
     and the value product (`weighted_values`). Gemma 2's `softcap` squashes the
     scaled logits into (-softcap, softcap) before the bias and mask
     (modeling_gemma2.py:192-208), and `sinks` `[H]` put one value-free logit
@@ -1298,11 +1313,9 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
         # A bias wider than the logits widens them; the softmax runs there and its weights round after.
         weights = jax.nn.softmax(logits).astype(dtype)
     if dropout_rate:
-        if dropout_rng is None:
-            raise ValueError("training attention dropout requires dropout_rng")
-        keep = 1.0 - dropout_rate
-        drawn = jax.random.bernoulli(dropout_rng, keep, weights.shape)
-        weights = weights * (drawn.astype(dtype) / jnp.asarray(keep, dtype))
+        if dropout_seed is None:
+            raise ValueError("training attention dropout requires dropout_seed")
+        weights = weights * dropout_draw(dropout_seed, dropout_rate, weights.shape).astype(dtype)
     if sinks is None:
         return weighted_values('...hqk,...khd->...qhd', weights, value, precision=precision)
     if kv_heads == 1:
@@ -1377,7 +1390,8 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         out = _dropout_attention(
             query, key, value, dtype, precision, force_fp32_for_softmax, implementation,
             causal, sliding_window, mask, bias, sinks, softcap, segment_ids,
-            key_value_seq_lengths, dropout_rate, dropout_rng, shards)
+            key_value_seq_lengths, dropout_rate, None if dropout_rng is None else dropout_seed(dropout_rng),
+            shards)
         live = visible_rows(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids,
                             key_value_seq_lengths)
         return checkpoint_name(_read_nothing(out, live), 'attention_output')
@@ -1416,7 +1430,7 @@ def _read_nothing(out: jax.Array, live: jax.Array | None) -> jax.Array:
 
 def _dropout_attention(query, key, value, dtype, precision, force_fp32_for_softmax, implementation,
                        causal, sliding_window, mask, bias, sinks, softcap, segment_ids,
-                       key_value_seq_lengths, dropout_rate, dropout_rng, shards):
+                       key_value_seq_lengths, dropout_rate, dropout_seed, shards):
     """Apply one reference probability draw, retaining visibility and projection precision."""
     if implementation not in ('auto', 'reference', 'xla'):
         raise ValueError(
@@ -1432,7 +1446,7 @@ def _dropout_attention(query, key, value, dtype, precision, force_fp32_for_softm
     return reference_attention(query, key, value, mask=mask, bias=bias, sinks=sinks, softcap=softcap,
                                dtype=dtype, precision=precision,
                                force_fp32_for_softmax=force_fp32_for_softmax,
-                               dropout_rate=dropout_rate, dropout_rng=dropout_rng)
+                               dropout_rate=dropout_rate, dropout_seed=dropout_seed)
 
 
 def _fused_attention(query, key, value, bias, mask, causal, sliding_window, implementation, *,
