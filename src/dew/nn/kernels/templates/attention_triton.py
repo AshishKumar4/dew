@@ -29,13 +29,13 @@ from dew.nn.kernels.templates.attention import (
     NATURAL,
     TRACED_TILE,
     Gradients,
+    HookKeys,
     Hooks,
     KeySpans,
     Kind,
     Split,
     block_map,
     gradients,
-    hook_program,
     kept_dtype,
     kernel_dot,
     padded_call,
@@ -235,7 +235,7 @@ def _written(spec, walked, *, rows, out_ref, residual_refs, flag_ref, residuals:
 
 
 @dataclasses.dataclass(frozen=True)
-class TritonForward(Template[Tiles]):
+class TritonForward(HookKeys, Template[Tiles]):
     """The template's forward in Pallas Triton over padded operands (`forward` pads them): queries
     `[B, Qp, H, Dp]` over keys `[B, Kp, Hk, Dp]` and values `[B, Kp, Hk, Dvp]`, each query's keys
     `start` to `end` `[B, Qp]` and, with documents, its id `[B, Qp]` against the keys' `[B, Kp]`; the
@@ -399,11 +399,6 @@ class TritonForward(Template[Tiles]):
 
     def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
         return spanned(specs, super().operands(specs, seed))
-
-    def traced(self, name: str, value: Callable | str | None) -> str | None:
-        if name == "output_mod":
-            return hook_program(name, value, self.output_kinds, self.output_dtypes, width=self.output_width)
-        return hook_program(name, value, self.score_kinds, self.score_dtypes)
 
 
 def _dividing[T: (Tiles, BackwardTiles)](space: tuple[T, ...], ba: tokamax.BoundArguments) -> tuple[T, ...]:
@@ -701,12 +696,13 @@ its dK/dV launch, its default first."""
 
 
 @dataclasses.dataclass(frozen=True)
-class TritonBackward(Template[BackwardTiles]):
+class TritonBackward(HookKeys, Template[BackwardTiles]):
     """The template's backward over padded operands (`backward` pads them), one tuning decision for its
     two launches: the dQ launch (`_dq_launch`), then the dK/dV launch (`_dkv_launch`) under its softmax.
     Returns the dQ launch's outputs, then the dK/dV launch's."""
 
     HOOKS = ("score_mod",)
+    DIFFERENTIATED = True
     name = "triton"
     config_cls = BackwardTiles
     score_mod: Callable | None = None
@@ -767,9 +763,6 @@ class TritonBackward(Template[BackwardTiles]):
 
     def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
         return spanned(specs, super().operands(specs, seed))
-
-    def traced(self, name: str, value: Callable | str | None) -> str | None:
-        return hook_program(name, value, self.score_kinds, self.score_dtypes, differentiated=True)
 
 
 def _backward_registers(ba: tokamax.BoundArguments, config: BackwardTiles, *, dq: bool) -> int:

@@ -49,6 +49,7 @@ from dew.nn.kernels.templates.attention import (
     NATURAL,
     TRACED_TILE,
     Gradients,
+    HookKeys,
     Hooks,
     KeySpans,
     Kind,
@@ -57,7 +58,6 @@ from dew.nn.kernels.templates.attention import (
     Split,
     block_map,
     gradients,
-    hook_program,
     kept_dtype,
     padded_call,
     power_of_two,
@@ -222,7 +222,7 @@ def _read_bytes(ba: tokamax.BoundArguments) -> int:
 
 
 @dataclasses.dataclass(frozen=True)
-class _Mainloop[Config: (Tiles, BackwardTiles)](Template[Config]):
+class _Mainloop[Config: (Tiles, BackwardTiles)](HookKeys, Template[Config]):
     """What this mainloop's launches share as Template implementations (`MosaicForward`, `MosaicBackward`):
     the call's own arrays as arguments, padded by a launch to its config's blocks; the score hook (and the
     forward's output hook) as fields keyed by what they compute (`hook_program`); the configs of the
@@ -378,10 +378,6 @@ class MosaicForward(_Mainloop[Tiles]):
                       tuple(map(Param, ba.arguments["output_params"], self.output_kinds)))
         return refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family)
 
-    def traced(self, name: str, value: Callable | str | None) -> str | None:
-        if name == "output_mod":
-            return hook_program(name, value, self.output_kinds, self.output_dtypes, width=self.output_width)
-        return hook_program(name, value, self.score_kinds, self.score_dtypes)
 
 
 def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool) -> int:
@@ -1172,6 +1168,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     (`cost`, both launches')."""
 
     HOOKS = ("score_mod",)
+    DIFFERENTIATED = True
     config_cls = BackwardTiles
     accurate: bool = ACCURATE
 
@@ -1249,8 +1246,6 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                       ba.arguments["initial"])
         return refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=True, family=family)
 
-    def traced(self, name: str, value: Callable | str | None) -> str | None:
-        return hook_program(name, value, self.score_kinds, self.score_dtypes, differentiated=True)
 
 
 def _backward_costs(op: MosaicBackward, ba: tokamax.BoundArguments, config: BackwardTiles,
@@ -1604,6 +1599,23 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, buffers, coords_of, par
     return tuple(total + piece for total, piece in zip(carry, key_pieces, strict=True)), (dk_acc, dv_acc)
 
 
+def _unread_tiles(family: mosaic.Family, store_tiles, count: int, shape: tuple[int, int], read: tuple,
+                  q_steps: int) -> None:
+    """A dK/dV consumer's `count` tile gradients over the query tiles its walk does not read (outside `read`,
+    `[lo, hi)` of `q_steps`): no query of them sees its keys, so they are zeros (`store_tiles(first query,
+    pieces)`)."""
+    zeros = family.zeros(shape)
+    lo, hi = read
+
+    @pl.loop(0, lo)
+    def _(tile):
+        store_tiles(tile * shape[0], [zeros] * count)
+
+    @pl.loop(hi, q_steps)
+    def _(tile):
+        store_tiles(tile * shape[0], [zeros] * count)
+
+
 def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans: _Spans | None,
                 score_params: tuple, *, walk: _Backward) -> tuple[jax.Array, ...]:
     """The dK/dV program under the dQ program's softmax: each consumer's `block_k` keys of a query head,
@@ -1690,16 +1702,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
                 for ref, sums in zip(key_refs, key_sums, strict=True):
                     ref[row, head, pl.ds(k_first, block_k)] = sums
             if tile_refs:
-                # The tiles the walk does not read: no query of this block sees them, so they are zeros.
-                zeros = family.zeros((block_q, block_k))
-
-                @pl.loop(0, lo)
-                def _(tile):
-                    store_tiles(tile * block_q, [zeros] * len(tile_refs))
-
-                @pl.loop(hi, q_steps)
-                def _(tile):
-                    store_tiles(tile * block_q, [zeros] * len(tile_refs))
+                _unread_tiles(family, store_tiles, len(tile_refs), (block_q, block_k), (lo, hi), q_steps)
 
         def producer():
             family.stream(streams, views, *streamed)
