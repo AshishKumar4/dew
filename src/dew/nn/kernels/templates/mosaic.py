@@ -242,6 +242,18 @@ PRODUCER_REGISTERS = 40
 THREADS = 128
 """The threads of a role: a warpgroup's, each family's compute and producer roles alike."""
 
+SMEM_ALIGNMENT = 1024
+"""The bytes each shared-memory allocation of a Mosaic GPU kernel starts at a multiple of (its lowering's
+`SMEM_ALIGNMENT`)."""
+
+BARRIER_BYTES = 8
+"""A barrier's shared memory."""
+
+
+def allocated(*sizes: int) -> int:
+    """The shared memory allocations of `sizes` bytes take, each rounded up to `SMEM_ALIGNMENT`."""
+    return sum(-(-size // SMEM_ALIGNMENT) * SMEM_ALIGNMENT for size in sizes)
+
 SWIZZLE_BYTES = 128
 """The widest swizzle a shared-memory block's rows are staged at, which an MMA reads conflict-free."""
 

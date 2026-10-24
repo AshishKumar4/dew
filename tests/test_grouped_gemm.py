@@ -287,8 +287,9 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
                                                              precision="default",
                                                              interpret_on_cpu=True))(x, w, dy)
 
+    # Eagerly: the Mosaic interpreter's ordered callbacks are not a jitted `linear_call`'s to carry.
     with tuning.seen() as launches:
-        assert_as_exact(jax.jit(through_mosaic), jax.jit(with_gradients(projection())), draw,
+        assert_as_exact(through_mosaic, jax.jit(with_gradients(projection())), draw,
                         f"unseen {unseen}", seeds=SEEDS, truth_fn=with_gradients(projection(jnp.float64)))
     assert {type(launch).__name__ for launch, _ in launches} == {"MosaicGmm", "MosaicTgmm"}
 
