@@ -1105,17 +1105,22 @@ def _query_key(q, k, corrected, do, dv, h, dh, hi, lo, taken, call: _Call, *, sc
 
             gate, low = family.rows_of(hi_ref.at[h, span]), family.rows_of(lo_ref.at[h, span])
             ending, ending_low = (jnp.full((CHUNK,), ref[h, last]) for ref in (hi_ref, lo_ref))
-            ((dq, dk, dw),), (pairs, after, leaving) = algebra.query_key_gradients(
+            refs = {"dq": dq_ref, "dk": dk_ref, "dw": dw_ref}
+
+            def stored(kind: str, index: int, grad) -> None:
+                # In the operands' dtype, as fla's dqkwg writes them, each as it is final.
+                del index
+                held.store(refs[kind], grad, row, CHUNK, h * width + c * BLOCK, BLOCK)
+
+            _, (pairs, after, leaving) = algebra.query_key_gradients(
                 functools.partial(whole, "queries", given), functools.partial(whole, "keys", given), 1,
                 functools.partial(column, "values", held), functools.partial(column, "out", given),
                 functools.partial(column, "value_grads", held),
                 lambda i, j: column("entered", memories, j), lambda i, j: column("leaving", memories, j),
                 blocks, gate, low, ending, ending_low, None, scale, held.dtype,
                 _Issuer(call, {"scores_dq": [staged]}), laid=(family.columns_of(column_hi_ref.at[h, span]),
-                                                              family.columns_of(column_lo_ref.at[h, span])))
-            # In the operands' dtype, as fla's dqkwg writes them.
-            for ref, grad in ((dq_ref, dq), (dk_ref, dk), (dw_ref, dw)):
-                held.store(ref, grad, row, CHUNK, h * width + c * BLOCK, BLOCK)
+                                                              family.columns_of(column_lo_ref.at[h, span])),
+                emit=stored)
             decay_ref.at[c, h, span][...] = algebra.summed_back(pairs, after, leaving, summed)
             return carry, accumulators
 

@@ -720,7 +720,8 @@ def reverse_carried(grad: list, keys: TileLoad, weights: TileLoad, queries: Tile
 def query_key_gradients(queries: TileLoad, keys: TileLoad, columns: int, values: TileLoad,
                         out_grads: TileLoad, value_grads: TileLoad, entered: TileLoad, leaving: TileLoad,
                         blocks: int, gate, low, last, last_low, memory_decay, scale: float, dtype,
-                        issue: Issue, *, laid: tuple | None = None):
+                        issue: Issue, *, laid: tuple | None = None,
+                        emit: Callable[[str, int, jax.Array], None] | None = None):
     """The queries', keys', weights' and decay's gradients of a chunk and value head (fla's dqkwg) under a
     decay a head: over the value blocks `j`, `ds = do v^T`, `dq = do S^T`, `dk = v dS^T` and `dw = -dv S^T`
     for the corrected values `values(j)`, the output's gradient `out_grads(j)`, the corrected values' own
@@ -730,7 +731,9 @@ def query_key_gradients(queries: TileLoad, keys: TileLoad, columns: int, values:
     summing key blocks apart adds it once). Returns each key block's `(dq, dk, dw)` fp32 and the decay's
     terms `(pairs, after, leaving)`, `leaving` `[C]` each token's write into the memory the chunk leaves,
     a term through `(t, C - 1]` (a vector a row each, as a mainloop holds it, where its place among the pairs
-    is a column's)."""
+    is a column's). Where `emit` is given, each block's gradients go to `emit('dq' | 'dk' | 'dw', c, grad)`
+    as they are final (a mainloop's store, none held past it) and none is returned."""
+    found: list = []
     ds = functools.reduce(jnp.add, (issue("values_ds", out_grads(j), values(j).T) for j in range(blocks)))
     row_decay = raised(gate, low)[:, None]
     leaving_decay = raised(last - gate, last_low - low)[:, None]
@@ -738,7 +741,6 @@ def query_key_gradients(queries: TileLoad, keys: TileLoad, columns: int, values:
     pair_decay = decayed(gate, low, column_gate, column_low)
     rows, cols = _grid(ds.shape)
     ds = jnp.where(rows >= cols, ds * pair_decay, 0.0) * scale
-    scores = functools.reduce(jnp.add, (issue("local_t", queries(c), keys(c).T) for c in range(columns)))
     grads, leaving_terms, after = [], [], []
     for c in range(columns):
         dq = _summed(issue("memory_dq", out_grads(j), entered(c, j).T) for j in range(blocks))
@@ -749,16 +751,30 @@ def query_key_gradients(queries: TileLoad, keys: TileLoad, columns: int, values:
         query, key = queries(c).value().astype(jnp.float32), keys(c).value().astype(jnp.float32)
         leaving_terms.append(jnp.sum(dk * key, axis=1))
         after.append(jnp.sum(dq * query, axis=1))
-        grads.append((dq, dk, dw))
+        if emit is None:
+            found.append(dw)
+        else:
+            emit("dw", c, dw)
+        grads.append((dq, dk))
     leaving_terms, after = _summed(leaving_terms), _summed(after)
+    # The scores once the blocks' products are done: a tile not live across them.
+    scores = functools.reduce(jnp.add, (issue("local_t", queries(c), keys(c).T) for c in range(columns)))
     pairs = jnp.where(rows > cols, ds * scores, 0.0)
     if memory_decay is not None:
         after = after + jnp.where(rows[:, 0] == ds.shape[0] - 1, memory_decay * raised(last, last_low), 0.0)
     narrow = ds.astype(dtype)
     transposed = Transposed(narrow)
-    grads = [(dq + issue("scores_dq", narrow, keys(c)), dk + issue("scores_dq", transposed, queries(c)), dw)
-             for c, (dq, dk, dw) in enumerate(grads)]
-    return grads, (pairs, after, leaving_terms)
+    final = []
+    for c, (dq, dk) in enumerate(grads):
+        dq = dq + issue("scores_dq", narrow, keys(c))
+        if emit is not None:
+            emit("dq", c, dq)
+        dk = dk + issue("scores_dq", transposed, queries(c))
+        if emit is None:
+            final.append((dq, dk, found[c]))
+        else:
+            emit("dk", c, dk)
+    return final, (pairs, after, leaving_terms)
 
 
 def weighted_gradient(lower, keys: TileLoad, columns: int, values: TileLoad, blocks: int, w_grads: TileLoad,
