@@ -247,19 +247,17 @@ def real_tail(x, valid, segments, width: int):
     where the row holds fewer, with their documents (`segments` `[B, S]`, -1 in front; all 0 where
     None) and the row's real count `[B]`: what a later slice of the row's sequence reads as the history
     behind its first real token (`held_conv1d`'s `held`)."""
-    batch, length, channels = x.shape
-    rank, source = _stream_order(valid)
-    count = rank[:, -1] + 1
+    length = x.shape[1]
+    order, count = valid_order(jnp.asarray(valid, bool))
+    # Each tail column's place among the row's real tokens, negative in front of the first, and the
+    # slot it reads: the real token's own, or the appended zero (document -1) in front.
+    places = count[:, None] - width + jnp.arange(width)[None, :]
+    slots = jnp.where(places >= 0, jnp.take_along_axis(order, jnp.maximum(places, 0), axis=1), length)
     padded = jnp.pad(x, ((0, 0), (0, 1), (0, 0)))
-    compact = jnp.take_along_axis(padded, source[:, :, None], axis=1, mode='promise_in_bounds')
-    owners = (jnp.zeros((batch, length), jnp.int32) if segments is None
-              else jnp.take_along_axis(jnp.asarray(segments, jnp.int32), source, axis=1, mode='fill',
-                                       fill_value=-1))
-    stream = jnp.concatenate([jnp.zeros((batch, width, channels), x.dtype), compact], axis=1)
-    documents = jnp.concatenate([jnp.full((batch, width), -1, jnp.int32), owners], axis=1)
-    rows = count[:, None] + jnp.arange(width)[None, :]
-    return (jnp.take_along_axis(stream, rows[:, :, None], axis=1),
-            jnp.take_along_axis(documents, rows, axis=1), count)
+    tail = jnp.take_along_axis(padded, slots[:, :, None], axis=1, mode='promise_in_bounds')
+    owners = (jnp.zeros(valid.shape, jnp.int32) if segments is None else jnp.asarray(segments, jnp.int32))
+    documents = jnp.take_along_axis(jnp.pad(owners, ((0, 0), (0, 1)), constant_values=-1), slots, axis=1)
+    return tail, documents, count
 
 
 def held_conv1d(x, kernel, valid, held=None, *, bias=None, segments=None, right_padded: bool = False,
