@@ -867,7 +867,10 @@ class DecisionInputs:
 
     @property
     def question_segments(self) -> jnp.ndarray:
-        """Return the `[B, Q]` row each question belongs to, 0 for a padding slot."""
+        """Return the `[B, Q]` row each question belongs to, 0 for a padding slot: the row its span
+        starts in, or, where the spans are the context's (`spans_in_context`), the window's one row."""
+        if self.spans_in_context:
+            return self.questions.astype(self.segments.dtype)
         return jnp.where(self.questions, jnp.take_along_axis(self.segments, self.spans[..., 0], axis=1), 0)
 
     @property
