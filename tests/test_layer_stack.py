@@ -9,6 +9,7 @@ loop's, with the largest observed difference written beside each bound.
 """
 
 import dataclasses
+import functools
 import json
 from pathlib import Path
 
@@ -153,8 +154,18 @@ def deepseek_widths(dtype=jnp.float32, **overrides):
 SHAPES = {"gemma4": gemma4_shaped, "gemma3n": gemma3n_shaped, "deepseek": deepseek_shaped,
           "deepseek_widths": deepseek_widths}
 
-SCAN_SEEDS = {"gemma4": 8, "gemma3n": 8, "deepseek": 8, "deepseek_widths": 8}
-"""Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada."""
+SCAN_WIDTHS = {"gemma3n": {"mlp_features": (192,) * 10}, "gemma4": {"per_layer_input_dim": 32}}
+"""Each shape's widths for the scanned stack's check 1, where the fixture's leave a draw's error to a few
+of its values: Gemma 3n's sparse layers keep about ten of 192 units a token at 0.95 sparsity, where 48
+keep two, as the architectures cell found (tests/test_architectures.py);
+Gemma 4's per-layer inputs are 32 wide, where at the fixture's 8 Dew paired with the plain loop did not
+resolve within 4096 draws (the released E2B's are 256)."""
+SCAN_SEEDS = {"gemma4": 256, "gemma3n": 256, "deepseek": 8, "deepseek_widths": 8}
+"""Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada: Gemma 3n's
+by the plain loop against itself; Gemma 4's and the DeepSeek shapes' paired with the scanned stack,
+whose arms share every upstream rounding (the same weights, rows and arithmetic, the DeepSeek shapes'
+bit for bit on a CPU) and whose errors are heavy-tailed across draws: the four largest of 1024 draws
+hold up to 40% of a Gemma 4 leaf's pooled error, of 64 up to 43% of a DeepSeek one's."""
 
 
 def same_metrics(left: dict, right: dict, relative: float = 1e-5) -> bool:
@@ -178,7 +189,7 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
     scanning reorders the loop's fp32 sums where an accelerator fuses a scanned layer apart from its
     neighbours, and is otherwise the same computation. The float64 run is on the CPU backend, which
     every lane keeps beside its accelerator, since a TPU has no float64."""
-    build = SHAPES[shape]
+    build = functools.partial(SHAPES[shape], **SCAN_WIDTHS.get(shape, {}))
     plain, scanned, variables, _ = scanned_pair(build)
     training = gemma3n_training_variables(variables) if shape == "gemma3n" else variables
 
