@@ -24,7 +24,8 @@ import dew
 import dew.nn.backbones  # registers the models
 from dew.artifacts import VideoGrid
 from dew.batch import merge
-from dew.config import MetricConfig, ModelConfig, ObjectiveConfig, TrainerConfig
+from dew.config import MetricConfig, ObjectiveConfig, TrainerConfig
+from dew.model_config import ModelConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data import ByteTokenizer, presets
 from dew.data.dataset import Loader

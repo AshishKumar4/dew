@@ -34,7 +34,8 @@ from collections.abc import Mapping
 
 import tyro
 
-from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
+from dew.config import ObjectiveConfig, OptimConfig, TrainerConfig
+from dew.model_config import ModelConfig
 from dew.config.lm import LMRunConfig
 from dew.data import mix, phases, presets
 from dew.data.pipeline import Pipeline

@@ -32,7 +32,8 @@ from PIL import Image
 
 import dew
 from dew.artifacts import uint8_pixels
-from dew.config import MetricConfig, ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
+from dew.config import MetricConfig, ObjectiveConfig, OptimConfig, TrainerConfig
+from dew.model_config import ModelConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.coordination import collective_host
 from dew.data import TFDS, Files, Loading, images, presets

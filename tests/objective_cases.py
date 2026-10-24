@@ -15,7 +15,8 @@ import jax
 import pytest
 from decision_support import decision_rows
 
-from dew.config import ModelConfig, ObjectiveConfig
+from dew.config import ObjectiveConfig
+from dew.model_config import ModelConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.config.jepa import JepaRunConfig
 from dew.data import TFDS, Loading, Memory, images as image_steps, presets

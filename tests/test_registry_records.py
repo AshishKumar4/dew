@@ -4,6 +4,8 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING
 
+import pytest
+
 from dew.config import ObjectiveConfig
 from dew.inputs import Field, InputSpec
 from dew.registry import Aliases
@@ -96,3 +98,19 @@ def test_a_dataclass_members_field_rebuilds_through_a_function_member():
 
 def supervised(loss: dict) -> ObjectiveConfig:
     return ObjectiveConfig("supervised", {"loss": loss, "inputs": InputSpec(Field("x", (3,)))})
+
+
+def test_a_model_records_wrappers_round_trip_by_their_class_and_refuse_what_wraps_nothing():
+    """A model record's wrappers are any `registry.Wrapper`, each written with its class path and
+    rebuilt as that class (`ModelConfig.wrappers`), so the record names no closed set of wrappers; a
+    value that wraps nothing is refused where the record is made."""
+    from dew.model_config import ModelConfig
+    from dew.quantization import InputQuantization
+    from dew.registry import to_record
+
+    quantized = InputQuantization(format="modelopt", sites=(("lm_head", "fp8"),))
+    wrapped = ModelConfig("simple_dit", wrappers=(quantized,))
+    rebuilt = ModelConfig.from_dict(to_record(wrapped, ModelConfig))
+    assert rebuilt == wrapped and type(rebuilt.wrappers[0]) is InputQuantization
+    with pytest.raises(TypeError):
+        ModelConfig("simple_dit", wrappers=(Field("image", (4, 4, 3)),))

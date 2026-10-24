@@ -34,8 +34,7 @@ import shlex
 import sys
 import types
 import typing
-from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Self, Union
@@ -57,7 +56,8 @@ from dew.data.dataset import Loader, Ramp, Reader, ramped, record_argument
 from dew.data.pipeline import Dataset
 from dew.files import write_atomically
 from dew.inputs import Field
-from dew.lora import AdapterRecord, LoRA
+from dew.lora import LoRA
+from dew.model_config import JsonDict, ModelConfig, Registered, default_record, member_fields
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.optim import (
     BF16_STATE_OPTIMIZERS,
@@ -71,17 +71,15 @@ from dew.optim import (
     scaled_solver,
     weight_decay_mask,
 )
-from dew.quantization import InputQuantization, Quantization
+from dew.quantization import Quantization
 from dew.records import JSON, duration, record, recorded_duration
 from dew.registry import (
     Annotation,
-    Configured,
     declared_type,
     from_record,
     metrics,
     models,
     objectives,
-    parameter_type,
     parameters,
     schedules,
     to_record,
@@ -97,20 +95,6 @@ from dew.training.selection import Best
 from dew.training.tracker import LocalTracker, Tracker, Trackers, WandbTracker
 from dew.training.trainer import Rollout, Trainer, run_length, run_steps
 
-JsonDict = Annotated[
-    Mapping[str, object],
-    tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1,
-        metavar="JSON",
-        instance_from_str=lambda args: json.loads(args[0]),
-        is_instance=lambda value: isinstance(value, dict),
-        str_from_instance=lambda value: [json.dumps(value)],
-    ),
-]
-"""The fields a model is built from, written as a single JSON string on the
-command line. The registry knows which architecture takes which field and
-narrows each one where it builds it, so the values are read there."""
-
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
@@ -122,110 +106,10 @@ else:
     ScheduleSpec = schedules.union
 
 
-ModelWrapper = InputQuantization | AdapterRecord | Quantization
-"""One wrapper a model record keeps (`ModelConfig.wrappers`)."""
 
 
 @dataclasses.dataclass(frozen=True)
-class _Configured(ABC):
-    """A registered class, named by an alias or an import path and held as the path, and the arguments a
-    run gives it: `fields`, the ones the run states, and `defaults`, every other one the class
-    defaults as it defaulted them when the run was first recorded, so the record builds the same
-    thing after a default changes (`arguments`). Each kind names its registry (`_member`) and whether
-    its stated fields are held as their records (`_recorded`)."""
-
-    name: str
-    fields: JsonDict = dataclasses.field(default_factory=dict)
-    defaults: JsonDict = dataclasses.field(default_factory=dict)
-    """Each argument the class defaults and `fields` leaves out, as a record holds it;
-    one a record lacks, as an argument the class has since gained, takes the class's default now."""
-
-    _recorded: ClassVar[bool] = True
-
-    @staticmethod
-    @abstractmethod
-    def _member(name: str) -> type:
-        """The class `name` names, from the kind's registry."""
-
-    def __post_init__(self) -> None:
-        member = self._member(self.name)
-        object.__setattr__(self, "name", registry.import_path(member))
-        if self._recorded:
-            object.__setattr__(self, "fields", registry.argument_records(member, self.fields))
-        object.__setattr__(self, "defaults", _defaults(member, self.fields, self.defaults))
-
-    @property
-    def arguments(self) -> JsonDict:
-        """The arguments the class is built from, before those the caller derives (`_arguments`)."""
-        return _arguments(self._member(self.name), self.fields, self.defaults)
-
-
-@dataclasses.dataclass(frozen=True)
-class ModelConfig(_Configured):
-    """A model's class and the fields the run gives it.
-
-    `name` is an alias or an import path, held as the path. `fields` are the
-    class's own fields, its compute and storage dtypes, attention kernel and
-    matmul precision included, which the command line sets one flag each
-    (`RunConfig.cli`); a recipe fills the ones it derives from its data in
-    `build`. `defaults` holds every other field the class defaults, as it
-    defaulted them when the run was first recorded, so the record builds the
-    same model after a default changes (`arguments`). `wrappers` are the
-    classes the model was wrapped in, in the order they were applied.
-    """
-
-    name: str = "simple_dit"
-    wrappers: tuple[ModelWrapper, ...] = ()
-    """What wraps the built model, innermost first, which `build` applies in
-    order: a checkpoint's input quantization, a bound LoRA (its factors are
-    stored with the checkpoint variables), the quantized training a run
-    wrapped it in."""
-
-    _recorded: ClassVar[bool] = False
-
-    @staticmethod
-    def _member(name: str) -> type:
-        return models[name]
-
-    @classmethod
-    def from_dict(cls, values: Mapping[str, object]) -> Self:
-        """Read back the record `RunConfig.to_dict` writes for this field."""
-        return from_record(cls, values, dtypes=False)
-
-    @property
-    def adapter(self) -> AdapterRecord | None:
-        """The bound LoRA among the wrappers, or None."""
-        return next((wrapper for wrapper in self.wrappers if isinstance(wrapper, AdapterRecord)), None)
-
-    @classmethod
-    def from_model(cls, model) -> Self:
-        """Return the module's class and constructor fields, and each wrapper
-        its class was made in, in the order they were applied."""
-        model_type, layers = registry.wrapper_layers(type(model))
-        wrappers = []
-        for layer in reversed(layers):
-            wrapper = layer._dew_wrapper()
-            if not isinstance(wrapper, ModelWrapper):
-                raise ValueError(f"{type(wrapper).__name__} wraps {model_type.__name__} where no model "
-                                 f"record can name it")
-            wrappers.append(wrapper)
-        return cls(registry.import_path(model_type), registry.record_fields(model, model_type),
-                   wrappers=tuple(wrappers))
-
-    def with_dtype(self, dtype: str | None) -> Self:
-        """This model computing in `dtype` (`dew.registry.with_dtype`); None keeps it."""
-        return dataclasses.replace(self, fields=registry.with_dtype(self.name, self.fields, dtype))
-
-    def build(self, **derived: Configured):
-        """Build the model from its fields and the ones the recipe `derived`."""
-        model = models.build(self.name, {**self.arguments, **derived})
-        for wrapper in self.wrappers:
-            model = wrapper.apply(model)
-        return model
-
-
-@dataclasses.dataclass(frozen=True)
-class ObjectiveConfig(_Configured):
+class ObjectiveConfig(Registered):
     """An objective's class and the arguments the run gives it.
 
     `name` is an alias or an import path, held as the path. `fields` are the
@@ -256,7 +140,7 @@ class ObjectiveConfig(_Configured):
 
 
 @dataclasses.dataclass(frozen=True)
-class MetricConfig(_Configured):
+class MetricConfig(Registered):
     """A metric's class and the arguments the run gives it.
 
     `name` is an alias of `dew.registry.metrics` or an import path, held as
@@ -306,97 +190,27 @@ def _member_flags(member: type, given: Mapping[str, object]) -> tuple[type, Mapp
     flags, started = [], {}
     # One record: a module two defaults share is written once.
     with registry.recording():
-        for name, declared, annotation in _member_fields(member):
+        for name, declared, annotation in member_fields(member):
             declared = None if declared is dataclasses.MISSING else declared
             annotation = registry.resolve_alias(annotation)
             if name in ("dtype", "param_dtype"):
                 typed = registry.DtypeName | None
-                declared = _record_of(name, declared, annotation)
+                declared = default_record(name, declared, annotation)
             elif name == "precision":
                 typed = Literal["default", "high", "highest"] | None
-                declared = _record_of(name, declared, annotation)
+                declared = default_record(name, declared, annotation)
             elif annotation is not None and _scalar(annotation):
                 typed = annotation if declared is not None else annotation | None
             else:
                 typed = Annotated[JSON, _JSON_FLAG]
                 try:
-                    declared = _record_of(name, declared, annotation)
+                    declared = default_record(name, declared, annotation)
                 except (TypeError, ValueError):
                     continue  # a field no record carries keeps its class default
             started[name] = given.get(name, declared)
             copied = functools.partial(copy.deepcopy, started[name])
             flags.append((name, typed, dataclasses.field(default_factory=copied)))
     return dataclasses.make_dataclass(f"{member.__name__}Fields", flags, frozen=True), started
-
-
-def _member_fields(member: type) -> Iterator[tuple[str, Configured, Annotation]]:
-    """Each field `_member_flags` flags: its name, its default
-    (`dataclasses.MISSING` for none) and its annotation (None where its
-    module cannot resolve it). A dataclass with a constructor of its own (a
-    metric over its base's fields) has that constructor's arguments, as the
-    registry builds it (`registry.record_class`)."""
-    if registry.record_class(member) is not None:
-        for field in registry.constructor_fields(member):
-            default = (field.default_factory() if callable(field.default_factory) else field.default)
-            yield field.name, default, declared_type(member, field.name)
-        return
-    for name, (parameter, owner) in registry.parameters(member)[0].items():
-        if parameter.kind is parameter.POSITIONAL_OR_KEYWORD and parameter.default is parameter.empty:
-            continue  # what the caller builds, the model first
-        try:
-            annotation = parameter_type(owner, name)
-        except ValueError:
-            annotation = None
-        default = dataclasses.MISSING if parameter.default is parameter.empty else parameter.default
-        yield name, default, annotation
-
-
-def _record_of(name: str, declared: Configured, annotation: Annotation) -> JSON:
-    """A member's default `declared` as a record holds it: a dtype by its
-    name, a matmul precision by its level, anything else as `to_record`
-    writes it. TypeError or ValueError for a value no record carries."""
-    if name in ("dtype", "param_dtype"):
-        return registry.dtype_name(registry.resolve_dtype(declared))
-    if name == "precision":
-        return None if declared is None else str(declared).lower().removeprefix("precision.")
-    # The record itself, not a copy: a module a later default shares turns
-    # this one into its defining record.
-    record = to_record(declared, annotation)
-    json.dumps(record)
-    return record
-
-
-def _defaults(member: type, stated: Mapping[str, object], recorded: Mapping[str, object]) -> JsonDict:
-    """The record of each field or argument `member` defaults that `stated`
-    leaves out: as `recorded` holds it, or else as the class defaults it now.
-    A default no record carries (a callable, say) is left to the class, and
-    a recorded one the class no longer takes is refused."""
-    defaults, named = {}, set()
-    # One record: a module two defaults share is written once.
-    with registry.recording():
-        for name, declared, annotation in _member_fields(member):
-            named.add(name)
-            if name in stated or name in recorded or declared is dataclasses.MISSING:
-                continue
-            try:
-                defaults[name] = _record_of(name, declared, annotation)
-            except (TypeError, ValueError):
-                continue
-    unknown = sorted(set(recorded) - named)
-    if unknown:
-        raise ValueError(f"{member.__name__} takes no {unknown}, which the record defaults")
-    return {**defaults, **{name: value for name, value in recorded.items() if name not in stated}}
-
-
-def _arguments(member: type, fields: Mapping[str, object], defaults: Mapping[str, object]) -> JsonDict:
-    """What a config builds `member` from beside what its caller derives:
-    `fields`, over each of `defaults` the class no longer defaults the same.
-    A default the class still has is left to it, so a class that treats an
-    argument left out in its own way, as `DPOObjective` holds its reference
-    at unit decay, still does."""
-    now = _defaults(member, {}, {})
-    return {**{name: value for name, value in defaults.items() if name not in now or now[name] != value},
-            **fields}
 
 
 def _chosen(given: list[str], field: str) -> str | None:
@@ -1173,7 +987,6 @@ def _parsed(path: str, text: str, annotation: Annotation) -> JSON:
         return text
 
 
-
 _RANDOM_SEARCH = RandomSearch()
 
 
@@ -1638,5 +1451,5 @@ class RunConfig:
         return finished
 
 
-__all__ = ["JsonDict", "MetricConfig", "ModelConfig", "ObjectiveConfig", "OptimConfig", "Prepared",
+__all__ = ["MetricConfig", "ObjectiveConfig", "OptimConfig", "Prepared",
            "RunConfig", "ScheduleSpec", "TrainerConfig", "Wandb", "flag_selected"]

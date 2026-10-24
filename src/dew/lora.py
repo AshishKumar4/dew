@@ -92,7 +92,7 @@ from dew.quantization import (
     measured_fp8_sites,
 )
 from dew.records import finite
-from dew.registry import rebuilt, wrapper_layers
+from dew.registry import Wrapper, rebuilt, wrapper_layers
 
 PEFT_CONFIG = "adapter_config.json"
 PEFT_WEIGHTS = "adapter_model.safetensors"
@@ -344,9 +344,10 @@ class Adapter:
 
         run = SavedRun.pinned(str(directory), step, trust)
         config = saved_model(run.record, None)
-        if config.adapter is None:
+        adapter = recorded_adapter(config.wrappers)
+        if adapter is None:
             raise ValueError(f"{directory} trained no adapter")
-        return cls.recorded(config.build(), run.variables(ema=ema), config.adapter)
+        return cls.recorded(config.build(), run.variables(ema=ema), adapter)
 
     @classmethod
     def recorded(cls, model: nn.Module, variables: Variables, adapter: AdapterRecord) -> Adapter:
@@ -808,6 +809,11 @@ class AdapterRecord:
                        binding.name, ((*module.split('/'), 'kernel'),), binding.shape, binding.transpose)
                    for module, binding in self.layouts.items()}
         return targets, layouts
+
+
+def recorded_adapter(wrappers: Sequence[Wrapper]) -> AdapterRecord | None:
+    """The LoRA bound among a model record's `wrappers` (`ModelConfig.wrappers`), or None."""
+    return next((wrapper for wrapper in wrappers if isinstance(wrapper, AdapterRecord)), None)
 
 
 def _record(bound: _Bound) -> AdapterRecord:

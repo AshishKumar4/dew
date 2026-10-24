@@ -14,7 +14,8 @@ import pytest
 from affine_run import Replaying
 
 import dew
-from dew.config import ModelConfig, TrainerConfig
+from dew.config import TrainerConfig
+from dew.model_config import ModelConfig
 from dew.config.lm import LMRunConfig
 from dew.data.dataset import Loader
 from dew.interop import Pretrained

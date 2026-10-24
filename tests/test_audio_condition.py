@@ -17,7 +17,8 @@ import pytest
 import torch
 from diffusion_support import images_of
 
-from dew.config import ModelConfig, ObjectiveConfig
+from dew.config import ObjectiveConfig
+from dew.model_config import ModelConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data import Loading, presets
 from dew.data.compile import fitted

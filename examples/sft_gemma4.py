@@ -28,7 +28,8 @@ import jax
 import jax.numpy as jnp
 import tyro
 
-from dew.config import ModelConfig, OptimConfig, TrainerConfig
+from dew.config import OptimConfig, TrainerConfig
+from dew.model_config import ModelConfig
 from dew.config.lm import LMRunConfig
 from dew.data import HFTokenizer, Loading, presets
 from dew.data.chat import Role

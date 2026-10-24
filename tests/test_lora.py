@@ -754,7 +754,7 @@ def squared_output(model, variables, inputs):
 def _registry_decoder():
     """A tiny causal transformer and its variables, built from the registry:
     no published checkpoint, so no weight layouts to resolve names through."""
-    from dew.config import ModelConfig
+    from dew.model_config import ModelConfig
 
     config = ModelConfig("causal_transformer", {**REGISTRY_FIELDS,
                                               "dtype": "float32", "attention_impl": "reference"})
@@ -805,7 +805,7 @@ def test_trained_factors_over_a_bf16_base_resume_on_the_rebuilt_model_as_an_unin
     run's step-2 state bit for bit, and its next two steps reach every leaf and the outputs an
     uninterrupted four-step run reaches, bit for bit. A template whose factors took the base's
     bfloat16 would round the restored factors; a resume that drew afresh would start elsewhere."""
-    from dew.config import ModelConfig
+    from dew.model_config import ModelConfig
     from dew.inputs import Field, InputSpec
     from dew.objectives.base import Objective
 

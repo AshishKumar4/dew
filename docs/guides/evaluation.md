@@ -187,7 +187,8 @@ The example continues the previous one and reuses `objective`, `data`, `Perplexi
 
 ```python
 from dew import Evaluation, LocalTracker
-from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
+from dew.config import OptimConfig, RunConfig, TrainerConfig
+from dew.model_config import ModelConfig
 from dew.config.sweep import GridSearch
 
 config = RunConfig(

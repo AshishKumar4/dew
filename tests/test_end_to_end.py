@@ -598,7 +598,8 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     from diffusion_stubs import batch_for
     from diffusion_support import images_of, saved_after_one_step
 
-    from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
+    from dew.config import ObjectiveConfig, TrainerConfig
+    from dew.model_config import ModelConfig
     from dew.config.diffusion import DiffusionRunConfig
     from dew.inputs import TextCondition
     from dew.nn.autoencoders.pretrained import PretrainedAutoencoder

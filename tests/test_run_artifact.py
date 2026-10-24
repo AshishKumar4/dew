@@ -10,7 +10,7 @@ import optax
 import pytest
 
 from dew.checkpoints import Checkpoints
-from dew.config import ModelConfig
+from dew.model_config import ModelConfig
 from dew.data import Loading, Memory
 from dew.data.compile import compile
 from dew.data.dataset import Loader

@@ -41,7 +41,8 @@ import numpy as np
 import optax
 from diffusion_support import images_of
 
-from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
+from dew.config import ObjectiveConfig, TrainerConfig
+from dew.model_config import ModelConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader
 from dew.diffusion.presets import Flow

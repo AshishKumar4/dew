@@ -22,7 +22,8 @@ from diffusion_stubs import PROMPTS, batch_for
 from diffusion_support import images_of
 from reference_error import assert_as_exact
 
-from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
+from dew.config import ObjectiveConfig, TrainerConfig
+from dew.model_config import ModelConfig
 from dew.config.diffusion import DiffusionRunConfig, FlowRolloutConfig
 from dew.diffusion.presets import Flow, ResolutionShift
 from dew.diffusion.process import Process
