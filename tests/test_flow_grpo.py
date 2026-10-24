@@ -237,7 +237,7 @@ def test_a_prediction_undefined_at_pure_noise_is_refused_only_where_a_walk_evalu
     def walk(start):
         _, (states, log_probs) = sample(
             denoise, start, solver=solver, key=jax.random.key(1), times=times, final_denoise=False,
-            record=lambda following, state: (following, state[0]))
+            record=lambda following, state, denoised: (following, state[0]))
         return jnp.concatenate((start[None], states)), log_probs
 
     assert np.isfinite(np.asarray(walk(x)[0])).all()
