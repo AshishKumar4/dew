@@ -54,8 +54,7 @@ def _summary(signature) -> str:
 
 
 def pytest_terminal_summary(terminalreporter, config):
-    paths = glob.glob("/tmp/dew-hlo/*cpu_after_optimizations.txt") or glob.glob(
-        "/tmp/dew-hlo/*after_optimizations.txt")
+    paths = glob.glob("/tmp/dew-hlo/*.after_optimizations.txt")
     modules = {path: Path(path).read_text() for path in paths}
 
     def entry(text):
