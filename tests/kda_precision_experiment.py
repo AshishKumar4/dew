@@ -31,6 +31,33 @@ def install_dot(algorithm='bf16x6'):
     fla_gdn._dot = fla_kda._dot = dot
 
 
+def install_pairwise_intra_decay():
+    from dew.nn.kernels import fla_kda
+
+    original = fla_kda.bwd_intra
+
+    def bwd(q, k, g, beta, daqk, dakk, dq, dk, db, dg, **options):
+        found = original(q, k, g, beta, daqk, dakk, dq, dk, db, dg, **options)
+        length = q.shape[1]
+        assert length <= options.get('chunk', 64), 'the diagnostic holds one chunk per row'
+        with jax.enable_x64():
+            q64, k64, g64, beta64 = [x.astype(jnp.float64) for x in (q, k, g, beta)]
+            qk = daqk[..., :length].astype(jnp.float64)
+            kk = dakk[..., :length].astype(jnp.float64)
+            decay = jnp.exp2(g64[:, :, None] - g64[:, None, :])
+            terms = ((qk[..., None] * q64[:, :, :, None, :]
+                      + kk[..., None] * (k64 * beta64[..., None])[:, :, :, None, :])
+                     * k64[:, None, :, :, :].transpose(0, 1, 3, 2, 4)
+                     * decay.transpose(0, 1, 3, 2, 4))
+            strict = np.tril(np.ones((length, length), bool), -1)
+            terms = jnp.where(strict[None, :, None, :, None], terms, 0.0)
+            intra = terms.sum(axis=3) - terms.sum(axis=1).transpose(0, 2, 1, 3)
+            precise = (dg.astype(jnp.float64) + intra).astype(jnp.float32)
+        return (*found[:3], precise)
+
+    fla_kda.bwd_intra = bwd
+
+
 def log_measurements():
     import reference_error
 
@@ -126,9 +153,13 @@ if __name__ == '__main__':
         install_prefix64(sys.argv[1])
     elif sys.argv[1] in ('bf16x6', 'bf16x9', 'ieee'):
         install_dot(sys.argv[1])
-    elif sys.argv[1] == 'prefix64-bf16x6':
+    elif sys.argv[1] in ('prefix64-bf16x6', 'prefix64-bf16x9', 'prefix64-ieee'):
+        install_prefix64()
+        install_dot(sys.argv[1].removeprefix('prefix64-'))
+    elif sys.argv[1] == 'prefix64-bf16x6-pairwise':
         install_prefix64()
         install_dot()
+        install_pairwise_intra_decay()
     elif sys.argv[1] == 'baseline':
         pass
     else:
