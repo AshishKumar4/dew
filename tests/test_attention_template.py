@@ -304,9 +304,7 @@ def test_the_templates_arithmetic_is_on_par_with_dews_reference_attention(case, 
 LAYOUTS = ("causal-documents-window", "cross-causal-lengths-starts")
 
 
-@pytest.mark.parametrize("dtype", DTYPES, ids=lambda dtype: jnp.dtype(dtype).name)
-@pytest.mark.parametrize("case", [CASES[name] for name in LAYOUTS], ids=LAYOUTS)
-def test_every_parameter_layout_and_the_output_hook_are_on_par(case, dtype):
+def layout_site(case, dtype):
     """A score hook reading a parameter of each score layout, a query's temperature, a key's bias and a
     dense bias, `s * t_q + b_k + B_qk`, and an output gate `o * sigmoid(g)`, on par with Dew's reference
     path taking them as it can: the temperature in the queries, the biases as one dense bias, the gate
@@ -342,8 +340,14 @@ def test_every_parameter_layout_and_the_output_hook_are_on_par(case, dtype):
                                            implementation="reference")
         return (out.astype(wide) * jax.nn.sigmoid(gate.astype(wide))).astype(query.dtype)
 
-    assert_as_exact(jax.jit(ours), jax.jit(dews), drawing(queries, keys, dtype),
-                    f"template layouts {case} {jnp.dtype(dtype).name}", seeds=SEEDS)
+    return (jax.jit(ours), jax.jit(dews), drawing(queries, keys, dtype),
+            f"template layouts {case} {jnp.dtype(dtype).name}")
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=lambda dtype: jnp.dtype(dtype).name)
+@pytest.mark.parametrize("case", [CASES[name] for name in LAYOUTS], ids=LAYOUTS)
+def test_every_parameter_layout_and_the_output_hook_are_on_par(case, dtype):
+    assert_as_exact(*layout_site(case, dtype), seeds=SEEDS)
 
 
 def halves(spans: template.KeySpans, half: int) -> tuple[template.KeySpans, template.KeySpans]:
