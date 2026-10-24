@@ -108,7 +108,8 @@ def test_quantized_projection_calls_keep_their_own_paths_under_a_joined_row(wrap
     inputs = jax.random.normal(jax.random.key(7), (2, 17, 64))
     if wrapped == "direct":
         qwix = pytest.importorskip("qwix")
-        provider = qwix.QtProvider([qwix.QtRule(module_path=".*", weight_qtype=jnp.int8, act_qtype=jnp.int8)])
+        provider = qwix.QtProvider([qwix.QtRule(module_path=".*gate_proj", weight_qtype=jnp.int8,
+                                               act_qtype=jnp.int8)])
         quantized = qwix.quantize_model(layer, provider)
 
         class Parent(nn.Module):
