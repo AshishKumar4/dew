@@ -46,7 +46,7 @@ def test_a_slot_release_loads_its_readout_and_exports_the_same_task(tmp_path, re
     elif readout == "fresh_head":
         labels = [task.tokenizer.encode(label)[0] for label in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"]
         table = task.model.table(task.variables)
-        np.testing.assert_array_equal(bundle.head_variables["params"]["slots"], table[labels])
+        np.testing.assert_array_equal(bundle.head_variables["params"]["slots"], np.asarray(table)[labels])
         assert np.count_nonzero(bundle.head_variables["params"]["q"]) > 0
         assert np.count_nonzero(bundle.head_variables["params"]["k"]) == 0
     else:
