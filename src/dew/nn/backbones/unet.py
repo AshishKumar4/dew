@@ -10,10 +10,9 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from ..attention import GroupNorm, RMSNorm, Stage, stage_attention
-from ..blocks import Downsample, FourierEmbedding, ResidualBlock, Upsample
+from ..blocks import Downsample, FourierEmbedding, ResidualBlock, TimeProjection, Upsample
 from ..conv import Conv
 from ..flops import MissingFlopsCount, patch_lengths
-from ..mlp import time_projection
 from .spatial import SpatialCount, SpatialForward, SpatialShape
 
 
@@ -138,7 +137,8 @@ class Unet(nn.Module):
         divisor = 2**(len(self.feature_depths) - 1)
         patch_lengths(sample_shape, (divisor, divisor), rows)
         operations = SpatialCount(context_lengths, text_features)
-        operations.flops = time_projection(self.emb_features).model_flops(np.ones((rows,), np.int64))
+        operations.flops = TimeProjection(self.emb_features, parent=None).model_flops(
+            np.ones((rows,), np.int64), self.emb_features)
         unet_body(self, SpatialShape((rows, *sample_shape)), SpatialShape((rows, self.emb_features)),
                   None, operations=operations)
         return operations.flops
@@ -157,5 +157,5 @@ class Unet(nn.Module):
 
     @nn.nowrap
     def time_embedding(self, temb):
-        return time_projection(self.emb_features, dtype=self.dtype, precision=self.precision,
-                               name="TimeProjection_0")(FourierEmbedding(features=self.emb_features, dtype=self.dtype)(temb))
+        return TimeProjection(features=self.emb_features, dtype=self.dtype, precision=self.precision)(
+            FourierEmbedding(features=self.emb_features, dtype=self.dtype)(temb))

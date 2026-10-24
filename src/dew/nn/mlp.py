@@ -7,7 +7,6 @@ import math
 from collections.abc import Callable
 from statistics import NormalDist
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
@@ -116,9 +115,6 @@ class GatedMLP(nn.Module):
     """
     hidden_features: int
     out_features: int
-    in_features: int | None = None
-    activation_after: bool = False
-    names: tuple[str, str] = ('up_proj', 'down_proj')
     activation: GatedActivation | Activation = 'swiglu'
     use_bias: bool = False
     activation_sparsity: float = 0.0
@@ -135,6 +131,9 @@ class GatedMLP(nn.Module):
     the down projection; None for none."""
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+    in_features: int | None = None
+    activation_after: bool = False
+    names: tuple[str, str] = ('up_proj', 'down_proj')
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
@@ -177,7 +176,8 @@ class GatedMLP(nn.Module):
             self.up_proj = dense(projections[up][1], name=up)
         self.down_proj = dense(projections[down][1], name=down, **normal_kernel(
             self.init_std if self.output_init_std is None else self.output_init_std))
-        self.dropout = nn.Dropout(rate=self.dropout_rate)
+        if self.dropout_rate:
+            self.dropout = nn.Dropout(rate=self.dropout_rate)
         if self.ngpt is not None:
             if not self._gated() or self.swiglu_limit is not None or self.activation_sparsity:
                 raise ValueError("an nGPT feed-forward is a plain gated product: it takes no clamp, "
@@ -241,7 +241,8 @@ class GatedMLP(nn.Module):
         return l2norm(hidden.astype(gate.dtype))
 
     def _down(self, hidden, train: bool):
-        hidden = self.dropout(hidden, deterministic=not train)
+        if self.dropout_rate:
+            hidden = self.dropout(hidden, deterministic=not train)
         return checkpoint_name(self.down_proj(hidden), 'down_proj')
 
     def _gate_up(self, x):
@@ -288,15 +289,6 @@ class GatedMLP(nn.Module):
         return (group,) if group.held(self.variables.get('params', {})) else ()
 
 
-def time_projection(features: int, *, in_features: int | None = None, dtype: Dtype | None = None,
-                    precision: PrecisionLike = None, name: str | None = None) -> GatedMLP:
-    """flaxdiff's `TimeProjection`: two maps to `features` with a tanh GELU after each, stored as
-    its `DenseGeneral_0` and `DenseGeneral_1` (`GatedMLP`'s ungated path)."""
-    return GatedMLP(features, features, in_features=in_features, activation=jax.nn.gelu, use_bias=True,
-                    activation_after=True, names=('DenseGeneral_0', 'DenseGeneral_1'), dtype=dtype,
-                    precision=precision, name=name)
-
-
 def geglu_feed_forward(dim: int, *, approximate: bool = True, **fields) -> GatedMLP:
     """diffusers' `FeedForward`: a GEGLU to four times `dim` and back, biased, its gate and up
     projections packed as the checkpoint keeps them, the up projection first; `approximate` is the
@@ -306,4 +298,4 @@ def geglu_feed_forward(dim: int, *, approximate: bool = True, **fields) -> Gated
                     packed_order=('up_proj', 'gate_proj'), **fields)
 
 
-__all__ = ["GatedMLP", "geglu_feed_forward", "time_projection"]
+__all__ = ["GatedMLP", "geglu_feed_forward"]

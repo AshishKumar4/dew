@@ -32,6 +32,7 @@ from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.backbones.decoder_block import DecoderBlock
 from dew.nn.dense import Dense
 from dew.nn.inputs import AttentionMetadata, coordinates
+from dew.nn.mlp import GatedMLP
 from dew.nn.precision import float32_dot_general
 from dew.nn.text_encoders import clip_layer
 
@@ -349,10 +350,11 @@ class MergeProjector(nn.Module):
             grouped = grouped.swapaxes(-1, -2)
         grouped = grouped.reshape(batch, count // block, block * self.hidden_size)
         act = named_activation(self.activation)
-        dense = functools.partial(Dense, use_bias=self.bias, dtype=self.dtype, precision=self.precision,
-                                  dot_general=float32_dot_general)
-        out = dense(self.out_width, name="fc2")(act(dense(self.width, name="fc1")(grouped)))
-        return act(out) if self.activation_after else out
+        mlp = GatedMLP(self.width, self.out_width, in_features=grouped.shape[-1], activation=act,
+                        activation_after=self.activation_after, use_bias=self.bias, names=("fc1", "fc2"),
+                        dtype=self.dtype, precision=self.precision)
+        nn.share_scope(self, mlp)
+        return mlp(grouped)
 
 
 PATCH_CONVOLUTION = "patch_embed.proj.weight"

@@ -258,7 +258,8 @@ class QwenImageTransformer(nn.Module):
         """`QwenImage21TimestepProjEmbeddings`: cosines first, then two
         bias-free linears with a SiLU between."""
         sinusoids = sinusoidal_time(time, TIME_FEATURES, dtype=at_least_fp32(self.dtype))
-        return embedding(sinusoids.astype(self.dtype or jnp.float32), self.features, "timestep_embedder",
+        time = sinusoids.astype(self.dtype or jnp.float32)
+        return embedding(self, time, self.features, "timestep_embedder",
                          bias=False, dtype=self.dtype, precision=self.precision)
 
     @nn.compact
@@ -328,8 +329,10 @@ class _TextIn(nn.Module):
     @nn.compact
     def __call__(self, x):
         x = RMSNorm(epsilon=self.eps, scale_offset=True, dtype=self.dtype, name="text_norm")(x)
-        x = nn.gelu(_dense(self.features, "in_layer", self.dtype, self.precision)(x), approximate=True)
-        return _dense(self.features, "out_layer", self.dtype, self.precision)(x)
+        mlp = GatedMLP(self.features, self.features, in_features=x.shape[-1], activation=nn.gelu,
+                        names=("in_layer", "out_layer"), dtype=self.dtype, precision=self.precision)
+        nn.share_scope(self, mlp)
+        return mlp(x)
 
 
 __all__ = ["QwenImageTransformer"]

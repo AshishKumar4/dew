@@ -192,6 +192,33 @@ def sinusoidal_time(time, features: int, *, dtype: DTypeLike, shift: float = 0, 
     return sinusoids(jnp.asarray(time, dtype).reshape(-1, 1) * frequencies[None], cosine_first=cosine_first)
 
 
+class TimeProjection(nn.Module):
+    """Two dense layers with the activation after each."""
+    features: int
+    activation: Callable = jax.nn.gelu
+    dtype: Dtype | None = None
+    precision: PrecisionLike = None
+
+    @nn.nowrap
+    def _mlp(self, input_features: int):
+        from .mlp import GatedMLP  # mlp reads this module's initializers
+
+        return GatedMLP(self.features, self.features, in_features=input_features,
+                        activation=self.activation, activation_after=True, use_bias=True,
+                        names=("DenseGeneral_0", "DenseGeneral_1"), dtype=self.dtype,
+                        precision=self.precision)
+
+    @nn.nowrap
+    def model_flops(self, lengths, input_features: int) -> float:
+        return self._mlp(input_features).model_flops(lengths)
+
+    @nn.compact
+    def __call__(self, x):
+        mlp = self._mlp(x.shape[-1])
+        nn.share_scope(self, mlp)
+        return mlp(x)
+
+
 def torch_nearest_resize(x, height: int, width: int):
     """Resample `[B, H, W, C]` to `height` by `width`, torch's nearest rule.
 

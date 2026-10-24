@@ -18,9 +18,9 @@ from dew.nn.dense import Dense
 from dew.objectives.base import merge
 
 from ..attention import NormalAttention, RMSNorm
+from ..blocks import TimeProjection
 from ..dit import ROPE_THETA
 from ..flops import MissingFlopsCount, patch_lengths, projection_flops
-from ..mlp import time_projection
 from ..precision import at_least_fp32, float32_dot_general
 from ..rope import rotary_freqs
 from .spatial import SpatialCount, SpatialShape
