@@ -397,7 +397,7 @@ def _waited_read(run: _FitRun, interval: Interval, *, agree: bool) -> Batch | No
     assert run.train is not None
     with region("input.wait"):
         asked = time.perf_counter()
-        batch = agreed_next(f"training read at step {run.current}", run.train) if agree else run.read()
+        batch = agreed_next("training read", run.train) if agree else run.read()
         interval.waited += time.perf_counter() - asked
     if batch is None and not run.current:
         raise ValueError("the training data holds no batch to train on")

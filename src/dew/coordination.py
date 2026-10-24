@@ -194,11 +194,11 @@ def agreed[T](phase: str, operation: Callable[[], T]) -> T:
 def agreed_next[T](phase: str, stream: Iterator[T]) -> T | None:
     """`stream`'s next item, read on every rank and agreed (`agreed`), or None where it has ended on
     every rank; refused on all of them where it ended on some and not the others."""
-    item, ended = agreed_count(phase, lambda: next(stream, None), lambda item: item is None)
+    read, ended = agreed_count(phase, lambda: next(stream, None), lambda read: read is None)
     if 0 < ended < jax.process_count():
         raise ValueError(f"{phase}: the stream ended on {ended} of {jax.process_count()} processes and the "
                          "others read on: each process's stream must hold as many items")
-    return item
+    return read
 
 
 def agreed_count[T](phase: str, operation: Callable[[], T], counted: Callable[[T], bool]) -> tuple[T, int]:
