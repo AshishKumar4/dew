@@ -441,8 +441,18 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
                              for (path, here), there in zip(drawn, wanted, strict=True)
                              if np.asarray(here).tobytes() != np.asarray(there).tobytes()]
                 if differing:
+                    details = []
+                    for (path, here), there in zip(drawn, wanted, strict=True):
+                        here, there = np.asarray(here), np.asarray(there)
+                        if here.tobytes() != there.tobytes():
+                            diff = here != there
+                            details.append((jax.tree_util.keystr(path), int(diff.sum()), int(diff.size),
+                                            float(np.max(np.abs(here.astype(np.float64) - there.astype(np.float64)))),
+                                            float(np.max(np.abs(there.astype(np.float64)))),
+                                            [int(i) for i in np.argwhere(diff)[0]],
+                                            float(here[tuple(np.argwhere(diff)[0])]), float(there[tuple(np.argwhere(diff)[0])])))
                     raise ValueError(f"the variables drawn split over {split} differ from one device's "
-                                     f"at {differing[:4]}")
+                                     f"at {details[:4]}")
                 _drawn_splits.add((repr(case), split))
                 return state, shardings, position
             return jax.device_put(jax.tree.map(lambda leaf: leaf.copy(), held), shardings), shardings, None
