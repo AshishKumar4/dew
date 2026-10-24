@@ -25,8 +25,9 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from common import git_head, host, peak_flops, throughput, write_record
+from common import host, peak_flops, throughput, write_record
 from qwen35 import MODEL, REVISION, WHOLE_PEAK_SCOPE, inputs, workload
+from reference_source import git_head
 from work import measure
 
 from dew.config import OptimConfig

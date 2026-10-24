@@ -23,22 +23,20 @@ Run with the Dew test environment's torch, on CPU:
     python tools/uvit_reference.py OUTPUT.npz
 """
 
-import importlib.util
+import importlib
 import sys
-import types
 from pathlib import Path
 
 import ml_dtypes
 import numpy as np
 import torch
-from reference_source import CACHE as UPSTREAM, saved_fixture, verified
+from reference_source import package, published_files, saved_fixture
 
 REPO, COMMIT = "baofff/U-ViT", "ce551708dc9cde9818d2af7d84dfadfeb7bd9034"
 FILES = {
     "libs/timm.py": "f1e414e5060038baba231ba30959bb1274839ebb1ba7649d3564288731a6babd",
     "libs/uvit_t2i.py": "2537800bd7251ea68f268b9125f5fbbfc64c1680bbc659767f37c737da468894",
 }
-CACHE = UPSTREAM / "U-ViT" / COMMIT
 CASES = {
     "published": {"img_size": 8, "patch_size": 2, "in_chans": 4, "embed_dim": 32, "depth": 4, "num_heads": 4,
                   "mlp_ratio": 4, "qkv_bias": False, "mlp_time_embed": False, "clip_dim": 12,
@@ -53,19 +51,8 @@ SEED = 47
 
 def uvit():
     """U-ViT's libs at `COMMIT`, as the package `uvit_libs`, in its math attention."""
-    package = types.ModuleType("uvit_libs")
-    package.__path__ = []
-    sys.modules["uvit_libs"] = package
-    modules = {}
-    for path, digest in FILES.items():
-        local = verified(f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/{path}", CACHE / path, digest)
-        name = "uvit_libs." + Path(path).stem
-        spec = importlib.util.spec_from_file_location(name, local)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-        modules[name] = module
-    t2i = modules["uvit_libs.uvit_t2i"]
+    package("uvit_libs", published_files(REPO, COMMIT, FILES) / "libs")
+    t2i = importlib.import_module("uvit_libs.uvit_t2i")
     t2i.ATTENTION_MODE = "math"
     return t2i
 
