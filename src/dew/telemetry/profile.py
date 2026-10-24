@@ -242,10 +242,17 @@ class Profiler:
         self._metadata: dict[str, JSON] = {}
         self._temporary = directory is None
         self._phase: Literal["starting", "running", "stopping"] | None = None
+        self._captures: list[Path] = []
 
     @property
     def directory(self) -> Path | None:
         return self._directory
+
+    @property
+    def captures(self) -> tuple[Path, ...]:
+        """The capture directories this profiler's stops exported, in order: each holds its manifest and
+        its `reports/`."""
+        return tuple(self._captures)
 
     def region(self, name: str) -> AbstractContextManager[None]:
         """Return a context manager that marks a named span in the trace while
@@ -350,6 +357,7 @@ class Profiler:
                 self._converter = None
                 self._metadata = {}
         assert capture is not None and converter is not None
+        self._captures.append(capture)
         metadata["body_status"] = body
         metadata["capture_status"] = "failed" if failures else "completed"
         metadata["capture_errors"] = [str(error) for error in failures]
