@@ -15,6 +15,7 @@ applies an output hook past the kernel, because the template's backward takes th
 
 import dataclasses
 import functools
+from typing import Literal, overload
 
 import jax
 
@@ -65,6 +66,18 @@ def _attend_forward(scale: float | None, query: jax.Array, key: jax.Array, value
     """The forward of a differentiated call, which keeps the residuals its backward reads."""
     out, peak, total, anchors, split = _forward(query, key, value, spans, hooks, scale, residuals=True)
     return out, (query, key, value, spans, hooks, (peak, total, anchors, split))
+
+
+@overload
+def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
+             scale: float | None, *, residuals: Literal[False]) -> jax.Array:
+    ...
+
+
+@overload
+def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
+             scale: float | None, *, residuals: Literal[True]) -> tuple[jax.Array, *Residuals]:
+    ...
 
 
 def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
