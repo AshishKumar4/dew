@@ -20,6 +20,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from fetched_fixtures import save
 from reference_source import CACHE, defined_in, git_head, verified
 from torch_precision import default_dtype, dtype_widened, float_as, replaced, widened_to
 
@@ -27,6 +28,8 @@ ROOT = Path(__file__).resolve().parents[1]
 REPO = "baselabs/elephant-1"
 REVISION = "b3f8a93462fb1051a9de031e94a7ff380e254072"
 PATCH_SHA256 = "f234c125f1d38d82104b9e1f24e75bde51e4401928acfba2fbf5c59ef2fb46b8"
+REFERENCE = f"https://huggingface.co/{REPO}/blob/{REVISION}/serve.patch; transformers"
+LICENSE = "MIT AND Apache-2.0"
 
 
 def release_blocks():
@@ -149,7 +152,7 @@ def main():
         arrays[f"blocks.input.{name}"] = np.stack([draw[name] for draw in draws])
     arrays["blocks.reference.logits"] = np.stack(references)
     arrays["blocks.truth.logits"] = np.stack(truths)
-    np.savez_compressed(args.output / "reference.npz", **arrays)
+    save(args.output / "reference.npz", arrays, reference=REFERENCE, license=LICENSE)
     provenance = {"generator": "tools/block_override_reference.py", "generator_revision": git_head(ROOT),
                   "repo": REPO, "revision": REVISION, "patch_sha256": PATCH_SHA256,
                   "packages": {name: importlib.metadata.version(name)
@@ -171,7 +174,7 @@ def calibrate(directory: Path):
     draw, reference, truth = indexed_recording(arrays, "blocks", capacity)
     count = seeds_for(reference, draw, "Qwen3.5 block attention", most=capacity, truth_fn=truth)
     arrays["blocks.seeds"] = np.asarray(count, np.int64)
-    np.savez_compressed(path, **arrays)
+    save(path, arrays, reference=REFERENCE, license=LICENSE)
     provenance = json.loads((directory / "source.json").read_text())
     provenance.update(seeds=count, recorded_seed_capacity=capacity, sizing_revision=git_head(ROOT))
     (directory / "source.json").write_text(json.dumps(provenance, indent=2) + "\n")
