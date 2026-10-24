@@ -2,8 +2,8 @@
 union it reads, in place of a pairwise mask. The decision layout's runs (`dew.decision.model.key_runs`) read
 exactly what its pairwise mask reads, causal or not, over packed rows and padding; a layer reading them
 computes what it computes over that mask, a windowed layer windowing each run over the key positions, whose
-places restart at each option; a mixer that reads no runs refuses them, and a local layer leaves its banded
-path for the kernel that reads them.
+places restart at each option; a local layer leaves its banded path for the kernel that reads them (a mixer
+that reads no runs refuses them: `test_mixers`).
 """
 
 import jax
@@ -15,11 +15,7 @@ from model_support import TINY_DECODER
 from dew.decision.layout import _parallel
 from dew.decision.model import key_runs
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
-from dew.nn.inputs import AttentionMetadata
 from dew.nn.kernels import generation
-from dew.nn.mixers import AttentionMixer, MixerContext
-from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 
 VOCAB = 37
 OPTIONS = 4
@@ -108,26 +104,6 @@ def test_a_layer_reading_key_runs_computes_what_it_computes_over_the_same_mask(k
     np.testing.assert_array_equal(np.asarray(ran), np.asarray(masked))
     jax.tree.map(lambda mine, theirs: np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs)),
                  sown, maxima)
-
-
-def test_a_mixer_that_reads_no_key_runs_refuses_them():
-    """Attention reads a call's key runs, which move its output; a gated delta net reads no runs, so its
-    layer refuses the call rather than run it as if every token read every earlier one."""
-    x = jax.random.normal(jax.random.key(1), (1, 4, 32))
-    own = AttentionMetadata(key_runs=jnp.stack([jnp.arange(4), jnp.arange(4) + 1], axis=-1)[None, :, None])
-    context = MixerContext(emb_features=32, num_heads=4, num_kv_heads=4, head_dim=8, max_seq_len=16)
-    delta = GatedDeltaNetMixer(linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=8,
-                               linear_value_head_dim=8)
-    for kind, reads in ((AttentionMixer(), True), (delta, False)):
-        layer = DecoderBlock(mixer=kind.build(context), feedforward=None, emb_features=32,
-                             wiring=BlockWiring())
-        params = layer.init(jax.random.key(0), x)
-        if reads:
-            ran = np.asarray(layer.apply(params, x, attention_metadata=own))
-            assert not np.allclose(ran, np.asarray(layer.apply(params, x)))
-        else:
-            with pytest.raises(ValueError, match="key_runs"):
-                layer.apply(params, x, attention_metadata=own)
 
 
 def test_a_local_layer_given_key_runs_leaves_its_banded_path():

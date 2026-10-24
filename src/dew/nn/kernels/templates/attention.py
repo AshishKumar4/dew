@@ -210,11 +210,8 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
         query_places, key_places = (jnp.asarray(places) for places in positions)
         ordered = _least_after(jnp.take_along_axis(key_places, order, axis=1),
                                None if key_ids is None else jnp.take_along_axis(key_ids, order, axis=1))
-        inside_lo = _searched(ordered, run_lo, run_hi, _moved(query_places, -before), "left")
-        inside_hi = _searched(ordered, run_lo, run_hi, _moved(query_places, after), "right")
-        held = inside_hi > inside_lo
-        start = jnp.where(held, jnp.maximum(start, _indexed(order, inside_lo, 0)), start)
-        end = jnp.where(held, jnp.minimum(end, _indexed(order, inside_hi - 1, -1) + 1), 0)
+        start, end = _narrowed(start, end, order, run_lo, run_hi, ordered, _moved(query_places, -before),
+                               _moved(query_places, after))
     elif sliding_window is not None and positions is None:
         # No two places of the call lie further apart than its queries and keys, so a wider window
         # keeps what that one does, and its bounds stay within int32.
@@ -238,24 +235,11 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
         query_places, key_places = (
             (index, jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32)[None, :], (batch, keys)))
             if positions is None else positions)
-
-        def chunk_of(places):
-            # Each place's chunk number in the places' own dtype; a chunk wider than it holds every
-            # place of one sign.
-            places = jnp.asarray(places)
-            if chunk > jnp.iinfo(places.dtype).max:
-                return jnp.where(places >= 0, 0, -1).astype(places.dtype)
-            return places // chunk
-
         # The query's document's keys of its chunk run together in document order, since their places
         # never decrease along it, and their first and last key indices bound the span.
-        wanted = chunk_of(query_places)
-        numbers = jnp.take_along_axis(chunk_of(key_places), order, axis=1)
-        inside_lo = _searched(numbers, run_lo, run_hi, wanted, "left")
-        inside_hi = _searched(numbers, run_lo, run_hi, wanted, "right")
-        held = inside_hi > inside_lo
-        start = jnp.where(held, jnp.maximum(start, _indexed(order, inside_lo, 0)), start)
-        end = jnp.where(held, jnp.minimum(end, _indexed(order, inside_hi - 1, -1) + 1), 0)
+        wanted = _chunk_of(query_places, chunk)
+        numbers = jnp.take_along_axis(_chunk_of(key_places, chunk), order, axis=1)
+        start, end = _narrowed(start, end, order, run_lo, run_hi, numbers, wanted, wanted)
     if lengths is not None:
         end = jnp.minimum(end, lengths.astype(jnp.int32)[:, None])
     if starts is not None:
@@ -270,6 +254,27 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     if valid is not None:
         query_ids, key_ids = _valid_ids(query_ids, key_ids, jnp.asarray(valid, bool), batch, queries)
     return KeySpans(start, end, query_ids, key_ids, keys, form)
+
+
+def _narrowed(start: jax.Array, end: jax.Array, order: jax.Array, run_lo: jax.Array, run_hi: jax.Array,
+              values: jax.Array, low: jax.Array, high: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Each query's `[start, end)` narrowed to its document's keys whose `values` (`[B, K]` in document
+    order, `order`, never decreasing along a document's run `[run_lo, run_hi)`) lie in `[low, high]`: they
+    run together, and their first and last key indices bound the span, which is empty where none do."""
+    inside_lo = _searched(values, run_lo, run_hi, low, "left")
+    inside_hi = _searched(values, run_lo, run_hi, high, "right")
+    held = inside_hi > inside_lo
+    return (jnp.where(held, jnp.maximum(start, _indexed(order, inside_lo, 0)), start),
+            jnp.where(held, jnp.minimum(end, _indexed(order, inside_hi - 1, -1) + 1), 0))
+
+
+def _chunk_of(places, chunk: int) -> jax.Array:
+    """Each place's chunk number in the places' own dtype; a chunk wider than it holds every place of one
+    sign."""
+    places = jnp.asarray(places)
+    if chunk > jnp.iinfo(places.dtype).max:
+        return jnp.where(places >= 0, 0, -1).astype(places.dtype)
+    return places // chunk
 
 
 def _within_runs(runs: jax.Array, start: jax.Array, end: jax.Array, keys: int, sides: tuple[int, int] | None,

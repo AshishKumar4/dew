@@ -1205,14 +1205,15 @@ class CausalTransformer(nn.Module):
                  positions=None, segment_ids=None,
                  input_embeddings=None,
                  attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
-                 attention_pairwise_mask=None, attention_key_positions=None, right_padded: bool = False,
-                 coordinates: Coordinates | None = None, conditioning: Mapping[str, jax.Array] | None = None):
+                 attention_pairwise_mask=None, attention_key_positions=None, attention_key_runs=None,
+                 right_padded: bool = False, coordinates: Coordinates | None = None,
+                 conditioning: Mapping[str, jax.Array] | None = None):
         x, prediction = self.hidden_and_mtp_inputs(
             tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
             input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
             block_groups=block_groups, rotary_positions=rotary_positions,
-            attention_pairwise_mask=attention_pairwise_mask,
-            attention_key_positions=attention_key_positions, right_padded=right_padded,
+            attention_pairwise_mask=attention_pairwise_mask, attention_key_positions=attention_key_positions,
+            attention_key_runs=attention_key_runs, right_padded=right_padded,
             coordinates=coordinates, conditioning=conditioning)
         if self.is_initializing() and self.dspark is not None:
             self.reach_drafter(tokens, x.dtype)
