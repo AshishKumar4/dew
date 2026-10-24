@@ -348,15 +348,21 @@ class Router(nn.Module):
             return self.tid2eid.value[jnp.asarray(tokens)]
         if tokens is not None:
             raise ValueError("only a hash router reads the token ids")
+        selection = self.selection(scores, media, blocks)
+        if self.expert_groups > 1:
+            selection = jnp.where(self.group_mask(selection), selection, -jnp.inf)
+        _, indices = jax.lax.top_k(selection, self.top_k)
+        return indices
+
+    def selection(self, scores, media=None, blocks=None):
+        """What a token's experts are chosen by before its groups are: its scores with the balancing
+        bias (a media token's own bias), and outside each block's shortlist -inf."""
         selection = scores if not self.expert_bias else scores + self.bias.value
         if media is not None:
             selection = jnp.where(media[..., None], scores + self.bias_vl.value, selection)
         if blocks is not None and self.block_experts is not None:
             selection = jnp.where(self.block_mask(selection, blocks, self.block_experts), selection, -jnp.inf)
-        if self.expert_groups > 1:
-            selection = jnp.where(self.group_mask(selection), selection, -jnp.inf)
-        _, indices = jax.lax.top_k(selection, self.top_k)
-        return indices
+        return selection
 
     def logits(self, x):
         """Each token's gate logit for every expert, in fp32 (`at_least_fp32`):
@@ -380,16 +386,20 @@ class Router(nn.Module):
         `n_group` means.
         """
         per_group = self.num_experts // self.expert_groups
-        grouped = selection.reshape(*selection.shape[:-1], self.expert_groups, per_group)
-        if self.group_score == 'max':
-            group_scores = jnp.max(grouped, axis=-1)
-        else:
-            best_two, _ = jax.lax.top_k(grouped, 2)
-            group_scores = jnp.sum(best_two, axis=-1)
-        _, groups = jax.lax.top_k(group_scores, self.groups_per_token)
+        _, groups = jax.lax.top_k(self.group_scores(selection), self.groups_per_token)
         kept = jnp.sum(
             jax.nn.one_hot(groups, self.expert_groups, dtype=jnp.int32), axis=-2)
         return jnp.repeat(kept > 0, per_group, axis=-1)
+
+    def group_scores(self, selection):
+        """Each expert group's score, by which a token's best groups are chosen (`group_mask`): its
+        best expert's selection score, or its two best's sum. `[..., expert_groups]`."""
+        grouped = selection.reshape(*selection.shape[:-1], self.expert_groups,
+                                    self.num_experts // self.expert_groups)
+        if self.group_score == 'max':
+            return jnp.max(grouped, axis=-1)
+        best_two, _ = jax.lax.top_k(grouped, 2)
+        return jnp.sum(best_two, axis=-1)
 
     @staticmethod
     def block_mask(selection, blocks, experts: int):

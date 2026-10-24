@@ -248,32 +248,22 @@ WALKS: dict[str, tuple[ModuleType, Callable[..., list[torch.Tensor]]]] = {
 }
 
 
-def multistep(**config) -> Case:
-    steps = config.pop("steps", STEPS)
-    return Case("DPMSolverMultistepScheduler",
-                dict(prediction_type="epsilon", final_sigmas_type="sigma_min",
-                     thresholding=False, **config), dew_grid(steps))
+def solver(scheduler: str, grid, **defaults):
+    """A factory of `scheduler`'s cases, each an epsilon prediction with `defaults` beside the
+    case's own config, on `grid` of its `steps` (STEPS unless it names them)."""
+    def case(**config) -> Case:
+        steps = config.pop("steps", STEPS)
+        return Case(scheduler, dict(prediction_type="epsilon", **defaults, **config), grid(steps))
+
+    return case
 
 
-def singlestep(**config) -> Case:
-    steps = config.pop("steps", STEPS)
-    return Case("DPMSolverSinglestepScheduler",
-                dict(prediction_type="epsilon", final_sigmas_type="sigma_min", **config),
-                dew_grid(steps))
-
-
-def deis(**config) -> Case:
-    steps = config.pop("steps", STEPS)
-    return Case("DEISMultistepScheduler",
-                dict(prediction_type="epsilon", timestep_spacing="trailing", **config),
-                trailing_grid(steps))
-
-
-def unipc(**config) -> Case:
-    steps = config.pop("steps", STEPS)
-    return Case("UniPCMultistepScheduler",
-                dict(prediction_type="epsilon", timestep_spacing="trailing",
-                     final_sigmas_type="sigma_min", **config), trailing_grid(steps))
+multistep = solver("DPMSolverMultistepScheduler", dew_grid, final_sigmas_type="sigma_min",
+                   thresholding=False)
+singlestep = solver("DPMSolverSinglestepScheduler", dew_grid, final_sigmas_type="sigma_min")
+deis = solver("DEISMultistepScheduler", trailing_grid, timestep_spacing="trailing")
+unipc = solver("UniPCMultistepScheduler", trailing_grid, timestep_spacing="trailing",
+               final_sigmas_type="sigma_min")
 
 
 def distilled(scheduler: str, **step_kwargs) -> Case:
