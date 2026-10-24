@@ -26,17 +26,29 @@ _log = logging.getLogger(__name__)
 ASSUMED: contextvars.ContextVar[str | None] = contextvars.ContextVar("assumed_generation", default=None)
 """The generation `assumed` stands in for the default device's, None outside it."""
 
+ASSUMED_TARGET: contextvars.ContextVar[GpuTarget | None] = contextvars.ContextVar("assumed_target",
+                                                                                    default=None)
+"""The device facts `assumed` stands in for the default device's where it was given them, None otherwise."""
+
 
 @contextlib.contextmanager
-def assumed(generation: str | None) -> Iterator[None]:
+def assumed(generation: str | GpuTarget | None) -> Iterator[None]:
     """Within the block, choose kernels as on a device of `generation` ('sm80'), whatever device this
     process has: `device_generation`, `bf16_dot_runs` and `triton_runs` answer for it, so every
     `KERNELS` choice and kernel refusal acts as on that GPU while a step traces and lowers for one on
-    a CPU (`dew.training._lowering`). None assumes nothing."""
-    token = ASSUMED.set(generation)
+    a CPU (`dew.training._lowering`). Given a target's facts (a GPU no row names, its multiprocessors,
+    shared memory, clock and bandwidth its own), `gpu_target` answers with them, so every launch is sized
+    and costed by them alone. None assumes nothing."""
+    if isinstance(generation, GpuTarget):
+        target, name = generation, generation.generation
+    else:
+        target, name = None, generation
+    token = ASSUMED.set(name)
+    facts = ASSUMED_TARGET.set(target)
     try:
         yield
     finally:
+        ASSUMED_TARGET.reset(facts)
         ASSUMED.reset(token)
 
 
@@ -419,13 +431,15 @@ def capability(generation: str) -> tuple[int, int] | None:
 def gpu_target(identifier: str | None = None) -> GpuTarget:
     """The target for a generation, reported device kind or case-insensitive lab alias.
 
-    None is this process's first device's: its generation is
+    None is this process's first device's (or the facts `assumed` was given): its generation is
     `device_generation`'s, the one seam that `assumed` and tests set, and its
     device kind only picks the SKU's peaks within that generation; a real GPU the table names no SKU of
     keeps its own kind, so its peaks stay unknown, while an assumed or patched
     generation takes the generation's canonical device. SKU queries retain
     that SKU's peaks. Unknown kinds have empty resources.
     """
+    if identifier is None and (facts := ASSUMED_TARGET.get()) is not None:
+        return facts
     if identifier is None:
         import jax
         device = jax.local_devices()[0]
