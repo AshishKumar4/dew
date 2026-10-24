@@ -15,6 +15,7 @@ from typing import Protocol, TypeGuard, overload, runtime_checkable
 
 import grain.experimental as gx
 import grain.python as pygrain
+import numpy as np
 
 from dew.data.dataset import LONG_RUN, Batch, logged_run
 from dew.data.pipeline import Record, Rejected
@@ -334,11 +335,35 @@ class Proportions:
         corpus = next(grown)
         return corpus, before[corpus]
 
+    def run(self, start: int, positions: int) -> tuple[np.ndarray, np.ndarray] | None:
+        """`at` of `positions` positions in a row from `start`, as two arrays, corpus and record:
+        `counts`' split taken for every position at once, a corpus at a time, so a run costs what one
+        position does in Python and a corpus's arithmetic in its vector. None where a position's
+        products would leave 64-bit integers, which `at` reads exactly."""
+        remaining = sum(self.proportions)
+        if (start + positions + 1) * remaining >= 2**62:
+            return None
+        left = np.arange(start, start + positions + 1, dtype=np.int64)
+        corpus = np.full(positions, -1, np.int64)
+        record = np.zeros(positions, np.int64)
+        for index, proportion in enumerate(self.proportions):
+            rest = left * (remaining - proportion) // remaining
+            # The position's corpus is the first whose count grows from it to the next position.
+            grows = (corpus < 0) & (np.diff(left - rest) > 0)
+            corpus[grows], record[grows] = index, (left - rest)[:-1][grows]
+            if (corpus >= 0).all():
+                break
+            left, remaining = rest, remaining - proportion
+        return corpus, record
+
 
 class ProportionalSelection(pygrain.DatasetSelectionMap):
     """Grain's weighted mix of corpora of `lengths` records as a selection map
     (`MapDataset.select_from_datasets`), by `Proportions`: as long as the mix reads no record of
     any corpus twice."""
+
+    RUN = 4096
+    """The positions read ahead together once a reader reads one after another (`Proportions.run`)."""
 
     def __init__(self, lengths: Sequence[int], weights: Sequence[float]):
         self._proportions = Proportions.of(weights)
@@ -348,12 +373,36 @@ class ProportionalSelection(pygrain.DatasetSelectionMap):
         if any(span == 0 for span in spans):
             raise ValueError("every corpus of a mix needs a record")
         self._length = min(sys.maxsize, int(min(spans)))
+        self._run: tuple[int, np.ndarray, np.ndarray] | None = None
+        self._last = -2
+        self._lock = threading.Lock()
+
+    def __getstate__(self) -> dict:
+        """What a worker process the selection is sent to reads: no run and no lock, its own."""
+        return {"_proportions": self._proportions, "_length": self._length}
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state, _run=None, _last=-2, _lock=threading.Lock())
 
     def __len__(self) -> int:
         return self._length
 
     def __getitem__(self, index: int) -> tuple[int, int]:
-        return self._proportions.at(index)
+        """`Proportions.at` of `index`: read from a run of positions where a reader reads them one
+        after another, as a loader does, at a corpus's Python cost a run rather than a position; a
+        position reached otherwise (a resume, a seek, a shuffled read) is read alone."""
+        with self._lock:
+            held = self._run
+            if held is not None and held[0] <= index < held[0] + len(held[1]):
+                start, corpora, records = held
+            elif index == self._last + 1 and (run := self._proportions.run(index, self.RUN)) is not None:
+                start, (corpora, records) = index, run
+                self._run = start, corpora, records
+            else:
+                self._last = index
+                return self._proportions.at(index)
+            self._last = index
+            return int(corpora[index - start]), int(records[index - start])
 
     def __repr__(self) -> str:
         return f"ProportionalSelection(proportions={self._proportions.proportions}, length={self._length})"

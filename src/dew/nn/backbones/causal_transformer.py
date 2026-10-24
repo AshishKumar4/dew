@@ -69,6 +69,7 @@ from ..inputs import (
     coordinates as build_coordinates,
     coordinates_of,
     numbered_blocks,
+    shifted_span,
 )
 from ..kv_cache import KVCache
 from ..mixer_base import MLP_RESIDUALS, RESIDUALS
@@ -1314,11 +1315,8 @@ class CausalTransformer(nn.Module):
         states = []
         for depth, block in enumerate(self.mtp, start=1):
             if valid is not None:
-                valid = valid[:, :-1]
-                if attention_mask is not None:
-                    valid = valid & attention_mask[:, depth:]
-                if segment_ids is not None:
-                    valid = valid & (segment_ids[:, :-depth] == segment_ids[:, depth:])
+                documents = None if segment_ids is None else segment_ids[:, depth - 1:]
+                valid = shifted_span(valid.shape, 1, valid=valid, segments=documents)
             segments, places = (None if field is None else field[:, depth:]
                                 for field in (segment_ids, positions))
             metadata = AttentionMetadata(
