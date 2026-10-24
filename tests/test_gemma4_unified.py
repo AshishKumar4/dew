@@ -289,8 +289,7 @@ def test_cached_unified_calls_keep_the_ordinary_forward_mask(source):
                     "Gemma4 Unified cached ordinary forward", seeds=8, truth_fn=truth)
 
 
-@pytest.mark.parametrize("media", ["text", "vision", "audio"])
-def test_a_unified_source_can_omit_either_media_component(source, tmp_path, media):
+def optional_source(source, directory, media):
     original = source[1]
     config = copy.deepcopy(original.config)
     if media != "vision":
@@ -301,10 +300,10 @@ def test_a_unified_source_can_omit_either_media_component(source, tmp_path, medi
     names = reference.state_dict().keys()
     reference.load_state_dict({name: value for name, value in original.state_dict().items() if name in names},
                                strict=True)
-    reference.save_pretrained(tmp_path, safe_serialization=True)
-    reference.config.to_json_file(tmp_path / "config.json", use_diff=False)
+    reference.save_pretrained(directory, safe_serialization=True)
+    reference.config.to_json_file(directory / "config.json", use_diff=False)
     for name in ("processor_config.json", "tokenizer_config.json", "tokenizer.json"):
-        shutil.copyfile(FIXTURE / name, tmp_path / name)
+        shutil.copyfile(FIXTURE / name, directory / name)
 
     def draw(seed):
         values = unified_draw(original.config, seed)
@@ -322,10 +321,16 @@ def test_a_unified_source_can_omit_either_media_component(source, tmp_path, medi
             del values["input_features"], values["input_features_mask"]
         return values
 
-    assert_forward(source_pair(tmp_path), draw, f"Gemma4 Unified {media} source")
+    return source_pair(directory), draw
 
 
-def test_equal_attention_geometries_still_use_the_full_layer_vision_mask(source, tmp_path):
+@pytest.mark.parametrize("media", ["text", "vision", "audio"])
+def test_a_unified_source_can_omit_either_media_component(source, tmp_path, media):
+    pair, draw = optional_source(source, tmp_path, media)
+    assert_forward(pair, draw, f"Gemma4 Unified {media} source")
+
+
+def equal_geometry_source(source, directory):
     from dew.interop.verify import scatter_weights
 
     config = source[1].config.to_dict()
@@ -335,10 +340,15 @@ def test_equal_attention_geometries_still_use_the_full_layer_vision_mask(source,
     torch.manual_seed(502)
     reference = Gemma4UnifiedForConditionalGeneration(config).float().eval()
     scatter_weights(reference)
-    reference.save_pretrained(tmp_path, safe_serialization=True)
+    reference.save_pretrained(directory, safe_serialization=True)
     # Preserve the explicitly empty per-layer geometry instead of reconstructing default global heads.
-    reference.config.to_json_file(tmp_path / "config.json", use_diff=False)
+    reference.config.to_json_file(directory / "config.json", use_diff=False)
     for name in ("processor_config.json", "tokenizer_config.json", "tokenizer.json"):
-        shutil.copyfile(FIXTURE / name, tmp_path / name)
-    assert_forward(source_pair(tmp_path), lambda seed: unified_draw(config, seed),
+        shutil.copyfile(FIXTURE / name, directory / name)
+    return source_pair(directory), lambda seed: unified_draw(config, seed)
+
+
+def test_equal_attention_geometries_still_use_the_full_layer_vision_mask(source, tmp_path):
+    pair, draw = equal_geometry_source(source, tmp_path)
+    assert_forward(pair, draw,
                     "Gemma4 Unified equal attention geometries")
