@@ -1041,8 +1041,9 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
 
 def stale(own: dict[str, float], observed: dict[str, float], seconds: float, cut: int, target: float) -> bool:
     """Whether a file's record `own` no longer cuts it as it runs: its tests differ from those its rows
-    `observed` (one added, removed or renamed); a file within `target` (it took `seconds`) is recorded past
-    it, so the plan would split what runs whole; or, for a file past it (as `cut` groups), the groups the
+    `observed` (one added, removed or renamed); a file within `target` (it took `seconds`), or one with no
+    tests to cut, is recorded past it, so the plan would split what runs whole; or, for a file past it (as
+    `cut` groups), the groups the
     plan cuts from the record (`split`) run a group past `KEPT` of the target as its tests ran, setup
     included, and those it would cut from what they took run their heaviest shorter. A cut that fits is
     kept whatever its tests' times drift, as the plan keeps it, and so is one whose heaviest group no cut
@@ -1050,7 +1051,7 @@ def stale(own: dict[str, float], observed: dict[str, float], seconds: float, cut
     where its plan changes for the better."""
     if own.keys() != observed.keys():
         return True
-    if seconds <= target:
+    if seconds <= target or not own:
         return sum(own.values()) > target
     nodes = sorted(own)
     recorded, ran = [own[node] for node in nodes], [observed[node] for node in nodes]

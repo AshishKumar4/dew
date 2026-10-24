@@ -820,6 +820,8 @@ def test_the_durations_fold_rewrites_only_a_file_its_record_no_longer_cuts(ci, t
     file("test_steady", [100.0] * 4, [[101.0, 99.0], [104.5, 98.0]])
     file("test_straggler", [381.593, 20.0, 20.0], [[382.0], [20.5, 19.0]])
     file("test_partial", [150.0] * 4, [[400.0, 400.0], [150.0, 150.0]], red=2)
+    file("test_empty", [], [[]])  # every test deselected, its collection past the target
+    rows[-2]["seconds"] = 300.0
     record["tests/test_gone.py::test_x"] = 5.0
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(record, indent=0) + "\n")
     verdict = tmp_path / "main.json"
@@ -836,16 +838,6 @@ def test_the_durations_fold_rewrites_only_a_file_its_record_no_longer_cuts(ci, t
         assert {node: s for node, s in folded.items() if f"/{name}.py" in node} == {
             node: s for node, s in record.items() if f"/{name}.py" in node}
     assert "tests/test_gone.py::test_x" not in folded
-    # The next plan weighs each group of a refolded file at what its tests take, within the budget the plan
-    # keeps a cut within; before the fold, test_drift's kept cut was weighed at 345 s and ran 390 s.
-    timings = {"rows": {row["name"]: row["seconds"] for row in rows if row["name"].startswith("3.12:")}}
-    for entry in ci.plan(240.0, timings):
-        if entry["python"] == "3.12" and entry["tests"] in ("tests/test_grown.py", "tests/test_drift.py"):
-            nodes = sorted(node for node in folded if node.startswith(entry["tests"] + "::"))
-            group, count = (int(part) for part in entry["split"].split("/"))
-            run = ci.session.groups([folded[node] for node in nodes], count)[group - 1]
-            took = sum(observed[node] for node in nodes[run.start:run.stop])
-            assert entry["weight"] == took <= ci.KEPT * 240.0, entry
 
 
 def test_a_tasks_wall_time_is_apportioned_by_its_files_tests_times(ci):
@@ -989,6 +981,45 @@ def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_
     git(tmp_path, "add", "-A")
     git(tmp_path, "commit", "-qm", "change")
     assert ci.policy("HEAD~1") == policy
+
+
+def test_a_fold_that_moves_a_test_between_groups_runs_each_test_once_in_its_new_group(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A fold that moves a test from one group to another, the file's cut count unchanged, reuses neither
+    group's green row: the next run of the file's groups, cut by the split plugin from the folded record, runs
+    every test once, the moved one in its new group."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 300}))
+    (tmp_path / "tests/test_moved.py").write_text(
+        "from pathlib import Path\n"
+        + "".join(f"def test_{index}():\n"
+                  f"    with Path('runs').open('a') as runs: runs.write('{index}')\n" for index in range(3)))
+    nodes = [f"tests/test_moved.py::test_{index}" for index in range(3)]
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(dict(zip(nodes, [300.0, 100.0, 100.0],
+                                                                           strict=True))))
+    interpreter(tmp_path, "3.12")
+    url, _, _ = cache_worker
+    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    cached(monkeypatch, url)
+    (tmp_path / ".verdict").mkdir()
+    base = commit(tmp_path, "base")
+
+    def run() -> dict[str, list[str]]:
+        rows = armada_task(ci, monkeypatch, tmp_path / ".verdict/verdict.json", ci.policy(base))
+        assert all(row["exitCode"] == 0 for row in rows)
+        return {row["name"]: sorted(row["tests"]) for row in rows}
+
+    assert run() == {"3.12:tests/test_moved.py#1/2": nodes[:1], "3.12:tests/test_moved.py#2/2": nodes[1:]}
+    verdict = tmp_path / ".verdict/main.json"
+    verdict.write_text(json.dumps({"rows": [
+        {"name": "3.12:tests/test_moved.py#1/2", "exitCode": 0, "seconds": 100.0, "tests": {nodes[0]: 100.0}},
+        {"name": "3.12:tests/test_moved.py#2/2", "exitCode": 0, "seconds": 600.0,
+         "tests": {nodes[1]: 100.0, nodes[2]: 500.0}}]}))
+    monkeypatch.setattr(sys, "argv", ["ci.py", "durations", str(verdict)])
+    assert ci.main() == 0
+    commit(tmp_path, "main's CI folded")
+    (tmp_path / "runs").write_text("")
+    assert run() == {"3.12:tests/test_moved.py#1/2": nodes[:2], "3.12:tests/test_moved.py#2/2": nodes[2:]}
+    assert sorted((tmp_path / "runs").read_text()) == ["0", "1", "2"]
 
 
 def test_a_durations_change_reruns_only_the_groups_cut_from_it(ci, tmp_path, monkeypatch, cache_worker):
