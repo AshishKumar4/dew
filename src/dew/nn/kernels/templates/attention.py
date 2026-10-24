@@ -78,6 +78,16 @@ def dense(spans: KeySpans) -> jax.Array:
     return jax.vmap(lambda row: visible(spans, row, queries, keys))(jnp.arange(spans.start.shape[0]))
 
 
+def reads(spans: KeySpans) -> jax.Array:
+    """Whether each query sees a key, `[B, Q]`: its interval holds one, of its document where the call has
+    ids, counted among that document's keys in index order however the documents lie (`_runs`)."""
+    if spans.query_ids is None or spans.key_ids is None:
+        return spans.end > spans.start
+    batch, queries = spans.start.shape
+    order, lo, hi = _runs(spans.query_ids, spans.key_ids, batch, queries, spans.keys)
+    return (_searched(order, lo, hi, spans.end, "left") > _searched(order, lo, hi, spans.start, "left"))
+
+
 def _runs(query_ids: jax.Array | None, key_ids: jax.Array | None, batch: int, queries: int,
           keys: int) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Each row's key indices in document order `[B, K]`, and where each query's document runs in it,
@@ -133,10 +143,12 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     `CrossDocuments` (its keys in ascending id order, as it takes them), keeps each query to its
     document's keys, under causality or a window a cross call's queries aligned to their document's last
     keys (`aligned_places`); `lengths` `[B]` end each row's keys and `starts` `[B]` begin them;
-    `block_groups`, each `[B, S]` over a call's own tokens (its queries its keys) of contiguous blocks, -1
-    outside any, keeps a causal query to its block's later keys too (block-causal: it sees a key of its
+    `block_groups`, each `[B, K]`, number the keys' blocks, runs of contiguous keys, -1 outside any: under
+    causality a query whose own key (its index, or a cross call's aligned place: a cache call's slot) is in
+    a block sees that block's later keys too, within its document (block-causal: it sees a key of its
     document at or before it, or of its own block), a window bounding only the keys behind it, as it does
-    an image's (`AttentionMixer.bidirectional_images`). Lengths and starts are int32 token coordinates;
+    an image's (`AttentionMixer.bidirectional_images`); several add their blocks' keys together. A block's
+    keys are one run, so a query's keys stay one interval. Lengths and starts are int32 token coordinates;
     places and ids keep their own dtypes."""
     from dew.nn.documents import CrossDocuments, aligned_places, document_ids
     from dew.nn.visibility import window_sides
@@ -145,6 +157,8 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     place = index
     start = jnp.zeros((batch, queries), jnp.int32)
     end = jnp.full((batch, queries), keys, jnp.int32)
+    # Past each query's document's last key, which bounds a block's later keys; 0 for padding.
+    bound = end
     query_ids, key_ids = (None, None) if segment_ids is None else document_ids(segment_ids)
     order, run_lo, run_hi = _runs(query_ids, key_ids, batch, queries, keys)
     present = run_hi > run_lo
@@ -155,6 +169,7 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
         padding = query_ids == 0
         start = jnp.where(padding, 0, jnp.maximum(start, first))
         end = jnp.where(padding, 0, jnp.minimum(end, last))
+        bound = end
         if isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None) and keys > 0:
             # A cross call's query sits at its rank among its document's keys, counted from the
             # document's first key (`cross_document_mask`).
@@ -167,15 +182,16 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
         before, after = window_sides(causal, min(sliding_window, queries + keys + 1))
         start = jnp.maximum(start, place - before)
         end = jnp.minimum(end, place + after + 1)
-    if block_groups and causal:
-        if queries != keys or isinstance(segment_ids, CrossDocuments):
-            raise ValueError("block groups name a call's own tokens: its queries are its keys")
-        # A block's later keys, within the query's document (none for padding, whose end is 0).
-        bound = (jnp.full((batch, queries), keys, jnp.int32) if segment_ids is None
-                 else jnp.where(query_ids == 0, 0, last))
+    if block_groups and causal and keys > 0:
+        # The block of the query's own key runs on to its end, within the query's document; a query
+        # placed before its document's keys has no key of its own.
+        own = (place >= start) & (place < keys)
+        at = jnp.clip(place, 0, keys - 1)
         for groups in block_groups:
-            extended = jnp.where(jnp.asarray(groups) >= 0, block_ends(groups), 0)
-            end = jnp.maximum(end, jnp.minimum(extended, bound))
+            groups = jnp.asarray(groups)
+            inside = own & (jnp.take_along_axis(groups, at, axis=1) >= 0)
+            ends = jnp.take_along_axis(block_ends(groups), at, axis=1)
+            end = jnp.where(inside, jnp.maximum(end, jnp.minimum(ends, bound)), end)
     if chunk is not None:
         query_places, key_places = (
             (index, jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32)[None, :], (batch, keys)))
@@ -202,8 +218,8 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
         end = jnp.minimum(end, lengths.astype(jnp.int32)[:, None])
     if starts is not None:
         start = jnp.maximum(start, starts.astype(jnp.int32)[:, None])
-    blocked = True if block_groups and causal else None
-    narrowed = (sliding_window, chunk, segment_ids, lengths, starts, blocked)
+    blocks = True if block_groups and causal else None
+    narrowed = (sliding_window, chunk, segment_ids, lengths, starts, blocks)
     form = "spans" if any(narrowing is not None for narrowing in narrowed) else "causal" if causal else "full"
     return KeySpans(start, end, query_ids, key_ids, keys, form)
 

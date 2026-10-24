@@ -18,7 +18,14 @@ from dew.nn.attention import (
     with_key_lengths,
     with_key_starts,
 )
-from dew.nn.documents import CrossDocuments, cross_document_mask, document_ids, document_mask, with_documents
+from dew.nn.documents import (
+    CrossDocuments,
+    aligned_places,
+    cross_document_mask,
+    document_ids,
+    document_mask,
+    with_documents,
+)
 from dew.nn.inputs import coordinates
 from dew.nn.kernels.templates import attention as template
 from dew.nn.visibility import windowed
@@ -71,30 +78,33 @@ CASES = {
     "block-causal": {"causal": True, "block_groups": True},
     "documents-block-causal-window": {"causal": True, "sliding_window": 24, "segment_ids": "own",
                                       "block_groups": True},
+    "cross-block-causal-window": {"causal": True, "sliding_window": 24, "segment_ids": "cross",
+                                  "block_groups": True},
 }
 
 
 def geometry(case: dict) -> tuple[int, int]:
-    """`case`'s query and key counts: a call's own documents or blocks are its keys, so it has as many of
-    each."""
-    own = case.get("segment_ids") == "own" or case.get("block_groups")
+    """`case`'s query and key counts: a call's own documents, or blocks of its own tokens, are its keys, so
+    it has as many of each; a cache call's blocks are its keys'."""
+    own = case.get("segment_ids") == "own" or (case.get("block_groups") and case.get("segment_ids") is None)
     return (QUERIES, QUERIES) if own else (QUERIES, KEYS)
 
 
-def block_groups() -> tuple[np.ndarray, ...]:
-    """Two layouts of contiguous blocks over a call's own `[2, 100]` tokens, -1 outside any: blocks of a
-    token, blocks across `own_documents`' boundaries (at 30 and 70 in the first row, 55 in the second), a
-    block of padding, blocks ending the row; and the second layout's blocks over the first's, as a kind with
-    both image groups and decision blocks reads them."""
+def block_groups(keys: int = QUERIES) -> tuple[np.ndarray, ...]:
+    """Two layouts of contiguous blocks over a call's first `keys` keys `[2, keys]`, -1 outside any: blocks
+    of a token, blocks across `own_documents`' boundaries (at 30 and 70 in the first row, 55 in the second)
+    and `cross_documents`' (at 60 in the first, 70 in the second), a block of padding, blocks ending the
+    row; and the second layout's blocks over the first's, as a kind with both image groups and decision
+    blocks reads them."""
     first = np.full((ROWS, QUERIES), -1, np.int32)
-    for row, runs in enumerate((((3, 4), (10, 22), (25, 35), (50, 60), (68, 72), (90, 100)),
-                                ((0, 1), (40, 50), (52, 58), (60, 61), (80, 99)))):
+    for row, runs in enumerate((((3, 4), (10, 22), (25, 35), (50, 60), (58, 64), (68, 72), (90, 100)),
+                                ((0, 1), (40, 50), (52, 58), (60, 61), (66, 75), (80, 99)))):
         for group, (lo, hi) in enumerate(runs):
             first[row, lo:hi] = group
     second = np.full((ROWS, QUERIES), -1, np.int32)
     second[:, 15:40] = 7
     second[:, 41:43] = 8
-    return first, second
+    return first[:, :keys], second[:, :keys]
 
 
 def arguments(case: dict) -> dict:
@@ -108,7 +118,7 @@ def arguments(case: dict) -> dict:
     if case.get("starts"):
         keywords["starts"] = STARTS
     if case.get("block_groups"):
-        keywords["block_groups"] = block_groups()
+        keywords["block_groups"] = block_groups(geometry(case)[1])
     if case.get("positions"):
         # Each token's place in its own document, as a packed row's coordinates count it.
         places = coordinates(segments=keywords["segment_ids"]).positions
@@ -127,20 +137,32 @@ def dews_mask(case: dict) -> np.ndarray:
     queries, keys = geometry(case)
     ids = keywords.get("segment_ids")
     causal, window = keywords.get("causal", False), keywords.get("sliding_window")
+    # Each query's own key: its index, or a cache call's slot, its document's first key plus its aligned
+    # place, none where that lies before its document's keys.
+    slots = np.broadcast_to(np.arange(queries), (ROWS, queries))
+    cross = False
     if isinstance(ids, CrossDocuments) and (causal or window is not None):
+        cross = True
         mask = cross_document_mask(ids, causal=causal, sliding_window=window)
+        query_ids, key_ids = (np.asarray(x) for x in document_ids(ids))
+        first = np.argmax(key_ids[:, None, :] == query_ids[:, :, None], axis=-1)
+        ranks = np.asarray(aligned_places(ids))
+        slots = np.where(ranks >= 0, first + ranks, -1)
     else:
         mask = combined_attention_mask(queries, keys, causal, window, None)
-        for groups in keywords.get("block_groups", ()):
-            # A block's tokens see each other, a causal window bounding only the keys behind
-            # (`AttentionMixer`'s image groups).
-            same = (groups[:, :, None] == groups[:, None, :]) & (groups[:, :, None] >= 0)
-            if window is not None:
-                same = same & windowed(np.arange(queries)[:, None], np.arange(keys)[None, :], window,
-                                       causal=causal)
-            mask = mask | same[:, None]
+    held = (slots >= 0) & (slots < keys)
+    for groups in keywords.get("block_groups", ()):
+        # A block's keys are seen by every query whose own key is in it, a causal window bounding only
+        # the keys behind (`AttentionMixer`'s image groups).
+        own = np.where(held, np.take_along_axis(groups, np.clip(slots, 0, keys - 1), axis=1), -1)
+        same = (own[:, :, None] == groups[:, None, :]) & (own[:, :, None] >= 0)
+        if window is not None:
+            same = same & windowed(slots[:, :, None], np.arange(keys)[None, None, :], window, causal=causal)
         if ids is not None:
-            mask = with_documents(mask, ids)
+            same = same & np.asarray(document_mask(ids))
+        mask = same[:, None] if mask is None else mask | same[:, None]
+    if ids is not None and not cross:
+        mask = with_documents(mask, ids)
     if "chunk" in keywords:
         places = keywords.get("positions", (jnp.arange(queries), jnp.arange(keys)))
         chunked = chunk_mask(*places, keywords["chunk"])
@@ -161,9 +183,13 @@ def test_key_spans_keep_the_keys_dews_masks_keep(case):
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     np.testing.assert_array_equal(np.asarray(template.dense(spans)), expected)
     static = {name: case[name] for name in ("causal", "sliding_window", "chunk") if name in case}
-    if case.get("block_groups"):
+    if case is CASES["block-causal"]:
         # A block runs to its end, past the query's own place.
         assert expected[0, 10, 21] and not expected[0, 9, 10]
+    if case is CASES["cross-block-causal-window"]:
+        # A cache call's query 68 sits at slot 58, whose block runs to 64 past its document's last key
+        # at 59: it sees 59 and not 60. The second row's first 30 queries hold no slot, so see nothing.
+        assert expected[0, 68, 59] and not expected[0, 68, 60] and not expected[1, :30].any()
     if case is CASES["documents-causal-chunk-places"]:
         # The second document opens at token 30, so its chunk 0 holds tokens 30 to 45: chunks counted
         # from the row's start would part tokens 31 and 32.
@@ -454,6 +480,42 @@ def test_the_spans_form_says_what_their_intervals_hold(case):
         assert spans.form == "spans"
     plain = {name: value for name, value in case.items() if name != "causal"}
     assert (spans.form != "spans") == (not plain and case.get("causal") in (None, True))
+
+
+@pytest.mark.parametrize("case", CASES.values(), ids=CASES)
+def test_a_query_reads_a_key_exactly_where_its_spans_hold_one(case):
+    """`template.reads`, the queries a call's spans leave a key, is where their visibility holds one."""
+    queries, keys = geometry(case)
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
+    np.testing.assert_array_equal(np.asarray(template.reads(spans)),
+                                  np.asarray(template.dense(spans)).any(-1))
+
+
+@pytest.mark.parametrize("ids, keywords", [
+    ([[1, 2, 1, 2, 2, 3, 1, 0]], {"causal": True, "starts": [3]}),
+    ([[1, 2, 1, 2, 2, 3, 1, 0]], {"sliding_window": 2}),
+    ([[2, 1, 2]], {"causal": True, "starts": [1], "lengths": [2]}),
+], ids=["causal-starts", "two-sided-window", "interval-of-another-document"])
+def test_reads_count_the_keys_of_interleaved_documents(ids, keywords):
+    """Interleaved documents, whose keys no interval holds alone: a query reads a key where its document
+    holds one inside its interval, so a query whose interval holds only another document's keys (the
+    third row's last, over key 1 alone) reads none."""
+    ids = jnp.asarray(ids, jnp.int32)
+    starts, lengths = (None if name not in keywords else jnp.asarray(keywords[name], jnp.int32)
+                       for name in ("starts", "lengths"))
+    spans = template.spans(ids.shape[1], ids.shape[1], 1, segment_ids=ids,
+                           causal=keywords.get("causal", False),
+                           sliding_window=keywords.get("sliding_window"), starts=starts, lengths=lengths)
+    np.testing.assert_array_equal(np.asarray(template.reads(spans)),
+                                  np.asarray(template.dense(spans)).any(-1))
+
+
+def test_a_blocks_end_is_one_past_the_last_token_of_its_run():
+    """`template.block_ends`: each token's run of equal ids ends one past its last token, a run of -1 as
+    any other."""
+    groups = jnp.asarray([[-1, 0, 0, -1, -1, 3, 3, 3], [5, 5, 5, 5, 1, 1, 1, 1]], jnp.int32)
+    np.testing.assert_array_equal(np.asarray(template.block_ends(groups)),
+                                  [[1, 3, 3, 5, 5, 8, 8, 8], [4, 4, 4, 4, 8, 8, 8, 8]])
 
 
 def test_hooks_are_a_pytree_whose_values_a_compiled_call_takes():
