@@ -123,16 +123,16 @@ states and cotangent, so their upstream rounding is shared): the head's scalar p
 logit scale among them, take their gradient's error from one sum over every option, whose ratio to the
 reference's varies widely from draw to draw."""
 
-ALGEBRAIC_ZEROS = ("to_k", "scorer_out")
+ALGEBRAIC_ZEROS = ("to_k",)
 """The head's modules whose bias gradient is zero by algebra: a key's bias shifts every key's logit of a
-query alike, and the scorer's shared bias every option's, so no logit moves with either (their float64
-values are residue)."""
+query alike, which the attention's softmax does not move with (its float64 value is residue)."""
 
 SCORER_MARGIN = 1e-4
 """The least gap a draw admits between the two sides of the scorer's `abs(repeated - options)` feature at
 a real option (`scorer_gap`), in float64: a hundred times the float32 rounding of the difference, so
-float32 and float64 take one slope of `abs` (a difference float32 rounds to zero takes `abs`'s slope at
-zero, 0, and moves every gradient behind it by its upstream value, which is no compaction's)."""
+float32 and float64 take one slope of `abs` (JAX's is +1 at zero, so a small negative difference float32
+rounds to zero flips its slope and moves every gradient behind it by twice its upstream value, which is
+no compaction's)."""
 
 
 def ragged_objective(examples) -> DecisionObjective:
