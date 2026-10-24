@@ -890,7 +890,7 @@ three. Off a GPU the two are bitwise."""
 @pytest.mark.parametrize("policy, memories, outputs", [
     (None, 1, 1),
     ({"recompute": ("delta_memory",)}, 2, 1),
-    ({"save": ("context", "delta_decay", "delta_inverse")}, 2, 2),
+    ({"save": ("scan", "delta_decay", "delta_inverse")}, 2, 2),
 ])
 @generation.chosen(gated_delta_rule="fla")
 def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(policy, memories, outputs):
