@@ -25,8 +25,7 @@ from dew.nn.kernels.templates.attention import (
     gradients,
     interpreted_dot,
     padded_call,
-    step_table,
-    stepped,
+    ranges_walk,
     within,
 )
 
@@ -128,7 +127,7 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
         tile_of = _identity
         if spec.form == "spans" and blocks_map.ranges is not None:
             # Runs walk their ranges' tiles in turn.
-            hi, tile_of = stepped(*step_table(blocks_map.ranges[row, i])[:3])
+            hi, tile_of = ranges_walk(blocks_map.ranges[row, i])
             lo = 0
         elif spec.form == "spans":
             lo, hi = blocks_map.lo[row, i], blocks_map.hi[row, i]
@@ -287,7 +286,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
         lo, hi, tile_of = bounds.lo[row, i], bounds.hi[row, i], _identity
         if bounds.ranges is not None:
             # Runs walk their ranges' tiles in turn, as the forward does.
-            hi, tile_of = stepped(*step_table(bounds.ranges[row, i])[:3])
+            hi, tile_of = ranges_walk(bounds.ranges[row, i])
             lo = 0
 
         def tile(step):

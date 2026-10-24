@@ -322,9 +322,10 @@ def test_a_block_map_visits_every_visible_entry_and_calls_a_tile_whole_only_wher
     block's whole range (`full_lo` to `full_hi`) whose blocks carry one document, or which has no
     documents, has every entry visible, the padding past the call's queries and keys excluded from no
     tile; with no narrowing, every tile inside the call is whole, and a call of its own documents has
-    whole tiles inside them. Over runs the block visits only its ranges (`ranges`), each tile once, and
-    every tile of each run's whole range (`wholes`) has every entry visible; a tile its queries see whole
-    through different runs is not called whole, so the whole ranges are sound, not exact."""
+    whole tiles inside them. Over runs the block visits only its ranges (`ranges`), each tile once, and every
+    tile of its whole range, its widest run's tiles every query sees through that run, has every entry
+    visible; a tile its queries see whole through other runs is not called whole, so the whole range over
+    runs is sound, not exact."""
     queries_, keys_ = geometry(case)
     spans = template.spans(queries_, keys_, ROWS, **arguments(case))
     blocks = template.block_map(spans, block_q, block_k)
@@ -336,7 +337,7 @@ def test_a_block_map_visits_every_visible_entry_and_calls_a_tile_whole_only_wher
     assert np.all((lo[rows, i] <= j) & (j < hi[rows, i]))
     assert np.all((q_lo[rows, j] <= i) & (i < q_hi[rows, j]))
     if blocks.ranges is not None:
-        ranges, wholes = np.asarray(blocks.ranges), np.asarray(blocks.wholes)
+        ranges = np.asarray(blocks.ranges)
         # The ranges are sorted, disjoint, nonempty first: a walk of them visits each tile once.
         lengths = ranges[..., 1] - ranges[..., 0]
         assert np.all(lengths >= 0)
@@ -344,20 +345,6 @@ def test_a_block_map_visits_every_visible_entry_and_calls_a_tile_whole_only_wher
         assert np.all(np.diff((lengths > 0).astype(int), axis=-1) <= 0)
         covered = np.any((ranges[rows, i, :, 0] <= j[:, None]) & (j[:, None] < ranges[rows, i, :, 1]), -1)
         assert covered.all()
-        tiles = np.arange(-(-keys_ // block_k))
-        whole_tiles = np.any((wholes[..., None, :, 0] <= tiles[:, None])
-                             & (tiles[:, None] < wholes[..., None, :, 1]), axis=-1)
-        padded = np.zeros((ROWS, -(-queries_ // block_q) * block_q, len(tiles) * block_k), bool)
-        padded[:, :queries_, :keys_] = seen
-        entire = padded.reshape(ROWS, padded.shape[1] // block_q, block_q, -1, block_k).all(axis=(2, 4))
-        if spans.query_ids is not None and spans.key_ids is not None:
-            query_doc = uniform_documents(spans.query_ids, block_q)
-            key_doc = uniform_documents(spans.key_ids, block_k)
-            whole_tiles &= (query_doc[:, :, None] == key_doc[:, None, :]) & (query_doc[:, :, None] != 0)
-        assert not (whole_tiles & ~entire).any()
-        if case is RUN_CASES["runs"] and (block_q, block_k) == (16, 16):
-            assert whole_tiles.any()
-        return
     query_doc = key_doc = None
     if spans.query_ids is not None and spans.key_ids is not None:
         query_doc = uniform_documents(spans.query_ids, block_q)
@@ -381,8 +368,8 @@ def test_a_block_map_visits_every_visible_entry_and_calls_a_tile_whole_only_wher
     tiles = padded.reshape(ROWS, padded.shape[1] // block_q, block_q, -1, block_k).all(axis=(2, 4))
     if query_doc is not None:
         tiles &= (query_doc[:, :, None] == key_doc[:, None, :]) & (query_doc[:, :, None] != 0)
-    assert whole == tiles.sum()
-    if case is CASES["documents"] and (block_q, block_k) == (16, 16):
+    assert whole == tiles.sum() if blocks.ranges is None else whole <= tiles.sum()
+    if (case is CASES["documents"] or case is RUN_CASES["runs"]) and (block_q, block_k) == (16, 16):
         assert whole > 0
 
 
