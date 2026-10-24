@@ -14,14 +14,13 @@ released configs, which the translation is held to.
 """
 
 import shutil
-import sys
-import tempfile
 from pathlib import Path
 
 import numpy as np
 import torch
 from diffusers_wan_reference import float64
 from huggingface_hub import hf_hub_download
+from reference_source import hub_modules
 
 from dew.interop.verify import probe_ids, scatter_weights
 
@@ -33,13 +32,8 @@ FIXTURES = Path(__file__).resolve().parents[1] / 'tests' / 'fixtures' / 'hf'
 
 def remote():
     """K2 Horizon's modeling module, imported from the pinned remote code as a package."""
-    package = Path(tempfile.mkdtemp()) / 'k2_horizon_remote'
-    package.mkdir()
-    (package / '__init__.py').write_text('')
-    for name in ('configuration_k2_horizon.py', 'modeling_k2_horizon.py'):
-        shutil.copy(hf_hub_download(REPO, name, revision=REVISION), package / name)
-    sys.path.insert(0, str(package.parent))
-    import k2_horizon_remote.modeling_k2_horizon as modeling
+    _, modeling = hub_modules('k2_horizon_remote', REPO, REVISION,
+                              ('configuration_k2_horizon.py', 'modeling_k2_horizon.py'))
     return modeling
 
 

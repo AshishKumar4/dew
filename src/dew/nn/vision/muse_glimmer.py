@@ -19,11 +19,14 @@ from dew.registry import Record
 
 from .common import (
     ProjectorBase,
+    ProjectorLayout,
     TowerBase,
     TowerGeometry,
+    TowerLayout,
     _vision_section,
     activation_name,
     block_tensor_path,
+    in_params,
     rope_base,
 )
 from .vit import MergeProjector, VisionTransformer, ViTLayout
@@ -204,3 +207,11 @@ def translate_muse_glimmer_projector_config(hf_config: Mapping[str, object]) -> 
         "activation": activation,
         "norm_eps": records.number(text.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
     }}
+
+
+MuseGlimmerVision.checkpoint = TowerLayout("vision_tower.", in_params(muse_glimmer_vision_path))
+# The adapter and the projection, each name its prefix off.
+MuseGlimmerProjector.checkpoint = ProjectorLayout(("vision_adapter.", "vision_projection."), {
+    "fc1.weight": ("adapter", "fc1", "kernel"), "fc2.weight": ("adapter", "fc2", "kernel"),
+    "weight": ("projection", "kernel"),
+})
