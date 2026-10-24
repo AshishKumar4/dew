@@ -291,7 +291,7 @@ class Layout:
         counted as unfit, and a task refuses it."""
         return len(row.tokens) <= self.max_len
 
-    def bounds(self, encoder: Tokenizer, specials: Specials) -> Bounds:
+    def bounds(self, encoder: Tokenizer, specials: Specials, context_length: int | None = None) -> Bounds:
         """The most rows, questions and options a window of `max_len` tokens
         packs, from the fewest tokens each takes in this layout: a row of one
         one-option question about an empty state, and what one more option or
@@ -300,20 +300,34 @@ class Layout:
         questions and m options in m rows' tokens, and each further question
         or option takes its own. The packer holds every window to these
         bounds, so a row shorter still starts a new window rather than
-        outgrowing one."""
+        outgrowing one. Where the questions are laid out in the row's context
+        (`Encoded.spans_in_context`), a window holds one row, and the questions
+        and options are those a context of `context_length` tokens holds."""
         roomy = dataclasses.replace(self, max_len=1 << 30)
         empty = self.state(encoder, specials, "")
+        probe = roomy.rows(encoder, specials, "", {"q": Choice("x", ["0"])}, tokens=empty)
+        in_context = probe[0].spans_in_context
+        if in_context and context_length is None:
+            raise ValueError("a layout that reads its questions in the row's context is bounded by the "
+                             "context's length; give its context_length")
+        budget = context_length if in_context and context_length is not None else self.max_len
 
         def size(*options: int) -> int:
             asked = {f"q{index}": Choice("x", [str(option) for option in range(count)])
                      for index, count in enumerate(options)}
-            return sum(len(row.tokens) for row in roomy.rows(encoder, specials, "", asked, tokens=empty))
+            laid = roomy.rows(encoder, specials, "", asked, tokens=empty)
+            return sum(len(row.context or ()) if in_context else len(row.tokens) for row in laid)
 
         row = size(1)
         question, option = size(1, 1) - row, size(2) - row
-        if row > self.max_len:
-            raise ValueError(f"max_len={self.max_len} holds no row of a {type(self).__name__}, whose "
-                             f"shortest is {row} tokens")
+        if row > budget:
+            raise ValueError(f"{'context_length' if in_context else 'max_len'}={budget} holds no row of a "
+                             f"{type(self).__name__}, whose shortest is {row} tokens")
+        if in_context:
+            # One row a window: as many questions and options as its context holds.
+            each = min(option, question)
+            left = budget - row
+            return Bounds(1, 1 + left // question, None if each <= 0 else 1 + left // each)
         rows = range(1, self.max_len // row + 1)
         each = min(option, question)
         options = None if each <= 0 else max(count + int((self.max_len - count * row) // each)
