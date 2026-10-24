@@ -24,6 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import two_documents
+from reference_error import FEWEST_SEEDS, assert_as_exact
 from token_support import token_rows
 
 from dew.nn.attention import (
@@ -154,19 +155,31 @@ def test_row_arguments_split_as_the_query_rows_do_where_the_heads_contend_for_th
 
     from dew.nn.sharding import DEFAULT_RULES
 
-    q_key, k_key, v_key = jax.random.split(jax.random.key(0), 3)
-    query = jax.random.normal(q_key, (BATCH, SEQ_LEN, 8, 8), jnp.float32)
-    key, value = (jax.random.normal(k, (BATCH, SEQ_LEN, 2, 8), jnp.float32) for k in (k_key, v_key))
     call = dict(CALLS[name])
     if name == "bias":
         call["bias"] = jax.random.normal(jax.random.key(3), (BATCH, 8, SEQ_LEN, SEQ_LEN))
     if name == "sinks":
         call["sinks"] = jax.random.normal(jax.random.key(4), (8,))
-    whole = scaled_dot_product_attention(query, key, value, **call)
-    with jax.set_mesh(MeshSpec(tensor=2, expert=2, sequence=2).build()), \
-            nn.logical_axis_rules((*HEADS_BEFORE_ROWS, *DEFAULT_RULES)):
-        split = jax.jit(lambda q, k, v: through(exchange, q, k, v, **call))(query, key, value)
-    np.testing.assert_allclose(np.asarray(split), np.asarray(whole), atol=TOLERANCE, rtol=0)
+
+    def draw(seed):
+        q_key, k_key, v_key = jax.random.split(jax.random.key(seed), 3)
+        query = jax.random.normal(q_key, (BATCH, SEQ_LEN, 8, 8), jnp.float32)
+        key, value = (jax.random.normal(k, (BATCH, SEQ_LEN, 2, 8), jnp.float32) for k in (k_key, v_key))
+        return query, key, value
+
+    def whole(query, key, value):
+        return scaled_dot_product_attention(query, key, value, **call)
+
+    mesh = MeshSpec(tensor=2, expert=2, sequence=2).build()
+    exchanged = jax.jit(lambda q, k, v: through(exchange, q, k, v, **call))
+
+    def split(query, key, value):
+        # The exchange under the mesh and the contending rules; the whole sequence outside them.
+        with jax.set_mesh(mesh), nn.logical_axis_rules((*HEADS_BEFORE_ROWS, *DEFAULT_RULES)):
+            return exchanged(query, key, value)
+
+    assert_as_exact(split, jax.jit(whole), draw, f"{exchange} exchange, {name}, under contending heads",
+                    seeds=FEWEST_SEEDS)
 
 
 @pytest.mark.mesh

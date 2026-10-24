@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as splash
 from model_support import model_draw
-from reference_error import assert_as_exact
+from reference_error import FEWEST_SEEDS, assert_as_exact
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -290,7 +290,6 @@ def test_row_fields_split_as_the_query_rows_do_where_the_heads_contend_for_the_a
     from dew.training import MeshSpec
 
     length, window = 64, 8
-    query, key, value = inputs(length, heads=8, kv_heads=2, batch=4)
     segment_ids = jnp.asarray(np.tile(packed(length, (20, 45, 60)), (4, 1)))
     valid = jnp.asarray(np.arange(length) % 7 != 3)[None].repeat(4, axis=0)
 
@@ -298,12 +297,19 @@ def test_row_fields_split_as_the_query_rows_do_where_the_heads_contend_for_the_a
         return local_attention(q, k, v, window=window, segment_ids=segment_ids, valid=valid,
                                implementation="xla")
 
-    whole = attend(query, key, value)
+    def draw(seed):
+        return inputs(length, heads=8, kv_heads=2, batch=4, seed=seed)
+
     rules = (("activation_heads", ("tensor", "expert")), ("activation_kv", ("tensor", "expert")),
              ("activation_batch", "expert"), *DEFAULT_RULES)
-    with jax.set_mesh(MeshSpec(tensor=2, expert=2, sequence=2).build()), nn.logical_axis_rules(rules):
-        split = jax.jit(attend)(query, key, value)
-    np.testing.assert_allclose(np.asarray(split), np.asarray(whole), atol=1e-6, rtol=0)
+    mesh, banded = MeshSpec(tensor=2, expert=2, sequence=2).build(), jax.jit(attend)
+
+    def split(query, key, value):
+        # The band under the mesh and the contending rules; the whole sequence outside them.
+        with jax.set_mesh(mesh), nn.logical_axis_rules(rules):
+            return banded(query, key, value)
+
+    assert_as_exact(split, jax.jit(attend), draw, "local attention under contending heads", seeds=FEWEST_SEEDS)
 
 
 @pytest.mark.parametrize("layout", [KVCache(), KVCache(page_size=4)], ids=["dense", "paged"])
