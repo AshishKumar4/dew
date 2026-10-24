@@ -192,6 +192,39 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
         "3.12:tests/test_pass.py": (1, "whole"), "3.12:tests/test_dies.py": (1, "whole")}
 
 
+def test_a_file_pytest_reports_nothing_of_is_red_unless_its_collection_shows_every_test_deselected(
+        ci, tmp_path):
+    """Every requested file is accounted for by its tests' rows, or by its collection: one whose every
+    test the selection deselected (`-m "not network"`) is green, though another file of its task fails. A
+    file whose tests vanish from the run with no word (a hook dropping them unreported) is red, and so is
+    every file of a run that wrote no report at all, though pytest exits 0: CI never goes green on tests
+    that did not run."""
+    files = {
+        "test_pass.py": "def test_ok(): pass\n",
+        "test_fails.py": "def test_no(): assert False\n",
+        "test_online.py": "import pytest\n@pytest.mark.network\ndef test_fetch(): pass\n",
+        "test_dropped.py": "def test_one(): pass\ndef test_two(): pass\n",
+    }
+    written(tmp_path, files)
+    (tmp_path / "tests" / "conftest.py").write_text(
+        "def pytest_collection_modifyitems(items):\n"
+        "    items[:] = [item for item in items if 'test_dropped' not in item.nodeid]\n")
+    interpreter(tmp_path, "3.12")
+    out = tmp_path / "verdict.json"
+    ci.task("3.12", [f"tests/{name}" for name in files], "", out, 600.0)
+    rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
+    assert {name: row["exitCode"] for name, row in rows.items()} == {
+        "3.12:tests/test_pass.py": 0, "3.12:tests/test_fails.py": 1, "3.12:tests/test_online.py": 0,
+        "3.12:tests/test_dropped.py": 1}
+    assert rows["3.12:tests/test_dropped.py"].get("kind") == "whole"
+    # A run that writes no report: pytest exits 0, and no file of it is green.
+    (tmp_path / "tests" / "conftest.py").write_text(
+        "def pytest_configure(config):\n    config.option.xmlpath = None\n")
+    ci.task("3.12", ["tests/test_pass.py", "tests/test_online.py"], "", out, 600.0)
+    assert {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]} == {
+        "3.12:tests/test_pass.py": 1, "3.12:tests/test_online.py": 1}
+
+
 def install_compiler(directory: Path) -> None:
     """A kernel's compiler under `directory`, named as the CUDA toolkit installs it (ptxas)."""
     directory.mkdir()
@@ -933,9 +966,9 @@ def test_a_stale_policy_reruns_every_file_whose_run_read_a_tool(ci, tmp_path, mo
 def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_changes(
         ci, tmp_path, monkeypatch, cache_worker):
     """A file's green row is kept across a change its tests never meet, the plan's own code (ci.py, which
-    runs outside every test process); it runs again once what its test process runs or reads changes: a
-    plugin loaded into it, a fixture, a Python file added (a conftest.py, a package's __init__.py, a test
-    module), which can change what an import finds, or the process group it runs as."""
+    runs outside every test process), or another test module; it runs again once what its test process
+    runs or reads changes: a plugin loaded into it, a fixture, a Python file added that can change what an
+    import finds (a conftest.py, a top-level package under src/), or the process group it runs as."""
     (tmp_path / "tests/test_kept.py").write_text(
         "from pathlib import Path\n"
         "def test_kept():\n"
@@ -948,8 +981,8 @@ def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_c
     changes = [(None, "", 1), ("tools/armada/ci.py", "# the plan's own code\n", 1),
                ("tools/armada/executed.py", "# a plugin loaded into it\n", 2),
                ("tests/fixtures/data.json", "{}\n", 3), ("tests/conftest.py", "VALUE = 1\n", 4),
-               ("src/package/__init__.py", "", 5), ("tests/more/test_added.py", "VALUE = 2\n", 6),
-               ("tools/armada/child_groups.py", "# its process group\n", 7)]
+               ("src/package/__init__.py", "", 5), ("tests/more/test_added.py", "VALUE = 2\n", 5),
+               ("tools/armada/child_groups.py", "# its process group\n", 6)]
     for path, text, runs in changes:
         if path:
             (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
@@ -997,6 +1030,57 @@ def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_
             (tmp_path / page).write_text(text)
         assert run() == runs
         assert run() == runs
+
+def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests_executed(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A train that loses a head loses the test modules and modules the head added, and its other
+    files keep their rows (the land queue's recompose after a pull): a test module, or a module in a
+    package no test imported, added or taken away runs no other file again. A module added beside
+    one a file's tests executed under src/, which an import there may now find, runs that file
+    again, and only that one, and so does its removal, and so does an __init__.py added to, or taken
+    from, a namespace package on the way to one; a top-level package added under src/, which may
+    shadow any import, runs every file."""
+    # src/pkg/space is a namespace package on the way to pkg.space.sub.used: its import executes no file.
+    for name, source in {"src/pkg/__init__.py": "", "src/pkg/space/sub/__init__.py": "",
+                         "src/pkg/space/sub/used.py": "def value(): return 1\n",
+                         "src/other/__init__.py": "", "src/other/lone.py": "def value(): return 2\n",
+                         "src/idle/__init__.py": ""}.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(source)
+    written(tmp_path, {
+        # Imported as it runs, not as it is collected, which every file of the task shares.
+        f"test_{name}.py": "import sys\nsys.path.insert(0, 'src')\n"
+                           f"def test_{name}():\n"
+                           f"    from {package} import value\n"
+                           f"    with open('runs-{name}', 'a') as runs: runs.write('x')\n"
+                           "    assert value()\n"
+        for name, package in (("uses", "pkg.space.sub.used"), ("lone", "other.lone"))})
+    interpreter(tmp_path, "3.12")
+    url, _, _ = cache_worker
+    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    cached(monkeypatch, url)
+    out = tmp_path / "verdict.json"
+
+    def run():
+        ci.task("3.12", ["tests/test_uses.py", "tests/test_lone.py"], "", out, 600.0)
+        assert [row["exitCode"] for row in json.loads(out.read_text())["rows"]] == [0, 0]
+        return [len((tmp_path / f"runs-{name}").read_text()) for name in ("uses", "lone")]
+
+    changes = [(None, None, [1, 1]), ("tests/test_added.py", "def test_added(): pass\n", [1, 1]),
+               ("src/idle/new.py", "def value(): return 3\n", [1, 1]),
+               ("src/other/extra.py", "def value(): return 4\n", [1, 2]),
+               ("src/other/extra.py", None, [1, 3]), ("tests/test_added.py", None, [1, 3]),
+               ("src/pkg/space/__init__.py", "", [2, 3]), ("src/pkg/space/__init__.py", None, [3, 3]),
+               ("src/top/__init__.py", "", [4, 4])]
+    for path, source, runs in changes:
+        if path and source is None:
+            (tmp_path / path).unlink()
+        elif path:
+            (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+            (tmp_path / path).write_text(source)
+        assert run() == runs, path
+        assert run() == runs, path
+
 
 def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(ci, tmp_path):
     """A hang is graded: the task interrupts pytest at its deadline, short of

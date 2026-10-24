@@ -23,6 +23,7 @@ from dew.decision.laya import LayaCheckpoint
 from dew.decision.layout import (
     DecisionInputs,
     Encoded,
+    Framing,
     JointLayout,
     Laid,
     Layout,
@@ -82,6 +83,7 @@ __all__ = [
     "Encoding",
     "EntropyConfidence",
     "Example",
+    "Framing",
     "Head",
     "JevConfidence",
     "JointCheckpoint",

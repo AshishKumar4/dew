@@ -22,11 +22,14 @@ from dew.registry import Record
 
 from .common import (
     ProjectorBase,
+    ProjectorLayout,
     TowerBase,
     TowerGeometry,
+    TowerLayout,
     _side,
     _vision_section,
     head_width,
+    in_params,
     rope_base,
     trunk_geometry,
 )
@@ -253,3 +256,8 @@ def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Record:
 def translate_llama4_projector_config(text_width: int) -> Record:
     """A Llama 4 wrapper's projector fields: the text width."""
     return {"class": "llama4", "fields": {"text_width": int(text_width)}}
+
+
+Llama4Vision.checkpoint = TowerLayout("vision_model.", in_params(llama4_vision_path))
+Llama4Projector.checkpoint = ProjectorLayout("multi_modal_projector.",
+                                             {"linear_1.weight": ("linear", "kernel")})

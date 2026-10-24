@@ -225,8 +225,9 @@ class Decide:
         # the backbone would where the caller overrides the compute dtype.
         model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype))
         laid = records.record(settings.layout, "layout")
+        # A layout is plain data, its framing's template variables included: no field is a dtype.
         rows = from_record(_LAYOUTS[records.text(laid["name"], "layout.name")],
-                           records.json_value(laid["fields"], "layout.fields"))
+                           records.json_value(laid["fields"], "layout.fields"), dtypes=False)
         if settings.tokenizer is None:
             raise ValueError("the run records no tokenizer to lay its rows out with")
         processor = None if settings.processor is None else load_processor(settings.processor, backbone)
@@ -298,7 +299,7 @@ class Decide:
                  images: Sequence[Image.Image] = (), context: JSON | None = None) -> dict[str, Answer]:
         """Return one answer per question in `questions`, about `state` and any `images`.
 
-        Images need a layout with a place for them (`Layout.image`) and the
+        Images need a layout with a place for them (`Layout.images`) and the
         backbone's processor, as a joint-head release brings. `context` is a
         sequence the decision reads beside the state through the backbone's
         cross-attention (`Example.context`).
@@ -307,6 +308,16 @@ class Decide:
             return self._seen(state, questions, images, context)[0]
         return self.batch([(state, questions)], contexts=[context])[0][0]
 
+    def rows(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]], *,
+             contexts: Sequence[JSON | None] | None = None) -> list[list[Encoded]]:
+        """Each request's rows as `batch` scores them: its state and questions laid out, with its
+        context (`contexts`, in order, or None for none) beside them."""
+        contexts = [None] * len(requests) if contexts is None else list(contexts)
+        if len(contexts) != len(requests):
+            raise ValueError(f"{len(contexts)} contexts for {len(requests)} requests")
+        return [self._encoded(state, questions, context=context)
+                for (state, questions), context in zip(requests, contexts, strict=True)]
+
     def batch(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]], *,
               contexts: Sequence[JSON | None] | None = None) -> list[tuple[dict[str, Answer], Usage]]:
         """Return each request's answers and usage.
@@ -314,11 +325,7 @@ class Decide:
         The rows of every request are scored together within the budget. `contexts`
         holds each request's context, in order (`__call__`), or None for none.
         """
-        contexts = [None] * len(requests) if contexts is None else list(contexts)
-        if len(contexts) != len(requests):
-            raise ValueError(f"{len(contexts)} contexts for {len(requests)} requests")
-        return self._answered([self._encoded(state, questions, context=context)
-                               for (state, questions), context in zip(requests, contexts, strict=True)],
+        return self._answered(self.rows(requests, contexts=contexts),
                               [questions for _, questions in requests])
 
     def _answered(self, encoded: Sequence[Sequence[Encoded]], asked: Sequence[Mapping[str, Question]]
@@ -351,9 +358,9 @@ class Decide:
     def _shown(self, state: JSON, questions: Mapping[str, Question], images: Sequence[Image.Image],
                context: JSON | None = None) -> tuple[Encoded, Images]:
         """A request's one row with its images laid out before the state, and the images."""
-        if self.processor is None or self.layout.image is None:
+        if self.processor is None or not self.layout.images:
             raise ValueError("images need a backbone with a vision encoder, which this task does not have")
-        media = Images.of(self.processor, images, self.layout.image)
+        media = Images.of(self.processor, images, self.processor.image_text())
         rows = self._encoded(state, questions, media.tokens, context=context)
         if len(rows) != 1:
             raise ValueError("a request's images go in a layout of one row")

@@ -41,13 +41,12 @@ import copy
 import json
 import sys
 import types
-import urllib.request
 from pathlib import Path
 
 import jax
 import numpy as np
 import torch
-from reference_source import definitions
+from reference_source import definitions, fetched
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 from reference_error import ORDERS, distance
@@ -63,7 +62,7 @@ GAMMA = 0.6
 
 def projection_loss(zs, zs_tilde) -> torch.Tensor:
     """`SILoss.__call__`'s projection-loss loop, verbatim, over one encoder."""
-    text = urllib.request.urlopen(REPA + "loss.py").read().decode()
+    text = fetched(REPA + "loss.py")
     start = text.index("        proj_loss = 0.")
     end = text.index("        return denoising_loss, proj_loss")
     body = "\n".join(line[8:] for line in text[start:end].splitlines())
@@ -178,7 +177,7 @@ def composed() -> None:
     keys = jax.random.split(jax.random.key(settings["key"]), 5)
     times = np.array(jax.random.uniform(keys[2], (b,)))
     noise = np.array(jax.random.normal(keys[3], (b, side, side, channels)))
-    text = urllib.request.urlopen(REPA + "train.py").read().decode()
+    text = fetched(REPA + "train.py")
     composition = next(line.strip() for line in text.splitlines()
                        if "loss = loss_mean + proj_loss_mean" in line)
     arrays = {"pixels": pixels, "encoder": encoder, "times": times, "noise": noise,

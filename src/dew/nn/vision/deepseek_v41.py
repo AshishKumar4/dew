@@ -15,7 +15,17 @@ from dew.nn.activations import gelu_exact
 from dew.nn.mlp import GatedMLP
 from dew.registry import Record
 
-from .common import ProjectorBase, TowerBase, TowerGeometry, _vision_section, block_tensor_path, rope_base
+from .common import (
+    ProjectorBase,
+    ProjectorLayout,
+    TowerBase,
+    TowerGeometry,
+    TowerLayout,
+    _vision_section,
+    block_tensor_path,
+    in_params,
+    rope_base,
+)
 from .vit import VisionTransformer, ViTLayout
 
 
@@ -174,3 +184,13 @@ def translate_deepseek_v41_projector_config(hf_config: Mapping[str, object],
         "downsample_ratio": records.integer(vision.get("downsample_ratio", 3), "downsample_ratio"),
         "out_width": int(text_width),
     }}
+
+
+DeepseekV41Vision.checkpoint = TowerLayout("vision.", in_params(deepseek_v41_vision_path))
+# The aligner's maps under its `aligner.` prefix, and the span's learned vectors, which the release
+# keeps at its top level (model.py:1215-1222).
+DeepseekV41Projector.checkpoint = ProjectorLayout("aligner.", {
+    "w1.weight": ("w1", "kernel"), "w1.bias": ("w1", "bias"),
+    "w2.weight": ("w2", "kernel"), "w2.bias": ("w2", "bias"),
+    "image_start": ("image_start",), "image_newline": ("image_newline",), "image_end": ("image_end",),
+})
