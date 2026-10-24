@@ -22,9 +22,9 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+import selection_margins
 from diffusion_stubs import StubText
 from diffusion_support import images_of
-from flax import linen as nn
 from recording import RecordingTracker
 from reference_error import assert_as_exact, assert_computes_the_oracle, chain_roundings, widened
 from residual_orders import permuted, residual_width
@@ -425,150 +425,32 @@ one device's pooled error, seed 247, an indexer selection the draw filter lets t
 where the reference compared with itself resolves no momentum within 4096 draws. Every cell is named:
 one added is sized."""
 
-MARGIN = 1e-5
-"""The least selection margin a draw admits (`selection_margin`), relative to the scale of what is
-selected: above the distance float32 rounding moves a selection's inputs from their float64 values,
-so one device, each layout and the float64 run select alike. Gemma 3n's gate, whose inputs carry the
-rounding of the attention and AltUp before it, moved at most 3.7e-6 of its row's deviation over the
-1,200 forwards of 320 draws, a light tail: each draw's largest was 1.6e-6 at the median and 2.5e-6
-at the 99th percentile. A selection is discontinuous: inputs within rounding of a boundary pick other
-keys or units in other runs, a difference no precision bounds."""
-
-
 def selects(case: Case) -> bool:
-    """Whether the cell's model selects discontinuously: a lightning indexer's top-k, Gemma 3n's
-    gaussian top-k or a mixture's routing (`selection_margin`)."""
-    fields = case.config.get("mixer", {}).get("fields", {})
-    sparsities = case.config.get("activation_sparsity_pattern", ())
-    return case.is_lm and bool(fields.get("index_topk") or any(sparsities) or routes(case))
-
-
-def routes(case: Case) -> bool:
-    """Whether the cell's mixture routes by its router's scores: hash routing selects by the token
-    alone, which no rounding moves."""
-    mixture = case.config.get("mixture")
-    return mixture is not None and not mixture.get("hash_layers")
+    """Whether the cell's model selects discontinuously (`selection_margins.selects`)."""
+    return case.is_lm and selection_margins.selects(case.config)
 
 
 @functools.cache
 def selections_forward(name: str):
-    """A cell's forward capturing its discontinuous selections (`selection_margin`), compiled once a
-    cell: the lightning indexer's scores from its `scores` method, Gemma 3n's gate from its gated MLP's
-    Dense, a Router's selection scores, group scores and group mask from its own methods, and gpt-oss's
-    and Gemma 4's router logits from their Dense. One compiled forward rather than an op at a time:
-    XLA:CPU's JIT failed to materialize a gather fusion among the many small programs an unjitted
-    capture compiles."""
-    from dew.nn.gemma4_moe import Gemma4TextRouter
-    from dew.nn.gpt_oss import GptOssMLP
-    from dew.nn.mla import SparseIndexer
-    from dew.nn.mlp import GatedMLP
-    from dew.nn.moe import Router
-
+    """A cell's forward capturing its discontinuous selections (`selection_margins.capture`), compiled
+    once a cell."""
     case = next(case for case in CASES if case.name == name)
-    model = models.build(case.architecture, **case.config)
-
-    def selecting(module, method):
-        if isinstance(module, SparseIndexer):
-            return method == "scores"
-        if isinstance(module, Router):
-            return method in ("selection", "group_scores", "group_mask")
-        if isinstance(module, nn.Dense) and method == "__call__" and (
-                (isinstance(module.parent, GptOssMLP) and module.name == "router")
-                or (isinstance(module.parent, Gemma4TextRouter) and module.name == "proj")):
-            return True
-        parent = module.parent
-        gated = isinstance(parent, GatedMLP) and bool(parent.activation_sparsity)
-        return method == "__call__" and isinstance(module, nn.Dense) and module.name == "gate_proj" and gated
-
-    return jax.jit(lambda variables, tokens: model.apply(
-        variables, tokens, capture_intermediates=selecting, mutable=["intermediates"]))
-
-
-def gate_margin(values: np.ndarray, sparsity: float) -> float:
-    """The smallest margin of Gemma 3n's gaussian top-k over gate rows `values`: each unit's distance
-    from its row's cutoff, the mean plus the sparsity's normal quantile times the population
-    deviation, as `dew.nn.mlp.gaussian_topk` forms it, over that deviation; the least kept unit's
-    height over the cutoff and the cutoff's over the greatest dropped one."""
-    from statistics import NormalDist
-
-    values = np.asarray(values, np.float64)
-    deviation = values.std(-1, keepdims=True)
-    cutoff = values.mean(-1, keepdims=True) + NormalDist().inv_cdf(sparsity) * deviation
-    kept = np.min(np.where(values > cutoff, values, np.inf), axis=-1, keepdims=True)
-    dropped = np.max(np.where(values > cutoff, -np.inf, values), axis=-1, keepdims=True)
-    return float(np.min(np.minimum(kept - cutoff, cutoff - dropped) / deviation))
-
-
-def top_margin(values: np.ndarray, kept: int) -> np.ndarray:
-    """Each row's gap between its `kept`-th largest value and the next, over its largest's size: how
-    far a top-`kept` selection over the row's last axis is from flipping. Infinite where the row
-    holds no more than `kept` finite values, which decide nothing."""
-    ranked = -np.sort(-values, axis=-1)
-    chosen, next_best = ranked[..., kept - 1], ranked[..., kept]
-    scale = np.maximum(np.abs(ranked[..., 0]), np.finfo(np.float32).tiny)
-    return np.where(np.isfinite(next_best), (chosen - next_best) / scale, np.inf)
+    return selection_margins.capture(models.build(case.architecture, **case.config))
 
 
 def selection_margin(case: Case, variables, tokens) -> float:
-    """The smallest margin, over the forward of `variables`, of the model's
-    discontinuous selections relative to their scale: the lightning indexer's top-k (the gap between
-    the k-th and the next visible key's score, over the query's largest), Gemma 3n's gaussian top-k
-    (the gate's distance from its cutoff, the row's mean plus the sparsity's normal quantile times its
-    population deviation, over that deviation, as `dew.nn.mlp.gaussian_topk` forms it) and a
-    mixture's routing, read from the router's own operands: a Router's best groups by its group
-    scores and its experts by its selection scores within them (`top_margin` of each), gpt-oss's and
-    Gemma 4's routers, which rank their logits or their softmax by a plain top-k, by their logits'. A
-    query that sees no more keys than its budget, and an exact zero tie of relu'd scores, ordered
-    alike by index in every run, decide nothing."""
-    fields = case.config.get("mixer", {}).get("fields", {})
-    sparsities = case.config.get("activation_sparsity_pattern", ())
-    margin, seen = np.inf, 0
-    mixture = case.config.get("mixture") or {}
-    _, captured = selections_forward(case.name)(variables, jnp.asarray(tokens[:, :-1]))
-    routers: dict[tuple[str, ...], dict[str, np.ndarray]] = {}
-    for path, values in jax.tree_util.tree_flatten_with_path(captured.get("intermediates", {}))[0]:
-        seen += 1
-        names = [str(getattr(part, "key", part)) for part in path]
-        if names[-2] in ("selection", "group_scores", "group_mask"):
-            routers.setdefault(tuple(names[:-2]), {})[names[-2]] = np.asarray(values)
-            continue
-        values = np.asarray(values, np.float64)
-        if "gate_proj" in names:
-            layer = int(next(name for name in names if name.startswith("layers_")).split("_")[1])
-            margin = min(margin, gate_margin(values, sparsities[layer]))
-            continue
-        if names[-3] in ("router", "proj") and names[-2] == "__call__":
-            # gpt-oss ranks its router's logits, Gemma 4's router their softmax: one order, by logit.
-            margin = min(margin, float(np.min(top_margin(values, mixture.get("top_k", 2)))))
-            continue
-        budget, (queries, keys) = fields["index_topk"], values.shape[-2:]
-        if keys <= budget:
-            continue
-        visible = np.tril(np.ones((queries, keys), bool), keys - queries)
-        ranked = -np.sort(-np.where(visible, values, -np.inf), axis=-1)
-        kept, rejected = ranked[..., budget - 1], ranked[..., budget]
-        decided = np.isfinite(rejected) & ~((kept == 0) & (rejected == 0))
-        scale = np.maximum(np.abs(ranked[..., 0]), np.finfo(np.float32).tiny)
-        margin = min(margin, float(np.min(np.where(decided, (kept - rejected) / scale, np.inf))))
-    # A model that selects shows its selections here, or the draw would pass unfiltered.
-    for operands in routers.values():
-        # A Router chooses its best groups by their scores, then its experts among the groups kept.
-        selection = np.asarray(operands["selection"], np.float64)
-        if "group_scores" in operands:
-            groups = np.asarray(operands["group_scores"], np.float64)
-            margin = min(margin, float(np.min(top_margin(groups, mixture.get("groups_per_token", 1)))))
-            selection = np.where(operands["group_mask"], selection, -np.inf)
-        margin = min(margin, float(np.min(top_margin(selection, mixture.get("top_k", 2)))))
-    assert seen, f"{case.name}: no selection was captured"
-    return margin
+    """The smallest margin of the model's discontinuous selections over the forward of `variables` on
+    the batch's input tokens, relative to their scale (`selection_margins.margin`)."""
+    captured = selections_forward(case.name)(variables, jnp.asarray(tokens[:, :-1]))
+    return selection_margins.margin(case.config, captured, case.name)
 
 
 def clears(case: Case, raw, initial, stepped) -> bool:
-    """Whether the selections of each step's forward on the batch `raw` clear MARGIN
+    """Whether the selections of each step's forward on the batch `raw` clear the margin
     (`selection_margin`): the first step's from `initial`, then the second's from the state
     `stepped(raw)` makes, made only once the first's clear."""
-    return (selection_margin(case, initial, raw["text"]) > MARGIN
-            and selection_margin(case, stepped(raw), raw["text"]) > MARGIN)
+    return (selection_margin(case, initial, raw["text"]) > selection_margins.MARGIN
+            and selection_margin(case, stepped(raw), raw["text"]) > selection_margins.MARGIN)
 
 
 def reordered(state, order):
@@ -667,22 +549,24 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layou
     width = residual_width(initial.variables) if case.is_lm else 0
     one_step = drawn_steps(case, tmp_path, 1, 1, initial, 1)
 
-    def draw(seed):
-        """A batch drawn from the seed and, independently, an order of the residual stream's units
-        (`reordered`), the cell's own batch and the identity at seed 0: the fresh batch varies the
+    def keyed(key):
+        """A batch drawn from the key and, independently, an order of the residual stream's units
+        (`reordered`), the cell's own batch and the identity at key 0: the fresh batch varies the
         values, the order every contraction's summation, and the reference and each layout start
         from the same reordered state, so all are judged in its coordinates. A model with no
-        token embedding has no residual stream to permute, and draws batches alone. A model that
-        selects discontinuously takes the seed's first batch whose selections, in the forward of
-        each step, clear MARGIN (`selection_margin`)."""
-        for attempt in range(64):
-            key = seed if attempt == 0 else 1_000_003 * (attempt + 1) + seed
-            order = (np.arange(width) if key == 0 else np.random.default_rng(key).permutation(width))
-            raw = next(batches(case, encoder, key)())
-            if not selects(case) or clears(case, raw, initial.variables,
-                                           lambda batch: one_step(batch, np.arange(width))["variables"]):
-                return raw, order
-        raise AssertionError(f"no batch of seed {seed} clears the selection margin {MARGIN}")
+        token embedding has no residual stream to permute, and draws batches alone."""
+        order = np.arange(width) if key == 0 else np.random.default_rng(key).permutation(width)
+        return next(batches(case, encoder, key)()), order
+
+    def cleared(inputs):
+        # The selections of each step's forward clear the margin: the first step's from the initial
+        # state, the second's from the state the first makes.
+        return clears(case, inputs[0], initial.variables,
+                      lambda batch: one_step(batch, np.arange(width))["variables"])
+
+    # A model that selects discontinuously takes the seed's first batch whose selections clear
+    # `selection_margins.MARGIN` (`selection_margins.clearing`).
+    draw = selection_margins.clearing(keyed, cleared) if selects(case) else keyed
 
     seeds = LAYOUT_SEEDS[case.name]
     fsdp = LAYOUTS[layout]
