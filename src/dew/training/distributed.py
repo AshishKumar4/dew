@@ -626,7 +626,8 @@ class Validation:
     """The mesh axes a batch's rows split over (`batch_axes`)."""
     unbound: dict[str, tuple[str, ...]]
     """Each logical axis the variables declare that no rule names, with the leaves that
-    declare it: the dimensions it names stay whole on every device."""
+    declare it. A leaf keeps the dimensions it names whole on every device where a rule
+    places another of its names, and takes the shape heuristic where none does (`shardings`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -924,10 +925,10 @@ class Layout:
         carrying the `NamedSharding` it is placed with (`shardings`, `Trainer.shardings`), so
         nothing is allocated. The report (`Validation`) gives each leaf's split and the part each
         device holds, the bytes each device of `mesh` keeps between steps, the axes a batch's rows
-        split over, and the logical axes the variables declare that no rule names, which leave
-        the dimensions they name whole on every device. A leaf in host memory (`host`), or on
-        devices outside `mesh` (a CPU-owned state's companion), takes none of a device's memory.
-        A rule naming an axis `mesh` lacks was refused where `shardings` placed the state.
+        split over, and the logical axes the variables declare that no rule names
+        (`Validation.unbound`). A leaf in host memory (`host`), or on devices outside `mesh` (a
+        CPU-owned state's companion), takes none of a device's memory. Rules naming an axis
+        `mesh` lacks raise ValueError here, as `shardings` refuses them.
 
         `capacity` is the bytes each device of `mesh` has. Unset, each of this process's devices
         gives its allocator's limit (`Device.memory_stats`' `bytes_limit`) where JAX reports one,
@@ -940,6 +941,7 @@ class Layout:
         before any of the step's temporaries, which the plan checks against the compiled step
         (`dew.training.planning`).
         """
+        self._refuse_unknown(mesh)
         leaves: dict[str, LeafPlacement] = {}
         devices = set(mesh.devices.flat)
         # The ids of `mesh`'s devices each leaf's mesh shares, matched as devices, not ids: a CPU
@@ -975,11 +977,12 @@ class Layout:
 
     def _unbound(self, state) -> dict[str, tuple[str, ...]]:
         """The logical axes the variables of `state` declare that no rule names, each with
-        the leaves that declare it, read as `shardings` reads a leaf's axes."""
+        the leaves that declare it, read from every declaration: a box none of whose names
+        a rule places too, which `shardings` leaves to the shape heuristic (`ruled_boxes`)."""
         named = {name for name, _ in self.axis_rules}
         found: dict[str, list[str]] = collections.defaultdict(list)
         declared = declarations(state)
-        with self._declared(state):
+        with boxed({**current_boxes(), **boxed_axes(state)}):
             for path, leaf in jax.tree_util.tree_flatten_with_path(state)[0]:
                 if _within_variables(path) is None:
                     continue

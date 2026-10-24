@@ -506,6 +506,8 @@ class Trainer(Generic[Loss, Effects]):
         # since has yet to run once.
         self.memory: JSON = None
         self._unproven = False
+        # The last validation of the state between steps (`validate`): as placed, then as each step holds it.
+        self.validation: Validation | None = None
         # The links the last compiled step decided its projections by, which say whether one spread over
         # each axis (`dew.nn.sharding.Link`), and each mesh axis's measured bandwidth.
         self.links: dict[str, Link] = {}
@@ -750,11 +752,12 @@ class Trainer(Generic[Loss, Effects]):
         return shardings, validation
 
     def _validation(self, placed: TrainState, capacity: int | None = None) -> Validation:
-        """`Layout.validate` of `placed`, read in the axes the modules box, which every process
-        agrees, each reading its own devices' memory."""
-        with self._declared():
-            return agreed("state placement", functools.partial(
+        """`Layout.validate` of `placed`, read in every axis the modules box, which every process
+        agrees, each reading its own devices' memory; it is the trainer's `validation`."""
+        with boxed(self._boxed_axes()):
+            self.validation = agreed("state placement", functools.partial(
                 self.layout.validate, self.device_mesh, placed, capacity=capacity))
+        return self.validation
 
     @ruled
     def place(self) -> tuple[TrainState, Placement[TrainState], bytes | None]:
