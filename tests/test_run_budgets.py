@@ -21,10 +21,10 @@ from dew.training import Checkpoints, Pause, Trainer
 
 FEATURES = 4
 RECORDS = 10
-BATCH = 4
-EXAMPLES = 21
-"""Two passes over the records and one more, which fill five batches and one of a single record: three
-updates of two steps."""
+BATCH = 8
+EXAMPLES = 41
+"""Four passes over the records and one more record, which fill five batches and one of a single record:
+three updates of two steps."""
 ACCUMULATION = 2
 PEAK = 0.2
 
@@ -129,9 +129,9 @@ def test_an_examples_budget_reads_each_record_once_and_its_read_ends_there(examp
 
 
 def test_an_examples_budget_counts_documents_before_they_are_packed():
-    """Documents packed into windows are counted before the pack: the read bounded to 13 of 5 documents
-    of 1 to 5 tokens holds each document's tokens once for each time the bound reaches it, in the windows
-    of the steps its plan counts, and ends."""
+    """Documents packed into windows as they arrive are counted before the pack: the read bounded to 13
+    of 5 documents of 1 to 5 tokens holds each document's tokens once for each time the bound reaches
+    it, in the windows of the steps one pass over it counts, and ends."""
     documents = [{"text": np.full(length, length, np.int32)} for length in range(1, 6)]
     loader = compile(Pipeline(Memory(documents)).pack(8).batch(2), examples=13)
     read = ids_read(loader, loader.example_steps(13), "text")
@@ -166,11 +166,11 @@ def test_a_run_paused_where_it_already_stands_trains_nothing_more(tmp_path):
 
 
 def test_an_examples_count_whose_last_steps_make_no_whole_update_is_refused():
-    """Nineteen records fill five batches, which leave a step no update takes, so the run is refused
+    """Thirty-five records fill five batches, which leave a step no update takes, so the run is refused
     before it trains rather than read records it never learns from."""
     (x,) = records(0)
     with pytest.raises(ValueError):
-        trainer().fit(chain(x), examples=19)
+        trainer().fit(chain(x), examples=35)
 
 
 def test_a_run_config_counts_examples_and_pauses_as_a_fit_does(tmp_path):

@@ -709,17 +709,30 @@ class Loader:
     def example_steps(self, examples: int, window: int = 1) -> int:
         """The steps that read the `examples` records this loader's training read is bounded to
         (`examples`), its last batch short where they end inside one, in whole updates of `window`
-        steps: refused where the read is bounded to another count or counts none ahead, and where
-        its last steps would make no whole update, so some examples would train nothing."""
+        steps. A global order's plan counts them ahead (`order_records`); one each share reads in
+        its own order, as a pack that runs as rows arrive does, is counted by reading it once to its
+        end, on the host, which a process reading the whole order alone can do. Refused where the
+        read is bounded to another count, where a pool's shares would each end at a step of their
+        own, and where the last steps would make no whole update, so some examples would train
+        nothing."""
         if self.examples != examples:
             held = "not bounded" if self.examples is None else f"bounded to {self.examples}"
             raise ValueError(f"examples={examples} reads a training chain bounded to that many records "
                              f"before packing, and this loader's is {held}; give fit the Dataset chain, "
                              "which it bounds and compiles")
-        if self.order_records is None:
-            raise ValueError("examples need a global order, whose read counts its batches ahead; this one "
-                             "reads each share's own order, so count the run in steps")
-        steps = self._steps(self.order_records, window)
+        if self.order_records is not None:
+            steps = self._steps(self.order_records, window)
+        elif jax.process_count() == 1:
+            stream = self.train(DataPartition())
+            try:
+                steps = sum(1 for _ in stream)
+            finally:
+                if isinstance(stream, Closeable):
+                    stream.close()
+        else:
+            raise ValueError("examples read in each share's own order end each share at a step of its own; "
+                             "read a global order (pack before the mix, or read a published packing) or "
+                             "count the run in steps")
         if steps % window:
             raise ValueError(f"{examples} examples fill {steps} batches, which are not whole updates of "
                              f"{window} steps: the last {steps % window} would update nothing; change the "
