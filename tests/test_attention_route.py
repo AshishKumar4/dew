@@ -3,10 +3,11 @@
 Its output and its gradients of the query, key, value and sinks are on par with Dew's reference path from
 float64 (check 1), for each call form the route takes, block groups among them, a cache call's included.
 Every case has grouped key heads: four query heads over two. The selector refuses the route a mask and a
-bias by their inherent limits; a GPU prefers it for a call with block groups, which no other fused kernel
-reads, and otherwise only a call that names it runs it. On meshes, a named call runs per shard under
-`sharded.assert_runs_per_shard`: with fewer key heads than the tensor shards, with key heads split partly, or
-with key heads split in the other order from the query heads.
+bias by their inherent limits; a target's measured row prefers it for a call with block groups, which no
+other fused kernel reads, and otherwise only a call that names it runs it. On meshes, a named call runs per
+shard under `sharded.assert_runs_per_shard`: with fewer key heads than the tensor shards, with key heads split
+partly, with key heads split in the other order from the query heads, or with heads that take an axis the
+rows' arguments name.
 """
 
 import functools
@@ -382,10 +383,10 @@ def test_no_target_prefers_the_template_so_only_a_named_call_takes_it():
 @pytest.mark.parametrize("kind", ["block_groups", "image_groups"])
 def test_a_gpu_prefers_the_template_for_a_call_with_block_groups(kind):
     """A causal call with block or image groups: flash and tokamax's Triton kernel refuse it by their
-    inherent limits, and cuDNN takes it only as its mask, by measurement. On every target whose Triton
-    mainloop runs (a GPU of sm80 or later) 'auto' resolves it to the template, and elsewhere to a path that
-    reads the mask its spans mean. Without causality the groups add no key, so the call is an ordinary
-    one."""
+    inherent limits, and cuDNN takes it only as its mask, by measurement. 'auto' resolves it to the
+    template exactly where the target's measured row names it (`attention_blocks`: sm80's, where the
+    template was faster and smaller than xla's mask at every length), and elsewhere to a path that reads
+    the mask its spans mean. Without causality the groups add no key, so the call is an ordinary one."""
     query = jnp.zeros((ROWS, QUERIES, HEADS, WIDTH), jnp.bfloat16)
     key = jnp.zeros((ROWS, QUERIES, KV_HEADS, WIDTH), jnp.bfloat16)
     groups = jnp.asarray(block_groups()[0])
@@ -403,8 +404,10 @@ def test_a_gpu_prefers_the_template_for_a_call_with_block_groups(kind):
         with generation.assumed(target):
             auto = attention.resolve_implementation("auto", query, key, causal=True, block_groups=blocks,
                                                     image_groups=images)
-            fused = generation.backend() == "gpu" and generation.bf16_dot_runs()
-            assert (auto == "template") == fused, (target, auto)
+            measured = generation.TARGETS[target].kernels.get("attention_blocks") == "template"
+            assert (auto == "template") == measured, (target, auto)
+    assert generation.TARGETS["sm80"].kernels["attention_blocks"] == "template"
+    assert "attention_blocks" not in generation.TARGETS["sm90"].kernels
 
 
 def test_the_route_takes_score_hooks_and_the_initial_state_and_refuses_an_output_hook():
