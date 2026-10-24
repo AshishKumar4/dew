@@ -433,10 +433,11 @@ class Pretrained:
             # Resolve the selected folder at the metadata snapshot's commit, never a revision
             # named after the folder. Every ordinary component then reads its local directory.
             resolved = sources.snapshot(str(name_or_dir), commit or revision, weights=(folder,)) / folder
-            return cls.load(resolved, dtype=dtype, param_dtype=param_dtype, attention_impl=attention_impl,
-                            max_seq_len=max_seq_len, gguf_file=gguf_file, single_file=single_file,
-                            dduf_file=dduf_file, mesh=mesh, layout=layout, fallback=fallback,
-                            weights=weights, on_host=on_host)
+            loaded = cls.load(resolved, dtype=dtype, param_dtype=param_dtype, attention_impl=attention_impl,
+                              max_seq_len=max_seq_len, gguf_file=gguf_file, single_file=single_file,
+                              dduf_file=dduf_file, mesh=mesh, layout=layout, fallback=fallback,
+                              weights=weights, on_host=on_host)
+            return replace(loaded, revision=commit, origin=None)
         elif fallback is not None:
             from dew.interop import torchax_fallback
             loaded = torchax_fallback.load(name_or_dir, directory, commit, dtype=dtype,
@@ -460,7 +461,7 @@ class Pretrained:
         if not isinstance(loaded, cls):
             raise TypeError(f"{name_or_dir} is a {type(loaded).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
-        loaded = _published(loaded, name_or_dir, selected=bool(selected))
+        loaded = _published(loaded, name_or_dir, selected=bool(selected) or bool(folder))
         if not weights:
             loaded = loaded.map_variables(lambda tree: jax.tree.map(
                 lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), tree))
