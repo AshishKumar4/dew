@@ -120,7 +120,7 @@ def main():
     weights = copy.deepcopy(model.state_dict())
     with oracle_precision():
         exact = AutoModelForImageTextToText.from_config(copy.deepcopy(config), dtype=torch.float64,
-                                                       attn_implementation="eager").cpu().eval()
+                                                       attn_implementation="eager").cpu().double().eval()
         exact.load_state_dict(weights)
     args.output.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(args.output)
