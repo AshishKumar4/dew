@@ -54,11 +54,12 @@ def gelu_exact_torch(x: jax.Array) -> jax.Array:
 
 def gelu_tanh(x: jax.Array) -> jax.Array:
     """`0.5 * x * (1 + tanh(sqrt(2 / pi) (x + 0.044715 x^3)))` in at least fp32, in `x`'s dtype, as
-    its identity `x * sigmoid(sqrt(8 / pi) (x + 0.044715 x^3))`. An A100's fp32 tanh is a fast
-    approximation, 6.6e-8 RMS from float64 relative to its size over 2^22 normal inputs at scale 3
-    where torch's CPU tanh lies 1.9e-8, and the sigmoid, an exp, keeps the tail `1 + tanh` cancels:
-    on a CPU the form lies 3.5e-8 from float64 against `jax.nn.gelu`'s 4.5e-8 and torch's 2.8e-8,
-    and 3.1e-7 against 1.3e-4 and 3.4e-5 below x = -3."""
+    its identity `x * sigmoid(sqrt(8 / pi) (x + 0.044715 x^3))`, which XLA:GPU leaves as written: the
+    tanh form after a biased matmul becomes cuBLASLt's GELU epilogue, which lay 2.4e-6 from float64
+    relative to its size on an A100 where this form lay 1.1e-7 (each alone 5.6e-8 and 4.9e-8). The
+    sigmoid also keeps the tail `1 + tanh` cancels: on a CPU the form lies 3.5e-8 from float64 against
+    `jax.nn.gelu`'s 4.5e-8 and torch's 2.8e-8, and 3.1e-7 against 1.3e-4 and 3.4e-5 below x = -3,
+    over 2^22 normal inputs at scale 3."""
     work = x.astype(at_least_fp32(x.dtype))
     return (work * jax.nn.sigmoid(math.sqrt(8 / math.pi) * (work + 0.044715 * work ** 3))).astype(x.dtype)
 
