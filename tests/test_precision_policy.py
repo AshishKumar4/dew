@@ -268,6 +268,32 @@ def test_bf16_logits_round_as_rounded_to_and_are_held_as_bf16_under_cuda():
         assert "reduce-precision" not in text and "bf16[16,512]" in text
 
 
+@pytest.mark.parametrize("rows, columns, features", [(1, 37, 16), (1, 2048, 64), (6, 1, 8), (6, 3, 8),
+                                                     (8, 1, 16), (12, 40, 16)])
+def test_a_bf16_product_is_its_rounded_operands_exact_product_at_every_shape(rows, columns, features):
+    """`bf16_product` and its backward are the exact products of the operands rounded to bf16, the
+    result rounded to bf16 once, at a vector side (one row, one column) and under XLA's GEMM rewrite
+    threshold as at any shape. Eighths sum exactly in fp32 in any order, so the logits, and the
+    gradients under eighths' cotangent, are float64's to the bit, and the logits' many ties show
+    round-to-nearest-even. On an A100 XLA's BF16_BF16_F32 algorithm, which the product named, missed
+    both at these shapes (node receipts SF-a100-tie-probe3)."""
+    import ml_dtypes
+
+    from dew.nn.precision import bf16_product
+
+    rng = np.random.default_rng(rows * 7919 + columns)
+    states, table, weights = (np.round(rng.standard_normal(shape) * 8).astype(np.float32) / 8
+                              for shape in ((rows, features), (columns, features), (rows, columns)))
+    exact = states.astype(np.float64) @ table.astype(np.float64).T
+    logits, pullback = jax.vjp(lambda states, table: bf16_product("td,vd->tv", states, table), states, table)
+    np.testing.assert_array_equal(
+        np.asarray(logits), exact.astype(np.float32).astype(ml_dtypes.bfloat16).astype(np.float32))
+    d_states, d_table = pullback(jnp.asarray(weights))
+    wide = weights.astype(np.float64)
+    np.testing.assert_array_equal(np.asarray(d_states), (wide @ table).astype(np.float32))
+    np.testing.assert_array_equal(np.asarray(d_table), (wide.T @ states).astype(np.float32))
+
+
 @pytest.mark.gpu(reason="the GPU's fp32 division is what `import dew` sets; a CPU's rounds to the nearest")
 def test_the_gpu_divides_fp32_to_the_nearest_float():
     """`import dew` has XLA:GPU divide fp32 to the nearest float
