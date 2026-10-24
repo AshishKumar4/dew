@@ -16,6 +16,19 @@ import pytest
 from jax.sharding import Mesh, PartitionSpec
 from reference_error import assert_as_exact, with_gradients
 from sharded import assert_runs_per_shard
+from test_attention_template import (
+    DTYPES,
+    KEYS,
+    LENGTHS,
+    QUERIES,
+    ROWS,
+    SEEDS,
+    SOFTCAP,
+    STARTS,
+    cross_documents,
+    geometry,
+    own_documents,
+)
 
 from dew.nn import attention
 from dew.nn.attention import scaled_dot_product_attention
@@ -25,19 +38,7 @@ from dew.nn.kernels.generation import INHERENT
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import attention as template, attention_route
 
-ROWS, HEADS, KV_HEADS, WIDTH = 2, 4, 2, 32
-QUERIES, KEYS = 100, 96
-"""A call's query and key counts, neither a multiple of a tile. A call of its own documents has as many keys
-as queries (`geometry`)."""
-LENGTHS = jnp.asarray([96, 61], jnp.int32)
-"""Each row's keys: the second row ends short of the keys' end."""
-STARTS = jnp.asarray([0, 17], jnp.int32)
-"""Each row's first key: the second row starts past the first key."""
-SOFTCAP = 0.5
-"""Gemma 2's logit cap, as the template's own tests set it."""
-SEEDS = 8
-"""The reference arithmetic's declared draws (check 1), sized by `seeds_for`."""
-DTYPES = [jnp.float32, jnp.bfloat16]
+HEADS, KV_HEADS, WIDTH = 4, 2, 32
 MESH_TENSOR, MESH_HEADS = 4, 8
 """The tensor shards of the per-shard test's mesh, beside its `ROWS` data shards, and its query heads: two on
 each tensor shard, over one or two key heads, which is fewer than the shards."""
@@ -55,24 +56,6 @@ CASES = {
     "key-lengths": {"lengths": True},
     "sinks-softcap": {"causal": True, "sinks": True, "softcap": SOFTCAP},
 }
-
-
-def own_documents() -> jax.Array:
-    """A call's own packed documents `[2, 100]`: three and two documents, then padding (0)."""
-    return jnp.asarray([[1] * 30 + [2] * 40 + [3] * 20 + [0] * 10, [4] * 55 + [5] * 45], jnp.int32)
-
-
-def cross_documents() -> tuple[jax.Array, jax.Array]:
-    """Another sequence's documents: the queries' ids `[2, 100]` in any order, the keys' `[2, 96]`
-    ascending with padding after them, and the second row's second document holding no query."""
-    queries = jnp.asarray([[2] * 20 + [1] * 50 + [0] * 30, [7] * 100], jnp.int32)
-    keys = jnp.asarray([[1] * 60 + [2] * 30 + [0] * 6, [7] * 70 + [8] * 26], jnp.int32)
-    return queries, keys
-
-
-def geometry(case: dict) -> tuple[int, int]:
-    """`case`'s query and key counts: a call of its own documents has as many keys as queries."""
-    return (QUERIES, QUERIES) if case.get("segment_ids") == "own" else (QUERIES, KEYS)
 
 
 def keywords(case: dict) -> dict:
