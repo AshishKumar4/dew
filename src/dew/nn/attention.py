@@ -98,8 +98,8 @@ pallas splash kernel, with the older pallas flash kernel behind it for the
 calls splash's mask descriptor cannot carry.
 'template' is the attention template's route (`attention_route.attend`): the call's visibility as
 spans, a softcap as a score hook and sinks as the initial state, on the template's Triton or Mosaic
-mainloop on a GPU and its plain-JAX one elsewhere. A GPU prefers it for a call with block groups, which
-no other fused kernel reads; otherwise only a call that names it takes it.
+mainloop on a GPU and its plain-JAX one elsewhere. A target's measured row prefers it for block calls
+(`attention_blocks`); otherwise only a call that names it takes it.
 'auto', every module's default, resolves per trace (`resolve_implementation`),
 so a configuration logged as 'auto' runs on the next machine too. The target's
 row decides: the attention selector (`ATTENTION`, `dew.nn.kernels.selection.select`)
@@ -911,7 +911,9 @@ def _per_shard(local, query, key, value, **extras):
     a process address (`str(id(...))` in its backend config), which the persistent
     cache key keeps, so every fresh process would compile again; under a fully manual
     map jax lowers neither. `extras` maps each further argument to its array, or None,
-    and the logical axes it splits on.
+    and the logical axes it splits on: a dimension named for the rows or the query heads splits as the
+    query's own rows or heads do (`_query_split`), whatever the rules give that name alone, so a shard's
+    coordinates are its own rows' and heads' where axes contend for them.
     """
     given = {name: pair for name, pair in extras.items() if pair[0] is not None}
     queries, keys = logical_spec(HEADS, query.shape), logical_spec(KV_HEADS, key.shape)
@@ -934,9 +936,19 @@ def _per_shard(local, query, key, value, **extras):
         return local(query, key, value, **dict(zip(names, arrays, strict=True)))
 
     # An extra may be a tree of arrays (`CrossDocuments`), each leaf split on its axes.
-    specs = (queries, keys, keys, *(jax.tree.map(lambda leaf, axes=axes: logical_spec(axes, leaf.shape), x)
-                                    for x, axes in given.values()))
+    specs = (queries, keys, keys,
+             *(jax.tree.map(lambda leaf, axes=axes: _query_split(axes, leaf, queries, query.shape), x)
+               for x, axes in given.values()))
     return manual_map(shard, specs, queries)(query, key, value, *(x for x, _ in given.values()))
+
+
+def _query_split(axes, leaf, queries: P, shape: tuple[int, ...]) -> P:
+    """The spec of a per-shard argument `leaf` whose dimensions `axes` names, from the query's own split
+    `queries` of its `shape`: a dimension of the rows, the queries or the query heads takes the query's,
+    where it is as long (a broadcast dimension of 1 stays whole), any other none."""
+    of = {"activation_batch": 0, "activation_length": 1, "activation_heads": 2}
+    return P(*(_entry(queries, of[axis]) if axis in of and length == shape[of[axis]] else None
+               for axis, length in zip(axes, jnp.shape(leaf), strict=False)))
 
 
 def _four_dimensional(x):
@@ -1765,6 +1777,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         documents=None if segment_ids is None else 'cross' if cross else 'own',
         aligned=cross and (causal or sliding_window is not None), max_segments=max_segments,
         lengths=key_value_seq_lengths is not None, starts=key_value_seq_starts is not None,
+        blocks=bool(causal) and (block_groups is not None or image_groups is not None),
         spans_only=((bool(causal) and (block_groups is not None or image_groups is not None))
                     or key_valid is not None or (places is not None and sliding_window is not None)),
         mask=mask is not None, bias=bias is not None,
