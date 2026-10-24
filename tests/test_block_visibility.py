@@ -19,11 +19,11 @@ VOCAB = 37
 LENGTH = 8
 
 
-def model(**kinds):
-    """A two-layer float32 decoder of the layer kinds `kinds` names, in turn, each with its fields."""
-    types = tuple(kinds) * (TINY_DECODER["num_layers"] // len(kinds))
-    return CausalTransformer(**{"vocab_size": VOCAB, **TINY_DECODER, "dtype": "float32", "layer_types": types,
-                                "kinds": kinds})
+def model(layers: int = TINY_DECODER["num_layers"], **kinds):
+    """A float32 decoder of `layers` layers of the kinds `kinds` names, in turn, each with its fields."""
+    types = tuple(kinds) * (layers // len(kinds))
+    return CausalTransformer(**{"vocab_size": VOCAB, **TINY_DECODER, "dtype": "float32", "num_layers": layers,
+                                "layer_types": types, "kinds": kinds})
 
 
 def block_causal(*groups, segments=None, valid=None, window=None) -> np.ndarray:
@@ -116,12 +116,16 @@ CACHED_SEEDS = 16
 """Check 1's declared seeds for the cached rollout, sized by `seeds_for`."""
 
 
-def test_a_cached_rollout_reads_its_blocks_as_the_full_pass_does():
+@pytest.mark.parametrize("shared", [False, True], ids=["own-keys", "shared-keys"])
+def test_a_cached_rollout_reads_its_blocks_as_the_full_pass_does(shared):
     """Gemma 4's layout, images on its sliding layers and blocks on its full ones: a prefill, a cached call of
-    several tokens and single steps, each call's groups written to the cache at its slots, on par with the
-    full pass over the same groups from the cached rollout's first prediction on (check 1, from float64)."""
-    decoder = model(sliding_attention={"window": 3, "mixer": AttentionMixer(bidirectional_images=True)},
-                    full_attention={"mixer": AttentionMixer(bidirectional_blocks=True)})
+    several tokens and single steps, each call's groups at its tokens' slots, on par with the full pass over
+    the same groups from the cached rollout's first prediction on (check 1, from float64). With shared keys
+    the last two layers read the first two's (Gemma 4's trailing run), so a layer reading groups over keys
+    another layer caches holds no cache of its own."""
+    kinds = {"sliding_attention": {"window": 3, "mixer": AttentionMixer(bidirectional_images=True)},
+             "full_attention": {"mixer": AttentionMixer(bidirectional_blocks=True)}}
+    decoder = (model(4, **kinds).clone(kv_shared_layers=(2, 3)) if shared else model(**kinds))
     blocks, images = jnp.asarray(CACHED_BLOCKS), jnp.asarray(CACHED_IMAGES)
 
     def rolled(decoder):
