@@ -181,7 +181,7 @@ def ema_update(ema, params, decay):
     frozen reference can.
     """
     def step(average, live):
-        dtype = at_least_fp32(jnp.result_type(average.dtype, live.dtype, decay))
+        dtype = jnp.result_type(average.dtype, live.dtype, decay, jnp.float32)
         if average.dtype != dtype or live.dtype != dtype:
             average, live = jax.lax.optimization_barrier((average, live))
         weight = jnp.asarray(decay, dtype)

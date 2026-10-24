@@ -29,10 +29,9 @@ from typing import TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from jax.experimental import checkify
 
 from dew.artifacts import TokenScores
-from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
+from dew.diffusion.discrete import MDLM_STEPS, REVEALED_UNDEFINED, DiscreteProcess, Unmask
 from dew.inference.tasks import MaskedGeneration, MaskedSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import real_slots
@@ -239,14 +238,12 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         return tokens, losses, counted * weights[:, None], counted, predicted, real
 
     def _sample_impl(self, params, key, *, count: int):
-        """`count` rows sampled from noise, with a revealed position that holds no distribution carried
-        out as an error beside them (`dew._distributions`)."""
-        def walked(params, key):
-            denoise = self.process.denoiser(self.model, thaw(params))
-            x_T = self.process.noise(key, (count, self.seq_len))
-            return sample(denoise, x_T, self.steps, solver=self.solver, key=key)
-
-        return checkify.checkify(walked, errors=checkify.user_checks)(params, key)
+        """`count` rows sampled from noise, and whether a position stayed masked, its scores holding
+        no distribution (`Unmask`)."""
+        denoise = self.process.denoiser(self.model, thaw(params))
+        x_T = self.process.noise(key, (count, self.seq_len))
+        sampled = sample(denoise, x_T, self.steps, solver=self.solver, key=key)
+        return sampled, jnp.any(sampled == self.process.mask_id)
 
     def preview(self, params, batch, step: Step, *, scored=None):
         """Generate `samples` rows on every process, then decode them on process zero.
@@ -256,8 +253,9 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         """
         def generate(prepared):
             weights, count = prepared
-            error, sampled = self._sample(weights, step.key, count=count)
-            error.throw()
+            sampled, undefined = self._sample(weights, step.key, count=count)
+            if bool(undefined):
+                raise ValueError(REVEALED_UNDEFINED)
             return sampled, None, None
 
         return text_preview("masked diffusion preview",
