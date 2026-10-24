@@ -987,7 +987,7 @@ def eligibility_call(dtype, head_dim, causal, window=None, documents=None, max_s
 
 
 @pytest.mark.gpu(reason="each requirement is held to the kernel it declares, on this GPU")
-@pytest.mark.parametrize("kernel", ["flash", "triton", "cudnn", "xla"])
+@pytest.mark.parametrize("kernel", ["flash", "triton", "cudnn", "xla", "template"])
 @pytest.mark.parametrize("call", eligibility_cases(),
                          ids=lambda call: "-".join(f"{name}={value}" for name, value in call.items()))
 def test_a_kernels_requirements_are_what_the_kernel_takes_on_this_gpu(kernel, call,
