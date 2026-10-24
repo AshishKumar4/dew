@@ -169,7 +169,9 @@ def _attend(query: jax.Array, span: tuple, read, block: int, scale: float, steps
 def _slice(span: tuple, block: int, split, splits: int) -> tuple:
     """The loop's steps of slice `split` of `splits` over a row's `span` of keys (its first and its
     length): whole steps of `block` keys, as even as they cut, the last slices empty where the span
-    holds fewer steps than slices."""
+    holds fewer steps than slices. The counts take the span's integer type, as `pl.cdiv` asks of both
+    its operands, which a Python int is not where x64 is on."""
+    block, splits = (jnp.asarray(count, span[1].dtype) for count in (block, splits))
     first, last = span[0] // block, pl.cdiv(span[1], block)
     per = pl.cdiv(last - first, splits)
     begin = first + split * per
