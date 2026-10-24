@@ -43,23 +43,23 @@ MARGIN = 1e-4
 and the first outside it, or the two largest under greedy decoding: past it a float64 forward keeps
 the tokens the float32 policy kept."""
 SEEDS = {'attention cache capacity': 32, 'attention cached scores raw': 8,
-         'attention cached scores policy': 16, 'attention perplexity': 16, 'attention positions': 8,
+         'attention cached scores policy': 16, 'attention perplexity': 16, 'attention positions': 16,
          'attention rescored generation': 8, 'greedy padded generation': 32, 'mla cache capacity': 8,
-         'mla cached scores raw': 8, 'mla cached scores policy': 8, 'mla positions': 8,
-         'mla rescored generation': 8, 'recurrent cache capacity': 32, 'recurrent cached scores raw': 16,
-         'recurrent cached scores policy': 32, 'recurrent perplexity': 64, 'recurrent positions': 64,
-         'recurrent rescored generation': 16, 'sampled padded generation': 16, 'trainer update': 32,
+         'mla cached scores raw': 8, 'mla cached scores policy': 64, 'mla positions': 8,
+         'mla rescored generation': 8, 'recurrent cache capacity': 32, 'recurrent cached scores raw': 64,
+         'recurrent cached scores policy': 64, 'recurrent perplexity': 64, 'recurrent positions': 64,
+         'recurrent rescored generation': 64, 'sampled padded generation': 32, 'trainer update': 32,
          'attention registered scores raw': 16, 'attention registered scores policy': 16,
          'deepseek_v4 registered scores raw': 16, 'deepseek_v4 registered scores policy': 16,
          'gated_delta_net registered scores raw': 32, 'gated_delta_net registered scores policy': 64,
          'kimi_delta_attention registered scores raw': 64,
          'kimi_delta_attention registered scores policy': 64,
          'kpool_sparse_attention registered scores raw': 8,
-         'kpool_sparse_attention registered scores policy': 8, 'llama4 registered scores raw': 8,
-         'llama4 registered scores policy': 8, 'mamba registered scores raw': 8,
-         'mamba registered scores policy': 8, 'mamba2 registered scores raw': 8,
-         'mamba2 registered scores policy': 8, 'mla registered scores raw': 8,
-         'mla registered scores policy': 8, 'mlp registered scores raw': 8,
+         'kpool_sparse_attention registered scores policy': 32, 'llama4 registered scores raw': 8,
+         'llama4 registered scores policy': 16, 'mamba registered scores raw': 8,
+         'mamba registered scores policy': 16, 'mamba2 registered scores raw': 8,
+         'mamba2 registered scores policy': 8, 'mla registered scores raw': 16,
+         'mla registered scores policy': 16, 'mlp registered scores raw': 8,
          'mlp registered scores policy': 16}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 
