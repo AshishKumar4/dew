@@ -350,6 +350,40 @@ def test_the_dot_family_at_the_bf16_algorithm_multiplies_bf16_operands(form, sha
         np.testing.assert_array_equal(np.asarray(grad), np.asarray(wanted, np.float32))
 
 
+@pytest.mark.parametrize(("subscripts", "shapes"), [
+    ("ij,j", ((5, 7), (7,))),
+    ("oh,bhwc,pw->bopc", ((3, 4), (2, 4, 5, 6), (2, 5))),
+    ("...ij,...jk", ((2, 3, 4), (2, 4, 5))),
+    ("ii,ij->ij", ((4, 4), (4, 3))),
+    ("ij,jk,kl,lm->im", ((2, 3), (3, 4), (4, 5), (5, 2))),
+], ids=["implicit", "three", "ellipsis", "diagonal", "chain"])
+def test_any_einsum_at_the_bf16_algorithm_multiplies_bf16_operands(subscripts, shapes):
+    """`float32_einsum` at XLA's BF16_BF16_F32 algorithm takes every expression einsum does (an
+    implicit result, three or more operands, an ellipsis, a repeated index), each product its
+    operands rounded to bf16 and summed in fp32, forward and backward: over eighths whose rounding is
+    themselves and whose sums are exact, float64's einsum to the bit."""
+    from dew.nn.precision import float32_einsum
+
+    rng = np.random.default_rng(len(subscripts))
+    exact = [np.round(rng.standard_normal(shape) * 8) / 8 for shape in shapes]
+
+    def product(*operands, wide=False):
+        if wide:
+            return jnp.einsum(subscripts, *operands, precision=jax.lax.Precision.HIGHEST)
+        return float32_einsum(subscripts, *operands, precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
+                              preferred_element_type=jnp.float32)
+
+    with jax.enable_x64(new_val=True):
+        want, pullback = jax.vjp(lambda *operands: product(*operands, wide=True), *exact)
+        cotangent = np.round(rng.standard_normal(want.shape) * 8) / 8
+        wants = pullback(jnp.asarray(cotangent))
+    got, pullback = jax.vjp(product, *(value.astype(np.float32) for value in exact))
+    grads = pullback(jnp.asarray(cotangent, jnp.float32))
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want, np.float32))
+    for grad, wanted in zip(grads, wants, strict=True):
+        np.testing.assert_array_equal(np.asarray(grad), np.asarray(wanted, np.float32))
+
+
 @pytest.mark.gpu(reason="the GPU's fp32 division is what `import dew` sets; a CPU's rounds to the nearest")
 def test_the_gpu_divides_fp32_to_the_nearest_float():
     """`import dew` has XLA:GPU divide fp32 to the nearest float
