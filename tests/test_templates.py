@@ -160,3 +160,32 @@ def test_a_call_runs_the_implementation_estimated_fastest_on_the_device_or_the_o
         assert type(choose(implementations, x)) is Doubling
         assert type(choose([Unpriced()], x)) is Unpriced
         assert type(choose(implementations, x.update(dtype=jnp.bfloat16))) is Hopper
+
+
+def _ranked(costs: dict, generic: dict | None = None, named: str | None = None) -> str:
+    """The kernel a selector over kernels of `costs` (each taking the call; None states no cost) runs,
+    the `generic` ones (name to cost) after them, `named` as `generation.chosen` names it."""
+    takes = (Requirement[None]("takes", lambda case: True, "", row=generation.INHERENT),)
+
+    def priced(cost):
+        return None if cost is None else (lambda case: cost)
+
+    kernels = [Kernel[None](name, takes, cost=priced(cost)) for name, cost in costs.items()]
+    kernels += [Kernel[None](name, takes, generic=True, cost=priced(cost))
+                for name, cost in (generic or {}).items()]
+    with generation.assumed("sm90"), generation.chosen(decode=named):
+        return select(Op("decode", tuple(kernels)), None).kernel
+
+
+def test_a_selector_ranks_every_costed_kernel_and_runs_an_unqualified_one_only_by_name():
+    """Where each kernel that takes the call states a cost, the selector runs the cheapest, a generic
+    kernel stating one among them (XLA's program beating a launch); a kernel costing no finite seconds,
+    which no measurement qualified, runs only where named, the call handed to the generic kernel where no
+    other qualifies; an op whose kernels do not all state costs keeps its declared order whole."""
+    assert _ranked({"a": 2.0, "b": 1.0}) == "b"
+    assert _ranked({"a": 2.0, "b": 1.0}, {"xla": 0.5}) == "xla"
+    assert _ranked({"a": 2.0, "b": 2.0}) == "a"
+    assert _ranked({"a": float("inf"), "b": 3.0}, {"xla": None}) == "b"
+    assert _ranked({"a": float("inf"), "b": float("inf")}, {"xla": None}) == "xla"
+    assert _ranked({"a": float("inf"), "b": 3.0}, named="a") == "a"
+    assert _ranked({"a": None, "b": 1.0}, {"xla": 0.5}) == "a"
