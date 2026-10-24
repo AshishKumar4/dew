@@ -86,10 +86,11 @@ def members(process: subprocess.Popen) -> list[int]:
     found = []
     for stat in Path("/proc").glob("[0-9]*/stat"):
         try:
-            fields = stat.read_text().rsplit(")", 1)[1].split()
+            # Bytes: a process's name is any bytes it set, which the fields after it never hold.
+            fields = stat.read_bytes().rsplit(b")", 1)[1].split()
         except (FileNotFoundError, ProcessLookupError):
             continue
-        if fields[0] != "Z" and int(fields[2]) == process.pid:
+        if fields[0] != b"Z" and int(fields[2]) == process.pid:
             found.append(int(stat.parent.name))
     return found
 
@@ -102,12 +103,17 @@ def end_group(process: subprocess.Popen, grace: float = 0.0, interrupt: int = si
     purpose (a session of its own) is out of reach."""
     if grace > 0 and exit_code(process) is None and signal_group(process, interrupt):
         groups_ended((process,), grace)
-    if signal_group(process, signal.SIGKILL):
-        # The kill lands asynchronously; the group is held, its leader unreaped, until it has.
-        deadline = time.monotonic() + SETTLE_SECONDS
-        while members(process) and time.monotonic() < deadline:
-            time.sleep(POLL_SECONDS)
-    return process.wait()
+    if not signal_group(process, signal.SIGKILL):
+        return process.wait()
+    # The kill lands asynchronously; the group is held, its leader unreaped, until it has.
+    deadline = time.monotonic() + SETTLE_SECONDS
+    while (left := members(process)) and time.monotonic() < deadline:
+        time.sleep(POLL_SECONDS)
+    code = process.wait()
+    if left:
+        raise TimeoutError(f"processes {left} of the group {process.pid} led outlived its SIGKILL by "
+                           f"{SETTLE_SECONDS:.0f} s")
+    return code
 
 
 @contextlib.contextmanager
