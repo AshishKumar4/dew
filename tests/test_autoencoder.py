@@ -235,7 +235,9 @@ def test_a_users_autoencoder_rebuilds_from_its_record_as_a_built_in_does(own):
     assert record["class"].endswith(f":{type(original).__name__}")
     assert record["fields"]["model"]["class"].endswith(":AutoencoderKL")
     rebuilt = AutoEncoder.bound(record, params=original.params)
-    assert type(rebuilt) is type(original) and rebuilt.normalization == original.normalization
+    assert type(rebuilt) is type(original)
+    assert dict(rebuilt.normalization.record) == dict(original.normalization.record)
+    assert (rebuilt.latent_shift, rebuilt.latent_scale) == (original.latent_shift, original.latent_scale)
     image = jax.random.uniform(jax.random.key(0), (2, IMAGE_SIZE, IMAGE_SIZE, 3), minval=-1.0, maxval=1.0)
     latent = original.encode(original.params, image)
     np.testing.assert_array_equal(rebuilt.encode(rebuilt.params, image), latent)
