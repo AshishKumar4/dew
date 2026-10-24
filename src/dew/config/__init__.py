@@ -975,6 +975,18 @@ def media_field(chain: Dataset, run: str) -> Field:
     return Field(name, tuple(shape))
 
 
+def flag_selected(given: Sequence[str], selected: Mapping[str, str]) -> list[str]:
+    """`given` command-line arguments with each optional setting of `selected`, a field's name and its
+    subcommand's, turned on by its own flags: `--lora.rank 16` stands for `lora:lora --lora.rank 16`,
+    where no `lora:` choice is given. A setting none of whose flags is given stays off."""
+    given = list(given)
+    for field, subcommand in selected.items():
+        flags = [index for index, arg in enumerate(given) if arg.startswith(f"--{field}.")]
+        if flags and not any(arg.startswith(f"{field}:") for arg in given):
+            given.insert(flags[0], f"{field}:{subcommand}")
+    return given
+
+
 def _set_arguments(given: list[str]) -> tuple[list[str], list[str]]:
     """`given` without its `--set path=value` pairs, and the pairs' assignments, in order."""
     rest, settings, index = [], [], 0
@@ -1338,10 +1350,7 @@ class RunConfig:
         (`--set data.lm.seq_len=512`), which have no flags of their own.
         """
         given, settings = _set_arguments(list(sys.argv[1:] if args is None else args))
-        for field, subcommand in cls._FLAG_SELECTED.items():
-            flags = [index for index, arg in enumerate(given) if arg.startswith(f"--{field}.")]
-            if flags and not any(arg.startswith(f"{field}:") for arg in given):
-                given.insert(flags[0], f"{field}:{subcommand}")
+        given = flag_selected(given, cls._FLAG_SELECTED)
         model, objective = cls._started(default, "model"), cls._started(default, "objective")
         if not isinstance(model, ModelConfig) or not isinstance(objective, ObjectiveConfig | None):
             raise TypeError(f"{cls.__name__} starts from the model {model!r} and the objective "
@@ -1624,4 +1633,4 @@ class RunConfig:
 
 
 __all__ = ["JsonDict", "MetricConfig", "ModelConfig", "ObjectiveConfig", "OptimConfig", "Prepared",
-           "RunConfig", "ScheduleSpec", "TrainerConfig", "Wandb"]
+           "RunConfig", "ScheduleSpec", "TrainerConfig", "Wandb", "flag_selected"]
