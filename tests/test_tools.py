@@ -22,6 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference, chain_roundings
+from test_chunked_cross_entropy import eighths
 from test_moe import OUTPUT_TOLERANCE, ROUTER_TOLERANCE
 from test_t5_encoders import TOLERANCE as T5_TOLERANCE
 from test_text_encoders import transformers_clip
@@ -307,11 +308,16 @@ def test_lm_head_variants_compute_the_same_loss_accuracy_and_gradients(states_dt
     tiles, so on one small case all three agree on the loss, the top-1
     accuracy and both gradients, in the states' own precision: bf16 states
     take the bf16 head product in every variant. The vocabulary of 12 does
-    not split into 4 equal tiles, so the short last tile is on the path."""
+    not split into 4 equal tiles, so the short last tile is on the path.
+    The states and the table are eighths (`eighths`), whose products sum
+    exactly in any order: a tile's logits are then the whole product's on
+    any device, where an fp32 sum's last bit, which a GPU's GEMM shape
+    picks, moved a bf16 logit a whole bf16 step on an A100."""
     tool = load("benchmark_lm_head")
     key = jax.random.PRNGKey(0)
-    states = jax.random.normal(key, (2, 3, 8), jnp.float32).astype(states_dtype)
-    table = jax.random.normal(jax.random.fold_in(key, 1), (12, 8), jnp.float32)
+    states, table = eighths(jax.random.normal(key, (2, 3, 8), jnp.float32),
+                            jax.random.normal(jax.random.fold_in(key, 1), (12, 8), jnp.float32))
+    states = states.astype(states_dtype)
     targets = jnp.array([[0, 5, 11], [3, 11, 4]], jnp.int32)
     variant = tool.parse_variant("stored4-fp32" if states_dtype == "float32" else "stored4")
 
