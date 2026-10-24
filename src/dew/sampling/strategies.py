@@ -22,6 +22,7 @@ from flax import struct
 from jax import lax
 from jax.experimental import checkify
 
+from dew.nn import categorical
 from dew.nn.inputs import PredictionPhase, continuation_keys, prompt_major
 from dew.nn.scatter import DROPPED
 from dew.objectives.base import Variables, token_log_probs
@@ -518,7 +519,7 @@ def _beam_candidates(state: DecoderState, beams: StepState, transform, live, rea
     checkify.check(jnp.all(decoding.wellformed(state.logits.astype(jnp.float32)).reshape(
         prompts, width) | ~genuine),
         "the model produced a live beam without a distribution to score")
-    raw = jax.nn.log_softmax(state.logits.astype(jnp.float32))
+    raw = categorical.log_probs(state.logits)
     scores = transform(beams, raw)
     checkify.check(jnp.all(decoding.wellformed(scores).reshape(prompts, width) | ~genuine),
                    "the transform chain left a live beam without a distribution to search")
@@ -534,18 +535,21 @@ def _beam_start(state: DecoderState, start: StepState, ops: DecodeOps, prompts: 
 
     Only beam zero starts alive, so the first step's continuations all come
     from the one prefilled row and the search does not begin by scoring
-    `width` copies of the same distribution.
+    `width` copies of the same distribution. Scores and log probabilities
+    are held as the categorical computes them (`categorical.widened`), a
+    float64 model's in float64.
     """
+    scored = categorical.widened(state.logits).dtype
     return _BeamCarry(
         ops.reindex(state, jnp.repeat(jnp.arange(prompts), width)),
         jax.tree.map(lambda leaf: jnp.repeat(leaf, width, axis=0), start),
-        jnp.broadcast_to(jnp.where(jnp.arange(width) == 0, 0.0, DEAD), (prompts, width)),
+        jnp.broadcast_to(jnp.where(jnp.arange(width) == 0, 0.0, DEAD).astype(scored), (prompts, width)),
         jnp.zeros((prompts * width, budget), jnp.int32),
-        jnp.zeros((prompts * width, budget), jnp.float32),
+        jnp.zeros((prompts * width, budget), scored),
         jnp.ones((prompts, 1), bool),
-        Completed(jnp.full((prompts, width), DEAD, jnp.float32),
+        Completed(jnp.full((prompts, width), DEAD, scored),
                   jnp.zeros((prompts, width, budget), jnp.int32),
-                  jnp.zeros((prompts, width, budget), jnp.float32),
+                  jnp.zeros((prompts, width, budget), scored),
                   jnp.zeros((prompts, width), bool),
                   jnp.zeros((prompts, width), jnp.int32),
                   jnp.zeros((prompts, width), bool)))

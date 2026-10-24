@@ -36,6 +36,7 @@ import numpy as np
 from flax import struct
 from jax import lax
 
+from dew.nn import categorical
 from dew.nn.inputs import token_ids, valid_order
 from dew.nn.scatter import DROPPED
 from dew.records import finite
@@ -344,9 +345,7 @@ class Typical(_Numerical):
     @staticmethod
     def apply(mass: float, state: StepState, logits: jax.Array) -> jax.Array:
         normalized = jax.nn.log_softmax(logits)
-        probabilities = jnp.exp(normalized)
-        entropy = -jnp.sum(jnp.where(jnp.isneginf(normalized), 0.0, normalized * probabilities),
-                           axis=-1, keepdims=True)
+        entropy = categorical.entropy(logits)[..., None]
         shifted = jnp.abs(-normalized - entropy)
         order = jnp.argsort(shifted, axis=-1, stable=True)
         sorted_shift = jnp.take_along_axis(shifted, order, axis=-1)
@@ -393,9 +392,8 @@ class EtaCutoff(_Numerical):
 
     @staticmethod
     def apply(epsilon: float, state: StepState, logits: jax.Array) -> jax.Array:
-        normalized = jax.nn.log_softmax(logits)
-        probabilities = jnp.exp(normalized)
-        entropy = -jnp.sum(jnp.where(jnp.isneginf(normalized), 0.0, normalized * probabilities), axis=-1)
+        probabilities = jnp.exp(jax.nn.log_softmax(logits))
+        entropy = categorical.entropy(logits)
         cutoff = jnp.asarray(epsilon, jnp.float32)
         eta = jnp.minimum(cutoff, jnp.sqrt(cutoff) * jnp.exp(-entropy))[:, None]
         best = jnp.max(logits, axis=-1, keepdims=True)
