@@ -26,6 +26,7 @@ from dew.decision.layout import (
     Text,
 )
 from dew.decision.renderer import Chunk, render
+from dew.records import JSON
 
 QWEN = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
 """Qwen3.5's ChatML template, with its thinking switch, over a tiny vocabulary of bytes and Qwen's
@@ -323,3 +324,26 @@ def test_a_whole_row_over_a_vocabulary_without_offsets_is_refused():
 
     with pytest.raises(TypeError):
         release(max_len=1024).rows(Plain(), SPECIALS, STATE, {"team": TEAM})
+
+
+@pytest.mark.parametrize("unit", ["pieces", "whole"])
+def test_a_question_row_holds_the_state_twice_each_copy_its_own_render_and_budget(qwen, unit):
+    """A question row may hold the state more than once, each copy rendered and cut on its own: one its
+    text's first 12 tokens, one its compact JSON's last 9, the row's kept count its least-kept copy's
+    share, under either unit."""
+    layout = release()
+    state: JSON = {"note": "charged twice this month"}
+    segments = (Text("<state>\n"), State(render="state", max_tokens=12), Text("\n</state>\n<tail>"),
+                State(render="compact", keep="end", max_tokens=9), Text("</tail>\n\n"),
+                *(segment for segment in layout.segments or () if not isinstance(segment, (State, Text))))
+    segments = (*segments[:5], segments[5], Text("\n\nOptions:\n"), segments[6], Text("\n\n"), segments[7])
+    twice = QuestionLayout(max_len=1 << 16, labels=layout.labels, unit=unit, framing=layout.framing,
+                           segments=segments)
+    [row] = twice.rows(qwen, SPECIALS, state, {"team": TEAM})
+    text = qwen.decode(list(row.tokens))
+    indented = json.dumps(state, ensure_ascii=False, indent=2)
+    compact = json.dumps(state, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    assert "<state>\n" + indented[:12] + "\n</state>" in text
+    assert "<tail>" + compact[-9:] + "</tail>" in text
+    shares = [(len(indented), 12), (len(compact), 9)]
+    assert (row.state_tokens, row.state_kept) == min(shares, key=lambda pair: pair[1] / pair[0])
