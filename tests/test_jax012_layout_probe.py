@@ -5,6 +5,7 @@ import json
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 import reference_error as gate
 import test_attention_template as site
 
@@ -121,3 +122,29 @@ def test_isolate_template_operations():
     for replacement in ("none", "qk", "pv", "dots", "exp", "sum"):
         _report("widen-" + replacement, gate._drawn(
             _pipeline(replacement), reference, draw, range(40), truth_fn=ours))
+
+
+@pytest.mark.parametrize("widen_bias", [False, True], ids=["original", "widened"])
+def test_layout_reference_computes_its_float64_oracle(widen_bias):
+    ours, reference, draw, label = site.layout_site(CASE, jnp.float32, widen_bias=widen_bias)
+    with jax.enable_x64(new_val=True):
+        inputs = gate.widened(draw(0))
+        oracle, actual = ours(*inputs), reference(*inputs)
+        roundings = gate.chain_roundings(jax.make_jaxpr(ours)(*inputs))
+    print(json.dumps({"widen_bias": widen_bias, "roundings": roundings,
+                      "truth_apart_rms": float(np.sqrt(np.mean(
+                          (np.asarray(actual) - np.asarray(oracle)) ** 2)))}), flush=True)
+    gate.assert_computes_the_oracle(actual, oracle, label, roundings=roundings)
+
+
+def test_layout_with_corrected_reference_truth():
+    ours, reference, draw, label = site.layout_site(CASE, jnp.float32, widen_bias=True)
+    _, original, _, _ = site.layout_site(CASE, jnp.float32)
+    inputs = draw(0)
+    print(json.dumps({"float32_reference_unchanged_bitwise": bool(np.array_equal(
+        np.asarray(reference(*inputs)), np.asarray(original(*inputs))))}), flush=True)
+    seeds = gate.seeds_for(reference, draw, label)
+    print(json.dumps({"corrected_truth_seeds_for": seeds}), flush=True)
+    for count in (8, 40, 256):
+        _report("corrected-truth-" + str(count), gate._drawn(ours, reference, draw, range(count)))
+    gate.assert_as_exact(ours, reference, draw, label, seeds=seeds)
