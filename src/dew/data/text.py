@@ -609,8 +609,7 @@ class Quality(Curated):
 
         rules = dict(zip(QUALITY_RULES, (GopherQualityFilter, C4QualityFilter, FineWebQualityFilter),
                          strict=True))
-        arguments: dict[str, Any] = {name: list(value) if isinstance(value, tuple) else value
-                                     for name, value in self.settings}
+        arguments: dict[str, Any] = dict(self.settings)
         return rules[self.rule](**arguments)
 
 
