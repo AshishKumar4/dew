@@ -407,7 +407,8 @@ def _gmm_pipelined(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs
     """Dew: `gmm` on mma.sync's bundle (`mosaic_sm80.Mma`), for a GPU without warpgroup MMA or TMA: one
     warpgroup a tile, persistent over the tiles in a planar snake, its row and matrix blocks loaded by
     `emit_pipeline` (`Mma.walk`) and multiplied synchronously, its output staged in shared memory and
-    stored through registers a power-of-two run of its group's rows at a time. No hooks or side operands
+    stored through registers a power-of-two run of its group's rows at a time (`mosaic.store_rows`,
+    `mosaic.copied`). No hooks or side operands
     (`_Mosaic.eligible`), and the matrix as stored (AMPERE3, the one layout an A100 ran)."""
     prologue, _, epilogue, _ = hooks
     if prologue is not None or epilogue is not None or any(sides) or transpose_rhs or len(dtypes) != 1:
@@ -416,6 +417,8 @@ def _gmm_pipelined(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs
     m, n, k, g = shape
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     (dtype,) = dtypes
+    # A cp.async load is not predicated past its operand, so a last row tile reads rows the padding holds.
+    lhs = jnp.pad(lhs, ((0, -m % block_m), (0, 0)))
     grid = (pl.cdiv(m, block_m) + g, n // block_n)  # g groups' boundaries, and the unrouted rows
     blocks = {'rows': ((block_m, block_k), lhs.dtype), 'matrix': ((block_k, block_n), rhs.dtype)}
 
@@ -430,7 +433,8 @@ def _gmm_pipelined(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs
                 @functools.partial(pl.run_scoped, o_smem=plgpu.SMEM((block_m, block_n), dtype))
                 def _(o_smem):
                     o_smem[...] = acc.astype(dtype)
-                    _stored_through_registers(o_smem, o_gmem, group, ni * block_n, min(block_m, m))
+                    mosaic.store_rows(o_smem, o_gmem, group.block_start, group.start_within_block,
+                                      group.actual_size, ni * block_n, min(block_m, m), copy=mosaic.copied)
 
             def step(_, slots, nothing, accumulators):
                 (acc,) = accumulators
@@ -453,26 +457,6 @@ def _gmm_pipelined(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs
     kernel = family.kernel(body, out_type=jax.ShapeDtypeStruct((m, n), dtype), grid=(multiprocessors,),
                            grid_names=("sm",), consumers=1, interpret=bool(interpret))
     return (kernel(table, lhs, rhs),)
-
-
-def _stored_through_registers(o_smem, o_gmem, group, column, most: int) -> None:
-    """Dew: the staged tile's rows of `group` (`GroupInfo`'s, within its block) to the output at column
-    `column`, through registers (no TMA): a power-of-two run of rows at a time, the largest that fits what
-    is left, so a ragged group's rows are stored and its neighbours' never."""
-    first, stored = group.start_within_block, group.actual_size
-    columns = pl.ds(column, o_smem.shape[1])
-    done = jnp.int32(0)
-    size = 1 << (most.bit_length() - 1)
-    while size >= 1:
-        fits = (stored - done) >= size
-
-        @pl.when(fits)
-        def _(size=size, done=done):
-            rows = o_smem.at[pl.ds(first + done, size)][...]
-            o_gmem.at[pl.ds(group.block_start + first + done, size), columns][...] = rows
-
-        done = jnp.where(fits, done + size, done)
-        size //= 2
 
 
 def _matrix_columns(gmem, column_tile, *, block_n: int, transpose_rhs: bool):
