@@ -1,6 +1,5 @@
 """Source-file loading for tools exercised by several test suites, and git in a test's scratch repository."""
 
-import importlib.util
 import os
 import subprocess
 import sys
@@ -9,20 +8,17 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
 
+from dew.registry import module_from_file
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = REPO_ROOT / "tests" / "fixtures"
 
 
 def load(name: str, directory: str = "tools") -> ModuleType:
-    """The repository's `directory/name.py` as the module `name_under_test`,
-    registered before it runs so its dataclasses resolve their module."""
-    spec = importlib.util.spec_from_file_location(
-        f"{name}_under_test", REPO_ROOT / directory / f"{name}.py")
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    """The repository's `directory/name.py` as the module `name_under_test`, that file and no other
+    (`dew.registry.module_from_file`), registered before it runs so its dataclasses resolve their
+    module."""
+    return module_from_file(REPO_ROOT / directory / f"{name}.py", f"{name}_under_test")
 
 
 @contextmanager
