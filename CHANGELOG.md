@@ -5,6 +5,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- `dew.sampling.sample`'s `record` reads each step's clean prediction too,
+  `record(x, state, denoised)`; a recorder written for two arguments takes a
+  third.
 - JEPA's `normalize_targets` is Flax's `LayerNorm` with no affine and exact
   variance. Its statistics are at least float32, as I-JEPA's `F.layer_norm`'s
   are, so a bfloat16 run's targets round once.
