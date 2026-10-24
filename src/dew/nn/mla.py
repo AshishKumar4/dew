@@ -54,7 +54,13 @@ from dew.nn.precision import (
 )
 from dew.nn.rope import YarnScaling, deinterleaved, rotary_freqs, rotate, yarn_query_scale
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
-from dew.nn.sparse_selection import index_scores, selection_mask, sparse_latent_attention, top_k_selection
+from dew.nn.sparse_selection import (
+    index_agreements,
+    selection_mask,
+    sparse_latent_attention,
+    top_k_selection,
+    weighted_agreements,
+)
 
 
 def open_latent_cache(module: nn.Module, key, value_dim: int, index_keys, max_seq_len: int, *, valid=None):
@@ -168,10 +174,16 @@ class IndexerFront:
         batch, length = q_resid.shape[:2]
         return self.wq_b(jax.lax.stop_gradient(q_resid)).reshape(batch, length, self.n_heads, self.head_dim)
 
+    def agreements(self, query, keys):
+        """Each head's `q_h . k` of `query` against `keys` before the relu, `[B, S, n_heads, T]`
+        (`index_agreements`): a key scores zero where every head's is at most zero."""
+        return index_agreements(query, keys, self.precision)
+
     def scored(self, query, keys, hidden):
         """`query`'s scores against `keys` `[B, S, T]`, its heads weighted by `weights_proj` of the
-        detached `hidden` (`index_scores`)."""
-        return index_scores(query, keys, self.weights_proj(jax.lax.stop_gradient(hidden)), self.precision)
+        detached `hidden` (`index_scores`, its heads' `agreements` weighted)."""
+        weights = self.weights_proj(jax.lax.stop_gradient(hidden))
+        return weighted_agreements(self.agreements(query, keys), weights, query.shape[-1], self.precision)
 
 
 @logical_axes({
