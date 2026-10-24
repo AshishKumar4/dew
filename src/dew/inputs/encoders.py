@@ -24,6 +24,7 @@ import numpy as np
 from flax.typing import Dtype
 from typing_extensions import TypeVar
 
+from dew.batch import FROZEN, Variables
 from dew.nn.blocks import table_rows
 from dew.nn.dit import TextContext
 from dew.nn.flops import counted_flops
@@ -41,7 +42,6 @@ from dew.nn.text_encoders import (
     translate_config,
     translate_t5_config,
 )
-from dew.objectives.base import FROZEN, Variables
 from dew.registry import dtype_name, encoders, import_path, resolve_dtype
 
 if TYPE_CHECKING:

@@ -22,13 +22,13 @@ import pytest
 from data_support import parse_grain_flags
 from token_support import encoded_token_fixture, export_byte_tokens, write_token_corpus
 
+from dew.batch import VALID_ROWS
 from dew.data import ByteTokenizer, Loading, presets
 from dew.data.compile import compile, held
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import Dataset
 from dew.data.sources.tokens import TokenFiles
 from dew.nn.backbones import causal_transformer as backbone
-from dew.objectives.base import VALID_ROWS
 from dew.objectives.lm import LMObjective
 from dew.training import Step
 

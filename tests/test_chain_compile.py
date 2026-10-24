@@ -10,12 +10,12 @@ import pytest
 from recording import RecordingTracker
 
 from dew import Trainer
+from dew.batch import VALID_ROWS
 from dew.data import Loading, Memory, from_grain, from_iter, mix, presets
 from dew.data.compile import compile, fitted, validation
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import ObjectiveData
 from dew.nn.backbones import CausalTransformer
-from dew.objectives.base import VALID_ROWS
 from dew.objectives.lm import LMObjective, Perplexity
 
 READ = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)

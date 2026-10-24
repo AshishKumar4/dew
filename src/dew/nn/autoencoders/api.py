@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
-from dew.objectives.base import Variables
+from dew.batch import Variables
 
 type RecordValue = float | np.ndarray | None
 """A value a latent normalization's record keeps: a number, one per channel or position, or absent."""

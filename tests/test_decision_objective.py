@@ -13,6 +13,7 @@ import pytest
 from decision_support import decision_rows
 
 from dew.artifacts import Decisions
+from dew.batch import FROZEN, VALID_ROWS
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
@@ -35,7 +36,7 @@ from dew.decision import (
 )
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import FROZEN, VALID_ROWS, joined
+from dew.objectives.base import joined
 from dew.training.trainer import Trainer
 
 FIXTURES = Path(__file__).parent / "fixtures" / "laya"

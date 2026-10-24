@@ -19,7 +19,7 @@ from token_support import repeated_token_batch, token_rows
 
 from dew.config import OptimConfig
 from dew.data.dataset import Loader
-from dew.nn.sharding import LayoutRefused, mesh_axes
+from dew.mesh import LayoutRefused, mesh_axes
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import DEFAULT_RULES, Layout, MeshSpec, Trainer

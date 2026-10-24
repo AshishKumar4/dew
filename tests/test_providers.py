@@ -10,11 +10,11 @@ import numpy as np
 import pytest
 from data_support import WideDraw
 
+from dew.batch import VALID_ROWS
 from dew.data import TFDS, Files, Loading, Memory
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import Pipeline
-from dew.objectives.base import VALID_ROWS
 
 READ = Loading(workers=0, threads=1, read_buffer=4, worker_buffer=1)
 PREPARED = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"

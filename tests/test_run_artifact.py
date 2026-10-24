@@ -125,10 +125,11 @@ def test_an_adapted_policy_run_loads_and_saves_the_policy_it_trained(kind, tmp_p
     rebuild write the files the trained adapter writes, byte for byte, and
     the loaded task and bundle hold the base draw bitwise under `frozen`
     and compute what the trained policy computes."""
+    from dew.batch import FROZEN
     from dew.inference import TextGeneration
     from dew.interop import Pretrained
     from dew.lora import Adapter, LoRA
-    from dew.objectives.base import FROZEN, part
+    from dew.objectives.base import part
     from dew.objectives.rl import DPOObjective, PPOObjective, ValueHead
 
     base = model()

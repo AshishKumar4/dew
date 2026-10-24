@@ -9,7 +9,7 @@ import optax
 from flax import struct
 from flax.training.dynamic_scale import DynamicScale
 
-from dew.objectives.base import Batch, Variables, merge
+from dew.batch import Batch, Variables, merge
 
 __all__ = ["CHECKPOINTED", "MODEL_STATE", "Accumulation", "TrainState", "Variables"]
 

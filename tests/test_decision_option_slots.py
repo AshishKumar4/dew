@@ -20,6 +20,7 @@ from decision_support import decision_rows
 from reference_error import assert_leaves_as_exact, float64_terms, widened
 from safetensors.numpy import load_file
 
+from dew.batch import VALID_ROWS
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer, HFTokenizer
 from dew.decision import (
@@ -36,7 +37,7 @@ from dew.decision.joint_checkpoint import StoredJointHead
 from dew.decision.layout import compacted
 from dew.decision.task import laid_out
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import VALID_ROWS, Step
+from dew.objectives.base import Step
 
 FIXTURES = Path(__file__).parent / "fixtures"
 TINY = FIXTURES / "joint_checkpoint" / "tiny"

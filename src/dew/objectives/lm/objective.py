@@ -39,6 +39,19 @@ from flax.traverse_util import unflatten_dict
 from jax.typing import ArrayLike
 
 from dew.artifacts import Artifact, TextSamples, TokenScores
+from dew.batch import (
+    COORDINATES_FIELD,
+    FROZEN,
+    VALID_ROWS,
+    Batch,
+    Coordinates,
+    Variables,
+    merge,
+    real_slots,
+    scored_targets,
+    shifted_span,
+    token_layout,
+)
 from dew.coordination import agreed, collective_host
 from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
@@ -46,18 +59,7 @@ from dew.inference.tasks import Processor, TextSettings, recorded_processor, rec
 from dew.inputs import Field, InputSpec
 from dew.nn.cross_attention import crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
-from dew.nn.inputs import (
-    CONTEXT,
-    CONTEXT_LENGTHS,
-    COORDINATES_FIELD,
-    Coordinates,
-    ModelInputs,
-    pad_token_rows,
-    real_slots,
-    rotate_rows,
-    shifted_span,
-    token_layout,
-)
+from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, ModelInputs, pad_token_rows, rotate_rows
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_moments
 from dew.nn.precision import at_least_fp32
@@ -76,11 +78,8 @@ from dew.nn.protocols import (
 )
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
-    FROZEN,
     OMITTED,
-    VALID_ROWS,
     Aux,
-    Batch,
     EMASpec,
     Objective,
     Omitted,
@@ -90,9 +89,7 @@ from dew.objectives.base import (
     Ratio,
     Shown,
     Step,
-    Variables,
     freeze,
-    merge,
     merge_totals,
     model_rngs,
     thaw,
@@ -288,10 +285,10 @@ def _prepared(tokens: ModelInputs | jax.Array, segment_ids: jax.Array | None = N
     """The rows as `ModelInputs`, bare ids cast to int32, their packing among the token fields.
 
     A packed batch from a data pipeline carries its windows' `coordinates`
-    (`dew.nn.inputs.Coordinates`, the packer's); a rollout's names each row's
+    (`dew.batch.Coordinates`, the packer's); a rollout's names each row's
     `segment_ids` and `positions`. Either comes beside the ids or in the
     `ModelInputs`; a field named both ways is refused. Everything after reads
-    the packing off what this returns (`dew.nn.inputs.token_layout`).
+    the packing off what this returns (`dew.batch.token_layout`).
     """
     prepared = tokens if isinstance(tokens, ModelInputs) else ModelInputs(jnp.asarray(tokens, jnp.int32))
     columns = {name: column for name, column in (("positions", positions), ("segment_ids", segment_ids),
@@ -351,7 +348,7 @@ def batch_text(batch) -> ModelInputs:
     stale = sorted({"text_segment_ids", "text_positions"} & set(batch))
     if stale:
         raise ValueError(f"a packed batch lays its documents out in text_coordinates "
-                         f"(dew.nn.inputs.coordinates), not {', '.join(stale)}")
+                         f"(dew.batch.coordinates), not {', '.join(stale)}")
     laid = batch.get("text_coordinates")
     return _prepared(batch[TEXT_KEY], coordinates=None if laid is None else jax.tree.map(jnp.asarray, laid))
 
@@ -553,27 +550,6 @@ def _phase_filter(model: nn.Module, indexer: IndexerTraining | None,
 
 _DEFAULT_SAMPLING = Sampling()
 
-
-
-def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, depth: int = 0,
-                   roles=None, role: int | None = None):
-    """Whether each target the loss scores at prediction `depth` counts, as
-    `[B, S - 1 - depth]` booleans, in `xp` (numpy for the host's FLOP
-    geometry and the data's target counts, jax.numpy for the loss): the
-    state at p scores the token `depth + 1` later, which counts when it is
-    not padding, when the attention mask keeps every position from the state
-    to it, in a packed batch when the state and it share a document (segment
-    0 is padding), and with a `role` (`loss_role`) when `roles`, one per
-    token, give the target that role."""
-    span = depth + 1
-    counted = shifted_span(tokens.shape, span, valid=attention_mask, segments=segment_ids, xp=xp)
-    if pad_id is not None:
-        counted = counted & (tokens[:, span:] != pad_id)
-    if segment_ids is not None:
-        counted = counted & (segment_ids[:, span:] != 0)
-    if role is not None and roles is not None:
-        counted = counted & (roles[:, span:] == role)
-    return counted
 
 class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     """Scores a causal decoder's tokens: the machinery the LM, preference and

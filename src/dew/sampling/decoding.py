@@ -36,7 +36,7 @@ import numpy as np
 from flax import struct
 from jax import lax
 
-from dew.nn.inputs import token_ids, valid_order
+from dew.batch import token_ids, valid_order
 from dew.nn.scatter import DROPPED
 from dew.records import finite
 from dew.sampling.vocabulary import (
@@ -162,7 +162,7 @@ def _counts(tokens: jax.Array, valid: jax.Array, vocab: int) -> jax.Array:
 
 def id_row(name: str, value: int | Sequence[int]) -> tuple[int, ...]:
     """`value`, one token id or a sequence of them (a range, an array's row), as a tuple, read by the
-    one law of token ids (`dew.nn.inputs.token_id`)."""
+    one law of token ids (`dew.batch.token_id`)."""
     row = (value,) if isinstance(value, int | np.integer) else value
     return tuple(token_ids(row if isinstance(row, np.ndarray) else tuple(row), where=name))
 

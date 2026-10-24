@@ -10,6 +10,7 @@ import pytest
 from attention_oracle import exact_attention
 from reference_error import assert_as_exact
 
+from dew.batch import coordinates
 from dew.nn.attention import (
     alibi_bias,
     chunk_mask,
@@ -19,7 +20,6 @@ from dew.nn.attention import (
     with_key_starts,
 )
 from dew.nn.documents import CrossDocuments, cross_document_mask, document_ids, document_mask, with_documents
-from dew.nn.inputs import coordinates
 from dew.nn.kernels.templates import attention as template
 from dew.nn.precision import FP32_SUMS
 

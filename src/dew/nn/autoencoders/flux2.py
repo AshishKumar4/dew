@@ -19,8 +19,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.batch import Variables
 from dew.interop.components import bind_component
-from dew.objectives.base import Variables
 
 from ..scan_orders import pixel_shuffle, pixel_unshuffle
 from .api import LatentNormalization, ModuleAutoEncoder, published_source

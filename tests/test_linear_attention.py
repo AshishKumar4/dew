@@ -41,7 +41,8 @@ from model_support import decode_through
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened
 from tuned import each_config, launches, timed
 
-from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
+from dew.batch import coordinates
+from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.kernels import tuning
 from dew.nn.kernels.recurrence_algebra import decays, factor
 from dew.nn.kernels.recurrence_chunk import chunk_delta_rule, chunk_gated_delta_rule, fla_rule
@@ -273,7 +274,7 @@ def test_the_port_keeps_each_row_to_itself_at_its_rows_tightest_document_bound()
     port (`fla_rule`) is bitwise the document run alone, a row's first from the row's memory.
     A row's padding runs as a sequence of its own, so a bound without it ran the second row's last
     document on from its first."""
-    from dew.nn.inputs import coordinates
+    from dew.batch import coordinates
 
     segments = jnp.asarray([[1] * 70 + [2] * 50 + [0] * 8, [1] * 50 + [2] * 50 + [0] * 28])
     tokens = coordinates(segments=segments, max_segments=2, right_padded=True)

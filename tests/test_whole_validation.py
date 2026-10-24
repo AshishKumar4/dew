@@ -21,6 +21,7 @@ from reference_error import assert_computes_the_oracle, chain_roundings
 from test_guidance_distillation import FIXTURES, FLUX
 
 from dew import Evaluation
+from dew.batch import VALID_ROWS
 from dew.config import ModelConfig, ObjectiveConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data import Loading
@@ -29,7 +30,7 @@ from dew.data.dataset import DataPartition, rows_of
 from dew.diffusion.presets import Flow
 from dew.inputs import TextCondition
 from dew.nn.backbones import CausalTransformer
-from dew.objectives.base import TEACHER, VALID_ROWS, Step
+from dew.objectives.base import TEACHER, Step
 from dew.objectives.diffusion import GuidanceDistillationObjective
 from dew.objectives.lm import LMObjective, Perplexity
 from dew.registry import objectives

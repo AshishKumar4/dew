@@ -69,13 +69,14 @@ from orbax.checkpoint.checkpoint_manager import AsyncOptions, MultiprocessingOpt
 from orbax.checkpoint.checkpoint_managers import preservation_policy as preservation
 
 from dew import position, records
+from dew.batch import Variables
 from dew.cleanup import attempted
 from dew.coordination import broadcast_from_process_zero, from_every_process
 from dew.files import write_atomically
 from dew.hashing import fmix32
+from dew.mesh import LogicalAxes
 from dew.nn import sharding
-from dew.nn.sharding import LogicalAxes
-from dew.objectives.base import PARAMETER_ROOTS, Variables
+from dew.objectives.base import PARAMETER_ROOTS
 from dew.records import JSON, duration, json_value
 from dew.telemetry.profile import region
 
@@ -1586,8 +1587,9 @@ class Checkpoints:
         The subtrees at `unread`'s paths are neither placed nor read
         (`dew.objectives.base.UNREAD`).
         """
+        from dew.batch import FROZEN, merge
         from dew.inference.banks import banked_placement, placed_rows, shape_rows, spread
-        from dew.objectives.base import FROZEN, merge, without
+        from dew.objectives.base import without
         from dew.registry import resolve_dtype
         from dew.training.distributed import (
             Layout as DefaultLayout,

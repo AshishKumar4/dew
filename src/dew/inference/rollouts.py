@@ -35,9 +35,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.batch import Variables, token_id
 from dew.coordination import agreed, collective_host
-from dew.nn.inputs import key_seed, request_key, token_id
-from dew.objectives.base import Variables, thaw
+from dew.nn.inputs import key_seed, request_key
+from dew.objectives.base import thaw
 from dew.records import JSON, finite
 from dew.sampling.decoding import EndOfSequence, StopStrings
 from dew.sampling.text import Generation, Sampling
@@ -79,7 +80,7 @@ FINISH_REASONS = frozenset({"stop", "tool_calls", "length", "abort"})
 
 
 def _token_ids(name: str, ids: object) -> tuple[int, ...]:
-    """`ids`, a tuple, each read by `dew.nn.inputs.token_id`'s law."""
+    """`ids`, a tuple, each read by `dew.batch.token_id`'s law."""
     if not isinstance(ids, tuple):
         raise ValueError(f"{name} must be a tuple of token ids, got {type(ids).__name__}")
     return tuple(token_id(token, where=name) for token in ids)

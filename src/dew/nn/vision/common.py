@@ -14,9 +14,9 @@ import numpy as np
 from flax import linen as nn
 
 from dew import records
+from dew.batch import Variables
 from dew.interop.decoder_parts import read_rope_theta
 from dew.interop.weights import placed
-from dew.objectives.base import Variables
 from dew.registry import Record, projectors, towers
 
 if TYPE_CHECKING:

@@ -18,9 +18,10 @@ from reference_error import assert_as_exact, assert_as_exact_as_the_reference, a
 from safetensors.numpy import load_file
 
 from dew import lora
+from dew.batch import merge
 from dew.interop.pretrained import Pretrained
 from dew.lora import Adapter, LoRA, Target
-from dew.objectives.base import Step, merge
+from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.optim import OPTIMIZER_MAP
 

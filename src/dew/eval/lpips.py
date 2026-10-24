@@ -31,8 +31,8 @@ import numpy as np
 from flax import linen as nn
 
 from dew.artifacts import ImageGrid
+from dew.batch import Variables
 from dew.nn.conv import Conv
-from dew.objectives.base import Variables
 
 from .common import ImageMetric, paired
 from .psnr import frame_batch

@@ -29,10 +29,10 @@ from typing import Protocol, runtime_checkable
 
 import jax
 
+from dew.batch import Variables
 from dew.inference.engine import Timed, normalized, reloaded, settled
 from dew.inference.tasks import held
 from dew.nn.inputs import mesh_of
-from dew.objectives.base import Variables
 
 
 @dataclass(frozen=True)

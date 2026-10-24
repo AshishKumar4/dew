@@ -38,6 +38,7 @@ import numpy as np
 
 from dew import records
 from dew._model_types import QWEN35_TEXT_TYPES, QWEN35_TYPES
+from dew.batch import Variables
 from dew.files import write_atomically
 from dew.interop.config_records import NativeFields
 from dew.interop.decoder_families import ENTRIES
@@ -69,7 +70,6 @@ from dew.nn.vision.gemma4 import translate_gemma4_projector_config, translate_ge
 from dew.nn.vision.llama4 import translate_llama4_projector_config, translate_llama4_vision_config
 from dew.nn.vision.qwen35 import translate_qwen35_projector_config, translate_qwen35_vision_config
 from dew.nn.vision.siglip import translate_gemma_projector_config, translate_siglip_vision_config
-from dew.objectives.base import Variables
 from dew.registry import from_record, towers
 
 GENERATION_CONFIG_FILE = "generation_config.json"

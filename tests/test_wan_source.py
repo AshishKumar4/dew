@@ -341,8 +341,8 @@ def test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone(pipeline, 
     bitwise where they were."""
     import optax
 
+    from dew.batch import FROZEN
     from dew.lora import LoRA
-    from dew.objectives.base import FROZEN
     from dew.training import Trainer
 
     _, record, arrays = walk

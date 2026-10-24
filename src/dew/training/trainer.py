@@ -36,6 +36,7 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
+from dew.batch import FROZEN, Batch, Variables
 from dew.checkpoints import Checkpoints, Ranking
 from dew.cleanup import attempted
 from dew.coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
@@ -51,18 +52,13 @@ from dew.data.dataset import (
     stream_identity,
 )
 from dew.data.pipeline import Dataset, DeviceStep
+from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, LogicalAxes, batch_axes
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, backend, gpu_mesh, gpu_target, measured_kernel
 from dew.nn.sharding import (
-    SEQUENCE_AXIS,
-    STAGE_AXIS,
-    TENSOR_AXIS,
-    LayoutRefused,
     Link,
-    LogicalAxes,
     Schedule,
-    batch_axes,
     boxed,
     boxed_axes,
     measured_links,
@@ -70,9 +66,7 @@ from dew.nn.sharding import (
     ruled_boxes,
 )
 from dew.objectives.base import (
-    FROZEN,
     Aux,
-    Batch,
     Initializer,
     Metric,
     Objective,
@@ -81,7 +75,6 @@ from dew.objectives.base import (
     Shown,
     Step,
     TrainingScalar,
-    Variables,
     select,
     taken_record,
 )

@@ -16,6 +16,7 @@ import numpy as np
 from flax.traverse_util import flatten_dict
 
 from dew import records
+from dew.batch import Variables
 from dew.diffusion.block import BlockProcess
 from dew.interop.config_records import NativeFields
 from dew.interop.hf_decoders import (
@@ -44,7 +45,6 @@ from dew.nn.vision.gemma4 import (
     translate_gemma4_projector_weights,
     translate_gemma4_vision_config,
 )
-from dew.objectives.base import Variables
 from dew.registry import from_record, projectors, towers
 
 VISION_PREFIX = "model.encoder.vision_tower."

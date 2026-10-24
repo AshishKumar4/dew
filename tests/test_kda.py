@@ -280,7 +280,8 @@ def test_padded_rows_preserve_the_memory_and_the_history():
     is on par, on the real tokens, with the layer over the same tokens
     contiguous, from the transcription's float64 evaluation over drawn
     inputs (check 1)."""
-    from dew.nn.inputs import AttentionMetadata, coordinates
+    from dew.batch import coordinates
+    from dew.nn.inputs import AttentionMetadata
 
     module, _, variables = layer_and_params(-5.0)
     params = oracle_params(variables)

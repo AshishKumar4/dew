@@ -9,9 +9,9 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn, struct
 
+from dew.batch import Variables
 from dew.diffusion.schedules import NoiseScheduler, expand
 from dew.diffusion.transforms import PredictionTransform, ScheduleWeighting, Weighting, broadcast_rates
-from dew.objectives.base import Variables
 
 
 @struct.dataclass

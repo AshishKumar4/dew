@@ -37,13 +37,14 @@ from safetensors.numpy import load_file
 from test_joined import row_joins
 
 from dew import lora
+from dew.batch import FROZEN, merge
 from dew.data.dataset import Loader
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.pretrained import Pretrained
 from dew.interop.safetensors_io import read_file, write_file
 from dew.lora import Adapter, AdapterBase, LoRA, Target
 from dew.nn.sharding import ADAPTER_RANK, declarations, declared_axes, parameter_path
-from dew.objectives.base import FROZEN, Step, merge, thaw
+from dew.objectives.base import Step, thaw
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
 from dew.optim import OPTIMIZER_MAP, muon_weight_dimension_numbers

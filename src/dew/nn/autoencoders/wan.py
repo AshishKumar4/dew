@@ -35,9 +35,9 @@ import numpy as np
 from flax.typing import Dtype
 
 from dew import records
+from dew.batch import Variables
 from dew.interop.components import bind_component
 from dew.interop.weights import indexed_path
-from dew.objectives.base import Variables
 
 from ..attention import l2_normalized, scaled_dot_product_attention
 from ..conv import Conv

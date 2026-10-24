@@ -31,6 +31,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from dew.batch import Variables, coordinates, real_slots, token_id, token_ids
 from dew.diffusion.block import CanvasGeneration, through_eos
 from dew.diffusion.process import Conditioning
 from dew.interop.weights import decoding_storage
@@ -39,18 +40,13 @@ from dew.nn.inputs import (
     ModelInputs,
     Request,
     continuation_keys,
-    coordinates,
     local_rows,
     mesh_of,
     prompt_major,
-    real_slots,
-    token_id,
-    token_ids,
 )
 from dew.nn.kernels.options import compiler_options
 from dew.nn.protocols import Logits, TokenModel
 from dew.nn.sharding import explicit_spec
-from dew.objectives.base import Variables
 
 MDLM_STEPS = 128
 """Reveal steps `generate` takes by default, MDLM's `sampling.steps` (configs/config.yaml)."""

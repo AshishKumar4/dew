@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
-from dew.nn.inputs import token_ids
+from dew.batch import token_ids
 from dew.records import JSON, json_value
 
 from .chat import Conversation, render_prompt

@@ -29,9 +29,10 @@ from flax import struct
 from typing_extensions import get_protocol_members
 
 from dew import records
+from dew.batch import Coordinates, coordinates
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.questions import Choice, Noul, Question, Score, kind_of
-from dew.nn.inputs import Coordinates, coordinates, pad_token_rows
+from dew.nn.inputs import pad_token_rows
 from dew.records import JSON
 
 if TYPE_CHECKING:

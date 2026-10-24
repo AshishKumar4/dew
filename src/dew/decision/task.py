@@ -18,6 +18,7 @@ from jax.typing import DTypeLike
 from PIL import Image
 
 from dew import records
+from dew.batch import Variables
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Reader
 from dew.data.text import HFTokenizer, Tokenizer
@@ -65,7 +66,7 @@ from dew.inference.tasks import shape_bucket
 from dew.interop.processors import Processor
 from dew.nn.inputs import ModelInputs, RowPlan, mesh_of
 from dew.nn.kernels.options import compiler_options
-from dew.objectives.base import Metric, Objective, Variables
+from dew.objectives.base import Metric, Objective
 from dew.records import JSON, json_value, record
 
 if TYPE_CHECKING:

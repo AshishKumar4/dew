@@ -6,10 +6,10 @@ from dataclasses import dataclass
 import jax.numpy as jnp
 import numpy as np
 
+from dew.batch import Variables
 from dew.inputs import CharTable, ConditionEncoder
 from dew.inputs.encoders import char_codes
 from dew.nn.dit import TextContext
-from dew.objectives.base import Variables
 
 RES = 8
 TOKENS = 5

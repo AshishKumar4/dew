@@ -172,13 +172,14 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     from diffusion_stubs import batch_for
     from diffusion_support import images_of
 
+    from dew.batch import FROZEN
     from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
     from dew.config.diffusion import DiffusionRunConfig
     from dew.diffusion.presets import Flow
     from dew.inputs import TextCondition
     from dew.lora import LoRA
-    from dew.objectives.base import FROZEN, TEACHER, Step
+    from dew.objectives.base import TEACHER, Step
     from dew.objectives.diffusion import ConsistencyDistillationObjective
     from dew.objectives.diffusion.objective import FAKE_SCORE
     from dew.sampling import Consistency, Euler, TextToImage

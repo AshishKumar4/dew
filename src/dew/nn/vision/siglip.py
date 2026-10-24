@@ -15,6 +15,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
+from dew.batch import Variables
 from dew.interop.weights import checkpoint_array
 from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.blocks import TokenEmbedding
@@ -28,7 +29,6 @@ from dew.nn.text_encoders import (
     clip_layer,
     tower_activation,
 )
-from dew.objectives.base import Variables
 from dew.registry import Record
 
 from .common import (

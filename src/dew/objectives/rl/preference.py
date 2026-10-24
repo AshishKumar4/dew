@@ -14,9 +14,10 @@ from __future__ import annotations
 import jax.numpy as jnp
 
 from dew.artifacts import TokenScores
+from dew.batch import Variables
 from dew.data.preferences import IDS_KEY, MASK_KEY
 from dew.inputs import Field, InputSpec
-from dew.objectives.base import Aux, EMASpec, Variables
+from dew.objectives.base import Aux, EMASpec
 from dew.rl.surrogate import preference_logsigmoid_terms
 
 from ..lm.objective import TokenScorer

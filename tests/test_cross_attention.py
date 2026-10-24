@@ -25,6 +25,7 @@ from model_support import TINY_DECODER, Digits, decoder, flat_tree
 from reference_error import assert_as_exact, torch_with_gradients, with_gradients
 from test_serving import assert_same_generation
 
+from dew.batch import FROZEN
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
 from dew.inference import RunProcessor, TextGeneration
@@ -41,7 +42,7 @@ from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CrossContext, ModelInputs
 from dew.nn.kv_cache import KVCache
 from dew.nn.mlp import GatedMLP
 from dew.nn.ngpt import NGPT
-from dew.objectives.base import FROZEN, thaw
+from dew.objectives.base import thaw
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling
 from dew.training import Layout, MeshSpec, Trainer

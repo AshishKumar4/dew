@@ -18,8 +18,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.batch import Batch
 from dew.data.dataset import rows_of
-from dew.objectives.base import Batch
 from dew.telemetry.instrumentation import NO_FLOPS, StepFlops
 from dew.training.display import TrainingDisplay
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS, _TokenCount

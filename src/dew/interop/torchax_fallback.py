@@ -44,9 +44,10 @@ from dew.interop.generation_config import read_generation_config
 from dew.interop.pickles import host_view
 from dew.interop.pretrained import PretrainedFallback, source_processor
 from dew.interop.weights import AUTO
+from dew.mesh import LogicalAxes
 from dew.nn.precision import at_least_fp32, configured_precision, float32_products
 from dew.nn.protocols import Lacks, OutputTable
-from dew.nn.sharding import LogicalAxes, Suffix, parameter_path
+from dew.nn.sharding import Suffix, parameter_path
 from dew.registry import resolve_dtype
 from dew.training.distributed import Layout
 
