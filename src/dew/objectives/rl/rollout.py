@@ -126,6 +126,8 @@ class PolicyCollector:
     def __post_init__(self) -> None:
         if type(self.max_new_tokens) is not int or self.max_new_tokens < 1:
             raise ValueError("a rollout generates at least one token")
+        # The policy's own: the reward's text trims at the end-of-sequence ids generation stops at.
+        object.__setattr__(self, "sampling", self.objective.sampled(self.sampling))
 
     @property
     def width(self) -> int:
