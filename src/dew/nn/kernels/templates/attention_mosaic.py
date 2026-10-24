@@ -737,6 +737,8 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
     q_steps = queries // block_q
     stages = min(program.tiles.stages, q_steps)
     graded = [kind for kind in kinds if kind in DKV_GRADS]
+    # A key gradient's column sums go through a row buffer of their own, which only a key hook needs.
+    keyed = Kind.KEY in kinds
     leaves, treedef = jax.tree.flatten((spans, score_params))
 
     def body(*refs, streams):
@@ -745,8 +747,9 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
         (spans_of, score_refs), refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
         dq_ref, refs = (refs[0], refs[1:]) if walk.fused else (None, refs)
         dk_ref, dv_ref, *refs = refs
-        grad_refs, (k_smem, v_smem, staged, out_smem, key_smem, k_loaded, v_loaded) = (
-            refs[:len(graded)], refs[len(graded):])
+        grad_refs, refs = refs[:len(graded)], refs[len(graded):]
+        k_smem, v_smem, staged, out_smem, *refs = refs
+        key_smem, (k_loaded, v_loaded) = (refs[0], refs[1:]) if keyed else (None, refs)
         key_refs = [ref for ref, kind in zip(grad_refs, graded, strict=True) if kind == Kind.KEY]
         tile_refs = [ref for ref, kind in zip(grad_refs, graded, strict=True) if kind == Kind.TILE]
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
@@ -797,7 +800,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
             out = (row, pl.ds(k_first, block_k), head)
             family.stored((dk, dv), (dk_ref.at[out], dv_ref.at[out]),
                           smem=out_smem.at[index, pl.ds(0, block_k)])
-            if key_refs:
+            if key_smem is not None:
                 # Each key gradient, the walk's column sums, through a row of the key stage.
                 key_views = tuple(ref.at[row, head, pl.ds(k_first, block_k)] for ref in key_refs)
                 family.stored(tuple(family.as_row(sums) for sums in key_sums), key_views,
@@ -831,8 +834,8 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
             plgpu.SMEM((consumers, 4 if walk.accurate else 2, block_q, block_k), query.dtype),
             # dK's and dV's output stage, and each tile's dQ's (`fused`).
             plgpu.SMEM((consumers, max(block_q, block_k), width), jnp.float32),
-            # Each key gradient's column sums, a row each, for their store.
-            plgpu.SMEM((consumers, block_k), jnp.float32),
+            # Each key gradient's column sums, a row each, for their store (a key hook's alone).
+            *([plgpu.SMEM((consumers, block_k), jnp.float32)] if keyed else []),
             plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_barriers=consumers),
             streams=family.streams(blocks, stages, consumers))
 
