@@ -653,11 +653,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # Interpreted only in a CPU process: the interpreter's callbacks are ordered effects, which a GPU
         # process's lowering of the platform choice cannot carry in the CPU branch it does not take.
         interpretable = not ba.arguments['interpret'] or jax.default_backend() == 'cpu'
-        # Without warpgroup MMA, mma.sync's tiles take the plain forward alone (`AMPERE_TILES`).
-        hooks = (self._hooks_lower(ba, first) if target.wgmma
-                 else ba.arguments['hooks'] == NO_HOOKS and not ba.arguments.get('trans_rhs', True))
         return (first == second and jnp.dtype(first).itemsize == 2 and interpretable
-                and _rated(target, first) and bool(self._family_tiles(self.space(ba), target)) and hooks
+                and _rated(target, first) and bool(self._family_tiles(self.space(ba), target))
+                and self._hooks_lower(ba, first, target)
                 and (self.EXACT_SUMS or not ba.arguments.get('exact_sums')))
 
     @staticmethod
@@ -671,15 +669,17 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         return self._family_tiles(super().fitting(ba, target), target)
 
     @staticmethod
-    def _hooks_lower(ba, dtype) -> bool:
-        """Whether Mosaic GPU's lowering takes the launch's hooks (`_hooks_lower`). A side operand the
-        launch squeezes and gives back with its dimension of one (`Hooks.prologue_broadcast`) has no
-        layout Mosaic's inference finds for the size-one dimension, so a hook taking one does not lower
-        there (GMMGATE-h100-8), where Triton's lowering takes it."""
+    def _hooks_lower(ba, dtype, target) -> bool:
+        """Whether Mosaic GPU's lowering takes the launch's hooks (`_hooks_lower`) under the semantics its
+        family's kernels lower in (a warpgroup's arrays for warpgroup MMA's, a lane's for mma.sync's). A
+        side operand the launch squeezes and gives back with its dimension of one
+        (`Hooks.prologue_broadcast`) has no layout Mosaic's inference finds for the size-one dimension,
+        so a hook taking one does not lower there (GMMGATE-h100-8), where Triton's lowering takes it."""
         hooks = ba.arguments['hooks']
         if hooks.prologue_broadcast or hooks.epilogue_broadcast:
             return False
-        return _hooks_lower(ba, dtype, mosaic_gpu_lowering.mosaic_lowering_rules[plgpu_core.WGxWG_SEMANTICS])
+        semantics = plgpu_core.WGxWG_SEMANTICS if target.wgmma else plgpu_core.LANExWG_SEMANTICS
+        return _hooks_lower(ba, dtype, mosaic_gpu_lowering.mosaic_lowering_rules[semantics])
 
     def staged_bytes(self, ba, config: mosaic_gpu.Tiles, target) -> int:
         # The pipeline's stages of both operand blocks and the prologue's side tiles, the epilogue's side
@@ -813,7 +813,8 @@ class MosaicTgmm(_Mosaic):
 
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         depth, width = ba.arguments['tokens'].shape[1], ba.arguments['cotangent'].shape[1]
-        return base.dividing(MOSAIC_TILES, (depth, width), lambda tile: (tile.block_m, tile.block_n))
+        return base.dividing(MOSAIC_TILES + AMPERE_TILES, (depth, width),
+                             lambda tile: (tile.block_m, tile.block_n))
 
     def fitting(self, ba, target) -> tuple[mosaic_gpu.Tiles, ...]:
         """The tiles that fit `target` (`Template.fitting`), with `exact_sums` those whose two fp32
