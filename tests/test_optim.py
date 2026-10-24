@@ -6,6 +6,7 @@ Each group's update is asserted against the transform it is supposed to be,
 because a parameter in the wrong group still trains, only worse.
 """
 import dataclasses
+import importlib
 import json
 import typing
 from pathlib import Path
@@ -312,6 +313,22 @@ def test_an_expert_stack_placed_over_the_mesh_is_orthogonalized_one_expert_at_a_
                                    np.asarray(expected['kernel']), atol=1e-8)
 
 
+def test_a_matrix_declared_with_no_axis_named_is_orthogonalized_as_one_matrix():
+    """Gemma 3n's AltUp declares its coefficient matrices (None, None), whole on every device: that
+    says how they shard, not which axes form the matrix, so Muon steps the kernel as optax steps one
+    undeclared matrix, contracting its rows into its columns."""
+    # Gemma 3n's modules declare AltUp's axes as they are defined.
+    importlib.import_module("dew.nn.gemma3n")
+
+    params = {'params': {'layers_0': {'altup': {'prediction_coefs': {'kernel': jnp.zeros((16, 4))}}}}}
+    path = ('params', 'layers_0', 'altup', 'prediction_coefs', 'kernel')
+    updates, grads = group_updates(params)
+    reference = optax.contrib.muon(LR)
+    one = {'kernel': at(grads, path)}
+    expected, _ = reference.update(one, reference.init(one), one)
+    np.testing.assert_array_equal(np.asarray(at(updates, path)), np.asarray(expected['kernel']))
+
+
 def test_the_router_gate_takes_the_adamw_update():
     """A router gate is declared ('embed', 'exp'): one column per expert, so
     its output side counts choices, not features, and the labs keep the
@@ -484,6 +501,37 @@ def test_a_gated_query_clips_its_query_half_and_bounds_the_logits():
     assert 0 < np.sum(eta < 1) < 4
     after = np.max(np.asarray(resown["qk"]["layers_0"]["self_attn"]["max_logits"][0]), axis=0)
     np.testing.assert_allclose(after, before * eta, rtol=1e-5)
+
+
+def test_a_biased_projection_clips_its_bias_with_its_kernel_and_bounds_the_logits():
+    """With `attention_bias`, a query is `x W + b`, so the clip scales the bias with the kernel. Here
+    the kernels are zero and the learned biases large, so the logits are the biases' alone: read
+    again on the same tokens after the clip, the firing group's maxima shrink and the other group's
+    hold, as the kernels' clip moves an unbiased layer's."""
+    model = tiny_decoder(attention_bias=True, num_layers=1)
+    variables = model.init(jax.random.key(0), jnp.ones((1, 8), jnp.int32))
+    rng = np.random.default_rng(2)
+    attention = dict(variables["params"]["layers_0"]["self_attn"])
+    for proj in ("q_proj", "k_proj"):
+        attention[proj] = {"kernel": jnp.zeros_like(attention[proj]["kernel"]),
+                           "bias": jnp.asarray(rng.normal(0, 3, attention[proj]["bias"].shape), jnp.float32)}
+    params = {**variables["params"], "layers_0": {**variables["params"]["layers_0"], "self_attn": attention}}
+    ids = jnp.asarray(rng.integers(0, 32, (2, 8)), jnp.int32)
+    _, sown = model.apply({**variables, "params": params}, ids, mutable=["qk"])
+    stats = sown["qk"]
+    before = np.max(np.asarray(stats["layers_0"]["self_attn"]["max_logits"][0]), axis=0)
+    tau = float(np.mean(before.reshape(2, 2).max(axis=1)))
+    tx = scale_by_qk_clip(tau)
+    updates, _ = tx.update(jax.tree.map(jnp.zeros_like, params), tx.init(params), params, qk_stats=stats)
+    clipped = optax.apply_updates(params, updates)
+    _, resown = model.apply({**variables, "params": clipped}, ids, mutable=["qk"])
+    firing = (before.reshape(2, 2).max(axis=1) > tau).repeat(2)
+    assert 0 < np.sum(firing) < 4
+    after = np.max(np.asarray(resown["qk"]["layers_0"]["self_attn"]["max_logits"][0]), axis=0)
+    # The firing group's logits shrink toward zero, the clip having reached the biases they come
+    # from; the other group's weights, and so its logits, stay as they were, bit for bit.
+    assert np.all(np.abs(after[firing]) < np.abs(before[firing]))
+    np.testing.assert_array_equal(after[~firing], before[~firing])
 
 
 def test_the_latent_branches_match_maxtext():
@@ -820,3 +868,20 @@ def test_adamw_steps_land_as_near_float64_as_torchs():
         updates, state = solver.update(jnp.asarray(grad), state, ours)
         ours = optax.apply_updates(ours, updates)
     assert_as_exact_as_the_reference(np.asarray(ours), tensor.detach().numpy(), params, "adamw steps")
+
+
+@pytest.mark.parametrize("optimizer", ["adam", "adamw"])
+@pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16])
+def test_narrow_weights_step_on_float32_moments_as_float32_weights_do(optimizer, dtype):
+    """With `state_dtype='float32'`, the default, weights in float16 or bfloat16 keep their moments in
+    float32: a gradient of 1e-4, whose square is below float16's smallest number, steps them as the
+    same gradient steps float32 weights, by the rate and not by the rate over eps. (A decay of the
+    weights themselves reads them in their own dtype, so none is taken here.)"""
+    solver = OptimConfig(optimizer=optimizer, rate=1e-3, clip_grads=0, weight_decay=0.0).build(4)
+    weights = {"w": jnp.full((4, 4), 0.5, dtype)}
+    gradient = {"w": jnp.full((4, 4), 1e-4, dtype)}
+    narrow, _ = solver.update(gradient, solver.init(weights), weights)
+    wide_weights = jax.tree.map(lambda leaf: leaf.astype(jnp.float32), weights)
+    wide, _ = solver.update(jax.tree.map(lambda leaf: leaf.astype(jnp.float32), gradient),
+                            solver.init(wide_weights), wide_weights)
+    np.testing.assert_array_equal(np.asarray(narrow["w"], np.float32), np.asarray(wide["w"]))

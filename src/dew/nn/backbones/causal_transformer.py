@@ -385,6 +385,12 @@ class CausalTransformer(nn.Module):
     mask_token_id: int | None = None
     """The vocabulary id that a masked-diffusion objective corrupts tokens to.
     None means plain training."""
+    shifted_logits: bool = False
+    """Whether masked diffusion reads position i's prediction from position i-1's logits, as a
+    checkpoint continued from an autoregressive one predicts the token after each position
+    (Dream-v0); False reads each position's own (LLaDA). The forward ignores it: it says how
+    the checkpoint's logits line up, which `dew.diffusion.discrete.aligned` applies for the
+    masked loss and the sampler alike."""
     scan_layers: bool = False                 # runs of like layers under flax's scan
     bank_layers: int | None = None
     """The most layers one scanned run holds, which is also how many layers its
@@ -527,12 +533,11 @@ class CausalTransformer(nn.Module):
 
     def _kind_rotary(self, kind: LayerKind) -> float | None:
         """The fraction of a kind's head its rotary turns, None for all of
-        it: the kind's own, else the model's on a kind that attends the whole
-        sequence. LongRoPE's factors fix the rotated width on every layer;
-        Gemma's windowed layers otherwise rotate whole heads."""
+        it: the kind's own, else the model's. A window changes what a layer
+        reads, not how much of its head turns; a family whose windowed layers
+        turn another fraction (Gemma 4's whole heads) states it on the kind."""
         factor = (kind.partial_rotary_factor if kind.partial_rotary_factor is not None
-                  else self.partial_rotary_factor if kind.window is None
-                  or isinstance(kind.rope_scaling or self.rope_scaling, LongRopeScaling) else None)
+                  else self.partial_rotary_factor)
         return None if factor == 1.0 else factor
 
     @property

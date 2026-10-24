@@ -238,19 +238,19 @@ class Tpu:
         has none of its name: not created yet, or deleted."""
         return next((node for node in self.gcloud.nodes(self.zone, timeout) if node.name == self.name), None)
 
-    def ready(self) -> Node | None:
-        """This TPU once its zone lists it READY, asked every POLL_SECONDS for up to READY_TIMEOUT
+    def ready(self, wait: float = READY_TIMEOUT) -> Node | None:
+        """This TPU once its zone lists it READY, asked every POLL_SECONDS for up to `wait` seconds
         (none in a dry run): a queued resource lists its node only once it is provisioned."""
         if self.gcloud.dry_run:
             return None
-        deadline = time.monotonic() + READY_TIMEOUT
+        deadline = time.monotonic() + wait
         state = "PENDING"
         while True:
             # Each listing has what is left of the wait, so a hung gcloud cannot hold it past its end.
             try:
                 node = self.describe(timeout=max(deadline - time.monotonic(), 0.0))
             except subprocess.TimeoutExpired:
-                raise SystemExit(f"{self.name} is still {state} after {READY_TIMEOUT}s; gcloud did not "
+                raise SystemExit(f"{self.name} is still {state} after {wait}s; gcloud did not "
                                  "answer within the wait") from None
             state = node.state if node else "PENDING"
             if state == "READY":
@@ -258,7 +258,7 @@ class Tpu:
             if state in DEAD_STATES:
                 raise SystemExit(f"{self.name} is {state}")
             if time.monotonic() >= deadline:
-                raise SystemExit(f"{self.name} is still {state} after {READY_TIMEOUT}s")
+                raise SystemExit(f"{self.name} is still {state} after {wait}s")
             emit(f"{self.name} is {state}")
             time.sleep(POLL_SECONDS)
 
