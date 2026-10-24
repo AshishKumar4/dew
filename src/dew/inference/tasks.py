@@ -74,13 +74,16 @@ class Processor(Protocol):
     """Interface for a loaded source's host processor, which prepares requests and decodes tokens.
 
     Calling it turns text, with optional images, into `ModelInputs`.
-    `decode` turns token rows into one string per row, and `bos_id` is the
-    id a sequence starts with, or None.
+    `decode` turns token rows into one string per row, `encode` one text into its ids, with the
+    special tokens a sequence carries or without, and `bos_id` is the id a sequence starts with, or
+    None.
     """
 
     def __call__(self, text: str | Sequence[str], *, images: Media | None = None) -> ModelInputs: ...
 
     def decode(self, tokens: ArrayLike) -> list[str]: ...
+
+    def encode(self, text: str, *, specials: bool) -> list[int]: ...
 
     @property
     def bos_id(self) -> int | None: ...
