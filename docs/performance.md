@@ -60,9 +60,11 @@ The prefetch worker counts host rows before placement. Per-row counts travel
 with their batch, reduce globally in the device step and accumulate in the same
 logging record as the loss, including every microbatch in an accumulation window.
 No new device-to-host read is inserted between steps. `train/tokens` is the mean
-number of real tokens per attempted step in the reporting interval. A step here
+number of targets the loss scored per attempted step in the reporting interval
+(`Objective.scored_tokens`, none on a repeat row), the count a token budget,
+`fit(tokens=)`, commits; the inputs stay the FLOP count's. A step here
 is a microbatch (`state.step`); optimizer commits are `state.updates`.
-`train/tokens_per_s` is the interval's total real tokens over its non-compile
+`train/tokens_per_s` is the interval's total scored targets over its non-compile
 time, independent of gradient accumulation and the rate used to compare runs. Compilation
 time is excluded from all throughput denominators. The peak in MFU is the sum
 over the training mesh; the compiler's FLOPs remain per-device.
@@ -1645,7 +1647,7 @@ sm120, where it was measured; the row is what qualification reads), on any
 heads, dtypes, chunk sizes and mesh, with keys up to 256 wide in bf16 or
 fp16 and 128 in fp32 (`recurrence_chunk.fla_rule`). The XLA math stays for
 CPUs, TPUs, unmeasured GPUs, forward-mode traces, float64 and wider keys,
-and as the tests' oracle (`port_refusal` names each case).
+and as the tests' oracle (`recurrence_chunk.PORT_SUPPORTS` names each case).
 On a G4 the port's bf16 forward ran 1.32 and 1.18 ms at the 0.8B's (8 x
 3072 tokens, 16 key and 16 value heads of 128) and the 9B's (4 x 3072, 16
 and 32) shapes against fla's 2.66 and 2.37 (kernel lab `fwd` job,
@@ -3036,7 +3038,7 @@ other GPU.
 
 Each kernel's implementation is chosen in one place and keyed by hardware generation (`dew.nn.kernels.device_generation`: `sm80`, `sm86`, `sm89`, `v5e`, `v6e`, ...), and a generation without a measurement here runs the XLA path. `tools/benchmark_kernels.py` and `tools/benchmark_lm_head.py` reproduce the rows. Each row is one process with jax 0.11.1 and bf16 compute, on a Colab NVIDIA L4 (the RTX 4080's architecture, sm_89), a Colab TPU v6e-1, or, for the kernel-level rows, the local RTX 4080. The step rows come from `tools/benchmark_kernels.py step` (built on `tools/benchmark_step.py`'s trainer), with 30 timed steps after 5 warmup. lm-moe has 321.8M parameters with 8 experts and top-2 routing, and lm-dense has 359.8M; both run at sequence 1024. The batch is 4 (moe) and 1 (dense) on the L4, and 8 and 8 on the v6e. "before" is main at c1f7e2dd.
 
-A call that runs another kernel where a row here measured one fastest logs a warning, once a process for each kernel and reason, on the `dew` logger: `attention runs 'cudnn', not 'flash', the kernel measured fastest on sm80: dew_flash_attn is not installed` (`dew.nn.kernels.ran_kernel`). A change that sends calls off the measured kernel shows in a run's log, not only in its step time.
+A call that runs another kernel where a row here measured one fastest logs a warning, once a process for each kernel and reason, on the `dew` logger: `attention runs 'cudnn', not 'flash', the kernel measured fastest on sm80: dew_flash_attn is not installed` (`dew.nn.kernels.generation.route`). A change that sends calls off the measured kernel shows in a run's log, not only in its step time.
 
 ### The MoE grouped matmul: `KERNELS['grouped_matmul']`
 

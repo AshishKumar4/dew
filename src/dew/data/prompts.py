@@ -148,6 +148,18 @@ def _ground_truth(row: Mapping[str, object], where: str) -> str:
     return _text(json_value(nested.get("ground_truth"), f"{where} reward_model.ground_truth"))
 
 
+def _opened(tokenizer: ByteTokenizer | HFTokenizer, text: str) -> list[int]:
+    """`text`'s ids as a sequence the model reads opens, as training text's do (`Tokenize`): the BOS a
+    tokenizer's own encoding begins with kept in front, so a BOS-prepending vocabulary (Llama 3's,
+    Gemma's) sees a prompt as it saw its training text, and no EOS, which would end the prompt before
+    its completion."""
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    bos = tokenizer.bos_id
+    # A text that already starts with the BOS keeps the one it has.
+    opens = bos is not None and ids[:1] != [bos] and tokenizer.encode(text)[:1] == [bos]
+    return [bos, *ids] if opens and bos is not None else ids
+
+
 def _prompt_ids(tokenizer: ByteTokenizer | HFTokenizer, prompt: object, tools: object, origin: str,
                 thinking: bool | None) -> list[int]:
     """Encodes a prompt, retaining structured messages until text rendering.
@@ -166,7 +178,7 @@ def _prompt_ids(tokenizer: ByteTokenizer | HFTokenizer, prompt: object, tools: o
             raise ValueError(f"{origin}: tools require chat messages, not a plain string")
         if not prompt.strip():
             raise ValueError(f"{origin}: the prompt is blank")
-        ids = tokenizer.encode(prompt, add_special_tokens=False)
+        ids = _opened(tokenizer, prompt)
     elif isinstance(prompt, np.ndarray) or (isinstance(prompt, (list, tuple)) and all(
             isinstance(token, (int, np.integer)) for token in prompt)):
         if tools is not None:

@@ -463,3 +463,30 @@ def test_a_frozen_split_moves_only_what_the_filter_keeps(source):
         steps=1, log_every=1)
     assert sorted(state.variables) == sorted(variables)
     assert "frozen" not in obj.pipeline(state, ema=False).variables
+
+
+def test_a_canvas_rows_context_reads_an_id_its_vocabulary_also_pads_with(source):
+    """A conversation's context may hold the id its rows pad with (id 0, Qwen's "!"): the canvas row
+    marks its context's own ids (`ResponseCanvases`' prompt_mask), so block SFT reads that id as the
+    context's, its loss and gradient those of the row whose validity says so outright."""
+    from dew.data.chat import ROLES_KEY, Role
+    from dew.data.steps.chat import ResponseCanvases
+
+    loaded, _, step, _ = source
+    step = step.replace(tape=None)
+    obj = objective(loaded, canvas_size=2, encoder_loss_weight=0)
+    variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
+    roles = [Role.USER] * 3 + [Role.ASSISTANT] * 3
+    rows = ResponseCanvases(prompt_length=4, canvas_size=2, count=2, eos_id=7, pad_id=0).flat_map(
+        {"text": np.asarray([5, 0, 6, 8, 9, 3], np.int32), ROLES_KEY: np.asarray(roles, np.int8)})
+    [row] = rows
+    np.testing.assert_array_equal(row["prompt_mask"], [True, True, True, False])
+    tokens = jnp.asarray(np.stack([row["text"]] * 2))
+    marked = {"text": tokens, "canvas_mask": jnp.asarray(np.stack([row["canvas_mask"]] * 2)),
+              "prompt_mask": jnp.asarray(np.stack([row["prompt_mask"]] * 2))}
+    valid = jnp.concatenate([marked["prompt_mask"], marked["canvas_mask"]], axis=-1)
+    stated = {"text": ModelInputs(tokens, {"attention_mask": valid}), "canvas_mask": marked["canvas_mask"]}
+    loss = jax.jit(jax.value_and_grad(lambda values, batch: obj.scalar_loss(values, batch, step)[0]))
+    for left, right in zip(jax.tree.leaves(loss(variables, marked)), jax.tree.leaves(loss(variables, stated)),
+                           strict=True):
+        np.testing.assert_array_equal(np.asarray(left), np.asarray(right))

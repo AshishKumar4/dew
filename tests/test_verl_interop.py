@@ -59,10 +59,10 @@ def test_native_rows_round_trip_through_rollouts():
     tool = trajectories[0].session
     first, second = tool.calls
     wire = rows[0]
-    assert first.prompt_ids == tuple(wire["prompt_ids"])
-    assert first.sampled_ids == tuple(wire["response_ids"][:5])
-    assert second.prompt_ids == tuple(wire["prompt_ids"] + wire["response_ids"][:15])
-    assert second.sampled_ids == tuple(wire["response_ids"][15:])
+    assert first.prompt == tuple(wire["prompt_ids"])
+    assert first.tokens == tuple(wire["response_ids"][:5])
+    assert second.prompt == tuple(wire["prompt_ids"] + wire["response_ids"][:15])
+    assert second.tokens == tuple(wire["response_ids"][15:])
     assert (first.finish_reason, second.finish_reason) == ("tool_calls", "stop")
     assert first.version == second.version == 7
     assert trajectories[1].extras["mm_processor_output"] == rows[1]["mm_processor_output"]

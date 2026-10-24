@@ -366,3 +366,4 @@ def test_masked_source_accepts_neutral_controls_and_honors_task_metadata(masked_
     wanted = expected(inputs, key=7, steps=5).host()
     for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(wanted), strict=True):
         np.testing.assert_array_equal(left, right)
+

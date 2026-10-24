@@ -53,7 +53,7 @@ from . import tuning
 from .generation import INHERENT, gpu_target, triton_runs
 from .selection import Requirement
 from .templates import attention_algebra as algebra
-from .templates.attention import NATURAL, kernel_dot
+from .templates.attention import NATURAL, capped, kernel_dot
 
 if TYPE_CHECKING:
     # Named in quotes: tokamax reads its ops' `_fwd` annotations as types, which postponed ones are not.
@@ -115,12 +115,6 @@ over an `AttentionCase`): a GPU Dew's Triton kernels run on, at most `QUERIES` p
 power-of-two width from 16 to 256, a capacity of whole blocks and one of its dtypes on both sides."""
 
 
-def _capped(softcap: float, logits, q_pos, k_pos):
-    """Gemma 2's logit cap, `softcap · tanh(logit / softcap)`, the decode kernel's one score hook."""
-    del q_pos, k_pos
-    return softcap * jnp.tanh(logits / softcap)
-
-
 def _spec(scale: float, softcap: float | None, natural: bool, dtype, sinks: bool) -> algebra.Forward:
     """The algebra's facts for a decode launch: each query block's keys its row's span (`spans`), no
     documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`), and
@@ -128,7 +122,7 @@ def _spec(scale: float, softcap: float | None, natural: bool, dtype, sinks: bool
     block's rows are a key head's query heads and positions (`grouped_query`), so the hook takes no query
     positions."""
     return algebra.Forward("spans", 0, ids=False, scale=scale,
-                           score_mod=None if softcap is None else functools.partial(_capped, softcap),
+                           score_mod=None if softcap is None else functools.partial(capped, softcap),
                            natural=natural, headroom=natural and algebra.headroom(dtype),
                            initial=sinks)
 

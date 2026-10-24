@@ -49,6 +49,51 @@ def test_repeated_token_gradients_accumulate_in_master_precision(dtype):
     np.testing.assert_array_equal(gradient, expected)
 
 
+@pytest.mark.parametrize("family", ["clip-token", "clip-position", "clip-vision", "siglip",
+                                    "gemma3n", "decision", "joint"])
+def test_family_embedding_gradients_sum_repeated_ids_in_master_precision(family):
+    """Each family's own configured table receives a cancelling sequence of repeated-ID
+    cotangents. Its fp32 master retains contributions lost by accumulation in bf16."""
+    from dew.decision.head import DecisionHead, JointSchemaHead
+    from dew.nn.text_encoders import CLIPTextTransformer, CLIPVisionTransformer
+    from dew.nn.vision.gemma3n import Gemma3nProjectorModule
+    from dew.nn.vision.siglip import SiglipVision, SiglipVisionTransformer
+
+    dtype = jnp.bfloat16
+    clip = CLIPTextTransformer(vocab_size=3, hidden_size=2, num_layers=0, num_heads=1,
+                               max_position_embeddings=3, dtype=dtype)
+    choices = {
+        "clip-token": (clip, lambda module, ids: module.token_embedding(ids), "token_embedding"),
+        "clip-position": (clip, lambda module, ids: module.position_embedding(ids), "position_embedding"),
+        "clip-vision": (CLIPVisionTransformer(hidden_size=2, num_layers=0, num_heads=1,
+                                             image_size=2, patch_size=1, dtype=dtype),
+                        lambda module, ids: module.position_embedding(ids), "position_embedding"),
+        "siglip": (SiglipVisionTransformer(SiglipVision(hidden_size=2, num_layers=0, num_heads=1,
+                                                        image_size=2, patch_size=1), dtype=dtype),
+                   lambda module, ids: module.position_embedding(ids), "position_embedding"),
+        "gemma3n": (Gemma3nProjectorModule(2, 2, vocab_size=3, dtype=dtype),
+                    lambda module, ids: module.embedding(ids), "embedding"),
+        "decision": (DecisionHead(2, layers=0, dtype=dtype),
+                     lambda module, ids: module.type_embedding(ids), "type_embedding"),
+        "joint": (JointSchemaHead(2, width=2, heads=1, layers=0, routing_layers=0, dtype=dtype),
+                  lambda module, ids: module.type_embedding(ids), "type_embedding"),
+    }
+    model, lookup, name = choices[family]
+    ids = jnp.asarray([0, 0, 0, 0, 1], jnp.int32)
+    cotangent = jnp.asarray([[1, -1], [2**-8, -2**-8], [2**-8, -2**-8], [-1, 1], [2, 3]], dtype)
+    variables = model.init(jax.random.key(5), ids, method=lookup)
+
+    def loss(params):
+        outputs = model.apply({"params": params}, ids, method=lookup)
+        return jnp.sum(outputs.astype(jnp.float32) * cotangent.astype(jnp.float32))
+
+    gradient = jax.jit(jax.grad(loss))(variables["params"])[name]["embedding"]
+    expected = np.zeros(gradient.shape, np.float32)
+    np.add.at(expected, np.asarray(ids), np.asarray(cotangent, np.float32))
+    assert gradient.dtype == jnp.float32
+    np.testing.assert_array_equal(gradient, expected)
+
+
 @struct.dataclass
 class Moments:
     errors: Ratio

@@ -320,7 +320,7 @@ KDA_TRAINING = (1, 4096, 32, 128)
 
 def kda_training_cases() -> Iterator[KernelCase]:
     """The port's forward and backward in bf16 through the rule's VJP: at the training shape, and with
-    keys of 256, the widest 16-bit keys `port_refusal` hands it (`fla_gdn.WIDEST_KEYS`)."""
+    keys of 256, the widest 16-bit keys the port takes (`fla_gdn.WIDEST_KEYS`)."""
     batch, length, heads, width = KDA_TRAINING
 
     def case(name, width, columns, heads):

@@ -30,8 +30,8 @@ from dew.data.dataset import Loader
 from dew.inference import TextGeneration
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
-from dew.objectives.rl import GRPOObjective, SampledRollout
-from dew.objectives.rl.episodes import EpisodeRollout, EpisodeStatus, Observation
+from dew.objectives.rl import GRPOObjective, RolloutScheduler
+from dew.objectives.rl.episodes import EpisodeStatus, Observation
 from dew.registry import mixers
 from dew.sampling import Sampling, generate
 from dew.training import Trainer
@@ -362,9 +362,9 @@ def test_eos_counts_as_action_and_reward_excludes_eos_and_padding():
         seen.append((record.data_source, completion, record.ground_truth, record.extra_info))
         return float(len(completion))
 
-    rollout = SampledRollout(objective, reward, groups=2, max_new_tokens=4,
-                             sampling=Sampling(temperature=0, eos_token_ids=eos, pad_token_id=12))
-    result = rollout(SimpleNamespace(variables=params, updates=0), batch, jax.random.key(1))
+    rollout = RolloutScheduler.sampled(objective, reward, groups=2, max_new_tokens=4,
+                                       sampling=Sampling(temperature=0, eos_token_ids=eos, pad_token_id=12))
+    result = rollout(SimpleNamespace(variables=params, step=0, updates=0), batch, jax.random.key(1))
     assert seen[:2] == [("a", "", "1", "")] * 2
     for index, (_, text, _, _) in enumerate(seen):
         where = result["session_index"] == index
@@ -441,7 +441,7 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
     model = decoder()
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     objective = GRPOObjective(model, seq_len=7, variables=params)
-    rollout = SampledRollout(
+    rollout = RolloutScheduler.sampled(
         objective, lambda text, record: float(sum(map(int, text.split()))),
         groups=2, max_new_tokens=4, sampling=Sampling(temperature=1.2, top_k=7))
     repeats = max(1, jax.device_count() // 2)
@@ -452,7 +452,7 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
     def rolled_from(key):
         run_key = jax.random.split(key)[1]
         rollout_key = jax.random.fold_in(jax.random.fold_in(run_key, 0), 1)
-        return rollout(SimpleNamespace(variables=params, updates=0), batch, rollout_key)
+        return rollout(SimpleNamespace(variables=params, step=0, updates=0), batch, rollout_key)
 
     def draw(seed):
         """A key and the rollout the trainer's first step takes from it, realized once, in float32."""
@@ -581,13 +581,13 @@ def test_a_rollout_draws_the_same_rows_from_a_legacy_key_as_from_its_typed_one()
     objective = GRPOObjective(model, seq_len=7)
     params = objective.init(jax.random.key(0))
     sampling = Sampling(temperature=1.2, eos_token_ids=(3, 7), pad_token_id=12)
-    sampled = SampledRollout(objective, lambda text, record: float(len(text) % 3),
-                             groups=2, max_new_tokens=4, sampling=sampling)
+    sampled = RolloutScheduler.sampled(objective, lambda text, record: float(len(text) % 3),
+                                       groups=2, max_new_tokens=4, sampling=sampling)
     state = Trainer(objective, optax.sgd(.01), key=jax.random.key(1)).initial_state()
-    episodes = EpisodeRollout(
+    episodes = RolloutScheduler.episodes(
         TextGeneration(model, params), answered,
         lambda episode: float(sum(sum(turn.action.tokens) for turn in episode.transitions) % 5),
-        4, 4, 1, groups=2, sampling=sampling)
+        max_prompt_tokens=4, max_new_tokens=4, max_turns=1, groups=2, sampling=sampling)
     for rollout, batch in ((sampled, prompts()), (episodes, {"task_id": np.array([31], np.int32)})):
         typed = rollout(state, batch, jax.random.key(3))
         legacy = rollout(state, batch, jax.random.PRNGKey(3))

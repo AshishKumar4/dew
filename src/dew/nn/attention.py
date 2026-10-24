@@ -51,7 +51,8 @@ from .flops import cross_attention_flops, projection_flops, self_attention_flops
 from .inputs import cu_seqlens
 from .kernels import decode_attention, generation, norm_swiglu
 from .kernels.generation import bf16_dot_runs, gpu_placed
-from .kernels.selection import forced, select
+from .kernels.selection import forced, select, selected
+from .kernels.templates import attention as template, attention_route
 from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import (
     asks_default_precision,
@@ -82,7 +83,7 @@ from .sharding import (
 )
 from .visibility import same_chunk, visible, window_sides, windowed
 
-AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "triton", "flash", "tpu"]
+AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "triton", "flash", "tpu", "template"]
 """Names which kernel an attention call runs.
 
 Every layer that carries the choice spells it the same way: a `ModelConfig`
@@ -97,6 +98,10 @@ FlashAttention-3 on Hopper and FlashAttention-2 elsewhere, from the
 dew_flash_attn wheel (docs/installation.md). 'tpu' is the
 pallas splash kernel, with the older pallas flash kernel behind it for the
 calls splash's mask descriptor cannot carry.
+'template' is the attention template's route (`attention_route.attend`): the call's visibility as
+spans, a softcap as a score hook and sinks as the initial state, on the template's Triton or Mosaic
+mainloop on a GPU and its plain-JAX one elsewhere. No target's row prefers it, so only a call that
+names it takes it.
 'auto', every module's default, resolves per trace (`resolve_implementation`),
 so a configuration logged as 'auto' runs on the next machine too. The target's
 row decides: the attention selector (`ATTENTION`, `dew.nn.kernels.selection.select`)
@@ -888,23 +893,39 @@ def split_with_queries(key, value, split: int):
 
 def _per_shard(local, query, key, value, **extras):
     """`local(query, key, value, **extras)` on each shard's rows and heads
-    (`manual_map`), the key heads repeated until the tensor axes split them as
-    they split the query's; whole off a mesh, or inside a map that already
-    holds every axis manual (the sequence exchanges), where the tensor axes
-    split nothing. A Pallas kernel has no
-    partitioning rule, and jax's cuDNN attention partitions through
-    `custom_partitioning`, whose lowering on several devices names the
-    partitioner by a process address (`str(id(...))` in its backend config),
-    which the persistent cache key keeps, so every fresh process would compile
-    again; under a fully manual map jax lowers neither. `extras` maps each
-    further argument to its array, or None, and the logical axes it splits on.
+    (`manual_map`). The key heads a shard reads are the ones its key shard holds,
+    at their offset in that shard, where the key heads' split begins with the query
+    heads' split; a key-head split that does not is set aside, and the key heads are
+    held whole on every shard. Where the tensor axes split the query heads more ways
+    than the key heads, each shard takes its share of the repeats `split_with_queries`
+    makes, so the key heads' gradient is one sum across the shards in the map's
+    transpose. Whole off a mesh, or inside a map that already holds every axis manual
+    (the sequence exchanges), where the tensor axes split nothing. A Pallas kernel has
+    no partitioning rule, and jax's cuDNN attention partitions through
+    `custom_partitioning`, whose lowering on several devices names the partitioner by
+    a process address (`str(id(...))` in its backend config), which the persistent
+    cache key keeps, so every fresh process would compile again; under a fully manual
+    map jax lowers neither. `extras` maps each further argument to its array, or None,
+    and the logical axes it splits on.
     """
     given = {name: pair for name, pair in extras.items() if pair[0] is not None}
-    key, value = split_with_queries(key, value, tensor_shards(query))
     queries, keys = logical_spec(HEADS, query.shape), logical_spec(KV_HEADS, key.shape)
+    query_axes, key_axes = mesh_axes(_entry(queries, 2)), mesh_axes(_entry(keys, 2))
+    if key_axes and query_axes[: len(key_axes)] != key_axes:
+        keys, key_axes = P(*keys[:2]), ()
+    split, kv_heads = tensor_shards(query), key.shape[-2]
+    heads = math.lcm(kv_heads, split)
+    share, copies = heads // split, heads // kv_heads
     names = tuple(given)
 
     def shard(query, key, value, *arrays):
+        if copies > 1 or key.shape[-2] != share:
+            # This shard's share of the repeated key heads (head n is key head n // copies), read from the key
+            # heads it holds, which begin at its own key shard's offset.
+            read = (jax.lax.axis_index(query_axes) * share + jnp.arange(share)) // copies
+            if key_axes:
+                read = read - jax.lax.axis_index(key_axes) * key.shape[-2]
+            key, value = (jnp.take(array, read, axis=-2) for array in (key, value))
         return local(query, key, value, **dict(zip(names, arrays, strict=True)))
 
     # An extra may be a tree of arrays (`CrossDocuments`), each leaf split on its axes.
@@ -1134,6 +1155,35 @@ def triton_attention(query, key, value, causal: bool):
         query, key, value, is_causal=causal, implementation='triton'), query, key, value)
 
 
+def template_attention(query, key, value, causal: bool, sliding_window, *, sinks, softcap, segment_ids,
+                       lengths, starts):
+    """The attention template's route (`attention_route.attend`) over the call's visibility as spans: its
+    causality, window, documents (`segment_ids`, or `CrossDocuments` aligned to their last keys), key lengths
+    and starts. A softcap is a score hook and sinks are the softmax's initial state. On a mesh it runs per
+    shard (`_per_shard`), as the decode kernel does: the key heads repeat until the tensor axes split them,
+    the sinks split with their heads, and the ids, lengths and starts with their rows. Its requirements
+    (`attention_kernels.TEMPLATE_SUPPORTS`) keep it off a sharded sequence axis.
+    """
+    if sinks is not None and sinks.shape != (query.shape[2],):
+        raise ValueError(f"sinks must have one logit per query head, got {sinks.shape}")
+
+    def local(query, key, value, sinks=None, segment_ids=None, lengths=None, starts=None):
+        batch, queries, keys = query.shape[0], query.shape[1], key.shape[1]
+        spans = template.spans(queries, keys, batch, causal=causal, sliding_window=sliding_window,
+                               segment_ids=segment_ids, lengths=lengths, starts=starts)
+        hooks = template.Hooks(
+            score_mod=None if softcap is None else functools.partial(template.capped, softcap),
+            initial=None if sinks is None else template.sinks(sinks, batch, queries, value.shape[-1]))
+        return attention_route.attend(query, key, value, spans, hooks)
+
+    # The GPU arms are Pallas launches, which have no partitioning rule, so each shard runs them on its own
+    # rows and heads.
+    rows = ("activation_batch",)
+    return _per_shard(local, query, key, value, sinks=(sinks, ("activation_heads",)),
+                      segment_ids=(segment_ids, ("activation_batch", None)), lengths=(lengths, rows),
+                      starts=(starts, rows))
+
+
 VALUE_BLOCK = 256
 """Keys per block of `weighted_values`' fp32 sum on XLA:CPU."""
 
@@ -1296,7 +1346,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     mask that only ends rows early costs cuDNN a dense bias per head, so pass
     lengths for right padding. `key_value_seq_starts` `[B]`, below the
     lengths, starts each row's keys there: a windowed decode step's cache,
-    which the decode kernel reads from the window's first block
+    which the decode kernel and the template read from the window's first block
     (`decode_attention.attend`) and every other path as the mask they mean.
 
     A mesh sequence axis above one runs `sequence_parallel_attention`. Active
@@ -1392,13 +1442,13 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
     attention selector chose (`resolve_implementation`, `_attention_kernel`), which held the call to
     the kernel's requirements (`attention_kernels.ATTENTION`) before it reaches here.
 
-    A narrower value rides in padded and its columns come back out, at no
-    runtime branch. `key_value_seq_lengths` reaches cudnn and xla as lengths
-    and 'tpu' as the mask it means; `key_value_seq_starts` reaches the decode
+    A narrower value rides in padded and its columns come back out, at no runtime branch, except that the
+    template takes its own value width. `key_value_seq_lengths` reaches cudnn, xla and the template as
+    lengths and 'tpu' as the mask it means; `key_value_seq_starts` reaches the template and the decode
     kernel alone (`_attention_kernel` folds them into the mask elsewhere).
     """
     v_head_dim = value.shape[-1]
-    if v_head_dim != query.shape[-1]:
+    if v_head_dim != query.shape[-1] and implementation != 'template':
         value = widen_value_heads(query, value)
 
     if implementation == 'cudnn':
@@ -1451,6 +1501,10 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
                 key_value_seq_lengths=key_value_seq_lengths,
                 local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
                 implementation='xla')
+    elif implementation == 'template':
+        out = template_attention(query, key, value, causal, sliding_window, sinks=sinks, softcap=softcap,
+                                 segment_ids=segment_ids, lengths=key_value_seq_lengths,
+                                 starts=key_value_seq_starts)
     else:  # 'tpu'
         if key_value_seq_lengths is not None:
             mask = with_key_lengths(mask, key_value_seq_lengths, key.shape[-3])
@@ -1524,7 +1578,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         segment_ids=segment_ids, max_segments=max_segments, lengths=lengths, starts=starts)
     live = visible_rows(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids, lengths,
                         starts)
-    if not FORWARD_MODE.get() or resolved not in ('cudnn', 'triton', 'flash', 'tpu'):
+    if not FORWARD_MODE.get() or resolved not in ('cudnn', 'triton', 'flash', 'tpu', 'template'):
         return _read_nothing(call(query, key, value, bias=bias, sinks=sinks, implementation=resolved), live)
 
     def fused(query, key, value, bias, sinks):
@@ -1563,20 +1617,19 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     """Run one whole-sequence attention call on the kernel `attention_kernel` resolved.
 
     `masked` is `mask` with the key `lengths` and `starts` in it. Splash takes sinks, a
-    softcap and packed segment ids itself, and flash takes the ids as its
-    packed sequences given `max_segments`; elsewhere segment ids become the
-    document mask, and sinks and a softcap run `reference_attention`, since
-    `jax.nn.dot_product_attention` has neither (a fused route this host runs as xla
-    included, `_hosted`). The rest goes to `_fused_attention`. Key
-    lengths reach cudnn and xla as they are and every other path as the mask
-    they mean, which splash cannot describe, so 'auto' never picks 'tpu' for
-    them. Key starts reach the decode kernel as they are and every other path
-    as the mask they mean.
+    softcap and packed segment ids itself, flash takes the ids as its packed sequences given
+    `max_segments`, and the template reads the ids (`CrossDocuments` included) as its spans;
+    elsewhere segment ids become the document mask, and sinks and a softcap run
+    `reference_attention`, since `jax.nn.dot_product_attention` has neither (a fused route this
+    host runs as xla included, `_hosted`). The rest goes to `_fused_attention`. Key lengths reach
+    cudnn, xla and the template as they are and every other path as the mask they mean, which
+    splash cannot describe, so 'auto' never picks 'tpu' for them. Key starts reach the decode
+    kernel and the template as they are and every other path as the mask they mean.
     """
     # Another sequence's documents under causality or a window align each document's queries with
     # its last keys (`CrossDocuments`), which splash does not; elsewhere the mask carries them.
     aligned = isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None)
-    packed = ((implementation == 'tpu' and not aligned)
+    packed = (implementation == 'template' or (implementation == 'tpu' and not aligned)
               or (implementation == 'flash' and max_segments is not None))
     if segment_ids is not None and not packed:
         if aligned:
@@ -1595,7 +1648,8 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
                                    dtype=dtype, precision=precision,
                                    force_fp32_for_softmax=force_fp32_for_softmax)
 
-    if implementation != 'decode':
+    # The decode kernel and the template read key starts as their own spans; elsewhere they are the mask.
+    if implementation not in ('decode', 'template'):
         mask = with_key_starts(mask, starts, key.shape[-3])
         starts = None
     return _fused_attention(query, key, value, bias, mask, causal, sliding_window,
@@ -1718,7 +1772,7 @@ def kernel_for_materialized_mask(implementation: str, query, key, *, dtype=None,
     case = dataclasses.replace(attention_case(query, key, dtype=dtype, precision=precision,
                                               force_fp32_for_softmax=force_fp32_for_softmax, named='xla'),
                                mask=True, folds=False)
-    return 'reference' if ATTENTION.kernel('xla').failed(case) else 'xla'
+    return selected(ATTENTION, case, 'xla').name
 
 
 def cudnn_takes_mask(implementation: str, query, *, softcap=None, sinks: bool = False) -> bool:
@@ -2029,6 +2083,20 @@ def projected_output(attended, name: str, features: int, *, flat: bool, bias: bo
                         name=name, dot_general=float32_dot_general)(attended)
 
 
+@dataclasses.dataclass(frozen=True)
+class QKNorm:
+    """How an attention RMS-normalizes its queries and keys: the norms' module `names`, their
+    `epsilon`, whether over each head's channels or, `across_heads`, each token's whole projection
+    before it splits (Wan's `rms_norm_across_heads`: another function, not another order), and
+    whether the normalized row rounds to the weight's dtype before it scales (`scale_after_cast`,
+    diffusers' `RMSNorm`)."""
+
+    names: tuple[str, str] = ("q_norm", "k_norm")
+    epsilon: float = 1e-6
+    across_heads: bool = False
+    scale_after_cast: bool = False
+
+
 @logical_axes({
     ("to_q",): ("embed", "heads", "head_dim"),
     ("to_k",): ("embed", "heads", "head_dim"),
@@ -2043,6 +2111,13 @@ class NormalAttention(nn.Module):
     `use_bias` is the projections' bias; `qkv_bias`, when given, the
     query, key and value projections' alone, as timm's ViT attention
     (U-ViT's) has them without one and its output projection with one.
+    `flat` stores each projection as the published attentions do,
+    `[C, heads * head_dim]`, rather than Dew's headed `[C, heads, head_dim]`
+    (`projected_heads`), under `names` (query, key, value, output): Wan's
+    are the defaults, the AutoencoderKL mid-block's `query/key/value/
+    proj_attn`. `qk_norm` normalizes the queries and keys (`QKNorm`), and
+    `rotary_pairs` names the channels each angle of `freqs_cis` turns
+    (`dew.nn.rope.rotate`).
     `mask`, boolean and broadcasting to `[B, H, S, S_context]`, keeps the keys
     each query may read. `key_value_seq_lengths` `[B]` ends each row's keys
     instead, for a right-padded context, which a fused kernel skips rather
@@ -2059,15 +2134,19 @@ class NormalAttention(nn.Module):
     use_bias: bool = True
     qkv_bias: bool | None = None
     force_fp32_for_softmax: bool = True
-    qk_norm: bool = False  # RMSNorm on q/k per head (SD3-style bf16 logit safety)
+    qk_norm: QKNorm | None = None
     attention_impl: str = "auto"  # an AttentionImpl
+    flat: bool = False
+    names: tuple[str, str, str, str] = ("to_q", "to_k", "to_v", "to_out_0")
+    rotary_pairs: Literal["half", "adjacent"] = "half"
 
     @nn.nowrap
     def projections(self, context_features: int | None = None) -> dict[str, tuple[int, int]]:
         inner = self.heads * self.dim_head
         context = self.query_dim if context_features is None else context_features
-        return {'to_q': (self.query_dim, inner), 'to_k': (context, inner), 'to_v': (context, inner),
-                'to_out_0': (inner, self.query_dim)}
+        query, key, value, output = self.names
+        return {query: (self.query_dim, inner), key: (context, inner), value: (context, inner),
+                output: (inner, self.query_dim)}
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
@@ -2078,16 +2157,19 @@ class NormalAttention(nn.Module):
     def cross_flops(self, lengths, context_lengths, context_features: int) -> float:
         """Cross-attention with the context geometry supplied by its owner."""
         maps = self.projections(context_features)
-        return (sum(projection_flops(lengths, *maps[name]) for name in ('to_q', 'to_out_0'))
-                + sum(projection_flops(context_lengths, *maps[name]) for name in ('to_k', 'to_v'))
+        query, key, value, output = self.names
+        return (sum(projection_flops(lengths, *maps[name]) for name in (query, output))
+                + sum(projection_flops(context_lengths, *maps[name]) for name in (key, value))
                 + cross_attention_flops(lengths, context_lengths, self.heads, self.dim_head, self.dim_head))
 
     def _heads(self, name: str, x, norm: str | None = None):
+        normed = self.qk_norm if norm is not None else None
+        rms = None if normed is None else RMSNorm(
+            epsilon=normed.epsilon, scale_after_cast=normed.scale_after_cast, dtype=self.dtype, name=norm)
         projected = projected_heads(
-            x, name, self.heads, self.dim_head, flat=False,
+            x, name, self.heads, self.dim_head, flat=self.flat,
             bias=self.use_bias if self.qkv_bias is None else self.qkv_bias, dtype=self.dtype,
-            precision=self.precision,
-            norm=RMSNorm(epsilon=1e-6, dtype=self.dtype, name=norm) if norm and self.qk_norm else None)
+            precision=self.precision, across_heads=normed is not None and normed.across_heads, norm=rms)
         return constrain(projected, HEADS)
 
     @nn.compact
@@ -2103,14 +2185,14 @@ class NormalAttention(nn.Module):
         # [B, S, heads, head_dim], column-parallel under a tensor axis; a
         # context's positions split over a sequence axis where its link pays
         # for it (`split_positions`).
-        query = self._heads("to_q", x, "q_norm")
+        q_name, k_name, v_name, out_name = self.names
+        q_norm, k_norm = self.qk_norm.names if self.qk_norm is not None else (None, None)
+        query = self._heads(q_name, x, q_norm)
         key, value = split_positions(context, (self.heads, self.dim_head),
-                                     lambda tokens: (self._heads("to_k", tokens, "k_norm"),
-                                                     self._heads("to_v", tokens)))
+                                     lambda tokens: (self._heads(k_name, tokens, k_norm),
+                                                     self._heads(v_name, tokens)))
         if freqs_cis is not None:
-            freqs_cos, freqs_sin = freqs_cis
-            query = rotate(query, freqs_cos, freqs_sin)
-            key = rotate(key, freqs_cos, freqs_sin)
+            query, key = (rotate(part, *freqs_cis, pairs=self.rotary_pairs) for part in (query, key))
 
         hidden_states = scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,
@@ -2118,17 +2200,24 @@ class NormalAttention(nn.Module):
             implementation=self.attention_impl, mask=mask, key_value_seq_lengths=key_value_seq_lengths,
             segment_ids=segment_ids, key_segment_ids=key_segment_ids, max_segments=max_segments,
         )
-        proj = projected_output(constrain(hidden_states, HEADS), "to_out_0", self.query_dim, flat=False,
+        proj = projected_output(constrain(hidden_states, HEADS), out_name, self.query_dim, flat=self.flat,
                                 bias=self.use_bias, dtype=self.dtype, precision=self.precision)
         return proj.reshape(orig_x_shape)
 
 
 class BasicTransformerBlock(nn.Module):
-    """Run self-attention, cross-attention over `context`, then feed-forward.
+    """Run a first attention, cross-attention over `context`, then feed-forward.
 
-    Each is pre-normed with a residual. `use_cross_only` drops the
-    self-attention. `only_pure_attention` runs the cross-attention alone,
-    with no norm and no residual, which the UNets' stages do by default.
+    Each is pre-normed (`norm`, RMS or affine layer norm, at `norm_epsilon`)
+    with a residual. `first_attention` names what the first attention reads:
+    the tokens themselves (`self`), the `context` too (`context`, the SD
+    checkpoints with no self-attention), or nothing, when the block has none
+    (`none`). `only_pure_attention` runs the cross-attention alone, with no
+    norm and no residual, which the UNets' stages do by default.
+    `qkv_bias` is the attentions' (`NormalAttention`). `dropout_rate` drops
+    each attention's output, inside the feed-forward and the block's output,
+    as diffusers' `BasicTransformerBlock` does in training; `approximate_gelu`
+    is the feed-forward's GELU (`geglu_feed_forward`).
     """
     query_dim: int
     heads: int = 4
@@ -2136,10 +2225,14 @@ class BasicTransformerBlock(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     use_bias: bool = True
-    use_cross_only:bool = False
+    qkv_bias: bool | None = None
+    first_attention: Literal["self", "context", "none"] = "self"
     only_pure_attention:bool = False
     force_fp32_for_softmax: bool = True
+    norm: Literal["rms", "layer"] = "rms"
     norm_epsilon: float = 1e-4
+    dropout_rate: float = 0.0
+    approximate_gelu: bool = True
     attention_impl: str = "auto"  # an AttentionImpl
 
     @nn.nowrap
@@ -2148,10 +2241,11 @@ class BasicTransformerBlock(nn.Module):
         from .mlp import geglu_feed_forward  # mlp's blocks import this module's norms
 
         attention = NormalAttention(self.query_dim, self.heads, self.dim_head, parent=None)
-        count = attention.cross_flops(lengths, context_lengths, context_features)
+        crossed = attention.cross_flops(lengths, context_lengths, context_features)
+        count = crossed
         if not self.only_pure_attention:
-            if not self.use_cross_only:
-                count += attention.model_flops(lengths)
+            first = {"self": attention.model_flops(lengths), "context": crossed, "none": 0}
+            count += first[self.first_attention]
             count += geglu_feed_forward(self.query_dim, parent=None).model_flops(lengths)
         return count
 
@@ -2163,6 +2257,7 @@ class BasicTransformerBlock(nn.Module):
             dim_head=self.dim_head,
             precision=self.precision,
             use_bias=self.use_bias,
+            qkv_bias=self.qkv_bias,
             dtype=self.dtype,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             attention_impl=self.attention_impl,
@@ -2172,19 +2267,26 @@ class BasicTransformerBlock(nn.Module):
 
         from .mlp import geglu_feed_forward  # mlp's blocks import this module's norms
 
-        self.ff = geglu_feed_forward(self.query_dim, dtype=self.dtype, precision=self.precision)
-        self.norm1 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
-        self.norm2 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
-        self.norm3 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
+        self.ff = geglu_feed_forward(self.query_dim, approximate=self.approximate_gelu, dtype=self.dtype,
+                                     precision=self.precision, dropout_rate=self.dropout_rate)
+        norm = RMSNorm if self.norm == "rms" else LayerNorm
+        self.norm1, self.norm2, self.norm3 = (norm(epsilon=self.norm_epsilon, dtype=self.dtype)
+                                              for _ in range(3))
+        self.dropout = nn.Dropout(self.dropout_rate)
 
-    def __call__(self, hidden_states, context=None):
+    def _dropped(self, x, train: bool):
+        return self.dropout(x, deterministic=not train)
+
+    def __call__(self, x, context=None, *, train: bool = False):
         if self.only_pure_attention:
-            return self.attention2(hidden_states, context)
+            return self.attention2(x, context)
 
-        if not self.use_cross_only:
-            hidden_states = hidden_states + self.attention1(self.norm1(hidden_states))
-        hidden_states = hidden_states + self.attention2(self.norm2(hidden_states), context)
-        return hidden_states + self.ff(self.norm3(hidden_states))
+        if self.first_attention != "none":
+            first = context if self.first_attention == "context" else None
+            x = x + self._dropped(self.attention1(self.norm1(x), first), train)
+        x = x + self._dropped(self.attention2(self.norm2(x), context), train)
+        x = x + self.ff(self.norm3(x), train=train)
+        return self._dropped(x, train)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2259,7 +2361,7 @@ class TransformerBlock(nn.Module):
         context_lengths = lengths if context_lengths is None else context_lengths
         context_features = inner if context_features is None else context_features
         block = BasicTransformerBlock(inner, self.heads, self.dim_head,
-                                       use_cross_only=not self.use_self_and_cross,
+                                       first_attention="self" if self.use_self_and_cross else "none",
                                        only_pure_attention=self.only_pure_attention, parent=None)
         count = block.cross_flops(lengths, context_lengths, context_features)
         return count + (2 * projection_flops(lengths, input_features, inner) if self.use_projection else 0)
@@ -2287,7 +2389,7 @@ class TransformerBlock(nn.Module):
             precision=self.precision,
             use_bias=False,
             dtype=self.dtype,
-            use_cross_only=(not self.use_self_and_cross),
+            first_attention="self" if self.use_self_and_cross else "none",
             only_pure_attention=self.only_pure_attention,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             attention_impl=self.attention_impl,

@@ -147,6 +147,10 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         """The student's real lengths of the batch it reads."""
         return self.student.real_lengths(batch)
 
+    def scored_tokens(self, batch: Batch) -> np.ndarray:
+        """The targets the student scores of the batch it reads."""
+        return self.student.scored_tokens(batch)
+
     def inference_record(self) -> JSON:
         """The student's record: a saved distillation loads as the student it trained, on the
         student's own tree, the teacher and the projections left unread (`UNREAD`)."""

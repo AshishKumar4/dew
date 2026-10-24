@@ -19,7 +19,6 @@ from jax.sharding import Mesh
 from dew.nn.kernels.generation import (
     PALLAS_CHOICES,
     TARGETS,
-    UNCLASSIFIED,
     GpuTarget,
     Refusal,
     Route,
@@ -32,7 +31,6 @@ from dew.nn.kernels.generation import (
     gpu_mesh,
     gpu_target,
     measured_kernel,
-    refused,
     route,
     routes,
     runtime_facts,
@@ -498,26 +496,21 @@ def test_a_call_the_dispatch_sends_off_flash_is_logged_at_info_and_a_float32_cal
 def test_a_route_records_the_targets_decision_where_its_dispatch_reports_it():
     """`route` records a dispatch's decision in every `routes` block open, an inner block's in the
     outer's too, as the target decides it: its generation within `assumed`, the kernel the row or
-    `chosen` prefers, a refusal's stable code (`refused`, the first check that fails) or a text's
-    `UNCLASSIFIED`, what the host ran, and the reporting function."""
+    `chosen` prefers, a refusal's stable code and the row that tracks it, what the host ran, and the
+    reporting function."""
     def dispatch(kernel, refusal=None, ran=None):
         return route("ssd", kernel=kernel, refusal=refusal, ran=ran)
 
     with assumed("sm90"), routes() as outer:
         assert dispatch("pallas").kernel == "pallas"
         row = measured_kernel("ssd", "pallas")
+        head_dim = Refusal("head_dim", "a 320-wide head", "inherent")
         with kernel_choices(ssd="pallas"), routes() as inner:
-            refusal = refused((True, "dtype", "a bf16 call"), (False, "head_dim", "a 320-wide head"),
-                              (False, "window_mask", "a window"))
-            dispatch("xla", refusal, ran="xla")
-            dispatch("xla", "a reason in text")
+            dispatch("xla", head_dim, ran="xla")
     test = test_a_route_records_the_targets_decision_where_its_dispatch_reports_it
     site = f"{__name__}:{test.__qualname__}.<locals>.dispatch"
-    head_dim, text = Refusal("head_dim", "a 320-wide head"), Refusal(UNCLASSIFIED, "a reason in text")
-    assert inner == [Route("ssd", "xla", "pallas", head_dim, "xla", "sm90", site),
-                     Route("ssd", "xla", "pallas", text, "xla", "sm90", site)]
+    assert inner == [Route("ssd", "xla", "pallas", head_dim, "xla", "sm90", site)]
     assert outer == [Route("ssd", "pallas", row, None, "pallas", "sm90", site), *inner]
-    assert refused((True, "dtype", "a bf16 call")) is None
 
 
 def test_a_dispatch_sending_a_call_off_its_preferred_kernel_reports_the_route(without_deterministic_ops):

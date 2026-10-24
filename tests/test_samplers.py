@@ -869,7 +869,7 @@ def test_ddim_at_eta_one_walks_as_diffusers_ddim_scheduler_on_the_same_draws():
     initial = np.random.default_rng(9).normal(size=(2, 3, 64)).astype(np.float32)
     denoise = process.denoiser(SourceOracle(), {}, {})
     _, walked = sample(denoise, jnp.asarray(initial), solver=DDIM(eta=1.0), key=3, times=times,
-                       final_denoise=False, record=lambda x, _: x)
+                       final_denoise=False, record=lambda x, state, denoised: x)
     draws = [np.asarray(jax.random.normal(jax.random.fold_in(request_key(3), index), initial.shape))
              for index in range(len(walked))]
 

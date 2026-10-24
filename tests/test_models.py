@@ -345,12 +345,12 @@ def test_hilbert_patchify_roundtrip(rng):
     unpatchify with that permutation must be an exact identity, on a grid
     that is not square and not a power of two on either side."""
     from dew.nn.dit import scan_ordered
-    from dew.nn.scan_orders import hilbert_unpatchify, patchify
+    from dew.nn.scan_orders import patchify, unscanned
 
     x = jax.random.normal(rng, (2, 12, 20, 3))
     patches, inv_idx = scan_ordered(patchify(x, 4), "hilbert", 3, 5)
     assert inv_idx is not None
-    rec = hilbert_unpatchify(patches, inv_idx, 4, 12, 20, 3)
+    rec = unscanned(patches, inv_idx, 4, 12, 20, 3)
     assert jnp.array_equal(rec, x)
 
 

@@ -27,11 +27,14 @@ loaded tile, so the normalized operand never reaches global memory. A producer t
 by tile, or whose operand changes its base's dtype, runs in XLA before the product, reported as the
 epilogue's is ('gemm_prologue').
 
-`generation.chosen(gemm_epilogue=..., gemm_prologue=...)` names either stage's route: 'xla' runs it in XLA
-beside the product whatever the kernels take, the reference a fused route is checked against, and
-'fused' raises where the kernels cannot take it rather than run XLA.
+Each stage is its selector's (`EPILOGUE`, `PROLOGUE`, `dew.nn.kernels.selection`), whose one fused kernel
+requires the analysis to take the stage tile by tile: `generation.chosen(gemm_epilogue=...,
+gemm_prologue=...)` names either stage's route: 'xla' runs it in XLA beside the product whatever the
+kernels take, the reference a fused route is checked against, and 'fused' raises where the kernels cannot
+take it rather than run XLA (`selection.KernelRefused`).
 """
 
+import dataclasses
 import functools
 
 import jax
@@ -42,7 +45,7 @@ from jax.experimental.pallas import fuser
 from jax.extend import core as jax_core
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.selection import forced
+from dew.nn.kernels.selection import Kernel, Op, Requirement, select
 from dew.nn.kernels.templates.gemm import template
 
 AXES = ('rows', 'columns')
@@ -73,16 +76,12 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, *fusions)
     acc = jax.ShapeDtypeStruct((lhs.shape[0], width), jnp.float32)
     consumer, values, prefetch = fuser.get_fusion_values(out_fusion, acc)
     leaves, treedef = jax.tree.flatten(values)
-    named = forced('gemm_epilogue')
-    axes = (generation.Refusal('chosen', "`generation.chosen` names XLA") if named == 'xla'
-            else generation.Refusal('scalar_prefetch', "the consumer reads scalar prefetch") if prefetch
+    axes = (generation.Refusal('scalar_prefetch', "the consumer reads scalar prefetch") if prefetch
             else _axes(consumer, values, acc))
-    if isinstance(axes, generation.Refusal):
-        _refused('gemm_epilogue', named, axes)
+    if select(EPILOGUE, Tiling(axes)).kernel == 'xla' or isinstance(axes, generation.Refusal):
         summed = template.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=jnp.float32,
                                interpret_on_cpu=interpret_on_cpu, **prologue)
         return consumer(values, summed)
-    generation.route('gemm_epilogue', kernel='fused')
     out_leaves, out_treedef = jax.tree.flatten(jax.eval_shape(consumer, values, acc))
     value_types = tuple(jax.typeof(leaf) for leaf in leaves)
     epilogue = functools.partial(_tiled, consumer, treedef, value_types, out_treedef, acc.shape)
@@ -95,13 +94,39 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, *fusions)
     return jax.tree.unflatten(out_treedef, consumed if several else (consumed,))
 
 
-def _refused(choice: str, named: str | None, refusal: generation.Refusal) -> None:
-    """Report `choice`'s stage run in XLA for `refusal`; raise where `generation.chosen` names it fused."""
-    if named == 'fused':
-        raise ValueError(f"`generation.chosen` names {choice}='fused', which the kernels cannot take: "
-                         f"{refusal.code}: {refusal.detail}")
-    generation.route(choice, kernel='xla', preferred=None if named == 'xla' else 'fused',
-                     refusal=None if named == 'xla' else refusal)
+@dataclasses.dataclass(frozen=True)
+class Tiling:
+    """A stage as its selector reads it (`EPILOGUE`, `PROLOGUE`): what its analysis `found` (`_axes`,
+    `_split`), a refusal where the kernels cannot take the stage tile by tile."""
+
+    found: tuple | generation.Refusal
+
+    @property
+    def refusal(self) -> generation.Refusal | None:
+        return self.found if isinstance(self.found, generation.Refusal) else None
+
+
+def _tileable(code: str) -> Requirement[Tiling]:
+    """The requirement that a stage's analysis turned it down for no reason `code` names, its detail the
+    analysis's."""
+    return Requirement(code, lambda case: case.refusal is None or case.refusal.code != code,
+                       lambda case: '' if case.refusal is None else case.refusal.detail, row='ledger 1295')
+
+
+_SHARED = ('scalar_prefetch', 'value_unblocked', 'value_off_axes', 'reads_position', 'untileable')
+
+EPILOGUE: Op[Tiling] = Op('gemm_epilogue', (
+    Kernel('fused', tuple(_tileable(code) for code in ('product_untiled', *_SHARED))),
+    Kernel('xla', (), generic=True)))
+"""The epilogue's selector: the consumers in the kernel's epilogue where the analysis takes them tile by
+tile (`_axes`), else after the product in XLA."""
+
+PROLOGUE: Op[Tiling] = Op('gemm_prologue', (
+    Kernel('fused', tuple(_tileable(code) for code in ('no_base', 'dtype_changes', 'input_unstaged',
+                                                       'base_untiled', *_SHARED))),
+    Kernel('xla', (), generic=True)))
+"""The prologue's selector: the producer's element stage in the kernel's prologue where the analysis
+takes it tile by tile (`_split`), else before the product in XLA."""
 
 
 PROLOGUE_AXES = ('rows', 'depth')
@@ -113,16 +138,13 @@ def _prologue(fusion) -> tuple[jax.Array, dict]:
     (the module's docstring), or the operand itself and none where the kernels cannot take its producer,
     each reported ('gemm_prologue')."""
     producer, values, prefetch = fuser.get_fusion_values(fusion)
-    named = forced('gemm_prologue')
     split = (generation.Refusal('scalar_prefetch', "the producer reads scalar prefetch") if prefetch
              else _split(producer, values))
-    if named == 'xla' and not isinstance(split, generation.Refusal):
-        split = generation.Refusal('chosen', "`generation.chosen` names XLA")
-    if isinstance(split, generation.Refusal):
-        if split.code != 'no_producer':
-            _refused('gemm_prologue', named, split)
+    # An operand as given has no producer to fuse, and no stage to choose.
+    if isinstance(split, generation.Refusal) and split.code == 'no_producer':
         return fusion(), {}
-    generation.route('gemm_prologue', kernel='fused')
+    if select(PROLOGUE, Tiling(split)).kernel == 'xla' or isinstance(split, generation.Refusal):
+        return fusion(), {}
     base, function, sides, axes, jvp = split
     return base, {'prologue': function, 'prologue_operands': tuple(zip(sides, axes, strict=True)),
                   'prologue_jvp': jvp}

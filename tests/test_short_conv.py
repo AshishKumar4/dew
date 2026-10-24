@@ -22,7 +22,7 @@ from reference_error import (
 from tuned import each_config, launches, timed
 
 from dew.nn.kernels import generation, short_conv, tuning
-from dew.nn.linear import causal_conv1d, conv_refusal, xla_conv1d
+from dew.nn.linear import causal_conv1d, xla_conv1d
 
 pytestmark = pytest.mark.kernel
 
@@ -307,9 +307,9 @@ def test_a_gpu_runs_the_kernels_both_ways():
     (jnp.bfloat16, jnp.bfloat16, DELTA, 12),
 ])
 def test_a_conv_the_kernels_do_not_take_runs_as_the_xla_conv(dtype, out, parts, taps):
-    """On a GPU whose row names the kernels, a conv they do not take (`conv_refusal`: float64, a piece
-    off its block, more taps than they hold) runs XLA's conv: the same values and gradients, and no
-    kernel launch."""
+    """On a GPU whose row names the kernels, a conv they do not take (`short_conv.CONV`: float64, a piece
+    off its block, more taps than they hold) runs XLA's conv, its route saying why: the same values and
+    gradients, and no kernel launch."""
     with jax.enable_x64(new_val=jnp.float64 in (dtype, out)):
         keys = jax.random.split(jax.random.key(89), 3)
         x = jax.random.normal(keys[0], (1, 8, sum(width for width, _ in parts))).astype(dtype)
@@ -323,13 +323,14 @@ def test_a_conv_the_kernels_do_not_take_runs_as_the_xla_conv(dtype, out, parts, 
                     conv(x, taps, parts=parts, dtype=out), probe, strict=True))
             return jax.value_and_grad(run, argnums=(0, 1))
 
-        with generation.assumed("sm80"):
-            assert conv_refusal(x, taps, parts, out) is not None
+        with generation.assumed("sm80"), generation.routes() as found:
             launched = [equation for equation in equations(jax.make_jaxpr(loss(causal_conv1d))(x, taps))
                         if equation.primitive.name == "pallas_call"]
             got = jax.jit(loss(causal_conv1d))(x, taps)
         want = jax.jit(loss(xla_conv1d))(x, taps)
     assert not launched
+    assert {(route.kernel, route.preferred, route.refusal is not None) for route in found
+            if route.choice == "short_conv"} == {("xla", "pallas", True)}
     for mine, theirs in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
 

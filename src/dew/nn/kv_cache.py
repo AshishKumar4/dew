@@ -45,7 +45,7 @@ from jax.sharding import PartitionSpec as P
 
 from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.generation import INHERENT, backend
-from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Requirement
+from dew.nn.kernels.selection import Kernel, Op, Requirement, selected
 from dew.nn.scatter import DROPPED
 from dew.nn.sharding import logical_spec, manual_map, mesh_axes
 
@@ -488,9 +488,8 @@ class KVStore:
         """
         case = self.case(query, value_dim=self.head_dim, softcap=softcap, arithmetic=False, named='auto',
                          windowed=starts is not None, sinks=sinks is not None)
-        kernel = 'triton' if backend() == "gpu" else 'tpu'
-        if failed := PAGED.kernel(kernel).failed(case):
-            raise KernelRefused(PAGED.choice, kernel, [requirement.refusal(case) for requirement in failed])
+        # The device's paged kernel, named: one its requirements turn down raises.
+        selected(PAGED, case, 'triton' if backend() == "gpu" else 'tpu')
 
         def local(query, key, value, lengths, table, *extras):
             # The optional operands as `decode` gave them: the window's starts, then the sinks.

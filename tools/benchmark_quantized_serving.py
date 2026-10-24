@@ -81,8 +81,6 @@ class Config:
     """The Hub commit or tag to load; local run directories do not use it."""
     clip: bool = True
     """Sample every prompt at both seeds and score the images with CLIP."""
-    decode_batch: int = 4
-    """Latents decoded per autoencoder call; bounds the decode's memory on CPU."""
 
 
 def spec(config: Config) -> Quantization:
@@ -122,20 +120,18 @@ def nonfinite(array: ArrayLike) -> int:
     return int(np.size(array) - np.count_nonzero(np.isfinite(np.asarray(array, np.float32))))
 
 
-def sample(pipe: TextToImage, key: int | jax.Array, decode_batch: int) -> tuple[np.ndarray, dict[str, int]]:
+def sample(pipe: TextToImage, key: int | jax.Array) -> tuple[np.ndarray, dict[str, int]]:
     """Every prompt's image as uint8 pixels, and how many non-finite values
-    the latents and the decoded pixels held before the pixels were clipped
-    and cast, which would hide them."""
-    latents = pipe(list(PROMPTS), key=key, steps=STEPS, solver=DPMSolverMultistep(), guidance=GUIDANCE,
-                   decode=False).latents
-    decode = jax.jit(pipe.autoencoder.decode)
-    decoded = np.concatenate([np.asarray(decode(pipe.variables["autoencoder"], latents[i:i + decode_batch]), np.float32)
-                              for i in range(0, len(latents), decode_batch)])
-    return (uint8_pixels(np.clip(decoded, -1.0, 1.0)),
-            {"latents": nonfinite(latents), "pixels": nonfinite(decoded)})
+    its latents and its decoded pixels held before the cast, which would hide
+    them: the task's own walk and decode (`walk_and_decode`, whose clip keeps a
+    NaN), a pixel-space model's walk included, read back as its real rows
+    without the padding that fills the devices (`Images.host`)."""
+    images = pipe(list(PROMPTS), key=key, steps=STEPS, solver=DPMSolverMultistep(), guidance=GUIDANCE).host()
+    found = {"latents": nonfinite(images.latents), "pixels": nonfinite(images.images)}
+    return uint8_pixels(images.images), found
 
 
-def quality(pipe: TextToImage, decode_batch: int) -> dict:
+def quality(pipe: TextToImage) -> dict:
     from dew.data.text import load_tokenizer
     from dew.eval.images import clip_image_text_cosine
     from dew.nn.text_encoders import DEFAULT_MODEL
@@ -146,7 +142,7 @@ def quality(pipe: TextToImage, decode_batch: int) -> dict:
     scores, seconds, counts = [], [], {"latents": 0, "pixels": 0}
     for seed in SEEDS:
         started = time.perf_counter()
-        pixels, found = sample(pipe, seed, decode_batch)
+        pixels, found = sample(pipe, seed)
         seconds.append(time.perf_counter() - started)
         counts = {stage: counts[stage] + found[stage] for stage in counts}
         scores += list(np.asarray(clip_image_text_cosine(pixels, tokens["input_ids"], tokens["attention_mask"])))
@@ -167,7 +163,7 @@ def main(config: Config) -> None:
             pipe = pipe.quantized(spec(config))
         row |= forward(pipe)
         if config.clip:
-            row |= quality(pipe, config.decode_batch)
+            row |= quality(pipe)
     except (ValueError, jax.errors.JaxRuntimeError) as error:
         row["error"] = str(error).splitlines()[0][:300]
     print(json.dumps(row), flush=True)

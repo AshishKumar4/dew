@@ -402,6 +402,22 @@ def test_a_float32_forward_and_its_output_table_multiply_float32_products(tokens
         assert products and all(precision == highest for precision in products), products
 
 
+def test_a_float64_forwards_logits_are_as_wide_as_its_output_tables(tokens, tmp_path):
+    """Under x64, a float64 torchax model's whole logits stay float64, as its output table's
+    logits over the same states do (`at_least_fp32`): neither read narrows to float32."""
+    loaded = tied_float32(tmp_path)
+    ids = jnp.asarray(tokens[:, :SEQ])
+    with jax.enable_x64(new_val=True):
+        model = loaded.model.clone(dtype=jnp.float64)
+        variables = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
+                                 if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf,
+                                 loaded.variables)
+        direct = model.apply(variables, ids)
+        hidden = model.apply(variables, ids, method="hidden_states")
+        table = model.apply(variables, method="output_table").logits(hidden)
+    assert direct.dtype == table.dtype == jnp.float64
+
+
 @pytest.mark.gpu(reason="TF32 is a GPU's default float32 product")
 def test_a_float32_forwards_logits_and_its_output_tables_are_as_exact_as_torchs(tokens, tmp_path):
     """On a GPU, a float32 torchax model's own logits and its output table's over the same

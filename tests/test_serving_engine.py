@@ -183,8 +183,18 @@ def test_a_stop_while_a_reload_holds_the_step_runs_no_step_after_it():
     kind.waiting.append("waiting")
     engine.start()
     looked.wait()
+    halted = threading.Event()
+    original = engine._halt
+
+    def halt():
+        original()
+        halted.set()
+
+    engine._halt = halt
     stopping = threading.Thread(target=engine.stop)
     stopping.start()
+    # The reload ends only once the stop has reached the engine, so the thread behind it sees the stop.
+    halted.wait()
     release.set()
     reloading.join()
     stopping.join()

@@ -255,11 +255,9 @@ class ModelInputs:
         """
         if left_padding.shape != (self.tokens.shape[0],):
             raise ValueError("left_padding must have one count per token row")
-        slots = (jnp.arange(self.tokens.shape[1])[None, :] + left_padding[:, None]) % self.tokens.shape[1]
 
         def shift(value: jax.Array) -> jax.Array:
-            indices = slots.reshape(slots.shape + (1,) * (value.ndim - 2))
-            return jnp.take_along_axis(value, indices, axis=1)
+            return rotate_rows(value, left_padding)
 
         return replace(self, tokens=shift(self.tokens),
                             token_fields={name: jax.tree.map(shift, value)
@@ -304,6 +302,30 @@ class ModelInputs:
         return replace(
             self, tokens=jnp.concatenate([self.tokens, tokens.astype(self.tokens.dtype)], axis=1),
             token_fields={name: continued(name, value) for name, value in self.token_fields.items()})
+
+
+def rotate_rows(values: jax.Array, shifts: jax.Array) -> jax.Array:
+    """Each row of `values` `[B, S, ...]` rotated left by its own count in `shifts` `[B]`: slot `i`
+    reads slot `(i + shift) % S`, so a row's first `shift` slots move to its end, and a negative
+    count rotates it back."""
+    slots = (jnp.arange(values.shape[1])[None, :] + shifts[:, None]) % values.shape[1]
+    return jnp.take_along_axis(values, slots.reshape(slots.shape + (1,) * (values.ndim - 2)), axis=1)
+
+
+def shifted_span(shape: tuple[int, ...], shift: int, *, valid=None, segments=None, xp=jnp):
+    """Which `[B, S - shift]` source positions can reach the token `shift` places later: every
+    intervening token is valid, including both endpoints, and their document IDs match. Padding
+    IDs and target roles belong to the caller; `segments` describes identity, not validity.
+    `xp` is NumPy for host geometry and JAX NumPy for model/loss execution."""
+    batch, length = shape
+    width = length - shift
+    admitted = xp.ones((batch, width), bool)
+    if valid is not None:
+        for offset in range(shift + 1):
+            admitted = admitted & xp.asarray(valid[:, offset:offset + width], bool)
+    if segments is not None:
+        admitted = admitted & (segments[:, :width] == segments[:, shift:shift + width])
+    return admitted
 
 
 @struct.dataclass

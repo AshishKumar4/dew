@@ -22,7 +22,7 @@ in at least fp32 as the reference casts its operands. The decode step is
 holds both to the reference's numbers.
 
 On a GPU whose target row names it the chunked scan is mamba_ssm's own
-kernels (`dew.nn.kernels.mamba_ssd`, `recurrence_chunk.ssd_port_refusal` names where not),
+kernels (`dew.nn.kernels.mamba_ssd`, `recurrence_chunk.SCAN` names where not),
 which multiply `x`, `B` and `C` in their own dtype into fp32 sums as
 mamba_ssm does; on a TPU whose tiling covers the geometry `dew.nn.kernels.ssd`'s
 Pallas kernel; elsewhere the template's portable math, chosen at trace time.
@@ -120,7 +120,7 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
     `at_least_fp32` of the operands' common dtype, the output unrounded for what a caller adds to it
     (the earlier shards' state, `_ssd`). `starts` `[B, S]` marks packed documents' first tokens,
     whose entering state drops. The op runs it on mamba_ssm's kernels where their port takes the
-    call (`recurrence_chunk.ssd_port_refusal`), on `x`, `B` and `C` in their common dtype; else in
+    call (`recurrence_chunk.SCAN`), on `x`, `B` and `C` in their common dtype; else in
     `at_least_fp32` of it, on the TPU's Pallas kernel where it takes the geometry, else the portable
     math.
     """

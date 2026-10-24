@@ -29,20 +29,13 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.attention import (
-    LayerNorm,
-    NormalAttention,
-    RMSNorm,
-    projected_heads,
-    projected_output,
-    scaled_dot_product_attention,
-)
+from dew.nn.attention import LayerNorm, NormalAttention, QKNorm
 from dew.nn.blocks import Modulation, sinusoidal_time
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
 from dew.nn.precision import at_least_fp32, float32_dot_general
-from dew.nn.rope import axis_tables, rotate
+from dew.nn.rope import axis_tables
 from dew.nn.sharding import logical_axes
 
 from ..mlp import GatedMLP
@@ -68,61 +61,6 @@ def wan_rotation(frames: int, rows: int, columns: int, head_dim: int, *,
 @logical_axes({(module, name): axes for module in ("attn1", "attn2")
                for name, axes in (*(((name), ("embed", None)) for name in ("to_q", "to_k", "to_v")),
                                   ("to_out_0", (None, "embed")))})
-class WanAttention(nn.Module):
-    """Runs the source's `Attention` under `WanAttnProcessor2_0`, for text-to-video.
-
-    Queries come from the video tokens. Keys and values come from `context`
-    (the text, for the cross-attention) or from the tokens themselves. It
-    differs from `JointAttention` in two ways. Wan's `rms_norm_across_heads`
-    normalizes each token's whole projection before it is split into heads,
-    where the MM-DiTs normalize each head. And its cross-attention reads keys
-    and values from the text alone, where theirs join the two streams.
-    `rotation`, `[1, S, D // 2]`, rotates the self-attention's queries and
-    keys.
-    """
-
-    heads: int
-    head_dim: int
-    qk_norm: bool = True
-    epsilon: float = 1e-6
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
-
-    @nn.nowrap
-    def model_flops(self, lengths) -> float:
-        return NormalAttention(self.heads * self.head_dim, self.heads, self.head_dim,
-                               parent=None).model_flops(lengths)
-
-    @nn.nowrap
-    def cross_flops(self, lengths, context_lengths) -> float:
-        inner = self.heads * self.head_dim
-        return NormalAttention(inner, self.heads, self.head_dim, parent=None).cross_flops(
-            lengths, context_lengths, inner)
-
-    def _projected(self, name: str, x, *, norm: str | None = None):
-        # Diffusers' `RMSNorm` rounds the normalized row to the weight's
-        # dtype before it scales.
-        return projected_heads(x, name, self.heads, self.head_dim, flat=True, dtype=self.dtype,
-                               precision=self.precision, across_heads=True,
-                               norm=RMSNorm(epsilon=self.epsilon, scale_after_cast=True, dtype=self.dtype,
-                                            name=norm) if norm and self.qk_norm else None)
-
-    @nn.compact
-    def __call__(self, x, context=None, rotation=None):
-        source = x if context is None else context
-        query = self._projected("to_q", x, norm="norm_q")
-        key = self._projected("to_k", source, norm="norm_k")
-        value = self._projected("to_v", source)
-        if rotation is not None:
-            # The source rotates in float64 and rounds once to its dtype.
-            query, key = (rotate(part, *rotation, pairs="adjacent") for part in (query, key))
-        attended = scaled_dot_product_attention(query, key, value, implementation=self.attention_impl,
-                                                precision=self.precision)
-        return projected_output(attended, "to_out_0", self.heads * self.head_dim, flat=True, dtype=self.dtype,
-                                precision=self.precision)
-
-
 class WanBlock(nn.Module):
     """Runs `WanTransformerBlock`: modulated self-attention, cross-attention to the text, and a feed-forward.
 
@@ -145,9 +83,16 @@ class WanBlock(nn.Module):
 
     @nn.nowrap
     def _attention(self, name=None):
-        return WanAttention(self.heads, self.features // self.heads, qk_norm=self.qk_norm,
-                            epsilon=self.epsilon, dtype=self.dtype, precision=self.precision,
-                            attention_impl=self.attention_impl, name=name)
+        """The source's `Attention` under `WanAttnProcessor2_0`: flat projections, Wan's
+        `rms_norm_across_heads` over each token's whole query and key, rounded to the weight's dtype
+        before they scale, and adjacent rotary pairs. Its cross-attention reads keys and values from
+        the text alone, where the MM-DiTs' join the two streams (`JointAttention`)."""
+        return NormalAttention(
+            self.features, self.heads, self.features // self.heads, dtype=self.dtype,
+            precision=self.precision,
+            qk_norm=QKNorm(("norm_q", "norm_k"), self.epsilon, across_heads=True, scale_after_cast=True)
+            if self.qk_norm else None,
+            attention_impl=self.attention_impl, flat=True, rotary_pairs="adjacent", name=name)
 
     @nn.nowrap
     def _feed_forward(self, name=None):
@@ -163,7 +108,8 @@ class WanBlock(nn.Module):
         """Self-attention, cross-attention maps/products and the ungated FFN."""
         matching_lengths(lengths, context_lengths)
         attention = self._attention()
-        return (attention.model_flops(lengths) + attention.cross_flops(lengths, context_lengths)
+        return (attention.model_flops(lengths)
+                + attention.cross_flops(lengths, context_lengths, self.features)
                 + self._feed_forward().model_flops(lengths))
 
     @nn.compact
@@ -176,7 +122,7 @@ class WanBlock(nn.Module):
         norm = layer_norm(wide, self.epsilon)
 
         attended = self._attention("attn1")(
-            modulate(norm(x), shift, scale).astype(x.dtype), rotation=rotation)
+            modulate(norm(x), shift, scale).astype(x.dtype), freqs_cis=rotation)
         x = (x.astype(wide) + attended * gate[:, None]).astype(x.dtype)
         normalized = (LayerNorm(epsilon=self.epsilon, dtype=x.dtype, name="norm2")(x)
                       if self.cross_attn_norm else x)
@@ -321,4 +267,4 @@ class WanTransformer(nn.Module):
                                 "b f h w pf ph pw c -> b (f pf) (h ph) (w pw) c")
 
 
-__all__ = ["WanAttention", "WanBlock", "WanTransformer"]
+__all__ = ["WanBlock", "WanTransformer"]

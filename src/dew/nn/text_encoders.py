@@ -177,7 +177,7 @@ class CLIPTextTransformer(nn.Module):
         return self.num_layers * self._layer().model_flops(lengths)
 
     def setup(self):
-        embed = functools.partial(nn.Embed, features=self.hidden_size, dtype=self.dtype)
+        embed = functools.partial(TokenEmbedding, features=self.hidden_size, dtype=self.dtype)
         self.token_embedding = embed(self.vocab_size, name="token_embedding")
         self.position_embedding = embed(self.max_position_embeddings,
                                         name="position_embedding")
@@ -269,7 +269,7 @@ class CLIPVisionTransformer(nn.Module):
             "class_embedding", nn.initializers.normal(self.hidden_size ** -0.5),
             (self.hidden_size,))
         self.patch_embedding = self._patch_embedding(name="patch_embedding")
-        self.position_embedding = nn.Embed(patches + 1, self.hidden_size,
+        self.position_embedding = TokenEmbedding(patches + 1, self.hidden_size,
                                            dtype=self.dtype, name="position_embedding")
         norm = functools.partial(LayerNorm, epsilon=self.layer_norm_eps,
                                  dtype=self.dtype)

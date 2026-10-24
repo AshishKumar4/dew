@@ -22,6 +22,7 @@ from dew.interop.decoder_parts import (
     MixtureFields,
     Packed,
     Renames,
+    RopeSpelling,
     base_config,
     kind_mixers,
     read_rope,
@@ -33,6 +34,9 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.llama4 import Llama4Mixer
+
+# Llama4TextConfig's default_theta (configuration_llama4.py:111), the base an omitted rope_theta means.
+_LLAMA4_SPELLING = RopeSpelling(theta=500000.0)
 
 
 def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -60,7 +64,8 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     # ramp is the model's, and every rotated layer applies it.
     used.update(('no_rope_layers', 'no_rope_layer_interval', 'layer_types'))
     config = base_config(hf_config, used, layer_types=layer_types,
-                          rope=dataclasses.replace(read_rope(hf_config, used), local_theta=None))
+                          rope=dataclasses.replace(read_rope(hf_config, used, _LLAMA4_SPELLING),
+                                                   local_theta=None))
     if hf_config.get('router_jitter_noise', 0.0):
         refuse("router_jitter_noise", "the router selects on the logits alone")
     if hf_config.get('output_router_logits', False):
@@ -70,10 +75,10 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
                  'moe_layers', 'interleave_moe_layer_step', 'attention_chunk_size',
                  'use_qk_norm', 'attn_temperature_tuning', 'floor_scale', 'attn_scale'))
     rule = {
-        'use_qk_norm': bool(hf_config.get('use_qk_norm', True)),
-        'attn_temperature_tuning': bool(hf_config.get('attn_temperature_tuning', True)),
-        'floor_scale': records.number(hf_config.get('floor_scale', 8192), 'floor_scale'),
-        'attn_scale': records.number(hf_config.get('attn_scale', 0.1), 'attn_scale'),
+        'use_qk_norm': bool(hf_config['use_qk_norm']),
+        'attn_temperature_tuning': bool(hf_config['attn_temperature_tuning']),
+        'floor_scale': records.number(hf_config['floor_scale'], 'floor_scale'),
+        'attn_scale': records.number(hf_config['attn_scale'], 'attn_scale'),
     }
     chunk = hf_config.get('attention_chunk_size')
     full = native_fields(LayerKind)(mixer=None)
@@ -87,7 +92,7 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     step = records.integer(hf_config.get('interleave_moe_layer_step', 1), 'interleave_moe_layer_step')
     mixture: MixtureFields = native_fields(Mixture)(
         experts=records.integer(hf_config['num_local_experts'], 'num_local_experts'),
-        top_k=records.integer(hf_config.get('num_experts_per_tok', 1), 'num_experts_per_tok'),
+        top_k=records.integer(hf_config['num_experts_per_tok'], 'num_experts_per_tok'),
         score_function='sigmoid',
         norm_topk_prob=False,
         scale_inputs=True,
@@ -146,4 +151,11 @@ LLAMA4_TEXT = DecoderFamily(
     weight_path=partial(renamed_path, _LLAMA4_NAMES, layer_leaves=_LLAMA4_EXPERTS),
     packed=_LLAMA4_PACKED,
     preserve_source_layout=True,
+    # Llama4TextConfig's defaults for the fields its decoder reads.
+    defaults={'rms_norm_eps': 1e-5, 'num_experts_per_tok': 1, 'use_qk_norm': True,
+              'attn_temperature_tuning': True, 'floor_scale': 8192, 'attn_scale': 0.1,
+              'attention_chunk_size': 8192, 'num_key_value_heads': 8, 'head_dim': 128,
+              'max_position_embeddings': 131072},
+    # A model whose rotated layers attend every key says so, against the class's 8192.
+    export_nulls=('attention_chunk_size',),
 )

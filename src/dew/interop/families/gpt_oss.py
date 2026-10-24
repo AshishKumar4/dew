@@ -29,9 +29,9 @@ from dew.nn.backbones.decoder_block import Mixture
 
 
 def _gpt_oss_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    ropes = read_rope(hf_config, used, records.integer(hf_config.get(
-        'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'),
-        RopeSpelling(theta=150000.0), ramps=('yarn',), per_kind=False)
+    ropes = read_rope(hf_config, used, RopeSpelling(theta=150000.0), yarn_max_pos=records.integer(
+        hf_config.get('max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'),
+        ramps=('yarn',), per_kind=False)
     layers = hf_config['num_hidden_layers']
     experts = hf_config['num_local_experts']
     top_k = hf_config['num_experts_per_tok']
@@ -68,9 +68,11 @@ def _gpt_oss_export(model: CausalTransformer) -> Mapping[str, object]:
     mixture = model.mixture
     if mixture is None:
         refuse('mixture', 'GPT OSS needs routed experts')
+    # A plain rotary is written as a plain record: an omitted one reads as the class's YaRN.
+    rope = ({'rope_type': 'default', 'rope_theta': model.rope_theta} if model.yarn is None
+            else {**asdict(model.yarn), 'rope_type': 'yarn', 'rope_theta': model.rope_theta})
     return {'hidden_act': 'silu', 'num_local_experts': mixture.experts,
-            'num_experts_per_tok': mixture.top_k, 'swiglu_limit': 7.0,
-            'rope_scaling': None if model.yarn is None else asdict(model.yarn)}
+            'num_experts_per_tok': mixture.top_k, 'swiglu_limit': 7.0, 'rope_parameters': rope}
 
 
 GPT_OSS = DecoderFamily(
@@ -83,4 +85,11 @@ GPT_OSS = DecoderFamily(
     weight_path=partial(renamed_path, (), layer_leaves=_GPT_OSS_LEAVES),
     export_path=partial(renamed_name, (), layer_leaves=_GPT_OSS_LEAVES),
     preserve_source_layout=False,
+    # GptOssConfig's defaults: biased attention, its own norm epsilon and expert geometry, a window,
+    # and its YaRN record where a config states none.
+    defaults={'attention_bias': True, 'rms_norm_eps': 1e-5, 'num_experts_per_tok': 4,
+              'num_local_experts': 128, 'sliding_window': 128, 'head_dim': 64, 'num_key_value_heads': 8,
+              'max_position_embeddings': 131072,
+              'rope_parameters': {'rope_type': 'yarn', 'factor': 32.0, 'beta_fast': 32.0, 'beta_slow': 1.0,
+                                  'truncate': False, 'original_max_position_embeddings': 4096}},
 )

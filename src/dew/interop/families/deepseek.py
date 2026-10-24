@@ -21,6 +21,7 @@ from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
     MOE_NAMES,
+    PLAIN_SPELLING,
     SERIALIZED_ENCODER_FIELDS,
     SERIALIZED_TEXT_FIELDS,
     DecoderFamily,
@@ -30,6 +31,7 @@ from dew.interop.decoder_parts import (
     MixtureFields,
     Ramp,
     Ropes,
+    RopeSpelling,
     base_config,
     dew_path,
     layer_depth_path,
@@ -51,6 +53,9 @@ from dew.nn.deepseek_v4 import DeepseekV4Mixer
 from dew.nn.dspark import DSpark
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mla import MLAMixer
+
+# MiniMaxM2Config's default_theta (configuration_minimax_m2.py:74).
+_MINIMAX_M2_SPELLING = RopeSpelling(theta=5000000.0)
 
 
 def _minimax_m2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -91,7 +96,7 @@ def _minimax_m2_config(hf_config: Mapping[str, object], used: set[str]) -> Decod
     # The release states its rotary under rope_scaling, which transformers reads as rope_parameters.
     theta, factor = plain_partial_rope(
         {**hf_config, 'rope_parameters': hf_config.get('rope_scaling') or hf_config.get('rope_parameters')},
-        default_factor=rotary_dim / head_dim, default_theta=5000000.0, reference='MiniMax-M2')
+        _MINIMAX_M2_SPELLING, default_factor=rotary_dim / head_dim, reference='MiniMax-M2')
     if 'rotary_dim' in hf_config and factor * head_dim != rotary_dim:
         refuse('rotary_dim', 'it disagrees with partial_rotary_factor * head_dim')
     if not 0 < factor <= 1 or int(head_dim * factor) % 2:
@@ -211,8 +216,10 @@ def deepseek_routed(hf_config: Mapping[str, object], layers: int, used: set) -> 
         refuse(f"moe_layer_freq {freq!r}",
                 "transformers builds every layer past the dense ones as MoE, "
                 "whatever this field says")
-    first_k = records.integer(hf_config.get('first_k_dense_replace', 0) or 0, 'first_k_dense_replace')
-    if not 0 <= first_k <= layers:
+    # A dense prefix past the stack leaves every layer dense, as DeepseekV3DecoderLayer builds them.
+    first_k = min(records.integer(hf_config.get('first_k_dense_replace', 0) or 0, 'first_k_dense_replace'),
+                  layers)
+    if first_k < 0:
         refuse(f"first_k_dense_replace {first_k!r}",
                 f"it names dense layers of a {layers}-layer model")
     pattern = hf_config.get('mlp_layer_types')
@@ -273,7 +280,7 @@ def deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
     three things from the config: `layer_types`, one entry per layer; the MLA
     `mixer` record; and the routed `mixture`.
     """
-    ropes = read_rope(hf_config, used, records.integer(hf_config.get(
+    ropes = read_rope(hf_config, used, PLAIN_SPELLING, yarn_max_pos=records.integer(hf_config.get(
         'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'),
         ramps=('yarn',), per_kind=False)
     config = base_config(hf_config, used, rope=ropes)
@@ -1153,6 +1160,11 @@ DEEPSEEK_V2 = DecoderFamily(
     lambda model: {},
     weight_path=layer_depth_path,
     preserve_source_layout=True,
+    aliases={'num_experts': 'n_routed_experts'},
+    # DeepseekV2Config's defaults for the fields its decoder and routing read.
+    defaults={'n_shared_experts': 2, 'n_routed_experts': 64, 'routed_scaling_factor': 1.0,
+              'topk_method': 'greedy', 'norm_topk_prob': False, 'first_k_dense_replace': 0,
+              'q_lora_rank': 1536, 'max_position_embeddings': 2048},
 )
 
 
@@ -1181,4 +1193,11 @@ DEEPSEEK_V3 = DecoderFamily(
     lambda model: {},
     weight_path=layer_depth_path,
     preserve_source_layout=True,
+    aliases={'num_local_experts': 'n_routed_experts', 'num_mtp_layers': 'num_nextn_predict_layers'},
+    # DeepseekV3Config's defaults for the fields its decoder and routing read: its routed weights
+    # scale by 2.5.
+    defaults={'n_shared_experts': 1, 'n_routed_experts': 256, 'num_experts_per_tok': 8,
+              'routed_scaling_factor': 2.5, 'n_group': 8, 'topk_group': 4, 'norm_topk_prob': True,
+              'first_k_dense_replace': 3, 'num_key_value_heads': 128, 'q_lora_rank': 1536,
+              'max_position_embeddings': 4096, 'num_nextn_predict_layers': 1},
 )

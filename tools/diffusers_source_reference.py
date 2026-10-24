@@ -30,6 +30,8 @@ and torchsde==0.2.6:
     PYTHONPATH=src python tools/diffusers_source_reference.py
     PYTHONPATH=src python tools/diffusers_source_reference.py rounding \
         tests/fixtures/diffusers/source_rounding.npz 32
+    PYTHONPATH=src python tools/diffusers_source_reference.py seeds \
+        tests/fixtures/diffusers/source_seeds.npz
 
 `cases NAME...` records those cases alone into the stored record and keeps
 every other array as it is, so a case added later leaves the cases another
@@ -406,8 +408,62 @@ def trajectory_gradient(module: ModuleType, case: Case, initial: torch.Tensor,
     return gradient.numpy()
 
 
-STATE_CASES = ("edm.exponential_v_threshold", "dpm_multi.eps_threshold", "edm.default",
-               "dpm_multi.flow", "cfg.zero_rescale")
+STATE_CASES = ("dpm_multi.eps_threshold", "edm.default", "dpm_multi.flow", "cfg.zero_rescale")
+SEEDED_CASES = ("edm.exponential_v_threshold",)
+"""The pointwise cases whose rounding resolves over seeds within check 1's reach (`seeds`): an
+independent initial state and cotangent each, where the rest's few unclipped entries carry too
+heavy a tail and keep `rounding`'s copies."""
+
+
+def seeds(destination: Path) -> None:
+    """Each seeded case's trajectory gradient over the seeds check 1 draws (`record_case`): a seed's
+    initial state at the scheduler's `init_noise_sigma` and its cotangent, the float32 VJP from it and
+    the float64 one, the per-step draws Dew's solver makes at its key 0 fed to both, the count planned
+    on Dew's own walk (tests/diffusion_support.py's `source_final`)."""
+    import diffusers
+    import jax
+
+    sys.path.insert(0, str(FIXTURES.parents[1]))
+    from diffusion_support import source_final
+    from recorded_references import provenance, record_case, save
+
+    torch.set_num_threads(2)
+    noises = step_noise(SHAPE, STEPS, np.float64)
+    arrays: dict[str, np.ndarray] = {}
+    for name in SEEDED_CASES:
+        case, module = CASES[name], MODULES[CASES[name].scheduler]
+        scheduler = getattr(module, case.scheduler)(**case.config)
+        with tempfile.TemporaryDirectory(prefix="dew-source-scheduler-") as saved:
+            scheduler.save_pretrained(saved)
+            config = json.loads((Path(saved) / "scheduler_config.json").read_text())
+        scheduler.set_timesteps(case.steps)
+        prior = float(scheduler.init_noise_sigma)
+        schedule = SourceSchedule.from_config(config)
+        process, times = schedule.sampling(case.steps)
+        final = source_final(schedule, process, times, case.guidance, LABEL, GUIDANCE_SCALE)
+
+        def draw(seed, prior=prior):
+            generator = torch.Generator().manual_seed(seed)
+            initial = (torch.randn(SHAPE, generator=generator, dtype=torch.float64) * prior).float()
+            cotangent = torch.randn(SHAPE, generator=generator, dtype=torch.float64).float()
+            return {"x_T": initial.numpy(), "cotangent": cotangent.numpy()}
+
+        def evaluate(inputs, case=case, module=module):
+            initial, cotangent = (torch.from_numpy(inputs[key]) for key in ("x_T", "cotangent"))
+            single = trajectory_gradient(module, case, initial, cotangent, torch.float32, noises)
+            with float64_scheduler(module):
+                wide = trajectory_gradient(module, case, initial, cotangent, torch.float64, noises)
+            return {"grad": single}, {"grad": wide}
+
+        def proxy(inputs, final=final):
+            return {"grad": jax.vjp(final, inputs["x_T"])[1](inputs["cotangent"])[0]}
+
+        arrays.update(record_case(name, draw, evaluate, proxy))
+    version = diffusers.__version__
+    command = f"python tools/diffusers_source_reference.py seeds {destination}"
+    save(destination, {**arrays, "provenance": provenance("diffusers", version, "cpu", command,
+                                                          torch=torch.__version__)},
+         reference=f"huggingface/diffusers {version}", license="Apache-2.0")
 
 
 def rounding(destination: Path, copies: int) -> None:
@@ -664,6 +720,8 @@ def main(only: Sequence[str] = ()) -> None:
 if __name__ == "__main__":
     if sys.argv[1:2] == ["rounding"]:
         rounding(Path(sys.argv[2]), int(sys.argv[3]))
+    elif sys.argv[1:2] == ["seeds"]:
+        seeds(Path(sys.argv[2]))
     elif sys.argv[1:2] == ["cases"]:
         main(sys.argv[2:])
     else:

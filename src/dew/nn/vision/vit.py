@@ -30,6 +30,7 @@ from dew.interop.weights import ParamTree, checkpoint_array, insert, placed
 from dew.nn.activations import activation as named_activation
 from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.backbones.decoder_block import DecoderBlock
+from dew.nn.blocks import table_rows
 from dew.nn.dense import Dense
 from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.precision import float32_dot_general
@@ -130,7 +131,7 @@ def _interp_taps(index, size, side: int, align_corners: bool):
     return jnp.clip(raw, 0, side - 1), weights
 
 
-def resampled_positions(table, rows, columns, heights, widths, *, align_corners: bool):
+def resampled_positions(table, rows, columns, heights, widths, *, align_corners: bool, dtype=None):
     """The learned square table resampled to each patch's grid place: bilinear over its rows and
     columns separately, the outer product of the taps (vision_utils.py,
     get_vision_interpolation_indices_and_weights)."""
@@ -139,7 +140,8 @@ def resampled_positions(table, rows, columns, heights, widths, *, align_corners:
     column_taps, column_weights = _interp_taps(columns, widths, side, align_corners)
     indices = (row_taps[..., :, None] * side + column_taps[..., None, :]).reshape(*rows.shape, 4)
     weights = (row_weights[..., :, None] * column_weights[..., None, :]).reshape(*rows.shape, 4)
-    return (table[indices] * weights[..., None]).sum(axis=-2)
+    gathered = table_rows(table, indices, table.dtype if dtype is None else dtype)
+    return (gathered * weights[..., None]).sum(axis=-2)
 
 
 def vit_block(layout: ViTLayout, index: int, *, dtype: Dtype | None,
@@ -203,8 +205,8 @@ class VisionTransformer(nn.Module):
                        dot_general=float32_dot_general)(pixels)
         if lay.position_table:
             table = nn.Embed(lay.position_table, lay.hidden_size, dtype=self.dtype, name="position_table")
-            hidden = hidden + resampled_positions(jnp.asarray(table.embedding, hidden.dtype), rows, columns,
-                                                  heights, widths, align_corners=lay.align_corners)
+            hidden = hidden + resampled_positions(table.embedding, rows, columns, heights, widths,
+                                                  align_corners=lay.align_corners, dtype=hidden.dtype)
         outer = functools.partial(LayerNorm, epsilon=lay.outer_norm_eps, dtype=self.dtype)
         if lay.pre_norm:
             hidden = outer(name="pre_norm")(hidden)

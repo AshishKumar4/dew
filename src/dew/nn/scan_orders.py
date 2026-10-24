@@ -127,9 +127,9 @@ def pixel_shuffle(x: jnp.ndarray) -> jnp.ndarray:
     return einops.rearrange(x, 'b h w (c p1 p2) -> b (h p1) (w p2) c', p1=2, p2=2)
 
 
-def hilbert_unpatchify(x: jnp.ndarray, inv_idx: np.ndarray, patch_size: int,
-                       H: int, W: int, C: int) -> jnp.ndarray:
+def unscanned(x: jnp.ndarray, inverse: np.ndarray | None, patch_size: int,
+              H: int, W: int, C: int) -> jnp.ndarray:
     """Scan-ordered patches `[B, N, p * p * C]` back to the image `[B, H, W, C]`
-    through the `inv_idx` their gather returned (`dew.nn.dit.scan_ordered`),
-    whichever order it was."""
-    return unpatchify(x[:, inv_idx, :], patch_size, H, W, C)
+    through the `inverse` their gather returned (`dew.nn.dit.scan_ordered`),
+    whichever order it was; None for raster patches, which are in order."""
+    return unpatchify(x if inverse is None else x[:, inverse, :], patch_size, H, W, C)

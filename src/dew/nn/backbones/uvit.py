@@ -25,12 +25,11 @@ from ..dit import (
     RematLadder,
     _TransformerOptions,
     remat_block,
-    scan_ordered,
 )
 from ..flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
 from ..precision import at_least_fp32, float32_dot_general
 from ..rope import rotary_freqs
-from ..scan_orders import hilbert_unpatchify, unpatchify
+from ..scan_orders import unscanned
 
 
 def u_walk(x, down, middle, merges, up, run):
@@ -172,8 +171,7 @@ class UViT(_TransformerOptions):
         if num_patches > rows:
             raise ValueError(f"{num_patches} patches exceed the position table's {rows} "
                              f"(image_size {self.image_size})")
-        patches, inverse = scan_ordered(self.patch_embed(x), self.scan_order, H // self.patch_size,
-                                        W // self.patch_size)
+        patches, inverse = self.patch_embed.scanned(x, self.scan_order)
 
         wide = at_least_fp32(self.dtype)
         time = sinusoidal_time(jnp.asarray(temb, wide) * self.time_scale, self.emb_features, dtype=wide)
@@ -197,10 +195,7 @@ class UViT(_TransformerOptions):
                    lambda block, x: block(x, conditioning=None, freqs_cis=None, train=train))
 
         out = self.decoder_pred(self.norm(x))[:, extras:]
-        if inverse is not None:
-            image = hilbert_unpatchify(out, inverse, self.patch_size, H, W, self.output_channels)
-        else:
-            image = unpatchify(out, self.patch_size, H, W, self.output_channels)
+        image = unscanned(out, inverse, self.patch_size, H, W, self.output_channels)
         return self.final_layer(image) if self.conv else image
 
 
@@ -288,8 +283,7 @@ class SimpleUDiT(RematLadder, _TransformerOptions):
             "Image dimensions must be divisible by patch size"
         )
 
-        x_seq, hilbert_inv_idx = scan_ordered(self.patch_embed(x), self.scan_order, H // self.patch_size,
-                                              W // self.patch_size)
+        x_seq, hilbert_inv_idx = self.patch_embed.scanned(x, self.scan_order)
 
         cond_emb = self.conditioning(temb, textcontext)
         freqs_cis = rotary_freqs(jnp.arange(x_seq.shape[1]), self.emb_features // self.num_heads,

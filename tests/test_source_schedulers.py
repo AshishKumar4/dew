@@ -12,15 +12,27 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from diffusion_support import ConditionalSourceOracle, SourceOracle, relative_gap, walk
-from reference_error import assert_as_exact_as_the_reference, assert_as_exact_over_orders, distance
+from diffusion_support import SourceOracle, relative_gap, source_final, walk
+from reference_error import (
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    assert_as_exact_over_orders,
+    declared_seeds,
+    distance,
+    indexed_recording,
+    recording,
+)
 
-from dew.sampling import CFG, DPMSolverSDE, sample
+from dew.sampling import DPMSolverSDE, sample
 
 DIFFUSERS_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "diffusers"
 SOURCE = json.loads((DIFFUSERS_FIXTURES / "source_schedulers.json").read_text())
 SOURCE_ARRAYS = np.load(DIFFUSERS_FIXTURES / "source_schedulers.npz")
 SOURCE_ROUNDING = np.load(DIFFUSERS_FIXTURES / "source_rounding.npz")
+SOURCE_SEEDS = DIFFUSERS_FIXTURES / "source_seeds.npz"
+SOURCE_SEEDED = recording(SOURCE_SEEDS)
+"""The seeded pointwise cases' trajectory gradients over check 1's seeds (`tools/diffusers_source_reference.py
+seeds`), each name's arrays under its own prefix."""
 
 
 def source_case(name: str):
@@ -72,19 +84,23 @@ def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
     tree answered, whose interval the reconstruction is checked to prepare.
     Every native walk and VJP runs in float32.
 
-    The VJP is held to twice the source's own RMS distance from its
-    float64 evaluation, using reference_error's common rounding rule.
-    The source fixture widens every scheduler table and retains that
-    gradient in float64, so its oracle shares no float32 arithmetic with
-    the reference whose rounding it measures. Five pointwise cases average
-    32 independent copies (768 gradient entries) in source_rounding.npz:
-    pixel permutations reproduce the same draw on both sides. A 256-copy
-    pilot's disjoint original-size subsets reached ratio 3.52, while every
-    32-copy subset stayed below 1.40 on default/AVX/Ice Lake CPU codegen.
-    The chosen new draws reach 1.43. Thresholding's maximum is 1 in these
-    cases, so the quantile is clamped to a constant and the limit is a
-    pointwise clip. CFG epsilon instead averages 52 pixel orders of its
-    per-sample variance reductions.
+    The VJP is held to the source's own rounding from its float64
+    evaluation, which widens every scheduler table and keeps that gradient
+    in float64, so its truth shares no float32 arithmetic with the reference
+    whose rounding it measures. In pointwise cases pixel permutations
+    reproduce one rounding draw. Exponential v-prediction with thresholding
+    is on par over the seeds its recording declares (check 1,
+    source_seeds.npz): its one draw's ratio was 1.70, 0.99 over 128 seeds.
+    Four others, whose few unclipped entries carry too heavy a tail for
+    seeds to resolve, average 32 independent copies (768 gradient entries)
+    in source_rounding.npz, held to twice the source's own distance; a
+    256-copy pilot's disjoint original-size subsets reached ratio 3.52,
+    while every 32-copy subset stayed below 1.40 on default/AVX/Ice Lake
+    CPU codegen. Thresholding's maximum is 1 in these cases, so the
+    quantile is clamped to a constant and the limit is a pointwise clip.
+    CFG epsilon instead averages 52 pixel orders of its per-sample variance
+    reductions; the rest are held to twice the source's own distance on
+    their one recorded draw.
     """
     schedule, process, times, x_T = source_case(name)
     rescale = SOURCE["cases"][name]["guidance"]
@@ -99,34 +115,21 @@ def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
     assert abs(prior - float(SOURCE_ARRAYS[f"{name}.prior"])) < 1e-5 * max(prior, 1.0)
     expected = SOURCE_ARRAYS[f"{name}.latents"]
     cotangent = jnp.asarray(SOURCE_ARRAYS[f"{name}.cotangent"])
+    final = source_final(schedule, process, times, rescale, SOURCE["label"], SOURCE["guidance_scale"])
     if rescale is None:
-        model = SourceOracle()
-        params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *x_T.shape[1:])), jnp.ones((1,)))
-        denoise = process.denoiser(model, params, {})
-        solver = schedule.solver
-        def run(value):
-            return walk(solver, process, model, value, times)
-        latents = run(x_T)
+        latents = walk(schedule.solver, process, SourceOracle(), x_T, times)
         assert latents.shape == expected.shape
         assert relative_gap(latents, expected) < 1e-4
-        def final(value):
-            return run(value)[-1]
     else:
-        model = ConditionalSourceOracle()
-        rows = x_T.shape[0]
-        params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *x_T.shape[1:])),
-                            jnp.ones((1,)), jnp.ones((1,)))
-        denoise = process.denoiser(model, params, {"label": jnp.full((rows,), SOURCE["label"])},
-                                   {"label": jnp.zeros((rows,))})
-        guidance = CFG(SOURCE["guidance_scale"], rescale=rescale)
-
-        def final(value):
-            return sample(denoise, value, solver=schedule.solver, guidance=guidance,
-                          key=jax.random.PRNGKey(0), times=times, final_denoise=False)
-
         assert relative_gap(final(x_T)[None], expected[-1:]) < 1e-4
     if name == "cfg.epsilon":
         source_gradient_over_orders(final, x_T, cotangent)
+    elif f"{name}.seeds" in SOURCE_SEEDED:
+        seeds = declared_seeds(SOURCE_SEEDS)[name]
+        draw, recorded, truth = indexed_recording(SOURCE_SEEDED, name, seeds)
+        gradient = jax.jit(lambda value, cot: {"grad": jax.vjp(final, value)[1](cot)[0]})
+        assert_as_exact(lambda index, inputs: gradient(inputs["x_T"], inputs["cotangent"]), recorded, draw,
+                        name, seeds=seeds, truth_fn=truth)
     elif f"{name}.x_T" in SOURCE_ROUNDING:
         gradient = jax.jit(lambda value, cot: jax.vjp(final, value)[1](cot)[0])(
             jnp.asarray(SOURCE_ROUNDING[f"{name}.x_T"]), jnp.asarray(SOURCE_ROUNDING[f"{name}.cotangent"]))
@@ -205,7 +208,7 @@ def test_source_grids_walk_repeated_initial_model_times(kind, extra):
     model = SourceOracle()
     denoise = process.denoiser(model, {}, {})
     _, walked = sample(denoise, jnp.asarray(initial), solver=schedule.solver, key=0,
-                       times=times, final_denoise=False, record=lambda x, _: x)
+                       times=times, final_denoise=False, record=lambda x, state, denoised: x)
 
     precision = load("diffusers_wan_reference")
     reference = []

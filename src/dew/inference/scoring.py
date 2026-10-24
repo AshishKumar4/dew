@@ -138,16 +138,17 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
         # Laid out by the task served now, which scores it with its weights, whatever reloads meanwhile.
         served = self._served
         waiting: _Request[Row, Payload, Output, Answer] = _Request(served[0].admit(request), served)
+        with self._ingress:
+            if self._failed is not None:
+                raise RuntimeError("the server stopped after a step failed") from self._failed
+            if waiting.scored.rows:
+                self._queue.append(waiting)
         if not waiting.scored.rows:
             # A request of no rows needs no pass: it is answered as it is admitted.
             waiting.future.set_running_or_notify_cancel()
             waiting.future.admitted = waiting.future.finished = time.perf_counter()
             settled(waiting.future, served[0].answer(waiting.scored.payload, []))
             return waiting.future
-        with self._ingress:
-            if self._failed is not None:
-                raise RuntimeError("the server stopped after a step failed") from self._failed
-            self._queue.append(waiting)
         self.arrived()
         return waiting.future
 

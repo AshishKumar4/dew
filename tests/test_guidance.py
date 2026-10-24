@@ -11,56 +11,48 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from diffusion_support import ConditionalSourceOracle
+from diffusion_support import apg_walked
 from flax import linen as nn
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference
+from reference_error import (
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    declared_seeds,
+    indexed_recording,
+    recording,
+)
 
 from dew.diffusion import (
     DirectPredictionTransform,
     EpsilonPredictionTransform,
     FlowMatchingScheduler,
-    FlowMatchPredictionTransform,
     LinearNoiseScheduler,
     Process,
     expand,
 )
-from dew.sampling import APG, CFG, DDIM, Autoguidance, CFGPlusPlus, Euler, Heun, sample
+from dew.sampling import APG, CFG, DDIM, Autoguidance, CFGPlusPlus, Heun, sample
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "guidance"
+APG_SEEDS = FIXTURES / "apg_seeds.npz"
 
 
 @pytest.mark.parametrize("name", ["plain", "projected", "momentum", "interval"])
 def test_apg_walks_diffusers_adaptive_projected_guidance(name):
     """Momentum, the norm clip and the projection onto the conditional
-    velocity, over a whole Euler walk; `plain` (eta 1, nothing clipped, no
-    momentum) is classifier-free guidance. `interval` guides only the
-    guider's steps [int(start N), int(stop N)) of ten, 2 through 6, which is
+    velocity, over a whole Euler walk, on par with Diffusers' guider over the
+    recorded seeds (check 1); `plain` (eta 1, nothing clipped, no momentum)
+    is classifier-free guidance. `interval` guides only the guider's steps
+    [int(start N), int(stop N)) of ten, 2 through 6, which is
     `interval=(2/10, 6/10)`, the momentum resting on the steps either side.
-
-    Plain guidance has no order-dependent reduction. Its 1024 independent
-    states resolve the RMS error instead: default/AVX/SDE-ICX ratios are
-    1.03/1.11/1.03; disjoint subsets of 128 states range from 0.98 to 1.17.
-    Two states put an AVX subset at 2.18 despite the same computation.
-
-    After the compensated projection, projected ratios over 52 spatial
-    orders range from 1.47 to 1.80 on default/SDE-ICX and 1.33 to 1.67 on
-    AVX, so its single-draw rule keeps a margin at the factor of two.
-    """
-    ensemble = name == "plain"
-    arrays = np.load(FIXTURES / ("apg_ensemble.npz" if ensemble else "apg.npz"))
-    case = json.loads(str(arrays["case"])) if ensemble else json.loads(str(arrays["cases"]))[name]
-    steps = case["steps"]
-    first, after = int(case["start"] * steps), int(case["stop"] * steps)
-    rows = arrays["x_T"].shape[0]
-    process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
-    condition = {"label": jnp.full((rows,), float(arrays["label"]))}
-    denoise = process.denoiser(ConditionalSourceOracle(), {}, condition, {"label": jnp.zeros((rows,))})
-    guidance = APG(case["scale"], eta=case["eta"], norm_threshold=case["norm_threshold"],
-                   momentum=case["momentum"], interval=(first / steps, (after - 1) / steps))
-    walked = sample(denoise, jnp.asarray(arrays["x_T"]), steps + 1, solver=Euler(),
-                    guidance=guidance, key=jax.random.PRNGKey(0), final_denoise=False)
-    prefix = "" if ensemble else f"{name}."
-    assert_as_exact_as_the_reference(walked, arrays[f"{prefix}result32"], arrays[f"{prefix}result"], name)
+    One initial state is a single rounding draw that a pointwise walk's
+    spatial orders do not move (the projected case's ranged 1.47 to 1.80 over
+    52 of them); over the seeds its ratio is 1.25."""
+    stored = recording(APG_SEEDS)
+    case = json.loads(str(stored["cases"]))[name]
+    seeds = declared_seeds(APG_SEEDS)[name]
+    draw, recorded, truth = indexed_recording(stored, name, seeds)
+    walked = jax.jit(lambda x_T: {"walked": apg_walked(case, float(stored["label"]), x_T)})
+    assert_as_exact(lambda index, inputs: walked(inputs["x_T"]), recorded, draw, f"APG {name}", seeds=seeds,
+                    truth_fn=truth)
 
 
 class RawPrediction(nn.Module):

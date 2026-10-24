@@ -94,7 +94,7 @@ def _rope(hf_config: Mapping[str, object], kinds: tuple[str, ...], used: set[str
             refuse(f'rope_parameters.{kind} partial_rotary_factor {factor}',
                    'a fraction of the head in (0, 1]')
         plain[kind], factors[kind] = entry, factor
-    ropes = read_rope({**hf_config, 'rope_parameters': plain or None}, used, None, _SPELLING, ramps=())
+    ropes = read_rope({**hf_config, 'rope_parameters': plain or None}, used, _SPELLING, ramps=())
     return ropes, factors
 
 

@@ -21,6 +21,7 @@ from dew.interop.decoder_parts import (
     FUSED_EXPERTS,
     GEMMA3_MODEL_TYPE,
     MOE_SHARED,
+    PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
     MixtureFields,
@@ -134,7 +135,7 @@ def _gemma_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     :374). Its released config names hidden_act 'gelu', which the reference
     computes as the erf gelu (modeling_gemma.py:93, ACT2FN['gelu']).
     """
-    config = base_config(hf_config, used, scale_after_cast=False, tie_embeddings=True,
+    config = base_config(hf_config, used, rope=PLAIN_SPELLING, scale_after_cast=False, tie_embeddings=True,
                           reads=frozenset({'attention_bias'}))
     config.update(scale_offset=True, embedding_scale=True)
     return config
@@ -167,7 +168,7 @@ def _gemma2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     (configuration_gemma2.py:95-98, modeling_gemma2.py:203-206).
     """
     layer_types = specified_layer_types(hf_config, used, ('sliding_attention', 'full_attention'))
-    config = base_config(hf_config, used, scale_after_cast=False,
+    config = base_config(hf_config, used, rope=PLAIN_SPELLING, scale_after_cast=False,
                           tie_embeddings=True, layer_types=layer_types,
                           reads=frozenset({'layer_types', 'sliding_window', 'attention_bias'}))
     sliding = kinds_of(config).get('sliding_attention', native_fields(LayerKind)())
@@ -189,7 +190,7 @@ the full layers at 1e6 and the sliding ones at rope_local_base_freq or 1e4
 
 
 def _gemma3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    rope = read_rope(hf_config, used, spelling=_GEMMA3_ROPE)
+    rope = read_rope(hf_config, used, _GEMMA3_ROPE)
     config = base_config(hf_config, used, qk_norm=True, scale_after_cast=False, rope=rope,
                           tie_embeddings=True, layer_types=_gemma_layer_types(hf_config, used))
     _gemma_softcaps(hf_config, used, config)
@@ -205,7 +206,7 @@ def _gemma3n_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
     """
     # Gemma3nTextConfig fills every fifth layer full.
     layer_types = specified_layer_types(hf_config, used, ('sliding_attention',) * 4 + ('full_attention',))
-    ropes = read_rope(hf_config, used, spelling=_GEMMA3_ROPE)
+    ropes = read_rope(hf_config, used, _GEMMA3_ROPE)
     config = base_config(hf_config, used, qk_norm=True, scale_after_cast=False,
                           tie_embeddings=True, layer_types=layer_types, rope=ropes)
     layers = records.integer(config.get('num_layers'), 'num_layers')
@@ -337,6 +338,16 @@ def gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
         hf_config.get("hidden_size_per_layer_input", 0), "hidden_size_per_layer_input"
     )
     sharing = _trailing_sharers(hf_config, len(layer_types), 0)
+    kinds = decoder_kinds(
+        layer_types,
+        kinds_of(config).get("sliding_attention", native_fields(LayerKind)()).value.window,
+        rope_local_theta,
+        None,
+        None if full_dim == sliding_dim else full_dim,
+    )
+    if partial is not None and "sliding_attention" in kinds:
+        # Gemma 4's sliding layers turn whole heads; its partial factor is the full layers' alone.
+        kinds["sliding_attention"]["partial_rotary_factor"] = 1.0
     config.update(
         sandwich_norms=True,
         embedding_scale=True,
@@ -344,13 +355,7 @@ def gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
         v_norm=True,
         head_dim=sliding_dim,
         rope_theta=rope_theta,
-        kinds=decoder_kinds(
-            layer_types,
-            kinds_of(config).get("sliding_attention", native_fields(LayerKind)()).value.window,
-            rope_local_theta,
-            None,
-            None if full_dim == sliding_dim else full_dim,
-        ),
+        kinds=kinds,
         partial_rotary_factor=partial,
         # The reference widens only sharing layers. With none, this flag
         # changes neither the weights nor the forward operation.
@@ -574,7 +579,9 @@ GEMMA3N_TEXT = DecoderFamily(
     sandwich_norms=True,
     weight_path=_gemma3n_path,
     preserve_source_layout=True,
-    defaults={'hidden_activation': 'gelu_pytorch_tanh', 'final_logit_softcapping': 30.0},
+    # Gemma3nTextConfig's window, which an omitted sliding_window means.
+    defaults={'hidden_activation': 'gelu_pytorch_tanh', 'final_logit_softcapping': 30.0,
+              'sliding_window': 512},
 )
 
 GEMMA4_TEXT = DecoderFamily(
@@ -605,7 +612,9 @@ GEMMA3_TEXT = DecoderFamily(
     _gemma3_export,
     sandwich_norms=True,
     preserve_source_layout=False,
-    defaults={'hidden_activation': 'gelu_pytorch_tanh', 'query_pre_attn_scalar': 256},
+    # Gemma3TextConfig's defaults for the fields its decoder reads.
+    defaults={'hidden_activation': 'gelu_pytorch_tanh', 'query_pre_attn_scalar': 256,
+              'sliding_window': 4096, 'head_dim': 256, 'max_position_embeddings': 131072},
 )
 
 GEMMA2 = DecoderFamily(
@@ -617,8 +626,10 @@ GEMMA2 = DecoderFamily(
     _gemma2_export,
     sandwich_norms=True,
     preserve_source_layout=False,
+    # Gemma2Config's defaults for the fields its decoder reads.
     defaults={'hidden_activation': 'gelu_pytorch_tanh', 'query_pre_attn_scalar': 256,
-              'final_logit_softcapping': 30.0, 'attn_logit_softcapping': 50.0},
+              'final_logit_softcapping': 30.0, 'attn_logit_softcapping': 50.0, 'sliding_window': 4096,
+              'head_dim': 256, 'max_position_embeddings': 8192},
 )
 
 GEMMA = DecoderFamily(

@@ -101,9 +101,11 @@ async function connect(request: Request, env: Env, id: string): Promise<Response
 	const forwarded = new Request(request.url, request);
 	forwarded.headers.set(SESSION_HEADER, id);
 	const pool = env.POOL.get(env.POOL.idFromName('global'));
-	const image = await pool.image();
+	// A session that already holds a host (a reconnect) keeps it, whatever the pool's free capacity.
+	const held = await pool.allocated(id);
+	const image = held?.image ?? (await pool.image());
 	if (!image) return new Response('queued for a warm model host', { status: 503 });
-	const host = await pool.allocate(id, image);
+	const host = held?.host ?? (await pool.allocate(id, image));
 	const end = await coordinatorOf(env).started(id, Date.now(), image);
 	if (end === null) {
 		await pool.close(id);

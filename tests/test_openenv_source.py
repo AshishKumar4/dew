@@ -109,8 +109,8 @@ def test_an_openenv_episode_draws_each_turn_on_the_exact_context_and_keeps_the_s
     for rollout in rollouts:
         assert (rollout.status, rollout.reward) == (Status.COMPLETED, 0.0)
         first, second = rollout.calls
-        assert (first.prompt_ids, first.sampled_ids) == ((PROMPT,), (6, EOS))
-        assert (second.prompt_ids, second.sampled_ids) == ((PROMPT, 6, EOS, HINT), (10, EOS))
+        assert (first.prompt, first.tokens) == ((PROMPT,), (6, EOS))
+        assert (second.prompt, second.tokens) == ((PROMPT, 6, EOS, HINT), (10, EOS))
         assert (first.reward, second.reward) == (-0.1, 1.0)
         assert (first.transcript, second.transcript) == (Transcript((prompt,)), Transcript((prompt, higher)))
     batch = pack(rollouts, 8, credit="turn")

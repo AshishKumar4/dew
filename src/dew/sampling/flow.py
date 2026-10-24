@@ -202,7 +202,7 @@ class FlowSDE:
                              "guidance carries nothing between steps; APG's momentum does")
         _, (states, log_probs, stochastic) = sample(
             denoise, x_T, steps, solver=self, guidance=guidance, key=key, final_denoise=False,
-            record=lambda following, state: (following, *state))
+            record=lambda following, state, denoised: (following, *state))
         states = jnp.concatenate((x_T[:, None], jnp.swapaxes(states, 0, 1)), axis=1)
         return FlowTrajectory(states, denoise.process.times(steps), log_probs.T, stochastic.T)
 

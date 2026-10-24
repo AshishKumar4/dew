@@ -195,8 +195,14 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split):
     def draw(seed):
         return scan_operands(*SHARDED, documents=True, seed=seed)[0]
 
-    # One float64 program for every seed's truth.
-    exact = jax.jit(through(32, starts, *widened((dy, dfinal))))
+    # One float64 program for every seed's truth: the scan's reference math, which the port chosen below
+    # refuses for float64 operands.
+    wide = through(32, starts, *widened((dy, dfinal)))
+
+    @jax.jit
+    def exact(*operands):
+        with row_names_port(port=False):
+            return wide(*operands)
 
     def spec(rank: int, axes: tuple[int, ...]):
         return PartitionSpec(*(axis if dim in axes else None for dim in range(rank)))

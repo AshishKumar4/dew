@@ -18,7 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.interop.weights import ParamTree, indexed_path, translate_parameters
-from dew.nn.attention import GroupNorm, projected_heads, projected_output, scaled_dot_product_attention
+from dew.nn.attention import GroupNorm, NormalAttention
 from dew.nn.autoencoders.api import check_class
 from dew.nn.conv import Conv
 
@@ -86,29 +86,25 @@ class FlaxAttentionBlock(nn.Module):
     """Attend over an image's pixels as a sequence, with a residual.
 
     One head as wide as the channels, which is what every AutoencoderKL
-    mid-block runs, through the shared attention core
-    (`dew.nn.attention.scaled_dot_product_attention`), which picks the kernel
-    and runs the softmax in fp32. Its logits are scaled by 1/sqrt(channels),
-    the scale diffusers splits over the query and the key: the same function,
-    rounded in another order.
+    mid-block runs, as an ordinary attention (`NormalAttention`) whose
+    projections keep the block's own flat `query/key/value/proj_attn` and
+    share its scope. Its logits are scaled by 1/sqrt(channels), the scale
+    diffusers splits over the query and the key: the same function, rounded
+    in another order.
     """
 
     channels: int
     num_groups: int = 32
     dtype: jnp.dtype = jnp.float32
 
-    @nn.compact
+    def setup(self):
+        self.group_norm = GroupNorm(self.num_groups, dtype=self.dtype)
+        self.attention = NormalAttention(self.channels, 1, self.channels, dtype=self.dtype, flat=True,
+                                         names=("query", "key", "value", "proj_attn"))
+        nn.share_scope(self, self.attention)
+
     def __call__(self, hidden_states):
-        residual = hidden_states
-        batch, height, width, channels = hidden_states.shape
-        hidden_states = GroupNorm(self.num_groups, dtype=self.dtype, name="group_norm")(hidden_states)
-        hidden_states = hidden_states.reshape((batch, height * width, channels))
-        query, key, value = (projected_heads(hidden_states, name, 1, self.channels, flat=True,
-                                             dtype=self.dtype)
-                             for name in ("query", "key", "value"))
-        hidden_states = projected_output(scaled_dot_product_attention(query, key, value), "proj_attn",
-                                         self.channels, flat=True, dtype=self.dtype)
-        return hidden_states.reshape((batch, height, width, channels)) + residual
+        return self.attention(self.group_norm(hidden_states)) + hidden_states
 
 
 class _Level(nn.Module):

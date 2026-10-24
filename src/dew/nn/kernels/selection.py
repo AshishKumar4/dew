@@ -3,12 +3,15 @@ the call (the op's case, the `C` its `Op[C]`, kernels and requirements share, so
 another op's case fails the type check) and what each kernel declares it takes (its `SUPPORTS`, ordered
 `Requirement`s), the one place a kernel's eligibility is written.
 
-The target's measured preference comes first (its row in `generation.TARGETS`, read through
-`measured_kernel`), then the op's own order: the first kernel whose requirements all hold takes the
-call, and the route names the preferred kernel's first failed requirement as its refusal
-(`generation.route`). A kernel the caller forces (`generation.chosen`, or a layer's named
-implementation) that does not take the call raises, listing every requirement it fails, as torch's
-`sdpa_kernel` does; a generic kernel forced so hands the call to the next generic one.
+An op that measures states its preference: the target's measured kernel (its row in
+`generation.TARGETS`, read through `measured_kernel`) comes first, then the op's own order. An op that
+predicts states each kernel's cost instead, and the kernel predicted fastest among those whose
+requirements hold comes first (a template's launches, by their cost model's estimate). The first
+kernel whose requirements all hold takes the call, and the route names the preferred kernel's first
+failed requirement as its refusal (`generation.route`). A kernel the caller forces
+(`generation.chosen`, or a layer's named implementation) that does not take the call raises, listing
+every requirement it fails, as torch's `sdpa_kernel` does; a generic kernel forced so hands the call to
+the next generic one.
 
 Selection reads only the call's static facts and the target's while a program traces: it adds no
 operation to the program, and outside `generation.routes()` it records nothing
@@ -16,6 +19,7 @@ operation to the program, and outside `generation.routes()` it records nothing
 """
 
 import dataclasses
+import math
 from collections.abc import Callable
 
 from . import generation
@@ -53,12 +57,16 @@ class Requirement[C]:
 
 @dataclasses.dataclass(frozen=True)
 class Kernel[C]:
-    """A kernel an op may run: `supports`, its requirements in the order a refusal names them, and
-    whether it is `generic`, a path that takes what the others turn down."""
+    """A kernel an op may run: `supports`, its requirements in the order a refusal names them,
+    whether it is `generic`, a path that takes what the others turn down, and `cost(case)`, the seconds
+    it is predicted to take on the case where it states them (a template launch's estimate at its
+    fastest fitting config; infinite where no measurement qualified it, so it runs only by name). A
+    generic kernel that states a cost is ranked with the others, and stays the path for what none takes."""
 
     name: str
     supports: tuple[Requirement[C], ...]
     generic: bool = False
+    cost: Callable[[C], float] | None = None
 
     def failed(self, case: C, forced: bool = False) -> list[Requirement[C]]:
         """The requirements `case` fails, in order; a `forced` kernel's measured ones hold."""
@@ -69,13 +77,14 @@ class Kernel[C]:
 @dataclasses.dataclass(frozen=True)
 class Op[C]:
     """A family of ops one selector serves: its `choice` (the name `TARGETS` rows, `chosen` and routes
-    use), its `kernels` in the order the selector tries them after the target's preference,
-    `preferred(case)` the kernel the target measured fastest for the case, and `hosted(kernel)` what
-    this host runs for the target's kernel (`generation.gpu_placed`)."""
+    use), its `kernels` in the order the selector tries them after the preferred one, `preferred(case)`
+    the kernel the target measured fastest for the case where the op measures (else its kernels'
+    predicted costs rank them, `select`), and `hosted(kernel)` what this host runs for the target's
+    kernel (`generation.gpu_placed`)."""
 
     choice: str
     kernels: tuple[Kernel[C], ...]
-    preferred: Callable[[C], str]
+    preferred: Callable[[C], str] | None = None
     hosted: Callable[[str], str] = lambda kernel: kernel
 
     def kernel(self, name: str) -> Kernel[C]:
@@ -105,17 +114,33 @@ def forced(choice: str) -> str | None:
 
 def select[C](op: Op[C], case: C, named: str | None = None, *, insist: bool = True) -> Route:
     """The kernel `op` runs for `case` on the target, reported as its route: `named` (or the kernel
-    `chosen` names) where it takes the case, else the target's preference, else the first of the op's
-    kernels that does. A named kernel that does not take the case raises with every requirement it
-    fails, its measured ones aside; a generic one hands a case its handoff requirements turn down to
-    the op's next generic kernel. Without `insist`, `named` is the call's own preference, before
-    `chosen`'s, and one that does not take the case hands it to the op's other kernels, its refusal
-    reported (a norm's or a SiLU product's per-call implementation)."""
+    `chosen` names) where it takes the case, else the op's preference (`preferred`, or the cheapest of
+    its kernels that take the case where each states a cost, the first of the op's order where several
+    tie), else the first of the op's kernels that does. A named kernel that does not take the case
+    raises with every requirement it fails, its measured ones aside; a generic one hands a case its
+    handoff requirements turn down to the op's next generic kernel. Without `insist`, `named` is the
+    call's own preference, before `chosen`'s, and one that does not take the case hands it to the op's
+    other kernels, its refusal reported (a norm's or a SiLU product's per-call implementation)."""
+    kernel, preferred, refusal = _decided(op, case, named, insist)
+    return generation.route(op.choice, kernel=kernel.name, preferred=preferred, refusal=refusal,
+                            ran=op.hosted(kernel.name))
+
+
+def selected[C](op: Op[C], case: C, named: str | None = None, *, insist: bool = True) -> Kernel[C]:
+    """The kernel `select` runs for `case`, reporting nothing: what a caller reads ahead of the dispatch
+    that reports it (the kernel a call that built its mask names, a projection's choice between XLA's
+    program and the GEMM template's launches, which select their own), raising as `select` does."""
+    return _decided(op, case, named, insist)[0]
+
+
+def _decided[C](op: Op[C], case: C, named: str | None,
+                insist: bool) -> tuple[Kernel[C], str, Refusal | None]:
+    """`select`'s kernel for `case`, the kernel preferred and the preferred one's refusal."""
     if named is not None and not insist:
         preferred, insisted = named, None
     else:
         insisted = named or forced(op.choice)
-        preferred = insisted or op.preferred(case)
+        preferred = insisted or _preferred(op, case)
     first = op.kernel(preferred)
     candidates = [first, *(kernel for kernel in op.kernels if kernel is not first
                            and (insisted is None or (first.generic and kernel.generic)))]
@@ -123,11 +148,37 @@ def select[C](op: Op[C], case: C, named: str | None = None, *, insist: bool = Tr
     for kernel in candidates:
         failed = kernel.failed(case, forced=insisted is not None)
         if not failed:
-            return generation.route(op.choice, kernel=kernel.name, preferred=preferred, refusal=refusal,
-                                    ran=op.hosted(kernel.name))
+            return kernel, preferred, refusal
         if kernel is first:
             refusal = failed[0].refusal(case)
             if insisted is not None and any(requirement.kind != 'handoff' for requirement in failed):
                 raise KernelRefused(op.choice, kernel.name,
                                     [requirement.refusal(case) for requirement in failed])
     raise ValueError(f"no {op.choice} kernel takes this call ({refusal})")
+
+
+def _preferred[C](op: Op[C], case: C) -> str:
+    """The kernel `op` prefers for `case`: its measured preference where it states one; else, where each
+    of its non-generic kernels that take the case states a cost (an op migrates to ranking whole), the
+    cheapest of those and of its generic kernels that take the case and state one, among the costs that
+    are finite, the first of the op's order where several tie: a kernel no measurement qualified for the
+    case costs no finite seconds and runs only by name, its case handed to the generic kernels where no
+    other qualifies, refused where none takes it (a lone candidate is estimated not at all, so a target
+    with no cost facts needs none); else the first non-generic kernel that takes it, else the first of
+    them, whose refusal the route then names."""
+    if op.preferred is not None:
+        return op.preferred(case)
+    taking = [kernel for kernel in op.kernels if not kernel.failed(case)]
+    native = [kernel for kernel in taking if not kernel.generic]
+    priced = [kernel for kernel in taking if kernel.cost is not None]
+    if len(priced) > 1 and all(kernel.cost is not None for kernel in native):
+        qualified = [(seconds, kernel) for kernel in priced if kernel.cost is not None
+                     and math.isfinite(seconds := kernel.cost(case))]
+        if qualified:
+            return min(qualified, key=lambda entry: entry[0])[1].name
+        handed = [kernel for kernel in taking if kernel.generic]
+        if not handed:
+            raise ValueError(f"no {op.choice} kernel that takes this call is qualified for it: "
+                             + ", ".join(kernel.name for kernel in priced))
+        return handed[0].name
+    return (native or [kernel for kernel in op.kernels if not kernel.generic] or list(op.kernels))[0].name

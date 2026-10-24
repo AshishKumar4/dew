@@ -306,6 +306,13 @@ def sinks(values: jax.Array, batch: int, queries: int, width: int) -> Initial:
     return Initial(m, jnp.ones_like(m), jnp.zeros((*m.shape, width), wide))
 
 
+def capped(softcap: float, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array) -> jax.Array:
+    """Gemma 2's logit cap, `softcap * tanh(logits / softcap)`, on the scaled logits as `reference_attention`
+    takes it. It is a score hook as `functools.partial(capped, softcap)`, which reads no position."""
+    del q_pos, k_pos
+    return softcap * jnp.tanh(logits / softcap)
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class Hooks:

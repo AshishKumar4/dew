@@ -101,6 +101,24 @@ def test_ssim_matches_the_filtered_equations_of_wang_et_al(rng, data_range):
     assert np.abs(got - expected).max() < 1e-5, f"{got} against {expected}"
 
 
+@pytest.mark.parametrize("dtypes", [(jnp.bfloat16, jnp.bfloat16), (jnp.float16, jnp.float32),
+                                    (jnp.float64, jnp.float32)], ids=["bf16", "fp16-fp32", "fp64-fp32"])
+def test_ssim_scores_a_batch_in_any_float_dtype_as_its_values_in_their_common_dtype(rng, dtypes):
+    """Predictions and targets in any floats score as the same values in their common dtype, at
+    least float32: a bfloat16 batch as its values in float32, a float64 one beside float32 targets
+    in float64."""
+    key_x, key_noise = jax.random.split(rng)
+    with jax.enable_x64(jnp.float64 in dtypes):
+        x = _ramp_image((2, 32, 32, 3), key_x)
+        y = x + 0.2 * jax.random.normal(key_noise, x.shape)
+        x, y = x.astype(dtypes[0]), y.astype(dtypes[1])
+        common = jnp.promote_types(jnp.result_type(x, y), jnp.float32)
+        got = ssim(x, y, data_range=2.0, per_example=True)
+        held = ssim(x.astype(common), y.astype(common), data_range=2.0, per_example=True)
+        assert got.dtype == common
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(held))
+
+
 @pytest.mark.parametrize("metric_fn", [psnr, ssim], ids=['psnr', 'ssim'])
 def test_video_scores_equal_the_flattened_frame_batch(rng, metric_fn):
     """(B, T, H, W, C) scores the same as the (B*T, H, W, C) frames do."""

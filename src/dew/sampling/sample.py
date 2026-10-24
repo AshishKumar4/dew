@@ -43,7 +43,7 @@ def sample[StateT, RecordT](
     times: ArrayLike | Sequence[float] | None = None,
     initial: StateT | None = None,
     final_denoise: bool = True,
-    record: Callable[[jax.Array, StateT], RecordT],
+    record: Callable[[jax.Array, StateT, jax.Array], RecordT],
 ) -> tuple[jax.Array, RecordT]: ...
 
 
@@ -58,7 +58,7 @@ def sample[StateT, RecordT](
     times: ArrayLike | Sequence[float] | None = None,
     initial: StateT | None = None,
     final_denoise: bool = True,
-    record: Callable[[jax.Array, StateT], RecordT] | None = None,
+    record: Callable[[jax.Array, StateT, jax.Array], RecordT] | None = None,
 ) -> jax.Array | tuple[jax.Array, RecordT]:
     """Run the reverse process from `x_T` with `solver` and return the final sample.
 
@@ -80,10 +80,12 @@ def sample[StateT, RecordT](
     that it built on the host from the concrete grid (`solver.init`), whose
     checks and tables need the grid's values.
 
-    `record` reads each step's new state and the solver's state after it,
-    and the sample comes back with those readings stacked over the steps,
-    `(sample, records)`; Flow-GRPO records each transition and its density
-    this way (`FlowSDE.trajectory`). A record needs at least one step.
+    `record` reads each step's new state, the solver's state after it and
+    the clean prediction the step took, and the sample comes back with those
+    readings stacked over the steps, `(sample, records)`; Flow-GRPO records
+    each transition and its density this way (`FlowSDE.trajectory`), and a
+    figure of the walk each step's clean prediction. A record needs at least
+    one step.
 
     `denoise` is `process.denoiser(...)`, which holds the process the solver
     reads, and `guidance` wraps it. Every step's noise comes from `key`
@@ -137,7 +139,7 @@ def sample[StateT, RecordT](
         with jax.ensure_compile_time_eval():
             initial = solver.init(x_T, times, process, key=key)
 
-    def scanned[ReadT](read: Callable[[jax.Array, StateT], ReadT]) -> tuple[jax.Array, ReadT]:
+    def scanned[ReadT](read: Callable[[jax.Array, StateT, jax.Array], ReadT]) -> tuple[jax.Array, ReadT]:
         """The sample, and `read` of every step stacked over the steps."""
         def body(carry, inputs):
             x, state, guided = carry
@@ -148,7 +150,7 @@ def sample[StateT, RecordT](
             (denoised, eps), guided = stepping.step(x, t, index, guided)
             x, state = _stepped(solver, key, index)(x, t, t_next, denoised, eps, state,
                                                     process=process, denoise=stepping.at(guided, index))
-            return (x, state, guided), read(x, state)
+            return (x, state, guided), read(x, state, denoised)
 
         (x, _, walked), readings = lax.scan(
             body, (x_T, initial, guided),
@@ -158,7 +160,7 @@ def sample[StateT, RecordT](
         return x, readings
 
     if record is None:
-        return scanned(lambda x, state: None)[0]
+        return scanned(lambda x, state, denoised: None)[0]
     return scanned(record)
 
 
