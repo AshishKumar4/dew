@@ -1120,14 +1120,15 @@ def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, mon
         "    import named\n"
         "    assert named.VALUE == 1\n")
     (tmp_path / "tools/named.py").write_text("VALUE = 1\n")
-    git("add", "-A")
+    git("add", "tests/test_named.py", "tools/named.py")
     git("commit", "-qm", "a test imports a tool by its name")
     rows = armada_task(ci, monkeypatch, tmp_path / ".verdict/verdict.json", ci.policy(base))
     assert [row["exitCode"] for row in rows] == [0, 0, 0]
     (tmp_path / "tools/named").mkdir()
     (tmp_path / "tools/named/__init__.py").write_text("VALUE = 2\n")
-    git("add", "-A")
+    git("add", "tools/named/__init__.py")
     git("commit", "-qm", "a package shadows the tool")
+    assert ci.policy(base) == "on"
     rows = armada_task(ci, monkeypatch, tmp_path / ".verdict/verdict.json", ci.policy(base))
     assert {row["name"]: row["exitCode"] for row in rows}["3.12:tests/test_named.py"] == 1
 
