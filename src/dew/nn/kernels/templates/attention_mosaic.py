@@ -29,6 +29,7 @@ from typing import NamedTuple
 import jax
 import jax.extend.core as jax_core
 import jax.numpy as jnp
+import numpy as np
 import tokamax
 from jax import lax
 from jax.experimental import pallas as pl
@@ -142,9 +143,23 @@ def _stages(steps: int, staged) -> tuple[int, ...]:
     return tuple(counts)
 
 
+MBARRIER_BYTES = 8
+"""The shared memory an mbarrier takes (PTX ISA, "Size and alignment of mbarrier object": 8 bytes), which a
+program's barriers take beside its arrays (`_staged`)."""
+
+
 def _staged(allocations) -> int:
-    """The shared memory `allocations` take, `(shape, dtype)` each, every one from an `ALIGNMENT` boundary."""
-    return sum(whole(math.prod(shape) * jnp.dtype(dtype).itemsize, ALIGNMENT) for shape, dtype in allocations)
+    """The shared memory a program's `allocations` take, as `Family.scoped` takes them (`plgpu.SMEM` arrays
+    and `plgpu.Barrier`s, its streams' allocations among them, nested in sequences and mappings): every
+    array from an `ALIGNMENT` boundary, then every barrier, `MBARRIER_BYTES` each, as JAX's Pallas Mosaic
+    GPU lowering lays a kernel's arrays out and its barriers after them."""
+    arrays = barriers = 0
+    for allocation in jax.tree.leaves(allocations):
+        if isinstance(allocation, plgpu.Barrier):
+            barriers += int(np.prod(allocation.num_barriers))
+        else:
+            arrays += whole(math.prod(allocation.shape) * jnp.dtype(allocation.dtype).itemsize, ALIGNMENT)
+    return arrays + MBARRIER_BYTES * barriers
 
 
 def _registers(family: mosaic.Family, carried, *phases) -> int:
@@ -160,29 +175,23 @@ def _registers(family: mosaic.Family, carried, *phases) -> int:
     return (words(carried) + max(map(words, phases), default=0)) // mosaic.THREADS + family.held_registers
 
 
-def _streams(blocks: dict, stages: int):
-    """`Family.streams`' allocations as a ring family stages them: `stages` slots of each block."""
-    return [((stages, *shape), dtype) for shape, dtype in blocks.values()]
-
-
-def _forward_blocks(tiles: Tiles, width: int, value_width: int, dtype) -> dict:
-    """The forward's streams' blocks: a key tile and its value tile."""
-    return {"keys": ((tiles.block_k, width), dtype), "values": ((tiles.block_k, value_width), dtype)}
-
-
-def _forward_staging(tiles: Tiles, width: int, value_width: int, dtype, residuals: bool) -> list:
-    """The forward program's shared memory beside its streams, `(shape, dtype)` each in `_launch`'s order:
-    its consumers' query stages and their rows' status; each one's output stage where the value is not as
-    wide as the query (the output stores through the query's stage where it is); in a training forward its
-    anchor keys' and split sums' stages (`_Residuals`)."""
-    consumers = tiles.consumers
-    staging = [((consumers, tiles.block_q, width), dtype), ((consumers, tiles.block_q), jnp.float32)]
+def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_width: int, dtype,
+                         residuals: bool, stages: int) -> tuple[list, dict]:
+    """The forward program's allocations as `Family.scoped` takes them, in `_launch`'s order: its consumers'
+    query stages and their rows' status; each one's output stage where the value is not as wide as the query
+    (the output stores through the query's stage where it is); in a training forward its anchor keys' and
+    split sums' stages (`_Residuals`); the query loads' barriers and the consumers' turns' barrier; and its
+    key and value streams in `stages` slots (`Family.streams`)."""
+    consumers, block_q, block_k = tiles.consumers, tiles.block_q, tiles.block_k
+    scoped = [plgpu.SMEM((consumers, block_q, width), dtype), plgpu.SMEM((consumers, block_q), jnp.float32)]
     if value_width != width:
-        staging.append(((consumers, tiles.block_q, value_width), dtype))
+        scoped.append(plgpu.SMEM((consumers, block_q, value_width), dtype))
     if residuals:
-        staging += [((consumers, tiles.block_q), jnp.int32),
-                    ((consumers, tiles.block_q, value_width), jnp.float32)]
-    return staging
+        scoped += [plgpu.SMEM((consumers, block_q), jnp.int32),
+                   plgpu.SMEM((consumers, block_q, value_width), jnp.float32)]
+    scoped += [plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_arrivals=consumers)]
+    blocks = {"keys": ((block_k, width), dtype), "values": ((block_k, value_width), dtype)}
+    return scoped, family.streams(blocks, stages, consumers)
 
 
 def _walked(causal: bool, consumers: int, block_q: int, block_k: int, programs: int,
@@ -317,16 +326,14 @@ class MosaicForward(_Mainloop[Tiles]):
         return tuple(configs)
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
-        """The program's shared memory (`_forward_staging`) and its streams' slots, each allocation from an
-        `ALIGNMENT` boundary, at the call's widths as the launch stages them (`_width`)."""
+        """The program's shared memory (`_forward_allocations`, `_staged`), at the call's widths as the launch
+        stages them (`_width`)."""
         family = BUNDLES[config.family]
         query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
         width, value_width = (_width(array.shape[-1], family, query.dtype) for array in (query, value))
         steps = _padded(query.shape[1], key.shape[1], config)[1] // config.block_k
-        blocks = _forward_blocks(config, width, value_width, query.dtype)
-        residuals = bool(ba.arguments.get("residuals"))
-        staging = _forward_staging(config, width, value_width, query.dtype, residuals)
-        return _staged([*staging, *_streams(blocks, min(config.stages, steps))])
+        return _staged(_forward_allocations(family, config, width, value_width, query.dtype,
+                                            bool(ba.arguments.get("residuals")), min(config.stages, steps)))
 
     def registers(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
         family = BUNDLES[config.family]
@@ -1031,9 +1038,11 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     program = _Program(family, tiles, steps, min(tiles.stages, steps), spec.keys, spec.form == "causal",
                        spec.queries)
     # The output stores through the query's stage where the two are as wide (its rows are read before the
-    # store); else it takes a stage of its own beside the query's and the rings (`_forward_staging`).
+    # store); else it takes a stage of its own beside the query's and the rings (`_forward_allocations`).
     reuse = value.shape[-1] == width
-    staging = _forward_staging(tiles, width, value.shape[-1], query.dtype, training)
+    scoped, rings = _forward_allocations(family, tiles, width, value.shape[-1], query.dtype, training,
+                                         program.stages)
+    arrays = len(scoped) - 2
 
     def body(q_ref, k_ref, v_ref, *refs, streams):
         read, refs = refs[:len(leaves)], refs[len(leaves):]
@@ -1041,7 +1050,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
         trained: tuple = ()
         if training:
             trained, refs = refs[:3], refs[3:]
-        (q_smem, row_smem, *stages), (q_loaded, schedule) = refs[:len(staging)], refs[len(staging):]
+        (q_smem, row_smem, *stages), (q_loaded, schedule) = refs[:arrays], refs[arrays:]
         out_smem, stages = (q_smem, stages) if reuse else (stages[0], stages[1:])
         spans_of, hooked_of, guard_of = treedef.unflatten(read)
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
@@ -1080,15 +1089,11 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
 
         family.roles(consumers, consumer, producer)
 
-    blocks = _forward_blocks(tiles, width, value.shape[-1], query.dtype)
     # The arrays the programs read beside the operands.
     leaves, treedef = jax.tree.flatten((spans, hooked, guard))
 
     def entry(*refs):
-        family.scoped(
-            functools.partial(body, *refs), *(plgpu.SMEM(shape, dtype) for shape, dtype in staging),
-            plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_arrivals=consumers),
-            streams=family.streams(blocks, program.stages, consumers))
+        family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
 
     out_type = (jax.ShapeDtypeStruct((batch, queries, heads, value.shape[-1]), query.dtype),
                 jax.ShapeDtypeStruct((2, batch, heads, queries), jnp.float32))
@@ -1109,36 +1114,38 @@ def _parts(accurate: bool, dtype) -> int:
     return len(jax.eval_shape(lambda c: algebra.cotangent_parts(c, dtype, accurate=accurate), tile))
 
 
-def _dq_blocks(config: BackwardTiles, width: int, value_width: int, dtype) -> dict:
-    """The dQ launch's streams' blocks: a key tile and its value tile."""
-    return {"keys": ((config.block_k, width), dtype), "values": ((config.block_k, value_width), dtype)}
-
-
-def _dq_staging(config: BackwardTiles, width: int, value_width: int, dtype) -> list:
-    """The dQ program's shared memory beside its streams, `(shape, dtype)` each in `_dq_launch`'s order: its
-    consumers' query and output-cotangent stages, their dQ output stage (fp32) and their rows' stage."""
-    consumers, block_q = config.consumers, config.block_q
-    return [((consumers, block_q, width), dtype), ((consumers, block_q, value_width), dtype),
-            ((consumers, block_q, width), jnp.float32), ((consumers, block_q), jnp.float32)]
-
-
-def _dkv_blocks(config: BackwardTiles, width: int, value_width: int, dtype) -> dict:
-    """The dK/dV launch's streams' blocks: a query tile and its output cotangents."""
-    return {"queries": ((config.block_q, width), dtype), "douts": ((config.block_q, value_width), dtype)}
-
-
-def _dkv_staging(config: BackwardTiles, width: int, value_width: int, dtype, *, parts: int,
-                 column_scratch: int) -> list:
-    """The dK/dV program's shared memory beside its streams, `(shape, dtype)` each in `_dkv_launch`'s order:
-    its consumers' resident keys and values; a tile's weights and score cotangents' `parts` staged for the
-    transposed products (`algebra.value_operands`, `algebra.cotangent_parts`); dK's and dV's output stage,
-    which a fused launch's dQ tiles take too (fp32); and each consumer's scratch for the key gradients' sums
-    across its warps (`Family.column_sums`)."""
+def _dq_allocations(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype,
+                    stages: int) -> tuple[list, dict]:
+    """The dQ program's allocations as `Family.scoped` takes them, in `_dq_launch`'s order: its consumers'
+    query and output-cotangent stages, their dQ output stage (fp32) and their rows' stage, the two loads'
+    barriers, and its key and value streams in `stages` slots (`Family.streams`)."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
-    return [((consumers, block_k, width), dtype), ((consumers, block_k, value_width), dtype),
-            ((consumers, 1 + parts, block_q, block_k), dtype),
-            ((consumers, max(block_q, block_k), width), jnp.float32),
-            ((consumers, column_scratch), jnp.float32)]
+    scoped = [plgpu.SMEM((consumers, block_q, width), dtype),
+              plgpu.SMEM((consumers, block_q, value_width), dtype),
+              plgpu.SMEM((consumers, block_q, width), jnp.float32),
+              plgpu.SMEM((consumers, block_q), jnp.float32),
+              plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_barriers=consumers)]
+    blocks = {"keys": ((block_k, width), dtype), "values": ((block_k, value_width), dtype)}
+    return scoped, family.streams(blocks, stages, consumers)
+
+
+def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype, *,
+                     parts: int, stages: int) -> tuple[list, dict]:
+    """The dK/dV program's allocations as `Family.scoped` takes them, in `_dkv_launch`'s order: its
+    consumers' resident keys and values; a tile's weights and score cotangents' `parts` staged for the
+    transposed products (`algebra.value_operands`, `algebra.cotangent_parts`); dK's and dV's output stage,
+    which a fused launch's dQ tiles take too (fp32); each consumer's scratch for the key gradients' sums
+    across its warps (`Family.column_sums`); the two loads' barriers; and its query and output-cotangent
+    streams in `stages` slots (`Family.streams`)."""
+    consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
+    scoped = [plgpu.SMEM((consumers, block_k, width), dtype),
+              plgpu.SMEM((consumers, block_k, value_width), dtype),
+              plgpu.SMEM((consumers, 1 + parts, block_q, block_k), dtype),
+              plgpu.SMEM((consumers, max(block_q, block_k), width), jnp.float32),
+              plgpu.SMEM((consumers, family.column_scratch), jnp.float32),
+              plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_barriers=consumers)]
+    blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, value_width), dtype)}
+    return scoped, family.streams(blocks, stages, consumers)
 
 
 def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype, *,
@@ -1213,23 +1220,20 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles,
                      target: generation.GpuTarget) -> int:
-        """The larger of its launches' programs' shared memory (`_dq_staging`, `_dkv_staging`) and their
-        streams' slots, each allocation from an `ALIGNMENT` boundary; a fused backward's dK/dV program's
-        alone."""
+        """The larger of its launches' programs' shared memory (`_dq_allocations`, `_dkv_allocations`,
+        `_staged`); a fused backward's dK/dV program's alone."""
         family = BUNDLES[config.family]
         query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
         dtype = query.dtype
         width, value_width = (_width(array.shape[-1], family, dtype) for array in (query, value))
         padded_q, padded_k = _padded(query.shape[1], key.shape[1], config)
-        dkv = _staged([*_dkv_staging(config, width, value_width, dtype, parts=_parts(self.accurate, dtype),
-                                     column_scratch=family.column_scratch),
-                       *_streams(_dkv_blocks(config, width, value_width, dtype),
-                                 min(config.stages, padded_q // config.block_q))])
+        dkv = _staged(_dkv_allocations(family, config, width, value_width, dtype,
+                                       parts=_parts(self.accurate, dtype),
+                                       stages=min(config.stages, padded_q // config.block_q)))
         if config.fused:
             return dkv
-        dq = _staged([*_dq_staging(config, width, value_width, dtype),
-                      *_streams(_dq_blocks(config, width, value_width, dtype),
-                                min(config.stages, padded_k // config.block_k))])
+        dq = _staged(_dq_allocations(family, config, width, value_width, dtype,
+                                     min(config.stages, padded_k // config.block_k)))
         return max(dq, dkv)
 
     def registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int:
@@ -1531,15 +1535,10 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, s
 
         family.roles(consumers, consumer, producer)
 
-    blocks = _dq_blocks(program.tiles, width, value_width, query.dtype)
+    scoped, rings = _dq_allocations(family, program.tiles, width, value_width, query.dtype, program.stages)
 
     def entry(*refs):
-        family.scoped(
-            functools.partial(body, *refs),
-            *(plgpu.SMEM(shape, dtype) for shape, dtype in _dq_staging(program.tiles, width, value_width,
-                                                                       query.dtype)),
-            plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_barriers=consumers),
-            streams=family.streams(blocks, program.stages, consumers))
+        family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
 
     sums = jax.ShapeDtypeStruct((batch, queries, heads, width), jnp.float32)
     stats_shape = jax.ShapeDtypeStruct((rows_count, batch, heads, queries), jnp.float32)
@@ -1712,15 +1711,11 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
 
         family.roles(consumers, consumer, producer)
 
-    blocks = _dkv_blocks(program.tiles, width, value_width, query.dtype)
-    staging = _dkv_staging(program.tiles, width, value_width, query.dtype,
-                           parts=_parts(walk.accurate, query.dtype), column_scratch=family.column_scratch)
+    scoped, rings = _dkv_allocations(family, program.tiles, width, value_width, query.dtype,
+                                     parts=_parts(walk.accurate, query.dtype), stages=stages)
 
     def entry(*refs):
-        family.scoped(
-            functools.partial(body, *refs), *(plgpu.SMEM(shape, dtype) for shape, dtype in staging),
-            plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_barriers=consumers),
-            streams=family.streams(blocks, stages, consumers))
+        family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
 
     gradient = jax.ShapeDtypeStruct((batch, keys_padded, heads, width), jnp.float32)
     grad_shapes = {Kind.KEY: jax.ShapeDtypeStruct((batch, heads, keys_padded), jnp.float32),
