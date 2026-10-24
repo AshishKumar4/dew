@@ -9,12 +9,12 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.attention import GroupNorm, LayerNorm, NormalAttention
+from dew.nn.attention import BasicTransformerBlock, GroupNorm
 from dew.nn.blocks import ResidualBlock, sinusoidal_time
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, projection_flops
-from dew.nn.mlp import GatedMLP, geglu_feed_forward
+from dew.nn.mlp import GatedMLP
 from dew.nn.precision import at_least_fp32, float32_dot_general
 
 from .spatial import SpatialCount, SpatialForward, SpatialShape
@@ -61,40 +61,6 @@ class _TimeMLP(nn.Module):
         return mlp(x)
 
 
-class _Transformer(nn.Module):
-    """Run one transformer block: self-attention, cross-attention, feed-forward.
-
-    Each sublayer is pre-normed and added back as a residual. Under
-    `stage.cross_only` the first attention reads `context` too, which is
-    what the SD checkpoints with no self-attention hold.
-    """
-
-    stage: UNetStage
-    dropout: float
-    dtype: Dtype
-    precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
-    approximate_gelu: bool = True
-
-    @nn.compact
-    def __call__(self, x, context, *, train=False):
-        def norm(name):
-            return LayerNorm(epsilon=1e-5, dtype=self.dtype, name=name)
-        def attention(name, x, context):
-            # The SD checkpoints hold no query, key or value bias.
-            attended = NormalAttention(
-                self.stage.features, self.stage.heads, self.stage.features // self.stage.heads, self.dtype,
-                self.precision, qkv_bias=False, attention_impl=self.attention_impl, name=name)(x, context)
-            return nn.Dropout(self.dropout)(attended, deterministic=not train) if self.dropout else attended
-
-        x = x + attention("self_attention", norm("self_norm")(x), context if self.stage.cross_only else None)
-        x = x + attention("cross_attention", norm("cross_norm")(x), context)
-        x = x + geglu_feed_forward(self.stage.features, approximate=self.approximate_gelu, dtype=self.dtype,
-                                   precision=self.precision, dropout_rate=self.dropout,
-                                   name="feed_forward")(norm("ff_norm")(x), train=train)
-        return nn.Dropout(self.dropout)(x, deterministic=not train) if self.dropout else x
-
-
 class _SpatialAttention(nn.Module):
     """Flatten an image to tokens, run `stage.depth` transformers, fold it back.
 
@@ -117,12 +83,11 @@ class _SpatialAttention(nn.Module):
     def cross_flops(self, lengths, context_lengths, text_features: int) -> float:
         """Spatial input/output maps and every configured transformer sublayer."""
         width = self.stage.features
-        attention = NormalAttention(width, self.stage.heads, width // self.stage.heads, parent=None)
-        crossed = attention.cross_flops(lengths, context_lengths, text_features)
-        first = crossed if self.stage.cross_only else attention.model_flops(lengths)
-        feedforward = geglu_feed_forward(width, parent=None).model_flops(lengths)
+        first = "context" if self.stage.cross_only else "self"
+        heads = self.stage.heads
+        block = BasicTransformerBlock(width, heads, width // heads, first_attention=first, parent=None)
         return (2 * projection_flops(lengths, width, width)
-                + self.stage.depth * (first + crossed + feedforward))
+                + self.stage.depth * block.cross_flops(lengths, context_lengths, text_features))
 
     @nn.compact
     def __call__(self, x, context, *, train=False):
@@ -137,9 +102,14 @@ class _SpatialAttention(nn.Module):
             x = Conv(channels, (1, 1), padding="VALID", dtype=self.dtype,
                      precision=self.precision, name="input")(x).reshape(batch, height * width, channels)
         for index in range(self.stage.depth):
-            x = _Transformer(self.stage, self.dropout, self.dtype, self.precision,
-                             self.attention_impl, approximate_gelu=self.approximate_gelu,
-                             name=f"layer_{index}")(x, context, train=train)
+            # Affine layer norms at 1e-5, no query, key or value bias, and under `stage.cross_only`
+            # a first attention that reads the text too: what the SD checkpoints hold.
+            x = BasicTransformerBlock(
+                self.stage.features, self.stage.heads, self.stage.features // self.stage.heads, self.dtype,
+                self.precision, qkv_bias=False,
+                first_attention="context" if self.stage.cross_only else "self", norm="layer",
+                norm_epsilon=1e-5, dropout_rate=self.dropout, approximate_gelu=self.approximate_gelu,
+                attention_impl=self.attention_impl, name=f"layer_{index}")(x, context, train=train)
         if self.linear_projection:
             x = Dense(channels, dtype=self.dtype, precision=self.precision, name="output",
                       dot_general=float32_dot_general)(x)
