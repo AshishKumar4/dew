@@ -36,11 +36,10 @@ from flax.linen.dtypes import promote_dtype
 from flax.typing import Dtype, PrecisionLike
 
 from .attention import LayerNorm, causal_attention_mask, kernel_for_materialized_mask
-from .inputs import PLAIN_CALL, MixerCall, PredictionPhase, coordinates_of, valid_order
+from .inputs import MixerCall, PredictionPhase, coordinates_of, valid_order
 from .mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
 from .mla import INDEXER, IndexerFront, MultiHeadLatentAttention, latent_refusals, open_latent_cache
 from .precision import at_least_fp32, float32_einsum
-from .sharding import down_projection
 from .sparse_selection import selection_mask, top_k_selection
 
 
@@ -251,8 +250,8 @@ class KPoolSparseAttention(MultiHeadLatentAttention):
             kpool=self.index_kpool, always_select_tail=self.index_kpool_always_select_tail,
             dtype=self.dtype, precision=self.precision, name=INDEXER)
 
-    @nn.compact
-    def __call__(self, x, call: MixerCall = PLAIN_CALL, prediction_phase: PredictionPhase = "ordinary"):
+    def _attend_projected(self, x, call: MixerCall, query, q_resid, latent, rot,
+                          prediction_phase: PredictionPhase):
         # No rope: the slot positions order the keys and nothing rotates.
         decode, attention_metadata = call.decode, call.metadata
         batch, length, _ = x.shape
@@ -266,10 +265,7 @@ class KPoolSparseAttention(MultiHeadLatentAttention):
             if valid.shape != (batch, length):
                 raise ValueError(f"row validity must be {(batch, length)}, got {valid.shape}")
         row_valid = jnp.ones((batch, length), bool) if valid is None else valid
-        # The latent attention's own projections, with no rope head.
-        place = down_projection(x, (self.q_lora_rank or 0) + self.kv_lora_rank)
-        query, q_resid = self._queries(x, place)
-        key, value = self._expand(*self._latents(x, place))
+        key, value = self._expand(latent, rot)
         packed = self.indexer.packed(x, row_valid)
         implementation = self.attention_impl
         if decode:
