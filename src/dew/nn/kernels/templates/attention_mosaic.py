@@ -134,6 +134,8 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     (its forward, or with `backward` its backward) at `tile`'s queries by keys, or None: its legality rule,
     which `forward` and `backward` refuse by and the route's chooser and the stability suite read."""
     hooks = Hooks() if hooks is None else hooks
+    if hooks.drop is not None:
+        return "the Mosaic mainloops take no probability dropout (the route runs a dropping call on Triton)"
     sixteen = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
     if backward and hooks != Hooks():
         return "the Mosaic backward takes no hooks yet"
