@@ -63,10 +63,13 @@ def test_a_resident_frozen_kernel_packs_in_a_sharded_program():
     mesh = Mesh(np.asarray(jax.devices()[:2]), ("model",))
     placed = jax.device_put(matrix, NamedSharding(mesh, P("model", None)))
     actual = jax.jit(frozen_fp8_leaves)(placed)
+    hosted = frozen_fp8_leaves(matrix)
+    assert all(isinstance(leaf, np.ndarray) for leaf in hosted.values())
     forward, forward_scale = quantize_fp8_blocks(matrix.T, (1, matrix.shape[0]))
     backward, backward_scale = quantize_fp8_blocks(matrix, (1, matrix.shape[1]))
     for key, expected in zip(FROZEN_FP8, (forward, forward_scale, backward, backward_scale), strict=True):
         np.testing.assert_array_equal(np.asarray(actual[key]), expected)
+        np.testing.assert_array_equal(hosted[key], expected)
 
 
 def decoder(**overrides):
