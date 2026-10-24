@@ -12,6 +12,7 @@ from jax.typing import DTypeLike
 
 from dew.nn.dense import Dense, DenseGeneral
 
+from . import activations
 from .attention import GroupNorm, RMSNorm
 from .conv import Conv
 from .flops import projection_flops
@@ -92,7 +93,7 @@ def modulation(conditioning, features: int, pieces: int, *, name: str, silu: boo
     return Dense(pieces * features, use_bias=bias, dtype=dtype, precision=precision, name=name,
                  kernel_init=nn.initializers.zeros if zero_init else nn.initializers.lecun_normal(),
                  dot_general=float32_dot_general)(
-        nn.silu(conditioning) if silu else conditioning)
+        activations.silu(conditioning) if silu else conditioning)
 
 
 class Modulation(nn.Module):

@@ -200,8 +200,10 @@ def channels_last(array) -> np.ndarray:
 def posterior_of(moments) -> tuple[jax.Array, jax.Array]:
     """The posterior's mean and standard deviation, split from an encoder's stacked moments as
     Diffusers' `DiagonalGaussianDistribution` splits them."""
-    mean, log_variance = jnp.split(moments, 2, axis=-1)
-    return mean, jnp.exp(0.5 * jnp.clip(log_variance, -30.0, 20.0))
+    from dew.nn.autoencoders.kl import posterior_moments
+
+    mean, log_variance = posterior_moments(moments)
+    return mean, jnp.exp(0.5 * log_variance)
 
 
 def assert_coder_vjps(loaded, reference, operand: str, posterior, bound: float) -> None:
