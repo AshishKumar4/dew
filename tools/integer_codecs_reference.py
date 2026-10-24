@@ -36,11 +36,9 @@ for gptqmodel's pack extension. Run from the checkout:
 """
 
 import copy
-import importlib.util
+import importlib
 import os
 import re
-import sys
-import types
 from pathlib import Path
 
 import gptqmodel
@@ -50,8 +48,8 @@ from gptqmodel.nn_modules.qlinear import PackableQuantLinear
 from gptqmodel.nn_modules.qlinear.torch import TorchLinear
 from gptqmodel.quantization.config import QuantizeConfig
 from gptqmodel.utils.model import convert_gptq_v1_to_v2_format_module, convert_gptq_v2_to_v1_format_module
+from reference_source import package, published_files, saved_fixture
 from safetensors.numpy import load_file
-from reference_source import CACHE as UPSTREAM, saved_fixture, verified
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "codecs" / "integer.npz"
@@ -63,31 +61,17 @@ AWQ_FILES = {
     "awq/utils/packing_utils.py": "65eab3eabe3f55e300ffbab5feac59c49322d985f42dcda4e2288859fb9a4abe",
     "awq/modules/linear/gemm.py": "a3ff4f116e01cfaa905440af4606c61089c788bf0dad7442314e0ad074843cf2",
 }
-CACHE = UPSTREAM / "AutoAWQ" / AWQ_COMMIT
 PROJECTION = re.compile(r"(q|k|v|o|gate|up|down)_proj\.weight$")
 
 
 def autoawq():
-    """AutoAWQ's gemm modules at `AWQ_COMMIT`, under empty package modules."""
-    for package in ("awq", "awq.utils", "awq.modules", "awq.modules.linear"):
-        module = types.ModuleType(package)
-        module.__path__ = []
-        sys.modules[package] = module
-    loaded = {}
-    for path, digest in AWQ_FILES.items():
-        local = verified(f"https://raw.githubusercontent.com/{AWQ_REPO}/{AWQ_COMMIT}/{path}",
-                         CACHE / path, digest)
-        name = path.removesuffix(".py").replace("/", ".")
-        spec = importlib.util.spec_from_file_location(name, local)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-        loaded[name] = module
-    gemm = loaded["awq.modules.linear.gemm"]
+    """AutoAWQ's gemm modules at `AWQ_COMMIT`, under an empty package."""
+    package("awq", published_files(AWQ_REPO, AWQ_COMMIT, AWQ_FILES) / "awq")
+    gemm = importlib.import_module("awq.modules.linear.gemm")
     if gemm.awq_ext is not None or gemm.TRITON_AVAILABLE:
         raise RuntimeError("AutoAWQ found its CUDA or triton kernels; the fixture records its torch "
                            "path only")
-    return loaded["awq.utils.packing_utils"], gemm
+    return importlib.import_module("awq.utils.packing_utils"), gemm
 
 
 def grid(rng, out: int, groups: int, bits: int, *, sym: bool):

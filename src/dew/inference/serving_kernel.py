@@ -22,7 +22,7 @@ from jax.sharding import Mesh, NamedSharding
 
 from dew.inference.tasks import cache_sized
 from dew.nn.cross_attention import CROSS_KEY, CROSS_VALUE
-from dew.nn.inputs import Admitted, ModelInputs
+from dew.nn.inputs import Admitted, ModelInputs, default_placement
 from dew.nn.kernels.options import compiler_options
 from dew.nn.kernels.tuning import tune
 from dew.nn.kv_cache import POOLED, ROW_CURSORS, TABLE, as_words, from_words, grouped, is_paged, leaf_name
@@ -33,7 +33,7 @@ from dew.objectives.base import Variables
 from dew.sampling import decoding
 from dew.sampling.decoding import LogitsTransform, StepState
 from dew.sampling.guided import Grammar
-from dew.sampling.strategies import DecoderState, draw
+from dew.sampling.strategies import DecoderState, row_step
 from dew.sampling.text import decode_ops, prefill_state
 
 
@@ -298,18 +298,16 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
                                                                 state.decoder.logits))
     view = StepState(state.tokens, state.valid, state.step, state.active,
                      jax.random.wrap_key_data(state.keys), prompt_width=capacity, budget=state.budget)
-    chain = decoding.chain(transforms)
-    token, behavior, raw = draw(view, decoder.logits,
-                                chain if grammar is None else grammar.guiding(chain, state.automaton))
-    committed = view.commit(token, state.active)
-    finished = decoding.finish(stopping)(committed, token)
+    drew = row_step(view, decoder.logits, decoding.chain(transforms), decoding.finish(stopping),
+                    None if grammar is None else (grammar, state.automaton))
     drawn = state.active
-    stopped = drawn & finished.done
+    stopped = drawn & drew.finished.done
+    committed = drew.committed
+    # A row stops at its own budget here, where `Sample` scans one budget for every row.
     return (Slots(decoder, committed.tokens, committed.valid, committed.step, state.budget,
                   drawn & ~stopped & (committed.step < state.budget), state.keys,
-                  state.automaton if grammar is None else grammar.advanced(state.automaton, token, drawn)),
-            Draws(token, drawn, stopped, drawn & finished.ended, jnp.where(drawn, behavior, 0.0),
-                  jnp.where(drawn, raw, 0.0)))
+                  state.automaton if drew.automaton is None else drew.automaton),
+            Draws(drew.token, drawn, stopped, drawn & drew.finished.ended, drew.behavior, drew.raw))
 
 
 def _mixed_step(model: nn.Module, params: Variables, pad_id: int, placement: Placement, decoder: DecoderState,
@@ -438,7 +436,7 @@ def state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
     values keep theirs. `state` is abstract: only its shapes are read.
     """
     if mesh is None:
-        device = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+        device = default_placement()
         return jax.tree.map(lambda _: device, state)
     paged = is_paged(state.decoder.cache)
 

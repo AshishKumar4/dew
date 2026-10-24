@@ -231,11 +231,14 @@ def test_sequence_bias_matches_the_reference_over_mixed_lengths():
            prompts, drawn, tolerance=1e-6)
 
 
-def test_bad_words_ban_sequences_and_keep_the_eos_reachable():
+@pytest.mark.parametrize("eos", [(4,), [4], range(4, 5), np.array([4]), np.int64(4)],
+                         ids=["tuple", "list", "range", "array", "numpy-int"])
+def test_bad_words_ban_sequences_and_keep_the_eos_reachable(eos):
+    """The EOS ids are any sequence of ids or one id, a tokenizer's arrays among them."""
     words = [[9], [1, 3], [4]]
     prompts = [[3, 3, 9, 1], [7, 2, 5, 2, 7]]
     drawn = [[1], [5]]
-    agrees(decoding.bad_words(words, eos_token_ids=(4,)),
+    agrees(decoding.bad_words(words, eos_token_ids=eos),
            NoBadWordsLogitsProcessor(words, eos_token_id=torch.tensor([4])), prompts, drawn)
 
 

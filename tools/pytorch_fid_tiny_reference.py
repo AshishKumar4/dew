@@ -23,20 +23,18 @@ Run with the Dew test environment's torch and torchvision, on CPU:
     python tools/pytorch_fid_tiny_reference.py OUTPUT.npz
 """
 
-import importlib.util
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 import torchvision
+from reference_source import github, loaded, saved_fixture
 from torchvision.models import inception as torchvision_inception
-from reference_source import CACHE as UPSTREAM, saved_fixture, verified
 
 REPO, COMMIT = "mseitzer/pytorch-fid", "0a754fb8e66021700478fd365b79c2eaa316e31b"
 PATH = "src/pytorch_fid/inception.py"
 DIGEST = "5c5af6e5f71dfdad17d85c3b87b6751c0cc515ca8e389ae90211573e520abf17"
-CACHE = UPSTREAM / "pytorch-fid" / COMMIT
 DIVISOR = 16
 SIZES = (64, 320)
 BATCH = 2
@@ -53,11 +51,7 @@ class NarrowConv2d(torchvision_inception.BasicConv2d):
 
 def pytorch_fid():
     """pytorch-fid's inception module at `COMMIT`."""
-    local = verified(f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/{PATH}", CACHE / PATH, DIGEST)
-    spec = importlib.util.spec_from_file_location("pytorch_fid_inception", local)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return loaded("pytorch_fid_inception", github(REPO, COMMIT, PATH, DIGEST))
 
 
 def build():

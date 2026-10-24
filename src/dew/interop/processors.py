@@ -35,6 +35,7 @@ class ProcessorCall(TypedDict, total=False):
     padding: bool
     truncation: bool
     return_tensors: str | None
+    add_special_tokens: bool
     audio: Media
     videos: Media
     video_metadata: Sequence[Mapping[str, object]]
@@ -60,14 +61,12 @@ def hosts(reference: PreTrainedTokenizerBase) -> TypeGuard[HostProcessor]:
                for name in ("__call__", "save_pretrained", "apply_chat_template", "batch_decode"))
 
 
-def _media_token_ids(record: Mapping[str, object], config: Mapping[str, object], *,
-                     qwen: bool, gemma: bool) -> tuple[int, int | None]:
-    """Read the source's image/video placeholder IDs before aligning features."""
-    image_id = record.get("image_token_id", config.get("image_token_id"))
+def _media_token_ids(record: Mapping[str, object]) -> tuple[int, int | None]:
+    """The source's image and video placeholder IDs, as its wrapper record reads them
+    (`hf_decoders.translate_wrapper_config`), before aligning features."""
+    image_id, video_id = record.get("image_token_id"), record.get("video_token_id")
     if type(image_id) is not int:
         raise ValueError("image_token_id must be an integer")
-    video_id = (config.get("video_token_id", 258884) if gemma else
-                config.get("video_token_id") if qwen else None)
     if video_id is not None and type(video_id) is not int:
         raise ValueError("video_token_id must be an integer")
     return image_id, video_id
@@ -224,6 +223,14 @@ class Processor:
         options = {"backend": "pil"} if self.config.get("model_type") == "gemma3" else {}
         return AutoProcessor.from_pretrained(str(self.directory), local_files_only=True, **options)
 
+    def host_media(self, text: str | Sequence[str], *, images: Media) -> dict[str, np.ndarray]:
+        """The source's fields for `text` and `images` as host arrays in their own dtypes, before Dew
+        aligns them to model rows: asked of the processor in the tensor type it computes in
+        (`_media_tensors`), and read as `_from_arrays` reads them, a bfloat16 field widened to
+        float32."""
+        return self._host_arrays(self.media(text=text if isinstance(text, str) else list(text), images=images,
+                                            return_tensors=self._media_tensors))
+
     def media(self, *, images: Media | None = None,
               **kwargs: Unpack[ProcessorCall]) -> Mapping[str, object]:
         """Return the source's media fields before Dew aligns them to model rows."""
@@ -305,6 +312,10 @@ class Processor:
         return "pt" if any(isinstance(part, TorchvisionBackend) for part in parts) else "np"
 
     def _from_arrays(self, values: Mapping[str, object]) -> ModelInputs:
+        """A media processor's fields as model inputs, read on the host (`_host_arrays`)."""
+        return self.from_hf(self._host_arrays(values))
+
+    def _host_arrays(self, values: Mapping[str, object]) -> dict[str, np.ndarray]:
         """A media processor's fields on the host, in their own dtypes: NumPy arrays as they are, and
         the tensors of a processor that computes in PyTorch (`_media_tensors`) read by PyTorch, which
         that processor installs, a bfloat16 one (Llama 4's pixels) widened to float32, which is exact.
@@ -323,7 +334,7 @@ class Processor:
                 raise TypeError(f"{type(self._media_reference).__name__} returned {name!r} as "
                                 f"{type(value).__name__}, which is no tensor")
             arrays[name] = (value.float() if value.dtype == torch.bfloat16 else value).numpy()
-        return self.from_hf(arrays)
+        return arrays
 
     def from_hf(self, values: Mapping[str, object]) -> ModelInputs:
         """Check a processor's raw outputs and turn them into `ModelInputs` for the device.
@@ -406,7 +417,7 @@ class Processor:
         """
         qwen = self.config.get("model_type") in QWEN35_TYPES
         gemma = self.config.get("model_type") == "gemma4"
-        image_id, video_id = _media_token_ids(self.record, self.config, qwen=qwen, gemma=gemma)
+        image_id, video_id = _media_token_ids(self.record)
         pixels = np.asarray(values.get("pixel_values", values.get("pixel_values_videos")))
         if pixels.ndim not in (2, 3, 4) or not np.issubdtype(pixels.dtype, np.floating):
             raise ValueError("pixel_values must contain floating image tensors or patch vectors")
@@ -590,7 +601,7 @@ class Processor:
                     pieces.append((pixels[offset:offset + frames * count],
                                    (frames, int(height), int(width))))
                     offset += frames * count
-            token_id = self.config[token_name]
+            token_id = self.record.get(token_name)
             if type(token_id) is not int:
                 raise ValueError(f"{token_name} must be an integer")
             streams[token_id] = pieces
@@ -647,6 +658,17 @@ class Processor:
     def bos_id(self) -> int | None:
         """The id the source's tokenizer starts a sequence with, or None."""
         return _row_start(self.reference)
+
+    def encode(self, text: str, *, specials: bool) -> list[int]:
+        """`text`'s ids from the source's tokenizer: with the special tokens its encoding adds around
+        a sequence where `specials` (a BOS it opens with, an EOS it closes with, as T5's does), and
+        none otherwise."""
+        values = self.reference(text=[text], add_special_tokens=specials, padding=False, truncation=False,
+                                return_tensors=None)
+        rows = values["input_ids"]
+        if not isinstance(rows, Sequence) or len(rows) != 1 or not isinstance(rows[0], Sequence):
+            raise TypeError(f"{type(self.reference).__name__} returned no one row of input ids for one text")
+        return [int(token) for token in rows[0]]
 
     def save_pretrained(self, directory: str | Path) -> None:
         """Save the tokenizer and the source's unchanged media processor files."""
