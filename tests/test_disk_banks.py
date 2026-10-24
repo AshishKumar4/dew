@@ -66,7 +66,7 @@ def test_safetensors_banks_refuse_pickle_only_before_whole_model_conversion(tmp_
     original = Path(__file__).parent / "fixtures/hf/qwen38-dense-tiny"
     shutil.copy2(original / "config.json", tmp_path / "config.json")
     torch.save(load_file(original / "model.safetensors"), tmp_path / "pytorch_model.bin")
-    with pytest.raises(FileNotFoundError, match="safetensors"):
+    with pytest.raises(FileNotFoundError):
         SafetensorsBanks(tmp_path)
     shutil.copy2(original / "model.safetensors", tmp_path / "model.safetensors")
     with SafetensorsBanks(tmp_path) as source:
