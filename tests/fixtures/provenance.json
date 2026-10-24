@@ -976,17 +976,6 @@
    ],
    "note": "Transformers delegates to the fetched kernel's numerics_details.mxfp.downcast_to_mxfp_torch CPU path."
   },
-  "guidance/apg_seeds.npz": {
-   "tool": "tools/guidance_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/diffusers",
-     "version": "5ff8e59ff9fe81c6e2df4fb4c6ea0d97a5df5ab2",
-     "runs": "fetched"
-    }
-   ],
-   "note": "The apg-seeds mode fetches and executes Diffusers' published AdaptiveProjectedGuidance guider (BaseGuidance.__init__/set_state, prepare_inputs, forward, _is_apg_enabled, normalized_guidance, MomentumBuffer) without importing diffusers, over each APG case's recorded seeds (tools/recorded_references.py's record_case): a seed's initial state and its float32 and float64 Euler walks. Its batching helper and output container are stand-ins."
-  },
   "guidance/apg_projection.npz": {
    "tool": "tools/guidance_reference.py",
    "sources": [
@@ -997,6 +986,17 @@
     }
    ],
    "note": "The apg-projection mode executes the published AdaptiveProjectedGuidance over 1024 pairs of nearly parallel raw predictions (torch seed 29), at ordinary, 1e30 and 1e-20 scales and with branches of different scales, without a norm clip, in float32 and float64. This isolates the projection's precision, exponent range and norm floor from model, norm-clip and Euler rounding."
+  },
+  "guidance/apg_seeds.npz": {
+   "tool": "tools/guidance_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "5ff8e59ff9fe81c6e2df4fb4c6ea0d97a5df5ab2",
+     "runs": "fetched"
+    }
+   ],
+   "note": "The apg-seeds mode fetches and executes Diffusers' published AdaptiveProjectedGuidance guider (BaseGuidance.__init__/set_state, prepare_inputs, forward, _is_apg_enabled, normalized_guidance, MomentumBuffer) without importing diffusers, over each APG case's recorded seeds (tools/recorded_references.py's record_case): a seed's initial state and its float32 and float64 Euler walks. Its batching helper and output container are stand-ins."
   },
   "guidance/autoguidance.npz": {
    "tool": "tools/guidance_reference.py",
