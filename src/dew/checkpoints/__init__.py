@@ -55,7 +55,6 @@ import datetime
 import hashlib
 import json
 import math
-import os
 from collections.abc import Callable, Mapping, Sequence
 from types import TracebackType
 from typing import TYPE_CHECKING, Literal, Protocol, overload, runtime_checkable
@@ -70,7 +69,7 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy as preserva
 
 from dew import position, records
 from dew.cleanup import attempted
-from dew.coordination import broadcast_from_process_zero, from_every_process
+from dew.coordination import broadcast_from_process_zero, from_every_process, seen_by_every_process
 from dew.files import write_atomically
 from dew.hashing import fmix32
 from dew.nn import sharding
@@ -410,15 +409,7 @@ def _check_shared(directory: str) -> None:
     """
     if jax.process_count() == 1 or is_uri(directory):
         return
-    marker = epath.Path(directory) / f".shared-{broadcast_from_process_zero(os.urandom(8).hex())}"
-    if jax.process_index() == 0:
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text("")
-    from_every_process(None)  # process 0 has written it
-    seen = from_every_process(marker.exists())
-    if jax.process_index() == 0:
-        marker.unlink()
-    blind = [index for index, saw in enumerate(seen) if not saw]
+    blind = [index for index, saw in enumerate(seen_by_every_process(directory)) if not saw]
     if blind:
         raise ValueError(
             f"The checkpoint directory {directory} is not shared: process(es) {blind} of "
