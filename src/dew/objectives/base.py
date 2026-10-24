@@ -887,9 +887,21 @@ class Objective(ABC, Generic[Loss, Effects]):
         return self.variables
 
     counts_tokens: bool = False
-    """Whether the objective supplies real token lengths (`real_lengths`), for throughput telemetry
-    and a run whose length is its tokens (`Trainer.fit(tokens=)`); an objective over another's
-    batches, a distillation's, counts as that one does."""
+    """Whether the objective counts the targets its loss scores (`scored_tokens`), for a run whose
+    length is its tokens (`Trainer.fit(tokens=)`) and its tokens a second; an objective over
+    another's batches, a distillation's, counts as that one does."""
+
+    def scored_tokens(self, batch: Batch) -> np.ndarray:
+        """Each row's tokens the loss scores, read before device placement: what a token budget
+        commits. By default every real input, each row's `real_lengths` summed; an objective that
+        scores fewer, a language model its shifted targets, counts those. The FLOP count reads the
+        inputs (`real_lengths`)."""
+        from dew.data.dataset import rows_of
+
+        rows = rows_of(batch)
+        return np.asarray([np.sum(self.real_lengths(jax.tree.map(
+            lambda leaf, index=index: leaf[index:index + 1] if np.ndim(leaf) and np.shape(leaf)[0] == rows
+            else leaf, batch))) for index in range(rows)], np.int64)
 
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """Real row (or packed-segment) lengths, read before device placement.

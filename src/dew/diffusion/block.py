@@ -32,6 +32,8 @@ from dew.nn.inputs import (
     next_position,
     prompt_major,
     real_slots,
+    token_id,
+    token_ids,
 )
 from dew.nn.kernels.options import compiler_options
 from dew.nn.protocols import BlockDenoiser
@@ -322,9 +324,11 @@ def _validated(model: nn.Module, process: BlockProcess, inputs: ModelInputs, max
         raise ValueError("n must be a positive integer number of continuations")
     if process.vocab_size != model.vocab_size or process.canvas_length != model.canvas_length:
         raise ValueError("BlockProcess geometry must match the loaded model")
-    if not 0 <= pad_token_id < process.vocab_size:
+    # Ids by the one law every parser of them reads; the vocabulary bounds them here.
+    if token_id(pad_token_id, where="pad_token_id") >= process.vocab_size:
         raise ValueError("pad_token_id is outside the vocabulary")
-    if any(not 0 <= token < process.vocab_size for token in eos_token_ids):
+    if any(token >= process.vocab_size for token in (token_ids(eos_token_ids, where="eos_token_ids")
+                                                       if eos_token_ids else ())):
         raise ValueError("eos_token_ids contain an id outside the vocabulary")
     _, prompt_length = inputs.tokens.shape
     if prompt_length == 0:
