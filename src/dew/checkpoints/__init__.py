@@ -983,8 +983,9 @@ class Checkpoints:
         without opening it or writing to it, as `latest` reads it: what a process beside the one
         that trains (an evaluation worker) reads as the run saves, a save in flight listed once it
         commits. `kept` is this process's own view, its retained steps and their metadata."""
-        found = ocp.step.standard_name_format().find_all(self.directory)
-        return sorted(step.step for step in found if self._complete(step.step))
+        # The name format lists finalized steps alone (a GCS step once its commit marker is written), so
+        # nothing here opens the store or reads what this process cached of it.
+        return sorted(found.step for found in ocp.step.standard_name_format().find_all(self.directory))
 
     def kept(self) -> list[Kept]:
         """Return the committed retained steps, oldest first; their immutable metadata is cached.
