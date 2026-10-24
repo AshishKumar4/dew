@@ -21,12 +21,13 @@ from __future__ import annotations
 import dataclasses
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated
 
 import jax
 
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig
 from dew.data.compile import fitted
+from dew.data.dataset import record_argument
 from dew.data.text import HFTokenizer
 from dew.decision.head import DecisionHead, JointSchemaHead
 from dew.decision.laya import LAYA, LayaCheckpoint
@@ -114,7 +115,7 @@ class DecisionRunConfig(RunConfig):
     (a hundred options, or a document's many hypotheses) fits under a `max_len`
     set for it without lengthening every other row's state. None lets the
     state fill the row."""
-    segments: tuple[Segment, ...] | None = None
+    segments: Annotated[tuple[Segment, ...], record_argument(tuple[Segment, ...])] | None = None
     """A joint row's user turn, its parts in order (`JointLayout.segments`): the schema first, or
     read as the row's context through `context_layers` (`Schema(stream="context")`), its
     `context_length` holding the whole schema. None keeps the layout's own, the release's turn."""

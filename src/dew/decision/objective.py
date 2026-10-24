@@ -358,11 +358,14 @@ def packing(layout: Layout, bounds: Bounds, context_length: int | None = None) -
                 segments=bounds.segments, along=along)
 
 
-def _rows(batch: Batch) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Each packed row's tokens, questions and options, window by window."""
+def _rows(batch: Batch, spans_in_context: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Each packed row's tokens, questions and options, window by window: a question the row its span
+    starts in, or, where the spans are the context's (`DecisionInputs.spans_in_context`), the window's
+    one row."""
     segments = np.asarray(batch["segments"])
-    owners = np.where(batch["questions"],
-                      np.take_along_axis(segments, np.asarray(batch["spans"])[..., 0], axis=1), 0)
+    starts = np.asarray(batch["spans"])[..., 0]
+    owners = (np.asarray(batch["questions"], segments.dtype) if spans_in_context else
+              np.where(batch["questions"], np.take_along_axis(segments, starts, axis=1), 0))
     options = np.sum(np.asarray(batch["options"], bool), axis=-1)
     counted = []
     for window, owner, option in zip(segments, owners, options, strict=True):
@@ -454,7 +457,7 @@ class DecisionObjective(Objective[Ratio]):
 
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """Each packed row's own length, not its window's."""
-        return _rows(batch)[0]
+        return _rows(batch, self.schema_in_context)[0]
 
     def model_flops(self, model, batch: Batch) -> float:
         """One backbone pass, its cross-attention over each row's context where rows carry one
@@ -493,7 +496,10 @@ class DecisionObjective(Objective[Ratio]):
             raise MissingFlopsCount("DecisionObjective needs its image tower's multi-sequence geometry")
         if not isinstance(model.head, CountedDecisions):
             raise MissingFlopsCount(f"{type(model.head).__name__} has no declared decision_flops")
-        return model.head.decision_flops(*_rows(batch))
+        # Spans in the context pool over its tokens, not the row's.
+        pooled = self._context_lengths(batch)
+        return model.head.decision_flops(*_rows(batch, self.schema_in_context),
+                                         **({} if pooled is None else {"pooled": pooled}))
 
     def training_flops(self, model, batch: Batch) -> float:
         """The backbone's frozen and trainable work, then three passes of the trained cross-attention

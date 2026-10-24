@@ -116,8 +116,10 @@ class DecisionHead(Head):
     attention_impl: str = "auto"
 
     @nn.nowrap
-    def decision_flops(self, lengths, questions, options) -> float:
-        """Full-row encoder layers and the scorer at real option markers."""
+    def decision_flops(self, lengths, questions, options, *, pooled=None) -> float:
+        """Full-row encoder layers and the scorer at real option markers; it pools no spans."""
+        if pooled is not None:
+            raise TypeError("Laya's head scores options at their markers in the row, and pools no context")
         decision_geometry(lengths, questions, options)
         per_layer = (12 * projection_flops(lengths, self.features, self.features)
                      + attention_flops(lengths, 1, self.features, self.features, causal=False))
@@ -325,8 +327,9 @@ class JointSchemaHead(Head):
     width_field: ClassVar[str] = "hidden_size"
 
     @nn.nowrap
-    def decision_flops(self, lengths, questions, options) -> float:
-        """Memory/option projections, evidence O-by-L and field Q-by-L attention.
+    def decision_flops(self, lengths, questions, options, *, pooled=None) -> float:
+        """Memory/option projections, evidence O-by-L and field Q-by-L attention, and the span
+        pooling over each row, or over `pooled` tokens a row where the spans are a context's.
 
         Each attention has query/output maps on its queries and key/value
         maps on memory. The field layers also have Q-by-Q self-attention.
@@ -346,7 +349,8 @@ class JointSchemaHead(Head):
                   + 4 * width * self.feedforward * np.sum(question))
         scorer = (8 * width * width + 2 * width) * np.sum(option)
         summaries = (6 * width + 2 * hidden) * np.sum(option)
-        pooling = 2 * hidden * np.sum(length * (question + 2 * option))
+        spanned = length if pooled is None else real_lengths(pooled)
+        pooling = 2 * hidden * np.sum(spanned * (question + 2 * option))
         return float(count + pooling + self.routing_layers * evidence
                      + self.layers * fields + scorer + summaries)
 
