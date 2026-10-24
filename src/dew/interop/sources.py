@@ -99,6 +99,17 @@ class SourceReference:
         """Resolve a component file against the pinned snapshot root, not its folder name."""
         return repo_file(self.name, root, (Path(self.subfolder or "") / filename).as_posix())
 
+    def optional_file(self, root: Path, filename: str) -> Path | None:
+        """A file, or proven absence at the pinned source. An offline Hub lookup raises rather than
+        treating an uncached file as absent and initializing replacement parameters."""
+        selected = (Path(self.subfolder or "") / filename).as_posix()
+        if os.path.isdir(self.name):
+            path = root / selected
+            return path if os.path.lexists(path) else None
+        from huggingface_hub import file_exists
+
+        return self.file(root, filename) if file_exists(self.name, selected, revision=root.name) else None
+
     def weights(self, root: Path, components: tuple[str, ...] = ("",)) -> Path:
         """The pinned root with exactly the requested component weights present."""
         requested = tuple((Path(self.subfolder or "") / part).as_posix() for part in components)

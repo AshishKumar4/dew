@@ -1255,6 +1255,7 @@ def _part_type(member: type, field: str, value: Configured) -> type | None:
 # Each kind's aliases, for the command line and the records a person writes.
 source_kinds: Aliases[type[SourceKind], SourceKind] = Aliases("source", {
     "decision": "dew.decision.sources:DecisionSource",
+    "slot": "dew.decision.slot_source:SlotSource",
 }, base="dew.interop.composite:SourceKind")
 
 

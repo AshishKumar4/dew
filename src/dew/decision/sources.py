@@ -32,7 +32,8 @@ from .task import Decide, DecideSettings
 class DecisionHeadSource(HeadComponent):
     """The head constructor reads the native backbone's output width and compute dtype."""
 
-    def build(self, backbone: Pretrained | None, dtype: str, attention_impl: str) -> Head:
+    def build(self, backbone: Pretrained | None, dtype: str, attention_impl: str, *,
+              shapes: Mapping[str, tuple[int, ...]] | None) -> Head:
         held = records.record(self.record, "head")
         fields = records.record(held["fields"], "head.fields")
         if backbone is None:
@@ -67,7 +68,12 @@ class PretrainedDecision(Pretrained):
     def save(self, directory: str | Path, *, variables: Mapping[str, object] | None = None,
              max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
         bundle = self if variables is None else dataclasses.replace(self, variables=dict(variables))
-        Decide.of(bundle).save_pretrained(directory, max_shard_size=max_shard_size)
+        if self.head.reads_labels:
+            from .slot_source import SlotSource
+
+            SlotSource.save(bundle, directory, max_shard_size=max_shard_size)
+        else:
+            Decide.of(bundle).save_pretrained(directory, max_shard_size=max_shard_size)
 
     @classmethod
     def from_components(cls, backbone: Pretrained, head: Head, head_variables: Variables,

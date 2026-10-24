@@ -128,6 +128,28 @@ def test_an_eager_and_a_streamed_binding_bind_aliases_alike(copy):
 
 
 @pytest.mark.mesh
+def test_a_mesh_resident_leaf_can_change_its_sharding_before_host_transport():
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    from dew.training.host import place_leaf
+
+    mesh = Mesh(np.asarray(jax.devices()[:2]), ("fsdp",))
+    values = np.arange(8 * 12, dtype=np.float32).reshape(8, 12)
+    current = place_leaf(values, NamedSharding(mesh, PartitionSpec("fsdp")))
+    for spec in (PartitionSpec(), PartitionSpec(None, "fsdp"), PartitionSpec("fsdp")):
+        target = NamedSharding(mesh, spec)
+        current = place_leaf(current, target)
+        assert current.sharding == target
+        np.testing.assert_array_equal(current, values)
+    host = NamedSharding(mesh, PartitionSpec("fsdp"), memory_kind="pinned_host")
+    held = place_leaf(current, host)
+    assert held.sharding == host
+    np.testing.assert_array_equal(held, values)
+    returned = place_leaf(held, current.sharding)
+    np.testing.assert_array_equal(returned, values)
+
+
+@pytest.mark.mesh
 def test_a_host_source_is_placed_holding_one_device_shard_at_a_time():
     """Each shard a `HostSource` reads is on its device before the next is
     read, so the host never holds two of a leaf's shards; a placement that
