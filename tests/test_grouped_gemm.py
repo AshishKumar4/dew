@@ -240,6 +240,12 @@ def test_cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
     assert ran == {"CutlassGmm", "CutlassTgmm"}
 
 
+def ragged_draw(seed):
+    """The ragged sizes' rows, matrices and cotangent in bf16, at a seed (`operands`)."""
+    x, w, dy, _ = operands(SIZES["ragged"], jnp.bfloat16, seed)
+    return tuple(jnp.asarray(value, jnp.bfloat16) for value in (x, w, dy))
+
+
 UNSEEN = {
     "ampere-class": generation.GpuTarget("sm80", "Unmeasured Ampere-class GPU", shared_limit=99 * 1024,
                                          multiprocessors=46, clock_hz=1.4e9, memory_bandwidth=0.45e12),
@@ -293,8 +299,6 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
     sizes = SIZES["ragged"]
     group_sizes = jnp.asarray(sizes, jnp.int32)
 
-    def draw(seed):
-        return tuple(jnp.asarray(value, jnp.bfloat16) for value in operands(sizes, jnp.bfloat16, seed)[:3])
 
     def held(w):
         # Where the family runs no kernel gradient, the matrix is frozen: the template forms no gradient
@@ -312,7 +316,7 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
 
     # Eagerly: the Mosaic interpreter's ordered callbacks are not a jitted `linear_call`'s to carry.
     with tuning.seen() as launches:
-        assert_as_exact(through_mosaic, jax.jit(with_gradients(projection())), draw,
+        assert_as_exact(through_mosaic, jax.jit(with_gradients(projection())), ragged_draw,
                         f"unseen {unseen}", seeds=SEEDS, truth_fn=with_gradients(projection(jnp.float64)))
     mosaic = [(launch, ba) for launch, ba in launches if isinstance(launch, grouped_matmul._Mosaic)]
     assert {type(launch).__name__ for launch, _ in mosaic} == launched
@@ -328,8 +332,6 @@ def test_a_frozen_matrix_forms_no_kernel_gradient():
     sizes = SIZES["ragged"]
     group_sizes = jnp.asarray(sizes, jnp.int32)
 
-    def draw(seed):
-        return tuple(jnp.asarray(value, jnp.bfloat16) for value in operands(sizes, jnp.bfloat16, seed)[:3])
 
     def frozen(product):
         return lambda x, w: product(x, jax.lax.stop_gradient(w))
@@ -344,7 +346,7 @@ def test_a_frozen_matrix_forms_no_kernel_gradient():
 
     # Eagerly: the Mosaic interpreter's ordered callbacks are not a jitted `linear_call`'s to carry.
     with tuning.seen() as launches:
-        assert_as_exact(through_mosaic, jax.jit(with_gradients(projection())), draw, "frozen matrix",
+        assert_as_exact(through_mosaic, jax.jit(with_gradients(projection())), ragged_draw, "frozen matrix",
                         seeds=SEEDS, truth_fn=with_gradients(projection(jnp.float64)))
     assert {type(launch).__name__ for launch, _ in launches} == {"MosaicGmm"}
 
