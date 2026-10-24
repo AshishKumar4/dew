@@ -28,6 +28,7 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import PartitionSpec as P
 
 from dew.nn.attention import FORWARD_MODE, repeat_kv_heads
@@ -36,7 +37,8 @@ from dew.nn.precision import at_least_fp32, l2norm
 from dew.nn.sharding import grouped_heads, manual_map, rows_like
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
-from .generation import Refusal, first_refusal, measured_kernel, ran_kernel, refused, route, triton_runs
+from .generation import INHERENT, measured_kernel, triton_runs
+from .selection import Kernel, Op, Requirement, select
 from .ssd import ssd_chunk_scan, ssd_kernel_platform
 
 CHUNK_SIZE = 64
@@ -467,11 +469,10 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     token, in at least fp32. The recurrence between them runs on the port of fla's kernels
     (`fla_rule`) for the delta rule with a decay where `ported` (the caller's route, `on_the_port`,
     decided here where None); without the delta rule, a rated decay (Mamba2's SSD) runs on the port
-    of mamba_ssm's kernels where it takes the call (`ssd_port_refusal`), or on a TPU's Pallas scan
-    where its tiling covers the geometry (`ssd_kernel_platform`), unless `ported` is False; else the
-    portable math
-    (`chunk_delta_rule`, in `chunk_size` chunks, the delta rule's no longer than `held_chunk`, which a
-    port's need not match). Packed documents
+    of mamba_ssm's kernels where it takes the call, or on a TPU's Pallas scan where its tiling covers
+    the geometry (`SCAN`), unless `ported` is False; else the portable math (`chunk_delta_rule`, in
+    `chunk_size` chunks, the delta rule's no longer than `held_chunk`, which a port's need not match).
+    Packed documents
     (`starts`, at most `max_segments` a row) each compute as they would alone. A conv runs before the
     op: it takes the conv's output. The operands the hooks read are checked as the decode step's
     (`recurrence.read`), and a rated decay is taken on its declared domain, a contraction."""
@@ -519,41 +520,59 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     return recurrence.normed(hooks, out, given, work).astype(dtype), final
 
 
-def port_refusal(query, key, value) -> Refusal | None:
-    """Why a rule over these operands runs the portable math rather than the
-    port (`fla_rule`) on a target whose row names the port, or None where the
-    port takes it: every shape, dtype, chunk size and mesh, except
-    inside `jax.jvp`'s traces (`FORWARD_MODE`), which the port's custom VJP
-    gives no tangent; inside a caller's `shard_map` that checks varying axes
-    over operands that vary, where a Pallas call, which states no varying
-    type for its results, cannot run; float64 operands, whose rule is the
-    reference math itself; and keys wider than the port takes in their
-    dtype. Packed documents take the port at any bound: it stores the
-    memories by where they pass, as many as the tokens' chunks, a row's and
-    one, whatever the bound (`chunked_launch.Sequences`)."""
-    widest = fla_gdn.WIDEST_KEYS if jnp.result_type(query, key, value).itemsize == 2 else fla_gdn.WIDEST
-    return refused(
-        (not FORWARD_MODE.get(), 'forward_mode',
-         "forward_mode_attention traces for jax.jvp, which the port's custom VJP gives no tangent"),
-        (not jax.typeof(value).mat.varying, 'varying',
-         "a shard_map that checks varying axes holds the operands, and a Pallas call states no "
-         "varying type for its results"),
-        (all(jnp.dtype(x.dtype) != jnp.float64 for x in (query, key, value)), 'float64',
-         "float64 operands, whose rule is the reference math itself"),
-        (key.shape[-1] <= widest, 'key_width',
-         f"keys {key.shape[-1]} wide; the port takes at most {widest} in "
-         f"{jnp.result_type(query, key, value).name}"),
-    )
+@dataclasses.dataclass(frozen=True)
+class PortCase:
+    """A delta rule's call as the port's selector reads it (`GATED_DELTA`): whether it is traced for
+    reverse mode alone (`reverse`; `FORWARD_MODE` marks `jax.jvp`'s traces), whether a caller's
+    `shard_map` that checks varying axes holds operands that vary (`varying`), the operands' common
+    `dtype` and the keys' width (`key_width`)."""
+
+    reverse: bool
+    varying: bool
+    dtype: np.dtype
+    key_width: int
+
+    @property
+    def widest(self) -> int:
+        """The widest keys the port takes in the call's dtype."""
+        return fla_gdn.WIDEST_KEYS if self.dtype.itemsize == 2 else fla_gdn.WIDEST
+
+
+_VARYING = ("a shard_map that checks varying axes holds the operands, and a Pallas call states no varying "
+            "type for its results")
+
+PORT_SUPPORTS: tuple[Requirement[PortCase], ...] = (
+    Requirement('forward_mode', lambda case: case.reverse,
+                "forward_mode_attention traces for jax.jvp, which the port's custom VJP gives no tangent",
+                row=INHERENT),
+    Requirement('varying', lambda case: not case.varying, _VARYING, row='ledger 822'),
+    Requirement('float64', lambda case: case.dtype != jnp.float64,
+                "float64 operands, whose rule is the reference math itself", row=INHERENT),
+    Requirement('key_width', lambda case: case.key_width <= case.widest,
+                lambda case: f"keys {case.key_width} wide; the port takes at most {case.widest} in "
+                             f"{case.dtype.name}", row=INHERENT),
+)
+"""What the port (`fla_rule`) needs of a rule's call: every shape, dtype, chunk size and mesh, except
+inside `jax.jvp`'s traces, which the port's custom VJP gives no tangent; inside a caller's `shard_map`
+that checks varying axes over operands that vary, where a Pallas call, which states no varying type for
+its results, cannot run; float64 operands, whose rule is the reference math itself; and keys wider than
+the port takes in their dtype. Packed documents take the port at any bound: it stores the memories by
+where they pass, as many as the tokens' chunks, a row's and one, whatever the bound
+(`chunked_launch.Sequences`)."""
+
+GATED_DELTA: Op[PortCase] = Op('gated_delta_rule',
+                               (Kernel('fla', PORT_SUPPORTS), Kernel('xla', (), generic=True)),
+                               lambda case: measured_kernel('gated_delta_rule', 'xla'))
+"""The delta rule's selector: the port where the target's row names it (`measured_kernel`, the table
+qualification reads) and the call meets its requirements, else the portable math."""
 
 
 def on_the_port(query, key, value) -> bool:
-    """Whether the rule runs on the port: where the target's row names it (`measured_kernel`, the table
-    qualification reads) and the call has no refusal (`port_refusal`), reported as the target's route
-    (`generation.route`), which logs a call the row's port turns down the first time."""
-    preferred = measured_kernel('gated_delta_rule', 'xla')
-    refusal = port_refusal(query, key, value) if preferred == 'fla' else None
-    kernel = 'fla' if preferred == 'fla' and refusal is None else 'xla'
-    return route('gated_delta_rule', kernel=kernel, refusal=refusal).kernel == 'fla'
+    """Whether the rule over these operands runs on the port, as its selector reports it (`GATED_DELTA`),
+    which logs a call the row's port turns down the first time."""
+    case = PortCase(reverse=not FORWARD_MODE.get(), varying=bool(jax.typeof(value).mat.varying),
+                    dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1])
+    return select(GATED_DELTA, case).kernel == 'fla'
 
 
 def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segments: int | None = None,
@@ -733,14 +752,14 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
     # The SSD's memory is `[P, N]`, values by keys: the template's `[N, P]` transposed.
     carried = (rows_like(jnp.zeros((batch, heads, head_dim, state_size), work), x) if state is None
                else jnp.swapaxes(state, -1, -2).astype(work))
-    refusal = ssd_port_refusal(x, B, chunk_size) if kernels else "the caller's route is the portable math"
-    if refusal is None:
+    case = scan_case(x, B, chunk_size, tpu=kernels)
+    # Without `kernels` the caller's route is the portable math.
+    kernel = select(SCAN, case, None if kernels else 'xla').kernel
+    if kernel == 'pallas':
         out, final = _ssd_ported(x, beta, rate, B, C, skip, carried, chunk_size, starts)
         return out.astype(work), jnp.swapaxes(final.astype(work), -1, -2)
-    ran_kernel('ssd', 'xla', refusal)
-    platform = ssd_kernel_platform(chunk_size, head_dim, state_size, dtype=work) if kernels else None
-    if platform is not None:
-        out, final = _ssd_tpu(x, beta, rate, B, C, skip, carried, chunk_size, starts, platform, work)
+    if kernel == 'tpu':
+        out, final = _ssd_tpu(x, beta, rate, B, C, skip, carried, chunk_size, starts, case.tpu, work)
         return out, jnp.swapaxes(final, -1, -2)
     group = heads // key.shape[2]
     if group > 1:
@@ -787,30 +806,69 @@ def _ssd_tpu(x, dt, A, B, C, D, carried, chunk_size: int, starts, platform, work
     return (scanned + skip)[:, :length], final
 
 
-def ssd_port_refusal(x, B, chunk_size: int) -> str | None:
-    """Why a chunked scan over these operands runs the XLA scan rather than
-    mamba_ssm's kernels (`mamba_ssd.ssd_scan`), or None where the port takes
-    it: on every GPU whose target row names it (`measured_kernel`), except
-    inside `jax.jvp`'s traces (`FORWARD_MODE`), which the port's custom VJP
-    gives no tangent; inside a caller's `shard_map` that checks varying axes
-    over operands that vary, where a Pallas call, which states no varying
-    type for its results, cannot run; float64 operands, whose scan is the
-    reference math itself; and head widths, state widths or chunks that are
-    not powers of two of at least 16, the smallest block Triton's dot takes."""
+@dataclasses.dataclass(frozen=True)
+class ScanCase:
+    """A rated decay's scan as the scan selector reads it (`SCAN`): whether it is traced for reverse mode
+    alone (`reverse`), whether a caller's `shard_map` that checks varying axes holds operands that vary
+    (`varying`), the operands' `dtype`, its head width, state width and chunk (`widths`), and the
+    platform the TPU's Pallas scan builds for, None where it does not take the scan
+    (`ssd_kernel_platform`)."""
+
+    reverse: bool
+    varying: bool
+    dtype: np.dtype
+    widths: tuple[int, int, int]
+    tpu: str | None
+
+
+SSD_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
+    Requirement('forward_mode', lambda case: case.reverse,
+                "forward_mode_attention traces for jax.jvp, which the port's custom VJP gives no tangent",
+                row=INHERENT),
+    Requirement('varying', lambda case: not case.varying, _VARYING, row='ledger 822'),
+    Requirement('float64', lambda case: case.dtype != jnp.float64,
+                "float64 operands, whose scan is the reference math itself", row=INHERENT),
+    Requirement('widths', lambda case: all(width >= 16 and width & (width - 1) == 0 for width in case.widths),
+                lambda case: "head width {}, state {} and chunk {}; the port takes powers of two of at least "
+                             "16".format(*case.widths), row=INHERENT),
+)
+"""What mamba_ssm's kernels (`mamba_ssd.ssd_scan`) need of a scan: reverse mode, which the port's
+custom VJP alone gives; no caller's `shard_map` that checks varying axes over operands that vary,
+where a Pallas call, which states no varying type for its results, cannot run; no float64 operands,
+whose scan is the reference math itself; and head widths, state widths and chunks that are powers of
+two of at least 16, the smallest block Triton's dot takes."""
+
+TPU_SCAN_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
+    Requirement('geometry', lambda case: case.tpu is not None,
+                lambda case: "the TPU's Pallas scan takes a float32 scan on a TPU over power-of-two widths "
+                             "and a chunk its program holds, not head width {}, state {} and chunk {}"
+                             .format(*case.widths), row=INHERENT),
+)
+"""What the TPU's Pallas scan (`dew.nn.kernels.ssd`) needs: its tiling over the geometry
+(`ssd_kernel_runs`)."""
+
+
+def scan_case(x, B, chunk_size: int, *, tpu: bool = True) -> ScanCase:
+    """The `ScanCase` of a scan over values `x` `[B, S, H, P]` and keys `B` `[B, S, G, N]` in
+    `chunk_size` chunks; on a TPU where `tpu` asks, the platform its Pallas scan builds for, which
+    logs the choice once a geometry (`ssd_kernel_platform`)."""
     widths = (x.shape[-1], B.shape[-1], chunk_size)
-    return first_refusal(
-        (measured_kernel('ssd', 'xla') == 'pallas',
-         "the device's target row (generation.TARGETS) does not name the port"),
-        (not FORWARD_MODE.get(), "forward_mode_attention traces for jax.jvp, which the port's custom VJP "
-                                 "gives no tangent"),
-        (not jax.typeof(x).mat.varying,
-         "a shard_map that checks varying axes holds the operands, and a Pallas call states no "
-         "varying type for its results"),
-        (jnp.dtype(x.dtype) != jnp.float64, "float64 operands, whose scan is the reference math itself"),
-        (all(width >= 16 and width & (width - 1) == 0 for width in widths),
-         f"head width {widths[0]}, state {widths[1]} and chunk {widths[2]}; the port takes powers of "
-         "two of at least 16"),
-    )
+    return ScanCase(reverse=not FORWARD_MODE.get(), varying=bool(jax.typeof(x).mat.varying),
+                    dtype=jnp.dtype(x.dtype), widths=widths,
+                    tpu=(ssd_kernel_platform(chunk_size, widths[0], widths[1], dtype=at_least_fp32(x.dtype))
+                         if tpu and generation.backend() == 'tpu' else None))
+
+
+def _scan_preferred(case: ScanCase) -> str:
+    """The port where the GPU's target row names it ('pallas'), the TPU's Pallas scan on a TPU, else the
+    portable math."""
+    return measured_kernel('ssd', 'tpu' if generation.backend() == 'tpu' else 'xla')
+
+
+SCAN: Op[ScanCase] = Op('ssd', (Kernel('pallas', SSD_SUPPORTS), Kernel('tpu', TPU_SCAN_SUPPORTS),
+                               Kernel('xla', (), generic=True)), _scan_preferred)
+"""The rated scan's selector: the port of mamba_ssm's kernels on every GPU whose target row names it, the
+TPU's Pallas scan where its tiling covers the geometry, else the portable math."""
 
 
 def _ssd_ported(x, dt, A, B, C, D, state, chunk_size: int, starts):

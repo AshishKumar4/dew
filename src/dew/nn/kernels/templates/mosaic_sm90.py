@@ -4,7 +4,6 @@ warpgroup MMA reads its right operand from shared memory and its left from share
 accumulates in a warpgroup's registers in the WGMMA layout, and runs asynchronously until waited for."""
 
 import functools
-from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -24,9 +23,21 @@ class Wgmma(mosaic.RingFamily):
     name = "wgmma"
     rows = 64
     consumers = 2
-    layout = plgpu.Layout.WGMMA
-    row = plgpu.Layout.WGMMA.reduce(1)
-    column = plgpu.Layout.WGMMA.reduce(0)
+
+    @property
+    def layout(self):
+        return plgpu.Layout.WGMMA
+
+    @property
+    def row(self):
+        return plgpu.Layout.WGMMA.reduce(1)
+
+    @property
+    def column(self):
+        return plgpu.Layout.WGMMA.reduce(0)
+
+    column_scratch = 4 * 32 * 2
+    """A WGMMA tile's columns sum across its four warps, each lane's two entries a register."""
 
     def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
         def scores(acc_ref):
@@ -41,6 +52,12 @@ class Wgmma(mosaic.RingFamily):
         if interpret:
             return jnp.dot(lhs, rhs[...], preferred_element_type=jnp.float32)
         return self.product(lhs, rhs, (lhs.shape[0], rhs.shape[1]))
+
+    def products(self, acc, lhs, rhs, interpret: bool):
+        if interpret:
+            return acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
+        plgpu.wgmma(acc, lhs, rhs)
+        return acc
 
     def register_products(self, acc, parts, rhs, interpret: bool):
         mosaic.unscaled(parts)
@@ -72,8 +89,8 @@ class Wgmma(mosaic.RingFamily):
         acc[...] = scale(acc[...])
         return self.register_products(acc, parts, rhs, interpret)
 
-    def settled(self) -> None:
-        plgpu.wgmma_wait(0)
+    def settled(self, pending: int = 0) -> None:
+        plgpu.wgmma_wait(pending)
 
     def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool, initial: tuple | None = None
                        ) -> tuple[C, tuple[jax.Array, ...]]:
@@ -102,49 +119,6 @@ class Wgmma(mosaic.RingFamily):
 
         return pl.run_scoped(run, *(plgpu.WGMMAAccumulatorRef(shape, jnp.float32) for shape in shapes))
 
-    def zeros(self, shape: tuple[int, ...]) -> jax.Array:
-        return self.full(shape, 0.0)
-
-    def full(self, shape: tuple[int, ...], value: float) -> jax.Array:
-        layout = self.layout if len(shape) == 2 else self.row
-        return plgpu.layout_cast(jnp.full(shape, value, jnp.float32), layout)
-
-    def column_zeros(self, count: int) -> jax.Array:
-        return plgpu.layout_cast(jnp.zeros((count,), jnp.float32), self.column)
-
-    def iota(self, shape: tuple[int, int], dimension: int) -> jax.Array:
-        return plgpu.broadcasted_iota(jnp.int32, shape, dimension, layout=self.layout)
-
-    def rows_of(self, ref) -> jax.Array:
-        return plgpu.load(ref, layout=self.row, optimized=False)
-
-    def columns_of(self, ref) -> jax.Array:
-        return plgpu.load(ref, layout=self.column, optimized=False)
-
-    column_scratch = 4 * 32 * 2
-    """A WGMMA tile's columns sum across its four warps, each lane's two entries a register
-    (`plgpu.Layout.WGMMA`): one register's partial sums at a time."""
-
-    def column_sums(self, value: jax.Array, scratch, interpret: bool) -> jax.Array:
-        if interpret:
-            return value.sum(axis=0)
-
-        def sums(ctx, tile, scratch):
-            del ctx
-            return tile.reduce("add", axis=0, scratch=scratch)
-
-        # Mosaic GPU's own reduction across the warps, through the given scratch; inline_mgpu passes the
-        # launch context first and takes the tile and its scratch.
-        summed: Callable[..., jax.Array] = plgpu.inline_mgpu(
-            arg_types=(self.layout, plgpu.RefType()),
-            return_type=plgpu.ShapeDtypeStruct((value.shape[1],), jnp.float32, layout=self.column))(sums)
-        return summed(value, scratch)
-
-    def tile_of(self, ref) -> jax.Array:
-        return plgpu.load(ref, layout=self.layout, optimized=False)
-
-    def as_row(self, vector: jax.Array) -> jax.Array:
-        return plgpu.layout_cast(vector, self.row)
 
 
 WGMMA = Wgmma()

@@ -5,6 +5,14 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- `dew.nn.attention.scaled_dot_product_attention(..., implementation='template')`
+  runs the attention template's route
+  (`dew.nn.kernels.templates.attention_route.attend`): causality, windows,
+  documents, key lengths and starts, a softcap and sinks, differentiable in the
+  query, key, value and sinks. It runs the Triton and Mosaic GPU mainloops on a
+  GPU and the plain-JAX one elsewhere, per shard on a mesh. No target prefers it
+  yet, so a call takes it only when it names it, or
+  `generation.chosen(attention='template')` does.
 - `dew.nn.moe.expert_projection` with `'pallas'` or `'auto'` runs its grouped
   matmuls through Dew's GEMM template and differentiates at every order:
   forward mode and higher-order derivatives no longer need `'xla'`. The old
@@ -14,9 +22,18 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   across a persistent tile loop, so the next tile's loads overlap this one's
   stores; it runs as fast as CUTLASS's grouped kernel gradient at the MoE
   shapes measured. A fused RMS norm's Mosaic GPU forward now lowers on Hopper.
+- A run's W&B display name is its own, `Wandb.name` (`--trainer.wandb.name`), apart from the
+  name its checkpoints are kept under; it shows the run's name where none is given.
+- `Checkpoints.committed()` lists a run's committed steps at each call without opening or writing
+  its store, so a process beside the one that trains (an evaluation worker) reads each step as it
+  commits; the checkpoints guide shows the worker's loop.
+- `dew.sampling.sample`'s `record` reads each step's clean prediction too,
+  `record(x, state, denoised)`; a recorder written for two arguments takes a
+  third.
 - JEPA's `normalize_targets` is Flax's `LayerNorm` with no affine and exact
   variance. Its statistics are at least float32, as I-JEPA's `F.layer_norm`'s
-  are, so a bfloat16 run's targets round once.
+  are, so a bfloat16 run's targets round once, and its epsilon is I-JEPA's,
+  PyTorch's default 1e-5, where it was 1e-6.
 - `Decide.systemone` takes a list of request bodies and answers each as it
   would alone, their rows scored together, a refused body's `ValueError` in its
   place. `dew.inference.ScoringServer` serves a task answered by one forward
