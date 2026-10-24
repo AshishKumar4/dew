@@ -19,7 +19,6 @@ Triton loads, so the fixture is mamba_ssm's algorithm at IEEE products, and reco
 
 import itertools
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -195,10 +194,9 @@ def main() -> None:
 
     if sys.argv[2:] == ["--seeded"]:
         from mamba_ssm.modules.ssd_minimal import ssd_minimal_discrete
+        from reference_source import git_head
 
-        revision = subprocess.run(["git", "-C", sys.argv[1], "rev-parse", "HEAD"], check=True,
-                                  capture_output=True, text=True).stdout.strip()
-        write_seeded(mamba_chunk_scan_combined, ssd_minimal_discrete, __version__, revision)
+        write_seeded(mamba_chunk_scan_combined, ssd_minimal_discrete, __version__, git_head(sys.argv[1]))
         return
 
     rng = np.random.default_rng(SEED)

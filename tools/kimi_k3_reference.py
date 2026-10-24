@@ -2,11 +2,11 @@
 
 The model is `KimiK3ForConditionalGeneration` from moonshotai/Kimi-K3 at
 REVISION: configuration_kimi_k3.py, modeling_kimi_k3.py and
-modeling_kimi_linear.py, fetched at that revision into CACHE. Their KDA
-layers call fla-core's Triton kernels (chunk_kda, fused_recurrent_kda,
-ShortConvolution, FusedRMSNormGated), so this runs on a CUDA device, in fp32,
-with TRITON_F32_DEFAULT=ieee for every dot that leaves its precision unset
-and IEEE forced on the one that sets it (the third item below). The routed
+modeling_kimi_linear.py, fetched at that revision through the hub's cache.
+Their KDA layers call fla-core's Triton kernels (chunk_kda,
+fused_recurrent_kda, ShortConvolution, FusedRMSNormGated), so this runs on a
+CUDA device, in fp32, with TRITON_F32_DEFAULT=ieee for every dot that leaves
+its precision unset and IEEE forced on the one that sets it (the third item below). The routed
 experts are encoded by compressed-tensors' MXFP4 compressor over the scales
 its `generate_mx_scales` gives each group's largest magnitude, and the
 reference computes with the library's own decompression of them, so the
@@ -43,16 +43,15 @@ zero-padded from the KDA heads to the KDA head dim (96 heads to 128 there).
 """
 
 import copy
-import importlib
 import json
 import os
 import sys
-import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
 import torch
+from reference_source import hub_modules
 from safetensors.torch import save_file
 
 REPO = "moonshotai/Kimi-K3"
@@ -63,21 +62,6 @@ ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 SOURCE = ROOT / "kimi-k3-source"
 DESTINATION = ROOT / "kimi-k3-tiny"
 LEARNING_RATE = 1e-2
-
-
-def remote_modules(repo: str, revision: str, cache: Path, package: str, names: tuple[str, ...]):
-    """Import remote code files pinned at `revision` as the modules of
-    `package`, fetched into `cache` once."""
-    directory = cache / package
-    directory.mkdir(parents=True, exist_ok=True)
-    for name in names:
-        path = directory / name
-        if not path.exists():
-            url = f"https://huggingface.co/{repo}/resolve/{revision}/{name}"
-            path.write_bytes(urllib.request.urlopen(url, timeout=60).read())
-    (directory / "__init__.py").touch()
-    sys.path.insert(0, str(cache))
-    return tuple(importlib.import_module(f"{package}.{name.removesuffix('.py')}") for name in names)
 
 
 def tiny_config() -> dict:
@@ -176,7 +160,7 @@ def released_modules():
     os.environ["TRITON_CACHE_DIR"] = str(CACHE / "triton-ieee")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    configuration, modeling, linear = remote_modules(REPO, REVISION, CACHE, "kimi_k3_remote", REMOTE)
+    configuration, modeling, linear = hub_modules("kimi_k3_remote", REPO, REVISION, REMOTE)
     from fla.ops.kda import chunk_intra
     from triton.language import constexpr
 

@@ -357,17 +357,24 @@ def _enclosure_rounded(x, hi, lo, inside, beyond, exact, name: str, fmt: Format)
     return result
 
 
+EXP_RANGE = (-110.0, 90.0)
+"""Where exp's results in a format no wider than fp32 lie strictly between the same two neighbours:
+below it every exp is under exp(-110), below half fp32's least subnormal (bf16's is larger), so
+between +0 and the least subnormal, and above it every exp is over exp(90), past fp32's and bf16's
+largest finite values, so between the largest finite value and inf."""
+
+
 def exp_rounded(x, fmt: Format) -> np.ndarray:
     """RN(exp(x)) in `fmt` for values of a format no wider than fp32, verified: a double-double exp
     with a proven relative bound (`_exp_enclosed`, EXP_BOUND) decides every element whose enclosure
     rounds one way, and mpmath's interval exp at rising precision decides the rest (exp of a nonzero
     rational is never a midpoint, so the precision needed is finite). No library exp is trusted.
-    Beyond [-110, 90] the result is 0 or inf in every format no wider than fp32 (exp(-110) is below
-    half fp32's least subnormal, exp(90) past its largest finite value); NaN is NaN."""
+    Beyond EXP_RANGE the result is 0 or inf in every format no wider than fp32; NaN is NaN."""
     x = np.asarray(x, np.float64)
-    inside = (x >= -110) & (x <= 90)
+    low, high = EXP_RANGE
+    inside = (x >= low) & (x <= high)
     hi, lo = _exp_enclosed(np.where(inside, x, 0.0))
-    return _enclosure_rounded(x, hi, lo, inside, x > 90, lambda iv, value: iv.exp(value), "exp", fmt)
+    return _enclosure_rounded(x, hi, lo, inside, x > high, lambda iv, value: iv.exp(value), "exp", fmt)
 
 
 def exp2_rounded(x, fmt: Format) -> np.ndarray:

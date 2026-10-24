@@ -52,7 +52,6 @@ included).
 """
 
 import copy
-import importlib.util
 import json
 import os
 import sys
@@ -71,14 +70,11 @@ def upstream_module():
     """joint_schema_model.py as the release the fixtures reproduce publishes it
     (source.json: its repo and revision), and its model class (`model`)."""
     from huggingface_hub import hf_hub_download
+    from reference_source import loaded
 
     source = json.loads((OUT / "source.json").read_text())
-    path = hf_hub_download(source["repo"], "joint_schema_model.py", revision=source["revision"])
-    spec = importlib.util.spec_from_file_location("joint_schema_model", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module  # its dataclasses look their module up
-    spec.loader.exec_module(module)
+    module = loaded("joint_schema_model",
+                    hf_hub_download(source["repo"], "joint_schema_model.py", revision=source["revision"]))
     return module, getattr(module, source["model"])
 
 
