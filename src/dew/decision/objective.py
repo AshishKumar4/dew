@@ -10,7 +10,7 @@ import grain.python as pygrain
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import linen as nn
+from flax import linen as nn, struct
 
 from dew.artifacts import Decisions
 from dew.data.pipeline import Configured, ObjectiveData, Pack, Rejected
@@ -22,6 +22,7 @@ from dew.decision.layout import (
     OPTION_TILE,
     Bounds,
     DecisionInputs,
+    Encoded,
     JointLayout,
     Layout,
     QuestionLayout,
@@ -103,6 +104,9 @@ class Encoding:
     shuffle: bool = True
     none_of_the_above: float = 0.0
     context_length: int | None = None
+    grouped: bool = False
+    """Whether each row carries its questions' consistency groups (`_grouped`), an objective with a
+    consistency term's rows; every row then carries them, an example of none with none in each."""
 
     def __call__(self, example: Example, names: Sequence[str], rng: np.random.Generator | None,
                  tokens: np.ndarray | None = None) -> Batch:
@@ -111,6 +115,7 @@ class Encoding:
             names = [names[int(index)] for index in rng.permutation(len(names))]
         asked: dict[str, Question] = {}
         golds: dict[str, np.ndarray] = {}
+        dropped: dict[str, str] = {}
         for name in names:
             question = example.questions[name]
             gold = example.distribution(name) if name in labels else None
@@ -120,8 +125,12 @@ class Encoding:
                 and rng is not None
                 and rng.random() < self.none_of_the_above
             ):
+                original = question
                 question, label = _none_of_the_above(question, labels[name], drop=rng.random() < 0.5)
                 gold = np.eye(len(question.options))[label]
+                gone = [key for key in original.options if key not in question.options]
+                if gone:
+                    dropped[name] = gone[0]
             asked[name] = question
             if gold is not None:
                 golds[name] = gold
@@ -162,6 +171,8 @@ class Encoding:
             "scored": np.zeros(questions, bool),
             "targets": np.zeros((questions, self.width), np.float32),
         }
+        if self.grouped:
+            row["groups"], row["canonical"] = _grouped(example, encoded, asked, dropped, self.width)
         for slot, laid in enumerate(encoded.questions):
             count = len(laid.options)
             if laid.name in golds:
@@ -178,6 +189,33 @@ class Encoding:
             row["context"] = np.asarray(encoded.context or (), np.int32)
         return row
 
+
+
+def _grouped(example: Example, encoded: Encoded, asked: Mapping[str, Question], dropped: Mapping[str, str],
+             width: int) -> tuple[np.ndarray, np.ndarray]:
+    """The row's consistency fields along its questions: each question's group in the example
+    (`Example.groups`), -1 for none, and each of its option slots' canonical option in that group,
+    the slot as the row shows it (`Laid.order`), -1 for padding and for an option the group does not
+    map. A "none of the above" that stands for the option it dropped maps to that option's canonical
+    one; one added beside every option maps to none."""
+    groups = np.full(len(encoded.questions), -1, np.int32)
+    canonical = np.full((len(encoded.questions), width), -1, np.int32)
+    for slot, laid in enumerate(encoded.questions):
+        found = example.group_of(laid.name)
+        if found is None:
+            continue
+        index, group = found
+        keys = sorted(set(next(iter(group.members.values())).values()))
+        mapped = group.members[laid.name]
+        groups[slot] = index
+        options = asked[laid.name].options
+        for shown, option in enumerate(laid.order):
+            key = options[option]
+            if key == NONE_OF_THE_ABOVE:
+                key = dropped.get(laid.name)
+            if key is not None and key in mapped:
+                canonical[slot, shown] = keys.index(mapped[key])
+    return groups, canonical
 
 
 def _none_of_the_above(question: Choice, label: int, *, drop: bool) -> tuple[Choice, int]:
@@ -233,6 +271,9 @@ class Fit(pygrain.MapTransform):
     """The most context tokens the backbone's cross-attention reads, or None where it reads none: an
     example whose context is longer refuses the run (ValueError), which the data plan's compile meets
     before training, so no example is silently cut or dropped."""
+    grouped: bool = False
+    """Whether the objective reads consistency groups, whose members a layout of a question a row lays
+    out in different rows: an example with groups under one refuses the run (ValueError)."""
     rejects = True
 
     def map(self, element: Batch) -> Batch | Rejected:
@@ -247,6 +288,10 @@ class Fit(pygrain.MapTransform):
             return Rejected("unfit")
         if self.context_length is not None:
             with_context(laid, self.tokenizer, example.context, self.context_length)
+        if self.grouped and example.groups and not self.layout.joint:
+            raise ValueError(f"an example's consistency groups {[group.name for group in example.groups]} "
+                             "stand in one row, and a layout of a question a row lays their members out "
+                             "apart; group them under a joint layout, or train without consistency")
         self.head.validate_rows(laid)
         tokens = np.asarray(state, np.int32)
         fitted = tuple(
@@ -327,6 +372,7 @@ class ConfigureLayout:
     none_of_the_above: float
     train: bool
     context_length: int | None = None
+    grouped: bool = False
 
     def __call__(self, metadata: Mapping[str, object]) -> LayoutRows | EvaluateRows:
         slots = record(metadata["slots"], "decision slots")
@@ -334,7 +380,7 @@ class ConfigureLayout:
         if width < 1:
             raise ValueError("decision source slot maxima must be positive")
         encoding = Encoding(self.layout, self.tokenizer, self.specials, width, self.shuffle,
-                            self.none_of_the_above, self.context_length)
+                            self.none_of_the_above, self.context_length, self.grouped)
         return LayoutRows(encoding) if self.train else EvaluateRows(encoding)
 
 
@@ -345,22 +391,26 @@ _ALONG_THE_QUESTIONS = ("kinds", "questions", "spans", "option_spans", "options"
 _READ_OUT = ("readout",)
 """The fields that run along its questions of a row whose options stand under labels (`Labels`)."""
 
+_GROUPED = ("groups", "canonical")
+"""The fields that run along its questions of a row whose questions stand in consistency groups
+(`Example.groups`), which an objective with a consistency term reads."""
 
-def _along(layout: Layout) -> tuple[str, ...]:
+
+def _along(layout: Layout, grouped: bool = False) -> tuple[str, ...]:
     """The fields along the questions of `layout`'s rows, its readout's where its options stand under
-    labels."""
+    labels, and their consistency groups' where they carry them (`grouped`)."""
     labelled = isinstance(layout, QuestionLayout) and layout.labels is not None
-    return _ALONG_THE_QUESTIONS + (_READ_OUT if labelled else ())
+    return _ALONG_THE_QUESTIONS + (_READ_OUT if labelled else ()) + (_GROUPED if grouped else ())
 
 
-def packing(layout: Layout, bounds: Bounds, context_length: int | None = None) -> Pack:
+def packing(layout: Layout, bounds: Bounds, context_length: int | None = None, grouped: bool = False) -> Pack:
     """Rows of `layout` packed first-fit into windows of its `max_len`, each
     window's rows, questions and options within `bounds` (`Layout.bounds`),
     and with a `context_length` each row's context along an axis of that
     many tokens."""
     parallel = isinstance(layout, QuestionLayout) and layout.parallel
     blocked = isinstance(layout, QuestionLayout) and layout.blocks
-    along = tuple((name, bounds.questions) for name in _along(layout))
+    along = tuple((name, bounds.questions) for name in _along(layout, grouped))
     if context_length is not None:
         along = (*along, ("context", context_length))
     fields = ("tokens", *(("positions", "slots") if parallel else ()), *(("blocks",) if blocked else ()))
@@ -383,6 +433,22 @@ def _rows(batch: Batch, spans_in_context: bool = False) -> tuple[np.ndarray, np.
                                  np.bincount(owner, weights=option, minlength=rows).astype(np.int64)])[:, 1:])
     lengths, questions, real = np.concatenate(counted, axis=1)
     return lengths, questions, real
+
+
+def _window_groups(element: Batch, owners: np.ndarray, options: np.ndarray
+                   ) -> tuple[np.ndarray, np.ndarray]:
+    """A window's consistency groups numbered apart across its rows, each row's group `g` the window's
+    own index of `(row, g)`, and the padding the packer added back at -1: a question slot of no row is
+    in no group, and an option slot of no option maps to no canonical option."""
+    groups = np.asarray(element["groups"]).astype(np.int64)
+    real = (owners > 0) & (groups >= 0)
+    keys = np.where(real, owners.astype(np.int64) * (groups.shape[-1] + 1) + groups, -1)
+    numbered = np.full(groups.shape, -1, np.int32)
+    if real.any():
+        _, index = np.unique(keys[real], return_inverse=True)
+        numbered[real] = index.astype(np.int32)
+    canonical = np.where(options & (owners > 0)[..., None], np.asarray(element["canonical"]), -1)
+    return numbered, canonical.astype(np.int32)
 
 
 @dataclass(frozen=True)
@@ -411,6 +477,8 @@ class PackedRows(pygrain.MapTransform):
         if "readout" in element:
             # A question's answer cue moves with its row in the window, as its spans do.
             laid["readout"] = element["readout"] + moved
+        if "groups" in element:
+            laid["groups"], laid["canonical"] = _window_groups(element, owners, options)
         if "slots" in element:
             laid["slots"] = element["slots"]
         if "blocks" in element:
@@ -425,7 +493,63 @@ class PackedRows(pygrain.MapTransform):
         return laid
 
 
-class DecisionObjective(Objective[Ratio]):
+def consistency_divergence(logits: jax.Array, options: jax.Array, groups: jax.Array,
+                           canonical: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Each question's share of its consistency group's divergence, and its share of the group, as
+    `[B, Q]` arrays a window's questions sum to each group's divergence and one a group.
+
+    `groups` `[B, Q]` names each question's group in its window (-1: none), and `canonical` `[B, Q, K]`
+    each option slot's canonical option (-1: none). A member's answer over the canonical options is its
+    distribution over its slots that map to one, summed onto them (`segment_log_partition`, the
+    categorical owner's); a group's divergence is the generalized Jensen-Shannon divergence of its
+    members' answers, the mean of each one's KL divergence from their mean, so it is zero exactly
+    where they agree, at most the log of the member count, and computed in at least float32 in the
+    log domain, finite at any finite logits."""
+    from dew.nn import categorical
+
+    width = logits.shape[-1]
+    mapped = options & (canonical >= 0)
+    log_p = categorical.log_probs(logits, mapped)
+    slots = jnp.where(mapped, canonical, width)
+
+    def answer(row_logits, row_slots):
+        return categorical.segment_log_partition(row_logits, row_slots, width)
+
+    log_answer, present = jax.vmap(jax.vmap(answer))(log_p, slots)
+    member = groups >= 0
+    count = groups.shape[-1]
+    ids = jnp.where(member, groups, count)
+
+    def window(log_answer, present, ids, member):
+        sizes = jax.ops.segment_sum(member.astype(log_answer.dtype), ids, num_segments=count + 1)[:count]
+        held = jnp.where(present & member[:, None], ids[:, None], count)
+
+        def mean_of(column, owners):
+            return categorical.segment_log_partition(column, owners, count)[0]
+
+        given = jnp.where(present, log_answer, -jnp.inf)
+        log_mean = jax.vmap(mean_of, in_axes=(1, 1), out_axes=1)(given, held)
+        log_mean = log_mean - jnp.log(jnp.maximum(sizes, 1.0))[:, None]
+        theirs = log_mean[jnp.minimum(ids, count - 1)]
+        each = jnp.sum(jnp.where(present, jnp.exp(log_answer) * (log_answer - theirs), 0.0), axis=-1)
+        size = sizes[jnp.minimum(ids, count - 1)]
+        return (jnp.where(member, each / jnp.maximum(size, 1.0), 0.0),
+                jnp.where(member, 1.0 / jnp.maximum(size, 1.0), 0.0))
+
+    return jax.vmap(window)(log_answer, present, ids, member)
+
+
+@struct.dataclass
+class DecisionStatistics:
+    """A decision loss's statistics where it adds a consistency term: the label loss and the groups'
+    divergence, each its own `Ratio`, their weighted sum the objective's value
+    (`DecisionObjective.reduce_loss`)."""
+
+    label: Ratio
+    consistency: Ratio
+
+
+class DecisionObjective(Objective[Ratio | DecisionStatistics]):
     """Trains a decision model on questions with known answers.
 
     The model is any backbone with final states (`dew.nn.protocols.HiddenStates`),
@@ -455,7 +579,13 @@ class DecisionObjective(Objective[Ratio]):
     mix of rows shorter than `max_len / segments` tokens fills its windows
     less under it and takes a larger one; None lets a window hold as many as
     the layout's shortest row fits. The loss is the mean over the batch's
-    scored questions.
+    scored questions. With `consistency` w > 0 it adds w times the mean over
+    the batch's consistency groups (`Example.groups`) of the generalized
+    Jensen-Shannon divergence of their members' answers over the group's
+    canonical options (`consistency_divergence`), reported as the
+    `consistency` metric; a group's members stand in one row, so a layout of a
+    question a row refuses an example with groups under it. At 0 the groups
+    are not read, and the loss is the label loss alone.
 
     Evaluation returns the model's `Decisions` on the validation rows, which
     `Accuracy`, `ECE`, `AURC` and the scoring rules read, its probabilities
@@ -553,7 +683,8 @@ class DecisionObjective(Objective[Ratio]):
                  head: Head | None = None, variables: Variables | None | Omitted = OMITTED,
                  label_smoothing: float = 0.0, shuffle_options: bool = True,
                  none_of_the_above: float = 0.0, temperatures: Temperatures | None = None,
-                 segments: int | None = 16, context_encoder: ContextEncoder | None = None):
+                 segments: int | None = 16, context_encoder: ContextEncoder | None = None,
+                 consistency: float = 0.0):
         held: Variables | None = None
         self.image_processor = None
         match backbone:
@@ -599,6 +730,9 @@ class DecisionObjective(Objective[Ratio]):
         self.loss_rule = LogLoss() if loss is None else loss
         self.variables = held
         self.label_smoothing = label_smoothing
+        if not consistency >= 0.0:
+            raise ValueError(f"consistency weighs a divergence, so it is nonnegative, got {consistency}")
+        self.consistency = consistency
         self.shuffle_options = shuffle_options
         self.none_of_the_above = none_of_the_above
         self.temperatures = temperatures
@@ -691,7 +825,8 @@ class DecisionObjective(Objective[Ratio]):
         )
         return self._charged(logits, inputs, batch)
 
-    def _charged(self, logits: jax.Array, inputs: DecisionInputs, batch: Batch) -> tuple[Ratio, Aux]:
+    def _charged(self, logits: jax.Array, inputs: DecisionInputs, batch: Batch
+                 ) -> tuple[Ratio | DecisionStatistics, Aux]:
         """The loss and its accuracy report over the questions' option logits."""
         options, scored = inputs.options, jnp.asarray(batch["scored"]).astype(jnp.float32)
         # A padding question has no options; it is scored nothing over a
@@ -705,13 +840,28 @@ class DecisionObjective(Objective[Ratio]):
         correct = (jnp.argmax(logits, axis=-1) == batch["labels"]).astype(jnp.float32)
         accuracy, _ = self.accuracy(correct, batch, scored).mean()
         loss = Ratio(self.row_mean(charge * scored, batch).total, self.row_mean(scored, batch).total)
-        return loss, Aux(metrics={"accuracy": accuracy})
+        if not self.consistency:
+            return loss, Aux(metrics={"accuracy": accuracy})
+        divergence, members = consistency_divergence(logits, options, jnp.asarray(batch["groups"]),
+                                                     jnp.asarray(batch["canonical"]))
+        term = Ratio(self.row_mean(divergence, batch).total, self.row_mean(members, batch).total)
+        return (DecisionStatistics(loss, term),
+                Aux(metrics={"accuracy": accuracy, "consistency": term.mean()[0]}))
+
+    def reduce_loss(self, stats: Ratio | DecisionStatistics) -> tuple[jax.Array, jax.Array]:
+        """The label loss, plus `consistency` times the groups' mean divergence where it adds one."""
+        if isinstance(stats, Ratio):
+            return stats.mean()
+        label, active = stats.label.mean()
+        divergence, grouped = stats.consistency.mean()
+        return label + self.consistency * divergence, active | grouped
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Decisions:
         inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context)
         return self._decisions(self._logits(self.evaluation_variables(params, step), inputs), inputs, batch)
 
-    def _validation_scores(self, params: Variables, batch: Batch, step: Step) -> tuple[Ratio, Decisions]:
+    def _validation_scores(self, params: Variables, batch: Batch, step: Step
+                           ) -> tuple[Ratio | DecisionStatistics, Decisions]:
         inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context)
         logits = self.model.logits(params, inputs)
         return self._charged(logits, inputs, batch)[0], self._decisions(logits, inputs, batch)
@@ -755,17 +905,19 @@ class DecisionObjective(Objective[Ratio]):
         if tokenizer not in (None, self.tokenizer):
             raise ValueError("a decision objective lays its rows out with its own tokenizer; "
                              "pass tokenizer= when building it")
+        grouped = bool(self.consistency)
         training = ConfigureLayout(self.layout, self.tokenizer, self.specials, self.shuffle_options,
-                                   self.none_of_the_above, train=True, context_length=self.context_length)
+                                   self.none_of_the_above, train=True, context_length=self.context_length,
+                                   grouped=grouped)
         evaluating = dataclasses.replace(training, train=False)
-        fit = Fit(self.layout, self.tokenizer, self.specials, self.model.head, self.context_length)
+        fit = Fit(self.layout, self.tokenizer, self.specials, self.model.head, self.context_length, grouped)
         expand = () if self.layout.joint else (QuestionRows(),)
         options = self.bounds.options if self.layout.joint else None
         compact = None if options is None else -(-options // OPTION_TILE) * OPTION_TILE
         return ObjectiveData(
             train=(fit, *expand, Configured(training, needs=("slots",), scope="run", random=True)),
             evaluate=(fit, *expand, Configured(evaluating, needs=("slots",), scope="run")),
-            pack=packing(self.layout, self.bounds, self.context_length),
+            pack=packing(self.layout, self.bounds, self.context_length, grouped),
             packed=(PackedRows(self.layout.max_len, compact),),
         )
 
