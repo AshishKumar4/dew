@@ -27,6 +27,7 @@ rounds to the query's dtype (`reference`).
 import dataclasses
 import enum
 import functools
+import math
 import operator
 from collections.abc import Callable
 from typing import ClassVar, NamedTuple
@@ -838,14 +839,18 @@ def hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, ..
     return tuning.program(pulled, square, *positions, *params)
 
 
-class HookKeys:
-    """What a template launch's picks key its hooks by (`tuning.KernelOp.traced`, ahead of the op's own in
-    its bases): what each computes (`hook_program`), a score hook at its parameters' kinds and dtypes
-    (`score_kinds`, `score_dtypes`) and with its pullback where the launch differentiates it
-    (`DIFFERENTIATED`, a backward's), a forward's output hook at its parameters' and the padded value
-    width (`output_kinds`, `output_dtypes`, `output_width`)."""
+class AttentionLaunch(tuning.KernelOp):
+    """What every launch of the template shares as the tuner sees it (ahead of the op's own bases): its hooks
+    keyed by what each computes (`tuning.KernelOp.traced`, `hook_program`), a score hook at its parameters'
+    kinds and dtypes (`score_kinds`, `score_dtypes`) and with its pullback where the launch differentiates
+    it (`DIFFERENTIATED`, a backward's), a forward's output hook at its parameters' and the padded value
+    width (`output_kinds`, `output_dtypes`, `output_width`); and its timing operands' spans whole
+    (`tuning.KernelOp.operands`, `spanned`), the spans' starts at its arrays' place `SPANS`."""
 
     DIFFERENTIATED: ClassVar[bool] = False
+    SPANS: ClassVar[int] = 3
+    """The place of the spans' starts among the launch's array arguments, their ends the next, then the
+    queries' and keys' ids where the call has them (a forward's after its queries, keys and values)."""
     score_kinds: tuple[Kind, ...] = ()
     score_dtypes: tuple[str, ...] = ()
     output_kinds: tuple[Kind, ...] = ()
@@ -858,18 +863,27 @@ class HookKeys:
         return hook_program(name, value, self.score_kinds, self.score_dtypes,
                             differentiated=self.DIFFERENTIATED)
 
+    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
+        return spanned(specs, super().operands(specs, seed), self.SPANS)
 
-def spanned(specs: list[jax.ShapeDtypeStruct], arrays: list[jax.Array]) -> list[jax.Array]:
-    """A launch's timing operands with its spans whole: of its integer operands by row `[B, Q]` (the
-    others, an anchor key `[B, H, Q]`, keep their draw), the first two each query's first key (0) and
-    one past its last (every key, `specs[1]` being the keys), the rest its documents' ids (one
-    document), so a timed launch visits every tile a dense call does."""
-    rows = [index for index, spec in enumerate(specs)
-            if jnp.issubdtype(spec.dtype, jnp.integer) and spec.ndim == 2]
+
+def spanned(specs: list[jax.ShapeDtypeStruct], arrays: list[jax.Array], first: int) -> list[jax.Array]:
+    """A launch's timing operands with its spans whole, so a timed launch visits every tile a dense call
+    does: its spans' starts and ends at `specs[first]` and the next (`[B, Q]`, or a call's runs `[B, Q, R]`),
+    each query's interval, or its first run, every key (`specs[1]` being the keys) and its other runs
+    empty past them; and its queries' and keys' ids where the call has them, the two integer arrays after
+    them, one document. Every other operand keeps its draw."""
     keys = specs[1].shape[1]
-    for place, index in enumerate(rows):
-        filled = (0, keys)[place] if place < 2 else 1
-        arrays[index] = jnp.full(specs[index].shape, filled, specs[index].dtype)
+    start, end = specs[first], specs[first + 1]
+    runs = start.shape[2:]
+    opened = (jnp.arange(math.prod(runs)) == 0).reshape(runs)
+    arrays[first] = jnp.broadcast_to(jnp.where(opened, 0, keys), start.shape).astype(start.dtype)
+    arrays[first + 1] = jnp.full(end.shape, keys, end.dtype)
+    ids = [index for index in (first + 2, first + 3)
+           if index < len(specs) and jnp.issubdtype(specs[index].dtype, jnp.integer)]
+    if len(ids) == 2:
+        for index in ids:
+            arrays[index] = jnp.ones(specs[index].shape, specs[index].dtype)
     return arrays
 
 

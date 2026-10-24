@@ -49,8 +49,8 @@ from dew.nn.kernels.templates.attention import (
     DQ_GRADS,
     NATURAL,
     TRACED_TILE,
+    AttentionLaunch,
     Gradients,
-    HookKeys,
     Hooks,
     KeySpans,
     Kind,
@@ -62,7 +62,6 @@ from dew.nn.kernels.templates.attention import (
     kept_dtype,
     padded_call,
     power_of_two,
-    spanned,
     whole,
 )
 from dew.nn.kernels.templates.base import Template
@@ -231,7 +230,7 @@ def _read_bytes(ba: tokamax.BoundArguments) -> int:
 
 
 @dataclasses.dataclass(frozen=True)
-class _Mainloop[Config: (Tiles, BackwardTiles)](HookKeys, Template[Config]):
+class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config]):
     """What this mainloop's launches share as Template implementations (`MosaicForward`, `MosaicBackward`):
     the call's own arrays as arguments, padded by a launch to its config's blocks; the score hook (and the
     forward's output hook) as fields keyed by what they compute (`hook_program`); the configs of the
@@ -277,9 +276,6 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](HookKeys, Template[Config]):
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> str | None:
         """Why the launch takes no call of `ba` on `family`, or None (`refused`)."""
         raise NotImplementedError
-
-    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
-        return spanned(specs, super().operands(specs, seed))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1176,6 +1172,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
 
     HOOKS = ("score_mod",)
     DIFFERENTIATED = True
+    SPANS = 4
+    """Its arrays' spans after the queries, keys, values and the output's cotangent (`_fwd`)."""
     config_cls = BackwardTiles
     accurate: bool = ACCURATE
 
