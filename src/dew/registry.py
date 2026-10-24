@@ -1019,10 +1019,12 @@ def _read(member: type | Callable[..., Configured], name: str, value, *, dtypes:
     held = record_class(member)
     if held is not None:
         declared = declared_type(held, name)
-        if (isinstance(declared, type) and not is_protocol(declared)
+        if (not (dtypes and name == "dtype") and isinstance(declared, type)
+                and declared not in (Any, object, bool, int, float, str) and not is_protocol(declared)
                 and not issubclass(declared, (Mapping, Sequence)) and isinstance(value, declared)):
-            # A value the caller built, of the field's own class (an encoder a binder made), is kept
-            # as it is, whatever its kind.
+            # A value the caller built, of the field's own nominal class (an encoder a binder made),
+            # is kept as it is, whatever its kind; `Any` and `object` name no class to check, and a
+            # scalar or a dtype's name is read as before (`_rebuilt`).
             return value
         return _rebuilt(declared, configured(value), dtypes=dtypes, name=name)
     if not (isinstance(value, (Mapping, list)) or (dtypes and name == "dtype")):
