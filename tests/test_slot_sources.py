@@ -145,8 +145,9 @@ def test_a_block_slot_source_trains_checkpoints_exports_and_serves_its_updated_r
     examples = [Example.of({**request, "answers": {"team": 0}})]
     objective = DecisionObjective(task, shuffle_options=False)
     data = decision_rows(examples, 1, objective=objective.data())
+    mesh = MeshSpec().build(devices=jax.devices()[:1])
     with Checkpoints(str(tmp_path / "run"), keep=1) as checkpoints:
-        trained = Trainer(objective, optax.sgd(1e-4), key=7, checkpoints=checkpoints).fit(
+        trained = Trainer(objective, optax.sgd(1e-4), key=7, mesh=mesh, checkpoints=checkpoints).fit(
             data, steps=1, checkpoint_every=1, log_every=100)
         checkpoints.wait()
         loaded = Decide.from_run(str(tmp_path / "run"))
