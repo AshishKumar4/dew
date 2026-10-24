@@ -29,37 +29,45 @@ type Unit = Literal["pieces", "whole"]
 type Mark = tuple[Hashable, int, int]
 """A named span of a chunk: its key, and its first and past-last character, or id."""
 
+type Point = tuple[Hashable, int]
+"""A named boundary of a chunk: its key, and the character, or id, it stands before."""
+
 
 @dataclass(frozen=True)
 class Chunk:
     """A piece of a row: `text`, or `ids` where it holds ids (a special token, media), with `marks`
-    in its own characters or ids."""
+    in its own characters or ids, and `points`, boundaries in them."""
 
     text: str = ""
     ids: tuple[int, ...] | None = None
     marks: tuple[Mark, ...] = ()
+    points: tuple[Point, ...] = ()
 
 
 @dataclass(frozen=True)
 class Rendered:
-    """A row's tokens, and each mark's `(start, end)` tokens in them."""
+    """A row's tokens, each mark's `(start, end)` tokens in them, and each point's token: the first
+    that does not end at or before it, as a release splits its prompt at a character (serve.patch
+    `token_layout`)."""
 
     tokens: tuple[int, ...]
     marks: dict[Hashable, tuple[int, int]]
+    points: dict[Hashable, int]
 
 
 def render(chunks: Sequence[Chunk], encoder: Tokenizer, unit: Unit) -> Rendered:
-    """`chunks` encoded by `unit`, each mark's tokens located in them. A `whole` encoding needs a
-    vocabulary that keeps character offsets (TypeError), and a mark that covers no token, or under
-    `pieces` part of a chunk, is refused (ValueError)."""
+    """`chunks` encoded by `unit`, each mark's tokens and each point's located in them. A `whole`
+    encoding needs a vocabulary that keeps character offsets (TypeError), and a mark that covers no
+    token, or under `pieces` a mark of part of a chunk or a point inside one, is refused (ValueError)."""
     tokens: list[int] = []
     marks: dict[Hashable, tuple[int, int]] = {}
+    points: dict[Hashable, int] = {}
     run: list[Chunk] = []
 
     def flush() -> None:
         # Only a whole layout gathers runs.
         if run:
-            tokens.extend(_whole(run, encoder, len(tokens), marks))
+            tokens.extend(_whole(run, encoder, len(tokens), marks, points))
             run.clear()
 
     for chunk in chunks:
@@ -67,6 +75,7 @@ def render(chunks: Sequence[Chunk], encoder: Tokenizer, unit: Unit) -> Rendered:
             flush()
             for key, start, end in chunk.marks:
                 marks[key] = (len(tokens) + start, len(tokens) + end)
+            points.update({key: len(tokens) + at for key, at in chunk.points})
             tokens.extend(chunk.ids)
         elif unit == "whole":
             run.append(chunk)
@@ -77,15 +86,20 @@ def render(chunks: Sequence[Chunk], encoder: Tokenizer, unit: Unit) -> Rendered:
                     raise ValueError(f"mark {key!r} covers part of a piece, which a layout of pieces encodes "
                                      "whole")
                 marks[key] = (len(tokens), len(tokens) + len(ids))
+            for key, at in chunk.points:
+                if at not in (0, len(chunk.text)):
+                    raise ValueError(f"point {key!r} stands inside a piece, which a layout of pieces encodes "
+                                     "whole")
+                points[key] = len(tokens) + (len(ids) if at else 0)
             tokens.extend(ids)
     flush()
-    return Rendered(tuple(tokens), marks)
+    return Rendered(tuple(tokens), marks, points)
 
 
-def _whole(run: Sequence[Chunk], encoder: Tokenizer, offset: int,
-           marks: dict[Hashable, tuple[int, int]]) -> list[int]:
-    """A run of text chunks encoded once, its marks' tokens, after `offset` tokens, written to
-    `marks`."""
+def _whole(run: Sequence[Chunk], encoder: Tokenizer, offset: int, marks: dict[Hashable, tuple[int, int]],
+           points: dict[Hashable, int]) -> list[int]:
+    """A run of text chunks encoded once, its marks' tokens and its points', after `offset` tokens,
+    written to `marks` and `points`."""
     if not isinstance(encoder, Offsets):
         raise TypeError(f"a layout that encodes its text whole locates its spans by the tokenizer's "
                         f"character offsets, which a {type(encoder).__name__} does not keep")
@@ -99,5 +113,6 @@ def _whole(run: Sequence[Chunk], encoder: Tokenizer, offset: int,
             if last <= first:
                 raise ValueError(f"mark {key!r} covers no token")
             marks[key] = (offset + first, offset + last)
+        points.update({key: offset + bisect.bisect_right(ends, at + point) for key, point in chunk.points})
         at += len(chunk.text)
     return ids

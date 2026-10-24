@@ -475,10 +475,10 @@ class QuestionLayout(Layout):
     framing: "Framing | None" = None
     """The conversation `segments`' text is the user's turn of, or None for none."""
     blocks: bool = False
-    """Whether each row splits into two blocks (`Encoded.blocks`): its state and what comes before
-    its question, and its question to the row's end, a published slot release's prefix and suffix
-    (serve.patch `block_ids`); a backbone that reads blocks attends to each whole, and the second to
-    the first in order. Off, every row is read in order."""
+    """Whether each row splits into two blocks (`Encoded.blocks`): what comes before its question (a
+    state-first row's state), and its question to the row's end, a published slot release's prefix
+    and suffix (serve.patch `block_ids`); a backbone that reads blocks attends to each whole, and the
+    second to the first in order. Off, every row is read in order."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -496,9 +496,6 @@ class QuestionLayout(Layout):
                                  "line after another")
         if self.blocks and self.parallel:
             raise ValueError("blocks and parallel options each say what a row's tokens read; a row takes one")
-        if self.blocks and not self._state_first and self.segments is None:
-            raise ValueError(f"a {type(self).__name__} asks its question before its state, so its rows have "
-                             "no state prefix to read as a block")
 
     def state(self, encoder: Tokenizer, specials: Specials, state: JSON) -> tuple[int, ...]:
         """Return the state's tokens, which every question of a request shares."""
@@ -515,11 +512,9 @@ class QuestionLayout(Layout):
                     for name, question in questions.items()]
         if tokens is None:
             tokens = self.state(encoder, specials, state)
-        rows = [self.encode(encoder, specials, question, tokens, conversation=_conversation(state),
+        return [self.encode(encoder, specials, question, tokens, conversation=_conversation(state),
                             order=(orders or {}).get(name), name=name)
                 for name, question in questions.items()]
-        # A state-first row asks its question from its head's first token.
-        return [_blocked(row, row.questions[0].span[0]) for row in rows] if self.blocks else rows
 
     def _segmented(self, encoder: Tokenizer, specials: Specials, state: JSON, question: Question,
                    order: Sequence[int] | None, name: str) -> Encoded:
@@ -544,12 +539,11 @@ class QuestionLayout(Layout):
                 instructions = (rendered(question.instructions, segment.render, specials)
                                 or segment.defaults.get(question.kind, ""))
                 head, tail = segment.headers[question.kind].split("{}")
-                # The question starts at its header, or at its instructions under a header of none: the
-                # suffix a release's blocks read from (serve.patch `suffix_start`).
-                opening = (("suffix", 0, len(head)),) if head else ()
-                marks = (("question", 0, len(instructions)),
-                         *(() if head else (("suffix", 0, len(instructions)),)))
-                chunks.extend([Chunk(head, marks=opening), Chunk(instructions, marks=marks), Chunk(tail)])
+                # The question starts at its header: the suffix a release's blocks read from
+                # (serve.patch `suffix_start`).
+                opening = (("suffix", 0),) if self.blocks else ()
+                chunks.extend([Chunk(head, points=opening),
+                               Chunk(instructions, marks=(("question", 0, len(instructions)),)), Chunk(tail)])
             elif isinstance(segment, OptionLines):
                 for index, (label, slot) in enumerate(zip(names, slots, strict=True)):
                     key, description = described[slot]
@@ -586,8 +580,8 @@ class QuestionLayout(Layout):
                    readout=len(tokens) - 1, label_ids=self.labels.ids(encoder, len(slots)))
         encoded = Encoded(tokens, (row,), None, None, whole, state_kept)
         # The prefix is the tokens that end at or before the suffix's first character (serve.patch
-        # `token_layout`), the first the suffix's mark holds.
-        return _blocked(encoded, laid.marks["suffix"][0]) if self.blocks else encoded
+        # `token_layout`).
+        return _blocked(encoded, laid.points["suffix"]) if self.blocks else encoded
 
     def _cut_ids(self, built: Callable[[tuple[int, ...]], Rendered], ids: tuple[int, ...],
                  keep: Literal["start", "end", "all"]) -> tuple[Rendered, int]:
@@ -648,9 +642,10 @@ class QuestionLayout(Layout):
         if self.unit == "pieces":
             before, after = self.framing.around(encoder)
             return [Chunk(before), *chunks, Chunk(after)]
-        content, marks, at = "", [], 0
+        content, marks, points, at = "", [], [], 0
         for chunk in chunks:
             marks.extend((key, at + start, at + end) for key, start, end in chunk.marks)
+            points.extend((key, at + point) for key, point in chunk.points)
             content += chunk.text
             at += len(chunk.text)
         templated = isinstance(encoder, HFTokenizer) and (self.framing.chat_template is not None
@@ -664,10 +659,13 @@ class QuestionLayout(Layout):
                                                      options=self.framing.options)
             moved = tuple((key, start + min(max(first - dropped, 0), kept),
                            start + min(max(last - dropped, 0), kept)) for key, first, last in marks)
-            return [Chunk(text + self.framing.prefill, marks=moved)]
+            # A point the template trims away stands where the content it preceded now starts.
+            placed = tuple((key, start + min(max(point - dropped, 0), kept)) for key, point in points)
+            return [Chunk(text + self.framing.prefill, marks=moved, points=placed)]
         before, after = self.framing.around(encoder)
         shifted = tuple((key, len(before) + first, len(before) + last) for key, first, last in marks)
-        return [Chunk(before + content + after, marks=shifted)]
+        return [Chunk(before + content + after, marks=shifted,
+                      points=tuple((key, len(before) + point) for key, point in points))]
 
     def encode(self, encoder: Tokenizer, specials: Specials, question: Question,
                state: Sequence[int], *, conversation: bool = False,
@@ -675,8 +673,17 @@ class QuestionLayout(Layout):
         """Lay out `question` over the state's tokens `state`, with its options in `order`.
 
         Slot s shows option order[s]; None keeps the question's order. A
-        `conversation` keeps the end of the state instead of its start.
+        `conversation` keeps the end of the state instead of its start. A
+        layout in blocks splits the row at its question's head (`blocks`).
         """
+        row = self._encoded(encoder, specials, question, state, conversation=conversation, order=order,
+                            name=name)
+        return _blocked(row, row.questions[0].span[0]) if self.blocks else row
+
+    def _encoded(self, encoder: Tokenizer, specials: Specials, question: Question,
+                 state: Sequence[int], *, conversation: bool, order: Sequence[int] | None,
+                 name: str) -> Encoded:
+        """`encode`'s row, read in order."""
         texts = self.options(question)
         slots = _slots(len(texts), order)
         instructions = render(question.instructions).replace(specials.marker_text, " ")
