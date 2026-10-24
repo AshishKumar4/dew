@@ -146,7 +146,7 @@ def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16():
         with np.load(directory / name) as stored:
             reference.update({key: stored[key] for key in stored.files})
     model = adapter.build(config, dtype="bfloat16", attention_impl="xla")
-    variables = adapter.translate_weights(tensors, config)
+    variables, _ = adapter.translate_weights(tensors, config)
     image = (reference["image_prompt"],
              ({"image_indices": jnp.where(reference["image_prompt"] == 60, 0, -1)},
               {"pixel_values": jnp.asarray(reference["pixels"])}))

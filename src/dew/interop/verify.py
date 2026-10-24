@@ -57,7 +57,7 @@ CONVENTIONS: tuple[tuple[str, decoder_parts.DecoderFamily], ...] = (
     # reads them (`prepare`, `packed`: GPT-2's buffers, fused experts) is
     # left out: its names cannot be checked before the weights are read.
     *((family.model_types[0], family) for family in ENTRIES
-      if family.model_types[0] != 'llama' and not set(family.model_types) & decoder_parts.MASKED_MODEL_TYPES
+      if family.model_types[0] != 'llama' and not family.bidirectional
       and family.prepare is decoder_parts.DecoderFamily.prepare and not family.packed),
 )
 """The registered families an unregistered type is tried as, in order, each

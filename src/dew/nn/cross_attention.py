@@ -191,7 +191,9 @@ class GatedCrossAttention(nn.Module):
         dropout = nn.Dropout(rate=self.dropout_rate)
 
         def joined(stream: jax.Array, name: str, branch: jax.Array) -> jax.Array:
-            gate = jnp.tanh(self.param(name, nn.initializers.zeros, (1,), jnp.float32).astype(jnp.float32))
+            # The gate in at least float32, and in its own float64 where a run widens it.
+            alpha = self.param(name, nn.initializers.zeros, (1,), jnp.float32)
+            gate = jnp.tanh(alpha.astype(at_least_fp32(alpha.dtype)))
             branch = dropout(branch, deterministic=not train)
             return jnp.where(present, gated_join(stream, branch, gate, ngpt=self.ngpt,
                                                  precision=self.precision), stream)

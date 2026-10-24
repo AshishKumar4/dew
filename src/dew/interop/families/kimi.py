@@ -66,6 +66,7 @@ from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
     IGNORED_FIELDS,
     KDA_LEAVES,
+    MOE_NAMES,
     SERIALIZED_ENCODER_FIELDS,
     SERIALIZED_TEXT_FIELDS,
     DecoderFamily,
@@ -73,8 +74,8 @@ from dew.interop.decoder_parts import (
     KindFields,
     Leaves,
     MixtureFields,
-    Renames,
     SituFields,
+    context_lengths,
     dew_path,
     record_float,
     record_int,
@@ -309,17 +310,11 @@ def _kimi_k3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
         refuse(f'linear_attn_config fields {extra}', 'KimiDeltaAttention reads no such field')
     tied = records.boolean(hf_config.get('tie_word_embeddings', False), 'tie_word_embeddings')
     used.update(_K3_WRAPPER_FIELDS)
-    # KimiLinearConfig's own default (configuration_kimi_k3.py:55), capped
-    # at the context every family builds by default.
-    context = min(record_int(text, 'max_position_embeddings', 4096), DEFAULT_MAX_SEQ_LEN)
-    return _decoder(text, tied, context)
+    # KimiLinearConfig's own default (configuration_kimi_k3.py:55).
+    capacity, _ = context_lengths(text, 4096)
+    return _decoder(text, tied, capacity)
 
 
-_KIMI_NAMES: Renames = (('block_sparse_moe', 'mlp'), ('w1', 'gate_proj'), ('w3', 'up_proj'),
-                        ('w2', 'down_proj'))
-"""Kimi's MoE block and its experts' projections onto DeepSeek's names, which
-the shared map reads. Only a load respells them: the families keep their
-source layout on export."""
 _KIMI_LEAVES: Leaves = {'model.output_attn_res_norm.weight': ('output_res', 'scale'),
                         'model.output_attn_res_proj.weight': ('output_res', 'kernel')}
 _KIMI_LAYER_LEAVES: Leaves = {
@@ -338,8 +333,10 @@ sites, KDA's (`KDA_LEAVES`) and K3's."""
 
 
 def _decoder_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """Return the variables-tree path of a decoder tensor named below `model.`."""
-    return renamed_path(_KIMI_NAMES, 'model.' + name, config, leaves=_KIMI_LEAVES,
+    """Return the variables-tree path of a decoder tensor named below `model.`. Kimi spells its MoE
+    block as Mixtral does (`MOE_NAMES`); only a load respells it, since the families keep their
+    source layout on export."""
+    return renamed_path(MOE_NAMES, 'model.' + name, config, leaves=_KIMI_LEAVES,
                         layer_leaves=_KIMI_LAYER_LEAVES)
 
 
