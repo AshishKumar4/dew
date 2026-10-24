@@ -3,9 +3,9 @@
 A batch pads every row to the most questions times the most options, and a
 row's real options are a few of them. The joint head computes each option on
 its own but for its weight in its question's summary, so over the compacted
-options it scores every real option as it does over the grid, to float32
-rounding, whatever the number of option slots: XLA's products sum in an
-order that may follow how many rows they multiply.
+options it scores every real option as near float64 as it does over the
+grid, whatever the number of option slots: XLA's products sum in an order
+that may follow how many rows they multiply.
 """
 
 import dataclasses
@@ -16,8 +16,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from decision_support import decision_rows
-from reference_error import assert_leaves_as_exact, float64_terms, widened
+from reference_error import assert_as_exact, widened, with_gradients
 from safetensors.numpy import load_file
 
 from dew.data.dataset import DataPartition
@@ -36,7 +37,7 @@ from dew.decision.joint_checkpoint import StoredJointHead
 from dew.decision.layout import compacted
 from dew.decision.task import laid_out
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import VALID_ROWS, Step
+from dew.objectives.base import VALID_ROWS, Step, part, thaw
 
 FIXTURES = Path(__file__).parent / "fixtures"
 TINY = FIXTURES / "joint_checkpoint" / "tiny"
@@ -115,26 +116,97 @@ def ragged() -> list[Example]:
             Example("book a flight", {"intent": intents}, {"intent": "i3"})]
 
 
-def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
-    """Rows of 100, 17 x 3 and 24 real options packed into windows of a grid
-    as many questions deep as a window holds, which the packing compacts into
-    the slots its bounds allow: the loss and every parameter's
-    gradient, backbone's and head's, as over the grid to float32 rounding,
-    and the loss reads only the real options."""
+OPTION_SEEDS = 64
+"""The compacted-options site's declared draws (`seeds_for`, paired: both arms read the same head, states
+and cotangent, so their upstream rounding is shared)."""
+
+ALGEBRAIC_ZEROS = ("to_k", "scorer_out")
+"""The head's modules whose bias gradient is zero by algebra: a key's bias shifts every key's logit of a
+query alike, and the scorer's shared bias every option's, so no logit moves with either (their float64
+values are residue)."""
+
+SCORER_MARGIN = 1e-4
+"""The least gap a draw admits between the two sides of the scorer's `abs(repeated - options)` feature at
+a real option (`scorer_gap`), in float64: a hundred times the float32 rounding of the difference, so
+float32 and float64 take one slope of `abs` (a difference float32 rounds to zero takes `abs`'s slope at
+zero, 0, and moves every gradient behind it by its upstream value, which is no compaction's)."""
+
+
+def ragged_objective(examples) -> DecisionObjective:
+    """A small decoder and joint head over `examples`, a window as long as their longest row."""
     tokenizer = ByteTokenizer()
     specials = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
-    examples = ragged()
     # Rows as long as the longest needs, since each attention here holds its
     # whole [rows, heads, queries, keys] score on the CPU.
     layout = JointLayout(max_len=16384)
     length = max(len(row.tokens) for example in examples
                  for row in layout.rows(tokenizer, specials, example.state, example.questions))
-    objective = DecisionObjective(
+    return DecisionObjective(
         CausalTransformer(vocab_size=256, emb_features=16, num_layers=1, num_heads=1, mlp_features=24,
                           max_seq_len=length, attention_impl="xla"),
         tokenizer=tokenizer, specials=specials, layout=JointLayout(max_len=length),
         head=JointSchemaHead(hidden_size=16, width=16, routing_layers=2, layers=1, heads=1, feedforward=24,
                              attention_impl="xla"), shuffle_options=False)
+
+
+def scored(objective: DecisionObjective, inputs: DecisionInputs):
+    """The joint head's every real option's logit (0 at a slot with none) and, under the draw's cotangent
+    on them, the gradients of its parameters, of the backbone's states it reads and of the vocabulary
+    rows (`reference_error.with_gradients`), compiled once for every draw."""
+    def logits(head, states, table):
+        found = objective.model.head.apply(head, states, inputs, table)
+        return jnp.where(inputs.options, found, 0.0)
+    return jax.jit(with_gradients(logits))
+
+
+def scorer_features(objective: DecisionObjective, inputs: DecisionInputs):
+    """The features `scorer_hidden` reads (`nn.intercept_methods`) in the joint head's forward of
+    `(head, states, table)` over `inputs`, compiled once for every draw: their first two quarters are
+    the scorer's `repeated` and `options`."""
+    def features(head, states, table):
+        seen = []
+
+        def record(next_fun, args, kwargs, context):
+            if context.method_name == "__call__" and context.module.name == "scorer_hidden":
+                seen.append(args[0])
+            return next_fun(*args, **kwargs)
+
+        with nn.intercept_methods(record):
+            objective.model.head.apply(head, states, inputs, table)
+        return seen[0]
+    return jax.jit(features)
+
+
+def scorer_gap(features, options, *drawn) -> float:
+    """The least gap, over the real option slots and the scorer's width, between the two sides of its
+    `abs(repeated - options)` feature in float64, read off `features` (`scorer_features`)."""
+    with jax.enable_x64(new_val=True):
+        taken = np.asarray(features(*widened(drawn)))
+    width = taken.shape[-1] // 4
+    difference = taken[..., :width] - taken[..., width:2 * width]
+    real = np.broadcast_to(np.asarray(options).reshape(difference.shape[:-1])[..., None], difference.shape)
+    return float(np.min(np.abs(difference[real])))
+
+
+def zeroed(tree):
+    """`tree` with the algebraic zeros' bias gradients (`ALGEBRAIC_ZEROS`) exactly zero."""
+    def exact(path, leaf):
+        names = [getattr(entry, "key", None) for entry in path]
+        return leaf * 0 if names[-1:] == ["bias"] and any(name in ALGEBRAIC_ZEROS for name in names) else leaf
+    return jax.tree_util.tree_map_with_path(exact, tree)
+
+
+def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
+    """Rows of 100, 17 x 3 and 24 real options packed into windows of a grid as many questions deep as a
+    window holds, which the packing compacts into the slots its bounds allow. The compaction is the
+    joint head's alone (the backbone reads the rows' tokens, never their option slots), so the head is
+    what check 1 holds: over draws of the backbone's states and of a cotangent on each real option, its
+    every real option's logit and the gradients of its parameters, of the states and of the vocabulary
+    rows it reads are on par with the grid's from float64, the compaction only reordering the sums over
+    the grid's option slots. The backbone's own gradient is its backward of those states' gradient, one
+    program on both. The loss reads only the real options."""
+    examples = ragged()
+    objective = ragged_objective(examples)
     data = decision_rows(examples, len(examples), examples, objective=objective.data())
     (slotted,) = list(data.val(DataPartition()))
     slotted = {name: value for name, value in slotted.items() if name != VALID_ROWS}
@@ -148,37 +220,38 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     assert sorted(totals) == [24, 51, 100]
     # A window's real options compact into the slots its bounds allow, a multiple of 128.
     capacity = -(-bounds.options // 128) * 128
-    assert laid_out(slotted, bounds.segments).option_slots.shape == (len(options), capacity)
+    compact = laid_out(slotted, bounds.segments)
+    assert compact.option_slots.shape == (len(options), capacity)
     batch = {name: value for name, value in slotted.items() if name not in ("option_slots", "slotted")}
+    grid = laid_out(batch, bounds.segments)
     variables = objective.init(jax.random.key(0))
+    head = thaw(part(variables, "head"))
+    table = objective.model.table(variables)
+    states_shape = (*np.shape(slotted["tokens"]), objective.model.head.hidden_size)
+    features = scorer_features(objective, grid)
+
+    def draw(seed):
+        """A seed's backbone states and cotangent on each real option, from the first of its candidates
+        whose scorer gap clears SCORER_MARGIN."""
+        for attempt in range(64):
+            rng = np.random.default_rng([0x5107, seed, attempt])
+            states = rng.standard_normal(states_shape, np.float32)
+            if scorer_gap(features, grid.options, head, states, table) > SCORER_MARGIN:
+                readout = rng.standard_normal(options.shape, np.float32) * options
+                return head, states, table, readout
+        raise AssertionError(f"no candidate of seed {seed} has its scorer gap above {SCORER_MARGIN}")
+
+    on_grid = scored(objective, grid)
+    # The truth of the algebraic zeros is exactly zero, which each of their rows is held to.
+    assert_as_exact(scored(objective, compact), on_grid, draw, "compacted options logits and gradients",
+                    seeds=OPTION_SEEDS, truth_fn=lambda *inputs: zeroed(on_grid(*inputs)))
+
     step = Step(jnp.asarray(0), jax.random.key(0), None)
 
     def loss(held, rows):
         return objective.scalar_loss(held, rows, step)[0]
 
-    (grid, grid_gradient), (fewer, fewer_gradient) = (jax.value_and_grad(loss)(variables, rows)
-                                                      for rows in (batch, slotted))
-    # Float64 truth: the grid's step in float64 (the head and its scoring rule
-    # keep a float64 input's dtype), with each gradient leaf's terms: a key
-    # bias's and the scorer's shared bias gradients cancel (q.b shifts every
-    # key's logit alike; the residual gate shifts every option's), so their
-    # terms, not their near-zero sizes, are their rounding's scale. The
-    # compacted step is held to it as the grid is, per tensor
-    # (tests/reference_error.py).
-    with jax.enable_x64(new_val=True):
-        wide_variables, wide_batch = widened((variables, batch))
-        (truth, truth_gradient), (_, terms) = float64_terms(jax.value_and_grad(loss), wide_variables,
-                                                            wide_batch)
-        truth, truth_gradient = float(truth), jax.tree.map(np.asarray, truth_gradient)
-    # The compaction reorders the sums over the grid's option slots.
-    slots = options.shape[1] * options.shape[2]
-    assert_leaves_as_exact(fewer, grid, truth, reductions=slots)
-    assert_leaves_as_exact(fewer_gradient, grid_gradient, truth_gradient, reductions=slots, terms=terms)
-    # A NaN in one gradient leaf fails the same comparison.
-    leaves, structure = jax.tree.flatten(fewer_gradient)
-    poisoned = jax.tree.unflatten(structure, [np.full_like(leaves[0], np.nan), *leaves[1:]])
-    with pytest.raises(AssertionError):
-        assert_leaves_as_exact(poisoned, grid_gradient, truth_gradient, reductions=slots, terms=terms)
+    fewer, fewer_gradient = jax.value_and_grad(loss)(variables, slotted)
 
     # Whatever the head gives a slot with no real option, the loss and its
     # gradients are the same bits: the model's logits mask those slots.
