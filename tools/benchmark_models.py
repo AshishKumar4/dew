@@ -59,28 +59,26 @@ from dew.training.distributed import DevicePrefetchIterator
 Batch = dict[str, np.ndarray | Mapping[str, np.ndarray] | ModelInputs]
 
 
+@dataclasses.dataclass(frozen=True, eq=False)
 class _DenoisingTextTable(ConditionEncoder[str]):
     """Synthetic token and pooled features for native diffusion models."""
 
-    def __init__(self, table: CharTable, features: int, pooled_features: int | None,
-                 guidance: float | None, masked: bool = False):
-        self.table = table
-        self.params = table.params
-        self.features = features
-        self.pooled_features = pooled_features
-        self.guidance = guidance
-        self.masked = masked
-        """Whether the condition marks the real tokens, as Z-Image reads them."""
+    table: CharTable
+    params: Variables
+    features: int
+    pooled_features: int | None
+    guidance: float | None
+    masked: bool = False
+    """Whether the condition marks the real tokens, as Z-Image reads them."""
 
     @classmethod
     def from_pretrained(cls, checkpoint: str = "char_table", *, tokens: int = TEXT_TOKENS,
                         features: int = TEXT_FEATURES, pooled_features: int | None = None,
                         guidance: float | None = None, masked: bool = False, vocab: int = 130, seed: int = 0,
                         dtype=None):
-        return cls(CharTable.from_pretrained(checkpoint, tokens=tokens,
-                                            features=max(features, pooled_features or 0),
-                                            vocab=vocab, seed=seed, dtype=dtype),
-                   features, pooled_features, guidance, masked)
+        table = CharTable.from_pretrained(checkpoint, tokens=tokens, vocab=vocab, seed=seed, dtype=dtype,
+                                          features=max(features, pooled_features or 0))
+        return cls(table, table.params, features, pooled_features, guidance, masked)
 
     def tokenize(self, data: Sequence[str]) -> Mapping[str, np.ndarray]:
         return self.table.tokenize(data)
@@ -93,9 +91,9 @@ class _DenoisingTextTable(ConditionEncoder[str]):
         return DenoisingCondition(hidden[..., :self.features], pooled, guidance=guidance,
                                   mask=jnp.asarray(text.mask, bool) if self.masked else None)
 
-    def to_json(self) -> dict:
-        return {**self.table.to_json(), "features": self.features, "pooled_features": self.pooled_features,
-                "guidance": self.guidance, "masked": self.masked}
+    def recorded_fields(self) -> dict:
+        return {**self.table.recorded_fields(), "features": self.features,
+                "pooled_features": self.pooled_features, "guidance": self.guidance, "masked": self.masked}
 
 
 def trainer_mesh(mesh: Mapping[str, int]) -> dict[str, object]:

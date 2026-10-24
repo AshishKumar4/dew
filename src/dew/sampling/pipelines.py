@@ -278,16 +278,16 @@ class TextToImage:
                 autoencoder_record = _computing(autoencoder_record, compute)
         params = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype,
                                parameter_roots=_parameter_roots(inputs_record, autoencoder_record))
-        inputs = InputSpec.from_json(inputs_record, params=params.get('encoders', {}))
+        inputs = InputSpec.bound(inputs_record, params=params.get('encoders', {}))
         end_to_end = settings.end_to_end
         autoencoder = None
         if autoencoder_record is not None and end_to_end is not None:
             from dew.objectives.diffusion.end_to_end import AUTOENCODER, EndToEnd
             tuning = from_record(EndToEnd, fields(end_to_end, 'end_to_end'), dtypes=False)
-            frozen = AutoEncoder.from_json(autoencoder_record, params=params['params'][AUTOENCODER])
+            frozen = AutoEncoder.bound(autoencoder_record, params=params['params'][AUTOENCODER])
             autoencoder, params = tuning.tuned(frozen, params)
         elif autoencoder_record is not None:
-            autoencoder = AutoEncoder.from_json(autoencoder_record, params=params['autoencoder'])
+            autoencoder = AutoEncoder.bound(autoencoder_record, params=params['autoencoder'])
         grid = None if settings.grid is None else from_record(SourceGrid, fields(settings.grid, 'grid'))
         return cls(config.build(), settings.process, inputs, without_loss_heads(params), autoencoder,
                    steps=settings.sampling_steps, guidance=settings.guidance, solver=settings.solver,

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 from typing import TYPE_CHECKING
 
 import pytest
@@ -114,3 +115,27 @@ def test_a_model_records_wrappers_round_trip_by_their_class_and_refuse_what_wrap
     assert rebuilt == wrapped and type(rebuilt.wrappers[0]) is InputQuantization
     with pytest.raises(TypeError):
         ModelConfig("simple_dit", wrappers=(Field("image", (4, 4, 3)),))
+
+
+@dataclasses.dataclass(frozen=True)
+class Loaded:
+    """A component built around a value its record must not carry: it records `name` alone."""
+
+    name: str
+    weights: tuple[float, ...]
+
+    def recorded_fields(self) -> dict:
+        return {"name": self.name}
+
+
+def test_a_recorded_dataclass_writes_its_view_alone_and_its_class_is_found_by_that_record():
+    """A dataclass that states its recorded view (`registry.Recorded`) is written as that view, never
+    its other fields, always naming its class; `component` finds the class back from the record, and
+    refuses a protocol as the base, which no class need derive from."""
+    from dew.registry import Recorded, component, to_record
+
+    record = json.loads(json.dumps(to_record(Loaded("tiny", (1.0, 2.0)), object)))
+    assert record == {"class": f"{Loaded.__module__}:Loaded", "fields": {"name": "tiny"}}
+    assert component(Loaded, record) == (Loaded, {"name": "tiny"})
+    with pytest.raises(TypeError):
+        component(Recorded, record)

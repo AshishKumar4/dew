@@ -24,6 +24,7 @@ from dew.nn.autoencoders.api import ModuleAutoEncoder
 from dew.nn.autoencoders.pretrained import REGISTRATIONS
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import Recorder, Step
+from dew.registry import to_record
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "vae"
 
@@ -147,17 +148,17 @@ def _published(kind: str, directory: Path):
     return autoencoder, autoencoder.params
 
 
-RECORDS = tuple(entry.record for entry in REGISTRATIONS)
-"""Every built-in autoencoder's record name, one per registration."""
+RECORDS = ("sd_vae", *ARCHIVES)
+"""Every built-in autoencoder, by the fixture it is built from: the SD VAE's `tiny_vae` and the others'
+archives (`_published`)."""
 
 
 def test_every_registration_is_one_autoencoder_with_a_fixture():
-    """No record name, wrapper or published class registers twice, and every registered autoencoder has
-    its fixture here (`_published`; the SD VAE's is `tiny_vae`)."""
+    """No wrapper or published class registers twice, and every registered autoencoder has its fixture
+    here."""
     published = [name for entry in REGISTRATIONS for name in entry.published]
-    assert len(set(RECORDS)) == len(RECORDS) and len(set(published)) == len(published)
-    assert len({entry.wrapper for entry in REGISTRATIONS}) == len(REGISTRATIONS)
-    assert set(ARCHIVES) | {"sd_vae"} == set(RECORDS)
+    assert len(set(published)) == len(published)
+    assert len({entry.wrapper for entry in REGISTRATIONS}) == len(REGISTRATIONS) == len(RECORDS)
 
 
 @pytest.mark.parametrize("kind", RECORDS)
@@ -221,10 +222,10 @@ def test_a_users_autoencoder_rebuilds_from_its_record_as_a_built_in_does():
     recorded, its normalization included. Its class and its module's survive JSON as import paths."""
     vae = tiny_vae()
     original = Halved(vae.model, vae.params, factor=0.5)
-    record = json.loads(json.dumps(original.to_json()))
+    record = json.loads(json.dumps(to_record(original, AutoEncoder)))
     assert record["class"].endswith(":Halved")
     assert record["fields"]["model"]["class"].endswith(":AutoencoderKL")
-    rebuilt = AutoEncoder.from_json(record, params=original.params)
+    rebuilt = AutoEncoder.bound(record, params=original.params)
     assert type(rebuilt) is Halved and rebuilt.factor == 0.5
     image = jax.random.uniform(jax.random.key(0), (2, IMAGE_SIZE, IMAGE_SIZE, 3), minval=-1.0, maxval=1.0)
     latent = original.encode(original.params, image)
@@ -240,7 +241,7 @@ def test_an_earlier_runs_autoencoder_record_reads_as_its_class_record():
     from dew.inference.tasks import earlier_shapes
 
     original = tiny_vae(latent_shift=0.25, latent_scale=0.5)
-    record = original.to_json()
+    record = to_record(original, AutoEncoder)
     earlier = {"name": "sd_vae", "fields": {**record["fields"], "model": record["fields"]["model"]["fields"]}}
     assert earlier_shapes({"autoencoder": earlier})["autoencoder"] == record
 
@@ -257,8 +258,8 @@ def test_every_built_in_autoencoder_rebuilds_from_its_saved_record_alone(kind, t
     else:
         original, params = _published(kind, tmp_path / "source")
         shutil.rmtree(tmp_path / "source")
-    record = json.loads(json.dumps(original.to_json()))
-    rebuilt = AutoEncoder.from_json(record, params=params)
+    record = json.loads(json.dumps(to_record(original, AutoEncoder)))
+    rebuilt = AutoEncoder.bound(record, params=params)
     assert type(rebuilt) is type(original)
     side = 2 * original.downscale_factor
     frames = (5,) if kind == "wan" else ()

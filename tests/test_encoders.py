@@ -11,6 +11,7 @@ import pytest
 
 from dew.inputs import Condition, Field, InputSpec
 from dew.nn.dit import ConditioningEmbed, TextContext, masked_mean
+from dew.registry import to_record
 
 
 def test_text_pooling_excludes_nonfinite_padding_from_values_and_gradients():
@@ -116,7 +117,7 @@ def test_condition_roundtrip_preserves_nondefault_character_embeddings():
 
     condition = Condition(CharTable.from_pretrained(
         seed=7, dtype="bfloat16", tokens=4, features=2, vocab=8))
-    restored = Condition.from_json(condition.to_json())
+    restored = Condition.bound(to_record(condition, Condition))
     contexts = [value.encoder.encode(value.encoder.params, value.encoder.tokenize(["ab", ""]))
                 for value in (condition, restored)]
     np.testing.assert_array_equal(contexts[0].hidden, contexts[1].hidden)

@@ -11,7 +11,6 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
-from dew._records import JSON
 from dew.batch import Variables
 
 type RecordValue = float | np.ndarray | None
@@ -152,30 +151,23 @@ class AutoEncoder(ABC):
         replaced.normalization = normalization
         return replaced
 
-    def to_json(self) -> dict:
-        """Return the record of this autoencoder's constructor, without its parameters, as the registry
-        records a component (`dew.registry.component`): its class by import path, and its module's
-        record and `record_arguments` as fields, which `from_json` passes its constructor as keywords
-        with `model` and `params`."""
-        from dew.registry import import_path, to_record
-
+    def recorded_fields(self) -> dict:
+        """The record a run keeps of this autoencoder, without its parameters (`dew.registry.Recorded`):
+        its module, whose record names its class, and `record_arguments`, an array as a list; `bound`
+        passes them back to its constructor with `params`."""
         arguments = {name: np.asarray(value).tolist() if isinstance(value, np.ndarray | jax.Array) else value
                      for name, value in self.record_arguments().items()}
-        return {'class': import_path(type(self)),
-                'fields': {'model': to_record(self.model, nn.Module), **arguments}}
+        return {'model': self.model, **arguments}
 
     @staticmethod
-    def from_json(record, *, params: Variables) -> AutoEncoder:
-        """Rebuild the autoencoder a run recorded (`to_json`), around the checkpoint's own `params`,
-        reading no source: its class found as every component's is (`dew.registry.component`), of
-        Dew's or of a package the run trusts."""
-        from dew._records import json_value, record as fields_of
-        from dew.registry import component, from_record
+    def bound(record, *, params: Variables) -> AutoEncoder:
+        """Rebuild the autoencoder a run recorded (`dew.registry.to_record`), around the checkpoint's own
+        `params`, reading no source: its class found as every component's is (`dew.registry.component`),
+        of Dew's or of a package the run trusts, and its fields read against its constructor."""
+        from dew.registry import component, read_arguments
 
-        autoencoder, recorded = component(AutoEncoder, record)
-        arguments = {name: json_value(value, name) for name, value in recorded.items() if name != 'model'}
-        model = from_record(nn.Module, fields_of(recorded.get('model'), 'model'))
-        return _constructed(autoencoder, model, params, arguments)
+        autoencoder, fields = component(AutoEncoder, record)
+        return _built(autoencoder, read_arguments(autoencoder, fields), params)
 
     @abstractmethod
     def encode_batch(self, params, x: jnp.ndarray, key: jax.Array | None = None,
@@ -267,12 +259,12 @@ class AutoEncoder(ABC):
 
 
 
-def _constructed[Recorded](recorded: Callable[..., Recorded], model: nn.Module, params: Variables,
-                           arguments: Mapping[str, JSON]) -> Recorded:
-    """A recorded autoencoder class constructed from its record's parts (`AutoEncoder.from_json`): its
-    module, the run's `params` and its `record_arguments`, each subclass's own keywords, as the registry
-    constructs a component it finds by name."""
-    return recorded(model=model, params=params, **arguments)
+def _built(autoencoder: Callable[..., AutoEncoder], arguments: Mapping[str, object],
+           params: Variables) -> AutoEncoder:
+    """The subclass a record names (`AutoEncoder.bound`), constructed from its read `arguments` around
+    `params`: called as the callable it is, since its abstract base declares no constructor."""
+    return autoencoder(**arguments, params=params)
+
 
 class ModuleAutoEncoder[M: nn.Module](AutoEncoder):
     """A frozen flax autoencoder module and the params it loaded. The

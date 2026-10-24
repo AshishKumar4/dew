@@ -457,6 +457,11 @@ def to_record(value, annotation) -> JSON:
         # A matmul precision as the name jax reads back as it: a dot algorithm
         # preset's own ('F32_F32_F32'), a precision's alias ('highest').
         return value.name if isinstance(value, jax.lax.DotAlgorithmPreset) else value.name.lower()
+    if isinstance(value, Recorded) and not isinstance(value, type):
+        # A component built around parameters (an encoder, an autoencoder) records the constructor
+        # view it is rebuilt from, never its parameters, always naming its class (`component`).
+        return {"class": import_path(type(value)),
+                "fields": {name: to_record(entry, object) for name, entry in value.recorded_fields().items()}}
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         with recording() as written:
             if isinstance(value, nn.Module) and id(value) in written.modules:
@@ -799,11 +804,14 @@ def _shared(annotation: Annotation, value: Mapping[str, object], *, dtypes: bool
 
 def component[Base](base: type[Base], record: Mapping[str, object]
                     ) -> tuple[type[Base], Mapping[str, object]]:
-    """The class a component's record, `{"class": ..., "fields": {...}}`, names by an alias or its import
-    path, one that is `base`, derives from it or, for a protocol, implements it as a class of Dew's or a
-    trusted package's, and the record's fields: the one lookup `from_record` builds a class record
-    through. A component built around parameters (an encoder, an autoencoder, a decision head) binds them
-    itself from these fields. A record of another shape, or of a function, is refused."""
+    """The class a component's record, `{"class": ..., "fields": {...}}` (`to_record`, `Recorded`), names
+    by an alias or its import path, one that is `base` or derives from it, and the record's fields as
+    written: the lookup `from_record` builds a class record through. A component built around parameters
+    (an encoder, an autoencoder, a decision head) reads its fields against its own constructor
+    (`read_arguments`) and binds them itself. A record of another shape, of a function, or a protocol
+    `base` (which no class need derive from) is refused."""
+    if is_protocol(base):
+        raise TypeError(f"a component's base is a class it derives from, not the protocol {base.__name__}")
     named = class_record(record)
     if named is None:
         raise ValueError(f"a {base.__name__} record is {{'class': ..., 'fields': {{...}}}}, not {record!r}")
@@ -1106,6 +1114,17 @@ class Wrapper(Protocol):
     (`dew.quantization`)."""
 
     def apply(self, model: nn.Module) -> nn.Module: ...
+
+
+@runtime_checkable
+class Recorded(Protocol):
+    """A component a run records by the constructor view it is rebuilt from, not by its attributes: an
+    encoder's checkpoint and settings, an autoencoder's module and normalization, never the parameters
+    it was built around (`to_record` writes it as `{"class", "fields"}`, `component` finds its class).
+    `to_record` asks for this view before it walks a dataclass's fields (`record_fields`), so a
+    dataclass that is `Recorded` is recorded by its view alone."""
+
+    def recorded_fields(self) -> Mapping[str, object]: ...
 
 
 @runtime_checkable
@@ -1435,6 +1454,7 @@ __all__ = [
     "KINDS",
     "Aliases",
     "Record",
+    "Recorded",
     "argument_records",
     "component",
     "dtype_name",

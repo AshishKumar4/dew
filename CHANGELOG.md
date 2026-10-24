@@ -5,6 +5,14 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- Every component record is the registry's class record, `{"class", "fields"}`, written by
+  `dew.registry.to_record` and its class found by `dew.registry.component`. A component built around
+  parameters states its record as `recorded_fields()` (`dew.registry.Recorded`): a condition encoder's
+  `to_json` is now `recorded_fields`, and an autoencoder records its module and `record_arguments`, any
+  subclass, no registration needed. `InputSpec.to_json`, `Condition.to_json` and `AutoEncoder.to_json`
+  give way to `to_record(value, InputSpec)` and the like; `from_json` and `encoders.rebuild` to
+  `InputSpec.bound`, `Condition.bound`, `AutoEncoder.bound` and `ConditionEncoder.bound`. A decision
+  head records `{"class"}` for `{"name"}`; earlier runs' head and autoencoder records still load.
 - The train state moves to `dew.state`, and a variables tree's operations (`Path`, `select`, `freeze`, `thaw`,
   `without`, `part`, `everything`, `under`, `PARAMETER_ROOTS`) from `dew.objectives.base` to `dew.batch`.
   `ModelConfig` moves from `dew.config` to `dew.model_config`; its wrappers are any `dew.registry.Wrapper`.

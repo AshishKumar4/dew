@@ -290,7 +290,7 @@ def test_builtin_autoencoder_record_uses_the_saved_parameters():
                            dtype=jnp.float32)
     variables = module.init(jax.random.key(0), image)
     original = StableDiffusionVAE(model=module, params=variables['params'], dtype=jnp.float32)
-    rebuilt = AutoEncoder.from_json(original.to_json(), params=original.params)
+    rebuilt = AutoEncoder.bound(to_record(original, AutoEncoder), params=original.params)
     np.testing.assert_array_equal(original.encode(original.params, image),
                                   rebuilt.encode(rebuilt.params, image))
     latent = original.encode(original.params, image)

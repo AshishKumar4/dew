@@ -26,6 +26,7 @@ from dew.data.sources.files import Files
 from dew.inputs import AudioCondition, Condition, HFAudio
 from dew.model_config import ModelConfig
 from dew.objectives.base import Step
+from dew.registry import to_record
 from dew.sampling import CFG
 from dew.training import Trainer
 
@@ -99,7 +100,7 @@ def test_an_audio_condition_rebuilt_from_its_record_encodes_the_same(towers):
     condition = Condition(HFAudio.from_pretrained(str(towers / "wav2vec2"), seconds=0.25),
                           field="audio", unconditional=0.0)
     saved = jax.tree.map(lambda leaf: np.asarray(leaf) * 2, condition.encoder.params)
-    rebuilt = Condition.from_json(condition.to_json(), params=saved)
+    rebuilt = Condition.bound(to_record(condition, Condition), params=saved)
     tokens = condition.encoder.tokenize([_tone(330, 0.25)])
 
     assert rebuilt.unconditional == 0.0 and rebuilt.encoder.seconds == 0.25
