@@ -14,6 +14,7 @@ import numpy as np
 import optax
 import pytest
 from decision_support import decision_rows
+from interop_support import allocated_bytes
 from PIL import Image
 from reference_error import assert_as_exact_as_the_reference, float64_forward, ieee_fixture
 from safetensors.numpy import load_file
@@ -36,7 +37,7 @@ from dew.decision import (
 )
 from dew.decision.calibration import softmax
 from dew.decision.images import Images
-from dew.decision.joint_checkpoint import StoredJointHead
+from dew.interop import Pretrained
 from dew.nn.kernels.generation import measured_kernel
 from dew.training.trainer import Trainer
 
@@ -44,6 +45,22 @@ FIXTURES = Path(__file__).parent / "fixtures"
 TINY = FIXTURES / "joint_checkpoint" / "tiny"
 BACKBONE = FIXTURES / "hf" / "qwen38-dense-tiny"
 CASES = json.loads((FIXTURES / "laya" / "cases.json").read_text())
+
+
+def test_a_shapes_only_readout_load_avoids_eager_native_buffers(monkeypatch):
+    """The standalone joint readout needs no backbone: its shapes-only load retains every
+    parameter's geometry while allocating fewer native-layout buffers than its eager load."""
+    expected = Pretrained.load(TINY, dtype="float32", attention_impl="xla", on_host=True)
+    _, eager_bytes = allocated_bytes(monkeypatch, lambda: Pretrained.load(
+        TINY, dtype="float32", attention_impl="xla", on_host=True))
+    loaded, deferred_bytes = allocated_bytes(monkeypatch, lambda: Pretrained.load(
+        TINY, dtype="float32", attention_impl="xla", weights=False))
+    assert eager_bytes > 0 and deferred_bytes < eager_bytes
+    assert jax.tree.structure(loaded.variables) == jax.tree.structure(expected.variables)
+    for actual, wanted in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(expected.variables),
+                              strict=True):
+        assert isinstance(actual, jax.ShapeDtypeStruct)
+        assert actual.shape == wanted.shape and actual.dtype == wanted.dtype
 
 
 @pytest.fixture(scope="module")
@@ -129,15 +146,15 @@ def head_logits(tokenizer: HFTokenizer) -> tuple[np.ndarray, ...]:
     """Dew's head, the release's fp32 head, its float64 head, and the terms
     Dew's float64 head sums for each logit (`float64_forward`), all on the
     same fp32 backbone states, over every question of every case."""
-    loaded = StoredJointHead.load(TINY, attention_impl="xla")
+    loaded = Pretrained.load(TINY, dtype="float32", attention_impl="xla")
     table = load_file(BACKBONE / "model.safetensors")["lm_head.weight"]
     found, reference, truth, terms = [], [], [], []
     with np.load(TINY / "states.npz") as states, np.load(TINY / "logits.npz") as logits:
         for case, (_, row) in laid_out(tokenizer).items():
             inputs = DecisionInputs.collate([row], 0)
-            given = ({"params": loaded.params}, states[case][None], inputs, table)
-            scores = loaded.head.apply(*given)
-            _, summed = float64_forward(loaded.head, *given)
+            given = (loaded.variables, states[case][None], inputs, table)
+            scores = loaded.model.apply(*given)
+            _, summed = float64_forward(loaded.model, *given)
             for slot, laid in enumerate(row.questions):
                 key = f"{case}/{laid.name}"
                 found.append(np.asarray(scores)[0, slot, :len(laid.options)])
@@ -159,23 +176,23 @@ def test_a_padded_batch_scores_every_row_as_it_scores_alone(tokenizer):
     """All five cases in one batch, padded to the longest row and the most
     questions and options: padding reaches none of the head's pooling or
     attention, so each question scores as it does alone."""
-    loaded = StoredJointHead.load(TINY, attention_impl="xla")
+    loaded = Pretrained.load(TINY, dtype="float32", attention_impl="xla")
     table = load_file(BACKBONE / "model.safetensors")["lm_head.weight"]
     rows = laid_out(tokenizer)
     inputs = DecisionInputs.collate([row for _, row in rows.values()], 0)
     with np.load(TINY / "states.npz") as states:
         length = inputs.tokens.shape[1]
         padded = np.stack([np.pad(states[case], ((0, length - len(states[case])), (0, 0))) for case in rows])
-        batched = np.asarray(loaded.head.apply({"params": loaded.params}, padded, inputs, table))
+        batched = np.asarray(loaded.model.apply(loaded.variables, padded, inputs, table))
         for index, (case, (_, row)) in enumerate(rows.items()):
-            alone = np.asarray(loaded.head.apply({"params": loaded.params}, states[case][None],
+            alone = np.asarray(loaded.model.apply(loaded.variables, states[case][None],
                                                  DecisionInputs.collate([row], 0), table))
             for slot, laid in enumerate(row.questions):
                 width = len(laid.options)
                 np.testing.assert_allclose(batched[index, slot, :width], alone[0, slot, :width], atol=2e-5)
 
     def total(rows_of_table):
-        scores = loaded.head.apply({"params": loaded.params}, padded, inputs, rows_of_table)
+        scores = loaded.model.apply(loaded.variables, padded, inputs, rows_of_table)
         return jax.numpy.sum(jax.numpy.where(jax.numpy.isfinite(scores), scores, 0.0))
 
     gradient = np.asarray(jax.grad(total)(jax.numpy.asarray(table)))
