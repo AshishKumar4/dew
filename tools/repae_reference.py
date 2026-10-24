@@ -66,9 +66,9 @@ from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from einops import rearrange
 from lpips_weights import drawn_weights
 from recorded_draws import Tape, TorchDraws
-from torch_precision import float_as, replaced
 from reference_source import defined_in, fetched, ran
 from safetensors.torch import load as load_safetensors
+from torch_precision import float_as, replaced
 from torchvision import models
 
 from dew.diffusion import presets
