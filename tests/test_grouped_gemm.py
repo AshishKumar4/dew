@@ -258,14 +258,13 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
     """On a GPU no row measured, each Mosaic GPU launch's tiles are its family's, generated from the
     family's facts and the call's extents, and fit the GPU's block; the cost model picks among them on
     the GPU's own facts (at a Qwen3 MoE projection's extents, not every pick the same GPU family's
-    canonical device picks), and the call takes those picks. Named there (mma.sync's for the forward,
-    warpgroup MMA's for the forward and both gradients), the projection's forward and gradients are as
-    exact as XLA's ragged dot from float64."""
+    canonical device picks), and the call takes those picks. Named there, the projection's forward and
+    its gradients through them (the matrix frozen where the family runs no kernel gradient) are as exact
+    as XLA's ragged dot from float64."""
     target = UNSEEN[unseen]
     canonical = generation.TARGETS[target.generation]
     family = "wgmma" if target.wgmma else "mma.sync"
-    # mma.sync's tiles run the products alone, named (its gradients run Triton's, which an Ampere GPU's
-    # measurements prefer); the kernel gradient is warpgroup MMA's.
+    # mma.sync's tiles run the product and the input gradient; the kernel gradient is warpgroup MMA's.
     launched = {"MosaicGmm", "MosaicTgmm"} if target.wgmma else {"MosaicGmm"}
 
     def calls(rows, depth, width, groups):
@@ -297,24 +296,19 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
     def draw(seed):
         return tuple(jnp.asarray(value, jnp.bfloat16) for value in operands(sizes, jnp.bfloat16, seed)[:3])
 
+    def held(w):
+        # Where the family runs no kernel gradient, the matrix is frozen: the template forms no gradient
+        # of it (a frozen operand's cotangent is never formed).
+        return w if target.wgmma else jax.lax.stop_gradient(w)
+
     def projection(dtype=jnp.bfloat16):
-        return lambda x, w: expert_projection(x, w, group_sizes, dtype, "xla", None)
-
-    def forward(x, w):
-        return template.gemm(x, w, group_sizes, out_dtype=jnp.bfloat16, precision="default",
-                             interpret_on_cpu=True)
-
-    def named(x, w):
-        # The forward alone named: its gradients, past this scope, run the launches the GPU's facts pick.
-        with generation.chosen(grouped_matmul="mosaic_gpu"):
-            return forward(x, w)
+        return lambda x, w: expert_projection(x, held(w), group_sizes, dtype, "xla", None)
 
     def through_mosaic(x, w, dy):
-        if target.wgmma:
-            with generation.assumed(target), generation.chosen(grouped_matmul="mosaic_gpu"):
-                return with_gradients(forward)(x, w, dy)
-        with generation.assumed(target):
-            return with_gradients(named)(x, w, dy)
+        with generation.assumed(target), generation.chosen(grouped_matmul="mosaic_gpu"):
+            return with_gradients(lambda x, w: template.gemm(x, held(w), group_sizes, out_dtype=jnp.bfloat16,
+                                                             precision="default",
+                                                             interpret_on_cpu=True))(x, w, dy)
 
     # Eagerly: the Mosaic interpreter's ordered callbacks are not a jitted `linear_call`'s to carry.
     with tuning.seen() as launches:
@@ -324,6 +318,35 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
     assert {type(launch).__name__ for launch, _ in mosaic} == launched
     with generation.assumed(target):
         assert all(ba.heuristics_config == launch.estimate(ba, target)[1] for launch, ba in mosaic)
+
+
+@INTERPRETS
+def test_a_frozen_matrix_forms_no_kernel_gradient():
+    """A projection whose matrix is frozen (no reverse pass reaches it) forms no kernel gradient: no
+    launch computes one, and its input gradient through the Mosaic launches is as exact as XLA's from
+    float64."""
+    sizes = SIZES["ragged"]
+    group_sizes = jnp.asarray(sizes, jnp.int32)
+
+    def draw(seed):
+        return tuple(jnp.asarray(value, jnp.bfloat16) for value in operands(sizes, jnp.bfloat16, seed)[:3])
+
+    def frozen(product):
+        return lambda x, w: product(x, jax.lax.stop_gradient(w))
+
+    def projection(dtype=jnp.bfloat16):
+        return frozen(lambda x, w: expert_projection(x, w, group_sizes, dtype, "xla", None))
+
+    def through_mosaic(x, w, dy):
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"):
+            return with_gradients(frozen(lambda x, w: template.gemm(x, w, group_sizes, out_dtype=jnp.bfloat16,
+                                                                    interpret_on_cpu=True)))(x, w, dy)
+
+    # Eagerly: the Mosaic interpreter's ordered callbacks are not a jitted `linear_call`'s to carry.
+    with tuning.seen() as launches:
+        assert_as_exact(through_mosaic, jax.jit(with_gradients(projection())), draw, "frozen matrix",
+                        seeds=SEEDS, truth_fn=with_gradients(projection(jnp.float64)))
+    assert {type(launch).__name__ for launch, _ in launches} == {"MosaicGmm"}
 
 
 def test_the_kernels_forward_mode_keeps_the_projections_law():
