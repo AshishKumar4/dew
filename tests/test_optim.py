@@ -877,7 +877,7 @@ def test_narrow_weights_step_on_float32_moments_as_float32_weights_do(optimizer,
     float32: a gradient of 1e-4, whose square is below float16's smallest number, steps them as the
     same gradient steps float32 weights, by the rate and not by the rate over eps. (A decay of the
     weights themselves reads them in their own dtype, so none is taken here.)"""
-    solver = OptimConfig(optimizer=optimizer, rate=1e-3, clip_grads=0, weight_decay=0.0).build(4)
+    solver = OptimConfig(optimizer=optimizer, learning_rate=1e-3, clip_grads=0, weight_decay=0.0).build(4)
     weights = {"w": jnp.full((4, 4), 0.5, dtype)}
     gradient = {"w": jnp.full((4, 4), 1e-4, dtype)}
     narrow, _ = solver.update(gradient, solver.init(weights), weights)
