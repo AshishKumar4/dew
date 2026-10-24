@@ -1,6 +1,7 @@
-"""Wall-clock timing of calls: `samples`, which every benchmark tool in Dew measures with, and
-`benchmark`, which lays out many calls' timings as a table; and the process's resident memory as
-the kernel reports it (`resident_memory`), which the memory benchmarks read.
+"""Wall-clock timing of calls: `samples`, which every benchmark tool in Dew measures independent
+calls with, `carried`, which times calls that carry a state from one to the next, and `benchmark`,
+which lays out many calls' timings as a table; and the process's resident memory as the kernel
+reports it (`resident_memory`), which the memory benchmarks read.
 
 A run is timed from the call to the moment its output is ready on the devices
 (`jax.block_until_ready`), so an asynchronous dispatch is timed as the work it
@@ -125,6 +126,29 @@ def samples[T](fn: Callable[..., T], *args, warmup: int = 3, repeats: int = 10,
     return measured
 
 
+def carried[S](step: Callable[[S], S], state: S, count: int, *, each: bool = False) -> tuple[S, list[float]]:
+    """`count` calls of `step`, each handed the state the last returned (a training step's state, a
+    decoder's cache), and the seconds they took, with the state the last call returned. With `each`,
+    one sample a call, synchronized before the next starts, which times every call alone; otherwise
+    one sample the window, its calls dispatched as a run dispatches them and synchronized once at its
+    end, which times their throughput. A carried state is never released between calls, so its
+    windows are timed apart from `samples`, whose calls are independent. Refuses no call."""
+    if count < 1:
+        raise ValueError(f"a measured window takes at least one call, not {count}")
+    if each:
+        seconds = []
+        for _ in range(count):
+            start = time.perf_counter()
+            state = jax.block_until_ready(step(state))
+            seconds.append(time.perf_counter() - start)
+        return state, seconds
+    start = time.perf_counter()
+    for _ in range(count):
+        state = step(state)
+    state = jax.block_until_ready(state)
+    return state, [time.perf_counter() - start]
+
+
 def benchmark[T](calls: Mapping[Hashable, Callable[[], T]], *, warmup: int = 1,
                  repeats: int = 3) -> Benchmark[T]:
     """Time each of `calls`, in order, `repeats` times after `warmup` untimed runs (`samples`), and
@@ -151,4 +175,4 @@ def benchmark[T](calls: Mapping[Hashable, Callable[[], T]], *, warmup: int = 1,
     return Benchmark(seconds, outputs)
 
 
-__all__ = ["Benchmark", "benchmark", "samples"]
+__all__ = ["Benchmark", "benchmark", "carried", "samples"]

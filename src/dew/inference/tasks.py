@@ -75,8 +75,9 @@ class Processor(Protocol):
 
     Calling it turns text, with optional images, into `ModelInputs`.
     `decode` turns token rows into one string per row, `encode` one text into its ids, with the
-    special tokens a sequence carries or without, and `bos_id` is the id a sequence starts with, or
-    None.
+    special tokens a sequence carries or without, `spelling` a row of ids into the text the
+    tokenizer's own decode gives it, its special tokens spelled out, and `bos_id` is the id a
+    sequence starts with, or None.
     """
 
     def __call__(self, text: str | Sequence[str], *, images: Media | None = None) -> ModelInputs: ...
@@ -84,6 +85,8 @@ class Processor(Protocol):
     def decode(self, tokens: ArrayLike) -> list[str]: ...
 
     def encode(self, text: str, *, specials: bool) -> list[int]: ...
+
+    def spelling(self, ids: Sequence[int]) -> str: ...
 
     @property
     def bos_id(self) -> int | None: ...

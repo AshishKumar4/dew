@@ -193,11 +193,10 @@ class DewLM(TemplateLM):
         closes it with nothing (`_opening`): a context and its continuation encode as one row, so an
         EOS a tokenizer closes a sequence with would end the context before its continuation,
         shifting where the continuation starts and scoring an EOS it never wrote. The opening is
-        left off where the text already starts with it, which the tokenizer reads off the text's own
-        BOS spelling, so no row starts with two. `HFLM` asks instead whether the text starts with
-        the BOS's decoded text; the two agree wherever decoding a BOS gives back its spelling, as in
-        released vocabularies. `left_truncate_len` keeps that many of the last ids. Any other option
-        raises TypeError, since `HFLM` reads none.
+        left off where the text already starts with its spelling, as `HFLM` leaves its BOS off where
+        the text starts with the BOS's decoded text (`Processor.spelling`), so no row starts with two.
+        `left_truncate_len` keeps that many of the last ids. Any other option raises TypeError, since
+        `HFLM` reads none.
         """
         if kwargs:
             raise TypeError(f"tok_encode takes no {', '.join(sorted(kwargs))}")
@@ -205,10 +204,14 @@ class DewLM(TemplateLM):
             ids = self._processor.encode(string, specials=True)
         else:
             ids = self._processor.encode(string, specials=False)
-            opening = self._opening
-            if add_special_tokens is None and ids[:len(opening)] != opening:
-                ids = [*opening, *ids]
+            if add_special_tokens is None and not string.startswith(self._opened):
+                ids = [*self._opening, *ids]
         return ids[-left_truncate_len:] if left_truncate_len else ids
+
+    @functools.cached_property
+    def _opened(self) -> str:
+        """The text the run's tokenizer spells its opening with (`_opening`, `Processor.spelling`)."""
+        return self._processor.spelling(self._opening)
 
     @functools.cached_property
     def _opening(self) -> list[int]:

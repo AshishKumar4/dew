@@ -29,6 +29,7 @@ import numpy as np
 import optax
 from flax import linen as nn
 
+from dew.nn.activations import silu
 from dew.nn.conv import convolution
 from dew.nn.precision import at_least_fp32, compensated_sum, float32_matmul
 
@@ -67,7 +68,7 @@ def mp_silu(x: jax.Array) -> jax.Array:
 
     This is Eq. 81 of the EDM2 paper.
     """
-    return jax.nn.silu(x) / 0.596
+    return silu(x) / 0.596
 
 
 def mp_sum(a: jax.Array, b: jax.Array, t: float = 0.5) -> jax.Array:

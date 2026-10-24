@@ -327,8 +327,10 @@ class ShortcutObjective(DiffusionObjective):
         def taught(conditions):
             return velocity(teacher, conditions, train=False)
 
-        target = jnp.where(expand(bootstrap, v), self._bootstrapped(
-            taught, given, bootstrap, rows, count, total, x, sigma, step_size), v)
+        # A target computed apart from the model the loss trains, which a whole update and its parts
+        # take by different paths (`_bootstrapped`), so each example's is a boundary of its own.
+        target = step.boundary("shortcut targets", jnp.where(expand(bootstrap, v), self._bootstrapped(
+            taught, given, bootstrap, rows, count, total, x, sigma, step_size), v))
         u = velocity(self.model_variables(variables), conditions, train=step.training)(
             x, sigma, sigma - step_size)
         losses = jnp.square(u - target)
