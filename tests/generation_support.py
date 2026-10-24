@@ -9,6 +9,8 @@ Mosaic GPU's lowering checks a kernel against the process's own device, so lower
 on a CPU or on that GPU.
 """
 
+import importlib.util
+
 import jax
 import pytest
 
@@ -46,6 +48,14 @@ def lowers(name: str):
     them (`runnable`): Mosaic GPU checks a kernel against the process's own device (an A100's 166912
     bytes of shared memory refuse an H100's tile)."""
     return runs(name)
+
+
+COMPILES_FOR_TPU = pytest.mark.skipif(
+    not (jax.default_backend() == "tpu"
+         or (jax.default_backend() == "cpu" and importlib.util.find_spec("libtpu") is not None)),
+    reason="compiles for a compile-only TPU, which libtpu does in a CPU process with it installed, or a TPU")
+"""A mark skipping a test that compiles kernels for a TPU (`kernel_compile.compile_tpu_kernels`) where this
+process cannot: a GPU host's process has no TPU toolchain."""
 
 
 def generations(*names: str) -> list:
