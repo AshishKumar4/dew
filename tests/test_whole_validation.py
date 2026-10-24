@@ -21,7 +21,7 @@ from reference_error import assert_computes_the_oracle, chain_roundings
 from test_guidance_distillation import FIXTURES, FLUX
 
 from dew import Evaluation
-from dew.batch import VALID_ROWS
+from dew.batch import VALID_ROWS, padded_rows
 from dew.config import ModelConfig, ObjectiveConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data import Loading
@@ -119,6 +119,16 @@ def test_the_last_batch_is_filled_out_and_marked_on_every_process_count(held):
                 valid = np.asarray(batch.get(VALID_ROWS, np.ones(4 // count, bool)))
                 seen.extend(np.asarray(batch["id"])[valid].tolist())
         assert sorted(seen) == list(range(held)), count
+
+
+def test_a_batch_fills_out_with_its_own_rows_in_turn_and_never_from_none():
+    """A batch of three rows filled out to seven repeats them in turn and marks the four repeats; a
+    batch of no rows has nothing to repeat, so filling one out is refused rather than made up."""
+    indices, repeats = padded_rows(3, 7)
+    assert indices.tolist() == [0, 1, 2, 0, 1, 2, 0]
+    assert repeats.tolist() == [False] * 3 + [True] * 4
+    with pytest.raises(ValueError):
+        padded_rows(0, 4)
 
 
 EVALUATED = sorted(set(objectives) - ROLLOUT)
