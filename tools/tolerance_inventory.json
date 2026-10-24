@@ -513,7 +513,7 @@
    "comparisons": 9,
    "lane": "Training"
   },
-  "tests/test_multimodal_model.py": {
+  "tests/test_multimodal_model.py": 18,
    "comparisons": 19,
    "lane": "Kernels"
   },
