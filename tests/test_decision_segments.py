@@ -136,3 +136,23 @@ def test_a_saved_run_reloads_its_segments_and_an_earlier_runs_record_reads_as_be
                                   "specials": to_record(SPECIALS, Specials), "tokenizer": "byte",
                                   "processor": None})
     assert settings.layout == JointLayout(max_len=1024)
+
+
+def test_a_whole_request_whose_row_leaves_its_state_out_is_refused():
+    """A layout whose segments write no state keeps none of it, so a scoring task that answers only
+    whole requests refuses a request with a state, as it refuses one whose state the row cut."""
+    import jax
+    from test_decision_objective import tiny_backbone
+
+    from dew.decision import Decide, DecisionObjective
+
+    layout = JointLayout(max_len=1024, segments=(Schema(),))
+    head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
+    base = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
+                             specials=SPECIALS, layout=layout, head=head)
+    task = Decide(base.model, base.init(jax.random.key(0)), layout, TOKENIZER, SPECIALS)
+    scoring, _ = task.scoring(whole=True)
+    asked = {name: question.wire() for name, question in QUESTIONS.items()}
+    body = {"state": "one two three", "questions": asked}
+    with pytest.raises(ValueError):
+        scoring.admit(body)
