@@ -39,7 +39,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.dense import Dense
 from dew.nn.inputs import real_places, valid_order
 
-from .precision import at_least_fp32, float32_dot_general
+from .precision import at_least_fp32, float32_dot_general, rms_statistics
 from .sharding import logical_axes
 
 _DEAD = -1
@@ -292,8 +292,8 @@ class EngramLayer(nn.Module):
             *kv.shape[:2], self.hc_mult, self.emb_features)
         value = kv[..., self.hc_mult * self.emb_features:].astype(wide)
         h = streams.astype(wide)
-        rstd = (jax.lax.rsqrt(jnp.mean(jnp.square(h), -1) + self.norm_eps)
-                * jax.lax.rsqrt(jnp.mean(jnp.square(key), -1) + self.norm_eps))
+        rstd = (rms_statistics(h, self.norm_eps, keepdims=False)[1]
+                * rms_statistics(key, self.norm_eps, keepdims=False)[1])
         dot = jnp.sum(h * (q_weight * k_weight) * key, -1) * rstd * self.emb_features ** -0.5
         gate = jax.nn.sigmoid(jnp.copysign(jnp.sqrt(jnp.maximum(jnp.abs(dot), 1e-6)), dot))
         if token_mask is not None:
