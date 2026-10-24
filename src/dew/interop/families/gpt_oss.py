@@ -68,9 +68,11 @@ def _gpt_oss_export(model: CausalTransformer) -> Mapping[str, object]:
     mixture = model.mixture
     if mixture is None:
         refuse('mixture', 'GPT OSS needs routed experts')
+    # A plain rotary is written as a plain record: an omitted one reads as the class's YaRN.
+    rope = ({'rope_type': 'default', 'rope_theta': model.rope_theta} if model.yarn is None
+            else {**asdict(model.yarn), 'rope_type': 'yarn', 'rope_theta': model.rope_theta})
     return {'hidden_act': 'silu', 'num_local_experts': mixture.experts,
-            'num_experts_per_tok': mixture.top_k, 'swiglu_limit': 7.0,
-            'rope_scaling': None if model.yarn is None else asdict(model.yarn)}
+            'num_experts_per_tok': mixture.top_k, 'swiglu_limit': 7.0, 'rope_parameters': rope}
 
 
 GPT_OSS = DecoderFamily(
