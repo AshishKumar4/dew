@@ -9,16 +9,15 @@ this package may import `dew.rl`.
 from dew.data.prompts import PromptRecord
 
 from .episodes import (
-                       Action,
                        Environment,
                        EnvironmentFactory,
                        Episode,
                        EpisodeCancelled,
+                       EpisodeCollector,
                        EpisodeFailure,
                        EpisodeId,
                        EpisodeInference,
                        EpisodeRecorder,
-                       EpisodeRollout,
                        EpisodeStatus,
                        Observation,
                        RecoverableEnvironment,
@@ -31,22 +30,25 @@ from .grpo import GRPOObjective
 from .journal import EpisodeJournal
 from .ppo import PPOObjective, PPORollout, ValueHead
 from .preference import DPOObjective
-from .rollout import Reward, SampledRollout
-from .scheduler import Publisher, RolloutScheduler, SchedulerRecord
+from .rollout import PolicyCollector, Reward, prompt_tasks
+from .scheduler import Asynchronous, Publisher, RolloutScheduler, SchedulerRecord, Synchronous, task_ids
 from .sessions import (
                        ADVANTAGES_KEY,
                        IDS_KEY,
                        OLD_LOG_PROBS_KEY,
                        RESPONSE_MASK_KEY,
+                       TOKEN_REWARDS_KEY,
                        Call,
+                       Collector,
                        Session,
                        SessionSource,
+                       Snapshot,
                        Status,
                        Task,
                        Transcript,
                        pack,
 )
-from .sources import EnvironmentSource, PromptSource, prompt_tasks
+from .sources import EnvironmentSource, PromptSource
 
 __all__ = [
                        "ADVANTAGES_KEY",
@@ -54,20 +56,22 @@ __all__ = [
                        "OLD_LOG_PROBS_KEY",
                        "RESPONSE_MASK_KEY",
                        "REWARDS_KEY",
-                       "Action",
+                       "TOKEN_REWARDS_KEY",
+                       "Asynchronous",
                        "Call",
+                       "Collector",
                        "DPOObjective",
                        "Environment",
                        "EnvironmentFactory",
                        "EnvironmentSource",
                        "Episode",
                        "EpisodeCancelled",
+                       "EpisodeCollector",
                        "EpisodeFailure",
                        "EpisodeId",
                        "EpisodeInference",
                        "EpisodeJournal",
                        "EpisodeRecorder",
-                       "EpisodeRollout",
                        "EpisodeStatus",
                        "FlowGRPOObjective",
                        "FlowReward",
@@ -76,17 +80,19 @@ __all__ = [
                        "Observation",
                        "PPOObjective",
                        "PPORollout",
+                       "PolicyCollector",
                        "PromptRecord",
                        "PromptSource",
                        "Publisher",
                        "RecoverableEnvironment",
                        "Reward",
                        "RolloutScheduler",
-                       "SampledRollout",
                        "SchedulerRecord",
                        "Session",
                        "SessionSource",
+                       "Snapshot",
                        "Status",
+                       "Synchronous",
                        "Task",
                        "Transcript",
                        "Transition",
@@ -95,4 +101,5 @@ __all__ = [
                        "pack",
                        "prompt_tasks",
                        "session_of",
+                       "task_ids",
 ]
