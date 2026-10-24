@@ -11,6 +11,7 @@ import pytest
 import torch
 from reference_error import assert_as_exact
 from transformers import Gemma4UnifiedConfig, Gemma4UnifiedForConditionalGeneration
+from transformers.conversion_mapping import get_checkpoint_conversion_mapping
 
 from dew.interop import Pretrained
 from tools.diffusers_wan_reference import float64
@@ -72,6 +73,143 @@ def assert_forward(source, draw, label):
 def test_unified_processor_and_native_forward_follow_the_published_forward(source):
     assert_forward(source, lambda seed: unified_draw(source[1].config, seed),
                     "Gemma4 Unified source forward")
+
+
+def gradient_functions(source):
+    """Every trainable source parameter and every floating media input, in the native input layout."""
+    native, reference, truth = source
+    parameters = dict(reference.named_parameters())
+    conversions = get_checkpoint_conversion_mapping(reference.config.model_type)
+    bindings = {}
+    for source_name, layout in native.weight_layouts.items():
+        runtime_name = source_name
+        for conversion in conversions:
+            renamed, matched = conversion.rename_source_key(source_name)
+            if matched is not None:
+                runtime_name = renamed
+                break
+        if runtime_name in parameters:
+            bindings[runtime_name] = (source_name, layout)
+    missing = parameters.keys() - bindings.keys()
+    if missing:
+        raise ValueError(f"unmapped trainable reference parameters: {sorted(missing)}")
+
+    @jax.jit
+    def native_observations(batch, probe):
+        floating = {name: value for name, value in batch.conditioning.items()
+                    if jnp.issubdtype(value.dtype, jnp.floating)}
+
+        def loss(params, media):
+            prepared = batch.replace(conditioning={**batch.conditioning, **media})
+            logits = native.model.apply({**native.variables, "params": params},
+                                         prepared.tokens, **prepared.kwargs())
+            return jnp.sum(logits * probe), logits
+
+        (_, logits), (gradient, media) = jax.value_and_grad(loss, (0, 1), has_aux=True)(
+            native.variables["params"], floating)
+        return logits, gradient, media
+
+    def ours(inputs, probe):
+        batch = native.processor.from_hf(inputs)
+        observed = {}
+        for row, mask in enumerate(inputs["attention_mask"]):
+            single = batch.take_rows(jnp.asarray([row])).slice_tokens(0, int(mask.sum()))
+            logits, gradient, media = native_observations(single, probe[row, mask][None])
+            observed[f"row{row}.logits"] = logits
+            observed.update({f"row{row}.parameter.{name}": layout.export({"params": gradient})
+                             for name, layout in bindings.values()})
+            observed.update({f"row{row}.input.{name}": value for name, value in media.items()})
+        return observed
+
+    def theirs(model, inputs, probe, *, wide=False):
+        tensors = {name: torch.tensor(value, dtype=torch.float64 if wide and np.issubdtype(
+            value.dtype, np.floating) else None) for name, value in inputs.items()}
+        media = {name: value.requires_grad_(requires_grad=True) for name, value in tensors.items()
+                 if value.is_floating_point()}
+        params = dict(model.named_parameters())
+        observed = {}
+        singles = _row_slices(tensors, model)
+        for row, single in enumerate(singles):
+            logits = model(**single, use_cache=False).logits
+            cotangent = torch.tensor(probe[row, inputs["attention_mask"][row]][None], dtype=logits.dtype)
+            gradients = torch.autograd.grad(logits, (*params.values(), *media.values()),
+                                            grad_outputs=cotangent, allow_unused=True,
+                                            retain_graph=row + 1 < len(singles))
+            observed[f"row{row}.logits"] = logits.detach().numpy()
+            for name, value in zip(params, gradients[:len(params)], strict=True):
+                if value is None:
+                    raise ValueError(f"unreached trainable reference parameter: {name}")
+                observed[f"row{row}.parameter.{bindings[name][0]}"] = value.detach().numpy()
+            raw = dict(inputs)
+            for (name, original), value in zip(media.items(), gradients[len(params):], strict=True):
+                raw[name] = torch.zeros_like(original).numpy() if value is None else value.detach().numpy()
+            prepared = native.processor.from_hf(raw).take_rows(jnp.asarray([row]))
+            observed.update({f"row{row}.input.{name}": value for name, value in prepared.conditioning.items()
+                             if np.issubdtype(value.dtype, np.floating)})
+        return observed
+
+    def oracle(inputs, probe):
+        with float64(), jax.enable_x64(new_val=True):
+            return theirs(truth, inputs, probe, wide=True)
+
+    def draw(seed):
+        inputs = unified_draw(reference.config, seed)
+        probe = np.random.default_rng(seed + 73).standard_normal((2, 14, 64), np.float32)
+        return inputs, probe
+
+    return ours, lambda *args: theirs(reference, *args), oracle, draw
+
+
+def test_unified_backward_reaches_all_source_parameters_and_media_inputs(source):
+    ours, reference, truth, draw = gradient_functions(source)
+    assert_as_exact(ours, reference, draw, "Gemma4 Unified complete backward", seeds=8, truth_fn=truth)
+
+
+def test_cached_unified_calls_keep_the_ordinary_forward_mask(source):
+    native, reference, truth = source
+    model = native.model.clone(language_model=native.model.language_model.clone(max_seq_len=32))
+
+    @jax.jit
+    def ours_cached(batch, continuation):
+        cache = model.apply(native.variables, 1, method="init_cache", mutable=["cache"])[1]["cache"]
+        prefill, changed = model.apply({**native.variables, "cache": cache}, batch.tokens,
+                                       **batch.kwargs(), decode=True, mutable=["cache"])
+        outputs = {"prefill": prefill}
+        for step in range(continuation.shape[1]):
+            value, changed = model.apply({**native.variables, "cache": changed["cache"]},
+                                          continuation[:, step:step + 1], decode=True, mutable=["cache"])
+            outputs[f"step{step}"] = value
+        return outputs
+
+    def ours(inputs, continuation):
+        batch = native.processor.from_hf(inputs).take_rows(jnp.asarray([1])).slice_tokens(0, 10)
+        return ours_cached(batch, continuation)
+
+    def theirs(model, inputs, continuation, *, wide=False):
+        tensors = {name: torch.tensor(value, dtype=torch.float64 if wide and np.issubdtype(
+            value.dtype, np.floating) else None) for name, value in inputs.items()}
+        single = _row_slices(tensors, model)[1]
+        with torch.no_grad():
+            result = model(**single, use_cache=True)
+            outputs = {"prefill": result.logits.numpy()}
+            for step in range(continuation.shape[1]):
+                result = model(input_ids=torch.from_numpy(continuation[:, step:step + 1]),
+                               attention_mask=torch.ones((1, single["input_ids"].shape[1] + step + 1),
+                                                         dtype=torch.bool),
+                               past_key_values=result.past_key_values, use_cache=True)
+                outputs[f"step{step}"] = result.logits.numpy()
+        return outputs
+
+    def oracle(inputs, continuation):
+        with float64():
+            return theirs(truth, inputs, continuation, wide=True)
+
+    def draw(seed):
+        return unified_draw(reference.config, seed), np.random.default_rng(seed + 83).integers(
+            4, 50, (1, 3), dtype=np.int32)
+
+    assert_as_exact(ours, lambda *args: theirs(reference, *args), draw,
+                    "Gemma4 Unified cached ordinary forward", seeds=8, truth_fn=oracle)
 
 
 @pytest.mark.parametrize("media", ["text", "vision", "audio"])
