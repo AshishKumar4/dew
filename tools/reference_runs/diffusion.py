@@ -45,7 +45,6 @@ from common import (
     TracedWindow,
     WorkloadWork,
     attach_xplane_profile,
-    git_head,
     host,
     peak_flops,
     sha256,
@@ -57,6 +56,7 @@ from common import (
 )
 from dew_lm import recorded_norm
 from flax.traverse_util import flatten_dict, unflatten_dict
+from reference_source import git_head
 
 # The DiT both packages define, at 64x64 pixels: 256 patches of 4x4.
 MODEL = {"output_channels": 3, "patch_size": 4, "emb_features": 384, "num_layers": 8,

@@ -26,6 +26,7 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 import jax
 import numpy as np
 import torch
+from recorded_draws import Tape
 from reference_source import defined_in, fetched
 
 COMMIT = "008a4e5316c8e3bfe61a62f874bddba254295afb"
@@ -68,10 +69,10 @@ def main() -> None:
     for dtype, suffix in (("float64", "result"), ("float32", "result32")):
         sampler = edm_sampler(dtype)
         for name, arguments in CASES.items():
-            noises = iter([np.asarray(jax.random.normal(jax.random.fold_in(key, index), SHAPE))
+            noises = Tape([np.asarray(jax.random.normal(jax.random.fold_in(key, index), SHAPE))
                            for index in range(arguments["num_steps"])])
             result = sampler(Net(), torch.from_numpy(latents),
-                             randn_like=lambda x: torch.from_numpy(next(noises)).to(x.dtype),
+                             randn_like=lambda x: torch.from_numpy(noises.next(shape=x.shape)).to(x.dtype),
                              **arguments)
             arrays[f"{name}.{suffix}"] = result.numpy()
             arrays[f"{name}.arguments"] = np.asarray(json.dumps(arguments))

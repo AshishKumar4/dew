@@ -26,19 +26,17 @@ Run with the Dew test environment's torch, on CPU:
     python tools/vjepa_reference.py OUTPUT.npz
 """
 
-import importlib.util
+import importlib
 import sys
-import types
 from functools import cache, partial
 from pathlib import Path
 
 import ml_dtypes
 import numpy as np
 import torch
-from reference_source import CACHE as UPSTREAM, saved_fixture, verified
+from reference_source import package, published_files, saved_fixture
 
 REPO, COMMIT = "facebookresearch/jepa", "51c59d518fc63c08464af6de585f78ac0c7ed4d5"
-# In import order: each module's own imports come before it.
 FILES = {
     "src/utils/tensors.py": "774a0f81eea52d2fcc4373818d8aab04e790c14f029e37e415ec0e5f6df2a8cb",
     "src/masks/utils.py": "2297fb30aabdbc635a7b9e9793806cebec62367f032d4b9bd57fbb4e1681a381",
@@ -48,7 +46,6 @@ FILES = {
     "src/models/vision_transformer.py": "3d2dd861d535434c4202c1b488436433fc545d558899a48c392c240b4afe8abf",
     "src/models/predictor.py": "2a2d6febea26d5a670445f97bc9bc4c726617ee3d02a38f9aeff3b4b6db5a816",
 }
-CACHE = UPSTREAM / "jepa" / COMMIT
 CASES = {
     "published": {"img_size": 8, "patch_size": 2, "in_chans": 3, "embed_dim": 32, "depth": 2, "num_heads": 4,
                   "mlp_ratio": 4, "eps": 1e-6, "predictor_embed_dim": 16, "pred_depth": 2,
@@ -64,18 +61,9 @@ SEED = 53
 @cache
 def jepa():
     """V-JEPA's `src` at `COMMIT`, under its own package names."""
-    for package in ("src", "src.models", "src.models.utils", "src.masks", "src.utils"):
-        module = types.ModuleType(package)
-        module.__path__ = []
-        sys.modules[package] = module
-    for path, digest in FILES.items():
-        local = verified(f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/{path}", CACHE / path, digest)
-        name = path.removesuffix(".py").replace("/", ".")
-        spec = importlib.util.spec_from_file_location(name, local)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-    return sys.modules["src.models.vision_transformer"], sys.modules["src.models.predictor"]
+    package("src", published_files(REPO, COMMIT, FILES) / "src")
+    return (importlib.import_module("src.models.vision_transformer"),
+            importlib.import_module("src.models.predictor"))
 
 
 def build(config: dict):

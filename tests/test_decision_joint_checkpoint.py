@@ -284,7 +284,8 @@ def test_a_joint_release_reads_images_as_its_own_model_does(tmp_path):
     pictures = [Image.fromarray(array) for array in np.load(BACKBONE / "images.npy")]
     request = CASES["quickstart"]
     questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
-    media = Images.of(decide.processor, pictures, JointLayout.image)
+    assert decide.processor is not None
+    media = Images.of(decide.processor, pictures, decide.processor.image_text())
     [row] = decide.layout.rows(decide.tokenizer, decide.specials, request["state"], questions,
                                media=media.tokens)
     assert list(row.tokens) == json.loads((TINY / "images.json").read_text())["ids"]

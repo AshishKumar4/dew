@@ -530,6 +530,7 @@ DIFFUSION_GEMMA_TEXT = DecoderFamily(
     packed=FUSED_EXPERTS,
     export_weights=gemma4_export_weights,
     preserve_source_layout=False,
+    bidirectional=True,
     defaults=GEMMA4_DEFAULTS,
 )
 
@@ -545,6 +546,7 @@ DREAM = DecoderFamily(
     'DreamModel',
     _mask_token_export,
     preserve_source_layout=True,
+    bidirectional=True,
 )
 
 LLADA = DecoderFamily(
@@ -569,6 +571,7 @@ LLADA = DecoderFamily(
     export_weights=decoder_tensors,
     export_nulls=_LLADA_MOE_NULLS,
     preserve_source_layout=True,
+    bidirectional=True,
 )
 
 LLADA_MOE_V2 = DecoderFamily(
@@ -580,6 +583,7 @@ LLADA_MOE_V2 = DecoderFamily(
     export_path=partial(renamed_name, _LLADA_MOE_NAMES), export_weights=decoder_tensors,
     export_nulls=_LLADA_MOE_NULLS,
     preserve_source_layout=True,
+    bidirectional=True,
 )
 
 LLADA2_MOE = DecoderFamily(
@@ -592,4 +596,5 @@ LLADA2_MOE = DecoderFamily(
     packed=_LLADA2_PACKED, tied_head_names=('lm_head.weight', 'model.word_embeddings.weight'),
     export_nulls=('num_shared_experts',),
     preserve_source_layout=True,
+    bidirectional=True,
 )

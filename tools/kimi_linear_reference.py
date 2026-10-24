@@ -2,10 +2,10 @@
 
 The model is `KimiLinearForCausalLM` from moonshotai/Kimi-Linear-48B-A3B-Instruct
 at REVISION: configuration_kimi.py and modeling_kimi.py, fetched at that
-revision into CACHE. Its KDA layers call fla-core's Triton kernels, whose
-0.4.0 `fused_kda_gate` signature the release calls (0.5 changed it), so this
-runs on a CUDA device, in fp32, with TRITON_F32_DEFAULT=ieee for every dot
-that leaves its precision unset.
+revision through the hub's cache. Its KDA layers call fla-core's Triton
+kernels, whose 0.4.0 `fused_kda_gate` signature the release calls (0.5
+changed it), so this runs on a CUDA device, in fp32, with
+TRITON_F32_DEFAULT=ieee for every dot that leaves its precision unset.
 
 Environment (~/.cache/dew/reference-venvs/kimi-linear): torch 2.8.0+cu128,
 transformers 4.57.1, fla-core 0.4.0.
@@ -57,15 +57,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from kimi_k3_reference import (
-    LEARNING_RATE,
-    fixture_batch,
-    greedy,
-    record_orders,
-    remote_modules,
-    scatter,
-    sgd_step,
-)
+from kimi_k3_reference import LEARNING_RATE, fixture_batch, greedy, record_orders, scatter, sgd_step
+from reference_source import hub_modules
 from safetensors.torch import save_file
 
 REPO = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
@@ -162,7 +155,7 @@ def released_modules():
     documented = transformers.utils.auto_docstring
     transformers.utils.auto_docstring = lambda obj=None, **kwargs: obj if obj is not None else (lambda inner: inner)
     try:
-        configuration, modeling = remote_modules(REPO, REVISION, CACHE, "kimi_linear_remote", REMOTE)
+        configuration, modeling = hub_modules("kimi_linear_remote", REPO, REVISION, REMOTE)
     finally:
         transformers.utils.auto_docstring = documented
     from fla.ops.kda import wy_fast

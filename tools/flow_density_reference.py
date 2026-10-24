@@ -17,7 +17,6 @@ from the first is the float32 run's rounding.
 
 from __future__ import annotations
 
-import contextlib
 from pathlib import Path
 
 import diffusers
@@ -25,7 +24,7 @@ import jax
 import numpy as np
 import torch
 from diffusers.training_utils import compute_density_for_timestep_sampling
-from torch_precision import replaced
+from recorded_draws import fixed_draws
 
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "flow" / "densities.npz"
 DRAWS = 4096
@@ -40,14 +39,6 @@ CASES = {
 density, logit_mean, logit_std and mode_scale."""
 
 
-@contextlib.contextmanager
-def drawn(base: torch.Tensor):
-    """`torch.normal(mean, std, size)` and `torch.rand(size)` return `base`'s values."""
-    with replaced((torch, "normal", lambda mean, std, size, **_: mean + std * base),
-                  (torch, "rand", lambda size, **_: base)):
-        yield
-
-
 def main() -> None:
     key = jax.random.key(0)
     bases = {"normal": np.asarray(jax.random.normal(key, (DRAWS,), dtype=jax.numpy.float32)),
@@ -56,7 +47,7 @@ def main() -> None:
     for case, arguments in CASES.items():
         base = bases["normal" if arguments["weighting_scheme"] == "logit_normal" else "uniform"]
         for dtype, tail in ((torch.float32, ""), (torch.float64, "_f64")):
-            with drawn(torch.tensor(base, dtype=dtype)):
+            with fixed_draws(torch.tensor(base, dtype=dtype)):
                 arrays[f"{case}{tail}"] = compute_density_for_timestep_sampling(
                     batch_size=DRAWS, **arguments).numpy()
     arrays["diffusers_version"] = np.array(diffusers.__version__)
