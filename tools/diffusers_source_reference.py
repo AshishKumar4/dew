@@ -29,7 +29,7 @@ and torchsde==0.2.6:
 
     PYTHONPATH=src python tools/diffusers_source_reference.py
     PYTHONPATH=src python tools/diffusers_source_reference.py rounding \
-        tests/fixtures/diffusers/source_rounding.npz
+        tests/fixtures/diffusers/source_rounding.npz 32
     PYTHONPATH=src python tools/diffusers_source_reference.py seeds \
         tests/fixtures/diffusers/source_seeds.npz
 
@@ -408,17 +408,18 @@ def trajectory_gradient(module: ModuleType, case: Case, initial: torch.Tensor,
     return gradient.numpy()
 
 
-STATE_CASES = ("edm.exponential_v_threshold", "dpm_multi.eps_threshold", "edm.default",
-               "dpm_multi.flow", "cfg.zero_rescale")
-"""The cases with no reduction over latent positions: their pixel permutations reproduce one rounding
-draw, so independent initial states and cotangents over seeds resolve their rounding (`seeds`)."""
+STATE_CASES = ("dpm_multi.eps_threshold", "edm.default", "dpm_multi.flow", "cfg.zero_rescale")
+SEEDED_CASES = ("edm.exponential_v_threshold",)
+"""The pointwise cases whose rounding resolves over seeds within check 1's reach (`seeds`): an
+independent initial state and cotangent each, where the rest's few unclipped entries carry too
+heavy a tail and keep `rounding`'s copies."""
 
 
 def seeds(destination: Path) -> None:
-    """Each pointwise case's trajectory gradient over the seeds check 1 draws (`record_case`): a seed's
-    initial state at the scheduler's `init_noise_sigma` and its cotangent, the float32 VJP from it
-    and the float64 one, the per-step draws Dew's solver makes at its key 0 fed to both, the count
-    planned on Dew's own walk (tests/diffusion_support.py's `source_final`)."""
+    """Each seeded case's trajectory gradient over the seeds check 1 draws (`record_case`): a seed's
+    initial state at the scheduler's `init_noise_sigma` and its cotangent, the float32 VJP from it and
+    the float64 one, the per-step draws Dew's solver makes at its key 0 fed to both, the count planned
+    on Dew's own walk (tests/diffusion_support.py's `source_final`)."""
     import diffusers
     import jax
 
@@ -429,7 +430,7 @@ def seeds(destination: Path) -> None:
     torch.set_num_threads(2)
     noises = step_noise(SHAPE, STEPS, np.float64)
     arrays: dict[str, np.ndarray] = {}
-    for name in STATE_CASES:
+    for name in SEEDED_CASES:
         case, module = CASES[name], MODULES[CASES[name].scheduler]
         scheduler = getattr(module, case.scheduler)(**case.config)
         with tempfile.TemporaryDirectory(prefix="dew-source-scheduler-") as saved:
@@ -465,17 +466,38 @@ def seeds(destination: Path) -> None:
          reference=f"huggingface/diffusers {version}", license="Apache-2.0")
 
 
-def rounding(destination: Path) -> None:
-    """CFG epsilon's reduction over pixels in 52 orders: its rescaling reduces over pixels, so each
-    permutation of the input and the cotangent moves rounding, and its float64 VJP must commute with
-    each before a reference distance is recorded. The original source_schedulers arrays are read,
-    never replaced."""
+def rounding(destination: Path, copies: int) -> None:
+    """Independent states for pointwise VJPs, pixel orders for CFG's reduction.
+
+    The five pointwise cases have no reduction over latent positions: their
+    pixel permutations reproduce one rounding draw. Independent initial
+    states and per-step noise draws enlarge their RMS comparison instead.
+    CFG with rescaling reduces over pixels, so its 52 permutations do move
+    rounding. Both its input and cotangent move, and its float64 VJP must
+    commute with each permutation before a reference distance is recorded.
+    The original source_schedulers arrays are read, never replaced.
+    """
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
     from reference_error import ORDERS, distance
     from residual_orders import orders
 
     torch.set_num_threads(2)
-    arrays: dict[str, np.ndarray] = {}
+    arrays: dict[str, np.ndarray] = {"copies": np.asarray(copies)}
+    shape = (SHAPE[0], SHAPE[1], SHAPE[2] * copies)
+    noises = step_noise(shape, STEPS, np.float64)
+    for name in STATE_CASES:
+        case, module = CASES[name], MODULES[CASES[name].scheduler]
+        generator = torch.Generator().manual_seed(SEED)
+        scheduler = getattr(module, case.scheduler)(**case.config)
+        scheduler.set_timesteps(case.steps)
+        initial = (torch.randn(shape, generator=generator, dtype=torch.float64)
+                   * float(scheduler.init_noise_sigma)).float()
+        cotangent = torch.randn(shape, generator=generator, dtype=torch.float64).float()
+        single = trajectory_gradient(module, case, initial, cotangent, torch.float32, noises)
+        with float64_scheduler(module):
+            truth = trajectory_gradient(module, case, initial, cotangent, torch.float64, noises)
+        arrays.update({f"{name}.x_T": initial.numpy(), f"{name}.cotangent": cotangent.numpy(),
+                       f"{name}.grad_float32": single, f"{name}.grad": truth})
     name = "cfg.epsilon"
     case, module = CASES[name], MODULES[CASES[name].scheduler]
     drawn = orders(int(np.prod(SHAPE[1:])), ORDERS, SEED)
@@ -499,7 +521,7 @@ def rounding(destination: Path) -> None:
     arrays["orders"] = drawn.astype(np.uint8)
     arrays[f"{name}.distances"] = np.asarray(distances)
     np.savez_compressed(destination, **arrays)
-    print(f"{destination}: {ORDERS} pixel orders")
+    print(f"{destination}: {copies} independent states per original entry, {ORDERS} pixel orders")
 
 
 def run(name: str, case: Case) -> dict[str, np.ndarray]:
@@ -697,7 +719,7 @@ def main(only: Sequence[str] = ()) -> None:
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["rounding"]:
-        rounding(Path(sys.argv[2]))
+        rounding(Path(sys.argv[2]), int(sys.argv[3]))
     elif sys.argv[1:2] == ["seeds"]:
         seeds(Path(sys.argv[2]))
     elif sys.argv[1:2] == ["cases"]:
