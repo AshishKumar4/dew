@@ -437,3 +437,24 @@ def test_a_collectives_bytes_are_as_xla_sizes_its_sub_byte_and_packed_results():
   %gathered = (s4[3]{0}, u4[]{}, s4[3]{0:E(4)}, bf16[2,3]{1,0}) all-gather-done(%started)
 }"""
     assert hlo_instructions(module)["gathered"].buffers == (3, 1, 2, 12)
+
+
+def test_a_collectives_device_groups_are_read_in_every_form_xla_prints():
+    """Each form a CPU step's compiled HLO prints a collective's groups in, read as the positions
+    in the device assignment that take part together: listed, an iota laid out and transposed,
+    over a mesh's named axes, a permute's pairs, and every device at once."""
+    from dew.telemetry.instrumentation import hlo_instructions
+
+    module = """ENTRY %main (p: f32[8]) -> f32[8] {
+  %listed = f32[8]{0} all-reduce(f32[8]{0} %p), replica_groups={{0,1},{4,5},{2,3},{6,7}}
+  %iota = f32[8]{0} all-reduce(f32[8]{0} %p), replica_groups=[4,2]<=[2,2,2]T(2,1,0)
+  %named = f32[8]{0} all-gather(f32[2]{0} %p), replica_groups=mesh['fsdp'=4,'sequence'=2] {'fsdp'}
+  %pairs = f32[8]{0} collective-permute(f32[8]{0} %p), source_target_pairs={{1,0},{3,2},{5,4},{7,6}}
+  %every = f32[8]{0} all-reduce(f32[8]{0} %p), replica_groups={}
+}"""
+    assert {name: instruction.groups for name, instruction in hlo_instructions(module).items()} == {
+        "listed": ((0, 1), (4, 5), (2, 3), (6, 7)),
+        "iota": ((0, 4), (2, 6), (1, 5), (3, 7)),
+        "named": ((0, 2, 4, 6), (1, 3, 5, 7)),
+        "pairs": ((1, 0), (3, 2), (5, 4), (7, 6)),
+        "every": ()}

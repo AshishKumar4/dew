@@ -167,12 +167,14 @@ def build(args: argparse.Namespace) -> Run:
 
     work = measure(objective, rows(np.arange(args.batch)))
     work.write(args.work)
-    schedule = Cosine(peak=args.lr_peak, warmup_steps=args.warmup, end=args.lr_end, init=args.lr_init)
+    schedule = Cosine(peak_value=args.lr_peak, warmup_steps=args.warmup, end_value=args.lr_end,
+                      init_value=args.lr_init)
     # One group over every parameter, as torch_lm.py's AdamW decays the norms
     # and biases too.
     solver = OptimConfig(
         optimizer="adamw", b1=args.b1, b2=args.b2, optimizer_opts={"eps": args.eps},
-        state_dtype=args.state_dtype, rate=schedule, weight_decay=args.weight_decay, clip_grads=args.clip,
+        state_dtype=args.state_dtype, learning_rate=schedule, weight_decay=args.weight_decay,
+        clip_grads=args.clip,
         param_groups=(ParamGroup("all", ("*",)),)).build(schedule_steps)
     devices = jax.device_count()
     mesh = {"data": MeshSpec(), "fsdp": MeshSpec(fsdp=devices), "expert": MeshSpec(expert=devices)}[args.mesh]

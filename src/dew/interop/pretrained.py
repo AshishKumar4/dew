@@ -420,7 +420,7 @@ class Pretrained:
             # A selected GGUF file is a decoder, whatever pipeline index the repo also ships.
             loaded = _pipeline_source(name_or_dir, directory, commit, single_file, dduf_file, placed,
                                       dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
-                                      streaming=streaming)
+                                      streaming=streaming or not weights)
         else:
             loaded = None
         if loaded is None:
@@ -1365,6 +1365,7 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
             # The vision layouts are the export's alone: the bundle's own are derived from its tree, as
             # every adapter (LoRA's projections) reads them.
             variables, vision = diffusion_gemma.translate_weights(tensors, config, param_dtype=param_dtype,
+                                                                  lazy=streaming,
                                                                   checked=checked)
             record, layouts, retained = config, (), {}
             built = {**config, "dtype": dtype, "attention_impl": attention_impl}

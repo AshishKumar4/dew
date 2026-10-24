@@ -73,6 +73,7 @@ from dew.coordination import broadcast_from_process_zero, from_every_process, se
 from dew.files import write_atomically
 from dew.hashing import fmix32
 from dew.nn import sharding
+from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import LogicalAxes
 from dew.objectives.base import PARAMETER_ROOTS, Variables
 from dew.records import JSON, duration, json_value
@@ -1473,7 +1474,7 @@ class Checkpoints:
                     dtypes = jax.tree.map(lambda leaf: leaf.dtype, average)
                     total = jax.tree.map(
                         lambda leaf, weight=weight: weight
-                        * leaf.astype(np.promote_types(leaf.dtype, np.float32)),
+                        * leaf.astype(at_least_fp32(leaf.dtype)),
                         average,
                     )
                 else:

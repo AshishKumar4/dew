@@ -38,7 +38,7 @@ def test_to_dict_and_from_dict_round_trip_a_run(dataset, tmp_path):
     config = RunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 64}),
         data=data,
-        optim=OptimConfig(optimizer="lamb", rate=1e-3, weight_decay=0.1, b1=0.8, b2=0.99),
+        optim=OptimConfig(optimizer="lamb", learning_rate=1e-3, weight_decay=0.1, b1=0.8, b2=0.99),
         trainer=TrainerConfig(name="run", steps=10, mesh=MeshSpec(fsdp=2),
                               layout=Layout(rules={"mlp": "fsdp"}, min_shard=8)),
     )
@@ -142,6 +142,27 @@ def test_the_model_config_builds_with_its_own_dtype_and_attention():
         params, ids)
     assert logits.dtype == jnp.float32
     assert jnp.array_equal(logits, expected)
+
+
+@pytest.mark.parametrize("scaling", ["llama3", "longrope"])
+def test_dtype_changes_preserve_union_held_rotary_policies(scaling):
+    """Model metadata may hold either rotary policy. It survives a compute-dtype override while
+    the model can still run on the same parameter tree."""
+    import jax
+
+    from dew.nn.rope import LongRopeScaling, RopeScaling
+
+    policy = (RopeScaling(8.0, 1.0, 4.0, 16) if scaling == "llama3" else
+              LongRopeScaling((1.0,) * 4, (2.0,) * 4, 16, factor=2.0))
+    model = CausalTransformer(vocab_size=16, emb_features=16, num_layers=1, num_heads=2,
+                              head_dim=8, mlp_features=32, max_seq_len=32, rope_scaling=policy,
+                              dtype="float32", attention_impl="reference")
+    configured = ModelConfig.from_model(model).with_dtype("bfloat16").build()
+    ids = jnp.asarray([[1, 2, 3]], jnp.int32)
+    variables = model.init(jax.random.key(0), ids)
+    expected = model.clone(dtype=jnp.bfloat16).apply(variables, ids)
+    actual = configured.apply(variables, ids)
+    assert jnp.array_equal(actual, expected)
 
 
 class Unprecise(nn.Module):
@@ -506,7 +527,7 @@ def test_a_learning_rate_schedule_is_a_typed_record_that_round_trips():
     from dew.optim import ParamGroup, Power, PowerTail
     config = RunConfig(
         trainer=TrainerConfig(steps=1),
-        optim=OptimConfig(rate=Power(peak=0.01, warmup_steps=5, a=4.0, c=16.0,
+        optim=OptimConfig(learning_rate=Power(peak_value=0.01, warmup_steps=5, a=4.0, c=16.0,
                                          tail=PowerTail(start=8)),
                           param_groups=ParamGroup.mup(4.0)))
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
@@ -517,17 +538,19 @@ def test_param_groups_with_schedules_momentum_and_bounds_round_trip():
     """A run's record reads back each group's schedules, `every` included,
     its bounds, and the config's own one-cycle schedule."""
     from dew.optim import Cosine, Exponential, OneCycle, ParamGroup
-    momentum = OneCycle(peak=0.85, init=0.95, end=0.95, every=40)
+    momentum = OneCycle(peak_value=0.85, init_value=0.95, end_value=0.95, every=40)
     config = RunConfig(
         trainer=TrainerConfig(steps=1),
         optim=OptimConfig(
-            optimizer="adam", rate=Exponential(init=1e-3, end=1e-5, decay_steps=8, offset=1e-6),
+            optimizer="adam",
+            learning_rate=Exponential(init_value=1e-3, end_value=1e-5, decay_steps=8, offset=1e-6),
             param_groups=(
-                ParamGroup("delays", ("*/delay",), schedule=Cosine(peak=0.1, warmup_steps=0, every=40),
+                ParamGroup("delays", ("*/delay",), schedule=Cosine(peak_value=0.1, warmup_steps=0, every=40),
                            bounds=(0.0, 24.0)),
                 ParamGroup("weights", ("*/kernel",), weight_decay=1e-5,
-                           schedule=OneCycle(peak=5e-3, every=40), b1=momentum),
-                ParamGroup("rest", ("*",), schedule=OneCycle(peak=5e-3, warmup_fraction=0.25), b1=momentum),
+                           schedule=OneCycle(peak_value=5e-3, every=40), b1=momentum),
+                ParamGroup("rest", ("*",), schedule=OneCycle(peak_value=5e-3, warmup_fraction=0.25),
+                           b1=momentum),
             )))
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
     assert loaded == config
