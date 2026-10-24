@@ -398,6 +398,9 @@ def test_a_tile_of_192_columns_stages_every_column_it_writes():
 
 
 @runs("sm80")
+@pytest.mark.skipif(jax.default_backend() == "gpu" and generation.gpu_target().wgmma,
+                    reason="Mosaic GPU lowers a kernel for the process's own device, and a Hopper GPU's "
+                           "pipelines for mma.sync's tiles exceed its shared memory (SM80-h100)")
 @pytest.mark.parametrize("sizes", [name for name in SIZES if any(SIZES[name])])
 def test_an_ampere_gpu_runs_the_mosaic_forward_only_by_name(sizes):
     """Without warpgroup MMA the Mosaic GPU forward runs mma.sync's tiles (`AMPERE_TILES`) only where the
