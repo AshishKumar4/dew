@@ -367,7 +367,7 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
                          first_slice, store=store, train=train, decode=decode,
                          attention_metadata=attention_metadata)
 
-        layer = functools.partial(_applied, run, opened, store, train=train, decode=decode,
+        layer = functools.partial(_applied, run, store, opened=opened, train=train, decode=decode,
                                   attention_metadata=attention_metadata)
 
         if count == 1:
@@ -386,8 +386,8 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     return x
 
 
-def _applied[Hidden](run: DecoderBlock, opened: bool | list[str], store, read, state, cache, hidden: Hidden,
-                     per_layer_slice, *, train: bool, decode: bool,
+def _applied[Hidden](run: DecoderBlock, store, read, state, cache, hidden: Hidden,
+                     per_layer_slice, *, opened: bool | list[str], train: bool, decode: bool,
                      attention_metadata) -> tuple[Hidden, dict]:
     """One layer of `run` applied in a scope of its own: `read` its read-only variables, `state`
     the caller's held collections and `cache` its cache slice, writing the `opened` collections
@@ -420,8 +420,8 @@ def _opened(run: DecoderBlock, spec: LayerSpec, probed: list[tuple[LayerSpec, li
         # A provider writes its keys and values into the store it is given: the
         # abstract run writes into a copy, so nothing it traces leaves it.
         _, changed = jax.eval_shape(lambda variables: _applied(
-            run, True, None if store is None else dict(store), variables, {}, None, hidden,
-            per_layer_slice, train=train, decode=decode,
+            run, None if store is None else dict(store), variables, {}, None, hidden,
+            per_layer_slice, opened=True, train=train, decode=decode,
             attention_metadata=attention_metadata), variables)
         written = list(changed)
         probed.append((spec, written))
