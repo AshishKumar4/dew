@@ -491,9 +491,6 @@ class QuestionLayout(Layout):
              tokens: Sequence[int] | None = None) -> list[Encoded]:
         if media:
             raise ValueError(f"a {type(self).__name__} row has no place for images")
-        if self.segments is not None:
-            return [self._segmented(encoder, specials, state, question, (orders or {}).get(name), name)
-                    for name, question in questions.items()]
         if tokens is None:
             tokens = self.state(encoder, specials, state)
         return [self.encode(encoder, specials, question, tokens, conversation=_conversation(state),
