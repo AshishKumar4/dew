@@ -94,6 +94,6 @@ def test_a_layout_and_a_head_of_a_runs_own_reload_by_import_path_and_an_earlier_
     head = WiderHead(hidden_size=8)
     assert Head.from_record(head.record(), 8) == head
     recorded = JointSchemaHead(hidden_size=8).record()
-    assert isinstance(recorded, dict)
+    assert isinstance(recorded, dict) and recorded["name"] == "dew.decision.head:JointSchemaHead"
     earlier = {"name": "JointSchemaHead", "fields": recorded["fields"]}
     assert Head.from_record(earlier, 8) == JointSchemaHead(hidden_size=8)

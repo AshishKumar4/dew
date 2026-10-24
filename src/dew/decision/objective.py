@@ -708,11 +708,10 @@ class DecisionObjective(Objective[Ratio]):
         from the source config; the decision record owns neither format.
         """
         from dew.inference.tasks import recorded_tokenizer
-        from dew.registry import to_record
 
         return DecideSettings(
             self.model.head.record(),
-            to_record(self.layout, Layout),
+            self.layout,
             self.specials, recorded_tokenizer(RunProcessor(self.tokenizer)),
             # A decision task reads text through its own tokenizer, so only a media processor is kept.
             None if self.image_processor is None or self.image_processor.directory is None
