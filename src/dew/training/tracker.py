@@ -105,6 +105,13 @@ def _gif(clip: np.ndarray) -> bytes:
 
 DECISION_ROWS = 256
 """The most scored questions a tracker shows of one `Decisions` preview."""
+DECISION_COLUMNS = ("row", "question", "label", "predicted", "p_label")
+"""The columns of a decision preview's rows (`_decided`), as every sink shows them."""
+
+
+def _texts(value: TextSamples) -> tuple[str, ...]:
+    """A text preview's samples as text: its decoded texts, or each row's token ids where it has none."""
+    return value.texts or tuple(str(row.tolist()) for row in _home(value.tokens))
 
 
 def _decided(value: Decisions) -> list[list[float | int]]:
@@ -165,8 +172,7 @@ def _(value: VideoGrid) -> Payload:
 def _(value: TextSamples) -> Payload:
     import wandb
 
-    texts = value.texts or tuple(str(row.tolist()) for row in _home(value.tokens))
-    rows = [[index, value.prompt, text] for index, text in enumerate(texts)]
+    rows = [[index, value.prompt, text] for index, text in enumerate(_texts(value))]
     table = wandb.Table(columns=["sample", "prompt", "text"])
     for row in rows:
         table.add_data(*row)
@@ -192,7 +198,7 @@ def _(value: TokenScores) -> Payload:
 def _(value: Decisions) -> Payload:
     import wandb
 
-    table = wandb.Table(columns=["row", "question", "label", "predicted", "p_label"])
+    table = wandb.Table(columns=list(DECISION_COLUMNS))
     for row in _decided(value):
         table.add_data(*row)
     return {"val/decisions": table}
@@ -694,9 +700,8 @@ def _(value: VideoGrid):
 def _(value: TextSamples):
     from tensorboard.compat.proto.summary_pb2 import Summary
 
-    texts = value.texts or tuple(str(row.tolist()) for row in _home(value.tokens))
     return Summary(value=[_text('val/samples', json.dumps(
-        {'prompt': value.prompt, 'texts': list(texts)}))])
+        {'prompt': value.prompt, 'texts': list(_texts(value))}))])
 
 
 def _histogram(tag: str, values: np.ndarray):
@@ -728,9 +733,8 @@ def _(value: TokenScores):
 def _(value: Decisions):
     from tensorboard.compat.proto.summary_pb2 import Summary
 
-    rows = _decided(value)
     return Summary(value=[_text('val/decisions', json.dumps(
-        {'columns': ['row', 'question', 'label', 'predicted', 'p_label'], 'rows': rows}))])
+        {'columns': list(DECISION_COLUMNS), 'rows': _decided(value)}))])
 
 
 class Trackers(_OwnedTracker):

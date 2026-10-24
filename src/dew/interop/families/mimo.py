@@ -31,6 +31,7 @@ from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
+    KindFields,
     Renames,
     Ropes,
     base_config,
@@ -41,9 +42,8 @@ from dew.interop.decoder_parts import (
     renamed_name,
     renamed_path,
 )
-from dew.interop.families.deepseek import deepseek_layout
+from dew.interop.families.deepseek import deepseek_layout, deepseek_mixture
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 
 _KINDS = ('full_attention', 'sliding_attention')
@@ -127,11 +127,23 @@ def _mimo_v2_flash_config(hf: Mapping[str, object], used: set[str]) -> DecoderFi
         # and gives it the sinks (modeling_mimo_v2_flash.py:348, 363).
         kinds['sliding_attention'].update(num_kv_heads=2 * kv_heads, sinks=True,
                                           partial_rotary_factor=local_factor)
-    scale = hf.get('attention_value_scale', 0.707)
+    return _attention_and_experts(
+        config, hf, used, kinds, value_dim=records.integer(hf.get('v_head_dim', 128), 'v_head_dim'),
+        scale=0.707, factor=full_factor, count=count, sparse=sparse)
+
+
+def _attention_and_experts(config: DecoderFields, hf: Mapping[str, object], used: set[str],
+                           kinds: Mapping[str, KindFields], *, value_dim: int, scale: float | None,
+                           factor: float, count: int, sparse: tuple[int, ...]) -> DecoderFields:
+    """`config` with what both MiMo-V2 readers set alike: the layer kinds, the value heads' width
+    and scale (`attention_value_scale`, `scale` where the config omits it), the unbiased output
+    projection, the 'default' partial rotary of the full layers,
+    attention dropout and the routed experts (`_mixture`)."""
     config.update(
-        kinds=kinds, value_head_dim=records.integer(hf.get('v_head_dim', 128), 'v_head_dim'),
-        value_scale=None if scale is None else records.number(scale, 'attention_value_scale'),
-        o_proj_bias=False, partial_rotary_factor=None if full_factor == 1.0 else full_factor,
+        kinds=kinds, value_head_dim=value_dim,
+        value_scale=None if (stated := hf.get('attention_value_scale', scale)) is None
+        else records.number(stated, 'attention_value_scale'),
+        o_proj_bias=False, partial_rotary_factor=None if factor == 1.0 else factor,
         partial_rotary_type='default',
         attention_dropout_rate=records.number(hf.get('attention_dropout', 0.), 'attention_dropout'),
         mixture=_mixture(hf, count, used, sparse))
@@ -146,18 +158,12 @@ def _mixture(hf: Mapping[str, object], count: int, used: set[str],
     reference does; its expert fields are read all the same."""
     if hf.get('n_routed_experts') is None and not sparse:
         return None
-    layout = deepseek_layout({**hf, 'routed_scaling_factor': hf.get('routed_scaling_factor') or 1.0},
-                             count, used, sparse_layers=sparse)
+    # A null scaling is the reference's 1.0.
+    stated = {**hf, 'routed_scaling_factor': hf.get('routed_scaling_factor') or 1.0}
     if not sparse:
+        deepseek_layout(stated, count, used, sparse_layers=sparse)
         return None
-    if hf.get('norm_topk_prob', True) is not True:
-        refuse('norm_topk_prob', 'DeepseekV3TopkRouter renormalizes the top-k weights')
-    return NativeFields(Mixture, {
-        **layout,
-        'score_function': 'sigmoid', 'bias': True,
-        'groups': records.integer(hf.get('n_group') or 1, 'n_group'),
-        'groups_per_token': records.integer(hf.get('topk_group') or 1, 'topk_group'),
-    })
+    return deepseek_mixture(stated, count, used, sparse_layers=sparse)
 
 
 def _mimo_v2_flash_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
@@ -302,27 +308,18 @@ def _mimo_v2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         # A windowed kind rotates whole heads unless it states its own
         # factor (`LayerKind`); MiMoV2Attention turns the same third of both.
         kinds['sliding_attention'].update(num_kv_heads=swa_kv_heads, partial_rotary_factor=factor)
-    scale = hf.get('attention_value_scale')
-    config.update(
-        kinds=kinds, value_head_dim=value_dim,
-        value_scale=None if scale is None else records.number(scale, 'attention_value_scale'),
-        o_proj_bias=False, partial_rotary_factor=None if factor == 1.0 else factor,
-        partial_rotary_type='default',
-        attention_dropout_rate=records.number(hf.get('attention_dropout', 0.), 'attention_dropout'),
-        mixture=_mixture(hf, count, used, sparse))
-    return config
+    return _attention_and_experts(config, hf, used, kinds, value_dim=value_dim,
+                                  scale=None, factor=factor, count=count,
+                                  sparse=sparse)
 
 
 _FUSED_QKV = grouped_qkv('.self_attn.qkv_proj')
 
 
 def _mimo_v2_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """The shared map under the family's names. The fused qkv is read through
-    its parts (`_FUSED_QKV`); the prediction layers, which the reference skips
+    """The shared map under the family's names; the prediction layers, which the reference skips
     on load, and the towers, which the text decoder never runs, have no place."""
     if name.startswith(('model.mtp.', 'visual.', 'audio_encoder.', 'speech_embeddings.')):
-        return None
-    if name.endswith(tuple(packing.name for packing in _FUSED_QKV)):
         return None
     return renamed_path(_NAMES, name, config)
 

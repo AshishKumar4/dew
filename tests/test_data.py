@@ -1225,17 +1225,16 @@ def test_records_whose_field_lengths_differ_are_refused_with_the_remedy():
     stream.close()
 
 
-def test_an_epoch_of_records_too_few_for_one_batch_is_refused():
-    """Three records repeat to fill a batch of four, as a run counted in steps reads them, but an
-    epoch of them is zero steps long, so a run counted in epochs is refused."""
+def test_an_epoch_of_records_too_few_for_one_batch_is_one_step():
+    """Three records repeat to fill a batch of four, as a run counted in steps reads them, and an
+    epoch of them is that one step, which holds the next epoch's first record."""
     data = _records(_columns(3))
     stream = data.train(DataPartition())
     try:
         assert len(next(stream)["index"]) == 4
     finally:
         stream.close()
-    with pytest.raises(ValueError):
-        data.epoch_steps(1)
+    assert data.epoch_steps(1) == 1
 
 
 def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(tmp_path):

@@ -21,6 +21,7 @@ from dew.records import JSON
 from ..activations import GatedActivation, gated_product
 from ..attention import LayerNorm, RMSNorm
 from ..attention_residuals import DepthAttention, ResidualSite, sources
+from ..cross_attention import NAME as CROSS_ATTENTION
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock
 from ..gemma4_moe import Gemma4Experts
@@ -31,6 +32,7 @@ from ..hyper_connections import (
     HyperConnections,
     HyperHead,
     collapse_by,
+    collapse_streams,
     mix_streams,
 )
 from ..inputs import LayerInputs, MixerCall, PredictionPhase, routing_blocks
@@ -307,6 +309,23 @@ class Mixture:
             dtype=dtype, precision=precision)
 
 
+LAYER_SCALAR_COLLECTIONS = {"trainable": "params", "frozen": "constants"}
+"""The collection a block keeps its layer scalar in, by mode (`BlockWiring.layer_scalar`): Google's
+release makes it a parameter, and Transformers a buffer, which Dew keeps as a constant."""
+
+
+def layer_scalar_mode(variables: Mapping[str, object], path: tuple[str, ...]) -> str | None:
+    """The mode whose collection holds the layer scalar at `path` within it, or None where neither does:
+    a tree being written decides, so an export agrees with whichever collection training left it in."""
+    for mode, collection in LAYER_SCALAR_COLLECTIONS.items():
+        node: object = variables.get(collection)
+        for part in path:
+            node = node.get(part) if isinstance(node, Mapping) else None
+        if node is not None:
+            return mode
+    return None
+
+
 @dataclasses.dataclass(frozen=True)
 class BlockWiring:
     """How a block norms its two sublayers, and whether it scales its output.
@@ -540,7 +559,10 @@ class DecoderBlock(nn.Module):
     the attention residual is divided by sqrt(2).
 
     `engram` first writes the layer's n-gram lookup into the streams, reading
-    the metadata's `engram_ids` at `engram_index`. A DSpark target layer
+    the metadata's `engram_ids` at `engram_index`. `cross` is the layer's gated
+    cross-attention factory (`dew.nn.cross_attention`): its block reads the
+    metadata's `context` and joins the residual, in its form, before the mixer
+    reads it. A DSpark target layer
     (`prediction_target`) sows the mean of the streams its attention reads, or
     of those it hands on when `prediction_site` is 'output', as
     `prediction_inputs/draft_context`.
@@ -576,6 +598,7 @@ class DecoderBlock(nn.Module):
     media_routed: bool = False  # the feed-forward routes a media span by its own bias
     engram: Callable[..., nn.Module] | None = None  # the layer's EngramLayer factory
     engram_index: int | None = None
+    cross: Callable[..., nn.Module] | None = None  # the layer's GatedCrossAttention factory
     prediction_target: bool = False  # records its streams' mean for DSpark
     prediction_site: Literal['input', 'output'] = 'input'  # where `prediction_target` records
     attention_norm: bool = True  # False: the attention reads its input unnormed (ModernBERT's first block)
@@ -671,7 +694,8 @@ class DecoderBlock(nn.Module):
         if self.wiring.ngpt is not None:
             self._ngpt_rates(self.wiring.ngpt)
         if self.wiring.layer_scalar == "frozen":
-            self.output_scalar = self.variable("constants", "layer_scalar", jnp.ones, (1,), jnp.float32).value
+            self.output_scalar = self.variable(LAYER_SCALAR_COLLECTIONS["frozen"], "layer_scalar", jnp.ones,
+                                               (1,), jnp.float32).value
         elif self.wiring.layer_scalar == "trainable":
             self.output_scalar = self.param("layer_scalar", nn.initializers.ones, (1,), jnp.float32)
         if self.per_layer_input_dim:
@@ -732,6 +756,8 @@ class DecoderBlock(nn.Module):
                 raise ValueError("an engram lookup gates into mHC's residual streams and reads "
                                  "one engram layer's bucket ids, so it needs both")
             self.engram_layer = self.engram(name='engram')
+        if self.cross is not None:
+            self.cross_attention = self.cross(name=CROSS_ATTENTION)
         self.dropout = nn.Dropout(rate=self.dropout_rate)
 
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
@@ -798,6 +824,9 @@ class DecoderBlock(nn.Module):
         every form.
         """
         state = self._enter(x, train, attention_metadata)
+        if self.cross is not None:
+            state = self._crossed(state, None if attention_metadata is None else attention_metadata.context,
+                                  decode, train)
         state, read, site = self._read(state, "attention")
         if not (self.wiring.pre_norms and self.attention_norm):
             normed = read
@@ -846,6 +875,23 @@ class DecoderBlock(nn.Module):
                 mlp_branch = mlp_branch + attention_branch
             state = self._write(state, "mlp", mlp_branch, site)
         return self._leave(state, train, per_layer_input)
+
+    def _crossed(self, state: _BlockState, context, decode: bool, train: bool) -> _BlockState:
+        """The state after the cross-attention block joins it: the plain stream (AltUp's active
+        copy among them, nGPT's unit one), mHC's streams through their mean, or the depth
+        state's partial block through the mixture the attention reads."""
+        cross = functools.partial(self.cross_attention, decode=decode, train=train)
+        if isinstance(state, _Plain):
+            return state._replace(x=constrain(cross(state.x, context), RESIDUAL))
+        if isinstance(state, _Streams):
+            streams = cross(state.streams, context, read=lambda streams: collapse_streams(streams, None))
+            return state._replace(streams=constrain(streams, STREAMS))
+
+        def mixture(partial):
+            if not state.finished:
+                return partial
+            return self.attention_res(sources(state.blocks, state.finished, partial))
+        return state._replace(partial=cross(state.partial, context, read=mixture))
 
     def _joined(self, state: _BlockState) -> tuple[SeamNorm, _Plain] | None:
         """The MLP's pre-norm and the plain stream, where that norm adds the

@@ -26,17 +26,23 @@ each element of the operand (the scaling of the loaded tile by them) runs in the
 loaded tile, so the normalized operand never reaches global memory. A producer the kernels cannot take tile
 by tile, or whose operand changes its base's dtype, runs in XLA before the product, reported as the
 epilogue's is ('gemm_prologue').
+
+`generation.chosen(gemm_epilogue=..., gemm_prologue=...)` names either stage's route: 'xla' runs it in XLA
+beside the product whatever the kernels take, the reference a fused route is checked against, and
+'fused' raises where the kernels cannot take it rather than run XLA.
 """
 
 import functools
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
 from jax.extend import core as jax_core
 
 from dew.nn.kernels import generation
+from dew.nn.kernels.selection import forced
 from dew.nn.kernels.templates.gemm import template
 
 AXES = ('rows', 'columns')
@@ -67,10 +73,12 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, *fusions)
     acc = jax.ShapeDtypeStruct((lhs.shape[0], width), jnp.float32)
     consumer, values, prefetch = fuser.get_fusion_values(out_fusion, acc)
     leaves, treedef = jax.tree.flatten(values)
-    axes = (generation.Refusal('scalar_prefetch', "the consumer reads scalar prefetch") if prefetch
+    named = forced('gemm_epilogue')
+    axes = (generation.Refusal('chosen', "`generation.chosen` names XLA") if named == 'xla'
+            else generation.Refusal('scalar_prefetch', "the consumer reads scalar prefetch") if prefetch
             else _axes(consumer, values, acc))
     if isinstance(axes, generation.Refusal):
-        generation.route('gemm_epilogue', kernel='xla', preferred='fused', refusal=axes)
+        _refused('gemm_epilogue', named, axes)
         summed = template.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=jnp.float32,
                                interpret_on_cpu=interpret_on_cpu, **prologue)
         return consumer(values, summed)
@@ -87,6 +95,15 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, *fusions)
     return jax.tree.unflatten(out_treedef, consumed if several else (consumed,))
 
 
+def _refused(choice: str, named: str | None, refusal: generation.Refusal) -> None:
+    """Report `choice`'s stage run in XLA for `refusal`; raise where `generation.chosen` names it fused."""
+    if named == 'fused':
+        raise ValueError(f"`generation.chosen` names {choice}='fused', which the kernels cannot take: "
+                         f"{refusal.code}: {refusal.detail}")
+    generation.route(choice, kernel='xla', preferred=None if named == 'xla' else 'fused',
+                     refusal=None if named == 'xla' else refusal)
+
+
 PROLOGUE_AXES = ('rows', 'depth')
 """The prologue's launch axes, in a tile's order."""
 
@@ -96,32 +113,36 @@ def _prologue(fusion) -> tuple[jax.Array, dict]:
     (the module's docstring), or the operand itself and none where the kernels cannot take its producer,
     each reported ('gemm_prologue')."""
     producer, values, prefetch = fuser.get_fusion_values(fusion)
+    named = forced('gemm_prologue')
     split = (generation.Refusal('scalar_prefetch', "the producer reads scalar prefetch") if prefetch
              else _split(producer, values))
+    if named == 'xla' and not isinstance(split, generation.Refusal):
+        split = generation.Refusal('chosen', "`generation.chosen` names XLA")
     if isinstance(split, generation.Refusal):
         if split.code != 'no_producer':
-            generation.route('gemm_prologue', kernel='xla', preferred='fused', refusal=split)
+            _refused('gemm_prologue', named, split)
         return fusion(), {}
     generation.route('gemm_prologue', kernel='fused')
-    base, function, sides, axes, vjp = split
+    base, function, sides, axes, jvp = split
     return base, {'prologue': function, 'prologue_operands': tuple(zip(sides, axes, strict=True)),
-                  'prologue_vjp': vjp}
+                  'prologue_jvp': jvp}
 
 
 CALLS = frozenset({'pjit', 'jit', 'closed_call', 'core_call', 'remat', 'remat2', 'checkpoint',
                    'custom_jvp_call', 'custom_vjp_call', 'custom_vjp_call_jaxpr'})
 """The equations whose bodies the split reads through (a jitted, checkpointed or custom-derivative call, as
-Dew's own norms are): their values are their bodies'; their derivatives stay the producer's (`_whole_vjp`)."""
+Dew's own norms are): their values are their bodies'; their derivatives stay the producer's (`_whole_jvp`)."""
 
 
 def _split(producer, values):
     """`producer(values)`'s kernel stage and what it reads (`_prologue`): the base array, the prologue on its
     tile and the side arrays' tiles, the side arrays, the launch axes each follows, and the producer's whole
-    VJP as the prologue's derivative; the refusal where the kernels cannot take it.
+    JVP as the prologue's derivative; the refusal where the kernels cannot take it.
 
-    The side arrays the producer computes (a row's statistics) carry no derivative of their own: the
-    template takes the operand's cotangent back through the producer's own VJP (`_whole_vjp`), so every
-    path from an input joins where the producer joins it, at its precision, its custom derivatives kept."""
+    The prologue's derivative is the whole producer's (`_whole_jvp`), the side arrays it computes (a row's
+    statistics) taking none of their own: forward mode takes it, reverse mode transposes it and every
+    higher order differentiates it (`template.gemm`'s `prologue_jvp`), so every path from an input joins
+    where the producer joins it, at its precision, its custom derivatives kept, and none twice."""
     leaves, treedef = jax.tree.flatten(values)
 
     def flat(*leaves):
@@ -148,12 +169,9 @@ def _split(producer, values):
            if jnp.issubdtype(jnp.result_type(leaf), jnp.inexact)):
         return generation.Refusal('input_unstaged',
                                   "an input reaches the operand only through a row or depth value")
-    # What the stage reads, each computed whole in XLA (the operand itself, unread, is left out there); a
-    # computed one with no derivative of its own (the docstring).
+    # What the stage reads, each computed whole in XLA (the operand itself, unread, is left out there).
     arrays = jax_core.jaxpr_as_fun(jax_core.ClosedJaxpr(jaxpr.replace(outvars=[base, *sides]),
                                                         closed.consts))(*leaves)
-    arrays = [array if var in given else jax.lax.stop_gradient(array)
-              for var, array in zip([base, *sides], arrays, strict=True)]
     whole = functools.partial(_staged, jax_core.ClosedJaxpr(
         jax_core.Jaxpr(jaxpr.constvars, [base, *sides], [out], stage), closed.consts))
     axes = _prologue_axes(whole, arrays, shape)
@@ -165,27 +183,33 @@ def _split(producer, values):
     named = tuple(tuple(axis for axis in side_axes if axis is not None) for side_axes in axes)
     function = functools.partial(_prologue_tile, whole, tuple(jax.typeof(array) for array in arrays), axes)
     places = tuple(given.get(var) for var in (base, *sides))
-    vjp = functools.partial(_whole_vjp, flat, tuple(leaves), places, tuple(array.shape for array in arrays))
-    return arrays[0], function, squeezed, named, vjp
+    jvp = functools.partial(_whole_jvp, flat, tuple(leaves), places, tuple(array.shape for array in arrays))
+    return arrays[0], function, squeezed, named, jvp
 
 
-def _whole_vjp(flat, leaves: tuple, places: tuple, shapes: tuple, base, *sides):
-    """The producer's own VJP as the prologue's derivative (`template.gemm`'s `prologue_vjp`): the
+def _whole_jvp(flat, leaves: tuple, places: tuple, shapes: tuple, base, *sides):
+    """The producer's own JVP as the prologue's derivative (`template.gemm`'s `prologue_jvp`): the
     template's base and side arrays put back among the producer's inputs (`places`, each one's index there,
-    None for a computed one), and a function of the operand's cotangent giving the base's and each side
-    array's, a computed one's zero."""
+    None for a computed one), and a function of the base's and each side array's tangent giving the
+    operand's, a computed side's tangent unread (the producer's own derivative carries its statistics)."""
     inputs = list(leaves)
     for place, array, shape in zip(places, (base, *sides), shapes, strict=True):
         if place is not None:
             inputs[place] = array.reshape(shape)
-    _, pull = jax.vjp(flat, *inputs)
 
-    def pulled(d_operand):
-        d_inputs = pull(d_operand)
-        return tuple(jnp.zeros_like(array) if place is None else d_inputs[place].reshape(array.shape)
-                     for place, array in zip(places, (base, *sides), strict=True))
+    def zero(leaf):
+        if jnp.issubdtype(jnp.result_type(leaf), jnp.inexact):
+            return jnp.zeros_like(leaf)
+        return np.zeros(jnp.shape(leaf), jax.dtypes.float0)
 
-    return pulled
+    def pushed(d_base, *d_sides):
+        tangents = [zero(leaf) for leaf in inputs]
+        for place, tangent, shape in zip(places, (d_base, *d_sides), shapes, strict=True):
+            if place is not None:
+                tangents[place] = tangent.reshape(shape)
+        return jax.jvp(flat, tuple(inputs), tuple(tangents))[1]
+
+    return pushed
 
 
 def _inlined(closed, *args):

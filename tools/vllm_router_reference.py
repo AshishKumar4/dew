@@ -42,12 +42,11 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from reference_source import CACHE as UPSTREAM, ran, saved_fixture, selected, verified
+from reference_source import github, ran, saved_fixture, selected
 
 REPO, COMMIT = "vllm-project/vllm", "ced6857afa0ea7b2e3f0846a62e1394e90f15607"
 PATH = "vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py"
 DIGEST = "048339e1799cdd42c9dae686a6cb891046577fb391b500f0d12eed73c8f61e52"
-CACHE = UPSTREAM / "vllm" / COMMIT
 CASES = {
     "kimi": {"experts": 256, "topk": 8, "renormalize": True, "num_expert_group": 1, "topk_group": 1,
              "scoring_func": "sigmoid", "routed_scaling_factor": 2.446, "bias": True},
@@ -65,7 +64,7 @@ SEED = 61
 
 def grouped_topk():
     """vLLM's `grouped_topk` at `COMMIT`, its body unchanged, on the torch path."""
-    local = verified(f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/{PATH}", CACHE / PATH, DIGEST)
+    local = github(REPO, COMMIT, PATH, DIGEST)
     [function] = selected(local.read_text(), {"grouped_topk"}, filename=str(local))
     function.decorator_list = []
     namespace = {

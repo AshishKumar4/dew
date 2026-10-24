@@ -16,7 +16,8 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
-from dew.interop.weights import placed
+from dew._model_types import SANDWICH_NORMS
+from dew.interop.weights import native_layouts, placed
 from dew.nn.attention import RMSNorm
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.dense import Dense
@@ -29,14 +30,14 @@ from dew.objectives.base import Variables
 from dew.registry import Record
 
 from .common import (
-    _PROJECTOR_PATHS,
     ProjectorBase,
+    ProjectorLayout,
     TowerBase,
     TowerGeometry,
+    TowerLayout,
     _vision_section,
     activation_name,
     head_width,
-    projector_weight_path,
     rope_base,
     trunk_geometry,
 )
@@ -262,11 +263,6 @@ _GEMMA4_VISION_TENSORS = {
 }
 _GEMMA4_VISION_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj")
 _GEMMA4_VISION_MLP = ("gate_proj", "up_proj", "down_proj")
-# The sandwich's four norms as the decoder block names them.
-_GEMMA4_VISION_NORMS = {"input_layernorm": "input_layernorm",
-                        "post_attention_layernorm": "attention_output_norm",
-                        "pre_feedforward_layernorm": "post_attention_layernorm",
-                        "post_feedforward_layernorm": "mlp_output_norm"}
 
 
 def _gemma4_vision_layer_path(parts) -> tuple[str, ...] | None:
@@ -274,8 +270,8 @@ def _gemma4_vision_layer_path(parts) -> tuple[str, ...] | None:
     if len(parts) < 5 or parts[:2] != ["encoder", "layers"] or not parts[2].isdigit():
         return None
     layer = f"layers_{parts[2]}"
-    if len(parts) == 5 and parts[3] in _GEMMA4_VISION_NORMS and parts[4] == "weight":
-        return (layer, _GEMMA4_VISION_NORMS[parts[3]], "scale")
+    if len(parts) == 5 and parts[3] in SANDWICH_NORMS and parts[4] == "weight":
+        return (layer, SANDWICH_NORMS[parts[3]], "scale")
     if len(parts) == 7 and parts[5] == "linear" and parts[6] == "weight":
         if parts[3] == "self_attn" and parts[4] in _GEMMA4_VISION_PROJECTIONS:
             return (layer, "self_attn", parts[4], "kernel")
@@ -311,6 +307,45 @@ def gemma4_vision_path(hf_name: str) -> tuple[str, ...] | None:
     return (collection, *path)
 
 
+GEMMA4_PROJECTOR_TENSORS = {"embedding_projection.weight": ("projection", "kernel")}
+"""The Gemma 4 embedder's tensors past `embed_vision.` (or its audio's), each to its leaf."""
+
+
+def gemma4_vision_name(path: tuple[str, ...]) -> str:
+    """The Gemma 4 vision tensor name of the leaf at `path`, its collection then its trunk path:
+    `gemma4_vision_path`'s inverse, for a tower built natively rather than read."""
+    trunk = path[1:]
+    named = next((name for name, known in _GEMMA4_VISION_TENSORS.items() if known == trunk), None)
+    if named is not None:
+        return named
+    layer, *rest = trunk
+    if not layer.startswith("layers_"):
+        raise ValueError(f"unknown vision parameter {path!r}")
+    norms = {native: name for name, native in SANDWICH_NORMS.items()}
+    if len(rest) == 2 and rest[0] in norms:
+        rest = [norms[rest[0]], "weight"]
+    elif rest[-1] == "kernel":
+        rest = [*rest[:-1], "linear", "weight"]
+    elif rest[-1] == "scale":
+        rest = [*rest[:-1], "weight"]
+    return ".".join(("encoder.layers", layer.removeprefix("layers_"), *rest))
+
+
+def gemma4_tower_layouts(variables: Variables) -> tuple[WeightLayout, ...]:
+    """The layouts that write a natively built Gemma 4 tower's tensors back from its collections
+    (`gemma4_vision_name`); a read tower's come from its reading (`Gemma4Vision.checkpoint`)."""
+    return native_layouts(variables, gemma4_vision_name, gemma4_vision_path)
+
+
+def gemma4_projector_layouts(params: Variables) -> tuple[WeightLayout, ...]:
+    """The layouts that write a natively built Gemma 4 embedder's projection back from its
+    parameters, rooted at `params`."""
+    names: dict[tuple[str, ...], str] = {("params", *path): name
+                                         for name, path in GEMMA4_PROJECTOR_TENSORS.items()}
+    return native_layouts({"params": params}, names.__getitem__,
+                          lambda name: ("params", *GEMMA4_PROJECTOR_TENSORS[name]))
+
+
 def translate_gemma4_projector_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
 ) -> tuple[Variables, tuple[WeightLayout, ...]]:
@@ -319,9 +354,9 @@ def translate_gemma4_projector_weights(
     The pre-projection norm carries no scale, so the projection weight is
     the only tensor.
     """
-    if set(hf_tensors) != set(_PROJECTOR_PATHS["gemma4"]):
+    if set(hf_tensors) != set(GEMMA4_PROJECTOR_TENSORS):
         raise ValueError(f"unknown tensor names {sorted(hf_tensors)}")
-    return placed(hf_tensors, lambda name: projector_weight_path("gemma4", name), param_dtype)
+    return placed(hf_tensors, GEMMA4_PROJECTOR_TENSORS.__getitem__, param_dtype)
 
 
 def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Record:
@@ -393,3 +428,8 @@ def translate_gemma4_projector_config(vision: Mapping[str, object],
         "text_width": int(text_width),
         "norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
     }}
+
+
+Gemma4Vision.checkpoint = TowerLayout("vision_tower.", gemma4_vision_path)
+Gemma4Projector.checkpoint = ProjectorLayout("embed_vision.", GEMMA4_PROJECTOR_TENSORS,
+                                             read=translate_gemma4_projector_weights)

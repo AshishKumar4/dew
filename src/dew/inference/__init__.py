@@ -4,6 +4,7 @@ from dew.sampling.pipelines import DenoisingInputs, Images, TextToImage
 
 from .banks import CheckpointBanks, HeldBanks, LayerBanks, SafetensorsBanks
 from .clients import Completion, OllamaCompletion, OpenAICompletion, Usage
+from .engine import Engine, Kind, Timed
 from .nccl import NCCLPush
 from .pipeline import RunProcessor, pipeline
 from .rollouts import (
@@ -16,6 +17,7 @@ from .rollouts import (
            SafetensorsReload,
            VLLMGenerateServer,
 )
+from .scoring import Scored, Scoring, ScoringServer
 from .serving import Server
 from .tasks import BlockGeneration, MaskedGeneration, Processor, TextGeneration
 
@@ -25,9 +27,11 @@ __all__ = [
     "Completion",
     "DenoisingInputs",
     "Draw",
+    "Engine",
     "HeldBanks",
     "Images",
     "InfrastructureError",
+    "Kind",
     "LayerBanks",
     "MaskedGeneration",
     "NCCLPush",
@@ -41,9 +45,13 @@ __all__ = [
     "RunProcessor",
     "SafetensorsBanks",
     "SafetensorsReload",
+    "Scored",
+    "Scoring",
+    "ScoringServer",
     "Server",
     "TextGeneration",
     "TextToImage",
+    "Timed",
     "Usage",
     "VLLMGenerateServer",
     "pipeline",

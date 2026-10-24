@@ -116,6 +116,26 @@ class DataPartition:
         """
         return dataclasses.replace(_partition(mesh, batch_axes(mesh)), window=window)
 
+    def held(self, rows: int, offset: int = 0) -> tuple[slice, bool]:
+        """Which of `rows` rows a validation read of this share holds, and whether they are real:
+        every count-th from its index, `offset` places on as a resume's count inside a batch leaves
+        it (`GlobalStream`); where that holds none of rows that hold some, the first in their place,
+        not real (`FilledBatch` marks them so), so every share reads a batch where any does and
+        none scores another's row."""
+        mine = self.cut(offset)
+        if rows and not range(rows)[mine]:
+            return slice(1), False
+        return mine, True
+
+    def cut(self, offset: int = 0) -> slice:
+        """This share's rows of an order or a batch: every count-th from its first (`first`)."""
+        return slice(self.first(offset), None, self.count)
+
+    def first(self, offset: int = 0) -> int:
+        """This share's first row of an order or a batch: its index, `offset` places on as a resume's
+        count inside a batch leaves it (`GlobalStream`)."""
+        return (self.index + offset) % self.count
+
     def rows(self, batch: int) -> int:
         """Return how many rows of a `batch`-row global batch one share holds.
 
@@ -545,20 +565,43 @@ class Ramp:
         stages.append(Stage(batch=final, records=records))
         return _update_aligned(tuple(stages), window)
 
-    def steps_for(self, records: int, final: int, window: int = 1) -> int:
+    def steps_for(self, records: int, final: int, window: int = 1, tail: Tail = "dropped") -> int:
         """Return the number of steps a run of updates of `window` steps takes to read `records`
-        records under this ramp.
+        records under this ramp, a last step that holds fewer than a batch counted where it is read
+        (`tail`).
 
         Early steps read fewer records, so a pass over a corpus takes more
         steps than it would with the final batch from the start.
         """
+        def whole(count: int, batch: int) -> int:
+            return -(-count // batch) if tail == "read" else count // batch
+
         stages = self.stages(final, window)
         steps = 0
         for stage, next_stage in itertools.pairwise(stages):
             if records < next_stage.records:
-                return steps + (records - stage.records) // stage.batch
+                return steps + whole(records - stage.records, stage.batch)
             steps += (next_stage.records - stage.records) // stage.batch
-        return steps + max(records - stages[-1].records, 0) // final
+        return steps + whole(max(records - stages[-1].records, 0), final)
+
+
+LONG_RUN = 1024
+"""The run of rejected records or empty shards in a row a read first logs (`logged_run`): longer
+than an ordinary filter's runs or a sharded store's empty files, so a filter that keeps nothing or a
+store of empty files is named from the first line. An endless read reads on through any run; none
+proves the store holds nothing to keep."""
+
+
+def logged_run(run: int, first: int = 1) -> bool:
+    """Whether a read logs a run of `run` empty reads in a row: at `first`, then at each doubling, so a
+    run that goes on is named again ever more rarely."""
+    return run >= first and not run & (run - 1)
+
+
+type Tail = Literal["dropped", "read"]
+"""What becomes of the records an epoch leaves short of a whole batch (`Loader.tail`): `read`, where
+an order that reads on carries them into the next epoch's first batch or one that keeps its last
+short batch fills it; `dropped`, where a training order that ends drops them."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -616,14 +659,24 @@ class Loader:
     device: tuple[DeviceStep, ...] = ()
     """The training batch's steps the compiled training step runs, on the
     accelerator, after the reader delivers it (`DeviceStep`)."""
+    tail: Tail = "dropped"
+    """What becomes of the records an epoch leaves short of a whole batch: read, carried into the
+    next epoch by an order that reads on or kept and filled by one that keeps them, so an epoch's
+    steps count their batch; or dropped, so they count none (`Tail`)."""
+    order_records: int | None = None
+    """The records a training read of a global order that ends hands out over all its passes, the
+    same on every share, by which a batch ramp ends its last step (`RampedStream`); None where the
+    order never ends or its read counts none ahead."""
 
     @property
     def steps_per_epoch(self) -> int | None:
-        if self.records is None:
-            return None
+        return None if self.records is None else self._steps(self.records)
+
+    def _steps(self, records: int, window: int = 1) -> int:
+        """The steps that read `records` records, a last short batch counted where it is read."""
         if self.ramp is None:
-            return self.records // self.batch
-        return self.ramp.steps_for(self.records, self.batch)
+            return -(-records // self.batch) if self.tail == "read" else records // self.batch
+        return self.ramp.steps_for(records, self.batch, window, self.tail)
 
     def epoch_steps(self, epochs: int = 1, window: int = 1) -> int:
         """Return the number of steps that `epochs` passes over the records take, in updates of
@@ -640,8 +693,7 @@ class Loader:
                 "without one, so give the run length in steps"
             )
         records = epochs * self.records
-        steps = (records // self.batch if self.ramp is None
-                 else self.ramp.steps_for(records, self.batch, window))
+        steps = self._steps(records, window)
         if steps == 0:
             raise ValueError(f"{records} records do not fill one batch of {self.batch}, so {epochs} epochs "
                              "are no steps at all: read more data, lower the batch, or count the run in "
@@ -895,8 +947,9 @@ def describe(source: Indexed | pygrain.MapDataset[Batch]) -> str:
 
 class FilledBatch(pygrain.MapTransform):
     """A batch of fewer than `rows` records filled out with repeats of its
-    own rows (`RowPlan.pad`), and `VALID_ROWS` marking the real ones. Without
-    `real` every row is a repeat."""
+    own rows (`RowPlan.pad`), and `VALID_ROWS` marking the real ones: those of
+    its own a batch that marks them already marks real. Without `real` every
+    row is a repeat."""
 
     def __init__(self, rows: int, *, real: bool = True):
         self._rows, self._real = rows, real
@@ -909,7 +962,10 @@ class FilledBatch(pygrain.MapTransform):
             return element
         plan = RowPlan(None, held, self._rows, 0, 1)
         indices = plan.pad(np.arange(held))
-        return {**take_batch(element, indices), VALID_ROWS: ~plan.padding & self._real}
+        valid = ~plan.padding & self._real
+        if VALID_ROWS in element:
+            valid = valid & np.asarray(element[VALID_ROWS], bool)[indices]
+        return {**take_batch(element, indices), VALID_ROWS: valid}
 
 
 def rows_of(batch: Mapping[str, object]) -> int:
@@ -1156,6 +1212,45 @@ class GlobalReader(Protocol):
     def identity(self) -> str: ...
 
 
+@dataclasses.dataclass(frozen=True)
+class Ranges:
+    """Consecutive ranges of `counts` items each, as an indexed store's shards hold their records,
+    a run's phases its records and a ramp's stages its batches: which range holds an item
+    (`locate`, or `holding` where a range that runs on follows them), where a range starts
+    (`start`) and the items of them all. A range of no items holds none, so an item is never
+    located in one."""
+
+    counts: tuple[int, ...]
+
+    @classmethod
+    def ending(cls, ends: Sequence[int]) -> Ranges:
+        """The ranges that end at each of `ends`, the first starting at 0."""
+        return cls(tuple(end - start for start, end in itertools.pairwise((0, *ends))))
+
+    @functools.cached_property
+    def ends(self) -> tuple[int, ...]:
+        return tuple(itertools.accumulate(self.counts))
+
+    def __len__(self) -> int:
+        return self.ends[-1] if self.ends else 0
+
+    def start(self, index: int) -> int:
+        """Where range `index` starts: past the last, where the range that runs on after them does."""
+        return self.ends[index - 1] if index else 0
+
+    def locate(self, position: int) -> tuple[int, int]:
+        """The range that holds the item at `position` of them all, and its place in that range."""
+        if not 0 <= position < len(self):
+            raise IndexError(position)
+        index = self.holding(position)
+        return index, position - self.start(index)
+
+    def holding(self, position: int) -> int:
+        """The range that holds the item at `position`, one past the last for an item past them all:
+        the range that runs on after them, as a run's last phase or a ramp's final batch does."""
+        return bisect.bisect_right(self.ends, position)
+
+
 def phase_ends(ends: Sequence[int | None], unit: Literal["step", "record"]) -> tuple[int, ...]:
     """The ends of every phase but the last, which runs on (`None`), each past the one before it and
     above zero, counted in `unit`s: steps where a run writes its phases (`Phases`), records where it
@@ -1193,7 +1288,8 @@ class PhasedStream:
     endless = True
 
     def __init__(self, phases: Sequence[tuple[Callable[[], GlobalReader], int | None]], stop_seconds: float):
-        self._ends = phase_ends([end for _, end in phases], "record")
+        # The phases that end, the last running on after them.
+        self._phases = Ranges.ending(phase_ends([end for _, end in phases], "record"))
         self._streams = [open_stream() for open_stream, _ in phases]
         self._records = 0
         self._current: int | None = None
@@ -1203,10 +1299,10 @@ class PhasedStream:
         return self
 
     def _phase(self, records: int) -> int:
-        return bisect.bisect_right(self._ends, records)
+        return self._phases.holding(records)
 
     def _start(self, phase: int) -> int:
-        return 0 if phase == 0 else self._ends[phase - 1]
+        return self._phases.start(phase)
 
     def __next__(self) -> Batch:
         phase = self._phase(self._records)
@@ -1227,10 +1323,10 @@ class PhasedStream:
         batch = next(stream)
         read = stream.records - before
         self._records += read
-        if phase < len(self._ends) and self._records > self._ends[phase]:
+        if phase < len(self._phases.ends) and self._records > self._phases.ends[phase]:
             raise ValueError(
                 f"a step of {read} records crossed the phase boundary at record "
-                f"{self._ends[phase]}; phases end on step boundaries"
+                f"{self._phases.ends[phase]}; phases end on step boundaries"
             )
         return batch
 
@@ -1238,15 +1334,16 @@ class PhasedStream:
         # The phase of the last record read: at a boundary nothing of the next
         # phase is read yet, so the finished one is still current and a
         # resume may change what follows it or extend it.
-        phase = bisect.bisect_left(self._ends, self._records)
+        phase = self._phases.holding(self._records - 1) if self._records else 0
         plans = [
             position.read(_global_position(stream.get_state())).plan for stream in self._streams[: phase + 1]
         ]
+        completed = zip((stream.order for stream in self._streams), self._phases.ends[:phase], strict=False)
         return position.encode(
             position.Global(
                 records=self._records,
                 order=self._streams[phase].order,
-                completed=tuple((self._streams[index].order, self._ends[index]) for index in range(phase)),
+                completed=tuple(completed),
                 plan={"phases": plans} if any(plan is not None for plan in plans) else None,
             )
         )
@@ -1271,8 +1368,8 @@ class PhasedStream:
         from dew.data.plan import same_order
 
         for index, (order, end) in enumerate(saved.completed):
-            if (index >= len(self._ends) or not same_order(order, self._streams[index].order)
-                    or self._ends[index] != end):
+            if (index >= len(self._phases.ends) or not same_order(order, self._streams[index].order)
+                    or self._phases.ends[index] != end):
                 raise ValueError(
                     f"the saved run finished phase {index} reading {order} to record "
                     f"{end}, and this run's phase {index} is not that; a phase the "
@@ -1285,17 +1382,18 @@ class PhasedStream:
                 f"reading {saved.order}, and this run's phase {phase} reads something "
                 f"else; resume with the order the checkpoint was written in"
             )
-        if phase < len(self._ends) and saved.records > self._ends[phase]:
+        if phase < len(self._phases.ends) and saved.records > self._phases.ends[phase]:
             raise ValueError(
                 f"the saved run has read {saved.records} records, past this run's end "
-                f"of phase {phase} at {self._ends[phase]}"
+                f"of phase {phase} at {self._phases.ends[phase]}"
             )
         self.close()
         self._records = saved.records
 
     def identity(self) -> str:
         return "; ".join(
-            [*(stream.identity() for stream in self._streams), f"phases ending at records {list(self._ends)}"]
+            [*(stream.identity() for stream in self._streams),
+             f"phases ending at records {list(self._phases.ends)}"]
         )
 
     def close(self) -> None:
@@ -1326,6 +1424,19 @@ def _global_position(state: Position) -> bytes:
     return state
 
 
+def _joined(kept: Batch, new: Batch) -> Batch:
+    """The rows of `kept` then `new`, a ramp's buffer as a read adds to it: a batch that marks its
+    real rows (`VALID_ROWS`), a kept short one, beside one that does not, all of whose rows are."""
+    if (VALID_ROWS in kept) != (VALID_ROWS in new):
+        kept, new = (batch if VALID_ROWS in batch else {**batch, VALID_ROWS: np.ones(rows_of(batch), bool)}
+                     for batch in (kept, new))
+
+    def join(held: list | np.ndarray, read: list | np.ndarray) -> list | np.ndarray:
+        return held + read if isinstance(held, list) else np.concatenate([held, read])
+
+    return jax.tree.map(join, kept, new, is_leaf=lambda column: isinstance(column, list))
+
+
 class RampedStream(Forwarding):
     """Grows a training stream's step over the run's first records.
 
@@ -1344,10 +1455,16 @@ class RampedStream(Forwarding):
 
     # MaxText reference: common/data_loader.py:122-176.
 
-    def __init__(self, source: Resumable, stages: Sequence[Stage], partition: DataPartition):
+    def __init__(self, source: Resumable, stages: Sequence[Stage], partition: DataPartition, *,
+                 tail: Tail = "dropped", order_records: int | None = None):
         self._source = source
         self._stages = tuple(stages)
-        self._starts = tuple(stage.records for stage in stages)
+        # Where a global order ends, every share ends its last step at the same record: whole where
+        # its short last step is dropped, holding the order's last records, the rest filled, where
+        # it is read (`Loader.tail`).
+        self._tail, self._order_records = tail, order_records
+        # The stages that end, the final batch running on after them.
+        self._ramp = Ranges.ending(tuple(stage.records for stage in stages[1:]))
         self._partition = partition
         self._records = 0
         self._held: Batch | None = None
@@ -1367,20 +1484,31 @@ class RampedStream(Forwarding):
 
     def _stage(self) -> Stage:
         """The stage the records read so far leave the run in."""
-        return self._stages[bisect.bisect_right(self._starts, self._records) - 1]
+        return self._stages[self._ramp.holding(self._records)]
 
     def __next__(self) -> Batch:
         stage = self._stage()
         rows = self._partition.rows(stage.batch)
+        left = None if self._order_records is None else self._order_records - self._records
+        if left is not None and (left <= 0 or (left < stage.batch and self._tail == "dropped")):
+            raise StopIteration
         while self._held is None or rows_of(self._held) < rows:
-            read = next(self._source)
-            self._held = (
-                read
-                if self._held is None
-                else jax.tree.map(lambda kept, new: kept + new if isinstance(kept, list)
-                                  else np.concatenate([kept, new]), self._held, read,
-                                  is_leaf=lambda column: isinstance(column, list))
-            )
+            read = next(self._source, None)
+            if read is None:
+                break
+            self._held = read if self._held is None else _joined(self._held, read)
+        if self._held is None or not rows_of(self._held):
+            raise StopIteration
+        if left is not None and left < stage.batch:
+            # The order's last step: its records the first `left` of the step, which this share's
+            # rows hold every count-th of from its own place on, the rest repeats.
+            step = FilledBatch(rows).map(take_batch(self._held, slice(min(rows, rows_of(self._held)))))
+            real = np.arange(rows) * self._partition.count + self._partition.index < left
+            self._held, self._records = None, self._records + stage.batch
+            return {**step, VALID_ROWS: np.asarray(step.get(VALID_ROWS, real), bool) & real}
+        if rows_of(self._held) < rows:
+            # The source ended short of a whole step, in an order whose end no read counted ahead.
+            raise StopIteration
         step = take_batch(self._held, slice(rows))
         self._held = take_batch(self._held, slice(rows, None))
         self._records += stage.batch
@@ -1434,7 +1562,8 @@ def ramped(dataset: Loader, ramp: Ramp) -> Loader:
         if isinstance(stream, Resumable):
             state = stream.get_state()
             if isinstance(state, bytes) and position.translates(state):
-                return RampedStream(stream, ramp.stages(dataset.batch, partition.window), partition)
+                return RampedStream(stream, ramp.stages(dataset.batch, partition.window), partition,
+                                    tail=dataset.tail, order_records=dataset.order_records)
         if isinstance(stream, Closeable):
             stream.close()
         raise TypeError(
