@@ -533,7 +533,7 @@ class Curated(abc.ABC):
         # DataTrove's filters and the spaCy pipeline they share build and mutate state as they read
         # (an index filled in place, a tokenizer's length bound), so a process's readers take turns.
         with _CURATING:
-            kept = _curator(self).filter(document)
+            kept = _curator(self, self.reads()).filter(document)
         # DataTrove's filters keep with True and drop with False or with False and their reason. One that
         # keeps may rewrite the text it keeps, as C4's drops the lines it disallows, and the record
         # keeps what it wrote.
@@ -543,6 +543,11 @@ class Curated(abc.ABC):
             return element
         rewritten = document.text.encode("utf-8") if isinstance(held, bytes) else document.text
         return {**element, self.field: rewritten}
+
+    def reads(self) -> str:
+        """What the filter reads beyond the step's own fields, by its content (a model's SHA-256),
+        which the process's filter is keyed by beside the step (`_curator`); none by default."""
+        return ""
 
     def dependencies(self) -> Mapping[str, object]:
         from importlib.metadata import version
@@ -556,8 +561,8 @@ thread-safe."""
 
 
 @functools.cache
-def _curator(step: Curated) -> BaseFilter:
-    """`step`'s DataTrove filter, one a process."""
+def _curator(step: Curated, reads: str) -> BaseFilter:
+    """`step`'s DataTrove filter, one a process for each content it `reads`."""
     return step.curator()
 
 
@@ -613,8 +618,9 @@ class Quality(Curated):
 class Classifier(Curated):
     """The text in `field` kept by a fastText classifier, DataTrove's fastText filter over the model at
     `model` (a path or a URL, which DataTrove downloads on first use): where one of `keep`'s
-    `(label, score)` pairs scores at least its score, or where none of `remove`'s does. The step's
-    identity records the model's SHA-256."""
+    `(label, score)` pairs scores at least its score, or where none of `remove`'s does. The model is
+    read once a step, to a copy named by its SHA-256 (`pinned`), which the filter loads and the
+    step's identity records, so a model replaced at its path later reaches neither."""
 
     model: str
     keep: tuple[tuple[str, float], ...] = ()
@@ -622,17 +628,37 @@ class Classifier(Curated):
     field: str = "text"
     reason = "classifier"
 
+    @functools.cached_property
+    def pinned(self) -> Path:
+        """The model's bytes as this step first read them, under the system's temporary directory by
+        their SHA-256: a local file's own, a URL's as DataTrove downloads it once into its asset cache,
+        which holds a local path's first bytes too."""
+        from datatrove.io import cached_asset_path_or_download
+
+        from dew.files import write_atomically
+
+        source = Path(self.model)
+        if not source.is_file():
+            source = Path(cached_asset_path_or_download(self.model, namespace="filters",
+                                                        subfolder="fasttext"))
+        content = source.read_bytes()
+        pinned = (Path(tempfile.gettempdir()) / "dew-classifiers"
+                  / f"{hashlib.sha256(content).hexdigest()}{source.suffix}")
+        if not pinned.exists():
+            write_atomically(pinned, content)
+        return pinned
+
+    def reads(self) -> str:
+        return self.pinned.stem
+
     def curator(self) -> BaseFilter:
         from datatrove.pipeline.filters import FastTextClassifierFilter
 
-        return FastTextClassifierFilter(self.model, keep_labels=list(self.keep) or None,
+        return FastTextClassifierFilter(str(self.pinned), keep_labels=list(self.keep) or None,
                                         remove_labels=list(self.remove) or None)
 
     def dependencies(self) -> Mapping[str, object]:
-        from datatrove.io import cached_asset_path_or_download
-
-        path = cached_asset_path_or_download(self.model, namespace="filters", subfolder="fasttext")
-        return {**super().dependencies(), "model": hashlib.sha256(Path(path).read_bytes()).hexdigest()}
+        return {**super().dependencies(), "model": self.reads()}
 
 
 @dataclasses.dataclass(frozen=True)
