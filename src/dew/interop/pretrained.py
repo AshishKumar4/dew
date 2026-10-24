@@ -1381,6 +1381,26 @@ def _composite_description(directory: Path) -> CompositeSource | None:
     return None
 
 
+def _load_native_component(source: sources.SourceReference, root: Path, component: NativeComponent, *,
+                            placed: Callable[[Variables], Variables], streaming: bool, dtype: str,
+                            param_dtype: str, attention_impl: str, max_seq_len: int | None
+                            ) -> tuple[Pretrained, Mapping[str, np.ndarray], Path]:
+    """A metadata-selected backbone, its shared tensors and resolved snapshot root."""
+    weight_source = source.component(component.weights_folder)
+    root = weight_source.weights(root)
+    if source.revision is not None:
+        source = replace(source, revision=root.name)
+    shared = sources.load_shards(weight_source.directory(root))
+    prefix = component.tensor_prefix
+    tensors = ({name[len(prefix):]: tensor for name, tensor in shared.items() if name.startswith(prefix)}
+               if prefix else shared)
+    backbone = _load_native_source(
+        source, root, gguf_file=None, component=component, tensors=tensors,
+        placed=placed, streaming=streaming, dtype=dtype, param_dtype=param_dtype,
+        attention_impl=attention_impl, max_seq_len=max_seq_len)
+    return backbone, shared, root
+
+
 def _load_composite_source(source: sources.SourceReference, root: Path,
                            description: CompositeSource, *, placed: Callable[[Variables], Variables],
                            streaming: bool, dtype: str, param_dtype: str, attention_impl: str,
@@ -1394,20 +1414,12 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
     directory = source.directory(root)
     backbone, shared, prefix = None, {}, ""
     if component is not None:
-        weight_source = source.component(component.weights_folder)
-        root = weight_source.weights(root)
+        backbone, shared, root = _load_native_component(
+            source, root, component, placed=placed, streaming=streaming, dtype=dtype,
+            param_dtype=param_dtype, attention_impl=attention_impl, max_seq_len=max_seq_len)
         directory = source.directory(root)
-        if source.revision is not None:
-            source = replace(source, revision=root.name)
-        shared = sources.load_shards(weight_source.directory(root))
+        source = replace(source, revision=backbone.revision)
         prefix = component.tensor_prefix
-        tensors = ({name[len(prefix):]: tensor for name, tensor in shared.items() if name.startswith(prefix)}
-                   if prefix else shared)
-        backbone = _load_native_source(
-            source, root,
-            gguf_file=None, component=component, tensors=tensors,
-            placed=placed, streaming=streaming, dtype=dtype, param_dtype=param_dtype,
-            attention_impl=attention_impl, max_seq_len=max_seq_len)
     head_source = description.head
     missing = False
     if head_source.weight_file is None:
