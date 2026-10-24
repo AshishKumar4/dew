@@ -32,10 +32,11 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
-from dew._distributions import categorical, row_categorical, wellformed
+from dew._distributions import draw, row_draw, wellformed
 from dew.diffusion.block import CanvasGeneration, through_eos
 from dew.diffusion.process import Conditioning
 from dew.interop.weights import decoding_storage
+from dew.nn import categorical
 from dew.nn.inputs import (
     RESPONSE_FIELDS,
     Coordinates,
@@ -271,12 +272,11 @@ class DiscreteDenoiser:
                                   capture_intermediates=False,
                                   method="logits" if isinstance(self.model, Logits) else None)
         assert not isinstance(logits, tuple)  # no mutable collections were asked for
-        # Normalized in fp32, as `token_log_probs` does: the reveal draws its
-        # categorical from these, and a bf16 log partition would quantize it.
+        # Normalized in at least fp32 (`dew.nn.categorical`) over the logits each position reads
+        # (`aligned`): the reveal draws its categorical from these, and a bf16 log partition would
+        # quantize it. The mask token takes no probability.
         logits = aligned(self.model, logits, None if self.inputs is None else self.inputs.token_fields)
-        logits = logits.astype(jnp.float32)
-        logits = logits.at[..., self.process.mask_id].set(-jnp.inf)
-        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        log_probs = categorical.log_probs(logits, jnp.arange(logits.shape[-1]) != self.process.mask_id)
         # A masked position whose scores hold no distribution stays masked: its argmax is no token.
         masked = self.masked(x_t) & wellformed(log_probs)
         filled = jnp.where(masked, jnp.argmax(log_probs, axis=-1), x_t)
@@ -303,7 +303,7 @@ class Unmask:
         reveal_key, token_key = jax.random.split(key)
         reveal = jax.random.uniform(reveal_key, x.shape) < chance[:, None]
         revealed = denoise.masked(x) & reveal
-        drawn = categorical(token_key, log_probs, revealed, REVEALED_UNDEFINED)
+        drawn = draw(token_key, log_probs, revealed, REVEALED_UNDEFINED)
         # A position whose scores hold no distribution stays masked rather than take an arbitrary token.
         return jnp.where(revealed & wellformed(log_probs), drawn, x), state
 
@@ -314,7 +314,7 @@ class Unmask:
         split = jax.vmap(jax.random.split)(keys)
         reveal = jax.vmap(lambda key: jax.random.uniform(key, x.shape[1:]))(split[:, 0]) < chance[:, None]
         revealed = denoise.masked(x) & reveal
-        drawn = row_categorical(split[:, 1], log_probs, revealed, REVEALED_UNDEFINED)
+        drawn = row_draw(split[:, 1], log_probs, revealed, REVEALED_UNDEFINED)
         return jnp.where(revealed & wellformed(log_probs), drawn, x), state
 
     @staticmethod

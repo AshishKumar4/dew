@@ -43,6 +43,7 @@ from jax.tree_util import Partial
 from typing_extensions import TypeIs, TypeVar
 
 from dew.artifacts import Artifact, Artifacts, TokenScores
+from dew.nn import categorical
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import accumulated, at_least_fp32, compensated_sum
 from dew.nn.protocols import HiddenStates, ProjectsParameters
@@ -1657,16 +1658,11 @@ def mean_of_totals(accumulated: tuple[float, float]) -> float:
 
 
 def token_log_probs(logits: jax.Array, tokens: jax.Array) -> jax.Array:
-    """`log_softmax(logits)[..., tokens]`, reduced in fp32 whatever `logits` holds.
+    """`log_softmax(logits)[..., tokens]`, reduced in at least fp32 (`dew.nn.categorical`).
 
-    `tokens` is `logits.shape[:-1]` of ids and the result has that shape. A
-    bf16 log partition over a vocabulary carries bf16's 8-bit mantissa into
-    every score, which is error in the second decimal of a log probability
-    near -10; fp32 carries the logits exactly and rounds only the reduction.
-    optax's cross entropy reads the target logit without building the
-    normalized row.
+    `tokens` is `logits.shape[:-1]` of ids and the result has that shape.
     """
-    return -optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), tokens)
+    return -categorical.cross_entropy(logits, tokens)
 
 __all__ = [
     "FROZEN",
