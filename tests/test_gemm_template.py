@@ -391,6 +391,7 @@ def _dense_draw(rows: int, depth: int, width: int, *, cotangent: bool = False):
     return draw
 
 
+@runs("sm90")
 def test_a_dense_gradient_takes_a_padded_tile_where_no_dividing_one_fits():
     """A dense kernel gradient at depth 96 on Hopper: the tiles dividing 96 have 32 output rows, which
     Hopper's warpgroup MMA refuses, so a 64-row tile runs over the padded depth, and the gradients hold

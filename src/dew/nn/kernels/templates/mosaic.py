@@ -24,6 +24,7 @@ from collections.abc import Callable
 
 import jax
 from jax import lax, numpy as jnp
+from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
@@ -114,6 +115,14 @@ def staging(name: str, shaped) -> dict:
             f'{name}_barriers': [plgpu.Barrier(num_barriers=2) for _ in shaped]}
 
 
+def viewed(view: tuple, block: tuple, step):
+    """Step `step`'s tile of a stream's view `(ref, index_map)` (`Family.opened`): the `block`-shaped tile of
+    `ref` at the block indices `index_map(step)` gives, as a `BlockSpec`'s index map does."""
+    ref, index_map = view
+    return ref.at[tuple(pl.ds(index * extent, extent)
+                        for index, extent in zip(index_map(step), block, strict=True))]
+
+
 def streamed(rings: tuple, views, lo, hi) -> None:
     """A producer's loads of steps `lo` to `hi` into `rings`, each ring's step counted from `lo` and loaded
     from its view of `views(step)`, then each ring drained."""
@@ -165,9 +174,11 @@ def load_fixed(views: list, refs: list, barriers: list, wg) -> None:
         plgpu.barrier_wait(barrier.at[wg])
 
 
-def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int) -> None:
+def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int,
+               copy: Callable = plgpu.copy_smem_to_gmem) -> None:
     """Rows `first` to `first + stored` of `o_smem` to `o_gmem` at row `row_start + first` and `column`, in a
-    power-of-two ladder of TMA stores (a descriptor's extents are static), the largest `most` rows'."""
+    power-of-two ladder of static-size `copy`s (a TMA store's descriptor has static extents; `copied`
+    moves the rows through registers where a GPU has no TMA), the largest `most` rows'."""
     start, size = first, most
     while size:
         rung = 1 << int(math.log2(size))
@@ -175,10 +186,16 @@ def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int) -> N
 
         @pl.when(stored & rung != 0)
         def _(start=start, rung=rung):
-            plgpu.copy_smem_to_gmem(o_smem.at[pl.ds(start, rung)],
-                                    o_gmem.at[pl.ds(row_start + start, rung), pl.ds(column, o_smem.shape[1])])
+            copy(o_smem.at[pl.ds(start, rung)],
+                 o_gmem.at[pl.ds(row_start + start, rung), pl.ds(column, o_smem.shape[1])])
 
         start = start + (stored & rung)
+
+
+def copied(source, destination) -> None:
+    """`source` (in shared memory) to `destination` (in global memory) through registers: a GPU without
+    TMA's `store_rows` copy."""
+    destination[...] = source[...]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -320,15 +337,32 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     mainloop issues that the hardware decides, so a mainloop holds no instruction, layout or barrier of its
     own. Its facts (`name`, the MMA's row unit `rows`), its launch and roles (`kernel`, `roles`), its operand
     streams (`streams`, `opened`, `stream` the producer's, `walk` and `passed` the consumer's), its products
-    (`product` into a fresh accumulator, `register_products` and `staged_products` in place, `settled`), and
-    its accumulator's layouts (`zeros`, `full`, `iota`, `rows_of`, `as_row`). It is generic in its streams'
-    allocations (`Allocated`, `streams`'), its opened streams (`Opened`, `opened`'s) and the accumulator its
-    products issue into in place (`Accumulator`: a warpgroup accumulator ref, or a register array)."""
+    (`product` into a fresh accumulator, `products`, `register_products` and `staged_products` in place,
+    `settled`), and its accumulator's layouts (`layout`, `row`, `column`, which `zeros`, `full`, `iota`,
+    `rows_of`, `columns_of` and `as_row` read). It is generic in its streams' allocations (`Allocated`,
+    `streams`'), its opened streams (`Opened`, `opened`'s) and the accumulator its products issue into in
+    place (`Accumulator`: a warpgroup accumulator ref, or a register array)."""
 
     name: str
     rows: int
     consumers: int
     """The compute roles a program may take (sm90 two warpgroups, sm80 one)."""
+
+    @property
+    @abc.abstractmethod
+    def layout(self) -> plgpu_core.SomeLayout:
+        """The accumulator's register layout, which the accumulator's layout members (`zeros` to `as_row`)
+        read."""
+
+    @property
+    @abc.abstractmethod
+    def row(self) -> plgpu_core.SomeLayout:
+        """A row vector's layout: the accumulator's reduced over its columns."""
+
+    @property
+    @abc.abstractmethod
+    def column(self) -> plgpu_core.SomeLayout:
+        """A column vector's layout: the accumulator's reduced over its rows."""
 
     @abc.abstractmethod
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
@@ -352,8 +386,8 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
 
     @abc.abstractmethod
     def opened(self, allocated: Allocated, views: dict | None = None) -> Opened:
-        """The streams of `streams`' allocations, scoped, by name; their `views` `(ref, block)` where the
-        family's walk loads them (each step `block` rows of an `[S, D]` operand)."""
+        """The streams of `streams`' allocations, scoped, by name; their `views` where the family's walk
+        loads them (`viewed`: each a ref and the block indices of a step's tile in it)."""
 
     @abc.abstractmethod
     def stream(self, streams, views: dict, lo, hi) -> None:
@@ -426,33 +460,34 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     def settled(self, pending: int = 0) -> None:
         """Every product issued so far done, but the last `pending` issued."""
 
-    @abc.abstractmethod
     def zeros(self, shape: tuple[int, ...]) -> jax.Array:
         """fp32 zeros in the accumulator's layout (two-dimensional) or a row's (one-dimensional)."""
+        return self.full(shape, 0.0)
 
-    @abc.abstractmethod
     def full(self, shape: tuple[int, ...], value: float) -> jax.Array:
         """fp32 `value` in the accumulator's layout or a row's (`zeros`)."""
+        layout = self.layout if len(shape) == 2 else self.row
+        return plgpu.layout_cast(jnp.full(shape, value, jnp.float32), layout)
 
-    @abc.abstractmethod
     def iota(self, shape: tuple[int, int], dimension: int) -> jax.Array:
         """Indices along `dimension` of a tile in the accumulator's layout."""
+        return plgpu.broadcasted_iota(jnp.int32, shape, dimension, layout=self.layout)
 
-    @abc.abstractmethod
     def rows_of(self, ref) -> jax.Array:
         """A row vector read from `ref` (`[rows]`) in a row's layout."""
+        return plgpu.load(ref, layout=self.row, optimized=False)
 
-    @abc.abstractmethod
     def columns_of(self, ref) -> jax.Array:
         """A column vector read from `ref` (`[columns]`) in a column's layout (a tile's keys')."""
+        return plgpu.load(ref, layout=self.column, optimized=False)
 
-    @abc.abstractmethod
     def tile_of(self, ref) -> jax.Array:
         """A tile read from `ref` (`[rows, columns]`) in the accumulator's layout."""
+        return plgpu.load(ref, layout=self.layout, optimized=False)
 
-    @abc.abstractmethod
     def as_row(self, vector: jax.Array) -> jax.Array:
         """`vector` `[rows]` in a row's layout, whatever its own."""
+        return plgpu.layout_cast(vector, self.row)
 
 
 class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
@@ -483,12 +518,13 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         return {name: Ring(**scoped) for name, scoped in allocated.items()}
 
     def stream(self, streams, views: dict, lo, hi) -> None:
-        names = tuple(streams)
+        rings = tuple(streams.values())
 
         def tiles(index):
-            return tuple(views[name][0].at[pl.ds(index * views[name][1], views[name][1])] for name in names)
+            return tuple(viewed(views[name], ring.smem.shape[1:], index)
+                         for name, ring in zip(streams, rings, strict=True))
 
-        streamed(tuple(streams.values()), tiles, lo, hi)
+        streamed(rings, tiles, lo, hi)
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None

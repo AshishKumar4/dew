@@ -12,7 +12,7 @@
 
 namespace ffi = xla::ffi;
 
-// The CUDA architectures the library holds code for, CMake's list joined by commas ("80-real,90a-real,...").
+// The CUDA architectures the library holds grouped kernels for, CMake's list joined by commas ("90a-real").
 extern "C" const char* dew_cutlass_architectures() { return DEW_CUTLASS_ARCHITECTURES; }
 
 namespace dew_cutlass {

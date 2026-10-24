@@ -304,7 +304,9 @@ class GpuTarget:
 
 # CUDA datasheets give sparse tensor peaks; the dense figures below are half.
 # A100 bf16 624; H100 SXM bf16/FP8 1979/3958, PCIe 1513/3026, NVL 1671/3341;
-# H200 SXM 1979/3958, NVL 1671/3341; L4 242/485; RTX PRO 6000 Blackwell Server 1000/2000 TF/s.
+# H200 SXM 1979/3958, NVL 1671/3341; GH200 (its H100 die) 1979/3958, its SMs, clock and HBM3 (4 TB/s)
+# or HBM3e (4.9) bandwidth a run reads of itself (`runtime_facts`); L4 242/485; RTX PRO 6000 Blackwell
+# Server 1000/2000 TF/s.
 # Existing rounded bf16 rates remain the baseline; FP8 uses the stated dense half.
 # https://i.dell.com/sites/csdocuments/App-Merchandizing_Documents/en/us/h100-gpu.pdf
 # https://www.nvidia.com/en-us/data-center/h100/
@@ -373,7 +375,8 @@ TARGETS = {target.generation: target for target in (
         'NVIDIA H100 PCIe': {'bf16': 756e12, 'fp8': 1513e12},
         'NVIDIA H100 NVL': {'bf16': 835e12, 'fp8': 1670.5e12},
         'NVIDIA H200': {'bf16': 989e12, 'fp8': 1979e12},
-        'NVIDIA H200 NVL': {'bf16': 835e12, 'fp8': 1670.5e12}}, multiprocessors=132,
+        'NVIDIA H200 NVL': {'bf16': 835e12, 'fp8': 1670.5e12},
+        'NVIDIA GH200': {'bf16': 989e12, 'fp8': 1979e12}}, multiprocessors=132,
               clock_hz=1830e6, memory_bandwidth=3350e9),
     # Datasheet facts alone, no routes: what a compile-only sm100 device needs (`tests/kernel_compile.py`),
     # its peaks the scoreboard's MFU; a B200 run states its own clock and bandwidth (`runtime_facts`).

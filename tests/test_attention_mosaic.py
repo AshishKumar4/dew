@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS
+from generation_support import INTERPRETS, lowers
 from jax.sharding import Mesh
 from reference_error import assert_as_exact
 from test_attention_template import CASES, ROWS, arguments, geometry as core_geometry
@@ -312,6 +312,7 @@ def test_a_causal_backward_of_more_keys_than_queries_is_on_par_interpreted():
         _check_backward("causal", (1, 64, 2, 1), accurate=False, interpret=True, keys=256, fused=fused)
 
 
+@lowers("sm90")
 @pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
 @pytest.mark.parametrize("call", ["causal", "causal-documents-window"])
 def test_the_launches_lower_for_an_h100(call, accurate):
