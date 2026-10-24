@@ -216,9 +216,8 @@ def combined_attention_mask(query_length: int, key_length: int, causal: bool,
 
 
 def key_spans(query_length: int, key_length: int, causal: bool, sliding_window: int | None,
-              segment_ids=None, key_value_seq_lengths=None, key_value_seq_starts=None, block_groups=None,
-              image_groups=None, key_valid=None, places=None, *,
-              rows: int | None = None) -> template.KeySpans:
+              segment_ids=None, key_value_seq_lengths=None, key_value_seq_starts=None, *, block_groups=None,
+              image_groups=None, key_valid=None, places=None, rows: int | None = None) -> template.KeySpans:
     """The keys each query of a call sees as the template's spans (`template.spans`), from the
     coordinates `scaled_dot_product_attention` takes: causality, a window, documents (`CrossDocuments`
     aligned to their last keys), key lengths and starts, block and image groups, and the keys' validity
@@ -242,20 +241,20 @@ def key_spans(query_length: int, key_length: int, causal: bool, sliding_window: 
 
 
 def visibility_mask(query_length: int, key_length: int, causal: bool, sliding_window: int | None, mask=None,
-                    segment_ids=None, key_value_seq_lengths=None, key_value_seq_starts=None,
+                    segment_ids=None, key_value_seq_lengths=None, key_value_seq_starts=None, *,
                     block_groups=None, image_groups=None, key_valid=None, places=None) -> jax.Array:
     """The keys each query sees, `[B or 1, 1, Q, K]`: the call's spans (`key_spans`) as a mask
     (`template.dense`), narrowed by `mask`. It is the mask a call's coordinates mean on the paths
     whose kernel does not read them all."""
     seen = template.dense(key_spans(query_length, key_length, causal, sliding_window, segment_ids,
-                                    key_value_seq_lengths, key_value_seq_starts, block_groups, image_groups,
-                                    key_valid, places))[:, None]
+                                    key_value_seq_lengths, key_value_seq_starts, block_groups=block_groups,
+                                    image_groups=image_groups, key_valid=key_valid, places=places))[:, None]
     return seen if mask is None else jnp.logical_and(seen, mask)
 
 
 def visible_rows(query_length: int, key_length: int, causal: bool, sliding_window: int | None,
                  mask=None, segment_ids=None, key_value_seq_lengths=None,
-                 key_value_seq_starts=None, block_groups=None, image_groups=None, key_valid=None,
+                 key_value_seq_starts=None, *, block_groups=None, image_groups=None, key_valid=None,
                  places=None) -> jax.Array | None:
     """Whether each query row sees a key, `[B or 1, Q, H or 1, 1]` over the
     output, or None where every row does.
@@ -283,12 +282,12 @@ def visible_rows(query_length: int, key_length: int, causal: bool, sliding_windo
         return (jnp.asarray(reach) & (jnp.asarray(segment_ids) != 0))[:, :, None, None]
     if mask is None:
         spans = key_spans(query_length, key_length, causal, sliding_window, segment_ids,
-                          key_value_seq_lengths, key_value_seq_starts, block_groups, image_groups, key_valid,
-                          places)
+                          key_value_seq_lengths, key_value_seq_starts, block_groups=block_groups,
+                          image_groups=image_groups, key_valid=key_valid, places=places)
         return template.reads(spans)[:, :, None, None]
     seen = jnp.any(visibility_mask(query_length, key_length, causal, sliding_window, mask, segment_ids,
-                                   key_value_seq_lengths, key_value_seq_starts, block_groups, image_groups,
-                                   key_valid, places), -1)
+                                   key_value_seq_lengths, key_value_seq_starts, block_groups=block_groups,
+                                   image_groups=image_groups, key_valid=key_valid, places=places), -1)
     return jnp.swapaxes(seen, -1, -2)[..., None]
 
 
@@ -1178,8 +1177,9 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
     def local(query, key, value, sinks=None, segment_ids=None, lengths=None, starts=None,
               block_groups=None, image_groups=None, key_valid=None, places=None):
         batch, queries, keys = query.shape[0], query.shape[1], key.shape[1]
-        spans = key_spans(queries, keys, causal, sliding_window, segment_ids, lengths, starts, block_groups,
-                          image_groups, key_valid, places, rows=batch)
+        spans = key_spans(queries, keys, causal, sliding_window, segment_ids, lengths, starts,
+                          block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
+                          places=places, rows=batch)
         hooks = template.Hooks(
             score_mod=None if softcap is None else functools.partial(template.capped, softcap),
             initial=None if sinks is None else template.sinks(sinks, batch, queries, value.shape[-1]))
@@ -1361,20 +1361,12 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     lengths, starts each row's keys there: a windowed decode step's cache,
     which the decode kernel and the template read from the window's first block
     (`decode_attention.attend`) and every other path as the mask they mean.
-    `block_groups` and `image_groups` `[B, K]` int number the keys' blocks:
-    runs of contiguous keys (a call's own tokens, or a cache call's slots
-    beside its `key_segment_ids`), -1 outside any. Under causality a query
-    whose own key is in a block also sees the block's later keys, within its
-    document: a block of `block_groups` is read whole whatever the window
-    (transformers' `block_sequence_ids`, a prompt's blocks), an image of
-    `image_groups` within the window, which bounds the keys behind the query
-    (Gemma 3's and 4's images, `template.spans`). Both add their keys together,
-    and without causality neither adds any. `key_valid` `[B, K]` marks the
-    real keys, the rest hidden from every query, and `places` `[B, S]` are a
-    call's own tokens' places, which its window counts by (`counted_places`:
-    padding inside a row skipped). The template reads all of these as its
-    spans; every other path takes the call's spans as the mask they mean
-    (`visibility_mask`).
+    `block_groups` and `image_groups` `[B, K]` number the keys' blocks, -1
+    outside any: under causality a block's query also sees its block whole,
+    an image's its later keys within the window (`template.spans`).
+    `key_valid` `[B, K]` marks the real keys and `places` `[B, S]` the places a
+    window counts (`counted_places`). The template reads these as its spans
+    (`key_spans`); every other path takes the mask they mean (`visibility_mask`).
 
     A mesh sequence axis above one runs `sequence_parallel_attention`. Active
     dropout runs `reference_attention`, independently per row, head and
@@ -1393,12 +1385,13 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         block_groups = image_groups = None
     if sliding_window is None:
         places = None
-    spanned = (block_groups, image_groups, key_valid, places)
-    if any(x is not None for x in spanned) and ((dropout_rate and not deterministic) or shards > 1):
+    spanned = {"block_groups": block_groups, "image_groups": image_groups, "key_valid": key_valid,
+               "places": places}
+    if any(x is not None for x in spanned.values()) and ((dropout_rate and not deterministic) or shards > 1):
         # Only a single device's template reads groups, key validity and places; elsewhere the call's
         # spans are the mask they mean, its causality, window, documents, key lengths and starts among them.
         mask = visibility_mask(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids,
-                               key_value_seq_lengths, key_value_seq_starts, *spanned)
+                               key_value_seq_lengths, key_value_seq_starts, **spanned)
         causal, sliding_window, segment_ids, block_groups, image_groups = False, None, None, None, None
         key_value_seq_lengths = key_value_seq_starts = key_valid = places = None
         if shards > 1:
@@ -1627,7 +1620,8 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         segment_ids=segment_ids, max_segments=max_segments, lengths=lengths, starts=starts,
         block_groups=block_groups, image_groups=image_groups, key_valid=key_valid, places=places)
     live = visible_rows(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids, lengths,
-                        starts, block_groups, image_groups, key_valid, places)
+                        starts, block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
+                        places=places)
     if not FORWARD_MODE.get() or resolved not in ('cudnn', 'triton', 'flash', 'tpu', 'template'):
         return _read_nothing(call(query, key, value, bias=bias, sinks=sinks, implementation=resolved), live)
 
@@ -1682,7 +1676,8 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     spanned = (block_groups, image_groups, key_valid, places)
     if any(x is not None for x in spanned) and implementation != 'template':
         mask = masked = visibility_mask(query.shape[-3], key.shape[-3], causal, sliding_window, mask,
-                                        segment_ids, lengths, starts, *spanned)
+                                        segment_ids, lengths, starts, block_groups=block_groups,
+                                        image_groups=image_groups, key_valid=key_valid, places=places)
         causal, sliding_window, segment_ids, lengths, starts = False, None, None, None, None
         block_groups = image_groups = key_valid = places = None
     # Another sequence's documents under causality or a window align each document's queries with

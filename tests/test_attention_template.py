@@ -269,7 +269,8 @@ def test_a_block_map_visits_every_visible_entry_and_calls_a_tile_whole_only_wher
                                                                                          block_k):
     """At each tile shape, every visible entry lies in a tile its query block visits (`lo` to `hi`), and
     its key block's query range (`q_lo` to `q_hi`) holds that query block; each block's one document
-    (`query_doc`, `key_doc`) is the one its tokens carry (`uniform_documents`); every tile in a query
+    (`query_doc`, `key_doc`) is the one its tokens carry in the spans' ids, its documents' and its invalid
+    keys' padding id (`uniform_documents`); every tile in a query
     block's whole range (`full_lo` to `full_hi`) whose blocks carry one document, or which has no
     documents, has every entry visible, the padding past the call's queries and keys excluded from no
     tile; with no narrowing, every tile inside the call is whole, and a call of its own documents has
@@ -285,9 +286,9 @@ def test_a_block_map_visits_every_visible_entry_and_calls_a_tile_whole_only_wher
     assert np.all((lo[rows, i] <= j) & (j < hi[rows, i]))
     assert np.all((q_lo[rows, j] <= i) & (i < q_hi[rows, j]))
     query_doc = key_doc = None
-    if "segment_ids" in case:
-        query_ids, key_ids = document_ids(arguments(case)["segment_ids"])
-        query_doc, key_doc = uniform_documents(query_ids, block_q), uniform_documents(key_ids, block_k)
+    if spans.query_ids is not None and spans.key_ids is not None:
+        query_doc = uniform_documents(spans.query_ids, block_q)
+        key_doc = uniform_documents(spans.key_ids, block_k)
         np.testing.assert_array_equal(np.asarray(blocks.query_doc), query_doc)
         np.testing.assert_array_equal(np.asarray(blocks.key_doc), key_doc)
     padded = np.zeros((ROWS, -(-queries_ // block_q) * block_q, -(-keys_ // block_k) * block_k), bool)
