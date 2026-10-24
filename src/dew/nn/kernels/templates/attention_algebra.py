@@ -43,8 +43,10 @@ class Forward:
     softmax `scale`, the score hook `score_mod(s, q_pos, k_pos, *params)` on natural logits, whether
     the call keeps its logits `natural` (`base2`), the accurate form, whether its weighted values can pass
     fp32's largest, so a program's walk is `guarded` (`headroom`), whether its softmax resumes from an
-    `initial` state (`raw`), and whether natural logits stay `scaled` whatever the scale (`raw`; the fold's
-    rewalk, `unfolded`)."""
+    `initial` state (`raw`), whether natural logits stay `scaled` whatever the scale (`raw`; the fold's
+    rewalk, `unfolded`), and the call's query count `queries` where a mainloop walks query tiles past it
+    without spans (a full or causal call padded to whole tiles, whose padding rows `seen` keeps from every
+    key; None where none does)."""
 
     form: str
     keys: int
@@ -55,6 +57,7 @@ class Forward:
     headroom: bool = False
     initial: bool = False
     scaled: bool = False
+    queries: int | None = None
 
     @property
     def raw(self) -> bool:
@@ -579,8 +582,10 @@ def seen(spec: Forward, coords: Coords, like: jax.Array) -> jax.Array | None:
     """Whether each query of a tile `like` `[bq, bk]` sees each key (`within`), every mainloop's one
     predicate, forward and backward; None where each sees every key. A spans call's intervals and, with
     documents, ids (its mainloops give each tile its queries' intervals and both blocks' ids); a causal
-    call's diagonal; and the call's keys, where a tile reaches past them: no walk visits a tile wholly past
-    them, so a call whose keys are whole tiles reads no padding."""
+    call's diagonal; the call's keys, where a tile reaches past them: no walk visits a tile wholly past
+    them, so a call whose keys are whole tiles reads no padding; and, where the spec names them, its queries
+    (a padding row sees no key, so a score hook's derivative there, undefined at its padded parameters,
+    reaches no reduction over the rows)."""
     visible = None
     if coords.spans is not None:
         start, end = coords.spans
@@ -591,6 +596,9 @@ def seen(spec: Forward, coords: Coords, like: jax.Array) -> jax.Array | None:
     if spec.form != "spans" and spec.keys % like.shape[1]:
         # A tile past the call's last key reads padding.
         visible = coords.k_pos < spec.keys if visible is None else visible & (coords.k_pos < spec.keys)
+    if spec.form != "spans" and spec.queries is not None and spec.queries % like.shape[0]:
+        rows = coords.q_pos < spec.queries
+        visible = rows if visible is None else visible & rows
     return visible
 
 
@@ -1337,30 +1345,25 @@ def keyed_terms(sums: DqSums, weights: jax.Array, prior: jax.Array, *, scale: fl
                           keyed_shift=jnp.full_like(sums.keyed_shift, scale_exponent)), keyed)
 
 
-def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array, key: jax.Array,
-            prior: jax.Array, *, scale: float, kinds: tuple, summed: tuple,
-            dot: Callable[[jax.Array, jax.Array], jax.Array], accurate: bool) -> DqSums:
-    """A dQ pass's sums after a key tile (`DqSums`): its score cotangents pulled through the score hook
-    (`pulled`) and scaled, times the keys (`cotangent_product`, in the form `accurate` names); the HEAD and
-    QUERY parameters' pullbacks of them (`summed` marks which `kinds` sum per row) and of the weights,
-    which take those gradients to the refined D (`dq_finish`); the weights' sums unnormalized; and in the
-    accurate form the weights' product with the keys over the prior denominator, which takes dQ there too.
-    The fast form leaves dQ at the first pass's D (the forward's anchored one, `split_delta`, or the dQ
-    launch's own, `off_anchor_delta`), FlashAttention's arithmetic, its `keyed` sums untouched: a
-    parameter's gradient sums its cotangents over every key and query, a position's or a scale's times
-    each, so the first pass's D error enters it multiplied (ALiBi's slope 2.3 to 6.7 times the reference's
-    error at its first D), where dQ's per query is FlashAttention's."""
+def dq_issued(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array | None, dtype,
+              prior: jax.Array, *, scale: float, kinds: tuple, summed: tuple, accurate: bool
+              ) -> tuple[DqSums, Parts, tuple[jax.Array | None, Parts] | None]:
+    """A dQ pass's row sums after a key tile and the products a mainloop issues for it, for keys of `dtype`:
+    the sums with their row fields updated (the cotangents' and the weights' sums, the summed parameters'
+    pullbacks and, in the accurate form, the keyed mass and exponent); dQ's parts (`cotangent_parts`), whose
+    products with the keys join dQ; and in the accurate form the keyed parts (`weights_parts`), whose products
+    join the keyed sums behind the row factor `(factor, parts)` the sums take first (None: none); None in the
+    fast form. `dq_step` takes these products as the Triton and plain-JAX mainloops do; a mainloop that issues
+    them in place takes the same parts."""
     if not accurate or slopes is None:
         terms, parts = dq_terms(sums, weights, cotangents, slopes, seen, scale=scale, kinds=kinds,
-                                summed=summed, dtype=key.dtype, accurate=accurate)
-        terms = terms._replace(dq=sums.dq + summed_products(parts, key, dot))
+                                summed=summed, dtype=dtype, accurate=accurate)
         if not accurate:
-            return terms
-        terms, keyed = keyed_terms(terms, weights, prior, scale=scale, dtype=key.dtype)
-        return terms._replace(keyed=sums.keyed + summed_products(keyed, key, dot))
+            return terms, parts, None
+        terms, keyed = keyed_terms(terms, weights, prior, scale=scale, dtype=dtype)
+        return terms, parts, (None, keyed)
     terms, pulled_weights = _dq_rows(sums, weights, cotangents, slopes, seen, kinds=kinds, summed=summed)
-    dq = sums.dq + cotangent_product(pulled(cotangents, slopes, seen, kinds)[0] * scale, key, dot,
-                                     accurate=accurate)
+    parts = cotangent_parts(pulled(cotangents, slopes, seen, kinds)[0] * scale, dtype, accurate=accurate)
     # The tile's coefficients against the keys, `pulled weight · scale / prior`, joined into the running
     # mean as a softmax's sums are joined under a running maximum. Each is held at its row's power of two,
     # never formed whole where it would overflow (a hook's slope near fp32's largest): the row's largest
@@ -1378,9 +1381,31 @@ def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, see
     coefficients = power2(pulled_weights, taken) * expand(scale_mantissa * prior_mantissa, pulled_weights)
     keyed_mass = before + jnp.abs(coefficients).sum(axis=-1)
     over = inverse(keyed_mass)
-    keyed = (expand(before * over, sums.keyed) * sums.keyed
-             + weights_product(coefficients * expand(over, coefficients), key, dot))
-    return terms._replace(dq=dq, keyed=keyed, keyed_mass=keyed_mass, keyed_shift=keyed_shift)
+    return (terms._replace(keyed_mass=keyed_mass, keyed_shift=keyed_shift), parts,
+            (before * over, weights_parts(coefficients * expand(over, coefficients), dtype)))
+
+
+def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array, key: jax.Array,
+            prior: jax.Array, *, scale: float, kinds: tuple, summed: tuple,
+            dot: Callable[[jax.Array, jax.Array], jax.Array], accurate: bool) -> DqSums:
+    """A dQ pass's sums after a key tile (`DqSums`): its score cotangents pulled through the score hook
+    (`pulled`) and scaled, times the keys (`cotangent_product`, in the form `accurate` names); the HEAD and
+    QUERY parameters' pullbacks of them (`summed` marks which `kinds` sum per row) and of the weights,
+    which take those gradients to the refined D (`dq_finish`); the weights' sums unnormalized; and in the
+    accurate form the weights' product with the keys over the prior denominator, which takes dQ there too.
+    The fast form leaves dQ at the first pass's D (the forward's anchored one, `split_delta`, or the dQ
+    launch's own, `off_anchor_delta`), FlashAttention's arithmetic, its `keyed` sums untouched: a
+    parameter's gradient sums its cotangents over every key and query, a position's or a scale's times
+    each, so the first pass's D error enters it multiplied (ALiBi's slope 2.3 to 6.7 times the reference's
+    error at its first D), where dQ's per query is FlashAttention's."""
+    terms, parts, keyed = dq_issued(sums, weights, cotangents, slopes, seen, key.dtype, prior, scale=scale,
+                                    kinds=kinds, summed=summed, accurate=accurate)
+    terms = terms._replace(dq=sums.dq + summed_products(parts, key, dot))
+    if keyed is None:
+        return terms
+    factor, keyed_parts = keyed
+    scaled = sums.keyed if factor is None else expand(factor, sums.keyed) * sums.keyed
+    return terms._replace(keyed=scaled + summed_products(keyed_parts, key, dot))
 
 
 def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax.Array,
