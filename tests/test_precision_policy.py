@@ -360,12 +360,19 @@ def test_the_dot_family_at_the_bf16_algorithm_multiplies_bf16_operands(form, sha
 def test_any_einsum_at_the_bf16_algorithm_multiplies_bf16_operands(subscripts, shapes):
     """`float32_einsum` at XLA's BF16_BF16_F32 algorithm takes every expression einsum does (an
     implicit result, three or more operands, an ellipsis, a repeated index), each product its
-    operands rounded to bf16 and summed in fp32, forward and backward: over eighths whose rounding is
-    themselves and whose sums are exact, float64's einsum to the bit."""
+    operands rounded to bf16 and summed in fp32, forward and backward.
+
+    Equal to float64's einsum by construction: the operands and the cotangent are integers in
+    [-2, 2], and every contraction here sums at most 20 terms, so each value a product reads (an
+    operand, an intermediate of the contraction path, a cotangent flowing back through it) is an
+    integer of magnitude at most 2 * 20 * 2 * 2 = 160 < 256, which bf16 holds exactly, and each
+    product and sum is an integer fp32 holds exactly. Where a value a product reads were not exact
+    in bf16, the algorithm's rounding of it would be its defined result, which this check does not
+    reach."""
     from dew.nn.precision import float32_einsum
 
     rng = np.random.default_rng(len(subscripts))
-    exact = [np.round(rng.standard_normal(shape) * 8) / 8 for shape in shapes]
+    exact = [rng.integers(-2, 3, shape).astype(np.float64) for shape in shapes]
 
     def product(*operands, wide=False):
         if wide:
@@ -375,8 +382,9 @@ def test_any_einsum_at_the_bf16_algorithm_multiplies_bf16_operands(subscripts, s
 
     with jax.enable_x64(new_val=True):
         want, pullback = jax.vjp(lambda *operands: product(*operands, wide=True), *exact)
-        cotangent = np.round(rng.standard_normal(want.shape) * 8) / 8
+        cotangent = rng.integers(-2, 3, want.shape).astype(np.float64)
         wants = pullback(jnp.asarray(cotangent))
+        assert max(float(np.abs(np.asarray(value)).max()) for value in (want, *wants)) < 2.**8
     got, pullback = jax.vjp(product, *(value.astype(np.float32) for value in exact))
     grads = pullback(jnp.asarray(cotangent, jnp.float32))
     np.testing.assert_array_equal(np.asarray(got), np.asarray(want, np.float32))
