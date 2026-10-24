@@ -988,7 +988,7 @@ def test_a_fold_that_moves_a_test_between_groups_runs_each_test_once_in_its_new_
     """A fold that moves a test from one group to another, the file's cut count unchanged, reuses neither
     group's green row: the next run of the file's groups, cut by the split plugin from the folded record, runs
     every test once, the moved one in its new group."""
-    (tmp_path / ".armada.json").write_text(json.dumps({"target": 300}))
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 300, "environment": {}}))
     (tmp_path / "tests/test_moved.py").write_text(
         "from pathlib import Path\n"
         + "".join(f"def test_{index}():\n"
