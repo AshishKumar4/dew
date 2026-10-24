@@ -262,6 +262,20 @@ ORACLE_CASES = {
 }
 
 
+def oracle_layout(case: str) -> tuple[tuple, tuple | None, dict, bool]:
+    """`ORACLE_CASES[case]`'s query and key shapes, its structure materialized (a dense mask of packed
+    documents; segment ids and the rows they keep live) and whether it takes sinks, which each site draws."""
+    q_shape, kv_shape, structure = ORACLE_CASES[case]
+    structure = dict(structure)
+    sunk = structure.pop("sinks", False)
+    if structure.pop("mask", False):
+        structure["mask"] = np.asarray(document_mask(packed_ids((100, 84, 72))[:1]))[:, None]
+    if structure.pop("segment_ids", False):
+        structure["segment_ids"] = packed_ids((100, 84, 50), (30, 190, 10))
+        structure["live"] = structure["segment_ids"] != 0
+    return q_shape, kv_shape, structure, sunk
+
+
 @pytest.mark.parametrize("case", ORACLE_CASES)
 def test_splash_agrees_with_the_reference_the_oracle_holds(case):
     """Splash in fp32, forward and every gradient (the sinks' included),
@@ -278,17 +292,11 @@ def test_splash_agrees_with_the_reference_the_oracle_holds(case):
     permutes the output and the three qkv gradients; the float64 oracle
     checks that symmetry under every order.
     """
-    q_shape, kv_shape, structure = ORACLE_CASES[case]
+    q_shape, kv_shape, structure, sunk = oracle_layout(case)
     query, _, _ = qkv(q_shape, jnp.float32)
     _, key, value = qkv(kv_shape or q_shape, jnp.float32, seed=1)
-    structure = dict(structure)
-    if structure.pop("sinks", False):
+    if sunk:
         structure["sinks"] = 2.0 + jax.random.normal(jax.random.PRNGKey(2), (q_shape[2],), jnp.float32)
-    if structure.pop("mask", False):
-        structure["mask"] = np.asarray(document_mask(packed_ids((100, 84, 72))[:1]))[:, None]
-    if structure.pop("segment_ids", False):
-        structure["segment_ids"] = packed_ids((100, 84, 50), (30, 190, 10))
-        structure["live"] = structure["segment_ids"] != 0
     splash = value_and_grads('tpu', query, key, value, **structure)
     with jax.enable_x64(new_val=True):
         wide = {name: jnp.asarray(np.asarray(x, np.float64)) if name == "sinks" else x
@@ -326,12 +334,8 @@ def test_splash_agrees_with_the_reference_the_oracle_holds(case):
         assert_as_exact_over_orders(*distances, f"{case} {ordered}")
 
 
-TPU_CASES = {name: ORACLE_CASES[name] for name in ("full", "causal", "grouped", "softcap", "sinks")}
-"""The oracle's cases whose check 1 runs on a TPU (`test_splash_is_on_par_on_a_tpu`)."""
-
-
 @on_tpu
-@pytest.mark.parametrize("case", TPU_CASES)
+@pytest.mark.parametrize("case", ORACLE_CASES)
 def test_splash_is_on_par_on_a_tpu(case):
     """Splash compiled by Mosaic on a TPU, fp32, its output and every gradient (the sinks' included),
     held to check 1 over fresh draws against XLA's own fp32 attention at the precision a TPU runs it
@@ -339,10 +343,10 @@ def test_splash_is_on_par_on_a_tpu(case):
     kernel's dots are XLA:CPU's, not the kernel's: its dV is bit for bit XLA:CPU's `lax.dot` of the
     weights transposed by the output cotangent, which XLA:CPU sums 2.6 times less exactly than the
     reference's contraction of the same operands over their leading axes, so the CPU sites above hold
-    the function and this one the numerics."""
-    q_shape, kv_shape, structure = TPU_CASES[case]
-    structure = dict(structure)
-    sunk = structure.pop("sinks", False)
+    the function and this one the numerics, over every one of their cases (`oracle_layout`). The float64
+    truth takes the host's CPU backend beside the TPU (JAX_PLATFORMS=tpu,cpu, as the TPU tier and
+    tools/qualify_splash.py start it)."""
+    q_shape, kv_shape, structure, sunk = oracle_layout(case)
     host = jax.devices("cpu")[0]
 
     def draw(seed):

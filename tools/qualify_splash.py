@@ -33,8 +33,8 @@ flag here: which kernel `auto` picks is read off these rows by hand and
 written, with the numbers, at `attention_kernels.TPU_SUPPORTS`.
 
 Usage:
-    JAX_PLATFORMS=tpu PYTHONPATH=src python tools/qualify_splash.py
-    JAX_PLATFORMS=tpu PYTHONPATH=src python tools/qualify_splash.py \\
+    JAX_PLATFORMS=tpu,cpu PYTHONPATH=src python tools/qualify_splash.py
+    JAX_PLATFORMS=tpu,cpu PYTHONPATH=src python tools/qualify_splash.py \\
         --sequence-lengths 2048 8192 --shapes causal packed --skip-parity --out splash.json
 """
 
@@ -46,10 +46,11 @@ import statistics
 from dataclasses import dataclass
 
 # tests/conftest.py defaults the platform to cpu, and it is imported after
-# this module, so the backend this asks for has to be named before jax opens
-# one. Naming it here rather than requiring the variable keeps the parity run
-# and the timing on the same devices.
-os.environ.setdefault("JAX_PLATFORMS", "tpu")
+# this module, so the backends this asks for have to be named before jax opens
+# one. Naming them here rather than requiring the variable keeps the parity run
+# and the timing on the same devices: the TPU first, the default, and the host's
+# CPU beside it, where the parity suite's float64 truth runs.
+os.environ.setdefault("JAX_PLATFORMS", "tpu,cpu")
 
 import jax
 import jax.numpy as jnp
