@@ -180,10 +180,12 @@ def gradient_functions(source):
             return theirs(truth, inputs, probe, wide=True)
 
     def draw(seed):
-        """Independent examples and a separately tagged cotangent stream, never another draw's media RNG."""
-        pairs = [unified_draw(reference.config, 4 * seed + index) for index in range(4)]
+        """Each draw sums more independent rows so one row's conditioning holds less of its error.
+        Cotangents use their own tagged stream; every per-example VJP remains in the result."""
+        pairs = [unified_draw(reference.config, 16 * seed + index) for index in range(16)]
         inputs = {name: np.concatenate([pair[name] for pair in pairs]) for name in pairs[0]}
-        probe = np.random.default_rng([0xBACC, seed]).standard_normal((8, 14, 64), np.float32)
+        probe = np.random.default_rng([0xBACC, seed]).standard_normal(
+            (*inputs["input_ids"].shape, reference.config.text_config.vocab_size), np.float32)
         return inputs, probe
 
     return ours, lambda *args: theirs(reference, *args), oracle, draw
