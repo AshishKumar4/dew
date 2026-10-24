@@ -478,6 +478,27 @@ def test_the_tpu_kernels_lower_for_a_tpu_on_a_mesh_that_splits_rows_or_heads(axe
     assert "tpu_custom_call" in lowered
 
 
+@pytest.mark.parametrize("structure", [{"causal": True}, {"causal": True, "softcap": 1.0},
+                                       {"causal": True, "sinks": True}], ids=["causal", "softcap", "sinks"])
+def test_a_query_of_one_key_takes_an_exactly_zero_query_gradient(structure):
+    """A causal first query reads one key, whose weight is exactly one, so the softmax's derivative and the
+    reference's query gradient there are exactly zero; Splash's is too, its delta formed from the weights
+    (`splash_block_sizes`), where the flash form, rowsum(o * do), left the output's rounding (1.2e-6 on a
+    v5e). With a sink the key's weight is below one, and the row is not zero: the test holds the
+    reference's zeros alone."""
+    query, _, _ = qkv((2, 256, 4, 64), jnp.float32)
+    _, key, value = qkv((2, 256, 4, 64), jnp.float32, seed=1)
+    structure = dict(structure)
+    if structure.pop("sinks", False):
+        structure["sinks"] = 2.0 + jax.random.normal(jax.random.PRNGKey(2), (4,), jnp.float32)
+    splash = value_and_grads('tpu', query, key, value, **structure)
+    expected = reference(query, key, value, **structure)
+    zero = expected[1] == 0
+    np.testing.assert_array_equal(splash[1][zero], 0.0)
+    if "sinks" not in structure:
+        assert zero[:, 0].all()
+
+
 @pytest.mark.parametrize("dtype, width, softcap, backward", [
     (jnp.bfloat16, 128, True, 1024),
     (jnp.float32, 128, False, 1024),
