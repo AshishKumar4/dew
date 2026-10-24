@@ -20,13 +20,13 @@ from reference_error import assert_as_exact
 from safetensors.numpy import load_file
 
 from dew import Trainer
-from dew.batch import FROZEN
+from dew.batch import FROZEN, freeze, select
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
 from dew.interop import Pretrained
 from dew.interop.diffusion_gemma import translate_weights
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import Step, freeze, select
+from dew.objectives.base import Step
 from dew.objectives.diffusion.block import BlockDiffusionObjective
 from dew.training import MeshSpec
 from dew.training.transaction import example_fields

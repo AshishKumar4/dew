@@ -490,11 +490,10 @@ class Pretrained:
         cross-attention, so `save` and `export` refuse the result; a run's
         checkpoint keeps it.
         """
-        from dew.batch import merge
+        from dew.batch import freeze, merge, select, thaw
         from dew.nn.cross_attention import crossing
         from dew.nn.inputs import request_key
         from dew.nn.protocols import CrossAttending, Predicting
-        from dew.objectives.base import freeze, select, thaw
 
         if not isinstance(self.model, CrossAttending):
             raise TypeError(f"a {type(self.model).__name__} takes no cross-attention layers")

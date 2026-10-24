@@ -26,8 +26,8 @@ from dew.nn.kernels.options import compiler_options
 from dew.nn.protocols import Recomputing, TritonGemm
 from dew.objectives.base import Objective
 from dew.records import JSON, integers, json_value
+from dew.state import TrainState
 from dew.training.distributed import parameter_axes
-from dew.training.state import TrainState
 
 _log = logging.getLogger(__name__)
 

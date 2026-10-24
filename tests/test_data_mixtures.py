@@ -29,7 +29,7 @@ import pytest
 from affine_run import FEATURES, Affine
 from token_support import write_token_corpus
 
-from dew.batch import VALID_ROWS
+from dew.batch import VALID_ROWS, freeze, thaw
 from dew.data import Files, Loading, Memory, phases, presets
 from dew.data.compile import compile, held, publish, validation
 from dew.data.dataset import CAPTION, DataPartition, GlobalStream, Loader, Ramp, Stage, ramped
@@ -37,7 +37,7 @@ from dew.data.images import EncodeCaptions
 from dew.data.pipeline import DeviceStep, Pipeline, mix
 from dew.data.plan import Manifest, Plan
 from dew.data.sources import TokenFiles
-from dew.objectives.base import Aux, Objective, Ratio, freeze, thaw
+from dew.objectives.base import Aux, Objective, Ratio
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
 READ = Loading(workers=0, threads=1, read_buffer=8, worker_buffer=1)

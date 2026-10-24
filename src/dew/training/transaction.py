@@ -39,9 +39,9 @@ from dew.objectives.base import (
     recorded_metrics,
     with_projected,
 )
+from dew.state import Accumulation, TrainState
 from dew.training.model_flops import _TokenCount, step_counts
 from dew.training.narrow import forward_variables, narrowed
-from dew.training.state import Accumulation, TrainState
 
 Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = TypeVar("Effects", default=None)

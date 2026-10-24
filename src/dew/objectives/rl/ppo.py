@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
 
-from dew.batch import Variables
+from dew.batch import Variables, part
 from dew.coordination import agreed, from_every_process
 from dew.inference.tasks import Processor, TextGeneration, TextSettings
 from dew.nn.dense import Dense
@@ -26,15 +26,14 @@ from dew.objectives.base import (
     Shown,
     Step,
     joined,
-    part,
     projected_draw,
     projected_parts,
 )
 from dew.rl.advantage import gae_advantages, masked_whiten
 from dew.rl.surrogate import clipped_value_loss_terms
 from dew.sampling.text import Generation, Sampling
+from dew.state import TrainState
 from dew.training.distributed import shard_batch
-from dew.training.state import TrainState
 
 from .episodes import EpisodeCollector, EpisodeInference
 from .grpo import GRPOObjective, onto_ids

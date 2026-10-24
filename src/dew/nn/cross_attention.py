@@ -67,7 +67,7 @@ CROSS_CACHE = frozenset({CROSS_KEY, CROSS_VALUE, CROSS_LENGTHS})
 
 def crossing(path) -> bool:
     """Whether a variables path runs through a cross-attention block: the filter that trains the
-    blocks alone (`dew.objectives.base.PathFilter`)."""
+    blocks alone (`dew.batch.PathFilter`)."""
     return NAME in path
 
 

@@ -9,7 +9,7 @@ them imports another for these."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -314,7 +314,146 @@ def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, 
     return counted
 
 
-__all__ = ["COORDINATES_FIELD", "EXAMPLE_ROWS", "FROZEN", "VALIDITY_FIELD", "VALID_ROWS", "Batch",
-           "Coordinates", "Variables", "coordinates", "document_ranks", "document_starts", "merge",
-           "padded_rows", "real_places", "real_slots", "scored_targets", "shifted_span", "token_id",
-           "token_ids", "token_layout", "token_positions", "token_validity", "valid_order", "with_validity"]
+type Path = tuple[str, ...]
+
+
+type PathFilter = Callable[[Path], bool]
+"""A function that selects leaves of a variables tree by the tuple of dict keys above them.
+
+One filter type is used for the EMA selection, for `optax.multi_transform`
+labels and for frozen subtrees."""
+
+
+def everything(path: Path) -> bool:
+    return True
+
+
+def under(*prefix: str) -> PathFilter:
+    """Return a filter that accepts the leaves below `prefix`.
+
+    For example, `under("params", "context_encoder")`.
+    """
+    return lambda path: path[:len(prefix)] == prefix
+
+
+def select(tree: Variables, keep: PathFilter) -> Variables:
+    """Return the subtree of `tree` whose leaves `keep` accepts, nested the same way.
+
+    A branch with no accepted leaf is dropped, so the result is what the EMA
+    stores and what `merge` puts back. Raises `ValueError` when `keep`
+    accepts no leaf at all.
+    """
+    def prune(node, path):
+        if isinstance(node, Mapping):
+            kept = {name: prune(child, (*path, name)) for name, child in node.items()}
+            return {name: child for name, child in kept.items() if child is not None} or None
+        return node if keep(path) else None
+
+    selected = prune(tree, ())
+    if not selected:
+        raise ValueError("the filter selected no leaf of the variables tree")
+    return selected
+
+
+def without(tree: Variables, paths: Sequence[Sequence[str]]) -> Variables:
+    """`tree` without the subtree at each of `paths`, a path the tree does not hold left as it is."""
+    kept = dict(tree)
+    for path in paths:
+        name, *rest = path
+        if name in kept:
+            if rest:
+                held = kept[name]
+                kept[name] = without(held, [rest]) if isinstance(held, Mapping) else held
+            else:
+                del kept[name]
+    return kept
+
+
+PARAMETER_ROOTS = (("params",), (FROZEN,))
+"""The collections of a variables tree that hold a model's parameters, which a run's loaders read
+and a storage dtype casts: the trained ones and the frozen."""
+
+
+def freeze(variables: Variables, trainable: PathFilter) -> Variables:
+    """Move the `params` leaves that `trainable` rejects into the `FROZEN` collection.
+
+    `trainable` sees full leaf paths, `("params", ...)`. A tree already split
+    keeps training the leaves its `params` hold, beside those `trainable`
+    takes from either collection, and keeps the rest frozen: an adapter
+    attached over another keeps both training. Raises `ValueError` when the
+    split keeps every leaf or none, since then there is nothing to split.
+    """
+    training = (frozenset() if FROZEN not in variables else frozenset(
+        ("params", *(entry.key for entry in path))
+        for path, _ in jax.tree_util.tree_leaves_with_path(variables["params"])))
+    variables = thaw(variables)
+
+    def trains(path: Path) -> bool:
+        return path in training or trainable(path)
+
+    leaves = jax.tree_util.tree_leaves_with_path(variables["params"])
+    kept = sum(trains(("params", *(entry.key for entry in path))) for path, _ in leaves)
+    if kept in (0, len(leaves)):
+        raise ValueError(
+            f"trainable keeps {kept} of {len(leaves)} parameter leaves, which "
+            f"{'freezes' if kept else 'trains'} nothing")
+    moving = select(variables, lambda path: path[0] == "params" and trains(path))
+    frozen = select(variables, lambda path: path[0] == "params" and not trains(path))
+    return {**variables, "params": moving["params"], FROZEN: frozen["params"]}
+
+
+def thaw(variables: Variables) -> Variables:
+    """Undo `freeze`, merging the frozen leaves back into one `params` collection.
+
+    Variables without a `FROZEN` collection are returned unchanged.
+    """
+    if FROZEN not in variables:
+        return variables
+    rest = {name: value for name, value in variables.items() if name != FROZEN}
+    return {**rest, "params": merge(variables[FROZEN], variables["params"])}
+
+
+def part(variables: Variables, name: str) -> Variables:
+    """Cut the `name` subtree out of every collection that holds one: one
+    module's own tree out of an objective's that nests several under each
+    collection, `params/policy` and `frozen/policy`, so an adapted module's
+    base comes with its factors."""
+    return {collection: subtree[name] for collection, subtree in variables.items() if name in subtree}
+
+
+__all__ = [
+    "COORDINATES_FIELD",
+    "EXAMPLE_ROWS",
+    "FROZEN",
+    "PARAMETER_ROOTS",
+    "VALIDITY_FIELD",
+    "VALID_ROWS",
+    "Batch",
+    "Coordinates",
+    "Path",
+    "PathFilter",
+    "Variables",
+    "coordinates",
+    "document_ranks",
+    "document_starts",
+    "everything",
+    "freeze",
+    "merge",
+    "padded_rows",
+    "part",
+    "real_places",
+    "real_slots",
+    "scored_targets",
+    "select",
+    "shifted_span",
+    "thaw",
+    "token_id",
+    "token_ids",
+    "token_layout",
+    "token_positions",
+    "token_validity",
+    "under",
+    "valid_order",
+    "with_validity",
+    "without",
+]

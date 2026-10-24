@@ -27,6 +27,7 @@ from dew.mesh import LayoutRefused
 from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import RECORD, Objective
 from dew.records import JSON
+from dew.state import TrainState
 from dew.telemetry.benchmark import samples
 from dew.training.distributed import Placement, batch_divisor
 from dew.training.host import snapshot
@@ -42,7 +43,6 @@ from dew.training.memory import (
     step_fits,
     temporaries_factor,
 )
-from dew.training.state import TrainState
 
 _log = logging.getLogger(__name__)
 

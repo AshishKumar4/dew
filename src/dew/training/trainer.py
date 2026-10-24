@@ -36,7 +36,7 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
-from dew.batch import FROZEN, Batch, Variables
+from dew.batch import FROZEN, Batch, Variables, select
 from dew.checkpoints import Checkpoints, Ranking
 from dew.cleanup import attempted
 from dew.coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
@@ -75,11 +75,11 @@ from dew.objectives.base import (
     Shown,
     Step,
     TrainingScalar,
-    select,
     taken_record,
 )
 from dew.optim import learning_rate, with_rate_scales
 from dew.records import JSON, boolean, json_value, record
+from dew.state import MODEL_STATE, Accumulation, TrainState, kept_window
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import (
     StepFlops,
@@ -162,7 +162,6 @@ from dew.training.profiling import ProfileWindow, owned_capture, start_capture, 
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best, HeldBest, rankings
-from dew.training.state import MODEL_STATE, Accumulation, TrainState, kept_window
 from dew.training.tracker import Tracker
 from dew.training.transaction import Committed, Transaction, compact_qk, outcome, window_dropped, with_ema
 

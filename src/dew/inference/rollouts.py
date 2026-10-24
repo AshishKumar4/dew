@@ -35,10 +35,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.batch import Variables, token_id
+from dew.batch import Variables, thaw, token_id
 from dew.coordination import agreed, collective_host
 from dew.nn.inputs import key_seed, request_key
-from dew.objectives.base import thaw
 from dew.records import JSON, finite
 from dew.sampling.decoding import EndOfSequence, StopStrings
 from dew.sampling.text import Generation, Sampling

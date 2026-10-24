@@ -32,18 +32,18 @@ from token_support import write_token_corpus
 
 from dew import position
 from dew.artifacts import Representations
-from dew.batch import merge
+from dew.batch import merge, under
 from dew.checkpoints import Ranking
 from dew.config import OptimConfig
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader, replayed
-from dew.objectives.base import Aux, EMASpec, Objective, under
+from dew.objectives.base import Aux, EMASpec, Objective
 from dew.optim import Cosine, Power
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainState, ema_update
+from dew.state import CHECKPOINTED, TrainState
+from dew.training import Checkpoints, Layout, MeshSpec, Trainer, ema_update
 from dew.training.evaluation import WARM_BATCHES
 from dew.training.model_flops import _TokenCount
 from dew.training.runtime import Preempted
-from dew.training.state import CHECKPOINTED
 
 
 def endless():

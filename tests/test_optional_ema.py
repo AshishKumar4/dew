@@ -8,19 +8,19 @@ import optax
 import pytest
 from flax import linen as nn
 
+from dew.batch import select
 from dew.checkpoints import Checkpoints
 from dew.diffusion.discrete import MDLM
 from dew.diffusion.presets import EDM
 from dew.inputs import Field, InputSpec
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives import Step
-from dew.objectives.base import select
 from dew.objectives.diffusion import DiffusionObjective, MaskedDiffusionObjective
 from dew.objectives.lm import LMObjective, Samples
 from dew.objectives.rl import GRPOObjective
 from dew.sampling import Sampling
+from dew.state import TrainState
 from dew.training import Trainer
-from dew.training.state import TrainState
 
 
 class Denoiser(nn.Module):

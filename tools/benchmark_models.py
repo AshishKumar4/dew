@@ -51,10 +51,10 @@ from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, sessions
 from dew.registry import models, projectors, resolve_dtype, towers
+from dew.state import TrainState
 from dew.telemetry.benchmark import carried
 from dew.training import Layout, MeshSpec, Trainer
 from dew.training.distributed import DevicePrefetchIterator
-from dew.training.state import TrainState
 
 Batch = dict[str, np.ndarray | Mapping[str, np.ndarray] | ModelInputs]
 

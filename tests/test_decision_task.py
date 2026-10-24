@@ -450,9 +450,10 @@ def test_a_task_under_lora_saves_its_factors_merged_and_reads_back_the_same(deci
     the adapted task does, the merged sum rounded once into each kernel
     (`assert_same_rounded_answers`), and differently from the task without the
     adapter."""
+    from dew.batch import part
     from dew.decision.model import DecisionModel
     from dew.lora import LoRA
-    from dew.objectives.base import joined, part
+    from dew.objectives.base import joined
 
     backbone = part(decide.variables, "backbone")
     adapter = LoRA(rank=4, modules=("q_proj", "v_proj")).apply(decide.model.backbone, backbone, key=1)
