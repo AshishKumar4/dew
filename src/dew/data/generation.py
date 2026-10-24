@@ -563,7 +563,7 @@ class _GenerationSource:
         return self.generation
 
     def manifest(self) -> ShardManifest:
-        return _indexed_manifest(self, self.generation.url, self.generation.url, 4096)
+        return _indexed_manifest(self, self.generation.url, 4096)
 
     def metadata(self) -> Mapping[str, object]:
         metadata = self.generation.manifest["metadata"]

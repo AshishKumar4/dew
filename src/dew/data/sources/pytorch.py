@@ -114,7 +114,7 @@ class Torch(Dataset):
     def manifest(self) -> ShardManifest:
         """The map-style records as a stream of consecutive index ranges (`_indexed_manifest`), as a
         memory source streams."""
-        return _indexed_manifest(self, "torch", self.describe(), 1024)
+        return _indexed_manifest(self, self.describe(), 1024)
 
     def metadata(self) -> Mapping[str, object]:
         return {**(self.known or {}), "rows": len(self.records("indexed"))}

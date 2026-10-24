@@ -1177,12 +1177,13 @@ def test_a_fill_whose_spool_drops_its_last_shard_reads_on_and_publishes_nothing(
 
 
 def test_a_streamed_generation_serves_its_files_at_another_mount(tmp_path):
-    """A streamed generation names its inputs by their files' places, which the same files mounted
-    elsewhere keep: a read at the second mount is the same key and finds every input the first filled,
-    and a packing plan publishes onto it there."""
+    """A streamed fill names its inputs by their files' places, which the same files mounted elsewhere
+    keep: a cached read at the second mount finds every input the first filled and runs no step, its
+    pieces the chain's own there, and a packing plan publishes onto the generation."""
     import shutil
 
     from dew.data.compile import iterate, publish
+    from dew.data.dataset import Loading
     from dew.data.pipeline import Pipeline
     from dew.data.sources import Files
     from dew.data.text import Chunks, Tokenize
@@ -1191,17 +1192,26 @@ def test_a_streamed_generation_serves_its_files_at_another_mount(tmp_path):
     first.mkdir()
     (first / "rows.jsonl").write_text("".join(json.dumps({"text": "x" * size}) + "\n" for size in (2, 5, 7)))
     shutil.copytree(first, second)
+    tokenized = []
+
+    def counted(row):
+        tokenized.append(row["text"])
+        return row
 
     def chunked(mount):
-        return Pipeline(Files(str(mount / "rows.jsonl"))).map(Tokenize()).flat_map(Chunks(4))
+        return (Pipeline(Files(str(mount / "rows.jsonl"))).map(counted, identity="counted@1").map(Tokenize())
+                .flat_map(Chunks(4)))
 
     def pieces(pipeline):
-        return sorted(row["text"].tolist() for row in iterate(pipeline, read="streamed"))
+        read = iterate(pipeline, read="streamed", loading=Loading(workers=0, threads=1, read_buffer=1))
+        return sorted(row["text"].tolist() for row in read)
 
     cache = Cache(str(tmp_path / "cache"))
     generation = publish(chunked(first), cache, read="streamed")
-    assert publish(chunked(second), cache, read="streamed").url == generation.url
-    assert pieces(chunked(second).cache(generation)) == pieces(chunked(second))
+    filled = len(tokenized)
+    cached = pieces(chunked(second).cache(cache))
+    assert len(tokenized) == filled
+    assert cached == pieces(chunked(second))
     assert publish(chunked(first).pack(4, bins=2), cache, read="streamed").url != generation.url
 
 
@@ -1712,21 +1722,23 @@ def test_a_generation_a_stream_filled_from_files_mounted_elsewhere_serves_under_
 
 
 def test_a_generation_written_under_the_earlier_schema_is_refused_as_stale(tmp_path):
-    """A cache generation, or a fill's segment, written under the schema before inputs were named by
-    their files' places is refused, naming the schema it was written under, rather than read under
-    names it was not written with."""
+    """A cache generation written under the schema before inputs were named by their files' places is
+    refused rather than read under names it was not written with, where the same manifest under the
+    current schema reads."""
     from dew.data.compile import publish
     from dew.data.generation import Generation
+    from dew.data.pipeline import Pipeline
 
     cache = Cache(str(tmp_path / "cache"))
-    generation = publish(Memory([{"id": index} for index in range(8)], shard_rows=4), cache, read="streamed")
+    generation = publish(Pipeline(Memory([{"id": index} for index in range(8)], shard_rows=4)), cache,
+                         read="streamed")
     (manifest,) = (tmp_path / "cache").rglob("generations/*/manifest.json")
     current = json.loads(manifest.read_bytes())
-    assert Generation(generation.url, {}, None).manifest() == current
+    assert Generation(generation.url, {}, None).manifest == current
     manifest.unlink()
     manifest.write_bytes(json.dumps({**current, "schema": 1}).encode())
     with pytest.raises(ValueError):
-        Generation(generation.url, {}, None).manifest()
+        _ = Generation(generation.url, {}, None).manifest
 
 
 def test_a_generation_a_memory_read_filled_from_unindexed_files_serves_hash_and_records_holdouts(tmp_path):

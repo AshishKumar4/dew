@@ -104,9 +104,7 @@ class WindowSource(View[TokenFiles]):
         return None
 
     def manifest(self) -> ShardManifest:
-        # Named without the store's location, which a local store's fingerprint leaves out (`WindowSource`'s
-        # is its tokens' with the windows'), so a fill keyed by its shards' rows finds them wherever it is.
-        return _indexed_manifest(self, f"windows={self.length},stride={self.stride}", self.describe(), 1024)
+        return _indexed_manifest(self, self.describe(), 1024)
 
 
 class _WindowIterator(grain.DatasetIterator[Batch]):
