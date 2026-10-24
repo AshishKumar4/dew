@@ -243,7 +243,7 @@ def persist_compilations() -> None:
     seen (a minute for a text-to-image sample on an A100), and every restart compiles them again
     without it. A process Dew readies for training turns it on (`dew.training.runtime.
     ready_process`, from `prepare_process` or the first `fit`), and a task where it is loaded,
-    `dew.pipeline` or a saved run's record (`dew.inference.tasks.run_record`). JAX's own switch,
+    `dew.pipeline` or a saved run's record (`dew.inference.tasks.SavedRun.pinned`). JAX's own switch,
     JAX_ENABLE_COMPILATION_CACHE=false (`jax_enable_compilation_cache`), turns it off, and a
     process pool whose processes key a step apart turns it off the same way. JAX writes entries
     from process 0 alone, so a pool takes the directory only where every process reads it as one

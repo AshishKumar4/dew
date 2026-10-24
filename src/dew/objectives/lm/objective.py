@@ -91,6 +91,7 @@ from dew.objectives.base import (
     Shown,
     Step,
     Variables,
+    ended,
     freeze,
     merge,
     merge_totals,
@@ -639,6 +640,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
                  samples: Samples | None = None, variables: Variables | None | Omitted = OMITTED,
                  qk_stats: bool = False, processor: Processor | None | Omitted = OMITTED):
         """Bind the decoder and set how its tokens are scored; the class docstring describes each argument."""
+        self.eos_token_ids = ended(model, OMITTED)
         model = self.bind_model(model, variables=variables, processor=processor)
         _check_reads(model)
         self.model = model
@@ -812,21 +814,30 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
 
+    def sampled(self, sampling: Sampling) -> Sampling:
+        """`sampling` with the end-of-sequence ids of the source this objective was built over where it
+        names none (`ended`), so a policy drawn from a loaded source stops where the source's own task
+        does; a bare model's objective names none to add."""
+        if sampling.eos_token_ids is not None or not self.eos_token_ids:
+            return sampling
+        return dataclasses.replace(sampling, eos_token_ids=self.eos_token_ids)
+
     def policy(self, params: Variables, sampling: Sampling = _DEFAULT_SAMPLING) -> TextGeneration:
-        """Return the model over this training tree as a generation task.
+        """Return the model over this training tree as a generation task, under `sampling` (`sampled`).
 
         A rollout uses one snapshot of the policy and draws every completion from it;
         the result records the actual and raw-policy likelihoods that the objective's
         ratio needs.
         """
-        return TextGeneration(self.model, params, sampling=sampling)
+        return TextGeneration(self.model, params, sampling=self.sampled(sampling))
 
     def task_settings(self) -> TextSettings:
-        """The decoder's row length, preview budget, sampling policy, and tokenizer or source processor."""
+        """The decoder's row length, preview budget, sampling policy (`sampled`), and tokenizer or
+        source processor."""
         samples = self.samples
         return TextSettings(seq_len=self.seq_len,
                             max_new_tokens=0 if samples is None else samples.max_new_tokens,
-                            sampling=Sampling() if samples is None else samples.sampling,
+                            sampling=self.sampled(Sampling() if samples is None else samples.sampling),
                             tokenizer=recorded_tokenizer(self.processor),
                             processor=recorded_processor(self.processor))
 

@@ -412,6 +412,38 @@ def test_a_bidirectional_media_wrapper_fills_a_response_after_an_image():
     np.testing.assert_array_equal(generated.lengths, [5])
 
 
+def test_a_media_wrapper_around_a_shifted_decoder_reads_the_logits_its_decoder_reads():
+    """A multimodal wrapper around a decoder whose predictions are the position before's logits
+    (Dream's, `shifted_logits`) reads its scores as its decoder does: over text alone, the masked
+    walk's unmasking distribution and the masked objective's loss are the decoder's own."""
+    from dew.nn.multimodal import MultimodalTransformer
+    from dew.nn.vision import GemmaProjector, SiglipVision
+    from dew.objectives.base import Step
+    from dew.objectives.diffusion import MaskedDiffusionObjective
+
+    text = CausalTransformer(vocab_size=32, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                             mlp_features=32, max_seq_len=16, causal=False, mask_token_id=31,
+                             shifted_logits=True)
+    model = MultimodalTransformer(
+        text, SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2,
+                           image_size=8, patch_size=4),
+        GemmaProjector(text_width=16, patches_per_side=2, tokens_per_side=1),
+        family="gemma3", image_token_id=1)
+    tokens = jnp.array([[2, 31, 3, 31, 4, 31]])
+    variables = model.init(jax.random.key(0), tokens)
+    alone = {"params": variables["params"]["language_model"]}
+    process = DiscreteProcess(LogLinear(), mask_id=31)
+    _, wrapped = process.denoiser(model, variables)(tokens, jnp.ones((1,)))
+    _, decoded = process.denoiser(text, alone)(tokens, jnp.ones((1,)))
+    np.testing.assert_array_equal(wrapped, decoded)
+    batch, step = {"text": np.array([[2, 5, 3, 6, 4, 7]])}, Step(jnp.array(0), jax.random.key(1), None)
+    wrapped_loss, decoded_loss = (
+        MaskedDiffusionObjective(network, process, 6, ema_decay=None).loss(held, batch, step)[0]
+        for network, held in ((model, variables), (text, alone)))
+    for leaf, own in zip(jax.tree.leaves(wrapped_loss), jax.tree.leaves(decoded_loss), strict=True):
+        np.testing.assert_array_equal(leaf, own)
+
+
 ############################################################################################################
 # A masked diffusion LM trains on the LM data path with no trainer change
 ############################################################################################################

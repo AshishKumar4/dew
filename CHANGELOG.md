@@ -12,6 +12,21 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   byte layout no longer collide. A data position saved under plan version 5 is
   refused, and a generation or fill segment of schema 1 is refused as stale:
   fill the cache again.
+- An earlier run's record is read through `dew.inference.tasks.earlier_shapes` at `SavedRun.pinned`, the one reader of earlier component shapes (a decision head or layout named by class name alone), carried to 1.0; `Head.from_record` reads an import path only, and `DecideSettings.of` is gone: a decision run's settings read as every task's do (`saved_settings`). An image run's input fields record through the registry.
+- `dew.inference.tasks.SavedRun` is the one pinned context every run loader reads (a task's `from_run`, `Pretrained.from_run`, `Adapter.from_run`, `dew.pipeline`, `dew export`): `SavedRun.pinned(directory, step, trust)` replaces `run_record`, and `run.objective` and `run.variables(...)` replace each loader's own lookup and restore. `Pretrained.from_run` reads a run's task through its settings (`saved_settings`) instead of parsing their fields again. `Decide.from_run` and `DewLM.from_run` take `trust` as the other tasks do.
+- A block- or masked-diffusion objective over a loaded source takes the source's
+  end-of-sequence ids (`Pretrained.eos_token_ids`, or `eos_token_ids=`), and its
+  task and saved run (`BlockSettings`, `MaskedSettings`) stop a response there,
+  as the source's own task does; they generated past it.
+- An LM, DPO, GRPO or PPO objective over a loaded source adds the source's
+  end-of-sequence ids to every policy it builds whose sampling names none: its
+  previews, task, saved run and the GRPO collector stop there.
+- A causal attention kind may read blocks whole: `AttentionMixer(bidirectional_blocks=True)` lets
+  each token of a block (`block_groups=`, `AttentionMetadata.block_groups`, `[B, S]`, -1 outside
+  any) see its whole block, whatever its window, as transformers' `block_sequence_ids` does, while
+  `bidirectional_images` keeps Gemma's images, read whole within the window. A kind may read both,
+  and every other kind stays causal. A cached call reads the groups of its own tokens, so no cache
+  keeps them, and a layer that shares another's keys and values reads them too.
 - A joint decision row's user turn is composed of segments, `JointLayout.segments`, a tuple of
   `Text`, `Media`, `State` and `Schema` in the order the row writes them: the default is the Laya
   joint release's turn, and another writes the schema before the state, or text of its own

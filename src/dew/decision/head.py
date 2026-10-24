@@ -78,11 +78,9 @@ class Head(nn.Module):
     @staticmethod
     def from_record(record: JSON, width: int) -> "Head":
         """Rebuild the head a run recorded, reading states `width` wide, in the numerics it
-        recorded. A record of an earlier run names its head by class name alone, one of this
-        module's, and is read as that class's path."""
+        recorded. An earlier run's record is read through `dew.inference.tasks.earlier_shapes`."""
         held = records.record(record, "head")
-        name = records.text(held.get("name"), "head.name")
-        path = name if ":" in name else f"{__name__}:{name}"
+        path = records.text(held.get("name"), "head.name")
         head = imported(path)
         if not (isinstance(head, type) and issubclass(head, Head)):
             raise ValueError(f"a run's head is a decision head (`Head`), not {path!r}")

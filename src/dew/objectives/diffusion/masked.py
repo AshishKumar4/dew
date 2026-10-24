@@ -47,6 +47,7 @@ from dew.objectives.base import (
     Source,
     Step,
     Variables,
+    ended,
     model_rngs,
     thaw,
 )
@@ -86,6 +87,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         decode: Callable[[Sequence[int]], str] | None = None,
         variables: Variables | None | Omitted = OMITTED,
         processor: Processor | None | Omitted = OMITTED,
+        eos_token_ids: Sequence[int] | Omitted = OMITTED,
     ):
         """Build an MDLM objective over `model` for `seq_len`-token rows.
 
@@ -100,7 +102,9 @@ class MaskedDiffusionObjective(Objective[Ratio]):
 
         `model` may be a loaded source, such as a released LLaDA or Dream
         checkpoint, and `variables` and `processor` override its own
-        (`Objective.bind_model`)."""
+        (`Objective.bind_model`), as `eos_token_ids`, the ids its task's
+        responses stop at, overrides the source's (`ended`)."""
+        self.eos_token_ids = ended(model, eos_token_ids)
         model = self.bind_model(model, variables=variables, processor=processor)
         if not isinstance(model, TokenModel) or model.causal:
             raise Lacks("bidirectional",
@@ -130,10 +134,10 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         return ObjectiveData(train=(geometry,), evaluate=(geometry,))
 
     def task_settings(self) -> MaskedSettings:
-        """The row length, response budget, process, solver, sampling steps, and tokenizer or
-        source processor: the task's own."""
+        """The row length, response budget, process, solver, sampling steps, end-of-sequence ids, and
+        tokenizer or source processor: the task's own."""
         return MaskedSettings(seq_len=self.seq_len, max_new_tokens=self.seq_len, process=self.process,
-                              solver=self.solver, sampling_steps=self.steps,
+                              solver=self.solver, sampling_steps=self.steps, eos_token_ids=self.eos_token_ids,
                               tokenizer=recorded_tokenizer(self.processor),
                               processor=recorded_processor(self.processor))
 

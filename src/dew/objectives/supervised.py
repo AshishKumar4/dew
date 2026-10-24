@@ -23,11 +23,10 @@ from collections.abc import Callable, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
-import optax
 from flax import linen as nn
 
 from dew.inputs import InputSpec
-from dew.nn.precision import at_least_fp32
+from dew.nn import categorical
 from dew.nn.protocols import Lacks
 from dew.objectives.base import FROZEN, Aux, Batch, Objective, Ratio, Source, Step, Variables, model_rngs
 
@@ -128,9 +127,7 @@ class CrossEntropy:
     output: tuple[int | str, ...] = ()
 
     def __call__(self, outputs: Outputs, batch: Batch) -> jax.Array:
-        logits = selected(outputs, self.output)
-        logits = logits.astype(at_least_fp32(logits.dtype))
-        return optax.softmax_cross_entropy_with_integer_labels(logits, batch[self.labels])
+        return categorical.cross_entropy(selected(outputs, self.output), batch[self.labels])
 
 
 @dataclasses.dataclass(frozen=True)

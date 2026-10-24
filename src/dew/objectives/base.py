@@ -43,6 +43,7 @@ from jax.tree_util import Partial
 from typing_extensions import TypeIs, TypeVar
 
 from dew.artifacts import Artifact, Artifacts, TokenScores
+from dew.nn import categorical
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import accumulated, at_least_fp32, compensated_sum
 from dew.nn.protocols import HiddenStates, ProjectsParameters
@@ -803,7 +804,7 @@ class Objective(ABC, Generic[Loss, Effects]):
     """The dataclass of what a saved run records beside its objective and model
     (`task_settings`), the one list of those fields: the objective writes an
     instance, its `saved_task` reads it back, and a record holding any other
-    field is refused (`dew.inference.tasks.run_record`). None records nothing
+    field is refused (`dew.inference.tasks.SavedRun.pinned`). None records nothing
     more."""
     """The task class a saved run of this objective loads as, which `dew.pipeline` builds from the run.
 
@@ -1558,6 +1559,23 @@ class Source(Protocol[M]):
     def text_processor(self) -> Processor | None: ...
 
 
+@runtime_checkable
+class Ending(Protocol):
+    """A loaded source that names the end-of-sequence ids its generation stops at, as
+    `dew.interop.Pretrained` does (`eos_token_ids`)."""
+
+    @property
+    def eos_token_ids(self) -> tuple[int, ...]: ...
+
+
+def ended(source: nn.Module | Source, eos_token_ids: Sequence[int] | Omitted) -> tuple[int, ...]:
+    """The end-of-sequence ids a task over `source` stops at: `eos_token_ids` where given, else a
+    loaded source's own (`Ending`), else none, as a bare model names none."""
+    if eos_token_ids is not OMITTED:
+        return tuple(eos_token_ids)
+    return tuple(source.eos_token_ids) if isinstance(source, Ending) else ()
+
+
 S = TypeVar("S")
 
 
@@ -1640,16 +1658,11 @@ def mean_of_totals(accumulated: tuple[float, float]) -> float:
 
 
 def token_log_probs(logits: jax.Array, tokens: jax.Array) -> jax.Array:
-    """`log_softmax(logits)[..., tokens]`, reduced in fp32 whatever `logits` holds.
+    """`log_softmax(logits)[..., tokens]`, reduced in at least fp32 (`dew.nn.categorical`).
 
-    `tokens` is `logits.shape[:-1]` of ids and the result has that shape. A
-    bf16 log partition over a vocabulary carries bf16's 8-bit mantissa into
-    every score, which is error in the second decimal of a log probability
-    near -10; fp32 carries the logits exactly and rounds only the reduction.
-    optax's cross entropy reads the target logit without building the
-    normalized row.
+    `tokens` is `logits.shape[:-1]` of ids and the result has that shape.
     """
-    return -optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), tokens)
+    return -categorical.cross_entropy(logits, tokens)
 
 __all__ = [
     "FROZEN",

@@ -279,6 +279,32 @@ def masked_source(request):
     return source, ModelInputs(tokens, fields)
 
 
+def test_a_masked_run_over_a_source_stops_at_its_end_of_sequence_ids(tmp_path):
+    """An objective over a loaded source takes the source's end-of-sequence ids into its task and its
+    saved run: each stops a response where the source's own task does."""
+    from dew.inference.tasks import MaskedGeneration
+
+    source = Pretrained.load(FIXTURES / "llada-tiny", dtype="float32", attention_impl="xla")
+    tokens = jnp.asarray([[0, 120, 5, 6], [1, 2, 3, 4], [0, 0, 7, 8]])
+    valid = jnp.asarray([[0, 1, 1, 1], [1, 1, 1, 1], [0, 0, 1, 1]], bool)
+    inputs = ModelInputs(tokens, {"attention_mask": valid,
+                                  "positions": jnp.asarray([[0, 3, 4, 5], [0, 1, 2, 3], [0, 0, 4, 5]])})
+    eos = int(source.text_generation()(inputs, 8, key=7, steps=5).host().tokens[0, 5])
+    ending = replace(source, generation_config={**source.generation_config, "eos_token_id": [eos]})
+    expected = ending.text_generation()(inputs, 8, key=7, steps=5).host()
+    objective = MaskedDiffusionObjective(ending, ending.text_generation().process, 12, ema_decay=None,
+                                         processor=None)
+    state = Trainer(objective, optax.sgd(0.05), key=jax.random.PRNGKey(19)).initial_state()
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
+    checkpoints.wait()
+    for task in (objective.pipeline(state, ema=False), MaskedGeneration.from_run(str(tmp_path / "run"))):
+        stopped = task(inputs, 8, key=7, steps=5).host()
+        np.testing.assert_array_equal(stopped.lengths, expected.lengths)
+        np.testing.assert_array_equal(stopped.terminated, expected.terminated)
+    assert np.any(np.asarray(expected.terminated))
+
+
 def test_native_masked_task_matches_direct_mdlm_trajectory(masked_source):
     source, inputs = masked_source
     task = source.text_generation()

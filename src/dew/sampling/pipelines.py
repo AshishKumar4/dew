@@ -252,15 +252,15 @@ class TextToImage:
         """
         from dew.config import ModelConfig
         from dew.diffusion.schedules.source import SourceGrid
-        from dew.inference.tasks import run_record, saved_settings
+        from dew.inference.tasks import SavedRun, saved_settings
         from dew.nn.autoencoders import AutoEncoder
         from dew.objectives.diffusion.objective import without_loss_heads
-        from dew.records import record as fields, text
-        from dew.registry import from_record, objectives
+        from dew.records import record as fields
+        from dew.registry import from_record
 
-        record, step = run_record(directory, step, trust)
-        settings = saved_settings(record, ImageSettings)
-        config = ModelConfig.from_dict(fields(record['model'], 'model'))
+        run = SavedRun.pinned(directory, step, trust)
+        settings = saved_settings(run.record, ImageSettings)
+        config = ModelConfig.from_dict(fields(run.record['model'], 'model'))
         inputs_record = fields(settings.inputs, 'inputs')
         autoencoder_record = None if settings.autoencoder is None else fields(settings.autoencoder,
                                                                               'autoencoder')
@@ -275,9 +275,8 @@ class TextToImage:
                 for keyword, condition in conditions.items()}}
             if autoencoder_record is not None:
                 autoencoder_record = _computing(autoencoder_record, compute)
-        params = objectives[text(record['objective'], 'objective')]._saved_variables(
-            directory, ema=ema, step=step, mesh=mesh, layout=layout, param_dtype=param_dtype,
-            parameter_roots=_parameter_roots(inputs_record, autoencoder_record))
+        params = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype,
+                               parameter_roots=_parameter_roots(inputs_record, autoencoder_record))
         inputs = InputSpec.from_json(inputs_record, params=params.get('encoders', {}))
         end_to_end = settings.end_to_end
         autoencoder = None

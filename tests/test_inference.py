@@ -314,6 +314,43 @@ def test_a_metric_a_run_names_without_a_validation_split_refuses_before_an_updat
     assert Checkpoints(str(tmp_path / "checkpoints"), keep=1).latest is None
 
 
+def test_an_lm_run_over_a_source_stops_at_its_end_of_sequence_ids(tmp_path):
+    """An LM objective over a loaded source takes the source's end-of-sequence ids into the policy it
+    trains, its task and its saved run, where its own sampling names none: each stops a greedy response
+    at the first id the source ends at, which the same objective over the bare model generates past."""
+    from dew.interop import Pretrained
+    from dew.objectives.lm import LMObjective, Samples
+    from dew.sampling import Sampling
+
+    source = Pretrained.load(Path(__file__).resolve().parent / "fixtures/hf/qwen3-tiny", dtype="float32",
+                             attention_impl="xla")
+    greedy = Samples([1, 2, 3], 0, sampling=Sampling(temperature=0))
+    prompt = jnp.asarray([[1, 2, 3], [4, 5, 6]], jnp.int32)
+
+    def generated(objective):
+        state = Trainer(objective, optax.sgd(0.1), key=jax.random.PRNGKey(0)).initial_state()
+        return objective, state, objective.pipeline(state, ema=False)(prompt, 6, key=7).host()
+
+    _, _, free = generated(LMObjective(source.model, 8, variables=source.variables, ema_decay=None,
+                                       samples=greedy))
+    eos = int(free.tokens[0, 3 + 2])
+    ending = dataclasses.replace(source, generation_config={**source.generation_config, "eos_token_id": eos})
+    objective, state, stopped = generated(LMObjective(ending, 8, ema_decay=None, samples=greedy,
+                                                      processor=None))
+    responses = np.asarray(free.tokens[:, 3:])
+    hits = [np.flatnonzero(row == eos) for row in responses]
+    expected = [int(hit[0]) + 1 if hit.size else 6 for hit in hits]
+    np.testing.assert_array_equal(stopped.lengths, expected)
+    np.testing.assert_array_equal(stopped.terminated, [bool(hit.size) for hit in hits])
+    policy = objective.policy(state.variables, Sampling(temperature=0))(prompt, 6, key=7).host()
+    np.testing.assert_array_equal(policy.lengths, expected)
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
+    checkpoints.wait()
+    restored = TextGeneration.from_run(str(tmp_path / "run"))(prompt, 6, key=7).host()
+    np.testing.assert_array_equal(restored.lengths, expected)
+
+
 def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16, fields=None):
     """Two training steps of a tiny byte-level decoder, its checkpoints, whose
     record names the byte tokenizer it decodes through, and the `run.json` the

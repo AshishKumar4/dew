@@ -39,8 +39,10 @@ from dew.interop.components import bind_component
 from dew.interop.weights import indexed_path
 from dew.objectives.base import Variables
 
+from ..activations import silu
 from ..attention import l2_normalized, scaled_dot_product_attention
 from ..conv import Conv
+from ..precision import at_least_fp32
 from .api import AutoEncoder, LatentNormalization, published_source
 from .kl import posterior_latent
 
@@ -64,7 +66,7 @@ class WanRMSNorm(nn.Module):
     @nn.compact
     def __call__(self, x):
         gamma = self.param("gamma", nn.initializers.ones, (self.features, *(1,) * (self.rank - 1)))
-        wide = x.astype(jnp.promote_types(x.dtype, jnp.float32))
+        wide = x.astype(at_least_fp32(x.dtype))
         return (l2_normalized(wide) * math.sqrt(self.features) * gamma.reshape(-1)).astype(self.dtype)
 
 
@@ -125,9 +127,9 @@ class WanResidualBlock(nn.Module):
         shortcut = x
         if self.in_features != self.features:
             shortcut = causal_conv(self.features, 1, spatial, self.dtype, "conv_shortcut")(x)
-        x = nn.silu(WanRMSNorm(self.in_features, 4, self.dtype, name="norm1")(x))
+        x = silu(WanRMSNorm(self.in_features, 4, self.dtype, name="norm1")(x))
         x = _causal(self, self.features, 3, spatial, "conv1", x)
-        x = nn.silu(WanRMSNorm(self.features, 4, self.dtype, name="norm2")(x))
+        x = silu(WanRMSNorm(self.features, 4, self.dtype, name="norm2")(x))
         return _causal(self, self.features, 3, spatial, "conv2", x) + shortcut
 
 
@@ -247,7 +249,7 @@ class _Encoder(nn.Module):
                 x = _Downsample(features, self.temporal[level], self.dtype, name=f"down_blocks_{index}")(x)
                 index += 1
         x = WanMidBlock(dims[-1], self.dtype, name="mid_block")(x)
-        x = nn.silu(WanRMSNorm(dims[-1], 4, self.dtype, name="norm_out")(x))
+        x = silu(WanRMSNorm(dims[-1], 4, self.dtype, name="norm_out")(x))
         return _causal(self, 2 * self.latent, 3, 3, "conv_out", x)
 
 
@@ -287,7 +289,7 @@ class _Decoder(nn.Module):
             upsample = level != len(self.multipliers) - 1
             x = _UpBlock(in_features // 2 if level > 0 else in_features, features, self.blocks, upsample,
                          upsample and upsampling[level], self.dtype, name=f"up_blocks_{level}")(x)
-        x = nn.silu(WanRMSNorm(dims[-1], 4, self.dtype, name="norm_out")(x))
+        x = silu(WanRMSNorm(dims[-1], 4, self.dtype, name="norm_out")(x))
         return _causal(self, 3, 3, 3, "conv_out", x)
 
 

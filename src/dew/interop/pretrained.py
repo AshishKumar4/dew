@@ -238,6 +238,13 @@ class Pretrained:
     fields.
     """
 
+
+    @property
+    def eos_token_ids(self) -> tuple[int, ...]:
+        """The end-of-sequence ids the source's generation stops at, from its generation config or
+        its config (`eos_token_id`), none where neither names one."""
+        return eos_ids(self.config, self.generation_config)
+
     @property
     def text_processor(self) -> TaskProcessor | None:
         """Return what the bundle's tasks encode and decode text with.
@@ -257,48 +264,53 @@ class Pretrained:
         """Return a trained run's selected checkpoint, rebuilt from the run's own inference record,
         in the layout of the architecture the record names. `trust` names the packages outside
         Dew the record may import (`TextGeneration.from_run`)."""
-        from dew.config import ModelConfig
-        from dew.inference.tasks import run_record
-        from dew.records import record, text
-        from dew.registry import models, objectives
-        declaration, step = run_record(str(directory), step, trust)
-        model_config = ModelConfig.from_dict(record(declaration['model'], 'model'))
+        from dew.inference.tasks import (
+            BlockSettings,
+            MaskedSettings,
+            SavedRun,
+            TaskSettings,
+            TextSettings,
+            saved_model,
+            saved_settings,
+        )
+        from dew.registry import models
+
+        run = SavedRun.pinned(str(directory), step, trust)
+        model_config = saved_model(run.record, None)
         model = model_config.build()
-        kind = text(declaration['objective'], 'objective')
-        variables = objectives[kind]._saved_variables(str(directory), step=step, ema=ema)
-        # The run's task (its policy, budget, pad id and process), in the format the export's readers read.
-        sampling = declaration.get('sampling')
-        budget = declaration.get('max_new_tokens')
-        budget = budget if isinstance(budget, int) else None
-        pad = declaration.get('pad_token_id')
-        pad = pad if isinstance(pad, int) else None
-        tokenizer = declaration.get('tokenizer')
-        tokenizer = None if tokenizer is None else text(tokenizer, 'tokenizer')
+        variables = run.variables(ema=ema)
+        # The run's task as its loader reads it (`saved_settings`): its policy, budget, pad and
+        # end-of-sequence ids and process, which the export writes in the format its readers read.
+        held = None if run.objective.settings is None else saved_settings(run.record, run.objective.settings)
+        task = held if isinstance(held, TaskSettings) else None
+        budget = None if task is None else task.max_new_tokens
+        tokenizer = None if task is None else task.tokenizer
         # A run over a source's own processor records its source, and the bundle writes its files.
-        source = declaration.get('processor')
-        processor = None if source is None else load_processor(text(source, 'processor'), model)
+        processor = None if task is None or task.processor is None else load_processor(task.processor, model)
         trained = models[model_config.name]
         if trained is CausalTransformer:
             decoder = from_record(CausalTransformer, model)
-            masked = objectives[kind] is objectives['masked_diffusion']
-            generation = (masked_generation_config(budget, pad) if masked else
-                          None if not isinstance(sampling, dict) else
-                          generation_config_of(Sampling(**sampling), budget))
+            generation = (masked_generation_config(budget, None, held.eos_token_ids)
+                          if isinstance(held, MaskedSettings) else
+                          generation_config_of(held.sampling, budget) if isinstance(held, TextSettings)
+                          else None)
             bundle = replace(PretrainedDecoder.from_model(decoder, variables, tokenizer=tokenizer,
                                                           generation_config=generation), processor=processor)
-            if masked:
+            if isinstance(held, MaskedSettings):
                 bundle = PretrainedMaskedDecoder(
                     decoder, bundle.variables, bundle.processor, bundle.config, bundle.source,
                     bundle.model_config, bundle.generation_config,
                     export_adapter=bundle.export_adapter, tokenizer=bundle.tokenizer)
         elif trained is models["diffusion_gemma"]:
-            from dew.diffusion.block import BlockProcess
             from dew.interop import diffusion_gemma
+            if not isinstance(held, BlockSettings):
+                raise TypeError(f"a {model_config.name} run of {run.objective.__name__} records no block "
+                                "process to export")
             block = from_record(DiffusionGemma, model)
             published = diffusion_gemma.published_config(block)
-            process = from_record(BlockProcess, record(declaration['process'], 'process'), dtypes=False)
-            generation = diffusion_gemma.generation_config_of(process, max_new_tokens=budget,
-                                                              pad_token_id=pad)
+            generation = diffusion_gemma.generation_config_of(held.process, max_new_tokens=budget,
+                                                              pad_token_id=held.pad_token_id,
+                                                              eos_token_ids=held.eos_token_ids)
             bundle = PretrainedBlockDecoder(
                 block, variables, processor, published, None, model_config.fields, generation,
                 export_adapter=diffusion_gemma.export_weights, tokenizer=tokenizer)
@@ -697,7 +709,7 @@ class PretrainedMaskedDecoder(Pretrained):
         audit_masked(config, generation)
         return MaskedGeneration(self.model, self.variables, MDLM(mask_id=mask_id)(),
                                 self.text_processor,
-                                eos_token_ids=eos_ids(config, generation),
+                                eos_token_ids=self.eos_token_ids,
                                 pad_token_id=pad_id(config, generation),
                                 max_new_tokens=generation_limit(config, generation, "max_new_tokens"),
                                 max_length=generation_limit(config, generation, "max_length"),
@@ -723,7 +735,7 @@ class PretrainedBlockDecoder(Pretrained):
             self.variables,
             diffusion_gemma.generation_process(self.config, self.generation_config),
             self.text_processor,
-            eos_ids(self.config, self.generation_config),
+            self.eos_token_ids,
             pad_id(self.config, self.generation_config),
             max_new_tokens=generation_limit(self.config, self.generation_config, "max_new_tokens"),
             max_length=generation_limit(self.config, self.generation_config, "max_length"),
@@ -880,6 +892,20 @@ def _assembled_pipeline(directory: Path, index: Mapping[str, object], commit: st
     return replace(loaded, variables=placed(loaded.variables), revision=commit)
 
 
+def _wrapper_attention(config: decoder_parts.DecoderFields, names: Sequence[str],
+                        fields: Mapping[str, object]) -> None:
+    """Compose a wrapper's attention metadata with each kind's source-declared mixer fields."""
+    kinds = decoder_parts.kinds_of(config).copy()
+    for name in names:
+        kind = kinds.get(name, {})
+        mixer = records.record(kind.get("mixer") or config.get("mixer")
+                               or {"class": "attention", "fields": {}}, "mixer")
+        held = records.record(mixer.get("fields", {}), "mixer.fields")
+        kinds[name] = NativeFields(LayerKind, {
+            **kind, "mixer": {**mixer, "fields": {**held, **fields}}})
+    config["kinds"] = kinds
+
+
 def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.WrapperFields,
                          max_seq_len: int | None) -> decoder_parts.DecoderFields:
     """Read the decoder fields a wrapper's text_config states, with the corrections
@@ -897,27 +923,17 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.Wra
         text_fields["max_seq_len"] = max_seq_len
     if family == "gemma3":
         text_fields["final_logit_softcap"] = None
-        text_fields["mixer"] = {"class": "attention", "fields": {"bidirectional_images": True}}
+        names = records.strings(text_fields["layer_types"], "layer_types")
+        _wrapper_attention(text_fields, tuple(dict.fromkeys(names)), {"bidirectional_images": True})
     if family == "gemma4" and text_config.get("use_bidirectional_attention") == "vision":
-        kinds = decoder_parts.kinds_of(text_fields).copy()
-        sliding = NativeFields(LayerKind, {
-            **kinds.get("sliding_attention", {}),
-            "mixer": {"class": "attention", "fields": {"bidirectional_images": True}}})
-        kinds["sliding_attention"] = sliding
-        text_fields["kinds"] = kinds
+        _wrapper_attention(text_fields, ("sliding_attention",), {"bidirectional_images": True})
     if family in QWEN35_TYPES:
         rope = records.record(text_config.get("rope_parameters") or {}, "rope_parameters")
         sections = rope.get("mrope_section", [11, 11, 10])
         if (not isinstance(sections, (list, tuple)) or len(sections) != 3
                 or any(type(value) is not int or value < 0 for value in sections)):
             raise ValueError("mrope_section must contain three nonnegative integer widths")
-        kinds = decoder_parts.kinds_of(text_fields).copy()
-        full = NativeFields(LayerKind, {
-            **kinds.get("full_attention", {}),
-            "mixer": {"class": "attention", "fields": {
-                      "mrope_section": [sections[0], sections[1], sections[2]]}}})
-        kinds["full_attention"] = full
-        text_fields["kinds"] = kinds
+        _wrapper_attention(text_fields, ("full_attention",), {"mrope_section": list(sections)})
     return text_fields
 
 

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import functools
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -563,18 +563,27 @@ def generation_config_of(sampling: Sampling, max_new_tokens: int | None = None) 
     return values
 
 
-def masked_generation_config(max_new_tokens: int | None = None, pad_token_id: int | None = None
-                             ) -> dict[str, JSON]:
+def masked_generation_config(max_new_tokens: int | None = None, pad_token_id: int | None = None,
+                             eos_token_ids: Sequence[int] = ()) -> dict[str, JSON]:
     """The generation_config.json a masked-diffusion export writes: no KV cache,
-    the response budget and the pad id, which `audit_masked` accepts and
-    `PretrainedMaskedDecoder.text_generation` reads back. Dew's solver and
-    step count have no field there, so the reader's MDLM defaults stand."""
-    values: dict[str, JSON] = {"use_cache": False}
+    the response budget, the pad id and the end-of-sequence ids, which
+    `audit_masked` accepts and `PretrainedMaskedDecoder.text_generation` reads
+    back. Dew's solver and step count have no field there, so the reader's MDLM
+    defaults stand."""
+    values: dict[str, JSON] = {"use_cache": False, **eos_field(eos_token_ids)}
     if max_new_tokens:
         values["max_new_tokens"] = max_new_tokens
     if pad_token_id is not None:
         values["pad_token_id"] = pad_token_id
     return values
+
+
+def eos_field(eos_token_ids: Sequence[int]) -> dict[str, JSON]:
+    """`eos_token_ids` as a generation config's `eos_token_id`, one id or a list (`eos_ids`'s
+    inverse), none where there are none."""
+    ids: list[JSON] = [int(token) for token in eos_token_ids]
+    named: dict[str, JSON] = {} if not ids else {"eos_token_id": ids[0] if len(ids) == 1 else ids}
+    return named
 
 
 def source_decoding(config: Mapping[str, object], generation_config: Mapping[str, object],
