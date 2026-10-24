@@ -605,8 +605,8 @@ def fetched_layer_states():
 
 
 def test_a_host_resident_stacks_layer_states_are_a_resident_ones():
-    """A stack whose layers sit in host memory, read by a caller that keeps intermediates, fetches
-    each row in Flax's lifted scope (`decoder_stack.run_stack`): every layer's output a reader of
+    """A stack whose layers sit in host memory, read by a caller that keeps intermediates, binds
+    each row through Linen (`decoder_stack.run_stack`): every layer's output a reader of
     layer states keeps is there, on par with the resident stack's, both measured from float64
     (check 1), where a fetched scope of its own once kept none of it."""
     hosted, resident, truth = fetched_layer_states()
