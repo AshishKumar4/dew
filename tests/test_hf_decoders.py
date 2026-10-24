@@ -484,7 +484,13 @@ _YARN_SOURCES = (
     # The Nemotron-H releases that carry their own remote code name the head width attention_head_dim.
     ("nemotron-h-tiny", lambda config: {**_without("head_dim")(config),
                                         "attention_head_dim": config["head_dim"]}),
-    ("llada-tiny", _without("n_kv_heads", "head_dim", "rope_theta")),
+    ("llada-tiny", _without("n_kv_heads", "head_dim")),
+    # Glm4MoeConfig fills an absent factor with half the head, the fixture's own.
+    ("glm4-moe-tiny", lambda config: {**_without("partial_rotary_factor")(config),
+                                      "rope_parameters": _without("partial_rotary_factor")(
+                                          config["rope_parameters"])}),
+    # MiMoV2FlashConfig installs per-kind bases 5e6 and 1e4 at a factor of 0.334 for an absent record.
+    ("mimo-v2-flash-tiny", _without("rope_parameters")),
     ("llada-tiny", lambda config: {
         **_without("n_layers", "activation_type")(config),
         "num_layers": config["n_layers"], "hidden_activation": config["activation_type"]}),
@@ -495,6 +501,104 @@ def test_a_source_spelled_another_way_computes_the_reference_logits(name, edit, 
     spelled fixture is, and computes the reference's logits."""
     ours, theirs = _reference_logits(name, _respelled(name, tmp_path, edit))
     assert np.max(np.abs(ours - theirs)) < 1e-4
+
+
+@pytest.mark.parametrize("name, edit", [
+    # LLaDA-MoE's config classes default the rotary's base and factor to -1, which names no rotary.
+    *[(name, _without(field)) for name in ("llada-moe-tiny", "llada-moe-v2-tiny")
+      for field in ("rope_theta", "partial_rotary_factor")],
+    # MiMoV2FlashRotaryEmbedding indexes each per-kind record's base; its class fills none.
+    ("mimo-v2-flash-tiny", lambda config: {**config, "rope_parameters": {
+        kind: _without("rope_theta")(entry) for kind, entry in config["rope_parameters"].items()}}),
+])
+def test_a_config_whose_class_names_no_value_for_an_unstated_field_is_refused(name, edit, tmp_path):
+    """A field the config class has no working default for, left unstated, is refused rather than
+    read at another family's default."""
+    with pytest.raises(ValueError):
+        fp32_decoder(_respelled(name, tmp_path, edit))
+
+
+def test_a_dense_llada_config_without_a_base_rotates_at_its_classs_10000(tmp_path):
+    """LLaDA's ModelConfig, which its config class starts from, rotates at 10000; the release states
+    its own 500000. Without a base the fixture computes what it computes at 10000."""
+    ids = np.load(FIXTURES / "llada-tiny" / "input_ids.npy")
+    unstated, stated = (fp32_decoder(_respelled("llada-tiny", tmp_path / where, edit)) for where, edit in (
+        ("unstated", _without("rope_theta")), ("stated", lambda config: {**config, "rope_theta": 10000.0})))
+    np.testing.assert_array_equal(np.asarray(unstated[0].apply(unstated[1], ids)),
+                                  np.asarray(stated[0].apply(stated[1], ids)))
+
+
+def test_a_plain_rotary_gpt_oss_exports_a_plain_record_that_reloads_to_its_logits(tmp_path):
+    """GptOssConfig reads an omitted rope record as YaRN; a GPT OSS loaded with a plain one exports a
+    plain one, which reloads to the logits it computed."""
+    directory = _respelled("gpt-oss-tiny", tmp_path / "plain", lambda config: {
+        **config, "rope_parameters": {"rope_type": "default",
+                                      "rope_theta": config["rope_parameters"]["rope_theta"]}})
+    ids = np.load(FIXTURES / "gpt-oss-tiny" / "input_ids.npy")
+    model, variables = fp32_decoder(directory)
+    PretrainedDecoder.from_model(model, variables).save(tmp_path / "export")
+    restored, restored_variables = fp32_decoder(tmp_path / "export")
+    np.testing.assert_array_equal(np.asarray(restored.apply(restored_variables, ids)),
+                                  np.asarray(model.apply(variables, ids)))
+
+
+CLASS_DEFAULTED = ("deepseek-v2-tiny", "deepseek-v3-tiny", "gpt-oss-tiny", "mistral-tiny", "mixtral-tiny",
+                   "ministral-tiny", "llama4-tiny", "modernbert-tiny", "qwen2-tiny", "qwen2-moe-tiny",
+                   "qwen3-tiny", "qwen3-moe-tiny", "gemma2-tiny", "gemma3-tiny", "olmo3-tiny", "phi3-tiny",
+                   "glm4-moe-tiny", "muse-glimmer-text-tiny")
+"""Fixtures of families whose transformers config class states their defaults."""
+_IDENTITY = frozenset({"model_type", "architectures", "transformers_version", "dtype", "torch_dtype",
+                       "auto_map", "_name_or_path"})
+
+
+def _class_fills(name):
+    """For each field of the fixture's transformers config class, what the class fills it with where
+    the fixture's config leaves it out, everything else as stated: a fixed default, or one derived
+    from the other fields (a layer pattern from the layer count). Each is a JSON value a file could
+    state."""
+    from huggingface_hub.errors import StrictDataclassClassValidationError
+    from transformers import CONFIG_MAPPING
+
+    config = fixture_config(name)
+    cls = CONFIG_MAPPING[config["model_type"]]
+    stated = {field: value for field, value in config.items() if field not in _IDENTITY}
+    fills = {}
+    for field in cls().to_dict():
+        if field in _IDENTITY or field.startswith("_"):
+            continue
+        try:
+            filled = cls(**{key: value for key, value in stated.items() if key != field}).to_dict().get(field)
+        except (ValueError, StrictDataclassClassValidationError):
+            continue  # the class refuses the config without it: there is no fill to read
+        if json.loads(json.dumps(filled, default=lambda value: None)) == filled:
+            fills[field] = filled
+    return fills
+
+
+def _translated(config):
+    """The decoder a config translates to, or the refusal's kind where the translation refuses it or
+    finds a field it requires missing."""
+    try:
+        return translate_config(config)
+    except (ValueError, KeyError) as refused:
+        return type(refused)
+
+
+@pytest.mark.parametrize("name", CLASS_DEFAULTED)
+def test_a_field_left_out_reads_as_its_config_class_fills_it(name):
+    """Each field of the family's config class, once stated as the class fills it and once left
+    out of the fixture's config: where the field left out translates at all, it translates to the
+    decoder the stated default does, because the family fills an omitted field as its class does,
+    never at another family's default. A field the family requires is refused when left out, never
+    read as something else. Over the fixture's own weights, one decoder computes one set of logits
+    (`test_a_source_spelled_another_way_computes_the_reference_logits`)."""
+    config = fixture_config(name)
+    differing = []
+    for field, filled in _class_fills(name).items():
+        left = _translated(_without(field)(config))
+        if not isinstance(left, type) and left != _translated({**config, field: filled}):
+            differing.append(field)
+    assert not differing, f"{name} reads {differing} otherwise than its class where they are left out"
 
 
 @pytest.mark.parametrize("name, theta", [
@@ -1397,3 +1501,38 @@ def test_a_nemotron_h_trunk_whose_config_names_a_step_loads_as_the_trunk(name, t
     ids = jnp.asarray(np.load(FIXTURES / name / "input_ids.npy"), jnp.int32)
     plain, held = fp32_decoder(FIXTURES / name)
     np.testing.assert_array_equal(np.asarray(model.apply(variables, ids)), np.asarray(plain.apply(held, ids)))
+
+
+def test_a_bundle_made_from_a_model_carries_its_record_as_a_loaded_one_does():
+    """`PretrainedDecoder.from_model`'s model_config is the decoder's record, the form a load's
+    takes: written as JSON and read back, it builds the same decoder."""
+    loaded = Pretrained.load(str(FIXTURES / "qwen3-tiny"), dtype="float32", attention_impl="reference")
+    bundle = PretrainedDecoder.from_model(loaded.model, loaded.variables)
+    assert models.build("causal_transformer", **json.loads(json.dumps(bundle.model_config))) == loaded.model
+
+
+def test_a_float64_decoder_saves_and_reloads_in_float64(tmp_path):
+    """A decoder computing in float64 end to end, as Dory's and nGPT's runs do: its bundle and a
+    run's record of it name float64, and the checkpoint it saves loads back in float64 to the same
+    weights and logits."""
+    from dew.config import ModelConfig
+    from dew.registry import to_record
+
+    with jax.enable_x64(new_val=True):
+        loaded = Pretrained.load(str(FIXTURES / "qwen3-tiny"), dtype="float64", param_dtype="float64",
+                                 attention_impl="reference")
+        bundle = PretrainedDecoder.from_model(loaded.model, loaded.variables)
+        record = json.loads(json.dumps(bundle.model_config))
+        assert models.build("causal_transformer", **record) == loaded.model
+        # A run records its model as every run does (`ModelConfig.from_model`), and rebuilds it.
+        run = json.loads(json.dumps(to_record(ModelConfig.from_model(loaded.model), ModelConfig)))
+        assert ModelConfig.from_dict(run).build() == loaded.model
+        bundle.save(tmp_path / "float64")
+        again = Pretrained.load(str(tmp_path / "float64"), dtype="float64", param_dtype="float64",
+                                attention_impl="reference")
+        pairs = zip(jax.tree.leaves(again.variables), jax.tree.leaves(loaded.variables), strict=True)
+        for ours, theirs in pairs:
+            np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+        ids = jnp.asarray(np.load(FIXTURES / "qwen3-tiny" / "input_ids.npy"))
+        np.testing.assert_array_equal(np.asarray(again.model.apply(again.variables, ids)),
+                                      np.asarray(loaded.model.apply(loaded.variables, ids)))

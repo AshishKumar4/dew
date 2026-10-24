@@ -44,7 +44,7 @@ from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
 from dew.inference.tasks import Processor, TextSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
-from dew.nn.cross_attention import crossing
+from dew.nn.cross_attention import crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import (
     CONTEXT,
@@ -689,6 +689,10 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
             valid = valid & (tokens != self.pad_id)
         return valid, token_layout(fields, xp=np)[1]
 
+    def scored_tokens(self, batch: Batch) -> np.ndarray:
+        """Each row's targets the loss scores (`scored_targets`), its `loss_role`'s alone."""
+        return self._prediction_lengths(batch)
+
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """Real input lengths, each packed document its own attention square.
 
@@ -781,8 +785,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         if held is None or FROZEN not in held or not isinstance(model, CrossAttending) or (
                 model.cross_attention is None):
             return False
-        return all(crossing(("params", *(entry.key for entry in path)))
-                   for path, _ in jax.tree_util.tree_leaves_with_path(held["params"]))
+        return crosses_alone(held["params"])
 
     def _context_flops(self, model, batch: Batch) -> float:
         """The forward work of the cross-attention blocks over the batch's context
@@ -1292,6 +1295,14 @@ class LMObjective(TokenScorer):
     @property
     def _warmup(self) -> bool:
         return self.indexer is not None and self.indexer.phase == "warmup"
+
+    def scored_tokens(self, batch: Batch) -> np.ndarray:
+        """Each row's targets the loss scores, or in an indexer's warm-up, which scores its KL alone,
+        each row's real queries (`_query_weights`)."""
+        if not self._warmup:
+            return super().scored_tokens(batch)
+        valid, _ = self._counted_tokens(batch)
+        return np.sum(valid[:, :-1], axis=-1, dtype=np.int64)
 
     def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
         """Split the tree as the indexer phase trains it.

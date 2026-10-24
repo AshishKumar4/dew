@@ -448,19 +448,27 @@ class QwenImageConditioner(_LanguageText):
     """The system turn's token count, which the pipeline derives the same way."""
 
     SYSTEM: ClassVar[str] = "Comprehend and analyze the provided prompt."
-    USER: ClassVar[tuple[str, str]] = ("<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n")
     assets = "processor"
 
     def __post_init__(self):
         system = [{"role": "system", "content": [{"type": "text", "text": self.SYSTEM}]}]
         self.drop = len(self.tokenizer.apply_chat_template(system, tokenize=True, return_dict=False))
 
+    @property
+    def framing(self) -> tuple[str, str]:
+        """The pipeline's template around a prompt: the system turn and the user's turn up to the
+        prompt, then the rest of it and the assistant's opening, as the encoder's own chat template
+        renders them (`dew.data.chat.framed`), the turn the system count (`drop`) reads too."""
+        from dew.data.chat import framed
+
+        return framed(self.tokenizer, self.SYSTEM, where=self.checkpoint)
+
     def tokenize(self, texts: Sequence[str | Mapping[str, object]]):
-        system = f"<|im_start|>system\n{self.SYSTEM}<|im_end|>\n"
+        before, after = self.framing
         rows = []
         for prompt in texts:
             record: Mapping[str, object] = {"text": prompt} if isinstance(prompt, str) else prompt
-            rows.append(f"{system}{self.USER[0]}{_prompt(record, 'text', '') or ' '}{self.USER[1]}")
+            rows.append(f"{before}{_prompt(record, 'text', '') or ' '}{after}")
         length = self.drop + self.tokens
         encoded = self.tokenizer(rows, padding="max_length", padding_side="right",
                                  max_length=length)

@@ -64,6 +64,7 @@ from diffusers.schedulers import (
     scheduling_tcd, scheduling_unipc_multistep,
 )
 from diffusers_wan_reference import float64_scheduler
+from recorded_draws import Tape
 
 from dew.diffusion.schedules.common import GeneralizedNoiseScheduler
 from dew.diffusion.schedules.source import SourceSchedule
@@ -373,13 +374,11 @@ class ReplayBrownian:
     """The draws `RecordedBrownian` kept, answered again in the same order."""
 
     def __init__(self, x, sigma_min, sigma_max, seed=None, transform=lambda value: value):
-        self.taken = 0
+        self.tape = Tape(RecordedBrownian.draws)
         self.dtype = x.dtype
 
     def __call__(self, sigma, sigma_next):
-        value = RecordedBrownian.draws[self.taken]
-        self.taken += 1
-        return torch.tensor(value, dtype=self.dtype)
+        return torch.tensor(self.tape.next(), dtype=self.dtype)
 
 
 def trajectory_gradient(module: ModuleType, case: Case, initial: torch.Tensor,

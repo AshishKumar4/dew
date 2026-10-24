@@ -99,7 +99,7 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.11.2.post15,<0.11.3`.
+Dew requires `jax>=0.11.2.post16,<0.11.3`.
 <!-- END JAX requirement -->
 
 It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves jax alone. Every other package, jaxlib and its CUDA plugins included, comes from PyPI. The fixes:
@@ -112,6 +112,7 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - A `custom_vjp` call (and Mosaic GPU's `custom_jvp` call) in a Pallas Triton or Mosaic GPU kernel lowers as its primal function, which a template's score hook through a `jax.custom_vjp` needs.
 - Mosaic GPU relays an MMA's accumulator out to a 16-bit MMA's left operand in registers, and an abstract device states its compute capability, which Mosaic GPU lowers for: the templates' Mosaic kernels need both on sm80.
 - The persistent compilation cache keys a program by jax's own build as well as jaxlib's, so two builds over one jaxlib never read each other's programs (on GPU nodes that ran several, reads of the other build's entries failed).
+- Mosaic GPU and Pallas Mosaic GPU lower `ceil` and `floor`, which a template's Mosaic kernel that rounds a value needs on an H100.
 
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
 
