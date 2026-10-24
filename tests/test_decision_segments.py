@@ -97,3 +97,42 @@ def test_a_layout_and_a_head_of_a_runs_own_reload_by_import_path_and_an_earlier_
     assert isinstance(recorded, dict) and recorded["name"] == "dew.decision.head:JointSchemaHead"
     earlier = {"name": "JointSchemaHead", "fields": recorded["fields"]}
     assert Head.from_record(earlier, 8) == JointSchemaHead(hidden_size=8)
+
+
+def test_a_row_without_a_state_segment_keeps_none_of_the_state():
+    """Segments without the state write none of it, and the row says so: none of the state kept, so
+    a request whose state the row leaves out reads as cut."""
+    [row] = JointLayout(segments=(Schema(),)).rows(TOKENIZER, SPECIALS, "abc", QUESTIONS)
+    assert (row.state_tokens, row.state_kept) == (3, 0)
+    assert "abc" not in text(row.tokens)
+
+
+def test_a_saved_run_reloads_its_segments_and_an_earlier_runs_record_reads_as_before(tmp_path):
+    """A run of a joint layout of segments of its own reloads them from its record, its task answering
+    as the live one does; an earlier run's record, which names its layout and head by class name alone
+    and holds no segments, reads as the default composition."""
+    import jax
+    import numpy as np
+    from test_decision_objective import EXAMPLES, INTENT, saved_and_reloaded, tiny_backbone
+
+    from dew.decision import Decide, DecisionObjective
+    from dew.decision.task import DecideSettings
+
+    layout = JointLayout(max_len=128, segments=SCHEMA_FIRST)
+    head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
+    base = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=layout,
+                             head=head)
+    task = Decide(base.model, base.init(jax.random.key(0)), layout, TOKENIZER, SPECIALS)
+    _, live, reloaded = saved_and_reloaded(task, tmp_path / "run")
+    assert reloaded.layout == layout
+    asked = {"team": INTENT}
+    np.testing.assert_array_equal(reloaded(EXAMPLES[0].state, asked)["team"].probabilities,
+                                  live(EXAMPLES[0].state, asked)["team"].probabilities)
+    fields = to_record(JointLayout(max_len=128), JointLayout)
+    assert isinstance(fields, dict)
+    earlier = {name: value for name, value in fields.items() if name not in ("segments", "framing")}
+    settings = DecideSettings.of({"head": {"name": "JointSchemaHead", "fields": {}},
+                                  "layout": {"name": "JointLayout", "fields": earlier},
+                                  "specials": to_record(SPECIALS, Specials), "tokenizer": "byte",
+                                  "processor": None})
+    assert settings.layout == JointLayout(max_len=128)
