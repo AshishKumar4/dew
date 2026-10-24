@@ -891,7 +891,7 @@ def split_with_queries(key, value, split: int):
     return repeat_kv_heads(key, heads), repeat_kv_heads(value, heads)
 
 
-def _per_shard(local, query, key, value, **extras):
+def _per_shard(local, query, key, value, *, coordinates: bool = False, **extras):
     """`local(query, key, value, **extras)` on each shard's rows and heads
     (`manual_map`). The key heads a shard reads are the ones its key shard holds,
     at their offset in that shard, where the key heads' split begins with the query
@@ -906,17 +906,24 @@ def _per_shard(local, query, key, value, **extras):
     a process address (`str(id(...))` in its backend config), which the persistent
     cache key keeps, so every fresh process would compile again; under a fully manual
     map jax lowers neither. `extras` maps each further argument to its array, or None,
-    and the logical axes it splits on.
+    and the logical axes it splits on. With `coordinates`, `local` also takes `global_rows` and
+    `global_heads`, the shard's global batch rows and query heads from the query's own split, so a draw keyed
+    on them is the same whatever the rules give the rows and heads alone (axis contention).
     """
     given = {name: pair for name, pair in extras.items() if pair[0] is not None}
     queries, keys = logical_spec(HEADS, query.shape), logical_spec(KV_HEADS, key.shape)
     query_axes, key_axes = mesh_axes(_entry(queries, 2)), mesh_axes(_entry(keys, 2))
+    row_axes = mesh_axes(_entry(queries, 0))
     if key_axes and query_axes[: len(key_axes)] != key_axes:
         keys, key_axes = P(*keys[:2]), ()
     split, kv_heads = tensor_shards(query), key.shape[-2]
     heads = math.lcm(kv_heads, split)
     share, copies = heads // split, heads // kv_heads
     names = tuple(given)
+
+    def shard_start(axes, extent):
+        # Where a shard's extent begins along the mesh axes that split it (0 where no axis does).
+        return jax.lax.axis_index(axes) * extent if axes else 0
 
     def shard(query, key, value, *arrays):
         if copies > 1 or key.shape[-2] != share:
@@ -926,7 +933,13 @@ def _per_shard(local, query, key, value, **extras):
             if key_axes:
                 read = read - jax.lax.axis_index(key_axes) * key.shape[-2]
             key, value = (jnp.take(array, read, axis=-2) for array in (key, value))
-        return local(query, key, value, **dict(zip(names, arrays, strict=True)))
+        arguments = dict(zip(names, arrays, strict=True))
+        if coordinates:
+            rows_at = shard_start(row_axes, query.shape[0])
+            arguments["global_rows"] = rows_at + jnp.arange(query.shape[0], dtype=jnp.int32)
+            heads_at = shard_start(query_axes, query.shape[2])
+            arguments["global_heads"] = heads_at + jnp.arange(query.shape[2], dtype=jnp.int32)
+        return local(query, key, value, **arguments)
 
     # An extra may be a tree of arrays (`CrossDocuments`), each leaf split on its axes.
     specs = (queries, keys, keys, *(jax.tree.map(lambda leaf, axes=axes: logical_spec(axes, leaf.shape), x)
@@ -1167,30 +1180,25 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
     if sinks is not None and sinks.shape != (query.shape[2],):
         raise ValueError(f"sinks must have one logit per query head, got {sinks.shape}")
 
-    def local(query, key, value, sinks=None, segment_ids=None, lengths=None, starts=None, draw_rows=None,
-              draw_heads=None, seed=None):
+    def local(query, key, value, sinks=None, segment_ids=None, lengths=None, starts=None, global_rows=None,
+              global_heads=None, seed=None):
         batch, queries, keys = query.shape[0], query.shape[1], key.shape[1]
         spans = template.spans(queries, keys, batch, causal=causal, sliding_window=sliding_window,
                                segment_ids=segment_ids, lengths=lengths, starts=starts)
         hooks = template.Hooks(
             score_mod=None if softcap is None else functools.partial(template.capped, softcap),
             initial=None if sinks is None else template.sinks(sinks, batch, queries, value.shape[-1]),
-            drop=None if seed is None or draw_rows is None or draw_heads is None
-            else template.Dropout(seed, draw_rows, draw_heads, dropout_rate))
+            drop=None if seed is None else template.Dropout(seed, global_rows, global_heads, dropout_rate))
         return attention_route.attend(query, key, value, spans, hooks)
 
     # The GPU arms are Pallas launches, which have no partitioning rule, so each shard runs them on its own
-    # rows and heads. A dropping call's draw takes each local row and head's global index, so it does not
-    # depend on the mesh.
+    # rows and heads. A dropping call's draw takes each shard's global rows and heads from the query's own
+    # split (`_per_shard`'s coordinates), so it does not depend on the mesh or on the rules of the other axes.
     rows = ("activation_batch",)
-    dropping = dropout_seed is not None
-    return _per_shard(local, query, key, value, sinks=(sinks, ("activation_heads",)),
+    return _per_shard(local, query, key, value, coordinates=dropout_seed is not None,
+                      sinks=(sinks, ("activation_heads",)),
                       segment_ids=(segment_ids, ("activation_batch", None)), lengths=(lengths, rows),
-                      starts=(starts, rows),
-                      draw_rows=(jnp.arange(query.shape[0], dtype=jnp.int32) if dropping else None, rows),
-                      draw_heads=(jnp.arange(query.shape[2], dtype=jnp.int32) if dropping else None,
-                                  ("activation_heads",)),
-                      seed=(dropout_seed, (None,)))
+                      starts=(starts, rows), seed=(dropout_seed, (None,)))
 
 
 VALUE_BLOCK = 256
