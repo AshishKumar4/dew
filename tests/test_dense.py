@@ -71,12 +71,17 @@ CASES = ([(name, Dense, nn.Dense, *case) for name, case in LAYERS.items()]
 @pytest.mark.parametrize(("ours", "flaxs", "build", "dtype", "shape"), [case[1:] for case in CASES],
                          ids=[case[0] for case in CASES])
 def test_a_layer_initializes_and_computes_what_flaxs_does(ours, flaxs, build, dtype, shape):
-    """Flax's parameters bit for bit, and with them, its biases zero, flax's output where both sum
-    their fp32 products as XLA does (`FP32_SUMS`)."""
+    """Flax's parameters bit for bit, but for a batched kernel, which draws each batch member alone
+    (`test_a_batched_kernel_draws_each_member_at_its_own_fan_in`), and with flax's parameters, its
+    biases zero, flax's output where both sum their fp32 products as XLA does (`FP32_SUMS`)."""
     x = jnp.asarray(np.random.default_rng(0).standard_normal(shape), dtype)
     mine, theirs = build(ours), build(flaxs)
     variables = theirs.init(jax.random.key(0), x)
-    jax.tree.map(np.testing.assert_array_equal, mine.init(jax.random.key(0), x), variables)
+    drawn = mine.init(jax.random.key(0), x)
+    if getattr(theirs, "batch_dims", ()):
+        assert jax.tree.map(np.shape, drawn) == jax.tree.map(np.shape, variables)
+    else:
+        jax.tree.map(np.testing.assert_array_equal, drawn, variables)
     if dtype == jnp.bfloat16:  # variables restored at a dtype other than the one declared
         variables = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), nn.unbox(variables))
     with jax.default_matmul_precision(FP32_SUMS):
@@ -84,6 +89,22 @@ def test_a_layer_initializes_and_computes_what_flaxs_does(ours, flaxs, build, dt
         got = mine.apply(variables, x)
     assert got.dtype == expected.dtype
     np.testing.assert_array_equal(np.asarray(got, np.float32), np.asarray(expected, np.float32))
+
+
+def test_a_batched_kernel_draws_each_member_at_its_own_fan_in():
+    """A DenseGeneral batched over 8 groups of 512 inputs draws each group's kernel as a layer of 512
+    inputs draws its own, at lecun's variance 1 / 512, where flax counts the groups as inputs too and
+    draws at 1 / 4096; DeepSeek V4's grouped output projection is such a layer. Each group's sample
+    variance over its 32,768 entries lies within 5% of 1 / 512, over six of its standard errors, the
+    groups apart, and a partitioned initializer keeps its box."""
+    x = jnp.zeros((8, 2, 512))
+    kernel = DenseGeneral(64, batch_dims=(0,), use_bias=False).init(jax.random.key(0), x)["params"]["kernel"]
+    variances = np.var(np.asarray(kernel, np.float64), axis=(1, 2)) * 512
+    assert np.all(np.abs(variances - 1) < 0.05), variances
+    assert len({np.asarray(member).tobytes() for member in kernel}) == 8
+    boxed = DenseGeneral(64, batch_dims=(0,), use_bias=False, kernel_init=PARTITIONED).init(
+        jax.random.key(0), x)["params"]["kernel"]
+    assert isinstance(boxed, nn.Partitioned) and boxed.value.shape == (8, 512, 64)
 
 
 @pytest.mark.parametrize(("layer", "shape"), [
