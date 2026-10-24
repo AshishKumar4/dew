@@ -18,7 +18,7 @@ wrote, which decide the vocabulary.
 from __future__ import annotations
 
 import dataclasses
-from typing import NamedTuple
+from typing import ClassVar, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -44,9 +44,14 @@ class Tokens(NamedTuple):
 class LMRunConfig(RunConfig):
     """A `RunConfig` plus the settings specific to language models."""
 
+    RESUMABLE: ClassVar[tuple[str, ...]] = (*RunConfig.RESUMABLE, "prompt", "max_new_tokens", "sampling")
+
     objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("lm"))
-    """The objective and its arguments: lm, masked_diffusion (MDLM), or
-    block_diffusion (the official DiffusionGemma fine-tuning objective)."""
+    """The objective and its arguments: lm, masked_diffusion (MDLM),
+    block_diffusion (the official DiffusionGemma fine-tuning objective), or
+    any objective by its import path that `LMObjective`'s arguments build:
+    the decoder, `seq_len`, its starting `variables`, `samples`, `processor`
+    and `qk_stats`."""
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
     optim: OptimConfig = dataclasses.field(
@@ -75,10 +80,6 @@ class LMRunConfig(RunConfig):
         if self.pretrained is None and self.pretrained_param_dtype != "float32":
             raise ValueError("--pretrained-param-dtype stores a --pretrained checkpoint's parameters; "
                              "this run loads none")
-        if self.objective.name not in (objectives.paths[name] for name in ("lm", "masked_diffusion",
-                                                                             "block_diffusion")):
-            raise ValueError(
-                f"--objective {self.objective.name!r} is not lm, masked_diffusion or block_diffusion")
         if self.objective.name == objectives.paths["block_diffusion"] and self.pretrained is None:
             raise ValueError("block_diffusion fine-tuning requires --pretrained")
 
@@ -143,11 +144,6 @@ class LMRunConfig(RunConfig):
         # Compiled once: the run's length and its cadences are read off this loader, which `train` trains on.
         loaded, held = fitted(self.chain(), self.validation, objective=objective.data(),
                               seed=self.data_seed)
-        if loaded.steps_per_epoch is None and self.trainer.steps is None:
-            raise ValueError("this data has no epoch length, so a run cannot count epochs of it: online "
-                             "packing or a filter over an indexed or streamed read cuts its order per share. "
-                             "Read it whole first (.read('memory')), read a published packing generation "
-                             "by index, or give the run length as --trainer.steps")
         # The run's own default metric, asked for where it holds a validation split to score.
         scored = self.trainer.eval_interval(loaded) is not None and bool(held)
         validation = (Perplexity(),) if scored else ()

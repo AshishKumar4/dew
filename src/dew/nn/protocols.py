@@ -666,6 +666,16 @@ class Serving(Protocol):
 
 
 @runtime_checkable
+class ShiftsLogits(Protocol):
+    """A masked-diffusion model that declares how its logits line up with its inputs: with
+    `shifted_logits`, position i's prediction is position i-1's logits (Dream-v0's). A model that
+    declares nothing predicts each position's own."""
+
+    @property
+    def shifted_logits(self) -> bool: ...
+
+
+@runtime_checkable
 class Bounded(Protocol):
     """A model that declares its vocabulary and cache capacity, which the host
     checks read to refuse an id outside the vocabulary or a request that would
