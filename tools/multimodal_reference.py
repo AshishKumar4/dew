@@ -72,7 +72,12 @@ def _row_slices(encoded: dict, model) -> list[dict]:
     valid = encoded["attention_mask"].bool()
     image_id = model.config.image_token_id
     grid = encoded.get("image_grid_thw")
-    image_offset = clip_offset = 0
+    image_offset = video_offset = clip_offset = 0
+    video_pixels = encoded.get("pixel_values_videos")
+    video_positions = encoded.get("video_position_ids")
+    if video_pixels is not None:
+        video_pixels = video_pixels.flatten(0, 1)
+        video_positions = video_positions.flatten(0, 1)
     singles = []
     for row in range(encoded["input_ids"].shape[0]):
         ids = encoded["input_ids"][row][valid[row]]
@@ -81,25 +86,37 @@ def _row_slices(encoded: dict, model) -> list[dict]:
             if name in encoded:
                 single[name] = encoded[name][row][valid[row]][None]
         images = _runs(ids, image_id)
-        if grid is None:
+        if "pixel_values" in encoded and images and grid is None:
             single["pixel_values"] = encoded["pixel_values"][image_offset:image_offset + images]
             if "image_position_ids" in encoded:
                 single["image_position_ids"] = encoded["image_position_ids"][
                     image_offset:image_offset + images]
-        else:
+        elif "pixel_values" in encoded and images:
             patches = grid.prod(dim=1)
             start = int(patches[:image_offset].sum())
             stop = int(patches[:image_offset + images].sum())
             single["pixel_values"] = encoded["pixel_values"][start:stop]
             single["image_grid_thw"] = grid[image_offset:image_offset + images]
         image_offset += images
+        if video_pixels is not None:
+            frames = _runs(ids, model.config.video_token_id)
+            if frames:
+                single["pixel_values_videos"] = video_pixels[video_offset:video_offset + frames, None]
+                single["video_position_ids"] = video_positions[video_offset:video_offset + frames, None]
+            video_offset += frames
         if "input_features" in encoded:
             clips = _runs(ids, model.config.audio_token_id)
-            single["input_features"] = encoded["input_features"][clip_offset:clip_offset + clips]
-            single["input_features_mask"] = encoded["input_features_mask"][clip_offset:clip_offset + clips]
+            if clips:
+                single["input_features"] = encoded["input_features"][clip_offset:clip_offset + clips]
+                single["input_features_mask"] = encoded["input_features_mask"][
+                    clip_offset:clip_offset + clips]
             clip_offset += clips
         singles.append(single)
-    assert image_offset == (encoded["pixel_values"].shape[0] if grid is None else grid.shape[0])
+    if ("pixel_values" in encoded
+            and image_offset != (encoded["pixel_values"].shape[0] if grid is None else grid.shape[0])):
+        raise ValueError("the reference's image rows do not match its placeholder runs")
+    if video_pixels is not None and video_offset != len(video_pixels):
+        raise ValueError("the reference's video frames do not match its placeholder runs")
     return singles
 
 
