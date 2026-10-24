@@ -183,12 +183,13 @@ gates and 4.9e-6 of the scale at the DeepSeek routers. Gemma 3n's sparse run is 
 layers: over all five of a ten-layer stack the gates' rounding reached 3.9e-5 against draws whose
 median margin was 2.7e-5, so no margin above it leaves draws to admit, where at two the median is
 6.4e-5."""
-SCAN_SEEDS = {"gemma4": 256, "gemma3n": 256, "deepseek": 8, "deepseek_widths": 8}
+SCAN_SEEDS = {"gemma4": 256, "gemma3n": 512, "deepseek": 8, "deepseek_widths": 8}
 """Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada: Gemma 3n's
 by the plain loop against itself; Gemma 4's and the DeepSeek shapes' paired with the scanned stack,
 whose arms share every upstream rounding (the same weights, rows and arithmetic, the DeepSeek shapes'
 bit for bit on a CPU) and whose errors are heavy-tailed across draws: the four largest of 1024 draws
-hold up to 40% of a Gemma 4 leaf's pooled error, of 64 up to 43% of a DeepSeek one's."""
+hold up to 40% of a Gemma 4 leaf's pooled error, of 64 up to 43% of a DeepSeek one's, which the plain
+loop against itself resolves within no 512 draws."""
 
 
 def same_metrics(left: dict, right: dict, relative: float = 1e-5) -> bool:
