@@ -5,6 +5,7 @@ token across two marks both's; and a published slot release's prompt as a layout
 81ce62f, rendered as its engine renders them), its options' spans the lines its runtime pools, its
 answer at its last token, and its state cut only where its segments say."""
 
+import dataclasses
 import json
 from pathlib import Path
 from typing import Literal
@@ -347,3 +348,27 @@ def test_a_question_row_holds_the_state_twice_each_copy_its_own_render_and_budge
     assert "<tail>" + compact[-9:] + "</tail>" in text
     shares = [(len(indented), 12), (len(compact), 9)]
     assert (row.state_tokens, row.state_kept) == min(shares, key=lambda pair: pair[1] / pair[0])
+
+
+@pytest.mark.parametrize("keep", ["start", "end"])
+def test_a_capped_copy_keeps_whole_characters_within_its_cap(keep):
+    """Encoded whole, a copy cut inside a character of several tokens keeps the character whole or not
+    at all, its own encoding within its cap: a cap of one byte keeps no two-byte character."""
+    layout = QuestionLayout(max_len=1 << 12, labels=Labels(variants=("{}",)), unit="whole",
+                            segments=(Text("S:"), State(render="state", keep=keep, max_tokens=1),
+                                      Text("\n"), *(release().segments or ())[-5:]))
+    [row] = layout.rows(ByteTokenizer(), SPECIALS, "éé", {"team": TEAM})
+    text = ByteTokenizer().decode(list(row.tokens))
+    assert "S:\n" in text and (row.state_tokens, row.state_kept) == (4, 0)
+
+
+def test_a_cut_takes_the_longest_state_a_merge_lets_fit():
+    """Encoded whole, a cut keeps the longest state that fits, past the share counted: where a state
+    token merges with the text before it, keeping it costs the row no token, and the cut keeps it."""
+    laya = HFTokenizer(str(LAYA), local_files_only=True)
+    segments = (Text("n"), State(render="state"), Text("\n"), *(release().segments or ())[-5:])
+    empty = QuestionLayout(max_len=1 << 12, labels=Labels(variants=("{}",)), unit="whole", segments=segments)
+    [bare] = empty.rows(laya, SPECIALS, "", {"team": TEAM})
+    tight = dataclasses.replace(empty, max_len=len(bare.tokens))
+    [row] = tight.rows(laya, SPECIALS, "ta", {"team": TEAM})
+    assert tight.fits(row) and row.state_kept >= 1
