@@ -3,8 +3,10 @@
 Design record, 2026-10-23, approved (Main); seams agreed with ImperialGorilla.
 
 Built so far: the joint row's user turn as segments (`JointLayout.segments`: `Text`, `Media`, `State`,
-`Schema`), and layouts and heads recorded by import path. Next: a segment's stream (§2) and the head
-reading a stream's spans (§3); then the per-question layouts as segment configurations. Owner: Training (`dew.decision`); cross-attention and `dew.inputs`' encoders: Models (ImperialGorilla).
+`Schema`); layouts and heads recorded by import path; and the schema's stream (`Schema.stream`): the
+schema read as the row's context, in a backbone pass of its own over the same weights, which the
+cross-attention reads and the head pools its questions and options from (§2, §3). Next: a stream for
+the other segments, and the per-question layouts as segment configurations. Owner: Training (`dew.decision`); cross-attention and `dew.inputs`' encoders: Models (ImperialGorilla).
 
 ## Today
 

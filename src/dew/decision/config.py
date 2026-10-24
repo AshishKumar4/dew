@@ -30,7 +30,7 @@ from dew.data.compile import fitted
 from dew.data.text import HFTokenizer
 from dew.decision.head import DecisionHead, JointSchemaHead
 from dew.decision.laya import LAYA, LayaCheckpoint
-from dew.decision.layout import Framing, Layout, default_layout
+from dew.decision.layout import Framing, Layout, Schema, Segment, default_layout
 from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.scoring import default_metrics
@@ -114,6 +114,10 @@ class DecisionRunConfig(RunConfig):
     (a hundred options, or a document's many hypotheses) fits under a `max_len`
     set for it without lengthening every other row's state. None lets the
     state fill the row."""
+    segments: tuple[Segment, ...] | None = None
+    """A joint row's user turn, its parts in order (`JointLayout.segments`): the schema first, or
+    read as the row's context through `context_layers` (`Schema(stream="context")`), its
+    `context_length` holding the whole schema. None keeps the layout's own, the release's turn."""
     framing: Framing | None = None
     """How a joint row frames itself as a conversation (`Framing`): its system message, the
     assistant's prefill, the reasoning switch, a Jinja chat template in place of the tokenizer's
@@ -145,7 +149,12 @@ class DecisionRunConfig(RunConfig):
         attention_impl = str(self.model.fields.get("attention_impl", "auto"))
         budgets = {"max_len": self.max_len, "head_max_len": self.head_max_len,
                    "option_tokens": self.option_tokens, "max_state_tokens": self.max_state_tokens,
-                   "framing": self.framing}
+                   "framing": self.framing, "segments": self.segments}
+        in_context = any(isinstance(segment, Schema) and segment.stream == "context"
+                         for segment in self.segments or ())
+        if in_context and self.context_layers is None:
+            raise ValueError("a schema read as the row's context is read by context layers; set "
+                             "--context-layers")
         derived = {}
         if LayaCheckpoint.exists(self.pretrained, subfolder=self.subfolder, revision=self.revision):
             if any(choice is not None for choice in (self.lora, self.head, self.loop_steps,
@@ -239,12 +248,16 @@ def looping(start: Pretrained, steps: int | None, layers: tuple[int, int] | None
     return dataclasses.replace(start, model=looped)
 
 
-def _fresh_layout(causal: bool, one_question: bool, budgets: dict[str, int | Framing | None]) -> Layout:
+type Budgets = dict[str, int | Framing | tuple[Segment, ...] | None]
+"""A run's budgets of a row's layout, by the layout's field names (`_budgeted`)."""
+
+
+def _fresh_layout(causal: bool, one_question: bool, budgets: Budgets) -> Layout:
     """The layout a fresh head reads (`default_layout`), with the run's `budgets`."""
     return _budgeted(default_layout(causal, one_question), budgets)
 
 
-def _budgeted(layout: Layout, budgets: dict[str, int | Framing | None]) -> Layout:
+def _budgeted(layout: Layout, budgets: Budgets) -> Layout:
     """`layout` with the `budgets` the run states, each but those left None, which keep the
     layout's own; zero is a budget too (a joint row of no state). A budget the layout has no
     field for is refused: a joint row has no question budget, and a row per question no state

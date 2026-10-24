@@ -22,6 +22,7 @@ from dew.decision.layout import (
     OPTION_TILE,
     Bounds,
     DecisionInputs,
+    JointLayout,
     Layout,
     QuestionLayout,
     Specials,
@@ -168,7 +169,21 @@ class Encoding:
             row["positions"] = np.asarray(encoded.positions, np.int32)
             row["slots"] = np.asarray(encoded.slots, np.int32)
         if self.context_length is not None:
-            row["context"] = context_tokens(self.tokenizer, example.context, self.context_length)
+            if encoded.spans_in_context:
+                # The row's context is its schema (`Schema.stream`), which it reads whole.
+                if example.context is not None:
+                    raise ValueError("an example's context and a schema read as the row's context are one "
+                                     "context too many; a layout that reads the schema in context reads "
+                                     "no example context")
+                if encoded.context is None or len(encoded.context) > self.context_length:
+                    raise ValueError(f"the schema needs {len(encoded.context or ())} context tokens, more "
+                                     f"than the {self.context_length} the backbone's cross-attention reads")
+                row["context"] = np.asarray(encoded.context, np.int32)
+            else:
+                row["context"] = context_tokens(self.tokenizer, example.context, self.context_length)
+        elif encoded.spans_in_context:
+            raise ValueError("a schema read as the row's context needs a backbone with cross-attention "
+                             "layers to read it (Pretrained.with_cross_attention)")
         return row
 
 
@@ -447,8 +462,20 @@ class DecisionObjective(Objective[Ratio]):
         vocabulary rows a head reads (an adapter's update merged into them) is execution, as
         recompute is."""
         model = self.model if model is None else model
-        return (counted_flops(model.backbone, self.real_lengths(batch)) + self._cross_flops(model, batch)
-                + self._head_flops(model, batch))
+        return (counted_flops(model.backbone, self.real_lengths(batch)) + self._context_flops(model, batch)
+                + self._cross_flops(model, batch) + self._head_flops(model, batch))
+
+    def _context_lengths(self, batch: Batch) -> np.ndarray | None:
+        """Each window row's context length where the backbone reads the context in a pass of its own,
+        as it reads a schema in context (`schema_in_context`); None where it reads none."""
+        if not self.schema_in_context or "context_lengths" not in batch:
+            return None
+        return np.asarray(batch["context_lengths"])
+
+    def _context_flops(self, model, batch: Batch) -> float:
+        """The backbone's forward over each row's context, where it reads one in a pass of its own."""
+        lengths = self._context_lengths(batch)
+        return 0.0 if lengths is None else counted_flops(model.backbone, lengths)
 
     def _cross_flops(self, model, batch: Batch) -> float:
         """The backbone's cross-attention work over each window row's context: none where rows carry
@@ -476,12 +503,17 @@ class DecisionObjective(Objective[Ratio]):
         else, trained whole, three passes of everything."""
         model = self.model if model is None else model
         lengths = self.real_lengths(batch)
+        context = self._context_lengths(batch)
         trained = 3 * (self._cross_flops(model, batch) + self._head_flops(model, batch))
         if isinstance(model.backbone, CountedTraining):
-            return model.backbone.training_flops(lengths) + trained
+            # An adapter trains through the context's pass too.
+            own = 0.0 if context is None else model.backbone.training_flops(context)
+            return model.backbone.training_flops(lengths) + own + trained
         if self._backbone_frozen():
+            # A context's pass trains nothing, so it runs forward alone (`DecisionModel.context_states`).
             forward = counted_flops(model.backbone, lengths)
-            return frozen_training_flops(forward, parameter_flops(model.backbone, lengths)) + trained
+            return (frozen_training_flops(forward, parameter_flops(model.backbone, lengths))
+                    + self._context_flops(model, batch) + trained)
         return super().training_flops(model, batch)
 
     def _backbone_frozen(self) -> bool:
@@ -603,6 +635,11 @@ class DecisionObjective(Objective[Ratio]):
         """The most context tokens a row carries (`DecisionModel.context_length`)."""
         return self.model.context_length
 
+    @property
+    def schema_in_context(self) -> bool:
+        """Whether a row's schema is its context (`JointLayout.schema_in_context`)."""
+        return isinstance(self.layout, JointLayout) and self.layout.schema_in_context
+
     @functools.cached_property
     def bounds(self) -> Bounds:
         """The most rows, questions and options a window packs (`Layout.bounds`),
@@ -615,7 +652,7 @@ class DecisionObjective(Objective[Ratio]):
         return dataclasses.replace(bounds, segments=min(most, bounds.segments))
 
     def loss(self, variables: Variables, batch: Batch, step: Step):
-        inputs = laid_out(batch, self.bounds.segments)
+        inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context)
         logits = self.model.logits(
             variables, inputs, train=step.training, rngs=model_rngs(step.key, training=step.training)
         )
@@ -638,11 +675,11 @@ class DecisionObjective(Objective[Ratio]):
         return loss, Aux(metrics={"accuracy": accuracy})
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Decisions:
-        inputs = laid_out(batch, self.bounds.segments)
+        inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context)
         return self._decisions(self._logits(self.evaluation_variables(params, step), inputs), inputs, batch)
 
     def _validation_scores(self, params: Variables, batch: Batch, step: Step) -> tuple[Ratio, Decisions]:
-        inputs = laid_out(batch, self.bounds.segments)
+        inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context)
         logits = self.model.logits(params, inputs)
         return self._charged(logits, inputs, batch)[0], self._decisions(logits, inputs, batch)
 

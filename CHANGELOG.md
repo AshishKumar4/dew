@@ -12,6 +12,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   so a layout or head of a package the run trusts reloads; a record of an earlier run, which
   names its class alone, reloads as before. `dew.decision.HEADS`, the closed table of heads a
   run could record, is removed.
+- A joint row may read its schema as its context, `Schema(stream="context")`
+  (`DecisionRunConfig.segments`): the backbone reads the schema in a pass of its own, with its own
+  weights, its cross-attention layers read that pass beside the row, and the joint head pools the
+  questions and options from it; the pass counts in `train/flops`.
 - `Decide.systemone` takes a list of request bodies and answers each as it
   would alone, their rows scored together, a refused body's `ValueError` in its
   place. `dew.inference.ScoringServer` serves a task answered by one forward
