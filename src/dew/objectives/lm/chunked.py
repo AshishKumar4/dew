@@ -41,6 +41,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
+from dew.nn.categorical import rescaled, target_loss
 from dew.nn.kernels.generation import gpu_target
 from dew.nn.precision import (
     at_least_fp32,
@@ -189,20 +190,6 @@ def _tile_logits(states, matrix, precision: jax.lax.PrecisionLike):
                       precision=precision, preferred_element_type=at_least_fp32(states.dtype))
 
 
-def _rescaled(maximum, total, larger):
-    """A sum of exponentials moved from its own maximum to the larger one;
-    unchanged where they agree, so two sums whose maximum is -inf add rather
-    than turn NaN."""
-    return jnp.where(maximum == larger, total, total * jnp.exp(maximum - larger))
-
-
-def token_loss(peak: jax.Array, mass: jax.Array, target: jax.Array) -> jax.Array:
-    """A token's cross entropy from its row's maximum `peak`, the sum of exponentials scaled to it
-    `mass`, and its target's logit: log(mass) - (target - peak), as Optax takes it, so neither term is
-    rounded at the logits' magnitude before the subtraction that cancels it does."""
-    return jnp.log(mass) - (target - peak)
-
-
 def _row_terms(logits, predict: bool) -> tuple[
         jax.Array, tuple[jax.Array, jax.Array] | None, tuple[jax.Array, jax.Array]]:
     """Each row's logsumexp, with `predict` its maximum and the first
@@ -228,7 +215,7 @@ def _row_terms(logits, predict: bool) -> tuple[
     the one reduction."""
     def combine(first, second):
         larger = jnp.maximum(first[0], second[0])
-        total = _rescaled(first[0], first[1], larger) + _rescaled(second[0], second[1], larger)
+        total = rescaled(first[0], first[1], larger) + rescaled(second[0], second[1], larger)
         if not predict:
             return larger, total
         keep = (first[0] > second[0]) | ((first[0] == second[0]) & (first[2] < second[2]))
@@ -333,7 +320,7 @@ def _forward(hidden, table, targets, excluded, chunks: int, tile: tuple[int, int
                 columns.sliced(first, count))
             peak = jnp.maximum(carry[1], terms.peak)
             merged = (carry[0] + terms.picked, peak,
-                      _rescaled(carry[1], carry[2], peak) + _rescaled(terms.peak, terms.mass, peak))
+                      rescaled(carry[1], carry[2], peak) + rescaled(terms.peak, terms.mass, peak))
             if terms.best is None or terms.column is None:
                 return merged
             better = terms.best > carry[3]
@@ -345,7 +332,7 @@ def _forward(hidden, table, targets, excluded, chunks: int, tile: tuple[int, int
             initial += (jnp.full((size,), -jnp.inf, work), jnp.zeros((size,), jnp.int32))
         target_logit, peak, mass, *rest = _over_tiles(initial, table.shape[0], width, vocabulary)
         total = peak + jnp.log(mass)
-        loss = target_logit if picked else token_loss(peak, mass, target_logit)
+        loss = target_logit if picked else target_loss(peak, mass, target_logit)
         values = (loss, total, peak, mass, *rest[1:])
         return tuple(jax.lax.dynamic_update_slice_in_dim(out, value, start, axis=0)
                      for out, value in zip(outputs, values, strict=True))
@@ -371,7 +358,7 @@ def _shared_partition(outputs, normalizer, group: tuple[str, ...]):
     first, best, log_z = outputs
     peak, mass = normalizer
     larger = jax.lax.pmax(peak, group)
-    mass = jax.lax.psum(_rescaled(peak, mass, larger), group)
+    mass = jax.lax.psum(rescaled(peak, mass, larger), group)
     return (first, best, (larger + jnp.log(mass)).reshape(log_z.shape)), (larger, mass)
 
 
@@ -541,7 +528,7 @@ def _whole_head_terms(hidden, table, targets, excluded, softcap, precision, pred
     # and sums the picked logit over shards, so only the owner may add one.
     picked_logits = _target_logits(logits, labels)
     best = None if top is None else top[1].reshape(targets.shape)
-    first = picked_logits if picked else token_loss(*normalizer, picked_logits)
+    first = picked_logits if picked else target_loss(*normalizer, picked_logits)
     return raw, normalizer, (first.reshape(targets.shape), best, log_z.reshape(targets.shape))
 
 
@@ -786,7 +773,7 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, columns: _C
         # +inf, as the chunked heads score it, and its gradient moves no logit.
         kept = _without(logits, 0, excluded)
         log_z, top, (peaks, masses) = _row_terms(kept, predict)
-        values = [token_loss(peaks, masses, _target_logits(kept, targets)), log_z]
+        values = [target_loss(peaks, masses, _target_logits(kept, targets)), log_z]
         if predict:
             assert top is not None
             values.append(top[1])
@@ -983,7 +970,7 @@ def logits_cross_entropy(logits, targets, *, predict: bool = True, temperature: 
     largest = jnp.max(logits, axis=-1)
     peak = jax.lax.stop_gradient(jnp.where(jnp.isfinite(largest), largest, 0))
     mass = jnp.sum(jnp.exp(logits - peak[..., None]), axis=-1)
-    loss = token_loss(peak, mass, _target_logits(logits, targets))
+    loss = target_loss(peak, mass, _target_logits(logits, targets))
     return loss, jnp.argmax(logits, axis=-1) if predict else None, peak + jnp.log(mass)
 
 
