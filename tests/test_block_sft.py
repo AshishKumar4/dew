@@ -15,6 +15,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from diffusion_support import applied, moved_weights, objective_gradient
+from reference_error import assert_as_exact, widened
 from safetensors.numpy import load_file
 
 from dew import Trainer
@@ -66,12 +68,11 @@ def reference_variables(loaded, name):
     return objective(loaded, variables=values).init(jax.random.key(0))
 
 
-def trainer_update(obj, batch, run_key):
-    """The trainer's first SGD update (rate 0.001) of a variables tree's params on one device, and the
-    objective's own update under the step's draws (`example_fields`), compiled as one program. One
-    device holds the comparison to the trainer's composition of the update, which computes it to the
-    bit; its layouts are the parallelism matrix's."""
-    trainer = Trainer(obj, optax.sgd(0.001), key=run_key, split=1)
+def trainer_update(obj, batch, run_key, rate: float):
+    """The trainer's first SGD update at `rate` of a variables tree's params on one device, compiled
+    once (`stepped`), and the step's draws (`example_fields`). One device holds the comparison to the
+    trainer's composition of the update; its layouts are the parallelism matrix's."""
+    trainer = Trainer(obj, optax.sgd(rate), key=run_key, split=1)
     trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
     initial = trainer.initial_state()
     step = Step(jnp.asarray(0, jnp.int32), jax.random.fold_in(initial.key, 0), None,
@@ -84,24 +85,45 @@ def trainer_update(obj, batch, run_key):
         state, *_ = run(state, batch)
         return jax.tree.map(np.asarray, state.variables["params"])
 
-    @jax.jit
+    return stepped, step
+
+
+UPDATE_SEEDS = {"text": 16, "image": 16}
+"""Check 1's declared seeds for the trainer's update of each SFT model, sized paired (`seeds_for` with
+the trainer's step as `dew_fn`)."""
+
+
+def assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, seeds: int):
+    """The trainer's update is the objective's at the step's draws: sgd(1)'s update applied is on par
+    with the objective's gradient over drawn weights (check 1), `twin`, the objective over its model in
+    float64, at the same draws the truth. They are two programs, which round otherwise; the
+    objective's gradient is compiled as one, as the trainer's is: XLA:CPU's compiled gradient of this
+    model sat 1.0 to 5.2 times further from float64 than the same ops run one by one (per leaf,
+    2026-10-21), a gap of the compiler's and not of the trainer. The run's own path, its loader, plan
+    and marked rows, then takes the trainer's own update on one device, to the bit: the same program
+    on the same values."""
+    stepped, step = trainer_update(obj, batch, run_key, 1.0)
+    compiled = jax.jit(lambda values: objective_gradient(obj, values, batch, step))
+
+    def trained(values):
+        return jax.tree.map(applied, values["params"], stepped(values))
+
     def objective_update(values):
-        gradient = jax.grad(lambda trainable: obj.scalar_loss(
-            {**values, "params": trainable}, batch, step)[0])(values["params"])
-        return jax.tree.map(lambda value, grad: value - 0.001 * grad, values["params"], gradient)
+        # The objective's gradient, its update applied in float32 as the trainer applies it.
+        grads = jax.tree.map(np.asarray, compiled(values))
+        return jax.tree.map(lambda before, grad: applied(before, (before - grad).astype(np.float32)),
+                            values["params"], grads)
 
-    return stepped, objective_update
+    def truth(values):
+        with jax.enable_x64(new_val=True):
+            return jax.tree.map(np.asarray, objective_gradient(twin, widened(values), widened(batch), step))
 
-
-def assert_updates_as_the_objective(obj, batch, data, run_key, variables):
-    """The trainer's update is the objective's at the step's draws, to the bit (`trainer_update`), and
-    the run's own path, its loader, plan and marked rows, takes that update on one device."""
-    stepped, objective_update = trainer_update(obj, batch, run_key)
-    expected = objective_update(variables)
-    assert_tree_equal(stepped(variables), expected)
+    assert_as_exact(trained, objective_update, moved_weights(variables), "trainer update", seeds=seeds,
+                    truth_fn=truth)
+    taken, _ = trainer_update(obj, batch, run_key, 0.001)
     solo = Trainer(obj, optax.sgd(0.001), key=run_key)
     solo.device_mesh = MeshSpec().build(jax.devices()[:1])
-    assert_tree_equal(solo.fit(data, steps=1, log_every=1).variables["params"], expected)
+    assert_tree_equal(solo.fit(data, steps=1, log_every=1).variables["params"], taken(variables))
 
 
 def assert_tree_equal(actual, expected):
@@ -267,10 +289,8 @@ def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
     run_key = jax.random.key(int(reference["run_seed"]))
     data = dataset(batch)
     variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
-    # The objective's update is compiled as one program, as the trainer's is: XLA:CPU's compiled
-    # gradient of this model sits 1.0 to 5.2 times further from float64 than the same ops run one by
-    # one (measured per leaf, 2026-10-21), a gap of the compiler's and not of the trainer.
-    assert_updates_as_the_objective(obj, batch, data, run_key, variables)
+    wide = objective(Pretrained.load(FIXTURE, dtype="float64", attention_impl="xla", max_seq_len=32))
+    assert_updates_as_the_objective(obj, wide, batch, data, run_key, variables, UPDATE_SEEDS["text"])
     trainer = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=Checkpoints(str(tmp_path / "run")))
     updated = trainer.fit(data, steps=1, checkpoint_every=1, log_every=1)
     # Google's dense text-only model: transformers' DiffusionGemmaForBlockDiffusion
@@ -394,7 +414,10 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     stream = grain.MapDataset.source([batch]).repeat().to_iter_dataset()
     data = Loader(train=lambda partition: iter(stream), val=None, records=rows, batch=rows)
     run_key = jax.random.key(2)
-    assert_updates_as_the_objective(obj, batch, data, run_key, variables)
+    wide = Pretrained.load(FIXTURE.parent / "diffusion-gemma-workflow", dtype="float64", attention_impl="xla",
+                           max_seq_len=32)
+    twin = BlockDiffusionObjective(wide.model, prompt_length=8, variables=wide.variables)
+    assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, UPDATE_SEEDS["image"])
     checkpoints = Checkpoints(str(tmp_path / "run"))
     updated = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=checkpoints).fit(
         data, steps=1, checkpoint_every=1, log_every=1)
