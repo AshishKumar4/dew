@@ -5,6 +5,12 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- The train state moves to `dew.state`, and a variables tree's operations (`Path`, `select`, `freeze`, `thaw`,
+  `without`, `part`, `everything`, `under`, `PARAMETER_ROOTS`) from `dew.objectives.base` to `dew.batch`.
+  `ModelConfig` moves from `dew.config` to `dew.model_config`; its wrappers are any `dew.registry.Wrapper`.
+  `dew.coordination` becomes the private `dew._coordination`; a hook calls `dew.distributed` (`agreed`,
+  `collective_host`, ...), whose `agreement_patience(seconds)` replaces `AGREEMENT_PATIENCE_SECONDS`.
+  `dew.records` becomes the private `dew._records`. Import each name from its new module.
 - Data plans are read by version 6 and cache generations by schema 2: a stream's
   shards are named by their files' places, which the same files mounted at
   another path keep, so a streamed cache fill serves there; and arrays are
