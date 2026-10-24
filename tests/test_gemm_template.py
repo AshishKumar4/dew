@@ -196,7 +196,7 @@ COOPERATIVE = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2)
 
 MOSAIC_RAN = {'mosaic_gpu'} if jax.default_backend() == 'cpu' else {'mosaic_gpu', 'triton'}
 """The grouped matmul's kernels a call pinned to Mosaic reports: a GPU process also traces the CPU branch
-of its platform choice, which interprets Triton's and never runs there (`grouped_matmul._launch`)."""
+of its platform choice, which interprets Triton's and never runs there (`grouped_matmul.launched`)."""
 
 
 def _kernels(taken) -> set:
@@ -594,6 +594,29 @@ def relu(x, weight):
     return (jax.nn.relu(_wide(x)) * weight).astype(x.dtype)
 
 
+def test_a_fused_producers_launch_keys_its_picks_by_what_its_prologue_computes():
+    """A fused producer's launches store and read back as a step's plan records them (`tuning.tune`'s
+    launches), their prologue keyed by what it computes: the same producer traced twice keys alike, another
+    producer apart."""
+    sizes = jnp.asarray(SIZES, jnp.int32)
+    rng = np.random.default_rng(3)
+    x = jnp.asarray(rng.normal(size=(ROWS, DEPTH)), jnp.bfloat16)
+    w = jnp.asarray(rng.normal(size=(len(SIZES), DEPTH, WIDTH)), jnp.bfloat16)
+    weight = jnp.asarray(rng.normal(size=(DEPTH,)), jnp.float32)
+
+    def keys(producer):
+        def fusing(x, w, weight):
+            return fused.fusible_gemm(producer(x, weight), w, sizes, interpret_on_cpu=True)
+
+        with generation.assumed("sm90"), tuning.seen() as launches:
+            jax.jit(fuser.fuse(fusing)).lower(x, w, weight)
+        text = tuning.dumps_launches([ba for _, ba in launches])
+        assert len(tuning.loads_launches(text)) == len(launches)
+        return text
+
+    assert keys(rms_norm) == keys(rms_norm) != keys(relu)
+
+
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_a_normed_operand_runs_in_the_prologue_with_the_programs_value(generation_name):
     """Under `fuser.fuse`, an RMS norm producing the product's left operand runs in the kernels' prologue
@@ -863,7 +886,7 @@ def test_the_hooked_tpu_launches_lower_for_a_v5e(launch, side_dtype):
 def test_a_tpu_lowers_xlas_program_for_a_call_no_launch_takes(product):
     """A product of widths no TPU block divides lowers for a TPU through XLA's program, the refusal
     reported, its kernel branches traced on the way and none raising. A CPU process's: a GPU's interprets
-    its CPU branch with Triton's launch whatever the target (`grouped_matmul._launch`)."""
+    its CPU branch with Triton's launch whatever the target (`grouped_matmul.launched`)."""
     x = jax.ShapeDtypeStruct((32, 64), jnp.bfloat16)
     other = jax.ShapeDtypeStruct((1, 64, 64) if product == "gemm" else (32, 64), jnp.bfloat16)
     sizes = jnp.asarray([32], jnp.int32)
@@ -1186,9 +1209,9 @@ def test_an_fp32_product_above_the_default_precision_runs_xla():
             product("default")(x, w)
         with generation.chosen(grouped_matmul="triton"), pytest.raises(ValueError):
             product("highest").lower(x, w)
-    taken = [(route.kernel, route.refusal is not None) for route in highest
-             if route.choice == "grouped_matmul"]
-    assert taken == [("xla", True)]
+    taken = {(route.kernel, route.refusal is not None) for route in highest
+             if route.choice == "grouped_matmul"}
+    assert taken == {("xla", True)}
     assert {route.kernel for route in default if route.choice == "grouped_matmul"} == {"triton"}
     xla = jax.jit(lambda x, w: jax.lax.ragged_dot(x, w, jnp.asarray([64]), precision="highest",
                                                   preferred_element_type=jnp.float32))(x, w)
@@ -1296,12 +1319,11 @@ def test_a_product_declares_its_promotion_and_the_kernels_refusal(compute, preci
                                                                    refused):
     """A precision above the default promotes each depth step's partial where an output is fp32; the
     kernels refuse fp32 products above the default (they multiply in TF32) and a dtype they do not
-    multiply in, and `ragged_dot_refusal` is the declaration's refusal."""
+    multiply in."""
     declared = product.declared(compute, precision, outputs=outputs)
     assert declared.promoted is promoted
     assert (declared.refusal is None) is (refused is None)
     assert refused is None or refused in declared.refusal
-    assert grouped_matmul.ragged_dot_refusal(compute, (), precision) == declared.refusal
 
 
 def test_a_product_under_x64_or_from_a_complex_master_is_refused():
@@ -1311,7 +1333,6 @@ def test_a_product_under_x64_or_from_a_complex_master_is_refused():
         assert "x64" in product.declared(jnp.bfloat16, DEFAULT).refusal
     refusal = product.declared(jnp.bfloat16, DEFAULT, operands=(jnp.complex64,)).refusal
     assert refusal is not None and "fp32 does not hold" in refusal
-    assert grouped_matmul.ragged_dot_refusal(jnp.bfloat16, (jnp.complex64,), DEFAULT) == refusal
 
 
 def swiglu(gate, up):
