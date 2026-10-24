@@ -17,7 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import largest_difference
-from reference_error import assert_as_exact, widened, without_ynn
+from reference_error import assert_as_exact, widened, with_gradients, without_ynn
 from sharded import assert_sharded
 from token_support import token_rows
 
@@ -153,12 +153,8 @@ def deepseek_widths(dtype=jnp.float32, **overrides):
 SHAPES = {"gemma4": gemma4_shaped, "gemma3n": gemma3n_shaped, "deepseek": deepseek_shaped,
           "deepseek_widths": deepseek_widths}
 
-FLOOR_FACTOR = 4.0
-"""How far a scanned stack may sit from the plain loop, in multiples of the
-plain loop's own distance from its float64 run: the rule tools/layout_parity.py
-judges a layout by. Scanning reorders the loop's fp32 sums, since a GPU fuses
-a scanned layer apart from its neighbours (a CPU compiles the two alike), so
-each run sits within its own rounding of the float64 result."""
+SCAN_SEEDS = {"gemma4": 8, "gemma3n": 8, "deepseek": 8, "deepseek_widths": 8}
+"""Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada."""
 
 
 def same_metrics(left: dict, right: dict, relative: float = 1e-5) -> bool:
@@ -175,62 +171,41 @@ def scanned_pair(build):
     return plain, scanned, variables, ids
 
 
-def judged(single, double, candidate) -> tuple[float, str]:
-    """The worst leaf of `candidate` against `single`, as a fraction of
-    FLOOR_FACTOR times `single`'s distance from `double`, and its path.
-
-    A leaf's floor is never below one fp32 rounding of the largest value in
-    its part (the logits, the loss or the gradients), as
-    tools/layout_parity.py measures a leaf against the rounding of the whole
-    step (`leaf_errors`): a sum's rounding scales with its terms, not with
-    the sum, so a leaf whose terms cancel sits below its part's rounding and
-    its own distance from float64 is noise. gemma3n's altup correction
-    coefficients are such leaves: on a TPU v6e at full fp32 matmuls, the
-    plain loop landed 2.3 of the leaf's own fp32 roundings from float64 and
-    the scanned stack 19, which read 2.0 of a floor taken from the leaf
-    alone."""
-    worst = (0.0, "")
-    for part in single:
-        scale = float(np.finfo(np.float32).eps) * max(
-            float(np.max(np.abs(np.asarray(leaf, np.float64)))) for leaf in jax.tree.leaves(double[part]))
-        for (path, reference), exact, other in zip(
-                jax.tree_util.tree_leaves_with_path(single[part]), jax.tree.leaves(double[part]),
-                jax.tree.leaves(candidate[part]), strict=True):
-            reference, exact, other = (np.asarray(leaf, np.float64) for leaf in (reference, exact, other))
-            floor = max(float(np.max(np.abs(reference - exact))), scale)
-            difference = float(np.max(np.abs(other - reference)))
-            ratio = difference / (FLOOR_FACTOR * floor) if floor else (0.0 if difference == 0 else np.inf)
-            worst = max(worst, (ratio, f"['{part}']{jax.tree_util.keystr(path)}"))
-    return worst
-
-
 @pytest.mark.parametrize("shape", sorted(SHAPES))
 def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
-    """The grouping read off the geometry, and the scanned logits, loss and
-    gradients against the plain loop's on a stack deep enough to scan, each
-    leaf within FLOOR_FACTOR of the plain loop's own distance from its
-    float64 run. That run is on the CPU backend, which every lane keeps
-    beside its accelerator, since a TPU has no float64."""
+    """The scanned stack's logits, loss and gradients on a stack deep enough to scan are as near a float64
+    run as the plain loop's, over the shape's declared draws of token rows (check 1, `assert_as_exact`):
+    scanning reorders the loop's fp32 sums where an accelerator fuses a scanned layer apart from its
+    neighbours, and is otherwise the same computation. The float64 run is on the CPU backend, which
+    every lane keeps beside its accelerator, since a TPU has no float64."""
     build = SHAPES[shape]
-    plain, scanned, variables, ids = scanned_pair(build)
-    ids = np.asarray(ids)
+    plain, scanned, variables, _ = scanned_pair(build)
     training = gemma3n_training_variables(variables) if shape == "gemma3n" else variables
 
     def measured(model, forward, trained):
-        def loss(variables):
-            current = {**trained, "params": variables}
-            if shape == "gemma3n":
-                return next_token_loss(model, current, ids)
-            return jnp.mean(model.apply(current, ids) ** 2)
-        value, gradients = jax.jit(jax.value_and_grad(loss))(trained["params"])
-        return {"logits": jax.jit(model.apply)(forward, ids), "loss": value, "gradients": gradients}
+        """The logits, and the loss with its gradients under the draw's cotangent (`with_gradients`)."""
+        @jax.jit
+        def run(ids, cotangent):
+            def loss(params):
+                current = {**trained, "params": params}
+                if shape == "gemma3n":
+                    return next_token_loss(model, current, ids)
+                return jnp.mean(model.apply(current, ids) ** 2)
+            value, gradients = with_gradients(loss)(trained["params"], cotangent)
+            return {"logits": model.apply(forward, ids), "loss": value, "gradients": gradients}
+        return run
 
-    single = measured(plain, variables, training)
-    candidate = measured(scanned, variables, training)
-    with jax.enable_x64(), jax.default_device(jax.devices("cpu")[0]):
-        double = measured(build(dtype=jnp.float64), widened(variables), widened(training))
-    ratio, path = judged(single, double, candidate)
-    assert ratio <= 1, f"{path} is {ratio:.2f} of its bound"
+    def draw(seed):
+        """Two rows of token ids and the scalar loss's cotangent, one."""
+        ids = np.random.default_rng([0x5CA7, seed]).integers(0, VOCAB, (2, 12)).astype(np.int32)
+        return ids, np.float32(1.0)
+
+    def truth(ids, cotangent):
+        with jax.default_device(jax.devices("cpu")[0]):
+            return measured(build(dtype=jnp.float64), widened(variables), widened(training))(ids, cotangent)
+
+    assert_as_exact(measured(scanned, variables, training), measured(plain, variables, training), draw,
+                    f"{shape} scanned stack", seeds=SCAN_SEEDS[shape], truth_fn=truth)
 
 
 def gemma3n_training_variables(variables):
