@@ -26,7 +26,7 @@ import json
 import math
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from types import MappingProxyType
@@ -97,20 +97,11 @@ class LayerBanks(Protocol):
         sites, shapes, _device_mesh, placement, entries = _bank_plan(model, self, mesh, layout)
 
         entry_values = jax.block_until_ready(self.entry(entries)) if entries else {}
-        bank_store: dict[str, dict] = {}
-        for site in sites:
-            for (first, count), name in zip(site.view.groups, site.view.bank_names(), strict=True):
-                bank = jax.block_until_ready(self.bank(
-                    range(first, first + count),
-                    _bank_placement(one_layer(placement, first, namespace=site.namespace),
-                                    one_layer(shapes, first, namespace=site.namespace), stacked=count > 1),
-                    namespace=site.namespace))
-                for collection, tree in bank.items():
-                    branch = bank_store.setdefault(collection, {})
-                    for component in site.namespace:
-                        branch = branch.setdefault(component, {})
-                    branch[name] = tree
-        return merge(entry_values, bank_store)
+        return merge(entry_values, assembled(sites, lambda site, first, count, _: self.bank(
+            range(first, first + count),
+            _bank_placement(one_layer(placement, first, namespace=site.namespace),
+                            one_layer(shapes, first, namespace=site.namespace), stacked=count > 1),
+            namespace=site.namespace)))
 
 
 def one_layer(variables: Variables, index: int, *, namespace: tuple[str, ...] = ()) -> Variables:
@@ -235,18 +226,19 @@ class CheckpointBanks(LayerBanks):
         return jax.jit(stack_layers, out_shardings=placement)(*rows)
 
     def _restored(self, placement: Placement) -> Variables:
-        """Restore the variables `placement` names onto its shardings."""
+        """Restore the variables `placement` names onto its shardings, as every load of a run's
+        variables restores them (`Checkpoints.materialized`)."""
         from dew.checkpoints import Checkpoints
 
         shapes = narrowed(self.shapes(), placement)
-        template = {"variables": _typed(shapes, narrowed(placement, shapes))}
+        template, placements = {"variables": shapes}, {"variables": narrowed(placement, shapes)}
         if self.ema:
             averaged = narrowed(self.stored["ema"], placement)
             if averaged:
-                template["ema"] = _typed(averaged, narrowed(placement, averaged))
+                template["ema"], placements["ema"] = averaged, narrowed(placement, averaged)
+        assert self.step is not None
         with Checkpoints(self.directory) as checkpoints:
-            values, _ = checkpoints.restore(template, step=self.step)
-        return merge(values["variables"], values["ema"]) if "ema" in template else values["variables"]
+            return checkpoints.materialized(template, placements, step=self.step)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -644,12 +636,6 @@ def narrowed(tree: Mapping, selection: Mapping) -> dict:
     return collected
 
 
-def _typed(shapes: Variables, placement: Placement) -> Variables:
-    return jax.tree.map(
-        lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
-        shapes, placement)
-
-
 def _row_placement(placement: Placement) -> Placement:
     """Return one layer's shardings out of a bank's: the layer axis dropped, in device
     memory, which is where the rows a bank is stacked out of are read."""
@@ -712,6 +698,29 @@ def bank_sites(model: BankedModel) -> tuple[DecoderBank, ...]:
     if any(right[:len(left)] == left for left, right in itertools.pairwise(ordered)):
         raise ValueError("declared decoder banks overlap in their canonical layer ownership")
     return tuple(owners.values())
+
+
+def assembled(sites: Sequence[DecoderBank],
+              bank: Callable[[DecoderBank, int, int, str], Variables | None]) -> dict[str, dict]:
+    """The banked store `sites` declare, one bank at a time: each site's groups in its stack's
+    order, `bank(site, first, count, name)` the bank named `name` of a group's `count` layers from
+    `first` (None for a group with nothing to hold), its copies landed (`block_until_ready`) before
+    the next is read, so a load has one bank's transfers in flight, and its collections set under
+    the site's namespace by that name. A source's whole banks (`LayerBanks.place`) and training's
+    snapshot of its state (`HostExecution.snapshot`) both assemble through it, each with its own
+    source and stacking."""
+    store: dict[str, dict] = {}
+    for site in sites:
+        for (first, count), name in zip(site.view.groups, site.view.bank_names(), strict=True):
+            held = bank(site, first, count, name)
+            if held is None:
+                continue
+            for collection, tree in jax.block_until_ready(held).items():
+                branch = store.setdefault(collection, {})
+                for component in site.namespace:
+                    branch = branch.setdefault(component, {})
+                branch[name] = tree
+    return store
 
 
 def entry_tree(variables: Variables, sites: Sequence[DecoderBank]) -> Variables:

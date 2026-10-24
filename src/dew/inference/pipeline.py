@@ -217,6 +217,10 @@ class RunProcessor:
         where `specials`, and none otherwise."""
         return self.tokenizer.encode(text, add_special_tokens=specials)
 
+    def spelling(self, ids: Sequence[int]) -> str:
+        """The text the run's tokenizer decodes `ids` to, its special tokens spelled out."""
+        return self.tokenizer.decode(list(ids))
+
     @property
     def bos_id(self) -> int | None:
         """The id the run's tokenizer starts a sequence with, or None."""
