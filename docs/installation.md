@@ -99,7 +99,7 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.11.2.post18,<0.11.3`.
+Dew requires `jax>=0.11.2.post19,<0.11.3`.
 <!-- END JAX requirement -->
 
 It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves jax alone. Every other package, jaxlib and its CUDA plugins included, comes from PyPI. The fixes:
@@ -114,6 +114,7 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - The persistent compilation cache keys a program by jax's own build as well as jaxlib's, so two builds over one jaxlib never read each other's programs (on GPU nodes that ran several, reads of the other build's entries failed).
 - Mosaic GPU and Pallas Mosaic GPU lower `ceil` and `floor`, which a template's Mosaic kernel that rounds a value needs on an H100.
 - Pallas Mosaic GPU lowers `add_any` and `integer_pow` of every integer exponent, which the Mosaic attention backward under a score hook needs: a hook's transposed pullback sums its cotangents, and a temperature's backward raises it to the power -2.
+- Splash attention's `BlockSizes.delta_from_weights` forms its backward's D from the weights, in a dq pass of its own, so a query with one key gets exactly zero gradient; it is off unless a kernel turns it on.
 
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
 
