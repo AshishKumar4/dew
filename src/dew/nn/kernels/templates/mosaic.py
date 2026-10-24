@@ -114,6 +114,14 @@ def staging(name: str, shaped) -> dict:
             f'{name}_barriers': [plgpu.Barrier(num_barriers=2) for _ in shaped]}
 
 
+def viewed(view: tuple, block: tuple, step):
+    """Step `step`'s tile of a stream's view `(ref, index_map)` (`Family.opened`): the `block`-shaped tile of
+    `ref` at the block indices `index_map(step)` gives, as a `BlockSpec`'s index map does."""
+    ref, index_map = view
+    return ref.at[tuple(pl.ds(index * extent, extent)
+                        for index, extent in zip(index_map(step), block, strict=True))]
+
+
 def streamed(rings: tuple, views, lo, hi) -> None:
     """A producer's loads of steps `lo` to `hi` into `rings`, each ring's step counted from `lo` and loaded
     from its view of `views(step)`, then each ring drained."""
@@ -352,8 +360,8 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
 
     @abc.abstractmethod
     def opened(self, allocated: Allocated, views: dict | None = None) -> Opened:
-        """The streams of `streams`' allocations, scoped, by name; their `views` `(ref, block)` where the
-        family's walk loads them (each step `block` rows of an `[S, D]` operand)."""
+        """The streams of `streams`' allocations, scoped, by name; their `views` where the family's walk
+        loads them (`viewed`: each a ref and the block indices of a step's tile in it)."""
 
     @abc.abstractmethod
     def stream(self, streams, views: dict, lo, hi) -> None:
@@ -478,12 +486,13 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         return {name: Ring(**scoped) for name, scoped in allocated.items()}
 
     def stream(self, streams, views: dict, lo, hi) -> None:
-        names = tuple(streams)
+        rings = tuple(streams.values())
 
         def tiles(index):
-            return tuple(views[name][0].at[pl.ds(index * views[name][1], views[name][1])] for name in names)
+            return tuple(viewed(views[name], ring.smem.shape[1:], index)
+                         for name, ring in zip(streams, rings, strict=True))
 
-        streamed(tuple(streams.values()), tiles, lo, hi)
+        streamed(rings, tiles, lo, hi)
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0) -> tuple[C, tuple[jax.Array, ...]]:
