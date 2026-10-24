@@ -1,13 +1,49 @@
-"""Discontinuous selections and the margin a draw clears them by: a lightning indexer's top-k, Gemma 3n's
+"""Discontinuous selections, which a check-1 site's float32 runs and its float64 run must make alike: an
+input within rounding of a boundary picks other keys, units or experts in other runs, a difference no
+precision bounds. A site holds them alike in one of two ways. It replays the float32 reference's choices
+in its float64 truth (`chosen`, `replaying`), so the truth follows the run it measures, where the choice
+is a method of its own: Gemma 3n's gaussian top-k (`GatedMLP.kept_units`). Or it draws inputs whose
+selections clear a stated margin (docs/design/testing.md): a lightning indexer's top-k, Gemma 3n's
 gaussian top-k and a mixture's routing, read from one compiled forward that captures them (`capture`),
-each margin relative to the scale of what it selects (`margin`). A check-1 site whose model selects draws
-inputs whose margins clear MARGIN, so its float32 runs and its float64 run select alike: an input within
-rounding of a boundary picks other keys, units or experts in other runs, a difference no precision
-bounds (docs/design/testing.md asks a stated margin of such a draw)."""
+each margin relative to the scale of what it selects (`margin`)."""
+
+import contextlib
 
 import jax
 import numpy as np
 from flax import linen as nn
+
+REPLAYED = "kept_units"
+"""The choice a float64 truth replays (`replaying`): Gemma 3n's gaussian top-k, `GatedMLP.kept_units`."""
+
+
+def chosen(model):
+    """`model`'s forward on `(variables, tokens)` returning the choices a truth replays (REPLAYED), as the
+    `replay` collection `replaying` reads, compiled once."""
+    return jax.jit(lambda variables, tokens: model.apply(
+        variables, tokens, capture_intermediates=lambda module, method: method == REPLAYED,
+        mutable=["intermediates"])[1].get("intermediates", {}))
+
+
+@contextlib.contextmanager
+def replaying():
+    """Within it, a module's REPLAYED choice is the one its variables' `replay` collection holds (a run's
+    `chosen`), not its own: so a float64 truth applied with `{**variables, "replay": chosen(...)}` keeps
+    the float32 run's units and differs from it by rounding alone. A program traced within it keeps
+    the replay; a module with no `replay` entry chooses for itself."""
+    def interceptor(next_fun, args, kwargs, context):
+        if context.method_name == REPLAYED and context.module.has_variable("replay", REPLAYED):
+            return context.module.get_variable("replay", REPLAYED)[0]
+        return next_fun(*args, **kwargs)
+    with nn.intercept_methods(interceptor):
+        yield
+
+
+def replayed(config) -> bool:
+    """Whether every discontinuous selection of a decoder built from `config` is one a truth replays
+    (Gemma 3n's gaussian top-k alone), so its site needs no margin."""
+    fields = config.get("mixer", {}).get("fields", {})
+    return not (fields.get("index_topk") or routes(config))
 
 MARGIN = 1e-5
 """The least selection margin a draw admits (`margin`), relative to the scale of what is selected: above

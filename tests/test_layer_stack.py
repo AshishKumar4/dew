@@ -167,22 +167,19 @@ def shaped(shape: str):
 
 SHAPES = {shape: shaped(shape) for shape in SHAPE_CONFIGS}
 
-SCAN_WIDTHS = {"gemma3n": {"mlp_features": (192,) * 10,
-                           "activation_sparsity_pattern": (0.95,) * 2 + (0.0,) * 8},
-               "gemma4": {"per_layer_input_dim": 32}}
+SCAN_WIDTHS = {"gemma3n": {"mlp_features": (192,) * 10}, "gemma4": {"per_layer_input_dim": 32}}
 """Each shape's widths for the scanned stack's check 1, where the fixture's leave a draw's error to a few
 of its values: Gemma 3n's sparse layers keep about ten of 192 units a token at 0.95 sparsity, where 48
 keep two, as the architectures cell found (tests/test_architectures.py);
 Gemma 4's per-layer inputs are 32 wide, where at the fixture's 8 Dew paired with the plain loop did not
 resolve within 4096 draws (the released E2B's are 256)."""
-SCAN_MARGIN = 7e-5
-"""The least selection margin a scanned-stack draw admits (`selection_margins.margin`), relative to the
-scale of what is selected: ten times the largest distance float32 rounding moved a selection's inputs
-from their float64 values over 48 draws of both parameter sets, 7.0e-6 of the deviation at Gemma 3n's
-gates and 4.9e-6 of the scale at the DeepSeek routers. Gemma 3n's sparse run is a scan group of two
-layers: over all five of a ten-layer stack the gates' rounding reached 3.9e-5 against draws whose
-median margin was 2.7e-5, so no margin above it leaves draws to admit, where at two the median is
-6.4e-5."""
+SCAN_MARGIN = 5e-5
+"""The least selection margin a scanned-stack draw of a DeepSeek shape admits (`selection_margins.margin`),
+relative to the scale of what its routers select: ten times the largest distance float32 rounding moved
+their inputs from their float64 values over 48 draws of both parameter sets, 4.9e-6 of the scale. Gemma
+3n's gaussian top-k needs none: its truth replays the plain loop's units (`selection_margins.replaying`),
+where a margin above the gates' rounding, which reached 3.9e-5 of their deviation over the five sparse
+layers against draws whose median margin was 2.7e-5, would leave no draws to admit."""
 SCAN_SEEDS = {"gemma4": 256, "gemma3n": 512, "deepseek": 8, "deepseek_widths": 8}
 """Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada: Gemma 3n's
 by the plain loop against itself; Gemma 4's and the DeepSeek shapes' paired with the scanned stack,
@@ -219,15 +216,20 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
 
     def measured(model, forward, trained):
         """The logits, and the loss with its gradients under the draw's cotangent (`with_gradients`),
-        compiled as both arms of a check between Dew's paths are (`without_ynn`)."""
-        def run(ids, cotangent):
+        compiled as both arms of a check between Dew's paths are (`without_ynn`); given `choices`, with
+        each parameter set's run replaying them (`selection_margins.replaying`)."""
+        def run(ids, cotangent, choices=None):
+            def held(tree, which):
+                return tree if choices is None else {**tree, "replay": choices[which]}
+
             def loss(params):
-                current = {**trained, "params": params}
+                current = held({**trained, "params": params}, "trained")
                 if shape == "gemma3n":
                     return next_token_loss(model, current, ids)
                 return jnp.mean(model.apply(current, ids) ** 2)
             value, gradients = with_gradients(loss)(trained["params"], cotangent)
-            return {"logits": model.apply(forward, ids), "loss": value, "gradients": gradients}
+            logits = model.apply(held(forward, "forward"), ids)
+            return {"logits": logits, "loss": value, "gradients": gradients}
         return without_ynn(run)
 
     config = SHAPE_CONFIGS[shape](**SCAN_WIDTHS.get(shape, {}))
@@ -247,18 +249,21 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
         ids = np.random.default_rng([0x5CA7, key]).integers(0, VOCAB, (BATCH, SEQ_LEN)).astype(np.int32)
         return ids, np.float32(1.0)
 
-    # A shape that selects (Gemma 3n's gaussian top-k, the DeepSeek shapes' routing) draws rows whose
+    # A shape whose selections a truth cannot replay (the DeepSeek shapes' routing) draws rows whose
     # selections clear the margin, so every run selects alike (`selection_margins`).
-    draw = selection_margins.clearing(rows, clears) if selection_margins.selects(config) else rows
-
+    draw = rows if selection_margins.replayed(config) else selection_margins.clearing(rows, clears)
+    choose = selection_margins.chosen(plain)
     wide = []
 
     def truth(ids, cotangent):
-        # Built at the first draw, under the float64 the gate runs the truth in, then compiled once.
-        with jax.default_device(jax.devices("cpu")[0]):
+        # The plain loop's own choices on this draw, which the float64 run replays: Gemma 3n's gaussian
+        # top-k keeps the units the float32 reference kept. Built at the first draw, under the float64
+        # the gate runs the truth in and within the replay, then compiled once.
+        choices = {"forward": choose(variables, ids), "trained": choose(training, ids)}
+        with jax.default_device(jax.devices("cpu")[0]), selection_margins.replaying():
             if not wide:
                 wide.append(measured(build(dtype=jnp.float64), widened(variables), widened(training)))
-            return wide[0](ids, cotangent)
+            return wide[0](ids, cotangent, choices)
 
     assert_as_exact(measured(scanned, variables, training), measured(plain, variables, training), draw,
                     f"{shape} scanned stack", seeds=SCAN_SEEDS[shape], truth_fn=truth)
