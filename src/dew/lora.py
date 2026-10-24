@@ -63,7 +63,7 @@ from dew.nn.flops import (
     parameter_flops,
     projection_flops,
 )
-from dew.nn.precision import float32_dot_general
+from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.protocols import (
     Counted,
     CountedConditionedSpatial,
@@ -469,7 +469,7 @@ def _scale(target: Target, rslora: bool) -> float:
 def _updated(kernel: jax.Array, a: jax.Array, b: jax.Array, scale: float) -> jax.Array:
     """`kernel` plus `scale` times the factors' product, summed in at least fp32 at full precision
     and stored in the kernel's dtype, as PEFT's `merge_and_unload` does."""
-    dtype = jnp.promote_types(kernel.dtype, jnp.float32)
+    dtype = at_least_fp32(kernel.dtype)
     delta = jnp.tensordot(a.astype(dtype), b.astype(dtype), axes=1, precision=jax.lax.Precision.HIGHEST)
     return (kernel.astype(dtype) + scale * delta).astype(kernel.dtype)
 

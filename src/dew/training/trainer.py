@@ -54,6 +54,7 @@ from dew.data.pipeline import Dataset, DeviceStep
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, backend, gpu_mesh, gpu_target, measured_kernel
+from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import (
     SEQUENCE_AXIS,
     STAGE_AXIS,
@@ -977,7 +978,7 @@ class Trainer(Generic[Loss, Effects]):
             return state
         stats, aux = shapes
         shared = isinstance(stats, (Ratio, jax.ShapeDtypeStruct))
-        mean_dtype = jnp.result_type(jnp.float32, *(x.dtype for x in jax.tree.leaves(stats)))
+        mean_dtype = at_least_fp32(jnp.result_type(*(x.dtype for x in jax.tree.leaves(stats))))
         slots = window - 1
         def shape(leaf: jax.Array) -> jax.ShapeDtypeStruct:
             return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
@@ -988,7 +989,7 @@ class Trainer(Generic[Loss, Effects]):
                    jax.tree.map(shape, {name: state.variables[name] for name in aux.variables}))
 
         def zeros(leaf):
-            wide = jnp.promote_types(leaf.dtype, jnp.float32)
+            wide = at_least_fp32(leaf.dtype)
             return jnp.zeros(leaf.shape, wide if jnp.issubdtype(leaf.dtype, jnp.inexact) else leaf.dtype)
 
         def buffer(tree):
@@ -1002,7 +1003,7 @@ class Trainer(Generic[Loss, Effects]):
                             tuple(zeros(x) for x in jax.tree.leaves(stats))),
                 effects=tuple(zeros(x) for x in jax.tree.leaves(aux.effects)),
                 qk_stats=jax.tree.map(
-                    lambda x: jnp.full(x.shape, -jnp.inf, jnp.promote_types(x.dtype, jnp.float32))
+                    lambda x: jnp.full(x.shape, -jnp.inf, at_least_fp32(x.dtype))
                     if jnp.issubdtype(x.dtype, jnp.inexact) else zeros(x),
                     compact_qk(jax.tree.map(zeros, aux.qk_stats))),
                 batches=None if shared else buffer(records),
