@@ -564,6 +564,23 @@ def test_a_window_holding_no_key_keeps_its_lower_bound_against_an_image():
     np.testing.assert_array_equal(np.asarray(template.dense(blocks)), [[[False, True]]])
 
 
+@pytest.mark.parametrize(("query", "key"), [(jnp.int64, jnp.uint64), (jnp.int32, jnp.uint32)])
+def test_places_no_integer_dtype_holds_both_of_are_refused(query, key):
+    """Signed and unsigned places no enabled integer dtype holds both of (JAX would promote int64 beside
+    uint64 to float64, and canonicalize int32 beside uint32 to int32 without x64) are refused for one dtype
+    rather than moved in floats or a narrowed one; int32 beside uint32 widens to int64 under x64."""
+    with jax.enable_x64(query == jnp.int64):
+        places = (jnp.asarray([[0]], query), jnp.asarray([[0]], key))
+        with pytest.raises(ValueError, match="share no integer dtype"):
+            template.spans(1, 1, 1, sliding_window=1, positions=places)
+    with jax.enable_x64(new_val=True):
+        mixed = template.spans(1, 2, 1, sliding_window=2, positions=(
+            jnp.asarray([[0]], jnp.int32), jnp.asarray([[0, 1]], jnp.uint32)))
+        signed = template.spans(1, 2, 1, sliding_window=2, positions=(
+            jnp.asarray([[0]], jnp.int64), jnp.asarray([[0, 1]], jnp.int64)))
+        np.testing.assert_array_equal(np.asarray(template.dense(mixed)), np.asarray(template.dense(signed)))
+
+
 def test_a_window_moves_its_bound_in_a_dtype_that_holds_both_places():
     """Queries' places at the top of int8, keys' in int16 past it: a two-sided window of two around 127
     keeps the key at 128, its bound moved in the wider dtype rather than held at int8's largest."""

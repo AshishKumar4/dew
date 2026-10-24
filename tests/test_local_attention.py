@@ -278,6 +278,34 @@ def test_a_row_with_padding_among_its_tokens_bands_its_window_over_a_sequence_ax
     assert banded * 4 < dense
 
 
+@pytest.mark.mesh(devices=8)
+def test_row_fields_split_as_the_query_rows_do_where_the_heads_contend_for_the_axis():
+    """Eight query heads over a tensor and an expert axis of two each, which the heads take before the rows
+    (the rows' rule names the expert axis too), and a sequence axis of two: the window's segment ids and
+    validity split as the query's own rows do (`query_split`), not as their names alone would, so each shard
+    bands its own rows'. The same output as the whole sequence's."""
+    from flax import linen as nn
+
+    from dew.nn.sharding import DEFAULT_RULES
+    from dew.training import MeshSpec
+
+    length, window = 64, 8
+    query, key, value = inputs(length, heads=8, kv_heads=2, batch=4)
+    segment_ids = jnp.asarray(np.tile(packed(length, (20, 45, 60)), (4, 1)))
+    valid = jnp.asarray(np.arange(length) % 7 != 3)[None].repeat(4, axis=0)
+
+    def attend(q, k, v):
+        return local_attention(q, k, v, window=window, segment_ids=segment_ids, valid=valid,
+                               implementation="xla")
+
+    whole = attend(query, key, value)
+    rules = (("activation_heads", ("tensor", "expert")), ("activation_kv", ("tensor", "expert")),
+             ("activation_batch", "expert"), *DEFAULT_RULES)
+    with jax.set_mesh(MeshSpec(tensor=2, expert=2, sequence=2).build()), nn.logical_axis_rules(rules):
+        split = jax.jit(attend)(query, key, value)
+    np.testing.assert_allclose(np.asarray(split), np.asarray(whole), atol=1e-6, rtol=0)
+
+
 @pytest.mark.parametrize("layout", [KVCache(), KVCache(page_size=4)], ids=["dense", "paged"])
 @pytest.mark.parametrize("shared", [False, True], ids=["per-row", "shared"])
 @pytest.mark.parametrize("origin", [0, 2], ids=["from-zero", "logical-origin"])
