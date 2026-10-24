@@ -47,6 +47,26 @@ def at_least_fp32(dtype: DTypeLike | None) -> jnp.dtype:
     return jnp.promote_types(jnp.float32 if dtype is None else dtype, jnp.float32)
 
 
+def rms_statistics(x: jax.Array, epsilon: float, *, axis=-1, keepdims: bool = True,
+                   count: int | None = None) -> tuple[jax.Array, jax.Array]:
+    """Mean square and inverse RMS in at least fp32. A padded kernel tile supplies its logical
+    `count` after zeroing padding; an ordinary array uses its reduction dimensions. Callers own
+    when the inverse, normalized values and learned scale round."""
+    square = jnp.square(x.astype(at_least_fp32(x.dtype)))
+    mean = (jnp.mean(square, axis=axis, keepdims=keepdims) if count is None
+            else jnp.sum(square, axis=axis, keepdims=keepdims) / count)
+    return mean, jax.lax.rsqrt(mean + epsilon)
+
+
+def weighted_total(x: jax.Array, weights: jax.Array, axis=None) -> tuple[jax.Array, jax.Array]:
+    """Weighted total and mass along `axis`, in `x`'s dtype. Broadcastable weights mark excluded
+    values with zero; those values are selected away before multiplication, so their NaNs and
+    infinities cannot reach the sum. The caller owns its denominator policy."""
+    weights = jnp.broadcast_to(jnp.asarray(weights, x.dtype), x.shape)
+    kept = jnp.where(weights != 0, x, 0)
+    return jnp.sum(kept * weights, axis=axis), jnp.sum(weights, axis=axis)
+
+
 def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     """`product` plus `bias` broadcast over its leading axes, in the dtype their addition promotes
     to, as flax's layer adds them.
@@ -600,7 +620,7 @@ def compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
 
 @functools.partial(jax.custom_jvp, nondiff_argnums=(1,))
 def _compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
-    wide = values.astype(jnp.promote_types(values.dtype, jnp.float32))
+    wide = values.astype(at_least_fp32(values.dtype))
     zero = jnp.zeros((), wide.dtype)
     hi, lo = jax.lax.reduce((wide, jnp.zeros_like(wide)), (zero, zero), compensated_add, axes)
     return compensated_total((hi, lo), jnp.sum(wide, axes)).astype(values.dtype)

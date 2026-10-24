@@ -33,7 +33,15 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from dew.inference.banks import bank_sharding, bank_sites, entry_tree, in_namespace, narrowed, one_layer
+from dew.inference.banks import (
+    assembled,
+    bank_sharding,
+    bank_sites,
+    entry_tree,
+    in_namespace,
+    narrowed,
+    one_layer,
+)
 from dew.nn.backbones.layer_plan import group_name, layer_index
 from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import FROZEN, merge, select, thaw, without
@@ -347,32 +355,24 @@ class HostExecution:
         entries = {**{collection: tree for collection, tree in whole.items()
                       if collection != "params"}, **entry_tree(weights, self.sites)}
         store = transfer(entries, narrowed(placement, entries))
-        for site in self.sites:
+
+        def bank(site, first: int, count: int, name: str):
+            """A group's bank from the state: its rows stacked on the CPU into the bank's placement
+            (`_stack_rows`) over the frozen bank the state holds, or its one layer placed as it is."""
             banks = in_namespace(weights, site.namespace)["params"]
-            for (first, count), name in zip(site.view.groups, site.view.bank_names(), strict=True):
-                rows = [one_layer(weights, index, namespace=site.namespace)
-                        for index in range(first, first + count)]
-                held = {"params": banks[name]} if count > 1 and name in banks else {}
-                if not rows[0] and not held:
-                    continue
-                if count == 1:
-                    bank = transfer(rows[0], _bank_shardings(
-                        one_layer(places, first, namespace=site.namespace), self.accelerator, count))
-                elif rows[0]:
-                    spread = _bank_shardings(one_layer(places, first, namespace=site.namespace),
-                                             self.accelerator, count)
-                    bank = jax.tree_util.tree_map_with_path(
-                        lambda path, sharding, *leaves: self._stack_rows(leaves, sharding), spread, *rows)
-                    bank = merge(held, bank)
-                else:
-                    bank = held
-                bank = jax.block_until_ready(bank)
-                for collection, values in bank.items():
-                    branch = store.setdefault(collection, {})
-                    for component in site.namespace:
-                        branch = branch.setdefault(component, {})
-                    branch[name] = values
-        return store
+            rows = [one_layer(weights, index, namespace=site.namespace)
+                    for index in range(first, first + count)]
+            held = {"params": banks[name]} if count > 1 and name in banks else {}
+            if not rows[0]:
+                return held or None
+            spread = _bank_shardings(one_layer(places, first, namespace=site.namespace),
+                                     self.accelerator, count)
+            if count == 1:
+                return transfer(rows[0], spread)
+            return merge(held, jax.tree_util.tree_map_with_path(
+                lambda path, sharding, *leaves: self._stack_rows(leaves, sharding), spread, *rows))
+
+        return merge(store, assembled(self.sites, bank))
 
     def _stack_rows(self, rows, sharding):
         """Stack the rows of one bank leaf into the bank's placement.

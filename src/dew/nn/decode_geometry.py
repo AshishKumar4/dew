@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 
 from .kernels import generation
-from .precision import float32_einsum, operand_precision
+from .precision import at_least_fp32, float32_einsum, operand_precision
 
 FOLDED_PAIRS = 16
 """Most query positions times key heads `folded_attention` takes."""
@@ -46,7 +46,7 @@ def folded_attention(query, key, value, mask=None):
     """
     batch, positions, heads, width = query.shape
     keys = key.shape[-3]
-    wide = jnp.promote_types(query.dtype, jnp.float32)
+    wide = at_least_fp32(query.dtype)
     logits = float32_einsum('bxd,byd->bxy', query.reshape(batch, positions * heads, width),
                             key.reshape(batch, keys * heads, width),
                             precision=operand_precision(query.dtype), preferred_element_type=wide)
