@@ -134,19 +134,25 @@ class LayaCheckpoint:
 
 def _head_tensors(params: Mapping[str, object]) -> dict[str, np.ndarray]:
     """`DecisionHead`'s parameters under Laya's tensor names, `_head_path`'s inverse."""
+    from dew.interop.weights import native_layouts
+    from dew.nn.vision.common import in_params
+
     modules = {path: name for name, path in (*_LAYER.items(), *_SCORER.items())}
-    tensors = {}
-    for path, leaf in jax.tree_util.tree_leaves_with_path(params):
-        keys = tuple(str(key.key) for key in path if isinstance(key, jax.tree_util.DictKey))
+
+    def name_of(path: tuple[str, ...]) -> str:
+        keys = path[1:]
         if keys[0] == "type_embedding":
             module = "type_emb"
         elif keys[0].startswith("layers_"):
             module = f"head.layers.{keys[0].removeprefix('layers_')}.{modules[keys[1:-1]]}"
         else:
             module = modules[keys[:-1]]
-        value = np.asarray(leaf)
         torch_leaf = "bias" if keys[-1] == "bias" else "weight"
-        tensors[f"{module}.{torch_leaf}"] = value.T if keys[-1] == "kernel" else value
+        return f"{module}.{torch_leaf}"
+
+    variables = {"params": params}
+    layouts = native_layouts(variables, name_of, in_params(_head_path))
+    tensors = {layout.name: layout.export(variables) for layout in layouts}
     return joined_packed(tensors, IN_PROJ)
 
 
