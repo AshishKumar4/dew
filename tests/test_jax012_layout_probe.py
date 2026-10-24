@@ -162,9 +162,11 @@ def _numpy_layout(inputs):
     return output / (1 + np.exp(-gates))
 
 
-def test_layout_with_corrected_reference_truth():
-    ours, reference, draw, label = site.layout_site(CASE, jnp.float32, widen_bias=True)
-    _, original, _, _ = site.layout_site(CASE, jnp.float32)
+@pytest.mark.parametrize("dtype", site.DTYPES, ids=lambda dtype: jnp.dtype(dtype).name)
+@pytest.mark.parametrize("case", [site.CASES[name] for name in site.LAYOUTS], ids=site.LAYOUTS)
+def test_layout_with_corrected_reference_truth(case, dtype):
+    ours, reference, draw, label = site.layout_site(case, dtype, widen_bias=True)
+    _, original, _, _ = site.layout_site(case, dtype)
     inputs = draw(0)
     print(json.dumps({"float32_reference_unchanged_bitwise": bool(np.array_equal(
         np.asarray(reference(*inputs)), np.asarray(original(*inputs))))}), flush=True)
@@ -241,3 +243,22 @@ def test_isolated_operator_rounding():
                           "pooled_rms": float(np.sqrt(np.mean(values))),
                           "per_seed_rms": np.sqrt(values[:8]).tolist(),
                           "seed0_output_digest": digests[name]}), flush=True)
+
+
+@pytest.mark.parametrize("widen_bias", [False, True], ids=["original", "corrected"])
+def test_per_seed_recording(widen_bias):
+    ours, reference, draw, _ = site.layout_site(CASE, jnp.float32, widen_bias=widen_bias)
+    digest = hashlib.sha256()
+
+    def recorded(seed):
+        inputs = draw(seed)
+        for value in inputs:
+            digest.update(np.asarray(value).tobytes())
+        return inputs
+
+    draws = gate._drawn(ours, reference, recorded, range(256))
+    print(json.dumps({"jax": jax.__version__, "widen_bias": widen_bias,
+                      "all_256_inputs_sha256": digest.hexdigest(),
+                      "ratio_interval": gate._judged(draws, 0),
+                      "per_seed_rms": np.sqrt(np.stack(
+                          [draws.mine[:, 0], draws.theirs[:, 0]], axis=-1)).tolist()}), flush=True)
