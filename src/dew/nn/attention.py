@@ -893,11 +893,12 @@ def split_with_queries(key, value, split: int):
 
 def _per_shard(local, query, key, value, **extras):
     """`local(query, key, value, **extras)` on each shard's rows and heads
-    (`manual_map`), the key heads repeated until the tensor axes split them as
-    they split the query's; whole off a mesh, or inside a map that already
-    holds every axis manual (the sequence exchanges), where the tensor axes
-    split nothing. A Pallas kernel has no
-    partitioning rule, and jax's cuDNN attention partitions through
+    (`manual_map`). A key head the tensor axes cannot split stays whole on every
+    shard, and each shard takes the copies its query heads read (the repeat
+    `split_with_queries` makes), so the key heads' gradient is one psum over the
+    tensor axes; whole off a mesh, or inside a map that already holds every axis
+    manual (the sequence exchanges), where the tensor axes split nothing. A Pallas
+    kernel has no partitioning rule, and jax's cuDNN attention partitions through
     `custom_partitioning`, whose lowering on several devices names the
     partitioner by a process address (`str(id(...))` in its backend config),
     which the persistent cache key keeps, so every fresh process would compile
@@ -905,11 +906,18 @@ def _per_shard(local, query, key, value, **extras):
     further argument to its array, or None, and the logical axes it splits on.
     """
     given = {name: pair for name, pair in extras.items() if pair[0] is not None}
-    key, value = split_with_queries(key, value, tensor_shards(query))
+    split, kv_heads = tensor_shards(query), key.shape[-2]
+    heads = math.lcm(kv_heads, split)
     queries, keys = logical_spec(HEADS, query.shape), logical_spec(KV_HEADS, key.shape)
-    names = tuple(given)
+    names, tensor = tuple(given), mesh_axes(_entry(queries, 2))
 
     def shard(query, key, value, *arrays):
+        if heads != kv_heads:
+            # The shard's share of the repeated heads, read from the whole key heads it holds: head n of them
+            # is key head n // copies. Taken here, the map's transpose sums their gradient across the shards.
+            share = heads // split
+            read = (jax.lax.axis_index(tensor) * share + jnp.arange(share)) // (heads // kv_heads)
+            key, value = (jnp.take(array, read, axis=-2) for array in (key, value))
         return local(query, key, value, **dict(zip(names, arrays, strict=True)))
 
     # An extra may be a tree of arrays (`CrossDocuments`), each leaf split on its axes.
