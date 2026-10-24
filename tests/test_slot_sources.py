@@ -16,12 +16,7 @@ from dew.training.distributed import Layout, MeshSpec
 BACKBONE = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
 
 
-@pytest.mark.parametrize("readout", ["slot_lm", "head", "fresh_head"])
-@pytest.mark.parametrize("n_slots", [16, 32, 512])
-def test_a_slot_release_loads_its_readout_and_exports_the_same_task(tmp_path, readout, n_slots):
-    """The stored head keeps all its rows and native q/k orientation. A fresh head draws only
-    the available label rows; the byte tokenizer has all letters but no single-token pairs.
-    All three become decision tasks and survive a native task export with their parameters."""
+def slot_release(tmp_path, readout, n_slots=32):
     import torch
 
     source = tmp_path / "release"
@@ -35,6 +30,16 @@ def test_a_slot_release_loads_its_readout_and_exports_the_same_task(tmp_path, re
     if readout == "head":
         torch.save({name: torch.from_numpy(value) for name, value in stored.items()},
                    source / "readout_head.pt")
+    return source, stored
+
+
+@pytest.mark.parametrize("readout", ["slot_lm", "head", "fresh_head"])
+@pytest.mark.parametrize("n_slots", [16, 32, 512])
+def test_a_slot_release_loads_its_readout_and_exports_the_same_task(tmp_path, readout, n_slots):
+    """The stored head keeps all its rows and native q/k orientation. A fresh head draws only
+    the available label rows; the byte tokenizer has all letters but no single-token pairs.
+    All three become decision tasks and survive a native task export with their parameters."""
+    source, stored = slot_release(tmp_path, readout, n_slots)
     bundle = Pretrained.load(source, dtype="float32", attention_impl="xla")
     task = Decide.of(bundle)
     [row] = task.layout.rows(task.tokenizer, task.specials, "Refund requested.",
@@ -63,22 +68,6 @@ def test_a_slot_release_loads_its_readout_and_exports_the_same_task(tmp_path, re
         assert abstract.shape == held.shape == original.shape
         assert abstract.dtype == held.dtype == original.dtype
         np.testing.assert_array_equal(held, original)
-    mesh = MeshSpec(fsdp=2).build(devices=jax.devices()[:2])
-    placed = Pretrained.load(source, dtype="float32", attention_impl="xla", mesh=mesh,
-                             layout=Layout(min_shard=1, tolerance=1.0))
-    assert_sharded(placed.variables, mesh)
-    if readout != "slot_lm":
-        assert_sharded(placed.head_variables, mesh)
-    for actual, expected in zip(jax.tree.leaves((placed.variables, placed.head_variables)),
-                               jax.tree.leaves((bundle.variables, bundle.head_variables)), strict=True):
-        np.testing.assert_array_equal(actual, expected)
-    replicated = Pretrained.load(source, dtype="float32", attention_impl="xla", mesh=mesh,
-                                  layout=Layout(min_shard=2048, tolerance=1.0))
-    assert_sharded(replicated.variables, mesh)
-    for actual, expected in zip(jax.tree.leaves(replicated.head_variables),
-                               jax.tree.leaves(bundle.head_variables), strict=True):
-        assert actual.is_fully_replicated
-        np.testing.assert_array_equal(actual, expected)
     exported = tmp_path / "exported"
     bundle.save(exported)
     restored = Decide.from_pretrained(exported, dtype="float32", attention_impl="xla")
@@ -90,6 +79,42 @@ def test_a_slot_release_loads_its_readout_and_exports_the_same_task(tmp_path, re
                                 {"team": Choice("Which team?", ["billing", "technical"])}) == [row]
     for actual, expected in zip(jax.tree.leaves(restored.variables), jax.tree.leaves(task.variables),
                                strict=True):
+        np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("readout", ["slot_lm", "head", "fresh_head"])
+@pytest.mark.parametrize("n_slots", [16, 32, 512])
+def test_a_loaded_readout_uses_its_own_layout_beside_the_backbone(tmp_path, readout, n_slots):
+    source, _ = slot_release(tmp_path, readout, n_slots)
+    bundle = Pretrained.load(source, dtype="float32", attention_impl="xla", on_host=True)
+    mesh = MeshSpec(fsdp=2).build(devices=jax.devices()[:2])
+    for minimum in (1, 2048):
+        placed = Pretrained.load(source, dtype="float32", attention_impl="xla", mesh=mesh,
+                                 layout=Layout(min_shard=minimum, tolerance=1.0))
+        assert_sharded(placed.variables, mesh)
+        if minimum == 1 and readout != "slot_lm":
+            assert_sharded(placed.head_variables, mesh)
+        if minimum == 2048:
+            assert all(leaf.is_fully_replicated for leaf in jax.tree.leaves(placed.head_variables))
+        for actual, expected in zip(jax.tree.leaves((placed.variables, placed.head_variables)),
+                                   jax.tree.leaves((bundle.variables, bundle.head_variables)), strict=True):
+            np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("readout", ["head", "fresh_head"])
+def test_a_bfloat16_readout_keeps_its_storage_through_the_released_format(tmp_path, readout):
+    import jax.numpy as jnp
+
+    source, _ = slot_release(tmp_path, readout, 16)
+    bundle = Pretrained.load(source, dtype="bfloat16", param_dtype="bfloat16", attention_impl="xla")
+    assert all(leaf.dtype == jnp.bfloat16 for leaf in jax.tree.leaves(bundle.head_variables))
+    exported = tmp_path / "exported"
+    bundle.save(exported)
+    restored = Pretrained.load(exported, dtype="bfloat16", param_dtype="auto", attention_impl="xla")
+    for actual, expected in zip(jax.tree.leaves((restored.variables, restored.head_variables)),
+                               jax.tree.leaves((bundle.variables, bundle.head_variables)), strict=True):
+        assert actual.dtype == expected.dtype
         np.testing.assert_array_equal(actual, expected)
 
 
