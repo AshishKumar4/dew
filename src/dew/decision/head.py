@@ -26,6 +26,7 @@ from dew.decision.questions import KINDS, Choice, Noul, Score
 from dew.nn.activations import gelu_exact_torch
 from dew.nn.attention import NormalAttention, l2_normalized
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, decoder_norm
+from dew.nn.blocks import TokenEmbedding
 from dew.nn.dense import Dense
 from dew.nn.flops import attention_flops, projection_flops, real_lengths
 from dew.nn.inputs import AttentionMetadata
@@ -131,7 +132,8 @@ class DecisionHead(Head):
         feedforward = functools.partial(
             GatedMLP, hidden_features=4 * self.features, out_features=self.features, activation="relu",
             use_bias=True, dtype=self.dtype, precision=self.precision)
-        self.type_embedding = nn.Embed(len(KINDS), self.features, dtype=self.dtype, name="type_embedding")
+        self.type_embedding = TokenEmbedding(len(KINDS), self.features, dtype=self.dtype,
+                                             name="type_embedding")
         self.blocks = [DecoderBlock(
             mixer=AttentionMixer(nope=True).build(context), feedforward=feedforward,
             emb_features=self.features, wiring=BlockWiring(), norm_type="layer", norm_bias=True,
@@ -354,7 +356,7 @@ class JointSchemaHead(Head):
         self.global_projection = dense(self.width, "global_projection")
         self.option_context_projection = dense(self.width, "option_context_projection")
         self.option_lexical_projection = dense(self.width, "option_lexical_projection")
-        self.type_embedding = nn.Embed(len(KINDS), self.width, dtype=self.dtype, name="type_embedding")
+        self.type_embedding = TokenEmbedding(len(KINDS), self.width, dtype=self.dtype, name="type_embedding")
         options = {"width": self.width, "heads": self.heads, "feedforward": self.feedforward,
                    "dtype": self.dtype, "precision": self.precision, "attention_impl": self.attention_impl}
         self.evidence_layers = [_RoutingLayer(**options, name=f"evidence_layers_{index}")
