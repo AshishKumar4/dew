@@ -250,9 +250,10 @@ class KPoolSparseAttention(MultiHeadLatentAttention):
             kpool=self.index_kpool, always_select_tail=self.index_kpool_always_select_tail,
             dtype=self.dtype, precision=self.precision, name=INDEXER)
 
-    def _attend_projected(self, x, call: MixerCall, query, q_resid, latent, rot,
+    def _attend_projected(self, x, call: MixerCall, queries, q_resid, latent, rot,
                           prediction_phase: PredictionPhase):
         # No rope: the slot positions order the keys and nothing rotates.
+        query = queries
         decode, attention_metadata = call.decode, call.metadata
         batch, length, _ = x.shape
         if coordinates_of(attention_metadata, batch, length).segments is not None:
