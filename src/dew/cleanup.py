@@ -13,7 +13,7 @@ POLL_SECONDS = 0.05
 """How often a group's end asks whether a process is left in it."""
 
 
-def attempted(steps: Sequence[tuple[str, Callable[[], None]]], *,
+def attempted(steps: Sequence[tuple[str, Callable[[], object]]], *,
               primary: BaseException | None = None) -> None:
     """Run every step, even after one fails. Each failure is noted on `primary`, the error its
     caller is already raising, which stays the one raised; without one the first failure is raised
