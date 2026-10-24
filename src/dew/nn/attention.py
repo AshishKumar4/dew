@@ -52,6 +52,7 @@ from .inputs import cu_seqlens
 from .kernels import decode_attention, generation, norm_swiglu
 from .kernels.generation import bf16_dot_runs, gpu_placed
 from .kernels.selection import forced, select, selected
+from .kernels.templates import attention as template, attention_route
 from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import (
     asks_default_precision,
@@ -82,7 +83,7 @@ from .sharding import (
 )
 from .visibility import same_chunk, visible, window_sides, windowed
 
-AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "triton", "flash", "tpu"]
+AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "triton", "flash", "tpu", "template"]
 """Names which kernel an attention call runs.
 
 Every layer that carries the choice spells it the same way: a `ModelConfig`
@@ -97,6 +98,10 @@ FlashAttention-3 on Hopper and FlashAttention-2 elsewhere, from the
 dew_flash_attn wheel (docs/installation.md). 'tpu' is the
 pallas splash kernel, with the older pallas flash kernel behind it for the
 calls splash's mask descriptor cannot carry.
+'template' is the attention template's route (`attention_route.attend`): the call's visibility as
+spans, a softcap as a score hook and sinks as the initial state, on the template's Triton or Mosaic
+mainloop on a GPU and its plain-JAX one elsewhere. No target's row prefers it, so only a call that
+names it takes it.
 'auto', every module's default, resolves per trace (`resolve_implementation`),
 so a configuration logged as 'auto' runs on the next machine too. The target's
 row decides: the attention selector (`ATTENTION`, `dew.nn.kernels.selection.select`)
@@ -888,23 +893,39 @@ def split_with_queries(key, value, split: int):
 
 def _per_shard(local, query, key, value, **extras):
     """`local(query, key, value, **extras)` on each shard's rows and heads
-    (`manual_map`), the key heads repeated until the tensor axes split them as
-    they split the query's; whole off a mesh, or inside a map that already
-    holds every axis manual (the sequence exchanges), where the tensor axes
-    split nothing. A Pallas kernel has no
-    partitioning rule, and jax's cuDNN attention partitions through
-    `custom_partitioning`, whose lowering on several devices names the
-    partitioner by a process address (`str(id(...))` in its backend config),
-    which the persistent cache key keeps, so every fresh process would compile
-    again; under a fully manual map jax lowers neither. `extras` maps each
-    further argument to its array, or None, and the logical axes it splits on.
+    (`manual_map`). The key heads a shard reads are the ones its key shard holds,
+    at their offset in that shard, where the key heads' split begins with the query
+    heads' split; a key-head split that does not is set aside, and the key heads are
+    held whole on every shard. Where the tensor axes split the query heads more ways
+    than the key heads, each shard takes its share of the repeats `split_with_queries`
+    makes, so the key heads' gradient is one sum across the shards in the map's
+    transpose. Whole off a mesh, or inside a map that already holds every axis manual
+    (the sequence exchanges), where the tensor axes split nothing. A Pallas kernel has
+    no partitioning rule, and jax's cuDNN attention partitions through
+    `custom_partitioning`, whose lowering on several devices names the partitioner by
+    a process address (`str(id(...))` in its backend config), which the persistent
+    cache key keeps, so every fresh process would compile again; under a fully manual
+    map jax lowers neither. `extras` maps each further argument to its array, or None,
+    and the logical axes it splits on.
     """
     given = {name: pair for name, pair in extras.items() if pair[0] is not None}
-    key, value = split_with_queries(key, value, tensor_shards(query))
     queries, keys = logical_spec(HEADS, query.shape), logical_spec(KV_HEADS, key.shape)
+    query_axes, key_axes = mesh_axes(_entry(queries, 2)), mesh_axes(_entry(keys, 2))
+    if key_axes and query_axes[: len(key_axes)] != key_axes:
+        keys, key_axes = P(*keys[:2]), ()
+    split, kv_heads = tensor_shards(query), key.shape[-2]
+    heads = math.lcm(kv_heads, split)
+    share, copies = heads // split, heads // kv_heads
     names = tuple(given)
 
     def shard(query, key, value, *arrays):
+        if copies > 1 or key.shape[-2] != share:
+            # This shard's share of the repeated key heads (head n is key head n // copies), read from the key
+            # heads it holds, which begin at its own key shard's offset.
+            read = (jax.lax.axis_index(query_axes) * share + jnp.arange(share)) // copies
+            if key_axes:
+                read = read - jax.lax.axis_index(key_axes) * key.shape[-2]
+            key, value = (jnp.take(array, read, axis=-2) for array in (key, value))
         return local(query, key, value, **dict(zip(names, arrays, strict=True)))
 
     # An extra may be a tree of arrays (`CrossDocuments`), each leaf split on its axes.
@@ -1134,6 +1155,35 @@ def triton_attention(query, key, value, causal: bool):
         query, key, value, is_causal=causal, implementation='triton'), query, key, value)
 
 
+def template_attention(query, key, value, causal: bool, sliding_window, *, sinks, softcap, segment_ids,
+                       lengths, starts):
+    """The attention template's route (`attention_route.attend`) over the call's visibility as spans: its
+    causality, window, documents (`segment_ids`, or `CrossDocuments` aligned to their last keys), key lengths
+    and starts. A softcap is a score hook and sinks are the softmax's initial state. On a mesh it runs per
+    shard (`_per_shard`), as the decode kernel does: the key heads repeat until the tensor axes split them,
+    the sinks split with their heads, and the ids, lengths and starts with their rows. Its requirements
+    (`attention_kernels.TEMPLATE_SUPPORTS`) keep it off a sharded sequence axis.
+    """
+    if sinks is not None and sinks.shape != (query.shape[2],):
+        raise ValueError(f"sinks must have one logit per query head, got {sinks.shape}")
+
+    def local(query, key, value, sinks=None, segment_ids=None, lengths=None, starts=None):
+        batch, queries, keys = query.shape[0], query.shape[1], key.shape[1]
+        spans = template.spans(queries, keys, batch, causal=causal, sliding_window=sliding_window,
+                               segment_ids=segment_ids, lengths=lengths, starts=starts)
+        hooks = template.Hooks(
+            score_mod=None if softcap is None else functools.partial(template.capped, softcap),
+            initial=None if sinks is None else template.sinks(sinks, batch, queries, value.shape[-1]))
+        return attention_route.attend(query, key, value, spans, hooks)
+
+    # The GPU arms are Pallas launches, which have no partitioning rule, so each shard runs them on its own
+    # rows and heads.
+    rows = ("activation_batch",)
+    return _per_shard(local, query, key, value, sinks=(sinks, ("activation_heads",)),
+                      segment_ids=(segment_ids, ("activation_batch", None)), lengths=(lengths, rows),
+                      starts=(starts, rows))
+
+
 VALUE_BLOCK = 256
 """Keys per block of `weighted_values`' fp32 sum on XLA:CPU."""
 
@@ -1296,7 +1346,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     mask that only ends rows early costs cuDNN a dense bias per head, so pass
     lengths for right padding. `key_value_seq_starts` `[B]`, below the
     lengths, starts each row's keys there: a windowed decode step's cache,
-    which the decode kernel reads from the window's first block
+    which the decode kernel and the template read from the window's first block
     (`decode_attention.attend`) and every other path as the mask they mean.
 
     A mesh sequence axis above one runs `sequence_parallel_attention`. Active
@@ -1392,13 +1442,13 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
     attention selector chose (`resolve_implementation`, `_attention_kernel`), which held the call to
     the kernel's requirements (`attention_kernels.ATTENTION`) before it reaches here.
 
-    A narrower value rides in padded and its columns come back out, at no
-    runtime branch. `key_value_seq_lengths` reaches cudnn and xla as lengths
-    and 'tpu' as the mask it means; `key_value_seq_starts` reaches the decode
+    A narrower value rides in padded and its columns come back out, at no runtime branch, except that the
+    template takes its own value width. `key_value_seq_lengths` reaches cudnn, xla and the template as
+    lengths and 'tpu' as the mask it means; `key_value_seq_starts` reaches the template and the decode
     kernel alone (`_attention_kernel` folds them into the mask elsewhere).
     """
     v_head_dim = value.shape[-1]
-    if v_head_dim != query.shape[-1]:
+    if v_head_dim != query.shape[-1] and implementation != 'template':
         value = widen_value_heads(query, value)
 
     if implementation == 'cudnn':
@@ -1451,6 +1501,10 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
                 key_value_seq_lengths=key_value_seq_lengths,
                 local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
                 implementation='xla')
+    elif implementation == 'template':
+        out = template_attention(query, key, value, causal, sliding_window, sinks=sinks, softcap=softcap,
+                                 segment_ids=segment_ids, lengths=key_value_seq_lengths,
+                                 starts=key_value_seq_starts)
     else:  # 'tpu'
         if key_value_seq_lengths is not None:
             mask = with_key_lengths(mask, key_value_seq_lengths, key.shape[-3])
@@ -1524,7 +1578,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         segment_ids=segment_ids, max_segments=max_segments, lengths=lengths, starts=starts)
     live = visible_rows(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids, lengths,
                         starts)
-    if not FORWARD_MODE.get() or resolved not in ('cudnn', 'triton', 'flash', 'tpu'):
+    if not FORWARD_MODE.get() or resolved not in ('cudnn', 'triton', 'flash', 'tpu', 'template'):
         return _read_nothing(call(query, key, value, bias=bias, sinks=sinks, implementation=resolved), live)
 
     def fused(query, key, value, bias, sinks):
@@ -1563,20 +1617,19 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     """Run one whole-sequence attention call on the kernel `attention_kernel` resolved.
 
     `masked` is `mask` with the key `lengths` and `starts` in it. Splash takes sinks, a
-    softcap and packed segment ids itself, and flash takes the ids as its
-    packed sequences given `max_segments`; elsewhere segment ids become the
-    document mask, and sinks and a softcap run `reference_attention`, since
-    `jax.nn.dot_product_attention` has neither (a fused route this host runs as xla
-    included, `_hosted`). The rest goes to `_fused_attention`. Key
-    lengths reach cudnn and xla as they are and every other path as the mask
-    they mean, which splash cannot describe, so 'auto' never picks 'tpu' for
-    them. Key starts reach the decode kernel as they are and every other path
-    as the mask they mean.
+    softcap and packed segment ids itself, flash takes the ids as its packed sequences given
+    `max_segments`, and the template reads the ids (`CrossDocuments` included) as its spans;
+    elsewhere segment ids become the document mask, and sinks and a softcap run
+    `reference_attention`, since `jax.nn.dot_product_attention` has neither (a fused route this
+    host runs as xla included, `_hosted`). The rest goes to `_fused_attention`. Key lengths reach
+    cudnn, xla and the template as they are and every other path as the mask they mean, which
+    splash cannot describe, so 'auto' never picks 'tpu' for them. Key starts reach the decode
+    kernel and the template as they are and every other path as the mask they mean.
     """
     # Another sequence's documents under causality or a window align each document's queries with
     # its last keys (`CrossDocuments`), which splash does not; elsewhere the mask carries them.
     aligned = isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None)
-    packed = ((implementation == 'tpu' and not aligned)
+    packed = (implementation == 'template' or (implementation == 'tpu' and not aligned)
               or (implementation == 'flash' and max_segments is not None))
     if segment_ids is not None and not packed:
         if aligned:
@@ -1595,7 +1648,8 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
                                    dtype=dtype, precision=precision,
                                    force_fp32_for_softmax=force_fp32_for_softmax)
 
-    if implementation != 'decode':
+    # The decode kernel and the template read key starts as their own spans; elsewhere they are the mask.
+    if implementation not in ('decode', 'template'):
         mask = with_key_starts(mask, starts, key.shape[-3])
         starts = None
     return _fused_attention(query, key, value, bias, mask, causal, sliding_window,
