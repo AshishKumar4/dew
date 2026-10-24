@@ -705,7 +705,7 @@ def test_the_host_offload_benchmark_counts_each_parameter_in_the_memory_space_it
     device = jax.devices()[0]
     host = jax.sharding.SingleDeviceSharding(device, memory_kind="pinned_host")
     resident = jax.sharding.SingleDeviceSharding(device, memory_kind="device")
-    compiled = jax.jit(lambda banked, x: x + 1.0, in_shardings=(host, resident)).lower(
+    compiled = jax.jit(lambda banked, x: x + 1.0, in_shardings=(host, resident), keep_unused=True).lower(
         jax.ShapeDtypeStruct((4,), jnp.float32), jax.ShapeDtypeStruct((4,), jnp.float32)).compile()
     assert tool.entry_spaces(compiled) == {"pinned_host": 1, "device": 1}
 
