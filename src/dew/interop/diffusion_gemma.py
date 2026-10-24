@@ -11,9 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping
-from typing import cast
 
-import jax
 import numpy as np
 from flax.traverse_util import flatten_dict
 
@@ -298,6 +296,7 @@ def export_weights(
     has none, and writes them through the layouts its own tree gives. A config
     the published implementation cannot build is refused (`_refuse_unreadable`).
     """
+    from dew.interop.decoder_parts import layout_tensors, leaf_layouts
     from dew.interop.hf_decoders import export_decoder_weights
 
     _refuse_unreadable(config)
@@ -315,15 +314,9 @@ def export_weights(
         if name.endswith(".layer_scalar"):
             encoder = target.replace("model.decoder.", "model.encoder.language_model.")
             names[encoder], specs[encoder] = name, spec
-    conditioning = {}
-    for name, leaf in flatten_dict(params["self_conditioning"], sep=".").items():
-        leaf = cast(jax.Array | np.ndarray, leaf)
-        module, kind = name.split(".")
-        target = f"model.decoder.self_conditioning.{module}.weight"
-        conditioning[target] = (leaf, kind)
-        shape = tuple(reversed(leaf.shape)) if kind == "kernel" else leaf.shape
-        specs[target] = jax.ShapeDtypeStruct(shape, leaf.dtype)
-    visual: Mapping[str, np.ndarray] = {}
+    leaves = {("params", "self_conditioning", *path): leaf
+              for path, leaf in flatten_dict(dict(params["self_conditioning"])).items()}
+    layouts = leaf_layouts(leaves, lambda path: f"model.decoder.self_conditioning.{path[-2]}.weight")
     if "conditioner" in params:
         if vision is None:
             tower = {collection: tree["conditioner"]["tower"] for collection, tree in variables.items()
@@ -332,19 +325,14 @@ def export_weights(
             vision = (_named(VISION_PREFIX, nested(gemma4_tower_layouts(tower), 1, "conditioner", "tower"))
                       + _named(PROJECTION_PREFIX, nested(gemma4_projector_layouts(projector),
                                                          1, "conditioner", "projector")))
-        from dew.interop.decoder_parts import layout_tensors
-
-        visual = layout_tensors({layout.name: layout for layout in vision}, variables)
-        specs.update(tensor_specs(visual))
+        layouts.update({layout.name: layout for layout in vision})
+    auxiliary = layout_tensors(layouts, variables)
+    specs.update(tensor_specs(auxiliary))
 
     def read(name: str) -> np.ndarray:
         if name in names:
             return decoded[names[name]]
-        if name in conditioning:
-            leaf, kind = conditioning[name]
-            value = np.asarray(leaf)
-            return np.ascontiguousarray(value.T if kind == "kernel" else value)
-        return visual[name]
+        return auxiliary[name]
 
     return LazyTensors(specs, read)
 
