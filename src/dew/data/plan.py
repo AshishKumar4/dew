@@ -19,6 +19,7 @@ import numpy as np
 
 from dew import _checkout
 from dew.data.sources.codec import content_fingerprint
+from dew.hashing import array_header
 from dew.records import JSON, json_value, record
 
 _log = logging.getLogger(__name__)
@@ -44,10 +45,11 @@ class Digest(Protocol):
 
 
 def array_digest(dtype: np.dtype, shape: Sequence[int]) -> Digest:
-    """The digest an array of `dtype` and `shape` is fingerprinted by, its header taken: its
-    elements' bytes follow in C order, whole (`fingerprint`) or page by page as a published plan
-    writes them (`generation._write_plan`), to the same hash."""
-    return hashlib.sha256(_canonical([dtype.str, list(shape)]))
+    """The digest an array of `dtype` and `shape` is fingerprinted by, its header taken
+    (`dew.hashing.array_header`, which tells apart dtypes of one byte layout): its elements' bytes
+    follow in C order, whole (`fingerprint`) or page by page as a published plan writes them
+    (`generation._write_plan`), to the same hash."""
+    return hashlib.sha256(array_header(dtype, shape))
 
 
 def fingerprint(value: JSON | Mapping[str, object] | np.ndarray) -> str:
@@ -400,7 +402,7 @@ class Plan:
     """A mixture's members, each what it reads and runs as one digest under its key, and its own
     stages under the empty key (`dew.data.analysis._member_manifests`): what a streamed mix's
     resume reads of a member that joined or left (`check`)."""
-    version: ClassVar[int] = 5
+    version: ClassVar[int] = 6
 
     def record(self) -> dict[str, JSON]:
         return {

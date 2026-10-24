@@ -1994,7 +1994,8 @@ def test_a_local_store_whose_producer_declared_other_bytes_is_refused(tmp_path):
 
 def _indexed_source(kind: str, root: Path):
     """A source of `kind` that streams its indexed records, and the shards (id, location, start,
-    stop, rows) its manifest names: the ids a cache keys rows by and a saved position counts into."""
+    stop, rows) its manifest names: the ids a cache keys rows by and a saved position counts into,
+    which name no directory a local store's fingerprint leaves out."""
     from token_support import write_token_corpus
 
     from dew.data.pipeline import Pack, Pipeline
@@ -2007,7 +2008,7 @@ def _indexed_source(kind: str, root: Path):
         import tensorflow_datasets as tfds
 
         path = str(Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0")
-        named = f"tfds:dew_images/None:None:all:{path}"
+        named = "tfds:dew_images/None:None:all"
         return TFDS("dew_images", path=path, split="all", shard_rows=8,
                     decoders={"image": tfds.decode.SkipDecoding()}), [
             (f"{named}:0", path, 0, 8, 8), (f"{named}:8", path, 8, 16, 8), (f"{named}:16", path, 16, 20, 4)]
@@ -2031,20 +2032,21 @@ def _indexed_source(kind: str, root: Path):
     corpus = write_token_corpus(root, np.tile(np.array([5, 255], np.uint16), 1030), eos_id=255)
     tokens = TokenFiles(corpus.train).provision()
     if kind == "tokens":
-        return tokens, [(f"{corpus.train}:train:0", corpus.train, 0, 1024, 1024),
-                        (f"{corpus.train}:train:1024", corpus.train, 1024, 1030, 6)]
+        return tokens, [("tokens:train:0", corpus.train, 0, 1024, 1024),
+                        ("tokens:train:1024", corpus.train, 1024, 1030, 6)]
     from dew.data.steps.windows import WindowSource
 
     windows = WindowSource(tokens, tokens.tokens, 4, 1)
-    named = f"{tokens.describe()} causal windows=4,stride=1"
-    return windows, [(f"{named}:0", named, 0, 1024, 1024), (f"{named}:1024", named, 1024, 2048, 1024),
-                     (f"{named}:2048", named, 2048, 2056, 8)]
+    described = f"{tokens.describe()} causal windows=4,stride=1"
+    return windows, [("windows=4,stride=1:0", described, 0, 1024, 1024),
+                     ("windows=4,stride=1:1024", described, 1024, 2048, 1024),
+                     ("windows=4,stride=1:2048", described, 2048, 2056, 8)]
 
 
 @pytest.mark.parametrize("kind", ["memory", "tfds", "tokens", "windows", "generation", "planned"])
 def test_an_indexed_source_streams_as_bounded_shards_of_its_records(tmp_path, kind):
-    """A source read by index streams as consecutive shards of its records, each named by its
-    store and first row; a shard reads that slice of the indexed records, and the manifest
+    """A source read by index streams as consecutive shards of its records, each named by what it
+    reads and its first row; a shard reads that slice of the indexed records, and the manifest
     pickles, reader and all, for Grain's worker processes."""
     source, expected = _indexed_source(kind, tmp_path)
     manifest = source.manifest()
