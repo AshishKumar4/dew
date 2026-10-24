@@ -299,16 +299,25 @@ def test_the_forward_is_on_par_under_every_hook_interpreted(hooks, dtype, natura
     _check_hooks(hooks, dtype, natural, interpret=True)
 
 
+PADDED_CALLS = {"one-query-default": (1, "default"), "one-query-accurate": (1, "accurate"),
+                "whole-padding-tile": (64, "default")}
+"""The padded calls' query counts and backward forms (`BACKWARD_FORMS`): one query, its tile mostly padding,
+in both forms; and a tile's worth of queries under two consumers, which pads to a pair of query tiles, its
+second wholly padding (the accurate form's one consumer pads 64 queries to no more)."""
+
+
 @INTERPRETS
-@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
-def test_padding_rows_reach_no_hook_gradient_interpreted(accurate):
-    """A call of one query and one key, padded to whole tiles, under a hook dividing by a query's
-    parameter and adding a head's: the padding rows' parameter is 0, so the hook is 0/0 there, and a
-    padding row that saw a key would carry its NaN into the head's gradient, a sum over the rows. Padding
-    rows see no key (`algebra.Forward.queries`), and every gradient is the reference's, the head's 0."""
-    spans = template.spans(1, 1, 1)
-    query, key, value = (jnp.zeros((1, 1, 1, 64), jnp.bfloat16) for _ in range(3))
-    dout = jnp.ones((1, 1, 1, 64), jnp.bfloat16)
+@pytest.mark.parametrize(("queries", "form"), PADDED_CALLS.values(), ids=PADDED_CALLS)
+def test_padding_rows_reach_no_hook_gradient_interpreted(queries, form):
+    """A call of `queries` queries over as many keys, padded to whole programs, under a hook dividing by a
+    query's parameter and adding a head's: the padding rows' parameter is 0, so the hook is 0/0 there, and a
+    padding row that saw a key would carry its NaN into the values' gradient and the head's, a sum over the
+    rows. Padding rows see no key, a tile's last ones or a whole tile of them (`algebra.Forward.queries`),
+    and every gradient is the reference's, the head's 0."""
+    spans = template.spans(queries, queries, 1)
+    query, key, value = (jnp.zeros((1, queries, 1, 64), jnp.bfloat16) for _ in range(3))
+    dout = jnp.ones((1, queries, 1, 64), jnp.bfloat16)
+    accurate, config = BACKWARD_FORMS[form]
 
     def score_mod(s, q_pos, k_pos, temperature, bias):
         del q_pos, k_pos
@@ -318,9 +327,9 @@ def test_padding_rows_reach_no_hook_gradient_interpreted(accurate):
         return template.Hooks(score_mod, (template.Param(temperature, template.Kind.QUERY),
                                           template.Param(bias, template.Kind.HEAD)))
 
-    params = (jnp.ones((1, 1, 1), jnp.float32), jnp.zeros((1,), jnp.float32))
+    params = (jnp.ones((1, 1, queries), jnp.float32), jnp.zeros((1,), jnp.float32))
     hooks = hooked(*params)
-    with _device(interpret=True):
+    with _device(interpret=True), _pinned(backward=config):
         residuals = attention_mosaic.forward(query, key, value, spans, hooks, residuals=True,
                                              interpret=True)[1:]
         grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
