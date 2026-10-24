@@ -485,7 +485,7 @@ def test_a_distillation_trains_for_a_count_of_its_students_tokens():
     objective, _ = fixture_objective(arrays)
     # The fixture's two rows on every data-parallel device.
     batch = {TEXT_KEY: jnp.tile(fixture_batch(arrays)[TEXT_KEY], (max(1, jax.device_count() // 2), 1))}
-    tokens = int(np.sum(objective.student.real_lengths(batch)))
+    tokens = int(np.sum(objective.student.scored_tokens(batch)))
     distilled = Trainer(objective, optax.sgd(0.0), key=0).fit(fixed(batch), tokens=3 * tokens, log_every=1)
     alone = Trainer(objective.student, optax.sgd(0.0), key=0).fit(fixed(batch), tokens=3 * tokens,
                                                                   log_every=1)
