@@ -13,7 +13,7 @@ from typing import ClassVar, Protocol
 import grain.python as grain
 import numpy as np
 
-from dew.data.dataset import Batch
+from dew.batch import Batch
 from dew.data.pipeline import Windows
 from dew.data.sources.base import Read, Rows, ShardManifest, View, _indexed_manifest
 from dew.data.sources.tokens import TokenFiles

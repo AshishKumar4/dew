@@ -210,7 +210,7 @@ import json, sys
 import jax, jax.numpy as jnp, numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 from dew.checkpoints import Checkpoints
-from dew.objectives.base import FROZEN
+from dew.batch import FROZEN
 from dew.training import MeshSpec
 
 mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])

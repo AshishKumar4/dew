@@ -18,17 +18,17 @@ A parameter that no declaration names (a convolution, a state matrix, a
 projection with no side worth naming) gets the shape heuristic, which
 places it on its largest divisible axis.
 
-This module also defines the mesh axis names and the functions that read
-the mesh in context: `pipeline_stages` for the decoder's stage count,
-`microbatches` for the schedule the trainer sets in context around its
-compiled step, `sequence_shards` for how many ways attention and the Mamba-2
-mixer split a sequence, `row_axes` for the axes their `shard_map`s split
-rows over, and `manual_map` for those maps.
+This module also defines the functions that read the mesh in context:
+`pipeline_stages` for the decoder's stage count, `microbatches` for the
+schedule the trainer sets in context around its compiled step,
+`sequence_shards` for how many ways attention and the Mamba-2 mixer split a
+sequence, and `manual_map` for their `shard_map`s, whose rows split over the
+axes `dew.mesh.row_axes` names.
 
-`DEFAULT_RULES` maps the logical names onto the mesh, for parameters and
-activations alike. `logical_spec` reads it (or the rules a layout sets in
-context) to place a parameter or an activation, and `constrain` applies that
-placement to an activation.
+The mesh's axis names, the rule table that maps the logical names onto them
+(`dew.mesh.DEFAULT_RULES`, for parameters and activations alike) and the spec
+it gives an array (`dew.mesh.logical_spec`) are `dew.mesh`'s, below the models
+and the data; `constrain` applies that spec to an activation.
 """
 
 from __future__ import annotations

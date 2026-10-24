@@ -10,7 +10,8 @@ from typing import TYPE_CHECKING
 import grain.python as grain
 import numpy as np
 
-from dew.data.dataset import Batch, Closeable, Records
+from dew.batch import Batch
+from dew.data.dataset import Closeable, Records
 from dew.data.pipeline import Dataset
 from dew.records import record
 

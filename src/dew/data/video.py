@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 import grain.python as grain
 import numpy as np
 
-from dew.data.dataset import Batch
+from dew.batch import Batch
 from dew.data.facts import shaped
 from dew.data.images import resized_to
 from dew.data.pipeline import Rejected

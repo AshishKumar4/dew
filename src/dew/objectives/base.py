@@ -1602,11 +1602,8 @@ def token_log_probs(logits: jax.Array, tokens: jax.Array) -> jax.Array:
     return -optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), tokens)
 
 __all__ = [
-    "FROZEN",
     "OMITTED",
-    "VALID_ROWS",
     "Aux",
-    "Batch",
     "EMASpec",
     "Metric",
     "Objective",
@@ -1622,11 +1619,9 @@ __all__ = [
     "Step",
     "TrainingScalar",
     "TrainingScalars",
-    "Variables",
     "everything",
     "freeze",
     "joined",
-    "merge",
     "model_rngs",
     "part",
     "select",

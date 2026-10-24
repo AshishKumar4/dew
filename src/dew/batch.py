@@ -76,7 +76,10 @@ batch the objective sees."""
 def padded_rows(rows: int, count: int) -> tuple[np.ndarray, np.ndarray]:
     """The rows `count` places hold of `rows` real ones, cycling through them, and which places hold
     a repeat: the rule a batch filled out with its own rows (`dew.data.dataset.FilledBatch`) and a
-    request's rows padded to its devices (`dew.nn.inputs.RowPlan`) both follow."""
+    request's rows padded to its devices (`dew.nn.inputs.RowPlan`) both follow. Places to fill from
+    no rows are refused: there is nothing to repeat."""
+    if count and not rows:
+        raise ValueError(f"{count} places can't repeat rows of none")
     places = np.arange(count)
     return places % rows, places >= rows
 
