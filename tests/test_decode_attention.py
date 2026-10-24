@@ -12,7 +12,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from attention_oracle import attention_terms, exact_attention, float64_weights
-from reference_error import assert_as_exact_as_the_reference, assert_fp32_reduction_bound
+from reference_error import (
+    FEWEST_SEEDS,
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    assert_fp32_reduction_bound,
+)
 
 from dew.nn.attention import attention_case, scaled_dot_product_attention, with_key_lengths
 from dew.nn.attention_kernels import DECODE, kernel_refusals
@@ -157,6 +162,20 @@ def grouped_case(dtype):
     return query, key, value, lengths
 
 
+def grouped_draw(dtype):
+    """`grouped_case`'s shapes drawn afresh by seed, check 1's draws: its queries, keys and values (the keys
+    at its 0.3 scale) over its rows' lengths."""
+    (query, key, _, _) = grouped_case(dtype)
+
+    def draw(seed):
+        rng = np.random.default_rng(1000 + seed)
+        return (jnp.asarray(rng.normal(size=query.shape), dtype),
+                jnp.asarray(rng.normal(size=key.shape) * 0.3, dtype),
+                jnp.asarray(rng.normal(size=key.shape), dtype))
+
+    return draw
+
+
 @pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
 @pytest.mark.parametrize("hooks", [{"sinks": True}, {"softcap": True}, {"sinks": True, "softcap": True}],
                          ids=["sinks", "softcap", "both"])
@@ -169,7 +188,8 @@ def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, ho
     attention over the same keys, against float64 (`exact_attention`). The idle row of one key keeps
     its sink's share. The dispatch takes such a call to the decode kernel where it runs (`decodes`),
     and the tuner times its launch on the sinks too (`timed`). In both forms of the exponent, the fold
-    and the accurate one (`natural`)."""
+    and the accurate one (`natural`); each config held to check 1 over fresh draws of the case's shapes
+    (`grouped_draw`)."""
     from tuned import each_config, launches, timed
 
     from dew.nn.attention import reference_attention
@@ -185,12 +205,15 @@ def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, ho
         assert decodes(case)
         assert kernel_refusals(DECODE, "decode", case) == [] or not ON_GPU
     read = spanned(jnp.zeros_like(lengths), lengths, key.shape[1])
-    with jax.enable_x64(new_val=True):
-        wide = [None if x is None else jnp.asarray(np.asarray(x, np.float64))
-                for x in (query, key, value, sinks)]
-        truth = np.asarray(exact_attention(*wide, softcap=softcap, mask=read))
-    with jax.default_matmul_precision("float32"):
-        plain = reference_attention(query, key, value, mask=jnp.asarray(read), sinks=sinks, softcap=softcap)
+
+    def reference(query, key, value):
+        with jax.default_matmul_precision("float32"):
+            return reference_attention(query, key, value, mask=jnp.asarray(read), sinks=sinks,
+                                       softcap=softcap)
+
+    def truth(query, key, value):
+        wide = None if sinks is None else jnp.asarray(np.asarray(sinks, np.float64))
+        return exact_attention(query, key, value, wide, softcap=softcap, mask=read)
 
     def attend(query, key, value, lengths):
         return decode_attention.attend(query, key, value, lengths, softcap=softcap, sinks=sinks,
@@ -203,12 +226,17 @@ def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, ho
         assert np.asarray(timed(launch), np.float32).shape[-1] == key.shape[-1]
     assert len(found) > 1
     for config in found:
-        pin = tuning.pinned({decode_attention.DecodeAttention: config})
-        with on_the_gpu(), pin, jax.default_matmul_precision("default"):
-            out = jax.jit(attend)(*arrays)
-        assert out.shape == plain.shape and out.dtype == plain.dtype
-        assert_as_exact_as_the_reference(np.asarray(out, np.float32), np.asarray(plain, np.float32), truth,
-                                         f"decode kernel with {sorted(hooks)}, natural {natural}, {config}")
+        def pinned(query, key, value, config=config):
+            pin = tuning.pinned({decode_attention.DecodeAttention: config})
+            with pin, jax.default_matmul_precision("default"):
+                return attend(query, key, value, lengths)
+
+        with on_the_gpu():
+            out = jax.jit(pinned)(query, key, value)
+            assert out.shape == reference(query, key, value).shape and out.dtype == query.dtype
+            assert_as_exact(jax.jit(pinned), jax.jit(reference), grouped_draw(dtype),
+                            f"decode kernel with {sorted(hooks)}, natural {natural}, {config}",
+                            seeds=FEWEST_SEEDS, truth_fn=truth)
 
 
 @pytest.mark.parametrize("softcap", [None, SOFTCAP], ids=["plain", "softcap"])
