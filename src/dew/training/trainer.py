@@ -129,6 +129,7 @@ from dew.training.distributed import (
     microbatch_shapes,
     placed_bytes,
     placed_held,
+    placed_shapes,
     prefetched_bytes,
     resumed_link_figures,
     ruled,
@@ -660,15 +661,19 @@ class Trainer(Generic[Loss, Effects]):
 
     def check(self, variables: Variables, placement: Placement[Variables]) -> None:
         """`Layout.check` of `variables` placed by `placement`, read as the
-        layout placed them: in the axes the modules box, and a CPU-owned
-        run's frozen banks as their layers (`dew.inference.banks.spread`)."""
-        from dew.inference.banks import row_sharding, shape_rows, spread
-        if self.host_master and FROZEN in variables:
-            variables = {**variables, FROZEN: spread(variables[FROZEN], shape_rows)}
-            placement = {**placement, FROZEN: spread(
-                placement[FROZEN], lambda sharding, count: [row_sharding(sharding)] * count)}
+        layout placed them (`_laid_out`), in the axes the modules box."""
         with self._declared():
-            self.layout.check(variables, placement, self.device_mesh)
+            self.layout.check(*self._laid_out(variables, placement), self.device_mesh)
+
+    def _laid_out(self, variables: Variables, placement: Placement[Variables]
+                  ) -> tuple[Variables, Placement[Variables]]:
+        """`variables` placed by `placement` as the layout placed them, a
+        CPU-owned run's frozen banks as their layers (`dew.inference.banks.spread`)."""
+        from dew.inference.banks import row_sharding, shape_rows, spread
+        if not (self.host_master and FROZEN in variables):
+            return variables, placement
+        return {**variables, FROZEN: spread(variables[FROZEN], shape_rows)}, {**placement, FROZEN: spread(
+            placement[FROZEN], lambda sharding, count: [row_sharding(sharding)] * count)}
 
     def _shardings(self, state: TrainState) -> Placement[TrainState]:
         mesh = self.state_mesh
@@ -732,31 +737,26 @@ class Trainer(Generic[Loss, Effects]):
             with self._traced_on(self.device_mesh) as schedule:
                 _, _, state = self._prepared(state, microbatch_shapes(device, split), schedule,
                                              split * self.accumulation)
-        return self._validated(state, capacity)[2]
+        return self._validated(state, capacity)[1]
 
     def _validated(self, abstract: TrainState, capacity: int | None = None
-                   ) -> tuple[Placement[TrainState], TrainState, Validation]:
-        """`abstract`'s placement, the state as shapes that carry it (a restore's template) and
-        what `Layout.validate` reads of those, once every refusal before a placement passed: a
-        float the devices cannot hold, a layout that replicates too much and a state over a
+                   ) -> tuple[Placement[TrainState], Validation]:
+        """`abstract`'s placement and what `Layout.validate` reads of the state it places, laid
+        out as the layout placed it (`_laid_out`), once every refusal before a placement passed:
+        a float the devices cannot hold, a layout that replicates too much and a state over a
         device's memory, which every process agrees, each reading its own devices'."""
         refuse_wide_floats(abstract, self.device_mesh)
         shardings = self.shardings(abstract)
-        self.check(abstract.variables, shardings.variables)
-        if self.host_master and FROZEN in abstract.variables:
-            abstract = dataclasses.replace(abstract, variables={
-                **abstract.variables, FROZEN: self._banked_frozen(
-                    abstract.variables[FROZEN],
-                    lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype))})
-        template = jax.tree.map(
-            lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
-            abstract, shardings)
+        variables, placement = self._laid_out(abstract.variables, shardings.variables)
+        laid_out = placed_shapes(dataclasses.replace(abstract, variables=variables),
+                                 dataclasses.replace(shardings, variables=placement))
         with self._declared():
+            self.layout.check(variables, placement, self.device_mesh)
             validation = agreed("state placement", functools.partial(
-                self.layout.validate, self.device_mesh, template, capacity=capacity))
+                self.layout.validate, self.device_mesh, laid_out, capacity=capacity))
         _log.info("the state holds %.2f GiB on its fullest device between steps",
                   max(validation.device_bytes.values()) / 2 ** 30)
-        return shardings, template, validation
+        return shardings, validation
 
     @ruled
     def place(self) -> tuple[TrainState, Placement[TrainState], bytes | None]:
@@ -777,14 +777,19 @@ class Trainer(Generic[Loss, Effects]):
         # another's: every process resumes from one step or none does.
         resume = None if checkpoints is None else agreed_same("newest checkpoint", lambda: checkpoints.latest)
         if checkpoints is None or resume is None:
-            shardings, _, _ = self._validated(abstract)
+            shardings, _ = self._validated(abstract)
             if self.host_master:
                 return self._placed_host(initializer, key, shardings), shardings, None
             held = placed_held(initializer, abstract.variables, shardings.variables, self.device_mesh)
             return taking_over(self.initial_state, *held, shardings)(key), shardings, None
         abstract = dataclasses.replace(abstract, accumulation=checkpoints.accumulation_template(resume))
-        shardings, template, _ = self._validated(abstract)
-        state, position = checkpoints.restore(template, resume,
+        shardings, _ = self._validated(abstract)
+        if self.host_master and FROZEN in abstract.variables:
+            abstract = dataclasses.replace(abstract, variables={
+                **abstract.variables, FROZEN: self._banked_frozen(
+                    abstract.variables[FROZEN],
+                    lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype))})
+        state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume,
                                               share=DataPartition.of(self.device_mesh))
         if self._config is not None:
             # The rate this run configures, not the one its checkpoint holds.
@@ -1258,8 +1263,7 @@ class Trainer(Generic[Loss, Effects]):
         micro = microbatch_shapes(batch, split)
         shapes, copies, prepared = self._prepared(state, micro, schedule, split * self.accumulation)
         shardings = self.shardings(prepared)
-        prepared = jax.tree.map(
-            lambda x, s: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=s), prepared, shardings)
+        prepared = placed_shapes(prepared, shardings)
         # The check reads the state's arguments as already on the devices. The copies and accumulators
         # `run` builds on the first call are not yet, so they count with the prefetched batches beside
         # the step, a ramp stage's window too, which `run` builds beside the last, already resident.
@@ -1335,8 +1339,7 @@ class Trainer(Generic[Loss, Effects]):
             placement = batch_shardings(mesh, batch)
             replicated = NamedSharding(mesh, P())
             jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
-            placed = [jax.tree.map(lambda x, s: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=s), tree, at)
-                      for tree, at in ((prepared, shardings), (batch, placement))]
+            placed = [placed_shapes(tree, at) for tree, at in ((prepared, shardings), (batch, placement))]
             return jitted.trace(*placed, jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)).lower(
                 lowering_platforms=('cuda',))
 

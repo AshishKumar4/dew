@@ -950,7 +950,7 @@ class Layout:
             shard = sharding.shard_shape(leaf.shape)
             leaves[_variable_path(path)] = LeafPlacement(sharding.spec, shard, kind)
             if kind == "device":
-                held.append((_variable_path(path[:1]), sharding.mesh, shard_bytes(leaf)))
+                held.append((_variable_path(path[:1]), sharding.mesh, _shard_bytes(leaf)))
         meshes = collections.Counter()
         for _, on, size in held:
             meshes[on] += size
@@ -1247,7 +1247,7 @@ def _without_state_axes(entry: MeshAxes) -> MeshAxes:
     return kept if kept else None
 
 
-def shard_bytes(leaf) -> int:
+def _shard_bytes(leaf) -> int:
     """The bytes each device its sharding places it on holds of `leaf`, an
     array or an abstract one that carries its sharding."""
     return math.prod(leaf.sharding.shard_shape(np.shape(leaf))) * leaf.dtype.itemsize
@@ -1256,7 +1256,14 @@ def shard_bytes(leaf) -> int:
 def placed_bytes(tree) -> int:
     """The bytes a device holds of `tree`'s arrays, each laid out as its
     sharding places it (abstract arrays carry their sharding)."""
-    return sum(map(shard_bytes, jax.tree.leaves(tree)))
+    return sum(map(_shard_bytes, jax.tree.leaves(tree)))
+
+
+def placed_shapes[TreeT](tree: TreeT, placement: Placement[TreeT]) -> TreeT:
+    """`tree`'s arrays as their shapes, each carrying where `placement` puts it: what a
+    lowering, a restore and `Layout.validate` read of a state not yet placed."""
+    return jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype,
+                                                                    sharding=sharding), tree, placement)
 
 
 def placed_held[Held](held: Held, variables: Variables, shardings: Placement[Variables],
@@ -1318,9 +1325,7 @@ def prefetched_bytes(batch: Batch, shardings: Placement[Batch], depth: int = PRE
     (`fit(device_prefetch=)`) and the one it is placing, each laid out as
     `shardings` places `batch`.
     """
-    placed = jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype,
-                                                                      sharding=sharding), batch, shardings)
-    return (depth + 1) * placed_bytes(placed)
+    return (depth + 1) * placed_bytes(placed_shapes(batch, shardings))
 
 
 class DevicePrefetchIterator:
