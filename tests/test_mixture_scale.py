@@ -171,3 +171,19 @@ def test_a_thousand_source_mixture_resumes_where_it_stopped(stop):
         assert ids(resumed, 20) == expected
     finally:
         resumed.close()
+
+
+def test_a_thousand_source_selection_reads_in_order_what_each_position_reads_alone():
+    """Read one position after another, a mixture's selection reads runs of positions at once; it
+    reads what each position reads alone, Grain's order, and a position reached out of order (a
+    resume, a seek) reads the same, before and after a run."""
+    from dew.data.mixing import Proportions, ProportionalSelection
+
+    weights = [float(tag % 7 + 1) for tag in range(SOURCES)]
+    lengths = [10**6] * SOURCES
+    selection = ProportionalSelection(lengths, weights)
+    proportions = Proportions.of(weights)
+    ordered = [selection[index] for index in range(10_000)]
+    assert ordered == [proportions.at(index) for index in range(10_000)]
+    for index in (123_456, 7, 9_999, 50_000, 50_001, 3):
+        assert selection[index] == proportions.at(index)
