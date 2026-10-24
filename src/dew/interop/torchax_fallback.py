@@ -372,7 +372,8 @@ def _forward(model: PreTrainedModel, tokens: torch.Tensor) -> tuple[torch.Tensor
 class TorchCausalLM(nn.Module):
     """A transformers causal LM as a Flax module, run by torchax.
 
-    `apply(variables, tokens)` returns fp32 logits. The variables are the
+    `apply(variables, tokens)` returns logits in at least float32, a float64
+    model's in float64 (`at_least_fp32`). The variables are the
     source's own tensors under their torch names, `params` and `buffers`;
     `init` has no initializer to draw from, so the module starts from the
     loaded variables only. Floating parameters are cast to `dtype` for the
