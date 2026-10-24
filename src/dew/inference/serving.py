@@ -80,7 +80,7 @@ from jax.experimental import checkify
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike
 
-from dew.hashing import array_fingerprint
+from dew._hashing import array_fingerprint
 from dew.inference.engine import Timed, normalized, reloaded, settled
 from dew.inference.pages import Pages
 from dew.inference.projections import pack_projections, packed_layout

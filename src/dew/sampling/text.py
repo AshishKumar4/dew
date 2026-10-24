@@ -32,7 +32,7 @@ from jax.experimental import checkify
 from jax.typing import ArrayLike
 from typing_extensions import TypeVar
 
-from dew.hashing import array_fingerprint
+from dew._hashing import array_fingerprint
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import (
     ModelInputs,
@@ -771,7 +771,7 @@ def _stable(value: object, seen: frozenset[int] = frozenset()) -> Identity:
 
 
 def _hashed(value: np.ndarray | np.generic | jax.Array) -> str:
-    """An array's dtype, shape and contents, fingerprinted (`dew.hashing.array_fingerprint`)."""
+    """An array's dtype, shape and contents, fingerprinted (`dew._hashing.array_fingerprint`)."""
     digest = hashlib.sha256()
     array_fingerprint(digest, np.asarray(value))
     return digest.hexdigest()

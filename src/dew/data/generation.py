@@ -54,7 +54,7 @@ ROW_PAGE = 4096
 """The dense rows a generation's row index holds in each of its pages (`index/rows-*.json`)."""
 GENERATION_SCHEMA = 2
 """How a generation's manifest and a fill's segments name inputs and digests: by the shards' places,
-which a store mounted elsewhere keeps, and arrays by their dtypes' names (`dew.hashing.array_header`),
+which a store mounted elsewhere keeps, and arrays by their dtypes' names (`dew._hashing.array_header`),
 since 2. Another schema's is refused, not read under names it was not written with."""
 
 

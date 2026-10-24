@@ -12,7 +12,7 @@ from pathlib import Path
 import jax
 import numpy as np
 
-from dew.hashing import array_fingerprint
+from dew._hashing import array_fingerprint
 from dew.inference.rollouts import Draw
 from dew.objectives.base import Variables
 
