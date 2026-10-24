@@ -342,7 +342,7 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
             out, history, final = token(mixed, conv_state.value, held.value)
             conv_state.value = history.astype(conv_state.value.dtype)
             held.value = final.astype(held.value.dtype)
-            return checkpoint_name(out, 'scan')
+            return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
     valid = coordinates.valid
     mixed, history = held_conv1d(mixed, taps, valid,
                                  None if conv_state is None else conv_state.value.astype(mixed.dtype),
@@ -354,8 +354,9 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
                       held=None if held is None else held.value)
     if held is not None:
         held.value = final.astype(held.value.dtype)
-    # The scan's output (a remat policy's `RESIDUALS`).
-    return checkpoint_name(out, 'scan')
+    # The scan's output under both names a remat policy reads it by (`RESIDUALS`): a mixer's
+    # 'context', as MaxText's recipes keep it, and the 'scan' only a recurrence marks.
+    return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
 
 
 def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None, parts=None, dtype=None):

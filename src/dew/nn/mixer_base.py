@@ -33,9 +33,9 @@ DELTA_RESIDUALS = ('delta_decay', 'delta_inverse', 'delta_memory')
 RESIDUALS = (*ATTENTION_RESIDUALS, 'context', 'scan', 'conv', *DELTA_RESIDUALS, *MLP_RESIDUALS)
 """The values a block names as it runs, each after the projection that
 produced it: `kv_proj` is latent attention's fused `kv_b_proj`, `context`
-the attention kernel's output before `o_proj`, `scan` a recurrence's (an
-SSM's or a delta rule's) output before its gate and `o_proj`, which a
-backward that drops it recomputes by running the scan again, `conv` a
+a mixer's output before `o_proj`, the attention kernel's or a recurrence's,
+`scan` a recurrence's (an SSM's or a delta rule's) alone, which a backward
+that drops it recomputes by running the scan again, `conv` a
 linear-attention or SSM mixer's short conv output (`causal_conv1d`,
 its queries, keys and values for a delta rule), `delta_decay`,
 `delta_inverse` and `delta_memory` the rule's cumulated decay, chunk inverse
@@ -45,8 +45,9 @@ and the routed experts alike. A remat policy picks from these; a
 name off the list is a typo that would otherwise recompute silently."""
 ATTENTION_CONTEXT_RESIDUALS = (*ATTENTION_RESIDUALS, 'context')
 """An attention mixer's names, its projections and its context."""
-DELTA_RULE_RESIDUALS = ('scan', 'conv', *DELTA_RESIDUALS)
-"""A delta-rule mixer's names: its scan's output, its convolution's output, the delta rule's three."""
+DELTA_RULE_RESIDUALS = ('context', 'scan', 'conv', *DELTA_RESIDUALS)
+"""A delta-rule mixer's names: its scan's output as its context and as a scan, its convolution's output,
+the delta rule's three."""
 
 
 @dataclasses.dataclass(frozen=True)
