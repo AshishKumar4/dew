@@ -233,15 +233,15 @@ The local process-pool tests run real `jax.distributed` processes. They do not c
 
 ## Checking a distributed run
 
-Before booking the GPUs, read what the run would hold on them. On a CPU host, start Python with as many simulated devices as the run has GPUs (`XLA_FLAGS=--xla_force_host_platform_device_count=8`, set before JAX starts), build the trainer as the run will, and validate it against the memory each GPU's allocator will have, 95% of the GPU in a training process:
+Before booking the GPUs, read what the run would hold on them. On a CPU host, start Python with as many simulated devices as the run has GPUs, as this page's first block does (`XLA_FLAGS=--xla_force_host_platform_device_count=8`, set before JAX starts). Build the trainer as the run will, and validate it with one global batch against the memory each GPU's allocator will have, 95% of the GPU in a training process. Here the run is the model above on eight 80 GB H100s, pooling four steps into each update:
 
 ```python
-trainer = Trainer(LMObjective(model, seq_len=4096), optax.adamw(1e-5), key=0,
+trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(rate=1e-3), key=0,
                   mesh=MeshSpec(fsdp=8), accumulation=4)
-report = trainer.validate(batch, capacity=int(0.95 * 80e9))  # one global batch; an 80 GB H100
-for path, leaf in report.leaves.items():
-    print(path, leaf.spec, leaf.shard_shape, leaf.memory_kind)
-print(max(report.device_bytes.values()) / 2**30, "GiB a device", report.collectives, report.unbound)
+report = trainer.validate({"text": rows}, steps=400, capacity=int(0.95 * 80e9))
+print(report.leaves["variables/params/layers_0/mlp/up_proj/kernel"])
+print(max(report.device_bytes.values()), "bytes on the fullest device")
+print(report.batch_axes, report.collectives, report.unbound)
 ```
 
 `validate` places nothing. It reports each leaf's split and the part each device holds, the bytes each device keeps between steps (parameters, optimizer state, EMA and the gradient accumulator), the axes a batch's rows split over, the collectives a step runs over each mesh axis (an all-gather and a reduce-scatter over `fsdp`, an all-reduce over `tensor` and over the data axes), and the logical axes your rules leave unnamed, whose dimensions stay whole on every device (a parameter none of whose axes a rule names takes the shape heuristic). It raises `LayoutRefused` when that state alone is over a device's `capacity`. On the GPUs themselves `fit` runs the same check against each GPU's allocator limit before it places anything, and the plan's fit check counts the accumulator and copies a step adds before it builds them; `trainer.validation` then holds the report of the plan the run takes. The step's activations and other temporaries come on top; the plan checks them against the compiled step on the GPU. A CPU host builds no narrow copies, the bf16 copies a GPU step reads of fp32 parameters, so it leaves out their 2 bytes a parameter.
