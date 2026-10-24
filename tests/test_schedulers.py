@@ -506,3 +506,27 @@ def test_a_karras_schedule_keeps_a_float64_runs_times_in_float64(schedule):
         narrow = schedule.sigmas(jnp.asarray(t, jnp.float32))
         assert narrow.dtype == jnp.float32
         assert not np.array_equal(np.asarray(sigma), np.asarray(narrow, np.float64))
+
+
+T_OF_SIGMA_SEEDS = 8
+"""Check 1's declared seeds for the EDM schedule's time of a sigma, sized by `seeds_for`."""
+
+
+def test_the_edm_schedules_time_of_a_sigma_is_on_par_with_its_correctly_rounded_quotient():
+    """An EDM1 schedule's time of a sigma, the centred log-sigma over P_std = 1.2, is on par with the
+    same quotient correctly rounded in float32 (check 1, float64 the truth), however XLA lowers its
+    division by the constant."""
+    from reference_error import assert_as_exact
+
+    schedule = EDMNoiseScheduler(P_mean=-1.2, P_std=1.2)
+    t_of_sigma = jax.jit(schedule.t_of_sigma)
+
+    def draw(seed):
+        return (np.exp(np.random.default_rng(seed).normal(-1.2, 1.2, 4096)).astype(np.float32),)
+
+    def reference(sigma):
+        centred = np.log(sigma.astype(np.float64)).astype(sigma.dtype) - sigma.dtype.type(-1.2)
+        return centred / sigma.dtype.type(1.2)
+
+    assert_as_exact(t_of_sigma, reference, draw, "EDM t_of_sigma", seeds=T_OF_SIGMA_SEEDS)
+
