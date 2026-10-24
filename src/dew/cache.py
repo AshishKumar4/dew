@@ -10,7 +10,6 @@ import functools
 import importlib.metadata
 import os
 import sys
-import uuid
 from collections.abc import Callable
 
 import jax
@@ -258,17 +257,7 @@ def persist_compilations() -> None:
 
 @functools.cache
 def _shared_by_pool(directory: str) -> bool:
-    """Whether every process of the pool reads `directory` as one: a mark process 0 writes there
-    is one each of them finds, over the coordination service (`from_every_process`)."""
-    from dew.coordination import broadcast_from_process_zero, from_every_process
+    """Whether every process of the pool reads `directory` as one (`seen_by_every_process`)."""
+    from dew.coordination import seen_by_every_process
 
-    mark = os.path.join(directory, f".dew-pool-{broadcast_from_process_zero(uuid.uuid4().hex)}")
-    if jax.process_index() == 0:
-        os.makedirs(directory, exist_ok=True)
-        with open(mark, "w"):
-            pass
-    from_every_process(None)  # every process looks once the mark is written
-    found = from_every_process(os.path.exists(mark))
-    if jax.process_index() == 0:
-        os.remove(mark)
-    return all(found)
+    return all(seen_by_every_process(directory))
