@@ -421,7 +421,7 @@ class Pretrained:
             loaded = _load_composite_source(reference, directory, composite,
                                             placed=placed, streaming=streaming or not weights, dtype=dtype,
                                             param_dtype=param_dtype, attention_impl=attention_impl,
-                                            max_seq_len=max_seq_len)
+                                            max_seq_len=max_seq_len, weights=weights)
         elif fallback is not None:
             from dew.interop import torchax_fallback
 
@@ -452,6 +452,8 @@ class Pretrained:
         if not weights:
             loaded = loaded.map_variables(lambda tree: jax.tree.map(
                 lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), tree))
+        elif on_host:
+            loaded = loaded.map_variables(lambda tree: jax.tree.map(np.asarray, tree))
         elif not streaming and not on_host:
             loaded = loaded.map_variables(on_default_device)
         return loaded
@@ -1371,7 +1373,7 @@ def _composite_description(directory: Path) -> CompositeSource | None:
 def _load_composite_source(source: sources.SourceReference, root: Path,
                            description: CompositeSource, *, placed: Callable[[Variables], Variables],
                            streaming: bool, dtype: str, param_dtype: str, attention_impl: str,
-                           max_seq_len: int | None) -> Pretrained:
+                           max_seq_len: int | None, weights: bool) -> Pretrained:
     """Materialize the described components through the native backbone and tensor-map owners.
     All Hub paths remain relative to the resolved snapshot root, including a selected subfolder."""
     from dew.interop.streaming import materialize
@@ -1396,21 +1398,43 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
             placed=placed, streaming=streaming, dtype=dtype, param_dtype=param_dtype,
             attention_impl=attention_impl, max_seq_len=max_seq_len)
     head_source = description.head
+    missing = False
     if head_source.weight_file is None:
         head_tensors = {name: tensor for name, tensor in shared.items() if not name.startswith(prefix)}
     else:
-        head_tensors = sources.tensor_file(source.file(root, head_source.weight_file))
-    head = head_source.build(backbone, dtype, attention_impl)
-    params, _ = record_layouts("", decoder_parts.split_packed(head_tensors, head_source.packed),
-                               head_source.path, (), param_dtype=param_dtype, lazy=True)
-    if head_source.reshape is not None:
-        params = head_source.reshape(head, params)
-    if not streaming:
-        params = materialize(params)
+        path = (source.file(root, head_source.weight_file) if head_source.initialize is None
+                else source.optional_file(root, head_source.weight_file))
+        missing = path is None
+        head_tensors = {} if path is None else sources.tensor_file(path)
+    head = head_source.build(backbone, dtype, attention_impl,
+                             shapes=None if missing else {name: tensor.shape
+                                                          for name, tensor in head_tensors.items()})
+    if missing:
+        if backbone is None or head_source.initialize is None:
+            raise ValueError("initializing a missing readout requires its backbone and initializer")
+        initialize = head_source.initialize
+
+        def drawn(variables):
+            return initialize(head, replace(backbone, variables=variables))
+
+        if weights:
+            variables = drawn(backbone.variables)
+        else:
+            shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype),
+                                   backbone.variables)
+            variables = jax.eval_shape(drawn, shapes)
+    else:
+        params, _ = record_layouts("", decoder_parts.split_packed(head_tensors, head_source.packed),
+                                   head_source.path, (), param_dtype=param_dtype, lazy=True)
+        if head_source.reshape is not None:
+            params = head_source.reshape(head, params)
+        if not streaming:
+            params = materialize(params)
+        variables = {"params": params}
     if backbone is None:
-        return Pretrained(head, placed({"params": params}), None, {}, directory,
+        return Pretrained(head, placed(variables), None, {}, directory,
                           record_fields(head, type(head)), revision=source.revision)
-    return description.bundle(backbone, head, placed({"params": params}), directory,
+    return description.bundle(backbone, head, placed(variables), directory,
                               description.tokenizer_folder, **description.fields)
 
 

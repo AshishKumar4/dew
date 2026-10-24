@@ -2,14 +2,20 @@
 
 import dataclasses
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal
+
+import jax
+import jax.numpy as jnp
+from flax import linen as nn
 
 from dew import records
 from dew.data.text import HFTokenizer
 from dew.interop.composite import CompositeSource, HeadComponent, NativeComponent, SourceKind
 from dew.interop.pretrained import Pretrained
-from dew.registry import dtype_name, import_path, to_record
+from dew.objectives.base import Variables
+from dew.registry import dtype_name, from_record, import_path, to_record
 
 from .calibration import Calibration
 from .head import Head, LabelReadout, SlotReadout
@@ -42,6 +48,11 @@ def _path(name: str) -> tuple[str, ...] | None:
     return {"slot": ("slots",), "q.weight": ("q",), "k.weight": ("k",)}.get(name)
 
 
+def _initialize(head: nn.Module, backbone: Pretrained) -> Variables:
+    return DecisionModel(backbone.model, from_record(Head, head)).initialize_head(
+        jax.random.key(0), backbone.variables, jnp.zeros((1, 1), jnp.int32))
+
+
 def _labels(tokenizer: HFTokenizer, count: int) -> tuple[Labels, tuple[tuple[int, ...], ...]]:
     """The release requires every bare letter to round-trip as one token, then admits all pairs
     together or none, as its engine's `_verify_slots` does."""
@@ -58,12 +69,25 @@ def _labels(tokenizer: HFTokenizer, count: int) -> tuple[Labels, tuple[tuple[int
 
 @dataclasses.dataclass(frozen=True)
 class SlotHeadSource(HeadComponent):
-    def build(self, backbone: Pretrained | None, dtype: str, attention_impl: str) -> Head:
+    def build(self, backbone: Pretrained | None, dtype: str, attention_impl: str, *,
+              shapes: Mapping[str, tuple[int, ...]] | None) -> Head:
         if backbone is None:
             raise ValueError("a slot readout needs its native backbone")
         width, compute = DecisionModel.head_size(backbone.model)
         held = records.record(self.record, "head")
-        fields = records.record(held["fields"], "head.fields")
+        fields = dict(records.record(held["fields"], "head.fields"))
+        if self.initialize is not None:
+            labels = records.listed(fields["label_ids"], "label_ids", read=records.integer)
+            if shapes is None:
+                fields["slot_rows"] = len(labels)
+            else:
+                if set(shapes) != {"slot", "q.weight", "k.weight"}:
+                    raise ValueError("a stored slot head holds slot, q.weight and k.weight")
+                slot, query, key = (shapes[name] for name in ("slot", "q.weight", "k.weight"))
+                if (len(slot) != 2 or slot[1] != width or slot[0] < len(labels) or len(query) != 2
+                        or query[1] != width or query[0] < 1 or key != query):
+                    raise ValueError("a stored slot head's slots and projections must match its backbone")
+                fields.update(slot_rows=slot[0], head_dim=query[0])
         return Head.from_record(records.json_value({**held, "fields": {
             **fields, "dtype": None if compute is None else dtype_name(compute)}}, "head"), width)
 
@@ -135,7 +159,7 @@ class SlotSource(SourceKind):
                     "label_ids": [list(row) for row in ids]}}, _path)
                 if mode == "slot_lm" else SlotHeadSource({"name": import_path(SlotReadout), "fields": {
                     "label_ids": [row[0] for row in ids], "head_dim": dimension, "slot_rows": count}},
-                    _path, weight_file="readout_head.pt"))
+                    _path, weight_file="readout_head.pt", initialize=_initialize))
         layout = SlotSource.layout(labels=labels, blocks=attention == "noncausal")
         return CompositeSource(NativeComponent(config), head, PretrainedDecision.from_components, "",
                                {"layout_record": to_record(layout, Layout),

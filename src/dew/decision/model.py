@@ -180,12 +180,12 @@ class DecisionModel:
         return {CONTEXT: jnp.asarray(context, self.backbone.context_dtype),
                 CONTEXT_LENGTHS: inputs.context_lengths}
 
-    def table(self, variables: Variables) -> jax.Array:
+    def table(self, variables: Variables) -> jax.Array | np.ndarray:
         """Return the backbone's head as `[V, D]` rows (`VocabularyRows`), which a head may read."""
         if not isinstance(self.backbone, VocabularyRows):
             raise TypeError(f"the head reads its backbone's vocabulary rows (`VocabularyRows`), which a "
                             f"{type(self.backbone).__name__} does not give")
-        return jnp.asarray(self.backbone.apply(thaw(part(variables, "backbone")), method="vocabulary_rows"))
+        return self.backbone.apply(thaw(part(variables, "backbone")), method="vocabulary_rows")
 
     @staticmethod
     def head_size(backbone: nn.Module) -> tuple[int, Dtype | None]:

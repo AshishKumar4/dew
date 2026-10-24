@@ -32,7 +32,8 @@ from .task import Decide, DecideSettings
 class DecisionHeadSource(HeadComponent):
     """The head constructor reads the native backbone's output width and compute dtype."""
 
-    def build(self, backbone: Pretrained | None, dtype: str, attention_impl: str) -> Head:
+    def build(self, backbone: Pretrained | None, dtype: str, attention_impl: str, *,
+              shapes: Mapping[str, tuple[int, ...]] | None) -> Head:
         held = records.record(self.record, "head")
         fields = records.record(held["fields"], "head.fields")
         if backbone is None:
