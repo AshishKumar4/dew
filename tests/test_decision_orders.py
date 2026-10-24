@@ -13,7 +13,8 @@ from dew.data.compile import compile
 from dew.data.dataset import Checkpointable, DataPartition
 from dew.decision import DecisionObjective, JointLayout, decisions
 
-ROWS = 4
+ROWS = 1
+"""One row a window, so each pass is the examples' count of windows."""
 
 
 def windows(seed: int, count: int, *, resumed: int | None = None) -> list[np.ndarray]:

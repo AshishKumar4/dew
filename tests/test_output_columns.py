@@ -4,6 +4,8 @@ head's own logits restricted to those ids, on par from float64 with restricting 
 transpose scatters back into the table; `exact` computes the product in fp32 whatever the table's
 compute; ids outside the vocabulary are refused."""
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -45,7 +47,12 @@ def test_a_tables_columns_are_its_logits_restricted_to_them(dtype, vocab_major):
             matrix, vocab_major, head.bias, head.softcap, compute=head.compute, scale=head.scale).logits(
             hidden)[..., jnp.asarray(IDS)])(matrix, hidden, cotangent)
 
-    assert_as_exact(columns, restricted, draw, f"columns {jnp.dtype(dtype).name}", seeds=COLUMN_SEEDS)
+    def truth(matrix, hidden, cotangent, head):
+        # The float64 truth computes in float64, the table's own compute widened with its leaves.
+        return restricted(matrix, hidden, cotangent, dataclasses.replace(head, compute=None))
+
+    assert_as_exact(columns, restricted, draw, f"columns {jnp.dtype(dtype).name}", seeds=COLUMN_SEEDS,
+                    truth_fn=truth)
 
 
 def test_exact_columns_compute_in_fp32_whatever_the_tables_compute():
