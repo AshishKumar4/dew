@@ -274,7 +274,7 @@ class PromptSource:
         failed = _draw_failure(drawn)
         if failed is not None:
             return Session(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {}, failed)
-        draw = drawn.result()
+        draw = drawn.result().checked(self.server.sampling)
         if draw.version != version:
             return Session(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {},
                            f"draw: served by version {draw.version}, submitted under {version}")

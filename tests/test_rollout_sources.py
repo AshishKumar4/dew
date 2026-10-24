@@ -22,7 +22,7 @@ import socket
 import threading
 from concurrent.futures import Future, wait
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import jax
 import numpy as np
@@ -408,7 +408,14 @@ def test_tokens_after_eos_never_execute_an_environment_turn():
     """A completed server future is still untrusted: a token after EOS must fail admission before
     a tool sees it or a verifier assigns it reward, and the opened environment is released."""
     entered, exited, stepped, scored = [], [], [], []
-    server = Server(tokens=(EOS, 7))
+    class BrokenTermination(Server):
+        def submit(self, prompt, max_new_tokens, *, key):
+            answered = super().submit(prompt, max_new_tokens, key=key).result()
+            future = Future()
+            future.set_result(replace(answered, finish_reason="stop"))
+            return future
+
+    server = BrokenTermination(tokens=(EOS, 7))
 
     def reward(task, episode):
         scored.append(episode)
@@ -423,6 +430,54 @@ def test_tokens_after_eos_never_execute_an_environment_turn():
         episodes.close()
     assert entered and exited == entered
     assert not stepped and not scored
+
+
+@pytest.mark.parametrize("ending", ["length", "stop"])
+def test_empty_server_actions_fail_before_tools_or_rewards(ending):
+    class Empty(Server):
+        def submit(self, prompt, max_new_tokens, *, key):
+            future = Future()
+            future.set_result(Draw(tuple(prompt), (), (), ending, self.version))
+            return future
+
+    entered, exited, stepped, rewarded = [], [], [], []
+    server = Empty(sampling=replace(SAMPLING, stop=("finished",)))
+
+    def reward(*args):
+        rewarded.append(args)
+        return 1.0
+
+    episodes = source(server, factory(entered, exited, on_step=lambda _: stepped.append(True)),
+                      verifier=reward)
+    prompts = PromptSource(server, reward, decode=str, max_new_tokens=4)
+    [task] = prompt_tasks(prompt_batch())
+    try:
+        for collector in (episodes, prompts):
+            with pytest.raises(ValueError):
+                collector.submit(task, 1, version=0, key=KEY)[0].result(timeout=10)
+    finally:
+        episodes.close()
+        prompts.close()
+    assert entered and exited == entered
+    assert not stepped and not rewarded
+
+
+def test_a_tool_call_finish_is_a_completed_single_turn_sample():
+    class ToolCall(Server):
+        def submit(self, prompt, max_new_tokens, *, key):
+            draw = super().submit(prompt, max_new_tokens, key=key).result()
+            future = Future()
+            future.set_result(replace(draw, finish_reason="tool_calls"))
+            return future
+
+    [task] = prompt_tasks(prompt_batch())
+    prompts = PromptSource(ToolCall(), lambda *_: 1.0, decode=str, max_new_tokens=4)
+    try:
+        session = prompts.submit(task, 1, version=0, key=KEY)[0].result(timeout=10)
+    finally:
+        prompts.close()
+    assert session.status == Status.COMPLETED
+    assert session.calls[0].terminated and session.reward == 1.0
 
 
 def test_an_environment_exit_that_fails_after_broken_code_does_not_turn_it_into_a_retry():

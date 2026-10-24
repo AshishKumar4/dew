@@ -173,7 +173,10 @@ class Draw:
         return self.finish_reason in ("stop", "tool_calls")
 
     def checked(self, sampling: Sampling) -> Draw:
-        """Return this draw after checking that it ends as `sampling` ends one (`check_ending`)."""
+        """Admit a nonempty sampled action ending as `sampling` ends one (`check_ending`).
+        Imported call records may be empty, but an action presented by a sampling server may not."""
+        if not self.tokens:
+            raise ValueError("a sampled action contains at least one token")
         check_ending(self.tokens, self.terminated, sampling)
         return self
 

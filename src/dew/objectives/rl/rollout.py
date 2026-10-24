@@ -37,7 +37,7 @@ def scored_draw(task: str, sample: int, call: Call, text: str, record: PromptRec
     except (InfrastructureError, OSError) as error:
         return Session(task, "", sample, 0, (call,), Status.INFRA_ERROR, None, {},
                        f"reward: {type(error).__name__}: {error}")
-    status = Status.COMPLETED if call.finish_reason == "stop" else Status.TRUNCATED
+    status = Status.COMPLETED if call.terminated else Status.TRUNCATED
     return Session(task, "", sample, 0, (call,), status, finite_reward(score))
 
 
