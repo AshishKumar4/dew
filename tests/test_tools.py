@@ -319,7 +319,7 @@ def test_lm_head_variants_compute_the_same_loss_accuracy_and_gradients(states_dt
     whatever order a device's GEMM of the tile's shape sums in, so every
     variant takes the baseline's top-1 accuracy exactly."""
     tool = load("benchmark_lm_head")
-    dtype = jnp.dtype(states_dtype)
+    dtype = jnp.float32 if states_dtype == "float32" else jnp.bfloat16
     targets = jnp.array([[0, 5, 11], [3, 11, 4]], jnp.int32)
     variant = tool.parse_variant("stored4-fp32" if states_dtype == "float32" else "stored4")
 
