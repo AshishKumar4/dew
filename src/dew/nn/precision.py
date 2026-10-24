@@ -155,6 +155,22 @@ def _intercepted() -> bool:
     return QUANTIZED_TRACE.value is not None
 
 
+def _own_backward(jaxpr) -> bool:
+    """Whether a product's trace calls a backward of its own (a `jax.custom_vjp`, as Qwix's quantized
+    products are when Qwix quantizes a model directly), in it or any program inside it: a product its
+    library owns, which `accumulated` neither widens nor transposes."""
+    for eqn in jaxpr.eqns:
+        if eqn.primitive.name.startswith("custom_vjp_call"):
+            return True
+        inner = [value if hasattr(value, "eqns") else value.jaxpr
+                 for value in jax.tree.leaves(eqn.params, is_leaf=lambda leaf: hasattr(leaf, "eqns")
+                                              or hasattr(getattr(leaf, "jaxpr", None), "eqns"))
+                 if hasattr(value, "eqns") or hasattr(getattr(value, "jaxpr", None), "eqns")]
+        if any(_own_backward(program) for program in inner):
+            return True
+    return False
+
+
 FP32_SUMS = "F32_F32_F32"
 """JAX's dot algorithm of fp32 operands summed in fp32: as a process's or a scope's default matmul
 precision, the statement that its fp32 products sum as an accelerator sums them, which `accumulated`
@@ -202,7 +218,9 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     keeps XLA's accumulation.
 
     A library that swaps JAX's products for its own while a model runs (Qwix, quantizing) owns them:
-    the product is its, as flax's own layers' would be.
+    the product is its, as flax's own layers' would be. One whose trace calls a backward of its own
+    (a `jax.custom_vjp`, Qwix's when it quantizes a model directly) is left to it whole, its forward
+    and its backward, read from the trace that gives the product's dtype (`_own_backward`).
 
     It is real CPU execution's policy alone, chosen by the platform the program is lowered for
     (`platform_dependent`), which keys every compiled program: a step a CPU lowers for a GPU target
@@ -216,9 +234,11 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     narrow = functools.partial(product, preferred_element_type=preferred_element_type)
     if not _sums_in_float64(*operands):
         return narrow(*operands)
-    dtype = jax.eval_shape(narrow, *operands).dtype
-    if jnp.promote_types(dtype, jnp.float32) != jnp.float32:
-        # A wider result converts the operands to it, so the products are not float32's.
+    traced, shape = jax.make_jaxpr(narrow, return_shape=True)(*operands)
+    dtype = shape.dtype
+    if jnp.promote_types(dtype, jnp.float32) != jnp.float32 or _own_backward(traced.jaxpr):
+        # A wider result converts the operands to it, so the products are not float32's; a product
+        # with a backward of its own is its library's.
         return narrow(*operands)
 
     def summed(*operands):
@@ -233,16 +253,13 @@ def accumulated(product: Callable[..., jax.Array], *operands,
             wide_cotangent = cotangent.astype(jnp.float64)
 
             def transposed(index):
-                # The product is linear in each operand alone, so its pullback there is its transpose,
-                # the cotangent's products. Taken by `jax.vjp`, which also differentiates a product
-                # another library swapped in with a backward of its own (Qwix quantizing a model
-                # directly, a custom_vjp), where `jax.linear_transpose` cannot; its unused forward is
-                # dropped from a compiled program, and computed once more by an eager pullback.
+                # The product is linear in each operand alone, so its transpose there forms the
+                # cotangent's products and nothing of the forward.
                 def alone(operand):
                     return product(*wide[:index], operand, *wide[index + 1:],
                                    precision=jax.lax.Precision.HIGHEST, preferred_element_type=None)
 
-                (gradient,) = jax.vjp(alone, wide[index])[1](wide_cotangent)
+                (gradient,) = jax.linear_transpose(alone, wide[index])(wide_cotangent)
                 return gradient.astype(operands[index].dtype)
 
             return tuple(transposed(index) for index in live)

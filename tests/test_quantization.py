@@ -89,8 +89,8 @@ def test_the_wrapped_forward_matches_qwixs_own_call(scan_layers):
 
 def test_a_dense_qwix_quantizes_directly_takes_its_gradient_on_a_cpu():
     """A Dew Dense Qwix quantizes directly (`qwix.quantize_model`, outside `quantize_with`'s trace)
-    differentiates on a CPU: the float64 sums' reverse pass (`precision.accumulated`) takes the
-    pullback of whatever product it is handed, Qwix's custom_vjp included."""
+    differentiates on a CPU: its product calls a backward of its own (a custom_vjp), so the float64
+    sums (`precision.accumulated`) leave it to Qwix, forward and backward, as on any platform."""
     qwix = pytest.importorskip("qwix")
     from dew.nn.dense import Dense
 
