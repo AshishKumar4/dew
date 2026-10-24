@@ -545,7 +545,8 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     call = padded_call(query, key, value, spans, hooks, _block(tiles))
     spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=scale,
                            score_mod=hooks.score_mod, natural=natural, headroom=algebra.headroom(value.dtype),
-                           initial=hooks.initial is not None, queries=call.queries)
+                           initial=hooks.initial is not None,
+                           queries=call.queries if call.query.shape[1] > call.queries else None)
     unit = family.column_unit(query.dtype)
     operands = tuple(_columns(array, unit) for array in (call.query, call.key, call.value))
     read = (_spans_of(spec, call, tiles.block_q, tiles.block_k), _hooked_of(hooks, call, unit))
@@ -730,8 +731,9 @@ class _Program[T: (Tiles, BackwardTiles)]:
     queries: int | None = None
 
     def padded(self, first) -> jax.Array | bool:
-        """Whether the query tile from `first` holds padding rows past the call's queries."""
-        if self.queries is None or self.queries % self.tiles.block_q == 0:
+        """Whether the query tile from `first` holds padding rows past the call's queries, some or all of
+        them (a call padded to whole programs)."""
+        if self.queries is None:
             return False
         return first + self.tiles.block_q > self.queries
 
@@ -1180,9 +1182,12 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=True,
                              family=family):
             raise NotImplementedError(reason)
+        # The call's query count where the launch pads past it (`algebra.Forward.queries`).
+        queries = start.shape[1]
+        padded = _padded(queries, key.shape[1], config)[0] > queries
         spec = algebra.Forward(spans.form, spans.keys, ids=query_ids is not None, scale=self.scale,
                                score_mod=self.score_mod, natural=self.natural, initial=initial is not None,
-                               queries=start.shape[1])
+                               queries=queries if padded else None)
         launch = functools.partial(_launch_backward, spec=spec, accurate=self.accurate, tiles=config,
                                    family=family, interpret=interpret)
         return gradients(launch, query, key, value, spans, hooks, dout, residuals,

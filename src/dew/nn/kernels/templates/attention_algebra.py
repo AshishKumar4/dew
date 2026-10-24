@@ -52,9 +52,9 @@ class Forward:
     the call keeps its logits `natural` (`base2`), the accurate form, whether its weighted values can pass
     fp32's largest, so a program's walk is `guarded` (`headroom`), whether its softmax resumes from an
     `initial` state (`raw`), whether natural logits stay `scaled` whatever the scale (`raw`; the fold's
-    rewalk, `unfolded`), and the call's query count `queries` where a mainloop walks query tiles past it
-    without spans (a full or causal call padded to whole tiles, whose padding rows `seen` keeps from every
-    key; None where none does)."""
+    rewalk, `unfolded`), and the call's query count `queries` where a mainloop walks query rows past it
+    without spans (a full or causal call padded to whole tiles or whole programs, whose padding rows, a
+    tile's last ones or a whole tile of them, `seen` keeps from every key; None where none does)."""
 
     form: str
     keys: int
@@ -621,7 +621,7 @@ def seen(spec: Forward, coords: Coords, like: jax.Array) -> jax.Array | None:
     if spec.form != "spans" and spec.keys % like.shape[1]:
         # A tile past the call's last key reads padding.
         visible = coords.k_pos < spec.keys if visible is None else visible & (coords.k_pos < spec.keys)
-    if spec.form != "spans" and spec.queries is not None and spec.queries % like.shape[0]:
+    if spec.form != "spans" and spec.queries is not None:
         rows = coords.q_pos < spec.queries
         visible = rows if visible is None else visible & rows
     return visible
