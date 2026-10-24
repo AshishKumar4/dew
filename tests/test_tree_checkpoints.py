@@ -151,3 +151,16 @@ def test_a_reader_beside_the_run_lists_each_step_as_it_commits(tmp_path):
     assert reader.committed() == [1, 2]
     assert sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*")) == before
     np.testing.assert_array_equal(reader.restore(step=2)[0]["x"], np.full((3,), 2))
+
+
+def test_a_listing_after_a_restore_and_close_opens_nothing(tmp_path, monkeypatch):
+    """A reader that restored a step and closed lists the committed steps without reopening the store:
+    the listing reads the step names alone."""
+    writer = Checkpoints(str(tmp_path))
+    writer.save(1, {"x": jnp.full((3,), 1)})
+    writer.wait()
+    reader = Checkpoints(str(tmp_path))
+    reader.restore(step=1)
+    reader.close()
+    monkeypatch.setattr(Checkpoints, "_open", lambda self: pytest.fail("committed() opened the store"))
+    assert reader.committed() == [1]
