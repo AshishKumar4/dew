@@ -11,6 +11,7 @@ import importlib.metadata
 import os
 import sys
 from collections.abc import Callable
+from pathlib import Path
 
 import jax
 
@@ -23,6 +24,16 @@ def dew_cache_dir() -> str:
     return os.path.expanduser(
         os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join("~", ".cache"), "dew")
     )
+
+
+def dew_config_dir() -> Path:
+    """Dew's configuration directory, which every configuration file of Dew's is read from:
+    `$DEW_CONFIG_DIR`, else `$XDG_CONFIG_HOME/dew`, else ~/.config/dew."""
+    override = os.environ.get("DEW_CONFIG_DIR")
+    if override:
+        return Path(override)
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    return (Path(xdg) if xdg else Path.home() / ".config") / "dew"
 
 
 @dataclasses.dataclass(frozen=True)
