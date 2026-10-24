@@ -5,6 +5,7 @@ mainloop, in XLA ops, so it runs on any backend and is the boundary test's secon
 same tiles). It takes a call at its launches' padded shapes, as `TritonForward` does."""
 
 import functools
+from typing import Literal, overload
 
 import jax
 import jax.numpy as jnp
@@ -172,6 +173,20 @@ def _unmapped(mapped, shape: tuple[int, ...], *, residuals: bool):
     split = Split(others.reshape(batch, heads, queries, value_width), rowwise(own), rowwise(others_total),
                   rowwise(shift))
     return out, (rowwise(m), rowwise(denominator), rowwise(anchors), split)
+
+
+@overload
+def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
+           *, block_q: int, block_k: int, pad: int, scale: float | None = None,
+           residuals: Literal[False] = False, natural: bool = NATURAL) -> jax.Array:
+    ...
+
+
+@overload
+def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
+           *, block_q: int, block_k: int, pad: int, scale: float | None = None, residuals: Literal[True],
+           natural: bool = NATURAL) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
+    ...
 
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,

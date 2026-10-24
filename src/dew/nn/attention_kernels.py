@@ -24,6 +24,7 @@ from .kernels.generation import (
     measured_kernel,
 )
 from .kernels.selection import Kernel, Op, Requirement
+from .kernels.templates.attention_triton import DTYPES as TEMPLATE_DTYPES
 
 CUDNN_DTYPES = (jnp.bfloat16, jnp.float16)
 
@@ -354,6 +355,28 @@ XLA_SUPPORTS = (
 the reference path."""
 
 
+TEMPLATE_SUPPORTS = (
+    _Need('dtype', lambda case: case.dtype in TEMPLATE_DTYPES and case.key_dtype == case.dtype,
+          lambda case: f"the query is {case.dtype} and the keys are {case.key_dtype}, where the template "
+                       "takes one dtype of fp32, bf16 and fp16 on its operands", row=INHERENT),
+    _Need('mask', lambda case: not case.mask,
+          "the call has an arbitrary mask, which the template reads as spans and never as a mask",
+          row=INHERENT),
+    _Need('bias', lambda case: not case.bias,
+          "the call has a bias, a dense term beside the spans that carry the template's validity",
+          row=INHERENT),
+    _Need('shards', lambda case: case.shards == 1,
+          "an automatic sequence axis gathers the keys, and a pallas call would gather the queries back",
+          row=INHERENT),
+    _ARITHMETIC,
+)
+"""The attention template's requirements (`attention_route.attend`, the 'template' kernel): one dtype of fp32,
+bf16 and fp16 on the queries and keys alike, no arbitrary mask and no bias, no sharded sequence axis, and the
+call's default arithmetic. It takes every other call form: causality, windows, documents, key lengths and
+starts, sinks and a softcap. No target's row prefers it, so it runs where a call names it
+(`implementation='template'`, or `generation.chosen(attention='template')`)."""
+
+
 def _attention_preferred(case: AttentionCase) -> str:
     """The kernel the target measured fastest for `case`: splash on a TPU and xla on a CPU, where its
     calls take the reference path (`_xla_kernel_on_cpu`); on a GPU
@@ -388,9 +411,11 @@ ATTENTION = Op[AttentionCase]('attention', (
     Kernel[AttentionCase]('tpu', TPU_SUPPORTS),
     Kernel[AttentionCase]('xla', XLA_SUPPORTS, generic=True),
     Kernel[AttentionCase]('reference', (), generic=True),
+    Kernel[AttentionCase]('template', TEMPLATE_SUPPORTS),
 ), _attention_preferred, _hosted)
 """Attention's selector: the target's preference (`_attention_preferred`), then flash, triton,
-cuDNN, splash, xla and the reference path, the first that takes the call."""
+cuDNN, splash, xla and the reference path, the first that takes the call. The template comes last,
+after the reference path, which takes every call, so only a call that names it runs it."""
 
 
 def _decode_preferred(case: AttentionCase) -> str:
