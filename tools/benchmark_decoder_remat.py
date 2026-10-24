@@ -84,7 +84,8 @@ def main():
         "conv_kernel": 4})}
     model = CausalTransformer(
         vocab_size=args.vocab, emb_features=args.width, num_layers=args.depth,
-        num_heads=args.heads, num_kv_heads=args.kv_heads, mlp_features=args.mlp or 2 * args.width,
+        num_heads=args.heads, num_kv_heads=args.kv_heads,
+        mlp_features=2 * args.width if args.mlp is None else args.mlp,
         max_seq_len=args.length, dtype=jnp.dtype(args.dtype), attention_impl=args.attention_impl,
         scan_layers=args.scan, remat=args.remat, **mixer,
         mixture=Mixture(experts=4, top_k=2) if args.case == "sparse" else None,
