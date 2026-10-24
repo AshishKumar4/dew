@@ -266,10 +266,19 @@ def _least_after(places: jax.Array, ids: jax.Array | None) -> jax.Array:
 
 def _widened(positions: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Array]:
     """The queries' and keys' places in one integer dtype that holds both, in which a window's bounds move
-    (`_moved`): a bound past the narrower one's range is still a place the other may hold."""
+    (`_moved`): a bound past the narrower one's range is still a place the other may hold. A signed and an
+    unsigned dtype that no enabled integer dtype holds both of (int64 beside uint64; int32 beside uint32
+    without x64), whose promotion would leave integers or narrow one, are refused for one dtype."""
     query_places, key_places = (jnp.asarray(places) for places in positions)
-    wide = jnp.promote_types(query_places.dtype, key_places.dtype)
-    return query_places.astype(wide), key_places.astype(wide)
+    held = [jnp.iinfo(places.dtype) for places in (query_places, key_places)]
+    least, largest = min(int(info.min) for info in held), max(int(info.max) for info in held)
+    for wide in map(jnp.dtype, ("int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64")):
+        info = jnp.iinfo(wide)
+        enabled = jax.dtypes.canonicalize_dtype(wide) == wide
+        if enabled and int(info.min) <= least and largest <= int(info.max):
+            return query_places.astype(wide), key_places.astype(wide)
+    raise ValueError(f"query places of {query_places.dtype} and key places of {key_places.dtype} share no "
+                     "integer dtype that holds both: pass them in one")
 
 
 def _moved(places: jax.Array, by: int) -> jax.Array:
