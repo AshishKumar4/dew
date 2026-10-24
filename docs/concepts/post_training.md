@@ -301,7 +301,7 @@ Use `GRPOObjective(model, seq_len=P + R - 1)`, and give the decoder enough conte
 | `sequence_mask`, `geometric_mask` | `None` | Chain rejection by summed or mean k1. |
 | `sampling_temperature` | `1.0` | Temperature the sampled IDs are scored at. |
 
-Pass `sampling=Sampling(eos_token_ids=..., temperature=..., top_k=...)`; `eos_id` takes one ID or a tuple. The response mask includes EOS; the text passed to the reward leaves out EOS and padding. The rollout turns `prompt_length` into the standard `ModelInputs` attention mask.
+Pass `sampling=Sampling(eos_token_ids=..., temperature=..., top_k=...)`; `eos_token_ids` takes one ID or a tuple. The response mask includes EOS; the text passed to the reward leaves out EOS and padding. The rollout turns `prompt_length` into the standard `ModelInputs` attention mask.
 
 Generation prefills the padded batch once and packs the real tokens into each row's cache, so prompts of different valid lengths reuse the same compiled shape. After a row hits EOS, later steps leave its cache unchanged. Rescoring reads each chain on its own through its segment IDs and positions. GRPO validation scores prompt perplexity over real next-token transitions; it does not generate answers for a separate reward evaluation.
 
@@ -351,7 +351,7 @@ A native row keeps its own `min_global_steps` and `max_global_steps`, and Dew wr
 
 Live, imported and journal-restored draws all go through the same validation (`Draw`): a nonempty context, nonnegative integer token ids (booleans excluded), aligned finite likelihoods, and a termination flag that agrees with the configured EOS. Tokens after EOS are refused. Checking the upper bound against the vocabulary is left to the caller, which knows the model.
 
-`tools/verl_interop_reference.py` writes the fixtures `tests/test_verl_interop.py` reads from verl revision `12ebe0cb4d300c58449fb6c675379e8700015c51`, run in an isolated environment: four rows of verl's `gsm8k_tool_agent_loop.py` parquet and two `AgentLoopOutput` dumps with their `as_dict()` tensors. One is a tool loop with routed experts. The other is a video turn whose `mm_processor_output` comes from `build_sglang_video_payload`. The test imports and re-exports verl's rows unchanged, and checks that packing matches verl's tensor mapping. `Prompts` reads the verl parquet's `reward_model.ground_truth`, keeps `tools_kwargs` inside `extra_info`, carries `ability` there too, beside them, for the reward, and reads and drops `agent_name`. Dew does not import torch or verl at runtime.
+`tools/verl_interop_reference.py` writes the fixtures `tests/test_verl_interop.py` reads from verl revision `12ebe0cb4d300c58449fb6c675379e8700015c51`, run in an isolated environment: four rows of verl's `gsm8k_tool_agent_loop.py` parquet and two `AgentLoopOutput` dumps with their `as_dict()` tensors. One is a tool loop with routed experts. The other is a video turn whose `mm_processor_output` comes from `build_sglang_video_payload`. The test imports and re-exports verl's rows unchanged, and checks that packing matches verl's tensor mapping. `presets.prompts` reads the verl parquet's `reward_model.ground_truth`, keeps `tools_kwargs` inside `extra_info`, carries `ability` there too, beside them, for the reward, and reads and drops `agent_name`. Dew does not import torch or verl at runtime.
 
 ### Episode journal
 
