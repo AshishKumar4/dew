@@ -27,4 +27,5 @@ def test_a_torch_processors_images_read_as_its_model_inputs_do():
     direct = processor([text + "\n"], images=list(pictures))
     assert media.fields and all(isinstance(value, np.ndarray) for value in media.fields.values())
     for name, value in media.fields.items():
-        np.testing.assert_array_equal(value, np.asarray(direct.conditioning[name]))
+        # The model inputs hold each row's images under a row axis of their own.
+        np.testing.assert_array_equal(value, np.asarray(direct.conditioning[name]).reshape(value.shape))
