@@ -287,23 +287,24 @@ codes for the forward product, `[out, in]`, and for the input gradient,
 `[in, out]`, each beside one float32 scale a row (`frozen_fp8_leaves`)."""
 
 
-def frozen_fp8_leaves(kernel: jax.typing.ArrayLike) -> dict[str, np.ndarray]:
+def frozen_fp8_leaves(kernel: jax.typing.ArrayLike) -> dict[str, jax.Array]:
     """A frozen `[in, out]` kernel packed once for both products it takes part
     in, each direction's rows scaled on their own by the one FP8 block cast
-    (`dew.interop.codecs.quantize_fp8_blocks` over `(1, width)` blocks): the
+    (`dew.interop.codecs.fp8_block_cast` over `(1, width)` blocks), on the
+    kernel's resident devices without a host gather: the
     forward's `[out, in]` rows contract the input, the input gradient's
     `[in, out]` rows the output's cotangent. A forward row's scale is a
     contracting-axis scale of the other direction, so the two are quantized
     apart. The two E4M3 copies replace the kernel in the train state
     (`frozen_fp8_kernel` decodes it back), two bytes a parameter, a bf16
     kernel's, so the gain over a bf16 base is the products' rate."""
-    from dew.interop.codecs import quantize_fp8_blocks
+    from dew.interop.codecs import fp8_block_cast
 
-    kernel = np.asarray(kernel, np.float32)
+    kernel = jnp.asarray(kernel, jnp.float32)
     if kernel.ndim != 2:
         raise ValueError(f"a frozen FP8 site packs a two-axis [in, out] kernel, got shape {kernel.shape}")
-    forward, forward_scale = quantize_fp8_blocks(kernel.T, (1, kernel.shape[0]))
-    dgrad, dgrad_scale = quantize_fp8_blocks(kernel, (1, kernel.shape[1]))
+    forward, forward_scale = fp8_block_cast(kernel.T, (1, kernel.shape[0]))
+    dgrad, dgrad_scale = fp8_block_cast(kernel, (1, kernel.shape[1]))
     return dict(zip(FROZEN_FP8, (forward, forward_scale, dgrad, dgrad_scale), strict=True))
 
 

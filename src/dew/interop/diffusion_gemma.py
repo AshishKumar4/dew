@@ -12,6 +12,7 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Mapping
 
+import jax
 import numpy as np
 from flax.traverse_util import flatten_dict
 
@@ -26,6 +27,7 @@ from dew.interop.hf_decoders import (
     translate_config,
     translate_denoiser_weights,
 )
+from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.streaming import WeightLayout
 from dew.interop.weights import nested
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -106,6 +108,7 @@ def translate_weights(
     config: Mapping[str, object],
     *,
     param_dtype: str = "float32",
+    lazy: bool = False,
     checked: Checked = NOTHING_CHECKED,
 ) -> tuple[Variables, tuple[WeightLayout, ...]]:
     """Map a DiffusionGemma checkpoint's tensors into its variables tree, with the layouts its
@@ -127,7 +130,7 @@ def translate_weights(
         else:
             text[name] = tensor
     fields = translate_config(text_config(config))
-    mapped = translate_denoiser_weights(text, fields, param_dtype=param_dtype, checked=checked)
+    mapped = translate_denoiser_weights(text, fields, param_dtype=param_dtype, lazy=lazy, checked=checked)
     params = {"text": mapped["text"]["params"],
               "self_conditioning": mapped["self_conditioning"]["params"]}
     variables = {"params": params}
@@ -284,7 +287,7 @@ def _refuse_unreadable(config: Mapping[str, object]) -> None:
 def export_weights(
     model: DiffusionGemma, variables: Variables, config: Mapping[str, object],
     vision: tuple[WeightLayout, ...] | None = None,
-) -> dict[str, np.ndarray]:
+) -> LazyTensors:
     """Return the checkpoint tensors for a DiffusionGemma, keyed by source name.
 
     The decoder half goes through `export_decoder_weights` and is renamed under
@@ -301,16 +304,24 @@ def export_weights(
     text_variables = {collection: tree["text"] for collection, tree in variables.items()
                       if "text" in tree}
     text = scalar_placement(model.text, text_variables)
-    tensors: dict[str, np.ndarray] = {}
-    for name, tensor in export_decoder_weights(text, text_variables, text_config(config)).items():
+    decoded = export_decoder_weights(text, text_variables, text_config(config))
+    names = {}
+    specs = {}
+    for name, spec in tensor_specs(decoded).items():
         target = "model.decoder." + name.removeprefix("model.") if name.startswith("model.") else name
-        tensors[target] = tensor
+        names[target] = name
+        specs[target] = spec
         if name.endswith(".layer_scalar"):
-            tensors[target.replace("model.decoder.", "model.encoder.language_model.")] = tensor
+            encoder = target.replace("model.decoder.", "model.encoder.language_model.")
+            names[encoder], specs[encoder] = name, spec
+    conditioning = {}
     for name, leaf in flatten_dict(params["self_conditioning"], sep=".").items():
         module, kind = name.split(".")
-        tensors[f"model.decoder.self_conditioning.{module}.weight"] = np.ascontiguousarray(
-            np.asarray(leaf).T if kind == "kernel" else np.asarray(leaf))
+        target = f"model.decoder.self_conditioning.{module}.weight"
+        conditioning[target] = (leaf, kind)
+        shape = tuple(reversed(leaf.shape)) if kind == "kernel" else leaf.shape
+        specs[target] = jax.ShapeDtypeStruct(shape, leaf.dtype)
+    visual: Mapping[str, np.ndarray] = {}
     if "conditioner" in params:
         if vision is None:
             tower = {collection: tree["conditioner"]["tower"] for collection, tree in variables.items()
@@ -319,9 +330,21 @@ def export_weights(
             vision = (_named(VISION_PREFIX, nested(gemma4_tower_layouts(tower), 1, "conditioner", "tower"))
                       + _named(PROJECTION_PREFIX, nested(gemma4_projector_layouts(projector),
                                                          1, "conditioner", "projector")))
-        for layout in vision:
-            tensors[layout.name] = layout.export(variables)
-    return tensors
+        from dew.interop.decoder_parts import layout_tensors
+
+        visual = layout_tensors({layout.name: layout for layout in vision}, variables)
+        specs.update(tensor_specs(visual))
+
+    def read(name: str) -> np.ndarray:
+        if name in names:
+            return decoded[names[name]]
+        if name in conditioning:
+            leaf, kind = conditioning[name]
+            value = np.asarray(leaf)
+            return np.ascontiguousarray(value.T if kind == "kernel" else value)
+        return visual[name]
+
+    return LazyTensors(specs, read)
 
 
 __all__ = ["build"]
