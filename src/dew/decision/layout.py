@@ -520,7 +520,8 @@ class QuestionLayout(Layout):
             elif isinstance(segment, State):
                 chunks.append(segment)
             elif isinstance(segment, Instructions):
-                instructions = rendered(question.instructions, segment.render, specials)
+                instructions = (rendered(question.instructions, segment.render, specials)
+                                or segment.defaults.get(question.kind, ""))
                 head, tail = segment.headers[question.kind].split("{}")
                 chunks.extend([Chunk(head), Chunk(instructions, marks=(("question", 0, len(instructions)),)),
                                Chunk(tail)])
@@ -933,12 +934,13 @@ type Segment = Text | Media | State | Schema
 @dataclass(frozen=True)
 class Instructions:
     """A question's instructions under a header of its kind (`headers`, `{}` the rendered
-    instructions), rendered by `render` (`rendered`). The question's span is its instructions'. A
-    question always has instructions, as its protocol requires them (`Question`), so a release's
-    default instructions for a question of none are never written."""
+    instructions), rendered by `render` (`rendered`); `defaults` are a kind's instructions where its
+    question's render empty, as instructions of whitespace alone do under a release's `entry`. The
+    question's span is its instructions'."""
 
     headers: Mapping[str, str]
     render: Render = "question"
+    defaults: Mapping[str, str] = dataclasses.field(default_factory=dict)
 
 
 @dataclass(frozen=True)
