@@ -555,10 +555,11 @@ def test_a_window_over_the_widest_places_neither_wraps_nor_aliases(window):
     the window keeps counted exactly (in int64), causal and two-sided: no bound wraps around the dtype."""
     places = jnp.asarray([[-2 ** 31, -2 ** 31 + 5, -1, 0, 2 ** 31 - 6, 2 ** 31 - 1]], jnp.int32)
     wide = np.asarray(places, np.int64)
+    queries, keys = wide[:, :, None], wide[:, None, :]
     for causal in (True, False):
         spans = template.spans(6, 6, 1, causal=causal, sliding_window=window, positions=(places, places))
-        distance = wide[:, :, None] - wide[:, None, :]
-        expected = (distance < window) & (distance >= 0) if causal else np.abs(distance) < window
+        after = 0 if causal else window - 1
+        expected = (keys >= queries - (window - 1)) & (keys <= queries + after)
         np.testing.assert_array_equal(np.asarray(template.dense(spans)), expected)
 
 
