@@ -30,7 +30,9 @@ from dataclasses import dataclass, replace
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
+from jax.experimental import checkify
 
+from dew._distributions import categorical, row_categorical
 from dew.diffusion.block import CanvasGeneration, through_eos
 from dew.diffusion.process import Conditioning
 from dew.interop.weights import decoding_storage
@@ -199,10 +201,15 @@ class DiscreteProcess:
         request, _ = Request.prepare(inputs, key, mesh_of(variables), check, phase="masked generation")
         plan = request.plan
         program = _compiled(plan.sharding, tuple(compiler_options(model).items()))
-        generated = program(model, decoding_storage(model, variables), plan.place(request.padded()),
-                            plan.keys(request.key), self, solver, max_new_tokens, steps, n, eos_token_ids,
-                            pad_token_id)
+        error, generated = program(model, decoding_storage(model, variables), plan.place(request.padded()),
+                                   plan.keys(request.key), self, solver, max_new_tokens, steps, n,
+                                   eos_token_ids, pad_token_id)
+        error.throw()
         return replace(generated, rows=plan.rows * n, prompt_width=request.inputs.tokens.shape[1])
+
+
+REVEALED_UNDEFINED = "the model left a position it reveals without a distribution to draw its token from"
+"""What a masked walk raises when a revealed position's scores hold no distribution."""
 
 
 @dataclass(frozen=True)
@@ -264,8 +271,9 @@ class Unmask:
         chance = self._reveal_chance(process, t, t_next)
         reveal_key, token_key = jax.random.split(key)
         reveal = jax.random.uniform(reveal_key, x.shape) < chance[:, None]
-        drawn = jax.random.categorical(token_key, log_probs, axis=-1)
-        return jnp.where(denoise.masked(x) & reveal, drawn, x), state
+        revealed = denoise.masked(x) & reveal
+        drawn = categorical(token_key, log_probs, revealed, REVEALED_UNDEFINED)
+        return jnp.where(revealed, drawn, x), state
 
     def step_rows(self, x, t, t_next, denoised, log_probs, state, keys, process, denoise):
         """`step`, row `i` drawing its reveals and tokens from `keys[i]` alone (`RowSolver`), as the
@@ -273,8 +281,9 @@ class Unmask:
         chance = self._reveal_chance(process, t, t_next)
         split = jax.vmap(jax.random.split)(keys)
         reveal = jax.vmap(lambda key: jax.random.uniform(key, x.shape[1:]))(split[:, 0]) < chance[:, None]
-        drawn = jax.vmap(jax.random.categorical)(split[:, 1], log_probs)
-        return jnp.where(denoise.masked(x) & reveal, drawn, x), state
+        revealed = denoise.masked(x) & reveal
+        drawn = row_categorical(split[:, 1], log_probs, revealed, REVEALED_UNDEFINED)
+        return jnp.where(revealed, drawn, x), state
 
     @staticmethod
     def _reveal_chance(process, t, t_next):
@@ -408,12 +417,23 @@ def _compiled(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str,
     """The generation program over `rows`, compiled with the model's own XLA `options`
     (`dew.nn.kernels.options.compiler_options`), so a quantized model and another never share it."""
     return jax.jit(
-        _generate,
+        _checked,
         static_argnames=("model", "process", "solver", "budget", "steps", "n", "eos_ids", "pad_id"),
         in_shardings=(None, rows, rows),
-        out_shardings=rows,
+        out_shardings=(None, rows),
         compiler_options=dict(options),
     )
+
+
+def _checked(model: nn.Module, variables: Variables, inputs: ModelInputs, keys: jax.Array,
+             process: DiscreteProcess, solver: Unmask, budget: int, steps: int, n: int,
+             eos_ids: tuple[int, ...], pad_id: int) -> tuple[checkify.Error, CanvasGeneration]:
+    """`_generate`, with a draw from a revealed position that holds no distribution carried out as an
+    error beside the generation, which the host throws (`dew._distributions`)."""
+    return checkify.checkify(
+        lambda variables, inputs, keys: _generate(model, variables, inputs, keys, process, solver, budget,
+                                                  steps, n, eos_ids, pad_id),
+        errors=checkify.user_checks)(variables, inputs, keys)
 
 
 __all__ = ["MDLM", "DiscreteDenoiser", "DiscreteProcess", "LogLinear", "MaskingSchedule", "Unmask"]

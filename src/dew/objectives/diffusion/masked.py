@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
+from jax.experimental import checkify
 
 from dew.artifacts import TokenScores
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
@@ -238,9 +239,14 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         return tokens, losses, counted * weights[:, None], counted, predicted, real
 
     def _sample_impl(self, params, key, *, count: int):
-        denoise = self.process.denoiser(self.model, thaw(params))
-        x_T = self.process.noise(key, (count, self.seq_len))
-        return sample(denoise, x_T, self.steps, solver=self.solver, key=key)
+        """`count` rows sampled from noise, with a revealed position that holds no distribution carried
+        out as an error beside them (`dew._distributions`)."""
+        def walked(params, key):
+            denoise = self.process.denoiser(self.model, thaw(params))
+            x_T = self.process.noise(key, (count, self.seq_len))
+            return sample(denoise, x_T, self.steps, solver=self.solver, key=key)
+
+        return checkify.checkify(walked, errors=checkify.user_checks)(params, key)
 
     def preview(self, params, batch, step: Step, *, scored=None):
         """Generate `samples` rows on every process, then decode them on process zero.
@@ -250,7 +256,9 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         """
         def generate(prepared):
             weights, count = prepared
-            return self._sample(weights, step.key, count=count), None, None
+            error, sampled = self._sample(weights, step.key, count=count)
+            error.throw()
+            return sampled, None, None
 
         return text_preview("masked diffusion preview",
                              lambda: (self.evaluation_variables(params, step), self.samples), generate,

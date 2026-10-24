@@ -19,8 +19,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
+from jax.experimental import checkify
 from typing_extensions import TypeVar, get_protocol_members
 
+from dew._distributions import categorical
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import (
     ModelInputs,
@@ -178,8 +180,10 @@ class BlockProcess:
         """Refines one canvas without updating its prefix cache, compiled with the model's own XLA
         options (`compiler_options`). `positions` `[B, canvas_length]` are its tokens' logical
         positions; None places them on from the cache's cursor."""
-        return _refining(tuple(compiler_options(model).items()))(self, model, variables, cache, key, batch,
-                                                                 finished, positions)
+        error, refined = _refining(tuple(compiler_options(model).items()))(self, model, variables, cache, key,
+                                                                          batch, finished, positions)
+        error.throw()
+        return refined
 
     def refined(self, model: nn.Module, variables: Variables, cache: Variables,
                 key: jax.Array, batch: int, finished: jax.Array,
@@ -204,7 +208,7 @@ class BlockProcess:
                 raise TypeError("a canvas forward must return a logits array")
             logits = self.temper(raw, self.max_steps - index)
             draw_key, noise_key = jax.random.split(jax.random.fold_in(key, index + 1))
-            drawn = jax.random.categorical(draw_key, logits, axis=-1).astype(jnp.int32)
+            drawn = categorical(draw_key, logits, ~state.finished[:, None], CANVAS_UNDEFINED)
             accepted, mask = self.accept(state.canvas, drawn, logits)
             canvas = self.renoise(noise_key, accepted, mask)
             argmax = jnp.argmax(logits, axis=-1).astype(jnp.int32)
@@ -256,11 +260,16 @@ class BlockProcess:
         plan = request.plan
         # The canvas sampler draws one batch-wide key per refinement, so its
         # repeats stay as they are and its rows take the request's own key.
-        generation = _compiled(plan.sharding, tuple(compiler_options(model).items()))(
+        error, generation = _compiled(plan.sharding, tuple(compiler_options(model).items()))(
             model, decoding_storage(model, variables), plan.place(plan.pad(request.inputs)), request.key,
             CanvasPlan(self, tuple(eos_token_ids), pad_token_id, max_new_tokens), n)
+        error.throw()
         return replace(generation, rows=plan.rows * n, prompt_width=request.inputs.tokens.shape[1])
 
+
+
+CANVAS_UNDEFINED = "the model left an unfinished canvas position without a distribution to draw from"
+"""What a canvas refinement raises when an unfinished row's position holds no distribution."""
 
 @dataclass(frozen=True)
 class CanvasPlan:
@@ -420,13 +429,26 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs,
 @functools.cache
 def _refining(options: tuple[tuple[str, bool], ...]):
     """`BlockProcess.refined` as a program of its own, with the model's XLA `options`."""
-    return jax.jit(BlockProcess.refined, static_argnames=("self", "model", "batch"),
-                   compiler_options=dict(options))
+    def refined(self: BlockProcess, model: nn.Module, variables: Variables, cache: Variables, key: jax.Array,
+                batch: int, finished: jax.Array, positions: jax.Array | None
+                ) -> tuple[checkify.Error, CanvasState]:
+        # A draw from a position that holds no distribution, carried out as an error (`dew._distributions`).
+        return checkify.checkify(
+            lambda *arrays: self.refined(model, *arrays[:3], batch, *arrays[3:]),
+            errors=checkify.user_checks)(variables, cache, key, finished, positions)
+
+    return jax.jit(refined, static_argnames=("self", "model", "batch"), compiler_options=dict(options))
 
 
 @functools.cache
 def _compiled(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
     """The generation program over `rows`, compiled with the model's own XLA `options`
     (`dew.nn.kernels.options.compiler_options`), so a quantized model and another never share it."""
-    return jax.jit(_generate, static_argnames=("model", "plan", "n"),
-                   in_shardings=(None, rows, None), out_shardings=rows, compiler_options=dict(options))
+    def checked(model: nn.Module, variables: Variables, inputs: ModelInputs, key: jax.Array, plan: CanvasPlan,
+                n: int) -> tuple[checkify.Error, CanvasGeneration]:
+        # A draw from a position that holds no distribution, carried out as an error (`dew._distributions`).
+        return checkify.checkify(lambda *arrays: _generate(model, *arrays, plan, n),
+                                 errors=checkify.user_checks)(variables, inputs, key)
+
+    return jax.jit(checked, static_argnames=("model", "plan", "n"), in_shardings=(None, rows, None),
+                   out_shardings=(None, rows), compiler_options=dict(options))

@@ -36,6 +36,7 @@ import numpy as np
 from flax import struct
 from jax import lax
 
+from dew._distributions import wellformed
 from dew.nn.inputs import token_ids, valid_order
 from dew.nn.scatter import DROPPED
 from dew.records import finite
@@ -226,16 +227,6 @@ class Greedy:
         best = jnp.argmax(logits, axis=-1)[:, None]
         point = jnp.where(jnp.arange(logits.shape[-1])[None, :] == best, 0.0, FILTER)
         return jnp.where(wellformed(logits)[:, None], point, logits)
-
-
-def wellformed(scores: jax.Array) -> jax.Array:
-    """Which rows hold a distribution: every score finite or `-inf`, one finite.
-
-    A NaN or a `+inf` beside a finite score makes the softmax undefined and
-    the draw arbitrary; a row with nothing finite has no distribution at all.
-    """
-    return (jnp.all(jnp.isfinite(scores) | jnp.isneginf(scores), axis=-1)
-            & jnp.any(jnp.isfinite(scores), axis=-1))
 
 
 class _Numerical:
