@@ -385,7 +385,7 @@ TEMPLATE_SUPPORTS = (
 """The attention template's requirements (`attention_route.attend`, the 'template' kernel): one dtype of fp32,
 bf16 and fp16 on the queries and keys alike, no arbitrary mask and no bias, no sharded sequence axis, and the
 call's default arithmetic. It takes every other call form: causality, windows, documents, key lengths and
-starts, sinks and a softcap. No target's row prefers it, so it runs where a call names it
+starts, sinks, a softcap and probability dropout. No target's row prefers it, so it runs where a call names it
 (`implementation='template'`, or `generation.chosen(attention='template')`)."""
 
 
