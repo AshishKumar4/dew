@@ -30,7 +30,7 @@ from dew.interop.components import bind_component
 from dew.interop.weights import indexed_path
 from dew.nn.dense import Dense
 
-from ..activations import gated_product
+from ..activations import gated_product, silu
 from ..attention import rms_normalized
 from ..conv import Conv
 from ..precision import at_least_fp32, float32_dot_general, float32_einsum
@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 
 _EPS = 1e-5
 _ATTENTION_EPS = 1e-15
-_ACTIVATIONS = {"relu": nn.relu, "relu6": nn.relu6, "silu": nn.silu}
+_ACTIVATIONS = {"relu": nn.relu, "relu6": nn.relu6, "silu": silu}
 
 
 PUBLISHED = ("AutoencoderDC",)
@@ -183,7 +183,7 @@ class _GLUMBConv(nn.Module):
     @nn.compact
     def __call__(self, x):
         hidden = 4 * self.features
-        y = nn.silu(_conv(2 * hidden, 1, self.dtype, "conv_inverted")(x))
+        y = silu(_conv(2 * hidden, 1, self.dtype, "conv_inverted")(x))
         y = _conv(2 * hidden, 3, self.dtype, "conv_depth", groups=2 * hidden)(y)
         y, gate = jnp.split(y, 2, axis=-1)
         y = _conv(self.features, 1, self.dtype, "conv_point", bias=False)(gated_product('swiglu')(gate, y))

@@ -58,11 +58,13 @@ from .precision import (
     asks_default_precision,
     at_default_precision,
     at_least_fp32,
+    capped_logits,
     configured_precision,
     float32_dot_general,
     float32_einsum,
     float32_products,
     operand_precision,
+    rms_statistics,
     rounded_to,
 )
 from .rope import rotate
@@ -353,7 +355,7 @@ def _xla_rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, sca
     activated = (lambda y: y) if activation is None else activation
     if fp32_statistics:
         y = x.astype(at_least_fp32(x.dtype))
-        y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + epsilon)
+        y = y * rms_statistics(y, epsilon)[1]
     else:
         # The reference rounds every step to the input dtype. XLA fuses the
         # chain and carries fp32 between the ops, so each rounding is explicit.
@@ -513,7 +515,7 @@ def unweighted_rmsnorm(x, eps: float, *, implementation: str = 'auto'):
         return norm_swiglu.rms_norm(x, None, eps, x.dtype, offset=False, after_cast=False, portable=portable,
                                     inverse_rounded=True)
     fp32 = x.astype(at_least_fp32(x.dtype))
-    inverse = jax.lax.rsqrt(jnp.mean(jnp.square(fp32), axis=-1, keepdims=True) + eps)
+    inverse = rms_statistics(fp32, eps)[1]
     return x * inverse.astype(x.dtype)
 
 
@@ -1198,7 +1200,7 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     if wide_logits:
         logits = logits * width ** -0.5
     if softcap is not None:
-        logits = jnp.tanh(logits / softcap) * softcap
+        logits = capped_logits(logits, softcap)
     if bias is not None:
         logits = logits + bias
     if mask is not None:
