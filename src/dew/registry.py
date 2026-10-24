@@ -1173,7 +1173,8 @@ def with_dtype(name: str, fields: Mapping[str, object], dtype: str | None) -> Ma
         return fields
     member = models[name]
     assert isinstance(member, type)
-    parts = {"dtype": dtype} if "dtype" in {field.name for field in dataclasses.fields(member)} else {}
+    parts: dict[str, object] = ({"dtype": dtype}
+                              if "dtype" in {field.name for field in dataclasses.fields(member)} else {})
     for key, value in fields.items():
         part = _part_type(member, key, configured(value))
         if part is None or "dtype" not in {field.name for field in dataclasses.fields(part)}:
