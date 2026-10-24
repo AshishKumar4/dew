@@ -5,7 +5,9 @@ token across two marks both's; and a published slot release's prompt as a layout
 81ce62f, rendered as its engine renders them), its options' spans the lines its runtime pools, its
 answer at its last token, and its state cut only where its segments say."""
 
+import itertools
 import json
+import string
 from pathlib import Path
 from typing import Literal
 
@@ -29,6 +31,8 @@ from dew.decision.render import Chunk, render
 
 QWEN = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
 """Qwen3.5's tokenizer and ChatML template, tiny, with its thinking switch."""
+ELEPHANT, ELEPHANT_REVISION = "baselabs/elephant-1", "b3f8a93462fb1051a9de031e94a7ff380e254072"
+"""The slot release whose tokenizer spells every one of its labels as one token."""
 
 SLOT_SYSTEM = ("Apply the question to the state. Choose exactly one of the listed options. Respond with only "
                "its uppercase letter, with no explanation or reasoning.")
@@ -124,21 +128,30 @@ def test_a_slot_release_row_is_the_releases_own_prompt(qwen, question, prompt):
     assert laid.label_ids == tuple((qwen.encode(label, add_special_tokens=False)[0],) for label in "ABC")
 
 
-def test_a_noul_asks_yes_first_and_more_options_than_letters_answer_with_one_label(qwen):
+def test_a_noul_asks_yes_first_with_the_releases_descriptions(qwen):
     """A noul's options are yes, then no, its true option first (`Laid.order`), each with the
-    release's own description where its question gives none; a choice of more options than letters
-    names them by the release's labels and asks for one label, its lines' structured descriptions
-    indented JSON."""
+    release's own description where its question gives none."""
     [row] = release().rows(qwen, SPECIALS, STATE, {"holds": Noul("Was the customer charged twice?")})
     [laid] = row.questions
     text = qwen.decode(list(row.tokens))
     assert laid.order == (1, 0)
     assert ("A. yes: the statement is true / the answer is yes\nB. no: the statement is false / the answer "
             "is no\n\nAnswer with one letter: A, B.") in text
+
+
+@pytest.mark.network
+def test_more_options_than_letters_answer_with_one_of_the_releases_labels():
+    """Under the release's own tokenizer (elephant-1 at its pinned commit), every one of its 256 labels
+    spells as one token, as its runtime verifies them; a choice of more options than letters names
+    them by those labels and asks for one label, a structured description indented JSON and a
+    structured state the same."""
+    pinned = HFTokenizer(f"{ELEPHANT}@{ELEPHANT_REVISION}")
+    ids = RELEASE_LABELS.ids(pinned, len(SLOT_LABELS))
+    assert all(pinned.decode(list(label)) == name for label, name in zip(ids, SLOT_LABELS, strict=True))
     queues = Choice("Which queue?", {f"queue{index:02d}": ({"team": index} if index == 0 else None)
                                      for index in range(30)})
-    [row] = release().rows(qwen, SPECIALS, {"ticket": "charged twice"}, {"queue": queues})
-    text = qwen.decode(list(row.tokens))
+    [row] = release().rows(pinned, SPECIALS, {"ticket": "charged twice"}, {"queue": queues})
+    text = pinned.decode(list(row.tokens))
     assert "A. queue00: " + json.dumps({"team": 0}, indent=2) + "\nB. queue01\n" in text
     assert "AA. queue26\n" in text and text.endswith(
         "Answer with one label: " + ", ".join(SLOT_LABELS[:30]) + ".<|im_end|>\n<|im_start|>assistant\n"
@@ -161,10 +174,9 @@ def test_a_token_across_two_marks_belongs_to_both(qwen):
     """Encoded whole, a token that overlaps two marks' characters is in both marks' spans, as the
     release's runtime counts a token straddling two lines in both; encoded piece by piece, each mark
     holds its own piece's tokens."""
-    merges = json.loads((QWEN / "tokenizer.json").read_text())["model"]["merges"]
-    pairs = (merge.split(" ") if isinstance(merge, str) else merge for merge in merges)
-    first, second = next((a, b) for a, b in pairs if len(qwen.encode(a + b, add_special_tokens=False)) == 1
-                         and len(a) == 1 and len(b) == 1)
+    characters = [*string.ascii_letters, " ", "\n"]
+    first, second = next((a, b) for a, b in itertools.product(characters, repeat=2)
+                         if len(qwen.encode(a + b, add_special_tokens=False)) == 1)
     chunks = [Chunk(first, marks=(("one", 0, 1),)), Chunk(second, marks=(("two", 0, 1),))]
     merged = render(chunks, qwen, "whole")
     assert len(merged.tokens) == 1 and merged.marks == {"one": (0, 1), "two": (0, 1)}
@@ -177,9 +189,11 @@ def test_a_row_past_its_length_cuts_its_state_where_its_segments_say(qwen):
     state keeps its start cuts the state's end at its own token boundaries to the longest that fits,
     the row encoded whole, and its options and cue whole."""
     long = " ".join(["refund"] * 200)
-    [whole] = release(max_len=200).rows(qwen, SPECIALS, long, {"team": TEAM})
-    assert not release(max_len=200).fits(whole)
-    cutting = release(max_len=200, keep="start")
+    [empty] = release().rows(qwen, SPECIALS, "", {"team": TEAM})
+    room = len(empty.tokens) + 40
+    [whole] = release(max_len=room).rows(qwen, SPECIALS, long, {"team": TEAM})
+    assert not release(max_len=room).fits(whole)
+    cutting = release(max_len=room, keep="start")
     [cut] = cutting.rows(qwen, SPECIALS, long, {"team": TEAM})
     assert cutting.fits(cut) and cut.state_kept < cut.state_tokens
     text = qwen.decode(list(cut.tokens))
