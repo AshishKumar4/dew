@@ -499,9 +499,10 @@ def hybrid(**overrides):
                 **overrides)
 
 
-def test_a_yarn_layer_refuses_a_partial_rotary(rng):
-    """YaRN ramps a whole head's frequencies (`dew.nn.rope.rotary_freqs`), so a layer given YaRN and a
-    partial rotary refuses at its first call."""
+def test_a_yarn_layer_refuses_a_proportional_partial_rotary(rng):
+    """YaRN ramps the rotated width and has no proportional form (`dew.nn.rope.rotary_freqs`), so a
+    layer given YaRN and a partial rotary under the proportional convention, the default, refuses at
+    its first call."""
     with pytest.raises(ValueError):
         tiny(partial_rotary_factor=0.5, yarn=YarnScaling()).init(rng, tokens(rng))
 
