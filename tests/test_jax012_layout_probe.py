@@ -1,5 +1,6 @@
 """Paired diagnostics for the JAX switch's parameter-layout site."""
 
+import hashlib
 import json
 
 import jax
@@ -148,3 +149,64 @@ def test_layout_with_corrected_reference_truth():
     for count in (8, 40, 256):
         _report("corrected-truth-" + str(count), gate._drawn(ours, reference, draw, range(count)))
     gate.assert_as_exact(ours, reference, draw, label, seeds=seeds)
+
+
+def test_isolated_operator_rounding():
+    queries, keys = site.geometry(CASE)
+    draw = site.drawing(queries, keys)
+    streams = jax.random.split(jax.random.key(5), 4)
+    temperature = np.asarray(jax.random.uniform(
+        streams[0], (site.ROWS, 4, queries), jnp.float32, 0.5, 1.5), np.float64)
+    key_bias = np.asarray(jax.random.normal(streams[1], (site.ROWS, 4, keys), jnp.float32), np.float64)
+    dense_bias = 0.5 * np.asarray(jax.random.normal(
+        streams[2], (site.ROWS, 4, queries, keys), jnp.float32), np.float64)
+    mask = site.dews_mask(CASE)[:, None]
+
+    def qk(query, key):
+        def one(row, head):
+            return jnp.einsum("qd,kd->qk", query[row, :, head], key[row, :, head // 2],
+                              preferred_element_type=query.dtype)
+        return jax.vmap(jax.vmap(one, in_axes=(None, 0)), in_axes=(0, None))(
+            jnp.arange(site.ROWS), jnp.arange(4))
+
+    def pv(probabilities, value):
+        def one(row, head):
+            return jnp.einsum("qk,kd->qd", probabilities[row, head], value[row, :, head // 2],
+                              preferred_element_type=value.dtype)
+        return jax.vmap(jax.vmap(one, in_axes=(None, 0)), in_axes=(0, None))(
+            jnp.arange(site.ROWS), jnp.arange(4))
+
+    fns = {"qk": jax.jit(qk), "pv": jax.jit(pv), "exp": jax.jit(jnp.exp),
+           "sum": jax.jit(lambda p: jnp.sum(p, axis=-1)),
+           "qk-without-ynn": gate.without_ynn(qk),
+           "pv-without-ynn": gate.without_ynn(pv)}
+    errors = {name: [] for name in fns}
+    digests = {}
+    for seed in range(40):
+        query, key, value = (np.asarray(x) for x in draw(seed))
+        k64 = np.repeat(key.astype(np.float64), 2, axis=2)
+        v64 = np.repeat(value.astype(np.float64), 2, axis=2)
+        dot64 = np.einsum("bqhd,bkhd->bhqk", query.astype(np.float64), k64)
+        logits64 = dot64 * (32 ** -0.5) * temperature[..., None] + key_bias[:, :, None, :] + dense_bias
+        logits64 = np.where(mask, logits64, -np.inf)
+        maximum = np.max(logits64, axis=-1, keepdims=True)
+        delta = logits64 - np.where(np.isfinite(maximum), maximum, 0)
+        probabilities = np.exp(delta).astype(np.float32)
+        common = {
+            "qk": ((query, key), dot64),
+            "pv": ((probabilities, value), np.einsum(
+                "bhqk,bkhd->bhqd", probabilities.astype(np.float64), v64)),
+            "exp": ((delta.astype(np.float32),), np.exp(delta.astype(np.float32).astype(np.float64))),
+            "sum": ((probabilities,), np.sum(probabilities.astype(np.float64), axis=-1)),
+        }
+        for name, fn in fns.items():
+            inputs, truth = common[name.removesuffix("-without-ynn")]
+            actual = np.asarray(fn(*inputs))
+            errors[name].append(float(np.mean((actual.astype(np.float64) - truth) ** 2)))
+            if seed == 0:
+                digests[name] = hashlib.sha256(actual.tobytes()).hexdigest()
+    for name, values in errors.items():
+        print(json.dumps({"operator": name, "jax": jax.__version__,
+                          "pooled_rms": float(np.sqrt(np.mean(values))),
+                          "per_seed_rms": np.sqrt(values[:8]).tolist(),
+                          "seed0_output_digest": digests[name]}), flush=True)
