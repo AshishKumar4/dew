@@ -80,7 +80,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from reference_source import saved_fixture
+from reference_source import loaded, saved_fixture
 
 REPO = "deepseek-ai/DeepSeek-V4.1-Flash"
 DEEPSEEK_V41_REVISION = "dba1be0a40aa45a94ad051997016db3960a90277"
@@ -721,12 +721,8 @@ def official_kernels():
     revision), under a name of their own beside the stand-in `kernel`."""
     from huggingface_hub import hf_hub_download
 
-    path = hf_hub_download(REPO, "inference/kernel.py", revision=DEEPSEEK_V41_REVISION)
-    spec = importlib.util.spec_from_file_location("deepseek_v41_tilelang_kernels", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return loaded("deepseek_v41_tilelang_kernels",
+                  hf_hub_download(REPO, "inference/kernel.py", revision=DEEPSEEK_V41_REVISION))
 
 
 def write_kernels():

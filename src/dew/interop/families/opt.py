@@ -6,10 +6,10 @@ from functools import partial
 from dew import records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
-    DEFAULT_MAX_SEQ_LEN,
     DecoderFamily,
     DecoderFields,
     Renames,
+    context_lengths,
     hf_ungated,
     refuse,
     renamed_name,
@@ -53,7 +53,7 @@ def _opt_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         norm_type='layer', norm_bias=True, norm_eps=1e-5,
         qk_norm=False, attention_bias=bool(hf.get('enable_bias', True)),
         position_embedding='learned', position_embedding_size=positions + 2,
-        max_seq_len=min(positions, DEFAULT_MAX_SEQ_LEN),
+        max_seq_len=context_lengths(hf, 2048)[0],
         position_embedding_offset=2,
         tie_embeddings=bool(hf.get('tie_word_embeddings', True)),
         dropout_rate=records.number(hf.get('dropout', .1), 'dropout'),

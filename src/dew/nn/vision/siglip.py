@@ -31,14 +31,16 @@ from dew.objectives.base import Variables
 from dew.registry import Record
 
 from .common import (
-    _PROJECTOR_PATHS,
     ProjectorBase,
+    ProjectorLayout,
     TowerBase,
     TowerGeometry,
+    TowerLayout,
     _side,
     _vision_section,
     activation_name,
     head_width,
+    in_params,
     trunk_geometry,
 )
 
@@ -196,6 +198,13 @@ def siglip_vision_path(hf_name: str) -> tuple[str, ...] | None:
     return path
 
 
+GEMMA_PROJECTOR_TENSORS = {
+    "mm_soft_emb_norm.weight": ("mm_soft_emb_norm", "scale"),
+    "mm_input_projection_weight": ("mm_input_projection", "kernel"),
+}
+"""The Gemma 3 projector's tensors past `multi_modal_projector.`, each to its leaf."""
+
+
 def translate_gemma_projector_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
 ) -> tuple[Variables, tuple[WeightLayout, ...]]:
@@ -208,11 +217,11 @@ def translate_gemma_projector_weights(
     """
     from dew.interop.streaming import WeightLayout
 
-    known = set(_PROJECTOR_PATHS["gemma"])
+    known = set(GEMMA_PROJECTOR_TENSORS)
     unknown = sorted(set(hf_tensors) - known)
     if unknown:
         raise ValueError(f"unknown tensor names {unknown}")
-    paths = _PROJECTOR_PATHS["gemma"]
+    paths = GEMMA_PROJECTOR_TENSORS
     return ({module: {leaf: np.ascontiguousarray(checkpoint_array(hf_tensors[name], param_dtype))}
              for name, (module, leaf) in paths.items()},
             tuple(WeightLayout(name, (path,), tuple(np.shape(hf_tensors[name])))
@@ -265,3 +274,8 @@ def translate_gemma_projector_config(vision: Mapping[str, object], text_width: i
         "tokens_per_side": side,
         "norm_eps": records.number(vision.get("layer_norm_eps", 1e-6), "layer_norm_eps"),
     }}
+
+
+SiglipVision.checkpoint = TowerLayout("vision_tower.", in_params(siglip_vision_path))
+GemmaProjector.checkpoint = ProjectorLayout("multi_modal_projector.", GEMMA_PROJECTOR_TENSORS,
+                                            read=translate_gemma_projector_weights)
