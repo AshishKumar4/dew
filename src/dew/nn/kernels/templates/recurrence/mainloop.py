@@ -970,8 +970,12 @@ def _reverse(q, k, w, do, hi, lo, dht, sequences, call: _Call, *, scale: float):
                 dh_ref, dv_ref, dh0_ref, *, streams, staging):
         j, s, h = lax.axis_index("blocks"), lax.axis_index("sequences"), lax.axis_index("heads")
         first, count, row, begins, ends = (seq_ref[s, i] for i in range(5))
-        (staged,) = staging
-        issue = _Issuer(call, dict.fromkeys(("local_dv", "values_dv", "reads", "weights_dv"), staged))
+        staged, split = staging
+        # The decayed output gradient fp32 as two parts against the queries (fla's split product, 16 of its
+        # significand's bits): one part put the initial memory's gradient 5 to 7 times the port's distance
+        # from float64.
+        issue = _Issuer(call, {**dict.fromkeys(("local_dv", "values_dv", "weights_dv"), staged),
+                               "reads": split})
 
         def memory(base, i):
             return (base * call.heads + h) * width + i * BLOCK
@@ -1042,8 +1046,9 @@ def _reverse(q, k, w, do, hi, lo, dht, sequences, call: _Call, *, scale: float):
     return _kernel(program, call, out_type=out_type, grid=(value_width // bv, sequences.shape[0], call.heads),
                    grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=2,
                    live=lambda refs: refs[9][lax.axis_index("sequences"), 1] > 0,
-                   staging=_staging(held, (BLOCK, bv)), once=finals)(*flipped, hi, lo, hi, lo, dht,
-                                                                     sequences)
+                   staging=(*_staging(held, (BLOCK, bv)), tuple(plgpu.SMEM((CHUNK, bv), held.stored)
+                                                                for _ in range(2))),
+                   once=finals)(*flipped, hi, lo, hi, lo, dht, sequences)
 
 
 def _query_key(q, k, corrected, do, dv, h, dh, hi, lo, taken, call: _Call, *, scale: float):
