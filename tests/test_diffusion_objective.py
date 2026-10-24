@@ -387,8 +387,7 @@ def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_
         tokens = explicit(rows, masked(jax.tree.map(lambda leaf: np.asarray(leaf, np.float32)
                                                     if np.issubdtype(np.asarray(leaf).dtype, np.floating)
                                                     else leaf, values), rows, at))
-        # The pixels in float64 too, so the loss's normalization, rates and noising run in float64.
-        tokens = {**tokens, "image": np.asarray(tokens["image"], np.float64)}
+        tokens = float64_pixels(tokens)
         with jax.enable_x64(new_val=True):
             wide = DiffusionObjective(source.model.clone(dtype=jnp.float64), source.process, source.inputs,
                                       unconditional_prob=0.0, steps=3, solver=Euler(),
@@ -470,6 +469,12 @@ def test_each_example_draws_its_own_times_noise_and_dropout_on_every_layout():
                                   np.asarray(jax.random.normal(third, (RES, RES, 3), jnp.float32)))
 
 
+def float64_pixels(batch):
+    """`batch` with its pixels in float64, so a float64 truth's loss normalizes them (`unit_range`) and
+    runs its rates and noising in float64; the step's draws stay its float32 ones."""
+    return {**batch, "image": np.asarray(batch["image"], np.float64)}
+
+
 def float64_twin(objective):
     """`objective` over its model in float64: the truth of its float32 step at the same draws."""
     import copy
@@ -519,10 +524,10 @@ def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_on
         return jax.tree.map(applied, variables["params"], after)
 
     # The whole batch's step.
-    alone = float32_update(as_a_step(objective, initial.variables, whole,
+    alone = float32_update(as_a_step(trainer, initial.variables, halves[0],
                                      lambda variables: objective_gradient(objective, variables, whole, info)))
     assert_as_exact(pooled, alone, moved_weights(template.variables), "pooled update", seeds=POOLED_SEEDS,
-                    truth_fn=float64_gradient(twin, whole, info))
+                    truth_fn=float64_gradient(twin, float64_pixels(whole), info))
 
 
 HOST_MASTER_SEEDS = 16
@@ -534,8 +539,9 @@ def test_a_host_master_step_draws_each_examples_noise_as_the_resident_step_does(
     """A step whose variables live on the host runs its loss on the accelerator with the examples'
     draws the step carries, so it takes the update a resident step takes: on par with it over drawn
     weights (check 1), the objective's float64 twin at the step's draws the truth. The two steps are
-    two programs, which round otherwise: the host's update is its CPU's. A host-master run's draws by
-    the attempt would read other times, noise and dropped conditions, and step elsewhere."""
+    two programs, which round otherwise: the host's update is its CPU's, and on a GPU its accelerator
+    programs take the modules' kernel options without the step's (ledger 1536). A host-master run's
+    draws by the attempt would read other times, noise and dropped conditions, and step elsewhere."""
     import optax
     from reference_error import assert_as_exact
 
@@ -567,4 +573,5 @@ def test_a_host_master_step_draws_each_examples_noise_as_the_resident_step_does(
     info = Step(jnp.asarray(0), jax.random.fold_in(template.key, 0), None,
                 **example_fields(template, 0, 1, batch))
     assert_as_exact(host, resident, moved_weights(template.variables), "host-master update",
-                    seeds=HOST_MASTER_SEEDS, truth_fn=float64_gradient(float64_twin(objective), batch, info))
+                    seeds=HOST_MASTER_SEEDS,
+                    truth_fn=float64_gradient(float64_twin(objective), float64_pixels(batch), info))

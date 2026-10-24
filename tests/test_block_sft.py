@@ -70,8 +70,9 @@ def reference_variables(loaded, name):
 
 def trainer_update(obj, batch, run_key, optimizer):
     """The trainer's first step under `optimizer` of a variables tree on one device, compiled once
-    (`stepped`, its stepped state), and the step's draws (`example_fields`). One device holds the
-    comparison to the trainer's composition of the update; its layouts are the parallelism matrix's."""
+    (`stepped`, its stepped state), the step's draws (`example_fields`) and the trainer. One device
+    holds the comparison to the trainer's composition of the update; its layouts are the parallelism
+    matrix's."""
     trainer = Trainer(obj, optimizer, key=run_key, split=1)
     trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
     initial = trainer.initial_state()
@@ -85,7 +86,7 @@ def trainer_update(obj, batch, run_key, optimizer):
         state, *_ = run(state, batch)
         return state
 
-    return stepped, step
+    return stepped, step, trainer
 
 
 UPDATE_SEEDS = {"text": 16, "image": 16}
@@ -94,23 +95,30 @@ the trainer's step as `dew_fn`)."""
 
 
 def assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, seeds: int):
-    """The trainer's update is the objective's at the step's draws: the gradient its step takes, which
+    """The trainer's update is the objective's at the step's draws. The gradient its step takes, which
     sgd with a momentum of zero keeps as its trace, is on par with the objective's own over drawn
-    weights (check 1), `twin`, the objective over its model in float64, at the same draws the truth.
-    They are two programs, which round otherwise; the objective's gradient is compiled as one with
-    the step's compiler options (`as_a_step`). The gradients are compared as they are, not through
-    an update applied to the weights, whose rounding at the weights' magnitude would swamp theirs.
-    The run's own path, its loader, plan and marked rows, then takes the trainer's own update on one
-    device, to the bit: the same program on the same values."""
-    stepped, step = trainer_update(obj, batch, run_key, optax.sgd(1.0, momentum=0.0))
+    weights (check 1), `twin`, the objective over its model in float64, at the same draws the truth;
+    they are two programs, which round otherwise, the objective's compiled with the step's compiler
+    options (`as_a_step`). The gradients are compared as they are, not through an update applied to
+    the weights, whose rounding at the weights' magnitude would swamp theirs; at each draw the step's
+    weights are then sgd(1)'s rule of that trace to the bit, the weights less the trace in float32, so
+    the update applies the gradient it holds. The run's own path, its loader, plan and marked rows,
+    takes the trainer's own update on one device, to the bit: the same program on the same values."""
+    stepped, step, trainer = trainer_update(obj, batch, run_key, optax.sgd(1.0, momentum=0.0))
 
     def trained(values):
-        return jax.tree.map(np.asarray, optax.tree_utils.tree_get(stepped(values).opt_state, "trace"))
+        state = stepped(values)
+        trace = jax.tree.map(np.asarray, optax.tree_utils.tree_get(state.opt_state, "trace"))
+        rule = jax.tree.map(lambda before, gradient: (np.asarray(before) - gradient).astype(np.float32),
+                            values["params"], trace)
+        assert_tree_equal(jax.tree.map(np.asarray, state.variables["params"]), rule)
+        return trace
 
-    gradient = as_a_step(obj, variables, batch, lambda values: objective_gradient(obj, values, batch, step))
+    gradient = as_a_step(trainer, variables, batch,
+                         lambda values: objective_gradient(obj, values, batch, step))
     assert_as_exact(trained, gradient, moved_weights(variables), "trainer update", seeds=seeds,
                     truth_fn=float64_gradient(twin, batch, step))
-    taken, _ = trainer_update(obj, batch, run_key, optax.sgd(0.001))
+    taken, _, _ = trainer_update(obj, batch, run_key, optax.sgd(0.001))
     solo = Trainer(obj, optax.sgd(0.001), key=run_key)
     solo.device_mesh = MeshSpec().build(jax.devices()[:1])
     assert_tree_equal(solo.fit(data, steps=1, log_every=1).variables["params"],
