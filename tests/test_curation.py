@@ -83,6 +83,37 @@ def test_a_fasttext_classifier_keeps_the_label_it_is_asked_for():
 
 
 @pytest.mark.network
+def test_a_classifier_replaced_at_its_path_runs_as_the_identity_it_records(tmp_path):
+    """A classifier step reads its model once, by content: a model replaced at the same path later
+    is a new step's model, both what its filter scores with and what its plan records, while the
+    first step still scores and records its own."""
+    import shutil
+
+    from datatrove.io import cached_asset_path_or_download
+
+    released = "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz"
+    path = tmp_path / "model.ftz"
+    shutil.copy(cached_asset_path_or_download(released, namespace="filters", subfolder="fasttext"), path)
+    records = [{"id": index, "text": passage} for index, passage in enumerate(PROSE)]
+    records.append({"id": 10, "text": FRENCH})
+
+    def chain(step):
+        return Pipeline(Memory(records, shard_rows=len(records))).filter_map(step)
+
+    def identity(step):
+        return compile(chain(step).batch(1), read="memory",
+                       loading=Loading(workers=0, threads=1, read_buffer=1)).plan.identity()
+
+    english = text.Classifier(str(path), keep=(("en", 0.5),))
+    first = one_pass(chain(english)), identity(english)
+    path.write_bytes(path.read_bytes() + b"\0")
+    assert (one_pass(chain(english)), identity(english)) == first
+    replaced = text.Classifier(str(path), keep=(("en", 0.5),))
+    assert identity(replaced) != first[1]
+    assert replaced.pinned.read_bytes() == path.read_bytes()
+
+
+@pytest.mark.network
 def test_language_identification_keeps_the_language_it_is_asked_for():
     records = [{"id": index, "text": passage} for index, passage in enumerate(PROSE)]
     records.append({"id": 10, "text": FRENCH})
