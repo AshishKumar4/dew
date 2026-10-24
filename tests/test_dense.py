@@ -79,7 +79,15 @@ def test_a_layer_initializes_and_computes_what_flaxs_does(ours, flaxs, build, dt
     variables = theirs.init(jax.random.key(0), x)
     drawn = mine.init(jax.random.key(0), x)
     if getattr(theirs, "batch_dims", ()):
-        assert jax.tree.map(np.shape, drawn) == jax.tree.map(np.shape, variables)
+        # The kernel draws a member at a time; its structure, shape, dtype and box are flax's, and
+        # every other leaf flax's bit for bit.
+        assert jax.tree.structure(drawn) == jax.tree.structure(variables)
+        for path, leaf in jax.tree_util.tree_leaves_with_path(drawn):
+            other = dict(jax.tree_util.tree_leaves_with_path(variables))[path]
+            if jax.tree_util.keystr(path).endswith("['kernel']"):
+                assert (leaf.shape, leaf.dtype) == (other.shape, other.dtype)
+            else:
+                np.testing.assert_array_equal(leaf, other)
     else:
         jax.tree.map(np.testing.assert_array_equal, drawn, variables)
     if dtype == jnp.bfloat16:  # variables restored at a dtype other than the one declared
@@ -98,13 +106,43 @@ def test_a_batched_kernel_draws_each_member_at_its_own_fan_in():
     variance over its 32,768 entries lies within 5% of 1 / 512, over six of its standard errors, the
     groups apart, and a partitioned initializer keeps its box."""
     x = jnp.zeros((8, 2, 512))
-    kernel = DenseGeneral(64, batch_dims=(0,), use_bias=False).init(jax.random.key(0), x)["params"]["kernel"]
+    layer = DenseGeneral(64, batch_dims=(0,), use_bias=False)
+    kernel = layer.init(jax.random.key(0), x)["params"]["kernel"]
     variances = np.var(np.asarray(kernel, np.float64), axis=(1, 2)) * 512
     assert np.all(np.abs(variances - 1) < 0.05), variances
     assert len({np.asarray(member).tobytes() for member in kernel}) == 8
+    np.testing.assert_array_equal(layer.init(jax.random.key(0), x)["params"]["kernel"], kernel)
     boxed = DenseGeneral(64, batch_dims=(0,), use_bias=False, kernel_init=PARTITIONED).init(
         jax.random.key(0), x)["params"]["kernel"]
     assert isinstance(boxed, nn.Partitioned) and boxed.value.shape == (8, 512, 64)
+    np.testing.assert_array_equal(boxed.value, kernel)
+
+
+@pytest.mark.parametrize("kernel_init", [nn.initializers.lecun_normal(), PARTITIONED], ids=["plain", "boxed"])
+def test_a_batched_kernel_of_no_members_is_empty(kernel_init):
+    """A batch axis of size zero draws an empty kernel, as flax's does, and computes an empty output."""
+    layer = DenseGeneral(64, batch_dims=(0,), use_bias=False, kernel_init=kernel_init)
+    x = jnp.zeros((0, 2, 512))
+    variables = layer.init(jax.random.key(0), x)
+    assert nn.unbox(variables)["params"]["kernel"].shape == (0, 512, 64)
+    assert layer.apply(variables, x).shape == (0, 2, 64)
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_batched_kernel_draws_its_members_where_its_names_place_them():
+    """A partitioned batched kernel drawn under a mesh by `jax.jit(init, out_shardings=...)` lands
+    split as its names say and holds the members a single device draws."""
+    from jax.sharding import Mesh, PartitionSpec
+
+    mesh = Mesh(np.asarray(jax.devices()[:2]), ("model",))
+    init = nn.with_partitioning(nn.initializers.lecun_normal(), (None, None, "model"))
+    layer = DenseGeneral(64, batch_dims=(0,), use_bias=False, kernel_init=init)
+    x = jnp.zeros((8, 2, 512))
+    shardings = nn.get_sharding(jax.eval_shape(layer.init, jax.random.key(0), x), mesh)
+    placed = jax.jit(layer.init, out_shardings=shardings)(jax.random.key(0), x)["params"]["kernel"]
+    assert placed.value.sharding.spec == PartitionSpec(None, None, "model")
+    np.testing.assert_array_equal(np.asarray(placed.value),
+                                  np.asarray(layer.init(jax.random.key(0), x)["params"]["kernel"].value))
 
 
 @pytest.mark.parametrize(("layer", "shape"), [

@@ -105,9 +105,8 @@ def _members(init, batched: int, flat_shape):
     def drawn(rng, shape, dtype=jnp.float32):
         member = tuple(int(size) for size in flat_shape(shape[batched:]))
         keys = jax.random.split(rng, int(np.prod(shape[:batched])))
-        value = jnp.reshape(jax.vmap(lambda key: meta.unbox(init(key, member, dtype)))(keys), shape)
-        first = init(keys[0], member, dtype)
-        return meta.replace_boxed(first, value) if isinstance(first, meta.AxisMetadata) else value
+        stacked = jax.vmap(lambda key: init(key, member, dtype))(keys)
+        return jax.tree.map(lambda value: jnp.reshape(value, shape), stacked)
     return drawn
 
 
