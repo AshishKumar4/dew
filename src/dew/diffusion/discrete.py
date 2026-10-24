@@ -30,9 +30,8 @@ from dataclasses import dataclass, replace
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from jax.experimental import checkify
 
-from dew._distributions import categorical, row_categorical
+from dew._distributions import categorical, row_categorical, wellformed
 from dew.diffusion.block import CanvasGeneration, through_eos
 from dew.diffusion.process import Conditioning
 from dew.interop.weights import decoding_storage
@@ -201,10 +200,11 @@ class DiscreteProcess:
         request, _ = Request.prepare(inputs, key, mesh_of(variables), check, phase="masked generation")
         plan = request.plan
         program = _compiled(plan.sharding, tuple(compiler_options(model).items()))
-        error, generated = program(model, decoding_storage(model, variables), plan.place(request.padded()),
-                                   plan.keys(request.key), self, solver, max_new_tokens, steps, n,
-                                   eos_token_ids, pad_token_id)
-        error.throw()
+        generated, undefined = program(model, decoding_storage(model, variables),
+                                       plan.place(request.padded()), plan.keys(request.key), self, solver,
+                                       max_new_tokens, steps, n, eos_token_ids, pad_token_id)
+        if bool(undefined):
+            raise ValueError(REVEALED_UNDEFINED)
         return replace(generated, rows=plan.rows * n, prompt_width=request.inputs.tokens.shape[1])
 
 
@@ -261,7 +261,9 @@ class Unmask:
     Each masked position is revealed with probability
     (alpha(s) - alpha(t)) / (1 - alpha(t)), and a revealed position takes a
     token drawn from the model's categorical distribution. The rest stay
-    masked. Stepping any other kind of process raises `ValueError`.
+    masked, as does a position whose scores hold no distribution (a NaN), so
+    a walk never commits an arbitrary token: generation refuses a response
+    left masked. Stepping any other kind of process raises `ValueError`.
     """
 
     def init(self, x, times, process, *, key) -> tuple:
@@ -273,7 +275,8 @@ class Unmask:
         reveal = jax.random.uniform(reveal_key, x.shape) < chance[:, None]
         revealed = denoise.masked(x) & reveal
         drawn = categorical(token_key, log_probs, revealed, REVEALED_UNDEFINED)
-        return jnp.where(revealed, drawn, x), state
+        # A position whose scores hold no distribution stays masked rather than take an arbitrary token.
+        return jnp.where(revealed & wellformed(log_probs), drawn, x), state
 
     def step_rows(self, x, t, t_next, denoised, log_probs, state, keys, process, denoise):
         """`step`, row `i` drawing its reveals and tokens from `keys[i]` alone (`RowSolver`), as the
@@ -283,7 +286,7 @@ class Unmask:
         reveal = jax.vmap(lambda key: jax.random.uniform(key, x.shape[1:]))(split[:, 0]) < chance[:, None]
         revealed = denoise.masked(x) & reveal
         drawn = row_categorical(split[:, 1], log_probs, revealed, REVEALED_UNDEFINED)
-        return jnp.where(revealed, drawn, x), state
+        return jnp.where(revealed & wellformed(log_probs), drawn, x), state
 
     @staticmethod
     def _reveal_chance(process, t, t_next):
@@ -381,8 +384,9 @@ def _response_inputs(inputs: ModelInputs, width: int, mask_id: int) -> tuple[Mod
 
 def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys: jax.Array,
               process: DiscreteProcess, solver: Unmask, budget: int, steps: int, n: int,
-              eos_ids: tuple[int, ...], pad_id: int) -> CanvasGeneration:
-    """The compiled body: one masked walk per row, `n` continuations each.
+              eos_ids: tuple[int, ...], pad_id: int) -> tuple[CanvasGeneration, jax.Array]:
+    """The compiled body: one masked walk per row, `n` continuations each, and whether a response
+    position stayed masked, its scores holding no distribution at every step it would have revealed.
 
     One model call denoises the batch at each step; only the random draws
     map over row keys. Mapping the whole model would batch its kernels too,
@@ -395,7 +399,8 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys:
     batch, prompt = inputs.tokens.shape
     if budget == 0:
         zeros = jnp.zeros((batch * n,), jnp.int32)
-        return CanvasGeneration(jnp.repeat(inputs.tokens, n, axis=0), zeros, zeros.astype(bool), zeros)
+        return (CanvasGeneration(jnp.repeat(inputs.tokens, n, axis=0), zeros, zeros.astype(bool), zeros),
+                jnp.zeros((), bool))
     full, mutable = _response_inputs(inputs, budget, process.mask_id)
 
     denoise = process.denoiser(model, variables, inputs=full, mutable_mask=mutable)
@@ -403,13 +408,15 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys:
     def continued(draw_keys):
         tokens = sample(denoise, full.tokens, steps, solver=solver, key=RowKeys(draw_keys))
         active = jnp.any(mutable, axis=-1)
+        undefined = jnp.any(mutable & (tokens == process.mask_id))
         response, length, ended = jax.vmap(
             lambda row, count: through_eos(row, count, eos_ids, pad_id))(
                 tokens[:, prompt:], jnp.where(active, budget, 0))
         return CanvasGeneration(jnp.concatenate([tokens[:, :prompt], response], axis=-1), length,
-                                ended, jnp.where(active, steps, 0))
+                                ended, jnp.where(active, steps, 0)), undefined
 
-    return prompt_major(jax.lax.map(continued, continuation_keys(keys, n)))
+    generated, undefined = jax.lax.map(continued, continuation_keys(keys, n))
+    return prompt_major(generated), jnp.any(undefined)
 
 
 @functools.cache
@@ -417,23 +424,12 @@ def _compiled(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str,
     """The generation program over `rows`, compiled with the model's own XLA `options`
     (`dew.nn.kernels.options.compiler_options`), so a quantized model and another never share it."""
     return jax.jit(
-        _checked,
+        _generate,
         static_argnames=("model", "process", "solver", "budget", "steps", "n", "eos_ids", "pad_id"),
         in_shardings=(None, rows, rows),
-        out_shardings=(None, rows),
+        out_shardings=(rows, None),
         compiler_options=dict(options),
     )
-
-
-def _checked(model: nn.Module, variables: Variables, inputs: ModelInputs, keys: jax.Array,
-             process: DiscreteProcess, solver: Unmask, budget: int, steps: int, n: int,
-             eos_ids: tuple[int, ...], pad_id: int) -> tuple[checkify.Error, CanvasGeneration]:
-    """`_generate`, with a draw from a revealed position that holds no distribution carried out as an
-    error beside the generation, which the host throws (`dew._distributions`)."""
-    return checkify.checkify(
-        lambda variables, inputs, keys: _generate(model, variables, inputs, keys, process, solver, budget,
-                                                  steps, n, eos_ids, pad_id),
-        errors=checkify.user_checks)(variables, inputs, keys)
 
 
 __all__ = ["MDLM", "DiscreteDenoiser", "DiscreteProcess", "LogLinear", "MaskingSchedule", "Unmask"]
