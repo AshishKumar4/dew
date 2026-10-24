@@ -84,7 +84,7 @@ source a placement reads one device shard at a time (`HostSource`)."""
 
 
 def placed_leaves(tree: Variables, place: Callable[[KeyPath, Leaf], Leaf], *, in_place: bool,
-                  rebuilt: Callable[[object, object], None] | None = None) -> Variables:
+                  rebuilt: Callable[[Leaf, Leaf], None] | None = None) -> Variables:
     """`tree` with each leaf replaced by what `place(path, leaf)` returns, `path` the leaf's key path
     as `jax.tree_util.tree_flatten_with_path` names it, one leaf at a time: a leaf placed lands
     (`block_until_ready`) before the next is read. A node JAX flattens that is not a mapping (a
@@ -161,7 +161,7 @@ def stream(tree: Variables, placement, held: Variables | None = None) -> Variabl
     if held is not None:
         index(held)
 
-    def handed(source, placed):
+    def handed(source: Leaf, placed: Leaf) -> None:
         for holder, key in holders.get(id(source), ()):
             holder[key] = placed
 
