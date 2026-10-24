@@ -659,22 +659,6 @@ class Trainer(Generic[Loss, Effects]):
         modules box, as its rules place them."""
         return boxed(ruled_boxes(self._boxed_axes(), self.layout.axis_rules))
 
-    def check(self, variables: Variables, placement: Placement[Variables]) -> None:
-        """`Layout.check` of `variables` placed by `placement`, read as the
-        layout placed them (`_laid_out`), in the axes the modules box."""
-        with self._declared():
-            self.layout.check(*self._laid_out(variables, placement), self.device_mesh)
-
-    def _laid_out(self, variables: Variables, placement: Placement[Variables]
-                  ) -> tuple[Variables, Placement[Variables]]:
-        """`variables` placed by `placement` as the layout placed them, a
-        CPU-owned run's frozen banks as their layers (`dew.inference.banks.spread`)."""
-        from dew.inference.banks import row_sharding, shape_rows, spread
-        if not (self.host_master and FROZEN in variables):
-            return variables, placement
-        return {**variables, FROZEN: spread(variables[FROZEN], shape_rows)}, {**placement, FROZEN: spread(
-            placement[FROZEN], lambda sharding, count: [row_sharding(sharding)] * count)}
-
     def _shardings(self, state: TrainState) -> Placement[TrainState]:
         mesh = self.state_mesh
         params = dict(state.variables)
@@ -715,7 +699,8 @@ class Trainer(Generic[Loss, Effects]):
             for field in self.layout.host})
 
     @ruled
-    def validate(self, batch: Batch | None = None, *, capacity: int | None = None) -> Validation:
+    def validate(self, batch: Batch | None = None, *, steps: int | None = None,
+                 capacity: int | None = None) -> Validation:
         """What `fit` checks of the state before it places it (`Layout.validate`), read without
         placing anything, so a run is checked on a CPU host before a costly launch.
 
@@ -723,13 +708,15 @@ class Trainer(Generic[Loss, Effects]):
         global `batch` as the run reads it, the accumulation its steps pool where `accumulation`
         is above 1, read as its first step reads the batch (whole, or in the `split` the trainer
         fixes). A CPU host leaves out the narrow copies a GPU step reads (`TrainState.compute`).
-        `capacity` is the bytes each device has, for a mesh whose devices report none: a CPU
-        mesh of `--xla_force_host_platform_device_count` devices standing in for GPUs.
+        An `OptimConfig` is built over `steps`, as `fit(steps=...)` builds it. `capacity` is the
+        bytes each device has, for a mesh whose devices report none: a CPU mesh of
+        `--xla_force_host_platform_device_count` devices standing in for GPUs.
 
         Raises what `fit` raises before placing the state: `LayoutRefused` for a state over a
         device's memory or a layout that replicates too much of the model, and ValueError for
         rules that name an axis the mesh lacks.
         """
+        self._schedule(None if steps is None else steps // self.accumulation)
         state = jax.eval_shape(self.initial_state)
         if batch is not None:
             device, _ = split_fields(marked(DataPartition(), self._counted_batch)(batch))
@@ -739,24 +726,35 @@ class Trainer(Generic[Loss, Effects]):
                                              split * self.accumulation)
         return self._validated(state, capacity)[1]
 
-    def _validated(self, abstract: TrainState, capacity: int | None = None
+    def _validated(self, state: TrainState, capacity: int | None = None
                    ) -> tuple[Placement[TrainState], Validation]:
-        """`abstract`'s placement and what `Layout.validate` reads of the state it places, laid
-        out as the layout placed it (`_laid_out`), once every refusal before a placement passed:
-        a float the devices cannot hold, a layout that replicates too much and a state over a
-        device's memory, which every process agrees, each reading its own devices'."""
-        refuse_wide_floats(abstract, self.device_mesh)
-        shardings = self.shardings(abstract)
-        variables, placement = self._laid_out(abstract.variables, shardings.variables)
-        laid_out = placed_shapes(dataclasses.replace(abstract, variables=variables),
-                                 dataclasses.replace(shardings, variables=placement))
+        """`state`'s placement and what `Layout.validate` reads of the state it places, as the
+        layout placed it, once every refusal before a placement passed: a float the devices
+        cannot hold, a layout that replicates too much and a state over a device's memory."""
+        refuse_wide_floats(state, self.device_mesh)
+        shardings = self.shardings(state)
+        variables, placement = state.variables, shardings.variables
+        if self.host_master and FROZEN in variables:
+            # A CPU-owned run's frozen banks, read as the layers the layout placed.
+            from dew.inference.banks import row_sharding, shape_rows, spread
+            variables = {**variables, FROZEN: spread(variables[FROZEN], shape_rows)}
+            placement = {**placement, FROZEN: spread(
+                placement[FROZEN], lambda sharding, count: [row_sharding(sharding)] * count)}
         with self._declared():
             self.layout.check(variables, placement, self.device_mesh)
-            validation = agreed("state placement", functools.partial(
-                self.layout.validate, self.device_mesh, laid_out, capacity=capacity))
+        validation = self._validation(placed_shapes(dataclasses.replace(state, variables=variables),
+                                                    dataclasses.replace(shardings, variables=placement)),
+                                      capacity)
         _log.info("the state holds %.2f GiB on its fullest device between steps",
                   max(validation.device_bytes.values()) / 2 ** 30)
         return shardings, validation
+
+    def _validation(self, placed: TrainState, capacity: int | None = None) -> Validation:
+        """`Layout.validate` of `placed`, read in the axes the modules box, which every process
+        agrees, each reading its own devices' memory."""
+        with self._declared():
+            return agreed("state placement", functools.partial(
+                self.layout.validate, self.device_mesh, placed, capacity=capacity))
 
     @ruled
     def place(self) -> tuple[TrainState, Placement[TrainState], bytes | None]:
@@ -1264,6 +1262,8 @@ class Trainer(Generic[Loss, Effects]):
         shapes, copies, prepared = self._prepared(state, micro, schedule, split * self.accumulation)
         shardings = self.shardings(prepared)
         prepared = placed_shapes(prepared, shardings)
+        # What the step holds between steps, the accumulator and copies it adds included, fits the devices.
+        self._validation(prepared)
         # The check reads the state's arguments as already on the devices. The copies and accumulators
         # `run` builds on the first call are not yet, so they count with the prefetched batches beside
         # the step, a ramp stage's window too, which `run` builds beside the last, already resident.
@@ -1551,8 +1551,7 @@ class Trainer(Generic[Loss, Effects]):
         else:
             # A supplied state's trees are held as dicts too (`initial_state`).
             initial = dataclasses.replace(initial, variables=unfreeze(dict(initial.variables)))
-            shardings = self.shardings(initial)
-            self.check(initial.variables, shardings.variables)
+            shardings, _ = self._validated(initial)
             state = jax.device_put(initial, shardings)
             position = None
         run.last_checkpoint = time.perf_counter()

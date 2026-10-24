@@ -941,8 +941,12 @@ class Layout:
         (`dew.training.planning`).
         """
         leaves: dict[str, LeafPlacement] = {}
-        # What the devices' own memory holds, leaf by leaf: its field, its mesh, a device's bytes of it.
-        held: list[tuple[str, Mesh, int]] = []
+        devices = set(mesh.devices.flat)
+        # The ids of `mesh`'s devices each leaf's mesh shares, matched as devices, not ids: a CPU
+        # companion's devices number themselves as the accelerators do.
+        shared: dict[Mesh, frozenset[int]] = {}
+        # What the devices' own memory holds, leaf by leaf: its field, its devices, a device's bytes of it.
+        held: list[tuple[str, frozenset[int], int]] = []
         for path, leaf in jax.tree_util.tree_flatten_with_path(state)[0]:
             sharding = leaf.sharding
             # A sharding that names no memory places in its devices' default, their own.
@@ -950,13 +954,16 @@ class Layout:
             shard = sharding.shard_shape(leaf.shape)
             leaves[_variable_path(path)] = LeafPlacement(sharding.spec, shard, kind)
             if kind == "device":
-                held.append((_variable_path(path[:1]), sharding.mesh, _shard_bytes(leaf)))
-        meshes = collections.Counter()
-        for _, on, size in held:
-            meshes[on] += size
+                on = sharding.mesh
+                if on not in shared:
+                    shared[on] = frozenset(device.id for device in devices.intersection(on.devices.flat))
+                held.append((_variable_path(path[:1]), shared[on], _shard_bytes(leaf)))
+        totals = collections.Counter()
+        for _, ids, size in held:
+            totals[ids] += size
         device_bytes = dict.fromkeys(mesh.device_ids.ravel().tolist(), 0)
-        for on, size in meshes.items():
-            for device in device_bytes.keys() & set(on.device_ids.ravel().tolist()):
+        for ids, size in totals.items():
+            for device in ids:
                 device_bytes[device] += size
         limits = (dict.fromkeys(device_bytes, capacity) if capacity is not None else
                   {device.id: limit for device in mesh.local_devices
@@ -982,7 +989,7 @@ class Layout:
         return {name: tuple(paths) for name, paths in found.items()}
 
 
-def _refuse_overfull(held: list[tuple[str, Mesh, int]], device_bytes: Mapping[int, int],
+def _refuse_overfull(held: list[tuple[str, frozenset[int], int]], device_bytes: Mapping[int, int],
                      limits: Mapping[int, int]) -> None:
     """Refuse a state some device would hold more of than its `limits`, naming the device
     furthest over and its bytes by field, from `held` (`Layout.validate`); both by device id."""
@@ -991,8 +998,8 @@ def _refuse_overfull(held: list[tuple[str, Mesh, int]], device_bytes: Mapping[in
         return
     fullest = max(over, key=lambda device: device_bytes[device] - limits[device])
     fields = collections.Counter()
-    for field, on, size in held:
-        if fullest in on.device_ids:
+    for field, ids, size in held:
+        if fullest in ids:
             fields[field] += size
     parts = ", ".join(f"{field} {size / 2 ** 30:.2f}" for field, size in fields.most_common())
     raise LayoutRefused(
