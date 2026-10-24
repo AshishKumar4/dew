@@ -26,7 +26,7 @@ import json
 import math
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from types import MappingProxyType
@@ -97,20 +97,11 @@ class LayerBanks(Protocol):
         sites, shapes, _device_mesh, placement, entries = _bank_plan(model, self, mesh, layout)
 
         entry_values = jax.block_until_ready(self.entry(entries)) if entries else {}
-        bank_store: dict[str, dict] = {}
-        for site in sites:
-            for (first, count), name in zip(site.view.groups, site.view.bank_names(), strict=True):
-                bank = jax.block_until_ready(self.bank(
-                    range(first, first + count),
-                    _bank_placement(one_layer(placement, first, namespace=site.namespace),
-                                    one_layer(shapes, first, namespace=site.namespace), stacked=count > 1),
-                    namespace=site.namespace))
-                for collection, tree in bank.items():
-                    branch = bank_store.setdefault(collection, {})
-                    for component in site.namespace:
-                        branch = branch.setdefault(component, {})
-                    branch[name] = tree
-        return merge(entry_values, bank_store)
+        return merge(entry_values, assembled(sites, lambda site, first, count, _: self.bank(
+            range(first, first + count),
+            _bank_placement(one_layer(placement, first, namespace=site.namespace),
+                            one_layer(shapes, first, namespace=site.namespace), stacked=count > 1),
+            namespace=site.namespace)))
 
 
 def one_layer(variables: Variables, index: int, *, namespace: tuple[str, ...] = ()) -> Variables:
@@ -712,6 +703,29 @@ def bank_sites(model: BankedModel) -> tuple[DecoderBank, ...]:
     if any(right[:len(left)] == left for left, right in itertools.pairwise(ordered)):
         raise ValueError("declared decoder banks overlap in their canonical layer ownership")
     return tuple(owners.values())
+
+
+def assembled(sites: Sequence[DecoderBank],
+              bank: Callable[[DecoderBank, int, int, str], Variables | None]) -> dict[str, dict]:
+    """The banked store `sites` declare, one bank at a time: each site's groups in its stack's
+    order, `bank(site, first, count, name)` the bank named `name` of a group's `count` layers from
+    `first` (None for a group with nothing to hold), its copies landed (`block_until_ready`) before
+    the next is read, so a load has one bank's transfers in flight, and its collections set under
+    the site's namespace by that name. A source's whole banks (`LayerBanks.place`) and training's
+    snapshot of its state (`HostExecution.snapshot`) both assemble through it, each with its own
+    source and stacking."""
+    store: dict[str, dict] = {}
+    for site in sites:
+        for (first, count), name in zip(site.view.groups, site.view.bank_names(), strict=True):
+            held = bank(site, first, count, name)
+            if held is None:
+                continue
+            for collection, tree in jax.block_until_ready(held).items():
+                branch = store.setdefault(collection, {})
+                for component in site.namespace:
+                    branch = branch.setdefault(component, {})
+                branch[name] = tree
+    return store
 
 
 def entry_tree(variables: Variables, sites: Sequence[DecoderBank]) -> Variables:
