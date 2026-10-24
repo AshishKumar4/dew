@@ -43,7 +43,7 @@ def fine_tune(mesh, layout, accumulation=1):
                    mesh=mesh, layout=layout, accumulation=accumulation, split=1)
 
 
-def tokens():
+def step_batch():
     return token_rows(VOCAB, BATCH, SEQ_LEN + 1)
 
 
@@ -55,7 +55,7 @@ def test_a_validated_fine_tune_is_placed_and_held_as_its_report_said(case):
     its own memory; and the step reads its batch's rows split over the reported axes."""
     mesh, layout, accumulation = CASES[case]
     run = fine_tune(mesh, layout, accumulation)
-    report = run.validate(tokens())
+    report = run.validate(step_batch())
     state = run.fit(Loader(train=lambda partition: repeated_token_batch(VOCAB, BATCH, SEQ_LEN + 1),
                            val=None, records=None, batch=BATCH), steps=2 * accumulation)
 
@@ -84,10 +84,10 @@ def test_a_fine_tune_over_a_devices_capacity_is_refused_before_anything_is_place
     mesh, layout, accumulation = CASES["fsdp_tensor_accumulating"]
     run = fine_tune(mesh, layout, accumulation)
     before = jax.live_arrays()
-    held = max(run.validate(tokens()).device_bytes.values())
-    run.validate(tokens(), capacity=held)
+    held = max(run.validate(step_batch()).device_bytes.values())
+    run.validate(step_batch(), capacity=held)
     with pytest.raises(LayoutRefused):
-        run.validate(tokens(), capacity=held - 1)
+        run.validate(step_batch(), capacity=held - 1)
     assert {id(array) for array in jax.live_arrays()} <= {id(array) for array in before}
 
 
