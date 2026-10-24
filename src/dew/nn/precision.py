@@ -49,7 +49,7 @@ def weighted_total(x: jax.Array, weights: jax.Array, axis=None) -> tuple[jax.Arr
     """Weighted total and mass along `axis`, in `x`'s dtype. Broadcastable weights mark excluded
     values with zero; those values are selected away before multiplication, so their NaNs and
     infinities cannot reach the sum. The caller owns its denominator policy."""
-    weights = jnp.asarray(weights, x.dtype)
+    weights = jnp.broadcast_to(jnp.asarray(weights, x.dtype), x.shape)
     kept = jnp.where(weights != 0, x, 0)
     return jnp.sum(kept * weights, axis=axis), jnp.sum(weights, axis=axis)
 

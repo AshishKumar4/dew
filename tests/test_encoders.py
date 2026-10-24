@@ -29,6 +29,20 @@ def test_text_pooling_excludes_nonfinite_padding_from_values_and_gradients():
         for observed, expected in zip(actual, clean, strict=True):
             np.testing.assert_array_equal(observed, expected)
 
+
+def test_a_shared_mask_counts_every_row_in_a_weighted_mean():
+    """A mask shared across the batch weighs as many rows as its explicit broadcast, including
+    its denominator and the gradient of the pooled result."""
+    from dew.rl.advantage import masked_mean as token_mean
+
+    values = jnp.arange(12, dtype=jnp.float32).reshape(4, 3)
+    shared = jnp.asarray([[1.0, 0.0, 0.5]])
+    explicit = jnp.broadcast_to(shared, values.shape)
+    values = jnp.where(explicit != 0, values, jnp.nan)
+    evaluate = jax.value_and_grad(token_mean)
+    for observed, expected in zip(evaluate(values, shared), evaluate(values, explicit), strict=True):
+        np.testing.assert_array_equal(observed, expected)
+
 ############################################################################################################
 # Text pooling reads the mask (T23)
 ############################################################################################################
