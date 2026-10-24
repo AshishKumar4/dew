@@ -278,7 +278,10 @@ text = generate(model, params, prompt, 300, key=key, sampling=Sampling(temperatu
 A loaded model is ready to run. `Pretrained.load` without a mesh or layout places its variables on JAX's
 default device, as a `jnp` array is placed, one leaf at a time; with a mesh it places them there.
 Keeping them on the host is an explicit request (`on_host=True`), for a caller that places them
-itself, such as a training start or an export.
+itself, such as an export or a run whose state lives on the host. A run that starts from a source reads
+it where its start keeps it (`TrainerConfig.source_placement`): onto its trainer's mesh, sharded as its
+layout shards the state, each process reading only its devices' shards; on the host for a run whose
+layout keeps the variables there; and no weights at all for a run that resumes from its own checkpoint.
 
 Serving is one engine of kinds (`dew.inference.Engine`). A kind (`Kind`) admits waiting requests
 within its own bounds, runs them with one bounded device call a `step`, and settles each request's
