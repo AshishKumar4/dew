@@ -935,19 +935,26 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
 
 
 
-def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
-    """The checkout's one 3.12 task, run green on one CPU class against the shared test cache as armada
-    starts it (`armada_task`) under the cache's policy, its verdict written beside the checkout's entries,
-    not among them (the checkout's own directory is an input): each call, how many times its test has run,
-    which it counts in `runs`."""
+def cached_checkout(ci, root: Path, monkeypatch, cache_worker) -> Path:
+    """Checkout `root` run by 3.12 tasks on one CPU class against the shared test cache, and where their
+    verdict is written: beside the checkout's entries, not among them (the checkout's own directory is an
+    input)."""
     interpreter(root, "3.12")
     url, _, _ = cache_worker
     monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
     cached(monkeypatch, url)
     (root / ".verdict").mkdir()
+    return root / ".verdict/verdict.json"
+
+
+def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
+    """The checkout's one 3.12 task, run green on one CPU class against the shared test cache as armada
+    starts it (`armada_task`) under the cache's policy (`cached_checkout`): each call, how many times its
+    test has run, which it counts in `runs`."""
+    verdict = cached_checkout(ci, root, monkeypatch, cache_worker)
 
     def run(policy: str = "on") -> int:
-        rows = armada_task(ci, monkeypatch, root / ".verdict/verdict.json", policy)
+        rows = armada_task(ci, monkeypatch, verdict, policy)
         assert [row["exitCode"] for row in rows] == [0]
         return len((root / "runs").read_text())
 
@@ -996,25 +1003,21 @@ def test_a_fold_that_moves_a_test_between_groups_runs_each_test_once_in_its_new_
     nodes = [f"tests/test_moved.py::test_{index}" for index in range(3)]
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(dict(zip(nodes, [300.0, 100.0, 100.0],
                                                                            strict=True))))
-    interpreter(tmp_path, "3.12")
-    url, _, _ = cache_worker
-    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
-    cached(monkeypatch, url)
-    (tmp_path / ".verdict").mkdir()
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
     base = commit(tmp_path, "base")
 
     def run() -> dict[str, list[str]]:
-        rows = armada_task(ci, monkeypatch, tmp_path / ".verdict/verdict.json", ci.policy(base))
+        rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
         assert all(row["exitCode"] == 0 for row in rows)
         return {row["name"]: sorted(row["tests"]) for row in rows}
 
     assert run() == {"3.12:tests/test_moved.py#1/2": nodes[:1], "3.12:tests/test_moved.py#2/2": nodes[1:]}
-    verdict = tmp_path / ".verdict/main.json"
-    verdict.write_text(json.dumps({"rows": [
+    main_ci = tmp_path / ".verdict/main.json"
+    main_ci.write_text(json.dumps({"rows": [
         {"name": "3.12:tests/test_moved.py#1/2", "exitCode": 0, "seconds": 100.0, "tests": {nodes[0]: 100.0}},
         {"name": "3.12:tests/test_moved.py#2/2", "exitCode": 0, "seconds": 600.0,
          "tests": {nodes[1]: 100.0, nodes[2]: 500.0}}]}))
-    monkeypatch.setattr(sys, "argv", ["ci.py", "durations", str(verdict)])
+    monkeypatch.setattr(sys, "argv", ["ci.py", "durations", str(main_ci)])
     assert ci.main() == 0
     commit(tmp_path, "main's CI folded")
     (tmp_path / "runs").write_text("")
@@ -1036,15 +1039,11 @@ def test_a_durations_change_reruns_only_the_groups_cut_from_it(ci, tmp_path, mon
     record = {"tests/test_heavy.py::test_heavy_0": 200.0, "tests/test_heavy.py::test_heavy_1": 200.0,
               "tests/test_light.py::test_light_0": 1.0, "tests/test_light.py::test_light_1": 1.0}
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(record))
-    interpreter(tmp_path, "3.12")
-    url, _, _ = cache_worker
-    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
-    cached(monkeypatch, url)
-    (tmp_path / ".verdict").mkdir()
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
     base = commit(tmp_path, "base")
 
     def run() -> dict[str, int]:
-        rows = armada_task(ci, monkeypatch, tmp_path / ".verdict/verdict.json", ci.policy(base))
+        rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
         assert sorted(row["name"] for row in rows if not row["exitCode"]) == [
             "3.12:tests/test_heavy.py#1/2", "3.12:tests/test_heavy.py#2/2", "3.12:tests/test_light.py"]
         return {name: len((tmp_path / f"runs-{name}").read_text()) for name in ("heavy", "light")}
@@ -1087,11 +1086,7 @@ def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, mon
             f"def test_{name}():\n"
             f"    with Path('runs-{name}').open('a') as runs: runs.write('x')\n"
             f"    assert runpy.run_path('tools/{name}.py')['VALUE'] >= 1\n")
-    interpreter(tmp_path, "3.12")
-    url, _, _ = cache_worker
-    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
-    cached(monkeypatch, url)
-    (tmp_path / ".verdict").mkdir()
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
     def git(*arguments: str) -> str:
         return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *arguments], cwd=tmp_path,
                               check=True, capture_output=True, text=True).stdout.strip()
@@ -1101,7 +1096,7 @@ def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, mon
     base = git("rev-parse", "HEAD")
 
     def run() -> list[int]:
-        rows = armada_task(ci, monkeypatch, tmp_path / ".verdict/verdict.json", ci.policy(base))
+        rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
         assert [row["exitCode"] for row in rows] == [0, 0]
         return [len((tmp_path / f"runs-{name}").read_text()) for name in ("first", "second")]
 
@@ -1122,14 +1117,14 @@ def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, mon
     (tmp_path / "tools/named.py").write_text("VALUE = 1\n")
     git("add", "tests/test_named.py", "tools/named.py")
     git("commit", "-qm", "a test imports a tool by its name")
-    rows = armada_task(ci, monkeypatch, tmp_path / ".verdict/verdict.json", ci.policy(base))
+    rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
     assert [row["exitCode"] for row in rows] == [0, 0, 0]
     (tmp_path / "tools/named").mkdir()
     (tmp_path / "tools/named/__init__.py").write_text("VALUE = 2\n")
     git("add", "tools/named/__init__.py")
     git("commit", "-qm", "a package shadows the tool")
     assert ci.policy(base) == "on"
-    rows = armada_task(ci, monkeypatch, tmp_path / ".verdict/verdict.json", ci.policy(base))
+    rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
     assert {row["name"]: row["exitCode"] for row in rows}["3.12:tests/test_named.py"] == 1
 
 
