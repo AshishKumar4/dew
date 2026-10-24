@@ -106,13 +106,13 @@ def test_a_gemma4_tower_runs_any_activation_the_shared_table_computes_as_the_ref
     from transformers.models.gemma4.modeling_gemma4 import Gemma4AudioModel
 
     from dew.nn.audio import AudioFeedForward, AudioLightConv
-    from tools.audio_reference import audio_config as reference_config, perturb
+    from tools import audio_reference
 
-    config = reference_config("gemma4")
+    config = audio_reference.audio_config("gemma4")
     config.hidden_act = "quick_gelu"
     torch.manual_seed(314)
     reference = Gemma4AudioModel(config).eval()
-    perturb(reference)
+    audio_reference.perturb(reference)
     ours = audio_config(config.to_dict())
     tensors = {name: tensor.numpy().copy() for name, tensor in reference.state_dict().items()}
     tree, _ = audio_weights(tensors, ours)
