@@ -214,7 +214,8 @@ def _decoder(text: Mapping[str, object], tied: bool, max_seq_len: int) -> Decode
             'linear_num_heads': record_int(linear, 'num_heads'),
             'linear_head_dim': record_int(linear, 'head_dim'),
             'linear_conv_kernel_dim': record_int(linear, 'short_conv_kernel_size'),
-            'linear_lower_bound': None if bound is None else float(_records.number(bound, 'gate_lower_bound')),
+            'linear_lower_bound': (None if bound is None
+                                   else float(_records.number(bound, 'gate_lower_bound'))),
             'use_full_rank_gate': bool(linear.get('use_full_rank_gate', False))}})
     if 'full_attention' in types:
         kinds['full_attention'] = native_fields(LayerKind)(mixer=None)
