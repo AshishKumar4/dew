@@ -236,11 +236,16 @@ def render(value: JSON) -> str:
 
 
 def context_tokens(tokenizer: Tokenizer, context: JSON | None, length: int) -> np.ndarray:
-    """A context's tokens as a row carries them: its text's (`render`), without specials, the first
-    `length` of them, and none for no context."""
+    """A context's tokens as a row carries them: its text's (`render`), without specials, and none for
+    no context. A context of more than `length` tokens, which the cross-attention reads no more of,
+    is refused (ValueError), never cut: a cut would answer from part of what the caller gave."""
     if context is None:
         return np.zeros(0, np.int32)
-    return np.asarray(tokenizer.encode(render(context), add_special_tokens=False)[:length], np.int32)
+    tokens = tokenizer.encode(render(context), add_special_tokens=False)
+    if len(tokens) > length:
+        raise ValueError(f"the context is {len(tokens)} tokens, more than the {length} its cross-attention "
+                         "reads (context_length)")
+    return np.asarray(tokens, np.int32)
 
 
 def with_context(rows: Sequence[Encoded], tokenizer: Tokenizer, context: JSON | None,

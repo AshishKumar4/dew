@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -24,6 +25,9 @@ from dew.nn.protocols import (
 )
 from dew.objectives.base import Variables, part, thaw
 
+type ContextEncoder = Literal["table", "backbone"]
+"""How a decision model encodes a row's context (`DecisionModel.context_encoder`)."""
+
 
 @dataclass(frozen=True)
 class DecisionModel:
@@ -42,6 +46,10 @@ class DecisionModel:
 
     backbone: nn.Module
     head: Head
+    context_encoder: ContextEncoder = "table"
+    """How a row's context becomes the states its cross-attention reads: `table`, its tokens through the
+    backbone's own embedding table, or `backbone`, the backbone's final states over it in a pass of its
+    own (`context_states`), as a schema read in context always is."""
 
     def __post_init__(self):
         if not isinstance(self.backbone, HiddenStates):
@@ -72,10 +80,12 @@ class DecisionModel:
         blocked: dict[str, jax.Array] = {} if inputs.blocks is None else {"block_groups": inputs.blocks}
         spanned = conditioning = None
         if inputs.context is not None:
-            # The context's own pass where it holds the schema, else the backbone's token table.
-            spanned = (self.context_states(variables, inputs, train=train, rngs=rngs)
-                       if inputs.spans_in_context else None)
-            conditioning = self.conditioning(backbone, inputs, spanned)
+            # The context's own pass where it holds the schema or the backbone encodes it, else the
+            # backbone's token table.
+            encoded = (self.context_states(variables, inputs, train=train, rngs=rngs)
+                       if inputs.spans_in_context or self.context_encoder == "backbone" else None)
+            spanned = encoded if inputs.spans_in_context else None
+            conditioning = self.conditioning(backbone, inputs, encoded)
         if media is not None:
             if inputs.slots is not None:
                 raise ValueError("a row of option positions holds no images")
