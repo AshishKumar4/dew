@@ -18,6 +18,7 @@ from reference_error import assert_as_exact
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import generation
 from dew.nn.mixers import AttentionMixer
+from dew.nn.visibility import block_ends, block_starts
 
 VOCAB = 37
 LENGTH = 8
@@ -284,3 +285,13 @@ def test_a_multimodal_wrappers_cached_rollout_reads_its_blocks_as_its_full_pass_
     assert_as_exact(lambda params, ids: rolled(params, ids)[:, 3:], full(wrapper),
                     model_draw(wrapper, (2, 12), VOCAB), "multimodal cached blocks", seeds=CACHED_SEEDS,
                     truth_fn=full(wide))
+
+
+def test_a_blocks_bounds_are_its_runs_first_token_and_one_past_its_last():
+    """`block_starts` and `block_ends`: each token's run of equal ids starts at its first token and ends one
+    past its last, a run of -1 as any other."""
+    groups = jnp.asarray([[-1, 0, 0, -1, -1, 3, 3, 3], [5, 5, 5, 5, 1, 1, 1, 1]], jnp.int32)
+    np.testing.assert_array_equal(np.asarray(block_starts(groups)),
+                                  [[0, 1, 1, 3, 3, 5, 5, 5], [0, 0, 0, 0, 4, 4, 4, 4]])
+    np.testing.assert_array_equal(np.asarray(block_ends(groups)),
+                                  [[1, 3, 3, 5, 5, 8, 8, 8], [4, 4, 4, 4, 8, 8, 8, 8]])
