@@ -106,10 +106,11 @@ def test_the_stored_joint_head_scores_compacted_options_as_it_scores_the_grid():
 
 
 def ragged() -> list[Example]:
-    """Ragged rows: one question of a hundred options, seventeen of three and one of
-    twenty-four."""
-    clauses = Choice("Which clause?", [f"c{index}" for index in range(100)])
-    hypotheses = {f"h{index}": Choice(f"Hypothesis {index}?", ["yes", "no", "unsaid"]) for index in range(17)}
+    """Ragged rows: one question of forty options, six of three and one of twenty-four. A window's grid
+    is its bound's questions times forty slots, more than the 128 (`OPTION_TILE`) its real options
+    compact into."""
+    clauses = Choice("Which clause?", [f"c{index}" for index in range(40)])
+    hypotheses = {f"h{index}": Choice(f"Hypothesis {index}?", ["yes", "no", "unsaid"]) for index in range(6)}
     intents = Choice("Which intent?", [f"i{index}" for index in range(24)])
     return [Example("a clause on fees", {"clause": clauses}, {"clause": "c7"}),
             Example("a contract", hypotheses, dict.fromkeys(hypotheses, "unsaid")),
@@ -197,7 +198,7 @@ def zeroed(tree):
 
 
 def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
-    """Rows of 100, 17 x 3 and 24 real options packed into windows of a grid as many questions deep as a
+    """Rows of 40, 6 x 3 and 24 real options packed into windows of a grid as many questions deep as a
     window holds, which the packing compacts into the slots its bounds allow. The compaction is the
     joint head's alone (the backbone reads the rows' tokens, never their option slots), so the head is
     what check 1 holds: over draws of the backbone's states and of a cotangent on each real option, its
@@ -212,12 +213,12 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     slotted = {name: value for name, value in slotted.items() if name != VALID_ROWS}
     options = np.asarray(slotted["options"])
     bounds = objective.bounds
-    assert options.shape[1:] == (bounds.questions, 100)
+    assert options.shape[1:] == (bounds.questions, 40)
     starts = np.asarray(slotted["spans"])[..., 0]
     owners = np.where(slotted["questions"], np.take_along_axis(slotted["segments"], starts, axis=1), 0)
     totals = [int(options[window][owners[window] == row].sum()) for window in range(len(options))
               for row in range(1, int(np.max(slotted["segments"][window])) + 1)]
-    assert sorted(totals) == [24, 51, 100]
+    assert sorted(totals) == [18, 24, 40]
     # A window's real options compact into the slots its bounds allow, a multiple of 128.
     capacity = -(-bounds.options // 128) * 128
     compact = laid_out(slotted, bounds.segments)
