@@ -13,6 +13,7 @@ and the call's queries and keys pad to whole blocks, which their spans leave unr
 import dataclasses
 import functools
 from collections.abc import Callable, Sequence
+from typing import Literal, overload
 
 import jax
 import jax.numpy as jnp
@@ -457,6 +458,20 @@ def _param_spec(kind: Kind, param: jax.Array, block_q: int, keys: int) -> pl.Blo
             return pl.BlockSpec((None, None, block_q, keys), lambda i, b, h: (b, h, i, 0))
         case Kind.OUTPUT:
             return pl.BlockSpec((None, block_q, None, param.shape[-1]), lambda i, b, h: (b, i, h, 0))
+
+
+@overload
+def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
+            *, scale: float | None = None, residuals: Literal[False] = False, natural: bool = NATURAL,
+            interpret: bool = False) -> jax.Array:
+    ...
+
+
+@overload
+def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
+            *, scale: float | None = None, residuals: Literal[True], natural: bool = NATURAL,
+            interpret: bool = False) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
+    ...
 
 
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
