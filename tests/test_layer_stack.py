@@ -318,6 +318,10 @@ class ScanCase:
         found = self.kept(*inputs)
         wrong = [entry for entry in found if entry[-1] > KEPT_BOUND]
         assert wrong == [], wrong
+        if found:
+            # Rows no check judges: their executions go with them.
+            for name in ("scanned", "plain", "truth"):
+                del self._ran[(name, np.asarray(inputs[0]).tobytes())]
         return not found
 
     def kept(self, ids, cotangent) -> list[tuple[str, str, str, int, float]]:
@@ -336,7 +340,10 @@ class ScanCase:
                     differs = ours[path][0] != kept
                     if differs.any():
                         gate = theirs[path][1]
-                        cutoff = np.asarray(gaussian_cutoff(gate, sparsity[layer_index(path)]))
+                        # The truth's cutoff, in float64 as its program forms it.
+                        fraction = sparsity[layer_index(path)]
+                        with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
+                            cutoff = np.asarray(gaussian_cutoff(jnp.asarray(gate), fraction))
                         margin = np.abs(gate - cutoff) / gate.std(-1, keepdims=True)
                         found.append((name, which, path, int(differs.sum()), float(margin[differs].max())))
         return found
@@ -383,9 +390,10 @@ def test_a_scanned_gate_at_another_sparsity_fails_its_choices_and_check_1():
         case.draw(0)
     assert any(run == "scanned" and margin > KEPT_BOUND for run, _, _, _, margin in case.kept(*case.drawn(0)))
     scanned, plain, truth = case.arms()
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError) as raised:
         assert_as_exact(scanned, plain, case.drawn, "gemma3n scanned stack at 0.951",
                         seeds=SCAN_SEEDS["gemma3n"], truth_fn=truth)
+    assert raised.type is AssertionError
 
 
 def gemma3n_training_variables(variables):
