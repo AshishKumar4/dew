@@ -520,3 +520,22 @@ def test_a_released_checkpoint_refuses_what_its_layout_cannot_hold(decide, tmp_p
     gated = decide.gated(0.5)
     with pytest.raises(ValueError):
         gated.save_pretrained(tmp_path)
+
+
+@pytest.mark.mesh
+def test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh(decide):
+    """A task whose weights are placed on a mesh of every device scores its examples there, its rows
+    split over the mesh's row axes, as a run's validation splits them, rather than handing one device's
+    inputs to weights on several; it answers the questions it answers on one device."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.training import MeshSpec
+
+    examples = answered()
+    alone = decide.score(examples)
+    mesh = MeshSpec().build(jax.devices())
+    spread = replace(decide, variables=jax.device_put(decide.variables, NamedSharding(
+        mesh, PartitionSpec())))
+    scores = spread.score(examples)
+    assert set(scores) == set(alone) and all(np.isfinite(value) for value in scores.values())
+    assert scores["accuracy"] == alone["accuracy"]
