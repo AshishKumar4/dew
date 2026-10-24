@@ -44,20 +44,18 @@ class Export:
     """Packages outside Dew whose modules the run's record may import."""
 
     def run_command(self) -> int:
-        from dew.inference.tasks import run_record
+        from dew.inference.tasks import SavedRun
         from dew.interop import Pretrained
         from dew.objectives.base import ReleasedTask
-        from dew.records import text
-        from dew.registry import objectives
 
         # A task that publishes its own released layout (a decision run's) writes it; any other
-        # run writes its model in the source layout its family reads.
-        record, _ = run_record(self.run, self.step, self.trust)
-        task = objectives[text(record['objective'], 'objective')].saved_task
+        # run writes its model in the source layout its family reads, both at the step pinned here.
+        run = SavedRun.pinned(self.run, self.step, self.trust)
+        task = run.objective.saved_task
         if task is not None and issubclass(task, ReleasedTask):
-            task.from_run(self.run, ema=self.ema, step=self.step).save_pretrained(self.destination)
+            task.from_run(run.directory, ema=self.ema, step=run.step).save_pretrained(self.destination)
         else:
-            loaded = Pretrained.from_run(self.run, ema=self.ema, step=self.step, trust=self.trust)
+            loaded = Pretrained.from_run(run.directory, ema=self.ema, step=run.step, trust=self.trust)
             loaded.save(self.destination)
         emit(f"exported {self.run} to {self.destination}")
         return 0

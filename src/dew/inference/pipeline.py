@@ -109,18 +109,17 @@ def pipeline(
 def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
               dtype: str | None, param_dtype: str | None, ema: bool | None,
               step: int | str | None, trust: Sequence[str]) -> SavedTask:
-    """The task the run's recorded objective declares (`Objective.saved_task`)."""
-    from dew.inference.tasks import run_record
-    from dew.records import text
-    from dew.registry import objectives
+    """The task the run's recorded objective declares (`Objective.saved_task`), loaded at the step
+    pinned here; the packages its record may import stay trusted for the process once pinned
+    (`dew.registry.import_trusted`), so the task's own load reads it too."""
+    from dew.inference.tasks import SavedRun
 
-    record, step = run_record(str(root), step, trust)
-    kind = text(record['objective'], 'objective')
-    task = objectives[kind].saved_task
+    run = SavedRun.pinned(str(root), step, trust)
+    task = run.objective.saved_task
     if task is None:
-        raise TypeError(f"a run of the {kind!r} objective ({objectives[kind].__name__}) loads as no task: "
-                        "its class declares no `saved_task`")
-    return task.from_run(str(root), ema=ema, step=step, mesh=mesh, layout=layout,
+        raise TypeError(f"a run of {run.objective.__name__} loads as no task: its class declares no "
+                        "`saved_task`")
+    return task.from_run(run.directory, ema=ema, step=run.step, mesh=mesh, layout=layout,
                          dtype=dtype, param_dtype=param_dtype)
 
 
