@@ -151,13 +151,7 @@ class BlockProcess:
                 raise ValueError(f"{name} must be positive and finite")
 
     def temperature(self, remaining: jax.typing.ArrayLike) -> jax.Array:
-        """The reference's linear schedule, t_min + (t_max - t_min) n / N at n steps remaining, read
-        from the table of every step's taken on the host in float64 and rounded once, as the
-        reference takes it: XLA writes a division by the constant N as a product with its rounded
-        reciprocal, which the logits' quotient by the temperature then carries into every step."""
-        steps = np.arange(self.max_steps + 1) / self.max_steps
-        table = (self.t_min + (self.t_max - self.t_min) * steps).astype(np.float32)
-        return jnp.asarray(table)[jnp.asarray(remaining)]
+        return self.t_min + (self.t_max - self.t_min) * jnp.asarray(remaining) / self.max_steps
 
     def noise(self, key: jax.Array, shape: Sequence[int]) -> jax.Array:
         return jax.random.randint(key, shape, 0, self.vocab_size, jnp.int32)

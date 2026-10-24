@@ -339,10 +339,9 @@ TEMPER_SEEDS = 8
 
 
 def test_the_tempered_logits_divide_by_the_reference_temperature_at_every_step():
-    """The temperature at n steps remaining is the reference's t_min + (t_max - t_min) n / N, taken
-    on the host, and the tempered logits, the logits over it, are on par with the reference's float32
-    quotient at every step (check 1, float64 the truth): XLA's product with a rounded reciprocal of N
-    is not the reference's fraction."""
+    """The temperature at n steps remaining is the reference's t_min + (t_max - t_min) n / N, and the
+    tempered logits, the logits over it, are on par with the reference's float32 quotient at every
+    step (check 1, float64 the truth), however XLA lowers its division by the constant N."""
     from reference_error import assert_as_exact
 
     from dew.diffusion.block import BlockProcess
