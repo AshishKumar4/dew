@@ -641,6 +641,26 @@ def test_a_host_resident_stack_keeps_what_its_callers_own_filter_asks_for():
     assert kept(on_host) == resident
 
 
+def test_a_capture_filter_can_select_only_a_later_host_resident_layer():
+    """Identical layer specs need not have identical capture policies: selecting one later layer
+    keeps it even when the first layer's shape probe captured nothing."""
+    model = tiny(scan_layers=False, attention_impl="reference")
+    ids = jnp.ones((1, SEQ_LEN), jnp.int32)
+    variables = model.init(jax.random.key(0), ids)
+    host = jax.sharding.SingleDeviceSharding(jax.devices()[0], memory_kind="pinned_host")
+    on_host = {**variables, "params": {
+        name: jax.device_put(tree, host) if name.startswith("layers_") else tree
+        for name, tree in variables["params"].items()}}
+
+    def selected(module, method):
+        return method == "__call__" and module.name == f"layers_{model.num_layers - 1}"
+
+    captures = [model.apply(tree, ids, capture_intermediates=selected, mutable=["intermediates"])[1]
+                for tree in (variables, on_host)]
+    assert jax.tree.leaves(captures[0])
+    assert jax.tree.structure(captures[1]) == jax.tree.structure(captures[0])
+
+
 def test_a_host_resident_key_sharing_stack_keeps_layer_states_through_cached_decoding():
     """A scanned stack whose later layers read the keys and values an earlier one provides, its
     layers in host memory, read by a caller that keeps every layer's output: decoding a prompt
