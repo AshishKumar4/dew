@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
 
+from dew._model_types import QWEN35_TYPES
 from dew.interop import Pretrained
 from dew.interop.verify import _ROUNDING
 from dew.sampling.text import Sampling
@@ -31,7 +32,7 @@ def rounding_bound(config, reference, *, image=False):
     # Image logits traverse the vision encoder's blocks before the decoder.
     vision = config.vision_config.to_dict() if image else {}
     layers = text.num_hidden_layers + int(vision.get('num_hidden_layers', vision.get('depth', 0)))
-    if config.model_type not in ('qwen3_5', 'qwen3_5_moe'):
+    if config.model_type not in QWEN35_TYPES:
         return float(2 * _ROUNDING * epsilon * layers * scale)
     def gamma(terms):
         unit_roundoff = epsilon / 2
@@ -99,7 +100,7 @@ def measure_checkpoint(checkpoint, output, revision=None):
     result = {'checkpoint': checkpoint, 'revision': revision,
               'dtype': 'float32', 'precision': 'highest', 'tf32': False,
               'bound': ('Qwen3.5 fixture calibration, linear token count and gamma_key_dim scaling'
-                        if config.model_type in ('qwen3_5', 'qwen3_5_moe') else
+                        if config.model_type in QWEN35_TYPES else
                         'verified-mapping rounding per transformer block, '
                         'including vision blocks for images'),
               'device': jax.devices()[0].device_kind, 'observations': observations}

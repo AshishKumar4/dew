@@ -35,6 +35,7 @@ from dew.interop.families.deepseek import (
     DSPARK_LEAVES,
     V4_LAYER_NAMES,
     V4_SCORES,
+    V4_TRUNK,
     deepseek_v4_prepare,
     dspark_fields,
     dspark_path,
@@ -127,7 +128,7 @@ def _deepseek_v41_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wr
         'projector': translate_deepseek_v41_projector_config(
             hf_config, record_int(text, 'emb_features')),
         'image_token_id': record_int(hf_config, 'image_token_id'),
-        'tokens_per_image': None, **NO_AUDIO}
+        'tokens_per_image': None, 'video_token_id': None, 'extra_placeholder_ids': (), **NO_AUDIO}
 
 
 def _v41_decoder(hf_config: Mapping[str, object], used: set[str], *, media_bias: bool) -> DecoderFields:
@@ -310,8 +311,6 @@ _DEEPSEEK_V41_NAMES = (
     ('.gate.bias_vl', '.gate.media_bias'),
     *V4_LAYER_NAMES,
 )
-_V41_TRUNK = {'embed.weight': 'model.embed_tokens.weight', 'norm.weight': 'model.norm.weight',
-              'head.weight': 'lm_head.weight'}
 # V4.1's Markov tables (v41:1077-1081), beside the leaves both releases name.
 _V41_DSPARK_LEAVES: dict[str, tuple[str, ...]] = {
     **DSPARK_LEAVES,
@@ -326,7 +325,7 @@ def _deepseek_v41_path(name: str, config: Mapping[str, object]) -> tuple[str, ..
     DSpark drafter's `mtp.*` included; the tied head's copy is None."""
     if name.startswith('mtp.'):
         return dspark_path(name, config, _V41_DSPARK_LEAVES, _deepseek_v41_path)
-    name = _V41_TRUNK.get(name, name)
+    name = V4_TRUNK.get(name, name)
     parts = name.split('.')
     if len(parts) >= 4 and parts[0] == 'layers' and parts[1].isdigit() and parts[2] == 'engram':
         leaf = '.'.join(parts[3:])

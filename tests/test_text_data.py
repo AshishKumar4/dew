@@ -248,6 +248,54 @@ def test_documents_write_one_eos_each_and_empty_documents_write_nothing(tmp_path
     assert stored.metadata()["eos_id"] == eos
 
 
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+def eos_tokenizer(directory: Path) -> str:
+    """An EOS-inserting Llama: the SentencePiece byte-fallback fixture with `</s>` appended to every
+    encoding by its post-processor, saved to `directory`."""
+    from tokenizers import Tokenizer, processors
+    from transformers import PreTrainedTokenizerFast
+
+    backend = Tokenizer.from_file(str(FIXTURES / "llama_cpp" / "tokenizer" / "tokenizer.json"))
+    eos = backend.token_to_id("</s>")
+    backend.post_processor = processors.TemplateProcessing(single="$A </s>",
+                                                           special_tokens=[("</s>", eos)])
+    PreTrainedTokenizerFast(tokenizer_object=backend, eos_token="</s>", bos_token="<s>",
+                            unk_token="<unk>").save_pretrained(directory)
+    return str(directory)
+
+
+@pytest.mark.parametrize("name", ["gpt2", "t5", "llama", "eos-llama", "wordpiece"])
+def test_a_tokenized_document_ends_in_one_eos_with_eos_and_none_without(tmp_path, name):
+    """Whatever a tokenizer's own special tokens add (T5's and an EOS-inserting Llama's `</s>`,
+    WordPiece's [CLS] and [SEP]), a document is its encoding ended by the tokenizer's EOS once with
+    `eos=True` where it has one, and by none with `eos=False`: never two, and none left behind."""
+    from token_support import wordpiece_tokenizer
+
+    from dew.data.text import Tokenize, tokenizer_for
+
+    if name == "eos-llama":
+        tokenizer = eos_tokenizer(tmp_path / name)
+    elif name == "wordpiece":
+        wordpiece_tokenizer(tmp_path / name)
+        tokenizer = str(tmp_path / name)
+    else:
+        tokenizer = str({"gpt2": FIXTURES / "tokenizers" / "gpt2", "t5": FIXTURES / "t5" / "tiny",
+                         "llama": FIXTURES / "llama_cpp" / "tokenizer"}[name])
+    vocabulary = tokenizer_for(tokenizer)
+    text = "the quick brown fox"
+    bare = Tokenize(tokenizer, eos=False).map({"text": text})["text"].tolist()
+    assert vocabulary.eos_id is None or vocabulary.eos_id not in bare
+    if vocabulary.eos_id is None:
+        with pytest.raises(ValueError):
+            Tokenize(tokenizer, eos=True).map({"text": text})
+        return
+    ended = Tokenize(tokenizer, eos=True).map({"text": text})["text"].tolist()
+    assert ended == [*bare, vocabulary.eos_id]
+    assert Tokenize(tokenizer, eos=None).map({"text": text})["text"].tolist() == ended
+
+
 def _export_cli(input_path, destination):
     """`dew data export` of a run file whose chain reads `input_path` as text, a line a document,
     whatever its name, into `destination` as byte tokens."""
