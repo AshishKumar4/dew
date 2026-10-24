@@ -102,6 +102,8 @@ def test_joined_projections_keep_the_dtype_their_promotion_gives_a_wider_bias():
 
 @pytest.mark.parametrize("wrapped", ["direct", "dew", "input", "input_lora"])
 def test_quantized_projection_calls_keep_their_own_paths_under_a_joined_row(wrapped):
+    from flax.errors import ScopeParamShapeError
+
     from dew.quantization import InputQuantization, Quantization
 
     layer = GatedMLP(hidden_features=96, out_features=64)
@@ -150,6 +152,8 @@ def test_quantized_projection_calls_keep_their_own_paths_under_a_joined_row(wrap
         together = jax.jit(observed)(variables, inputs)
     for actual, expected in zip(jax.tree.leaves(together), jax.tree.leaves(apart), strict=True):
         np.testing.assert_array_equal(actual, expected)
+    with pytest.raises((TypeError, ScopeParamShapeError)):
+        quantized.apply(variables, inputs[..., :-1])
     plain = layer.init(jax.random.key(29), inputs)
     with row_joins("gate_up"):
         assert dots(layer.apply, plain, inputs) == 2
@@ -182,6 +186,11 @@ def test_direct_qwix_preserves_projection_sites_in_plain_and_scanned_decoders(sc
         together = jax.jit(observed)(variables)
     for actual, expected in zip(jax.tree.leaves(together), jax.tree.leaves(apart), strict=True):
         np.testing.assert_array_equal(actual, expected)
+    plain = model.init(jax.random.key(31), tokens)
+    with row_joins("gate_up", joins=False):
+        separate = dots(model.apply, plain, tokens)
+    with row_joins("gate_up"):
+        assert dots(model.apply, plain, tokens) < separate
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
