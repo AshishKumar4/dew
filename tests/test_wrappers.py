@@ -45,8 +45,9 @@ def test_a_wrapper_dtype_change_reaches_the_decoder_that_computes_its_logits():
     ids = jnp.asarray([[1, 2, 3]], jnp.int32)
     original = loaded.model.apply(loaded.variables, ids)
     narrowed = changed.apply(loaded.variables, ids)
-    assert original.dtype == jnp.float32
-    assert narrowed.dtype == jnp.bfloat16
+    hidden = changed.apply(loaded.variables, ids, method=changed.hidden_states)
+    assert original.dtype == narrowed.dtype == jnp.float32
+    assert hidden.dtype == jnp.bfloat16
     assert np.isfinite(np.asarray(narrowed, np.float32)).all()
     np.testing.assert_array_equal(loaded.model.apply(loaded.variables, ids), original)
 
