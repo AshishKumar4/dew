@@ -237,8 +237,10 @@ def with_context(rows: Sequence[Encoded], tokenizer: Tokenizer, context: JSON | 
             raise ValueError("a schema read as the row's context needs a backbone with cross-attention "
                              "layers to read it (Pretrained.with_cross_attention)")
         for row in rows:
-            if len(row.context or ()) > length:
-                raise ValueError(f"the schema needs {len(row.context or ())} context tokens, more than the "
+            if row.context is None:
+                raise ValueError("a row whose questions are laid out in its context carries no context")
+            if len(row.context) > length:
+                raise ValueError(f"the schema needs {len(row.context)} context tokens, more than the "
                                  f"{length} the backbone's cross-attention reads")
         return list(rows)
     if context is None:
