@@ -39,6 +39,7 @@ from dew.nn.kernels.templates import (
     attention_mosaic,
     attention_portable,
     attention_triton,
+    mosaic_sm90,
 )
 
 PINS = {attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2),
@@ -766,9 +767,8 @@ def _mosaic_takes(family: Family) -> bool:
     (`attention_mosaic.refused`)."""
     query, _, value, extra, _ = family.draw(0)
     hooks = _hooks(jnp.asarray(query), jax.tree.map(jnp.asarray, extra))
-    tiles = attention_mosaic.BACKWARD_DEFAULTS["wgmma"]
     return attention_mosaic.refused(jnp.dtype(family.dtype), query.shape[-1], value.shape[-1], hooks,
-                                    backward=True, tile=(tiles.block_q, tiles.block_k)) is None
+                                    backward=True, family=mosaic_sm90.WGMMA) is None
 
 
 def _held_empty(family: Family, found, label: str) -> None:

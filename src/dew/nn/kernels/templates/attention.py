@@ -32,6 +32,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
+from dew.nn.kernels import tuning
 from dew.nn.precision import at_least_fp32
 
 
@@ -479,7 +480,7 @@ def power_of_two(width: int) -> int:
     return max(16, 1 << (width - 1).bit_length())
 
 
-def _whole(count: int, block: int) -> int:
+def whole(count: int, block: int) -> int:
     """`count` rounded up to whole `block`s."""
     return -(-count // block) * block
 
@@ -536,7 +537,7 @@ def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySp
     whole `block`s (a backend's largest tile), its head widths at powers of two."""
     queries, width = query.shape[1], query.shape[3]
     keys, value_width = key.shape[1], value.shape[-1]
-    padded_q, padded_k = _whole(max(queries, 1), block), _whole(max(keys, 1), block)
+    padded_q, padded_k = whole(max(queries, 1), block), whole(max(keys, 1), block)
     padded_d, padded_dv = power_of_two(width), power_of_two(value_width)
 
     def pad(array, rows, columns):
@@ -560,6 +561,71 @@ def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySp
 def kept_dtype(dtype) -> str:
     """A hook parameter's dtype in the kernels: fp32 for a floating one (`padded_call`), else its own."""
     return "float32" if jnp.issubdtype(dtype, jnp.floating) else jnp.dtype(dtype).name
+
+
+def floating_params(params) -> list[int]:
+    """The places of a hook's floating parameters, the ones it differentiates along."""
+    return [index for index, param in enumerate(params) if jnp.issubdtype(param.dtype, jnp.floating)]
+
+
+def differentiable(score_mod: Callable, q_pos, k_pos, params, floating: list[int]) -> Callable:
+    """`score_mod` at the tile's coordinates as a function of its logits and its floating parameters
+    (`floating`) alone, the others held: what `jax.vjp` takes."""
+    def hooked(s, *wide):
+        values = list(params)
+        for index, value in zip(floating, wide, strict=True):
+            values[index] = value
+        return score_mod(s, q_pos, k_pos, *values)
+
+    return hooked
+
+
+TRACED_TILE = 16
+"""The tile a hook is traced at for its picks' key (`hook_program`)."""
+
+
+def hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, ...], *,
+                 differentiated: bool = False, width: int = TRACED_TILE) -> str | None:
+    """What a score or output hook computes, as its launch's picks key it (`tuning.program`): a score
+    hook traced at a `TRACED_TILE` square fp32 tile, an output hook at `TRACED_TILE` queries of the
+    call's padded value `width`, the entries' indices and each parameter as its kind lays it out there,
+    in its dtype in the kernels (`dtypes`); `differentiated`, its pullback too, so a hook whose
+    derivative is its own rule (`jax.custom_vjp`) keys by that rule. None or an already traced key as
+    it is."""
+    if hook is None or isinstance(hook, str):
+        return hook
+    tile = TRACED_TILE
+    layouts = {Kind.HEAD: (), Kind.QUERY: (tile, 1), Kind.KEY: (1, tile), Kind.TILE: (tile, tile),
+               Kind.OUTPUT: (tile, width)}
+    params = [jax.ShapeDtypeStruct(layouts[kind], dtype) for kind, dtype in zip(kinds, dtypes, strict=True)]
+    square = jax.ShapeDtypeStruct((tile, tile), jnp.float32)
+    if name == "output_mod":
+        return tuning.program(hook, jax.ShapeDtypeStruct((tile, width), jnp.float32), *params)
+    positions = (jax.ShapeDtypeStruct((tile, 1), jnp.int32), jax.ShapeDtypeStruct((1, tile), jnp.int32))
+    if not differentiated:
+        return tuning.program(hook, square, *positions, *params)
+    floating = floating_params(params)
+
+    def pulled(s, q_pos, k_pos, *values):
+        hooked = differentiable(hook, q_pos, k_pos, values, floating)
+        out, pull = jax.vjp(hooked, s, *(values[index] for index in floating))
+        return out, pull(jnp.ones_like(out))
+
+    return tuning.program(pulled, square, *positions, *params)
+
+
+def spanned(specs: list[jax.ShapeDtypeStruct], arrays: list[jax.Array]) -> list[jax.Array]:
+    """A launch's timing operands with its spans whole: of its integer operands by row `[B, Q]` (the
+    others, an anchor key `[B, H, Q]`, keep their draw), the first two each query's first key (0) and
+    one past its last (every key, `specs[1]` being the keys), the rest its documents' ids (one
+    document), so a timed launch visits every tile a dense call does."""
+    rows = [index for index, spec in enumerate(specs)
+            if jnp.issubdtype(spec.dtype, jnp.integer) and spec.ndim == 2]
+    keys = specs[1].shape[1]
+    for place, index in enumerate(rows):
+        filled = (0, keys)[place] if place < 2 else 1
+        arrays[index] = jnp.full(specs[index].shape, filled, specs[index].dtype)
+    return arrays
 
 
 class Split(NamedTuple):
