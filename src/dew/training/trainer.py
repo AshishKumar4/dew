@@ -1217,6 +1217,11 @@ class Trainer(Generic[Loss, Effects]):
         placement = batch_shardings(mesh, batch)
         candidates = splits(self._rows, batch, mesh, self.microbatches, self._split)
         shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
+        # What a step holds between steps, its accumulator and copies included, at the fewest
+        # microbatches, the least any plan holds, fits the devices before any plan compiles.
+        _, _, least = self._prepared(state, microbatch_shapes(batch, candidates[0]), schedule,
+                                     candidates[0] * self.accumulation)
+        self._validation(placed_shapes(least, self.shardings(least)))
 
         def lower(split: int) -> Candidate:
             return self._candidate(state, batch, schedule, placement, replicated, split,
@@ -1242,6 +1247,7 @@ class Trainer(Generic[Loss, Effects]):
         seconds = timed([self._runner(plan, mesh) for plan in plans]) if len(plans) > 1 and timed else []
         # Every process runs the plan process zero timed fastest.
         planned = plans[broadcast_from_process_zero(seconds.index(min(seconds)) if seconds else 0)]
+        self._validation(planned.candidate.prepared)
         self.objective.substitute(list(planned.modules))
         self.objective.restore_head(planned.tile, fused=planned.fused)
         self._xla_defaults = planned.xla_defaults
@@ -1265,8 +1271,6 @@ class Trainer(Generic[Loss, Effects]):
         shapes, copies, prepared = self._prepared(state, micro, schedule, split * self.accumulation)
         shardings = self.shardings(prepared)
         prepared = placed_shapes(prepared, shardings)
-        # What the step holds between steps, the accumulator and copies it adds included, fits the devices.
-        self._validation(prepared)
         # The check reads the state's arguments as already on the devices. The copies and accumulators
         # `run` builds on the first call are not yet, so they count with the prefetched batches beside
         # the step, a ramp stage's window too, which `run` builds beside the last, already resident.
