@@ -642,19 +642,20 @@ class MultiHeadLatentAttention(nn.Module):
             allocated = self.has_variable("cache", "cache_index")
             committed = self.get_variable("cache", "cache_index")
             row_valid = jnp.ones(x.shape[:2], bool) if valid is None else jnp.asarray(valid, bool)
-            # Allocation needs geometry, not another intercepted projection or dropout draw.
-            shape_key = jax.ShapeDtypeStruct((*x.shape[:2], self.num_heads,
-                                             self.qk_nope_head_dim + self.qk_rope_head_dim), latent.dtype)
+            # Allocate from the actual projection's dtype and retain its one interceptor/dropout
+            # draw. Only the decoupled rope channels change once the cache supplies their slots.
+            key, value = self._expand(latent, rot)
             index_keys = self._index_keys(x, row_valid) if self.indexed else None
-            positions, append = open_latent_cache(self, shape_key, self.v_head_dim, index_keys,
+            positions, append = open_latent_cache(self, key, self.v_head_dim, index_keys,
                                                   self.max_seq_len, valid=valid)
             q_rot, rot, freqs_cos, freqs_sin = self._rotated(
                 q_rot, rot,
                 positions if logical_positions is None else logical_positions)
+            if self.rotary:
+                key = key.at[..., self.qk_nope_head_dim:].set(rot[:, :, None, :])
             if index_keys is not None:
                 index_keys = self._rotated_index_keys(index_keys, freqs_cos, freqs_sin)
-            key, value, index_full = append(
-                *self._expand(latent, rot), index_keys)
+            key, value, index_full = append(key, value, index_keys)
             keep = self._visible(positions, key.shape[1])[:, 0]
             selection, _ = self._selection(
                 x, q_resid, index_full, keep, freqs_cos, freqs_sin, call, row_valid, slots=positions,
