@@ -175,6 +175,7 @@ def _preferred[C](op: Op[C], case: C) -> str:
                      if kernel.name in costs and math.isfinite(costs[kernel.name])]
         if qualified:
             return op.kernels[min(qualified, key=lambda index: (costs[op.kernels[index].name], index))].name
-        native = [kernel for kernel in native if kernel.cost is None]
-    return (native or [kernel for kernel in op.kernels if kernel.generic and not kernel.failed(case)]
-            or [kernel for kernel in op.kernels if not kernel.generic] or list(op.kernels))[0].name
+        handed = [kernel for kernel in op.kernels if kernel.generic and not kernel.failed(case)]
+        if handed:
+            return handed[0].name
+    return (native or [kernel for kernel in op.kernels if not kernel.generic] or list(op.kernels))[0].name
