@@ -25,7 +25,6 @@ import dataclasses
 import functools
 import importlib
 import importlib.util
-import itertools
 import math
 from collections.abc import Callable, Hashable
 from typing import ClassVar
@@ -63,16 +62,49 @@ class Tile:
     stages: int
 
 
-TILES = tuple(Tile(*shape) for shape in itertools.product((64, 128, 256), (128, 256), (128, 64, 32), (8, 4),
-                                                            (3, 4, 2)))
-"""Every tile the Triton launches may take: the ones the A100 and H100 sweeps found fastest lie inside.
-Where the cost model ties, the first wins: the deeper step, which synchronizes its pipeline fewer times
-a tile (at 128 x 256 on an H100, a step of 64 took 1.56 ms where 32 took 1.78, GMM-h100-2), and the
-more warps."""
+def _doubling(least: int, most: int) -> tuple[int, ...]:
+    """`least` and its doublings up to `most`, ascending."""
+    return tuple(least << power for power in range(max(most // least, 1).bit_length())
+                 if least << power <= most)
 
-TPU_BLOCKS = tuple(mosaic_tpu.Blocks(*shape) for shape in itertools.product((128, 256, 512), repeat=3))
-"""Every block the TPU launches may take: multiples of the MXU's 128 (Megablox's default is 128 cubed),
-none past the 16 MiB a v5e's kernel holds at XLA's default (`_MosaicTpu.staged_bytes`)."""
+
+def triton_tiles(dtype) -> tuple[Tile, ...]:
+    """Every tile a Triton launch may take for operands of `dtype`, from the MMA's facts and Triton's
+    alone (no table of tiles): each axis a power of two (`tl.arange`'s extents are); rows from one
+    warpgroup's MMA rows (`mosaic.Family.role_rows`: wgmma's 64, four warps of mma.sync's 16) and columns
+    from a swizzled row's elements (`mosaic.SWIZZLE_BYTES`), each to a block's extent
+    (`mosaic.Family.block_extent`); a step from half a swizzled row to two, the deepest the sweeps
+    measured, past which the cost model is uncalibrated; one warpgroup a program or as many as warpgroup
+    MMA's consumer roles (`mosaic.Family.consumers`), over which Triton spreads a dot; each count of
+    `mosaic_gpu.STAGES`. A target's launch keeps those that fit it (`_Triton.fitting`). Where the cost
+    model ties (it charges a compute-bound tile's work alike), the first wins: the fewest rows, which a
+    group's boundary tile computes past its group's; the deeper step, which synchronizes its pipeline
+    fewer times a tile (at 128 x 256 on an H100, a step of 64 took 1.56 ms where 32 took 1.78,
+    GMM-h100-2); the more warps; and the deeper pipeline."""
+    family = mosaic_sm90.WGMMA
+    row = mosaic.SWIZZLE_BYTES // jnp.dtype(dtype).itemsize
+    warps = [mosaic.THREADS // 32 * consumers for consumers in range(family.consumers, 0, -1)]
+    return tuple(Tile(block_m, block_n, block_k, warp_count, stages)
+                 for block_m in _doubling(family.role_rows, family.block_extent)
+                 for block_n in _doubling(row, family.block_extent)
+                 for block_k in reversed(_doubling(row // 2, 2 * row))
+                 for warp_count in warps for stages in mosaic_gpu.STAGES)
+
+
+TPU_BLOCK_EXTENT = 4 * mosaic_tpu.LANES
+"""The longest axis a generated TPU block spans (`tpu_blocks`): four of a vreg's lanes, the extent the TPU
+launches' blocks have taken (Megablox's default is 128 cubed), past which no measurement has calibrated
+the cost model."""
+
+
+def tpu_blocks() -> tuple[mosaic_tpu.Blocks, ...]:
+    """Every block a TPU launch may take, from Mosaic TPU's facts alone (no table of blocks): each axis a
+    vreg's lanes (`mosaic_tpu.LANES`) doubled to `TPU_BLOCK_EXTENT`, smaller first where the cost model
+    ties; a target's launch keeps those whose buffers fit its scoped VMEM (`_MosaicTpu.fitting`)."""
+    extents = _doubling(mosaic_tpu.LANES, TPU_BLOCK_EXTENT)
+    return tuple(mosaic_tpu.Blocks(block_m, block_n, block_k)
+                 for block_m in extents for block_n in extents for block_k in extents)
+
 
 INTERPRETED = plgpu.InterpretGPUParams(out_of_bounds_reads="uninitialized")
 """How a CPU interprets the Mosaic GPU launches: a read past an operand's rows, which a TMA load zeroes,
@@ -362,7 +394,7 @@ class _Triton(_GroupedLaunch[Tile]):
         """The depth and width a dense call's tiles divide."""
 
     def space(self, ba) -> tuple[Tile, ...]:
-        return TILES
+        return triton_tiles(ba.arguments['tokens'].dtype)
 
     def fitting(self, ba, target) -> tuple[Tile, ...]:
         """The tiles that fit `target` (`Template.fitting`) whose accumulator (two with `exact_sums`)
@@ -1092,7 +1124,7 @@ class MosaicTpuGmm(_MosaicTpu):
     def space(self, ba) -> tuple[mosaic_tpu.Blocks, ...]:
         kernel = ba.arguments['kernel']
         depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
-        return tuple(blocks for blocks in TPU_BLOCKS
+        return tuple(blocks for blocks in tpu_blocks()
                      if depth % blocks.block_k == 0 and width % blocks.block_n == 0
                      and self._lays_out(ba, blocks))
 
@@ -1146,7 +1178,7 @@ class MosaicTpuTgmm(_MosaicTpu):
 
     def space(self, ba) -> tuple[mosaic_tpu.Blocks, ...]:
         depth, width = ba.arguments['tokens'].shape[1], ba.arguments['cotangent'].shape[1]
-        return tuple(blocks for blocks in TPU_BLOCKS
+        return tuple(blocks for blocks in tpu_blocks()
                      if depth % blocks.block_m == 0 and width % blocks.block_n == 0
                      and self._lays_out(ba, blocks))
 
