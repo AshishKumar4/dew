@@ -277,6 +277,10 @@ SPLIT_ROWS = {
 }
 """Each row of the sequence split's check: its real tokens and its documents (None for one)."""
 
+SPLIT_BATCH = 8
+"""The rows a sequence-split draw holds: every parameter's gradient, the heads' `D` and `A_log` too,
+sums over all of them."""
+
 SPLIT_SEEDS = 8
 """The sequence split's declared draws."""
 
@@ -293,16 +297,16 @@ def test_a_layer_split_over_the_sequence_runs_padded_and_packed_rows_as_whole_on
     module = layer(geometry)
     variables = layer_params(reference)
     valid, segments = SPLIT_ROWS[row]
-    fields = {"valid": jnp.asarray(np.broadcast_to(valid, (2, 32)))}
+    fields = {"valid": jnp.asarray(np.broadcast_to(valid, (SPLIT_BATCH, 32)))}
     if segments is not None:
-        fields["segments"] = jnp.asarray(np.broadcast_to(segments, (2, 32)), jnp.int32)
+        fields["segments"] = jnp.asarray(np.broadcast_to(segments, (SPLIT_BATCH, 32)), jnp.int32)
     call = MixerCall(AttentionMetadata(coordinates=coordinates(**fields)))
     width = geometry["hidden_size"]
 
     def draw(seed):
         rng = np.random.default_rng([0x5E9, seed])
-        return (rng.standard_normal((2, 32, width)).astype(np.float32),
-                rng.standard_normal((2, 32, width)).astype(np.float32))
+        return (rng.standard_normal((SPLIT_BATCH, 32, width)).astype(np.float32),
+                rng.standard_normal((SPLIT_BATCH, 32, width)).astype(np.float32))
 
     def run(model, params, mesh=None):
         def pulled(hidden, cotangent):
