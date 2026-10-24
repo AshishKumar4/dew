@@ -293,12 +293,16 @@ def _tile(slots, name: str, operand: _Operand, rows=None, columns=None) -> _Part
     return _Parts((view(slots[f"{name}{p}"]) for p in range(operand.parts)), operand.dtype)
 
 
-def _views(block: int | None = None, /, **parted) -> dict:
-    """A launch's streams' views by stream part name (`Family.opened`'s `(ref, block)`), `parted[name]` a list
-    of an operand's parts' views: each step `block` rows of its view, or the whole view in one step where
-    None."""
-    return {f"{name}{p}": (view, view.shape[0] if block is None else block) for name, views in parted.items()
-            for p, view in enumerate(views)}
+def _views(**parted) -> dict:
+    """A launch's streams' views by stream part name (`Family.opened`'s `(ref, index_map)`, `mosaic.viewed`),
+    `parted[name]` a list of an operand's parts' views: step `i` the `i`-th tile of the stream's rows down
+    its view, as wide as the view (the whole view where the stream's tile is)."""
+    return {f"{name}{p}": (view, _down) for name, views in parted.items() for p, view in enumerate(views)}
+
+
+def _down(step) -> tuple:
+    """A view's block indices at `step`: its `step`-th row tile, from its first column."""
+    return step, 0
 
 
 def _staging(operand: _Operand, *shapes) -> tuple:
@@ -586,7 +590,7 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
             return (base * call.heads + h) * width + i * BLOCK
 
         # Each step a chunk of every row's operands, by its index among the call's chunks.
-        views = _views(CHUNK, **({"w": held.views(w_ref, 0, call.rows, h * width, width)} if delta else {}),
+        views = _views(**({"w": held.views(w_ref, 0, call.rows, h * width, width)} if delta else {}),
                        keys=keys.views(k_ref, 0, call.rows, h // keyed * width, width),
                        values=values.views(u_ref, 0, call.rows, h * value_width + j * bv, bv))
         initial_views = _views(**{f"initial{i}": initial.views(h0_ref, memory(row, i), BLOCK, j * bv, bv)
@@ -997,7 +1001,7 @@ def _reverse(q, k, w, do, hi, lo, dht, sequences, call: _Call, *, scale: float):
             return (base * call.heads + h) * width + i * BLOCK
 
         key_columns = h // call.group * width
-        views = _views(CHUNK, queries=given.views(q_ref, 0, call.rows, key_columns, width),
+        views = _views(queries=given.views(q_ref, 0, call.rows, key_columns, width),
                        keys=given.views(k_ref, 0, call.rows, key_columns, width),
                        w=held.views(w_ref, 0, call.rows, h * width, width),
                        out=given.views(do_ref, 0, call.rows, h * value_width + j * bv, bv))

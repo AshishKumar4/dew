@@ -126,8 +126,7 @@ class MmaSync(mosaic.Family[dict, dict, jax.Array]):
 
         def copy(index, slot):
             for name in names:
-                ref, block = streams[name].view
-                view = ref.at[pl.ds(index * block, block)]
+                view = mosaic.viewed(streams[name].view, streams[name].smem.shape[1:], index)
                 if _INTERPRETED.get():
                     streams[name].smem.at[slot][...] = view[...]
                     continue
