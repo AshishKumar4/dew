@@ -7,7 +7,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import jax
 import jax.numpy as jnp
@@ -88,8 +88,8 @@ class AxialPatchEmbedding(nn.Module):
     position_size: int
     block_size: int = 1
     use_bias: bool = False
-    table_axis: int = 0
-    axis_validity: bool = False
+    table_axis: Literal[0, 1] = 0
+    position_validity: Literal["token", "axis"] = "token"
     norm: Callable[..., nn.Module] | None = None
     initializer: Initializer = nn.initializers.normal(0.02)
     dtype: Dtype | None = None
@@ -132,7 +132,7 @@ class AxialPatchEmbedding(nn.Module):
                  else (self.position_size, 2, self.features))
         table = jnp.moveaxis(self.param("position_table", self.initializer, shape), self.table_axis, 0)
         valid = positions >= 0
-        mask = (valid if self.axis_validity else
+        mask = (valid if self.position_validity == "axis" else
                 jnp.broadcast_to(valid.all(axis=-1, keepdims=True), valid.shape))
         safe = jnp.maximum(positions, 0)
         embedded = [jnp.where(mask[..., axis, None],
