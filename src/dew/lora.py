@@ -53,6 +53,7 @@ from flax.linen.dtypes import promote_dtype
 from flax.linen.module import Interceptor
 from flax.nnx import bridge
 
+from dew.cache import INTERCEPTED
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_plan import group_layers
@@ -747,11 +748,11 @@ def _adapted(model: nn.Module, bound: _Bound) -> nn.Module:
             return _record(bound)
 
         def apply(self, variables, *args, **kwargs):
-            with nn.intercept_methods(branch):
+            with INTERCEPTED(new_value=True), nn.intercept_methods(branch):
                 return super().apply(thaw(variables), *args, **kwargs)
 
         def init_with_output(self, *args, **kwargs):
-            with nn.intercept_methods(branch):
+            with INTERCEPTED(new_value=True), nn.intercept_methods(branch):
                 output, variables = super().init_with_output(*args, **kwargs)
             return output, _fp8_packed(model, dict(freeze(variables, lambda path: path in factors)))
 

@@ -62,7 +62,7 @@ import numpy as np
 from flax import core, linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 
-from dew.cache import QUANTIZED_TRACE
+from dew.cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.nn.dense import _contractions, _linear_site
 from dew.nn.kernels.generation import backend
 from dew.nn.precision import accumulated, correctly_rounded_divide
@@ -260,7 +260,7 @@ def _keyed[**Arguments, Result](method: Callable[Arguments, Result],
     """`method` run under `key` in `QUANTIZED_TRACE`."""
     @functools.wraps(method)
     def keyed(*args: Arguments.args, **kwargs: Arguments.kwargs) -> Result:
-        with QUANTIZED_TRACE(key):
+        with QUANTIZED_TRACE(key), INTERCEPTED(new_value=True):
             return method(*args, **kwargs)
     return keyed
 
@@ -709,7 +709,7 @@ class InputQuantization:
                 return record.quantizer(module)
 
             def apply(self, variables, *args, **kwargs):
-                with nn.intercept_methods(quantize_inputs):
+                with INTERCEPTED(new_value=True), nn.intercept_methods(quantize_inputs):
                     return super().apply(variables, *args, **kwargs)
 
             def init_with_output(self, *args, **kwargs):

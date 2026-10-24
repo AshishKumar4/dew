@@ -125,7 +125,7 @@ def test_quantized_projection_calls_keep_their_own_paths_under_a_joined_row(wrap
         quantized = InputQuantization(sites=(("gate_proj", "fp8"), ("up_proj", "fp8"))).apply(layer)
     variables = quantized.init(jax.random.key(11), inputs)
     if wrapped == "input":
-        variables["quantization"] = {name: {"input_scale": jnp.asarray(0.01)}
+        variables["quantization"] = {name: {"fp8_input_scale": jnp.asarray(0.01)}
                                       for name in ("gate_proj", "up_proj")}
     with row_joins("gate_up", joins=False):
         apart = jax.jit(quantized.apply)(variables, inputs)
