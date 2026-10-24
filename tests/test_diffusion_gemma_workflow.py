@@ -49,6 +49,19 @@ def test_public_generation_override_keeps_canvas_semantics():
         np.testing.assert_array_equal(result.decoder_steps, reference["stopped_steps"])
 
 
+def test_block_generation_reads_its_ids_as_every_parser_of_ids_does():
+    """A NumPy pad id generates as the Python one does (`dew.nn.inputs.token_id`), and a fraction or
+    a flag where an id goes is refused before the loop runs."""
+    bundle = Pretrained.load(str(FIXTURE), dtype="float32", attention_impl="xla", max_seq_len=32)
+    process = BlockProcess(canvas_length=4, vocab_size=64, max_steps=4)
+    python = process.generate(bundle.model, bundle.variables, [[2, 5, 7]], 4, key=0, pad_token_id=0)
+    arrays = process.generate(bundle.model, bundle.variables, [[2, 5, 7]], 4, key=0, pad_token_id=np.int64(0))
+    np.testing.assert_array_equal(arrays.tokens, python.tokens)
+    for wrong in ({"pad_token_id": 0.5}, {"eos_token_ids": (True,)}):
+        with pytest.raises(ValueError):
+            process.generate(bundle.model, bundle.variables, [[2, 5, 7]], 4, key=0, **wrong)
+
+
 def test_public_pipeline_source_storage_and_saved_block_compute_are_independent(tmp_path):
     import jax.numpy as jnp
     import optax

@@ -929,24 +929,33 @@ def test_the_fused_decode_step_computes_the_layers_token(heads, width, rows, hel
                                          f"{config} state")
 
 
-def test_a_cached_layer_choosing_the_fused_step_takes_a_jvp_through_the_recurrence():
-    """A cached gated delta net whose A100 row chooses the fused step (`generation.chosen`), traced for
+def test_a_cached_layer_traced_for_a_jvp_decodes_through_the_recurrence():
+    """A cached gated delta net on an A100, whose row's step kernel decodes its tokens, traced for
     `jax.jvp` (`forward_mode_attention`, as MeanFlow and consistency training trace it), decodes its
     token through the differentiable recurrence, which gives the tangent the in-place kernels do not,
-    and reports that route with its stable code."""
+    and reports that route with its stable code; the fused step chosen for such a token
+    (`generation.chosen`) raises, naming it (`selection.KernelRefused`)."""
     from dew.nn.attention import forward_mode_attention
     from dew.nn.kernels.generation import assumed, chosen, routes
+    from dew.nn.kernels.selection import KernelRefused
 
     layer, variables, cache, token = fused_case(4, 32, 2, jnp.float32, jnp.float32)
 
     def step(token):
         return layer.apply({**variables, "cache": cache}, token, MixerCall(decode=True), mutable=["cache"])[0]
 
-    tangent = jax.random.normal(jax.random.key(9), token.shape)
-    with assumed("sm80"), chosen(delta_decode="fused"), forward_mode_attention(), routes() as found:
+    def traced():
+        tangent = jax.random.normal(jax.random.key(9), token.shape)
         jax.make_jaxpr(lambda token, tangent: jax.jvp(step, (token,), (tangent,)))(token, tangent)
+
+    with assumed("sm80"), forward_mode_attention(), routes() as found:
+        traced()
     (decode,) = [route for route in found if route.choice == "delta_decode"]
-    assert (decode.kernel, decode.preferred, decode.refusal.code) == ("xla", "fused", "forward_mode")
+    assert (decode.kernel, decode.preferred, decode.refusal.code) == ("xla", "step", "forward_mode")
+    with assumed("sm80"), chosen(delta_decode="fused"), forward_mode_attention(), pytest.raises(
+            KernelRefused) as refused:
+        traced()
+    assert [refusal.code for refusal in refused.value.refusals] == ["forward_mode"]
 
 
 def test_the_fused_decode_step_leaves_an_idle_row_alone():
@@ -1080,30 +1089,36 @@ def test_the_fused_step_compiles_on_tritons_compiler_within_each_gpus_block(targ
 
 def test_a_decode_token_reports_the_fused_step_as_its_route_where_its_target_takes_it():
     """A gated delta net's decode token traced for an A100 on this CPU, the generation's choice
-    'delta_decode' set to 'fused', reports the fused step as its route; at widths neither the fused nor
-    the step kernel's blocks take, the portable recurrence with the refusal's code; with no choice, the
-    step kernel, as the rule's row names the port; and with the rule's math chosen, the portable
-    recurrence, so an unfused reference decodes unfused."""
+    'delta_decode' set to 'fused', reports the fused step as its route; with no choice, the step
+    kernel, as the rule's row names the port, and at widths the step kernel's blocks do not take the
+    portable recurrence with the refusal's code, where the fused step chosen raises, naming its own
+    (`selection.KernelRefused`); and with the rule's math chosen, the portable recurrence, so an
+    unfused reference decodes unfused."""
     from dew.nn.kernels.generation import assumed, chosen, routes
+    from dew.nn.kernels.selection import KernelRefused
 
     def decode_routes(width):
         module = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=4, head_k_dim=width,
                                head_v_dim=width, dtype=jnp.bfloat16)
         x = jnp.zeros((2, 1, 64), jnp.bfloat16)
         step = MixerCall(decode=True)
-        params = jax.eval_shape(lambda: module.init(jax.random.key(0), x))
-        cache = jax.eval_shape(lambda v: module.apply(v, x, step, mutable=["cache"])[1], params)
-        with assumed("sm80"), routes() as found:
-            jax.eval_shape(lambda v: module.apply(v, x, step, mutable=["cache"]), {**params, **cache})
+        with assumed("sm80"):
+            params = jax.eval_shape(lambda: module.init(jax.random.key(0), x))
+            cache = jax.eval_shape(lambda v: module.apply(v, x, step, mutable=["cache"])[1], params)
+            with routes() as found:
+                jax.eval_shape(lambda v: module.apply(v, x, step, mutable=["cache"]), {**params, **cache})
         return [(found_route.kernel, found_route.preferred, found_route.refusal and found_route.refusal.code)
                 for found_route in found if found_route.choice == "delta_decode"]
 
     assert decode_routes(32)[-1] == ("step", "step", None)
+    assert decode_routes(24)[-1] == ("xla", "step", "step_widths")
     with chosen(gated_delta_rule="xla"):
         assert decode_routes(32)[-1] == ("xla", "xla", None)
     with chosen(delta_decode="fused"):
         assert decode_routes(32)[-1] == ("fused", "fused", None)
-        assert decode_routes(24)[-1] == ("xla", "fused", "widths")
+        with pytest.raises(KernelRefused) as refused:
+            decode_routes(24)
+    assert [refusal.code for refusal in refused.value.refusals] == ["widths"]
 
 
 @pytest.mark.gpu(reason="launch timing and occupancy vary on a GPU")
