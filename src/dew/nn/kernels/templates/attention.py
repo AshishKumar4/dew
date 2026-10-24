@@ -374,9 +374,9 @@ class BlockMap:
     blocks `[q_lo[b, j], q_hi[b, j])`, each of which still checks `lo <= j < hi`. Every visible entry lies
     in a visited tile; a visited tile may hold none (an envelope over a block's spans). Over runs
     (`KeySpans`), query block i reads the union of its runs' tile envelopes, `ranges[b, i]` `[R, 2]`
-    sorted, disjoint and nonempty first, `(0, 0)` after, which `[lo, hi)` envelops, and its tiles in any
-    of `wholes[b, i]` `[R, 2]`, each run's tiles every query of the block sees, are whole; `[full_lo,
-    full_hi)` is the widest of them. A key block is read where some range holds it."""
+    sorted, disjoint and nonempty first, `(0, 0)` after, which `[lo, hi)` envelops; `[full_lo, full_hi)`
+    are the widest run's tiles every query of the block sees whole. A key block is read where some range
+    holds it."""
 
     lo: jax.Array
     hi: jax.Array
@@ -389,7 +389,6 @@ class BlockMap:
     block_q: int = dataclasses.field(metadata={"static": True})
     block_k: int = dataclasses.field(metadata={"static": True})
     ranges: jax.Array | None = None
-    wholes: jax.Array | None = None
 
 
 def _blocked(values: jax.Array, block: int, fill) -> jax.Array:
@@ -411,74 +410,53 @@ def _uniform_doc(ids: jax.Array | None, block: int) -> jax.Array | None:
 
 
 def block_map(spans: KeySpans, block_q: int, block_k: int) -> BlockMap:
-    """The `BlockMap` of `spans` at `block_q` by `block_k` tiles."""
-    if spans.start.ndim == 3:
-        return _runs_map(spans, block_q, block_k)
+    """The `BlockMap` of `spans` at `block_q` by `block_k` tiles. One interval a query is a call of one
+    run: each run's tile envelope over a block's queries and its tiles every query of the block sees whole,
+    the envelopes merged into their sorted union where a call has several (`_merged`), the widest run's
+    whole tiles the block's, and each key block read by the query blocks some range of which holds it."""
+    runs = spans.start.ndim == 3
     keys = spans.keys
     key_blocks = -(-keys // block_k)
-    start, end = _blocked(spans.start, block_q, 0), _blocked(spans.end, block_q, 0)
-    nonempty = end > start
     big = jnp.iinfo(jnp.int32).max
-    first = jnp.min(jnp.where(nonempty, start, big), axis=-1)
-    last = jnp.max(jnp.where(nonempty, end, 0), axis=-1)
-    any_rows = jnp.any(nonempty, axis=-1)
-    lo = jnp.where(any_rows, first // block_k, 0)
-    hi = jnp.where(any_rows, -(-last // block_k), 0)
-    # A tile is whole where every query of the block sees all its keys: the block's latest start and
-    # earliest end bound it, and a query that sees nothing leaves no tile whole.
-    all_rows = jnp.all(nonempty, axis=-1)
-    whole_lo = -(-jnp.max(start, axis=-1) // block_k)
-    whole_hi = jnp.minimum(jnp.min(end, axis=-1), keys) // block_k
-    full_lo = jnp.where(all_rows, jnp.clip(whole_lo, lo, hi), lo)
-    full_hi = jnp.where(all_rows & (whole_hi > whole_lo), jnp.clip(whole_hi, full_lo, hi), full_lo)
-    # The query blocks reading each key block: those whose range holds it.
-    j = jnp.arange(key_blocks)[None, None, :]
-    reads = (lo[:, :, None] <= j) & (j < hi[:, :, None])
+    start, end = (spans.start, spans.end) if runs else (spans.start[..., None], spans.end[..., None])
+    start, end = _blocked(start, block_q, 0), _blocked(end, block_q, 0)
+    nonempty = end > start
+    held = jnp.any(nonempty, axis=2)
+    # Each run's envelope over the block's queries, `(0, 0)` where none of them reads it.
+    lo_r = jnp.where(held, jnp.min(jnp.where(nonempty, start, big), axis=2) // block_k, 0)
+    hi_r = jnp.where(held, -(-jnp.max(jnp.where(nonempty, end, 0), axis=2) // block_k), 0)
+    ranges = _merged(lo_r, hi_r, held, key_blocks) if runs else jnp.stack([lo_r, hi_r], axis=-1)
+    lo = jnp.where(jnp.any(ranges[..., 1] > ranges[..., 0], axis=-1), ranges[..., 0, 0], 0)
+    hi = jnp.max(ranges[..., 1], axis=-1)
+    # A run's tile is whole where every query of the block sees all its keys through it: the block's latest
+    # start and earliest end bound them, and a query that misses the run leaves none whole.
+    whole_lo = -(-jnp.max(start, axis=2) // block_k)
+    whole_hi = jnp.minimum(jnp.min(end, axis=2), keys) // block_k
+    whole = jnp.all(nonempty, axis=2) & (whole_hi > whole_lo)
+    widest = jnp.argmax(jnp.where(whole, whole_hi - whole_lo, -1), axis=-1)[..., None]
+    some = jnp.any(whole, axis=-1)
+    full_lo = jnp.where(some, jnp.take_along_axis(whole_lo, widest, axis=-1)[..., 0], lo)
+    full_hi = jnp.where(some, jnp.take_along_axis(whole_hi, widest, axis=-1)[..., 0], full_lo)
+    # The query blocks reading each key block: those some range of which holds it.
+    j = jnp.arange(key_blocks)[None, None, :, None]
+    reads = jnp.any((ranges[:, :, None, :, 0] <= j) & (j < ranges[:, :, None, :, 1]), axis=-1)
     i = jnp.arange(lo.shape[1])[None, :, None]
     q_lo = jnp.min(jnp.where(reads, i, big), axis=1, initial=big)
     q_hi = jnp.max(jnp.where(reads, i + 1, 0), axis=1, initial=0)
     q_lo = jnp.where(q_hi > 0, q_lo, 0)
     return BlockMap(lo, hi, full_lo, full_hi, q_lo, q_hi, _uniform_doc(spans.query_ids, block_q),
-                    _uniform_doc(spans.key_ids, block_k), block_q, block_k)
+                    _uniform_doc(spans.key_ids, block_k), block_q, block_k, ranges if runs else None)
 
 
-def step_table(ranges: jax.Array) -> jax.Array:
-    """Query blocks' walks over their tile `ranges` `[..., R, 2]` (`BlockMap.ranges`) as `[..., 4, R]`
-    int32: each range's first tile, the steps before it and its length, and a row of zeros, so a launch
-    tiles it by powers of two (R being one, `stepped`)."""
-    lo, hi = ranges[..., 0], ranges[..., 1]
-    lengths = hi - lo
-    offsets = jnp.cumsum(lengths, axis=-1) - lengths
-    return jnp.stack([lo, offsets, lengths, jnp.zeros_like(lo)], axis=-2).astype(jnp.int32)
-
-
-def stepped(lo: jax.Array, offsets: jax.Array, lengths: jax.Array) -> tuple[jax.Array,
-                                                                          Callable[[jax.Array], jax.Array]]:
-    """A query block's walk over its ranges (`step_table`'s rows `[R]`): its step count, and each step's
-    key tile, the ranges' tiles in turn, by a select over the ranges every mainloop lowers."""
-
-    def tile(step: jax.Array) -> jax.Array:
-        inside = (offsets <= step) & (step < offsets + lengths)
-        return jnp.sum(jnp.where(inside, lo + step - offsets, 0))
-
-    return jnp.sum(lengths), tile
-
-
-def _runs_map(spans: KeySpans, block_q: int, block_k: int) -> BlockMap:
-    """`block_map` over runs: each query block's runs' tile envelopes merged into their union, sorted
-    (a later run's envelope may start inside an earlier one's), and each run's whole tiles."""
-    keys = spans.keys
-    key_blocks = -(-keys // block_k)
+def _merged(lo: jax.Array, hi: jax.Array, held: jax.Array, key_blocks: int) -> jax.Array:
+    """Each query block's run envelopes `[lo, hi)` `[B, Qb, R]` (`held` where a query reads the run) merged
+    into their union, `[B, Qb, R, 2]`: sorted, disjoint and nonempty first, `(0, 0)` after. A later run's
+    envelope may start inside an earlier one's, so they are sorted first; a range opens where an envelope
+    starts past every one before it, and runs to its group's last end."""
     big = jnp.iinfo(jnp.int32).max
-    start, end = _blocked(spans.start, block_q, 0), _blocked(spans.end, block_q, 0)
-    nonempty = end > start
-    held = jnp.any(nonempty, axis=2)
-    # Each run's envelope over the block's queries, an empty one at the end of the keys.
-    lo_r = jnp.where(held, jnp.min(jnp.where(nonempty, start, big), axis=2) // block_k, key_blocks)
-    hi_r = jnp.where(held, -(-jnp.max(jnp.where(nonempty, end, 0), axis=2) // block_k), key_blocks)
-    order = jnp.argsort(lo_r, axis=-1, stable=True)
-    lo_s, hi_s = (jnp.take_along_axis(bound, order, axis=-1) for bound in (lo_r, hi_r))
-    # A range opens where an envelope starts past every one before it, and runs to its group's last end.
+    lo, hi = jnp.where(held, lo, key_blocks), jnp.where(held, hi, key_blocks)
+    order = jnp.argsort(lo, axis=-1, stable=True)
+    lo_s, hi_s = (jnp.take_along_axis(bound, order, axis=-1) for bound in (lo, hi))
     covered = jax.lax.cummax(hi_s, axis=hi_s.ndim - 1)
     before = jnp.concatenate([jnp.full_like(covered[..., :1], -1), covered[..., :-1]], axis=-1)
     opens = lo_s > before
@@ -487,29 +465,22 @@ def _runs_map(spans: KeySpans, block_q: int, block_k: int) -> BlockMap:
     closes = jnp.max(jnp.where(same, hi_s[..., None, :], 0), axis=-1)
     kept = opens & (closes > lo_s)
     rank = jnp.argsort(jnp.where(kept, lo_s, big), axis=-1, stable=True)
-    r_lo, r_hi = (jnp.take_along_axis(jnp.where(kept, bound, 0), rank, axis=-1) for bound in (lo_s, closes))
-    any_rows = jnp.any(kept, axis=-1)
-    lo = jnp.where(any_rows, r_lo[..., 0], 0)
-    hi = jnp.max(r_hi, axis=-1)
-    # A run's tile is whole where every query of the block sees all its keys through that run.
-    every = jnp.all(nonempty, axis=2)
-    whole_lo = -(-jnp.max(start, axis=2) // block_k)
-    whole_hi = jnp.minimum(jnp.min(end, axis=2), keys) // block_k
-    whole = every & (whole_hi > whole_lo)
-    wholes = jnp.stack([jnp.where(whole, whole_lo, 0), jnp.where(whole, whole_hi, 0)], axis=-1)
-    widest = jnp.argmax(jnp.where(whole, whole_hi - whole_lo, -1), axis=-1)[..., None]
-    some = jnp.any(whole, axis=-1)
-    full_lo = jnp.where(some, jnp.take_along_axis(whole_lo, widest, axis=-1)[..., 0], lo)
-    full_hi = jnp.where(some, jnp.take_along_axis(whole_hi, widest, axis=-1)[..., 0], full_lo)
-    j = jnp.arange(key_blocks)[None, None, :, None]
-    reads = jnp.any((r_lo[:, :, None, :] <= j) & (j < r_hi[:, :, None, :]), axis=-1)
-    i = jnp.arange(lo.shape[1])[None, :, None]
-    q_lo = jnp.min(jnp.where(reads, i, big), axis=1, initial=big)
-    q_hi = jnp.max(jnp.where(reads, i + 1, 0), axis=1, initial=0)
-    q_lo = jnp.where(q_hi > 0, q_lo, 0)
-    return BlockMap(lo, hi, full_lo, full_hi, q_lo, q_hi, _uniform_doc(spans.query_ids, block_q),
-                    _uniform_doc(spans.key_ids, block_k), block_q, block_k,
-                    jnp.stack([r_lo, r_hi], axis=-1), wholes)
+    return jnp.stack([jnp.take_along_axis(jnp.where(kept, bound, 0), rank, axis=-1)
+                      for bound in (lo_s, closes)], axis=-1)
+
+
+def ranges_walk(ranges: jax.Array) -> tuple[jax.Array, Callable[[jax.Array], jax.Array]]:
+    """A query block's walk over its tile `ranges` `[R, 2]` (`BlockMap.ranges`): its step count, and each
+    step's key tile, the ranges' tiles in turn, by a select over the ranges every mainloop lowers."""
+    lo, hi = ranges[..., 0], ranges[..., 1]
+    lengths = hi - lo
+    offsets = jnp.cumsum(lengths, axis=-1) - lengths
+
+    def tile(step: jax.Array) -> jax.Array:
+        inside = (offsets <= step) & (step < offsets + lengths)
+        return jnp.sum(jnp.where(inside, lo + step - offsets, 0))
+
+    return jnp.sum(lengths), tile
 
 
 class Kind(enum.Enum):
