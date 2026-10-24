@@ -115,6 +115,15 @@ def test_a_deduplicating_snapshot_of_a_pass_that_keeps_nothing_seals_nothing(tmp
     assert manifest["rows"] == 0 and manifest["metadata"]["near_duplicates"]["removed"] == 0
 
 
+def test_a_quality_rule_that_rewrites_the_text_it_keeps_keeps_the_rewrite():
+    """C4's rules drop the lines they disallow from a page they keep: the record keeps the page with
+    its JavaScript notice gone, and its other fields as they were."""
+    page = {"id": 0, "text": "This line has words.\nJavascript should be enabled."}
+    kept = list(iterate(Pipeline(Memory([page])).filter_map(text.Quality("c4", settings=(
+        ("min_num_sentences", -1),))), read="memory"))
+    assert [(int(record["id"]), str(record["text"])) for record in kept] == [(0, "This line has words.")]
+
+
 def test_a_quality_rule_takes_its_filters_own_settings_a_list_among_them():
     """A setting is the filter's constructor argument: Gopher's stop words, a list, given as a tuple,
     replace its own, so prose that holds none of them is rejected for that, and the step's identity

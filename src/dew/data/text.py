@@ -509,16 +509,22 @@ class Curated(abc.ABC):
     def __call__(self, element: Batch) -> Batch | Rejected:
         from datatrove.data import Document
 
-        text = element[self.field]
-        text = text.decode("utf-8") if isinstance(text, bytes) else str(text)
+        held = element[self.field]
+        text = held.decode("utf-8") if isinstance(held, bytes) else str(held)
+        document = Document(text=text, id="")
         # DataTrove's filters and the spaCy pipeline they share build and mutate state as they read
         # (an index filled in place, a tokenizer's length bound), so a process's readers take turns.
         with _CURATING:
-            kept = _curator(self).filter(Document(text=text, id=""))
-        # DataTrove's filters keep with True and drop with False or with False and their reason.
-        if kept is True:
+            kept = _curator(self).filter(document)
+        # DataTrove's filters keep with True and drop with False or with False and their reason. One that
+        # keeps may rewrite the text it keeps, as C4's drops the lines it disallows, and the record
+        # keeps what it wrote.
+        if kept is not True:
+            return Rejected(kept[1] if isinstance(kept, tuple) else self.reason)
+        if document.text == text:
             return element
-        return Rejected(kept[1] if isinstance(kept, tuple) else self.reason)
+        rewritten = document.text.encode("utf-8") if isinstance(held, bytes) else document.text
+        return {**element, self.field: rewritten}
 
     def dependencies(self) -> Mapping[str, object]:
         from importlib.metadata import version
