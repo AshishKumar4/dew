@@ -727,39 +727,40 @@ def bf16_product(subscripts: str, hidden: jax.Array, head: jax.Array) -> jax.Arr
     return bf16_logits(bf16_einsum(subscripts, hidden, head))
 
 
-def _bf16_einsum(subscripts: str, lhs: jax.Array, rhs: jax.Array) -> jax.Array:
+def bf16_einsum(subscripts: str, lhs: jax.Array, rhs: jax.Array) -> jax.Array:
     """`jnp.einsum(subscripts, lhs, rhs)` of the operands rounded to bf16 (to nearest even), each
     product exact and summed in fp32 to an fp32 result; backward, the cotangent rounds to bf16 once
     and each product multiplies bf16 operands alike, as XLA's `BF16_BF16_F32` dot algorithm states
-    the arithmetic. Every index of an operand is in the result or the other operand.
+    the arithmetic, and forward mode takes the same product's tangent (`linear_tangent`). Every index
+    of an operand is in the result or the other operand.
 
     The operands are bf16 arrays rather than fp32 ones under that algorithm. On an A100, XLA's dot
-    with a vector side (one row or one column) or below its GEMM rewrite threshold (6 x 3 x 8)
-    rounded fp32 operands otherwise and moved bf16 results off round-to-nearest-even at their ties,
-    on fp32 operands and on bf16 ones alike, at the default precision and at the highest; with bf16
-    operands and no algorithm every shape was exact (node receipts SF-a100-tie-probe3 and 4). A
-    one-token tile of the chunked head and a one-row decode are such dots."""
-    return jnp.einsum(subscripts, lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16),
-                      preferred_element_type=jnp.float32)
+    under the algorithm with a vector side (one row or one column), or below its GEMM rewrite
+    threshold (6 x 3 x 8), did not round fp32 operands to nearest even, and products of exact bf16
+    values came out off round-to-nearest-even at their ties; at a vector side bf16 operands under the
+    algorithm missed too, at the default precision and at the highest. With bf16 operands and no
+    algorithm every shape was exact (node receipts SF-a100-tie-probe3 and 4). A one-token tile of the
+    chunked head and a one-row decode are such dots."""
+    from .kernels.generation import linear_tangent
 
+    def typed(spec: str, lhs, rhs):
+        return jnp.einsum(spec, lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16),
+                          preferred_element_type=jnp.float32)
 
-def _bf16_einsum_fwd(subscripts: str, lhs: jax.Array, rhs: jax.Array):
-    return bf16_einsum(subscripts, lhs, rhs), (lhs, rhs)
+    def pulled(saved, operands, cotangent):
+        """Each operand's cotangent: the product's two transposes over the cotangent rounded to bf16."""
+        del saved
+        lhs, rhs = operands
+        given, product = subscripts.split("->")
+        left, right = given.split(",")
+        rounded = cotangent.astype(jnp.bfloat16)
+        return (typed(f"{product},{right}->{left}", rounded, rhs).astype(lhs.dtype),
+                typed(f"{product},{left}->{right}", rounded, lhs).astype(rhs.dtype))
 
+    def forward(lhs, rhs):
+        return typed(subscripts, lhs, rhs)
 
-def _bf16_einsum_bwd(subscripts: str, residuals, cotangent: jax.Array):
-    lhs, rhs = residuals
-    operands, product = subscripts.split("->")
-    left, right = operands.split(",")
-    rounded = cotangent.astype(jnp.bfloat16)
-    return (bf16_einsum(f"{product},{right}->{left}", rounded, rhs).astype(lhs.dtype),
-            bf16_einsum(f"{product},{left}->{right}", rounded, lhs).astype(rhs.dtype))
-
-
-# `jax.custom_vjp` is generic in its return type, and a `functools.partial`
-# decorator loses that binding, so it is built by hand.
-bf16_einsum = jax.custom_vjp(_bf16_einsum, nondiff_argnums=(0,))
-bf16_einsum.defvjp(_bf16_einsum_fwd, _bf16_einsum_bwd)
+    return linear_tangent(lambda lhs, rhs: (forward(lhs, rhs), ()), pulled, forward)(lhs, rhs)
 
 
 def _subscripts(dimension_numbers, lhs_rank: int, rhs_rank: int) -> str:
