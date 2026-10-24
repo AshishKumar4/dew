@@ -790,30 +790,54 @@ def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
                            + ["tests/test_split.py::test_unrecorded"])
 
 
-def test_durations_are_each_tests_least_time_over_green_runs_floors(ci):
-    """`durations` records each test of the newest verdict at its least time
-    over green verdicts' floor rows, so a slow container or run moves nothing
-    and a test since removed is dropped, and refuses a red run or rows that
-    carry no times."""
-    def verdict(x, y):
-        return {"rows": [
-            {"name": "3.12:tests/test_a.py#1/2", "exitCode": 0, "tests": {"tests/test_a.py::test_x": x}},
-            {"name": "3.12:tests/test_a.py#2/2", "exitCode": 0, "tests": {"tests/test_a.py::test_y": y}},
-            {"name": "3.14:tests/test_a.py", "exitCode": 0, "tests": {"tests/test_a.py::test_x": 90.0}}]}
+def test_the_durations_fold_rewrites_only_a_file_its_record_no_longer_cuts(ci, tmp_path, monkeypatch):
+    """`durations` folds main's CI verdict into the record a file at a time, each whole, from its floor rows:
+    a file whose cut no longer fits as its tests ran takes what they took, though no test's node id changed
+    and its total barely moved (one test grown from 10 s to 180 s of 100; ten of 20 grown from 30 s to 39 s,
+    each within half again), so the next plan cuts it to fit; a file whose cut fits keeps its entries byte for
+    byte; a file with a red group keeps its own; a file the checkout no longer has loses them; the newest
+    Python's times move nothing."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 240}))
+    record, rows = {}, []
 
-    assert ci.durations([verdict(1.2346, 2.0)]) == {
-        "tests/test_a.py::test_x": 1.235, "tests/test_a.py::test_y": 2.0}
-    assert ci.durations([verdict(1.5, 2.0), verdict(30.0, 60.0), verdict(1.0, 2.5)]) == {
-        "tests/test_a.py::test_x": 1.0, "tests/test_a.py::test_y": 2.0}
-    removed = {"rows": [{"name": "3.12:tests/test_a.py", "exitCode": 0,
-                         "tests": {"tests/test_a.py::test_x": 0.5, "tests/test_a.py::test_gone": 3.0}}]}
-    assert ci.durations([verdict(1.0, 2.0), removed]) == {
-        "tests/test_a.py::test_x": 0.5, "tests/test_a.py::test_y": 2.0}
-    red = {"name": "3.12:tests/test_b.py", "exitCode": 1, "tests": {}}
-    with pytest.raises(SystemExit):
-        ci.durations([verdict(1.0, 2.0), {"rows": [*verdict(1.0, 2.0)["rows"], red]}])
-    with pytest.raises(SystemExit):
-        ci.durations([{"rows": [{"name": "3.12:tests/test_b.py", "exitCode": 0}]}])
+    def file(name: str, recorded: list[float], ran: list[list[float]], red: int | None = None) -> None:
+        (tmp_path / f"tests/{name}.py").write_text("")
+        nodes = [f"tests/{name}.py::test_{index:03}" for index in range(len(recorded))]
+        record.update(zip(nodes, recorded, strict=True))
+        start = 0
+        for group, times in enumerate(ran, start=1):
+            split = f"#{group}/{len(ran)}" if len(ran) > 1 else ""
+            tests = dict(zip(nodes[start:start + len(times)], times, strict=True))
+            start += len(times)
+            rows.append({"name": f"3.12:tests/{name}.py{split}", "exitCode": int(group == red),
+                         "seconds": sum(times), "tests": tests})
+            rows.append({"name": f"3.14:tests/{name}.py{split}", "exitCode": 0, "seconds": 999.0,
+                         "tests": dict.fromkeys(tests, 999.0)})
+
+    file("test_grown", [10.0] * 100, [[180.0] + [10.0] * 19] + [[10.0] * 20] * 4)
+    file("test_drift", [30.0] * 20, [[39.0] * 10, [30.0] * 10])
+    file("test_steady", [100.0] * 4, [[101.0, 99.0], [104.5, 98.0]])
+    file("test_partial", [150.0] * 4, [[400.0, 400.0], [150.0, 150.0]], red=2)
+    record["tests/test_gone.py::test_x"] = 5.0
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(record, indent=0) + "\n")
+    verdict = tmp_path / "main.json"
+    verdict.write_text(json.dumps({"rows": rows}))
+    monkeypatch.setattr(sys, "argv", ["ci.py", "durations", str(verdict)])
+    assert ci.main() == 0
+    folded = json.loads((tmp_path / "tests/test_durations.json").read_text())
+    observed = {node: seconds for row in rows if row["name"].startswith("3.12:") and not row["exitCode"]
+                for node, seconds in row["tests"].items()}
+    for name in ("test_grown", "test_drift"):
+        assert {node: s for node, s in folded.items() if f"/{name}.py" in node} == {
+            node: s for node, s in observed.items() if f"/{name}.py" in node}
+    for name in ("test_steady", "test_partial"):
+        assert {node: s for node, s in folded.items() if f"/{name}.py" in node} == {
+            node: s for node, s in record.items() if f"/{name}.py" in node}
+    assert "tests/test_gone.py::test_x" not in folded
+    timings = {"rows": {row["name"]: row["seconds"] for row in rows if row["name"].startswith("3.12:")}}
+    for entry in ci.plan(240.0, timings):
+        if entry["python"] == "3.12" and entry["tests"] in ("tests/test_grown.py", "tests/test_drift.py"):
+            assert entry["weight"] <= 240.0, entry
 
 
 def test_a_tasks_wall_time_is_apportioned_by_its_files_tests_times(ci):
@@ -957,6 +981,55 @@ def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_
     git(tmp_path, "add", "-A")
     git(tmp_path, "commit", "-qm", "change")
     assert ci.policy("HEAD~1") == policy
+
+
+def test_a_durations_change_reruns_only_the_groups_cut_from_it(ci, tmp_path, monkeypatch, cache_worker):
+    """The durations record is no file's input but a split file's groups', which are cut from that file's
+    own entries: a change to another file's entries reuses every row, and one to the split file's reruns
+    its groups alone, under the policy CI computes for the change from main (a refresh reran the whole
+    suite while the record was every file's input)."""
+    for name in ("heavy", "light"):
+        (tmp_path / f"tests/test_{name}.py").write_text(
+            "from pathlib import Path\n"
+            + "".join(f"def test_{name}_{index}():\n"
+                      f"    with Path('runs-{name}').open('a') as runs: runs.write('x')\n"
+                      for index in range(2)))
+    record = {"tests/test_heavy.py::test_heavy_0": 200.0, "tests/test_heavy.py::test_heavy_1": 200.0,
+              "tests/test_light.py::test_light_0": 1.0, "tests/test_light.py::test_light_1": 1.0}
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(record))
+    interpreter(tmp_path, "3.12")
+    url, _, _ = cache_worker
+    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    cached(monkeypatch, url)
+    (tmp_path / ".verdict").mkdir()
+    base = commit(tmp_path, "base")
+
+    def run() -> dict[str, int]:
+        rows = armada_task(ci, monkeypatch, tmp_path / ".verdict/verdict.json", ci.policy(base))
+        assert sorted(row["name"] for row in rows if not row["exitCode"]) == [
+            "3.12:tests/test_heavy.py#1/2", "3.12:tests/test_heavy.py#2/2", "3.12:tests/test_light.py"]
+        return {name: len((tmp_path / f"runs-{name}").read_text()) for name in ("heavy", "light")}
+
+    assert run() == {"heavy": 2, "light": 2}
+    (tmp_path / "tests/test_durations.json").write_text(
+        json.dumps({**record, "tests/test_light.py::test_light_0": 2.0}))
+    commit(tmp_path, "the light file's entry moves")
+    assert run() == {"heavy": 2, "light": 2}
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {**record, "tests/test_heavy.py::test_heavy_0": 201.0, "tests/test_heavy.py::test_heavy_1": 201.0}))
+    commit(tmp_path, "the heavy file's entries move")
+    assert run() == {"heavy": 4, "light": 2}
+
+
+def commit(root: Path, message: str) -> str:
+    """Every change in checkout `root` committed (a repository made at the first), and the commit's sha."""
+    if not (root / ".git").exists():
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    for arguments in (["add", "-A"], ["commit", "-qm", message]):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *arguments], cwd=root, check=True,
+                       capture_output=True)
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True,
+                          text=True).stdout.strip()
 
 
 def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, monkeypatch, cache_worker):
