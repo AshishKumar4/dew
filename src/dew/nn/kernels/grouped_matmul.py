@@ -82,11 +82,11 @@ model prices no term the cooperative schedule changes yet (its MMA issue, the se
 the shared stage), so where it ties, the first wins: a one-warpgroup tile, then a cooperative tile
 (shared memory staging's barriers, a few hundred bytes, are not counted against the block either)."""
 
-AMPERE_TILES = (mosaic_gpu.Tiles(128, 256, 32, 3, 8, family='mma.sync'),
-                mosaic_gpu.Tiles(128, 128, 32, 3, 8, family='mma.sync'))
-"""The tiles the Mosaic GPU forward takes on a GPU without warpgroup MMA (mma.sync's bundle): the two whose
-programs an A100's Mosaic lowering placed (AMPERE3, AMPDIAG; at every other tile its layout inference
-found no solution), the one it timed first."""
+AMPERE_TILES = (mosaic_gpu.Tiles(128, 256, 32, 3, 8, family='mma.sync'),)
+"""The tiles the Mosaic GPU forward takes on a GPU without warpgroup MMA (mma.sync's bundle): the one whose
+program an A100's Mosaic lowering (jax 0.11.2.post16) placed and ran exact (SM80-probe, AMPERE3). At
+128 x 128 its layout inference finds no layout for the epilogue's stores, and at every other tile none
+for the mainloop."""
 
 TPU_BLOCKS = tuple(mosaic_tpu.Blocks(*shape) for shape in itertools.product((128, 256, 512), repeat=3))
 """Every block the TPU launches may take: multiples of the MXU's 128 (Megablox's default is 128 cubed),
@@ -698,6 +698,10 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if config.warpgroups == 2:
             epilogue_sides = ba.arguments.get('epilogue_operands', ())
             epilogue += _side_tile_bytes(*_uncut(epilogue_sides, hooks.epilogue_axes), extents)
+        if config.family == 'mma.sync':
+            # Its pipeline's stages are scoped within the walk and its output's staging after it, so the
+            # block holds the larger (`mosaic_gpu._gmm_pipelined`).
+            return max(config.stages * step, staged_outs * config.block_m * config.block_n)
         return config.stages * step + epilogue + staged_outs * config.block_m * config.block_n
 
     @staticmethod
