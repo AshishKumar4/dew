@@ -1,6 +1,7 @@
 """Disk-backed MoE banks read at execution, not once at trace or load time."""
 
 import json
+import shutil
 from importlib import import_module
 from pathlib import Path
 
@@ -25,6 +26,35 @@ DEVICE = Layout(min_shard=1, tolerance=1.0)
 
 def single_mesh():
     return MeshSpec().build([jax.devices()[0]])
+
+
+def test_a_composite_wrapper_streams_float64_layers_from_its_native_source(tmp_path):
+    from dew.inference.banks import SafetensorsBanks
+    from dew.interop import Pretrained
+
+    directory = tmp_path / "source"
+    shutil.copytree(Path(__file__).parent / "fixtures/hf/qwen38-dense-tiny", directory)
+    (directory / "readout.json").write_text(json.dumps({
+        "readout": "slot_lm", "n_slots": 16, "head_dim": 8, "attention": "noncausal"}))
+    with jax.enable_x64(new_val=True):
+        bundle = Pretrained.load(directory, weights=False, dtype="float64", param_dtype="float64",
+                                  attention_impl="reference")
+        model = bundle.model.clone(language_model=bundle.model.language_model.clone(
+            scan_layers=True, bank_layers=1))
+        with SafetensorsBanks(directory, cache_bytes=0, param_dtype="float64", read_ahead=False) as source:
+            streamed = source.stream(model, mesh=single_mesh(), layout=DEVICE)
+            assert source.stats().misses == 0
+            resident = Pretrained.load(directory, dtype="float64", param_dtype="float64",
+                                       attention_impl="reference")
+            resident_store = HeldBanks(resident.variables).place(model, mesh=single_mesh(), layout=DEVICE)
+            tokens = jnp.asarray([[1, 8, 4, 6, 7, 2]], jnp.int32)
+            groups = jnp.asarray([[0, 0, 0, 1, 1, 1]], jnp.int32)
+            expected = jax.jit(lambda values: model.apply(
+                values, tokens, block_groups=groups))(resident_store)
+            actual = jax.jit(lambda values: model.apply(values, tokens, block_groups=groups))(streamed)
+            assert actual.dtype == expected.dtype == jnp.float64
+            np.testing.assert_array_equal(actual, expected)
+            assert source.stats().misses >= len(model.bank_sites[0].view.groups)
 
 
 def decoder(config, bank_layers):
