@@ -592,12 +592,14 @@ class Wandb:
     """Where a run reports to Weights & Biases.
 
     Setting it turns tracking on; the entity and the offline switch have no effect
-    without a project.
+    without a project. `name` is the run's display name there, apart from the name
+    its checkpoints are kept under; None shows it as the run is named.
     """
 
     project: str
     entity: str | None = None
     offline: bool = False
+    name: str | None = None
 
 
 def _best_argument():
@@ -1530,9 +1532,10 @@ class RunConfig:
         try:
             wandb_tracker = None
             if trainer.wandb is not None and trainer.lower_for is None:
+                # Shown under its own name where one is given, kept under the run's either way.
                 wandb_tracker = WandbTracker(
-                    trainer.wandb.project, name, entity=trainer.wandb.entity,
-                    offline=trainer.wandb.offline)
+                    trainer.wandb.project, name if trainer.wandb.name is None else trainer.wandb.name,
+                    entity=trainer.wandb.entity, offline=trainer.wandb.offline)
             checkpoints = Checkpoints(os.path.join(trainer.checkpoint_dir, name), keep=trainer.keep)
             local = _local_tracker(checkpoints.directory, name)
             tracker = Trackers(local, *(() if wandb_tracker is None else (wandb_tracker,)))
