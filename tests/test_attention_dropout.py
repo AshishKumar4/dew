@@ -69,7 +69,7 @@ def dropping_draw(queries: int, keys: int, dtype, *, sinks: bool):
     base = drawing(queries, keys, dtype, sinks=sinks)
 
     def draw(seed: int):
-        return (*base(seed), jax.random.key(seed))
+        return (*base(seed), jax.random.PRNGKey(seed))
 
     return draw
 
@@ -92,7 +92,7 @@ def test_a_dropping_call_reports_its_route_and_a_chosen_template_runs_it():
     not preferred), and `generation.chosen(attention='template')` runs it on the template instead."""
     query = jnp.zeros((ROWS, QUERIES, HEADS, WIDTH), jnp.bfloat16)
     key = jnp.zeros((ROWS, KEYS, KV_HEADS, WIDTH), jnp.bfloat16)
-    rng = jax.random.key(0)
+    rng = jax.random.PRNGKey(0)
 
     def dropping_call():
         return scaled_dot_product_attention(query, key, key, dropout_rate=RATE, dropout_rng=rng,

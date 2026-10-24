@@ -1190,7 +1190,7 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
                       draw_rows=(jnp.arange(query.shape[0], dtype=jnp.int32) if dropping else None, rows),
                       draw_heads=(jnp.arange(query.shape[2], dtype=jnp.int32) if dropping else None,
                                   ("activation_heads",)),
-                      seed=(dropout_seed, ()))
+                      seed=(dropout_seed, (None,)))
 
 
 VALUE_BLOCK = 256
