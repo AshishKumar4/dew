@@ -160,8 +160,8 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype):
 @pytest.mark.parametrize('case', GRADIENT_CASES)
 def test_the_ports_forward_takes_the_mosaic_backward_as_exact_as_its_own(case):
     """The port's rule (`recurrence_chunk.fla_rule`) with the template's fast backward (`backward='mosaic'`,
-    `_mosaic_backward_rule`, the selector's candidate) in a 16-bit call: its gradient on par from float64
-    with the port's own backward's over the case's draws (check 1)."""
+    `_mosaic_backward_rule`, the selector's 'fla_mosaic' kernel) in a 16-bit call: its gradient on par from
+    float64 with the port's own backward's over the case's draws (check 1)."""
     scale = SHAPES[case]['key_width'] ** -0.5
     hooks = recurrence.Hooks(decay='scalar', scale=scale)
 

@@ -512,11 +512,13 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         out, final = _rated_scan(hooks, query, key, value, g, beta, given, state, starts, chunk_size, work,
                                  kernels=ported is not False)
     else:
-        if hooks.delta and hooks.decay != 'none' and (on_the_port(query, key, value) if ported is None
-                                                        else ported):
+        port = hooks.delta and hooks.decay != 'none' and ported is not False
+        kernel = port_kernel(query, key, value, g) if port else 'xla'
+        if port and (ported or kernel != 'xla'):
             # Unrounded where an epilogue follows, as on the portable math.
+            backward = 'mosaic' if kernel == 'fla_mosaic' else 'fla'
             out, final = fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
-                                  scale=scale, wide=epilogue)
+                                  scale=scale, wide=epilogue, backward=backward)
         else:
             group = value.shape[2] // key.shape[2]
             if group > 1:
@@ -535,12 +537,17 @@ class PortCase:
     """A delta rule's call as the port's selector reads it (`GATED_DELTA`): whether it is traced for
     reverse mode alone (`reverse`; `FORWARD_MODE` marks `jax.jvp`'s traces), whether a caller's
     `shard_map` that checks varying axes holds operands that vary (`varying`), the operands' common
-    `dtype` and the keys' width (`key_width`)."""
+    `dtype`, the keys' and values' widths (`key_width`, `value_width`), whether the decay is a key
+    dimension's (`per_key`), and the instruction family whose Mosaic bundle the recurrence template's
+    mainloop runs on this device (`family`, `mainloop.family_of`'s name, None where none claims it)."""
 
     reverse: bool
     varying: bool
     dtype: np.dtype
     key_width: int
+    value_width: int = 0
+    per_key: bool = False
+    family: str | None = None
 
     @property
     def widest(self) -> int:
@@ -570,19 +577,54 @@ the port takes in their dtype. Packed documents take the port at any bound: it s
 where they pass, as many as the tokens' chunks, a row's and one, whatever the bound
 (`chunked_launch.Sequences`)."""
 
+MOSAIC_BACKWARD: tuple[Requirement[PortCase], ...] = (
+    Requirement('decay', lambda case: not case.per_key,
+                "a decay a key dimension, whose fast backward the mainloop does not take yet",
+                row='recurrence coverage: KDA backward'),
+    Requirement('dtype', lambda case: case.dtype.itemsize == 2,
+                lambda case: f"{case.dtype.name} operands; the fast backward takes 16-bit ones, an fp32 call "
+                             "the portable math's accurate adjoint", row=INHERENT),
+    Requirement('width', lambda case: max(case.key_width, case.value_width) <= 128,
+                lambda case: f"keys {case.key_width} and values {case.value_width} wide; the mainloop takes "
+                             "at most 128", row='recurrence coverage: widths past 128'),
+    Requirement('family', lambda case: case.family is not None,
+                "no Mosaic bundle of the recurrence mainloop claims this device's instruction family",
+                row='recurrence coverage: sm100, TPU'),
+    Requirement('measured', lambda case: False,
+                "the template's fast backward is ranked only once its cost is stated (selection's cost "
+                "provider); until then only a named call takes it", row='recurrence coverage: GDN cost',
+                kind='measured'),
+)
+"""What the port's forward with the recurrence template's fast backward (`fla_rule(..., backward='mosaic')`)
+needs of a call beyond the port's own: a decay a head, 16-bit operands, keys and values at most 128 wide,
+and a Mosaic bundle for the device's family; and, until its cost is stated, a named call."""
+
 GATED_DELTA: Op[PortCase] = Op('gated_delta_rule',
-                               (Kernel('fla', PORT_SUPPORTS), Kernel('xla', (), generic=True)),
+                               (Kernel('fla_mosaic', PORT_SUPPORTS + MOSAIC_BACKWARD),
+                                Kernel('fla', PORT_SUPPORTS), Kernel('xla', (), generic=True)),
                                lambda case: measured_kernel('gated_delta_rule', 'xla'))
 """The delta rule's selector: the port where the target's row names it (`measured_kernel`, the table
-qualification reads) and the call meets its requirements, else the portable math."""
+qualification reads) and the call meets its requirements, else the portable math; the port's forward with
+the template's fast backward ('fla_mosaic') where named."""
+
+
+def port_kernel(query, key, value, g=None) -> str:
+    """The kernel the delta rule's selector (`GATED_DELTA`) gives a call over these operands and log decay
+    (a key dimension's where `g` is `[B, S, Hv, Dk]`), which logs a call the row's port turns down the
+    first time."""
+    from .templates.recurrence import mainloop
+
+    family = mainloop.family_of()
+    case = PortCase(reverse=not FORWARD_MODE.get(), varying=bool(jax.typeof(value).mat.varying),
+                    dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1],
+                    value_width=value.shape[-1], per_key=g is not None and g.ndim == 4,
+                    family=None if family is None else family.name)
+    return select(GATED_DELTA, case).kernel
 
 
 def on_the_port(query, key, value) -> bool:
-    """Whether the rule over these operands runs on the port, as its selector reports it (`GATED_DELTA`),
-    which logs a call the row's port turns down the first time."""
-    case = PortCase(reverse=not FORWARD_MODE.get(), varying=bool(jax.typeof(value).mat.varying),
-                    dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1])
-    return select(GATED_DELTA, case).kernel == 'fla'
+    """Whether the rule over these operands runs on the port, its forward at least (`port_kernel`)."""
+    return port_kernel(query, key, value) != 'xla'
 
 
 def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segments: int | None = None,
