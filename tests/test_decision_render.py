@@ -139,6 +139,24 @@ def test_a_noul_asks_yes_first_with_the_releases_descriptions(qwen):
             "is no\n\nAnswer with one letter: A, B.") in text
 
 
+def test_more_options_than_letters_ask_for_one_label_their_structures_indented(qwen):
+    """A choice of more options than letters asks for one label, by the cue past them, each line under
+    the layout's own label; a structured description and a structured state are indented JSON."""
+    labels = Labels(variants=("{}",), names=(*LETTERS, "a", "b", "c", "d"))
+    layout = release()
+    many = QuestionLayout(max_len=layout.max_len, labels=labels, unit="whole", framing=layout.framing,
+                          segments=layout.segments)
+    queues = Choice("Which queue?", {f"queue{index:02d}": ({"team": index} if index == 0 else None)
+                                     for index in range(30)})
+    [row] = many.rows(qwen, SPECIALS, {"ticket": "charged twice"}, {"queue": queues})
+    text = qwen.decode(list(row.tokens))
+    assert "A. queue00: " + json.dumps({"team": 0}, indent=2) + "\nB. queue01\n" in text
+    assert "a. queue26\n" in text and "Answer with one label: " + ", ".join(labels.names or ()) + "." in text
+    assert "<state>\n" + json.dumps({"ticket": "charged twice"}, indent=2) + "\n</state>" in text
+    [laid] = row.questions
+    assert len(laid.options) == 30 and laid.label_ids == labels.ids(qwen, 30)
+
+
 @pytest.mark.network
 def test_more_options_than_letters_answer_with_one_of_the_releases_labels():
     """Under the release's own tokenizer (elephant-1 at its pinned commit), every one of its 256 labels
