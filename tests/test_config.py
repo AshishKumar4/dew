@@ -444,7 +444,7 @@ def test_a_saved_run_retains_vision_tower_and_projector_outputs(tmp_path):
     import jax
 
     run = VisionRun()
-    tower, projector = run.vision["tower"].build(), run.vision["projector"].build()
+    tower, projector = run.vision["tower"].build(), run.vision["projector"]
     pixels = jnp.arange(12, dtype=jnp.float32).reshape(1, 3, 2, 2)
     tower_params = tower.init(jax.random.key(2), pixels)
     encoded = tower.apply(tower_params, pixels)
