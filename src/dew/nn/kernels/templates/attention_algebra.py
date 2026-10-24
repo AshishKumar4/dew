@@ -1513,7 +1513,9 @@ def grad_scores(exponentials: jax.Array, products: jax.Array, anchor: jax.Array,
     test, fails check 1 there in both dQ and dK (a query of one key, the stability suite's ordinary "one
     key" and causal windows' first queries: rows whose float64 gradient is exactly 0)."""
     if multiplier is not None:
-        products = products * multiplier
+        # Each dropped product rounds once before it is centred, in both sweeps alike: fused into its
+        # subtraction (a contracted multiply-add) it would round differently against a centre that rounded it.
+        products = jax.lax.optimization_barrier(products * multiplier)
     relative = products - expand(anchor, products)
     if at_anchor is not None:
         relative = jnp.where(at_anchor, 0.0, relative)
