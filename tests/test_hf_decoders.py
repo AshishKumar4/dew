@@ -267,15 +267,6 @@ def test_a_float32_decoder_multiplies_float32_products_on_a_gpu():
     assert_as_exact_as_the_reference(ours, theirs(torch.float32), theirs(torch.float64), "float32 logits")
 
 
-STALE_FIELD_SEEDS = {"qwen2-tiny": 8, "mamba2-tiny": 8, "nemotron-h-tiny": 8, "qwen35-tiny": 8,
-                     "granitemoe-tiny": 8, "modernbert-tiny": 8}
-"""Check 1's declared seeds for each stale-field checkpoint, sized by `seeds_for` (on armada)."""
-STALE_FIELD_ROWS = (8, 32)
-"""A stale-field draw's rows of ids: at the fixtures' own 2 rows of 12, Qwen 3.5's float32 error
-from float64 is heavy-tailed enough across draws that the reference compared with itself resolves
-no factor within 512 seeds."""
-
-
 @pytest.mark.parametrize(("name", "stale"), [
     ("qwen2-tiny", {"use_mrope": True}),
     ("mamba2-tiny", {"rms_norm": False, "intermediate_size": 3, "norm_before_gate": True}),
@@ -288,44 +279,34 @@ def test_a_field_the_reference_does_not_read_leaves_its_logits_whatever_it_holds
     """A released config may carry fields its reference neither declares nor reads (a multimodal
     rotary flag, mamba_ssm's own sizes, an older name for a field it reads under another, an output
     gate the attention always builds, a router jitter or a direction the reference never applies), and
-    the reference computes the same model whatever they hold; so the checkpoint, under the fields,
-    loads to logits on par with the reference's over drawn ids, both measured from the reference in
-    float64 (check 1), however the fields disagree with the ones the reference reads."""
-    import contextlib
+    the reference computes the same model whatever they hold: its logits under them are its logits
+    without them, bit for bit. The checkpoint loads to the same model too, however the fields
+    disagree with the ones the reference reads: its logits under them are the bits it computes
+    without them, the same program on the same values, which the fixture's parity test holds to the
+    reference's."""
     from shutil import copytree
 
     import torch
     import transformers
 
-    from tools.diffusers_wan_reference import float64
-
     directory = tmp_path / "checkpoint"
     copytree(FIXTURES / name, directory)
     config = {**fixture_config(name), **stale}
     (directory / "config.json").write_text(json.dumps(config))
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
-    forward = jax.jit(lambda ids: loaded.model.apply(loaded.variables, ids))
-    architecture = getattr(transformers, config["architectures"][0])
-    # The experts' loop, whose float64 run the grouped product (`torch._grouped_mm`) does not take.
-    eager = {"attn_implementation": "eager", "experts_implementation": "eager"}
-    with float64():
-        wide = architecture.from_pretrained(directory, dtype=torch.float64, **eager)
-    references = {torch.float32: architecture.from_pretrained(directory, **eager).eval(),
-                  torch.float64: wide.eval()}
+    ids = np.load(FIXTURES / name / "input_ids.npy")
 
-    def draw(seed):
-        rng = np.random.default_rng([0x57, seed])
-        return (rng.integers(0, config["vocab_size"], STALE_FIELD_ROWS).astype(np.int32),)
+    def theirs(source):
+        reference = getattr(transformers, config["architectures"][0]).from_pretrained(
+            source, attn_implementation="eager").eval()
+        with torch.no_grad():
+            return reference(torch.from_numpy(ids).long()).logits.numpy()
 
-    def theirs(dtype):
-        def logits(ids):
-            with float64() if dtype == torch.float64 else contextlib.nullcontext(), torch.no_grad():
-                return {"logits": references[dtype](torch.from_numpy(ids).long()).logits.double().numpy()}
-        return logits
+    def ours(source):
+        loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
+        return np.asarray(loaded.model.apply(loaded.variables, ids))
 
-    assert_as_exact(lambda ids: {"logits": np.asarray(forward(ids))}, theirs(torch.float32), draw,
-                    f"{name} logits beside {', '.join(stale)}", seeds=STALE_FIELD_SEEDS[name],
-                    truth_fn=theirs(torch.float64))
+    np.testing.assert_array_equal(theirs(directory), theirs(FIXTURES / name))
+    np.testing.assert_array_equal(ours(directory), ours(FIXTURES / name))
 
 
 @pytest.mark.parametrize("family", ["qwen3_moe", "deepseek_v3"])
