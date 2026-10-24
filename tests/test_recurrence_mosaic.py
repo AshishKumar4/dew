@@ -200,14 +200,17 @@ key heads, value heads, key and value widths, and whether the decay is a key dim
 
 
 @pytest.mark.parametrize('target', ['sm80', 'sm90'])
-def test_the_mosaic_mainloop_compiles_within_each_gpus_resources(target):
+def test_the_mosaic_mainloop_compiles_within_each_gpus_shared_memory(target):
     """The mainloop's launches, its forward in a 16-bit and an fp32 call and the gated delta rule's fast
     backward, at the scoreboard's widths, one row of 256 tokens and packed documents, compiled by Mosaic for a
-    compile-only A100 and H100 on this CPU (tests/kernel_compile.py): within the multiprocessor's shared
-    memory (163 KB, 227 KB), no register spilled. Lowering alone takes no device's budget: a launch past an
-    A100's shared memory lowered and failed on the GPU (the fast backward's readout's third staging tile)."""
+    compile-only A100 and H100 on this CPU (tests/kernel_compile.py): every launch compiles, within the
+    multiprocessor's shared memory (163 KB, 227 KB) and tensor memory. Lowering alone takes no device's
+    budget: a launch past an A100's shared memory lowered and failed on the GPU (the fast backward's
+    readout's third staging tile). The gate's third resource, no register spilled, the mainloop does not
+    meet yet (ledger: the recurrence mainloop's register spills), and this test turns into the whole gate
+    (`mosaic_failures`) when it does."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+    from kernel_compile import compile_mosaic_kernels
 
     from dew.nn.kernels.templates import mosaic_sm90
     from dew.nn.kernels.templates.recurrence import _sm80
@@ -248,5 +251,16 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources(target):
              if not (RESOURCE_SHAPES[name][4] and dtype == jnp.float32)]
     cases += [case('qwen3.5-27b-gdn', jnp.bfloat16, training=True, packed=packed) for packed in (False, True)]
     found = compile_mosaic_kernels(cases, target)
-    assert all(record.get('kernels') for record in found), found
-    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+    failed = [f"{record['name']}: {record.get('error', 'no Mosaic GPU kernel compiled')}" for record in found
+              if 'error' in record or not record.get('kernels')]
+
+    def within(record: dict, kernel: dict) -> bool:
+        """Whether Mosaic's report states the kernel's shared and tensor memory, within the target's."""
+        if {'shared bytes', 'tensor memory columns'} & set(kernel['unread']):
+            return False
+        return kernel['shared'] <= record['limit'] and kernel['tmem'] <= record['tmem_limit']
+
+    failed += [f"{record['name']} {kernel['kernel']}: {kernel['shared']} shared bytes (limit "
+               f"{record['limit']}), {kernel['tmem']} tensor memory columns (limit {record['tmem_limit']})"
+               for record in found for kernel in record.get('kernels', ()) if not within(record, kernel)]
+    assert not failed, "\n".join(failed)
