@@ -429,12 +429,17 @@ def _halo(mixed, valid, segments, width: int):
     here = jax.lax.axis_index(SEQUENCE_AXIS)
     halo = jnp.zeros_like(tail)
     halo_documents = jnp.full_like(documents, -1)
+    slots = jnp.arange(width)[None, :]
     for shard in range(tails.shape[0]):
-        kept = jnp.minimum(counts[shard], width)
-        rows = kept[:, None] + jnp.arange(width)[None, :]
-        joined = jnp.take_along_axis(jnp.concatenate([halo, tails[shard]], axis=1), rows[:, :, None], axis=1)
-        joined_documents = jnp.take_along_axis(
-            jnp.concatenate([halo_documents, all_documents[shard]], axis=1), rows, axis=1)
+        # A shard's tail holds its last `kept` real tokens at its end, zeros before them; behind them
+        # come the halo's last `width - kept`.
+        kept = jnp.minimum(counts[shard], width)[:, None]
+        behind = slots < width - kept
+        rows = jnp.minimum(kept + slots, width - 1)
+        joined = jnp.where(behind[:, :, None], jnp.take_along_axis(halo, rows[:, :, None], axis=1),
+                           tails[shard])
+        joined_documents = jnp.where(behind, jnp.take_along_axis(halo_documents, rows, axis=1),
+                                     all_documents[shard])
         earlier = shard < here
         halo = jnp.where(earlier, joined, halo)
         halo_documents = jnp.where(earlier, joined_documents, halo_documents)
