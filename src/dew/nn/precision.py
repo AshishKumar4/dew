@@ -31,6 +31,7 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 import numpy as np
+import opt_einsum
 from flax.typing import Dtype, PrecisionLike
 from jax.typing import DTypeLike
 
@@ -288,9 +289,35 @@ def float32_einsum(subscripts: str, *operands, precision: jax.lax.PrecisionLike 
     `BF16_BF16_F32` algorithm."""
     precision = float32_products(products_dtype(*operands), precision)
     if _bf16_algorithm(precision):
-        return _held(bf16_einsum(subscripts, *operands), preferred_element_type, *operands)
+        return _held(_bf16_contracted(subscripts, *operands), preferred_element_type, *operands)
     return accumulated(functools.partial(jnp.einsum, subscripts, precision=precision, **kwargs), *operands,
                        preferred_element_type=preferred_element_type)
+
+
+def _bf16_contracted(subscripts: str, *operands) -> jax.Array:
+    """`jnp.einsum(subscripts, *operands)` of any expression einsum takes, each of its products
+    `bf16_einsum`'s: the operands contracted two at a time along opt_einsum's path, as `jnp.einsum`
+    contracts them, an index a pair's result drops that only one of the pair holds summed out of
+    that operand first, and an operand's own indices (a sum, a diagonal, a transpose) taken by
+    einsum alone, which forms no product."""
+    _, path = opt_einsum.contract_path(subscripts, *operands, shapes=False)
+    held = list(operands)
+    for indices, _, step, *_ in path.contraction_list:
+        pair = [held.pop(index) for index in indices]
+        given, produced = step.split("->")
+        specs = given.split(",")
+        if len(pair) == 1:
+            held.append(jnp.einsum(step, *pair))
+            continue
+        kept = []
+        for at, (spec, operand) in enumerate(zip(specs, pair, strict=True)):
+            other = specs[1 - at]
+            own = "".join(dict.fromkeys(label for label in spec if label in other or label in produced))
+            kept.append((own, operand if own == spec else jnp.einsum(f"{spec}->{own}", operand)))
+        (left, lhs), (right, rhs) = kept
+        held.append(bf16_einsum(f"{left},{right}->{produced}", lhs, rhs))
+    (result,) = held
+    return result
 
 
 def _bf16_algorithm(precision: jax.lax.PrecisionLike) -> bool:
