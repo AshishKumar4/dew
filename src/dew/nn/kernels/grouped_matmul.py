@@ -700,7 +700,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             epilogue += _side_tile_bytes(*_uncut(epilogue_sides, hooks.epilogue_axes), extents)
         if config.family == 'mma.sync':
             # Its pipeline's stages are scoped within the walk and its output's staging after it, so the
-            # block holds the larger (`mosaic_gpu._gmm_pipelined`).
+            # block holds the larger (`mosaic_sm80.Mma.persist`).
             return max(config.stages * step, staged_outs * config.block_m * config.block_n)
         return config.stages * step + epilogue + staged_outs * config.block_m * config.block_n
 
