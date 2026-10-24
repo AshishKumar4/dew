@@ -12,7 +12,7 @@ from typing import Literal
 import pytest
 
 from dew.data.text import ByteTokenizer, HFTokenizer
-from dew.decision import Choice, Noul, Score
+from dew.decision import Choice, Noul, Question, Score
 from dew.decision.layout import (
     LETTERS,
     AnswerCue,
@@ -57,7 +57,11 @@ def release(*, max_len: int = 32768, keep: Literal["start", "end", "all"] = "all
         framing=Framing(system=SLOT_SYSTEM, prefill="", thinking=False),
         segments=(Text("<state>\n"), State(render="state", keep=keep), Text("\n</state>\n\n"),
                   Instructions({"choice": "Question: {}", "noul": "Question: {}",
-                                "score": "Rate the state: {}"}, render="entry"),
+                                "score": "Rate the state: {}"}, render="entry",
+                               defaults={"choice": "Which option applies to the state?",
+                                         "score": "Which level describes the state?",
+                                         "noul": ("Is the statement true, or is the answer to the question "
+                                                  "yes?")}),
                   Text("\n\nOptions:\n"),
                   OptionLines(criteria={"true": "the statement is true / the answer is yes",
                                         "false": "the statement is false / the answer is no"}),
@@ -128,13 +132,20 @@ def test_a_slot_release_row_is_the_releases_own_prompt(qwen, question, prompt):
 
 def test_a_noul_asks_yes_first_with_the_releases_descriptions(qwen):
     """A noul's options are yes, then no, its true option first (`Laid.order`), each with the
-    release's own description where its question gives none."""
+    release's own description where its question gives none; a noul whose instructions are whitespace
+    alone, which its protocol admits from the wire and the release's entry renders empty, asks the
+    release's default instructions, its span theirs."""
     [row] = release().rows(qwen, SPECIALS, STATE, {"holds": Noul("Was the customer charged twice?")})
     [laid] = row.questions
     text = qwen.decode(list(row.tokens))
     assert laid.order == (1, 0)
     assert ("A. yes: the statement is true / the answer is yes\nB. no: the statement is false / the answer "
             "is no\n\nAnswer with one letter: A, B.") in text
+    blank = Question.from_wire({"type": "noul", "instructions": "   "})
+    [row] = release().rows(qwen, SPECIALS, STATE, {"holds": blank})
+    start, end = row.questions[0].span
+    assert qwen.decode(list(row.tokens[start:end])) == ("Is the statement true, or is the answer to the "
+                                                        "question yes?")
 
 
 def test_more_options_than_letters_ask_for_one_label_their_structures_indented(qwen):
@@ -272,13 +283,16 @@ def test_a_framing_carries_its_marks_through_a_trimming_template_and_refuses_one
     assert "Answer with one letter: A, B, C.<|im_end|>" in shown
     assert list(blank.questions[0].options) == [overlapping(qwen, shown, line) for line in lines_of(shown, 3)]
     verbatim = trimming.replace("message.content | trim", "message.content")
+    options_last = tuple(segment for segment in layout.segments or () if not isinstance(segment, AnswerCue))
     padded = QuestionLayout(max_len=layout.max_len, labels=layout.labels, unit="whole",
                             framing=Framing(system=SLOT_SYSTEM, prefill="", thinking=None,
                                             chat_template=verbatim),
-                            segments=(Text("  "), *(layout.segments or ()), Text("\n")))
+                            segments=(Text("   "), *options_last[:-1]))
     [row] = padded.rows(qwen, SPECIALS, STATE, {"team": TEAM})
     prompt = qwen.decode(list(row.tokens))
-    assert list(row.questions[0].options) == [overlapping(qwen, prompt, line) for line in lines_of(prompt, 3)]
+    last = prompt.index("C. fraud: Suspected unauthorised use")
+    expected = overlapping(qwen, prompt, (last, last + len("C. fraud: Suspected unauthorised use")))
+    assert row.questions[0].options[-1] == expected
     rewriting = trimming.replace("message.content | trim", "message.content | upper")
     with pytest.raises(ValueError):
         QuestionLayout(max_len=layout.max_len, labels=layout.labels, unit="whole", segments=layout.segments,
