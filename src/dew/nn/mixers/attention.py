@@ -55,7 +55,7 @@ from dew.nn.precision import at_least_fp32, float32_dot_general, l2norm, rounded
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, mrope_tables, rotary_freqs, rotate
 from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
-from dew.nn.visibility import visible, windowed
+from dew.nn.visibility import same_group, visible, windowed
 
 
 def temperature_scale(positions, floor_scale: float, attn_scale: float, *, dtype: DTypeLike):
@@ -102,7 +102,8 @@ def held_reads(index: jax.Array, positions: jax.Array) -> jax.Array:
     return jnp.where(jnp.asarray(positions) >= 0, index, 1)
 
 
-def mixed_attention_refusal(ctx: MixerContext, *, alibi: bool, bidirectional_images: bool) -> str | None:
+def mixed_attention_refusal(ctx: MixerContext, *, alibi: bool, bidirectional_images: bool,
+                            bidirectional_blocks: bool) -> str | None:
     """Why attention over `ctx` cannot run a serving step's mixed call
     (`dew.nn.inputs.Admitted`), or None: it reads a full-precision cache,
     dense or one page pool, whole and causal, and nothing a row carries
@@ -116,7 +117,8 @@ def mixed_attention_refusal(ctx: MixerContext, *, alibi: bool, bidirectional_ima
         "attention sinks": ctx.attention_sinks,
         "ALiBi": alibi,
         "keys shared from another layer": ctx.kv_shared,
-        "bidirectional attention or image groups": not ctx.causal or bidirectional_images,
+        "bidirectional attention, image groups or blocks": (not ctx.causal or bidirectional_images
+                                                            or bidirectional_blocks),
     }
     named = [reason for reason, refused in refusals.items() if refused]
     return None if not named else ", ".join(named)
@@ -192,6 +194,13 @@ class CausalSelfAttention(nn.Module):
     Glimmer, modeling_muse_glimmer.py:305, 351). Either way the branch
     multiplies by its sigmoid."""
     bidirectional_images: bool = False
+    """Whether a causal layer lets each token of an image (`AttentionMetadata.image_groups`) see the
+    image's later tokens too, within its window (Gemma 3's, and Gemma 4's sliding layers')."""
+    bidirectional_blocks: bool = False
+    """Whether a causal layer lets each token of a block (`AttentionMetadata.block_groups`) see the whole
+    block, whatever its window (transformers' `block_sequence_ids`): a decision prompt's blocks, read both
+    ways on the full layers that train so, a unified model's media. A layer reading image groups as well
+    sees the union."""
     mrope_section: tuple[int, int, int] | None = None
     rotary_axes: tuple[int, ...] | None = None
     """The channel widths of a rotary over several axes (`dew.nn.rope.axis_tables`),
@@ -471,31 +480,22 @@ class CausalSelfAttention(nn.Module):
             rope_scaling=self.ctx.rope_scaling if self.ctx.yarn is None else self.ctx.yarn,
             dtype=dtype, reach=reach)
 
-    def _metadata_mask(self, metadata: AttentionMetadata | None, slots, counted,
-                       batch: int, length: int, key_length: int, decode: bool):
-        """Combine key validity, causality, image groups and the layer's window, which counts
-        tokens: a cache's slots are its tokens, and an uncached call's are `counted`
-        (`counted_places`), padding among them skipped."""
+    def _metadata_mask(self, metadata: AttentionMetadata | None, slots, counted, documents, batch: int,
+                       length: int, key_length: int, decode: bool):
+        """The call's visibility as one mask `[B, 1, S, keys]`: causality, its keys' validity (an uncached
+        call's real tokens, a cache call's filled slots, which its `documents` hold), its own documents,
+        the layer's window, which counts tokens (a cache's slots are its tokens, and an uncached call's are
+        `counted`, `counted_places`, padding among them skipped), and the image and block groups a causal
+        layer reads (`_groups`): an image's token sees its later tokens within the window, which bounds
+        only the keys behind it (Gemma's `AND(window, OR(causal, image))`), and a block's token its whole
+        block whatever the window (transformers' `block_sequence_ids`)."""
         query_slots = (slots if decode else jnp.broadcast_to(jnp.arange(length), (batch, length)))
-        groups = (None if metadata is None else metadata.image_groups)
-        if groups is None:
-            groups = jnp.full((batch, length), -1, jnp.int32)
-        key_groups = groups
-        if decode and self.bidirectional_images:
-            allocated = self.has_variable("cache", "cached_image_groups")
-            stored = self.variable("cache", "cached_image_groups", jnp.full,
-                                   (batch, self.ctx.max_seq_len), -1, jnp.int32)
-            if allocated:
-                stored.value = write_cache(stored.value, groups, query_slots)
-            key_groups = stored.value
-        valid = (cached_validity(self, key_length) if decode
-                 else None if metadata is None else metadata.valid)
         keep = (causal_attention_mask(query_slots, key_length)
                 if self.ctx.causal else jnp.ones((batch, 1, length, key_length), bool))
-        if self.bidirectional_images:
-            same_image = ((groups[:, :, None] == key_groups[:, None, :])
-                          & (groups[:, :, None] >= 0))
-            keep = keep | same_image[:, None]
+        images, blocks = (self._groups(metadata, name, slots, key_length, decode) if self.ctx.causal else None
+                          for name in ("image_groups", "block_groups"))
+        if images is not None:
+            keep = keep | same_group(images[0][:, :, None], images[1][:, None, :])[:, None]
         if self.ctx.sliding_window is not None and (self.ctx.causal or self.ctx.bidirectional_window):
             places = jnp.broadcast_to(query_slots if decode else counted, (batch, length))
             key_places = jnp.arange(key_length)[None, :] if decode else places
@@ -504,33 +504,66 @@ class CausalSelfAttention(nn.Module):
             # two-sided one bounds both (`windowed`).
             keep = keep & windowed(places[:, None, :, None], key_places[:, None, None, :],
                                    self.ctx.sliding_window, causal=self.ctx.causal)
-        if valid is not None:
-            keep = keep & valid[:, None, None, :]
+        if blocks is not None:
+            keep = keep | same_group(blocks[0][:, :, None], blocks[1][:, None, :])[:, None]
+        held = (documents.key if isinstance(documents, CrossDocuments)
+                else None if metadata is None else metadata.valid)
+        if held is not None:
+            keep = keep & jnp.asarray(held, bool)[:, None, None, :]
         if decode:
             keep = keep & (query_slots[:, None, :, None] >= 0)
+        elif documents is not None:
+            keep = with_documents(keep, documents)
         return keep
+
+    def _group_fields(self) -> tuple[str, ...]:
+        """The `AttentionMetadata` fields of groups the layer reads: `image_groups` under
+        `bidirectional_images`, `block_groups` under `bidirectional_blocks`."""
+        return tuple(name for name, reads in (("image_groups", self.bidirectional_images),
+                                              ("block_groups", self.bidirectional_blocks)) if reads)
+
+    def _reads_groups(self, metadata: AttentionMetadata | None, decode: bool = False,
+                      length: int = 0) -> bool:
+        """Whether the call carries groups the layer reads, a call of `length` tokens: a single decode step
+        reads none, since its keys are those before it, so its block's later ones are not yet there."""
+        return (metadata is not None and not (decode and length == 1)
+                and any(getattr(metadata, name) is not None for name in self._group_fields()))
+
+    def _groups(self, metadata: AttentionMetadata | None, name: str, slots, key_length: int,
+                decode: bool) -> tuple[jax.Array, jax.Array] | None:
+        """The queries' `[B, S]` and keys' `[B, keys]` groups of field `name`, None where the layer reads
+        none or the call carries none: an uncached call's keys are its own tokens, and a cache call's are
+        its tokens at their `slots` and -1 elsewhere. A cache call matches its whole pass where each block
+        lies in one call, since a call's queries were computed before any later call's keys: the keys of
+        its own block it reads are then the call's tokens. So no cache keeps the groups, and a layer
+        sharing another's keys reads them as its own."""
+        groups = None if metadata is None or name not in self._group_fields() else getattr(metadata, name)
+        if groups is None:
+            return None
+        groups = jnp.asarray(groups, jnp.int32)
+        if not decode:
+            return groups, groups
+        return groups, write_cache(jnp.full((groups.shape[0], key_length), -1, jnp.int32), groups, slots)
 
     def _restricts_visibility(self, metadata: AttentionMetadata | None, decode: bool) -> bool:
         """Whether metadata narrows who sees whom, so the mask has to be built.
 
-        Key validity does, and image groups on a bidirectional-image layer; rotary
-        positions and an explicit pairwise mask do not. Otherwise causality and the
-        window stay flags, since a materialized [B, 1, S, S] mask sends the call to
-        the xla kernel (docs/performance.md). A validity array is opaque at trace
-        time, so a host that knows a row is unpadded passes none, and one that
-        right-pads its rows says so (`AttentionMetadata.right_padded`): causality
-        alone keeps a real query off the padding after it. Decoding always
+        Key validity does; rotary positions and an explicit pairwise mask do not,
+        and groups the layer reads build it beside (`_reads_groups`). Otherwise
+        causality and the window stay flags, since a materialized [B, 1, S, S] mask
+        sends the call to the xla kernel (docs/performance.md). A validity array is
+        opaque at trace time, so a host that knows a row is unpadded passes none, and
+        one that right-pads its rows says so (`AttentionMetadata.right_padded`):
+        causality alone keeps a real query off the padding after it. Decoding always
         builds the mask, which carries the cache's validity.
         """
         if decode:
-            return metadata is not None or self.bidirectional_images
+            return metadata is not None
         # QK-Clip's logit maxima are taken under the mask (`_attended`), so a
         # layer that sows them keeps it.
         implied = (metadata is not None and metadata.right_padded and self.ctx.causal
                    and not (not self.is_initializing() and self.is_mutable_collection("qk")))
-        return metadata is not None and (
-            (metadata.valid is not None and not implied)
-            or (self.bidirectional_images and metadata.image_groups is not None))
+        return metadata is not None and metadata.valid is not None and not implied
 
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL, train: bool = False):
@@ -817,13 +850,13 @@ class CausalSelfAttention(nn.Module):
         cached = isinstance(documents, CrossDocuments)
         if cached and self.ctx.attention_impl != 'auto':  # a named kernel's handoff (`_mask_kernel`)
             implementation = masked
-        if prefix is None and self._restricts_visibility(attention_metadata, decode) and not (
-                cached and not self.bidirectional_images):
-            # A cache's mask or a cache call's documents hold the rows' validity; image groups add to it.
-            if not decode or self.bidirectional_images:
-                mask = self._metadata_mask(attention_metadata, positions, places, B, S, key.shape[-3], decode)
-                if segment_ids is not None and not decode:
-                    mask = with_documents(mask, segment_ids)
+        grouped = prefix is None and self._reads_groups(attention_metadata, decode, S)
+        if prefix is None and ((self._restricts_visibility(attention_metadata, decode) and not cached)
+                               or grouped):
+            # A decode step's mask and a cache call's documents hold the rows' validity; groups add to them.
+            if not decode or grouped:
+                mask = self._metadata_mask(attention_metadata, positions, places, documents, B, S,
+                                           key.shape[-3], decode)
             documents = None
             causal, window = False, None
             implementation = masked
@@ -935,7 +968,8 @@ class CausalSelfAttention(nn.Module):
         """Each token's slot in its row, `[1, tokens]`, -1 for padding: a
         decoding row's token at its cursor, a prompt's after its row's start."""
         refusal = mixed_attention_refusal(self.ctx, alibi=self.alibi,
-                                          bidirectional_images=self.bidirectional_images)
+                                          bidirectional_images=self.bidirectional_images,
+                                          bidirectional_blocks=self.bidirectional_blocks)
         if refusal is not None:
             raise ValueError(f"a mixed serving step needs plain attention; {self.name}: {refusal}")
         index = self.get_variable("cache", "cache_index")
@@ -1086,9 +1120,9 @@ class CausalSelfAttention(nn.Module):
         `[S, S]` mask a window or chunk otherwise costs.
 
         That is a causal local layer's whole-sequence pass, over row
-        validity and packed documents. A cache, a pairwise mask or
-        bidirectional image groups keep the mask path, and so does an open
-        `qk` collection, whose maxima read the dense logits anyway.
+        validity and packed documents. A cache, a pairwise mask or the image
+        or block groups the layer reads keep the mask path, and so does an
+        open `qk` collection, whose maxima read the dense logits anyway.
         """
         if (self.ctx.sliding_window is None and self.ctx.attention_chunk is None) or not self.ctx.causal:
             return False
@@ -1096,7 +1130,7 @@ class CausalSelfAttention(nn.Module):
             return False
         return metadata is None or (
             metadata.pairwise_mask is None and metadata.position_bias is None
-            and not (self.bidirectional_images and metadata.image_groups is not None))
+            and not self._reads_groups(metadata))
 
     def _output(self, attention, gate, batch: int, length: int, own_value):
         """Exclude the own value where the layer does, gate the attended values
@@ -1123,17 +1157,20 @@ class CausalSelfAttention(nn.Module):
 
 @dataclasses.dataclass(frozen=True)
 class AttentionMixer(MixerBase):
-    """Grouped-query attention with optional image-block masking and M-RoPE.
+    """Grouped-query attention with optional image- and block-bidirectional masking and M-RoPE.
 
-    Geometry, norms and kernel policy come from the decoder context. Image
-    bidirectionality, spatial rotary sections, NoPE and exclusive self attention
-    are this mixer's own fields, which a hybrid names on its attention kind
-    (`{"name": "attention", "fields": {"nope": true}}`).
+    Geometry, norms and kernel policy come from the decoder context. Image and
+    block bidirectionality, spatial rotary sections, NoPE and exclusive self
+    attention are this mixer's own fields, which a hybrid names on its attention
+    kind (`{"name": "attention", "fields": {"nope": true}}`).
     """
 
     residuals = (*QKV_RESIDUALS, 'output_gate', 'o_proj', 'context')
 
     bidirectional_images: bool = False
+    """Whether a causal layer reads an image whole (`CausalSelfAttention.bidirectional_images`)."""
+    bidirectional_blocks: bool = False
+    """Whether a causal layer reads a block whole (`CausalSelfAttention.bidirectional_blocks`)."""
     mrope_section: tuple[int, int, int] | None = None
     nope: bool = False
     """No positional encoding: q and k enter the kernel unrotated and the
@@ -1155,7 +1192,8 @@ class AttentionMixer(MixerBase):
     mixed_step = True
 
     def mixed_refusal(self, ctx: MixerContext) -> str | None:
-        return mixed_attention_refusal(ctx, alibi=self.alibi, bidirectional_images=self.bidirectional_images)
+        return mixed_attention_refusal(ctx, alibi=self.alibi, bidirectional_images=self.bidirectional_images,
+                                       bidirectional_blocks=self.bidirectional_blocks)
 
     def __post_init__(self):
         if self.mrope_section is not None:
