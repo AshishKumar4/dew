@@ -781,7 +781,8 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
         def pullback(operands, cotangent):
             whole = jax.vjp(portable, *operands)[1](cotangent)
-            return whole if live is None else tuple(whole[index] for index in live)
+            # `live` indexes the operands' leaves, as the reverse pass's `backward` takes them.
+            return whole if live is None else tuple(jax.tree.leaves(whole)[index] for index in live)
 
         return pulled(*primals, live), jax.jvp(pullback, (operands, cotangent), (doperands, dcotangent))[1]
 
