@@ -37,6 +37,7 @@ from dew.nn.flops import matching_lengths, patch_lengths, projection_flops
 from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.mlp import GatedMLP
 from dew.nn.precision import float32_dot_general
+from dew.nn.sharding import logical_axes
 from dew.nn.text_encoders import clip_layer
 
 if TYPE_CHECKING:
@@ -227,6 +228,8 @@ def _gather(x, index):
     return jnp.take_along_axis(x, index.reshape(*index.shape, *(1,) * (x.ndim - 2)), axis=1)
 
 
+@logical_axes({("patch_embed",): (None, None, None, "embed"),
+               ("position_table",): (None, None, "embed")})
 class VisionTransformer(nn.Module):
     """A family's trunk (`ViTLayout`): patches mapped and placed, the blocks, and the trunk sequence
     in merge-block order.
@@ -361,7 +364,8 @@ class VisionTransformer(nn.Module):
             if not images:
                 raise ValueError("a tower returning its patch grid takes NCHW images")
             height, width = jnp.shape(pixel_values)[2:]
-            hidden = hidden.reshape(hidden.shape[0], height // lay.patch_size, width // lay.patch_size, -1)
+            hidden = hidden.reshape(hidden.shape[0], height // lay.patch_size, width // lay.patch_size,
+                                    lay.hidden_size)
         return hidden, pooled
 
     def _embedded(self, pixel_values, pixels, rows, columns, heights, widths, images):
@@ -374,7 +378,7 @@ class VisionTransformer(nn.Module):
                           strides=(lay.patch_size, lay.patch_size), padding="VALID", use_bias=lay.patch_bias,
                           dtype=self.dtype, precision=self.precision, name="patch_embed")(
                               jnp.asarray(pixel_values).transpose(0, 2, 3, 1))
-            hidden = hidden.reshape(hidden.shape[0], -1, lay.hidden_size)
+            hidden = hidden.reshape(hidden.shape[0], pixels.shape[1], lay.hidden_size)
         else:
             hidden = Dense(lay.hidden_size, use_bias=lay.patch_bias, dtype=self.dtype,
                            precision=self.precision, name="patch_embed",
@@ -453,10 +457,15 @@ class VisionTransformer(nn.Module):
             if lay.image_size is not None and (height, width) != (lay.image_size, lay.image_size):
                 raise ValueError(f"pixel_values must be {lay.image_size}x{lay.image_size} images")
             stride = patch * merge
-            if channels != lay.in_channels or height % stride or width % stride:
+            if channels != lay.in_channels or (lay.patch_projection == "dense"
+                                               and (height % stride or width % stride)):
                 raise ValueError(f"pixel_values must be {lay.in_channels}-channel images tiled by "
                                  f"{stride}px blocks")
             rows, columns = height // patch, width // patch
+            if lay.patch_projection == "conv":
+                # VALID convolution ignores an incomplete trailing patch. This packing supplies
+                # its grid geometry; the convolution itself still reads the original image.
+                pixels = pixels[:, :, :rows * patch, :columns * patch]
             if lay.merge_blocks:
                 blocks = pixels.reshape(batch, channels, rows // merge, merge, patch, columns // merge, merge,
                                         patch).transpose(0, 2, 5, 3, 6, 1, 4, 7)
@@ -468,7 +477,8 @@ class VisionTransformer(nn.Module):
                 flat, (batch, rows * columns, lay.temporal_patch_size, channels, patch, patch))
             if lay.channels_first:
                 frames = frames.transpose(0, 1, 3, 2, 4, 5)
-            pixels = frames.reshape(batch, rows * columns, -1)
+            pixels = frames.reshape(batch, rows * columns,
+                                    channels * lay.temporal_patch_size * patch ** 2)
             grid = jnp.broadcast_to(jnp.array([1, rows, columns], jnp.int32), (batch, 3))
             return pixels, grid, True
         if lay.image_size is not None:

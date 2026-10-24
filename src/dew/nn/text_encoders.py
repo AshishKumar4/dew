@@ -207,7 +207,6 @@ class CLIPTextTransformer(nn.Module):
         return CLIPTowerOutput(hidden_states, hidden_states[jnp.arange(batch), index], tuple(states))
 
 
-@logical_axes({("patch_embed",): (None, None, None, "embed"), ("position_table",): (None, "embed")})
 class CLIPVisionTransformer(nn.Module):
     """The vision tower of CLIP, param layout and defaults of `CLIPVisionConfig`.
 
