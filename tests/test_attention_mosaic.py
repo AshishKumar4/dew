@@ -22,7 +22,13 @@ from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry 
 from test_attention_triton import BACKWARD_SEEDS, HOOKS, SCORE_HOOKS, gate_of, hooks_for, score_hooks
 
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_triton, mosaic_sm90
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_mosaic,
+    attention_mosaic_program,
+    attention_triton,
+    mosaic_sm90,
+)
 
 pytestmark = pytest.mark.kernel
 
@@ -42,14 +48,14 @@ ALL_HOOKS_SEEDS = 32
 BACKWARD_HOOKS = [name for name in SCORE_HOOKS if name != "row-indexed"]
 """The backward's score hooks: every one the backward differentiates (`test_attention_triton.SCORE_HOOKS`) but
 the hook indexed off the query's coordinates' column, which forms a unit axis the mainloop refuses
-(`attention_mosaic.unlowered`, ledger row 1428): `test_a_hook_that_forms_a_unit_axis_is_refused`."""
+(`attention_mosaic_program.unlowered`, ledger row 1428): `test_a_hook_that_forms_a_unit_axis_is_refused`."""
 FORWARD_HOOKS = {**{name: (SCORE_HOOKS[name], False) for name in BACKWARD_HOOKS},
                  "gate": ((), True),
                  "all": (("softcap", "custom", "sinks", "alibi", "temperature", "key", "tile"), True)}
 """The forward's hooks: each score hook the backward differentiates (`test_attention_triton.SCORE_HOOKS`:
 every kind of parameter, the initial state as sinks or a resumed partial, a hook through a custom VJP), an
 output gate, and all at once; each `(score hooks, gate)`. The hook indexed off the query's coordinates'
-column forms a unit axis, which the mainloop refuses (`attention_mosaic.unlowered`, ledger row 1428):
+column forms a unit axis, which the mainloop refuses (`attention_mosaic_program.unlowered`, ledger row 1428):
 `test_a_hook_that_forms_a_unit_axis_is_refused`."""
 HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False),
               "bfloat16-natural": (jnp.bfloat16, True), "float16-natural": (jnp.float16, True)}
@@ -392,7 +398,7 @@ UNSEEN = {
 }
 """GPUs no row measured, one of each family (`test_grouped_gemm.UNSEEN`'s): a Hopper-class part with fewer
 multiprocessors, a smaller block and another L2 bandwidth than an H100's, and an Ampere-class one with an
-sm86's block, whose family this mainloop has no bundle for (`attention_mosaic.BUNDLES`)."""
+sm86's block, whose family this mainloop has no bundle for (`attention_mosaic_program.BUNDLES`)."""
 
 
 def _bound(op, *arrays, **options):
@@ -486,7 +492,7 @@ def test_a_hook_that_forms_a_unit_axis_is_refused():
         params, initial = draw_hooks(0)
         hooks = template.Hooks(score_mod, tuple(template.Param(param, kind)
                                                 for param, kind in zip(params, kinds, strict=True)), initial)
-        assert (attention_mosaic.unlowered(hooks, (64, 64), 64) is not None) == refused, names
+        assert (attention_mosaic_program.unlowered(hooks, (64, 64), 64) is not None) == refused, names
     with pytest.raises(NotImplementedError), _device(interpret=True):
         attention_mosaic.forward(query, key, value, spans,
                                  template.Hooks(score_hooks(("indexed",), queries, keys, 64)[0]),
