@@ -3,10 +3,9 @@ truth and both arms at the draw's parameters moved by relative noise of each sca
 leaf's change from the unmoved draw over the leaf's size (PERTURB lines); the run then stops."""
 import numpy as np
 
-SEEDS = (182, 90, 3)
+SEEDS = (182, 90)
 SCALES = (0.0, 1e-12, 1e-9, 1e-7, 1e-6, 1e-5)
-WATCHED = ("['text']['layers_0']['self_attn']['q_proj']['kernel']", "['text']['layers_0']['self_attn']['q_norm']['scale']",
-           "['text']['layers_1']['mlp']['gate_proj']['kernel']")
+WATCHED = ("['text']['layers_0']['self_attn']['q_proj']['kernel']",)
 
 
 def pytest_configure(config):
@@ -39,7 +38,7 @@ def pytest_configure(config):
                     moved_by = np.sqrt(np.mean(np.square(flat["truth"][name] - base["truth"][name]))) / size
                     errors = {arm: np.sqrt(np.mean(np.square(flat[arm][name] - flat["truth"][name]))) / size
                               for arm in ("dew", "ref")}
-                    print(f"PERTURB seed {seed} scale {scale:.0e} {name}: truth moved {moved_by:.3e}; "
+                    print(f"PERTURB {seed} {scale:.0e} q: truth moved {moved_by:.3e}; "
                           f"dew error {errors['dew']:.3e}; ref error {errors['ref']:.3e}", flush=True)
         raise SystemExit("perturb probe done")
 
