@@ -259,9 +259,14 @@ def rows_alone(decide, batch):
 
 
 PACKING_SEEDS = {"joint": 128, "marker": 256, "parallel": 256, "flash": 8}
-"""Check 1's declared seeds for each arm's packed window, sized paired (`seeds_for` with the packed window
-as `dew_fn`) on an A100, where the joint arm took 128, the marker and parallel arms 256 (node receipts
-SF-a100-packing-seeds), against 16, 8 and 8 on armada; the flash arm's on an A100."""
+"""Check 1's declared seeds for each arm's packed window: the most paired sizing (`seeds_for` with the
+packed window as `dew_fn`) gives on any platform the site runs on. An A100 took 128 for the joint arm and
+256 for the marker and parallel arms (node receipts SF-a100-packing-seeds), armada 16, 8 and 8
+(run-tests sf-packing-cpu-sizing-898ec4ac6); the flash arm's is an A100's. The A100's are the head's
+gradients whose float64 truth is zero by symmetry, which both arms err at by 0 to 3 fp32 ulps: the
+marker and parallel arms' scorer_out bias, shared by a question's options, and the joint arm's
+attention key biases (ledger 1548). Twice the rows a draw took the same counts on an A100 (node
+receipts SF-packing-scale2-sizing), each draw twice the work."""
 
 
 def assert_rows_decided_alone(objective, wide_modules, seeds: int, held=lambda path: True) -> None:
