@@ -746,11 +746,6 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         """The row tiles a band of the planar snake keeps in flight at once on `target`."""
         return max(1.0, _multiprocessors(generation.effective(target)) / config.grid_block_n)
 
-    # Last in the class: its name would hide the `cost` module from the annotations above it.
-    def cost(self, ba, config: mosaic_gpu.Tiles, target) -> float:
-        # mma.sync's tiles ran 2.8 to 3.3 times Triton's forward on an A100 (AMPERE3): no estimate they
-        # win by, so they run only by name (`generation.chosen`).
-        return math.inf if config.family == 'mma.sync' else super().cost(ba, config, target)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1274,22 +1269,31 @@ kernels compute exactly on the target (its declaration's refusal, the target's t
 dtype, no step-by-step sums on a TPU, whose launches do not add them apart), and rows to launch."""
 
 
-def _launch_kernel(name: str) -> selection.Kernel[GroupedCase]:
+def _launch_kernel(name: str, *measured: _Need) -> selection.Kernel[GroupedCase]:
     """`GROUPED`'s kernel for the launches implementation `name` runs: `SUPPORTS`, then its own
-    eligibility for the call (`Template.eligible`), its cost the seconds its fastest fitting config is
-    estimated to take."""
+    eligibility for the call (`Template.eligible`), then what the targets measured of it (`measured`, which
+    a call naming it overrides), its cost the seconds its fastest fitting config is estimated to take."""
     return selection.Kernel(name, (*SUPPORTS, _Need(
         'launch', lambda case: case.call.eligible(name),
         lambda case: f"the {name} launches take no call of these dtypes, widths, side operands or hooks on "
-                     f"{case.call.target.generation}", row='ledger 1295')),
+                     f"{case.call.target.generation}", row='ledger 1295'), *measured),
         cost=lambda case: case.call.seconds(name))
+
+
+AMPERE_MEASURED = _Need(
+    'mma_sync', lambda case: case.call.target.wgmma,
+    "an A100 ran the Mosaic GPU forward's mma.sync tiles at 2.8 to 3.3 times Triton's time (AMPERE3), so "
+    "they run where the call names them", row='ledger 1297', kind='measured')
+"""What the targets measured of the Mosaic GPU launches without warpgroup MMA: slower than Triton's, so
+they run only by name (`generation.chosen`)."""
 
 
 _GMMS = (MosaicGmm(), CutlassGmm(), MosaicTpuGmm(), Gmm())
 _TGMMS = (MosaicTgmm(), CutlassTgmm(), MosaicTpuTgmm(), Tgmm())
 
 GROUPED: selection.Op[GroupedCase] = selection.Op('grouped_matmul', (
-    *(_launch_kernel(launch.name) for launch in _GMMS),
+    *(_launch_kernel(launch.name, *((AMPERE_MEASURED,) if launch.name == 'mosaic_gpu' else ()))
+      for launch in _GMMS),
     selection.Kernel[GroupedCase]('xla', (), generic=True)))
 """The grouped selector: the launch whose fastest fitting config the cost model estimates fewest seconds
 among those that take the call (the first of Mosaic GPU's, CUTLASS's, the TPU's and Triton's where
