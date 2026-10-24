@@ -464,7 +464,8 @@ class Decide:
             inputs, tokens=_widened(inputs.tokens, length, self.specials.pad),
             segments=_widened(inputs.segments, length),
             positions=None if inputs.positions is None else _widened(inputs.positions, length),
-            slots=None if inputs.slots is None else _widened(inputs.slots, length))
+            slots=None if inputs.slots is None else _widened(inputs.slots, length),
+            blocks=None if inputs.blocks is None else _widened(inputs.blocks, length, -1))
         count = shape_bucket(len(rows), 1)
         padded = RowPlan(None, len(rows), count, 0, 1).pad(inputs)
         held = self.variables if variables is None else variables
@@ -852,7 +853,7 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
                           positions=array("positions"), slots=given("slots"),
                           option_slots=given("option_slots"), slotted=given("slotted"),
                           context=given("context"), context_lengths=given("context_lengths"),
-                          readout=given("readout"), max_segments=max_segments,
+                          readout=given("readout"), blocks=given("blocks"), max_segments=max_segments,
                           spans_in_context=spans_in_context)
 
 
