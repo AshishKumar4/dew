@@ -645,6 +645,7 @@ class Classifier(Curated):
         pinned = (Path(tempfile.gettempdir()) / "dew-classifiers"
                   / f"{hashlib.sha256(content).hexdigest()}{source.suffix}")
         if not pinned.exists():
+            pinned.parent.mkdir(parents=True, exist_ok=True)
             write_atomically(pinned, content)
         return pinned
 
@@ -741,7 +742,10 @@ def near_duplicates_removed(records: Callable[[], Iterator[Batch]],
 
     config = MinhashConfig(n_grams=near.n, num_buckets=near.buckets, hashes_per_bucket=near.hashes)
     work = tempfile.TemporaryDirectory(prefix="dew-minhash-")
-    MinhashDedupSignature(f"{work.name}/signatures", config=config).run(documents(), rank=0, world_size=1)
+    # The signatures shingle each text through DataTrove's word tokenizer, which the curation steps share
+    # and which sets its length bound per input, so they take their turn with them (`_CURATING`).
+    with _CURATING:
+        MinhashDedupSignature(f"{work.name}/signatures", config=config).run(documents(), rank=0, world_size=1)
     banded = MinhashDedupBuckets(f"{work.name}/signatures", f"{work.name}/bands", config=config)
     for bucket in range(near.buckets):
         banded.run(None, rank=bucket, world_size=near.buckets)
