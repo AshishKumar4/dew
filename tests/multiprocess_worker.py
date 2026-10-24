@@ -1314,6 +1314,8 @@ def _builtin_sampler_failure(kind, phase, source, rank, fault):
                 terminated=jax.numpy.zeros((1,), bool),
                 behavior_log_probs=jax.numpy.zeros((1, 1)),
                 raw_log_probs=jax.numpy.zeros((1, 1)), rows=1)
+        if kind == "masked":
+            return result, np.asarray(False)
         return result
     return sample_failure
 
