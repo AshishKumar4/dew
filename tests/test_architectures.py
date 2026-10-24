@@ -419,8 +419,10 @@ sized by `seeds_for` on armada. Every cell's arms share their upstream rounding 
 and draws); a cell whose errors are also heavy-tailed across draws is sized paired with the layout's
 arm (`dew_fn`), as testing.md has it: Gemma 3n's and Qwen 3.5's (the four largest of 64 draws hold
 half of a layer's pooled error, LONG_SEQ_LEN), and MLA's, where one draw in 1024 holds all of one
-device's pooled error (seed 247, an indexer selection the draw filter lets through: ledger 1527) and
-the reference compared with itself resolves no momentum within 4096 draws. Every other cell's errors
+device's pooled error (seed 247: one device's float32 run leaves its routed layer's gradients 5%
+from float64, where the layout's and float64 agree, though every selection the margin reads clears
+it by 2e-4; ledger 1527) and the reference compared with itself resolves no momentum within 4096
+draws. Every other cell's errors
 are light-tailed (the four largest of 64 draws hold 7 to 12% of an arm's pooled error at the median
 leaf, 6% being uniform), and it is sized by the reference against itself. Every cell is named: one
 added is sized."""
