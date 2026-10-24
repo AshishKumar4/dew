@@ -637,7 +637,8 @@ def test_the_loss_is_the_mean_squared_error_to_normalized_targets_of_the_same_bl
             samples = (jnp.asarray(pixels, dtype) - 127.5) / 127.5
             z, predictions = (np.asarray(value, dtype)
                               for value in outputs(live, target, samples, context_idx, target_idx))
-            normed = (z - z.mean(-1, keepdims=True)) / np.sqrt(z.var(-1, keepdims=True) + 1e-6)
+            # I-JEPA's `F.layer_norm(h, (h.size(-1),))`, at PyTorch's default eps.
+            normed = (z - z.mean(-1, keepdims=True)) / np.sqrt(z.var(-1, keepdims=True) + 1e-5)
             targets = np.stack([normed[row][np.asarray(target_idx)[row, block]]
                                 for row in range(len(samples)) for block in range(blocks)])
             return np.mean(np.square(predictions - targets))
