@@ -308,12 +308,9 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     can be hoisted above the layer before it (it is issued inside that layer's
     iteration or ordered by the carry). Training uses the native Linen scan
     instead, with map_variables staging one row under remat, so the backward
-    refetches the pinned bank rather than keeping a device copy. A layer read
-    one at a time runs in a scope of its own, where the caller's
-    `capture_intermediates` filter does not reach, so a caller that keeps
-    intermediates runs the native scan too, fetching each row in Flax's lifted
-    scope; a stack streamed from disk is read one layer at a time alone, and
-    refuses such a caller.
+    refetches the pinned bank rather than keeping a device copy. Each fetched
+    layer binds its variables through Linen's `Module.bind`, which keeps the
+    enclosing call's intermediate-capture policy active.
     """
     runs = [layers[first] if count == 1 else block(first, group_name(first, count))
             for first, count in groups]
@@ -321,11 +318,7 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     if streaming and train:
         raise ValueError("disk streaming is inference-only")
     fetching = streaming or banked or any(_on_host(run.variables.get('params', {})) for run in runs)
-    capturing = any(run.is_mutable_collection('intermediates') for run in runs)
-    if streaming and capturing:
-        raise ValueError("a stack streamed from disk runs each layer in a scope of its own, which keeps "
-                         "no intermediates: capture them from a resident or host-resident stack")
-    if not fetching or train or capturing:
+    if not fetching or train:
         return _scanned_runs(runs, groups, specs, x, fetching=fetching, train=train, decode=decode,
                              kv_store=kv_store, per_layer_input=per_layer_input,
                              attention_metadata=attention_metadata)
@@ -393,18 +386,20 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     return x
 
 
-def _applied[Hidden](run: DecoderBlock, opened: list[str], store, read, state, cache, hidden: Hidden,
+def _applied[Hidden](run: DecoderBlock, opened: bool | list[str], store, read, state, cache, hidden: Hidden,
                      per_layer_slice, *, train: bool, decode: bool,
                      attention_metadata) -> tuple[Hidden, dict]:
     """One layer of `run` applied in a scope of its own: `read` its read-only variables, `state`
     the caller's held collections and `cache` its cache slice, writing the `opened` collections
-    (`run_stack`).
+    (`run_stack`). Binding instead of nesting `apply` leaves Linen's enclosing
+    capture policy active, including a filter over individual sublayers.
     The hidden state comes out as it went in, a residual stream or `Carried` streams."""
     variables = {**read, **state} if cache is None else {**read, **state, 'cache': cache}
-    hidden, changed = run.apply(
-        variables, hidden, mutable=opened, train=train, decode=decode, kv_store=store,
-        per_layer_input=per_layer_slice, attention_metadata=attention_metadata)
-    return hidden, dict(changed)
+    bound = run.bind(variables, mutable=opened)
+    hidden = bound(hidden, train=train, decode=decode, kv_store=store,
+                   per_layer_input=per_layer_slice, attention_metadata=attention_metadata)
+    return hidden, {name: tree for name, tree in bound.variables.items()
+                    if bound.is_mutable_collection(name)}
 
 
 def _opened(run: DecoderBlock, spec: LayerSpec, probed: list[tuple[LayerSpec, list[str]]], read, state,
@@ -424,9 +419,9 @@ def _opened(run: DecoderBlock, spec: LayerSpec, probed: list[tuple[LayerSpec, li
         variables = {**read, **state} if cache is None else {**read, **state, 'cache': cache}
         # A provider writes its keys and values into the store it is given: the
         # abstract run writes into a copy, so nothing it traces leaves it.
-        _, changed = jax.eval_shape(lambda variables: run.apply(
-            variables, hidden, mutable=True, train=train, decode=decode,
-            kv_store=None if store is None else dict(store), per_layer_input=per_layer_slice,
+        _, changed = jax.eval_shape(lambda variables: _applied(
+            run, True, None if store is None else dict(store), variables, {}, None, hidden,
+            per_layer_slice, train=train, decode=decode,
             attention_metadata=attention_metadata), variables)
         written = list(changed)
         probed.append((spec, written))
