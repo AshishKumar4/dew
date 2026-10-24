@@ -795,8 +795,9 @@ def test_the_durations_fold_rewrites_only_a_file_its_record_no_longer_cuts(ci, t
     a file whose cut no longer fits as its tests ran takes what they took, though no test's node id changed
     and its total barely moved (one test grown from 10 s to 180 s of 100; ten of 20 grown from 30 s to 39 s,
     each within half again), so the next plan cuts it to fit; a file whose cut fits keeps its entries byte for
-    byte; a file with a red group keeps its own; a file the checkout no longer has loses them; the newest
-    Python's times move nothing."""
+    byte, as does one whose heaviest group is a test past the budget alone, which no cut shortens, though
+    its time moves; a file with a red group keeps its own; a file the checkout no longer has loses them; the
+    newest Python's times move nothing."""
     (tmp_path / ".armada.json").write_text(json.dumps({"target": 240}))
     record, rows = {}, []
 
@@ -817,6 +818,7 @@ def test_the_durations_fold_rewrites_only_a_file_its_record_no_longer_cuts(ci, t
     file("test_grown", [10.0] * 100, [[180.0] + [10.0] * 19] + [[10.0] * 20] * 4)
     file("test_drift", [30.0] * 20, [[39.0] * 10, [30.0] * 10])
     file("test_steady", [100.0] * 4, [[101.0, 99.0], [104.5, 98.0]])
+    file("test_straggler", [381.593, 20.0, 20.0], [[382.0], [20.5, 19.0]])
     file("test_partial", [150.0] * 4, [[400.0, 400.0], [150.0, 150.0]], red=2)
     record["tests/test_gone.py::test_x"] = 5.0
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(record, indent=0) + "\n")
@@ -830,7 +832,7 @@ def test_the_durations_fold_rewrites_only_a_file_its_record_no_longer_cuts(ci, t
     for name in ("test_grown", "test_drift"):
         assert {node: s for node, s in folded.items() if f"/{name}.py" in node} == {
             node: s for node, s in observed.items() if f"/{name}.py" in node}
-    for name in ("test_steady", "test_partial"):
+    for name in ("test_steady", "test_straggler", "test_partial"):
         assert {node: s for node, s in folded.items() if f"/{name}.py" in node} == {
             node: s for node, s in record.items() if f"/{name}.py" in node}
     assert "tests/test_gone.py::test_x" not in folded
