@@ -304,9 +304,10 @@ def test_the_portable_mainloop_draws_the_reference_mask_at_every_tiling(block):
 
 def test_the_draw_under_vmap_is_each_calls_own_draw():
     """Vmapped over seeds, each element keeps the entries its own seed draws (a batched seed is a batched
-    draw), as a call of that seed alone does. The portable arm issues its fp32 products as float64 on the
-    CPU (`product.interpreted`), and a vmapped call of them fails on an A100 (receipt DROPOUT-a100:
-    `GEMM is not supported by cublasLt`), so the comparison runs on the CPU device the arm is written for."""
+    draw), as a call of that seed alone does. The probe's fp32 products are promoted (`Precision.HIGHEST`),
+    and `interpreted_dot` issues those in float64 off a GPU only: on an A100 a vmapped call of them fails
+    (receipt DROPOUT-a100: `GEMM is not supported by cublasLt`), so the comparison runs on the CPU, where
+    the arm issues its products."""
     with jax.default_device(jax.devices("cpu")[0]):
         seeds = jnp.stack([seed_words(index) for index in (1, 2, 3)])
         mapped = jax.vmap(lambda words: probe(words, 8, 16, 2, 4, block=(8, 8)))(seeds)
