@@ -444,7 +444,7 @@ def _gemma4_export(model: CausalTransformer) -> Mapping[str, object]:
         if mixer is not None and not isinstance(mixer, AttentionMixer):
             refuse(f'kinds.{name}.mixer', 'Gemma4 uses ordinary attention')
         if isinstance(mixer, AttentionMixer) and (
-            mixer.bidirectional_images or mixer.mrope_section is not None
+            mixer.bidirectional_images or mixer.bidirectional_blocks or mixer.mrope_section is not None
         ):
             refuse(f'kinds.{name}.mixer', 'multimodal attention metadata needs its source wrapper')
         if kind.rope_scaling is not None or kind.yarn is not None:

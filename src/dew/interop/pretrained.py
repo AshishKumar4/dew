@@ -914,8 +914,9 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.Wra
     its own family makes to them.
 
     Gemma 3 projects its logits without the causal-LM class's final tanh cap
-    and attends its image spans both ways; Gemma 4 does the same on its
-    sliding layers when the config asks for it; Qwen3.5 splits its rotary
+    and attends its image spans both ways; Gemma 4 does the same within its
+    sliding window. Unified reads each vision block whole on every attention layer.
+    Qwen3.5 splits its rotary
     into the three mrope sections its wrapper positions rows with.
     """
     family = config.get("model_type")
@@ -932,12 +933,13 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.Wra
         kinds = decoder_parts.kinds_of(text_fields).copy()
         selected = (dict.fromkeys(records.strings(text_fields["layer_types"], "layer_types"))
                     if family == "gemma4_unified" else ("sliding_attention",))
+        visibility = "bidirectional_blocks" if family == "gemma4_unified" else "bidirectional_images"
         for name in selected:
             kind = kinds.get(name, {})
             mixer = records.record(kind.get("mixer", {"class": "attention", "fields": {}}), "mixer")
             fields = records.record(mixer.get("fields", {}), "mixer.fields")
             kinds[name] = NativeFields(LayerKind, {
-                **kind, "mixer": {**mixer, "fields": {**fields, "bidirectional_images": True}}})
+                **kind, "mixer": {**mixer, "fields": {**fields, visibility: True}}})
         text_fields["kinds"] = kinds
     if family in QWEN35_TYPES:
         rope = records.record(text_config.get("rope_parameters") or {}, "rope_parameters")
