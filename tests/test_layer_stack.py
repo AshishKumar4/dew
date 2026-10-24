@@ -196,8 +196,10 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
         return run
 
     def draw(seed):
-        """Two rows of token ids and the scalar loss's cotangent, one."""
-        ids = np.random.default_rng([0x5CA7, seed]).integers(0, VOCAB, (2, 12)).astype(np.int32)
+        """BATCH rows of SEQ_LEN token ids and the scalar loss's cotangent, one: rows enough that a
+        draw's error is a sum of many roundings, where two rows of twelve left one draw in a few holding
+        most of a leaf's."""
+        ids = np.random.default_rng([0x5CA7, seed]).integers(0, VOCAB, (BATCH, SEQ_LEN)).astype(np.int32)
         return ids, np.float32(1.0)
 
     wide = []
