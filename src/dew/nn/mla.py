@@ -569,9 +569,9 @@ class MultiHeadLatentAttention(nn.Module):
                     keep = rows if keep is None else jnp.logical_and(keep, rows)
                 if keep is None:
                     keep = jnp.ones((1, length, length), jnp.bool_)
-                if valid is not None:
-                    # Selection and its objective range over real keys only.
-                    keep = jnp.logical_and(keep, jnp.asarray(valid, bool)[:, None, :])
+                # Candidates carry every row even when all its keys are real; pooled indexers
+                # gather row-specific slot lists from this visibility.
+                keep = jnp.logical_and(keep, row_valid[:, None, :])
                 index_keys = (self._rotated_index_keys(self._index_keys(x, row_valid), freqs_cos, freqs_sin)
                               if self.indexed else None)
                 selection, index_scores = self._selection(
