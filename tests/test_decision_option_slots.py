@@ -117,9 +117,11 @@ def ragged() -> list[Example]:
             Example("book a flight", {"intent": intents}, {"intent": "i3"})]
 
 
-OPTION_SEEDS = 64
-"""The compacted-options site's declared draws (`seeds_for`, paired: both arms read the same head, states
-and cotangent, so their upstream rounding is shared)."""
+OPTION_SEEDS = 512
+"""The compacted-options site's declared draws, sized by `seeds_for` paired (both arms read the same head,
+states and cotangent, so their upstream rounding is shared): the head's scalar parameters, the prior's
+logit scale among them, take their gradient's error from one sum over every option, whose ratio to the
+reference's varies widely from draw to draw."""
 
 ALGEBRAIC_ZEROS = ("to_k", "scorer_out")
 """The head's modules whose bias gradient is zero by algebra: a key's bias shifts every key's logit of a
