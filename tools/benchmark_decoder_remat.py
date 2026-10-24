@@ -55,6 +55,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES, Mixture
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
+from dew.telemetry.benchmark import carried
 
 
 def main():
@@ -111,15 +112,12 @@ def main():
     jax.block_until_ready((params, opt_state, tokens))
     device = jax.devices()[0]
     allocated_before = device.memory_stats()
-    params, opt_state, value = jitted(params, opt_state, tokens)
-    for _ in range(2):
-        params, opt_state, value = jitted(params, opt_state, tokens)
-    jax.block_until_ready((params, opt_state, value))
-    started = time.perf_counter()
-    for _ in range(args.steps):
-        params, opt_state, value = jitted(params, opt_state, tokens)
-    jax.block_until_ready((params, opt_state, value))
-    milliseconds = 1000 * (time.perf_counter() - started) / args.steps
+    def stepped(carry):
+        return jitted(carry[0], carry[1], tokens)
+
+    warm, _ = carried(stepped, (params, opt_state, None), 3)
+    (params, opt_state, value), (seconds,) = carried(stepped, warm, args.steps)
+    milliseconds = 1000 * seconds / args.steps
     allocated_after = device.memory_stats()
     print(json.dumps({
         **vars(args), "device": device.device_kind, "backend": jax.default_backend(),
@@ -131,7 +129,8 @@ def main():
         "compiler_output_bytes": None if memory is None else memory.output_size_in_bytes,
         "compiler_alias_bytes": None if memory is None else memory.alias_size_in_bytes,
         "device_live_bytes_before": None if allocated_before is None else allocated_before["bytes_in_use"],
-        "device_peak_bytes_before": None if allocated_before is None else allocated_before["peak_bytes_in_use"],
+        "device_peak_bytes_before":
+            None if allocated_before is None else allocated_before["peak_bytes_in_use"],
         "device_peak_bytes_after": None if allocated_after is None else allocated_after["peak_bytes_in_use"],
     }, sort_keys=True))
 
