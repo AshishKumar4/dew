@@ -270,12 +270,12 @@ def _widened(positions: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Arr
     unsigned dtype that no enabled integer dtype holds both of (int64 beside uint64; int32 beside uint32
     without x64), whose promotion would leave integers or narrow one, are refused for one dtype."""
     query_places, key_places = (jnp.asarray(places) for places in positions)
-    held = [jnp.iinfo(places.dtype) for places in (query_places, key_places)]
-    least, largest = min(int(info.min) for info in held), max(int(info.max) for info in held)
+    ranges = [jnp.iinfo(places.dtype) for places in (query_places, key_places)]
+    least, largest = min(int(bounds.min) for bounds in ranges), max(int(bounds.max) for bounds in ranges)
     for wide in map(jnp.dtype, ("int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64")):
-        info = jnp.iinfo(wide)
+        holds = jnp.iinfo(wide)
         enabled = jax.dtypes.canonicalize_dtype(wide) == wide
-        if enabled and int(info.min) <= least and largest <= int(info.max):
+        if enabled and int(holds.min) <= least and largest <= int(holds.max):
             return query_places.astype(wide), key_places.astype(wide)
     raise ValueError(f"query places of {query_places.dtype} and key places of {key_places.dtype} share no "
                      "integer dtype that holds both: pass them in one")

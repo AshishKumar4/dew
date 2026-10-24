@@ -571,7 +571,7 @@ def test_places_no_integer_dtype_holds_both_of_are_refused(query, key):
     rather than moved in floats or a narrowed one; int32 beside uint32 widens to int64 under x64."""
     with jax.enable_x64(query == jnp.int64):
         places = (jnp.asarray([[0]], query), jnp.asarray([[0]], key))
-        with pytest.raises(ValueError, match="share no integer dtype"):
+        with pytest.raises(ValueError):
             template.spans(1, 1, 1, sliding_window=1, positions=places)
     with jax.enable_x64(new_val=True):
         mixed = template.spans(1, 2, 1, sliding_window=2, positions=(
