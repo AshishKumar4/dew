@@ -467,10 +467,13 @@ class VisionTransformer(nn.Module):
                 raise ValueError(f"pixel_values must be {lay.in_channels}-channel images tiled by "
                                  f"{stride}px blocks")
             rows, columns = height // patch, width // patch
+            grid = jnp.broadcast_to(jnp.asarray([1, rows, columns], jnp.int32), (batch, 3))
             if lay.patch_projection == "conv":
-                # VALID convolution ignores an incomplete trailing patch. This packing supplies
-                # its grid geometry; the convolution itself still reads the original image.
-                pixels = pixels[:, :, :rows * patch, :columns * patch]
+                # Convolution consumes the original image. Its patch sequence needs only geometry,
+                # not a second pixel packing (which would also reshape Explicit batch axes).
+                geometry = jax.ShapeDtypeStruct(
+                    (batch, rows * columns, channels * lay.temporal_patch_size * patch ** 2), pixels.dtype)
+                return geometry, grid, True
             if lay.merge_blocks:
                 blocks = pixels.reshape(batch, channels, rows // merge, merge, patch, columns // merge, merge,
                                         patch).transpose(0, 2, 5, 3, 6, 1, 4, 7)
@@ -484,7 +487,6 @@ class VisionTransformer(nn.Module):
                 frames = frames.transpose(0, 1, 3, 2, 4, 5)
             pixels = frames.reshape(batch, rows * columns,
                                     channels * lay.temporal_patch_size * patch ** 2)
-            grid = jnp.broadcast_to(jnp.array([1, rows, columns], jnp.int32), (batch, 3))
             return pixels, grid, True
         if lay.image_size is not None:
             raise ValueError("a fixed-image tower takes NCHW images")
