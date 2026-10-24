@@ -22,6 +22,7 @@ heuristic (its `PICKS`); `dew.nn.kernels.recurrence_chunk.fla_rule` shapes any o
 
 import dataclasses
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -51,8 +52,9 @@ from dew.nn.kernels.chunked_launch import (
     write_rows,
 )
 
-RCP_LN2 = 1.4426950216
-"""fla's 1 / ln 2: its kernels take the cumulated decay in base 2 and exponentiate with exp2."""
+RCP_LN2 = 1 / math.log(2)
+"""1 / ln 2, fla's RCP_LN2 (whose 1.4426950216 rounds to the same fp32): its kernels take the cumulated
+decay in base 2 and exponentiate with exp2; the prefix converts in float64 (`recurrence.cumulated`)."""
 
 WIDEST = 128
 """The widest values each of the port's calls takes: its spaces are proven at the 0.8B's and 9B's
@@ -91,17 +93,20 @@ def _dot(a, b, *, exact: bool, ieee: bool = False, solve: jnp.dtype | None = Non
     kernel (the suite's 'highest' made every fp32 product IEEE):
     - bf16 or fp16: exact products summed in fp32 (fla's `tl.dot` of narrow operands); no precision.
     - fp32 with `ieee`: IEEE products, fla's `allow_tf32=False` dots (`recompute_w_u`'s `A @ v`).
-    - fp32 otherwise: TF32x3 (`DotAlgorithmPreset.TF32_TF32_F32_X3`), three TF32 products near IEEE
-      accuracy where fla's own dots take one TF32 (Triton's default `input_precision` for fp32, and
-      `SOLVE_TRIL_DOT_PRECISION`, chunk_fwd.py:21). jax 0.11's Pallas lowers `Precision.HIGH` as
-      plain TF32 (pallas/triton/lowering.py `_TF32_PRECISIONS`), so the preset is named. IEEE there
-      lowers on sm80 to FMA loops ptxas took 3.5 to over 15 minutes to compile for the WY backward;
-      TF32x3 compiles in seconds.
+    - fp32 otherwise: BF16x6 (`DotAlgorithmPreset.BF16_BF16_F32_X6`), six bf16 products, an fp32
+      product's accuracy where fla's own dots take one TF32 (Triton's default `input_precision` for fp32,
+      and `SOLVE_TRIL_DOT_PRECISION`, chunk_fwd.py:21). TF32x3 drops the low parts' product: an
+      A100 gave (1 + 2^-11)^2 as 1.0009765625, its fp32 1.0009768 (SE-dbg-kda-dot-redgreen-3f3c64bb2),
+      which put Kimi delta attention's fp32 rule past check 1 against fla's recorded torch. jax 0.11's
+      Pallas lowers `Precision.HIGH` as plain TF32 (pallas/triton/lowering.py `_TF32_PRECISIONS`), so
+      the preset is named. IEEE there lowers on sm80 to FMA loops ptxas took 3.5 to over 15 minutes to
+      compile for the WY backward; the presets compile in seconds.
     - fp32 with `solve`, the call's dtype, at the solves' products of fp32 intermediates (the kkt and
-      KDA sub-chunk merges and products, fla's SOLVE_TRIL_DOT_PRECISION): TF32x3 in an fp32 call,
+      KDA sub-chunk merges and products, fla's SOLVE_TRIL_DOT_PRECISION): BF16x6 in an fp32 call,
       where one TF32 put a Kimi linear layer's logits 100 times the reference's distance from
       float64 on an H100; one TF32, fla's, in a 16-bit call, whose operands' rounding it stays under
-      and where TF32x3 cost Kimi Linear's bf16 layer 17% on an H100 and 19% on an A100.
+      and where an fp32 product's three-part form cost Kimi Linear's bf16 layer 17% on an H100 and 19%
+      on an A100.
     - interpreted: no precision, the CPU's fp32."""
     if jnp.dtype(a.dtype) != jnp.dtype(b.dtype):
         raise TypeError(f"Pallas dot operands must have the same dtype, got {a.dtype} and {b.dtype}")
@@ -112,7 +117,7 @@ def _dot(a, b, *, exact: bool, ieee: bool = False, solve: jnp.dtype | None = Non
     elif wide:
         narrow_call = solve is not None and jnp.dtype(solve).itemsize < 4
         precision = (jax.lax.Precision.HIGHEST if ieee else jax.lax.Precision.DEFAULT if narrow_call
-                     else jax.lax.DotAlgorithmPreset.TF32_TF32_F32_X3)
+                     else jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6)
     else:
         precision = None
     return jnp.dot(a, b, preferred_element_type=jnp.float32, precision=precision)
