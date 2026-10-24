@@ -134,12 +134,10 @@ class LMRunConfig(RunConfig):
             else:
                 source = source.adapt(self.lora, key=self.trainer.key)
                 model, variables = source.model, source.variables
-        # A source, adapted or not, is what the objective binds, so its end-of-sequence ids reach the task.
-        bound = model if source is None else source
         if kind == "masked_diffusion":
-            objective = self.masked_objective(bound, fields, variables)
+            objective = self.masked_objective(model, fields, variables, source)
         elif kind == "block_diffusion":
-            objective = self.block_objective(model, bound, variables)
+            objective = self.block_objective(model, variables, source)
         else:
             objective = self.objective.build(
                 model=model if source is None else source, seq_len=tokens.seq_len, variables=variables,
@@ -221,14 +219,15 @@ class LMRunConfig(RunConfig):
         reference = name if loaded.revision is None else f"{name}@{loaded.revision}"
         return loaded, dataclasses.replace(self, pretrained=reference)
 
-    def masked_objective(self, model, fields, variables):
+    def masked_objective(self, model, fields, variables, source=None):
         """MDLM over a bidirectional model, its mask id from the model's fields.
 
         A `pretrained` diffusion checkpoint carries `mask_token_id`; a
         from-scratch run names it beside --model.no-causal. A token window is
         `seq_len + 1` ids wide, and masked diffusion has no shift, so it
         denoises the whole row. The validation text is the unmasked rows
-        decoded with the run's tokenizer, or bare ids with no preview budget."""
+        decoded with the run's tokenizer, or bare ids with no preview budget. A loaded `source` is
+        what the objective binds, so its end-of-sequence ids reach the task."""
         from dew.diffusion.discrete import MDLM
 
         mask = fields.get("mask_token_id")
@@ -237,13 +236,14 @@ class LMRunConfig(RunConfig):
                              "diffusion checkpoint, which carries one, or name --model.mask-token-id beside "
                              "--model.no-causal")
         decode = None if self.max_new_tokens <= 0 else tokenizer_for(self.tokenizer).decode
-        return self.objective.build(model=model, process=MDLM(mask_id=int(mask))(),
-                                    seq_len=self.tokens().seq_len + 1, decode=decode, variables=variables,
-                                    processor=self.processor())
+        return self.objective.build(model=model if source is None else source,
+                                    process=MDLM(mask_id=int(mask))(), seq_len=self.tokens().seq_len + 1,
+                                    decode=decode, variables=variables, processor=self.processor())
 
-    def block_objective(self, model, bound, variables):
+    def block_objective(self, model, variables, source=None):
         """Each complete token-window row split into the clean prompt the run
-        names (`--objective.prompt-length`) and response canvases."""
+        names (`--objective.prompt-length`) and response canvases, over a loaded `source`
+        where there is one, whose end-of-sequence ids the task takes."""
         from dew.nn.protocols import BlockDenoiser
 
         if not isinstance(model, BlockDenoiser):
@@ -256,8 +256,8 @@ class LMRunConfig(RunConfig):
         response = self.tokens().seq_len + 1 - prompt
         if width < 1 or response < width or response % width:
             raise ValueError("seq_len + 1 must equal prompt_length plus whole training canvases")
-        return self.objective.build(model=bound, num_canvases=response // width, variables=variables,
-                                    processor=self.processor())
+        return self.objective.build(model=model if source is None else source, num_canvases=response // width,
+                                    variables=variables, processor=self.processor())
 
 
 def same_vocabulary(written: str, loaded, name: str) -> bool:
