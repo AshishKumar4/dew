@@ -44,7 +44,7 @@ from flax import linen as nn
 
 from .attention import unweighted_rmsnorm
 from .flops import projection_flops
-from .precision import at_least_fp32, float32_matmul, float32_products
+from .precision import at_least_fp32, float32_einsum, float32_matmul
 
 HEADS = ('mean', 'weighted', 'carried')
 
@@ -116,7 +116,7 @@ def mix_streams(post, comb, output, streams):
     (modeling_glm5_next.py:1316-1318).
     """
     dtype = streams.dtype
-    mixed = jnp.einsum('bsjk,bsjd->bskd', comb.astype(dtype), streams, precision=float32_products(dtype))
+    mixed = float32_einsum('bsjk,bsjd->bskd', comb.astype(dtype), streams)
     return post.astype(dtype)[..., None] * output[..., None, :] + mixed
 
 

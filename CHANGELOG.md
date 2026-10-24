@@ -5,14 +5,36 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A joint decision row's user turn is composed of segments, `JointLayout.segments`, a tuple of
+  `Text`, `Media`, `State` and `Schema` in the order the row writes them: the default is the Laya
+  joint release's turn, and another writes the schema before the state, or text of its own
+  between the parts. A run records its layout and head by import path through `dew.registry`,
+  so a layout or head of a package the run trusts reloads; a record of an earlier run, which
+  names its class alone, reloads as before. `dew.decision.HEADS`, the closed table of heads a
+  run could record, is removed.
+- A joint row may read its schema as its context, `Schema(stream="context")`
+  (`DecisionRunConfig.segments`): the backbone reads the schema in a pass of its own, with its own
+  weights, its cross-attention layers read that pass beside the row, and the joint head pools the
+  questions and options from it; the pass counts in `train/flops`.
+- On a CPU, every float32 product a Dew model forms (the dot family, a bias's
+  gradient, attention's reference path, which a CPU's attention now takes in
+  every dtype) sums in float64 and rounds once (`dew.nn.precision.accumulated`),
+  rather than XLA:CPU's float32 sum, whose order its shape and release choose.
+  A CPU forward costs about 1.6 times, a training step 1.4 to 1.9 times;
+  GPU and TPU programs are unchanged, and convolutions keep their float32 sum.
+  `jax.default_matmul_precision("F32_F32_F32")` takes the float32 sum back.
 - A run's W&B display name is its own, `Wandb.name` (`--trainer.wandb.name`), apart from the
   name its checkpoints are kept under; it shows the run's name where none is given.
 - `Checkpoints.committed()` lists a run's committed steps at each call without opening or writing
   its store, so a process beside the one that trains (an evaluation worker) reads each step as it
   commits; the checkpoints guide shows the worker's loop.
+- `dew.sampling.sample`'s `record` reads each step's clean prediction too,
+  `record(x, state, denoised)`; a recorder written for two arguments takes a
+  third.
 - JEPA's `normalize_targets` is Flax's `LayerNorm` with no affine and exact
   variance. Its statistics are at least float32, as I-JEPA's `F.layer_norm`'s
-  are, so a bfloat16 run's targets round once.
+  are, so a bfloat16 run's targets round once, and its epsilon is I-JEPA's,
+  PyTorch's default 1e-5, where it was 1e-6.
 - `Decide.systemone` takes a list of request bodies and answers each as it
   would alone, their rows scored together, a refused body's `ValueError` in its
   place. `dew.inference.ScoringServer` serves a task answered by one forward
