@@ -353,23 +353,30 @@ def write_gemma4_native() -> None:
 
 
 
-def unified_draw(config, seed: int) -> dict[str, np.ndarray]:
+def unified_draw(config, seed: int, *, side: int = 2) -> dict[str, np.ndarray]:
     """Unequal image, video and audio runs, including holes in each media item's padded slots."""
     rng = np.random.default_rng(seed)
-    tokens = rng.integers(4, 50, (2, 14), dtype=np.int32)
+    image_tokens = side ** 2
+    tokens = rng.integers(4, 50, (2, image_tokens + 10), dtype=np.int32)
     tokens[:, 0] = config.bos_token_id
-    tokens[0, 2:6], tokens[1, 2:5] = config.image_token_id, config.video_token_id
-    tokens[0, 7:10], tokens[1, 6:8] = config.audio_token_id, config.audio_token_id
+    tokens[0, 2:2 + image_tokens], tokens[1, 2:5] = config.image_token_id, config.video_token_id
+    tokens[0, image_tokens + 3:image_tokens + 6] = config.audio_token_id
+    tokens[1, 6:8] = config.audio_token_id
     tokens[1, 10:] = config.pad_token_id
     types = np.where(tokens == config.image_token_id, 1,
                      np.where(tokens == config.video_token_id, 2,
                               np.where(tokens == config.audio_token_id, 3, 0))).astype(np.int32)
     vision = config.vision_config
     patch_width = 3 * (vision.patch_size * vision.pooling_kernel_size) ** 2
+    positions = np.full((1, image_tokens + 2, 2), -1, np.int32)
+    valid_slots = np.delete(np.arange(image_tokens + 2), [1, image_tokens])
+    positions[0, valid_slots] = np.stack(
+        [np.tile(np.arange(side), side), np.repeat(np.arange(side), side)], -1)
+    positions[0, 1] = (-1, 0)
     return {"input_ids": tokens, "attention_mask": tokens != config.pad_token_id,
             "mm_token_type_ids": types,
-            "pixel_values": rng.random((1, 6, patch_width), dtype=np.float32),
-            "image_position_ids": np.asarray([[[0, 0], [-1, 0], [1, 0], [0, 1], [-1, -1], [1, 1]]], np.int32),
+            "pixel_values": rng.random((1, image_tokens + 2, patch_width), dtype=np.float32),
+            "image_position_ids": positions,
             "pixel_values_videos": rng.random((1, 1, 4, patch_width), dtype=np.float32),
             "video_position_ids": np.asarray([[[[0, 0], [1, 0], [0, -1], [0, 1]]]], np.int32),
             "input_features": rng.standard_normal((2, 4, config.audio_config.audio_embed_dim), np.float32),
