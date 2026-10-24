@@ -6,8 +6,8 @@ parameters are a leaf of the objective's tree, and the trainer's layout
 places them like any other leaf, so a frozen tower's weights reach the
 compiled step as arguments, not as constants compiled into it.
 
-`rebuild(name, fields)` rebuilds an encoder from a run's record, where
-`fields` is what `to_json` wrote.
+`rebuild(record)` rebuilds an encoder from a run's record, the registry's
+`{"class": ..., "fields": ...}` whose fields `to_json` wrote.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ from dew.nn.text_encoders import (
     translate_config,
     translate_t5_config,
 )
-from dew.registry import dtype_name, encoders, import_path, resolve_dtype
+from dew.registry import component, dtype_name, import_path, resolve_dtype
 
 if TYPE_CHECKING:
     from torchax.interop import JittableModule
@@ -144,22 +144,21 @@ class ConditionEncoder(ABC, Generic[Raw, Encoded]):
         return {"class": import_path(type(self)), "fields": self.to_json()}
 
 
-def rebuild(name: str, fields: Mapping[str, object], *,
-            params: Variables | None = None) -> ConditionEncoder:
-    """Rebuild the encoder an alias or import path `name`s from its JSON fields.
+def rebuild(record: Mapping[str, object], *, params: Variables | None = None) -> ConditionEncoder:
+    """Rebuild the encoder a record names, `{"class": alias or import path, "fields": ...}`, the class
+    found as every component's is (`dew.registry.component`).
 
-    A run's record stores the encoder's import path and the keyword fields `to_json`
-    wrote. This function unpacks those fields into the encoder's
-    `from_pretrained`, so each encoder keeps its own concrete signature.
-    `checkpoint` is the one field every encoder takes, and this function
-    reads it; a record without one raises ValueError. The other fields
-    belong to the encoder, and its signature checks them.
+    The fields are the keywords `to_json` wrote, unpacked into the encoder's `from_pretrained`, so each
+    encoder keeps its own concrete signature. `checkpoint` is the one field every encoder takes, and this
+    function reads it; a record without one raises ValueError. The other fields belong to the encoder,
+    and its signature checks them.
     """
+    encoder, fields = component(ConditionEncoder, record)
     checkpoint = fields.get("checkpoint")
     if not isinstance(checkpoint, str):
-        raise ValueError(f"the {name} record names no checkpoint to rebuild from")
+        raise ValueError(f"the {record['class']} record names no checkpoint to rebuild from")
     rest = {key: value for key, value in fields.items() if key != "checkpoint"}
-    return encoders[name].from_pretrained(checkpoint, **rest, params=params)
+    return encoder.from_pretrained(checkpoint, **rest, params=params)
 
 
 def _pinned_tokenizer(checkpoint: str, revision: str | None) -> PinnedTokenizer:

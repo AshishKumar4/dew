@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 from abc import ABC, abstractmethod
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from typing import Self
 
 import jax
@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
+from dew._records import JSON
 from dew.batch import Variables
 
 type RecordValue = float | np.ndarray | None
@@ -130,10 +131,11 @@ class AutoEncoder(ABC):
     model: nn.Module
 
     def record_arguments(self) -> dict:
-        """The built-in subclass's constructor arguments besides `model` and
-        `params`, as it was given them: its compute dtype and latent
-        normalization."""
-        raise TypeError(f"{type(self).__name__} is not a registered built-in (`pretrained.REGISTRATIONS`)")
+        """The subclass's constructor arguments besides `model` and `params`, as it was given them (a
+        built-in's compute dtype and latent normalization), which its record rebuilds it with
+        (`to_json`). A subclass a run records states them."""
+        raise TypeError(f"{type(self).__name__} states no constructor arguments for its record "
+                        f"(`AutoEncoder.record_arguments`)")
 
     @property
     def latent_shift(self) -> float | np.ndarray:
@@ -151,38 +153,29 @@ class AutoEncoder(ABC):
         return replaced
 
     def to_json(self) -> dict:
-        """Return the record of this built-in autoencoder's constructor, without its parameters: its
-        registration's name (`pretrained.REGISTRATIONS`), its module's fields and `record_arguments`.
+        """Return the record of this autoencoder's constructor, without its parameters, as the registry
+        records a component (`dew.registry.component`): its class by import path, and its module's
+        record and `record_arguments` as fields, which `from_json` passes its constructor as keywords
+        with `model` and `params`."""
+        from dew.registry import import_path, to_record
 
-        One no registration names raises `TypeError`.
-        """
-        from dew.registry import record_fields
-
-        from .pretrained import registration
-        registered = registration(type(self))
-        if registered is None:
-            raise TypeError(f"{type(self).__name__} is not a registered built-in "
-                            "(`pretrained.REGISTRATIONS`)")
         arguments = {name: np.asarray(value).tolist() if isinstance(value, np.ndarray | jax.Array) else value
                      for name, value in self.record_arguments().items()}
-        return {'name': registered.record,
-                'fields': {'model': record_fields(self.model, registered.module), **arguments}}
+        return {'class': import_path(type(self)),
+                'fields': {'model': to_record(self.model, nn.Module), **arguments}}
 
-    @classmethod
-    def from_json(cls, record, *, params: Variables) -> AutoEncoder:
-        """Rebuild a built-in autoencoder from its `record`, around the checkpoint's own `params`,
-        reading no source. A name no built-in declares raises `ValueError`.
-        """
-        from dew.registry import from_record
+    @staticmethod
+    def from_json(record, *, params: Variables) -> AutoEncoder:
+        """Rebuild the autoencoder a run recorded (`to_json`), around the checkpoint's own `params`,
+        reading no source: its class found as every component's is (`dew.registry.component`), of
+        Dew's or of a package the run trusts."""
+        from dew._records import json_value, record as fields_of
+        from dew.registry import component, from_record
 
-        from .pretrained import registration
-        registered = registration(record['name'])
-        if registered is None:
-            raise ValueError(f"{record['name']!r} is not a registered built-in autoencoder "
-                             "(`pretrained.REGISTRATIONS`)")
-        fields = dict(record['fields'])
-        model = from_record(registered.module, fields.pop('model'))
-        return registered.wrapper(model=model, params=params, **fields)
+        autoencoder, recorded = component(AutoEncoder, record)
+        arguments = {name: json_value(value, name) for name, value in recorded.items() if name != 'model'}
+        model = from_record(nn.Module, fields_of(recorded.get('model'), 'model'))
+        return _constructed(autoencoder, model, params, arguments)
 
     @abstractmethod
     def encode_batch(self, params, x: jnp.ndarray, key: jax.Array | None = None,
@@ -272,6 +265,14 @@ class AutoEncoder(ABC):
         """Encode `x`, then decode it."""
         return self.decode(params, self.encode(params, x, key=key))
 
+
+
+def _constructed[Recorded](recorded: Callable[..., Recorded], model: nn.Module, params: Variables,
+                           arguments: Mapping[str, JSON]) -> Recorded:
+    """A recorded autoencoder class constructed from its record's parts (`AutoEncoder.from_json`): its
+    module, the run's `params` and its `record_arguments`, each subclass's own keywords, as the registry
+    constructs a component it finds by name."""
+    return recorded(model=model, params=params, **arguments)
 
 class ModuleAutoEncoder[M: nn.Module](AutoEncoder):
     """A frozen flax autoencoder module and the params it loaded. The

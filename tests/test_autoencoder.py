@@ -19,7 +19,8 @@ from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
-from dew.nn.autoencoders import AutoEncoder, AutoencoderKL, StableDiffusionVAE
+from dew.nn.autoencoders import AutoEncoder, AutoencoderKL, LatentNormalization, StableDiffusionVAE
+from dew.nn.autoencoders.api import ModuleAutoEncoder
 from dew.nn.autoencoders.pretrained import REGISTRATIONS
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import Recorder, Step
@@ -198,6 +199,50 @@ def test_a_stochastic_encoder_samples_at_its_given_noise_and_a_deterministic_one
     sampled = autoencoder.encode(params, image, jax.random.key(6), noise)
     np.testing.assert_array_equal(autoencoder.encode(params, image, jax.random.key(7), noise), sampled)
     assert not np.array_equal(sampled, mean)
+
+
+class Halved(ModuleAutoEncoder[AutoencoderKL]):
+    """A user's autoencoder, no built-in: a native AutoencoderKL whose latents it scales by `factor`,
+    recorded with that factor (`record_arguments`)."""
+
+    def __init__(self, model: AutoencoderKL, params, factor: float):
+        super().__init__(model, params)
+        self.factor = factor
+        self.normalization = LatentNormalization({"factor": factor}, 0.0, factor)
+
+    def record_arguments(self) -> dict:
+        return {"factor": self.factor}
+
+
+def test_a_users_autoencoder_rebuilds_from_its_record_as_a_built_in_does():
+    """An autoencoder of the user's own records itself as the registry records any component, its class
+    by import path (`AutoEncoder.to_json`), and rebuilds from that record around the run's parameters
+    (`from_json`), no registration needed: the rebuilt one encodes and decodes bitwise as the one it
+    recorded, its normalization included. Its class and its module's survive JSON as import paths."""
+    vae = tiny_vae()
+    original = Halved(vae.model, vae.params, factor=0.5)
+    record = json.loads(json.dumps(original.to_json()))
+    assert record["class"].endswith(":Halved")
+    assert record["fields"]["model"]["class"].endswith(":AutoencoderKL")
+    rebuilt = AutoEncoder.from_json(record, params=original.params)
+    assert type(rebuilt) is Halved and rebuilt.factor == 0.5
+    image = jax.random.uniform(jax.random.key(0), (2, IMAGE_SIZE, IMAGE_SIZE, 3), minval=-1.0, maxval=1.0)
+    latent = original.encode(original.params, image)
+    np.testing.assert_array_equal(rebuilt.encode(rebuilt.params, image), latent)
+    np.testing.assert_array_equal(rebuilt.decode(rebuilt.params, latent),
+                                  original.decode(original.params, latent))
+
+
+def test_an_earlier_runs_autoencoder_record_reads_as_its_class_record():
+    """An earlier run recorded a built-in autoencoder by its registration's name with its module's bare
+    fields; the run's loader (`SavedRun.pinned`, `earlier_shapes`) reads it as the class record Dew
+    writes now, which rebuilds the same autoencoder."""
+    from dew.inference.tasks import earlier_shapes
+
+    original = tiny_vae(latent_shift=0.25, latent_scale=0.5)
+    record = original.to_json()
+    earlier = {"name": "sd_vae", "fields": {**record["fields"], "model": record["fields"]["model"]["fields"]}}
+    assert earlier_shapes({"autoencoder": earlier})["autoencoder"] == record
 
 
 @pytest.mark.parametrize("kind", RECORDS)

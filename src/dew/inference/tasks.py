@@ -335,14 +335,29 @@ class SavedRun:
 
 def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     """A run's record with its components in the shapes Dew writes now, every earlier shape read here
-    and nowhere else (`SavedRun.pinned`), so no component keeps two readers: a decision head named by
-    its class name alone, read as `dew.decision.head`'s path, and a decision layout by class name,
-    read as the registry class record of `dew.decision.layout`'s class. A record in today's shapes
-    passes as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
+    and nowhere else (`SavedRun.pinned`), so no component keeps two readers: a decision head's
+    `{"name"}` record, its class by import path or by class name alone in `dew.decision.head`, a
+    built-in autoencoder's by its registration's name (`pretrained.Registration.record`) with its module's
+    bare fields, and a decision layout's by class name in `dew.decision.layout`, each read as the
+    registry's class record. A record in today's shapes passes as it is. Carried to 1.0, when it is
+    deleted (ledger 1552)."""
     current = dict(record)
     head = record.get("head")
-    if isinstance(head, Mapping) and ":" not in named(head.get("name"), "head.name"):
-        current["head"] = {**head, "name": f"dew.decision.head:{head['name']}"}
+    if isinstance(head, Mapping) and "name" in head and "class" not in head:
+        name = named(head["name"], "head.name")
+        current["head"] = {"class": name if ":" in name else f"dew.decision.head:{name}",
+                           "fields": named_fields(head.get("fields", {}), "head.fields")}
+    autoencoder = record.get("autoencoder")
+    if isinstance(autoencoder, Mapping) and "name" in autoencoder and "class" not in autoencoder:
+        from dew.nn.autoencoders.pretrained import registration
+        from dew.registry import import_path
+
+        built = registration(named(autoencoder["name"], "autoencoder.name"))
+        if built is None:
+            raise ValueError(f"{autoencoder['name']!r} names no built-in autoencoder an earlier run recorded")
+        fields = dict(named_fields(autoencoder.get("fields", {}), "autoencoder.fields"))
+        fields["model"] = {"class": import_path(built.module), "fields": fields["model"]}
+        current["autoencoder"] = {"class": import_path(built.wrapper), "fields": fields}
     layout = record.get("layout")
     if isinstance(layout, Mapping) and "name" in layout and "class" not in layout:
         current["layout"] = {"class": f"dew.decision.layout:{named(layout['name'], 'layout.name')}",

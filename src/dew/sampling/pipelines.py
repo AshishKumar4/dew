@@ -709,14 +709,15 @@ def _parameter_roots(inputs: Mapping[str, object], autoencoder: Mapping[str, obj
     """The parameter roots of a recorded run's tree, which a storage override
     casts: the denoiser's, each condition encoder's own collections and the
     autoencoder's. The rest keep the dtypes they were saved in."""
-    from dew._records import record, text
+    from dew._records import record
     from dew.batch import PARAMETER_ROOTS
-    from dew.registry import encoders
+    from dew.inputs.encoders import ConditionEncoder
+    from dew.registry import component
 
     roots: list[tuple[str, ...]] = list(PARAMETER_ROOTS)
     for keyword, condition in record(inputs['conditions'], 'conditions').items():
-        name = text(record(record(condition, keyword)['encoder'], 'encoder')['class'], 'encoder class')
-        collections = encoders[name].parameter_collections
+        encoder, _ = component(ConditionEncoder, record(record(condition, keyword)['encoder'], 'encoder'))
+        collections = encoder.parameter_collections
         roots.extend([("encoders", keyword)] if collections is None else
                      [("encoders", keyword, collection) for collection in collections])
     if autoencoder is not None:
@@ -725,16 +726,16 @@ def _parameter_roots(inputs: Mapping[str, object], autoencoder: Mapping[str, obj
 
 
 def _computing(owner: Mapping[str, object], compute: str) -> Mapping[str, object]:
-    """A recorded encoder or autoencoder computing in `compute`: its own
-    `dtype`, and the dtype of the model it wraps where it records one."""
+    """A recorded encoder or autoencoder (a class record, `dew.registry.component`) computing in
+    `compute`: its own `dtype`, and the dtype of the model it wraps where it records one."""
     from dew._records import record
 
     recorded = dict(record(owner['fields'], 'fields'))
     if 'dtype' in recorded:
         recorded['dtype'] = compute
     model = recorded.get('model')
-    if isinstance(model, Mapping) and 'dtype' in model:
-        recorded['model'] = {**record(model, 'model'), 'dtype': compute}
+    if isinstance(model, Mapping) and 'dtype' in record(model.get('fields', {}), 'model.fields'):
+        recorded['model'] = {**model, 'fields': {**record(model['fields'], 'model.fields'), 'dtype': compute}}
     return {**owner, 'fields': recorded}
 
 
