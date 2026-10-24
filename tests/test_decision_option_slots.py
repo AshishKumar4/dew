@@ -16,8 +16,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from flax import linen as nn
 from decision_support import decision_rows
+from flax import linen as nn
 from reference_error import assert_as_exact, widened, with_gradients
 from safetensors.numpy import load_file
 
