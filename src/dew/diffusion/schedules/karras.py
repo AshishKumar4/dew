@@ -3,6 +3,8 @@
 import jax
 import jax.numpy as jnp
 
+from dew.nn.precision import correctly_rounded_divide
+
 from .common import GeneralizedNoiseScheduler, times
 
 
@@ -58,7 +60,12 @@ class EDMNoiseScheduler(GeneralizedNoiseScheduler):
         return jnp.exp(times(t) / self.T * self.P_std + self.P_mean)
 
     def t_of_sigma(self, sigma):
-        return (jnp.log(times(sigma)) - self.P_mean) / self.P_std * self.T
+        # The centred log-sigma over P_std correctly rounded: XLA writes a division by a constant as a
+        # product with its rounded reciprocal, which `sigmas`' exponential then amplifies on the way back.
+        centred = jnp.log(times(sigma)) - self.P_mean
+        if centred.dtype == jnp.float64:
+            return centred / self.P_std * self.T
+        return correctly_rounded_divide(centred, jnp.asarray(self.P_std, centred.dtype)) * self.T
 
     def sample_t(self, key, n):
         return jax.random.normal(key, (n,), dtype=jnp.float32)
