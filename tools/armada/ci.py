@@ -916,7 +916,10 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     did not follow, as the fla reference's in another environment's Python) grows its pool as it uses
     it rather than taking the share at its first GPU op (`XLA_PYTHON_CLIENT_PREALLOCATE`), so such a
     child has what the file has not yet taken; a file that grows to the whole share still leaves its
-    child none.
+    child none. Each file's process takes its share of the CPUs this process may use, as of the files
+    that run at once (`OMP_NUM_THREADS`): a torch reference arm's small ops on all of a node's 30 CPUs
+    ran 13 times slower than on 4 (test_gemma3n's gradient reference on an A100 node, 1175 s against
+    armada's 326 s), and the more so as files share them.
 
     First the pinned fixtures the tests read offline are fetched while the Hub is reachable
     (tools/fetched_fixtures.py): a store file already whole is kept, and a pin whose upload is due stops
@@ -926,6 +929,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     [total] = (int(megabytes) * 2 ** 20 for megabytes in gpu_query("memory.total"))
     budget = float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) * total
     held = device_class()
+    threads = str(max(1, len(os.sched_getaffinity(0)) // processes))
 
     def needs(name: str) -> dict | None:
         return recorded(record_key(python, row(python, name, ""), held), token)
@@ -954,7 +958,8 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                     # Its pool taken at its first op, or grown where it holds the whole share, as this lane
                     # says whatever its own environment does: a GPU node's session grows every job's pool.
                     environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total),
-                               "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true"}
+                               "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true",
+                               "OMP_NUM_THREADS": threads}
                     running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache,
                                         session.GRACE, common, environ)] = fits
                     continue
