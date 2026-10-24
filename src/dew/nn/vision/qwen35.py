@@ -9,6 +9,7 @@ from flax import linen as nn
 
 from dew import records
 from dew._model_types import _QWEN35_VISION_TYPES
+from dew.interop.weights import in_params
 from dew.nn.text_encoders import TOWER_ACTIVATIONS
 from dew.registry import Record
 

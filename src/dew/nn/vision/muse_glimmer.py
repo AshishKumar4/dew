@@ -10,6 +10,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
+from dew.interop.weights import in_params
 from dew.nn.activations import HIDDEN_ACT
 from dew.nn.attention import RMSNorm
 from dew.nn.dense import Dense

@@ -12,6 +12,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
+from dew.interop.weights import in_params
 from dew.nn.activations import gelu_exact
 from dew.nn.dense import Dense
 from dew.nn.precision import float32_dot_general
