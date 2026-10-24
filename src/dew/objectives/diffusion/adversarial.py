@@ -33,6 +33,7 @@ from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec
 from dew.nn.attention import l2_normalized
 from dew.nn.blocks import sinusoidal_time
+from dew.nn.conv import convolution
 from dew.nn.dit import TextContext, masked_mean
 from dew.nn.precision import accumulated
 from dew.nn.protocols import Lacks
@@ -74,9 +75,8 @@ class SpectralConv(nn.Module):
         if self.circular:
             x = jnp.pad(x, [(0, 0), *pad, (0, 0)], mode="wrap")
             pad = [(0, 0), (0, 0)]
-        y = jax.lax.conv_general_dilated(x, (kernel / sigma).astype(x.dtype), (1, 1), pad,
-                                         dimension_numbers=("NHWC", "HWIO", "NHWC"))
-        return y + bias
+        # The library's convolution of the normalized kernel, placed and at the precision its own layers run.
+        return convolution(x, (kernel / sigma).astype(x.dtype), pad) + bias
 
 
 class BatchNormLocal(nn.Module):
@@ -93,13 +93,8 @@ class BatchNormLocal(nn.Module):
         rows, height, width, channels = x.shape
         groups = math.ceil(rows / self.virtual_batch)
         grouped = x.reshape(groups, -1, height * width, channels)
-
-        def group_mean(values: jax.Array) -> jax.Array:
-            mean, _ = Objective.row_mean(values, batch, (1, 2), rows=(0, 1)).mean()
-            return jnp.expand_dims(mean, (1, 2))
-
-        mean = group_mean(grouped)
-        var = group_mean(jnp.square(grouped - mean))
+        mean, var = (jnp.expand_dims(moment, (1, 2))
+                     for moment in Objective.row_moments(grouped, batch, (1, 2), rows=(0, 1)))
         normalized = ((grouped - mean) / jnp.sqrt(var + self.eps)).reshape(x.shape)
         weight = self.param("weight", nn.initializers.ones, (channels,))
         bias = self.param("bias", nn.initializers.zeros, (channels,))

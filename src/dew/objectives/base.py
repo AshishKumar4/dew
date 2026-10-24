@@ -1148,6 +1148,17 @@ class Objective(ABC, Generic[Loss, Effects]):
                      jnp.sum(jnp.broadcast_to(real, values.shape).astype(dtype), axes))
 
     @staticmethod
+    def row_moments(values: jax.Array, batch: Batch, axis: int | tuple[int, ...], *,
+                    rows: int | tuple[int, ...] = 0) -> tuple[jax.Array, jax.Array]:
+        """Return the mean and the biased variance of `values` over `axis`, over `batch`'s rows
+        (`row_mean`), in two passes as `jnp.mean` and `jnp.var` take them; both drop `axis`."""
+        axes = (axis,) if isinstance(axis, int) else tuple(axis)
+        mean, _ = Objective.row_mean(values, batch, axes, rows=rows).mean()
+        centered = values - jnp.expand_dims(mean, axes)
+        var, _ = Objective.row_mean(jnp.square(centered), batch, axes, rows=rows).mean()
+        return mean, var
+
+    @staticmethod
     def row_weights(batch: Batch, rows: int) -> jax.Array:
         """Each of the batch's `rows` rows' weight, float32: 1 for a real row
         and 0 for a repeat that fills an evaluation batch (`VALID_ROWS`), and 1

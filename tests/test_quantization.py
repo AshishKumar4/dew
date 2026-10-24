@@ -146,7 +146,7 @@ def test_an_int8_trunk_trains_down():
     _, qmodel, variables, _ = quantized_forward(Quantization())
     objective = LMObjective(qmodel, SEQ_LEN)
     batch = token_batch()
-    solver = OptimConfig(learning_rate=1e-3).build(5)
+    solver = OptimConfig(rate=1e-3).build(5)
     params, opt_state = variables["params"], solver.init(variables["params"])
 
     @jax.jit
@@ -1105,7 +1105,7 @@ def diffusion_run(directory, batch=RUN_BATCH, **trainer):
     from diffusion_support import images_of
 
     from dew.config import ModelConfig, TrainerConfig
-    from dew.objectives.diffusion import DiffusionRunConfig
+    from dew.config.diffusion import DiffusionRunConfig
 
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 16,
