@@ -15,7 +15,14 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from diffusion_support import applied, float32_update, float64_gradient, moved_weights, objective_gradient
+from diffusion_support import (
+    applied,
+    as_a_step,
+    float32_update,
+    float64_gradient,
+    moved_weights,
+    objective_gradient,
+)
 from reference_error import assert_as_exact
 from safetensors.numpy import load_file
 
@@ -107,7 +114,8 @@ def assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, 
     def trained(values):
         return jax.tree.map(applied, values["params"], stepped(values))
 
-    objective_update = float32_update(jax.jit(lambda values: objective_gradient(obj, values, batch, step)))
+    objective_update = float32_update(as_a_step(obj, variables, batch,
+                                                lambda values: objective_gradient(obj, values, batch, step)))
     truth = float64_gradient(twin, batch, step)
     assert_as_exact(trained, objective_update, moved_weights(variables), "trainer update", seeds=seeds,
                     truth_fn=truth)
