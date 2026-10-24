@@ -1,5 +1,7 @@
 """The standalone torch-free stage probe keeps the recorded draw and the existing float64 truth."""
 
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -10,7 +12,8 @@ from tool_support import load
 
 
 @pytest.mark.parametrize("seed", [0, 3, 17])
-def test_the_stage_probe_keeps_the_native_draw_and_float64_h0_truth(seed):
+def test_the_stage_probe_keeps_the_native_draw_and_float64_h0_truth(seed, monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "tools"))
     probe = load("mamba_ssd_dh0_probe")
     arrays = probe.draw(seed)
     expected = mamba_ssd_draw(seed, probe.SHAPE, jnp.float32, True)
