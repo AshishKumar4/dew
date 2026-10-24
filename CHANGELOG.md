@@ -5,6 +5,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- `Checkpoints.committed()` lists a run's committed steps at each call without opening or writing
+  its store, so a process beside the one that trains (an evaluation worker) reads each step as it
+  commits; the checkpoints guide shows the worker's loop.
 - JEPA's `normalize_targets` is Flax's `LayerNorm` with no affine and exact
   variance. Its statistics are at least float32, as I-JEPA's `F.layer_norm`'s
   are, so a bfloat16 run's targets round once.
