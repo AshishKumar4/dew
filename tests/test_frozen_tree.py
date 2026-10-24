@@ -80,3 +80,19 @@ def test_timing_a_frontier_of_plans_leaves_the_frozen_tree_whole():
     timer([step, step])
     assert frozen_ids(timer.state.variables[FROZEN]) == frozen_ids(held[FROZEN])
     assert not any(leaf.is_deleted() for leaf in jax.tree.leaves(held[FROZEN]))
+
+
+def test_an_objective_whose_init_rebuilds_its_frozen_tree_is_refused_on_the_mesh():
+    """The trainer shares an objective's held frozen tree as its state's (`Objective.held_variables`):
+    an objective whose init returns a frozen tree of another dtype than the one it holds breaks that
+    contract, and its placed start is refused rather than holding two."""
+
+    class Widened(LMObjective):
+        def init(self, key, variables=None):
+            tree = super().init(key, variables)
+            return {**tree, FROZEN: jax.tree.map(lambda leaf: leaf.astype(jnp.float16), tree[FROZEN])}
+
+    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=16)
+    rebuilt = Widened(source.adapt(LoRA(rank=2, modules=("q_proj", "v_proj")), key=0), 8, ema_decay=None)
+    with pytest.raises(ValueError):
+        Trainer(rebuilt, optax.sgd(0.1), key=jax.random.key(5), mesh=MeshSpec()).place()
