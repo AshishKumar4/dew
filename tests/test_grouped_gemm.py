@@ -381,16 +381,20 @@ def test_a_cooperative_tile_refuses_what_its_consumers_cannot_compute(block_m, b
 
 
 @INTERPRETS
-def test_a_cooperative_tile_refuses_a_width_it_cannot_stage_whole():
-    """A consumer stages its bf16 output 128 columns at a time: a 192-column cooperative tile refuses a
-    16-bit output rather than leaving its last 64 columns unwritten."""
-    x, w, _, _ = operands(SIZES["ragged"], jnp.bfloat16)
+def test_a_tile_of_192_columns_stages_every_column_it_writes():
+    """A consumer stages its bf16 output in chunks of at most 128 columns that divide its tile: a 192-column
+    tile, one warpgroup or two, writes all of its columns, as exact as XLA's ragged dot from float64."""
+    sizes = SIZES["ragged"]
+    x, w, dy, group = operands(sizes, jnp.bfloat16)
     wide = np.tile(w, (1, 1, 2))[..., :192]
-    tiles = mosaic_gpu.Tiles(128, 192, 64, 2, 1, warpgroups=2)
-    with pytest.raises(ValueError):
-        mosaic_gpu.gmm(jnp.asarray(x, jnp.bfloat16), jnp.asarray(wide, jnp.bfloat16),
-                       jnp.asarray(SIZES["ragged"], jnp.int32), tiles=tiles, transpose_rhs=False,
-                       out_dtype=jnp.bfloat16, multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
+    truth = oracle.products(x, wide, np.tile(dy, (1, 2))[:, :192], sizes)
+    reference = xla_products(x, wide, np.tile(dy, (1, 2))[:, :192], sizes, jnp.bfloat16, jnp.float32)
+    for warpgroups in (1, 2):
+        tiles = mosaic_gpu.Tiles(128, 192, 64, 2, 1, warpgroups=warpgroups)
+        got = mosaic_gpu.gmm(jnp.asarray(x, jnp.bfloat16), jnp.asarray(wide, jnp.bfloat16),
+                             jnp.asarray(sizes, jnp.int32), tiles=tiles, transpose_rhs=False,
+                             out_dtype=jnp.bfloat16, multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
+        check(got, reference[0], truth[0], group, f"forward {tiles}")
 
 
 def test_the_cost_model_names_a_fact_its_target_lacks():
