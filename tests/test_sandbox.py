@@ -29,11 +29,13 @@ from dew.objectives.rl import EpisodeStatus
 
 
 def alive(pid):
+    """Whether `pid` still runs. A zombie has ended: it waits only for its reaper, which for an orphan may
+    be a child subreaper that reaps when its own job ends, as a GPU node's job runner does."""
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
         return False
-    return True
+    return stat.rsplit(")", 1)[1].split()[0] != "Z"
 
 
 def wait_gone(pids, seconds=5.):
