@@ -749,11 +749,11 @@ def _bf16_einsum_fwd(subscripts: str, lhs: jax.Array, rhs: jax.Array):
 
 def _bf16_einsum_bwd(subscripts: str, residuals, cotangent: jax.Array):
     lhs, rhs = residuals
-    operands, result = subscripts.split("->")
+    operands, product = subscripts.split("->")
     left, right = operands.split(",")
     rounded = cotangent.astype(jnp.bfloat16)
-    return (bf16_einsum(f"{result},{right}->{left}", rounded, rhs).astype(lhs.dtype),
-            bf16_einsum(f"{result},{left}->{right}", rounded, lhs).astype(rhs.dtype))
+    return (bf16_einsum(f"{product},{right}->{left}", rounded, rhs).astype(lhs.dtype),
+            bf16_einsum(f"{product},{left}->{right}", rounded, lhs).astype(rhs.dtype))
 
 
 # `jax.custom_vjp` is generic in its return type, and a `functools.partial`
@@ -773,8 +773,8 @@ def _subscripts(dimension_numbers, lhs_rank: int, rhs_rank: int) -> str:
     right = [left[shared[axis]] if axis in shared else next(letters) for axis in range(rhs_rank)]
     free_left = [left[axis] for axis in range(lhs_rank) if axis not in (*lhs_contracting, *lhs_batch)]
     free_right = [right[axis] for axis in range(rhs_rank) if axis not in shared]
-    result = [left[axis] for axis in lhs_batch] + free_left + free_right
-    return f"{''.join(left)},{''.join(right)}->{''.join(result)}"
+    product = [left[axis] for axis in lhs_batch] + free_left + free_right
+    return f"{''.join(left)},{''.join(right)}->{''.join(product)}"
 
 
 def at_default_precision[Output](fn: Callable[..., Output]) -> Callable[..., Output]:
