@@ -42,6 +42,10 @@ def flag(name, default=""):
 fail = state.get("fail", "")
 if fail and fail in " ".join(argv):
     die("the fake was told to fail here", 3)
+hang = state.get("hang", "")
+if hang and hang in " ".join(argv):
+    import time
+    time.sleep(600)
 
 if program == "rsync":
     raise SystemExit(0)
@@ -133,6 +137,11 @@ class Fake:
         self.state["fail"] = fragment
         self.flush()
 
+    def hang_on(self, fragment: str) -> None:
+        """Make every call whose arguments hold `fragment` hang, as a gcloud that never answers."""
+        self.state["hang"] = fragment
+        self.flush()
+
     @property
     def calls(self) -> list[list[str]]:
         if not self.calls_path.is_file():
@@ -208,6 +217,20 @@ def test_create_uses_the_configured_defaults(fake):
         "compute", "tpus", "tpu-vm", "create", "slice", "--zone=us-central2-b",
         "--accelerator-type=v5litepod-16", "--version=v2-alpha-tpuv5-lite")
     assert json.loads((config_dir() / "zones.json").read_text()) == {"slice": "us-central2-b"}
+
+
+def test_a_create_waiting_on_a_gcloud_that_never_answers_ends_at_its_deadline(fake, monkeypatch):
+    """Each readiness probe has what is left of the wait, so a listing that hangs is killed there and
+    the wait ends with the TPU unready, instead of running past its deadline."""
+    from dew.cli import gcloud as gcloud_module
+
+    monkeypatch.setattr(gcloud_module, "READY_TIMEOUT", 2)
+    fake.offer("slice", "us-central2-b")
+    fake.hang_on("list")
+    began = time.monotonic()
+    with pytest.raises(SystemExit):
+        run("create", "slice", "--zone", "us-central2-b")
+    assert time.monotonic() - began < 60
 
 
 def test_a_dry_run_writes_nothing_it_would_keep(fake):
