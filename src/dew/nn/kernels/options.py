@@ -1,4 +1,5 @@
-"""The XLA options a program compiles with, by the models it runs and the device it runs on.
+"""The XLA options a program compiles with, by the models it runs and the device it runs on, and the
+one place a program over them is compiled (`program`).
 
 `dew.nn.kernels.generation` stays free of Dew's imports, since benchmark
 environments load its target table without Dew or JAX; this reads its
@@ -7,7 +8,11 @@ facts with the run's own XLA flags.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
+import functools
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, cast, runtime_checkable
+
+import jax
 
 from dew.devices import xla_flag
 from dew.nn.kernels.generation import backend, gpu_target
@@ -55,3 +60,21 @@ def compiler_options(*models: nn.Module) -> dict[str, bool]:
             or xla_flag("xla_gpu_enable_triton_gemm") is not None):
         return {}
     return {"xla_gpu_enable_triton_gemm": False}
+
+
+def program(function: Callable[..., object], *models: nn.Module, **arguments: object
+            ) -> Callable[..., Any]:
+    """`function` jitted with the XLA options a program over `models` compiles with
+    (`compiler_options`) and the rest of `jax.jit`'s `arguments` (its static arguments, its
+    shardings), each hashable: one program for each function, options and arguments, which every call
+    with the same reuses, so a quantized model and another never share one. Every program Dew compiles
+    over a task's model, an autoencoder or an objective's modules outside an objective's own
+    (`Objective.program`) is one of these."""
+    return _program(function, tuple(sorted(compiler_options(*models).items())),
+                    tuple(sorted(arguments.items())))
+
+
+@functools.cache
+def _program(function: Callable[..., object], options: tuple[tuple[str, bool], ...],
+             arguments: tuple[tuple[str, object], ...]) -> Callable[..., Any]:
+    return jax.jit(function, compiler_options=dict(options), **cast(dict[str, Any], dict(arguments)))

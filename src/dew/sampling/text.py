@@ -45,7 +45,7 @@ from dew.nn.inputs import (
     valid_order,
     with_validity,
 )
-from dew.nn.kernels.options import compiler_options
+from dew.nn.kernels.options import program
 from dew.nn.kv_cache import gather_cache_rows, refuse_unassigned, write_cache
 from dew.nn.protocols import (
     BlockDenoiser,
@@ -841,13 +841,6 @@ def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax
         params, inputs, keys, budget, transforms, stopping, strategy)
 
 
-@functools.cache
-def _compiled(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
-    """The generation program over `rows`, compiled with the model's own XLA `options`
-    (`dew.nn.kernels.options.compiler_options`), so a quantized model and another never share it."""
-    return jax.jit(_checked, static_argnames=("model", "trips", "pad_id", "n", "packing"),
-                   in_shardings=(None, rows, rows, None, None, None, None),
-                   out_shardings=(None, rows), compiler_options=dict(options))
 
 
 _DEFAULT_SAMPLING = Sampling()
@@ -915,11 +908,13 @@ def generate(model: nn.Module, params: Variables,
         refuse_unassigned(model.kv_cache, plan.count, capacity)
     from dew.inference.projections import pending
 
-    program = _compiled(plan.sharding, tuple(compiler_options(model).items()))
+    compiled = program(_checked, model, static_argnames=("model", "trips", "pad_id", "n", "packing"),
+                       in_shardings=(None, plan.sharding, plan.sharding, None, None, None, None),
+                       out_shardings=(None, plan.sharding))
     # A tree a loader owns arrives packed; one borrowed from a live objective packs in the call.
-    failure, output = program(model, decoding_storage(model, params), plan.place(request.padded()),
-                              plan.keys(request.key), jnp.int32(max_new_tokens), scanned, sampling.pad, n,
-                              *components, pending(model, params))
+    failure, output = compiled(model, decoding_storage(model, params), plan.place(request.padded()),
+                               plan.keys(request.key), jnp.int32(max_new_tokens), scanned, sampling.pad, n,
+                               *components, pending(model, params))
     # The error's flags are the one read a request waits on.
     jax.device_get(failure).throw()
     return replace(output, rows=plan.rows * n)
