@@ -13,6 +13,7 @@ does not run, so they build the dense [S, S] logits a global layer does: at
 """
 
 from collections.abc import Mapping
+from functools import partial
 
 import numpy as np
 
@@ -20,11 +21,12 @@ from dew import records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
     ACTIVATIONS,
-    DEFAULT_MAX_SEQ_LEN,
     DecoderFamily,
     DecoderFields,
+    Leaves,
     Packed,
     Renames,
+    context_lengths,
     decoder_kinds,
     hf_activation,
     hf_ungated,
@@ -32,6 +34,7 @@ from dew.interop.decoder_parts import (
     refuse,
     renamed_name,
     renamed_path,
+    specified_layer_types,
     ungated_mlp,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -83,12 +86,8 @@ def _modernbert_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
     if activation not in ACTIVATIONS:
         refuse(f'hidden_activation={activation!r}', f'the GLU supports {sorted(ACTIVATIONS)}')
 
-    if hf.get('layer_types') is not None:
-        layer_types = records.strings(hf['layer_types'], 'layer_types')
-    else:
-        every = records.integer(hf.get('global_attn_every_n_layers', 3), 'global_attn_every_n_layers')
-        layer_types = tuple('sliding_attention' if index % every else 'full_attention'
-                            for index in range(layers))
+    every = records.integer(hf.get('global_attn_every_n_layers', 3), 'global_attn_every_n_layers')
+    layer_types = specified_layer_types(hf, used, ('full_attention',) + ('sliding_attention',) * (every - 1))
     if isinstance(hf.get('rope_parameters'), Mapping):
         ropes = read_rope(hf, used)
         if ropes.scaling is not None or ropes.local_scaling is not None:
@@ -112,8 +111,7 @@ def _modernbert_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
         emb_features=hidden, num_layers=layers, num_heads=heads, num_kv_heads=heads,
         head_dim=hidden // heads, mlp=ACTIVATIONS[activation],
         mlp_features=records.integer(hf['intermediate_size'], 'intermediate_size'),
-        max_seq_len=min(records.integer(hf.get('max_position_embeddings', 8192), 'max_position_embeddings'),
-                        DEFAULT_MAX_SEQ_LEN),
+        max_seq_len=context_lengths(hf, 8192)[0],
         rope_theta=theta, layer_types=layer_types,
         norm_type='layer', norm_bias=bool(hf.get('norm_bias', False)),
         norm_eps=records.number(hf.get('norm_eps', 1e-5), 'norm_eps'),
@@ -147,10 +145,10 @@ _MODERNBERT_PACKED = (
     Packed('.mlp.Wi.weight', ('.mlp.gate_proj.weight', '.mlp.up_proj.weight'), 0),
     Packed('.mlp.Wi.bias', ('.mlp.gate_proj.bias', '.mlp.up_proj.bias'), 0))
 
-_HEAD: Mapping[str, tuple[str, ...]] = {
+# The masked LM's head, by its names after the renames (`decoder` is `lm_head`).
+_HEAD: Leaves = {
     'head.dense.weight': ('head_dense', 'kernel'), 'head.norm.weight': ('head_norm', 'scale'),
-    'head.norm.bias': ('head_norm', 'bias'), 'decoder.bias': ('head_bias',)}
-_HEAD_NAMES = {'.'.join(path): name for name, path in _HEAD.items()}
+    'head.norm.bias': ('head_norm', 'bias'), 'lm_head.bias': ('head_bias',)}
 
 
 def _nested(name: str) -> str:
@@ -164,19 +162,7 @@ def _modernbert_prepare(tensors: Mapping[str, np.ndarray],
 
 
 def _modernbert_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    name = _nested(name)
-    if name in _HEAD:
-        return ('params', *_HEAD[name])
-    # Alias inspection sees the raw names before preparation splits them.
-    if name.endswith(('.attn.Wqkv.weight', '.mlp.Wi.weight', '.mlp.Wi.bias')):
-        return None
-    return renamed_path(_MODERNBERT_NAMES, name, config)
-
-
-def _modernbert_export_path(dew_name: str, config: Mapping[str, object]) -> str | None:
-    if dew_name in _HEAD_NAMES:
-        return _HEAD_NAMES[dew_name]
-    return renamed_name(_MODERNBERT_NAMES, dew_name, config)
+    return renamed_path(_MODERNBERT_NAMES, _nested(name), config, leaves=_HEAD)
 
 
 def _modernbert_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -216,7 +202,7 @@ MODERNBERT = DecoderFamily(
     ('modernbert',), _modernbert_config,
     lambda fields: not fields.causal and fields.embedding_norm and not fields.first_attention_norm,
     'modernbert', 'ModernBertForMaskedLM', _modernbert_export,
-    weight_path=_modernbert_path, export_path=_modernbert_export_path,
+    weight_path=_modernbert_path, export_path=partial(renamed_name, _MODERNBERT_NAMES, leaves=_HEAD),
     prepare=_modernbert_prepare, spelling=_nested, packed=_MODERNBERT_PACKED, preserve_source_layout=False,
     tied_head_names=('decoder.weight', 'model.embeddings.tok_embeddings.weight'),
 )

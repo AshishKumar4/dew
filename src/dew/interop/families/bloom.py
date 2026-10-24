@@ -7,6 +7,7 @@ from dew import records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
+    MEGATRON_NAMES,
     DecoderFamily,
     DecoderFields,
     Renames,
@@ -52,16 +53,7 @@ def _bloom_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
 
 
 _BLOOM_NAMES: Renames = (
-    ('transformer.word_embeddings_layernorm', 'model.embedding_layernorm'),
-    ('transformer.word_embeddings', 'model.embed_tokens'), ('transformer.ln_f', 'model.norm'),
-    ('transformer.h', 'model.layers'), ('self_attention.dense', 'self_attn.o_proj'),
-    ('mlp.dense_h_to_4h', 'mlp.up_proj'), ('mlp.dense_4h_to_h', 'mlp.down_proj'))
-
-
-def _bloom_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    if '.self_attention.query_key_value.' in name:
-        return None
-    return renamed_path(_BLOOM_NAMES, name, config)
+    ('transformer.word_embeddings_layernorm', 'model.embedding_layernorm'), *MEGATRON_NAMES)
 
 
 def _bloom_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -81,7 +73,7 @@ BLOOM = DecoderFamily(
     ('bloom',), _bloom_config,
     lambda fields: fields.position_embedding == 'alibi' and fields.embedding_norm,
     'bloom', 'BloomForCausalLM', _bloom_export,
-    weight_path=_bloom_path, export_path=partial(renamed_name, _BLOOM_NAMES),
+    weight_path=partial(renamed_path, _BLOOM_NAMES), export_path=partial(renamed_name, _BLOOM_NAMES),
     packed=grouped_qkv('.self_attention.query_key_value'),
     export_weights=decoder_tensors,
     preserve_source_layout=False,
