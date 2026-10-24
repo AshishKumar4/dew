@@ -834,10 +834,16 @@ def test_the_durations_fold_rewrites_only_a_file_its_record_no_longer_cuts(ci, t
         assert {node: s for node, s in folded.items() if f"/{name}.py" in node} == {
             node: s for node, s in record.items() if f"/{name}.py" in node}
     assert "tests/test_gone.py::test_x" not in folded
+    # The next plan weighs each group of a refolded file at what its tests take, within the budget the plan
+    # keeps a cut within; before the fold, test_drift's kept cut was weighed at 345 s and ran 390 s.
     timings = {"rows": {row["name"]: row["seconds"] for row in rows if row["name"].startswith("3.12:")}}
     for entry in ci.plan(240.0, timings):
         if entry["python"] == "3.12" and entry["tests"] in ("tests/test_grown.py", "tests/test_drift.py"):
-            assert entry["weight"] <= 240.0, entry
+            nodes = sorted(node for node in folded if node.startswith(entry["tests"] + "::"))
+            group, count = (int(part) for part in entry["split"].split("/"))
+            run = ci.session.groups([folded[node] for node in nodes], count)[group - 1]
+            took = sum(observed[node] for node in nodes[run.start:run.stop])
+            assert entry["weight"] == took <= ci.KEPT * 240.0, entry
 
 
 def test_a_tasks_wall_time_is_apportioned_by_its_files_tests_times(ci):
@@ -1022,12 +1028,14 @@ def test_a_durations_change_reruns_only_the_groups_cut_from_it(ci, tmp_path, mon
 
 
 def commit(root: Path, message: str) -> str:
-    """Every change in checkout `root` committed (a repository made at the first), and the commit's sha."""
-    if not (root / ".git").exists():
+    """Checkout `root`'s changes committed, and the commit's sha: every file at the first, which makes the
+    repository, and its tracked files' changes after, so what a run leaves in the checkout stays out."""
+    first = not (root / ".git").exists()
+    if first:
         subprocess.run(["git", "init", "-q"], cwd=root, check=True)
-    for arguments in (["add", "-A"], ["commit", "-qm", message]):
-        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *arguments], cwd=root, check=True,
-                       capture_output=True)
+        subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit",
+                    "-qm" if first else "-qam", message], cwd=root, check=True, capture_output=True)
     return subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True,
                           text=True).stdout.strip()
 
