@@ -27,6 +27,7 @@ import numpy as np
 
 from dew import registry
 from dew.nn.inputs import ModelInputs
+from dew.nn.precision import at_least_fp32
 from dew.nn.text_encoders import DEFAULT_MODEL
 from dew.objectives.base import Batch, Variables
 from dew.registry import DtypeName
@@ -42,7 +43,7 @@ def unit_range(pixels: jax.typing.ArrayLike) -> jax.Array:
     stay float64.
     """
     pixels = jnp.asarray(pixels)
-    return (pixels.astype(jnp.promote_types(pixels.dtype, jnp.float32)) - 127.5) / 127.5
+    return (pixels.astype(at_least_fp32(pixels.dtype)) - 127.5) / 127.5
 
 
 @dataclass(frozen=True)
