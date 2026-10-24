@@ -51,14 +51,15 @@ def float64_logits(checkpoint, revision, weights, batches) -> list[np.ndarray]:
     """Each batch's logits in float64, on the CPU: the model built in float64 from its config, so its
     rotary tables, the vision tower's among them, are computed in float64 rather than widened from
     float32, and every float32 pin in it (norms, softmax, a pooler's or standardizer's casts) is
-    widened; the fp32 checkpoint `weights` load into it exactly."""
+    widened; its experts, where it has them, run one at a time, as Torch's grouped GEMM takes no
+    float64; the fp32 checkpoint `weights` load into it exactly."""
     from tools.diffusers_wan_reference import float64
 
     torch.set_num_threads(1)
     with float64(), torch.no_grad():
         model = AutoModelForImageTextToText.from_config(
             AutoConfig.from_pretrained(checkpoint, revision=revision), dtype=torch.float64,
-            attn_implementation='eager').eval()
+            attn_implementation='eager', experts_implementation='eager').eval()
         model.load_state_dict(weights)
         return [model(**batch, use_cache=False).logits.double().numpy() for batch in batches]
 
