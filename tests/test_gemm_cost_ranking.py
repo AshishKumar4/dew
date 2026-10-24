@@ -83,10 +83,11 @@ def _launch(record):
 
 
 def _config(text: str):
-    """A config from its repr: `Tile(block_m=64, ...)` or `Tiles(...)`."""
+    """A config from its repr: `Tile(block_m=64, ...)` or `Tiles(..., family='wgmma')`."""
     name, _, fields = text.partition("(")
     values = dict(field.split("=") for field in fields.rstrip(")").split(", "))
-    return {"Tile": Tile, "Tiles": Tiles}[name](**{key: int(value) for key, value in values.items()})
+    parsed = {key: value.strip("'") if value.startswith("'") else int(value) for key, value in values.items()}
+    return {"Tile": Tile, "Tiles": Tiles}[name](**parsed)
 
 
 def _cases():

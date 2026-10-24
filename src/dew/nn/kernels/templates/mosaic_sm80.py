@@ -7,6 +7,7 @@ registers (the fork's relayout, jax 0.11.2.post13 and later), as FlashAttention-
 Its layouts are its operands' dtype's (`Layout.MMA_ACC(dtype)`), so a bundle is a dtype's (`Mma`)."""
 
 import dataclasses
+import functools
 from collections.abc import Callable
 
 import jax
@@ -72,6 +73,22 @@ class Mma(mosaic.Family):
     name = "mma.sync"
     rows = 16
     consumers = 1
+    bounded_loads = False
+    role_rows = 4 * 16
+    operands_in_registers = True
+
+    def registers(self, consumers: int) -> int:
+        del consumers  # one role, at a thread's whole budget
+        return 255
+
+    def column_unit(self, dtype) -> int:
+        # Its stores move a row through registers, laid over the role's threads, one element or more each.
+        del dtype
+        return mosaic.THREADS
+
+    def depths(self, dtype) -> tuple[int, ...]:
+        # Its operand blocks' rows staged at a 128- or 64-byte swizzle (`swizzled`).
+        return tuple(swizzle // jnp.dtype(dtype).itemsize for swizzle in (mosaic.SWIZZLE_BYTES, 64))
 
     @property
     def layout(self):
@@ -94,11 +111,11 @@ class Mma(mosaic.Family):
         return plgpu.Layout.MMA_RHS(self.dtype)
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
-               interpret: bool) -> Callable:
+               interpret: bool, approx_math: bool = True) -> Callable:
         _one(consumers)
         return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
-                            compiler_params=plgpu.CompilerParams(approx_math=True),
-                            interpret=plgpu.InterpretGPUParams() if interpret else None)
+                            compiler_params=plgpu.CompilerParams(approx_math=approx_math),
+                            interpret=mosaic.interpreted(interpret))
 
     def scoped(self, body, *allocations, streams) -> None:
         pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)
@@ -119,6 +136,33 @@ class Mma(mosaic.Family):
 
     def stream(self, streams, views, lo, hi) -> None:
         del streams, views, lo, hi
+
+    def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, consumer: Callable, *,
+                consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0) -> None:
+        # Each tile's pipeline is its own (`emit_pipeline` fills and drains it), its step count static; an
+        # output is staged after it, in the shared memory its stages held, and stored through registers
+        # (no TMA before Hopper).
+        _one(consumers)
+        del in_flight
+
+        def store(output, value, ref, place):
+            shape, dtype = outputs[output]
+
+            @functools.partial(pl.run_scoped, smem=plgpu.SMEM(shape, dtype))
+            def _(smem):
+                smem[...] = value.astype(dtype)
+                mosaic.store_rows(smem, ref, *place, copy=mosaic.copied)
+
+        @plgpu.nd_loop(tiles, collective_axes=axis)
+        def _(loop: plgpu.NDLoopInfo):
+            active, steps, views, tile = schedule(loop.index)
+
+            def walk(step, start, shapes, *, initial=None):
+                return self.walk(self.opened(streams, views), ((step, 0, steps),), start, shapes, interpret,
+                                 initial=initial)
+
+            pl.when(active)(lambda: consumer(0, tile, walk, store, active=True))
+            pl.when(~active)(lambda: consumer(0, tile, mosaic.unwalked(self), store, active=False))
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None
