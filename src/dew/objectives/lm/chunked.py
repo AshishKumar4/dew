@@ -806,7 +806,7 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, columns: _C
             values.append(float32_einsum('tv,vd->td', d_raw, product_matrix, precision=precision,
                                      preferred_element_type=work))
             operand = jax.lax.dynamic_slice_in_dim(hidden, start, size).astype(operands)
-            # Summed over the token tiles as the whole head's one product sums them (`running_sum`).
+            # Summed over the token tiles as the bounded head sums them (`_token_sum`).
             d_table = added_to(d_table, float32_einsum('tv,td->vd', d_raw, operand, precision=precision,
                                                        preferred_element_type=work))
         outputs = tuple(jax.lax.dynamic_update_slice_in_dim(out, value, start, axis=0)
@@ -818,7 +818,7 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, columns: _C
         outputs += (jnp.zeros((count,), jnp.int32),)
     if gradients:
         outputs += (jnp.zeros((count, features), work),)
-    d_table = running_sum(table.shape, work) if gradients else None
+    d_table = _token_sum(table.shape, work, count, chunk) if gradients else None
     d_columns = (jax.tree.map(lambda terms: _token_sum(terms.shape, work, count, chunk), columns)
                  if gradients else None)
     outputs, d_table, d_columns = _over_tiles((outputs, d_table, d_columns), count, chunk, tokens)
