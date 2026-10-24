@@ -87,6 +87,7 @@ def test_a_unified_source_can_omit_either_media_component(source, tmp_path, medi
     reference.load_state_dict({name: value for name, value in original.state_dict().items() if name in names},
                                strict=True)
     reference.save_pretrained(tmp_path, safe_serialization=True)
+    reference.config.to_json_file(tmp_path / "config.json", use_diff=False)
     for name in ("processor_config.json", "tokenizer_config.json", "tokenizer.json"):
         shutil.copyfile(FIXTURE / name, tmp_path / name)
 
@@ -120,6 +121,9 @@ def test_equal_attention_geometries_still_use_the_full_layer_vision_mask(source,
     reference = Gemma4UnifiedForConditionalGeneration(config).float().eval()
     scatter_weights(reference)
     reference.save_pretrained(tmp_path, safe_serialization=True)
+    # An explicit null per_layer_config means no override. A diff-only config omits it and
+    # reconstructs the reference's default 512-wide global heads on reload.
+    reference.config.to_json_file(tmp_path / "config.json", use_diff=False)
     for name in ("processor_config.json", "tokenizer_config.json", "tokenizer.json"):
         shutil.copyfile(FIXTURE / name, tmp_path / name)
     assert_forward(source_pair(tmp_path), lambda seed: unified_draw(config, seed),

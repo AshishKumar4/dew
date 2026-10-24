@@ -410,6 +410,7 @@ def write_gemma4_unified_native() -> None:
         for index, layer in enumerate(model.model.language_model.layers):
             layer.layer_scalar.fill_(0.8 + index * 0.125)
     model.save_pretrained(destination, safe_serialization=True)
+    config.to_json_file(destination / "config.json", use_diff=False)
     special = {"<pad>": 0, "<bos>": 1, "<eos>": 2, "<unk>": 3,
                "<|video|>": 56, "<audio>": 57, "<start_of_audio>": 58, "<end_of_audio>": 59,
                "<image_soft_token>": 60, "<start_of_image>": 61, "<end_of_image>": 62}
