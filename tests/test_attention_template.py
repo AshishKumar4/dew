@@ -100,10 +100,46 @@ CASES = {
 }
 
 
+OPTIONS = ((20, 4, 10), (10, 3, 12))
+"""Each row's decision layout over its call's 100 tokens (`decision_runs`): its prefix's length, then its
+options' count and width, the second row's options leaving a fragment empty."""
+
+
+def decision_runs() -> tuple[np.ndarray, np.ndarray]:
+    """A parallel decision layout's runs `[2, 100, 6, 2]` and places `[2, 100]` (`dew.decision.layout`): a
+    shared token reads every fragment of its row, the prefix, each option and the suffix, each a run of its
+    own; an option's token reads the prefix, its own option and the suffix, the rest empty. The places
+    restart at each option, the suffix continuing after the widest, so they never decrease within a run."""
+    runs = np.zeros((ROWS, QUERIES, 6, 2), np.int32)
+    places = np.zeros((ROWS, QUERIES), np.int32)
+    for row, (prefix, count, width) in enumerate(OPTIONS):
+        after = prefix + count * width
+        fragments = [(0, prefix), *((prefix + k * width, prefix + (k + 1) * width) for k in range(count)),
+                     (after, QUERIES)]
+        places[row] = np.concatenate([np.arange(prefix), *(np.arange(prefix, prefix + width),) * count,
+                                      np.arange(prefix + width, prefix + width + QUERIES - after)])
+        for query in range(QUERIES):
+            option = (query - prefix) // width if prefix <= query < after else None
+            kept = fragments if option is None else [fragments[0], fragments[1 + option], fragments[-1]]
+            runs[row, query, :len(kept)] = kept
+    return runs, places
+
+
+RUN_CASES = {
+    "runs": {"runs": True},
+    "runs-window-places": {"runs": True, "sliding_window": 6, "positions": True},
+    "runs-causal": {"runs": True, "causal": True},
+    "runs-documents-valid": {"runs": True, "segment_ids": "own", "valid": True},
+}
+"""Call forms over runs (`template.spans`'s `runs`): a decision row's, under a two-sided window over its
+places, under causality, and beside packed documents and key validity."""
+
+
 def geometry(case: dict) -> tuple[int, int]:
     """`case`'s query and key counts: a call's own documents, or blocks of its own tokens, are its keys, so
     it has as many of each; a cache call's blocks are its keys'."""
-    own = case.get("segment_ids") == "own" or (case.get("block_groups") and case.get("segment_ids") is None)
+    own = (case.get("segment_ids") == "own" or case.get("runs")
+           or (case.get("block_groups") and case.get("segment_ids") is None))
     return (QUERIES, QUERIES) if own else (QUERIES, KEYS)
 
 
@@ -138,6 +174,12 @@ def arguments(case: dict) -> dict:
         keywords["block_groups"], keywords["image_groups"] = block_groups(geometry(case)[1])
     if case.get("valid"):
         keywords["valid"] = key_validity(geometry(case)[1])
+    if case.get("runs"):
+        runs, places = decision_runs()
+        keywords["runs"] = jnp.asarray(runs)
+        if case.get("positions"):
+            keywords["positions"] = (jnp.asarray(places), jnp.asarray(places))
+            return keywords
     if case.get("positions"):
         # Each token's place in its own document, as a packed row's coordinates count it, over its real
         # tokens where only some are (`counted_places`).
@@ -203,11 +245,17 @@ def dews_mask(case: dict) -> np.ndarray:
     if "valid" in keywords:
         real = jnp.asarray(keywords["valid"])[:, None, None, :]
         mask = real if mask is None else jnp.logical_and(mask, real)
+    if "runs" in keywords:
+        # A query keeps a key one of its runs holds.
+        runs = np.asarray(keywords["runs"])
+        index = np.arange(keys)[None, None, :, None]
+        held = np.any((index >= runs[:, :, None, :, 0]) & (index < runs[:, :, None, :, 1]), axis=-1)
+        mask = held[:, None] if mask is None else jnp.logical_and(mask, held[:, None])
     full = np.ones((ROWS, queries, keys), bool)
     return full if mask is None else np.broadcast_to(np.asarray(mask)[:, 0], full.shape)
 
 
-@pytest.mark.parametrize("case", CASES.values(), ids=CASES)
+@pytest.mark.parametrize("case", [*CASES.values(), *RUN_CASES.values()], ids=[*CASES, *RUN_CASES])
 def test_key_spans_keep_the_keys_dews_masks_keep(case):
     """Each call form's spans (`template.spans`, `template.dense`) keep exactly the keys Dew's reference
     path keeps, under `jax.jit` too, the bounds traced."""
@@ -264,7 +312,7 @@ def uniform_documents(ids, block: int) -> np.ndarray:
 
 
 @pytest.mark.parametrize("block_q, block_k", BLOCKS)
-@pytest.mark.parametrize("case", CASES.values(), ids=CASES)
+@pytest.mark.parametrize("case", [*CASES.values(), *RUN_CASES.values()], ids=[*CASES, *RUN_CASES])
 def test_a_block_map_visits_every_visible_entry_and_calls_a_tile_whole_only_where_it_is(case, block_q,
                                                                                          block_k):
     """At each tile shape, every visible entry lies in a tile its query block visits (`lo` to `hi`), and
@@ -274,7 +322,9 @@ def test_a_block_map_visits_every_visible_entry_and_calls_a_tile_whole_only_wher
     block's whole range (`full_lo` to `full_hi`) whose blocks carry one document, or which has no
     documents, has every entry visible, the padding past the call's queries and keys excluded from no
     tile; with no narrowing, every tile inside the call is whole, and a call of its own documents has
-    whole tiles inside them."""
+    whole tiles inside them. Over runs the block visits only its ranges (`ranges`), each tile once, and
+    every tile of each run's whole range (`wholes`) has every entry visible; a tile its queries see whole
+    through different runs is not called whole, so the whole ranges are sound, not exact."""
     queries_, keys_ = geometry(case)
     spans = template.spans(queries_, keys_, ROWS, **arguments(case))
     blocks = template.block_map(spans, block_q, block_k)
@@ -285,6 +335,29 @@ def test_a_block_map_visits_every_visible_entry_and_calls_a_tile_whole_only_wher
     i, j = queries // block_q, keys // block_k
     assert np.all((lo[rows, i] <= j) & (j < hi[rows, i]))
     assert np.all((q_lo[rows, j] <= i) & (i < q_hi[rows, j]))
+    if blocks.ranges is not None:
+        ranges, wholes = np.asarray(blocks.ranges), np.asarray(blocks.wholes)
+        # The ranges are sorted, disjoint, nonempty first: a walk of them visits each tile once.
+        lengths = ranges[..., 1] - ranges[..., 0]
+        assert np.all(lengths >= 0)
+        assert np.all(ranges[..., 1:, 0][lengths[..., 1:] > 0] >= ranges[..., :-1, 1][lengths[..., 1:] > 0])
+        assert np.all(np.diff((lengths > 0).astype(int), axis=-1) <= 0)
+        covered = np.any((ranges[rows, i, :, 0] <= j[:, None]) & (j[:, None] < ranges[rows, i, :, 1]), -1)
+        assert covered.all()
+        tiles = np.arange(-(-keys_ // block_k))
+        whole_tiles = np.any((wholes[..., None, :, 0] <= tiles[:, None])
+                             & (tiles[:, None] < wholes[..., None, :, 1]), axis=-1)
+        padded = np.zeros((ROWS, -(-queries_ // block_q) * block_q, len(tiles) * block_k), bool)
+        padded[:, :queries_, :keys_] = seen
+        entire = padded.reshape(ROWS, padded.shape[1] // block_q, block_q, -1, block_k).all(axis=(2, 4))
+        if spans.query_ids is not None and spans.key_ids is not None:
+            query_doc = uniform_documents(spans.query_ids, block_q)
+            key_doc = uniform_documents(spans.key_ids, block_k)
+            whole_tiles &= (query_doc[:, :, None] == key_doc[:, None, :]) & (query_doc[:, :, None] != 0)
+        assert not (whole_tiles & ~entire).any()
+        if case is RUN_CASES["runs"] and (block_q, block_k) == (16, 16):
+            assert whole_tiles.any()
+        return
     query_doc = key_doc = None
     if spans.query_ids is not None and spans.key_ids is not None:
         query_doc = uniform_documents(spans.query_ids, block_q)
@@ -531,7 +604,7 @@ def test_the_spans_form_says_what_their_intervals_hold(case):
     assert (spans.form != "spans") == (not plain and case.get("causal") in (None, True))
 
 
-@pytest.mark.parametrize("case", CASES.values(), ids=CASES)
+@pytest.mark.parametrize("case", [*CASES.values(), *RUN_CASES.values()], ids=[*CASES, *RUN_CASES])
 def test_a_query_reads_a_key_exactly_where_its_spans_hold_one(case):
     """`template.reads`, the queries a call's spans leave a key, is where their visibility holds one."""
     queries, keys = geometry(case)
