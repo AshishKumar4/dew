@@ -1,0 +1,21 @@
+{
+  "generator": "tools/block_override_reference.py",
+  "generator_revision": "28e8385864d64757c9bd727357f12f1960330cad",
+  "repo": "baselabs/elephant-1",
+  "revision": "b3f8a93462fb1051a9de031e94a7ff380e254072",
+  "patch_sha256": "f234c125f1d38d82104b9e1f24e75bde51e4401928acfba2fbf5c59ef2fb46b8",
+  "packages": {
+    "transformers": "5.19.0",
+    "torch": "2.8.0+cpu",
+    "numpy": "2.4.0",
+    "safetensors": "0.8.0"
+  },
+  "seeds": 8,
+  "redraw": 4,
+  "parameter_seed": 43,
+  "attention_impl": "eager",
+  "device": "cpu",
+  "precision": "ieee",
+  "recorded_seed_capacity": 16,
+  "sizing_revision": "a6d2c781d972eb7e8f887f2cea583aea7e2ad48e"
+}
