@@ -150,11 +150,6 @@ class Mma(mosaic.Family):
         for view, ref, _ in copies:
             ref[...] = plgpu.load(view, layout=self.lhs, optimized=False)
 
-    def stored(self, parts, views, *, smem) -> None:
-        del smem
-        for part, view in zip(parts, views, strict=True):
-            view[...] = part.astype(view.dtype)
-
     def added(self, value: jax.Array, view, interpret: bool, *, smem) -> None:
         del smem
         if not interpret:

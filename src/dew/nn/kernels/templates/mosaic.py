@@ -405,9 +405,12 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     def loaded(self, copies) -> None:
         """Each `(view, ref, barrier)` copied whole into its shared-memory `ref`."""
 
-    @abc.abstractmethod
     def stored(self, parts, views, *, smem) -> None:
-        """Each of `parts` written whole to its view of `views`, through `smem` where the family stores so."""
+        """Each of `parts` written whole to its view of `views`, through `smem` where the family stores so
+        (a TMA family's, `RingFamily`'s): from registers directly here, as a family without TMA stores."""
+        del smem
+        for part, view in zip(parts, views, strict=True):
+            view[...] = part.astype(view.dtype)
 
     @abc.abstractmethod
     def added(self, value: jax.Array, view, interpret: bool, *, smem) -> None:

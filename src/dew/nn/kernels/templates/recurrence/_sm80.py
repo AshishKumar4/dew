@@ -172,12 +172,6 @@ class MmaSync(mosaic.Family[dict, dict, jax.Array]):
         if not _INTERPRETED.get():
             plgpu.wait_gmem_to_smem(0)
 
-    def stored(self, parts, views, *, smem) -> None:
-        # Registers to global memory directly: no TMA before Hopper.
-        del smem
-        for part, view in zip(parts, views, strict=True):
-            view[...] = part.astype(view.dtype)
-
     def added(self, value: jax.Array, view, interpret: bool, *, smem) -> None:
         raise NotImplementedError("mma.sync's bundle adds into global memory by no TMA reduction (sm90's)")
 
