@@ -138,7 +138,9 @@ def key_runs(slots: jax.Array, segments: jax.Array, options: int, *, causal: boo
     another option's, over `slots` `[B, L]` (0 shared, k for option k's tokens) and `segments` `[B, L]`
     (`DecisionInputs`), and under `causal` none after it. The runs are the document's fragments: its
     prefix, each of its options, its suffix, each a run of its own, in which the layout's positions never
-    decrease (`layout._parallel` restarts them only between options). A shared token reads every fragment;
+    decrease (`layout._parallel` restarts them only between options). A document's options lie back to
+    back, as `layout._parallel` lays them, its shared tokens only before the first and after the last: a
+    shared token between two options would lie in no fragment. A shared token reads every fragment;
     an option's token the prefix, its own option and the suffix; padding (segment 0), trailing, its own
     span. An unread fragment is `(0, 0)`. `options` is the layout's option capacity (the last axis of
     `DecisionInputs.options`), so the runs' count is static."""

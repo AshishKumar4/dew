@@ -68,6 +68,11 @@ def test_the_decision_runs_read_what_its_pairwise_mask_reads(causal):
     """`key_runs` over packed documents and padding equals `_read`'s mask, bitwise, and keeps its static
     count of runs, the option capacity and two."""
     slots, segments, _ = layout(ROWS, LENGTH)
+    # The layout's options lie back to back in each document, no shared token between two of them.
+    for row in range(len(slots)):
+        for document in set(segments[row].tolist()) - {0}:
+            options = np.nonzero((segments[row] == document) & (slots[row] > 0))[0]
+            assert np.all(slots[row, options.min():options.max() + 1] > 0)
     runs = np.asarray(key_runs(jnp.asarray(slots), jnp.asarray(segments), OPTIONS, causal=causal))
     assert runs.shape == (2, LENGTH, OPTIONS + 2, 2)
     np.testing.assert_array_equal(dense(runs, LENGTH), visible(slots, segments, causal=causal))
