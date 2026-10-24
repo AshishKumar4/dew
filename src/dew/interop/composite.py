@@ -4,6 +4,8 @@ Source kinds describe files and constructor records. Snapshot resolution, tensor
 loading and component assembly belong to `Pretrained.load`.
 """
 
+from __future__ import annotations
+
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
