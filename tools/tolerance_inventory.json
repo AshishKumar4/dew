@@ -514,7 +514,7 @@
    "lane": "Training"
   },
   "tests/test_multimodal_model.py": {
-   "comparisons": 19,
+   "comparisons": 18,
    "lane": "Kernels"
   },
   "tests/test_multiprocess.py": {
