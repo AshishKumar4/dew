@@ -15,7 +15,7 @@ import pytest
 from generation_support import INTERPRETS
 from jax.sharding import Mesh
 from reference_error import assert_as_exact
-from test_attention_template import CASES, ROWS, arguments, geometry as core_geometry
+from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
 from test_attention_triton import HOOKS, SCORE_HOOKS, gate_of, hooks_for, score_hooks
 
 from dew.nn.kernels import generation
@@ -406,3 +406,28 @@ def test_a_causal_backward_of_more_keys_than_queries_is_on_par_on_an_h100():
 def test_the_backward_is_on_par_on_an_h100(call, accurate, fused):
     """The backward in both forms compiled on an H100."""
     _check_backward(call, SHAPES["compiled"], accurate=accurate, interpret=False, fused=fused)
+
+
+def test_a_call_over_runs_is_refused_by_the_legality_rule():
+    """Runs, several key intervals a query (`KeySpans`), are no call this mainloop reads: its legality rule
+    names them, and a direct forward or backward over a decision row's runs refuses by it, before any
+    launch, where the route sends them to the Triton mainloop."""
+    queries, keys = core_geometry(RUN_CASES["runs"])
+    spans = template.spans(queries, keys, ROWS, **arguments(RUN_CASES["runs"]))
+    tiles = attention_mosaic.DEFAULTS["wgmma"]
+    reason = attention_mosaic.refused(jnp.bfloat16, 128, 128, None, backward=False,
+                                      tile=(tiles.block_q, tiles.block_k), runs=spans.start.shape[-1])
+    assert reason is not None
+    query = jnp.zeros((ROWS, queries, 2, 128), jnp.bfloat16)
+    key = jnp.zeros((ROWS, keys, 1, 128), jnp.bfloat16)
+    with pytest.raises(NotImplementedError) as forward:
+        attention_mosaic.forward(query, key, key, spans, family=mosaic_sm90.WGMMA, interpret=True)
+    assert str(forward.value) == reason
+    with pytest.raises(NotImplementedError) as backward:
+        nothing = jnp.zeros(())
+        attention_mosaic.backward(query, key, key, spans, None, query,
+                                  residuals=(nothing, nothing, nothing, template.Split(*[nothing] * 4)),
+                                  family=mosaic_sm90.WGMMA, interpret=True)
+    assert str(backward.value) == attention_mosaic.refused(
+        jnp.bfloat16, 128, 128, None, backward=True, tile=(tiles.block_q, tiles.block_k),
+        runs=spans.start.shape[-1])
