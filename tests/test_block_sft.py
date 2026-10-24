@@ -15,14 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from diffusion_support import (
-    applied,
-    as_a_step,
-    float32_update,
-    float64_gradient,
-    moved_weights,
-    objective_gradient,
-)
+from diffusion_support import as_a_step, float64_gradient, moved_weights, objective_gradient
 from reference_error import assert_as_exact
 from safetensors.numpy import load_file
 
@@ -75,11 +68,11 @@ def reference_variables(loaded, name):
     return objective(loaded, variables=values).init(jax.random.key(0))
 
 
-def trainer_update(obj, batch, run_key, rate: float):
-    """The trainer's first SGD update at `rate` of a variables tree's params on one device, compiled
-    once (`stepped`), and the step's draws (`example_fields`). One device holds the comparison to the
-    trainer's composition of the update; its layouts are the parallelism matrix's."""
-    trainer = Trainer(obj, optax.sgd(rate), key=run_key, split=1)
+def trainer_update(obj, batch, run_key, optimizer):
+    """The trainer's first step under `optimizer` of a variables tree on one device, compiled once
+    (`stepped`, its stepped state), and the step's draws (`example_fields`). One device holds the
+    comparison to the trainer's composition of the update; its layouts are the parallelism matrix's."""
+    trainer = Trainer(obj, optimizer, key=run_key, split=1)
     trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
     initial = trainer.initial_state()
     step = Step(jnp.asarray(0, jnp.int32), jax.random.fold_in(initial.key, 0), None,
@@ -90,39 +83,38 @@ def trainer_update(obj, batch, run_key, rate: float):
         # The step consumes its state: it steps copies.
         state = jax.tree.map(jnp.copy, initial).replace(variables=jax.tree.map(jnp.copy, values))
         state, *_ = run(state, batch)
-        return jax.tree.map(np.asarray, state.variables["params"])
+        return state
 
     return stepped, step
 
 
 UPDATE_SEEDS = {"text": 16, "image": 16}
-"""Check 1's declared seeds for the trainer's update of each SFT model, sized paired (`seeds_for` with
+"""Check 1's declared seeds for the trainer's gradient of each SFT model, sized paired (`seeds_for` with
 the trainer's step as `dew_fn`)."""
 
 
 def assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, seeds: int):
-    """The trainer's update is the objective's at the step's draws: sgd(1)'s update applied is on par
-    with the objective's gradient over drawn weights (check 1), `twin`, the objective over its model in
-    float64, at the same draws the truth. They are two programs, which round otherwise; the
-    objective's gradient is compiled as one, as the trainer's is: XLA:CPU's compiled gradient of this
-    model sat 1.0 to 5.2 times further from float64 than the same ops run one by one (per leaf,
-    2026-10-21), a gap of the compiler's and not of the trainer. The run's own path, its loader, plan
-    and marked rows, then takes the trainer's own update on one device, to the bit: the same program
-    on the same values."""
-    stepped, step = trainer_update(obj, batch, run_key, 1.0)
+    """The trainer's update is the objective's at the step's draws: the gradient its step takes, which
+    sgd with a momentum of zero keeps as its trace, is on par with the objective's own over drawn
+    weights (check 1), `twin`, the objective over its model in float64, at the same draws the truth.
+    They are two programs, which round otherwise; the objective's gradient is compiled as one with
+    the step's compiler options (`as_a_step`). The gradients are compared as they are, not through
+    an update applied to the weights, whose rounding at the weights' magnitude would swamp theirs.
+    The run's own path, its loader, plan and marked rows, then takes the trainer's own update on one
+    device, to the bit: the same program on the same values."""
+    stepped, step = trainer_update(obj, batch, run_key, optax.sgd(1.0, momentum=0.0))
 
     def trained(values):
-        return jax.tree.map(applied, values["params"], stepped(values))
+        return jax.tree.map(np.asarray, optax.tree_utils.tree_get(stepped(values).opt_state, "trace"))
 
-    objective_update = float32_update(as_a_step(obj, variables, batch,
-                                                lambda values: objective_gradient(obj, values, batch, step)))
-    truth = float64_gradient(twin, batch, step)
-    assert_as_exact(trained, objective_update, moved_weights(variables), "trainer update", seeds=seeds,
-                    truth_fn=truth)
-    taken, _ = trainer_update(obj, batch, run_key, 0.001)
+    gradient = as_a_step(obj, variables, batch, lambda values: objective_gradient(obj, values, batch, step))
+    assert_as_exact(trained, gradient, moved_weights(variables), "trainer update", seeds=seeds,
+                    truth_fn=float64_gradient(twin, batch, step))
+    taken, _ = trainer_update(obj, batch, run_key, optax.sgd(0.001))
     solo = Trainer(obj, optax.sgd(0.001), key=run_key)
     solo.device_mesh = MeshSpec().build(jax.devices()[:1])
-    assert_tree_equal(solo.fit(data, steps=1, log_every=1).variables["params"], taken(variables))
+    assert_tree_equal(solo.fit(data, steps=1, log_every=1).variables["params"],
+                      jax.tree.map(np.asarray, taken(variables).variables["params"]))
 
 
 def assert_tree_equal(actual, expected):
