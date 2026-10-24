@@ -130,9 +130,11 @@ RUN_CASES = {
     "runs-window-places": {"runs": True, "sliding_window": 6, "positions": True},
     "runs-causal": {"runs": True, "causal": True},
     "runs-documents-valid": {"runs": True, "segment_ids": "own", "valid": True},
+    "runs-chunk-places": {"runs": True, "chunk": 8, "positions": True},
 }
 """Call forms over runs (`template.spans`'s `runs`): a decision row's, under a two-sided window over its
-places, under causality, and beside packed documents and key validity."""
+places, under causality, beside packed documents and key validity, and in chunks of its places, which
+restart at each option, so a suffix's chunk holds keys of every option."""
 
 
 def geometry(case: dict) -> tuple[int, int]:
