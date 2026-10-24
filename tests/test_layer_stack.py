@@ -617,8 +617,9 @@ def test_a_host_resident_stacks_layer_states_are_a_resident_ones():
 def test_a_host_resident_stack_keeps_what_its_callers_own_filter_asks_for():
     """A caller's own capture filter, every layer's input norm and nothing else, reaches the layers
     a host-resident stack fetches: it keeps the sublayer outputs the resident stack keeps, at the
-    same places, and no layer output nobody asked for."""
-    model = tiny(scan_layers=True, attention_impl="reference")
+    same places, and no layer output nobody asked for. A layer norm runs its own call, where the
+    default RMS norm runs fused into its seam."""
+    model = tiny(scan_layers=True, attention_impl="reference", norm_type="layer")
     variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
     host = jax.sharding.SingleDeviceSharding(jax.devices()[0], memory_kind="pinned_host")
     on_host = {**variables, "params": {
@@ -638,6 +639,39 @@ def test_a_host_resident_stack_keeps_what_its_callers_own_filter_asks_for():
     resident = kept(variables)
     assert resident and all("input_layernorm" in path for path, _ in resident)
     assert kept(on_host) == resident
+
+
+def test_a_host_resident_key_sharing_stack_keeps_layer_states_through_cached_decoding():
+    """A scanned stack whose later layers read the keys and values an earlier one provides, its
+    layers in host memory, read by a caller that keeps every layer's output: decoding a prompt
+    through its cache, it computes the resident stack's tokens and keeps the same layer outputs,
+    the providers' writes carried out of the lifted scope that fetches them."""
+    model = gemma4_shaped(scan_layers=True)
+    tokens = jnp.asarray([[1, 2, 3, 4, 5, 6]], jnp.int32)
+    variables = model.init(jax.random.key(0), tokens)
+    assert any(count > 1 for _, count in model.bind(variables).groups)
+    host = jax.sharding.SingleDeviceSharding(jax.devices()[0], memory_kind="pinned_host")
+    on_host = {**variables, "params": {
+        name: jax.device_put(tree, host) if name.startswith("layers_") else tree
+        for name, tree in variables["params"].items()}}
+    kept = [*model.layer_collections, "cache"]
+
+    def run(tree):
+        steps, cache = [], {}
+        for position in range(tokens.shape[1]):
+            logits, state = model.apply({**tree, **cache}, tokens[:, position:position + 1], decode=True,
+                                        capture_intermediates=model.capture_layers, mutable=kept)
+            steps.append((np.asarray(jnp.argmax(logits, -1)),
+                          sorted(jax.tree_util.keystr(path) for path, _ in
+                                 jax.tree_util.tree_flatten_with_path(state["intermediates"])[0])))
+            cache = {"cache": state["cache"]}
+        return steps
+
+    resident, hosted = run(variables), run(on_host)
+    assert all(paths for _, paths in resident)
+    for (ours, our_paths), (theirs, their_paths) in zip(hosted, resident, strict=True):
+        np.testing.assert_array_equal(ours, theirs)
+        assert our_paths == their_paths
 
 
 def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_resident_one():
