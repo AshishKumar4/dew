@@ -54,6 +54,7 @@ from dew.nn.inputs import (
     ModelInputs,
     pad_token_rows,
     real_slots,
+    shifted_span,
     token_layout,
 )
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
@@ -570,13 +571,11 @@ def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, 
     0 is padding), and with a `role` (`loss_role`) when `roles`, one per
     token, give the target that role."""
     span = depth + 1
-    width = tokens.shape[1] - span
-    counted = xp.ones((tokens.shape[0], width), bool) if pad_id is None else tokens[:, span:] != pad_id
-    if attention_mask is not None:
-        for offset in range(span + 1):
-            counted = counted & attention_mask[:, offset:offset + width].astype(bool)
+    counted = shifted_span(tokens.shape, span, valid=attention_mask, segments=segment_ids, xp=xp)
+    if pad_id is not None:
+        counted = counted & (tokens[:, span:] != pad_id)
     if segment_ids is not None:
-        counted = counted & (segment_ids[:, span:] == segment_ids[:, :-span]) & (segment_ids[:, span:] != 0)
+        counted = counted & (segment_ids[:, span:] != 0)
     if role is not None and roles is not None:
         counted = counted & (roles[:, span:] == role)
     return counted
@@ -767,12 +766,8 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         depth_rows = []
         for depth in range(1, model.num_nextn_predict_layers + 1):
             span = valid.shape[1] - 1 - depth
-            admitted = np.ones((valid.shape[0], span), bool)
-            for offset in range(depth + 1):
-                admitted &= valid[:, offset:offset + span]
+            admitted = shifted_span(valid.shape, depth, valid=valid, segments=documents, xp=np)[:, :-1]
             segments = None if documents is None else documents[:, :span]
-            if documents is not None:
-                admitted &= segments == documents[:, depth:depth + span]
             scored = self._scored(np, tokens, mask, documents, self._batch_roles(batch, np), depth)
             depth_rows.append((self._row_lengths(admitted, segments), self._row_lengths(scored, segments)))
         return depth_rows
