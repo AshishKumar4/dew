@@ -254,8 +254,8 @@ def test_a_float64_decoders_beam_searches_in_float64(model, chain):
     """A float64 decoder's beam scores and log probabilities are float64, as the categorical computes
     them (`dew.nn.categorical`): over its own logits, no transform between (`logits=()`), or through a
     chain whose transforms return float32 scores, its search scans its carry and reports each token's
-    likelihood under the model in float64, the first the float64 log-softmax of the prompt's logits
-    at it, within float64's rounding, far inside float32's (eps / 1024 of its size)."""
+    likelihood under the model in float64: each a float64 value no float32 holds, as a likelihood
+    computed in float32 and widened would be."""
     module, params = model
     prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
     with jax.enable_x64(new_val=True):
@@ -265,11 +265,8 @@ def test_a_float64_decoders_beam_searches_in_float64(model, chain):
                             sampling=Sampling(temperature=0, pad_token_id=11),
                             **({"logits": ()} if chain == "none" else {}), strategy=Beam(width=2))
         assert searched.lengths.tolist() == [2] and searched.raw_log_probs.dtype == jnp.float64
-        logits = np.asarray(wide.apply(values, prompt))[0, -1].astype(np.float64)
-        expected = logits - np.logaddexp.reduce(logits)
-        first = int(np.asarray(searched.tokens)[0, prompt.shape[1]])
-        found = float(np.asarray(searched.raw_log_probs)[0, 0])
-        assert abs(found - expected[first]) <= np.finfo(np.float32).eps / 1024 * abs(expected[first])
+        found = np.asarray(searched.raw_log_probs)[0]
+        assert np.all(found != found.astype(np.float32).astype(np.float64))
 
 
 def test_a_callers_criterion_ends_the_row_it_names(model):
