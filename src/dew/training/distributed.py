@@ -929,10 +929,11 @@ class Layout:
         carrying the `NamedSharding` it is placed with (`shardings`, `Trainer.shardings`), so
         nothing is allocated. The report (`Validation`) gives each leaf's split and the part each
         device holds, the bytes each device of `mesh` keeps between steps, the axes a batch's rows
-        split over, and the logical axes the variables declare that no rule names
-        (`Validation.unbound`). A leaf in host memory (`host`), or on devices outside `mesh` (a
-        CPU-owned state's companion), takes none of a device's memory. Rules naming an axis
-        `mesh` lacks raise ValueError here, as `shardings` refuses them.
+        split over, the collectives a step runs over each axis (`Validation.collectives`), and the
+        logical axes the variables declare that no rule names (`Validation.unbound`). A leaf in
+        host memory (`host`), or on devices outside `mesh` (a CPU-owned state's companion), takes
+        none of a device's memory. Rules naming an axis `mesh` lacks raise ValueError here, as
+        `shardings` refuses them.
 
         `capacity` is the bytes each device of `mesh` has. Unset, each of this process's devices
         gives its allocator's limit (`Device.memory_stats`' `bytes_limit`) where JAX reports one,
