@@ -200,9 +200,14 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
         ids = np.random.default_rng([0x5CA7, seed]).integers(0, VOCAB, (2, 12)).astype(np.int32)
         return ids, np.float32(1.0)
 
+    wide = []
+
     def truth(ids, cotangent):
+        # Built at the first draw, under the float64 the gate runs the truth in, then compiled once.
         with jax.default_device(jax.devices("cpu")[0]):
-            return measured(build(dtype=jnp.float64), widened(variables), widened(training))(ids, cotangent)
+            if not wide:
+                wide.append(measured(build(dtype=jnp.float64), widened(variables), widened(training)))
+            return wide[0](ids, cotangent)
 
     assert_as_exact(measured(scanned, variables, training), measured(plain, variables, training), draw,
                     f"{shape} scanned stack", seeds=SCAN_SEEDS[shape], truth_fn=truth)
