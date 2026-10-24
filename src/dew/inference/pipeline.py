@@ -126,7 +126,7 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout 
 
 def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
                  dtype: str | None, param_dtype: str | None,
-                 revision: str | None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
+                 revision: str | None) -> SavedTask:
     from dew.inference.projections import packed_owned
     from dew.interop import Pretrained, PretrainedPipeline
     from dew.training.distributed import MeshSpec as DefaultMesh

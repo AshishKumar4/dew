@@ -68,7 +68,7 @@ from dew.nn.backbones.decoder_block import layer_scalar_mode
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import MultimodalTransformer
-from dew.objectives.base import Variables
+from dew.objectives.base import SavedTask, Variables
 from dew.registry import dtype_name, from_record, projectors, record_fields, resolve_dtype, towers
 from dew.sampling.pipelines import TextToImage
 from dew.sampling.text import Sampling
@@ -244,7 +244,7 @@ class Pretrained:
         Composite bundles apply the same transformation to each component."""
         return replace(self, variables=transform(self.variables))
 
-    def pipeline(self):
+    def pipeline(self) -> SavedTask:
         """The native task declared by this source kind."""
         raise TypeError(f"{type(self).__name__} has no native task")
 
@@ -374,24 +374,13 @@ class Pretrained:
         (`dew.interop.gguf`), and its tokenizer is the processor when the repo ships
         no tokenizer.
 
-        `single_file` names an original-format diffusion checkpoint in the repo or
-        directory. Diffusers' own key maps convert it once into Dew's cache as the
-        diffusers pipeline it describes (`dew.interop.single_file`), which then loads;
-        the cache entry is published only after that load succeeds. The configs come
-        from the repo or directory when it has a model_index.json, and otherwise from
-        the diffusers repo that diffusers infers from the checkpoint, at the commit
-        fetched. A component the file lacks gets its weights from the same place, or
-        is refused by name.
-
-        `dduf_file` names a DDUF file in the repo or directory, which is a diffusers
-        pipeline packed into one archive. It is unpacked once into Dew's cache
-        (`dew.interop.dduf`) and loads as the directory it packs, the same way
-        diffusers' own `from_pretrained(..., dduf_file=)` reads it.
-
-        `fallback="torchax"` opts into tier 3 for any causal LM that transformers can
-        build, registered or not: transformers' PyTorch forward lowered to JAX by
-        torchax (`dew.interop.torchax_fallback`), with no Dew kernels, sharding rules
-        or cached generation.
+        `single_file` selects an original diffusion checkpoint, converted through
+        Diffusers' key maps (`dew.interop.single_file`); `dduf_file` selects a packed
+        diffusion pipeline (`dew.interop.dduf`). Both load through the ordinary
+        directory pipeline after conversion. `fallback="torchax"` selects the
+        explicit transformers-forward route (`dew.interop.torchax_fallback`).
+        `subfolder` selects a folder within the resolved snapshot; decision releases
+        are assembled from their declared backbone and head components.
 
         Called on a specific kind (`PretrainedDecoder.load`), it refuses a source of
         another kind and names that kind.
@@ -1478,7 +1467,10 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
                 max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming,
                 quantized=source_quantization(config) is not None, checked=checked)
     model, variables = _input_quantization(model, variables, layouts, config, grid)
-    source = str(name_or_dir) if commit is None else f"{name_or_dir}@{commit}"
+    resolved_commit = commit
+    if component is None and commit is not None:
+        resolved_commit = directory.name
+    source = str(name_or_dir) if resolved_commit is None else f"{name_or_dir}@{resolved_commit}"
     processor = source_processor(directory, config, record, model, gguf_path, source=source)
     generation_config = read_generation_config(directory)
 
@@ -1491,7 +1483,7 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
                     layouts, retained, export_adapter, quantized_tensors=quantized_tensors,
                     quantized_scale_dtype=scale_dtype, quantization_grid=grid,
                     # The weights' commit: a pickle repo's may be its conversion's.
-                    revision=commit,
+                    revision=resolved_commit,
                     tokenizer="byte" if named == "byte" else None)
 
     if family == "diffusion_gemma":

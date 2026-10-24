@@ -7,6 +7,7 @@ files, translates weights and places them through the ordinary native route.
 import dataclasses
 import json
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import Self
 
@@ -17,7 +18,7 @@ from dew.data.text import HFTokenizer
 from dew.interop.composite import CompositeSource, HeadComponent, NativeComponent, SourceKind
 from dew.interop.pretrained import Pretrained
 from dew.objectives.base import Variables
-from dew.registry import from_record, import_path, to_record
+from dew.registry import dtype_name, from_record, import_path, to_record
 
 from .calibration import Calibration, Temperatures
 from .head import DecisionHead, Head, JointSchemaHead
@@ -41,8 +42,9 @@ class DecisionHeadSource(HeadComponent):
         else:
             width, compute = DecisionModel.head_size(backbone)
         configured = {name: value for name, value in fields.items() if name != "hidden_size"}
-        return Head.from_record({**held, "fields": {**configured, "dtype": compute,
-                                                     "attention_impl": attention_impl}}, width)
+        return Head.from_record(records.json_value({**held, "fields": {
+            **configured, "dtype": None if compute is None else dtype_name(compute),
+            "attention_impl": attention_impl}}), width)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -128,8 +130,10 @@ class DecisionSource(SourceKind):
                         if config_path.is_file() else None)
             fields = {key: records.integer(config[key], key)
                       for key in ("hidden_size", "width", "routing_layers", "layers", "heads", "feedforward")}
-            head = DecisionHeadSource({"name": import_path(JointSchemaHead), "fields": fields},
-                                      _path, IN_PROJ, HEAD_WEIGHTS, _shaped)
+            head = DecisionHeadSource(records.json_value({"name": import_path(JointSchemaHead),
+                                                          "fields": fields}),
+                                      _path, IN_PROJ, HEAD_WEIGHTS,
+                                      partial(_shaped, fields["hidden_size"]))
             layout, calibration = JointLayout(), Calibration()
             tokenizer_folder, strict_specials = "", False
         else:

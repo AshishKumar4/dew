@@ -14,8 +14,8 @@ import re
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import linen as nn
 
-from dew.decision.head import JointSchemaHead
 from dew.decision.layout import DecisionInputs
 
 HEAD_CONFIG = "joint_head_config.json"
@@ -63,10 +63,9 @@ def _path(name: str) -> tuple[str, ...]:
 
 
 
-def _shaped(head: JointSchemaHead, params: dict) -> dict:
+def _shaped(width: int, head: nn.Module, params: dict) -> dict:
     """`params` reshaped to the head's own shapes: its attention projections
     hold their heads apart, `[in, heads, head_width]` and `[heads, head_width, out]`."""
-    width = head.hidden_size
     one = jnp.ones((1, 1), bool)
     inputs = DecisionInputs(tokens=jnp.zeros((1, 2), jnp.int32), segments=jnp.ones((1, 2), jnp.int32),
                             kinds=jnp.zeros((1, 1), jnp.int32), questions=one, spans=jnp.asarray([[[0, 1]]]),
