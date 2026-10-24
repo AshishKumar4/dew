@@ -128,16 +128,7 @@ def test_canvas_generation_can_resume_at_committed_boundaries(system, budget):
                                 eos_token_ids=eos_ids, pad_token_id=0)
     plan = CanvasPlan(process, eos_ids, 0, budget)
     begin = jax.jit(lambda weights, data: _begin(model, weights, data, plan))
-    # A refinement checks its draws (`dew._distributions`), so its program carries the check out.
-    def advanced(weights, state):
-        return _advance(model, weights, state, jax.random.key(11), plan)
-
-    checked = jax.jit(checkify.checkify(advanced, errors=checkify.user_checks))
-
-    def advance(weights, state):
-        error, advanced = checked(weights, state)
-        error.throw()
-        return advanced
+    advance = jax.jit(lambda weights, state: _advance(model, weights, state, jax.random.key(11), plan))
     state = begin(variables, inputs)
     for _ in range(plan.blocks):
         state = advance(variables, jax.device_get(state))
