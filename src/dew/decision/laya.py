@@ -134,8 +134,7 @@ class LayaCheckpoint:
 
 def _head_tensors(params: Mapping[str, object]) -> dict[str, np.ndarray]:
     """`DecisionHead`'s parameters under Laya's tensor names, `_head_path`'s inverse."""
-    from dew.interop.weights import native_layouts
-    from dew.nn.vision.common import in_params
+    from dew.interop.weights import in_params, native_layouts
 
     modules = {path: name for name, path in (*_LAYER.items(), *_SCORER.items())}
 

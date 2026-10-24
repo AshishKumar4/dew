@@ -26,7 +26,6 @@ from .common import (
     _vision_section,
     activation_name,
     block_tensor_path,
-    in_params,
     rope_base,
 )
 from .vit import MergeProjector, VisionTransformer, ViTLayout

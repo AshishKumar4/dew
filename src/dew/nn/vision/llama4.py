@@ -29,7 +29,6 @@ from .common import (
     _side,
     _vision_section,
     head_width,
-    in_params,
     rope_base,
     trunk_geometry,
 )

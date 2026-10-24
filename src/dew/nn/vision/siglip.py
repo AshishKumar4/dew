@@ -40,7 +40,6 @@ from .common import (
     _vision_section,
     activation_name,
     head_width,
-    in_params,
     trunk_geometry,
 )
 

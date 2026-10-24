@@ -25,7 +25,6 @@ from .common import (
     TowerLayout,
     _vision_section,
     block_tensor_path,
-    in_params,
     rope_base,
 )
 from .vit import VisionTransformer, ViTLayout

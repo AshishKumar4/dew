@@ -19,7 +19,6 @@ from .common import (
     _vision_section,
     activation_name,
     block_tensor_path,
-    in_params,
     merger_projector,
 )
 from .vit import MergeProjector, VisionTransformer, ViTLayout, translate_vit_weights
