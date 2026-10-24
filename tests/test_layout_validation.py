@@ -13,6 +13,7 @@ import optax
 import pytest
 from jax.sharding import Mesh
 from model_support import TINY_DECODER
+from sharded import collective_axes
 from test_parallelism import BoxedReadout
 from token_support import repeated_token_batch, token_rows
 
@@ -43,14 +44,15 @@ NATIVE = Layout(rules={"embed": ("zero", "zero2"), "mlp": "zero", "heads": "zero
                 data_axes=("replica", "zero", "zero2"), min_shard=TINY_SHARD)
 
 CASES = {
-    # Between them the meshes place a state over fsdp alone, beside tensor and beside sequence
-    # (which holds the state with fsdp), over a native mesh's own axes, with the optimizer state
-    # and the EMA in pinned host memory, and with the gradient accumulator of two steps.
+    # Between them the meshes place a state over fsdp alone, beside tensor, beside sequence (which
+    # holds the state with fsdp) and beside pipeline stages, over a native mesh's own axes, with the
+    # optimizer state and the EMA in pinned host memory, and with the gradient accumulator of two steps.
     "fsdp": (lambda: MeshSpec(fsdp=8), Layout(min_shard=TINY_SHARD), 1),
     "fsdp_tensor_accumulating": (lambda: MeshSpec(fsdp=4, tensor=2), Layout(min_shard=TINY_SHARD), 2),
     "fsdp_host_accumulating": (lambda: MeshSpec(fsdp=8),
                                Layout(min_shard=TINY_SHARD, host=("opt_state", "ema")), 2),
     "fsdp_sequence": (lambda: MeshSpec(fsdp=4, sequence=2), Layout(min_shard=TINY_SHARD), 1),
+    "fsdp_stage": (lambda: MeshSpec(fsdp=2, stage=2), Layout(min_shard=TINY_SHARD), 1),
     "native_accumulating": (native, NATIVE, 2),
 }
 
@@ -74,8 +76,8 @@ def leaf_path(path) -> str:
 def test_a_validated_fine_tune_is_placed_and_held_as_its_report_said(case):
     """The report read before launch, and fit's own once it compiled its step, name every leaf of
     the state the run then holds, each placed as reported; each device holds, byte for byte, what
-    they said it would of the leaves in its own memory; and the step reads its batch's rows split
-    over the reported axes."""
+    they said it would of the leaves in its own memory; the step reads its batch's rows split over
+    the reported axes; and it runs every collective the report says each axis implies, over it."""
     mesh, layout, accumulation = CASES[case]
     run = fine_tune(mesh(), layout, accumulation)
     report = run.validate(step_batch())
@@ -102,6 +104,12 @@ def test_a_validated_fine_tune_is_placed_and_held_as_its_report_said(case):
     arguments, _ = run.executable.input_shardings
     rows = {mesh_axes(sharding.spec[0]) for sharding in jax.tree.leaves(arguments[1]) if sharding.spec}
     assert rows == {report.batch_axes}
+    # Every collective the report says an axis implies, the compiled step runs over that axis.
+    ran = collective_axes(run.executable.as_text(), run.device_mesh)
+    assert set(report.collectives) == {axis for axis, size in run.device_mesh.shape.items() if size > 1}
+    for axis, ops in report.collectives.items():
+        for op in ops:
+            assert any(kind == op and axis in axes for kind, axes in ran), (axis, op)
 
 
 @pytest.mark.mesh(devices=8)
