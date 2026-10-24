@@ -293,7 +293,8 @@ class Pretrained:
         # A run over a source's own processor records its source, and the bundle writes its files.
         source = declaration.get('processor')
         processor = (None if source is None else
-                     load_processor(from_record(sources.SourceReference, source), model))
+                     load_processor(from_record(sources.SourceReference,
+                                                records.record(source, "processor source")), model))
         trained = models[model_config.name]
         if trained is CausalTransformer:
             decoder = from_record(CausalTransformer, model)
