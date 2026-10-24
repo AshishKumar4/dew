@@ -31,7 +31,7 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 
 import numpy as np
 import torch
-from diffusers_reference_helpers import restore_transformers_names
+from diffusers_reference_helpers import recording, restore_transformers_names
 
 BASE = dict(sample_size=16, patch_size=2, in_channels=4, num_layers=2, attention_head_dim=8,
             num_attention_heads=2, joint_attention_dim=12, caption_projection_dim=16,
@@ -184,12 +184,7 @@ def main(destination: str) -> None:
     restore_transformers_names()
     import diffusers
 
-    from reference_releases import require
-
-    require("diffusers")
-    torch.set_num_threads(2)
-    root = Path(destination)
-    root.mkdir(parents=True, exist_ok=True)
+    root = recording(destination, "diffusers")
     arrays: dict[str, np.ndarray] = {}
     cases: dict[str, dict[str, object]] = {}
     record: dict[str, object] = {"diffusers": diffusers.__version__, "base": BASE,

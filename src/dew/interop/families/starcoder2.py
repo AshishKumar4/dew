@@ -7,9 +7,9 @@ from functools import partial
 
 from dew import records
 from dew.interop.decoder_parts import (
+    GPT_MLP,
     DecoderFamily,
     DecoderFields,
-    Renames,
     base_config,
     hf_ungated,
     renamed_name,
@@ -46,9 +46,6 @@ def _starcoder2_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
     return config
 
 
-_STARCODER2_NAMES: Renames = (('mlp.c_fc', 'mlp.up_proj'), ('mlp.c_proj', 'mlp.down_proj'))
-
-
 def _starcoder2_export(model: CausalTransformer) -> Mapping[str, object]:
     windowed = 'sliding_attention' in model.per_layer_types
     return {
@@ -79,7 +76,7 @@ def _matches(fields: CausalTransformer) -> bool:
 
 STARCODER2 = DecoderFamily(
     ('starcoder2',), _starcoder2_config, _matches, 'starcoder2', 'Starcoder2ForCausalLM', _starcoder2_export,
-    weight_path=partial(renamed_path, _STARCODER2_NAMES),
-    export_path=partial(renamed_name, _STARCODER2_NAMES),
+    weight_path=partial(renamed_path, GPT_MLP),
+    export_path=partial(renamed_name, GPT_MLP),
     preserve_source_layout=False,
 )

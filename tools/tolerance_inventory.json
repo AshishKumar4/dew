@@ -41,10 +41,6 @@
    "comparisons": 4,
    "lane": "Training"
   },
-  "tests/test_architectures.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_attention_masked_rows.py": {
    "comparisons": 1,
    "lane": "Kernels"
@@ -190,7 +186,7 @@
    "lane": "Training"
   },
   "tests/test_diffusion_objective.py": {
-   "comparisons": 8,
+   "comparisons": 7,
    "lane": "Training"
   },
   "tests/test_discrete.py": {

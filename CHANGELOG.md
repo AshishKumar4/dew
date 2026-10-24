@@ -16,6 +16,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   (`DecisionRunConfig.segments`): the backbone reads the schema in a pass of its own, with its own
   weights, its cross-attention layers read that pass beside the row, and the joint head pools the
   questions and options from it; the pass counts in `train/flops`.
+- JEPA's `normalize_targets` is Flax's `LayerNorm` with no affine and exact
+  variance. Its statistics are at least float32, as I-JEPA's `F.layer_norm`'s
+  are, so a bfloat16 run's targets round once.
 - `Decide.systemone` takes a list of request bodies and answers each as it
   would alone, their rows scored together, a refused body's `ValueError` in its
   place. `dew.inference.ScoringServer` serves a task answered by one forward

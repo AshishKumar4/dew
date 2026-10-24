@@ -26,7 +26,6 @@ compiles with nvcc, which takes a host gcc of at most 14:
         ~/.cache/dew/reference-venvs/deepseek-v41/bin/python tools/deepseek_kernels_reference.py
 """
 
-import importlib.util
 import subprocess
 import sys
 import tempfile
@@ -35,7 +34,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from deepseek_v41_kernels import E2M1
-from reference_source import CACHE, saved_fixture, verified
+from reference_source import CACHE, loaded, saved_fixture, verified
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "codecs" / "deepseek_kernels.npz"
@@ -56,13 +55,8 @@ V3_SHAPES = ((256, 384), (130, 259), (5, 7))
 def kernel(release: str):
     """One release's inference/kernel.py at its pinned commit, checked."""
     url, repo, commit, digest = KERNELS[release]
-    local = verified(url.format(repo=repo, commit=commit),
-                     CACHE / repo / commit / "inference" / "kernel.py", digest)
-    spec = importlib.util.spec_from_file_location(f"{release}_kernel", local)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    return loaded(f"{release}_kernel", verified(url.format(repo=repo, commit=commit),
+                                                CACHE / repo / commit / "inference" / "kernel.py", digest))
 
 
 def fp4_rows(rng) -> np.ndarray:
