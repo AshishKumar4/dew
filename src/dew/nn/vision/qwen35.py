@@ -25,7 +25,7 @@ from .common import (
     in_params,
     merger_projector,
 )
-from .vit import MergeProjector, VisionTransformer, ViTLayout, translate_vit_weights
+from .vit import LearnedPositions, MergeProjector, VisionTransformer, ViTLayout, translate_vit_weights
 
 
 @dataclasses.dataclass(frozen=True)
@@ -60,7 +60,7 @@ class Qwen35Vision(TowerBase):
             norm_type="fast_layer", norm_eps=1e-6, norm_bias=True, mlp_bias=True, packed=True,
             patch_bias=True,
             attention=("full",) * self.depth, order=("patches",) * self.depth, sinks=(False,) * self.depth,
-            position_table=self.num_position_embeddings)
+            positions=LearnedPositions(round(self.num_position_embeddings ** 0.5)))
 
     def build(self) -> nn.Module:
         return VisionTransformer(self.layout())

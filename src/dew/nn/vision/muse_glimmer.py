@@ -29,7 +29,7 @@ from .common import (
     in_params,
     rope_base,
 )
-from .vit import MergeProjector, VisionTransformer, ViTLayout
+from .vit import LearnedPositions, MergeProjector, VisionTransformer, ViTLayout
 
 
 def default_layer_types(layers: int) -> tuple[str, ...]:
@@ -82,7 +82,7 @@ class MuseGlimmerVision(TowerBase):
             norm_eps=1e-5, norm_bias=True, mlp_bias=True, packed=False, patch_bias=False,
             attention=tuple("window" if kind == "window_attention" else "full" for kind in self.layer_types),
             order=("windows",) * self.num_hidden_layers, sinks=(False,) * self.num_hidden_layers,
-            position_table=self.pos_emb_height * self.pos_emb_width, align_corners=False, pre_norm=True,
+            positions=LearnedPositions(self.pos_emb_height, align_corners=False), pre_norm=True,
             post_norm="layer", outer_norm_eps=self.layer_norm_eps, rope_theta=self.rope_theta,
             rotary_columns_first=True, rotary_origin=1, window=self.pos_emb_height, merge_blocks=False,
             channels_first=False)

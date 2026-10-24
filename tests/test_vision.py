@@ -84,7 +84,7 @@ def assert_tower_with_live_positions(tower, variables, fixture, positions: str) 
 
 @pytest.mark.parametrize("name, family, translate, positions", [
     ("siglip-tiny", "siglip", siglip.translate_siglip_vision_config, "embedding"),
-    ("llama4-vision-tiny", "llama4", llama4.translate_llama4_vision_config, "positional_embedding"),
+    ("llama4-vision-tiny", "llama4", llama4.translate_llama4_vision_config, "embedding"),
 ], ids=["siglip", "llama4"])
 def test_a_tower_matches_the_reference_implementation(name, family, translate, positions):
     """fp32 parity on the tiny SigLIP and Llama 4 trunks, and their positions (Llama 4's grid

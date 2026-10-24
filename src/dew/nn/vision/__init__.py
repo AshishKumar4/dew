@@ -77,11 +77,7 @@ from .llama4 import (
 from .mimo import MiMoProjector as MiMoProjector, MiMoVision as MiMoVision
 from .muse_glimmer import MuseGlimmerProjector as MuseGlimmerProjector, MuseGlimmerVision as MuseGlimmerVision
 from .qwen35 import Qwen35Projector as Qwen35Projector, Qwen35Vision as Qwen35Vision
-from .siglip import (
-    GemmaProjector as GemmaProjector,
-    SiglipVision as SiglipVision,
-    SiglipVisionTransformer as SiglipVisionTransformer,
-)
+from .siglip import GemmaProjector as GemmaProjector, SiglipVision as SiglipVision
 from .vit import (
     MergeProjector as MergeProjector,
     VisionTransformer as VisionTransformer,

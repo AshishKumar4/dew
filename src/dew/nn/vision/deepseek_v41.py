@@ -56,7 +56,7 @@ class DeepseekV41Vision(TowerBase):
             in_channels=3, patch_size=self.patch_size, temporal_patch_size=1, spatial_merge_size=1,
             norm_type="rms", norm_eps=1e-6, norm_bias=False, mlp_bias=False, packed=True, mlp_packed=True,
             patch_bias=True, attention=("full",) * depth, order=("patches",) * depth, sinks=(False,) * depth,
-            post_norm="rms", outer_norm_eps=1e-6, rope_theta=self.rope_theta, grid_output=True)
+            post_norm="rms", outer_norm_eps=1e-6, rope_theta=self.rope_theta, output="patch_grid")
 
     def build(self) -> nn.Module:
         return VisionTransformer(self.layout())
