@@ -48,6 +48,15 @@ A decision (`dew.decision`) may read a context beside its state: `Example.contex
 - **Serving.** `Decide(state, questions, context=...)` and `Decide.batch(requests, contexts=...)` read a request's context as training did, its images too.
 - **No blocks attached.** Training over a source without cross-attention leaves `Example.context` unread: the rows carry no context, as a table with no context column trains. Serving refuses a context such a task cannot read (ValueError), and a model refuses rows that carry one (TypeError), so no answer silently ignores a context it was given.
 
+### Options read at labels
+
+A question layout given `labels=Labels(...)` writes each option as a line `{label}. {text}` (labels `A` to `Z`, then two letters, or a release's own list, `Labels.names`), the whole line its span, and the answer cue (`Labels.cue`) last. The lines share the layout's `head_max_len` with the instructions as marker options do, and in the parallel layout each line starts at the first one's position, none reading another, and the cue reads them all. Over a causal backbone (`TokenModel.causal`) the parallel layout's visibility is causal as well, so no token reads a later one and no option reads another through the tokens after them. Its rows carry each question's answer position (`DecisionInputs.readout`), which packing moves with the row as it moves the spans. A label is read as the token of each of `Labels.variants`, a template of its name (`" {}"` by default; `"{}"` for the bare letter); a variant the tokenizer spells as more than one token is refused (ValueError). Two heads read these rows:
+
+- **`LabelReadout`** is Dew's own readout. Tied, it reads the backbone's own logit at each label of the answer position: the backbone's output table at those columns alone (`OutputTable.columns`, with the table's input QDQ, scale, bias and softcap, its product in fp32 or wider), and where the head is no single table (an adapter, a transform), its exact head over the answer states (`LogitsFromHidden`), the labels' columns taken. Several variants of a label are grouped by their logsumexp. `untied=True` gives each variant a trainable row and bias drawn from its output row and bias, read through the same cap, so at its draw it is the tied readout.
+- **`SlotReadout`** is a published slot release's head: slot `i` scores `<slot_i, h> + <q h, k m_i> / sqrt(head_dim)`, `h` the answer state and `m_i` the mean final state over option `i`'s line, with no bias and no softcap. It may hold more slot rows (`slot_rows`) than its labels, as a release's file does.
+
+A readout reads a row's labels only where they are its own, its first as many as the question has options (`Head.validate_rows`, ValueError), and a pass padded past them reads -inf there. Both readouts compute in at least float32, and a run reloaded at another dtype (`Decide.from_run(dtype=)`) widens them.
+
 ## 2. The mesh
 
 Two ways to describe the devices, one path underneath.
