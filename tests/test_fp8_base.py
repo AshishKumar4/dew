@@ -197,6 +197,106 @@ def test_the_frozen_product_multiplies_the_cast_rows_exactly_and_trains_no_kerne
     assert_products_exact(jax.jit(fp8_products), "the frozen FP8 product")
 
 
+TANGENT_SEEDS = 8
+"""The forward-mode product's declared draws (check 1, `assert_as_exact`), sized by `seeds_for` (on
+armada): the fewest for which the float32 reference compared with itself resolves the factor."""
+
+
+def tangent_case(seed=1):
+    """`product_case`'s input and packed kernel, and a direction for the input: `(x, forward,
+    forward_scale, dgrad, dgrad_scale, direction)`."""
+    x, *leaves, _ = product_case(seed)
+    direction = jnp.asarray(np.random.default_rng([7, seed]).standard_normal(x.shape), x.dtype)
+    return x, *leaves, direction
+
+
+def fp8_tangents(x, forward, forward_scale, dgrad, dgrad_scale, direction):
+    """Dew's frozen product in forward mode (`jax.jvp`): its value and its tangent along `direction`."""
+    return jax.jvp(lambda x: frozen_fp8_product(x, forward, forward_scale, dgrad, dgrad_scale), (x,),
+                   (direction,))
+
+
+def decoded_tangents(x, forward, forward_scale, dgrad, dgrad_scale, direction):
+    """The reference arm: the dequantized product (`dequantized_products`) and the direction times the
+    decoded forward rows, each code times its row's scale, multiplied in float32 by XLA."""
+    value, _ = dequantized_products(x, forward, forward_scale, dgrad, dgrad_scale, direction)
+    rows = forward.astype(jnp.float32) * forward_scale
+    return value, jnp.dot(direction.astype(jnp.float32), rows.T, precision=jax.lax.Precision.HIGHEST,
+                          preferred_element_type=jnp.float32)
+
+
+def exact_tangents(x, forward, forward_scale, dgrad, dgrad_scale, direction):
+    """The float64 product of the cast rows (`exact_products`) and the direction times the decoded
+    forward rows in float64."""
+    value, _ = exact_products(x, forward, forward_scale, dgrad, dgrad_scale, direction)
+    return value, np.asarray(direction, np.float64) @ exactly(forward, forward_scale).T
+
+
+def test_the_frozen_product_in_forward_mode_is_the_decoded_kernels_tangent():
+    """Forward mode (`jax.jvp`, MeanFlow's target) takes the product's value as the FP8 product and its
+    tangent as the input's direction times the decoded kernel (`frozen_fp8_kernel`), the linear map the
+    FP8 products stand for, each on par with the dequantized float32 products by check 1 from float64;
+    the packed leaves take no tangent."""
+    assert_as_exact(jax.jit(fp8_tangents), jax.jit(decoded_tangents), tangent_case,
+                    "the frozen FP8 product in forward mode", seeds=TANGENT_SEEDS, truth_fn=exact_tangents)
+    x, *leaves, _ = tangent_case()
+    _, along_leaves = jax.jvp(frozen_fp8_product, (x, *leaves),
+                              (jnp.zeros_like(x), *(jnp.ones_like(leaf) for leaf in leaves)))
+    assert not np.any(np.asarray(along_leaves))
+
+
+def test_meanflow_trains_an_adapter_over_an_fp8_base():
+    """MeanFlow's target is its model's JVP in time (`jax.jvp`), which runs through each frozen FP8 site
+    in forward mode, and its loss's gradient runs through them in reverse: Adam steps on an adapter over
+    a DiT whose MLP projections are FP8 sites keep the loss finite and move every factor the adapter
+    trains, and the packed base stays out of what trains."""
+    from dew.diffusion import presets
+    from dew.inputs import CharTable, Condition, Field, InputSpec
+    from dew.nn.backbones import SimpleDiT
+    from dew.objectives.base import Step
+    from dew.objectives.diffusion.few_step import MeanFlowObjective
+
+    model = SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1, interval=True)
+    inputs = InputSpec(Field("image", (4, 4, 3)),
+                       {"textcontext": Condition(CharTable.from_pretrained("char_table"))})
+    plain = MeanFlowObjective(model, presets.MeanFlow()(), inputs, ema_decay=None)
+    variables = plain.model_variables(plain.init(jax.random.key(0)))
+    # adaLN-Zero's gates and output start at zero, where no gradient reaches the MLP; drawn weights let it.
+    leaves, structure = jax.tree.flatten(variables["params"])
+    keys = jax.random.split(jax.random.key(4), len(leaves))
+    variables = {**variables, "params": jax.tree.unflatten(structure, [
+        0.3 * jax.random.normal(key, leaf.shape, leaf.dtype)
+        for key, leaf in zip(keys, leaves, strict=True)])}
+    kernels = flatten_dict(variables["params"], sep="/")
+    named = tuple(path.removesuffix("/kernel") for path in kernels
+                  if path.endswith("/kernel") and path.split("/")[-2] in ("up_proj", "down_proj"))
+    assert named
+    fp8_base = InputQuantization(frozen_fp8=named, measured_on=device_generation())
+    adapter = LoRA(rank=2, modules=("up_proj",)).apply(model, variables, key=1, fp8_base=fp8_base)
+    assert set(sites(adapter)) == set(named)
+    objective = MeanFlowObjective(adapter.model, presets.MeanFlow()(), inputs, ema_decay=None,
+                                  variables=adapter.variables)
+    tree = objective.init(jax.random.key(0))
+    batch = {"image": np.asarray(jax.random.randint(jax.random.key(1), (4, 4, 4, 3), 0, 256), np.uint8),
+             **inputs.tokenize(["a", "b", "c", "d"])}
+
+    def loss(params, step):
+        return objective.scalar_loss({**tree, "params": params}, batch,
+                                     Step(step=jnp.asarray(step), key=jax.random.key(2), ema=None))[0]
+
+    optimizer = optax.adam(1e-2)
+    params, state = tree["params"], optimizer.init(tree["params"])
+    for step in range(3):
+        value, gradients = jax.value_and_grad(loss)(params, step)
+        assert np.isfinite(float(value))
+        updates, state = optimizer.update(gradients, state, params)
+        params = optax.apply_updates(params, updates)
+    assert QUANTIZATION in tree and all(path.endswith(("lora_A", "lora_B")) for path in
+                                        flatten_dict(tree["params"], sep="/"))
+    assert all(not np.array_equal(np.asarray(after), np.asarray(before)) for after, before in
+               zip(jax.tree.leaves(params), jax.tree.leaves(tree["params"]), strict=True))
+
+
 @pytest.mark.mesh(devices=2)
 def test_split_over_fsdp_the_frozen_product_is_one_devices():
     """The input's rows and the packed kernel's split over fsdp, as a run
