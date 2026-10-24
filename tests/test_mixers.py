@@ -112,7 +112,8 @@ def test_a_layer_runs_no_mask_its_mixer_does_not_read(own):
     ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
     params = recurrent.init(jax.random.key(0), ids)
     with pytest.raises(ValueError):
-        recurrent.apply(params, ids, attention_pairwise_mask=own.pairwise_mask)
+        recurrent.apply(params, ids, attention_pairwise_mask=own.pairwise_mask,
+                        attention_key_runs=own.key_runs)
 
 
 def test_alibi_biases_rotated_attention_by_its_keys_places():
