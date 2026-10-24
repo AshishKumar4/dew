@@ -26,6 +26,12 @@ TIME = 13.0
 """The UNet's timestep, as the recorded reference took it."""
 WIDTHS = {"norm": 12, "odd": 10}
 """Each UNet case's latent width: 12 the group norm's whole groups, 10 an odd width."""
+TABLE_JITTER = 0.01
+"""How far a walk's draw scales its beta table's ends. A walk's rounding is dominated by its few
+per-step coefficients, which the table fixes: a draw of the initial rows alone holds each arm to one
+rounding of each coefficient, a coin flip no count of draws resolves (pndm-linspace's walk at a pooled
+1.80 times diffusers' over 40 draws of one table, Dew's coefficients correctly rounded and diffusers'
+not, nearer the float64 table's by chance). Each draw rounds its own table's coefficients."""
 SEEDS = {"ddim-linspace": 8, "pndm-linspace": 8, "ddim-clip": 8, "euler-zero-snr": 8, "dpm-karras": 8,
          "norm": 8, "odd": 8}
 """Each case's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada."""
@@ -64,28 +70,36 @@ def check_schedule(ref, case):
     if case == "pndm-linspace":
         expected_times = np.concatenate([expected_times[:1], expected_times[2:]])
     np.testing.assert_array_equal(model_times, expected_times)
-    denoise = process.denoiser(Oracle(), {}, {})
-    scale = process.sampler_schedule.prior_scale()
     source = getattr(diffusers, config["_class_name"])
 
+    def drawn(jitter):
+        """The case's config with its beta ends scaled by `jitter`."""
+        return {**config, "beta_start": config["beta_start"] * float(jitter),
+                "beta_end": config["beta_end"] * float(jitter)}
+
     def draw(seed):
+        """The initial rows and a factor within TABLE_JITTER of one, a float32 every arm reads alike."""
         rng = np.random.default_rng([0xED6E, seed])
-        return ((rng.standard_normal((ROWS, 3)) * 8).astype(np.float32),)
+        return ((rng.standard_normal((ROWS, 3)) * 8).astype(np.float32),
+                np.float32(1 + TABLE_JITTER * rng.uniform(-1, 1)))
 
-    def dew(initial):
-        return np.asarray(sample(denoise, jnp.asarray(initial) * scale, solver=policy.solver, times=times,
-                                 key=jax.random.PRNGKey(0), final_denoise=False))
+    def dew(initial, jitter):
+        process, times = SourceSchedule.from_config(drawn(jitter)).sampling(STEPS)
+        denoise = process.denoiser(Oracle(), {}, {})
+        return np.asarray(sample(denoise, jnp.asarray(initial) * process.sampler_schedule.prior_scale(),
+                                 solver=policy.solver, times=times, key=jax.random.PRNGKey(0),
+                                 final_denoise=False))
 
-    def reference(initial):
+    def reference(initial, jitter):
         import torch
 
-        return oracle_walk(source.from_config(config), initial, torch.float32)
+        return oracle_walk(source.from_config(drawn(jitter)), initial, torch.float32)
 
-    def truth(initial):
+    def truth(initial, jitter):
         import torch
 
         with float64_scheduler(sys.modules[source.__module__]):
-            return oracle_walk(source.from_config(config), initial, torch.float64)
+            return oracle_walk(source.from_config(drawn(jitter)), initial, torch.float64)
 
     assert_as_exact(dew, reference, draw, f"{case} walk", seeds=SEEDS[case], truth_fn=truth)
 
