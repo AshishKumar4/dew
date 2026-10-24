@@ -73,7 +73,7 @@ def _axes(axes: Iterable[int] | int, ndim: int | None = None) -> tuple[int, ...]
     return axes if ndim is None else tuple(sorted(axis if axis >= 0 else ndim + axis for axis in axes))
 
 
-class _LinearEnvelope:
+class _LinearEnvelope(nn.Module):
     """A managed arithmetic call inside an owner's input/output policy, at the same parameter scope."""
 
     @nn.compact
