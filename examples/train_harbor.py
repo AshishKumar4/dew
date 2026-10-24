@@ -140,7 +140,7 @@ def main(config: Config) -> dict:
     data = Loader(train=lambda partition: iter(
                        lambda: {"task_id": draw.integers(0, len(tasks), config.prompts, np.int32)}, None),
                    val=None, records=len(tasks), batch=config.prompts)
-    trainer = Trainer(objective, OptimConfig(rate=config.learning_rate, b2=0.99, weight_decay=0.0),
+    trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate, b2=0.99, weight_decay=0.0),
                       key=jax.random.key(config.seed), rollout=rollout)
     try:
         with trials:
