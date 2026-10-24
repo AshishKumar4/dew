@@ -5,6 +5,17 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A causal attention kind may read blocks whole: `AttentionMixer(bidirectional_blocks=True)` lets
+  each token of a block (`block_groups=`, `AttentionMetadata.block_groups`, `[B, S]`, -1 outside
+  any) see its whole block, whatever its window, as transformers' `block_sequence_ids` does, while
+  `bidirectional_images` keeps Gemma's images, read whole within the window. A kind may read both,
+  and every other kind stays causal. A cached call reads the groups of its own tokens, so no cache
+  keeps them, and a layer that shares another's keys and values reads them too.
+- `scaled_dot_product_attention(block_groups=, image_groups=)` reads blocks and images as the
+  attention template's key spans, one interval a query, so an A100 runs a block or image layer on the
+  template's fused kernels rather than xla's `[B, 1, S, S]` mask (268 MB a row a layer at 16k
+  tokens), where it measured faster at every length; every other path takes the mask the spans mean. A window counts a call's places, padding
+  inside a row skipped, in the spans too.
 - `dew.nn.attention.scaled_dot_product_attention(..., implementation='template')`
   runs the attention template's route
   (`dew.nn.kernels.templates.attention_route.attend`): causality, windows,

@@ -173,7 +173,7 @@ class DiffusionGemma(DecoderWrapper):
         self.text.init_cache(batch_size)
 
     def encode(self, tokens, *, positions=None, segment_ids=None, image_indices=None,
-               attention_mask=None, image_groups=None, rotary_positions=None,
+               attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
                attention_pairwise_mask=None, attention_key_positions=None,
                conditioning: Mapping[str, jax.Array] | None = None, train: bool = False,
                states: bool = False):
@@ -189,7 +189,7 @@ class DiffusionGemma(DecoderWrapper):
         return read(tokens, decode=True, train=train, positions=positions,
                     segment_ids=segment_ids, input_embeddings=embeddings,
                     attention_mask=attention_mask,
-                    image_groups=image_groups, rotary_positions=rotary_positions,
+                    image_groups=image_groups, block_groups=block_groups, rotary_positions=rotary_positions,
                     attention_pairwise_mask=attention_pairwise_mask,
                     attention_key_positions=attention_key_positions)
 
