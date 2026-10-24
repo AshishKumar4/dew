@@ -39,10 +39,10 @@ class Unlocked(Exception):
 
 
 def _builds():
-    """dew.telemetry.builds, this checkout's own, loaded by its path: Dew's
+    """dew.builds, this checkout's own, loaded by its path: Dew's
     package imports JAX, which no environment holds yet."""
-    path = Path(__file__).resolve().parents[1] / "src" / "dew" / "telemetry" / "builds.py"
-    spec = importlib.util.spec_from_file_location("dew_telemetry_builds", path)
+    path = Path(__file__).resolve().parents[1] / "src" / "dew" / "builds.py"
+    spec = importlib.util.spec_from_file_location("dew_builds", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -51,9 +51,9 @@ def _builds():
 
 def machine_lock() -> str:
     """The lock this machine installs: the newest of JAX's CUDA builds its
-    NVIDIA driver and GPUs run (`dew.telemetry.builds`), else cpu, where
+    NVIDIA driver and GPUs run (`dew.builds`), else cpu, where
     Dew's own runtime check speaks for a GPU no build runs on
-    (`dew.telemetry.devices.cpu_only_refusal`)."""
+    (`dew.devices.cpu_only_refusal`)."""
     builds = _builds()
     if shutil.which("nvidia-smi") is None:
         return "cpu"

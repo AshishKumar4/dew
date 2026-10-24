@@ -8,6 +8,8 @@ import numpy as np
 from dew import records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
+    GPT_MLP,
+    GPT_TRUNK,
     DecoderFamily,
     DecoderFields,
     Packed,
@@ -66,12 +68,7 @@ def _gpt_neo_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
 
 
 _GPT_NEO_NAMES: Renames = (
-    ('attn.attention.out_proj', 'self_attn.o_proj'),
-    ('attn.attention', 'self_attn'),
-    ('transformer.wte', 'model.embed_tokens'), ('transformer.wpe', 'model.embed_positions'),
-    ('transformer.ln_f', 'model.norm'), ('transformer.h', 'model.layers'),
-    ('ln_1', 'input_layernorm'), ('ln_2', 'post_attention_layernorm'),
-    ('mlp.c_fc', 'mlp.up_proj'), ('mlp.c_proj', 'mlp.down_proj'))
+    ('attn.attention.out_proj', 'self_attn.o_proj'), ('attn.attention', 'self_attn'), *GPT_TRUNK, *GPT_MLP)
 
 
 def _gpt_neo_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -111,11 +108,11 @@ def _gptj_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     return config
 
 
+# GPT-J's block has no second norm and its model no learned positions, so of
+# GPT-2's trunk names it carries the embeddings, the final norm, the layers and ln_1.
 _GPTJ_NAMES: Renames = (
-    ('transformer.wte', 'model.embed_tokens'), ('transformer.ln_f', 'model.norm'),
-    ('transformer.h', 'model.layers'), ('ln_1', 'input_layernorm'),
     ('attn.out_proj', 'self_attn.o_proj'), ('attn', 'self_attn'),
-    ('mlp.fc_in', 'mlp.up_proj'), ('mlp.fc_out', 'mlp.down_proj'))
+    ('mlp.fc_in', 'mlp.up_proj'), ('mlp.fc_out', 'mlp.down_proj'), *GPT_TRUNK)
 
 
 def _gptj_order(head_dim: int, rotated: int) -> np.ndarray:
@@ -234,11 +231,7 @@ def _nested(name: str) -> str:
     return 'transformer.' + name if name.startswith(('h.', 'wte.', 'wpe.', 'ln_f.')) else name
 
 
-GPT2_NAMES: Renames = (
-    ('transformer.wte', 'model.embed_tokens'), ('transformer.wpe', 'model.embed_positions'),
-    ('transformer.ln_f', 'model.norm'), ('transformer.h', 'model.layers'),
-    ('ln_1', 'input_layernorm'), ('ln_2', 'post_attention_layernorm'),
-    ('attn.c_proj', 'self_attn.o_proj'), ('mlp.c_fc', 'mlp.up_proj'), ('mlp.c_proj', 'mlp.down_proj'))
+GPT2_NAMES: Renames = (('attn.c_proj', 'self_attn.o_proj'), *GPT_TRUNK, *GPT_MLP)
 
 # Conv1D stores `[in, out]` where the path map reads a torch Linear's
 # `[out, in]`, and c_attn holds q, k and v side by side on `out`.
@@ -252,9 +245,8 @@ _GPT2_PACKED = (
 
 def _gpt2_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
     name = _nested(name)
-    # Alias inspection sees raw names before preparation. A fused qkv
-    # has three leaves, and the fixed buffers are validated by preparation.
-    if '.attn.c_attn.' in name or name.endswith(('.attn.bias', '.attn.masked_bias')):
+    # Alias inspection sees raw names before preparation, which validates and drops the buffers.
+    if name.endswith(('.attn.bias', '.attn.masked_bias')):
         return None
     return renamed_path(GPT2_NAMES, name, config)
 

@@ -302,3 +302,26 @@ def test_async_sdk_completion_and_streaming(kind):
         finally:
             await client.close()
     asyncio.run(run())
+
+
+def test_an_async_ollama_call_has_every_row_in_flight_at_once_and_keeps_their_order():
+    """Two rows, each answered only once both requests have arrived: rows awaited one by one would
+    never let the second arrive. Each answer keeps its row's place."""
+    async def run():
+        arrived, both = [], asyncio.Event()
+
+        async def network(request):
+            body = json.loads(request.content)
+            arrived.append(body["prompt"])
+            if len(arrived) == 2:
+                both.set()
+            await asyncio.wait_for(both.wait(), timeout=30)
+            return httpx.Response(200, json={"response": f"after {body['prompt']}", "eval_count": 1})
+
+        client = ollama.AsyncClient(host="http://fixture", transport=httpx.MockTransport(network))
+        try:
+            result = await OllamaCompletion("tiny", client).acall(["first", "second"], 5)
+        finally:
+            await client.close()
+        assert result.texts == ("after first", "after second")
+    asyncio.run(run())

@@ -12,22 +12,33 @@ from __future__ import annotations
 import dataclasses
 import os
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Annotated, ClassVar
+from typing import TYPE_CHECKING, Annotated, ClassVar, TypedDict
 
 import jax
 import numpy as np
 import tyro
 
+from dew.checkpoints import Checkpoints
 from dew.config import MetricConfig, ModelConfig, ObjectiveConfig, Prepared, RunConfig, media_field
 from dew.data.compile import fitted
 from dew.data.dataset import record_argument
 from dew.diffusion.presets import EDM, Flow, build_process
 from dew.diffusion.process import Process
-from dew.inputs import Condition, Field, InputSpec, rebuild
+from dew.inputs import AudioCondition, Field, InputSpec, TextCondition
 from dew.nn.autoencoders import AutoEncoder
+from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
 from dew.nn.protocols import IntervalModel, TimeScaled
-from dew.nn.text_encoders import DEFAULT_MODEL
-from dew.objectives.base import Variables, merge
+from dew.objectives.base import TEACHER, Variables, merge
+from dew.objectives.diffusion.alignment import Alignment
+from dew.objectives.diffusion.end_to_end import AUTOENCODER
+from dew.objectives.diffusion.few_step import SMOOTH_TIME_SCALE, MeanFlowObjective
+from dew.objectives.diffusion.guidance_distillation import GuidanceDistillationObjective
+from dew.objectives.diffusion.objective import (
+    LOSS_HEADS,
+    DiffusionObjective,
+    FlowDistillationObjective,
+    teacher_weights,
+)
 from dew.records import number, record
 from dew.registry import (
     Configured,
@@ -43,11 +54,6 @@ from dew.registry import (
     to_record,
 )
 from dew.sampling.solvers import EulerAncestral, Solver
-
-from .alignment import Alignment
-from .end_to_end import AUTOENCODER
-from .few_step import SMOOTH_TIME_SCALE, MeanFlowObjective
-from .objective import LOSS_HEADS, DiffusionObjective
 
 if TYPE_CHECKING:
 
@@ -72,106 +78,6 @@ DEFAULT_MODEL_CONFIG = {
     "precision": "default",
     "dtype": "bfloat16",
 }
-
-
-@dataclasses.dataclass(frozen=True)
-class TextCondition:
-    """Text conditioning: which registered encoder reads the batch's tokens, and from which checkpoint."""
-
-    encoder: str = "clip_text"
-    checkpoint: str = DEFAULT_MODEL
-    dtype: DtypeName | None = None
-    """The encoder's compute dtype; None follows the model's compute dtype."""
-    param_dtype: DtypeName = "float32"
-    """The storage dtype when loading source weights; supplied params keep theirs."""
-    field: str = "text"
-    """The batch field holding the tokenized text."""
-    unconditional: str = ""
-    """The prompt the unconditional branch is encoded from."""
-    max_length: int | None = None
-    """The token length every prompt is padded to.
-
-    None keeps the encoder's own default, which for CLIP is the checkpoint's
-    context length.
-    """
-    revision: str | None = None
-    """The checkpoint's git revision.
-
-    With it, a rerun conditions on the weights the run named, even after the
-    branch has moved on.
-    """
-
-    def build(self, *, params: Variables | None = None,
-              dtype: DtypeName | None = None) -> Condition:
-        """Build the encoder over supplied params, without loading source weights or casting storage.
-
-        `dtype` is the run's own compute dtype, which an unset `self.dtype` follows:
-        the tower runs next to the model it conditions in every step, so a checkpoint
-        stored in float32 is no reason to run it in float32.
-        """
-        fields = {name: value for name, value in
-                  (("max_length", self.max_length), ("revision", self.revision))
-                  if value is not None}
-        return Condition(
-            rebuild(self.encoder, {"checkpoint": self.checkpoint,
-                                   "dtype": dtype if self.dtype is None else self.dtype,
-                                   "param_dtype": self.param_dtype, **fields}, params=params),
-            field=self.field, unconditional=self.unconditional)
-
-
-@dataclasses.dataclass(frozen=True)
-class AudioCondition:
-    """Audio conditioning on each clip, through an audio tower.
-
-    `checkpoint` names the `hf_audio` tower, whose feature extractor encodes the
-    waveform in the batch's `audio` field on the host.
-    The dataset's clip length sets the waveform length used to encode every
-    clip and the silent unconditional input, so the two always agree.
-    """
-
-    encoder: ClassVar[str] = "hf_audio"
-    checkpoint: str = "facebook/wav2vec2-base-960h"
-    dtype: DtypeName | None = None
-    """The tower's compute dtype; None follows the model's compute dtype."""
-    param_dtype: DtypeName = "float32"
-    """The storage dtype when loading source weights; supplied params keep theirs."""
-
-    def build(self, seconds: float, *, params: Variables | None = None,
-              dtype: DtypeName | None = None) -> Condition:
-        """Build the tower over supplied params for waveforms of `seconds` (the clips' `audio_seconds`,
-        `Dataset.facts`), without loading source weights or casting storage."""
-        return Condition(
-            rebuild(self.encoder, {"checkpoint": self.checkpoint, "seconds": seconds,
-                                   "dtype": dtype if self.dtype is None else self.dtype,
-                                   "param_dtype": self.param_dtype}, params=params),
-            field="audio", unconditional=0.0)
-
-
-@dataclasses.dataclass(frozen=True)
-class PretrainedAutoencoder:
-    """A published autoencoder for latent diffusion.
-
-    It is the class the checkpoint's config names, one of
-    `dew.nn.autoencoders.pretrained.LOADERS`, or a Stable Diffusion
-    AutoencoderKL (`dew.nn.autoencoders.pretrained.load_autoencoder`).
-    """
-
-    modelname: str = "pcuenq/sd-vae-ft-mse-flax"
-    revision: str = "bf16"
-    dtype: DtypeName = "bfloat16"
-    latent_shift: float | None = None
-    latent_scale: float | None = None
-    """Per-dataset latent statistics; None keeps the checkpoint's."""
-
-    def build(self, *, params: Variables | None = None) -> AutoEncoder:
-        """Build the autoencoder from its config over supplied params."""
-        import jax.numpy as jnp
-
-        from dew.nn.autoencoders.pretrained import load_autoencoder
-
-        return load_autoencoder(self.modelname, revision=self.revision, dtype=jnp.dtype(self.dtype),
-                                latent_shift=self.latent_shift, latent_scale=self.latent_scale,
-                                params=params)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -209,6 +115,15 @@ class FlowRolloutConfig:
                            train_steps=self.train_steps)
 
 
+class TeacherArguments(TypedDict, total=False):
+    """What a distillation objective takes of its teacher's run (`DiffusionRunConfig.teacher_run`)."""
+
+    teacher_variables: Variables
+    """The tree the teacher's run published, where the starting tree holds no teacher."""
+    teacher: DiffusionObjective
+    """Guidance distillation's teacher, its objective rebuilt from the run's record."""
+
+
 @dataclasses.dataclass(frozen=True)
 class DiffusionRunConfig(RunConfig):
     """A diffusion run's configuration: the shared run fields plus the diffusion objective's own settings."""
@@ -229,7 +144,7 @@ class DiffusionRunConfig(RunConfig):
     EMA, condition dropout and validation sampling (`--objective.ema-decay`,
     `--objective.guidance`, `--objective.steps`), or a loss of its own in its
     place, as `--objective mean_flow --objective.omega 2` or `--objective rcm
-    --objective.teacher-run runs/teacher`. Each objective refuses a preset or a
+    --teacher-run runs/teacher`. Each objective refuses a preset or a
     guidance its loss cannot train or sample with.
     """
     text: TextCondition | None = dataclasses.field(default_factory=TextCondition)
@@ -255,6 +170,11 @@ class DiffusionRunConfig(RunConfig):
     """
     pretrained_param_dtype: DtypeName = "float32"
     """The dtype `pretrained`'s parameters are stored and trained in."""
+    teacher_run: str | None = None
+    """The run directory a distillation's teacher trained in. Its published weights are the frozen
+    teacher's (`teacher_variables=`), unless the starting tree holds the teacher; guidance distillation
+    also rebuilds the teacher's objective from the run's record (`teacher=`). Only a distillation
+    takes one."""
     rollout: Annotated[FlowRolloutConfig, tyro.conf.subcommand("rollout")] | None = None
     """The rollout a Flow-GRPO run trains on: its reward metric, group size, time points and trained
     transitions, `--rollout.reward clip_score --rollout.groups 4`. A Flow-GRPO run without one takes
@@ -432,9 +352,33 @@ class DiffusionRunConfig(RunConfig):
             sample = source.inputs.sample
         inputs = InputSpec(sample=sample, conditions=conditions)
         objective = self.objective.build(model=model, process=self._process(convention), inputs=inputs,
-                                         autoencoder=autoencoder, variables=variables)
+                                         autoencoder=autoencoder, variables=variables,
+                                         **self._teacher(variables))
         assert isinstance(objective, DiffusionObjective)
         return objective
+
+    def _teacher(self, variables: Variables | None) -> TeacherArguments:
+        """The teacher a distillation reads from `teacher_run`: the tree its run published, unless the
+        starting tree holds the teacher (`TEACHER`), and for guidance distillation the teacher's
+        objective rebuilt from the run's record over the tree the student holds frozen
+        (`teacher_weights`)."""
+        if self.teacher_run is None:
+            return {}
+        kind = objectives[self.objective.name]
+        if not issubclass(kind, FlowDistillationObjective | GuidanceDistillationObjective):
+            raise ValueError(f"teacher_run names a distillation's teacher, and {self.objective.name} "
+                             f"distills none")
+        published: Variables | None = None
+        if variables is None or TEACHER not in variables:
+            # A resumed student holds its teacher, so only a fresh one reads the teacher's run.
+            with Checkpoints(self.teacher_run) as checkpoints:
+                published = checkpoints.variables(ema=None, step=None, mesh=None, layout=None,
+                                                  param_dtype=None)
+        given: TeacherArguments = {} if published is None else {"teacher_variables": published}
+        if issubclass(kind, GuidanceDistillationObjective):
+            held = teacher_weights(variables, published, whole=True)
+            given["teacher"] = DiffusionRunConfig.load(self.teacher_run).build(variables=held)
+        return given
 
     def prepare(self) -> Prepared:
         """The objective `build` makes, with the run's Hub sources pinned
@@ -572,3 +516,6 @@ class DiffusionRunConfig(RunConfig):
 
 if not TYPE_CHECKING:
     PresetSpec = presets.union
+
+
+__all__ = ["DiffusionRunConfig", "FlowRolloutConfig"]

@@ -1397,3 +1397,38 @@ def test_a_nemotron_h_trunk_whose_config_names_a_step_loads_as_the_trunk(name, t
     ids = jnp.asarray(np.load(FIXTURES / name / "input_ids.npy"), jnp.int32)
     plain, held = fp32_decoder(FIXTURES / name)
     np.testing.assert_array_equal(np.asarray(model.apply(variables, ids)), np.asarray(plain.apply(held, ids)))
+
+
+def test_a_bundle_made_from_a_model_carries_its_record_as_a_loaded_one_does():
+    """`PretrainedDecoder.from_model`'s model_config is the decoder's record, the form a load's
+    takes: written as JSON and read back, it builds the same decoder."""
+    loaded = Pretrained.load(str(FIXTURES / "qwen3-tiny"), dtype="float32", attention_impl="reference")
+    bundle = PretrainedDecoder.from_model(loaded.model, loaded.variables)
+    assert models.build("causal_transformer", **json.loads(json.dumps(bundle.model_config))) == loaded.model
+
+
+def test_a_float64_decoder_saves_and_reloads_in_float64(tmp_path):
+    """A decoder computing in float64 end to end, as Dory's and nGPT's runs do: its bundle and a
+    run's record of it name float64, and the checkpoint it saves loads back in float64 to the same
+    weights and logits."""
+    from dew.config import ModelConfig
+    from dew.registry import to_record
+
+    with jax.enable_x64(new_val=True):
+        loaded = Pretrained.load(str(FIXTURES / "qwen3-tiny"), dtype="float64", param_dtype="float64",
+                                 attention_impl="reference")
+        bundle = PretrainedDecoder.from_model(loaded.model, loaded.variables)
+        record = json.loads(json.dumps(bundle.model_config))
+        assert models.build("causal_transformer", **record) == loaded.model
+        # A run records its model as every run does (`ModelConfig.from_model`), and rebuilds it.
+        run = json.loads(json.dumps(to_record(ModelConfig.from_model(loaded.model), ModelConfig)))
+        assert ModelConfig.from_dict(run).build() == loaded.model
+        bundle.save(tmp_path / "float64")
+        again = Pretrained.load(str(tmp_path / "float64"), dtype="float64", param_dtype="float64",
+                                attention_impl="reference")
+        pairs = zip(jax.tree.leaves(again.variables), jax.tree.leaves(loaded.variables), strict=True)
+        for ours, theirs in pairs:
+            np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+        ids = jnp.asarray(np.load(FIXTURES / "qwen3-tiny" / "input_ids.npy"))
+        np.testing.assert_array_equal(np.asarray(again.model.apply(again.variables, ids)),
+                                      np.asarray(loaded.model.apply(loaded.variables, ids)))

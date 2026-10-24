@@ -22,7 +22,15 @@ from dew.nn.precision import float32_dot_general
 from dew.registry import Record, from_record
 
 from ..mobilenet import _ARCHITECTURE, MobileNetV5, MobileNetV5Encoder
-from .common import _PROJECTOR_PATHS, ProjectorBase, TowerBase, TowerGeometry, _vision_section
+from .common import (
+    ProjectorBase,
+    ProjectorLayout,
+    TowerBase,
+    TowerGeometry,
+    TowerLayout,
+    _vision_section,
+    in_params,
+)
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
@@ -166,11 +174,20 @@ def gemma3n_vision_path(hf_name: str) -> tuple[str, ...]:
     return prefix + parts[:-1] + ("scale" if norm else "kernel",)
 
 
+GEMMA3N_PROJECTOR_TENSORS = {
+    "embedding.weight": ("embedding", "embedding"),
+    "hard_embedding_norm.weight": ("hard_embedding_norm", "scale"),
+    "soft_embedding_norm.weight": ("soft_embedding_norm", "scale"),
+    "embedding_projection.weight": ("embedding_projection", "kernel"),
+}
+"""The Gemma 3n embedder's tensors past `embed_vision.` (or its audio's), each to its leaf."""
+
+
 def translate_gemma3n_projector_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
 ) -> tuple[Mapping[str, object], tuple[WeightLayout, ...]]:
     """A Gemma 3n vision embedder's parameter tree, with the layouts that write it back."""
-    paths = _PROJECTOR_PATHS["gemma3n"]
+    paths = GEMMA3N_PROJECTOR_TENSORS
     if set(hf_tensors) != set(paths):
         raise ValueError(f"vision embedder tensors differ: missing {sorted(set(paths) - set(hf_tensors))}, "
                          f"unknown {sorted(set(hf_tensors) - set(paths))}")
@@ -225,3 +242,8 @@ def translate_gemma3n_projector_config(hf_config: Mapping[str, object],
     embedder, _ = _gemma3n_vision_record(hf_config)
     value: Gemma3nProjector = from_record(Gemma3nProjector, {**embedder, "text_width": text_width})
     return {"class": "gemma3n", "fields": {**dataclasses.asdict(value)}}
+
+
+Gemma3nVision.checkpoint = TowerLayout("vision_tower.", in_params(gemma3n_vision_path))
+Gemma3nProjector.checkpoint = ProjectorLayout("embed_vision.", GEMMA3N_PROJECTOR_TENSORS,
+                                              read=translate_gemma3n_projector_weights)

@@ -36,7 +36,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from dew.inference.banks import bank_sharding, bank_sites, entry_tree, in_namespace, narrowed, one_layer
 from dew.nn.backbones.layer_plan import group_name, layer_index
 from dew.nn.kernels.options import compiler_options
-from dew.objectives.base import FROZEN, merge, thaw
+from dew.objectives.base import FROZEN, merge, select, thaw, without
 from dew.training.distributed import batch_shardings
 from dew.training.host import transfer
 from dew.training.transaction import Realization, placed_as_rows
@@ -186,20 +186,10 @@ def banked(tree, sites, stack, release=None):
 
 def _without_banks(variables, sites):
     """Return `variables` without the banks a scanned run stores under its name."""
-    banks = {(*site.namespace, name) for site in sites
+    banks = [(*site.namespace, name) for site in sites
              for (first, count), name in zip(site.view.groups, site.view.bank_names(), strict=True)
-             if count > 1}
-
-    def prune(tree, path):
-        pruned = {}
-        for name, value in tree.items():
-            current = (*path, name)
-            if current in banks:
-                continue
-            pruned[name] = prune(value, current) if isinstance(value, Mapping) else value
-        return pruned
-
-    return {collection: prune(tree, ()) for collection, tree in variables.items()}
+             if count > 1]
+    return {collection: without(tree, banks) for collection, tree in variables.items()}
 
 
 def _drop(tree, keys):
@@ -254,17 +244,6 @@ def _logical(tree, sites):
     return tree
 
 
-def _selected(tree, paths):
-    """Pick out the leaves at `paths`, which are the canonical trainable ones."""
-    selected: dict = {}
-    for path in paths:
-        node, target = tree, selected
-        for name in path[:-1]:
-            node, target = node[name], target.setdefault(name, {})
-        target[path[-1]] = node[path[-1]]
-    return selected
-
-
 def _after(device: tuple[DeviceStep, ...], loss, variables, batch, execution):
     """`loss` over the batch the dataset's `device` steps make of `batch`."""
     for step in device:
@@ -310,7 +289,8 @@ def _trainable_cotangent(back, cotangent, *, sites, paths, layout):
     cotangents = iter(back(cotangent)[0])
     placed = treedef.unflatten([None if known else next(cotangents) for known in held])
     gradient = _logical({"params": placed}, sites)["params"]
-    return _selected(gradient, paths)
+    trainable = frozenset(paths)
+    return select(gradient, lambda path: path in trainable)
 
 
 class HostExecution:

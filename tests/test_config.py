@@ -15,10 +15,10 @@ from flax import linen as nn
 import dew.config
 import dew.nn.backbones
 from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
+from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader, Ramp
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
-from dew.objectives.diffusion import DiffusionRunConfig
 from dew.registry import Aliases, projectors, towers
 from dew.training import Checkpoints, Layout, MeshSpec
 
@@ -38,7 +38,7 @@ def test_to_dict_and_from_dict_round_trip_a_run(dataset, tmp_path):
     config = RunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 64}),
         data=data,
-        optim=OptimConfig(optimizer="lamb", learning_rate=1e-3, weight_decay=0.1, b1=0.8, b2=0.99),
+        optim=OptimConfig(optimizer="lamb", rate=1e-3, weight_decay=0.1, b1=0.8, b2=0.99),
         trainer=TrainerConfig(name="run", steps=10, mesh=MeshSpec(fsdp=2),
                               layout=Layout(rules={"mlp": "fsdp"}, min_shard=8)),
     )
@@ -503,10 +503,10 @@ class Spec(Base):
 def test_a_learning_rate_schedule_is_a_typed_record_that_round_trips():
     """A run's record reads back the schedule it names, its tail and the muP
     groups included."""
-    from dew.training.optim import ParamGroup, Power, PowerTail
+    from dew.optim import ParamGroup, Power, PowerTail
     config = RunConfig(
         trainer=TrainerConfig(steps=1),
-        optim=OptimConfig(schedule=Power(peak=0.01, warmup_steps=5, a=4.0, c=16.0,
+        optim=OptimConfig(rate=Power(peak=0.01, warmup_steps=5, a=4.0, c=16.0,
                                          tail=PowerTail(start=8)),
                           param_groups=ParamGroup.mup(4.0)))
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
@@ -516,12 +516,12 @@ def test_a_learning_rate_schedule_is_a_typed_record_that_round_trips():
 def test_param_groups_with_schedules_momentum_and_bounds_round_trip():
     """A run's record reads back each group's schedules, `every` included,
     its bounds, and the config's own one-cycle schedule."""
-    from dew.training.optim import Cosine, Exponential, OneCycle, ParamGroup
+    from dew.optim import Cosine, Exponential, OneCycle, ParamGroup
     momentum = OneCycle(peak=0.85, init=0.95, end=0.95, every=40)
     config = RunConfig(
         trainer=TrainerConfig(steps=1),
         optim=OptimConfig(
-            optimizer="adam", schedule=Exponential(init=1e-3, end=1e-5, decay_steps=8, offset=1e-6),
+            optimizer="adam", rate=Exponential(init=1e-3, end=1e-5, decay_steps=8, offset=1e-6),
             param_groups=(
                 ParamGroup("delays", ("*/delay",), schedule=Cosine(peak=0.1, warmup_steps=0, every=40),
                            bounds=(0.0, 24.0)),
