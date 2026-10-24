@@ -645,7 +645,7 @@ class DecisionObjective(Objective[Ratio]):
         """The most rows, questions and options a window packs (`Layout.bounds`),
         at most `segments` rows, and one where rows carry a context: a backbone's
         cross-attention reads one context a window row, the row's own."""
-        bounds = self.layout.bounds(self.tokenizer, self.specials)
+        bounds = self.layout.bounds(self.tokenizer, self.specials, self.context_length)
         most = 1 if self.context_length is not None else self.segments
         if most is None:
             return bounds

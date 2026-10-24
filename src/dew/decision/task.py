@@ -582,7 +582,7 @@ class Decide:
         """Each answered question of `reader`'s rows, with its raw logits and its
         gold distribution in the order the row shows its options."""
         scored = []
-        segments = self.layout.bounds(self.tokenizer, self.specials).segments
+        segments = self.layout.bounds(self.tokenizer, self.specials, self.context_length).segments
         for batch in reader(DataPartition()):
             inputs = laid_out(batch, segments, spans_in_context=isinstance(self.layout, JointLayout)
                               and self.layout.schema_in_context)

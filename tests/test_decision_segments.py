@@ -118,21 +118,21 @@ def test_a_saved_run_reloads_its_segments_and_an_earlier_runs_record_reads_as_be
     from dew.decision import Decide, DecisionObjective
     from dew.decision.task import DecideSettings
 
-    layout = JointLayout(max_len=128, segments=SCHEMA_FIRST)
+    layout = JointLayout(max_len=1024, segments=SCHEMA_FIRST)
     head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
-    base = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=layout,
-                             head=head)
+    base = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
+                             specials=SPECIALS, layout=layout, head=head)
     task = Decide(base.model, base.init(jax.random.key(0)), layout, TOKENIZER, SPECIALS)
     _, live, reloaded = saved_and_reloaded(task, tmp_path / "run")
     assert reloaded.layout == layout
     asked = {"team": INTENT}
     np.testing.assert_array_equal(reloaded(EXAMPLES[0].state, asked)["team"].probabilities,
                                   live(EXAMPLES[0].state, asked)["team"].probabilities)
-    fields = to_record(JointLayout(max_len=128), JointLayout)
+    fields = to_record(JointLayout(max_len=1024), JointLayout)
     assert isinstance(fields, dict)
     earlier = {name: value for name, value in fields.items() if name not in ("segments", "framing")}
     settings = DecideSettings.of({"head": {"name": "JointSchemaHead", "fields": {}},
                                   "layout": {"name": "JointLayout", "fields": earlier},
                                   "specials": to_record(SPECIALS, Specials), "tokenizer": "byte",
                                   "processor": None})
-    assert settings.layout == JointLayout(max_len=128)
+    assert settings.layout == JointLayout(max_len=1024)

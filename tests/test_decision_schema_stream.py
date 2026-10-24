@@ -64,8 +64,10 @@ def test_a_schema_read_in_context_leaves_the_row_and_its_spans_index_the_context
 
 def test_a_run_reads_each_rows_schema_in_context_and_its_task_serves_alike():
     """Rows whose schemas are their contexts train, each logged step reporting the work of the
-    context's own pass beside the row's; the run's task answers a request, and a question asked in
-    other words answers otherwise, as the head pools it from the context's pass."""
+    context's own pass beside the row's, beyond the row's alone
+    (`test_the_contexts_own_pass_is_counted_once_where_it_trains_nothing` holds the count itself); the
+    run's task answers a request, and a question asked in other words answers otherwise, as the head
+    pools it from the context's pass."""
     objective = read_in_context()
     data = decision_rows([Example(state, QUESTION, {"pick": label}) for state, label in ROWS], 8,
                          objective=objective.data())
@@ -74,7 +76,8 @@ def test_a_run_reads_each_rows_schema_in_context_and_its_task_serves_alike():
     tracker = RecordingTracker()
     state = Trainer(objective, optax.adam(1e-3), key=0, tracker=tracker).fit(data, steps=1, log_every=1)
     [logged] = [scalars["train/flops"] for _, scalars in tracker.scalars if "train/loss" in scalars]
-    assert logged == pytest.approx(objective.training_flops(None, batch), rel=1e-6)
+    without = {name: value for name, value in batch.items() if name != "context_lengths"}
+    assert logged > objective.training_flops(None, without)
 
     task = objective.pipeline(state)
     assert isinstance(task, Decide)
