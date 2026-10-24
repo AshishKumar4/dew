@@ -71,6 +71,13 @@ def crossing(path) -> bool:
     return NAME in path
 
 
+def crosses_alone(trained) -> bool:
+    """Whether every leaf of `trained`, the trained part of a tree split from its frozen rest
+    (`dew.objectives.base.FROZEN`), is a cross-attention block's (`crossing`)."""
+    return all(crossing(tuple(entry.key for entry in path))
+               for path, _ in jax.tree_util.tree_leaves_with_path(trained))
+
+
 @dataclasses.dataclass(frozen=True)
 class CrossAttention:
     """The decoder layers that read a conditioning sequence, and its geometry.
@@ -184,7 +191,9 @@ class GatedCrossAttention(nn.Module):
         dropout = nn.Dropout(rate=self.dropout_rate)
 
         def joined(stream: jax.Array, name: str, branch: jax.Array) -> jax.Array:
-            gate = jnp.tanh(self.param(name, nn.initializers.zeros, (1,), jnp.float32).astype(jnp.float32))
+            # The gate in at least float32, and in its own float64 where a run widens it.
+            alpha = self.param(name, nn.initializers.zeros, (1,), jnp.float32)
+            gate = jnp.tanh(alpha.astype(at_least_fp32(alpha.dtype)))
             branch = dropout(branch, deterministic=not train)
             return jnp.where(present, gated_join(stream, branch, gate, ngpt=self.ngpt,
                                                  precision=self.precision), stream)

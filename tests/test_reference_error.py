@@ -382,6 +382,28 @@ def _bf16_operands(x, w):
                          preferred_element_type=jnp.float32)}
 
 
+@jax.jit
+def _broadcast(x, w):
+    """The product with a singleton axis before it: the reference's values, not its shape."""
+    return {"y": jnp.dot(x, w, precision="highest")[None]}
+
+
+@jax.jit
+def _renamed(x, w):
+    return {"z": jnp.dot(x, w, precision="highest")}
+
+
+def test_check_one_holds_each_leaf_to_its_truths_path_and_shape():
+    """A result with a singleton axis added, whose values broadcast against the truth, or with its key
+    renamed, whose values pair with the truth's by position, is not the reference's output: check 1
+    fails it before any arithmetic. So does a reference whose shape is not its truth's."""
+    for dew_fn in (_broadcast, _renamed):
+        with pytest.raises(AssertionError):
+            assert_as_exact(dew_fn, _product, _draw, "another tree", seeds=8)
+    with pytest.raises(AssertionError):
+        assert_as_exact(_product, _broadcast, _draw, "another reference", seeds=8, truth_fn=_product)
+
+
 def test_check_one_passes_an_equally_exact_sum_over_the_seeds_its_own_reference_resolves():
     """The product summed in reverse rounds as exactly as the reference, by other partial sums: over the
     seeds the reference compared with itself needs (`seeds_for`), its pooled RMS error sits within
@@ -394,7 +416,8 @@ def test_check_one_passes_an_equally_exact_sum_over_the_seeds_its_own_reference_
 def test_a_committed_fixture_is_its_references_output_within_twice_a_fresh_runs_error():
     """An artifact check, not a parity (`assert_same_artifact`): a committed fixture whose largest error
     from float64 is up to twice a fresh run's is the reference's output; one further is not, even where
-    only one element moves, which an RMS would let through."""
+    only one element moves, which an RMS would let through, nor one not finite, or held to a fresh run
+    that is not."""
     f64 = np.linspace(-1, 1, 101)
     fresh = f64 + 1e-7
     assert_same_artifact(fresh, f64 - 2e-7, f64, "twice as far")
@@ -405,6 +428,11 @@ def test_a_committed_fixture_is_its_references_output_within_twice_a_fresh_runs_
     assert np.sqrt(np.mean(np.square(corrupted - f64))) < 1e-7
     with pytest.raises(AssertionError):
         assert_same_artifact(fresh, corrupted, f64, "one element moved")
+    # Neither a NaN nor an infinity on either side is an evaluation of the reference.
+    for committed, recomputed in ((np.full_like(f64, np.nan), fresh), (f64 + 1e-7, np.full_like(f64, np.inf)),
+                                  (np.full_like(f64, np.inf), np.full_like(f64, np.inf))):
+        with pytest.raises(AssertionError):
+            assert_same_artifact(recomputed, committed, f64, "not finite")
 
 
 def test_a_runs_learning_rates_part_from_the_base_at_any_float32_difference(monkeypatch):
