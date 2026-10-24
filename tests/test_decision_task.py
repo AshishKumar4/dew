@@ -41,6 +41,31 @@ def decide() -> Decide:
     return Decide.from_pretrained(TINY, attention_impl="xla")
 
 
+def test_a_decision_source_loads_through_pretrained_and_its_declared_pipeline(decide, tmp_path):
+    """A Laya component release loads through the public source loader, including a subfolder,
+    and its declared task retains the same answers through export."""
+    from shutil import copytree
+
+    from dew import pipeline
+    from dew.interop import Pretrained
+
+    copytree(TINY, tmp_path / "release")
+    bundle = Pretrained.load(tmp_path, subfolder="release", dtype="float32", attention_impl="xla")
+    task = replace(Decide.of(bundle), name=decide.name)
+    request = CASES["quickstart"]
+    assert task.systemone(request) == decide.systemone(request)
+    original = jax.tree.map(lambda value: np.asarray(value).copy(), bundle.variables)
+    for _ in range(2):
+        assert_same_rounded_answers(replace(bundle.pipeline(), name=decide.name).systemone(request),
+                                    decide.systemone(request), "borrowed bundle task")
+    for held, expected in zip(jax.tree.leaves(bundle.variables), jax.tree.leaves(original), strict=True):
+        np.testing.assert_array_equal(held, expected)
+    bundle.save(tmp_path / "export", variables=bundle.variables, max_shard_size="10KB")
+    served = pipeline(str(tmp_path / "export"), dtype="float32")
+    assert_same_rounded_answers(replace(served, name=decide.name).systemone(request),
+                                decide.systemone(request), "public source pipeline")
+
+
 def assert_same_rounded_answers(found: dict, expected: dict, case: str) -> None:
     """Two `systemone(details=True)` answers to `case` from logits that differ
     by fp32 rounding: the same choices, and every reported number within one

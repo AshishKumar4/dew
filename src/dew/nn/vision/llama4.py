@@ -12,6 +12,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
+from dew.interop.weights import in_params
 from dew.nn.attention import LayerNorm
 from dew.nn.dense import Dense
 from dew.nn.inputs import AttentionMetadata
@@ -29,7 +30,6 @@ from .common import (
     _side,
     _vision_section,
     head_width,
-    in_params,
     rope_base,
     trunk_geometry,
 )

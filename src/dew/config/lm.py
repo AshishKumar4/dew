@@ -187,7 +187,8 @@ class LMRunConfig(RunConfig):
         checkpoint's: continuing pretraining on ids from another vocabulary
         trains the embedding table against noise.
         """
-        from dew.interop import Pretrained, split_revision
+        from dew.interop import Pretrained
+        from dew.interop.sources import SourceReference
 
         assert self.pretrained is not None
         choices = ("max_seq_len", "dtype", "attention_impl")
@@ -199,25 +200,26 @@ class LMRunConfig(RunConfig):
         if reach is not None and not isinstance(reach, int):
             raise ValueError(f"--model.max_seq_len is {reach!r}; the context a checkpoint is reloaded at "
                              "is a number of tokens")
-        name, revision = split_revision(self.pretrained)
+        reference = SourceReference.parse(self.pretrained)
         dtype = resolve_dtype(self.model.fields.get("dtype"))
-        loaded = Pretrained.load(name, dtype=jnp.bfloat16 if dtype is None else dtype,
+        loaded = Pretrained.load(reference.name, dtype=jnp.bfloat16 if dtype is None else dtype,
                                  param_dtype=self.pretrained_param_dtype,
                                  attention_impl=str(self.model.fields.get("attention_impl", "auto")),
-                                 max_seq_len=reach, revision=revision,
+                                 max_seq_len=reach, revision=reference.revision,
                                  # An adapter keeps its source as it is.
                                  **self.trainer.source_placement(frozen=self.lora is not None))
-        if not same_vocabulary(written, loaded, name):
+        if not same_vocabulary(written, loaded, reference.name):
             raise ValueError(f"the token files were written with {written}, and {self.pretrained} "
-                             f"expects its own tokenizer's ids. Retokenize with --tokenizer {name}.")
+                             "expects its own tokenizer's ids. Retokenize with "
+                             f"--tokenizer {reference.name}.")
         # A decoder's embedding table is usually padded past the tokenizer's ids
         # (Qwen3 stores 151936 rows for 151669 tokens), so covering them is the
         # requirement, not matching the count.
         if loaded.model.vocab_size < vocab_size:
             raise ValueError(f"{self.pretrained} has room for {loaded.model.vocab_size} ids and the token "
                              f"files use {vocab_size}")
-        reference = name if loaded.revision is None else f"{name}@{loaded.revision}"
-        return loaded, dataclasses.replace(self, pretrained=reference)
+        pinned = reference.name if loaded.revision is None else f"{reference.name}@{loaded.revision}"
+        return loaded, dataclasses.replace(self, pretrained=pinned)
 
     def masked_objective(self, model, fields, variables):
         """MDLM over a bidirectional model, its mask id from the model's fields.

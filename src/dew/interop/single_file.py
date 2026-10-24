@@ -50,6 +50,8 @@ from dew.files import staged, stat_identity
 from dew.interop import sources
 from dew.interop.pickles import host_view
 from dew.interop.safetensors_io import WEIGHT_STEMS, folder_weights, read_file, write_file
+from dew.records import JSON
+from dew.registry import to_record
 
 if TYPE_CHECKING:
     import torch
@@ -198,19 +200,19 @@ def _link(source: Path, destination: Path) -> None:
         shutil.copyfile(source, destination)
 
 
-def _key(path: Path, configs: str) -> str:
+def _key(path: Path, configs: JSON) -> str:
     """The cache entry's name: the file (a Hub file resolves to its
     content-addressed blob), the configs it was converted with, and the
     diffusers whose key maps convert it."""
     import diffusers
 
-    identity = "\0".join(map(str, (*stat_identity(path), configs, diffusers.__version__)))
+    identity = json.dumps([*stat_identity(path), configs, diffusers.__version__], sort_keys=True)
     return hashlib.sha256(identity.encode()).hexdigest()[:24]
 
 
 @contextmanager
 def unpacked(path: str | os.PathLike[str], configs: Path | None = None,
-             hub: tuple[str, str] | None = None) -> Iterator[tuple[Path, Path]]:
+             hub: sources.SourceReference | None = None) -> Iterator[tuple[Path, Path]]:
     """The diffusers directory a single-file checkpoint describes, as
     `(directory, published)`: the directory to load now and where it lives
     in Dew's cache once the load succeeds.
@@ -248,10 +250,10 @@ def unpacked(path: str | os.PathLike[str], configs: Path | None = None,
         checkpoint = {name: _torch_view(np.asarray(tensor)) for name, tensor in stored.items()}
         repo = config_repo(checkpoint)
         configs = _configs(repo)
-        hub = (repo, configs.name)
+        hub = sources.SourceReference(repo, configs.name)
     metadata = _metadata(configs)
     if hub is not None:
-        origin = f"{hub[0]}@{hub[1]}"
+        origin = to_record(hub, sources.SourceReference)
     else:
         # A local directory's configs can change in place, so their contents
         # name them, not their path, and so do the size and mtime of the
@@ -292,7 +294,8 @@ def unpacked(path: str | os.PathLike[str], configs: Path | None = None,
             # The Hub snapshot and the local directory are both read by
             # `weight_files`' rule, so a precision variant or non-EMA copy
             # beside the weights is neither fetched nor linked.
-            weights = configs if hub is None else sources.snapshot(*hub, weights=tuple(missing))
+            weights = (configs if hub is None else hub.directory(hub.weights(
+                sources.snapshot(hub.name, hub.revision, weights=False), tuple(missing))))
             empty = []
             for name in missing:
                 selected = folder_weights(weights / name)

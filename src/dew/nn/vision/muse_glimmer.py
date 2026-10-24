@@ -10,6 +10,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
+from dew.interop.weights import in_params
 from dew.nn.activations import HIDDEN_ACT
 from dew.nn.attention import RMSNorm
 from dew.nn.dense import Dense
@@ -26,7 +27,6 @@ from .common import (
     _vision_section,
     activation_name,
     block_tensor_path,
-    in_params,
     rope_base,
 )
 from .vit import MergeProjector, VisionTransformer, ViTLayout
