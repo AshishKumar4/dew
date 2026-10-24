@@ -29,6 +29,7 @@ from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.protocols import OutputTable
 from dew.objectives.base import part, thaw
+from dew.quantization import InputQuantizer
 
 LLAMA = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
 
@@ -125,12 +126,18 @@ def test_a_lora_adapted_heads_readout_is_its_own_logits_at_the_labels():
                     seeds=READOUT_SEEDS)
 
 
+QUANTIZER = InputQuantizer.fp8(0.01)
+"""An FP8 input QDQ, its grid coarse at the drawn states' scale."""
+
+
 def table_of(seed: int, vocab: int = 128, features: int = 32) -> OutputTable:
-    """An output table with a bias, a per-token scale off one and a softcap, drawn from `seed`."""
+    """An output table with an FP8 input quantizer, a bias, a per-token scale off one and a softcap,
+    drawn from `seed`."""
     rng = np.random.default_rng([0x7AB, seed])
     return OutputTable(jnp.asarray(rng.standard_normal((vocab, features)) * 0.3, jnp.float32),
                        vocab_major=True, bias=jnp.asarray(rng.standard_normal(vocab), jnp.float32),
-                       softcap=3.0, scale=jnp.asarray(1 + 0.5 * rng.random(vocab), jnp.float32))
+                       softcap=3.0, scale=jnp.asarray(1 + 0.5 * rng.random(vocab), jnp.float32),
+                       input_quantizer=QUANTIZER)
 
 
 GROUPED = ((65, 97), (66, 98), (67, 99))
@@ -140,9 +147,11 @@ GROUPED = ((65, 97), (66, 98), (67, 99))
 def test_an_untied_readout_drawn_from_a_table_is_its_tied_readout():
     """Each slot's every variant drawn by the head's own initializer from its table's row (scale folded
     in) and bias, read through the table's QDQ and cap and grouped alike: at its draw the untied
-    readout is the tied one, the table's own columns grouped (check 1), over tables with a bias, a
-    scale off one and a softcap, each label of two variants."""
+    readout is the tied one, the table's own columns grouped (check 1), over tables with an FP8 input
+    QDQ that moves the states, a bias, a scale off one and a softcap, each label of two variants."""
     tied, untied = LabelReadout(32, GROUPED), LabelReadout(32, GROUPED, untied=True)
+    states = jax.random.normal(jax.random.key(0), (2, 8, 32), jnp.float32)
+    assert not np.array_equal(np.asarray(table_of(0).states(states)), np.asarray(states))
 
     def draw(seed):
         batch = DecisionInputs.collate(rows_of(seed), SPECIALS.pad)
@@ -162,14 +171,17 @@ def test_an_untied_readout_drawn_from_a_table_is_its_tied_readout():
 
 def test_a_runs_untied_readout_starts_as_its_tied_readout():
     """The objective draws an untied readout from its backbone's table (`complete_variables`): a run's
-    first logits are the tied readout's over the same backbone (check 1)."""
+    first logits, over rows its head admits (`validate_rows`), are the tied readout's over the same
+    backbone (check 1)."""
     objective = DecisionObjective(backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
-                                  head=LabelReadout(32, GROUPED, untied=True))
-    tied = model(LabelReadout(32, GROUPED))
+                                  head=LabelReadout(32, ids(), untied=True))
+    tied = model(LabelReadout(32, ids()))
     initialized = jax.jit(objective.init)
 
     def draw(seed):
-        return initialized(jax.random.key(seed)), DecisionInputs.collate(rows_of(seed), SPECIALS.pad)
+        rows = rows_of(seed)
+        objective.model.head.validate_rows(rows)
+        return initialized(jax.random.key(seed)), DecisionInputs.collate(rows, SPECIALS.pad)
 
     def as_tied(values, batch):
         return tied.logits({"params": {"backbone": values["params"]["backbone"], "head": {}}}, batch)
@@ -237,6 +249,15 @@ def test_a_readout_of_as_many_labels_as_options_reads_a_pass_padded_past_them(ki
     np.testing.assert_array_equal(wide[..., :3], exact)
     assert np.all(np.isneginf(wide[..., 3]))
     assert head.clone(dtype=jnp.float64).dtype == jnp.float64
+
+
+def test_a_slot_heads_work_is_each_real_options_slot_key_and_pooling():
+    """A slot head counts each question's query, each real option's slot row, key and affinity, and the
+    pooling of its line over its row's tokens, from integer row geometry."""
+    head = SlotReadout(32, (65, 66, 67), head_dim=8)
+    lengths, questions, options = np.asarray([10, 7]), np.asarray([1, 1]), np.asarray([3, 2])
+    expected = (2 * 2 * 32 * 8 + 2 * 5 * 32 * 9 + 2 * 5 * 8 + 2 * (3 * 10 + 2 * 7) * 32)
+    assert head.decision_flops(lengths, questions, options) == expected
 
 
 def test_a_parallel_labelled_rows_lines_read_none_of_each_other():

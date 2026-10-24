@@ -556,11 +556,10 @@ class SlotReadout(Head):
     def decision_flops(self, lengths, questions, options) -> float:
         """Each real option's slot product and key, its affinity with its question's query, and its
         line's pooling over the row; each question's query."""
-        lengths, questions, options = decision_geometry(lengths, questions, options)
+        widths, _, counted = decision_geometry(lengths, questions, options)
         return (projection_flops(questions, self.features, self.head_dim)
                 + projection_flops(options, self.features, 1 + self.head_dim)
-                + 2 * np.sum(options.astype(np.float64)) * self.head_dim
-                + projection_flops(options * lengths, 1, self.features))
+                + 2 * np.sum(counted) * self.head_dim + 2 * np.sum(counted * widths) * self.features)
 
     @nn.compact
     def __call__(self, states: jax.Array, inputs: DecisionInputs, table=None, train: bool = False, *,
