@@ -29,7 +29,13 @@ from test_attention_template import (
 
 from dew.nn.attention import dropout_draw, dropout_seed, reference_attention, scaled_dot_product_attention
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention as template, attention_portable, attention_route
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_mosaic,
+    attention_portable,
+    attention_route,
+    attention_triton,
+)
 
 RATE = 0.25
 """The dropout rate the check-1 tests drop at: a quarter of the weights."""
@@ -356,3 +362,80 @@ def test_fp16_values_at_two_to_the_minus_ten_under_a_near_total_draw_stay_finite
     ref = reference_attention(query, key, value, dropout_rate=rate, dropout_seed=words)
     assert bool(jnp.all(jnp.isfinite(ref)))
     assert bool(jnp.all(jnp.isfinite(dew)))
+
+
+def identical_keys(seed: int, queries: int, keys: int, dtype):
+    """A query, a cotangent, and a key and value repeating one row across the keys: every query's keys are
+    identical, so its score cotangents must sum to zero over them."""
+    streams = jax.random.split(jax.random.PRNGKey(seed), 3)
+    row = jax.random.normal(streams[1], (ROWS, 1, KV_HEADS, WIDTH), jnp.float32).astype(dtype)
+    query = jax.random.normal(streams[0], (ROWS, queries, HEADS, WIDTH), jnp.float32).astype(dtype)
+    dout = jax.random.normal(streams[2], (ROWS, queries, HEADS, WIDTH), jnp.float32).astype(dtype)
+    key = jnp.broadcast_to(row, (ROWS, keys, KV_HEADS, WIDTH))
+    return query, key, key, dout
+
+
+def test_identical_keys_give_an_exactly_zero_query_gradient_on_the_portable_mainloop():
+    """Two identical keys and values, both kept at rate 1/4, in bf16. Each query's score cotangents sum to
+    zero over its keys, and identical keys multiply each by the same key, so dQ is exactly zero, as the
+    reference's is. A first D from the forward's narrowed dropped weights leaves dQ off zero (-3.26e-4)."""
+    words = first_seed(RATE, 2, lambda kept: bool(kept.all()))
+    query, key, value, dout = identical_keys(0, 3, 2, jnp.bfloat16)
+    grads = attention_portable.backward(query, key, value, template.spans(3, 2, ROWS),
+                                        hooked(words, ROWS, HEADS), dout, block_q=8, block_k=8,
+                                        pad=attention_triton.BLOCK)
+    np.testing.assert_array_equal(np.asarray(grads.query, np.float32), np.zeros(query.shape, np.float32))
+
+
+def test_a_kept_bf16_weight_is_scaled_in_fp32_and_rounded_once():
+    """Ledger 1533: three equal weights of 1/3 at rate 0.1, in bf16. A kept weight is 1/3 times 1/0.9 in fp32,
+    rounded once to bf16: 0.37109375 (190/512). Rounding the multiplier to bf16 first (1.109375) gives
+    0.369140625 (189/512)."""
+    rate = 0.1
+    words = first_seed(rate, 3, lambda kept: bool(kept.any()))
+    query = jnp.zeros((1, 1, 1, 4), jnp.bfloat16)
+    key = jnp.zeros((1, 3, 1, 4), jnp.bfloat16)
+    value = jnp.broadcast_to(jnp.eye(3, dtype=jnp.bfloat16)[None, :, None, :], (1, 3, 1, 3))
+    out = reference_attention(query, key, value, dropout_rate=rate, dropout_seed=words)
+    kept = np.asarray(dropout_draw(words, rate, (1, 1, 1, 3)))[0, 0, 0] > 0
+    row = np.asarray(out, np.float32)[0, 0, 0]
+    np.testing.assert_array_equal(row[kept], np.full(int(kept.sum()), 0.37109375, np.float32))
+    np.testing.assert_array_equal(row[~kept], np.zeros(int((~kept).sum()), np.float32))
+
+
+def test_the_template_reference_narrows_the_normalized_dropped_coefficient():
+    """The fp16 witness on the template's reference: rate 1 - 2^-16 (z = 2^16), one of two equal-logit keys
+    kept. Narrowed unnormalized, its weight z is past fp16's largest and the output is infinite. Normalized
+    first, the weight is z / 2 = 2^15 and the output is 2^5 = 32, exactly."""
+    rate = 1.0 - 2.0 ** -16
+    words = first_seed(rate, 2, lambda kept: int(kept.sum()) == 1)
+    query = jnp.zeros((1, 1, 1, 8), jnp.float16)
+    key = jnp.zeros((1, 2, 1, 8), jnp.float16)
+    value = jnp.full((1, 2, 1, 8), 2.0 ** -10, jnp.float16)
+    out = template.reference(query, key, value, template.spans(1, 2, 1), hooked(words, 1, 1, rate))
+    np.testing.assert_array_equal(np.asarray(out, np.float32), np.full((1, 1, 1, 8), 32.0, np.float32))
+
+
+def test_a_dropping_call_under_x64_on_fp32_inputs_keeps_fp32_gradients():
+    """The dropout multiplier stays fp32 under x64 (`Draw`): a float64 multiplier changes the backward's loop
+    carries, so the gradients would not stay fp32 (review)."""
+    spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
+    with jax.enable_x64(new_val=True):
+        streams = jax.random.split(jax.random.PRNGKey(0), 3)
+        query = jax.random.normal(streams[0], (ROWS, QUERIES, HEADS, WIDTH), jnp.float32)
+        key = jax.random.normal(streams[1], (ROWS, KEYS, KV_HEADS, WIDTH), jnp.float32)
+        value = jax.random.normal(streams[2], (ROWS, KEYS, KV_HEADS, WIDTH), jnp.float32)
+        hooks = hooked(seed_words(4), ROWS, HEADS)
+        out, pull = jax.vjp(lambda q, k, v: attention_route.attend(q, k, v, spans, hooks), query, key, value)
+        grads = pull(jnp.ones_like(out))
+    for array in (out, *grads):
+        assert array.dtype == jnp.float32
+        assert bool(jnp.all(jnp.isfinite(array)))
+
+
+def test_the_mosaic_legality_rule_refuses_active_dropout():
+    """Mosaic's mainloops take no probability dropout: their legality rule refuses a dropping forward, so no
+    launch returns it undropped (the route sends hooked calls to Triton, `_mosaic_takes`)."""
+    hooks = template.Hooks(drop=dropout_of(seed_words(0), ROWS, HEADS))
+    reason = attention_mosaic.refused(jnp.bfloat16, WIDTH, WIDTH, hooks, backward=False, tile=(64, 64))
+    assert reason is not None
