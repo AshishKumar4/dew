@@ -14,7 +14,7 @@ from dew.data.dataset import Checkpointable, DataPartition
 from dew.decision import DecisionObjective, JointLayout, decisions
 
 ROWS = 1
-"""One row a window, so each pass is the examples' count of windows."""
+"""One window a batch, and one row a window (`segments=1`), so each pass is the examples' count."""
 
 
 def windows(seed: int, count: int, *, resumed: int | None = None) -> list[np.ndarray]:
@@ -24,7 +24,7 @@ def windows(seed: int, count: int, *, resumed: int | None = None) -> list[np.nda
     fresh reader."""
     layout = JointLayout(max_len=1024)
     data = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
-                             specials=SPECIALS, layout=layout).data()
+                             specials=SPECIALS, layout=layout, segments=1).data()
     chain = Memory([{"example": example} for example in EXAMPLES]).pipe(decisions).repeat(2).batch(ROWS)
     loader = compile(chain, read="memory", objective=data, seed=seed)
     reader = loader.train(DataPartition())
