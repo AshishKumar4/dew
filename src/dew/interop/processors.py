@@ -377,7 +377,8 @@ class Processor:
                 vision = (types == 1) | (types == 2)
                 previous = np.concatenate([np.zeros((tokens.shape[0], 1), bool), vision[:, :-1]], axis=1)
                 groups = np.cumsum(vision & ~previous, axis=1, dtype=np.int32) - 1
-                field = "block_groups" if self.config.get("model_type") == "gemma4_unified" else "image_groups"
+                field = ("block_groups" if self.config.get("model_type") == "gemma4_unified"
+                         else "image_groups")
                 token_fields[field] = jnp.asarray(np.where(vision, groups, -1))
         elif "video_position_ids" in values:
             raise ValueError("video_position_ids require the Gemma4 visual tower")
