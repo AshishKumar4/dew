@@ -156,9 +156,13 @@ class DewLM(TemplateLM):
 
     @property
     def eot_token_id(self) -> int:
-        """The id a row with no context is conditioned on: the sampling policy's first EOS, or 0."""
+        """The id a row with no context is conditioned on: the sampling policy's first EOS. A task
+        whose policy names none has no such id, and is refused (ValueError) rather than given one."""
         stops = self.task.sampling.stops
-        return stops[0] if stops else 0
+        if not stops:
+            raise ValueError("the task's sampling policy names no EOS id, the end-of-text id a row with "
+                             "no context is conditioned on; give the task's sampling eos_token_ids")
+        return stops[0]
 
     @property
     def prefix_token_id(self) -> int:
@@ -186,38 +190,42 @@ class DewLM(TemplateLM):
                    left_truncate_len: int | None = None, **kwargs: int | None) -> list[int]:
         """Encode `string` with the run's own tokenizer into one row of ids, as `HFLM.tok_encode` does.
 
-        The run's processor adds the special tokens it added in training.
-        Where it inserts a BOS, the BOS is left off with
-        `add_special_tokens=False`, and with None when the text already
-        starts with a BOS, which the tokenizer reads off the text as a second
-        BOS id, so no such row starts with two. `HFLM` asks instead whether
-        the text starts with the BOS's decoded text. The two agree wherever
-        decoding a BOS gives back its spelling, as in released vocabularies,
-        and this reads only what the processor does: the task's processor
-        names no tokenizer, and a checkpoint's decodes with special tokens
-        skipped. `left_truncate_len` keeps that many of the last ids. Any
-        other option raises TypeError, since `HFLM` reads none.
+        `add_special_tokens=True` is the tokenizer's own encoding, its special tokens around the text
+        (a BOS before it, T5's EOS after it); False is the text's ids alone. None, the default every
+        scored context and continuation reads, opens the text as the tokenizer opens a sequence and
+        closes it with nothing (`_opening`): a context and its continuation encode as one row, so an
+        EOS a tokenizer closes a sequence with would end the context before its continuation,
+        shifting where the continuation starts and scoring an EOS it never wrote. The opening is
+        left off where the text already starts with it, which the tokenizer reads off the text's own
+        BOS spelling, so no row starts with two. `HFLM` asks instead whether the text starts with
+        the BOS's decoded text; the two agree wherever decoding a BOS gives back its spelling, as in
+        released vocabularies. `left_truncate_len` keeps that many of the last ids. Any other option
+        raises TypeError, since `HFLM` reads none.
         """
         if kwargs:
             raise TypeError(f"tok_encode takes no {', '.join(sorted(kwargs))}")
-        ids = self._encoded(string)
-        if self._inserts_bos and (add_special_tokens is False
-                                  or (add_special_tokens is None and ids[1:2] == ids[:1])):
-            ids = ids[1:]
+        if add_special_tokens:
+            ids = self._processor.encode(string, specials=True)
+        else:
+            ids = self._processor.encode(string, specials=False)
+            opening = self._opening
+            if add_special_tokens is None and ids[:len(opening)] != opening:
+                ids = [*opening, *ids]
         return ids[-left_truncate_len:] if left_truncate_len else ids
 
-    def _encoded(self, string: str) -> list[int]:
-        return [int(token) for token in np.asarray(self._processor([string]).tokens)[0]]
-
     @functools.cached_property
-    def _inserts_bos(self) -> bool:
-        """Whether the run's processor starts an encoding with the BOS it declares, as Llama's does.
-
-        GPT-2's declares one and inserts none. The probe is one letter,
-        since a processor refuses an empty row.
-        """
-        bos = self._processor.bos_id
-        return bos is not None and self._encoded("a")[:1] == [bos]
+    def _opening(self) -> list[int]:
+        """The special ids the run's tokenizer opens a sequence with: those its own encoding of a
+        probe holds before the probe's ids (Llama's BOS; none for GPT-2's, which declares a BOS and
+        inserts none, or T5's, whose one special closes a sequence). The probe is one letter, since a
+        tokenizer may refuse an empty row."""
+        whole = self._processor.encode("a", specials=True)
+        bare = self._processor.encode("a", specials=False)
+        for start in range(len(whole) - len(bare) + 1):
+            if whole[start:start + len(bare)] == bare:
+                return whole[:start]
+        raise ValueError("the run's tokenizer encodes a text with its special tokens around ids other "
+                         "than the text's own")
 
     def tok_decode(self, tokens: Sequence[int]) -> str:
         return self._processor.decode(np.asarray([list(tokens)], np.int32))[0]
