@@ -557,7 +557,7 @@ def test_a_stage_without_dtype_computes_in_the_models_dtype(dtype, rng):
     np.testing.assert_array_equal(output, explicit.apply(variables, x))
 
 
-GROUP_NORM_SEEDS = 16
+GROUP_NORM_SEEDS = 32
 """The group norm's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada."""
 
 
