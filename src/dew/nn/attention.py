@@ -1841,7 +1841,8 @@ def splash_attention(query, key, value, descriptor, *, softcap, sinks, segment_i
 
 
 def splash_backward_vmem(block_q: int, block_kv: int, width: int, itemsize: int, softcap: bool) -> int:
-    """A bound on the scoped VMEM splash's fused backward kernel plans at XLA's default limit, in bytes:
+    """A bound on the scoped VMEM splash's backward kernels plan at XLA's default limit, in bytes, the fused
+    kernel's, which its separate dq and dkv kernels each stay within:
     its fp32 logits blocks (two, three with a softcap's derivative), each `block_q` by `block_kv`; its
     query, output-gradient, key and value blocks, each double-buffered in the operands' dtype; and its
     key and value gradients' fp32 scratch. On a v5e at the 16 MiB default (2026-10-21, 96 configs of
@@ -1861,10 +1862,15 @@ def splash_block_sizes(q_len: int, kv_len: int, *, width: int, itemsize: int, so
 
     The greatest common divisor divides its sequence, as the mask blocking
     requires, and stays a multiple of `SPLASH_LANES`, as the key compute block
-    requires. The backward runs as one kernel for dq, dk and dv, which reads
-    each logits block once where separate dq and dkv kernels read it twice;
-    its blocks are set because a kernel built without them raises "Need to
-    specify backward blocks." at its first gradient. On a TPU whose scoped
+    requires. The backward forms each query's delta from its weights, sum_k p
+    * dp, in a pass of the dq kernel's own before its dq and dkv kernels
+    (`BlockSizes.delta_from_weights`): the flash form, rowsum(o * do), leaves
+    the output's rounding where a query reads one key, whose dq is exactly
+    zero (1.2e-6 from a causal first query on a v5e, where the reference's is
+    0); the sum of its weights cancels there, as the softmax's derivative
+    does. It reads each logits block three times where the fused kernel read
+    it once. Its blocks are set because a kernel built without them raises
+    "Need to specify backward blocks." at its first gradient. On a TPU whose scoped
     VMEM limit is measured (`GpuTarget.scoped_vmem`), past which a kernel fails
     to compile, they halve together, as measured (half of `SPLASH_BLOCK`
     compiled on every config), while they stay whole lanes, until its plan fits
@@ -1883,7 +1889,7 @@ def splash_block_sizes(q_len: int, kv_len: int, *, width: int, itemsize: int, so
     return splash_attention_kernel.BlockSizes(
         block_q=block_q, block_kv=block_kv, block_kv_compute=block_kv,
         block_q_dkv=back_q, block_kv_dkv=back_kv, block_kv_dkv_compute=back_kv,
-        use_fused_bwd_kernel=True)
+        block_q_dq=back_q, block_kv_dq=back_kv, delta_from_weights=True)
 
 
 def splash_mask_descriptor(q_len: int, kv_len: int, heads: int, causal: bool,
