@@ -774,7 +774,7 @@ def test_a_configured_optimizer_is_optaxs_own_at_the_rate_its_state_holds(optimi
     config = OptimConfig(optimizer=optimizer, **betas, optimizer_opts=opts,
                          learning_rate=3e-3 if schedule is None else schedule, clip_grads=0.5)
     solver = config.build(10)
-    scale, shape = scaled(config.rate)
+    scale, shape = scaled(config.learning_rate)
     ratio = (lambda count: 1.0) if shape is None else shape.schedule(10)
     given = {**betas, **opts, **({"mask": weight_decay_mask} if adam else {})}
     reference = optax.chain(optax.clip_by_global_norm(0.5), OPTIMIZER_MAP[optimizer](
