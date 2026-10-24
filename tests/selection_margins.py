@@ -139,9 +139,10 @@ def margin(config, captured, label: str) -> float:
 
 
 def clearing(draw, clears, tries: int = 64):
-    """`draw(key)` at the first key from a seed whose inputs `clears`: the seed itself, then keys apart
-    from every other seed's (`1_000_003 * (attempt + 1) + seed`), so a redrawn seed takes fresh inputs
-    no other seed draws. A seed none of `tries` keys clears fails its site."""
+    """`draw(key)` at the first key from a seed whose inputs `clears`: the seed itself, then
+    `1_000_003 * (attempt + 1) + seed`, apart from every seed of the windows a site draws (a verdict's
+    from 0, a sizing's from SIZING_FROM, 2^20), which differ by no multiple of 1_000_003, so a redrawn
+    seed takes inputs no other seed of them draws. A seed none of `tries` keys clears fails its site."""
     def drawn(seed):
         for attempt in range(tries):
             inputs = draw(seed if attempt == 0 else 1_000_003 * (attempt + 1) + seed)
