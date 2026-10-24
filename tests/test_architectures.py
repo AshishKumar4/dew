@@ -484,7 +484,7 @@ def in_identity_order(stepped: dict, order):
                         stepped, is_leaf=mirrors)
 
 
-ORBIT = 2
+ORBIT = 4
 """The residual orders each draw of a mixture cell runs at (`assert_as_exact`'s `orders`): its own and
 ORBIT - 1 more, each arm's worst row its worst over them. A routed expert's row of a step's momentum
 can nearly cancel on one draw, its rounding then set by the order its few tokens sum in; one order's
