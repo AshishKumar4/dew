@@ -136,7 +136,7 @@ def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forwa
     its first term."""
     first_key, length = span
     rows = jnp.arange(QUERIES)
-    spans = jnp.full((QUERIES,), first_key), jnp.full((QUERIES,), length)
+    spans = ((jnp.full((QUERIES,), first_key), jnp.full((QUERIES,), length)),)
 
     def body(step, state):
         key, value = read(step)

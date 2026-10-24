@@ -238,13 +238,10 @@ def key_spans(query_length: int, key_length: int, causal: bool, sliding_window: 
     if pair[0] is not None and pair[1] is not None:
         positions = (jnp.broadcast_to(jnp.atleast_2d(pair[0]), (rows, query_length)),
                      jnp.broadcast_to(jnp.atleast_2d(pair[1]), (rows, key_length)))
+    valid = None if key_valid is None else jnp.broadcast_to(key_valid, (rows, key_length))
     return template.spans(query_length, key_length, rows, causal=causal, sliding_window=sliding_window,
-                          positions=positions, segment_ids=segment_ids,
-                          lengths=lengths, starts=starts, block_groups=block_groups,
-                          image_groups=image_groups,
-                          valid=(None if key_valid is None
-                                 else jnp.broadcast_to(key_valid, (rows, key_length))),
-                          runs=key_runs)
+                          positions=positions, segment_ids=segment_ids, lengths=lengths, starts=starts,
+                          block_groups=block_groups, image_groups=image_groups, valid=valid, runs=key_runs)
 
 
 def visibility_mask(query_length: int, key_length: int, causal: bool, sliding_window: int | None, mask=None,
@@ -264,8 +261,7 @@ def visibility_mask(query_length: int, key_length: int, causal: bool, sliding_wi
 def visible_rows(query_length: int, key_length: int, causal: bool, sliding_window: int | None,
                  mask=None, segment_ids=None, key_value_seq_lengths=None,
                  key_value_seq_starts=None, *, block_groups=None, image_groups=None, key_valid=None,
-                 key_runs=None,
-                 places=None) -> jax.Array | None:
+                 key_runs=None, places=None) -> jax.Array | None:
     """Whether each query row sees a key, `[B or 1, Q, H or 1, 1]` over the
     output, or None where every row does.
 
