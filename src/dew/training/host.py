@@ -130,38 +130,47 @@ def stream(tree: Variables, placement, held: Variables | None = None) -> Variabl
 
     `held` is the tree the sources came from, the one an objective keeps and
     hands the trainer as data. A dict node of it that holds a placed source
-    is updated to the placed array, so the objective and the state share one
-    copy instead of two. A node that is not a dict is left as it is.
+    is updated to the placed array as it lands, and one that holds a node of
+    another kind to the node rebuilt over its placed leaves, so the objective
+    and the state share one copy instead of two.
 
-    Every dict node of `tree` is updated in place, so the caller's other
-    references to it see the placed arrays too, and a node that is not one
-    (a FrozenDict) is rebuilt as a dict over the same leaves. Each leaf goes to
+    The dicts of `tree` reached through mappings alone are updated in place, so
+    the caller's other references to them see the placed arrays too; any other
+    mapping (a FrozenDict) is rebuilt as a dict over the same children, and the
+    dicts below a node of another kind are rebuilt with it. Each leaf goes to
     the target at its key path in `placement` (`target`): a quantized array's
     buffers to the shardings `placement` holds in their places, or all to one
     target that `placement` gives the node whole.
     """
     holders: dict[int, list[tuple[dict, object]]] = {}
 
-    def index(node):
+    def index(node, into: dict[int, list[tuple[dict, object]]]):
         if not isinstance(node, dict):
             return
         for name, child in node.items():
             if isinstance(child, Mapping):
-                index(child)
+                index(child, into)
             else:
-                holders.setdefault(id(child), []).append((node, name))
+                into.setdefault(id(child), []).append((node, name))
 
     if held is not None:
-        index(held)
+        index(held, holders)
+    # Where `tree` holds each node `held` shares, to hand `held` a rebuilt node once it is placed.
+    owners: dict[int, list[tuple[dict, object]]] = {}
+    index(tree, owners)
 
     def landed(path: KeyPath, leaf):
         placed = place_leaf(leaf, target(placement, path))
-        for holder, key in holders.get(id(leaf), ()):
+        for holder, key in holders.pop(id(leaf), ()):
             holder[key] = placed
         return placed
 
-    return placed_leaves(tree, landed, in_place=True)
-
+    placed = placed_leaves(tree, landed, in_place=True)
+    for shared, places in holders.items():
+        for owner, name in owners.get(shared, ())[:1]:
+            for holder, key in places:
+                holder[key] = owner[name]
+    return placed
 
 
 def target(placement, path: KeyPath) -> Sharding | Format:
