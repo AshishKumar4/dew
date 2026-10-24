@@ -259,10 +259,13 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
     family's facts and the call's extents, and fit the GPU's block; the cost model picks among them on
     the GPU's own facts (at a Qwen3 MoE projection's extents, not every pick the same GPU family's
     canonical device picks), and the call takes those picks. Named there, the projection's forward and
-    both gradients through them are as exact as XLA's ragged dot from float64."""
+    its gradients through them (the matrix's where the family runs the kernel gradient) are as exact as
+    XLA's ragged dot from float64."""
     target = UNSEEN[unseen]
     canonical = generation.TARGETS[target.generation]
     family = "wgmma" if target.wgmma else "mma.sync"
+    # mma.sync's tiles run the forward and the input gradient; the kernel gradient is warpgroup MMA's.
+    launched = {"MosaicGmm", "MosaicTgmm"} if target.wgmma else {"MosaicGmm"}
 
     def calls(rows, depth, width, groups):
         def bf16(shape):
@@ -276,6 +279,8 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
     picks = {}
     with generation.assumed(target):
         for launch, args, options in calls(65536, 2048, 1536, 128):
+            if type(launch).__name__ not in launched:
+                continue
             ba = launch.bind(*args, out_dtype="bfloat16", interpret=grouped_matmul.INTERPRETED, **options)
             fits = launch.fitting(ba, target)
             assert fits and {tile.family for tile in fits} == {family}
@@ -291,12 +296,16 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
     def draw(seed):
         return tuple(jnp.asarray(value, jnp.bfloat16) for value in operands(sizes, jnp.bfloat16, seed)[:3])
 
+    def held(w):
+        # Where the kernel gradient is not the family's, the matrix is held: no gradient of it is formed.
+        return w if target.wgmma else jax.lax.stop_gradient(w)
+
     def projection(dtype=jnp.bfloat16):
-        return lambda x, w: expert_projection(x, w, group_sizes, dtype, "xla", None)
+        return lambda x, w: expert_projection(x, held(w), group_sizes, dtype, "xla", None)
 
     def through_mosaic(x, w, dy):
         with generation.assumed(target), generation.chosen(grouped_matmul="mosaic_gpu"):
-            return with_gradients(lambda x, w: template.gemm(x, w, group_sizes, out_dtype=jnp.bfloat16,
+            return with_gradients(lambda x, w: template.gemm(x, held(w), group_sizes, out_dtype=jnp.bfloat16,
                                                              precision="default",
                                                              interpret_on_cpu=True))(x, w, dy)
 
@@ -304,7 +313,7 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
     with tuning.seen() as launches:
         assert_as_exact(through_mosaic, jax.jit(with_gradients(projection())), draw,
                         f"unseen {unseen}", seeds=SEEDS, truth_fn=with_gradients(projection(jnp.float64)))
-    assert {type(launch).__name__ for launch, _ in launches} == {"MosaicGmm", "MosaicTgmm"}
+    assert {type(launch).__name__ for launch, _ in launches} == launched
     with generation.assumed(target):
         assert all(ba.heuristics_config == launch.estimate(ba, target)[1] for launch, ba in launches)
 

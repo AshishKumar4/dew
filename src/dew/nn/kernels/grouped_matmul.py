@@ -806,13 +806,13 @@ class MosaicTgmm(_Mosaic):
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         tokens, cotangent = ba.arguments['tokens'], ba.arguments['cotangent']
         # A gradient tile's rows divide the tokens' width; its steps run over a group's rows, padded to
-        # whole steps (`mosaic_gpu.tgmm`), which mma.sync masks at a group's edges in its accumulator's
-        # layout, whose base tile is a role's rows: no step shorter.
-        families = _families(tokens.dtype)
-        return tuple(tile for tile in mosaic_gpu.generated(families, depth=None,
+        # whole steps (`mosaic_gpu.tgmm`). Warpgroup MMA's alone: a gradient's stage, its neighbouring
+        # groups' rows zeroed in shared memory, is published to its products by Hopper's async-proxy
+        # fence, which an Ampere GPU has no instruction for (GEN2-route-a100: LLVM cannot select
+        # `fence.proxy.async.shared_cta` at sm80).
+        return tuple(tile for tile in mosaic_gpu.generated((mosaic_sm90.WGMMA,), depth=None,
                                                            width=cotangent.shape[1], dtype=tokens.dtype)
-                     if tokens.shape[1] % tile.block_m == 0
-                     and (tile.family != 'mma.sync' or tile.block_k >= mosaic_sm80.Mma.role_rows))
+                     if tokens.shape[1] % tile.block_m == 0)
 
     def fitting(self, ba, target) -> tuple[mosaic_gpu.Tiles, ...]:
         """The tiles that fit `target` (`Template.fitting`), with `exact_sums` those whose two fp32
