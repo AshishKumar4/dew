@@ -129,9 +129,12 @@ def transformers_clip(source, inputs, dtype, names):
             outputs.update(last_hidden_state=text.last_hidden_state, pooler_output=text.pooler_output)
             # `get_text_features`' projection of the pooled row, without running the tower again.
             outputs["text_embeds"] = model.text_projection(text.pooler_output)
-        if "image_embeds" in names:
+        if {"image_embeds", "vision_hidden_state", "vision_pooler_output"} & set(names):
             pixels = torch.from_numpy(np.asarray(inputs["pixel_values"])).to(dtype)
-            outputs["image_embeds"] = model.get_image_features(pixel_values=pixels).pooler_output
+            vision = model.vision_model(pixel_values=pixels)
+            outputs.update(vision_hidden_state=vision.last_hidden_state,
+                           vision_pooler_output=vision.pooler_output,
+                           image_embeds=model.visual_projection(vision.pooler_output))
     return {name: outputs[name].numpy() for name in names}
 
 
@@ -322,10 +325,15 @@ def test_tiny_checkpoint_image_embeddings_match_the_reference():
     assert np.array_equal(pixel_values, expected["pixel_values"])
     shape = tuple(json.loads((TINY / "prompts.json").read_text())["images"]["shape"])
 
-    def embedded(inputs):
-        return {"image_embeds": model.get_image_features(inputs["pixel_values"])}
+    def observed(module, pixels):
+        tower = module.vision_model(pixels)
+        return {"image_embeds": module.visual_projection(tower.pooler_output),
+                "vision_hidden_state": tower.last_hidden_state, "vision_pooler_output": tower.pooler_output}
 
-    assert_as_exact_as_transformers(embedded, ("image_embeds",), TINY, image_draw(TINY, shape),
+    forward = jax.jit(lambda pixels: model.module.apply(model.variables, pixels, method=observed))
+    names = ("image_embeds", "vision_hidden_state", "vision_pooler_output")
+    assert_as_exact_as_transformers(lambda inputs: forward(inputs["pixel_values"]), names,
+                                    TINY, image_draw(TINY, shape),
                                     "tiny image embeddings")
 
     baseline = model.module.apply(
