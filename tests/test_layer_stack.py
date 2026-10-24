@@ -175,6 +175,14 @@ of its values: Gemma 3n's sparse layers keep about ten of 192 units a token at 0
 keep two, as the architectures cell found (tests/test_architectures.py);
 Gemma 4's per-layer inputs are 32 wide, where at the fixture's 8 Dew paired with the plain loop did not
 resolve within 4096 draws (the released E2B's are 256)."""
+SCAN_MARGIN = 7e-5
+"""The least selection margin a scanned-stack draw admits (`selection_margins.margin`), relative to the
+scale of what is selected: ten times the largest distance float32 rounding moved a selection's inputs
+from their float64 values over 48 draws of both parameter sets, 7.0e-6 of the deviation at Gemma 3n's
+gates and 4.9e-6 of the scale at the DeepSeek routers. Gemma 3n's sparse run is a scan group of two
+layers: over all five of a ten-layer stack the gates' rounding reached 3.9e-5 against draws whose
+median margin was 2.7e-5, so no margin above it leaves draws to admit, where at two the median is
+6.4e-5."""
 SCAN_SEEDS = {"gemma4": 256, "gemma3n": 256, "deepseek": 8, "deepseek_widths": 8}
 """Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada: Gemma 3n's
 by the plain loop against itself; Gemma 4's and the DeepSeek shapes' paired with the scanned stack,
@@ -226,10 +234,10 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
 
     def clears(inputs):
         """Whether the draw's selections, in the forward of both parameter sets the arms read (the
-        logits' and the loss's), clear `selection_margins.MARGIN`."""
+        logits' and the loss's), clear SCAN_MARGIN."""
         ids = jnp.asarray(inputs[0])
-        return all(selection_margins.margin(config, selected(tree, ids), shape)
-                   > selection_margins.MARGIN for tree in (variables, training))
+        return all(selection_margins.margin(config, selected(tree, ids), shape) > SCAN_MARGIN
+                   for tree in (variables, training))
 
     def rows(key):
         """BATCH rows of SEQ_LEN token ids and the scalar loss's cotangent, one: rows enough that a
