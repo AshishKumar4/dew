@@ -1130,7 +1130,7 @@ def placed_bytes(tree) -> int:
 
 
 def placed_held[Held](held: Held, variables: Variables, shardings: Placement[Variables],
-                      mesh: Mesh, shared: frozenset[int] = frozenset()) -> tuple[Held, Held]:
+                      mesh: Mesh, shared: Mapping[int, NamedSharding] | None = None) -> tuple[Held, Held]:
     """A copy of `held` on `mesh` as two trees, each None where the other holds
     an array: the arrays a state of `variables` placed by `shardings` takes
     over, each where the state keeps the variable of its path and shape
@@ -1142,10 +1142,12 @@ def placed_held[Held](held: Held, variables: Variables, shardings: Placement[Var
     the free memory a step's temporaries need in one block
     (`step_headroom`). Placed where the state keeps them and donated
     (`taking_over`), they become the state's buffers. The copy leaves the
-    objective's own arrays alone. The held leaves whose ids are `shared`, which
-    the state keeps as they are and no step donates (its frozen tree, `apart`),
-    are placed as they are, the same arrays where they are placed already, and
-    kept: no copy of them is made."""
+    objective's own arrays alone. The held leaves whose ids `shared` maps to
+    where the state keeps them, which it keeps as they are and no step donates
+    (its frozen tree, `apart`, wherever its init moves them), are placed there
+    as they are, the same arrays where they are placed already, and kept: no
+    copy of them is made."""
+    shared = shared or {}
     kept = {path: (sharding, leaf.shape) for (path, leaf), sharding in zip(
         jax.tree_util.tree_leaves_with_path(variables), jax.tree.leaves(shardings), strict=True)}
     replicated = NamedSharding(mesh, P())
@@ -1164,7 +1166,7 @@ def placed_held[Held](held: Held, variables: Variables, shardings: Placement[Var
     owned = jax.tree.map(lambda leaf: leaf if id(leaf) in shared or not isinstance(leaf, jax.Array)
                          else leaf.copy(), held)
     placed = jax.device_put(owned, jax.tree_util.tree_map_with_path(
-        lambda path, leaf: variable(path, leaf) or replicated, held))
+        lambda path, leaf: shared.get(id(leaf)) or variable(path, leaf) or replicated, held))
     keep = {id(placed_leaf) for leaf, placed_leaf in zip(jax.tree.leaves(held), jax.tree.leaves(placed),
                                                          strict=True) if id(leaf) in shared}
     taken = jax.tree_util.tree_map_with_path(
@@ -1219,11 +1221,12 @@ def placed_start(initial_state: Callable[[Initializer, jax.Array], TrainState], 
         taken, kept = placed_held(initializer, abstract.variables, shardings.variables, mesh)
         return taking_over(initial_state, taken, kept, shardings)(key)
     inputs = jax.tree.leaves(initializer)
+    where, structure = jax.tree.flatten(frozen)
+    # Each passed leaf is placed once, where the state keeps it, whatever path the init moves it to.
     taken, kept = placed_held(initializer, abstract.variables, shardings.variables, mesh,
-                              shared=frozenset(id(inputs[index]) for index in through.values()))
+                              shared={id(inputs[given]): where[index] for index, given in through.items()})
     placed = jax.tree.leaves(jax.tree.map(lambda one, other: other if one is None else one, taken, kept,
                                           is_leaf=lambda leaf: leaf is None))
-    where, structure = jax.tree.flatten(frozen)
     built = [index for index in range(len(where)) if index not in through]
 
     def rest(tree: Initializer, draw: jax.Array) -> tuple[TrainState, tuple[jax.Array, ...]]:
@@ -1237,7 +1240,7 @@ def placed_start(initial_state: Callable[[Initializer, jax.Array], TrainState], 
     def leaf(index: int) -> jax.Array:
         if index in drawn:
             return drawn[index]
-        # A held leaf an init passes through at another path is placed where the state keeps that one.
+        # A held leaf an init passes through at two places of other shardings is placed at the second too.
         held = placed[through[index]]
         return held if held.sharding == where[index] else jax.device_put(held, where[index])
 

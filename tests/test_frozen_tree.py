@@ -18,7 +18,7 @@ from dew.interop import Pretrained
 from dew.lora import LoRA
 from dew.objectives.base import FROZEN
 from dew.objectives.lm import TEXT_KEY, LMObjective
-from dew.training import MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer
 
 LLAMA = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
 
@@ -124,6 +124,31 @@ def test_a_frozen_leaf_an_init_builds_is_the_states_own_placed_as_fresh(change):
                             jax.tree.leaves(fresh.variables[FROZEN]), strict=True):
         assert mine.dtype == theirs.dtype and np.array_equal(np.asarray(mine), np.asarray(theirs))
     assert not any(leaf.is_deleted() for leaf in jax.tree.leaves(held[FROZEN]))
+
+
+def test_a_frozen_tree_an_init_moves_is_the_held_arrays_where_the_state_keeps_them():
+    """An init that nests its held frozen tree under a key of its own, as an objective that holds a
+    policy's tree does: the placed start's frozen leaves at their new paths are the held arrays
+    themselves, placed where the state keeps them once, from a source loaded onto the mesh, every leaf
+    sharded (`min_shard=1`) so no path's placement is the replicated one."""
+
+    class Moved(LMObjective):
+        def init(self, key, variables=None):
+            tree = super().init(key, variables)
+            return {**tree, FROZEN: {"policy": tree[FROZEN]}}
+
+    sharded = Layout(min_shard=1)
+    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=16,
+                             mesh=MeshSpec(), layout=sharded)
+    objective = Moved(source.adapt(LoRA(rank=2, modules=("q_proj", "v_proj")), key=0), 8, ema_decay=None)
+    trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(5), mesh=MeshSpec(), layout=sharded)
+    state, shardings = trainer.place()[:2]
+    held = objective.held_variables()
+    assert held is not None
+    assert frozen_ids(state.variables[FROZEN]["policy"]) == frozen_ids(held[FROZEN])
+    for leaf, sharding in zip(jax.tree.leaves(state.variables[FROZEN]),
+                              jax.tree.leaves(shardings.variables[FROZEN]), strict=True):
+        assert leaf.sharding == sharding
 
 
 def test_a_placed_start_shares_a_frozen_tree_held_in_flax_containers():
