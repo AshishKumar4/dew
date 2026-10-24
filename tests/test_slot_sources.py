@@ -49,6 +49,16 @@ def test_a_slot_release_loads_its_readout_and_exports_the_same_task(tmp_path, re
         assert np.count_nonzero(bundle.head_variables["params"]["k"]) == 0
     else:
         assert not jax.tree.leaves(bundle.head_variables)
+    shapes = Pretrained.load(source, dtype="float32", attention_impl="xla", weights=False)
+    host = Pretrained.load(source, dtype="float32", attention_impl="xla", on_host=True)
+    for abstract, held, original in zip(jax.tree.leaves((shapes.variables, shapes.head_variables)),
+                                       jax.tree.leaves((host.variables, host.head_variables)),
+                                       jax.tree.leaves((bundle.variables, bundle.head_variables)), strict=True):
+        assert isinstance(abstract, jax.ShapeDtypeStruct)
+        assert isinstance(held, np.ndarray)
+        assert abstract.shape == held.shape == original.shape
+        assert abstract.dtype == held.dtype == original.dtype
+        np.testing.assert_array_equal(held, original)
     exported = tmp_path / "exported"
     bundle.save(exported)
     restored = Decide.from_pretrained(exported, dtype="float32", attention_impl="xla")
@@ -57,3 +67,34 @@ def test_a_slot_release_loads_its_readout_and_exports_the_same_task(tmp_path, re
     for actual, expected in zip(jax.tree.leaves(restored.variables), jax.tree.leaves(task.variables),
                                strict=True):
         np.testing.assert_array_equal(actual, expected)
+
+
+class HostRows(np.ndarray):
+    """Real host rows that refuse transfer of the whole vocabulary through JAX's array protocol.
+    Their native gather returns ordinary NumPy rows, whose transfer is allowed."""
+
+    def __jax_array__(self, dtype=None):
+        raise AssertionError("initializing a few slots must not transfer the entire host vocabulary")
+
+    def take(self, indices, axis=None, out=None, mode="raise"):
+        return np.asarray(super().take(indices, axis=axis, out=out, mode=mode))
+
+
+def test_a_slot_draw_transfers_only_selected_host_rows_and_matches_a_device_draw():
+    import jax.numpy as jnp
+    from test_decision_readout import ids, rows_of
+
+    from dew.decision import DecisionInputs
+    from dew.decision.head import SlotReadout
+
+    table = (np.arange(256 * 32, dtype=np.float32).reshape(256, 32) / 8192).view(HostRows)
+    head = SlotReadout(32, tuple(row[0] for row in ids()), head_dim=8, slot_rows=8)
+    inputs = DecisionInputs.collate(rows_of(0), 0)
+    states = jnp.zeros((*inputs.tokens.shape, 32), jnp.float32)
+    key = jax.random.key(3)
+    host = head.init(key, states, inputs, table)
+    device = head.init(key, states, inputs, jnp.asarray(np.asarray(table)))
+    for actual, expected in zip(jax.tree.leaves(host), jax.tree.leaves(device), strict=True):
+        assert actual.dtype == expected.dtype
+        np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(host["params"]["slots"][:3], np.asarray(table)[[65, 66, 67]])
