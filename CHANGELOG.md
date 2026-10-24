@@ -5,6 +5,13 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- `Trainer.fit(examples=N)` and `--trainer.examples N` bound a run to the chain's
+  first N records, counted before packing and each read once, its steps (and so
+  its schedule) the ones the data plan counts for them. `Pause(fraction)`, as
+  `stop=` or `--trainer.stop.fraction`, ends a run at that fraction of its
+  budget, to resume as one that never paused. A training stream that runs out
+  ends the run with its final checkpoint, on every process at the same step,
+  instead of raising `StopIteration`.
 - JEPA's `normalize_targets` is Flax's `LayerNorm` with no affine and exact
   variance. Its statistics are at least float32, as I-JEPA's `F.layer_norm`'s
   are, so a bfloat16 run's targets round once.

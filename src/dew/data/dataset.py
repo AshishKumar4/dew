@@ -667,6 +667,10 @@ class Loader:
     """The records a training read of a global order that ends hands out over all its passes, the
     same on every share, by which a batch ramp ends its last step (`RampedStream`); None where the
     order never ends or its read counts none ahead."""
+    examples: int | None = None
+    """The records the training read is bounded to before they are packed (`compile`'s
+    `examples`), whose steps a run's `examples=` budget takes (`example_steps`); None where it is
+    not bounded."""
 
     @property
     def steps_per_epoch(self) -> int | None:
@@ -698,6 +702,26 @@ class Loader:
             raise ValueError(f"{records} records do not fill one batch of {self.batch}, so {epochs} epochs "
                              "are no steps at all: read more data, lower the batch, or count the run in "
                              "steps")
+        return steps
+
+    def example_steps(self, examples: int, window: int = 1) -> int:
+        """The steps that read the `examples` records this loader's training read is bounded to
+        (`examples`), its last batch short where they end inside one, in whole updates of `window`
+        steps: refused where the read is bounded to another count or counts none ahead, and where
+        its last steps would make no whole update, so some examples would train nothing."""
+        if self.examples != examples:
+            held = "not bounded" if self.examples is None else f"bounded to {self.examples}"
+            raise ValueError(f"examples={examples} reads a training chain bounded to that many records "
+                             f"before packing, and this loader's is {held}; give fit the Dataset chain, "
+                             "which it bounds and compiles")
+        if self.order_records is None:
+            raise ValueError("examples need a global order, whose read counts its batches ahead; this one "
+                             "reads each share's own order, so count the run in steps")
+        steps = self._steps(self.order_records, window)
+        if steps % window:
+            raise ValueError(f"{examples} examples fill {steps} batches, which are not whole updates of "
+                             f"{window} steps: the last {steps % window} would update nothing; change the "
+                             "examples, the batch or the accumulation")
         return steps
 
 

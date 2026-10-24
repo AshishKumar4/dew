@@ -1,0 +1,187 @@
+"""A run's length as a count of examples, and a pause partway through its budget."""
+
+import collections
+import dataclasses
+
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from recording import RecordingTracker
+from reference_error import assert_as_exact
+
+from dew.config import OptimConfig, RunConfig, TrainerConfig
+from dew.data import Memory
+from dew.data.compile import compile
+from dew.data.dataset import Closeable, DataPartition, Loader
+from dew.data.pipeline import Pipeline
+from dew.objectives import Aux, Objective
+from dew.objectives.base import VALID_ROWS
+from dew.optim import Linear
+from dew.training import Checkpoints, Pause, Trainer
+
+FEATURES = 4
+RECORDS = 10
+BATCH = 4
+EXAMPLES = 21
+"""Two passes over the records and one more, which fill five batches and one of a single record: three
+updates of two steps."""
+ACCUMULATION = 2
+PEAK = 0.2
+
+SEEDS = 8
+"""Check 1's declared seeds for an examples run and for its pause, sized by `seeds_for` on armada."""
+
+
+class Pulled(Objective):
+    """A weight pulled toward each batch's real rows: the mean over them and their coordinates of
+    (w - x)^2, whose gradient over an update's window is 2 (w - the mean of its rows) / FEATURES."""
+
+    def fresh_variables(self, key, held):
+        return {"params": {"w": jnp.zeros(FEATURES)}}
+
+    def loss(self, variables, batch, step):
+        return self.row_mean(jnp.square(variables["params"]["w"] - batch["x"]), batch), Aux({})
+
+
+def records(seed: int) -> tuple[np.ndarray]:
+    """The corpus of one draw: RECORDS rows of FEATURES coordinates from a unit normal."""
+    return (np.random.default_rng(seed).normal(size=(RECORDS, FEATURES)).astype(np.float32),)
+
+
+def chain(x: np.ndarray) -> Pipeline:
+    return Pipeline(Memory({"x": x})).batch(BATCH)
+
+
+def descended(x):
+    """The losses of each step and the weight after them, of Adam on `Pulled` over the first EXAMPLES
+    records of `x` read in order, pass after pass, in batches of BATCH (the last holding the one
+    record left) and updates of ACCUMULATION batches, at a rate falling linearly from PEAK to 0 over
+    the updates, in `x`'s own dtype: the reference arm, and in float64 the truth."""
+    rows = x[np.arange(EXAMPLES) % RECORDS]
+    batches = [rows[start:start + BATCH] for start in range(0, EXAMPLES, BATCH)]
+    updates = len(batches) // ACCUMULATION
+    w = first = second = jnp.zeros(FEATURES, x.dtype)
+    losses = []
+    for update in range(updates):
+        window = batches[update * ACCUMULATION:(update + 1) * ACCUMULATION]
+        losses += [jnp.mean(jnp.square(w - batch)) for batch in window]
+        held = jnp.concatenate(window)
+        gradient = 2 * jnp.sum(w - held, axis=0) / (len(held) * FEATURES)
+        first, second = 0.9 * first + 0.1 * gradient, 0.999 * second + 0.001 * jnp.square(gradient)
+        moved = (first / (1 - 0.9 ** (update + 1))) / (jnp.sqrt(second / (1 - 0.999 ** (update + 1))) + 1e-8)
+        w = w - PEAK * (1 - update / updates) * moved
+    return {"w": w, "loss": jnp.stack(losses)}
+
+
+def trainer(directory=None, tracker=None) -> Trainer:
+    return Trainer(Pulled(), OptimConfig(optimizer="adam", rate=Linear(peak=PEAK)), key=0,
+                   accumulation=ACCUMULATION, tracker=tracker,
+                   checkpoints=None if directory is None else Checkpoints(str(directory)))
+
+
+def losses(tracker: RecordingTracker) -> list[float]:
+    return [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
+
+
+def trained(x, directory=None, stops: tuple[Pause | None, ...] = (None,)):
+    """The losses of every step and the final weight of an examples run over `x`, fitted once under
+    each of `stops` in turn, each fit resuming the one before from `directory`."""
+    stepped, state = [], None
+    for stop in stops:
+        tracker = RecordingTracker()
+        state = trainer(directory, tracker).fit(chain(x), examples=EXAMPLES, log_every=1, stop=stop)
+        stepped += losses(tracker)
+    assert state is not None
+    return {"w": np.asarray(state.variables["params"]["w"]), "loss": np.asarray(stepped)}
+
+
+def ids_read(loader: Loader, steps: int, field: str) -> collections.Counter:
+    """The real values of `field` in the first `steps` training batches of `loader`, which ends there."""
+    stream = loader.train(DataPartition())
+    read: collections.Counter = collections.Counter()
+    try:
+        for _ in range(steps):
+            batch = next(stream)
+            real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch[field]), bool)), bool)
+            values = np.asarray(batch[field])[real]
+            read.update(values[values > 0].tolist())
+        with pytest.raises(StopIteration):
+            next(stream)
+    finally:
+        if isinstance(stream, Closeable):
+            stream.close()
+    return read
+
+
+@pytest.mark.parametrize("examples", [7, 23])
+def test_an_examples_budget_reads_each_record_once_and_its_read_ends_there(examples):
+    """A read bounded to its first `examples` records, shuffled pass after pass, hands each out once
+    for each pass it reaches, within its steps, and ends: a count under one pass reads each record of
+    it once, and one over two reads every record two or three times, the third time `examples` mod
+    RECORDS of them."""
+    ids = np.arange(1, RECORDS + 1, dtype=np.int32)
+    loader = compile(Pipeline(Memory({"id": ids})).shuffle(3).batch(BATCH), examples=examples)
+    read = ids_read(loader, loader.example_steps(examples), "id")
+    passes, rest = divmod(examples, RECORDS)
+    assert sum(read.values()) == examples
+    assert collections.Counter(read.values()) == collections.Counter(
+        {passes + 1: rest, passes: RECORDS - rest} if passes else {1: rest})
+
+
+def test_an_examples_budget_counts_documents_before_they_are_packed():
+    """Documents packed into windows are counted before the pack: the read bounded to 13 of 5 documents
+    of 1 to 5 tokens holds each document's tokens once for each time the bound reaches it, in the windows
+    of the steps its plan counts, and ends."""
+    documents = [{"text": np.full(length, length, np.int32)} for length in range(1, 6)]
+    loader = compile(Pipeline(Memory(documents)).pack(8).batch(2), examples=13)
+    read = ids_read(loader, loader.example_steps(13), "text")
+    reached = collections.Counter(1 + index % 5 for index in range(13))
+    assert read == {token: count * token for token, count in reached.items()}
+
+
+def test_an_examples_run_trains_each_record_once_under_the_schedule_its_plan_sizes():
+    """An examples run takes the steps its data plan counts, sizes its schedule's horizon from them and
+    trains on each record as many times as the bound reaches it: its losses and weight match SGD on
+    the same records at a rate falling to 0 over those updates (check 1)."""
+    assert_as_exact(trained, descended, records, "examples run", seeds=SEEDS)
+
+
+def test_a_paused_run_resumed_trains_on_as_one_that_never_paused(tmp_path):
+    """A run paused halfway through its budget and resumed without the pause lands where the whole
+    run does, step for step and in its weight (check 1): the budget, not the pause, sized its
+    schedule, and its checkpoint held its data position."""
+    directories = iter(range(1 << 20))
+    assert_as_exact(lambda x: trained(x, tmp_path / str(next(directories)), (Pause(0.5), None)), trained,
+                    records, "paused run", seeds=SEEDS, truth_fn=descended)
+
+
+def test_a_run_paused_where_it_already_stands_trains_nothing_more(tmp_path):
+    """A paused run fitted again with the same pause is already where it pauses: it returns the
+    checkpointed state at the pause, two of the three updates in, and trains no further."""
+    (x,) = records(0)
+    first = trainer(tmp_path).fit(chain(x), examples=EXAMPLES, stop=Pause(0.5))
+    again = trainer(tmp_path).fit(chain(x), examples=EXAMPLES, stop=Pause(0.5))
+    assert int(first.step) == int(again.step) == 2 * ACCUMULATION
+    assert Checkpoints(str(tmp_path)).latest == 2 * ACCUMULATION
+
+
+def test_an_examples_count_whose_last_steps_make_no_whole_update_is_refused():
+    """Nineteen records fill five batches, which leave a step no update takes, so the run is refused
+    before it trains rather than read records it never learns from."""
+    (x,) = records(0)
+    with pytest.raises(ValueError):
+        trainer().fit(chain(x), examples=19)
+
+
+def test_a_run_config_counts_examples_and_pauses_as_a_fit_does(tmp_path):
+    """A run config's `examples` and `stop` reach the fit, its record holding both: paused halfway it
+    stands two updates in, and run again without the pause it goes on to the steps its examples fill."""
+    (x,) = records(0)
+    config = RunConfig(optim=OptimConfig(optimizer="adam", rate=Linear(peak=PEAK)), trainer=TrainerConfig(
+        checkpoint_dir=str(tmp_path), examples=EXAMPLES, stop=Pause(0.5), accumulation=ACCUMULATION,
+        log_every=1, eval_every=None, checkpoint_every=None))
+    assert RunConfig.from_dict(config.to_dict()) == config
+    paused = config.train(Pulled(), chain(x), name="budget")
+    resumed = dataclasses.replace(config, trainer=dataclasses.replace(config.trainer, stop=None)).train(
+        Pulled(), chain(x), name="budget")
+    assert (int(paused.step), int(resumed.step)) == (2 * ACCUMULATION, 3 * ACCUMULATION)

@@ -188,6 +188,11 @@ def agreed[T](phase: str, operation: Callable[[], T]) -> T:
     the next collective. The peers raise `PeerFailure`; the failing rank
     re-raises its own error. On one process this is a plain call.
     """
+    return agreed_count(phase, operation, lambda _: True)[0]
+
+
+def agreed_count[T](phase: str, operation: Callable[[], T], counted: Callable[[T], bool]) -> tuple[T, int]:
+    """`agreed`, with how many ranks' outcomes `counted` holds for, learned in the same round."""
     held: tuple[T] | None = None
     error: BaseException | None = None
     try:
@@ -195,13 +200,13 @@ def agreed[T](phase: str, operation: Callable[[], T]) -> T:
     except BaseException as failure:
         error = failure
     try:
-        agree_process_phase(error, phase=phase)
+        count = agree_process_phase(error, phase=phase, available=held is not None and counted(held[0]))
     except BaseException as failure:
         if error is None:
             raise PeerFailure(str(failure)) from failure
         raise
     assert held is not None
-    return held[0]
+    return held[0], count
 
 
 def agreed_same[T](phase: str, find: Callable[[], T]) -> T:
@@ -486,6 +491,7 @@ __all__ = [
     "PeerFailure",
     "agree_process_phase",
     "agreed",
+    "agreed_count",
     "agreed_same",
     "broadcast_from_process_zero",
     "collective_host",

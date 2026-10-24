@@ -38,7 +38,13 @@ from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew.checkpoints import Checkpoints, Ranking
 from dew.cleanup import attempted
-from dew.coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
+from dew.coordination import (
+    agree_process_phase,
+    agreed,
+    agreed_count,
+    agreed_same,
+    broadcast_from_process_zero,
+)
 from dew.data.compile import fitted
 from dew.data.dataset import (
     Closeable,
@@ -209,22 +215,28 @@ class Rollout(Protocol):
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch: ...
 
 
-def run_length(steps: int | None, epochs: int | None, tokens: int | None, *, required: bool = True) -> None:
-    """Refuse a run whose length is named twice, as both `steps` and `epochs`, or, where `required`,
-    not at all; `tokens` caps either or bounds a run alone."""
-    if None not in (steps, epochs):
-        raise ValueError("steps and epochs both name the run length; set one")
-    if required and steps is epochs is tokens is None:
-        raise ValueError("the run length is steps or epochs, or tokens, which also caps either")
+def run_length(steps: int | None, epochs: int | None, tokens: int | None, examples: int | None = None, *,
+               required: bool = True) -> None:
+    """Refuse a run whose length is named twice, by two of `steps`, `epochs` and `examples`, or, where
+    `required`, not at all; `tokens` caps any of them or bounds a run alone."""
+    named = [name for name, value in (("steps", steps), ("epochs", epochs), ("examples", examples))
+             if value is not None]
+    if len(named) > 1:
+        raise ValueError(f"{' and '.join(named)} each name the run length; set one")
+    if required and not named and tokens is None:
+        raise ValueError("the run length is steps, epochs or examples, or tokens, which also caps any of "
+                         "them")
 
 
 def run_steps(loader: Loader, steps: int | None, epochs: int | None, tokens: int | None,
-              accumulation: int) -> int | None:
+              accumulation: int, examples: int | None = None) -> int | None:
     """The microsteps a run takes over `loader`, the one policy for a fit's and a config's run length:
-    `steps`, or `epochs` of it, whose ramp stages begin where updates do, as the stream cuts them, or None
-    where `tokens` alone bounds it. Refuses a run with no length or two, and epochs of a stream with no
-    record count."""
-    run_length(steps, epochs, tokens)
+    `steps`, `epochs` of it, whose ramp stages begin where updates do, as the stream cuts them, or the
+    steps that read the `examples` it is bounded to (`Loader.example_steps`), or None where `tokens`
+    alone bounds it. Refuses a run with no length or two, and epochs of a stream with no record count."""
+    run_length(steps, epochs, tokens, examples)
+    if examples is not None:
+        return loader.example_steps(examples, accumulation)
     if epochs is None:
         return steps
     return loader.epoch_steps(epochs, accumulation)
@@ -258,6 +270,29 @@ class Plateau:
     def __post_init__(self):
         if self.evals < 1 or self.min_delta < 0 or not math.isfinite(self.min_delta):
             raise ValueError("Plateau needs evals >= 1 and min_delta >= 0")
+
+
+@dataclasses.dataclass(frozen=True)
+class Pause:
+    """Ends the run once it has trained `fraction` of its budget, its state and data position
+    written, so a run resumed from that checkpoint trains on as one that never paused: the budget
+    still sizes the learning-rate schedule. A budget of steps, epochs or examples pauses at the
+    whole update nearest the fraction, a token budget at the first update whose tokens reach it,
+    and with both the first reached. Resume without it, or with a later fraction, to go on; with
+    the same one the run is already where it pauses, so nothing trains."""
+    fraction: float
+
+    def __post_init__(self):
+        if not 0 < self.fraction <= 1:
+            raise ValueError(f"Pause needs a fraction of the budget in (0, 1], got {self.fraction}")
+
+    def at(self, steps: int | None, tokens: int | None, accumulation: int) -> tuple[int | None, int | None]:
+        """The step and the real tokens a run of `steps` microsteps, `accumulation` an update, and of
+        `tokens` pauses at, each None where that budget is not set."""
+        step = None if steps is None else round(self.fraction * (steps // accumulation)) * accumulation
+        if step == 0:
+            raise ValueError(f"Pause({self.fraction}) of {steps} steps ends before the first update")
+        return step, None if tokens is None else math.ceil(self.fraction * tokens)
 
 
 def _split_metrics(suites: Mapping[str, EvalSuite]) -> dict[str, tuple[Metric, ...]]:
@@ -302,6 +337,8 @@ class _FitPlan:
     preview: bool
     best: tuple[Best, ...] = ()
     stop: Plateau | None = None
+    pause: tuple[int | None, int | None] = (None, None)
+    """The step and the real tokens a `Pause` ends the run at (`Pause.at`)."""
     suites: Mapping[str, EvalSuite] = dataclasses.field(default_factory=dict)
     held_best: bool = False  # a restore_best without Checkpoints (`HeldBest`)
     """Every validation split by name, its metrics and cadence resolved."""
@@ -315,6 +352,20 @@ class _FitPlan:
         """Whether either run-length cap has been reached, after `real` tokens."""
         return ((self.steps is not None and step >= self.steps)
                 or (self.tokens is not None and real >= self.tokens))
+
+    def paused(self, step: int, real: int) -> bool:
+        """Whether the run has reached where its `Pause` ends it, after `real` tokens."""
+        at, tokens = self.pause
+        return (at is not None and step >= at) or (tokens is not None and real >= tokens)
+
+    def ended(self, step: int, real: int) -> bool:
+        """Whether this fit has nothing left to train: its budget reached, or its pause."""
+        return self.finished(step, real) or self.paused(step, real)
+
+    def real(self, interval: Interval) -> int:
+        """The run's real tokens where a token budget reads them, else 0: the count is read from the
+        devices, which a run without one need not wait on."""
+        return interval.real_tokens if self.tokens is not None else 0
 
     @property
     def declared(self) -> dict[str, tuple[Metric, ...]]:
@@ -371,6 +422,7 @@ class _FitRun:
     other: float = 0.0
     first_step: float | None = None
     preempted: int | None = None
+    paused: int | None = None
     notice: PreemptionNotice | None = None
     endless: bool = False
     taken: Taken | None = None
@@ -389,6 +441,35 @@ class _FitRun:
         run's traceback."""
         assert self.train is not None
         return next(self.train)
+
+
+def _waited_read(run: _FitRun, interval: Interval, *, agree: bool) -> Batch | None:
+    """The training stream's next batch, its wait counted in `interval`, or None where it has run out
+    on every process, which ends the run as its length would. Where `agree`, the read is agreed
+    (`agreed_count`): one that fails stops every process, and a stream that runs out on some
+    processes and reads on on the others is refused on all of them, at the step it ran out at, as
+    is one with no batch for a run at step 0 to train on. An endless stream's later reads are not
+    agreed, as it never runs out."""
+    def read() -> Batch | None:
+        try:
+            return run.read()
+        except StopIteration:
+            return None
+
+    with region("input.wait"):
+        asked = time.perf_counter()
+        if not agree:
+            batch = run.read()
+        else:
+            batch, ran_out = agreed_count("training read", read, lambda batch: batch is None)
+            if 0 < ran_out < jax.process_count():
+                raise ValueError(f"the training data ran out on {ran_out} of {jax.process_count()} processes "
+                                 f"at step {run.current}, and the others read on: each process's stream must "
+                                 "hold as many batches")
+            if ran_out and not run.current:
+                raise ValueError("the training data holds no batch to train on")
+        interval.waited += time.perf_counter() - asked
+    return batch
 
 
 def _read_whole(accumulation: int, split: int | None, step: Callable[..., StepFn] | None, layout: Layout,
@@ -1372,6 +1453,7 @@ class Trainer(Generic[Loss, Effects]):
         steps: int | None = None,
         epochs: int | None = None,
         tokens: int | None = None,
+        examples: int | None = None,
         log_every: int = 100,
         eval_every: int | None = None,
         checkpoint_every: int | datetime.timedelta | None = None,
@@ -1379,7 +1461,7 @@ class Trainer(Generic[Loss, Effects]):
         metrics: Sequence[Metric] = (),
         preview: bool = False,
         best: str | Metric | TrainingScalar | types.MethodType | Best | Sequence[Best] | None = None,
-        stop: Plateau | None = None,
+        stop: Plateau | Pause | None = None,
         validation: Dataset | Mapping[str, Dataset | Reader | EvalSuite] | None = None,
         restore_best: bool = False,
         state: TrainState | None = None,
@@ -1400,6 +1482,19 @@ class Trainer(Generic[Loss, Effects]):
         budget, from the same counter as `train/tokens`, persisted in checkpoints.
         Padding never counts. With both caps the first reached ends the run;
         with `steps=None`, a decaying schedule needs its own step horizon.
+
+        `examples` trains on the first that many records of `dataset`, a Dataset
+        chain, as they reach its packing (or its batch where nothing packs), each
+        once: the chain is read on past its end where they span passes, its last
+        batch is kept short where they end inside it, and the run takes the steps
+        its data plan counts for them (`Loader.example_steps`), which size the
+        schedule as `steps` would. A training stream that runs out before the
+        run's length ends the run as its length would, on every process at once;
+        one that runs out on some processes and not the others is refused.
+
+        `stop` ends the run early: `Plateau` once validation stops improving, or
+        `Pause` at a fraction of the budget, which still sizes the schedule, so the
+        run resumed from the pause trains on as one that never paused.
 
         Every `eval_every` steps, and at the end, the validation split is scored. The
         objective's artifacts go to the tracker and to `metrics`, whose reductions are
@@ -1437,18 +1532,23 @@ class Trainer(Generic[Loss, Effects]):
         `prepare_process` readies it: a program that never called that gets Dew's
         log handler, and one whose JAX opened on the CPU beside an NVIDIA GPU stops.
         """
-        run_length(steps, epochs, tokens)
+        run_length(steps, epochs, tokens, examples)
         if tokens is not None and not self.objective.counts_tokens:
             raise ValueError("tokens= needs an objective that counts real tokens")
+        pause = stop if isinstance(stop, Pause) else None
+        if pause is not None and self.checkpoints is None:
+            raise ValueError("a Pause ends a run its checkpoint resumes, and this trainer has no "
+                             "checkpointer; pass Checkpoints(directory)")
         ready_process()
-        loader, validation = fitted(dataset, validation, objective=self.objective.data())
+        loader, validation = fitted(dataset, validation, objective=self.objective.data(), examples=examples)
         self._device, self._prefetch = loader.device, device_prefetch
-        steps = run_steps(loader, steps, epochs, tokens, self.accumulation)
+        steps = run_steps(loader, steps, epochs, tokens, self.accumulation, examples)
         count_compilation_cache()
         self._schedule(None if steps is None else steps // self.accumulation)
         suites = _suites(loader, validation, metrics, eval_every)
-        selection, stop = self._fit_policies(best, stop, metrics, suites, checkpoint_every)
-        self._preflight(loader, stop, suites, preview=preview,
+        selection, plateau = self._fit_policies(best, None if pause is not None else stop, metrics, suites,
+                                                checkpoint_every)
+        self._preflight(loader, plateau, suites, preview=preview,
                         loss=(self.checkpoints is not None or restore_best) and not selection)
         preview = preview and self.tracker is not None
         run = _FitRun(time.perf_counter())
@@ -1464,7 +1564,8 @@ class Trainer(Generic[Loss, Effects]):
                 dataset=loader, steps=steps, log_every=log_every, eval_every=eval_every, tokens=tokens,
                 checkpoint_every=checkpoint_every, checkpoint_final=checkpoint_final,
                 local_every=None if checkpoints is None else checkpoints.local_every,
-                metrics=metrics, preview=preview, best=selection, stop=stop, suites=suites,
+                metrics=metrics, preview=preview, best=selection, stop=plateau, suites=suites,
+                pause=(None, None) if pause is None else pause.at(steps, tokens, self.accumulation),
                 held_best=restore_best and checkpoints is None, observe=observe,
             )
             trained = self._training_loop(plan, run, profiler, tracer, profile, checkpoints, state)
@@ -1521,7 +1622,7 @@ class Trainer(Generic[Loss, Effects]):
         compiled: dict[Signature, tuple[CompiledStep, StepFlops | None]] = {}
         seen = 0
         run.notice = PreemptionNotice()
-        while not plan.finished(run.current, interval.real_tokens if plan.tokens is not None else 0):
+        while not plan.ended(run.current, plan.real(interval)):
             # The window's capture opens before this iteration's first read, so the step row records
             # the read it waits on rather than a compile that ran before capture began.
             if (profiler is not None and profile is not None
@@ -1533,13 +1634,13 @@ class Trainer(Generic[Loss, Effects]):
             step_scope = (jax.profiler.StepTraceAnnotation("train", step_num=run.current)
                           if capturing else contextlib.nullcontext())
             with step_scope:
-                with region("input.wait"):
-                    # The first read restores the stream's position and opens its reader on the prefetch
-                    # worker, and a stream that may run out can on any read: a process whose read failed stops
-                    # its peers before they compile or step without it.
-                    asked = time.perf_counter()
-                    batch = run.read() if seen and run.endless else agreed("training read", run.read)
-                    interval.waited += time.perf_counter() - asked
+                # The first read restores the stream's position and opens its reader on the prefetch
+                # worker, and a stream that may run out can on any read: a process whose read failed stops
+                # its peers before they compile or step without it.
+                batch = _waited_read(run, interval, agree=not (seen and run.endless))
+                if batch is None:
+                    self._display.note(f"The training data ran out at step {run.current}")
+                    break
                 if self.rollout is not None:
                     batch, sampled = self._rolled_out(state, batch)
                     interval.rollout_seconds += sampled
@@ -1669,13 +1770,13 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError(
                 "checkpoint_every asks for checkpoints and this trainer has no "
                 "checkpointer; pass Checkpoints(directory) to write any")
-        complete = (plan.finished(current, interval.real_tokens) and checkpoints is not None
+        complete = (plan.ended(current, interval.real_tokens) and checkpoints is not None
                     and checkpoints.latest is not None)
         if plan.observe:
             plan.observe.opened(current, state, complete=complete)
         if complete:
             return True
-        if not plan.finished(current, interval.real_tokens):
+        if not plan.ended(current, interval.real_tokens):
             # A ramp's stages begin where updates do (`Ramp.stages`).
             partition = DataPartition.of(mesh, window=self.accumulation)
             run.source = plan.dataset.train(partition)
@@ -1740,7 +1841,8 @@ class Trainer(Generic[Loss, Effects]):
         the checkpoints, and the preemption notice. Returns whether the
         notice stops the run at this step, whose checkpoint is then written."""
         current, checkpoints = run.current, self.checkpoints
-        ending = plan.finished(current, interval.real_tokens if plan.tokens is not None else 0)
+        real = plan.real(interval)
+        ending = plan.finished(current, real)
         record, aux = taken_record(aux)
         if record is not None:
             self.records.append(record)
@@ -1778,17 +1880,22 @@ class Trainer(Generic[Loss, Effects]):
         if plan.observe:
             plan.observe.at(current, state)
         # Asked at every step on every process, as JAX's agreement needs; the last step ends the run.
+        # A pause falls on the same step on every process, so where it is reached none asks.
         if run.stopped:
             return True
         assert run.notice is not None
-        if not ending and run.notice.reached(current):
+        paused = plan.paused(current, real)
+        if not ending and (paused or run.notice.reached(current)):
             self._take(plan, run, interval, state, unlogged=True)
             if checkpoints is not None and interval.last_saved != current:
                 self._read_taken(run)
                 run.other += self._saved_checkpoint(
                     checkpoints, current, state, position, interval,
                     training_best=not plan.validation and not plan.best, control=run.stop_control)
-            run.preempted = current
+            if paused:
+                run.paused = current
+            else:
+                run.preempted = current
             return True
         return False
 
@@ -1882,6 +1989,9 @@ class Trainer(Generic[Loss, Effects]):
                     else "the trainer has no checkpointer, so nothing is written"))
 
             agreed("preemption announcement", announce_preemption)
+        if run.paused is not None and checkpoints is not None:
+            self._display.note(f"Paused at step {run.paused}: its checkpoint and data position are in "
+                               f"{checkpoints.directory}, where the run resumed without the pause goes on")
         if run.tracing and profile is not None:
             run.tracing = False
             # The window outlived the run, and a trace left running takes the next one down with it.
@@ -1895,6 +2005,7 @@ class Trainer(Generic[Loss, Effects]):
         if (
             (plan.validation or plan.eval_every or plan.best or plan.stop or plan.held_best)
             and run.preempted is None
+            and run.paused is None
             and not run.stopped
         ):
             run.evaluation = self._evaluation(plan, state, shardings, run.training)

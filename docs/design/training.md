@@ -109,7 +109,10 @@ state = trainer.fit(
 )
 ```
 
-- One budget: `steps=`, `epochs=` or `tokens=` (committed valid target tokens, the same clock the data `schedule` reads). A run's tokens grow only at a committed update. `fit` checks the budget between steps, so after a rejected microbatch a split step can reach it at a commit and keep a later partial window; ending at that commit is not built yet.
+- One budget: `steps=`, `epochs=`, `examples=` or `tokens=` (committed valid target tokens, the same clock the data `schedule` reads). A run's tokens grow only at a committed update. `fit` checks the budget between steps, so after a rejected microbatch a split step can reach it at a commit and keep a later partial window; ending at that commit is not built yet.
+- `examples=N` trains on the chain's first N records as they reach its packing, or its batch where nothing packs, each read once: the chain reads on past its end where they span passes, its last batch is kept short and marked, and the run takes the steps the data plan counts for them, which size the schedule as `steps=` does. It needs a global order, whose read counts its batches ahead, and steps that make whole updates.
+- `stop=` ends a run before its budget: `Plateau` when validation stops improving, `Pause(fraction)` at that fraction of the budget. A pause writes the state and the data position, and the budget still sizes the schedule, so the run resumed without the pause trains on as one that never paused.
+- A finite stream that runs out ends the run as its budget would, with its final checkpoint and a completed outcome, on every host at the same step; a stream that runs out on some hosts and not the others is refused on all of them.
 - `validation` is one chain or a dict of named chains, each reported separately.
 - `fit` returns the final `TrainState`. `state=` supplies initial state rather than a continuation; checkpoint restore also restores the data position.
 

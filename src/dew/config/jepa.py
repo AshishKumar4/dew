@@ -11,7 +11,6 @@ from __future__ import annotations
 import dataclasses
 
 from dew.config import JsonDict, ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig, media_field
-from dew.data.compile import fitted
 from dew.data.pipeline import ObjectiveData
 from dew.inputs import Field
 from dew.objectives.jepa.masking import MultiBlockMask
@@ -55,8 +54,7 @@ class JepaRunConfig(RunConfig):
         computes as the encoder does, its compute dtype and attention kernel."""
         # Compiled once, before the objective, whose EMA ramps over the run's length: JEPA reads its
         # batches as the chain makes them, with no stages of its own.
-        dataset, held = fitted(self.chain(), self.validation, objective=ObjectiveData(),
-                                seed=self.data_seed)
+        dataset, held = self.compiled(ObjectiveData(), self.chain(), self.validation)
         sample = self.sample()
         video = sample.key == "video"
         if video != (models[self.model.name] is models["jepa_video_encoder"]):
