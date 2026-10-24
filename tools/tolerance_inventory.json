@@ -718,7 +718,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_tools.py": {
-   "comparisons": 28,
+   "comparisons": 25,
    "lane": "Models, Serving & RL"
   },
   "tests/test_torchax_fallback.py": {

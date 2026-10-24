@@ -22,6 +22,7 @@ from flax import linen as nn, struct
 from typing_extensions import TypeVar, get_protocol_members
 
 from dew.interop.weights import decoding_storage
+from dew.nn import categorical
 from dew.nn.inputs import (
     ModelInputs,
     Request,
@@ -110,8 +111,7 @@ class CanvasState:
 
 
 def _entropy(logits: jax.Array) -> jax.Array:
-    log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
-    return -(jnp.exp(log_probs) * log_probs).sum(axis=-1)
+    return categorical.entropy(logits)
 
 
 @dataclass(frozen=True)
