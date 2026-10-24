@@ -184,7 +184,8 @@ def ema_update(ema, params, decay):
         if average.dtype != dtype or live.dtype != dtype:
             average, live = jax.lax.optimization_barrier((average, live))
         weight = jnp.asarray(decay, dtype)
-        updated = weight * average.astype(dtype) + (1 - weight) * live.astype(dtype)
+        wide = average.astype(dtype)
+        updated = wide + (1 - weight) * (live.astype(dtype) - wide)
         stored = updated.astype(average.dtype)
         return jnp.where(jnp.asarray(decay) >= 1.0, average, stored)
     return jax.tree.map(step, ema, _project(params, ema))
