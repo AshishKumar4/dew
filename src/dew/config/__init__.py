@@ -88,6 +88,7 @@ from dew.registry import (
     wants_tuple,
 )
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
+from dew.training.budget import Pause, run_length, run_steps
 from dew.training.display import TrainingDisplay
 from dew.training.distributed import Layout, MeshSpec
 from dew.training.profiling import ProfileWindow
@@ -95,7 +96,7 @@ from dew.training.quantization import quantize_trunk
 from dew.training.selection import Best
 from dew.training.state import TrainState
 from dew.training.tracker import LocalTracker, Tracker, Trackers, WandbTracker
-from dew.training.trainer import Pause, Rollout, Trainer, run_length, run_steps
+from dew.training.trainer import Rollout, Trainer
 
 JsonDict = Annotated[
     Mapping[str, object],

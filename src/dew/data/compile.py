@@ -596,9 +596,9 @@ def _staged(
     validation_counts: dict[str, CorpusCounts] = {}
     # A chain's own layout is bounded as written, before preparation could plan it into its source; the
     # objective's goes in with its preparation, so the bound follows that.
-    written = examples is not None and _lays_out(train)
-    if written:
-        train = _bounded(train, examples)
+    written = None if examples is None or not _lays_out(train) else examples
+    if written is not None:
+        train = _bounded(train, written)
     branches = _prepared(
         (train,) if validation is None else (train, validation),
         read,
@@ -609,7 +609,7 @@ def _staged(
     )
     if not any(isinstance(stage, BatchStage) for stage in branches[0].stages):
         raise ValueError("compile needs one batch(global_size) stage on the training pipeline")
-    if examples is not None and not written:
+    if examples is not None and written is None:
         branches = (_bounded(branches[0], examples), *branches[1:])
     original = branches[0]
     train, *scored = _made(branches, read, (counts, validation_counts)[: len(branches)], training=True)
