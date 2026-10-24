@@ -912,9 +912,12 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.Wra
                 or any(type(value) is not int or value < 0 for value in sections)):
             raise ValueError("mrope_section must contain three nonnegative integer widths")
         kinds = decoder_parts.kinds_of(text_fields).copy()
+        kind = kinds.get("full_attention", {})
+        mixer = records.record(kind.get("mixer", {"class": "attention", "fields": {}}), "mixer")
+        fields = records.record(mixer.get("fields", {}), "mixer.fields")
         full = NativeFields(LayerKind, {
-            **kinds.get("full_attention", {}),
-            "mixer": {"class": "attention", "fields": {
+            **kind,
+            "mixer": {**mixer, "fields": {**fields,
                       "mrope_section": [sections[0], sections[1], sections[2]]}}})
         kinds["full_attention"] = full
         text_fields["kinds"] = kinds
