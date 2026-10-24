@@ -258,7 +258,7 @@ def persist_compilations() -> None:
     """
     if jax.config.jax_compilation_cache_dir or not jax.config.jax_enable_compilation_cache:
         return
-    from dew.coordination import pool_size
+    from dew._coordination import pool_size
 
     directory = default_compilation_cache_dir()
     if pool_size() > 1 and not _shared_by_pool(directory):
@@ -269,6 +269,6 @@ def persist_compilations() -> None:
 @functools.cache
 def _shared_by_pool(directory: str) -> bool:
     """Whether every process of the pool reads `directory` as one (`seen_by_every_process`)."""
-    from dew.coordination import seen_by_every_process
+    from dew._coordination import seen_by_every_process
 
     return all(seen_by_every_process(directory))

@@ -27,7 +27,7 @@ and stops at a phase that fails on any replica. Its delivery starts the update,
 posts `/update_weights`, which returns once every tensor has landed, while this
 side broadcasts them, and finishes the update under the version. Every process of a pool calls the push,
 and the policy is gathered to process 0 as `SafetensorsReload` gathers it, in
-groups of at most `dew.coordination.GATHER_BYTES`.
+groups of at most `dew._coordination.GATHER_BYTES`.
 """
 
 from __future__ import annotations
@@ -46,9 +46,9 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import SingleDeviceSharding
 
+from dew._coordination import agreed, byte_groups, collective_host
 from dew._records import JSON
 from dew.batch import Variables
-from dew.coordination import agreed, byte_groups, collective_host
 from dew.devices import primary_context
 from dew.nn.inputs import mesh_of
 

@@ -21,8 +21,8 @@ from typing import TYPE_CHECKING
 import jax
 from jax.experimental import multihost_utils
 
+from dew._coordination import broadcast_from_process_zero, end_pool_on_failure, pool_size, preemption_service
 from dew.cache import enable_compilation_cache, persist_compilations
-from dew.coordination import broadcast_from_process_zero, end_pool_on_failure, pool_size, preemption_service
 from dew.devices import apply_xla_flags, cuda_plugin, preallocate_gpu_pool, refuse_cpu_only_jax, xla_flag
 from dew.logging import configure as configure_logging
 from dew.pool import (

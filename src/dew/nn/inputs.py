@@ -15,6 +15,7 @@ import numpy as np
 from flax import struct
 from jax.core import Tracer
 
+from dew._coordination import agreed
 from dew.batch import (
     COORDINATES_FIELD,
     VALIDITY_FIELD,
@@ -29,7 +30,6 @@ from dew.batch import (
     token_validity,
     with_validity,
 )
-from dew.coordination import agreed
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS
 from dew.nn.sharding import rows_like
 

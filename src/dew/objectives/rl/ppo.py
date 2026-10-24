@@ -9,8 +9,8 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
 
+from dew._coordination import agreed, from_every_process
 from dew.batch import Variables, part
-from dew.coordination import agreed, from_every_process
 from dew.inference.tasks import Processor, TextGeneration, TextSettings
 from dew.nn.dense import Dense
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of

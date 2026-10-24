@@ -38,6 +38,7 @@ from flax import linen as nn, struct
 from flax.traverse_util import unflatten_dict
 from jax.typing import ArrayLike
 
+from dew._coordination import agreed, collective_host
 from dew.artifacts import Artifact, TextSamples, TokenScores
 from dew.batch import (
     COORDINATES_FIELD,
@@ -55,7 +56,6 @@ from dew.batch import (
     thaw,
     token_layout,
 )
-from dew.coordination import agreed, collective_host
 from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
 from dew.inference.tasks import Processor, TextSettings, recorded_processor, recorded_tokenizer

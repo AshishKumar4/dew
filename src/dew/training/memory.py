@@ -340,7 +340,7 @@ def fits_everywhere(headroom: int | None) -> bool:
     A process reads only its own devices' memory, so the pool takes the minimum;
     a process that reports none does not affect the result.
     """
-    from dew.coordination import from_every_process
+    from dew._coordination import from_every_process
 
     return min((value for value in from_every_process(headroom) if value is not None), default=0) >= 0
 

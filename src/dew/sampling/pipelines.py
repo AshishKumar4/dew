@@ -17,10 +17,10 @@ from jax.experimental import multihost_utils
 from jax.typing import ArrayLike, DTypeLike
 from typing_extensions import TypeVar
 
+from dew._coordination import agreed
 from dew._records import JSON
 from dew.artifacts import uint8_pixels
 from dew.batch import Variables, thaw
-from dew.coordination import agreed
 from dew.diffusion.process import Conditioning, Denoiser, Process
 from dew.inputs import InputSpec, encode_conditions, unit_range
 from dew.nn.autoencoders import AutoEncoder

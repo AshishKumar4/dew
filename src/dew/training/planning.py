@@ -20,9 +20,9 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import AbstractMesh, Mesh
 
+from dew._coordination import from_every_process
 from dew._records import JSON
 from dew.batch import Batch
-from dew.coordination import from_every_process
 from dew.data.dataset import rows_of
 from dew.mesh import LayoutRefused
 from dew.nn.kernels.options import compiler_options

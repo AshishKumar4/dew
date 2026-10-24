@@ -36,11 +36,11 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
+from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON, boolean, json_value, record
 from dew.batch import FROZEN, Batch, Variables, select
 from dew.checkpoints import Checkpoints, Ranking
 from dew.cleanup import attempted
-from dew.coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew.data.compile import fitted
 from dew.data.dataset import (
     Closeable,

@@ -21,14 +21,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.batch import Variables, token_id
-from dew.coordination import (
+from dew._coordination import (
     PeerFailure,
     agree_process_phase,
     agreed,
     agreed_same,
     broadcast_from_process_zero,
 )
+from dew.batch import Variables, token_id
 from dew.data.dataset import DataPartition
 from dew.inference.rollouts import Draw
 from dew.nn.inputs import ModelInputs, mesh_of, pad_token_rows

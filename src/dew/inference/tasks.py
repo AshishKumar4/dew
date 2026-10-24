@@ -27,10 +27,10 @@ from flax.core import freeze
 from jax.sharding import NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike, DTypeLike
 
+from dew._coordination import agreed
 from dew._records import integer, record as named_fields, strings, text as named
 from dew.batch import PARAMETER_ROOTS, Variables, thaw
 from dew.cache import persist_compilations
-from dew.coordination import agreed
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_causal
 from dew.inference.projections import packed_owned

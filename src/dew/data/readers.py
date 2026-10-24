@@ -90,7 +90,7 @@ class _CanonicalPass:
         import jax
         from jax.experimental import multihost_utils
 
-        from dew.coordination import agreed, broadcast_from_process_zero
+        from dew._coordination import agreed, broadcast_from_process_zero
         from dew.data.sources.codec import decode, encode
 
         root = jax.process_index() == 0
