@@ -1,3 +1,5 @@
+import faulthandler
+faulthandler.disable()
 import gc
 import http.server
 import json
