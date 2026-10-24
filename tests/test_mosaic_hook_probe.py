@@ -9,9 +9,10 @@ import numpy as np
 import pytest
 from jax import lax
 from jax.experimental import pallas as pl
-
+from jax.experimental.pallas import mosaic_gpu as plgpu
 from test_attention_mosaic import ON_HOPPER, _check_hooked_backward
 
+from dew.nn.kernels.templates import attention_algebra as algebra
 from dew.nn.kernels.templates import attention_mosaic, mosaic, mosaic_sm90
 
 pytestmark = [pytest.mark.kernel, ON_HOPPER,
@@ -35,6 +36,36 @@ def test_hook_control(monkeypatch, hook, accurate, consumers, approx):
     monkeypatch.setattr(mosaic, "compiler_params",
                         lambda **_: dataclasses.replace(params(), approx_math=approx))
     _check_hooked_backward(hook, accurate=accurate, interpret=False)
+
+
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
+def test_only_weights_exact(monkeypatch, accurate):
+    scored = attention_mosaic._scores
+    normalized = algebra.normalized
+
+    def exact_normalized(logits, peak, total, how):
+        argument = algebra.exponent(logits, peak, how)
+
+        @plgpu.inline_mgpu(
+            arg_types=(plgpu.Layout.WGMMA,),
+            return_type=plgpu.ShapeDtypeStruct(argument.shape, argument.dtype, layout=plgpu.Layout.WGMMA),
+        )
+        def precise_exp(ctx, value):
+            del ctx
+            return value.exp(approx=False)
+
+        weights = precise_exp(argument)
+        return weights, weights * algebra.expand(algebra.inverse(total), weights)
+
+    def exact_scores(*args, **kwargs):
+        algebra.normalized = exact_normalized
+        try:
+            return scored(*args, **kwargs)
+        finally:
+            algebra.normalized = normalized
+
+    monkeypatch.setattr(attention_mosaic, "_scores", exact_scores)
+    _check_hooked_backward("softcap-sinks-alibi", accurate=accurate, interpret=False)
 
 
 @pytest.mark.parametrize("consumers", [1, 2])
