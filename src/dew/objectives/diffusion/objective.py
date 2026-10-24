@@ -499,8 +499,8 @@ class DiffusionObjective(Objective[Ratio]):
     def task_settings(self) -> ImageSettings:
         """The process, input encoders, autoencoder and sampling convention."""
         from dew.registry import to_record
-        return ImageSettings(self.process, self.inputs.to_json(),
-                             None if self.autoencoder is None else self.autoencoder.to_json(),
+        return ImageSettings(self.process, to_record(self.inputs, InputSpec),
+                             None if self.autoencoder is None else to_record(self.autoencoder, AutoEncoder),
                              self.solver, self.guidance, self.steps,
                              # A tuned autoencoder's weights and statistics sit in the run's own tree.
                              None if self.end_to_end is None else to_record(self.end_to_end, EndToEnd),

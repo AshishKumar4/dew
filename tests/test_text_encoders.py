@@ -29,6 +29,7 @@ from reference_error import assert_as_exact
 
 from dew.inputs import CLIPText, Condition, Field, InputSpec, T5Text
 from dew.nn.text_encoders import CLIPModel, translate_config
+from dew.registry import to_record
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "clip"
 TINY = FIXTURES / "tiny"
@@ -228,10 +229,10 @@ def test_the_json_fields_rebuild_an_encoder_that_agrees():
     equal fields and equal outputs."""
     spec = InputSpec(Field("image", (8, 8, 3)),
                      {"textcontext": Condition(CLIPText.from_pretrained(str(TINY)))})
-    data = spec.to_json()
+    data = to_record(spec, InputSpec)
 
 
-    restored = InputSpec.from_json(data)
+    restored = InputSpec.bound(data)
     assert restored.sample == spec.sample
     encoder, rebuilt = spec.conditions["textcontext"].encoder, restored.conditions["textcontext"].encoder
     tokens = encoder.tokenize(prompts(TINY))

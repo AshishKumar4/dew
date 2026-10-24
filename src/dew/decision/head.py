@@ -71,6 +71,7 @@ class Head(nn.Module):
         """Return the head as a run records it, the registry's class record (`dew.registry.component`):
         its class by import path and its fields but the width, which the backbone it reads gives, so
         any head reloads, one of a package the run trusts too."""
+        # The class record `to_record(self, Head)` writes, its fields the registry's but for the width.
         fields = record_fields(self, type(self))
         del fields[self.width_field]
         return {"class": import_path(type(self)), "fields": fields}

@@ -49,7 +49,7 @@ class StubText(ConditionEncoder[str]):
         return tuple("".join(chr(97 + int(i)) for i in row[row > 1])
                      for row in np.asarray(tokens["input_ids"]))
 
-    def to_json(self):
+    def recorded_fields(self):
         return {"checkpoint": self.checkpoint, "tokens": self.tokens,
                 "features": int(self.params["table"].shape[1]), "vocab": self.vocab}
 

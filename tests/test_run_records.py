@@ -118,7 +118,7 @@ def test_the_published_runs_weights_are_the_ones_its_models_read():
 
     artifact, variables = published_layout()
     model = saved_model(artifact, None).build()
-    autoencoder = AutoEncoder.from_json(artifact["autoencoder"], params=variables["autoencoder"])
+    autoencoder = AutoEncoder.bound(artifact["autoencoder"], params=variables["autoencoder"])
     sample = tuple(artifact["inputs"]["sample"]["shape"])
     latents = jax.ShapeDtypeStruct((1, *autoencoder.latent_shape(sample)), jnp.float32)
     # CLIP ViT-L/14's 77 tokens of 768 features, the published run's text condition.

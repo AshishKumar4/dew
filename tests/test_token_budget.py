@@ -12,6 +12,7 @@ from dew.data.pipeline import Pipeline
 from dew.data.sources.memory import Memory
 from dew.data.steps.text import FixedTokens
 from dew.inputs import Field, InputSpec
+from dew.registry import to_record
 
 READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
 
@@ -97,7 +98,7 @@ def test_a_finite_batch_marks_its_remainder_or_drops_it(by, drop_remainder, shar
 def test_variable_axis_is_an_input_contract_not_a_trainer_exception():
     declared = InputSpec(Field("tokens", (16,), variable_axes=(0,)))
     declared.check({"tokens": np.zeros((4, 8), np.int32)})
-    assert InputSpec.from_json(declared.to_json()) == declared
+    assert InputSpec.bound(to_record(declared, InputSpec)) == declared
     with pytest.raises(ValueError):
         declared.check({"tokens": np.zeros((4, 17), np.int32)})
     fixed = InputSpec(Field("tokens", (16,)))

@@ -348,7 +348,7 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
         ids = tokens["input_ids"][:, 0] if self.stacked else tokens["input_ids"]
         return tuple(self.tokenizers[0].batch_decode(np.asarray(ids), skip_special_tokens=True))
 
-    def to_json(self):
+    def recorded_fields(self):
         return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.towers[0].dtype),
                 "param_dtype": self.param_dtype, "height": self.height, "width": self.width}
 
@@ -417,7 +417,7 @@ class _LanguageText(ConditionEncoder[str | Mapping[str, object]]):
     def captions(self, tokens):
         return tuple(self.tokenizer.batch_decode(np.asarray(tokens["input_ids"]), skip_special_tokens=True))
 
-    def to_json(self):
+    def recorded_fields(self):
         return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.tower.dtype),
                 "param_dtype": self.param_dtype, "tokens": self.tokens}
 
