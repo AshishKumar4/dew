@@ -46,7 +46,6 @@ from dew.nn.kernels.generation import gpu_target
 from dew.nn.precision import (
     added_to,
     at_least_fp32,
-    bf16_einsum,
     bf16_product,
     capped_logits,
     compensated_sum,
@@ -94,7 +93,7 @@ def _logits_cotangent(cotangent, precision: jax.lax.PrecisionLike):
     and their cotangent is rounded to bf16 once, as the gradient of torch
     autocast's bf16 logits is: the state product and the head's own read
     that one copy. Otherwise it stays in its own dtype, fp32 or wider. The
-    cast is round-to-nearest-even, as `bf16_einsum` rounds its operands."""
+    cast is round-to-nearest-even, as `bf16_dot_general` rounds its operands."""
     return cotangent.astype(jnp.bfloat16) if precision is BF16 else cotangent
 
 
@@ -205,16 +204,6 @@ def _tile_logits(states, matrix, precision: jax.lax.PrecisionLike):
         return bf16_product('td,vd->tv', states, matrix)
     return float32_einsum('td,vd->tv', states, matrix.astype(states.dtype),
                       precision=precision, preferred_element_type=at_least_fp32(states.dtype))
-
-
-def _backward_product(subscripts: str, lhs, rhs, precision: jax.lax.PrecisionLike, work):
-    """A backward product of the head's: under the bf16 algorithm its bf16 operands multiplied
-    exactly and summed in fp32 (`bf16_einsum`), which an A100 computes wrong under the algorithm
-    itself where the product has a vector side, a one-token tile's; otherwise the product of the
-    work dtype (`float32_einsum`)."""
-    if precision is BF16:
-        return bf16_einsum(subscripts, lhs, rhs)
-    return float32_einsum(subscripts, lhs, rhs, precision=precision, preferred_element_type=work)
 
 
 def _row_terms(logits, predict: bool) -> tuple[
@@ -474,10 +463,12 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, gro
             # cotangents stay fp32; only the product's two backward operands round.
             d_tile = jax.tree.map(added_to, d_tile, terms_tile)
             d_raw = _logits_cotangent(d_raw, precision)
-            states_tile = _backward_product('tv,vd->td', d_raw, product_matrix, precision, work)
-            matrix_tile = _backward_product(
-                'tv,td->vd', d_raw, jax.lax.dynamic_slice_in_dim(flat, start, size).astype(operands),
-                precision, work)
+            states_tile = float32_einsum('tv,vd->td', d_raw, product_matrix, precision=precision,
+                                     preferred_element_type=work)
+            matrix_tile = float32_einsum(
+                'tv,td->vd', d_raw,
+                jax.lax.dynamic_slice_in_dim(flat, start, size).astype(operands), precision=precision,
+                preferred_element_type=work)
             # The state and head gradients run over the vocabulary and token tiles as the whole
             # head's products sum them (`running_sum`; the forms' axis comes first).
             prior = jax.lax.dynamic_slice_in_dim(d_states, start, size, axis=1)
@@ -600,8 +591,8 @@ def _whole_head_bwd(chunks, precision, predict, temperature, picked, group, resi
     d_raw = _logits_cotangent(d_raw, precision)
     width = None if precision is BF16 else tile_columns(table.shape[0], chunks, chunked_tile()[1])
     d_states = _state_product(d_raw, table.astype(operands), precision, work, width)
-    d_table = _backward_product('tv,td->vd', d_raw, hidden.reshape(-1, features).astype(operands),
-                                precision, work)
+    d_table = float32_einsum('tv,td->vd', d_raw, hidden.reshape(-1, features).astype(operands),
+                         precision=precision, preferred_element_type=work)
     return (d_states.reshape(hidden.shape).astype(hidden.dtype), d_table.astype(table.dtype),
             None, None, d_cap, d_columns)
 
@@ -614,12 +605,13 @@ def _state_product(d_raw, table, precision, work, width: int | None) -> jax.Arra
     tiles are those the tiled head walks by default (`chunked_tile`). A bf16 head keeps one product,
     as exact as the tiled head's."""
     if width is None or table.shape[0] <= width:
-        return _backward_product('tv,vd->td', d_raw, table, precision, work)
+        return float32_einsum('tv,vd->td', d_raw, table, precision=precision, preferred_element_type=work)
 
     def columns(first, running, size):
-        return added_to(running, _backward_product(
+        return added_to(running, float32_einsum(
             'tv,vd->td', jax.lax.dynamic_slice_in_dim(d_raw, first, size, axis=1),
-            jax.lax.dynamic_slice_in_dim(table, first, size), precision, work))
+            jax.lax.dynamic_slice_in_dim(table, first, size), precision=precision,
+            preferred_element_type=work))
 
     return running_total(_over_tiles(running_sum((d_raw.shape[0], table.shape[1]), work), table.shape[0],
                                      width, columns))
@@ -809,10 +801,12 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, columns: _C
             d_raw, terms = pullback(cotangent)
             d_columns = jax.tree.map(added_to, d_columns, terms)
             d_raw = _logits_cotangent(d_raw, precision)
-            values.append(_backward_product('tv,vd->td', d_raw, product_matrix, precision, work))
+            values.append(float32_einsum('tv,vd->td', d_raw, product_matrix, precision=precision,
+                                     preferred_element_type=work))
             operand = jax.lax.dynamic_slice_in_dim(hidden, start, size).astype(operands)
             # Summed over the token tiles as the bounded head sums them (`_token_sum`).
-            d_table = added_to(d_table, _backward_product('tv,td->vd', d_raw, operand, precision, work))
+            d_table = added_to(d_table, float32_einsum('tv,td->vd', d_raw, operand, precision=precision,
+                                                       preferred_element_type=work))
         outputs = tuple(jax.lax.dynamic_update_slice_in_dim(out, value, start, axis=0)
                         for out, value in zip(outputs, values, strict=True))
         return outputs, d_table, d_columns
