@@ -35,7 +35,6 @@ from dew.nn.kernels.templates.attention import (
     gradients,
     kept_dtype,
     power_of_two,
-    whole,
 )
 from dew.nn.kernels.templates.attention_mosaic_backward import (
     _dkv_allocations,
@@ -58,10 +57,6 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     refused,
 )
 from dew.nn.kernels.templates.base import Template
-
-ALIGNMENT = 1024
-"""The byte boundary Mosaic GPU starts each shared-memory allocation at (JAX's Pallas Mosaic GPU
-`SMEM_ALIGNMENT`, for the TMA swizzles), so a program stages each allocation rounded up to it (`_staged`)."""
 
 
 def _extents(family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
@@ -87,23 +82,19 @@ def _stages(steps: int, staged) -> tuple[int, ...]:
     return tuple(counts)
 
 
-MBARRIER_BYTES = 8
-"""The shared memory an mbarrier takes (PTX ISA, "Size and alignment of mbarrier object": 8 bytes), which a
-program's barriers take beside its arrays (`_staged`)."""
-
-
 def _staged(allocations) -> int:
     """The shared memory a program's `allocations` take, as `Family.scoped` takes them (`plgpu.SMEM` arrays
     and `plgpu.Barrier`s, its streams' allocations among them, nested in sequences and mappings): every
-    array from an `ALIGNMENT` boundary, then every barrier, `MBARRIER_BYTES` each, as JAX's Pallas Mosaic
-    GPU lowering lays a kernel's arrays out and its barriers after them."""
-    arrays = barriers = 0
+    array rounded up to the toolkit's alignment (`mosaic.allocated`), then every barrier
+    (`mosaic.BARRIER_BYTES`), as JAX's Pallas Mosaic GPU lowering lays a kernel's arrays out and its barriers
+    after them."""
+    arrays, barriers = [], 0
     for allocation in jax.tree.leaves(allocations):
         if isinstance(allocation, plgpu.Barrier):
             barriers += int(np.prod(allocation.num_barriers))
         else:
-            arrays += whole(math.prod(allocation.shape) * jnp.dtype(allocation.dtype).itemsize, ALIGNMENT)
-    return arrays + MBARRIER_BYTES * barriers
+            arrays.append(math.prod(allocation.shape) * jnp.dtype(allocation.dtype).itemsize)
+    return mosaic.allocated(*arrays) + mosaic.BARRIER_BYTES * barriers
 
 
 def _registers(family: mosaic.Family, carried, *phases) -> int:
