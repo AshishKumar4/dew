@@ -32,6 +32,8 @@ jobs:
     runs-on: ${{ matrix.machine == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     timeout-minutes: 300
     strategy:
+      # One machine's build failing tells nothing of the others', which run to their ends.
+      fail-fast: false
       matrix:
         # Each CUDA major on each machine; `variants` names each major's project and environment, which
         # the publish jobs take one a major.
@@ -67,7 +69,9 @@ jobs:
     - name: Build
       env:
         PYTHON: python3.12
-        JOBS: "4"
+        # Four nvcc processes at once outgrow the arm runner's memory (killed, exit 137, on its first run);
+        # two fit it.
+        JOBS: ${{ matrix.machine == 'aarch64' && '2' || '4' }}
       run: |
         source /opt/rh/gcc-toolset-12/enable
         sh kernels/cutlass/build.sh
