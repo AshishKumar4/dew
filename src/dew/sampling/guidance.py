@@ -43,7 +43,7 @@ from flax import linen as nn, struct
 
 from dew.diffusion.process import Denoiser
 from dew.diffusion.schedules import expand
-from dew.nn.precision import at_least_fp32, compensated_add, two_product
+from dew.nn.precision import compensated_add, two_product
 
 Predict = Callable[[jax.Array, jax.Array], tuple[jax.Array, jax.Array]]
 # A step's index in its walk: traced inside the walk's scan, a Python int at
@@ -242,7 +242,7 @@ def _projected_components(direction, output):
     Euler walk matches its float64-projection twin bitwise over 52 spatial
     orders on CPU (default, AVX and SDE-ICX). Raw predictions meet the
     reference-error rule on an RTX 4080. TPU arithmetic has not been measured."""
-    dtype = at_least_fp32(jnp.result_type(direction, output))
+    dtype = jnp.result_type(direction, output, jnp.float32)
     vector, conditioned = direction.astype(dtype), output.astype(dtype)
     axes = tuple(range(1, output.ndim))
     shape = (output.shape[0],) + (1,) * (output.ndim - 1)
