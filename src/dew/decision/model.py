@@ -1,7 +1,7 @@
 """A backbone and a decision head, applied as two modules over one variables tree."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import jax
 import jax.numpy as jnp
@@ -22,7 +22,7 @@ from dew.nn.protocols import (
     VocabularyRows,
     head_table,
 )
-from dew.objectives.base import Variables, part, thaw
+from dew.objectives.base import Variables, joined, part, thaw
 
 
 @dataclass(frozen=True)
@@ -48,6 +48,36 @@ class DecisionModel:
             raise TypeError(f"a decision head reads its backbone's final states (`HiddenStates`), "
                             f"which a {type(self.backbone).__name__} does not give")
 
+    def initialize_head(self, key: jax.Array, backbone: Variables, tokens: jax.Array) -> Variables:
+        """Draw the head over a held backbone, at `tokens`' shape, without running the backbone.
+
+        Readouts draw from its output table or vocabulary rows as their own contract declares;
+        a tied readout has no local parameters. The token values are only initialization geometry.
+        """
+        head = self.head
+        states = jnp.zeros((*tokens.shape, getattr(head, head.width_field)), jnp.float32)
+        one = jnp.ones((tokens.shape[0], 1), bool)
+        inputs = DecisionInputs(
+            tokens=tokens,
+            segments=jnp.ones_like(tokens),
+            kinds=jnp.zeros((tokens.shape[0], 1), jnp.int32),
+            questions=one,
+            spans=jnp.broadcast_to(jnp.asarray([[[0, 1]]]), (*one.shape, 2)),
+            option_spans=jnp.broadcast_to(jnp.asarray([[[[0, 1]]]]), (*one.shape, 1, 2)),
+            options=one[..., None],
+        )
+        variables = joined({"backbone": backbone})
+        if head.reads_labels:
+            inputs = replace(inputs, readout=jnp.zeros(one.shape, jnp.int32))
+            gives_rows = isinstance(self.backbone, VocabularyRows)
+            table = (self.output_table(variables) if not head.draws_from_rows
+                     else self.table(variables) if gives_rows else None)
+            labels = head.tied_labels()
+            tied = None if labels is None else jnp.zeros((*one.shape, 1, len(labels[0])), jnp.float32)
+            return head.init(key, states, inputs, table, tied=tied)
+        table = self.table(variables) if head.reads_table else None
+        return head.init(key, states, inputs, table)
+
     def states(self, variables: Variables, inputs: DecisionInputs, *, media: ModelInputs | None = None,
                train: bool = False, rngs: dict[str, jax.Array] | None = None) -> jax.Array:
         """Return the backbone's `[B, L, features]` final states, each packed
@@ -67,6 +97,9 @@ class DecisionModel:
         """The row's final states (`states`), and the context's where the questions' spans are in it."""
         backbone = thaw(part(variables, "backbone"))
         laid = inputs.coordinates()
+        # A row in blocks is read by the backbone's attention whole within each block, on the kinds
+        # that read blocks (`AttentionMetadata.block_groups`); a row in order passes none.
+        blocked: dict[str, jax.Array] = {} if inputs.blocks is None else {"block_groups": inputs.blocks}
         spanned = conditioning = None
         if inputs.context is not None:
             # The context's own pass where it holds the schema, else the backbone's token table.
@@ -83,12 +116,15 @@ class DecisionModel:
                     held = kwargs.get("conditioning", {})
                     assert isinstance(held, Mapping)
                     kwargs["conditioning"] = {**held, **conditioning}
-                return module.hidden_states(rows.tokens, train=train, coordinates=laid, **kwargs)
+                return module.hidden_states(rows.tokens, train=train, coordinates=laid, **kwargs, **blocked)
             return _array(self.backbone.apply(backbone, inputs, media, rngs=rngs, method=read_media)), spanned
         if inputs.slots is None:
-            return _array(self.backbone.apply(backbone, inputs.tokens, train=train, coordinates=laid,
-                                              conditioning=conditioning, method="hidden_states",
-                                              rngs=rngs)), spanned
+            def read(module, tokens):
+                return module.hidden_states(tokens, train=train, coordinates=laid, conditioning=conditioning,
+                                            **blocked)
+            return _array(self.backbone.apply(backbone, inputs.tokens, rngs=rngs, method=read)), spanned
+        if blocked:
+            raise ValueError("a row of option positions sets what each token reads, which blocks set too")
         slots, segments = inputs.slots, inputs.segments
         other = (slots[:, :, None] > 0) & (slots[:, None, :] > 0) & (slots[:, :, None] != slots[:, None, :])
         # A token reads its own row's, and the padding its own; an option reads no other option.
