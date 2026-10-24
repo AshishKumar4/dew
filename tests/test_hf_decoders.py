@@ -279,17 +279,34 @@ def test_a_field_the_reference_does_not_read_leaves_its_logits_whatever_it_holds
     """A released config may carry fields its reference neither declares nor reads (a multimodal
     rotary flag, mamba_ssm's own sizes, an older name for a field it reads under another, an output
     gate the attention always builds, a router jitter or a direction the reference never applies), and
-    the reference computes the same model whatever they hold; so the checkpoint loads to its
-    reference logits however they disagree with the fields the reference reads."""
+    the reference computes the same model whatever they hold: its logits under them are its logits
+    without them, bit for bit. The checkpoint loads to the same model too, however the fields
+    disagree with the ones the reference reads: its logits under them are the bits it computes
+    without them, the same program on the same values, which the fixture's parity test holds to the
+    reference's."""
     from shutil import copytree
+
+    import torch
+    import transformers
 
     directory = tmp_path / "checkpoint"
     copytree(FIXTURES / name, directory)
-    (directory / "config.json").write_text(json.dumps({**fixture_config(name), **stale}))
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    config = {**fixture_config(name), **stale}
+    (directory / "config.json").write_text(json.dumps(config))
     ids = np.load(FIXTURES / name / "input_ids.npy")
-    actual = np.asarray(loaded.model.apply(loaded.variables, ids))
-    np.testing.assert_allclose(actual, np.load(FIXTURES / name / "logits.npy"), atol=1e-4, rtol=0)
+
+    def theirs(source):
+        reference = getattr(transformers, config["architectures"][0]).from_pretrained(
+            source, attn_implementation="eager").eval()
+        with torch.no_grad():
+            return reference(torch.from_numpy(ids).long()).logits.numpy()
+
+    def ours(source):
+        loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
+        return np.asarray(loaded.model.apply(loaded.variables, ids))
+
+    np.testing.assert_array_equal(theirs(directory), theirs(FIXTURES / name))
+    np.testing.assert_array_equal(ours(directory), ours(FIXTURES / name))
 
 
 @pytest.mark.parametrize("family", ["qwen3_moe", "deepseek_v3"])

@@ -1587,15 +1587,13 @@ class Checkpoints:
         (`dew.objectives.base.UNREAD`).
         """
         from dew.inference.banks import banked_placement, placed_rows, shape_rows, spread
-        from dew.objectives.base import FROZEN, merge, without
-        from dew.registry import resolve_dtype
+        from dew.objectives.base import FROZEN, without
         from dew.training.distributed import (
             Layout as DefaultLayout,
             MeshSpec as DefaultMesh,
             device_mesh as resolve_mesh,
         )
 
-        target = resolve_dtype(param_dtype)
         step = self.pinned(step)
         stored = self.stored(step)
         template = {"variables": without(stored["variables"], unread)}
@@ -1617,24 +1615,38 @@ class Checkpoints:
         if frozen is not None:
             placement["variables"] = {**placement["variables"], FROZEN: banked_placement(
                 frozen, placement["variables"][FROZEN])}
+        params = self.materialized(template, placement, step=step, param_dtype=param_dtype,
+                                   parameter_roots=parameter_roots)
+        if frozen is not None:
+            params = {**params, FROZEN: spread(params[FROZEN], placed_rows)}
+        return params
+
+    def materialized(self, template: Mapping[str, Variables], placement: Mapping[str, Variables], *,
+                     step: int, param_dtype: jax.typing.DTypeLike | None = None,
+                     parameter_roots: tuple[tuple[str, ...], ...] = PARAMETER_ROOTS) -> Variables:
+        """The variables at `step` whose leaves `template` names (`stored`'s, under `"variables"`, and
+        under `"ema"` the averaged ones, merged over them), restored onto `placement`'s shardings, no
+        other leaf read; the floating leaves under `parameter_roots` read as `param_dtype` where one is
+        given, the rest in their stored dtypes. Every load of a run's variables restores through it: a
+        whole run's onto its layout (`variables`) and a bank's rows onto theirs
+        (`dew.inference.banks.CheckpointBanks`)."""
+        from dew.objectives.base import merge
+        from dew.registry import resolve_dtype
+
+        target = resolve_dtype(param_dtype)
         selected = set()
         if target is not None:
             roots = tuple(tuple(jax.tree_util.DictKey(name) for name in root) for root in parameter_roots)
-            selected = {path for path, leaf in jax.tree_util.tree_flatten_with_path(stored["variables"])[0]
+            selected = {path for path, leaf in jax.tree_util.tree_flatten_with_path(template["variables"])[0]
                         if jnp.issubdtype(leaf.dtype, jnp.floating) and
                         any(path[:len(root)] == root for root in roots)}
-        template = jax.tree_util.tree_map_with_path(
+        typed = jax.tree_util.tree_map_with_path(
             lambda path, leaf, sharding: jax.ShapeDtypeStruct(
                 leaf.shape, target if path[1:] in selected else leaf.dtype, sharding=sharding),
-            template, placement)
-        values, _ = self.restore(template, step=step)
+            dict(template), dict(placement))
+        values, _ = self.restore(typed, step=step)
         params = values.pop("variables")
-        if frozen is not None:
-            params = {**params, FROZEN: spread(params[FROZEN], placed_rows)}
-        if averaged:
-            params = merge(params, values["ema"])
-
-        return params
+        return merge(params, values["ema"]) if "ema" in values else params
 
     def stored(self, step: int | str | None = None) -> Variables:
         """Return what the checkpoint at `step` holds, without reading its values.

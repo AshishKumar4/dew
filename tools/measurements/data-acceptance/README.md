@@ -18,7 +18,7 @@ record steps, two loading workers each.
 | Resident memory within Grain's + 10% | 0.996, passes | 1.022, passes | 1.035, passes | 1.144, fails |
 | Warm first batch under 10 s | 6.6 s, passes | 5.5 s, passes | 5.3 s, passes | 5.1 s, passes |
 | Cold first batch under 30 s | 5.6 s, passes | 5.4 s, passes | 5.4 s, passes | 5.1 s, passes |
-| Device idle under 5% of a step | 15.8% | 3.0% | 13.2% | 24.7% |
+| Host wait for data, of wait and step | 15.8% | 3.0% | 13.2% | 24.7% |
 
 - Throughput is records per second for images and real tokens per second for text, in steady
   state after warmup. A single run moves by several percent: six alternating Dew and Grain runs
@@ -28,9 +28,12 @@ record steps, two loading workers each.
 - A cold first batch opens a fresh copy of the inputs Dew never provisioned, written through
   and evicted from the page cache (`POSIX_FADV_DONTNEED`), under a cache home of its own. The
   host's page cache is not dropped, which needs root.
-- Device idle is the training step's wait for data over wait and step, with the tool's toy
-  models: their steps take 1 to 25 ms, so the loader is most of the step by construction. It
-  does not stand for a real model's idle.
+- Host wait is the training loop's time in `next(reader)` over wait and step, with the tool's
+  toy models: their steps take 1 to 25 ms, so the loader is most of the step by construction. It
+  overlaps the updates still running on the device, so it is not the device's idle; these
+  receipts record it as `device_idle_fraction` under the 5% check. The tool now reads device
+  idle from the accelerator's timeline of traced steps (`device_idle_fraction`, the part a batch's
+  copy ended as `device_input_idle_fraction`) and checks that; none of these receipts has it.
 
 ## Interleave scaling
 
