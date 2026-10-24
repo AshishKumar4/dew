@@ -1011,22 +1011,19 @@ def _implied_collectives(mesh: Mesh, rows: tuple[str, ...], split: set[str]) -> 
     (all-reduce). Where it also splits a variable (`split`), it gathers the variable whole to use
     it (all-gather), and a row axis sums each gradient into its shares (reduce-scatter), as fully
     sharded data parallelism does. An axis that splits a variable and no batch, tensor, sums the
-    partial products of the width it splits (all-reduce). The expert axis sends each token to its
-    expert's devices and back (all-to-all), and the stage axis hands each microbatch's activations
-    on (collective-permute). The attention's own exchange over the sequence axis, an all-to-all or
-    a gather by its heads and lengths (`dew.nn.attention.sequence_parallel_attention`), is the
-    model's choice, not the placement's, and is not named."""
+    partial products of the width it splits (all-reduce). The stage axis hands each microbatch's
+    activations on (collective-permute). How the experts on the expert axis meet their tokens, an
+    all-to-all or a gather by the layer's dispatch (`dew.nn.moe`), and the attention's exchange
+    over the sequence axis, an all-to-all or a gather by its heads and lengths
+    (`dew.nn.attention.sequence_parallel_attention`), are the model's choice, not the
+    placement's, and are not named."""
     implied = {}
     for axis, size in mesh.shape.items():
         if size == 1:
             continue
-        shares, splits = axis in rows or axis == SEQUENCE_AXIS, axis in split
-        ops = []
-        if shares or (splits and axis != EXPERT_AXIS):
-            ops.append("all-reduce")
-        if splits and axis == EXPERT_AXIS:
-            ops.append("all-to-all")
-        elif splits and shares:
+        shares = axis in rows or axis == SEQUENCE_AXIS
+        ops = ["all-reduce"] if shares or axis in split else []
+        if shares and axis in split and axis != EXPERT_AXIS:
             ops.append("all-gather")
             if axis in rows:
                 ops.append("reduce-scatter")
