@@ -114,9 +114,13 @@ def assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, 
         return jax.tree.map(lambda before, grad: applied(before, (before - grad).astype(np.float32)),
                             values["params"], grads)
 
+    # Compiled once, as each arm is, rather than run op by op at every draw: a 0.12 CPU sizing of this
+    # site ran its process out of memory for compiled code within its draws.
+    wide = jax.jit(lambda values: objective_gradient(twin, values, widened(batch), step))
+
     def truth(values):
         with jax.enable_x64(new_val=True):
-            return jax.tree.map(np.asarray, objective_gradient(twin, widened(values), widened(batch), step))
+            return jax.tree.map(np.asarray, wide(widened(values)))
 
     assert_as_exact(trained, objective_update, moved_weights(variables), "trainer update", seeds=seeds,
                     truth_fn=truth)
