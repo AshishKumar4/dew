@@ -22,10 +22,10 @@ from tools.torch_precision import default_dtype
 FIXTURE = Path(__file__).parent / "fixtures" / "hf" / "gemma4-unified-native-tiny"
 
 
-def source_pair(directory):
-    native = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+def source_pair(directory, dtype="float32"):
+    native = Pretrained.load(directory, dtype=dtype, param_dtype=dtype, attention_impl="reference")
     reference = Gemma4UnifiedForConditionalGeneration.from_pretrained(
-        directory, dtype=torch.float32, attn_implementation="eager").eval()
+        directory, dtype=getattr(torch, dtype), attn_implementation="eager").eval()
     with float64(), default_dtype(torch.float64):
         truth = Gemma4UnifiedForConditionalGeneration(copy.deepcopy(reference.config)).double().eval()
     truth.load_state_dict(reference.state_dict(), strict=True)
@@ -37,7 +37,7 @@ def source():
     return source_pair(FIXTURE)
 
 
-def assert_forward(source, draw, label):
+def forward_functions(source):
     native, reference, truth = source
     processor = native.processor
 
@@ -60,15 +60,21 @@ def assert_forward(source, draw, label):
             tensors = {name: value.double() if value.is_floating_point() else value
                        for name, value in tensors.items()}
         with torch.no_grad():
-            return {f"row{row}": model(**single, use_cache=False).logits.numpy()
+            return {f"row{row}": model(**single, use_cache=False).logits.to(
+                torch.float64 if wide else torch.float32).numpy()
                     for row, single in enumerate(_row_slices(tensors, model))}
 
     def oracle(inputs):
         with float64():
             return theirs(truth, inputs, wide=True)
 
-    assert_as_exact(ours, lambda inputs: theirs(reference, inputs), lambda seed: (draw(seed),),
-                    label, seeds=8, truth_fn=oracle)
+    return ours, lambda inputs: theirs(reference, inputs), oracle
+
+
+def assert_forward(source, draw, label):
+    ours, reference, truth = forward_functions(source)
+    assert_as_exact(ours, reference, lambda seed: (draw(seed),),
+                    label, seeds=8, truth_fn=truth)
 
 
 def test_unified_processor_and_native_forward_follow_the_published_forward(source):
@@ -79,6 +85,12 @@ def test_unified_processor_and_native_forward_follow_the_published_forward(sourc
 def test_vision_blocks_longer_than_the_window_keep_their_whole_block(source):
     assert_forward(source, lambda seed: unified_draw(source[1].config, seed, side=4),
                     "Gemma4 Unified long vision block")
+
+
+def test_a_bfloat16_unified_source_uses_the_same_media_and_decoder_policy():
+    source = source_pair(FIXTURE, "bfloat16")
+    assert_forward(source, lambda seed: unified_draw(source[1].config, seed),
+                    "Gemma4 Unified bfloat16 source forward")
 
 
 def gradient_functions(source):
@@ -216,7 +228,7 @@ def test_raw_media_train_and_reload_through_the_public_source(source, tmp_path):
                                   expected)
 
 
-def test_cached_unified_calls_keep_the_ordinary_forward_mask(source):
+def cached_functions(source):
     native, reference, truth = source
     model = native.model.clone(language_model=native.model.language_model.clone(max_seq_len=32))
 
@@ -259,8 +271,13 @@ def test_cached_unified_calls_keep_the_ordinary_forward_mask(source):
         return unified_draw(reference.config, seed), np.random.default_rng(seed + 83).integers(
             4, 50, (1, 3), dtype=np.int32)
 
-    assert_as_exact(ours, lambda *args: theirs(reference, *args), draw,
-                    "Gemma4 Unified cached ordinary forward", seeds=8, truth_fn=oracle)
+    return ours, lambda *args: theirs(reference, *args), oracle, draw
+
+
+def test_cached_unified_calls_keep_the_ordinary_forward_mask(source):
+    ours, reference, truth, draw = cached_functions(source)
+    assert_as_exact(ours, reference, draw,
+                    "Gemma4 Unified cached ordinary forward", seeds=8, truth_fn=truth)
 
 
 @pytest.mark.parametrize("media", ["text", "vision", "audio"])
