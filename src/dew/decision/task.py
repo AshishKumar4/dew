@@ -130,11 +130,12 @@ def usage_of(rows: Sequence[Encoded]) -> Usage:
 @dataclass(frozen=True)
 class DecideSettings:
     """What a decision run records beside its backbone, and its task is built with
-    (`Decide.from_run`): the head's record (`Head.record`), the layout's name and fields, the
-    special tokens, the text tokenizer's name, and an image processor's source, or None."""
+    (`Decide.from_run`): the head's record (`Head.record`), the layout (by import path, its
+    segments with it), the special tokens, the text tokenizer's name, and an image processor's
+    source, or None."""
 
     head: JSON
-    layout: JSON
+    layout: Layout
     specials: Specials
     tokenizer: str | None
     processor: str | None
@@ -214,6 +215,12 @@ class Decide:
         from dew.registry import from_record, objectives
 
         record, step = run_record(directory, step)
+        laid = record.get("layout")
+        if isinstance(laid, Mapping) and "name" in laid:
+            # An earlier run's record names its layout by class name alone, one of dew.decision.layout's.
+            name = records.text(laid["name"], "layout.name")
+            record = {**record, "layout": {"class": f"dew.decision.layout:{name}",
+                                           "fields": records.json_value(laid.get("fields"), "layout.fields")}}
         settings = saved_settings(record, DecideSettings)
         backbone = saved_model(record, dtype).build()
         width, head_dtype = DecisionModel.head_size(backbone)
@@ -221,13 +228,7 @@ class Decide:
         # The head computes in the dtype it recorded, or as a fresh head over
         # the backbone would where the caller overrides the compute dtype.
         model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype))
-        laid = records.record(settings.layout, "layout")
-        if "name" in laid:
-            # An earlier run's record names its layout by class name alone, one of dew.decision.layout's.
-            laid = {"class": f"dew.decision.layout:{records.text(laid['name'], 'layout.name')}",
-                    "fields": records.json_value(laid.get("fields"), "layout.fields")}
-        # A layout is plain data, its framing's template variables included: no field is a dtype.
-        rows = from_record(Layout, laid, dtypes=False)
+        rows = settings.layout
         if settings.tokenizer is None:
             raise ValueError("the run records no tokenizer to lay its rows out with")
         processor = None if settings.processor is None else load_processor(settings.processor, backbone)

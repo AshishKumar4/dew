@@ -67,12 +67,12 @@ class Head(nn.Module):
                              "QuestionLayout or use a joint head")
 
     def record(self) -> JSON:
-        """Return the head as a run records it: its class by import path and its fields but the
-        width, which the backbone it reads gives (`dew.registry`), so any head reloads, one of a
+        """Return the head as a run records it: its class by import path (`dew.registry`) and its
+        fields but the width, which the backbone it reads gives, so any head reloads, one of a
         package the run trusts too."""
         fields = record_fields(self, type(self))
         del fields[self.width_field]
-        return {"class": import_path(type(self)), "fields": fields}
+        return {"name": import_path(type(self)), "fields": fields}
 
     @staticmethod
     def from_record(record: JSON, width: int) -> "Head":
@@ -80,8 +80,8 @@ class Head(nn.Module):
         recorded. A record of an earlier run names its head by class name alone, one of this
         module's, and is read as that class's path."""
         held = records.record(record, "head")
-        path = (records.text(held["class"], "head.class") if "class" in held
-                else f"{__name__}:{records.text(held.get('name'), 'head.name')}")
+        name = records.text(held.get("name"), "head.name")
+        path = name if ":" in name else f"{__name__}:{name}"
         head = imported(path)
         if not (isinstance(head, type) and issubclass(head, Head)):
             raise ValueError(f"a run's head is a decision head (`Head`), not {path!r}")
