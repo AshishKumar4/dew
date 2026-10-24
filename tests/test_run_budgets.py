@@ -79,7 +79,7 @@ def descended(x):
 
 
 def trainer(directory=None, tracker=None) -> Trainer:
-    return Trainer(Pulled(), OptimConfig(optimizer="adam", rate=Linear(peak=PEAK)), key=0,
+    return Trainer(Pulled(), OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK)), key=0,
                    accumulation=ACCUMULATION, tracker=tracker,
                    checkpoints=None if directory is None else Checkpoints(str(directory)))
 
@@ -177,7 +177,7 @@ def test_a_pause_on_a_step_that_ranks_a_weights_only_best_writes_the_whole_state
     objective = Pulled()
 
     def fitted(stop):
-        return Trainer(objective, OptimConfig(optimizer="adam", rate=Linear(peak=PEAK)), key=0,
+        return Trainer(objective, OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK)), key=0,
                        accumulation=ACCUMULATION, checkpoints=Checkpoints(str(tmp_path))).fit(
             chain(x), examples=EXAMPLES, stop=stop, eval_every=2 * ACCUMULATION,
             best=Best(objective.loss, weights_only=True))
@@ -201,7 +201,7 @@ def test_a_stream_that_runs_out_on_an_evaluated_step_scores_that_step_once():
     tracker = RecordingTracker()
     batch = {"x": x[:BATCH]}
     finite = Loader(lambda partition: iter([batch] * 3), lambda partition: iter([batch]), None, BATCH)
-    Trainer(Pulled(), OptimConfig(optimizer="adam", rate=0.1), key=0, tracker=tracker).fit(
+    Trainer(Pulled(), OptimConfig(optimizer="adam", learning_rate=0.1), key=0, tracker=tracker).fit(
         finite, steps=5, eval_every=1, log_every=1)
     assert [step for step, scalars in tracker.scalars if "val/loss" in scalars] == [1, 2, 3]
 
@@ -212,7 +212,7 @@ def test_a_stream_that_runs_out_after_a_ranked_step_ends_on_a_whole_checkpoint(t
     (x,) = records(0)
     objective = Pulled()
     finite = Loader(lambda partition: iter([{"x": x[:BATCH]}]), None, None, BATCH)
-    Trainer(objective, OptimConfig(optimizer="adam", rate=0.1), key=0,
+    Trainer(objective, OptimConfig(optimizer="adam", learning_rate=0.1), key=0,
             checkpoints=Checkpoints(str(tmp_path))).fit(
         finite, steps=10, eval_every=1, best=Best(objective.loss, weights_only=True))
     assert Checkpoints(str(tmp_path)).latest == 1
@@ -222,7 +222,8 @@ def test_a_run_config_counts_examples_and_pauses_as_a_fit_does(tmp_path):
     """A run config's `examples` and `stop` reach the fit, its record holding both: paused halfway it
     stands two updates in, and run again without the pause it goes on to the steps its examples fill."""
     (x,) = records(0)
-    config = RunConfig(optim=OptimConfig(optimizer="adam", rate=Linear(peak=PEAK)), trainer=TrainerConfig(
+    optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK))
+    config = RunConfig(optim=optim, trainer=TrainerConfig(
         checkpoint_dir=str(tmp_path), examples=EXAMPLES, stop=Pause(0.5), accumulation=ACCUMULATION,
         log_every=1, eval_every=None, checkpoint_every=None))
     assert RunConfig.from_dict(config.to_dict()) == config
