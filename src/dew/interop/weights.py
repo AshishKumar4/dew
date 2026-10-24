@@ -52,6 +52,14 @@ def check_tree(variables: Mapping[str, object], module: nn.Module, *inputs) -> N
     check_shapes(shapes(dict(variables)).items(), expected)
 
 
+def in_params(path: TensorPath) -> TensorPath:
+    """`path`, whose leaves are parameters, rooted at `params`."""
+    def rooted(name: str) -> tuple[str, ...] | None:
+        leaf = path(name)
+        return None if leaf is None else ("params", *leaf)
+    return rooted
+
+
 AUTO = "auto"
 """The param_dtype that stores a checkpoint's parameters in its own dtype."""
 

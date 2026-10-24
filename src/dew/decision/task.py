@@ -5,6 +5,7 @@ import binascii
 import functools
 import io
 import json
+import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -33,7 +34,6 @@ from dew.decision.calibration import (
 from dew.decision.data import Example
 from dew.decision.head import Head
 from dew.decision.images import Images
-from dew.decision.joint_checkpoint import JointCheckpoint
 from dew.decision.laya import LAYA, LayaCheckpoint
 from dew.decision.layout import (
     DecisionInputs,
@@ -63,15 +63,19 @@ from dew.files import write_atomically
 from dew.inference import scoring
 from dew.inference.tasks import shape_bucket
 from dew.interop.processors import Processor
+from dew.interop.safetensors_io import MAX_SHARD_SIZE
+from dew.interop.sources import SourceReference
 from dew.nn.inputs import ModelInputs, RowPlan, mesh_of
 from dew.nn.kernels.options import compiler_options
-from dew.objectives.base import Metric, Objective, Variables
+from dew.nn.sharding import batch_axes
+from dew.objectives.base import Metric, Objective, Variables, joined
 from dew.records import JSON, json_value, record
 
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
     from dew.decision.objective import DecisionObjective
+    from dew.decision.sources import PretrainedDecision
     from dew.training.distributed import Layout as Placement, MeshSpec
 
 TASK_FILE = "decide.json"
@@ -138,7 +142,7 @@ class DecideSettings:
     layout: Layout
     specials: Specials
     tokenizer: str | None
-    processor: str | None
+    processor: SourceReference | None
 
     @staticmethod
     def of(record: Mapping[str, object]) -> "DecideSettings":
@@ -186,27 +190,33 @@ class Decide:
     def from_pretrained(cls, name: str | Path = LAYA, *, subfolder: str | None = None,
                         revision: str | None = None, dtype: str = "float32", param_dtype: str = "float32",
                         attention_impl: str = "auto") -> Self:
-        """Load a released Laya checkpoint (`LayaCheckpoint`) or joint-head
-        checkpoint (`JointCheckpoint`) as a task.
+        """Load a released Laya or joint-head checkpoint through `Pretrained.load` as a task.
 
         A Laya task uses the temperatures that Laya's agent reads from
         `rl_agent_config.json`; a joint-head release ships none. Either
         answers with Jev's confidence; `replace(task, confidence=...)` selects
         Laya's (`EntropyConfidence`) or the top probability (`TopProbability`).
         """
-        label = str(name) if subfolder is None else f"{name}/{subfolder}"
-        if subfolder is None and JointCheckpoint.exists(name, revision=revision):
-            release = JointCheckpoint.load(name, revision=revision, dtype=dtype, param_dtype=param_dtype,
-                                           attention_impl=attention_impl)
-            return cls(release.model, release.variables, JointLayout(), release.tokenizer, release.specials,
-                       name=label, processor=release.processor)
-        checkpoint = LayaCheckpoint.load(name, subfolder=subfolder, revision=revision, dtype=dtype,
-                                         param_dtype=param_dtype, attention_impl=attention_impl)
-        choice, score, noul = checkpoint.temperatures
-        temperatures = Temperatures({"choice": choice, "score": score, "noul": noul},
-                                    checkpoint.bucket_temperatures)
-        return cls(checkpoint.model, checkpoint.variables, checkpoint.layout, checkpoint.tokenizer,
-                   checkpoint.specials, Calibration(temperatures), name=label)
+        from dew.decision.sources import PretrainedDecision
+        from dew.interop.pretrained import Pretrained
+
+        bundle = Pretrained.load(name, subfolder=subfolder, revision=revision, dtype=dtype,
+                                  param_dtype=param_dtype, attention_impl=attention_impl)
+        if not isinstance(bundle, PretrainedDecision):
+            raise TypeError(f"{name} declares no decision task")
+        return cls.of(bundle)
+
+    @classmethod
+    def of(cls, bundle: "PretrainedDecision") -> Self:
+        """Build the declared decision task from a loaded composite bundle, without loading again."""
+        from dew.registry import from_record
+
+        settings = DecideSettings.of(records.record(bundle.settings, "decision settings"))
+        calibration = from_record(Calibration, bundle.calibration)
+        return cls(DecisionModel(bundle.model, bundle.head),
+                   joined({"backbone": bundle.variables, "head": bundle.head_variables}),
+                   settings.layout, bundle.decision_tokenizer, settings.specials, calibration,
+                   name=str(bundle.origin or bundle.source), processor=bundle.processor)
 
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
@@ -264,7 +274,7 @@ class Decide:
                        budget=from_record(Budget, records.json_value(settings["budget"], "budget")),
                        name=records.text(settings["name"], "name"))
 
-    def save_pretrained(self, directory: str | Path) -> None:
+    def save_pretrained(self, directory: str | Path, *, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
         """Write this task as a released checkpoint, which `from_pretrained` reads back.
 
         A ModernBERT backbone under Laya's head and layout is written in Laya's
@@ -284,7 +294,7 @@ class Decide:
         types = applied.types
         LayaCheckpoint(self.model, self.variables, self.layout, self.tokenizer, self.specials,
                        (types.get("choice", 1.0), types.get("score", 1.0), types.get("noul", 1.0)),
-                       dict(applied.buckets)).save(directory)
+                       dict(applied.buckets)).save(directory, max_shard_size=max_shard_size)
 
     def save(self, directory: str) -> None:
         """Write this task's calibration, budget and name into the run `directory`.
@@ -532,7 +542,7 @@ class Decide:
         minimum counts are Laya's: a type's temperature needs `type_minimum` answers
         and a bucket's `bucket_minimum`.
         """
-        scored = self._scored(held_out if callable(held_out) else self._held(held_out))
+        scored = self._scored(held_out if callable(held_out) else self._held(held_out, self._mesh))
         if not scored:
             raise ValueError("calibration needs examples with answers")
         temperatures = Temperatures.fit(scored, type_minimum=type_minimum, bucket_minimum=bucket_minimum)
@@ -549,27 +559,39 @@ class Decide:
         each probability divided by its temperature; a binning map or abstention
         thresholds are not applied. The default metrics are Accuracy, ECE, AURC
         and the log loss. The pass agrees its result across a process pool, so
-        there every process calls it.
+        there every process calls it. It scores on the mesh the task's weights are
+        placed on, its rows split over the mesh's row axes as a run's validation
+        splits them, or on one local device for weights placed on none.
         """
         from dew.decision.scoring import default_metrics
-        from dew.training.distributed import MeshSpec
         from dew.training.evaluation import Evaluation
 
         chosen = list(metrics) or default_metrics()
-        evaluation = Evaluation.run(self._scoring, self.variables, self._held(examples),
-                                    key=0, metrics=chosen, mesh=MeshSpec().build(jax.local_devices()[:1]))
+        evaluation = Evaluation.run(self._scoring, self.variables, self._held(examples, self._mesh),
+                                    key=0, metrics=chosen, mesh=self._mesh)
         return {metric.name: evaluation.scores[f"val/{metric.name}"] for metric in chosen}
 
-    def _held(self, examples: Iterable[Example | Mapping[str, object]]) -> Reader:
+    @property
+    def _mesh(self) -> "Mesh":
+        """The mesh the task's weights are placed on, or one local device for weights placed on none."""
+        from dew.training.distributed import MeshSpec
+
+        placed = mesh_of(self.variables)
+        return MeshSpec().build(jax.local_devices()[:1]) if placed is None else placed
+
+    def _held(self, examples: Iterable[Example | Mapping[str, object]], mesh: "Mesh") -> Reader:
         """`examples` as a validation reader of this task's rows, laid out as
         its objective evaluates them. A batch is one pass within the budget, as
-        `batch` packs its rows, on one device, as an answer is: a short last
-        batch need not divide."""
+        `batch` packs its rows, rounded to a multiple of the rows `mesh` splits a
+        batch over, so every batch divides; a short last batch is filled as a
+        run's validation fills it (`VALID_ROWS`)."""
         from dew.data import Memory
         from dew.data.compile import validation
         from dew.decision.data import decisions
 
+        shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
         rows = max(1, min(self.budget.rows, self.budget.tokens // self.layout.max_len))
+        rows = -(-rows // shards) * shards
         rows_of = [{"example": row} if isinstance(row, Example) else row for row in examples]
         held = decisions(Memory(rows_of))
         return validation(held, batch=rows, objective=self._scoring.data(), read="memory")
@@ -847,7 +869,8 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
                           positions=array("positions"), slots=given("slots"),
                           option_slots=given("option_slots"), slotted=given("slotted"),
                           context=given("context"), context_lengths=given("context_lengths"),
-                          max_segments=max_segments, spans_in_context=spans_in_context)
+                          readout=given("readout"), max_segments=max_segments,
+                          spans_in_context=spans_in_context)
 
 
 def _widened(leaf: jax.Array, length: int, fill: int = 0) -> jax.Array:

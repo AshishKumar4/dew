@@ -66,6 +66,23 @@ class SourceLeaf:
     def ndim(self) -> int:
         return len(self.shape)
 
+    def reshape(self, shape: tuple[int, ...]) -> SourceLeaf:
+        """Split or join native axes as views, without reading or casting their stored bytes.
+
+        Stacked members retain their leading expert axis. NumPy's `copy=False` refuses a reshape
+        that needs a rearrangement rather than a view; each later read still builds only its shard.
+        """
+        if shape == self.shape:
+            return self
+        member_shape = shape
+        if self.stacked:
+            if not shape or shape[0] != len(self.members):
+                raise ValueError("a stacked source view keeps its leading expert axis")
+            member_shape = shape[1:]
+        members = tuple(np.reshape(member.swapaxes(-1, -2) if self.transposed else member,
+                                   member_shape, copy=False) for member in self.members)
+        return SourceLeaf(members, self.dtype, stacked=self.stacked)
+
     def _member(self, member: np.ndarray, index: tuple[slice, ...]) -> np.ndarray:
         """One member's values at `index` of its view, C-ordered in `dtype`:
         read and cast in the stored layout, which is contiguous, then

@@ -11,9 +11,10 @@ from collections.abc import Mapping
 from flax import linen as nn
 
 from dew import records
+from dew.interop.weights import in_params
 from dew.registry import Record
 
-from .common import TowerBase, TowerGeometry, TowerLayout, in_params
+from .common import TowerBase, TowerGeometry, TowerLayout
 from .gemma4 import AxialPatchEmbedding
 
 

@@ -11,6 +11,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
+from dew.interop.weights import in_params
 from dew.nn.activations import gelu_exact
 from dew.nn.mlp import GatedMLP
 from dew.registry import Record
@@ -23,7 +24,6 @@ from .common import (
     TowerLayout,
     _vision_section,
     block_tensor_path,
-    in_params,
     rope_base,
 )
 from .vit import VisionTransformer, ViTLayout

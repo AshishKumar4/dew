@@ -14,7 +14,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
-from dew.interop.weights import checkpoint_array
+from dew.interop.weights import checkpoint_array, in_params
 from dew.nn.attention import RMSNorm
 from dew.nn.dense import Dense
 from dew.nn.precision import float32_dot_general
@@ -32,7 +32,6 @@ from .common import (
     _vision_section,
     activation_name,
     head_width,
-    in_params,
     trunk_geometry,
 )
 from .vit import LearnedPositions, VisionTransformer, ViTLayout
