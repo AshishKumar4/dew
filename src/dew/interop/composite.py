@@ -40,7 +40,7 @@ class HeadComponent:
     weight_file: str | None = None
     reshape: Callable[[nn.Module, dict], dict] | None = None
 
-    def build(self, backbone: nn.Module, dtype: str, attention_impl: str) -> nn.Module:
+    def build(self, backbone: nn.Module | None, dtype: str, attention_impl: str) -> nn.Module:
         """Build the readout against the backbone's output contract."""
         raise NotImplementedError
 
@@ -50,7 +50,7 @@ class CompositeSource:
     """A backbone and readout with the native model and bundle types that own their composition.
     `fields` are task metadata passed to the bundle; they contain no loader or placement policy."""
 
-    backbone: NativeComponent
+    backbone: NativeComponent | None
     head: HeadComponent
     bundle: Callable[..., Pretrained]
     tokenizer_folder: str

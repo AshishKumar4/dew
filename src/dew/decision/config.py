@@ -30,7 +30,7 @@ from dew.data.compile import fitted
 from dew.data.dataset import record_argument
 from dew.data.text import HFTokenizer
 from dew.decision.head import DecisionHead, JointSchemaHead
-from dew.decision.laya import LAYA, LayaCheckpoint
+from dew.decision.laya import LAYA
 from dew.decision.layout import Framing, Layout, Schema, Segment, default_layout
 from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
@@ -157,20 +157,20 @@ class DecisionRunConfig(RunConfig):
             raise ValueError("a schema read as the row's context is read by context layers; set "
                              "--context-layers")
         derived = {}
-        if LayaCheckpoint.exists(self.pretrained, subfolder=self.subfolder, revision=self.revision):
+        from dew.decision.sources import PretrainedDecision
+
+        start = Pretrained.load(self.pretrained, subfolder=self.subfolder, revision=self.revision,
+                                dtype=dtype, param_dtype=self.param_dtype, attention_impl=attention_impl,
+                                weights=not self.trainer.resumes(), on_host=True)
+        if isinstance(start, PretrainedDecision):
             if any(choice is not None for choice in (self.lora, self.head, self.loop_steps,
                                                     self.loop_layers, self.loop_backprop_steps,
                                                     self.remat, self.context_layers)) or self.loop_remat:
                 raise ValueError("--lora, --head, --remat, --context-layers and the loop shape a fresh "
                                  "backbone; a Laya checkpoint trains whole under its own head")
-            start = Decide.from_pretrained(self.pretrained, subfolder=self.subfolder, revision=self.revision,
-                                           dtype=dtype, param_dtype=self.param_dtype,
-                                           attention_impl=attention_impl)
+            start = Decide.of(start)
             derived["layout"] = _budgeted(start.layout, budgets)
         else:
-            start = Pretrained.load(self.pretrained, revision=self.revision, dtype=dtype,
-                                    param_dtype=self.param_dtype, attention_impl=attention_impl,
-                                    weights=not self.trainer.resumes(), on_host=True)
             if self.remat is not None:
                 if not isinstance(start.model, RematChoosing):
                     raise ValueError(f"--remat chooses a decoder's layer policy (RematChoosing), which "

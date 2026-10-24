@@ -36,6 +36,7 @@ from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import InputSpec
 from dew.interop import decoder_parts, gguf, hf_decoders as decoders, mamba2, sources, verify
 from dew.interop.codecs import SourceQuantization, source_quantization
+from dew.interop.composite import CompositeSource, NativeComponent
 from dew.interop.config_records import NativeFields
 from dew.interop.decoder_bindings import decoder_layouts, reading_layout
 from dew.interop.generation_config import (
@@ -1366,7 +1367,7 @@ def _selected_payload(fallback: str | None, **files: str | None) -> list[str]:
     return selected
 
 
-def _composite_description(directory: Path):
+def _composite_description(directory: Path) -> CompositeSource | None:
     """A registered composite's metadata, without reading or placing its weights."""
     from dew.registry import source_kinds
 
@@ -1377,38 +1378,45 @@ def _composite_description(directory: Path):
     return None
 
 
-def _load_composite_source(name_or_dir, root, commit, folder, description, *, placed, streaming,
-                           dtype, param_dtype, attention_impl, max_seq_len):
+def _load_composite_source(name_or_dir: str | Path, root: Path, commit: str | None, folder: str,
+                           description: CompositeSource, *, placed: Callable[[Variables], Variables],
+                           streaming: bool, dtype: str, param_dtype: str, attention_impl: str,
+                           max_seq_len: int | None) -> Pretrained:
     """Materialize the described components through the native backbone and tensor-map owners.
     All Hub paths remain relative to the resolved snapshot root, including a selected subfolder."""
     from dew.interop.safetensors_io import read_file
     from dew.interop.weights import translate_parameters
 
     component = description.backbone
-    weights_folder = str(Path(folder) / component.weights_folder).removeprefix("./")
-    if weights_folder == ".":
-        weights_folder = ""
-    root = sources.snapshot(str(name_or_dir), commit, weights=(weights_folder,))
     directory = root / folder
-    shared = sources.load_shards(root / weights_folder)
-    prefix = component.tensor_prefix
-    tensors = ({name[len(prefix):]: tensor for name, tensor in shared.items() if name.startswith(prefix)}
-               if prefix else shared)
-    backbone = _load_native_source(
-        name_or_dir, directory, commit, gguf_file=None, component=component, tensors=tensors,
-        placed=placed, streaming=streaming, dtype=dtype, param_dtype=param_dtype,
-        attention_impl=attention_impl, max_seq_len=max_seq_len)
+    backbone, shared, prefix = None, {}, ""
+    if component is not None:
+        weights_folder = str(Path(folder) / component.weights_folder)
+        if weights_folder == ".":
+            weights_folder = ""
+        root = sources.snapshot(str(name_or_dir), commit, weights=(weights_folder,))
+        shared = sources.load_shards(root / weights_folder)
+        prefix = component.tensor_prefix
+        tensors = ({name[len(prefix):]: tensor for name, tensor in shared.items() if name.startswith(prefix)}
+                   if prefix else shared)
+        backbone = _load_native_source(
+            name_or_dir, directory, commit, gguf_file=None, component=component, tensors=tensors,
+            placed=placed, streaming=streaming, dtype=dtype, param_dtype=param_dtype,
+            attention_impl=attention_impl, max_seq_len=max_seq_len)
     head_source = description.head
     if head_source.weight_file is None:
         head_tensors = {name: tensor for name, tensor in shared.items() if not name.startswith(prefix)}
     else:
         filename = (Path(folder) / head_source.weight_file).as_posix()
         head_tensors = read_file(sources.repo_file(name_or_dir, root, filename))[0]
-    head = head_source.build(backbone.model, dtype, attention_impl)
+    head = head_source.build(None if backbone is None else backbone.model, dtype, attention_impl)
     params = translate_parameters(decoder_parts.split_packed(head_tensors, head_source.packed),
                                   head_source.path, param_dtype)
     if head_source.reshape is not None:
         params = head_source.reshape(head, params)
+    if backbone is None:
+        return Pretrained(head, placed({"params": params}), None, {}, directory,
+                          record_fields(head, type(head)), revision=commit)
     return description.bundle(backbone, head, placed({"params": params}), directory,
                               description.tokenizer_folder, **description.fields)
 
@@ -1416,7 +1424,8 @@ def _load_composite_source(name_or_dir, root, commit, folder, description, *, pl
 def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | None, *,
                         gguf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
                         dtype: str, param_dtype: str, attention_impl: str,
-                        max_seq_len: int | None, component=None, tensors=None) -> Pretrained:
+                        max_seq_len: int | None, component: NativeComponent | None = None,
+                        tensors: Mapping[str, np.ndarray] | None = None) -> Pretrained:
     """Decode native source weights and bind their processors and export layout.
 
     Diffusers pipelines and the explicit torchax fallback have already taken

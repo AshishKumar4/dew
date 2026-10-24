@@ -14,24 +14,18 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Self
 
 import jax
 import numpy as np
 
-from dew import records
 from dew.data.text import HFTokenizer
 from dew.decision.head import DecisionHead
 from dew.decision.layout import MarkerLayout, Specials
 from dew.decision.model import DecisionModel
-from dew.interop import sources
-from dew.interop.decoder_parts import Packed, joined_packed, split_packed
-from dew.interop.hf_decoders import translate_config, translate_weights
-from dew.interop.safetensors_io import read_weights, write_file
-from dew.interop.weights import translate_parameters
+from dew.interop.decoder_parts import Packed, joined_packed
+from dew.interop.safetensors_io import write_file
 from dew.lora import FACTORS
-from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import Variables, joined, part, thaw
+from dew.objectives.base import Variables, part, thaw
 from dew.registry import from_record
 
 # Laya's head, as nn.TransformerEncoderLayer and its nn.Sequential scorer name it.
@@ -96,69 +90,10 @@ class LayaCheckpoint:
     temperatures: tuple[float, float, float]
     bucket_temperatures: dict[str, float]
 
-    @staticmethod
-    def exists(name_or_dir: str | Path, *, subfolder: str | None = None, revision: str | None = None) -> bool:
-        """Return whether `name_or_dir` (in `subfolder`) holds a Laya checkpoint.
 
-        A Laya checkpoint has an `rl_agent_config.json` next to the weights. For a
-        Hub repo id, it asks the Hub without downloading anything (`sources.has_file`).
-        """
-        config = f"{subfolder}/{CONFIG_FILE}" if subfolder else CONFIG_FILE
-        if Path(name_or_dir).is_dir():
-            return (Path(name_or_dir) / config).is_file()
-        return sources.has_file(str(name_or_dir), config, revision=revision)
-
-    @classmethod
-    def load(cls, name_or_dir: str | Path = LAYA, *, subfolder: str | None = None,
-             revision: str | None = None, dtype: str = "float32", param_dtype: str = "float32",
-             attention_impl: str = "auto") -> Self:
-        """Read the checkpoint at `name_or_dir`, a Hub repo or a directory.
-
-        `subfolder` selects a checkpoint where the repo bundles several.
-        """
-        root = sources.snapshot(str(name_or_dir), revision, weights=(subfolder or "",))
-        directory = root / subfolder if subfolder else root
-        config = records.record(json.loads((directory / CONFIG_FILE).read_text()), CONFIG_FILE)
-        tensors = read_weights(directory)
-        encoder = {name.removeprefix("encoder."): tensor for name, tensor in tensors.items()
-                   if name.startswith("encoder.")}
-        record = translate_config(json.loads((directory / "encoder" / "config.json").read_text()))
-        # The encoder ships ModernBertModel's tensors under a masked-LM config.
-        for field in ("head_transform", "head_bias"):
-            record.pop(field, None)
-        backbone = from_record(CausalTransformer,
-                               {**record, "dtype": dtype, "attention_impl": attention_impl})
-        head = DecisionHead(features=backbone.emb_features,
-                            layers=records.integer(config.get("head_layers", 2), "head_layers"),
-                            dtype=backbone.dtype, attention_impl=attention_impl)
-        head_tensors = split_packed({name: tensor for name, tensor in tensors.items()
-                                     if not name.startswith("encoder.")}, IN_PROJ)
-        variables = joined({
-            "backbone": translate_weights(encoder, record, "modernbert", param_dtype=param_dtype),
-            "head": {"params": translate_parameters(head_tensors, _head_path, param_dtype)}})
-        layout = MarkerLayout(
-            max_len=records.integer(config.get("max_len", 512), "max_len"),
-            head_max_len=records.integer(config.get("head_max_len", 192), "head_max_len"),
-            option_tokens=records.integer(config.get("option_tokens", MarkerLayout.option_tokens),
-                                          "option_tokens"),
-            parallel=config.get("option_layout", "sequential") == "parallel")
-        tokenizer = HFTokenizer(str(directory / "tokenizer"), local_files_only=True)
-        hf = tokenizer.tokenizer
-        specials = Specials(begin=_token(hf.cls_token_id, "cls"), separator=_token(hf.sep_token_id, "sep"),
-                            marker=_token(hf.mask_token_id, "mask"), marker_text=str(hf.mask_token),
-                            pad=_token(hf.pad_token_id, "pad"))
-        listed = config.get("temperature", [1.0, 1.0, 1.0])
-        if not isinstance(listed, list) or len(listed) != 3:
-            raise ValueError("rl_agent_config.json's temperature lists one per question type: "
-                             "choice, score, noul")
-        temperatures = tuple(records.number(value, "temperature") for value in listed)
-        buckets = records.record(config.get("temperature_by_options", {}), "temperature_by_options")
-        return cls(DecisionModel(backbone, head), variables, layout, tokenizer, specials,
-                   (temperatures[0], temperatures[1], temperatures[2]),
-                   {name: records.number(value, name) for name, value in buckets.items()})
 
     def save(self, directory: str | Path) -> None:
-        """Write this checkpoint in Laya's layout, which `load` and llama.cpp's converter read.
+        """Write this checkpoint in Laya's layout, which `Pretrained.load` and llama.cpp's converter read.
 
         That is `model.safetensors` (the encoder's ModernBertModel tensors under
         `encoder.` and the head's under Laya's names), `encoder/config.json`, the

@@ -32,11 +32,16 @@ from .task import Decide, DecideSettings
 class DecisionHeadSource(HeadComponent):
     """The head constructor reads the native backbone's output width and compute dtype."""
 
-    def build(self, backbone: nn.Module, dtype: str, attention_impl: str) -> Head:
-        width, compute = DecisionModel.head_size(backbone)
+    def build(self, backbone: nn.Module | None, dtype: str, attention_impl: str) -> Head:
         held = records.record(self.record, "head")
         fields = records.record(held["fields"], "head.fields")
-        return Head.from_record({**held, "fields": {**fields, "dtype": compute,
+        if backbone is None:
+            width = records.integer(fields["hidden_size"], "hidden_size")
+            compute = dtype
+        else:
+            width, compute = DecisionModel.head_size(backbone)
+        configured = {name: value for name, value in fields.items() if name != "hidden_size"}
+        return Head.from_record({**held, "fields": {**configured, "dtype": compute,
                                                      "attention_impl": attention_impl}}, width)
 
 
@@ -79,6 +84,7 @@ class PretrainedDecision(Pretrained):
         layout = from_record(Layout, layout_record)
         settings = DecideSettings(head.record(), layout, specials, str(directory / tokenizer_folder), None)
         inherited = {field.name: getattr(backbone, field.name) for field in dataclasses.fields(Pretrained)}
+        inherited["source"] = directory
         return cls(**inherited, head=head, head_variables=head_variables,
                    settings=to_record(settings, DecideSettings), calibration=calibration_record,
                    decision_tokenizer=tokenizer)
@@ -117,10 +123,11 @@ class DecisionSource(SourceKind):
             config = records.record(json.loads((directory / HEAD_CONFIG).read_text()), HEAD_CONFIG)
             if records.number(config.get("dropout", 0.0), "dropout"):
                 raise ValueError("the stored head drops out at a rate Dew's head does not train with")
-            native = records.record(json.loads((directory / "config.json").read_text()), "config.json")
-            backbone = NativeComponent(native)
+            config_path = directory / "config.json"
+            backbone = (NativeComponent(records.record(json.loads(config_path.read_text()), "config.json"))
+                        if config_path.is_file() else None)
             fields = {key: records.integer(config[key], key)
-                      for key in ("width", "routing_layers", "layers", "heads", "feedforward")}
+                      for key in ("hidden_size", "width", "routing_layers", "layers", "heads", "feedforward")}
             head = DecisionHeadSource({"name": import_path(JointSchemaHead), "fields": fields},
                                       _path, IN_PROJ, HEAD_WEIGHTS, _shaped)
             layout, calibration = JointLayout(), Calibration()

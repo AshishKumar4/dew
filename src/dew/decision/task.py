@@ -185,8 +185,7 @@ class Decide:
     def from_pretrained(cls, name: str | Path = LAYA, *, subfolder: str | None = None,
                         revision: str | None = None, dtype: str = "float32", param_dtype: str = "float32",
                         attention_impl: str = "auto") -> Self:
-        """Load a released Laya checkpoint (`LayaCheckpoint`) or joint-head
-        checkpoint (`JointCheckpoint`) as a task.
+        """Load a released Laya or joint-head checkpoint through `Pretrained.load` as a task.
 
         A Laya task uses the temperatures that Laya's agent reads from
         `rl_agent_config.json`; a joint-head release ships none. Either
