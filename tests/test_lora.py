@@ -646,6 +646,77 @@ def test_a_clipped_linear_adapts_once_inside_its_bounds_and_reloads(tmp_path):
     assert np.all(np.isfinite(merged)) and np.all(np.abs(merged) <= 1)
 
 
+def test_field_only_linear_subclasses_train_their_adapter():
+    from dew.nn.dense import Dense
+
+    class FieldDense(Dense):
+        use_bias: bool = False
+
+    class FieldFlaxDense(nn.Dense):
+        use_bias: bool = False
+
+    inputs = jnp.asarray(np.random.default_rng(9).standard_normal((4, 6)), jnp.float32)
+    for projection in (FieldDense(5), FieldFlaxDense(5)):
+        model = _BranchHost(projection)
+        variables = model.init(jax.random.key(3), inputs)
+        adapter = LoRA(rank=2, modules=("proj",)).apply(model, variables, key=4)
+        gradient = jax.grad(lambda params, bound=adapter: jnp.sum(jnp.square(bound.model.apply(
+            {**bound.variables, "params": params}, inputs))))(adapter.variables["params"])
+        assert np.any(np.asarray(gradient["proj"]["lora_B"]))
+
+
+@pytest.mark.parametrize("arithmetic", [False, True])
+def test_an_opaque_linear_override_is_refused_instead_of_training_unused_factors(arithmetic):
+    from dew.nn.dense import Dense
+
+    class OpaqueCall(Dense):
+        @nn.compact
+        def __call__(self, inputs):
+            return jnp.tanh(super().__call__(inputs))
+
+    class OpaqueArithmetic(Dense):
+        def _linear(self, inputs):
+            return jnp.tanh(super()._linear(inputs))
+
+    model = _BranchHost(OpaqueArithmetic(5) if arithmetic else OpaqueCall(5))
+    inputs = jnp.ones((4, 6), jnp.float32)
+    variables = model.init(jax.random.key(3), inputs)
+    adapter = LoRA(rank=2, modules=("proj",)).apply(model, variables, key=4)
+    with pytest.raises(TypeError):
+        adapter.model.apply(adapter.variables, inputs)
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+@pytest.mark.parametrize("boundary", ["input", "output"])
+def test_quantized_clipped_adapters_keep_both_clamp_boundaries(frozen, boundary):
+    """Clamped inputs have zero derivatives while interior inputs still train. A saturated
+    output is exactly its stored bound, including when a packed base replaces the linear call."""
+    from dew.nn.kernels.generation import device_generation
+    from dew.quantization import QUANTIZATION, InputQuantization
+
+    model, variables, _, _, _, _ = clipped_adapter_case()
+    kernel = variables["params"]["proj"]["kernel"]
+    variables["params"]["proj"]["kernel"] = jnp.full_like(kernel, 1 / 256 if boundary == "input" else 1)
+    checkpoint = InputQuantization(sites=(("proj", "nvfp4"),))
+    quantized = checkpoint.apply(model)
+    variables = {**variables, QUANTIZATION: jax.tree.map(
+        lambda scale: jnp.full_like(scale, 0.1), checkpoint.declared())}
+    packed = (InputQuantization(frozen_fp8=("proj",), measured_on=device_generation()) if frozen else None)
+    adapter = LoRA(rank=2, modules=("proj",)).apply(quantized, variables, key=4, fp8_base=packed)
+    inputs = (jnp.stack([jnp.full((16,), 2.0), jnp.full((16,), 0.1)]) if boundary == "input"
+              else jnp.full((2, 16), 0.5)).astype(jnp.float32)
+    output = adapter.model.apply(adapter.variables, inputs)
+    gradient = jax.grad(lambda values: jnp.sum(adapter.model.apply(adapter.variables, values)))(inputs)
+    if boundary == "input":
+        assert np.all(np.asarray(output) > 0)
+        np.testing.assert_array_equal(gradient[0], jnp.zeros_like(gradient[0]))
+        assert np.all(np.asarray(gradient[1]) != 0)
+    else:
+        upper = variables["constants"]["proj"]["output_max"]
+        np.testing.assert_array_equal(output, jnp.broadcast_to(upper, output.shape))
+        np.testing.assert_array_equal(gradient, jnp.zeros_like(gradient))
+
+
 def test_the_branch_reads_a_keyword_input():
     """Flax calls Dense's inputs by keyword as well as positionally; the
     branch has to read `inputs` from kwargs where the call passes it there."""
