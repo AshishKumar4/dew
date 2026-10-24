@@ -343,7 +343,9 @@ def test_every_parameter_layout_and_the_output_hook_are_on_par(case, dtype):
     def dews(query, key, value):
         wide = jnp.promote_types(query.dtype, jnp.float32)
         scaled = (query.astype(wide) * jnp.swapaxes(temperature, 1, 2)[..., None]).astype(query.dtype)
-        bias = (key_bias[:, :, None, :] + dense_bias).astype(query.dtype)
+        # Each bias widened before the sum, as the template widens each parameter: a float64 truth sums
+        # them in float64, not their fp32 sum widened after its rounding.
+        bias = (key_bias[:, :, None, :].astype(wide) + dense_bias.astype(wide)).astype(query.dtype)
         out = scaled_dot_product_attention(scaled, key, value, mask=mask, bias=bias,
                                            implementation="reference")
         return (out.astype(wide) * jax.nn.sigmoid(gate.astype(wide))).astype(query.dtype)
