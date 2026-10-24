@@ -5,9 +5,7 @@ token across two marks both's; and a published slot release's prompt as a layout
 81ce62f, rendered as its engine renders them), its options' spans the lines its runtime pools, its
 answer at its last token, and its state cut only where its segments say."""
 
-import itertools
 import json
-import string
 from pathlib import Path
 from typing import Literal
 
@@ -30,7 +28,10 @@ from dew.decision.layout import (
 from dew.decision.render import Chunk, render
 
 QWEN = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
-"""Qwen3.5's tokenizer and ChatML template, tiny, with its thinking switch."""
+"""Qwen3.5's ChatML template, with its thinking switch, over a tiny vocabulary of bytes and Qwen's
+special tokens: no merges, so its ids are the text's bytes and the template's own tokens."""
+LAYA = Path(__file__).parent / "fixtures" / "laya" / "tiny" / "tokenizer"
+"""Laya's tiny BPE tokenizer, which merges."""
 ELEPHANT, ELEPHANT_REVISION = "baselabs/elephant-1", "b3f8a93462fb1051a9de031e94a7ff380e254072"
 """The slot release whose tokenizer spells every one of its labels as one token."""
 
@@ -119,7 +120,8 @@ def overlapping(tokenizer: HFTokenizer, prompt: str, span: tuple[int, int]) -> t
 def test_a_slot_release_row_is_the_releases_own_prompt(qwen, question, prompt):
     """A choice and a score lay out as the release renders them: their ids the tokenizer's of the
     release's whole prompt, each option's span the tokens overlapping its line, the answer the last
-    token, and each label the bare letter's one id."""
+    token, and each label the bare letter's one id (over a vocabulary that merges nothing; the
+    release's own tokenizer, which merges, under `network`)."""
     [row] = release().rows(qwen, SPECIALS, STATE, {"asked": question})
     assert list(row.tokens) == qwen.encode(prompt, add_special_tokens=False)
     [laid] = row.questions
@@ -159,11 +161,17 @@ def test_more_options_than_letters_ask_for_one_label_their_structures_indented(q
 
 @pytest.mark.network
 def test_more_options_than_letters_answer_with_one_of_the_releases_labels():
-    """Under the release's own tokenizer (elephant-1 at its pinned commit), every one of its 256 labels
-    spells as one token, as its runtime verifies them; a choice of more options than letters names
+    """Under the release's own tokenizer (elephant-1 at its pinned commit), which merges, its prompts'
+    ids and spans are its own; every one of its 256 labels spells as one token, as its runtime
+    verifies them; and a choice of more options than letters names
     them by those labels and asks for one label, a structured description indented JSON and a
     structured state the same."""
     pinned = HFTokenizer(f"{ELEPHANT}@{ELEPHANT_REVISION}")
+    for question, prompt in ((TEAM, CHOICE_PROMPT), (URGENCY, SCORE_PROMPT)):
+        [row] = release().rows(pinned, SPECIALS, STATE, {"asked": question})
+        assert list(row.tokens) == pinned.encode(prompt, add_special_tokens=False)
+        [laid] = row.questions
+        assert list(laid.options) == [overlapping(pinned, prompt, line) for line in lines_of(prompt, 3)]
     ids = RELEASE_LABELS.ids(pinned, len(SLOT_LABELS))
     assert all(pinned.decode(list(label)) == name for label, name in zip(ids, SLOT_LABELS, strict=True))
     queues = Choice("Which queue?", {f"queue{index:02d}": ({"team": index} if index == 0 else None)
@@ -188,17 +196,17 @@ def test_the_two_units_agree_where_the_vocabulary_never_merges():
     assert one.tokens == other.tokens and one.questions == other.questions
 
 
-def test_a_token_across_two_marks_belongs_to_both(qwen):
+def test_a_token_across_two_marks_belongs_to_both():
     """Encoded whole, a token that overlaps two marks' characters is in both marks' spans, as the
     release's runtime counts a token straddling two lines in both; encoded piece by piece, each mark
-    holds its own piece's tokens."""
-    characters = [*string.ascii_letters, " ", "\n"]
-    first, second = next((a, b) for a, b in itertools.product(characters, repeat=2)
-                         if len(qwen.encode(a + b, add_special_tokens=False)) == 1)
+    holds its own piece's tokens. Laya's tiny tokenizer merges `n` and `t` into one token."""
+    laya = HFTokenizer(str(LAYA), local_files_only=True)
+    first, second = "n", "t"
+    assert len(laya.encode(first + second, add_special_tokens=False)) == 1
     chunks = [Chunk(first, marks=(("one", 0, 1),)), Chunk(second, marks=(("two", 0, 1),))]
-    merged = render(chunks, qwen, "whole")
+    merged = render(chunks, laya, "whole")
     assert len(merged.tokens) == 1 and merged.marks == {"one": (0, 1), "two": (0, 1)}
-    apart = render(chunks, qwen, "pieces")
+    apart = render(chunks, laya, "pieces")
     assert apart.marks == {"one": (0, 1), "two": (1, 2)}
 
 
