@@ -234,9 +234,10 @@ def accumulated(product: Callable[..., jax.Array], *operands,
 
             def transposed(index):
                 # The product is linear in each operand alone, so its pullback there is its transpose,
-                # the cotangent's products, its unused forward dropped. Taken by `jax.vjp`, which also
-                # differentiates a product another library swapped in with a backward of its own (Qwix
-                # quantizing a model directly, a custom_vjp), where `jax.linear_transpose` cannot.
+                # the cotangent's products. Taken by `jax.vjp`, which also differentiates a product
+                # another library swapped in with a backward of its own (Qwix quantizing a model
+                # directly, a custom_vjp), where `jax.linear_transpose` cannot; its unused forward is
+                # dropped from a compiled program, and computed once more by an eager pullback.
                 def alone(operand):
                     return product(*wide[:index], operand, *wide[index + 1:],
                                    precision=jax.lax.Precision.HIGHEST, preferred_element_type=None)

@@ -95,11 +95,13 @@ def test_a_dense_qwix_quantizes_directly_takes_its_gradient_on_a_cpu():
     from dew.nn.dense import Dense
 
     layer = Dense(8)
-    x = jnp.asarray(np.random.default_rng(0).standard_normal((4, 16)), jnp.float32)
-    variables = layer.init(jax.random.key(0), x)
-    quantized = qwix.quantize_model(layer, qwix.QtProvider(
-        [qwix.QtRule(module_path=".*", weight_qtype=jnp.int8, act_qtype=jnp.int8)]))
-    gradients = jax.jit(jax.grad(lambda variables: jnp.sum(quantized.apply(variables, x) ** 2)))(variables)
+    with jax.default_device(jax.devices("cpu")[0]):
+        x = jnp.asarray(np.random.default_rng(0).standard_normal((4, 16)), jnp.float32)
+        variables = layer.init(jax.random.key(0), x)
+        quantized = qwix.quantize_model(layer, qwix.QtProvider(
+            [qwix.QtRule(module_path=".*", weight_qtype=jnp.int8, act_qtype=jnp.int8)]))
+        loss = jax.grad(lambda variables: jnp.sum(quantized.apply(variables, x) ** 2))
+        gradients = jax.jit(loss)(variables)
     kernel = np.asarray(gradients["params"]["kernel"])
     assert np.all(np.isfinite(kernel)) and np.any(kernel)
 
