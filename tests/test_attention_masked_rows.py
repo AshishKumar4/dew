@@ -98,16 +98,16 @@ def test_a_row_that_sees_no_key_reads_nothing_on_the_fused_gpu_kernels(implement
 
 @pytest.mark.parametrize("implementation", ["reference", "xla", "template"])
 def test_a_row_its_key_starts_empty_reads_its_blocks_later_keys(implementation):
-    """A causal row whose own key the key starts cut sees none of its own, and its block's later keys revive
-    it, on every implementation: in the first row a two-token block over starts of 1, whose first query reads
-    the second key alone; in the second, starts of 2 under a block of tokens 1 and 2, whose first query
-    reads key 2 alone, and a first query no block holds, which reads nothing. A row reading one key is that
-    key's value exactly."""
+    """A causal row whose own key the key starts cut sees none of its own, and its whole block's later keys
+    revive it, on every implementation: in the first row a two-token block over starts of 1, whose first
+    query reads the second key alone; in the second, starts of 2 under a block of tokens 1 and 2, whose
+    first query reads key 2 alone, and a first query no block holds, which reads nothing. A row reading one
+    key is that key's value exactly."""
     query, key, value = qkv((2, 4, 2, 8), jnp.float32)
     groups = jnp.asarray([[0, 0, -1, -1], [-1, 1, 1, -1]], jnp.int32)
     out = np.asarray(scaled_dot_product_attention(query, key, value, causal=True,
                                                   key_value_seq_starts=jnp.asarray([1, 2], jnp.int32),
-                                                  block_groups=(groups,), implementation=implementation))
+                                                  block_groups=groups, implementation=implementation))
     np.testing.assert_array_equal(out[0, 0], np.asarray(value)[0, 1])
     np.testing.assert_array_equal(out[1, 1], np.asarray(value)[1, 2])
     np.testing.assert_array_equal(out[1, 0], 0)
