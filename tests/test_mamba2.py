@@ -281,8 +281,12 @@ SPLIT_BATCH = 8
 """The rows a sequence-split draw holds: every parameter's gradient, the heads' `D` and `A_log` too,
 sums over all of them."""
 
-SPLIT_SEEDS = 8
-"""The sequence split's declared draws."""
+SPLIT_SEEDS = {"all_valid": 64, "right_padded": 128, "left_padded": 128, "gaps": 128, "packed": 256,
+               "empty_shard": 256, "empty_shard_packed": 64}
+"""Each row's declared draws, sized by `seeds_for` on armada paired with the unsplit layer: the two arms
+share every upstream rounding (the same weights and hidden states), and the gradients of `A_log`, `D`
+and the conv's parameters, sums of the whole draw into a few values, are heavy-tailed across draws, so
+that the unsplit layer against itself resolves none of them within 512 draws."""
 
 
 @pytest.mark.mesh
@@ -325,7 +329,7 @@ def test_a_layer_split_over_the_sequence_runs_padded_and_packed_rows_as_whole_on
 
     mesh = MeshSpec(sequence=4).build(jax.devices()[:4])
     assert_as_exact(run(module, variables, mesh), run(module, variables), draw,
-                    f"mamba2 split over the sequence, {row}", seeds=SPLIT_SEEDS, truth_fn=truth)
+                    f"mamba2 split over the sequence, {row}", seeds=SPLIT_SEEDS[row], truth_fn=truth)
     split = run(module, variables, mesh)(*draw(0))[0]
     assert not np.any(np.asarray(split)[:, ~valid])
 
