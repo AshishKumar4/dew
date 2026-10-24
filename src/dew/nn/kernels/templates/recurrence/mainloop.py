@@ -293,11 +293,13 @@ def _tile(slots, name: str, operand: _Operand, rows=None, columns=None) -> _Part
     return _Parts((view(slots[f"{name}{p}"]) for p in range(operand.parts)), operand.dtype)
 
 
-def _views(**parted) -> dict:
+def _views(index_map=None, /, **parted) -> dict:
     """A launch's streams' views by stream part name (`Family.opened`'s `(ref, index_map)`, `mosaic.viewed`),
     `parted[name]` a list of an operand's parts' views: step `i` the `i`-th tile of the stream's rows down
-    its view, as wide as the view (the whole view where the stream's tile is)."""
-    return {f"{name}{p}": (view, _down) for name, views in parted.items() for p, view in enumerate(views)}
+    its view, as wide as the view (the whole view where the stream's tile is), or the tile `index_map(i)`
+    names."""
+    return {f"{name}{p}": (view, _down if index_map is None else index_map) for name, views in parted.items()
+            for p, view in enumerate(views)}
 
 
 def _down(step) -> tuple:
@@ -958,13 +960,6 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, starts=None, max_segments: in
 # terms token by token (`summed_back`) and writes a vector a chunk and value head, which XLA adds.
 
 
-def _flipped(x, call: _Call):
-    """`x` `[parts * R, columns]` with its chunks in reverse order: walked forward, a sequence's chunks from
-    its last (a chunk `n`'s rows at chunk `chunks - 1 - n`)."""
-    parts = x.shape[0] // call.rows
-    return x.reshape(parts, call.chunks, CHUNK, -1)[:, ::-1].reshape(x.shape)
-
-
 def _reverse(q, k, w, do, hi, lo, dht, sequences, call: _Call, *, scale: float):
     """`(dh [chunks * HV * Dk, Dv], dv [R, HV * Dv], dh0 [B * HV * Dk, Dv])`: the gradient of the memory each
     chunk leaves as `call.memories`, the corrected values' gradient as `call.held` (their own output's,
@@ -995,7 +990,9 @@ def _reverse(q, k, w, do, hi, lo, dht, sequences, call: _Call, *, scale: float):
             return (base * call.heads + h) * width + i * BLOCK
 
         key_columns = h // call.group * width
-        views = _views(queries=given.views(q_ref, 0, call.rows, key_columns, width),
+        # Step `f` the chunk `chunks - 1 - f`: a sequence's chunks from its last, walked forward.
+        views = _views(lambda f: (chunks - 1 - f, 0),
+                       queries=given.views(q_ref, 0, call.rows, key_columns, width),
                        keys=given.views(k_ref, 0, call.rows, key_columns, width),
                        w=held.views(w_ref, 0, call.rows, h * width, width),
                        out=given.views(do_ref, 0, call.rows, h * value_width + j * bv, bv))
@@ -1036,12 +1033,11 @@ def _reverse(q, k, w, do, hi, lo, dht, sequences, call: _Call, *, scale: float):
     blocks = _streamed(queries=((CHUNK, width), given), keys=((CHUNK, width), given),
                        w=((CHUNK, width), held), out=((CHUNK, bv), given))
     finals = _streamed(**{f"final{i}": ((BLOCK, bv), final) for i in range(slices)})
-    flipped = [_flipped(x, call) for x in (q, k, w, do)]
     return _kernel(program, call, out_type=out_type, grid=(value_width // bv, sequences.shape[0], call.heads),
                    grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=2,
                    live=lambda refs: refs[9][lax.axis_index("sequences"), 1] > 0,
                    staging=(*_staging(held, (BLOCK, bv)), (plgpu.SMEM((CHUNK, bv), held.stored),)),
-                   once=finals)(*flipped, hi, lo, hi, lo, dht, sequences)
+                   once=finals)(q, k, w, do, hi, lo, hi, lo, dht, sequences)
 
 
 def _query_key(q, k, corrected, do, dv, h, dh, hi, lo, taken, call: _Call, *, scale: float):

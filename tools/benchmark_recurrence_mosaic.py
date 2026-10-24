@@ -34,6 +34,10 @@ ROUTES = {'mosaic': {'mainloop': 'mosaic'}, 'port': {}, 'hybrid': {}, 'xla': {'p
 the hybrid the port's rule itself with the template's fast backward (`fla_rule(..., backward='mosaic')`)."""
 
 
+KERNELS = 40
+"""The heaviest kernels a row lists: every launch a pass's glue takes as well as its mainloop's."""
+
+
 def measured(compiled, args, warmup: int, repeats: int) -> tuple[float, list]:
     """The median of `repeats` calls' device milliseconds after `warmup`, every kernel of a call summed, and
     the heaviest kernels' medians."""
@@ -52,7 +56,7 @@ def measured(compiled, args, warmup: int, repeats: int) -> tuple[float, list]:
     # A finalizing read detaches CUPTI from the process.
     profiler.Cupti().measure(compiled, aggregate=False)(*args)
     top = sorted(((name[:80], round(statistics.median(ms), 4)) for name, ms in kernels.items()),
-                 key=lambda item: -item[1])[:8]
+                 key=lambda item: -item[1])[:KERNELS]
     return statistics.median(times), top
 
 
