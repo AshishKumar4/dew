@@ -38,12 +38,6 @@ def _gpt_bigcode_config(hf: Mapping[str, object], used: set[str]) -> DecoderFiel
     return config
 
 
-def _gpt_bigcode_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    # The fused qkv has three leaves, the query's heads, then the one key head
-    # and the one value head (`GPTBigCodeAttention.forward`), split by `packed`.
-    return None if '.attn.c_attn.' in name else renamed_path(GPT2_NAMES, name, config)
-
-
 def _gpt_bigcode_export(model: CausalTransformer) -> Mapping[str, object]:
     fields = dict(gpt2_export(model))
     fields.update({'multi_query': model.kv_heads == 1,
@@ -56,7 +50,7 @@ GPT_BIGCODE = DecoderFamily(
     ('gpt_bigcode',), _gpt_bigcode_config,
     lambda fields: fields.position_embedding == 'learned' and fields.kv_heads == 1 < fields.num_heads,
     'gpt_bigcode', 'GPTBigCodeForCausalLM', _gpt_bigcode_export,
-    weight_path=_gpt_bigcode_path, export_path=partial(renamed_name, GPT2_NAMES),
+    weight_path=partial(renamed_path, GPT2_NAMES), export_path=partial(renamed_name, GPT2_NAMES),
     packed=grouped_qkv('.attn.c_attn'), export_weights=decoder_tensors, preserve_source_layout=False,
     tied_head_names=('lm_head.weight', 'transformer.wte.weight'),
 )

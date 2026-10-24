@@ -5,9 +5,9 @@ from functools import partial
 
 from dew import records
 from dew.interop.decoder_parts import (
+    MEGATRON_NAMES,
     DecoderFamily,
     DecoderFields,
-    Renames,
     base_config,
     decoder_tensors,
     grouped_qkv,
@@ -53,18 +53,6 @@ def _falcon_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     return config
 
 
-_FALCON_NAMES: Renames = (
-    ('transformer.word_embeddings', 'model.embed_tokens'), ('transformer.ln_f', 'model.norm'),
-    ('transformer.h', 'model.layers'), ('self_attention.dense', 'self_attn.o_proj'),
-    ('mlp.dense_h_to_4h', 'mlp.up_proj'), ('mlp.dense_4h_to_h', 'mlp.down_proj'))
-
-
-def _falcon_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    if '.self_attention.query_key_value.' in name:
-        return None
-    return renamed_path(_FALCON_NAMES, name, config)
-
-
 def _falcon_export(model: CausalTransformer) -> Mapping[str, object]:
     return {
         'alibi': False, 'new_decoder_architecture': False, 'multi_query': model.kv_heads == 1,
@@ -83,7 +71,7 @@ FALCON = DecoderFamily(
     lambda fields: fields.shared_parallel_norm and fields.mlp == 'gelu_exact'
                    and fields.partial_rotary_factor is None,
     'falcon', 'FalconForCausalLM', _falcon_export,
-    weight_path=_falcon_path, export_path=partial(renamed_name, _FALCON_NAMES),
+    weight_path=partial(renamed_path, MEGATRON_NAMES), export_path=partial(renamed_name, MEGATRON_NAMES),
     packed=grouped_qkv('.self_attention.query_key_value'), export_weights=decoder_tensors,
     preserve_source_layout=False,
     tied_head_names=('lm_head.weight', 'transformer.word_embeddings.weight'),
