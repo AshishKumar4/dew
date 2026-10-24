@@ -74,9 +74,9 @@ class Gemma4ClippableLinear(Dense):
 
     use_clipped_linears: bool = False
 
-    @nn.compact
-    def __call__(self, inputs):
-        return clipped_linear(self, super().__call__, inputs, self.use_clipped_linears)
+    @nn.nowrap
+    def _envelope(self, linear, inputs):
+        return clipped_linear(self, linear, inputs, self.use_clipped_linears)
 
 
 class Gemma4VisionTransformer(nn.Module):
