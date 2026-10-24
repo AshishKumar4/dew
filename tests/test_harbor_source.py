@@ -34,6 +34,49 @@ from dew.interop.harbor import HARBOR_KEY, Harbor, outcome
 from dew.interop.harness import Command, HarnessSource
 from dew.objectives.rl.sessions import Call, Status, Task, Transcript
 
+
+@pytest.mark.parametrize("slow_endpoint", ["/health/workers", "/v1/models"])
+def test_gateway_readiness_rejects_an_answer_after_its_deadline(slow_endpoint):
+    """A worker-health probe or its proxied model listing answers too late. Each network phase
+    receives the remaining budget, and neither late answer establishes readiness."""
+    probes = []
+
+    def network(request):
+        probes.append(request)
+        if request.url.path == slow_endpoint:
+            threading.Event().wait(timeout=0.1)
+        return httpx.Response(200, json={"healthy": 1} if request.url.path == "/health/workers" else {})
+
+    with httpx.Client(transport=httpx.MockTransport(network), timeout=30) as client:
+        gateway = Gateway("http://gateway", client=client)
+        with pytest.raises(RuntimeError):
+            gateway.ready(timeout=0.05, poll=30)
+    assert probes
+    assert all(0 < request.extensions["timeout"]["read"] <= 0.05 for request in probes)
+
+
+def test_gateway_readiness_checks_both_endpoints_within_its_budget():
+    probes = []
+    closed = []
+
+    class UnreadBody(httpx.SyncByteStream):
+        def __iter__(self):
+            raise RuntimeError("readiness must not wait for a response body")
+
+        def close(self):
+            closed.append(self)
+
+    def network(request):
+        probes.append(request)
+        return httpx.Response(200, stream=UnreadBody())
+
+    with httpx.Client(transport=httpx.MockTransport(network), timeout=30) as client:
+        Gateway("http://gateway", client=client).ready(timeout=10)
+    assert [request.url.path for request in probes] == ["/health/workers", "/v1/models"]
+    assert 0 < probes[1].extensions["timeout"]["read"] <= probes[0].extensions["timeout"]["read"] <= 10
+    assert len(closed) == len(probes)
+
+
 KEY = jax.random.key(0)
 
 
@@ -253,7 +296,7 @@ def fake_gateway(unhealthy_checks=0, unreachable_models=0, version=7, extra=()):
                                              "healthy": healthy, "total": 1})
         if request.url.path == "/v1/models":
             listings[0] += 1
-            if listings[0] <= unreachable_models:
+            if checks[0] <= unhealthy_checks or listings[0] <= unreachable_models:
                 return httpx.Response(500, text="Internal Server Error")
             return httpx.Response(200, json={"object": "list", "data": [{"id": "policy"}]})
         if request.method == "DELETE":

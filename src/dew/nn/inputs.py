@@ -306,6 +306,22 @@ class ModelInputs:
             token_fields={name: continued(name, value) for name, value in self.token_fields.items()})
 
 
+def shifted_span(shape: tuple[int, ...], shift: int, *, valid=None, segments=None, xp=jnp):
+    """Which `[B, S - shift]` source positions can reach the token `shift` places later: every
+    intervening token is valid, including both endpoints, and their document IDs match. Padding
+    IDs and target roles belong to the caller; `segments` describes identity, not validity.
+    `xp` is NumPy for host geometry and JAX NumPy for model/loss execution."""
+    batch, length = shape
+    width = length - shift
+    admitted = xp.ones((batch, width), bool)
+    if valid is not None:
+        for offset in range(shift + 1):
+            admitted = admitted & xp.asarray(valid[:, offset:offset + width], bool)
+    if segments is not None:
+        admitted = admitted & (segments[:, :width] == segments[:, shift:shift + width])
+    return admitted
+
+
 @struct.dataclass
 class Coordinates:
     """Where each token of a batch sits, built once (`coordinates`) and read by every token mixer.
