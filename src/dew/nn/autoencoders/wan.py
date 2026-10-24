@@ -42,6 +42,7 @@ from dew.objectives.base import Variables
 from ..activations import silu
 from ..attention import l2_normalized, scaled_dot_product_attention
 from ..conv import Conv
+from ..precision import at_least_fp32
 from .api import AutoEncoder, LatentNormalization, published_source
 from .kl import posterior_latent
 
