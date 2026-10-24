@@ -95,7 +95,7 @@ class FlowGRPOObjective(DiffusionObjective):
     shown: Mapping[str, Shown] = {"loss": Shown(), "reward": Shown(better="higher")}
     # With beta > 0 the EMA slot holds the frozen reference, so pipelines,
     # evaluation and previews read the live weights.
-    _ema_is_reference = True
+    ema_is_reference = True
 
     def __init__(self, model: nn.Module, process: Process | Preset, inputs: InputSpec, *,
                  sde: FlowSDE = _DEFAULT_SDE, beta: float = 0.0,

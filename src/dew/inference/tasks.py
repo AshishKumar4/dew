@@ -37,7 +37,7 @@ from dew.interop.weights import decoding_storage
 from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key
 from dew.nn.protocols import Bounded, CacheCapacity, TokenModel
 from dew.objectives.base import UNREAD, Objective
-from dew.records import integer, record as named_fields, text as named
+from dew.records import integer, record as named_fields, strings, text as named
 from dew.sampling import decoding, vocabulary
 from dew.sampling.decoding import LogitsTransform, Stopping, id_row
 from dew.sampling.solvers import Solver
@@ -313,11 +313,24 @@ class SavedRun:
     def variables(self, *, ema: bool | None, mesh: MeshSpec | Mesh | None = None,
                   layout: Layout | None = None, param_dtype: DTypeLike | None = None,
                   parameter_roots: tuple[tuple[str, ...], ...] = PARAMETER_ROOTS) -> Variables:
-        """The model's variables at this step, as the run's objective restores them
-        (`Objective._saved_variables`)."""
-        return self.objective._saved_variables(self.directory, step=self.step, ema=ema, mesh=mesh,
-                                               layout=layout, param_dtype=param_dtype,
-                                               parameter_roots=parameter_roots)
+        """The model's variables at this step, as every run loader reads them: an objective whose
+        average is its frozen reference gives the trained weights whatever `ema` asks
+        (`Objective.ema_is_reference`), and one that nests the model beside other networks gives the
+        model's own part (`Objective.model_tree`), trained and frozen collections together; the parts
+        the record names unread (`UNREAD`) are neither placed nor read. The other arguments are
+        `Checkpoints.variables`'."""
+        from dew.checkpoints import Checkpoints
+
+        unread = self.record.get(UNREAD, [])
+        if not isinstance(unread, list):
+            raise ValueError(f"{UNREAD} must be a list of paths")
+        objective = self.objective
+        with Checkpoints(self.directory) as checkpoints:
+            variables = checkpoints.variables(
+                step=self.step, ema=False if objective.ema_is_reference else ema, mesh=mesh, layout=layout,
+                param_dtype=param_dtype, parameter_roots=parameter_roots,
+                unread=tuple(strings(path, UNREAD) for path in unread))
+        return objective.model_tree(variables)
 
 
 def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
