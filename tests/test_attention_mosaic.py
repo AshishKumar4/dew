@@ -346,9 +346,10 @@ def test_the_training_forwards_overflowed_rows_keep_their_form_and_every_other_r
     """A call as many queries as heads, one consumer's tile of them, whose head 0 sees two keys of equal
     logits past the fold's reach over values near bf16's largest: the call walks again unfolded, and head
     0's rows, whose weighted values overflow, take the guarded walk in that form (`algebra.unfolded`), its
-    residuals in its units. Head 0's output is its values' mean, as the reference's; every other head's rows
-    are the plain launch's bits, as where head 0's values do not overflow; and the backward from these
-    residuals gives head 0's values a gradient wherever the reference does, finite where it is."""
+    residuals in its units. Head 0's output is its values' mean exactly, its one value row (where the
+    reference's fp32 sums overflow); every other head's rows are the plain launch's bits, as where head 0's
+    values do not overflow; and the backward from these residuals gives head 0's values a gradient wherever
+    the reference does, finite where it is."""
     queries, keys, width = 64, 2, 64
     spans = template.spans(queries, keys, 1)
     streams = jax.random.split(jax.random.key(0), 4)
@@ -366,9 +367,8 @@ def test_the_training_forwards_overflowed_rows_keep_their_form_and_every_other_r
     largest = value.at[:, :, 0].set(3e38).astype(jnp.bfloat16)
     out, *residuals = trained(largest)
     ordinary_out, *ordinary = trained(value.at[:, :, 0].set(1.0).astype(jnp.bfloat16))
-    expected = template.reference(query, key, largest, spans)
-    np.testing.assert_array_equal(np.asarray(out[:, :, 0], np.float32),
-                                  np.asarray(expected[:, :, 0], np.float32))
+    head, row = np.asarray(out[:, :, 0], np.float32), np.asarray(largest[:, :1, 0], np.float32)
+    np.testing.assert_array_equal(head, np.broadcast_to(row, head.shape))
     np.testing.assert_array_equal(np.asarray(out[:, :, 1:]), np.asarray(ordinary_out[:, :, 1:]))
     for found, plain in zip(residuals[:3], ordinary[:3], strict=True):
         np.testing.assert_array_equal(np.asarray(found[:, 1:]), np.asarray(plain[:, 1:]))
@@ -619,6 +619,49 @@ def test_the_launches_lower_for_an_h100(call, accurate):
         jax.jit(lambda q, k, v, dout, residuals: attention_mosaic.backward(
             q, k, v, spans, None, dout, residuals=residuals, accurate=accurate)).trace(
             q, kv, kv, q, residuals).lower(lowering_platforms=("cuda",))
+
+
+def _fullest(op, ba, target):
+    """The fitting config of `op`'s launch of `ba` on `target` that stages the most shared memory."""
+    return max(op.fitting(ba, target), key=lambda config: op.staged_bytes(ba, config, target))
+
+
+@lowers("sm90")
+@pytest.mark.parametrize("launch", ["forward", "training", "default", "accurate"])
+def test_the_fullest_fitting_tiles_lower_within_a_hoppers_block(launch):
+    """Mosaic GPU's own lowering, which refuses a kernel staging past a block's shared memory, takes each
+    launch at the fitting config that stages the most (`staged_bytes`), the one nearest the H100's block: the
+    model counts every array and barrier the launch allocates (`_staged`), an independent witness of it."""
+    rows, tokens, heads, kv_heads = SHAPES["compiled"]
+    width = 128
+    spans = template.spans(tokens, tokens, rows, causal=True)
+    q = jax.ShapeDtypeStruct((rows, tokens, heads, width), jnp.bfloat16)
+    kv = jax.ShapeDtypeStruct((rows, tokens, kv_heads, width), jnp.bfloat16)
+    stats = jnp.zeros((rows, heads, tokens), jnp.float32)
+    residuals = (stats, stats, jnp.zeros((rows, heads, tokens), jnp.int32),
+                 template.Split(jnp.zeros((rows, heads, tokens, width), jnp.float32), stats, stats, stats))
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        target = generation.gpu_target()
+        if launch in ("forward", "training"):
+            training = launch == "training"
+            op, ba = _forward_call((rows, tokens, heads, kv_heads), width, width, training)
+            fullest = _fullest(op, ba, target)
+            assert op.staged_bytes(ba, fullest, target) <= generation.shared_budget(target)
+            with _pinned(fullest):
+                entry = functools.partial(attention_mosaic.forward, spans=spans, residuals=training)
+                jax.jit(entry).trace(q, kv, kv).lower(lowering_platforms=("cuda",))
+            return
+        accurate = launch == "accurate"
+        op = attention_mosaic.MosaicBackward(form="causal", keys=tokens, scale=width ** -0.5,
+                                             accurate=accurate)
+        ba = _bound(op, q, kv, kv, q, spans.start, spans.end, None, None, (), None, residuals)
+        fullest = _fullest(op, ba, target)
+        assert op.staged_bytes(ba, fullest, target) <= generation.shared_budget(target)
+        with _pinned(backward=fullest):
+            jax.jit(lambda q, k, v, dout, residuals: attention_mosaic.backward(
+                q, k, v, spans, None, dout, residuals=residuals, accurate=accurate)).trace(
+                q, kv, kv, q, residuals).lower(lowering_platforms=("cuda",))
 
 
 @lowers("sm90")
