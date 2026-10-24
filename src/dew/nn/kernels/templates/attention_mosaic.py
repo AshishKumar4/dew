@@ -485,7 +485,7 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
     family = BUNDLES[tiles.family]
     call, spec, (q, k, v), (spans_of, hooked) = _prepared(query, key, value, spans, hooks, scale=scale,
                                                           natural=natural, tiles=tiles, family=family)
-    queries_padded, value_width = call.query.shape[1], value.shape[3]
+    value_width = value.shape[3]
 
     def launch(form: algebra.Forward, live: jax.Array | None):
         if live is None:
@@ -494,20 +494,25 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
                                                          training=True, interpret=interpret)
             split = Split(jnp.swapaxes(others, 1, 2), rows[2], rows[3], rows[4])
             return (out, rows[0], rows[1], anchors, split), status[0], status[1] > 0
-        # The overflowed rows' guarded training walk, the plain-JAX mainloop's, padded as this call's; its
-        # maxima and overflows `walked_launches` does not read.
-        guarded = attention_portable.attend(query, key, value, spans, hooks, block_q=tiles.block_q,
-                                            block_k=tiles.block_k, pad=queries_padded, scale=scale,
-                                            residuals=True, natural=form.natural)
-        padded = _padded_query_rows(guarded, queries_padded, v.shape[-1])
-        return padded, padded[1], jnp.zeros_like(live)
+        # The overflowed rows' guarded training walk, the plain-JAX mainloop's over this call's padding in
+        # this launch's form (the rewalk's units kept, `algebra.unfolded`); its maxima and overflows
+        # `walked_launches` does not read.
+        out, rows = attention_portable.padded_walk(form, call, hooks, block_q=tiles.block_q,
+                                                   block_k=tiles.block_k, residuals=True)
+        maximum, total, anchors, split = rows
+        widened = (_widened(out, v.shape[-1]), maximum, total, anchors,
+                   split._replace(others=_widened(split.others, v.shape[-1])))
+        return widened, maximum, jnp.zeros_like(live)
 
     def kept(live: jax.Array, guarded, plain):
-        def chosen(new: jax.Array, old: jax.Array) -> jax.Array:
-            # Each leaf's query rows: the output's `[B, Qp, H, ...]`, the residuals' `[B, H, Qp, ...]`.
-            rows = jnp.swapaxes(live, 1, 2) if new.ndim == 4 and new.shape[1] != live.shape[1] else live
-            return jnp.where(rows.reshape(rows.shape + (1,) * (new.ndim - rows.ndim)), new, old)
-        return jax.tree.map(chosen, guarded, plain)
+        # The output's query rows lie on its axis 1 (`[B, Qp, H, Dv]`), every residual's on its axis 2
+        # (`[B, H, Qp, ...]`).
+        out = jnp.where(jnp.swapaxes(live, 1, 2)[..., None], guarded[0], plain[0])
+
+        def rows(new: jax.Array, old: jax.Array) -> jax.Array:
+            return jnp.where(live.reshape(live.shape + (1,) * (new.ndim - live.ndim)), new, old)
+
+        return (out, *jax.tree.map(rows, tuple(guarded[1:]), tuple(plain[1:])))
 
     out, maximum, total, anchors, split = algebra.walked_launches(spec, launch, kept)
     queries = call.queries
@@ -517,20 +522,9 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
             anchors[:, :, :queries], split)
 
 
-def _padded_query_rows(outputs: tuple, queries: int, width: int) -> tuple:
-    """A training forward's outputs (`_trained_forward`'s) with their query rows padded to `queries` and their
-    value widths to `width`, as this mainloop's launch gives them."""
-    out, maximum, total, anchors, split = outputs
-
-    def padded(array: jax.Array, rows_axis: int) -> jax.Array:
-        pads = [(0, 0)] * array.ndim
-        pads[rows_axis] = (0, queries - array.shape[rows_axis])
-        if array.ndim == 4:
-            pads[-1] = (0, width - array.shape[-1])
-        return jnp.pad(array, pads)
-
-    return (padded(out, 1), padded(maximum, 2), padded(total, 2), padded(anchors, 2),
-            Split(*(padded(part, 2) for part in split)))
+def _widened(array: jax.Array, width: int) -> jax.Array:
+    """`array` with its last axis padded to `width`, as this mainloop's launch stages values (`_columns`)."""
+    return jnp.pad(array, ((0, 0),) * (array.ndim - 1) + ((0, width - array.shape[-1]),))
 
 
 def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
@@ -834,10 +828,14 @@ def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, sh
     if spans is None:
         return algebra.Coords(q_pos, k_pos)
     rows = pl.ds(first, shape[0])
-    # A call's runs lie one row of bounds a run (`_spans_of`).
-    runs = (((spans.start.at[row, run], spans.end.at[row, run]) for run in range(spans.start.shape[1]))
-            if spans.start.ndim == 3 else ((spans.start.at[row], spans.end.at[row]),))
-    bounds = tuple((family.rows_of(start.at[rows]), family.rows_of(end.at[rows])) for start, end in runs)
+
+    def bounds_of(*run):
+        # A query's interval, or a call's run's, one row of bounds a run (`_spans_of`).
+        return (family.rows_of(spans.start.at[(row, *run, rows)]),
+                family.rows_of(spans.end.at[(row, *run, rows)]))
+
+    runs = [(run,) for run in range(spans.start.shape[1])] if spans.start.ndim == 3 else [()]
+    bounds = tuple(bounds_of(*run) for run in runs)
     ids = None
     if spans.query_ids is not None and spans.key_ids is not None:
         ids = (family.rows_of(spans.query_ids.at[row, rows]),
