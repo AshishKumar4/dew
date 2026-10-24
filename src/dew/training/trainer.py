@@ -365,6 +365,9 @@ class _FitRun:
     taken: Taken | None = None
     scored: frozenset[str] = frozenset()
     """The suites `evaluation` scored at its step, which a run whose stream ends there scores once."""
+    ahead: tuple[Batch | None] | None = None
+    """The next batch, or None for the stream's end, read before the step that takes it, where a
+    save had to know whether the run ends there (`Trainer._ends_here`)."""
     best: HeldBest = dataclasses.field(default_factory=HeldBest)
     """The log taken at the latest logging step and not yet read."""
     stepped: tuple[jax.Array, dict[str, jax.Array], jax.Array] | None = None
@@ -393,7 +396,10 @@ def _waited_read(run: _FitRun, interval: Interval, *, agree: bool) -> Batch | No
     (`agreed_count`): one that fails stops every process, and a stream that runs out on some
     processes and reads on on the others is refused on all of them, at the step it ran out at, as
     is one with no batch for a run at step 0 to train on. An endless stream's later reads are not
-    agreed, as it never runs out."""
+    agreed, as it never runs out. A batch read ahead (`_FitRun.ahead`) is this read's."""
+    if run.ahead is not None:
+        (batch,), run.ahead = run.ahead, None
+        return batch
     with region("input.wait"):
         asked = time.perf_counter()
         if not agree:
@@ -1875,13 +1881,13 @@ class Trainer(Generic[Loss, Effects]):
         if (checkpoints is not None and interval.last_saved != current
                 and (run.checkpoint_due or candidate or (final and plan.checkpoint_final) or full)):
             self._read_taken(run)
-            # A stream that may run out may end the run at any step, whose save is then its last: whole.
+            # A save of weights alone is no step to resume from, so not the run's last (`_ends_here`).
             run.other += self._saved_checkpoint(
                 checkpoints, current, state, position, interval, scores=scores, ranking=ranking,
                 training_best=not plan.validation and not plan.best, control=run.stop_control,
-                weights_only=not run.checkpoint_due and not run.stopped and not full and run.endless
+                weights_only=not run.checkpoint_due and not run.stopped and not full
                 and not (final and plan.checkpoint_final) and bool(winners)
-                and all(rank.weights_only for rank in winners))
+                and all(rank.weights_only for rank in winners) and not self._ends_here(run, interval))
             run.last_checkpoint = time.perf_counter()
         if (plan.local_every and checkpoints is not None and current % plan.local_every == 0
                 and run.last_local_saved != current):
@@ -1948,6 +1954,16 @@ class Trainer(Generic[Loss, Effects]):
             plan.observe.last(current, state)
         if checkpoints is not None:
             checkpoints.wait()
+
+    def _ends_here(self, run: _FitRun, interval: Interval) -> bool:
+        """Whether a stream that may run out has, so this step is the run's last: its next batch is
+        read now, agreed as every such read is, and kept for the step that takes it (`ahead`), the
+        position the step saves taken before it. An endless stream never ends here."""
+        if run.endless:
+            return False
+        if run.ahead is None:
+            run.ahead = (_waited_read(run, interval, agree=True),)
+        return run.ahead[0] is None
 
     def _fit_policies(self, best, stop, metrics, suites, checkpoint_every, steps, tokens):
         """The run's best selection and its stop policy: a `Plateau` with its metric bound to the
