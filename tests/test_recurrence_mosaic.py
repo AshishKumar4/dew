@@ -11,13 +11,14 @@ GPU's interpreter on the wgmma bundle (`mainloop.INTERPRETED`), whose products a
 coverage of the mainloop's algebra and its roles' streams, not proof of its kernels, which the GPU gate is;
 the stability suite holds the mainloop under its regimes there (tests/test_recurrence_stability.py)."""
 
+import dataclasses
 import functools
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, with_gradients
 from test_recurrence_chunk import FORMED, HOOKS, SEEDS as HOOK_SEEDS, draw as hooked_draw, token_by_token
 
 from dew.nn.kernels import recurrence
@@ -99,6 +100,46 @@ def test_the_mosaic_forward_is_as_exact_as_its_reference(case, dtype):
     reference = truth if dtype == jnp.float32 else jax.jit(functools.partial(chunk, hooks, ported=True))
     assert_as_exact(dew, reference, functools.partial(draw, dtype, **SHAPES[case]),
                     f'the mosaic forward, {case} in {jnp.dtype(dtype).name}', seeds=SEEDS, truth_fn=truth)
+
+
+GRADIENT_CASES = [case for case, shape in SHAPES.items() if not shape.get('per_key')]
+"""The cases whose gradient the mainloop takes: a decay a head's (the gated delta rule's)."""
+
+
+def drawn(dtype, seed: int, **shape) -> tuple[Chunk, tuple[jax.Array, jax.Array]]:
+    """A draw's operands (`draw`), its documents' starts taken out (`restarted` puts them back: they are not
+    differentiable), and cotangents of its output, in `dtype`, and its final memory, fp32, from the seed's
+    own key."""
+    (operands,) = draw(dtype, seed, **shape)
+    keys = jax.random.split(jax.random.fold_in(jax.random.key(seed), 101))
+    return dataclasses.replace(operands, starts=None), (
+        jax.random.normal(keys[0], operands.value.shape).astype(dtype),
+        jax.random.normal(keys[1], operands.state.shape))
+
+
+def restarted(fn, case: str):
+    """`fn` on operands whose documents start as the case's draws' do (`draw`'s, the same each seed)."""
+    (operands,) = draw(jnp.float32, 0, **SHAPES[case])
+    return lambda drawn: fn(dataclasses.replace(drawn, starts=operands.starts))
+
+
+@ON_ITS_FAMILY
+@pytest.mark.parametrize('dtype', [jnp.bfloat16, jnp.float32], ids=['bf16', 'fp32'])
+@pytest.mark.parametrize('case', GRADIENT_CASES)
+def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype):
+    """The gradient of the mainloop's rule on par from float64 with its reference's over the case's draws
+    (check 1, truth the recurrence a token at a time's in float64): in a 16-bit call the mainloop's fast
+    backward (`mainloop.gradients`, fla's DAG) against the fla port's, whose numbers it runs; in an fp32 call
+    the portable math's adjoint against the fp32 recurrence's."""
+    hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5)
+
+    def compiled(**route):
+        return jax.jit(with_gradients(restarted(functools.partial(chunk, hooks, **route), case)))
+
+    truth = jax.jit(with_gradients(restarted(functools.partial(token_by_token, hooks), case)))
+    reference = truth if dtype == jnp.float32 else compiled(ported=True)
+    assert_as_exact(compiled(mainloop='mosaic'), reference, functools.partial(drawn, dtype, **SHAPES[case]),
+                    f'the mosaic gradient, {case} in {jnp.dtype(dtype).name}', seeds=SEEDS, truth_fn=truth)
 
 
 TAKEN = HOOKS + FORMED
