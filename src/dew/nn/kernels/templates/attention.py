@@ -472,10 +472,19 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         p = jnp.exp(s - safe[:, None])
         carried = jnp.where(jnp.isfinite(m0), jnp.exp(m0 - safe), 0)
         total = total0 * carried + jnp.sum(p, axis=-1)
-        kept = p if hooks.drop is None else p * hooks.drop.draw(row, head)(*positions)
-        acc = acc0 * carried[:, None] + jnp.einsum("qk,kd->qd", kept.astype(value.dtype), v,
-                                                    preferred_element_type=wide)
-        o = jnp.where(total[:, None] > 0, acc / jnp.where(total > 0, total, 1)[:, None], 0)
+        if hooks.drop is None:
+            acc = acc0 * carried[:, None] + jnp.einsum("qk,kd->qd", p.astype(value.dtype), v,
+                                                        preferred_element_type=wide)
+            o = jnp.where(total[:, None] > 0, acc / jnp.where(total > 0, total, 1)[:, None], 0)
+        else:
+            # Normalized before the draw's multiplier narrows them, as the kernels take them: a kept weight's
+            # z times its normalized weight stays in the values' range where z times the unnormalized one may
+            # not (fp16 at a rate of 1 - 2^-16). The state's share is normalized the same way.
+            inverse = jnp.where(total > 0, 1 / jnp.where(total > 0, total, 1), 0)
+            kept = (p * inverse[:, None]) * hooks.drop.draw(row, head)(*positions)
+            acc = acc0 * (carried * inverse)[:, None] + jnp.einsum("qk,kd->qd", kept.astype(value.dtype), v,
+                                                                    preferred_element_type=wide)
+            o = acc
         if hooks.output_mod is not None:
             o = hooks.output_mod(o, *(_per_head(p, row, head) for p in hooks.output_params))
         return o.astype(query.dtype), safe, total
