@@ -738,14 +738,20 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, starts=None, max_segm
                                 scale=scale, delta=delta, wide=wide, **run)
 
     def forward(*operands):
-        return rule(*operands), operands
+        if not fast:
+            return rule(*operands), (operands, None)
+        # The chunks' inverses kept for the fast backward, as fla's keeps its `A`.
+        out, final, inverse = mainloop.forward(*operands[:6], starts=operands[6], max_segments=max_segments,
+                                               scale=scale, delta=delta, wide=wide, with_inverse=True, **run)
+        return (out, final), (operands, inverse)
 
-    def backward(operands, grads):
+    def backward(saved, grads):
+        operands, inverse = saved
         out_grad, final_grad = grads
         query, key, value, g, beta, state, starts = operands
         if fast:
             grads = mainloop.gradients(query, key, value, g, beta, state, out_grad, final_grad, starts=starts,
-                                       max_segments=max_segments, scale=scale, **run)
+                                       max_segments=max_segments, scale=scale, inverse=inverse, **run)
             return (*grads[:5], None if state is None else grads[5], None)
 
         def portable(query, key, value, g, beta, state):
