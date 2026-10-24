@@ -1,9 +1,10 @@
 """dew.nn.attention's `implementation='template'` (`attention_route.attend`) on the CPU's plain-JAX mainloop.
 
 Its output and its gradients of the query, key, value and sinks are on par with Dew's reference path from
-float64 (check 1), for each call form the route takes. Every case has grouped key heads: four query heads
-over two. The selector refuses the route a mask and a bias by their inherent limits, and no target's
-preference picks it, so only a call that names it runs it. On meshes, a named call runs per shard under
+float64 (check 1), for each call form the route takes, block groups among them, a cache call's included.
+Every case has grouped key heads: four query heads over two. The selector refuses the route a mask and a
+bias by their inherent limits; a GPU prefers it for a call with block groups, which no other fused kernel
+reads, and otherwise only a call that names it runs it. On meshes, a named call runs per shard under
 `sharded.assert_runs_per_shard`: with fewer key heads than the tensor shards, with key heads split partly, or
 with key heads split in the other order from the query heads.
 """
@@ -27,7 +28,9 @@ from test_attention_template import (
     SEEDS,
     SOFTCAP,
     STARTS,
+    block_groups,
     cross_documents,
+    dews_mask,
     geometry,
     own_documents,
 )
@@ -58,6 +61,10 @@ CASES = {
     "cross-documents-causal": {"causal": True, "segment_ids": "cross"},
     "key-lengths": {"lengths": True},
     "sinks-softcap": {"causal": True, "sinks": True, "softcap": SOFTCAP},
+    "block-causal-documents-window": {"causal": True, "sliding_window": 24, "segment_ids": "own",
+                                      "block_groups": True},
+    "cache-call-blocks-starts": {"causal": True, "segment_ids": "cross", "block_groups": True, "starts": True,
+                                 "sinks": True},
 }
 
 
@@ -73,6 +80,8 @@ def keywords(case: dict) -> dict:
         keywords["key_value_seq_lengths"] = LENGTHS
     if case.get("starts"):
         keywords["key_value_seq_starts"] = STARTS
+    if case.get("block_groups"):
+        keywords["block_groups"] = tuple(jnp.asarray(groups) for groups in block_groups(geometry(case)[1]))
     return keywords
 
 
@@ -129,8 +138,10 @@ MESH_CASES = {
     "own-documents": {"causal": True, "segment_ids": "own", "softcap": SOFTCAP},
     "cross-documents": {"causal": True, "segment_ids": "cross"},
     "lengths-and-starts": {"lengths": True, "starts": True},
+    "own-documents-blocks": {"causal": True, "segment_ids": "own", "block_groups": True},
 }
-"""The calls the per-shard test takes, each with sinks: its ids, lengths and starts split with their rows."""
+"""The calls the per-shard test takes, each with sinks: its ids, lengths, starts and block groups split with
+their rows."""
 WIDE_HEADS = 24
 """The query heads of the partly split mesh tests: eight ways over the tensor and expert axes, three on each
 shard."""
@@ -254,10 +265,12 @@ def test_key_heads_the_query_heads_do_not_lead_are_gathered_on_a_tensor_and_expe
                        label="template split eight ways, key heads the other way", shards=WIDE_SHARDS)
 
 
-def test_a_route_call_under_forward_mode_keeps_the_template_value_and_the_reference_derivative():
+@pytest.mark.parametrize("name", ["causal-window", "block-causal-documents-window"])
+def test_a_route_call_under_forward_mode_keeps_the_template_value_and_the_reference_derivative(name):
     """Under `forward_mode_attention` a fused call keeps its kernel's value and takes its tangent from the
-    reference path's JVP, so the route's primal and tangent are on par with the reference path's (check 1)."""
-    case = CASES["causal-window"]
+    reference path's JVP over the same keys, block groups among them, so the route's primal and tangent are
+    on par with the reference path's (check 1)."""
+    case = CASES[name]
 
     def pushed(implementation: str):
         def run(query, key, value, _sinks, dout):
@@ -271,8 +284,21 @@ def test_a_route_call_under_forward_mode_keeps_the_template_value_and_the_refere
         return run
 
     assert_as_exact(jax.jit(pushed("template")), jax.jit(pushed("reference")),
-                    drawing(QUERIES, KEYS, jnp.float32, sinks=False), "template route forward mode",
+                    drawing(*geometry(case), jnp.float32, sinks=False), f"template route forward mode {name}",
                     seeds=SEEDS)
+
+
+def test_a_dropped_out_call_draws_over_the_keys_its_block_groups_mean():
+    """Under active dropout a call runs the reference path's one draw (`_dropout_attention`): with block
+    groups, documents and a window it draws over the mask its spans mean, so it is the same call as one
+    given that mask (`dews_mask`) under the same key, bitwise."""
+    case = CASES["block-causal-documents-window"]
+    query, key, value, _, _ = drawing(*geometry(case), jnp.float32, sinks=False)(0)
+    dropped = functools.partial(scaled_dot_product_attention, dropout_rate=0.25,
+                                dropout_rng=jax.random.key(3), deterministic=False)
+    blocked = dropped(query, key, value, **keywords(case))
+    masked = dropped(query, key, value, mask=jnp.asarray(dews_mask(case))[:, None])
+    np.testing.assert_array_equal(np.asarray(blocked), np.asarray(masked))
 
 
 def test_the_selector_refuses_a_mask_and_a_bias_by_their_inherent_limits():
@@ -318,6 +344,29 @@ def test_no_target_prefers_the_template_so_only_a_named_call_takes_it():
     with generation.chosen(attention="template"):
         for call in calls:
             assert attention.resolve_implementation("auto", query, key, **call) == "template", call
+
+
+def test_a_gpu_prefers_the_template_for_a_call_with_block_groups():
+    """A causal call with block groups: flash and tokamax's Triton kernel refuse it by their inherent limits,
+    and cuDNN takes it only as its mask, by measurement. On every target whose Triton mainloop runs (a GPU of
+    sm80 or later) 'auto' resolves it to the template, and elsewhere to a path that reads the mask its spans
+    mean. Without causality block groups add no key, so the call is an ordinary one."""
+    query = jnp.zeros((ROWS, QUERIES, HEADS, WIDTH), jnp.bfloat16)
+    key = jnp.zeros((ROWS, QUERIES, KV_HEADS, WIDTH), jnp.bfloat16)
+    groups = tuple(jnp.asarray(blocks) for blocks in block_groups())
+    case = attention.attention_case(query, key, causal=True, block_groups=groups, named="template")
+    assert case.blocks and kernel_refusals(ATTENTION, "template", case) == []
+    for kernel in ("flash", "triton"):
+        assert ("blocks", INHERENT) in [(refusal.code, refusal.row)
+                                        for refusal in kernel_refusals(ATTENTION, kernel, case)]
+    assert ("blocks", "measured") in [(requirement.code, requirement.kind) for requirement
+                                      in ATTENTION.kernel("cudnn").failed(case)]
+    assert not attention.attention_case(query, key, block_groups=groups).blocks
+    for target in generation.TARGETS:
+        with generation.assumed(target):
+            auto = attention.resolve_implementation("auto", query, key, causal=True, block_groups=groups)
+            fused = generation.backend() == "gpu" and generation.bf16_dot_runs()
+            assert (auto == "template") == fused, (target, auto)
 
 
 def test_the_route_takes_score_hooks_and_the_initial_state_and_refuses_an_output_hook():
