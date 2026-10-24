@@ -262,7 +262,7 @@ class BlockProcess:
         generation, undefined = _compiled(plan.sharding, tuple(compiler_options(model).items()))(
             model, decoding_storage(model, variables), plan.place(plan.pad(request.inputs)), request.key,
             CanvasPlan(self, tuple(eos_token_ids), pad_token_id, max_new_tokens), n)
-        if bool(undefined):
+        if bool(jax.device_get(undefined)):
             raise ValueError(CANVAS_UNDEFINED)
         return replace(generation, rows=plan.rows * n, prompt_width=request.inputs.tokens.shape[1])
 

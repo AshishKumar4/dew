@@ -34,13 +34,13 @@ WORKER = Path(__file__).with_name("episode_recovery_worker.py")
 
 
 def test_journal_refuses_a_different_policy_at_identical_clocks(tmp_path):
-    trainer, rollout = build(environment(), journal=EpisodeJournal(str(tmp_path)))
+    trainer, collector = build(environment(), journal=EpisodeJournal(str(tmp_path)))
     state = trainer.initial_state()
-    complete = collect(rollout, state)
-    assert collect(rollout, state) == complete
+    complete = collect(collector, state)
+    assert collect(collector, state) == complete
     changed = replace(state, variables=jax.tree.map(lambda value: value + .001, state.variables))
     with pytest.raises(ValueError):
-        collect(rollout, changed)
+        collect(collector, changed)
 
 
 def test_journal_tells_apart_policies_whose_weights_are_equal_bytes_of_another_dtype():
@@ -85,10 +85,10 @@ class Sayings(Harness):
 def test_a_journaled_episode_keeps_the_messages_its_environment_said(tmp_path):
     """Messages an environment gives in any mapping are kept as JSON: a journaled collection writes
     them and reads the same episodes back, and each call's transcript lists those before it."""
-    trainer, rollout = build(Sayings(), journal=EpisodeJournal(str(tmp_path)))
+    trainer, collector = build(Sayings(), journal=EpisodeJournal(str(tmp_path)))
     state = trainer.initial_state()
-    episodes = collect(rollout, state)
-    assert collect(rollout, state) == episodes
+    episodes = collect(collector, state)
+    assert collect(collector, state) == episodes
     for episode in episodes:
         said = [{"role": "user", "content": "square"},
                 *({"role": "tool", "content": turn.observation.detail} for turn in episode.transitions)]
@@ -139,10 +139,7 @@ def test_sigkill_resumes_completed_turns_and_produces_the_same_update(tmp_path):
     for before, after in zip(original, restored, strict=True):
         assert before["identity"] == after["identity"]
         assert before["reward"] == after["reward"]
-        for old, new in zip(before["transitions"], after["transitions"], strict=True):
-            old["action"].pop("_binding_id")
-            new["action"].pop("_binding_id")
-            assert old == new
+        assert before["transitions"] == after["transitions"]
 
     with environment()(IDENTITY) as first:
         assert isinstance(first, RecoverableEnvironment)
