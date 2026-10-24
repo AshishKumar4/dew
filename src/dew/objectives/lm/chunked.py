@@ -181,15 +181,17 @@ class _Columns(NamedTuple):
         return jax.tree.map(lambda terms: jax.lax.dynamic_slice_in_dim(terms, first, count), self)
 
 
-def _column_sum(shape: tuple[int, ...], dtype) -> jax.Array:
-    """An empty running sum of a per-column term's gradient over token tiles (`added_to`,
-    `running_total`) that keeps what each addition drops on every backend, a double-float pair and the
-    plain sum beside it for an overflowed term's infinity (`compensated_total`). A whole head sums a
-    column's gradient over its tokens in one reduction, which a GPU sums as a tree; summed tile after
-    tile in fp32, 43 tiles of a 128-token fp32 fused head left the scale and bias gradients 1.5 times as
-    far from float64 as the whole head's, and 171 tiles of 3 tokens a tiled head's bias 2.08 times on an
-    A100. It is a column of the vocabulary wide, so the pair costs nothing measurable."""
-    return jnp.zeros((3, *shape), dtype)
+def _token_sum(shape: tuple[int, ...], dtype, tiles: int) -> jax.Array:
+    """An empty running sum over `tiles` token tiles (`added_to`, `running_total`): where more than
+    one adds into it, a double-float pair and the plain sum beside it for an overflowed term's
+    infinity (`compensated_total`) on every backend, else `running_sum`'s. A whole head sums a
+    column's gradient, and the head's, over its tokens in one reduction or product, which a GPU sums
+    as a tree for few outputs; summed tile after tile in fp32, 43 tiles of a 128-token fp32 fused head
+    left the scale and bias gradients 1.5 times as far from float64 as the whole head's, and on an
+    A100 171 tiles of 3 tokens left a tiled head's bias 2.16 times and its head gradient 1.60 times,
+    0.50 paired (SF-a100-numerics-diag). One tile is its own product, rounded once, and a token tile
+    as wide as a device's tokens is the default's, so the pair costs a default step nothing."""
+    return jnp.zeros((3, *shape), dtype) if tiles > 1 else running_sum(shape, dtype)
 
 
 def _tile_logits(states, matrix, precision: jax.lax.PrecisionLike):
@@ -411,8 +413,8 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, gro
     stored tile by tile, the softcap's and the per-column terms'. The inner
     loop walks token tiles carrying `(d_states, d_matrix, d_cap, d_tile)`,
     where `d_matrix` and `d_tile` accumulate one vocabulary tile's head and
-    per-column gradients in fp32 before they are stored, `d_tile` as the
-    fused head's (`_column_sum`).
+    per-column gradients in fp32 before they are stored, paired over several
+    token tiles (`_token_sum`).
     """
     del predict  # Argmax has no gradient.
     hidden, table, targets, excluded, normalizer, softcap, columns = residuals
@@ -430,6 +432,7 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, gro
     d_loss = loss_cotangent.reshape(-1)
     d_partition = partition_cotangent.reshape(-1)
     count = labels.shape[0]
+    token_tiles = -(-count // token_tile)
 
     def vocabulary(first, gradients, width):
         d_states, d_table, d_cap, d_columns = gradients
@@ -476,8 +479,8 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, gro
             return d_states, added_to(d_matrix, matrix_tile), d_cap, d_tile
 
         d_states, d_matrix, d_cap, d_tile = _over_tiles(
-            (d_states, running_sum((width, features), work), d_cap,
-             jax.tree.map(lambda terms: _column_sum((width,), work), columns)),
+            (d_states, _token_sum((width, features), work, token_tiles), d_cap,
+             jax.tree.map(lambda terms: _token_sum((width,), work, token_tiles), columns)),
             count, token_tile, tokens)
         # fp32 until every token tile is in, so a bf16 head does not round
         # once per tile.
@@ -572,8 +575,9 @@ def _whole_head_fwd(hidden, table, targets, excluded, softcap, chunks, precision
 def _whole_head_bwd(chunks, precision, predict, temperature, picked, group, residuals, cotangents):
     """The same gradient `_bounded_head_bwd` takes tile by tile, from the kept
     logits: the logits' cotangent as `_logits_cotangent` gives it to both
-    products, and the head's gradient accumulated in fp32 once."""
-    del chunks, predict
+    products, the head's gradient accumulated in fp32 once, and an fp32 head's
+    state gradient over the tiled head's column tiles (`_state_product`)."""
+    del predict
     hidden, table, targets, excluded, raw, (peaks, masses), softcap, columns = residuals
     loss_cotangent, _, partition_cotangent = _shared_cotangents(cotangents, group)
     work = at_least_fp32(hidden.dtype)
@@ -585,12 +589,31 @@ def _whole_head_bwd(chunks, precision, predict, temperature, picked, group, resi
         logits, 0, excluded, peaks, masses, targets.reshape(-1), loss_cotangent.reshape(-1),
         partition_cotangent.reshape(-1), picked))
     d_raw = _logits_cotangent(d_raw, precision)
-    d_states = float32_einsum('tv,vd->td', d_raw, table.astype(operands), precision=precision,
-                              preferred_element_type=work)
+    width = None if precision is BF16 else tile_columns(table.shape[0], chunks, chunked_tile()[1])
+    d_states = _state_product(d_raw, table.astype(operands), precision, work, width)
     d_table = float32_einsum('tv,td->vd', d_raw, hidden.reshape(-1, features).astype(operands),
                          precision=precision, preferred_element_type=work)
     return (d_states.reshape(hidden.shape).astype(hidden.dtype), d_table.astype(table.dtype),
             None, None, d_cap, d_columns)
+
+
+def _state_product(d_raw, table, precision, work, width: int | None) -> jax.Array:
+    """The state gradient `d_raw @ table` over the vocabulary: one product, or with `width` the sum of
+    its column tiles' products as the tiled head sums them (`running_sum`). On an A100 an fp32 whole
+    head's one product over 2053 columns sat 1.47 to 1.50 times as far from float64 as the tiled
+    head's, and its former 1024-column blocks, summed as a double-float pair, 2.0 times; a bf16 head
+    keeps one product, as exact as the tiled head's and faster (`chunked_tile`)."""
+    if width is None or table.shape[0] <= width:
+        return float32_einsum('tv,vd->td', d_raw, table, precision=precision, preferred_element_type=work)
+
+    def columns(first, running, size):
+        return added_to(running, float32_einsum(
+            'tv,vd->td', jax.lax.dynamic_slice_in_dim(d_raw, first, size, axis=1),
+            jax.lax.dynamic_slice_in_dim(table, first, size), precision=precision,
+            preferred_element_type=work))
+
+    return running_total(_over_tiles(running_sum((d_raw.shape[0], table.shape[1]), work), table.shape[0],
+                                     width, columns))
 
 
 _whole_head = jax.custom_vjp(_whole_head_impl, nondiff_argnums=(5, 6, 7, 8, 10, 11))
@@ -793,7 +816,8 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, columns: _C
     if gradients:
         outputs += (jnp.zeros((count, features), work),)
     d_table = running_sum(table.shape, work) if gradients else None
-    d_columns = jax.tree.map(lambda terms: _column_sum(terms.shape, work), columns) if gradients else None
+    d_columns = (jax.tree.map(lambda terms: _token_sum(terms.shape, work, -(-count // chunk)), columns)
+                 if gradients else None)
     outputs, d_table, d_columns = _over_tiles((outputs, d_table, d_columns), count, chunk, tokens)
     summed = None if d_columns is None else jax.tree.map(running_total, d_columns)
     return outputs, None if d_table is None else running_total(d_table), summed
