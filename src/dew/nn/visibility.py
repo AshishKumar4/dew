@@ -1,9 +1,10 @@
 """Which keys a query sees, by their coordinates: causality and a symmetric window (`visible`,
-`windowed`, whose extent `window_sides` counts) and chunks (`same_chunk`), which Dew's attention masks
-and banded layouts compare positions by. The coordinates are whatever the caller's layout counts,
-slots, places in a document or banded rows, so a caller keeps its layout and builds no global mask to
-ask. An asymmetric window (Gemma's audio blocks) states its own sides."""
+`windowed`, whose extent `window_sides` counts), chunks (`same_chunk`) and blocks (`same_group`), which
+Dew's attention masks and banded layouts compare positions by. The coordinates are whatever the
+caller's layout counts, slots, places in a document or banded rows, so a caller keeps its layout and
+builds no global mask to ask. An asymmetric window (Gemma's audio blocks) states its own sides."""
 
+import jax
 import jax.numpy as jnp
 
 
@@ -29,6 +30,22 @@ def same_chunk(query, key, chunk_size: int):
     """Whether a key falls in the query's chunk of `chunk_size` (broadcast), both counted from the
     sequence start: transformers' `chunked_overlay`, `kv // chunk == q // chunk`."""
     return query // chunk_size == key // chunk_size
+
+
+def same_group(query_groups, key_groups):
+    """Whether a key is in the query's block (broadcast): both carry one group id, -1 being none, as an
+    image's tokens (`AttentionMetadata.image_groups`) or a prompt's blocks (`block_groups`) do."""
+    return (query_groups == key_groups) & (query_groups >= 0)
+
+
+def block_starts(groups):
+    """Each token's block's first token, `[B, S]` int32 of `groups` `[B, S]`: where the run of equal ids
+    that holds it begins (a block is such a run, -1 tokens runs of their own)."""
+    groups = jnp.asarray(groups)
+    batch, length = groups.shape
+    index = jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
+    opens = jnp.concatenate([jnp.ones((batch, 1), bool), groups[:, 1:] != groups[:, :-1]], axis=1)
+    return jax.lax.cummax(jnp.where(opens, index, 0), axis=1)
 
 
 def window_sides(causal: bool, sliding_window: int) -> tuple[int, int]:

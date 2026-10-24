@@ -164,6 +164,7 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
     float32 and, the saved pipeline loaded widened, in float64 (`fp64.`)."""
     from diffusers import ZImagePipeline
     from diffusers.pipelines.z_image import pipeline_z_image
+    from diffusers.schedulers import scheduling_flow_match_euler_discrete
 
     pipe = build_pipeline(root)
     generator = torch.Generator().manual_seed(SEED + 9)
@@ -186,7 +187,8 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
 
     narrow = walk(pipe, torch.float32)
     # The call keeps its latents in float32, which it names and asserts in its own module.
-    with float64(), float64_scheduler(pipeline_z_image):
+    with (float64(), float64_scheduler(pipeline_z_image),
+          float64_scheduler(scheduling_flow_match_euler_discrete)):
         wide_pipe = ZImagePipeline.from_pretrained(root / "pipeline", torch_dtype=torch.float64,
                                                    local_files_only=True)
         wide_pipe.set_progress_bar_config(disable=True)
