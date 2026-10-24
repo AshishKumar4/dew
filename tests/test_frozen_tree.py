@@ -105,9 +105,11 @@ class Rebuilt(LMObjective):
 @pytest.mark.parametrize("change", ["values", "dtype"])
 def test_a_frozen_leaf_an_init_builds_is_the_states_own_placed_as_fresh(change):
     """An init that builds a frozen leaf, same-shaped values of its own or another dtype, and passes
-    the rest through: the placed start's frozen tree is the fresh start's, value for value, the built
-    leaf its own array and every other the held array itself, the held arrays left whole."""
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=16)
+    the rest through, from a source loaded onto the mesh: the placed start's frozen tree is the fresh
+    start's, value for value, the built leaf its own array and every other the held array itself, the
+    held arrays left whole."""
+    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=16,
+                             mesh=MeshSpec())
     built = {"values": lambda leaf: leaf + 1, "dtype": lambda leaf: leaf.astype(jnp.float16)}[change]
     rebuilt = Rebuilt(built, source.adapt(LoRA(rank=2, modules=("q_proj", "v_proj")), key=0), 8,
                       ema_decay=None)
