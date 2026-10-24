@@ -197,12 +197,6 @@ def gradient_functions(source):
     return ours, lambda *args: theirs(reference, *args), oracle, draw
 
 
-def test_unified_backward_reaches_all_source_parameters_and_media_inputs(source):
-    ours, reference, truth, draw = gradient_functions(source)
-    assert_as_exact(ours, reference, draw, "Gemma4 Unified complete backward",
-                    seeds=seed_count("backward"), truth_fn=truth)
-
-
 def test_raw_media_train_and_reload_through_the_public_source(source, tmp_path):
     native, _, _ = source
     rng = np.random.default_rng(52)
@@ -292,10 +286,12 @@ def cached_functions(source):
     return ours, lambda *args: theirs(reference, *args), oracle, draw
 
 
-def test_cached_unified_calls_keep_the_ordinary_forward_mask(source):
-    ours, reference, truth, draw = cached_functions(source)
+@pytest.mark.parametrize(("site", "functions"), [("backward", gradient_functions),
+                                                 ("cached", cached_functions)])
+def test_unified_runtime_observations_follow_the_reference(source, site, functions):
+    ours, reference, truth, draw = functions(source)
     assert_as_exact(ours, reference, draw,
-                    "Gemma4 Unified cached ordinary forward", seeds=seed_count("cached"), truth_fn=truth)
+                    f"Gemma4 Unified {site}", seeds=seed_count(site), truth_fn=truth)
 
 
 def optional_source(source, directory, media):
