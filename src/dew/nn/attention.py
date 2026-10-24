@@ -2212,9 +2212,10 @@ class BasicTransformerBlock(nn.Module):
         norm = RMSNorm if self.norm == "rms" else LayerNorm
         self.norm1, self.norm2, self.norm3 = (norm(epsilon=self.norm_epsilon, dtype=self.dtype)
                                               for _ in range(3))
+        self.dropout = nn.Dropout(self.dropout_rate)
 
     def _dropped(self, x, train: bool):
-        return nn.Dropout(self.dropout_rate)(x, deterministic=not train) if self.dropout_rate else x
+        return self.dropout(x, deterministic=not train)
 
     def __call__(self, x, context=None, *, train: bool = False):
         if self.only_pure_attention:
