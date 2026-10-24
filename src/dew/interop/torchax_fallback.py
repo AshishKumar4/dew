@@ -44,7 +44,7 @@ from dew.interop.generation_config import read_generation_config
 from dew.interop.pickles import host_view
 from dew.interop.pretrained import PretrainedFallback, source_processor
 from dew.interop.weights import AUTO
-from dew.nn.precision import at_least_fp32, configured_precision, float32_products
+from dew.nn.precision import configured_precision, float32_products
 from dew.nn.protocols import Lacks, OutputTable
 from dew.nn.sharding import LogicalAxes, Suffix, parameter_path
 from dew.registry import resolve_dtype
@@ -410,11 +410,10 @@ class TorchCausalLM(nn.Module):
 
     def __call__(self, tokens, train: bool = False) -> jax.Array:
         logits, _ = self._run(tokens, train)
-        return logits.astype(at_least_fp32(logits.dtype))
+        return logits.astype(jnp.float32)
 
     def logits(self, tokens, *, train: bool = False, **packing) -> jax.Array:
-        """The logits of the whole rows, as `__call__` returns them: in at least float32
-        (`at_least_fp32`), so a float64 model's are float64, as its output table's are."""
+        """The fp32 logits of the whole rows, as `__call__` returns them."""
         _refuse_packing(packing)
         return self(tokens, train=train)
 
