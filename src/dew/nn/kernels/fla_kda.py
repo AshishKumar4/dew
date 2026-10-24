@@ -641,7 +641,11 @@ def _bwd_intra_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, daqk_ref, dakk_r
     (`dq2`, `dk2`, the decay factored at its first row) and after (`dkt`, factored at its last row),
     fp32 products at the call's solve precision (`fla_gdn._dot`'s `solve`), and from its own tokens
     one by one in fp32; then beta's
-    and the decay's gradients, added to the ones `bwd_wy_dqkg` gave. Beta's is this key block's share.
+    and the decay's gradients, added to the ones `bwd_wy_dqkg` gave. Beta's is this key block's share. In
+    an fp32 call the decay's gradient is each pair's own (`_paired_decay`), where fla recovers it from the
+    summed gradients, `q dq + (dk - dk^T) k`: that cancellation, its decays factored at a sub-chunk's rows,
+    put the decay's gradient 1.6 times fla's recorded torch's distance from float64 on an A100, 1.4 paired
+    (SE-dbg-kda-pairwise32-5480feaf3); a 16-bit call's operands' rounding stays above it.
     A chunk's rows past its end read as zeros under its last row's decay, and its own tokens stop
     there, as fla's varlen loads stop at the sequence's end."""
     count = chunk // SUB
@@ -654,6 +658,7 @@ def _bwd_intra_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, daqk_ref, dakk_r
         index = jnp.arange(SUB)
         width = k_ref.shape[-1]
         own_tokens = SUB if aligned else jnp.minimum(SUB, taken - first)
+        aligned_tokens = chunk if aligned else taken
 
         def left(at):
             """The chunk's rows from `at`: a whole sub-chunk's where every chunk is whole."""
@@ -731,10 +736,45 @@ def _bwd_intra_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, daqk_ref, dakk_r
             return dkt + jnp.where(causal, kk[:, None] * weighted[None, :] * decay, 0.0)
 
         dkt = jax.lax.fori_loop(0, own_tokens, own, dkt)
-        dg2 = dg2 + (dk2 - dkt) * key + tile(dg_ref, first)
+        if k_ref.dtype == jnp.float32:
+            dg2 = _paired_decay(q_ref, k_ref, g_ref, beta_ref, daqk_ref, dakk_ref, start, first,
+                                aligned_tokens, gate, tile(q_ref, first).astype(jnp.float32), key, beta,
+                                left(first))
+        else:
+            dg2 = dg2 + (dk2 - dkt) * key
+        dg2 = dg2 + tile(dg_ref, first)
         write_rows(_rows(dk2_ref, start + first, SUB), left(first), dk2 + tile(dk_ref, first) + dkt)
         write_rows(_rows(dg2_ref, start + first, SUB), left(first), dg2)
         write_rows(_rows(db2_ref, start + first, SUB), left(first), beta_grad)
+
+
+def _paired_decay(q_ref, k_ref, g_ref, beta_ref, daqk_ref, dakk_ref, start, first, tokens, gate, query, key,
+                  beta, taken):
+    """A sub-chunk's rows' decay gradient within their chunk, each pair's own term, fp32: for each of the
+    chunk's `tokens` `s` and each row `t` from `first`, the term `(dAqk[t, s] q_t + dAkk[t, s] beta_t k_t)
+    k_s exp2(g_t - g_s)` through the range `(s, t]` adds to `t`'s gradient where `s < t`, and the pair
+    `(s, t)`'s subtracts where `s > t`. `gate`, `query`, `key` and `beta` are the rows' cumulated decay and
+    operands, `taken` the rows a read takes."""
+    rows = first + jnp.arange(SUB)
+    weighted = beta[:, None] * key
+
+    def token(ref, s):
+        return ref[start + s].astype(jnp.float32)
+
+    def paired(s, total):
+        g_s, k_s = _row(g_ref, start + s)[None, :], token(k_ref, s)[None, :]
+        column = pl.ds(s, 1)
+        qk = read_rows(_rows(daqk_ref, start + first, SUB, column), taken).astype(jnp.float32)
+        kk = read_rows(_rows(dakk_ref, start + first, SUB, column), taken).astype(jnp.float32)
+        toward = (qk * query + kk * weighted) * k_s * jnp.exp2(gate - g_s)
+        qk_s = daqk_ref[start + s, pl.ds(first, SUB)].astype(jnp.float32)[:, None]
+        kk_s = dakk_ref[start + s, pl.ds(first, SUB)].astype(jnp.float32)[:, None]
+        back = ((qk_s * token(q_ref, s)[None, :] + kk_s * (token(k_ref, s) * token(beta_ref, s))[None, :])
+                * key * jnp.exp2(g_s - gate))
+        return (total + jnp.where((rows > s)[:, None], toward, 0.0)
+                - jnp.where((rows < s)[:, None], back, 0.0))
+
+    return jax.lax.fori_loop(0, tokens, paired, jnp.zeros(gate.shape, jnp.float32))
 
 
 @dataclasses.dataclass(frozen=True)
