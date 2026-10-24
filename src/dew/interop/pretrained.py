@@ -1018,10 +1018,17 @@ def load_processor(source: sources.SourceReference, model: nn.Module) -> Process
     A saved task keeps the source's directory/repository, commit and subfolder
     as a typed record, not its translated fields. Reading that source's config
     and translating its wrapper derives a media processor's geometry again
-    without loading the model's weights.
+    without loading the model's weights. A composite's metadata codec selects
+    the native component's config, as it does for the initial load.
     """
     directory = source.metadata()
-    config, _ = _source_config(source.name, directory, source.revision, None)
+    description = _composite_description(directory)
+    component = None if description is None else description.backbone
+    if component is None:
+        config, _ = _source_config(source.name, directory, source.revision, None)
+    else:
+        config = component.config
+        directory = directory / component.config_folder
     record = decoders.translate_wrapper_config(config) if _media_wrapper(config) else {}
     return source_processor(directory, config, record, model, source=source)
 
