@@ -667,7 +667,7 @@ _DEFAULT_CACHE = KVCache()
 
 
 def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KVCache = _DEFAULT_CACHE,
-                  value_dim: int | None = None, places: bool = False):
+                  value_dim: int | None = None, places: bool = False, groups: tuple[str, ...] = ()):
     """Fixed-size K/V with a cursor and cached validity for each batch row.
 
     Returns [B, S] compact slot positions and a writer. Invalid tokens have
@@ -677,7 +677,8 @@ def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KV
     storage behind the slots, dense or paged, full or quantized
     (`dew.nn.kv_cache`); the slots and the cursor are the same for all. Values
     are `value_dim` wide, None for the keys' width. `places` also keeps each
-    token's place beside its key (`dew.nn.kv_cache.Append.places`).
+    token's place beside its key (`dew.nn.kv_cache.Append.places`), and
+    `groups` its groups of the fields named (`Append.groups`).
     """
     shards = sequence_shards()
     if shards > 1:
@@ -690,7 +691,7 @@ def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KV
     if valid is None and length > max_seq_len:
         raise ValueError(f"{length} tokens do not fit a KV cache of {max_seq_len}.")
     store = KVStore.open(module, layout, batch, max_seq_len, heads, head_dim, key.dtype, value_dim=value_dim,
-                         places=places)
+                         places=places, groups=groups)
     positions, allocated = cache_positions(module, batch, length, valid)
     return positions, Append(store, positions, allocated)
 
