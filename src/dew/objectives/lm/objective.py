@@ -54,6 +54,7 @@ from dew.nn.inputs import (
     ModelInputs,
     pad_token_rows,
     real_slots,
+    rotate_rows,
     shifted_span,
     token_layout,
 )
@@ -331,12 +332,6 @@ class Samples:
     decode: Callable[[list[int]], str] = lambda ids: str(ids)
 
 
-def _shift_rows(values: jax.Array, shifts: jax.Array) -> jax.Array:
-    """Shift each row left by its count, wrapping padding to the right."""
-    indices = (jnp.arange(values.shape[1])[None, :] + shifts[:, None]) % values.shape[1]
-    return jnp.take_along_axis(values, indices, axis=1)
-
-
 def _unpadded(values: jax.Array, padding: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Undo a left alignment on scored rows, and mark the slots that scored.
 
@@ -345,7 +340,7 @@ def _unpadded(values: jax.Array, padding: jax.Array) -> tuple[jax.Array, jax.Arr
     were scored for, beside a mask that is true where the row held a real
     token rather than padding.
     """
-    restored = _shift_rows(values, -padding)
+    restored = rotate_rows(values, -padding)
     valid = jnp.arange(restored.shape[1])[None, :] >= padding[:, None]
     return restored, valid
 

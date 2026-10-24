@@ -33,7 +33,7 @@ from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers import AttentionMixer
 from dew.nn.mlp import GatedMLP
-from dew.nn.precision import at_least_fp32, capped_logits, scaled_logits
+from dew.nn.precision import accumulated, at_least_fp32, capped_logits, scaled_logits
 from dew.nn.scatter import DROPPED
 from dew.records import JSON
 from dew.registry import from_record, import_path, imported, record_fields
@@ -265,7 +265,8 @@ def _span_means(values: jax.Array, spans: jax.Array) -> jax.Array:
     inside = (positions >= spans[..., :1]) & (positions < spans[..., 1:])
     counts = jnp.maximum(jnp.sum(inside, axis=-1, keepdims=True), 1)
     flat = inside.reshape(inside.shape[0], -1, inside.shape[-1]).astype(values.dtype)
-    summed = jnp.einsum("bnl,bld->bnd", flat, values).reshape(*inside.shape[:-1], values.shape[-1])
+    summed = accumulated(functools.partial(jnp.einsum, "bnl,bld->bnd"), flat, values)
+    summed = summed.reshape(*inside.shape[:-1], values.shape[-1])
     return summed / counts.astype(values.dtype)
 
 
@@ -444,9 +445,11 @@ class JointSchemaHead(Head):
         grid = _laid_back(routed, inputs)
 
         fields = self.question_projection(questions)
-        affinity = jnp.einsum("bqkw,bqw->bqk", grid, fields) / math.sqrt(self.width)
+        affinity = (accumulated(functools.partial(jnp.einsum, "bqkw,bqw->bqk"), grid, fields)
+                    / math.sqrt(self.width))
         weights = jax.nn.softmax(jnp.where(inputs.options, affinity, -jnp.inf), axis=-1)
-        summaries = jnp.einsum("bqk,bqkw->bqw", jnp.where(inputs.options, weights, 0.0), grid)
+        summaries = accumulated(functools.partial(jnp.einsum, "bqk,bqkw->bqw"),
+                                jnp.where(inputs.options, weights, 0.0), grid)
         types = jnp.asarray(_TYPE_ROWS)[inputs.kinds]
         fields = (fields + self.option_summary_norm(summaries) + self.global_projection(last_state)
                   + self.type_embedding(types))
@@ -456,7 +459,8 @@ class JointSchemaHead(Head):
 
         anchor = _per_slot(l2_normalized(questions + last_state, 1e-12), owners, inputs)
         prior = (jnp.exp(jnp.minimum(self.prior_logit_scale, math.log(100.0)))
-                 * jnp.einsum("bpd,bpd->bp", l2_normalized(lexical, 1e-12), anchor))
+                 * accumulated(functools.partial(jnp.einsum, "bpd,bpd->bp"),
+                               l2_normalized(lexical, 1e-12), anchor))
         options = self.option_norm(routed)
         repeated = _per_slot(fields, owners, inputs)
         cosine = jnp.sum(l2_normalized(repeated, 1e-8) * l2_normalized(options, 1e-8), axis=-1)
