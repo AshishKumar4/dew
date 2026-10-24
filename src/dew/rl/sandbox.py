@@ -60,6 +60,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol
 
+from dew.cleanup import process_group
 from dew.data.prompts import PromptRecord
 from dew.inference.rollouts import InfrastructureError
 from dew.objectives.rl.episodes import Action, Environment, EpisodeId, EpisodeStatus, Observation
@@ -110,30 +111,30 @@ def _observation(value: object) -> Observation:
                        messages(value.get("messages", []), "messages"))
 
 
-def launch(command: tuple[str, ...], limits: SandboxLimits, directory: str) -> subprocess.Popen[bytes]:
-    """Start `command` in `directory` under `limits`, in its own session, with piped streams.
+def launched(command: tuple[str, ...], limits: SandboxLimits,
+             directory: str) -> contextlib.AbstractContextManager[subprocess.Popen[bytes]]:
+    """`command` started in `directory` under `limits`, in its own session, with piped streams, whose
+    process group ends and whose streams close with the block, however it ends (`process_group`).
 
     The launcher applies RLIMIT_CPU, RLIMIT_AS and no core dumps, installs the
     parent-death signal, then execs the command with a minimal environment.
     """
     launcher = str(Path(__file__).with_name("_sandbox_exec.py"))
-    return subprocess.Popen(
+    return process_group(
         [sys.executable, "-I", launcher, str(limits.cpu_seconds), str(limits.memory_bytes),
          str(os.getpid()), *command], cwd=directory,
         env={"PATH": os.defpath, "LANG": "C.UTF-8", "PYTHONUNBUFFERED": "1"},
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        start_new_session=True)
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
 class _ProcessEnvironment:
     """Drive one sandboxed worker process over a line-delimited JSON protocol."""
 
-    def __init__(self, command: tuple[str, ...], limits: SandboxLimits,
-                 identity: EpisodeId, directory: str):
+    def __init__(self, process: subprocess.Popen[bytes], limits: SandboxLimits, identity: EpisodeId):
         self.identity, self.limits = identity, limits
         self.deadline = time.monotonic() + limits.wall_seconds
         self.output = bytearray()
-        self.process = launch(command, limits, directory)
+        self.process = process
         assert (
             self.process.stdin is not None
             and self.process.stdout is not None
@@ -216,16 +217,6 @@ class _ProcessEnvironment:
         if not isinstance(reply, Mapping) or reply.get("restored") is not True:
             raise ValueError("sandbox set_state must acknowledge restored state")
 
-    def close(self) -> None:
-        # The group is already gone when the sandbox exited on its own.
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(self.process.pid, signal.SIGKILL)
-        try:
-            self.process.wait(timeout=5)
-        finally:
-            for stream in (self.stdin, self.stdout, self.stderr):
-                stream.close()
-
 
 @dataclass(frozen=True)
 class SubprocessEnvironment:
@@ -259,12 +250,9 @@ class SubprocessEnvironment:
 
     @contextmanager
     def __call__(self, identity: EpisodeId) -> Iterator[Environment]:
-        with tempfile.TemporaryDirectory(prefix="dew-episode-") as directory:
-            worker = _ProcessEnvironment(self.command, self.limits, identity, directory)
-            try:
-                yield worker
-            finally:
-                worker.close()
+        with (tempfile.TemporaryDirectory(prefix="dew-episode-") as directory,
+              launched(self.command, self.limits, directory) as process):
+            yield _ProcessEnvironment(process, self.limits, identity)
 
 class Verdict(Enum):
     """How a program ended."""
@@ -448,16 +436,9 @@ class ProcessRunner:
             _written(program, directory)
             started = time.monotonic()
             deadline = started + limits.wall_seconds
-            process = launch(program.command, limits, directory)
-            try:
+            with launched(program.command, limits, directory) as process:
                 streams, stopped = _collected(process, program.stdin.encode(), deadline, limits.message_bytes)
-            finally:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGKILL)
-            try:
-                return _outcome(process, streams, stopped, started, deadline)
-            finally:
-                _closed(process)
+            return _outcome(process, streams, stopped, started, deadline)
 
 
 _REMOVAL_SECONDS = 60
