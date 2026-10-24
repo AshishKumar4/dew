@@ -95,11 +95,12 @@ or an image its window cuts."""
 @pytest.mark.parametrize("layout", LAYOUTS.values(), ids=list(LAYOUTS))
 def test_a_block_layer_reads_the_keys_the_block_causal_rule_keeps(layout):
     """A layer reading block groups computes what it computes over an explicit mask of the rule's keys
-    (`attention_pairwise_mask`), its logits and its QK-Clip maxima alike: both run the reference path over
-    the same keys, so they agree bitwise, and a key added or dropped moves them. The rule keeps keys a
-    causal mask does not, so the groups are read."""
+    (`attention_pairwise_mask`), its logits and its QK-Clip maxima alike: both run xla's kernel over the
+    same keys, the one named on every backend, so they agree bitwise, and a key added or dropped moves
+    them. The rule keeps keys a causal mask does not, so the groups are read. (The fused kernels' own
+    parity over these spans is the template's and the route's tests'.)"""
     kinds, fields, rule = layout
-    decoder = model(**kinds)
+    decoder = model(**kinds).clone(attention_impl="xla")
     ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
     params = decoder.init(jax.random.key(1), ids)
     segment_ids, attention_mask, block_groups, image_groups = (
