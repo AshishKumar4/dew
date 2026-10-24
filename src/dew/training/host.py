@@ -211,6 +211,7 @@ def place_leaf(value, target: Sharding | Format) -> jax.Array:
             isinstance(value.sharding, NamedSharding) or jnp.issubdtype(value.dtype, jax.dtypes.prng_key)):
         source = value.sharding
         if isinstance(source, NamedSharding) and source.mesh == target.mesh and source.spec != target.spec:
+            # Same-mesh resharding changes indices; transfer preserves them between companion devices.
             return jax.block_until_ready(jax.device_put(value, target))
         return transfer(value, target)
     if isinstance(value, HostSource):
