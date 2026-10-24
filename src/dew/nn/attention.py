@@ -1375,9 +1375,9 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     which the decode kernel and the template read from the window's first block
     (`decode_attention.attend`) and every other path as the mask they mean.
 
-    A mesh sequence axis above one runs `sequence_parallel_attention`. Active dropout draws each weight from
-    `dropout_rng` on the route the selector takes for it (`reference`, or `template` where named), and
-    refuses explicit fused kernels, a dropping call's sequence parallelism among them. The
+    A mesh sequence axis above one runs `sequence_parallel_attention`. Active dropout draws each weight
+    from `dropout_rng` on the route the selector takes for it (`reference`, or `template` where named),
+    and refuses explicit fused kernels and a sequence axis above one. The
     result carries the checkpoint name 'attention_output', so a remat policy
     can save it instead of replaying the kernel (`remat_block` in dit.py).
     """
@@ -1428,8 +1428,8 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         out = kernel(query, key, value, causal=causal, sliding_window=sliding_window,
                      mask=mask, bias=bias, sinks=sinks, segment_ids=segment_ids,
                      max_segments=max_segments, key_value_seq_lengths=key_value_seq_lengths,
-                     key_value_seq_starts=key_value_seq_starts, dropout_rate=dropout_rate,
-                     dropout_seed=words)
+                     key_value_seq_starts=key_value_seq_starts,
+                     dropout_rate=dropout_rate if dropping else 0.0, dropout_seed=words)
     return checkpoint_name(out, 'attention_output')
 
 
