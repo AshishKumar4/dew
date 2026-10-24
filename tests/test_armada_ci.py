@@ -823,6 +823,8 @@ def test_the_durations_fold_rewrites_only_a_file_its_record_no_longer_cuts(ci, t
     file("test_empty", [], [[]])  # every test deselected, its collection past the target
     rows[-2]["seconds"] = 300.0
     record["tests/test_gone.py::test_x"] = 5.0
+    rows.append({"name": "3.12:tests/test_gone.py", "exitCode": 0, "seconds": 5.0,
+                 "tests": {"tests/test_gone.py::test_x": 5.0, "tests/test_gone.py::test_y": 1.0}})
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(record, indent=0) + "\n")
     verdict = tmp_path / "main.json"
     verdict.write_text(json.dumps({"rows": rows}))
@@ -837,7 +839,7 @@ def test_the_durations_fold_rewrites_only_a_file_its_record_no_longer_cuts(ci, t
     for name in ("test_steady", "test_straggler", "test_partial"):
         assert {node: s for node, s in folded.items() if f"/{name}.py" in node} == {
             node: s for node, s in record.items() if f"/{name}.py" in node}
-    assert "tests/test_gone.py::test_x" not in folded
+    assert not [node for node in folded if node.startswith("tests/test_gone.py")]
 
 
 def test_a_tasks_wall_time_is_apportioned_by_its_files_tests_times(ci):
@@ -1061,15 +1063,13 @@ def test_a_durations_change_reruns_only_the_groups_cut_from_it(ci, tmp_path, mon
 
 def commit(root: Path, message: str) -> str:
     """Checkout `root`'s changes committed, and the commit's sha: every file at the first, which makes the
-    repository, and its tracked files' changes after, so what a run leaves in the checkout stays out."""
+    repository, and the tracked and staged changes after, so what a run leaves in the checkout stays out."""
     first = not (root / ".git").exists()
     if first:
-        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
-        subprocess.run(["git", "add", "-A"], cwd=root, check=True)
-    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit",
-                    "-qm" if first else "-qam", message], cwd=root, check=True, capture_output=True)
-    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True,
-                          text=True).stdout.strip()
+        git(root, "init", "-q")
+        git(root, "add", "-A")
+    git(root, "commit", "-qm" if first else "-qam", message)
+    return git(root, "rev-parse", "HEAD").strip()
 
 
 def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, monkeypatch, cache_worker):
@@ -1087,13 +1087,7 @@ def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, mon
             f"    with Path('runs-{name}').open('a') as runs: runs.write('x')\n"
             f"    assert runpy.run_path('tools/{name}.py')['VALUE'] >= 1\n")
     verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
-    def git(*arguments: str) -> str:
-        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *arguments], cwd=tmp_path,
-                              check=True, capture_output=True, text=True).stdout.strip()
-    git("init", "-q")
-    git("add", "-A")
-    git("commit", "-qm", "base")
-    base = git("rev-parse", "HEAD")
+    base = commit(tmp_path, "base")
 
     def run() -> list[int]:
         rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
@@ -1102,7 +1096,7 @@ def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, mon
 
     assert run() == [1, 1]
     (tmp_path / "tools/first.py").write_text("VALUE = 2\n")
-    git("commit", "-qam", "the first tool changes")
+    commit(tmp_path, "the first tool changes")
     assert run() == [2, 1]
     # A package added beside a tool a test imports by its name, from tools/ on sys.path, shadows it: each file
     # that executed a tool there runs again, and the one that imports it by name sees the package.
@@ -1115,14 +1109,14 @@ def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, mon
         "    import named\n"
         "    assert named.VALUE == 1\n")
     (tmp_path / "tools/named.py").write_text("VALUE = 1\n")
-    git("add", "tests/test_named.py", "tools/named.py")
-    git("commit", "-qm", "a test imports a tool by its name")
+    git(tmp_path, "add", "tests/test_named.py", "tools/named.py")
+    commit(tmp_path, "a test imports a tool by its name")
     rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
     assert [row["exitCode"] for row in rows] == [0, 0, 0]
     (tmp_path / "tools/named").mkdir()
     (tmp_path / "tools/named/__init__.py").write_text("VALUE = 2\n")
-    git("add", "tools/named/__init__.py")
-    git("commit", "-qm", "a package shadows the tool")
+    git(tmp_path, "add", "tools/named/__init__.py")
+    commit(tmp_path, "a package shadows the tool")
     assert ci.policy(base) == "on"
     rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
     assert {row["name"]: row["exitCode"] for row in rows}["3.12:tests/test_named.py"] == 1
