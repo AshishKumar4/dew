@@ -222,7 +222,7 @@ class Flux2Transformer(TextStream, nn.Module):
         def embed(values, name: str):
             features = sinusoidal_time(values, self.timestep_guidance_channels,
                                        dtype=at_least_fp32(self.dtype)).astype(image.dtype)
-            return embedding(features, self.features, name, bias=False, dtype=self.dtype,
+            return embedding(self, features, self.features, name, bias=False, dtype=self.dtype,
                              precision=self.precision)
 
         embedded = guided_time(embed, time, conditioning.guidance, guidance_embeds=self.guidance_embeds)

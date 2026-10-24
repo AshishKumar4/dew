@@ -84,20 +84,11 @@ class MiMoVision(TowerBase):
                              channels=self.in_channels)
 
 
-@dataclasses.dataclass(frozen=True)
-class MiMoProjector(ProjectorBase):
+class MiMoProjector(MergeProjector, ProjectorBase):
     """MiMo's merger (MiMoVisionPatchMerger): a layer norm, each merge block grouped, and two maps
     around an exact GELU to the decoder width. The release stores none of its biases."""
 
-    vision_width: int
-    merge_size: int
-    out_width: int
-
-    def build(self) -> nn.Module:
-        grown = self.vision_width * self.merge_size ** 2
-        return MergeProjector(hidden_size=self.vision_width, spatial_merge_size=self.merge_size,
-                              width=grown, out_width=self.out_width, bias=False)
-
+    bias: bool = False
 
 _BLOCK_MAPS = {("attn", "qkv"): ("self_attn", "qkv_proj"), ("attn", "proj"): ("self_attn", "o_proj"),
                ("mlp", "gate_proj"): ("mlp", "gate_proj"), ("mlp", "up_proj"): ("mlp", "up_proj"),
@@ -149,7 +140,7 @@ def translate_mimo_vision_config(hf_config: Mapping[str, object]) -> Record:
 
 def translate_mimo_projector_config(hf_config: Mapping[str, object], text_width: int) -> Record:
     """A MiMo-V2 wrapper's merger fields (`merger_projector`)."""
-    return merger_projector(hf_config, text_width, "mimo")
+    return merger_projector(hf_config, text_width, "mimo", bias=False)
 
 
 MiMoVision.checkpoint = TowerLayout("visual.", in_params(mimo_vision_path), read=translate_vit_weights)
