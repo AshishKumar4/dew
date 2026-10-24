@@ -180,6 +180,9 @@ class Encoded:
     """Where the row holds a request's images, as a [start, end) span of its tokens."""
     trimmed: bool = False
     """Whether the layout shortened the question's instructions or options to fit its budgets."""
+    context: tuple[int, ...] | None = None
+    """The tokens of the context the row reads beside its state, through a backbone's
+    cross-attention, or None for none."""
 
 
 def question_fields(row: Encoded, count: int, width: int) -> dict[str, np.ndarray]:
@@ -206,6 +209,13 @@ def render(value: JSON) -> str:
         case _:
             return json.dumps(value, ensure_ascii=False)
 
+
+def context_tokens(tokenizer: Tokenizer, context: JSON | None, length: int) -> np.ndarray:
+    """A context's tokens as a row carries them: its text's (`render`), without specials, the first
+    `length` of them, and none for no context."""
+    if context is None:
+        return np.zeros(0, np.int32)
+    return np.asarray(tokenizer.encode(render(context), add_special_tokens=False)[:length], np.int32)
 
 def _conversation(state: JSON) -> bool:
     """Whether `state` is a conversation, a list of turns, which keeps its newest turns (Laya's agent)."""
@@ -632,7 +642,10 @@ class DecisionInputs:
       `[B, Q, K]` the real slots;
     - `option_slots` `[B, P]` each window's real options as flat indices
       `q * K + k` into its `[Q, K]` grid, in that order (`compacted`), and
-      `slotted` `[B, P]` which of them are real, or None for the grid itself.
+      `slotted` `[B, P]` which of them are real, or None for the grid itself;
+    - `context` `[B, C]` each window row's context tokens, which a backbone's
+      cross-attention reads, `context_lengths` `[B]` how many are real, the
+      padding after them, or None for rows that carry none.
 
     A row of one question with one marker per option, Laya's, has spans one
     token long. A head that reads `option_slots` computes the real options
@@ -651,6 +664,8 @@ class DecisionInputs:
     slots: jnp.ndarray | None = None
     option_slots: jnp.ndarray | None = None
     slotted: jnp.ndarray | None = None
+    context: jnp.ndarray | None = None
+    context_lengths: jnp.ndarray | None = None
     max_segments: int = struct.field(pytree_node=False, default=1)
 
     @property
@@ -678,7 +693,8 @@ class DecisionInputs:
 
     @classmethod
     def collate(cls, rows: Sequence[Encoded], pad: int, *, questions: int | None = None,
-                options: int | None = None, option_slots: int | None = None) -> "DecisionInputs":
+                options: int | None = None, option_slots: int | None = None,
+                context_length: int | None = None) -> "DecisionInputs":
         """Right-pad `rows` into one batch (`pad_token_rows`), one row a window, its question
         and option slots to the widest.
 
@@ -686,6 +702,8 @@ class DecisionInputs:
         keeps fixed. `option_slots` is the real options a row may hold, a shape
         a caller keeps fixed too (`compacted`); without it, the batch's most,
         rounded up to `OPTION_TILE`, where that is fewer than the grid's slots.
+        With a `context_length`, each row's context (`Encoded.context`, none
+        where it holds none) is padded to that many tokens.
         """
         parallel = rows[0].positions is not None
         if any((row.positions is not None) != parallel for row in rows):
@@ -708,12 +726,22 @@ class DecisionInputs:
         else:
             compact = True
         indexed = [compacted(row, option_slots) for row in real_options] if compact else None
+        context = lengths = None
+        if context_length is not None:
+            held = [row.context or () for row in rows]
+            if max(map(len, held)) > context_length:
+                raise ValueError(f"a row's context holds {max(map(len, held))} tokens, more than the "
+                                 f"{context_length} the backbone's cross-attention reads")
+            context = jnp.asarray([[*tokens, *[pad] * (context_length - len(tokens))] for tokens in held],
+                                  jnp.int32)
+            lengths = jnp.asarray([len(tokens) for tokens in held], jnp.int32)
         return cls(jnp.asarray(tokens), jnp.asarray(valid, jnp.int32), jnp.asarray(kinds), jnp.asarray(real),
                    jnp.asarray(spans), jnp.asarray(option_spans), jnp.asarray(real_options),
                    jnp.asarray(padded["positions"], jnp.int32) if parallel else None,
                    jnp.asarray(padded["slots"], jnp.int32) if parallel else None,
                    None if indexed is None else jnp.asarray(np.stack([slots for slots, _ in indexed])),
-                   None if indexed is None else jnp.asarray(np.stack([real for _, real in indexed])))
+                   None if indexed is None else jnp.asarray(np.stack([real for _, real in indexed])),
+                   context, lengths)
 
 
 OPTION_TILE = 128
