@@ -2,6 +2,7 @@
 
 import json
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 import jax
@@ -116,6 +117,54 @@ def test_a_bfloat16_readout_keeps_its_storage_through_the_released_format(tmp_pa
                                jax.tree.leaves((bundle.variables, bundle.head_variables)), strict=True):
         assert actual.dtype == expected.dtype
         np.testing.assert_array_equal(actual, expected)
+
+
+def test_a_block_slot_source_trains_checkpoints_exports_and_serves_its_updated_readout(tmp_path):
+    import optax
+    from decision_support import decision_rows
+
+    from dew.checkpoints import Checkpoints
+    from dew.decision import DecisionObjective, Example
+    from dew.inference import ScoringServer
+    from dew.objectives.base import part
+    from dew.training import Trainer
+
+    source, _ = slot_release(tmp_path, "head", 16)
+    config = json.loads((source / "config.json").read_text())
+    config["modeling_overrides"] = {
+        "readout": "head", "head_dim": 8, "n_slots": 16,
+        "attention": {"full_attention": "block_bidirectional", "linear_attention": "causal"}}
+    (source / "config.json").write_text(json.dumps(config))
+    (source / "readout.json").unlink()
+    bundle = Pretrained.load(source, dtype="float32", attention_impl="xla")
+    task = bundle.pipeline()
+    task = replace(task, layout=replace(task.layout, max_len=512))
+    request = {"state": "Refund requested.", "questions": {
+        "team": {"type": "choice", "instructions": "Which team?", "options": ["billing", "technical"]}}}
+    examples = [Example.of({**request, "answers": {"team": 0}})]
+    objective = DecisionObjective(task, shuffle_options=False)
+    data = decision_rows(examples, 1, objective=objective.data())
+    with Checkpoints(str(tmp_path / "run"), keep=1) as checkpoints:
+        trained = Trainer(objective, optax.sgd(1e-4), key=7, checkpoints=checkpoints).fit(
+            data, steps=1, checkpoint_every=1, log_every=100)
+        checkpoints.wait()
+        loaded = Decide.from_run(str(tmp_path / "run"))
+    for component in ("backbone", "head"):
+        assert any(not np.array_equal(before, after) for before, after in zip(
+            jax.tree.leaves(part(task.variables, component)),
+            jax.tree.leaves(part(trained.variables, component)), strict=True))
+    updated = replace(bundle, variables=part(trained.variables, "backbone"),
+                      head_variables=part(trained.variables, "head"))
+    updated.save(tmp_path / "updated")
+    exported = Decide.from_pretrained(tmp_path / "updated", dtype="float32", attention_impl="xla")
+    question = {"team": Choice("Which team?", ["billing", "technical"])}
+    rows = loaded.layout.rows(loaded.tokenizer, loaded.specials, request["state"], question)
+    np.testing.assert_array_equal(loaded.scored(rows), exported.scored(rows))
+    server = ScoringServer.from_task(*exported.scoring())
+    first, second = server.submit(request), server.submit(request)
+    server.step()
+    assert not server.busy
+    assert first.result() == second.result()
 
 
 class HostRows:
