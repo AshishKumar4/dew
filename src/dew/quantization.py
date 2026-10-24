@@ -298,9 +298,11 @@ def frozen_fp8_leaves(kernel: jax.typing.ArrayLike) -> dict[str, jax.Array | np.
     apart. The two E4M3 copies replace the kernel in the train state
     (`frozen_fp8_kernel` decodes it back), two bytes a parameter, a bf16
     kernel's, so the gain over a bf16 base is the products' rate."""
+    from jax import core
+
     from dew.interop.codecs import fp8_block_cast, quantize_fp8_blocks
 
-    resident = isinstance(kernel, (jax.Array, jax.core.Tracer))
+    resident = isinstance(kernel, (jax.Array, core.Tracer))
     kernel = jnp.asarray(kernel, jnp.float32) if resident else np.asarray(kernel, np.float32)
     if kernel.ndim != 2:
         raise ValueError(f"a frozen FP8 site packs a two-axis [in, out] kernel, got shape {kernel.shape}")

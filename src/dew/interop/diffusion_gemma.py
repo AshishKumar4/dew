@@ -314,7 +314,7 @@ def export_weights(
         if name.endswith(".layer_scalar"):
             encoder = target.replace("model.decoder.", "model.encoder.language_model.")
             names[encoder], specs[encoder] = name, spec
-    leaves = {("params", "self_conditioning", *path): leaf
+    leaves: dict[tuple[str, ...], object] = {("params", "self_conditioning", *path): leaf
               for path, leaf in flatten_dict(dict(params["self_conditioning"])).items()}
     layouts = leaf_layouts(leaves, lambda path: f"model.decoder.self_conditioning.{path[-2]}.weight")
     if "conditioner" in params:
