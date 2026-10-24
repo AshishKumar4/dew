@@ -55,9 +55,30 @@ def test_public_processor_and_native_forward_match_conditional_model(source):
     reference = np.load(FIXTURE / "logits.npy")
     np.testing.assert_allclose(np.asarray(output)[valid], reference[valid], atol=1e-4, rtol=0)
     np.testing.assert_array_equal(np.asarray(output)[valid].argmax(-1), reference[valid].argmax(-1))
-    causal_images = model.clone(language_model=model.language_model.clone(mixer=AttentionMixer()))
-    wrong = causal_images.apply(loaded.variables, inputs.tokens, **inputs.kwargs())
-    assert np.max(np.abs(np.asarray(wrong)[valid] - reference[valid])) > 1e-2
+    from reference_error import assert_moves, widened
+
+    from dew.config import ModelConfig
+
+    language = model.language_model
+    ordinary = language.mixer or AttentionMixer()
+    kinds = {name: dataclasses.replace(kind, mixer=dataclasses.replace(
+        kind.mixer or ordinary, bidirectional_images=False)) for name, kind in language.kinds.items()}
+    causal_images = model.clone(language_model=language.clone(
+        mixer=dataclasses.replace(ordinary, bidirectional_images=False), kinds=kinds))
+    exact = ModelConfig.from_model(model).with_dtype("float64").build()
+
+    def forward(module, variables, pixels):
+        prepared = inputs.replace(conditioning={**inputs.conditioning, "pixel_values": pixels})
+        return module.apply(variables, prepared.tokens, **prepared.kwargs())[valid]
+
+    def draw(seed):
+        pixels = np.asarray(inputs.conditioning["pixel_values"])
+        return (pixels + np.random.default_rng(seed).standard_normal(pixels.shape).astype(np.float32) * 0.01,)
+
+    assert_moves(jax.jit(lambda pixels: forward(model, loaded.variables, pixels)),
+                 jax.jit(lambda pixels: forward(causal_images, loaded.variables, pixels)), draw,
+                 "Gemma3 image visibility", seeds=8,
+                 truth_fn=lambda pixels: forward(exact, widened(loaded.variables), pixels))
 
 
 def test_objective_pixel_gradient_matches_reference(source):
