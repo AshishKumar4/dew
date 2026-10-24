@@ -575,7 +575,10 @@ def _dstates_kernel(dout_ref, c_ref, da_ref, *refs, batch: int, length: int, chu
             scale = jnp.where(seq[0][rows] == earlier, scale, 0.0)
         dout = (dout.astype(jnp.float32) * scale[:, None]).astype(dout.dtype)
         cm = read_rows(c_ref.at[rows], _from(limit, offset)).astype(dout.dtype)
-        return acc + _dot(dout.T, cm, exact=exact)
+        # IEEE products, mamba_ssm's: where a document begins, its carry is zero and the state's gradient
+        # is this sum alone, which TF32x3 put at 1.52 times mamba_ssm's distance from float64 on an A100
+        # (the initial state's, packed documents; IEEE 0.98).
+        return acc + _dot(dout.T, cm, exact=exact, ieee=True)
 
     out_ref[...] = jax.lax.fori_loop(0, chunk // bk, step, jnp.zeros(out_ref.shape, jnp.float32))
 
