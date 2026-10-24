@@ -36,6 +36,7 @@ from dew.decision.objective import DecisionObjective
 from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
 from dew.nn.backbones.decoder_block import remat_policy
+from dew.nn.cross_attention import CrossAttention
 from dew.nn.protocols import RematChoosing
 from dew.records import number, record
 from dew.training.state import TrainState
@@ -65,7 +66,7 @@ class DecisionRunConfig(RunConfig):
     objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("decision"))
     """The decision objective and its arguments: its scoring rule (`loss`),
     label smoothing, option shuffling and none-of-the-above rate."""
-    optim: OptimConfig = dataclasses.field(default_factory=lambda: OptimConfig(learning_rate=2.5e-5))
+    optim: OptimConfig = dataclasses.field(default_factory=lambda: OptimConfig(rate=2.5e-5))
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
     pretrained: str = LAYA
@@ -113,6 +114,15 @@ class DecisionRunConfig(RunConfig):
     (a hundred options, or a document's many hypotheses) fits under a `max_len`
     set for it without lengthening every other row's state. None lets the
     state fill the row."""
+    context_layers: tuple[int, ...] | None = None
+    """The backbone layers that read each example's context (`Example.context`)
+    through gated cross-attention, the context embedded by the backbone's own
+    token table; the blocks train from zero gates beside the head, the loaded
+    backbone frozen (`Pretrained.with_cross_attention`), with `lora` its adapter
+    beside them. None reads no context."""
+    context_length: int = 256
+    """The most tokens of an example's context the cross-attention reads, its
+    first; with `context_layers` alone."""
     def prepare(self) -> Prepared:
         """The objective over the backbone `pretrained` names, on the table's
         or the mixture's rows, scored on the held-out ones, which calibrate the
@@ -134,9 +144,9 @@ class DecisionRunConfig(RunConfig):
         if LayaCheckpoint.exists(self.pretrained, subfolder=self.subfolder, revision=self.revision):
             if any(choice is not None for choice in (self.lora, self.head, self.loop_steps,
                                                     self.loop_layers, self.loop_backprop_steps,
-                                                    self.remat)) or self.loop_remat:
-                raise ValueError("--lora, --head, --remat and the loop shape a fresh backbone; "
-                                 "a Laya checkpoint trains whole under its own head")
+                                                    self.remat, self.context_layers)) or self.loop_remat:
+                raise ValueError("--lora, --head, --remat, --context-layers and the loop shape a fresh "
+                                 "backbone; a Laya checkpoint trains whole under its own head")
             start = Decide.from_pretrained(self.pretrained, subfolder=self.subfolder, revision=self.revision,
                                            dtype=dtype, param_dtype=self.param_dtype,
                                            attention_impl=attention_impl)
@@ -154,6 +164,11 @@ class DecisionRunConfig(RunConfig):
                     or self.loop_backprop_steps is not None or self.loop_remat):
                 start = looping(start, self.loop_steps, self.loop_layers,
                                 backprop_steps=self.loop_backprop_steps, remat=self.loop_remat or None)
+            if self.context_layers is not None:
+                # Drawn from a key of their own, apart from the adapter's and the head's.
+                blocks = CrossAttention(self.context_layers, self.context_length)
+                start = start.with_cross_attention(blocks, key=jax.random.fold_in(
+                    jax.random.key(self.trainer.key), 1))
             start = start if self.lora is None else start.adapt(self.lora, key=self.trainer.key)
             # The tokenizer of the commit the weights come from.
             root = sources.snapshot(self.pretrained, self.revision, weights=False)

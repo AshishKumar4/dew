@@ -17,11 +17,13 @@ binomials; documents reset on chunks' first and last tokens; and saturated gates
 Mamba's step through softplus at 30), and pre-activations spread over [-20, 20], which keep gates near 0 and 1
 apart; a memory fading over a long sequence, whose output falls far below its scale; and a steep decay every
 eighth token between mild ones, whose pairs after it are differences of large, nearly equal prefixes. Each
-runs the portable math (`recurrence_chunk.chunk`'s `chunk_delta_rule`), held to the recurrence by check 1;
-a decay a key dimension no steeper than the regime's floor (`FLOORS`), Kimi Linear's domain. The recurrence
-template's Mosaic GPU mainloop takes its arm (`template`) at the sites it takes (`TEMPLATED`), compiled on a
-GPU of an instruction family one of its bundles claims; the suite runs compiled on a GPU as on a CPU, where a
-CPU's interpretation of a kernel judges its host's arithmetic, not the kernel's."""
+runs the portable math (`recurrence_chunk.chunk`'s `chunk_delta_rule`) forward and through its gradient
+(`reference_error.with_gradients`, each seed's cotangents drawn with its operands), held to the recurrence's
+by check 1; a decay a key dimension no steeper than the regime's floor (`FLOORS`), Kimi Linear's domain. The
+recurrence template's Mosaic GPU mainloop takes its forward arm (`template`) at the sites it takes
+(`TEMPLATED`), compiled on a GPU of an instruction family one of its bundles claims; the suite runs compiled
+on a GPU as on a CPU, where a CPU's interpretation of a kernel judges its host's arithmetic, not the
+kernel's."""
 
 import dataclasses
 import functools
@@ -30,7 +32,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, widened
+from reference_error import assert_as_exact, widened, with_gradients
 from test_recurrence_chunk import CHUNK, KEY_WIDTH, VALUE_HEADS, draw, token_by_token
 
 from dew.nn.kernels import recurrence
@@ -147,6 +149,61 @@ REGIMES = {
 }
 """Each regime's transform of a draw's operands and its tokens (the draw's own where None)."""
 
+GRADIENT_SEEDS = {
+    ('scalar delta', 'decays near one'): 8,
+    ('scalar delta', 'decays near zero'): 64,
+    ('scalar delta', 'the decay bound'): 16,
+    ('scalar delta', 'aligned keys'): 8,
+    ('scalar delta', 'resets on chunk edges'): 8,
+    ('scalar delta', 'saturated gates'): 8,
+    ('scalar delta', 'spread gates'): 8,
+    ('scalar delta', 'a long sequence'): 8,
+    ('scalar delta', 'a fading memory'): 8,
+    ('scalar delta', 'steep then mild'): 8,
+    ('vector delta', 'decays near one'): 8,
+    ('vector delta', 'decays near zero'): 64,
+    ('vector delta', 'the decay bound'): 16,
+    ('vector delta', 'aligned keys'): 8,
+    ('vector delta', 'resets on chunk edges'): 8,
+    ('vector delta', 'saturated gates'): 8,
+    ('vector delta', 'spread gates'): 8,
+    ('vector delta', 'a long sequence'): 8,
+    ('vector delta', 'a fading memory'): 8,
+    ('vector delta', 'steep then mild'): 8,
+    ('scalar write', 'decays near one'): 8,
+    ('scalar write', 'decays near zero'): 64,
+    ('scalar write', 'the decay bound'): 8,
+    ('scalar write', 'aligned keys'): 8,
+    ('scalar write', 'resets on chunk edges'): 8,
+    ('scalar write', 'saturated gates'): 8,
+    ('scalar write', 'spread gates'): 8,
+    ('scalar write', 'a long sequence'): 8,
+    ('scalar write', 'a fading memory'): 8,
+    ('scalar write', 'steep then mild'): 8,
+    ('gated', 'decays near one'): 32,
+    ('gated', 'decays near zero'): 512,
+    ('gated', 'the decay bound'): 64,
+    ('gated', 'aligned keys'): 64,
+    ('gated', 'resets on chunk edges'): 64,
+    ('gated', 'saturated gates'): 128,
+    ('gated', 'spread gates'): 128,
+    ('gated', 'a long sequence'): 32,
+    ('gated', 'a fading memory'): 64,
+    ('gated', 'steep then mild'): 64,
+    ('rated', 'decays near one'): 16,
+    ('rated', 'decays near zero'): 128,
+    ('rated', 'the decay bound'): 256,
+    ('rated', 'aligned keys'): 128,
+    ('rated', 'resets on chunk edges'): 16,
+    ('rated', 'saturated gates'): 16,
+    ('rated', 'spread gates'): 128,
+    ('rated', 'a long sequence'): 32,
+    ('rated', 'a fading memory'): 256,
+    ('rated', 'steep then mild'): 256,
+}
+
+"""Each site's declared seeds for its gradient's check 1, sized by `seeds_for`."""
+
 SEEDS = {
     ('scalar delta', 'decays near one'): 8,
     ('scalar delta', 'decays near zero'): 64,
@@ -228,6 +285,37 @@ def stressed(hooks, regime: str, seed: int, *, value_heads: int = VALUE_HEADS) -
     return (operands,)
 
 
+def cotangents(hooks, regime: str, seed: int) -> tuple[Chunk, tuple[jax.Array, jax.Array]]:
+    """Draw `seed`'s operands under `regime` (`stressed`), their documents' starts taken out (`restarting`
+    puts them back: they are not differentiable), and fp32 cotangents of their output `[B, S, Hv, Dv]`
+    and final memory `[B, Hv, Dk, Dv]` from the seed's own key, which the float64 truth takes as they
+    are."""
+    (operands,) = stressed(hooks, regime, seed, value_heads=RATED_HEADS if hooks.rated else GRADIENT_HEADS)
+    batch, length, heads, width = operands.value.shape
+    keys = jax.random.split(jax.random.fold_in(jax.random.key(seed), 101))
+    return dataclasses.replace(operands, starts=None), (
+        jax.random.normal(keys[0], (batch, length, heads, width)),
+        jax.random.normal(keys[1], (batch, heads, operands.key.shape[-1], width)))
+
+
+GRADIENT_HEADS = 16
+"""The gradient arms' value heads: a head's own parameters (the gates' `log_a` and `bias`) are a leaf of a
+head each, which two heads do not resolve within 512 seeds."""
+
+RATED_HEADS = 64
+"""A rated decay's gradient arms' value heads: its rate, a head's one factor of every token's decay, did not
+resolve within 512 seeds at 16 heads under aligned keys, decays near zero, the decay bound and steep then
+mild."""
+
+
+def restarting(fn, regime: str):
+    """`fn` on operands whose documents start as the regime's do, a constant of their shape (`_reset`),
+    which `cotangents` takes out of the draw."""
+    if regime != 'resets on chunk edges':
+        return fn
+    return lambda operands: fn(_reset(operands))
+
+
 TEMPLATED = tuple(SITES)
 """The sites the recurrence template's Mosaic GPU mainloop takes: every one."""
 
@@ -239,6 +327,8 @@ CASES = [pytest.param(name, regime, arm, id=f'{name}-{regime}-{arm}',
                       marks=[ON_ITS_FAMILY] * (arm == 'template'))
          for name in SITES for regime in REGIMES
          for arm in (('portable', 'template') if name in TEMPLATED else ('portable',))]
+
+GRADIENT_CASES = [pytest.param(name, regime, id=f'{name}-{regime}') for name in SITES for regime in REGIMES]
 
 
 @pytest.mark.parametrize('name, regime, arm', CASES)
@@ -262,3 +352,25 @@ def test_the_chunked_op_stays_finite_and_exact_where_chunked_forms_break(name, r
                 f'{leaf}: not finite where float64 is, seed {seed}')
     label = 'the portable math' if arm == 'portable' else "the template's Mosaic mainloop"
     assert_as_exact(dew, reference, draws, f'{label}, {name} under {regime}', seeds=SEEDS[name, regime])
+
+
+@pytest.mark.parametrize('name, regime', GRADIENT_CASES)
+def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime):
+    """The portable math's gradient finite wherever the reference's in float64 is, and on par with the
+    token-by-token recurrence's from float64 (check 1) over the site's declared seeds."""
+    hooks = SITES[name]
+    dew = jax.jit(with_gradients(restarting(functools.partial(chunk, hooks, chunk_size=CHUNK, ported=False),
+                                            regime)))
+    reference = jax.jit(with_gradients(restarting(functools.partial(token_by_token, hooks), regime)))
+    draws = functools.partial(cotangents, hooks, regime)
+    for seed in range(2):
+        drawn = draws(seed)
+        mine = dew(*drawn)
+        with jax.enable_x64(new_val=True):
+            truth = reference(*widened(drawn))
+        leaves = zip(jax.tree.leaves(mine), jax.tree.leaves(truth), strict=True)
+        for index, (ours, exact) in enumerate(leaves):
+            finite = np.isfinite(np.asarray(exact))
+            assert np.all(np.isfinite(np.asarray(ours))[finite]), f'leaf {index}: not finite, seed {seed}'
+    assert_as_exact(dew, reference, draws, f"the portable math's gradient, {name} under {regime}",
+                    seeds=GRADIENT_SEEDS[name, regime])

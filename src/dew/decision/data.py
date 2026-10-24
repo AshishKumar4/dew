@@ -6,14 +6,14 @@ import hashlib
 import json
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import ClassVar, Literal
 
 import numpy as np
 
 from dew import records
 from dew.data.lowering import prepared_rows
 from dew.data.pipeline import Configured, Dataset, Pipeline, Stage, mix
-from dew.data.sources.base import Read, ShardManifest, Source, _consumed, stated as store_facts
+from dew.data.sources.base import Read, Rows, Source, View, _consumed, stated as store_facts
 from dew.decision.questions import Choice, Question
 from dew.records import JSON, json_value, record
 
@@ -27,12 +27,17 @@ class Example:
     distribution, as a teacher's or a panel's is, `targets` gives it instead:
     one probability per option, in the question's own order. A question with
     neither is asked but not scored.
+
+    `context` is a sequence the decision reads beside its state, through the
+    backbone's cross-attention layers (`DecisionObjective`'s context), rendered
+    as text; None, or a backbone without those layers, reads none.
     """
 
     state: JSON
     questions: Mapping[str, Question]
     answers: Mapping[str, str | int] = field(default_factory=dict)
     targets: Mapping[str, tuple[float, ...]] = field(default_factory=dict)
+    context: JSON | None = None
 
     def __post_init__(self):
         _asked(self.questions, [*self.answers, *self.targets])
@@ -75,7 +80,9 @@ class Example:
         for name, target in stated.items():
             where = f"targets.{name}"
             targets[name] = _distribution(questions[name], json_value(target, where), where)
-        return cls(json_value(row.get("state"), "state"), questions, answers, targets)
+        context = row.get("context")
+        return cls(json_value(row.get("state"), "state"), questions, answers, targets,
+                   None if context is None else json_value(context, "context"))
 
     def labels(self) -> dict[str, int]:
         """Return each answered question's right option, as an index: a target's most likely one."""
@@ -142,7 +149,8 @@ class ParseTable:
     """A flat table's row as a one-question `Example`. A label names its
     option by key, or by index where it is an int; where the options are the
     label column's own values (`by_value`), every label names its option by
-    value, an int one included."""
+    value, an int one included. A `context` column's value is the example's
+    context (`Example.context`), none where the column holds None."""
 
     options: tuple[str, ...]
     text: str = "text"
@@ -150,6 +158,7 @@ class ParseTable:
     question: str = "label"
     instructions: str = "Classify the input into the correct category."
     by_value: bool = False
+    context: str | None = None
 
     def __call__(self, row: Mapping[str, object]) -> Mapping[str, object]:
         if "state" in row and "questions" in row:
@@ -158,11 +167,14 @@ class ParseTable:
         if not isinstance(label, (str, int, float, bool)):
             raise ValueError(f"decision label {self.label} must name an option")
         question = Choice(self.instructions, list(self.options))
+        column = self.context
+        context = None if column is None else row[column]
         return {
             "example": Example(
                 json_value(row[self.text], self.text),
                 {self.question: question},
                 {self.question: str(label) if self.by_value else _label(label)},
+                context=None if context is None or column is None else json_value(context, column),
             )
         }
 
@@ -180,11 +192,12 @@ def _named_by(rows, label: str, names: Sequence[object]) -> bool:
 
 
 @dataclass(frozen=True)
-class _DecisionSource:
+class _DecisionSource(View[Source]):
     """A store's rows read as decisions: `table`'s options and the slots its rows need are inferred
     in a memory read, from the rows as the stages `before` the decisions make them (a rename, a
     relabelling); `mixture` is the facts a decision mixture states of itself (`mixture`)."""
 
+    rows: ClassVar[Rows] = "described"
     source: Source
     slots: Mapping[str, int] | None = None
     table: ParseTable | None = None
@@ -204,17 +217,8 @@ class _DecisionSource:
         consumed._facts.update(self._facts)
         return consumed
 
-    def label(self) -> str:
-        return self.source.label()
-
-    def describe(self) -> str:
-        return self.source.describe()
-
     def fingerprint(self) -> Mapping[str, object]:
         return {**self.source.fingerprint(), **({"descriptor": self.descriptor} if self.descriptor else {})}
-
-    def supports(self, read: Read) -> bool:
-        return self.source.supports(read)
 
     def records(self, read: Read):
         records = self.source.records(read)
@@ -287,19 +291,17 @@ class _DecisionSource:
                         **({"decision_options_by_value": True} if valued else {})}
         return {**stated, "slots": self._facts} if self._facts else stated
 
-    def lengths(self) -> np.ndarray | None:
-        return self.source.lengths()
 
-    def manifest(self) -> ShardManifest:
-        return self.source.manifest()
 
 
 def decisions(dataset: Dataset, *, options: Sequence[str] = (), text: str = "text", label: str = "label",
               question: str = "label",
-              instructions: str = "Classify the input into the correct category.") -> Pipeline:
+              instructions: str = "Classify the input into the correct category.",
+              context: str | None = None) -> Pipeline:
     """`dataset`'s rows as decisions, each an `Example` under `example`, for a chain to batch: a flat
     table's `text` and `label` columns read as one `question` over `options` (its ClassLabel names, or
-    read whole in memory, where none are given), or rows that hold their examples already. Its stages
+    read whole in memory, where none are given), its `context` column, where named, each example's
+    context, or rows that hold their examples already. Its stages
     before this one, a holdout's selection among them, stand; a decision chain is a store's rows, and
     a mixture of them mixes decision chains (`mixture`). Raises ValueError for a mixture or phases
     under it."""
@@ -308,7 +310,7 @@ def decisions(dataset: Dataset, *, options: Sequence[str] = (), text: str = "tex
     chain = dataset._chain()
     if not isinstance(chain.source, Source):
         raise ValueError("decisions reads a store's rows; mix decision chains rather than reading a mixture")
-    table = ParseTable(tuple(options), text, label, question, instructions)
+    table = ParseTable(tuple(options), text, label, question, instructions, context=context)
     wrapped = _DecisionSource(chain.source, {"questions": 1, "options": len(options)} if options else None,
                               table=table, before=tuple(chain.stages))
     return dataclasses.replace(chain, source=wrapped).map(Configured(_ParseConfigured(table), needs=()))
