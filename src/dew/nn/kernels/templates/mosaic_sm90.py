@@ -4,6 +4,7 @@ warpgroup MMA reads its right operand from shared memory and its left from share
 accumulates in a warpgroup's registers in the WGMMA layout, and runs asynchronously until waited for."""
 
 import functools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -119,6 +120,25 @@ class Wgmma(mosaic.RingFamily):
 
     def columns_of(self, ref) -> jax.Array:
         return plgpu.load(ref, layout=self.column, optimized=False)
+
+    column_scratch = 4 * 32 * 2
+    """A WGMMA tile's columns sum across its four warps, each lane's two entries a register
+    (`plgpu.Layout.WGMMA`): one register's partial sums at a time."""
+
+    def column_sums(self, value: jax.Array, scratch, interpret: bool) -> jax.Array:
+        if interpret:
+            return value.sum(axis=0)
+
+        def sums(ctx, tile, scratch):
+            del ctx
+            return tile.reduce("add", axis=0, scratch=scratch)
+
+        # Mosaic GPU's own reduction across the warps, through the given scratch; inline_mgpu passes the
+        # launch context first and takes the tile and its scratch.
+        summed: Callable[..., jax.Array] = plgpu.inline_mgpu(
+            arg_types=(self.layout, plgpu.RefType()),
+            return_type=plgpu.ShapeDtypeStruct((value.shape[1],), jnp.float32, layout=self.column))(sums)
+        return summed(value, scratch)
 
     def tile_of(self, ref) -> jax.Array:
         return plgpu.load(ref, layout=self.layout, optimized=False)

@@ -38,8 +38,12 @@ barriers."""
 def compiler_params(*, approx_math: bool = False) -> plgpu.CompilerParams:
     """A mainloop's compiler parameters: Mosaic GPU's warpgroup lowering, whose arrays are a warpgroup's,
     and with `approx_math` the hardware's approximate exponential and reciprocal (ex2.approx, as Triton's
-    exp2 and FlashAttention's are)."""
-    return plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup, approx_math=approx_math)
+    exp2 and FlashAttention's are). No shared memory is reserved for reductions across warps: a block's
+    warpgroups reduce at once, so each takes its own scratch, the consumers' from the kernel's allocations
+    (`Family.column_sums`), and a reduction that would take Mosaic GPU's implicit scratch fails to lower
+    rather than share it."""
+    return plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup, approx_math=approx_math,
+                                reduction_scratch_bytes=0)
 
 
 def cooperative(body, out_type, *, consumers: int, cluster: int, multiprocessors: int, interpret):
@@ -430,6 +434,15 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     @abc.abstractmethod
     def column_zeros(self, count: int) -> jax.Array:
         """fp32 zeros `[count]` in a column's layout (`columns_of`'s), the carry of a tile's key sums."""
+
+    column_scratch: int
+    """The fp32 entries of shared memory a consumer's `column_sums` takes (a reduction across its warps)."""
+
+    @abc.abstractmethod
+    def column_sums(self, value: jax.Array, scratch, interpret: bool) -> jax.Array:
+        """The sums of `value`'s columns `[columns]` in a column's layout, `value` `[rows, columns]` in the
+        accumulator's layout: across the warps holding its rows, through the consumer's own `scratch`
+        (`column_scratch` fp32 entries), as the block's other warpgroups reduce at once."""
 
     @abc.abstractmethod
     def tile_of(self, ref) -> jax.Array:
