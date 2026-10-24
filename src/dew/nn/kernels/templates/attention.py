@@ -26,6 +26,8 @@ rounds to the query's dtype (`reference`).
 
 import dataclasses
 import enum
+import functools
+import operator
 from collections.abc import Callable
 from typing import NamedTuple
 
@@ -60,9 +62,11 @@ def within(keys: jax.Array, start: jax.Array, end: jax.Array,
     (the queries' and the keys', broadcasting alike), is of its document: the keys a call's spans let a
     query see, which the reference (`visible`) and every mainloop (`attention_algebra.modify`, the
     backward's tiles) mask by. Runs, an interval axis more on `start` and `end` than on `keys`, see their
-    union."""
+    union, taken run by run (their count is static), which Pallas Triton lowers where a reduction over the
+    axis (`reduce_or`) it does not."""
     if start.ndim > keys.ndim:
-        seen = jnp.any((keys[..., None] >= start) & (keys[..., None] < end), axis=-1)
+        held = [(keys >= start[..., run]) & (keys < end[..., run]) for run in range(start.shape[-1])]
+        seen = functools.reduce(operator.or_, held)
     else:
         seen = (keys >= start) & (keys < end)
     return seen if ids is None else seen & (ids[0] == ids[1])
