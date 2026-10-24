@@ -120,7 +120,7 @@ def main(config: Config) -> Path:
     data = chat_rows(config, objective, data_source(config.chat).shuffle(seed=0).repeat())
 
     checkpoints = Checkpoints(str(config.out / "checkpoints"), keep=1)
-    trainer = Trainer(objective, OptimConfig(rate=config.learning_rate), key=jax.random.key(1),
+    trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate), key=jax.random.key(1),
                       mesh=MeshSpec(fsdp=jax.device_count()),
                       layout=Layout(host=("variables",)), checkpoints=checkpoints)
     state = trainer.fit(data, steps=config.steps, log_every=1,
