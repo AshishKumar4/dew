@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS
+from generation_support import INTERPRETS, lowers
 from jax.sharding import Mesh
 from reference_error import assert_as_exact
 from test_attention_template import CASES, ROWS, arguments, geometry as core_geometry
@@ -406,6 +406,7 @@ def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, accura
     _check_hooked_backward(hooks, accurate=accurate, interpret=True)
 
 
+@lowers("sm90")
 @pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
 @pytest.mark.parametrize("call", ["causal", "causal-documents-window"])
 def test_the_launches_lower_for_an_h100(call, accurate):
@@ -440,6 +441,7 @@ def test_the_launches_lower_for_an_h100(call, accurate):
             q, kv, kv, q, residuals).lower(lowering_platforms=("cuda",))
 
 
+@lowers("sm90")
 @pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
 @pytest.mark.parametrize("hooks", BACKWARD_HOOKS)
 def test_the_backward_under_every_score_hook_lowers_for_an_h100(hooks, accurate):
