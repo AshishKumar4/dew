@@ -351,16 +351,30 @@ class Labels:
     its own, its span the whole line, and after the options the `cue`, whose last token the readout
     reads. Each label is read as the token id of each of `variants`, a template of its name (`{}`): a
     release's slot is one variant, its name after a space; a readout groups several as one. A variant
-    that spells as other than one token is refused."""
+    that spells as other than one token is refused.
+
+    `names` are the labels in slot order, a release's own list where it names its slots otherwise
+    (one that leaves out the pairs its tokenizer spells as two tokens), or `label_names`' where unset;
+    the lines and the ids both read them (`names_for`), and a question with more options than they
+    name is refused."""
 
     cue: str = "\nAnswer:"
     variants: tuple[str, ...] = (" {}",)
+    names: tuple[str, ...] | None = None
+
+    def names_for(self, count: int) -> tuple[str, ...]:
+        """The first `count` labels."""
+        if self.names is None:
+            return label_names(count)
+        if count > len(self.names):
+            raise ValueError(f"{count} options outnumber the layout's {len(self.names)} labels")
+        return self.names[:count]
 
     def ids(self, encoder: Tokenizer, count: int) -> tuple[tuple[int, ...], ...]:
         """Each of the first `count` labels' ids, one a variant."""
         same = _same(encoder)
         found = []
-        for name in label_names(count):
+        for name in self.names_for(count):
             ids = []
             for variant in self.variants:
                 spelled = variant.format(name)
@@ -459,19 +473,26 @@ class QuestionLayout(Layout):
         """A row of `question` whose options stand under labels (`self.labels`): the state and the
         question, ordered as the layout orders them (`_state_first`), each option slot a line
         `{label}. {text}`, its span the whole line, and the answer cue last, at which the labels'
-        readout reads the answer."""
+        readout reads the answer. The lines and the cue share `head_max_len` with the instructions as
+        a marker row's options do: each line cut to `option_tokens`, and every line cut evenly where
+        they leave the instructions fewer than 16 tokens. In the parallel layout every line starts at
+        the first one's position and none attends to another, and the cue, after the longest, reads
+        them all."""
         assert self.labels is not None
-        if self.parallel:
-            raise ValueError("labelled options are read at one answer cue after them all, which the parallel "
-                             "layout, each option apart, has none of")
         same = _same(encoder)
-        names = label_names(len(slots))
-        lines = [list(_piece(same, f"\n{label}. " + texts[slot].replace(specials.marker_text, " ")))
-                 [:self.option_tokens] for label, slot in zip(names, slots, strict=True)]
+        names = self.labels.names_for(len(slots))
+        whole = [list(_piece(same, f"\n{label}. " + texts[slot].replace(specials.marker_text, " ")))
+                 for label, slot in zip(names, slots, strict=True)]
         cue = list(_piece(same, self.labels.cue))
+        lines = [line[:self.option_tokens] for line in whole]
         budget = self.head_max_len - sum(map(len, lines)) - len(cue)
+        if budget < 16:
+            each = max(4, (self.head_max_len - 16 - len(cue)) // max(1, len(lines)))
+            lines = [line[:each] for line in lines]
+            budget = self.head_max_len - sum(map(len, lines)) - len(cue)
         kept_head = head[:max(8, budget)]
-        trimmed = len(kept_head) < len(head)
+        trimmed = len(kept_head) < len(head) or any(
+            len(kept) < len(full) for kept, full in zip(lines, whole, strict=True))
         begin = _begin(specials)
         fixed = len(begin) + len(kept_head) + sum(map(len, lines)) + len(cue) + 2
         kept = self._kept(state, self.max_len - fixed, conversation)
@@ -489,11 +510,12 @@ class QuestionLayout(Layout):
         if not self._state_first:
             tokens.extend([specials.separator, *kept])
         tokens.extend(cue)
-        if len(tokens) > self.max_len:
-            raise ValueError(f"a labelled row of {len(tokens)} tokens does not fit max_len={self.max_len}")
+        # A row past max_len does not fit (`fits`): training leaves it out and a task refuses it.
+        positions, option_slots = (_parallel(spans, len(tokens)) if self.parallel else (None, None))
         laid = Laid(name, kind_of(question), span, tuple(spans), tuple(slots), readout=len(tokens) - 1,
                     label_ids=self.labels.ids(encoder, len(slots)))
-        return Encoded(tuple(tokens), (laid,), None, None, len(state), len(kept), trimmed=trimmed)
+        return Encoded(tuple(tokens), (laid,), positions, option_slots, len(state), len(kept),
+                       trimmed=trimmed)
 
     _state_first: ClassVar[bool] = True
     """Whether a row starts with the state, before the question; a marker layout puts it after."""

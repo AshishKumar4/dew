@@ -453,6 +453,17 @@ class AffineHead(Protocol):
     def output_table(self) -> OutputTable | None: ...
 
 
+def head_table(model: nn.Module, variables) -> OutputTable | None:
+    """`model`'s head over `variables` as one matrix (`AffineHead.output_table`),
+    or None for a model whose head no matrix alone is, or that names none: the
+    one checked read of a model's output table, which a loss and a readout share."""
+    table = model.apply(variables, method="output_table") if isinstance(model, AffineHead) else None
+    if table is not None and not isinstance(table, OutputTable):
+        raise TypeError(f"{type(model).__name__}.output_table gives a {type(table).__name__}, "
+                        f"not an OutputTable")
+    return table
+
+
 @runtime_checkable
 class VocabularyRows(Protocol):
     """A model whose head scores its final states against one row per vocabulary token: each

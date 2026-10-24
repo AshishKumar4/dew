@@ -522,20 +522,46 @@ def test_a_released_checkpoint_refuses_what_its_layout_cannot_hold(decide, tmp_p
         gated.save_pretrained(tmp_path)
 
 
+MESH_SEEDS = 8
+"""Check 1's declared seeds for a task's logits on a mesh against one device's."""
+
+
 @pytest.mark.mesh
 def test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh(decide):
     """A task whose weights are placed on a mesh of every device scores its examples there, its rows
     split over the mesh's row axes, as a run's validation splits them, rather than handing one device's
-    inputs to weights on several; it answers the questions it answers on one device."""
+    inputs to weights on several: a pass of three rows, the task's budget, is rounded up to a multiple
+    of the devices the mesh splits rows over. Each answered question's logits there are on par from
+    float64 with the task's on one device (check 1), and its metrics are the ones it scores there."""
     from jax.sharding import NamedSharding, PartitionSpec
 
     from dew.training import MeshSpec
 
     examples = answered()
-    alone = decide.score(examples)
     mesh = MeshSpec().build(jax.devices())
-    spread = replace(decide, variables=jax.device_put(decide.variables, NamedSharding(
-        mesh, PartitionSpec())))
-    scores = spread.score(examples)
+    task = replace(decide, budget=Budget(rows=3))
+    wide = replace(Decide.from_pretrained(TINY, dtype="float64", param_dtype="float64", attention_impl="xla"),
+                   budget=task.budget)
+
+    def held_logits(on: Decide) -> np.ndarray:
+        return np.concatenate([scored.logits for scored in on._scored(on._held(examples, on._mesh))])
+
+    def spread(variables) -> Decide:
+        return replace(task, variables=jax.device_put(variables, NamedSharding(mesh, PartitionSpec())))
+
+    def draw(seed):
+        key = jax.random.key(seed)
+        return (jax.tree.map(lambda leaf: leaf * (1 + 0.05 * jax.random.normal(key, np.shape(leaf))),
+                             decide.variables),)
+
+    def alone(variables) -> np.ndarray:
+        return held_logits(replace(task, variables=variables))
+
+    def truth(variables) -> np.ndarray:
+        return held_logits(replace(wide, variables=variables))
+
+    assert_as_exact(lambda variables: held_logits(spread(variables)), alone, draw, "scored on a mesh",
+                    seeds=MESH_SEEDS, truth_fn=truth)
+    alone, scores = task.score(examples), spread(decide.variables).score(examples)
     assert set(scores) == set(alone) and all(np.isfinite(value) for value in scores.values())
     assert scores["accuracy"] == alone["accuracy"]

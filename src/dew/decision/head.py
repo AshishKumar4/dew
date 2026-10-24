@@ -57,6 +57,9 @@ class Head(nn.Module):
     """Whether the head reads the answer state of each question at its row's answer cue
     (`DecisionInputs.readout`) against labels (`Labels`), the backbone's output table its `table`
     (`OutputTable`, None where no matrix alone is the backbone's head)."""
+    draws_from_rows: ClassVar[bool] = False
+    """Whether the head draws its parameters from the backbone's vocabulary rows (`VocabularyRows`),
+    its `table` when it is drawn, and reads no table after."""
     one_question: ClassVar[bool] = False
     """Whether the head reads one question a row, refusing a joint row's several
     questions at the host boundary (`validate_rows`)."""
@@ -463,16 +466,27 @@ class LabelReadout(Head):
     `untied` gives each slot's every variant a trainable row and bias of its own, drawn from its
     variant's output row (scale folded in) and bias, read through the same input QDQ and softcap and
     grouped alike, so at its draw it is the tied readout at every state; it needs the backbone's
-    output table to draw from (`table`)."""
+    output table to draw from (`table`). Its rows and their product compute in at least float32, its
+    table's or `dtype` where wider.
+
+    A row's labels are the head's, its first as many as the question has options (`validate_rows`);
+    option slots past the labels, a batch's padding, read -inf."""
 
     features: int
     label_ids: tuple[tuple[int, ...], ...]
     untied: bool = False
+    dtype: Dtype | None = None
     reads_labels: ClassVar[bool] = True
 
     @nn.nowrap
     def tied_labels(self) -> tuple[tuple[int, ...], ...] | None:
         return None if self.untied else self.label_ids
+
+    @nn.nowrap
+    def validate_rows(self, rows: Sequence[Encoded]) -> None:
+        """Refuse rows whose labels are not the head's (`_labels_of`)."""
+        super().validate_rows(rows)
+        _refuse_other_labels(rows, self.label_ids)
 
     @nn.nowrap
     def decision_flops(self, lengths, questions, options) -> float:
@@ -485,25 +499,27 @@ class LabelReadout(Head):
     def __call__(self, states: jax.Array, inputs: DecisionInputs, table=None, train: bool = False, *,
                  tied: jax.Array | None = None) -> jax.Array:
         width = inputs.options.shape[-1]
-        if width > len(self.label_ids):
-            raise ValueError(f"{width} option slots outnumber the readout's {len(self.label_ids)} labels")
         ids = jnp.asarray(self.label_ids, jnp.int32)
         if not self.untied:
             assert tied is not None, "a tied readout reads the backbone's own label logits"
-            return jax.nn.logsumexp(tied[..., :width, :], axis=-1)
+            return _past_labels(jax.nn.logsumexp(tied[..., :width, :], axis=-1), width)
         if table is None:
             raise TypeError("an untied readout draws its rows from the backbone's output table, which a head "
                             "past a transform, an adapter or a code has not; read the labels tied instead")
-        rows = self.param("rows", lambda key: jnp.take(table.rows(), ids.reshape(-1), axis=0).astype(
-            jnp.float32).reshape(*ids.shape, -1))
-        bias = self.param("bias", lambda key: (jnp.zeros(ids.shape, jnp.float32) if table.bias is None else
-                                               jnp.take(table.bias, ids.reshape(-1)).reshape(ids.shape)
-                                               .astype(jnp.float32)))
+
+        def drawn(values: jax.Array) -> jax.Array:
+            return values.astype(_wide(values.dtype, self.dtype))
+
+        rows = self.param("rows", lambda key: drawn(jnp.take(table.rows(), ids.reshape(-1), axis=0)).reshape(
+            *ids.shape, -1))
+        bias = self.param("bias", lambda key: (
+            jnp.zeros(ids.shape, _wide(table.matrix.dtype, self.dtype)) if table.bias is None
+            else drawn(jnp.take(table.bias, ids.reshape(-1)).reshape(ids.shape))))
         answers = table.states(_answers(states, inputs))
-        answers = answers.astype(at_least_fp32(answers.dtype))
-        logits = jnp.einsum("bqd,kvd->bqkv", answers, rows, precision=jax.lax.Precision.HIGHEST)
-        capped = capped_logits(scaled_logits(logits, None, bias), table.softcap)
-        return jax.nn.logsumexp(capped[..., :width, :], axis=-1)
+        answers = answers.astype(_wide(jnp.result_type(answers, rows), self.dtype))
+        logits = jnp.einsum("bqd,kvd->bqkv", answers, rows[:width], precision=jax.lax.Precision.HIGHEST)
+        capped = capped_logits(scaled_logits(logits, None, bias[:width]), table.softcap)
+        return _past_labels(jax.nn.logsumexp(capped, axis=-1), width)
 
 
 class SlotReadout(Head):
@@ -517,22 +533,34 @@ class SlotReadout(Head):
 
     `slot_rows` is the rows the head holds, the labels' count where unset: a release may hold more
     rows than its tokenizer spells labels for, the rows past the labels kept, drawn at zero, and read by
-    no option."""
+    no option. Drawn fresh, its slot rows are the backbone's vocabulary rows at its labels
+    (`VocabularyRows`, its `table` then), or a normal of std `features ** -0.5` over a backbone that
+    gives none. It computes in at least float32, its states' or `dtype` where wider; option slots past
+    the labels, a batch's padding, read -inf."""
 
     features: int
     label_ids: tuple[int, ...]
     head_dim: int = 64
     slot_rows: int | None = None
+    dtype: Dtype | None = None
     reads_labels: ClassVar[bool] = True
+    draws_from_rows: ClassVar[bool] = True
+
+    @nn.nowrap
+    def validate_rows(self, rows: Sequence[Encoded]) -> None:
+        """Refuse rows whose labels are not the head's (`_labels_of`)."""
+        super().validate_rows(rows)
+        _refuse_other_labels(rows, tuple((label,) for label in self.label_ids))
 
     @nn.nowrap
     def decision_flops(self, lengths, questions, options) -> float:
-        """The slots' rows and the query over each answer state, the key over each option's pooled line,
-        and the line pooling."""
-        decision_geometry(lengths, questions, options)
-        return (projection_flops(questions, self.features, len(self.label_ids) + self.head_dim)
-                + projection_flops(options, self.features, self.head_dim)
-                + 2 * np.sum(options) * self.head_dim)
+        """Each real option's slot product and key, its affinity with its question's query, and its
+        line's pooling over the row; each question's query."""
+        lengths, questions, options = decision_geometry(lengths, questions, options)
+        return (projection_flops(questions, self.features, self.head_dim)
+                + projection_flops(options, self.features, 1 + self.head_dim)
+                + 2 * np.sum(options.astype(np.float64)) * self.head_dim
+                + projection_flops(options * lengths, 1, self.features))
 
     @nn.compact
     def __call__(self, states: jax.Array, inputs: DecisionInputs, table=None, train: bool = False, *,
@@ -542,29 +570,54 @@ class SlotReadout(Head):
         held = labels if self.slot_rows is None else self.slot_rows
         if held < labels:
             raise ValueError(f"{held} slot rows hold fewer than the {labels} labels")
-        if width > labels:
-            raise ValueError(f"{width} option slots outnumber the readout's {labels} labels")
+        real = min(width, labels)
         ids = jnp.asarray(self.label_ids, jnp.int32)
+        drawn_dtype = _wide(jnp.float32 if table is None else table.dtype, self.dtype)
 
         def drawn(key):
             if table is None:
-                rows = jax.random.normal(key, (labels, self.features), jnp.float32) * self.features ** -0.5
+                rows = jax.random.normal(key, (labels, self.features), drawn_dtype) * self.features ** -0.5
             else:
-                rows = jnp.take(table.rows(), ids, axis=0).astype(jnp.float32)
+                rows = jnp.take(table, ids, axis=0).astype(drawn_dtype)
             return jnp.pad(rows, ((0, held - labels), (0, 0)))
 
         slots = self.param("slots", drawn)
         q = self.param("q", nn.initializers.normal(self.features ** -0.5), (self.head_dim, self.features),
-                       jnp.float32)
-        k = self.param("k", nn.initializers.zeros, (self.head_dim, self.features), jnp.float32)
-        states = states.astype(at_least_fp32(states.dtype))
+                       drawn_dtype)
+        k = self.param("k", nn.initializers.zeros, (self.head_dim, self.features), drawn_dtype)
+        states = states.astype(_wide(jnp.result_type(states, slots), self.dtype))
         answers = _answers(states, inputs)
-        pooled = _span_means(states, inputs.option_spans)
+        pooled = _span_means(states, inputs.option_spans[:, :, :real])
         highest = jax.lax.Precision.HIGHEST
-        score = jnp.einsum("bqd,kd->bqk", answers, slots[:width], precision=highest)
+        score = jnp.einsum("bqd,kd->bqk", answers, slots[:real], precision=highest)
         query = jnp.einsum("bqd,hd->bqh", answers, q, precision=highest)
         key = jnp.einsum("bqkd,hd->bqkh", pooled, k, precision=highest)
-        return score + jnp.einsum("bqh,bqkh->bqk", query, key, precision=highest) / math.sqrt(self.head_dim)
+        scores = score + jnp.einsum("bqh,bqkh->bqk", query, key, precision=highest) / math.sqrt(self.head_dim)
+        return _past_labels(scores, width)
+
+
+def _wide(dtype, floor: Dtype | None) -> jnp.dtype:
+    """`dtype` at least float32, and at least `floor` where one is given."""
+    return at_least_fp32(dtype if floor is None else jnp.promote_types(dtype, floor))
+
+
+def _past_labels(scores: jax.Array, width: int) -> jax.Array:
+    """`scores` `[B, Q, K]` of a readout's labels widened to `width` option slots, -inf past them."""
+    return jnp.pad(scores, ((0, 0), (0, 0), (0, width - scores.shape[-1])), constant_values=-jnp.inf)
+
+
+def _refuse_other_labels(rows: Sequence[Encoded], labels: tuple[tuple[int, ...], ...]) -> None:
+    """Refuse a row whose question stands under other labels than a readout's `labels`, or under none,
+    or has more options than the readout reads: each question's labels are the readout's first."""
+    for row in rows:
+        for laid in row.questions:
+            if laid.label_ids is None:
+                raise ValueError(f"question {laid.name!r} stands under no labels, which a readout reads; lay "
+                                 "its rows out with labels (QuestionLayout.labels)")
+            if tuple(laid.label_ids) != labels[:len(laid.label_ids)] or len(laid.label_ids) > len(labels):
+                raise ValueError(f"question {laid.name!r} stands under {len(laid.label_ids)} labels other "
+                                 f"than the readout's first, of {len(labels)}; lay the rows out under the "
+                                 "readout's labels")
 
 
 HEADS: Mapping[str, type[Head]] = {head.__name__: head for head in (DecisionHead, JointSchemaHead,

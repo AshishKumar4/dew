@@ -1,17 +1,23 @@
 """A decision's option orders are the data's to draw (data.md §2): a random step's draw is keyed by the
 data seed and the record's place in the run's order, its epoch included. So two runs that share a data
-seed see the same orders whatever their model seeds, each pass over the data reorders them, and a
-resume restores them where it left off."""
+seed see the same orders whatever their model seeds, as a decision run builds its loader
+(`DecisionRunConfig.prepare`), each pass over the data reorders them, and a resume restores them where
+it left off."""
 
+import dataclasses
 import itertools
+from pathlib import Path
 
 import numpy as np
 from test_decision_objective import EXAMPLES, SPECIALS, TOKENIZER, tiny_backbone
 
-from dew.data import Memory
+from dew.data import Loading, Memory
 from dew.data.compile import compile
 from dew.data.dataset import Checkpointable, DataPartition
 from dew.decision import DecisionObjective, JointLayout, decisions
+from dew.decision.config import DecisionRunConfig
+
+TINY = Path(__file__).parent / "fixtures" / "laya" / "tiny"
 
 ROWS = 1
 """One window a batch, and one row a window (`segments=1`), so each pass is the examples' count."""
@@ -49,3 +55,31 @@ def test_option_orders_follow_the_data_seed_each_pass_and_a_resume():
     resumed = windows(0, 2 * per_pass, resumed=per_pass + 1)
     assert all(np.array_equal(a, b) for a, b in zip(one, resumed, strict=True))
     assert any(not np.array_equal(a, b) for a, b in zip(one, windows(1, 2 * per_pass), strict=True))
+
+
+class Loaded(DecisionRunConfig):
+    """A decision run that hands back the loader it would train on, rather than training."""
+
+    def train(self, objective, dataset, **settings):
+        return dataset
+
+
+def run_windows(model_seed: int, data_seed: int, count: int) -> list[np.ndarray]:
+    """The first `count` training windows' tokens of a decision run over the examples, as its
+    `prepare` builds its loader, under its trainer's key `model_seed` and its `data_seed`."""
+    chain = (Memory([{"example": example} for example in EXAMPLES]).pipe(decisions).read("memory")
+             .batch(ROWS).loading(Loading(workers=0)))
+    default = Loaded()
+    run = dataclasses.replace(default, pretrained=str(TINY), data=chain, data_seed=data_seed,
+                              trainer=dataclasses.replace(default.trainer, key=model_seed))
+    loader = run.prepare().train("orders")
+    return [np.asarray(batch["tokens"]) for batch in itertools.islice(loader.train(DataPartition()), count)]
+
+
+def test_a_decision_runs_option_orders_are_its_data_seeds_whatever_its_model_seed():
+    """Two decision runs of one data seed and two model seeds lay out the same windows, their options
+    in the same orders; another data seed lays them out otherwise."""
+    count = 2 * len(EXAMPLES)
+    one, other = run_windows(0, 0, count), run_windows(1, 0, count)
+    assert all(np.array_equal(a, b) for a, b in zip(one, other, strict=True))
+    assert any(not np.array_equal(a, b) for a, b in zip(one, run_windows(0, 1, count), strict=True))

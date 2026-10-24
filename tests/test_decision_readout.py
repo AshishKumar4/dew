@@ -3,23 +3,34 @@
 the answer cue last; the tied readout is the backbone's own logit at each label, on par from float64
 with the backbone's full logits there (check 1), through a LoRA-adapted head too, which has no single
 table; an untied readout at its draw is the tied one (check 1), a label of several variants among
-them; and a release's slot head computes the release's law (check 1, with nonzero q and k). A packed
+them, drawn by its own initializer from tables with a bias, a scale and a softcap; a release's slot
+head computes the release's law (check 1, with nonzero q and k); a readout reads a pass padded past
+its labels; parallel lines read none of each other; and rows under other labels are refused. A packed
 window reads each row's answer as the row alone does (test_decision_packing's readout arm)."""
 
 import dataclasses
+from dataclasses import replace
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, without_ynn
 from test_decision_objective import SPECIALS, TOKENIZER
 
 from dew.decision import Choice
 from dew.decision.head import LabelReadout, SlotReadout
 from dew.decision.layout import DecisionInputs, Labels, StateFirstLayout
 from dew.decision.model import DecisionModel
+from dew.decision.objective import DecisionObjective
+from dew.interop import Pretrained
+from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.protocols import OutputTable
+from dew.objectives.base import part, thaw
+
+LLAMA = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
 
 LABELS = Labels(variants=("{}",))
 """Labels a byte vocabulary spells as one token each: the bare letter."""
@@ -82,40 +93,89 @@ def test_the_tied_readout_is_the_backbones_own_logit_at_each_label():
         answer = jnp.take_along_axis(logits, batch.readout[..., None], axis=1)
         return jnp.take(answer, jnp.asarray([label for (label,) in ids()]), axis=-1)
 
-    assert_as_exact(lambda values, batch: decision.logits(values, batch), full, draw, "tied readout",
+    assert_as_exact(without_ynn(decision.logits), without_ynn(full), draw, "tied readout",
                     seeds=READOUT_SEEDS)
 
 
-def test_an_untied_readout_at_its_draw_is_the_tied_one_a_label_of_two_variants_among_them():
-    """Each slot's every variant drawn from its output row and bias, read through the same cap and
-    grouping: at its draw the untied readout is the tied one (check 1), each label grouped from two
-    variants (`A`, `a`)."""
-    grouped = ((65, 97), (66, 98), (67, 99))
-    tied = model(LabelReadout(32, grouped))
-    untied = model(LabelReadout(32, grouped, untied=True))
-    inputs = DecisionInputs.collate(rows_of(0), SPECIALS.pad)
-    params = tied.backbone.init(jax.random.key(0), inputs.tokens)["params"]
-    table = untied.output_table({"params": {"backbone": params}})
-    states = jnp.zeros((1, 4, 32), jnp.float32)
-    assert inputs.readout is not None and table is not None
-    one = dataclasses.replace(inputs, readout=jnp.zeros_like(inputs.readout))
-    head = untied.head.init(jax.random.key(1), states, one, table)["params"]
+def test_a_lora_adapted_heads_readout_is_its_own_logits_at_the_labels():
+    """A backbone whose output head carries a LoRA adapter is no single table (`output_table` None):
+    the tied readout reads its exact head over the answer states (`LogitsFromHidden`), on par from
+    float64 with the adapted backbone's full logits at each label (check 1), its factors nonzero."""
+    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=128)
+    adapted = source.adapt(LoRA(rank=2, modules=("lm_head",)), key=0)
+    objective = DecisionObjective(adapted, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
+                                  head=LabelReadout(64, ids()))
+    decision = objective.model
+    initialized = objective.init(jax.random.key(0))
+    assert decision.output_table(initialized) is None
 
     def draw(seed):
-        return moved(params, seed), DecisionInputs.collate(rows_of(seed), SPECIALS.pad)
+        key = jax.random.key(seed)
+        # Additive, so the adapter's zero factors move off zero.
+        values = jax.tree.map(lambda leaf: leaf + 0.05 * jax.random.normal(key, leaf.shape, leaf.dtype),
+                              initialized)
+        return values, DecisionInputs.collate(rows_of(seed), SPECIALS.pad)
 
-    def drawn_untied(backbone_params, batch):
-        table = untied.output_table({"params": {"backbone": backbone_params}})
-        assert table is not None
-        rows = jnp.take(table.rows(), jnp.asarray(grouped).reshape(-1), axis=0).reshape(3, 2, -1)
-        bias = jnp.zeros((3, 2)) if table.bias is None else jnp.take(table.bias, jnp.asarray(grouped))
-        return untied.logits({"params": {"backbone": backbone_params, "head": {**head, "rows": rows,
-                                                                               "bias": bias}}}, batch)
+    def full(values, batch):
+        logits = jnp.asarray(decision.backbone.apply(thaw(part(values, "backbone")), batch.tokens))
+        answer = jnp.take_along_axis(logits, batch.readout[..., None], axis=1)
+        return jnp.take(answer, jnp.asarray([label for (label,) in ids()]), axis=-1)
 
-    def drawn_tied(backbone_params, batch):
-        return tied.logits({"params": {"backbone": backbone_params, "head": {}}}, batch)
+    assert_as_exact(without_ynn(decision.logits), without_ynn(full), draw, "adapted readout",
+                    seeds=READOUT_SEEDS)
 
-    assert_as_exact(drawn_untied, drawn_tied, draw, "untied at its draw", seeds=READOUT_SEEDS)
+
+def table_of(seed: int, vocab: int = 128, features: int = 32) -> OutputTable:
+    """An output table with a bias, a per-token scale off one and a softcap, drawn from `seed`."""
+    rng = np.random.default_rng([0x7AB, seed])
+    return OutputTable(jnp.asarray(rng.standard_normal((vocab, features)) * 0.3, jnp.float32),
+                       vocab_major=True, bias=jnp.asarray(rng.standard_normal(vocab), jnp.float32),
+                       softcap=3.0, scale=jnp.asarray(1 + 0.5 * rng.random(vocab), jnp.float32))
+
+
+GROUPED = ((65, 97), (66, 98), (67, 99))
+"""Labels of two variants each, `A` and `a`."""
+
+
+def test_an_untied_readout_drawn_from_a_table_is_its_tied_readout():
+    """Each slot's every variant drawn by the head's own initializer from its table's row (scale folded
+    in) and bias, read through the table's QDQ and cap and grouped alike: at its draw the untied
+    readout is the tied one, the table's own columns grouped (check 1), over tables with a bias, a
+    scale off one and a softcap, each label of two variants."""
+    tied, untied = LabelReadout(32, GROUPED), LabelReadout(32, GROUPED, untied=True)
+
+    def draw(seed):
+        batch = DecisionInputs.collate(rows_of(seed), SPECIALS.pad)
+        states = jax.random.normal(jax.random.key(seed), (*batch.tokens.shape, 32), jnp.float32)
+        return table_of(seed), states, batch
+
+    def drawn(table, states, batch):
+        return untied.apply(untied.init(jax.random.key(0), states, batch, table), states, batch, table)
+
+    def columns(table, states, batch):
+        answers = jnp.take_along_axis(states, batch.readout[..., None], axis=1)
+        found = table.columns(answers, np.asarray(GROUPED).reshape(-1).tolist(), exact=True)
+        return tied.apply({}, states, batch, table, tied=found.reshape(*answers.shape[:2], 3, 2))
+
+    assert_as_exact(without_ynn(drawn), without_ynn(columns), draw, "untied drawn", seeds=READOUT_SEEDS)
+
+
+def test_a_runs_untied_readout_starts_as_its_tied_readout():
+    """The objective draws an untied readout from its backbone's table (`complete_variables`): a run's
+    first logits are the tied readout's over the same backbone (check 1)."""
+    objective = DecisionObjective(backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
+                                  head=LabelReadout(32, GROUPED, untied=True))
+    tied = model(LabelReadout(32, GROUPED))
+    initialized = jax.jit(objective.init)
+
+    def draw(seed):
+        return initialized(jax.random.key(seed)), DecisionInputs.collate(rows_of(seed), SPECIALS.pad)
+
+    def as_tied(values, batch):
+        return tied.logits({"params": {"backbone": values["params"]["backbone"], "head": {}}}, batch)
+
+    assert_as_exact(without_ynn(objective.model.logits), without_ynn(as_tied), draw, "untied at its start",
+                    seeds=READOUT_SEEDS)
 
 
 def test_a_slot_heads_scores_are_the_releases_law_with_its_query_and_key_trained():
@@ -151,19 +211,68 @@ def test_a_slot_heads_scores_are_the_releases_law_with_its_query_and_key_trained
         logits = score + jnp.einsum("bqh,bqkh->bqk", query, key) / np.sqrt(8)
         return jnp.where(batch.options, logits, -jnp.inf)
 
-    assert_as_exact(dew, law, draw, "slot head law", seeds=READOUT_SEEDS)
+    assert_as_exact(without_ynn(dew), without_ynn(law), draw, "slot head law", seeds=READOUT_SEEDS)
+
+
+def padded(batch: DecisionInputs, width: int) -> DecisionInputs:
+    """`batch` with its option slots padded to `width`, as a pass rounds them (`shape_bucket`)."""
+    more = width - batch.options.shape[-1]
+    return dataclasses.replace(batch, options=jnp.pad(batch.options, ((0, 0), (0, 0), (0, more))),
+                               option_spans=jnp.pad(batch.option_spans, ((0, 0), (0, 0), (0, more), (0, 0))))
+
+
+@pytest.mark.parametrize("kind", ["tied", "untied", "slots"])
+def test_a_readout_of_as_many_labels_as_options_reads_a_pass_padded_past_them(kind):
+    """A pass pads its option slots past a question's (`Decide`'s shape buckets): a readout of exactly
+    as many labels as the options reads the padded pass, the real options' logits those of the pass
+    unpadded and the padding -inf; a float64 head of either kind reloads (`clone(dtype=)`)."""
+    head = {"tied": LabelReadout(32, ids()), "untied": LabelReadout(32, ids(), untied=True),
+            "slots": SlotReadout(32, tuple(label for (label,) in ids()), head_dim=8)}[kind]
+    objective = DecisionObjective(backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
+                                  head=head)
+    variables = objective.init(jax.random.key(0))
+    batch = DecisionInputs.collate(rows_of(0), SPECIALS.pad)
+    exact = np.asarray(objective.model.logits(variables, batch))
+    wide = np.asarray(objective.model.logits(variables, padded(batch, 4)))
+    np.testing.assert_array_equal(wide[..., :3], exact)
+    assert np.all(np.isneginf(wide[..., 3]))
+    assert head.clone(dtype=jnp.float64).dtype == jnp.float64
+
+
+def test_a_parallel_labelled_rows_lines_read_none_of_each_other():
+    """In the parallel layout each lettered line starts at the first one's position, a slot of its own,
+    and the cue after the longest reads them all: a line's states are the same whatever another line
+    holds (the row's other option changed to text of its length)."""
+    layout = replace(LAYOUT, parallel=True)
+    choices = [Choice("Which team?", ["billing", "tech", other]) for other in ("sales", "games")]
+    rows = [layout.rows(TOKENIZER, SPECIALS, "one two three", {"team": choice})[0] for choice in choices]
+    [laid] = rows[0].questions
+    assert rows[0].positions is not None and rows[0].slots is not None
+    starts = [rows[0].positions[start] for start, _ in laid.options]
+    assert len(set(starts)) == 1
+    assert [rows[0].slots[start] for start, _ in laid.options] == [1, 2, 3]
+    assert rows[0].slots[-1] == 0
+    decision = model(LabelReadout(32, ids()))
+    inputs = [DecisionInputs.collate([row], SPECIALS.pad) for row in rows]
+    variables = {"params": {"backbone": decision.backbone.init(jax.random.key(0), inputs[0].tokens)["params"],
+                            "head": {}}}
+    first, second = (np.asarray(decision.states(variables, one)) for one in inputs)
+    start, end = laid.options[0]
+    np.testing.assert_array_equal(first[0, start:end], second[0, start:end])
 
 
 def test_a_readout_refuses_what_it_cannot_read():
-    """A labelled layout over a variant its vocabulary spells as two tokens, the parallel layout, and
-    more option slots than labels are each refused."""
+    """A label its vocabulary spells as two tokens, a question of more options than a layout's own
+    labels name, and rows under other labels than the readout's, or more of them, are each refused."""
     with pytest.raises(ValueError):
         Labels(variants=(" {}",)).ids(TOKENIZER, 3)
     with pytest.raises(ValueError):
-        StateFirstLayout(max_len=128, labels=LABELS, parallel=True).rows(TOKENIZER, SPECIALS, "s",
-                                                                         {"team": QUESTION})
-    decision = model(LabelReadout(32, ids(2)))
-    inputs = DecisionInputs.collate(rows_of(0), SPECIALS.pad)
-    params = decision.backbone.init(jax.random.key(0), inputs.tokens)["params"]
+        replace(LAYOUT, labels=Labels(variants=("{}",), names=("A", "B"))).rows(
+            TOKENIZER, SPECIALS, "s", {"team": QUESTION})
+    rows = rows_of(0)
     with pytest.raises(ValueError):
-        decision.logits({"params": {"backbone": params, "head": {}}}, inputs)
+        LabelReadout(32, ids(2)).validate_rows(rows)
+    with pytest.raises(ValueError):
+        LabelReadout(32, GROUPED).validate_rows(rows)
+    with pytest.raises(ValueError):
+        SlotReadout(32, (66, 67, 68)).validate_rows(rows)

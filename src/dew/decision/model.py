@@ -13,12 +13,12 @@ from dew.decision.head import Head
 from dew.decision.layout import DecisionInputs
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, ModelInputs
 from dew.nn.protocols import (
-    AffineHead,
     CrossAttending,
     HiddenStates,
     LogitsFromHidden,
     OutputTable,
     VocabularyRows,
+    head_table,
 )
 from dew.objectives.base import Variables, part, thaw
 
@@ -137,8 +137,9 @@ class DecisionModel:
         if self.head.reads_labels:
             labels = self.head.tied_labels()
             tied = None if labels is None else self.label_logits(variables, states, inputs, labels)
-            logits = _array(self.head.apply(head, states, inputs, self.output_table(variables), train=train,
-                                            tied=tied, rngs=rngs))
+            # A head drawn from the vocabulary rows reads no table after its draw.
+            table = None if self.head.draws_from_rows else self.output_table(variables)
+            logits = _array(self.head.apply(head, states, inputs, table, train=train, tied=tied, rngs=rngs))
         else:
             table = self.table(variables) if self.head.reads_table else None
             logits = _array(self.head.apply(head, states, inputs, table, train=train, rngs=rngs))
@@ -146,12 +147,7 @@ class DecisionModel:
 
     def output_table(self, variables: Variables) -> OutputTable | None:
         """The backbone's head as one matrix (`AffineHead`), or None where no matrix alone is it."""
-        if not isinstance(self.backbone, AffineHead):
-            return None
-        table = self.backbone.apply(thaw(part(variables, "backbone")), method="output_table")
-        if table is not None and not isinstance(table, OutputTable):
-            raise TypeError(f"output_table returned a {type(table).__name__}, not an OutputTable")
-        return table
+        return head_table(self.backbone, thaw(part(variables, "backbone")))
 
     def label_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
                      labels: tuple[tuple[int, ...], ...]) -> jax.Array:

@@ -43,7 +43,7 @@ from dew.lora import Adapter
 from dew.nn.cross_attention import crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import ModelInputs
-from dew.nn.protocols import CountedDecisions, CountedTraining, CrossAttending, TokenModel
+from dew.nn.protocols import CountedDecisions, CountedTraining, CrossAttending, TokenModel, VocabularyRows
 from dew.objectives.base import (
     FROZEN,
     OMITTED,
@@ -606,9 +606,12 @@ class DecisionObjective(Objective[Ratio]):
             )
             backbone = joined({"backbone": parts["backbone"]})
             if self.model.head.reads_labels:
-                # A readout draws its rows from the backbone's output table, its answer at position 0.
+                # A readout draws its rows from the backbone's output table, or from its vocabulary rows
+                # where it reads them, its answer at position 0.
                 inputs = dataclasses.replace(inputs, readout=jnp.zeros((1, 1), jnp.int32))
-                table = self.model.output_table(backbone)
+                gives_rows = isinstance(self.model.backbone, VocabularyRows)
+                table = (self.model.output_table(backbone) if not self.model.head.draws_from_rows
+                         else self.model.table(backbone) if gives_rows else None)
                 labels = self.model.head.tied_labels()
                 tied = (None if labels is None else
                         jnp.zeros((1, 1, 1, len(labels[0])), jnp.float32))
