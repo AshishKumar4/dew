@@ -60,14 +60,12 @@ def hosts(reference: PreTrainedTokenizerBase) -> TypeGuard[HostProcessor]:
                for name in ("__call__", "save_pretrained", "apply_chat_template", "batch_decode"))
 
 
-def _media_token_ids(record: Mapping[str, object], config: Mapping[str, object], *,
-                     qwen: bool, gemma: bool) -> tuple[int, int | None]:
-    """Read the source's image/video placeholder IDs before aligning features."""
-    image_id = record.get("image_token_id", config.get("image_token_id"))
+def _media_token_ids(record: Mapping[str, object]) -> tuple[int, int | None]:
+    """The source's image and video placeholder IDs, as its wrapper record reads them
+    (`hf_decoders.translate_wrapper_config`), before aligning features."""
+    image_id, video_id = record.get("image_token_id"), record.get("video_token_id")
     if type(image_id) is not int:
         raise ValueError("image_token_id must be an integer")
-    video_id = (config.get("video_token_id", 258884) if gemma else
-                config.get("video_token_id") if qwen else None)
     if video_id is not None and type(video_id) is not int:
         raise ValueError("video_token_id must be an integer")
     return image_id, video_id
@@ -406,7 +404,7 @@ class Processor:
         """
         qwen = self.config.get("model_type") in QWEN35_TYPES
         gemma = self.config.get("model_type") == "gemma4"
-        image_id, video_id = _media_token_ids(self.record, self.config, qwen=qwen, gemma=gemma)
+        image_id, video_id = _media_token_ids(self.record)
         pixels = np.asarray(values.get("pixel_values", values.get("pixel_values_videos")))
         if pixels.ndim not in (2, 3, 4) or not np.issubdtype(pixels.dtype, np.floating):
             raise ValueError("pixel_values must contain floating image tensors or patch vectors")
@@ -590,7 +588,7 @@ class Processor:
                     pieces.append((pixels[offset:offset + frames * count],
                                    (frames, int(height), int(width))))
                     offset += frames * count
-            token_id = self.config[token_name]
+            token_id = self.record.get(token_name)
             if type(token_id) is not int:
                 raise ValueError(f"{token_name} must be an integer")
             streams[token_id] = pieces

@@ -62,7 +62,7 @@ def objective(loaded, *, variables=None, **kwargs):
 
 
 def reference_variables(loaded, name):
-    values = translate_weights(load_file(str(REFERENCES / name)), loaded.config)
+    values, _ = translate_weights(load_file(str(REFERENCES / name)), loaded.config)
     return objective(loaded, variables=values).init(jax.random.key(0))
 
 
