@@ -1324,7 +1324,11 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     if dropout_rate:
         if dropout_seed is None:
             raise ValueError("training attention dropout requires dropout_seed")
-        weights = weights * dropout_draw(dropout_seed, dropout_rate, weights.shape).astype(dtype)
+        # The multiplier and the scaling stay in fp32 and the weights round once, to the dtype (ledger
+        # 1533): a 1 / (1 - rate) rounded to bf16 first biases every kept weight.
+        wide = at_least_fp32(dtype)
+        draw = dropout_draw(dropout_seed, dropout_rate, weights.shape)
+        weights = (weights.astype(wide) * draw).astype(dtype)
     if sinks is None:
         return weighted_values('...hqk,...khd->...qhd', weights, value, precision=precision)
     if kv_heads == 1:
