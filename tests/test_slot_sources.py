@@ -55,7 +55,8 @@ def test_a_slot_release_loads_its_readout_and_exports_the_same_task(tmp_path, re
     host = Pretrained.load(source, dtype="float32", attention_impl="xla", on_host=True)
     for abstract, held, original in zip(jax.tree.leaves((shapes.variables, shapes.head_variables)),
                                        jax.tree.leaves((host.variables, host.head_variables)),
-                                       jax.tree.leaves((bundle.variables, bundle.head_variables)), strict=True):
+                                       jax.tree.leaves((bundle.variables, bundle.head_variables)),
+                                       strict=True):
         assert isinstance(abstract, jax.ShapeDtypeStruct)
         assert isinstance(held, np.ndarray)
         assert abstract.shape == held.shape == original.shape

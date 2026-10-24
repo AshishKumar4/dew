@@ -43,10 +43,12 @@ _NOT_ONE_TOKEN = frozenset(["BQ", "BZ", "CJ", "CQ", "CZ", "DQ", "DZ", "EJ", "EY"
 SLOT_LABELS = (*LETTERS, *[first + second for first in LETTERS for second in LETTERS
                            if first + second not in _NOT_ONE_TOKEN][:256 - 26])
 """OneJev qev/prompt.py's 256 labels at 81ce62f1597c91e46767d4d02d6ac2e18534fe94."""
+_PATHS = {"slot": ("slots",), "q.weight": ("q",), "k.weight": ("k",)}
+_LABELS = Labels(variants=("{}",), names=SLOT_LABELS)
 
 
 def _path(name: str) -> tuple[str, ...] | None:
-    return {"slot": ("slots",), "q.weight": ("q",), "k.weight": ("k",)}.get(name)
+    return _PATHS.get(name)
 
 
 def _initialize(head: nn.Module, backbone: Pretrained) -> Variables:
@@ -82,7 +84,7 @@ class SlotHeadSource(HeadComponent):
             if shapes is None:
                 fields["slot_rows"] = len(labels)
             else:
-                if set(shapes) != {"slot", "q.weight", "k.weight"}:
+                if set(shapes) != _PATHS.keys():
                     raise ValueError("a stored slot head holds slot, q.weight and k.weight")
                 slot, query, key = (shapes[name] for name in ("slot", "q.weight", "k.weight"))
                 if (len(slot) != 2 or slot[1] != width or slot[0] < len(labels) or len(query) != 2
@@ -125,17 +127,18 @@ class SlotSource(SourceKind):
         bundle.decision_tokenizer.save_pretrained(root)
         if mode == "head":
             import torch
+            from torch.utils.dlpack import from_dlpack
 
             cpu = jax.local_devices(backend="cpu")[0]
             params = bundle.head_variables["params"]
-            tensors = {name: torch.from_dlpack(jax.device_put(params[path[0]], cpu))
-                       for name in ("slot", "q.weight", "k.weight") if (path := _path(name)) is not None}
+            tensors = {name: from_dlpack(jax.device_put(params[path[0]], cpu))
+                       for name, path in _PATHS.items()}
             torch.save(tensors, root / "readout_head.pt")
         (root / "readout.json").write_text(json.dumps(readout, indent=2) + "\n")
 
     @staticmethod
     def layout(*, max_len: int = 32768, keep: Literal["start", "end", "all"] = "all",
-               labels: Labels = Labels(variants=("{}",), names=SLOT_LABELS),
+               labels: Labels = _LABELS,
                blocks: bool = False) -> QuestionLayout:
         """The release's whole-prompt encoding with thinking disabled and its question last."""
         return QuestionLayout(
@@ -146,8 +149,8 @@ class SlotSource(SourceKind):
                                     "score": "Rate the state: {}"}, render="entry",
                                    defaults={"choice": "Which option applies to the state?",
                                              "score": "Which level describes the state?",
-                                             "noul": ("Is the statement true, or is the answer to the question "
-                                                      "yes?")}),
+                                             "noul": ("Is the statement true, or is the answer to the "
+                                                      "question yes?")}),
                       Text("\n\nOptions:\n"),
                       OptionLines(criteria={"true": "the statement is true / the answer is yes",
                                             "false": "the statement is false / the answer is no"}),

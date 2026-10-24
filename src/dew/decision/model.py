@@ -185,7 +185,10 @@ class DecisionModel:
         if not isinstance(self.backbone, VocabularyRows):
             raise TypeError(f"the head reads its backbone's vocabulary rows (`VocabularyRows`), which a "
                             f"{type(self.backbone).__name__} does not give")
-        return self.backbone.apply(thaw(part(variables, "backbone")), method="vocabulary_rows")
+        rows = self.backbone.apply(thaw(part(variables, "backbone")), method="vocabulary_rows")
+        if not isinstance(rows, (jax.Array, np.ndarray)):
+            raise TypeError(f"vocabulary_rows must return an array, got {type(rows).__name__}")
+        return rows
 
     @staticmethod
     def head_size(backbone: nn.Module) -> tuple[int, Dtype | None]:

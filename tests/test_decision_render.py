@@ -13,16 +13,7 @@ import pytest
 
 from dew.data.text import ByteTokenizer, HFTokenizer
 from dew.decision import Choice, Noul, Question, Score
-from dew.decision.layout import (
-    LETTERS,
-    AnswerCue,
-    Framing,
-    Labels,
-    QuestionLayout,
-    Specials,
-    State,
-    Text,
-)
+from dew.decision.layout import LETTERS, AnswerCue, Framing, Labels, QuestionLayout, Specials, State, Text
 from dew.decision.renderer import Chunk, render
 from dew.decision.slot_source import SLOT_LABELS, SLOT_SYSTEM, SlotSource
 
