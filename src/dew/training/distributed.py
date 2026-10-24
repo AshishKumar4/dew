@@ -39,6 +39,7 @@ from dew.nn.inputs import filled_validity
 from dew.nn.sharding import (
     DATA_AXIS,
     DEFAULT_RULES,
+    EXPERT_AXIS,
     FSDP_AXIS,
     MESH_AXES,
     SEQUENCE_AXIS,
@@ -624,6 +625,9 @@ class Validation:
     them; a device that reports none, such as a CPU, is absent."""
     batch_axes: tuple[str, ...]
     """The mesh axes a batch's rows split over (`batch_axes`)."""
+    collectives: dict[str, tuple[str, ...]]
+    """The collectives a training step runs over each axis of the mesh above size one, by the
+    role the placement gives the axis, in HLO's names (`_implied_collectives`)."""
     unbound: dict[str, tuple[str, ...]]
     """Each logical axis the variables declare that no rule names, with the leaves that
     declare it. A leaf keeps the dimensions it names whole on every device where a rule
@@ -949,8 +953,12 @@ class Layout:
         shared: dict[Mesh, frozenset[int]] = {}
         # What the devices' own memory holds, leaf by leaf: its field, its devices, a device's bytes of it.
         held: list[tuple[str, frozenset[int], int]] = []
+        # The axes of `mesh` that split some variable.
+        split: set[str] = set()
         for path, leaf in jax.tree_util.tree_flatten_with_path(state)[0]:
             sharding = leaf.sharding
+            if sharding.mesh == mesh and _within_variables(path) is not None:
+                split |= _spec_axes(sharding.spec)
             # A sharding that names no memory places in its devices' default, their own.
             kind = sharding.memory_kind or "device"
             shard = sharding.shard_shape(leaf.shape)
@@ -973,7 +981,8 @@ class Layout:
         _refuse_overfull(held, device_bytes, limits)
         with nn.logical_axis_rules(self.axis_rules):
             rows = batch_axes(mesh)
-        return Validation(leaves, device_bytes, limits, rows, self._unbound(state))
+        return Validation(leaves, device_bytes, limits, rows, _implied_collectives(mesh, rows, split),
+                          self._unbound(state))
 
     def _unbound(self, state) -> dict[str, tuple[str, ...]]:
         """The logical axes the variables of `state` declare that no rule names, each with
@@ -990,6 +999,41 @@ class Layout:
                     if name is not None and name not in named:
                         found[name].append(_variable_path(path))
         return {name: tuple(paths) for name, paths in found.items()}
+
+
+def _implied_collectives(mesh: Mesh, rows: tuple[str, ...], split: set[str]) -> dict[str, tuple[str, ...]]:
+    """The collectives a training step runs over each axis of `mesh` above size one, by the role a
+    placement gives the axis, in HLO's names (`dew.telemetry.instrumentation.COLLECTIVES`).
+
+    An axis whose devices each compute their own share of a batch, its rows (`rows`) or the
+    sequence axis's positions, sums the step's loss and the gradients of what it holds whole
+    (all-reduce). Where it also splits a variable (`split`), it gathers the variable whole to use
+    it (all-gather), and a row axis sums each gradient into its shares (reduce-scatter), as fully
+    sharded data parallelism does. An axis that splits a variable and no batch, tensor, sums the
+    partial products of the width it splits (all-reduce). The expert axis sends each token to its
+    expert's devices and back (all-to-all), and the stage axis hands each microbatch's activations
+    on (collective-permute). The attention's own exchange over the sequence axis, an all-to-all or
+    a gather by its heads and lengths (`dew.nn.attention.sequence_parallel_attention`), is the
+    model's choice, not the placement's, and is not named."""
+    implied = {}
+    for axis, size in mesh.shape.items():
+        if size == 1:
+            continue
+        shares, splits = axis in rows or axis == SEQUENCE_AXIS, axis in split
+        ops = []
+        if shares or (splits and axis != EXPERT_AXIS):
+            ops.append("all-reduce")
+        if splits and axis == EXPERT_AXIS:
+            ops.append("all-to-all")
+        elif splits and shares:
+            ops.append("all-gather")
+            if axis in rows:
+                ops.append("reduce-scatter")
+        if axis == STAGE_AXIS:
+            ops.append("collective-permute")
+        if ops:
+            implied[axis] = tuple(ops)
+    return implied
 
 
 def _refuse_overfull(held: list[tuple[str, frozenset[int], int]], device_bytes: Mapping[int, int],
