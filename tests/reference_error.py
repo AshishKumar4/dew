@@ -194,10 +194,15 @@ def without_ynn(fn, **jit_options):
     return jax.jit(fn, **jit_options)
 
 
-def with_gradients(fn):
+def with_gradients(fn, *, has_aux: bool = False):
     """`fn` as `run(*inputs, cotangent)`, which returns `fn(*inputs)` and the gradients of its inputs
-    under the cotangent passed last: a differentiated call's leaves, as the gate compares them."""
+    under the cotangent passed last: a differentiated call's leaves, as the gate compares them. Where
+    `has_aux`, `fn` returns its differentiated output and values beside it that carry no gradient,
+    which `run` returns after the gradients, from the same evaluation."""
     def run(*arguments):
+        if has_aux:
+            out, pull, aux = jax.vjp(fn, *arguments[:-1], has_aux=True)
+            return out, *pull(arguments[-1]), aux
         out, pull = jax.vjp(fn, *arguments[:-1])
         return out, *pull(arguments[-1])
 
