@@ -27,7 +27,7 @@ def adapted() -> LMObjective:
 
 
 def batch():
-    return {TEXT_KEY: jnp.asarray(np.random.default_rng(0).integers(0, 256, (2, 9)), jnp.int32)}
+    return {TEXT_KEY: jnp.asarray(np.random.default_rng(0).integers(0, 256, (8, 9)), jnp.int32)}
 
 
 def frozen_ids(tree) -> set[int]:
