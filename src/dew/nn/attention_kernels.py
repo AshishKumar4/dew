@@ -129,6 +129,7 @@ class AttentionCase:
     arithmetic: bool
     narrows: bool
     folds: bool
+    dropout: bool
     splash_mask: bool
     shards: int
 
@@ -229,6 +230,9 @@ FLASH_SUPPORTS = (
     _Need('deterministic', lambda case: not deterministic_ops_requested(),
                 "--xla_gpu_deterministic_ops is set, which its backward's atomic sum of the query gradient "
                 "does not keep", row=INHERENT),
+    _Need('dropout', lambda case: not case.dropout,
+          "the call drops attention weights, which FlashAttention's path here does not take",
+          row='roadmap: attention dropout in FlashAttention'),
     _ARITHMETIC,
     _Need('not_installed', _flash_installed, "dew_flash_attn is not installed", row=INHERENT),
     _Need('binary_arch', _flash_built,
@@ -270,6 +274,9 @@ CUDNN_SUPPORTS = (
     _Need('deterministic', lambda case: not deterministic_ops_requested(),
                 "--xla_gpu_deterministic_ops is set, under which XLA's cuDNN attention backward crashes "
                 "(openxla/xla#46500)", row=INHERENT),
+    _Need('dropout', lambda case: not case.dropout,
+          "the call drops attention weights, which cuDNN's fused path here does not take",
+          row='roadmap: attention dropout in cuDNN'),
     _ARITHMETIC,
 )
 """cuDNN's fused attention's requirements (`cudnn_attention`): a GPU of sm80 or later (cuDNN refuses
@@ -299,6 +306,8 @@ TRITON_SUPPORTS = (
         ('key_lengths', lambda case: not case.lengths, "the call ends its keys by lengths"),
         ('key_starts', lambda case: not case.starts, "the call starts its keys by starts"),
     )),
+    _Need('dropout', lambda case: not case.dropout, "tokamax's Triton kernel takes no probability dropout",
+          row=INHERENT),
     _ARITHMETIC,
 )
 """tokamax's Triton flash kernel's requirements (`triton_attention`): a GPU of sm80 or later, heads at
@@ -331,6 +340,7 @@ TPU_SUPPORTS = (
                                 and case.splash_mask),
          "splash's blocking does not tile the lengths, or its descriptor cannot describe the mask"),
     )),
+    _Need('dropout', lambda case: not case.dropout, "splash takes no probability dropout", row=INHERENT),
     _ARITHMETIC,
 )
 """Splash's requirements (`tpu_attention`): a TPU, no bias or key lengths, one of its two dtypes,
@@ -350,6 +360,8 @@ XLA_SUPPORTS = (
     _Need('arithmetic', lambda case: not case.arithmetic,
                 "the call asks for arithmetic only the reference path computes (`reference_only`)",
                 row=INHERENT, kind='handoff'),
+    _Need('dropout', lambda case: not case.dropout, "jax.nn's attention takes no probability dropout",
+          row=INHERENT, kind='handoff'),
 )
 """jax.nn's xla attention's requirements: the generic kernel, which hands what it cannot honour to
 the reference path."""
@@ -443,7 +455,7 @@ def decodes(case: AttentionCase) -> bool:
     folded attention reads (`decode_geometry.folds`) and differentiates; with sinks or a softcap, which
     the decode kernel applies itself, any query heads that group over the key heads on a GPU, which the
     reference path differentiates."""
-    if not (case.lengths and case.queries <= decode_attention.QUERIES
+    if case.dropout or not (case.lengths and case.queries <= decode_attention.QUERIES
             and not (case.mask or case.bias or case.causal) and case.window is None
             and case.documents is None):
         return False
