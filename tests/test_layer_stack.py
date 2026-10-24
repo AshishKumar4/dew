@@ -240,9 +240,15 @@ class ScanCase:
                        for tree in (self.variables, self.training))
 
         # The DeepSeek shapes draw rows whose routing clears the margin, so every run routes alike
-        # (`selection_margins`); Gemma 3n's draws are held to choose alike instead (`kept`).
-        routes = selection_margins.routes(self.config)
-        self.draw = selection_margins.clearing(drawn, clears) if routes else drawn
+        # (`selection_margins`); Gemma 3n's draws are its rows on which every run keeps float64's units
+        # (`agrees`). `drawn` is the rows alone.
+        self.drawn = drawn
+        if selection_margins.routes(self.config):
+            self.draw = selection_margins.clearing(drawn, clears)
+        elif any(self.config.get("activation_sparsity_pattern", ())):
+            self.draw = selection_margins.clearing(drawn, self.agrees)
+        else:
+            self.draw = drawn
         self._wide = []
 
     def measured(self, model, forward, trained):
@@ -272,17 +278,25 @@ class ScanCase:
                                                 widened(self.training)))
             return self._wide[0](ids, cotangent)
 
-    def kept(self, seed: int) -> list[tuple[int, str, str, int, float]]:
-        """Where the draw's float32 runs keep other Gemma 3n units than float64 does of its own accord,
-        both parameter sets, each as its seed, run, layer, unit count and largest float64 margin there
-        (a unit's distance from its row's cutoff over the row's deviation): none, on a draw check 1
-        judges."""
+    def agrees(self, inputs) -> bool:
+        """Whether every float32 run keeps exactly float64's Gemma 3n units on the rows `inputs`, both
+        parameter sets (`kept`): the precondition on which check 1 compares one computation. A unit
+        chosen otherwise within KEPT_BOUND of its cutoff is rounding's, and its rows are no draw check 1
+        judges; one past it is a wrong choice, and fails the site."""
+        found = self.kept(inputs[0])
+        wrong = [entry for entry in found if entry[-1] > KEPT_BOUND]
+        assert wrong == [], wrong
+        return not found
+
+    def kept(self, ids) -> list[tuple[str, str, int, float]]:
+        """Where the float32 runs keep other Gemma 3n units than float64 does of its own accord on the
+        rows `ids`, both parameter sets, each as its run, layer, unit count and largest float64 margin
+        there (a unit's distance from its row's cutoff over the row's deviation)."""
         if not hasattr(self, "_choices"):
             with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
                 wide = gate_choices(self.build(dtype=jnp.float64))
             self._choices = (wide, {"scanned": gate_choices(self.scanned), "plain": gate_choices(self.plain)})
         wide, runs = self._choices
-        ids, _ = self.draw(seed)
         found = []
         for tree in (self.variables, self.training):
             with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
@@ -294,7 +308,7 @@ class ScanCase:
                     differs = chosen[path][0] != kept
                     if differs.any():
                         margin = np.abs(gate - cutoff) / gate.std(-1, keepdims=True)
-                        found.append((seed, name, path, int(differs.sum()), float(margin[differs].max())))
+                        found.append((name, path, int(differs.sum()), float(margin[differs].max())))
         return found
 
 
@@ -334,25 +348,25 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
     run as the plain loop's, over the shape's declared draws of token rows (check 1, `assert_as_exact`):
     scanning reorders the loop's fp32 sums where an accelerator fuses a scanned layer apart from its
     neighbours, and is otherwise the same computation. Gemma 3n's gaussian top-k chooses discretely, so
-    its every declared draw first holds both float32 runs to the units float64 keeps of its own accord
-    (`ScanCase.kept`, KEPT_BOUND), the precondition on which check 1 compares one computation; a unit
-    past KEPT_BOUND chosen otherwise is a wrong choice, one within it a draw check 1 cannot judge."""
+    each of its draws holds both float32 runs to the units float64 keeps of its own accord
+    (`ScanCase.agrees`, KEPT_BOUND), the precondition on which check 1 compares one computation: a unit
+    past KEPT_BOUND chosen otherwise fails the site as a wrong choice, and rows on which one within it
+    is chosen otherwise, rounding's, are drawn again (`selection_margins.clearing`)."""
     case = ScanCase(shape)
-    if shape == "gemma3n":
-        assert [found for seed in range(SCAN_SEEDS[shape]) for found in case.kept(seed)] == []
     assert_as_exact(*case.arms(), case.draw, f"{shape} scanned stack", seeds=SCAN_SEEDS[shape],
                     truth_fn=case.truth)
 
 
 def test_a_scanned_gate_at_another_sparsity_fails_its_choices_and_check_1():
     """A Gemma 3n scanned stack whose sparse layers cut at 0.951 in place of 0.95 moves each cutoff about
-    0.0035 of its row's deviation, far past KEPT_BOUND: it keeps other units than float64 does on the
-    declared draws, and check 1 fails it."""
+    0.0035 of its row's deviation, far past KEPT_BOUND: its first draw keeps other units than float64
+    does past the bound, which fails the site's precondition, and check 1 over the rows alone fails it."""
     case = ScanCase("gemma3n", activation_sparsity_pattern=(0.951,) * 5 + (0.0,) * 5)
-    found = [found for seed in range(SCAN_SEEDS["gemma3n"]) for found in case.kept(seed)]
-    assert any(run == "scanned" and margin > KEPT_BOUND for _, run, _, _, margin in found)
     with pytest.raises(AssertionError):
-        assert_as_exact(*case.arms(), case.draw, "gemma3n scanned stack at 0.951",
+        case.draw(0)
+    assert any(run == "scanned" and margin > KEPT_BOUND for run, _, _, margin in case.kept(case.drawn(0)[0]))
+    with pytest.raises(AssertionError):
+        assert_as_exact(*case.arms(), case.drawn, "gemma3n scanned stack at 0.951",
                         seeds=SCAN_SEEDS["gemma3n"], truth_fn=case.truth)
 
 
