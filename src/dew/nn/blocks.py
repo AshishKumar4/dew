@@ -131,6 +131,11 @@ class Modulation(nn.Module):
 class TokenEmbedding(nn.Embed):
     """Token lookup with cotangent accumulation in the parameter dtype."""
 
+    padding_idx: int | None = None
+    """The id whose row this lookup reads but never trains, as torch's `nn.Embedding(padding_idx=...)`
+    leaves it: the row's gradient takes nothing from the places that read that id. None trains every
+    row it reads."""
+
     def __call__(self, inputs: jax.Array) -> jax.Array:
         if not jnp.issubdtype(inputs.dtype, jnp.integer):
             raise ValueError("Input type must be an integer or unsigned integer.")
@@ -140,7 +145,10 @@ class TokenEmbedding(nn.Embed):
             if promoted is None:
                 raise ValueError("Embedding dtype promotion must return an array")
             return promoted
-        return table_rows(self.embedding, inputs, self.dtype or self.embedding.dtype)
+        rows = table_rows(self.embedding, inputs, self.dtype or self.embedding.dtype)
+        if self.padding_idx is None:
+            return rows
+        return jnp.where((inputs == self.padding_idx)[..., None], jax.lax.stop_gradient(rows), rows)
 
 
 class FourierEmbedding(nn.Module):
