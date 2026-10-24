@@ -232,6 +232,18 @@ def objective_gradient(objective, variables, batch, step):
     return jax.grad(loss)(variables["params"])
 
 
+def as_a_step(objective, variables, batch, gradient):
+    """`gradient` jitted with the compiler options a trainer's one-device step of `objective` over
+    `batch` takes (`dew.training.memory.step_compiler_options`), so a check of that step against it
+    compiles both arms alike: on a GPU the step keeps dots that share an input apart, where XLA's
+    default merges them into one GEMM, which rounds otherwise."""
+    from dew.objectives.base import FROZEN
+    from dew.training.memory import device_tokens, step_compiler_options
+
+    options = step_compiler_options(objective, device_tokens(objective, batch, 1), FROZEN in variables, 1)
+    return jax.jit(gradient, compiler_options=options)
+
+
 def float32_update(gradient):
     """The update a trainer's sgd(1) step is held to (`applied`): `gradient(variables)`, the objective's
     own, applied in float32 as the trainer applies it."""
