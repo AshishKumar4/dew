@@ -906,8 +906,9 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, starts=None, max_segments: in
     terms = per_chunk(decay.sum(0) + decay_w)
     diagonal = jnp.eye(CHUNK, dtype=bool)
     after = jnp.sum(jnp.where(diagonal, terms, 0.0), -1)
-    pairs = jnp.where(diagonal, 0.0, terms)
-    dg = jax.vmap(jax.vmap(algebra.summed_back))(pairs, after)
+    leaving = jnp.sum(jnp.where(jnp.eye(CHUNK, k=1, dtype=bool), terms, 0.0), -1)
+    pairs = jnp.tril(terms, -1)
+    dg = jax.vmap(jax.vmap(algebra.summed_back))(pairs, after, leaving)
     # The memory's decay across each chunk: its gradient `sum(S dS)` through the decay `exp(g_last)` from
     # the chunk's start, every token's.
     memory = jnp.sum((run.h.astype(jnp.float32) * dh.astype(jnp.float32)).reshape(chunks, heads, -1), -1)
@@ -1049,7 +1050,8 @@ def _query_key(q, k, corrected, do, dv, h, dh, hi, lo, taken, call: _Call, *, sc
     """`(dq, dk [R, HV * Dk] fp32, dw [R, HV * Dk] as call.held, decay [blocks, R, HV * C] fp32)`: each
     chunk's and key block's queries', keys' and weights' gradients a value head's (fla's dqkwg,
     `algebra.query_key_gradients`), and its decay's terms over the block's key columns, the pairs strictly
-    lower and the terms from the chunk's start on the diagonal. `h` and `dh` the memories each chunk enters
+    lower, the terms from the chunk's start on the diagonal and each token's write to the chunk's end just
+    above it. `h` and `dh` the memories each chunk enters
     and its leaving memory's gradient (`call.memories`)."""
     width, value_width, family = call.width, call.value_width, call.family
     held, memories, given = dataclasses.replace(call.held, rows=call.rows), call.memories, call.given
@@ -1082,7 +1084,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, hi, lo, taken, call: _Call, *, sc
 
             gate, low = family.rows_of(hi_ref.at[h, span]), family.rows_of(lo_ref.at[h, span])
             ending, ending_low = (jnp.full((CHUNK,), ref[h, last]) for ref in (hi_ref, lo_ref))
-            ((dq, dk, dw),), (pairs, after) = algebra.query_key_gradients(
+            ((dq, dk, dw),), (pairs, after, leaving) = algebra.query_key_gradients(
                 functools.partial(whole, "queries", given), functools.partial(whole, "keys", given), 1,
                 functools.partial(column, "values", held), functools.partial(column, "out", given),
                 functools.partial(column, "value_grads", held),
@@ -1094,8 +1096,12 @@ def _query_key(q, k, corrected, do, dv, h, dh, hi, lo, taken, call: _Call, *, sc
             dq_ref.at[span, out_columns][...] = dq
             dk_ref.at[span, out_columns][...] = dk
             held.store(dw_ref, dw, row, CHUNK, h * width + c * BLOCK, BLOCK)
-            decay_ref.at[c, span, pl.ds(h * CHUNK, CHUNK)][...] = jnp.where(_diagonal(CHUNK, family),
-                                                                            after[:, None], pairs)
+            # Each token's terms from the chunk's start on the diagonal, its write's to the chunk's end
+            # beside it (a vector a row each, which a tile's last row would take as a column's).
+            rows, cols = family.iota((CHUNK, CHUNK), 0), family.iota((CHUNK, CHUNK), 1)
+            terms = jnp.where(cols == rows + 1, leaving[:, None], pairs)
+            decay_ref.at[c, span, pl.ds(h * CHUNK, CHUNK)][...] = jnp.where(rows == cols, after[:, None],
+                                                                            terms)
             return carry, accumulators
 
         _walk(streams, views, step, call)

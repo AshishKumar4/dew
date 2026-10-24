@@ -657,7 +657,9 @@ def query_key_gradients(queries: Load, keys: Load, columns: int, values: Load, o
     `c`); then the gates, `ds`'s causal mask, `dq += ds k` and `dk += ds^T q`. `memory_decay` is the decay's
     gradient through the memory the chunk leaves, `sum(S dS)` (a row's vector of it; None where a caller
     summing key blocks apart adds it once). Returns each key block's `(dq, dk, dw)` fp32 and the decay's
-    terms `(pairs, after)`."""
+    terms `(pairs, after, leaving)`, `leaving` `[C]` each token's write into the memory the chunk leaves,
+    a term through `(t, C - 1]` (a vector a row each, as a mainloop holds it, where its place among the pairs
+    is a column's)."""
     ds = functools.reduce(jnp.add, (issue("values_ds", out_grads(j), values(j).T) for j in range(blocks)))
     row_decay = raised(gate, low)[:, None]
     leaving_decay = raised(last - gate, last_low - low)[:, None]
@@ -680,16 +682,14 @@ def query_key_gradients(queries: Load, keys: Load, columns: int, values: Load, o
         leaving_terms = leaving_terms + jnp.sum(dk * key, axis=1)
         after = after + jnp.sum(dq * query, axis=1)
         grads.append((dq, dk, dw))
-    ends = rows == ds.shape[0] - 1
-    strict = rows > cols
-    pairs = jnp.where(strict, ds * scores, 0.0) + jnp.where(ends & strict, leaving_terms[None, :], 0.0)
+    pairs = jnp.where(rows > cols, ds * scores, 0.0)
     if memory_decay is not None:
         after = after + jnp.where(rows[:, 0] == ds.shape[0] - 1, memory_decay * raised(last, last_low), 0.0)
     narrow = ds.astype(dtype)
     transposed = Transposed(narrow)
     grads = [(dq + issue("scores_dq", narrow, keys(c)), dk + issue("scores_dq", transposed, queries(c)), dw)
              for c, (dq, dk, dw) in enumerate(grads)]
-    return grads, (pairs, after)
+    return grads, (pairs, after, leaving_terms)
 
 
 def weighted_gradient(lower, keys: Load, columns: int, values: Load, blocks: int, w_grads: Load,
@@ -747,14 +747,17 @@ def weighted_gradient(lower, keys: Load, columns: int, values: Load, blocks: int
     return key_grads, value_grads, d_beta, (pairs, d_gate)
 
 
-def summed_back(pairs, after, issue: Issue = portable):
+def summed_back(pairs, after, leaving=None, issue: Issue = portable):
     """The gradient of each of a chunk's per-token decays from the gradients of terms through ranges of its
-    prefix: `pairs` `[C, C]` fp32, each `(i, j)` a term through `(j, i]` (strictly lower), and `after` `[C]`,
-    each `s` a term through the chunk's start to `s`. Each token sums only the terms whose range holds it,
+    prefix: `pairs` `[C, C]` fp32, each `(i, j)` a term through `(j, i]` (strictly lower), `after` `[C]`,
+    each `s` a term through the chunk's start to `s`, and `leaving` `[C]` where given, each `t` a term
+    through `(t, C - 1]`, a pair of the chunk's last row. Each token sums only the terms whose range holds it,
     `sum_{j < t <= i} pairs + sum_{s >= t} after`: each row's pairs before `t` a product with the strictly
     upper ones ('summed', no pair added and taken back), and each column's sum the transpose's row sums (a
-    product with the identity, exact), so a mainloop needs neither a scan nor a sum down a tile's rows."""
+    product with the identity, exact)."""
     rows, cols = _grid(pairs.shape)
+    if leaving is not None:
+        pairs = pairs + jnp.where((rows == pairs.shape[0] - 1) & (rows > cols), leaving[None, :], 0.0)
     through = issue("summed", pairs, jnp.where(rows < cols, 1.0, 0.0))
     held = jnp.where(rows >= cols, through + after[:, None], 0.0)
     return jnp.sum(issue("summed", Transposed(held), jnp.where(rows == cols, 1.0, 0.0)), axis=1)
