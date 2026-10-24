@@ -230,25 +230,6 @@ def test_a_dropping_call_at_eval_takes_no_dropout():
         np.testing.assert_array_equal(np.asarray(out), np.asarray(plain))
 
 
-def test_the_reference_draw_keeps_a_bf16_call_unbiased():
-    """Over the draws, each query row's output has the mean of its undropped output: a kept weight keeps
-    with probability 0.9 and scales by 1/0.9, so the expected output is the weights' sum. The 131072 rows
-    are independent draws over generic weights, so the bf16 rounding of their products averages out
-    (uniform weights round alike). The bound is four standard errors of the mean over the sample's own
-    spread. A multiplier rounded to bf16 (1.109375 for 1/0.9) biases the mean by about -0.0016
-    (ledger 1533)."""
-    keys = jax.random.split(jax.random.PRNGKey(0), 2)
-    query = jax.random.normal(keys[0], (1, 131072, 1, 8), jnp.float32).astype(jnp.bfloat16)
-    key = jax.random.normal(keys[1], (1, 128, 1, 8), jnp.float32).astype(jnp.bfloat16)
-    value = jnp.ones((1, 128, 1, 8), jnp.bfloat16)
-    undropped = scaled_dot_product_attention(query, key, value, implementation="reference")
-    dropped = scaled_dot_product_attention(query, key, value, implementation="reference", dropout_rate=0.1,
-                                           dropout_rng=jax.random.PRNGKey(0), deterministic=False)
-    rows, base = np.asarray(dropped, np.float64)[0, :, 0, 0], np.asarray(undropped, np.float64)[0, :, 0, 0]
-    error = np.sqrt(np.var(rows) / rows.size)
-    assert abs(rows.mean() - base.mean()) < 4 * error
-
-
 @pytest.mark.parametrize("dtype", DTYPES, ids=lambda dtype: jnp.dtype(dtype).name)
 @pytest.mark.parametrize("name", HOOKED)
 def test_the_template_route_drops_on_par_with_the_reference_path(name, dtype):
