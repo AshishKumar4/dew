@@ -159,7 +159,7 @@ class Llama4Vision(TowerBase):
                              channels=self.num_channels)
 
 
-class Llama4ProjectorModule(nn.Module):
+class Llama4Projector(ProjectorBase):
     """Tower output to text width: one bias-free map."""
 
     text_width: int
@@ -173,16 +173,6 @@ class Llama4ProjectorModule(nn.Module):
 
     def __call__(self, image_features) -> jax.Array:
         return self.linear(image_features)
-
-
-@dataclasses.dataclass(frozen=True)
-class Llama4Projector(ProjectorBase):
-    """Llama 4's projector fields: the text width."""
-
-    text_width: int
-
-    def build(self) -> nn.Module:
-        return Llama4ProjectorModule(text_width=self.text_width)
 
 
 # Llama 4 names its layers' norms and maps as the decoder block does.

@@ -70,21 +70,11 @@ class Qwen35Vision(TowerBase):
                              channels=self.in_channels)
 
 
-@dataclasses.dataclass(frozen=True)
-class Qwen35Projector(ProjectorBase):
+class Qwen35Projector(MergeProjector, ProjectorBase):
     """Qwen 3.5's projector fields: the trunk width, the merge size, the
     merged width the text embeddings read directly. The merger
     (modeling_qwen3_5.py, Qwen3_5VisionPatchMerger) is `MergeProjector`: norm,
     each merge block grouped, two maps around an exact GELU."""
-
-    vision_width: int
-    merge_size: int
-    out_width: int
-
-    def build(self) -> nn.Module:
-        return MergeProjector(hidden_size=self.vision_width, spatial_merge_size=self.merge_size,
-                              width=self.vision_width * self.merge_size ** 2, out_width=self.out_width)
-
 
 _QWEN35_VISION_TENSORS = {
     "patch_embed.proj.weight": ("patch_embed", "kernel"),

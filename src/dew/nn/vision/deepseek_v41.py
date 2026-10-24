@@ -65,7 +65,7 @@ class DeepseekV41Vision(TowerBase):
         return TowerGeometry(patch_size=self.patch_size, channels=3)
 
 
-class DeepseekV41ProjectorModule(nn.Module):
+class DeepseekV41Projector(ProjectorBase):
     """DeepSeek-V4.1's aligner and image span (vision.py:106-119,
     model.py:1228-1239).
 
@@ -110,21 +110,6 @@ class DeepseekV41ProjectorModule(nn.Module):
         return jnp.concatenate([jnp.broadcast_to(start, (images, 1, self.out_width)),
                                 lines.reshape(images, high * (wide + 1), self.out_width),
                                 jnp.broadcast_to(end, (images, 1, self.out_width))], axis=1)
-
-
-@dataclasses.dataclass(frozen=True)
-class DeepseekV41Projector(ProjectorBase):
-    """DeepSeek-V4.1's aligner fields: the ViT width, the side of the squares
-    it groups, and the decoder width."""
-
-    vision_width: int
-    downsample_ratio: int
-    out_width: int
-
-    def build(self) -> nn.Module:
-        return DeepseekV41ProjectorModule(vision_width=self.vision_width,
-                                          downsample_ratio=self.downsample_ratio,
-                                          out_width=self.out_width)
 
 
 # A block's maps as the decoder block names them (`block_tensor_path`).

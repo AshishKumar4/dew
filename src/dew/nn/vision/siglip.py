@@ -118,7 +118,7 @@ class SiglipVision(TowerBase):
                              channels=self.num_channels)
 
 
-class GemmaProjectorModule(nn.Module):
+class GemmaProjector(ProjectorBase):
     """Patch features into soft tokens: block average, norm, map to text width.
 
     The reference reshapes the trunk sequence into its patch grid, averages
@@ -157,22 +157,6 @@ class GemmaProjectorModule(nn.Module):
         pooled = grid.reshape(batch, tokens, kernel, tokens, kernel, width).mean(axis=(2, 4))
         return self.mm_input_projection(
             self.mm_soft_emb_norm(pooled.reshape(batch, tokens * tokens, width)))
-
-
-@dataclasses.dataclass(frozen=True)
-class GemmaProjector(ProjectorBase):
-    """Gemma's projector fields: the decoder width and the patch grid pooled
-    into the soft-token grid."""
-
-    text_width: int
-    patches_per_side: int
-    tokens_per_side: int
-    norm_eps: float = 1e-6
-
-    def build(self) -> nn.Module:
-        return GemmaProjectorModule(
-            text_width=self.text_width, patches_per_side=self.patches_per_side,
-            tokens_per_side=self.tokens_per_side, norm_eps=self.norm_eps)
 
 
 _SIGLIP_TENSORS = {
