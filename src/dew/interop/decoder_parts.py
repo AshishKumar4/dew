@@ -32,6 +32,7 @@ from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mixers import AttentionMixer, MixerBase
 from dew.nn.rope import RopeScaling, YarnScaling
 from dew.nn.text_encoders import check_tree
+from dew.registry import from_record, record_fields
 
 # The KV cache is allocated at the full decode length, so a 128k-context
 # checkpoint would allocate one of those whether the caller asked or not.
@@ -825,8 +826,37 @@ def translate_family_config(hf_config: Mapping[str, object],
     used = {'model_type', 'use_bidirectional_attention', 'num_hidden_layers'}
     # An omitted field is the config class's default; an explicit null stays null.
     config = family.translate_config({**family.defaults, **hf_config}, used)
+    modeling_overrides(hf_config, config, used)
 
     return config, _unread(hf_config, used)
+
+
+def modeling_overrides(source: Mapping[str, object], config: DecoderFields, used: set[str]) -> None:
+    """Apply the source's per-kind attention overrides without replacing its other mixer fields.
+    Recurrent kinds retain their causal recurrence; a block-bidirectional override needs attention."""
+    if "modeling_overrides" not in source:
+        return
+    used.add("modeling_overrides")
+    overrides = records.record(source["modeling_overrides"], "modeling_overrides")
+    if set(overrides) - {"attention"}:
+        refuse("modeling_overrides", "only its attention record is supported")
+    attention = records.record(overrides.get("attention", {}), "modeling_overrides.attention")
+    kinds = kinds_of(config)
+    for name, mode in attention.items():
+        if name not in kinds:
+            refuse(f"attention override for {name}", "the decoder has no such layer kind")
+        if mode not in ("causal", "block_bidirectional"):
+            refuse(f"attention override {mode!r}", "the supported modes are causal and block_bidirectional")
+        kind = kinds[name]
+        specified = kind.get("mixer", config.get("mixer"))
+        mixer = AttentionMixer() if specified is None else from_record(MixerBase, specified)
+        if not isinstance(mixer, AttentionMixer):
+            if mode != "causal":
+                refuse(f"block-bidirectional {name}", "a recurrent kind remains causal")
+            continue
+        fields = record_fields(mixer, AttentionMixer)
+        fields["bidirectional_blocks"] = mode == "block_bidirectional"
+        kind["mixer"] = {"class": "attention", "fields": fields}
 
 
 # Every wrapper record carries the audio fields; families without an audio

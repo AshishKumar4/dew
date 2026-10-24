@@ -52,6 +52,7 @@ from dew.interop.decoder_parts import (
     _unread,
     held_parts,
     hf_activation,
+    modeling_overrides,
     record_float,
     record_int,
     refuse,
@@ -299,6 +300,7 @@ def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
                 "no supported multimodal wrapper is registered for this model")
     used = {"model_type"}
     record = read(hf_config, used)
+    modeling_overrides(hf_config, record["text"], used)
     unknown = _unread(hf_config, used)
     if unknown:
         refuse(f"config fields {sorted(unknown)}",
@@ -879,6 +881,15 @@ def export_config(model) -> Mapping[str, object]:
         'hidden_act': hf_activation(model.mlp),
         'use_cache': model.causal,
     }
+    from dew.nn.mixers import AttentionMixer
+
+    overrides = {}
+    for name in set(model.per_layer_types):
+        mixer = model.kind_of(name).mixer or model.mixer or AttentionMixer()
+        if isinstance(mixer, AttentionMixer) and mixer.bidirectional_blocks:
+            overrides[name] = "block_bidirectional"
+    if overrides:
+        config["modeling_overrides"] = {"attention": overrides}
     # A dial only some families' references read cannot ride in another
     # family's config. Qwen2 splits the o_proj bias from the others, and
     # Dream's reference is that block with the causal mask dropped
