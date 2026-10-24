@@ -16,7 +16,7 @@ from dew.config.sweep import GridSearch
 from dew.data.dataset import Loader
 from dew.training import LocalTracker
 
-SPACE = {'optim.rate': [0.1, 0.01], 'optim.clip_grads': [0.0, 1.0]}
+SPACE = {'optim.learning_rate': [0.1, 0.01], 'optim.clip_grads': [0.0, 1.0]}
 
 
 def config(tmp_path, name='sweep'):
@@ -46,11 +46,11 @@ def test_four_trials_train_their_own_points_and_reach_the_callers_tracker(tmp_pa
     assert [trial.name for trial in trials] == [f'sweep/trial-{index}' for index in range(4)]
     # Every point of the grid was trained, each under its own run.
     assert ({tuple(sorted(trial.overrides.items())) for trial in trials}
-            == {(('optim.clip_grads', clip), ('optim.rate', rate))
+            == {(('optim.clip_grads', clip), ('optim.learning_rate', rate))
                 for rate in (0.1, 0.01) for clip in (0.0, 1.0)})
     trained = [json.loads((tmp_path / 'runs' / trial.name / 'run.json').read_text())['fields']
                for trial in trials]
-    assert [run['optim']['rate'] for run in trained] == [0.1, 0.1, 0.01, 0.01]
+    assert [run['optim']['learning_rate'] for run in trained] == [0.1, 0.1, 0.01, 0.01]
     assert [run['optim']['clip_grads'] for run in trained] == [0.0, 1.0, 0.0, 1.0]
     # The swept rate reached the optimizer, not just the record.
     assert trials[0].value != trials[2].value
@@ -71,7 +71,7 @@ def test_optunas_first_trials_draw_apart_and_a_resumed_sweep_draws_the_same():
     from dew.config.sweep import OptunaSearch
     from dew.telemetry.records import TrialFinished
 
-    space = {"optim.rate": [10.0 ** -exponent for exponent in range(1, 41)]}
+    space = {"optim.learning_rate": [10.0 ** -exponent for exponent in range(1, 41)]}
     search = OptunaSearch(seed=3)
     finished: list[TrialFinished] = []
     for index in range(5):
@@ -79,7 +79,7 @@ def test_optunas_first_trials_draw_apart_and_a_resumed_sweep_draws_the_same():
         assert search(space, finished) == point
         finished.append(TrialFinished(index=index, name=f"trial-{index}", overrides=point,
                                       value=float(index)))
-    assert len({trial.overrides["optim.rate"] for trial in finished}) > 1
+    assert len({trial.overrides["optim.learning_rate"] for trial in finished}) > 1
 
 
 def test_a_grid_of_a_million_points_names_each_trial_as_its_product_orders_it():

@@ -118,7 +118,7 @@ def test_a_fine_tune_over_a_devices_capacity_is_refused_before_anything_is_place
     holds of the state alone and of the state with the accumulator its steps pool, the state alone
     passes and the whole is refused, and exactly the whole passes."""
     mesh, layout, accumulation = CASES["fsdp_tensor_accumulating"]
-    run = fine_tune(mesh(), layout, accumulation, OptimConfig(optimizer="adam", rate=1e-3))
+    run = fine_tune(mesh(), layout, accumulation, OptimConfig(optimizer="adam", learning_rate=1e-3))
     alone = max(run.validate(steps=8).device_bytes.values())
     whole = max(run.validate(step_batch(), steps=8).device_bytes.values())
     assert alone < whole

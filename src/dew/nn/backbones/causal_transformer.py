@@ -386,6 +386,12 @@ class CausalTransformer(nn.Module):
     mask_token_id: int | None = None
     """The vocabulary id that a masked-diffusion objective corrupts tokens to.
     None means plain training."""
+    shifted_logits: bool = False
+    """Whether masked diffusion reads position i's prediction from position i-1's logits, as a
+    checkpoint continued from an autoregressive one predicts the token after each position
+    (Dream-v0); False reads each position's own (LLaDA). The forward ignores it: it says how
+    the checkpoint's logits line up, which `dew.diffusion.discrete.aligned` applies for the
+    masked loss and the sampler alike."""
     scan_layers: bool = False                 # runs of like layers under flax's scan
     bank_layers: int | None = None
     """The most layers one scanned run holds, which is also how many layers its

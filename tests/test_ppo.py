@@ -279,7 +279,7 @@ def test_muonclip_steps_both_the_actor_and_a_transformer_critic():
     model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1,
                               num_heads=2, mlp_features=16, max_seq_len=8, qk_norm=False)
     objective = PPOObjective(model, 5, critic=ValueHead(model), qk_stats=True)
-    optimizer = OptimConfig(optimizer="muonclip", rate=0.,
+    optimizer = OptimConfig(optimizer="muonclip", learning_rate=0.,
                             optimizer_opts={"qk_clip_threshold": .01}).build(1)
     trainer = Trainer(objective, optimizer, key=jax.random.key(0))
     initial = trainer.initial_state()

@@ -169,6 +169,66 @@ def test_compiled_samples_follow_the_substituted_masked_model():
     assert objective._sample is objective._sample
 
 
+@pytest.mark.parametrize("name", ["llada-tiny", "dream-tiny"])
+def test_a_masked_family_unmasks_each_position_from_the_logits_its_reference_reads(name):
+    """LLaDA predicts each position's token from its own logits; Dream-v0, continued from an
+    autoregressive model, from the position before (its reference shifts the logits right, the first
+    repeated). One unmasking step's distribution at every position is the softmax of those logits of
+    the released model, the mask's column left out, as exact as the release's own float32 forward
+    is to float64."""
+    from reference_error import assert_as_exact_as_the_reference
+
+    from dew.diffusion.discrete import DiscreteProcess, LogLinear
+
+    model, variables = loaded(name)
+    directory = FIXTURES / name
+    ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
+
+    def unmasking(logits):
+        logits = np.asarray(logits, np.float64)
+        if name == "dream-tiny":
+            logits = np.concatenate([logits[:, :1], logits[:, :-1]], axis=1)
+        logits[..., 120] = -np.inf
+        shifted = logits - logits.max(axis=-1, keepdims=True)
+        return np.exp(shifted) / np.exp(shifted).sum(axis=-1, keepdims=True)
+
+    _, log_probs = DiscreteProcess(LogLinear(), mask_id=120).denoiser(model, variables)(ids, jnp.ones((1,)))
+    assert_as_exact_as_the_reference(np.exp(np.asarray(log_probs, np.float64)),
+                                      unmasking(np.load(directory / "logits.npy")),
+                                      unmasking(np.load(directory / "logits_f64.npy")), f"{name} unmasking")
+
+
+def test_a_shifted_model_reads_each_document_and_padded_row_as_if_alone():
+    """Dream reads position i's prediction from position i-1, but a packed document's first token,
+    and a left-padded row's first real one, read their own, as the reference does a row's first: a
+    packed row's predictions are its documents' each aligned alone, and a padded row's real ones are
+    its text's aligned alone."""
+    from dew.diffusion.discrete import aligned
+
+    model, _ = loaded("dream-tiny")
+    scores = jnp.arange(6.0).reshape(1, 6, 1) + 10
+    alone = [aligned(model, scores[:, :3]), aligned(model, scores[:, 3:])]
+    packed = aligned(model, scores, {"segment_ids": jnp.array([[1, 1, 1, 2, 2, 2]])})
+    np.testing.assert_array_equal(packed, jnp.concatenate(alone, axis=1))
+    padded = aligned(model, scores, {"attention_mask": jnp.array([[False, False, True, True, True, True]])})
+    np.testing.assert_array_equal(padded[:, 2:], aligned(model, scores[:, 2:]))
+    one = aligned(model, scores[:, :1], {"segment_ids": jnp.array([[1]])})
+    np.testing.assert_array_equal(one, scores[:, :1])
+
+
+def test_a_dream_shaped_record_keeps_how_its_logits_line_up():
+    """The alignment is a fact of the checkpoint, so the model's record carries it: a Dream config
+    reads to a model that shifts, which its record rebuilds as one that shifts, and LLaDA's to one
+    that does not."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.registry import from_record, to_record
+
+    for name, shifted in (("dream-tiny", True), ("llada-tiny", False)):
+        model, _ = loaded(name)
+        assert model.shifted_logits is shifted
+        assert from_record(CausalTransformer, to_record(model, CausalTransformer)).shifted_logits is shifted
+
+
 def test_unmask_sampler_runs_on_a_loaded_model_end_to_end():
     """Evaluation on llada-tiny unmasks the fully masked rows into vocabulary
     ids: [4, 12] int32 with no mask id left. A sampler returning its input

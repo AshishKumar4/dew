@@ -25,14 +25,17 @@ import dataclasses
 import datetime
 import functools
 import importlib
+import importlib.util
 import inspect
 import itertools
 import operator
+import os
 import sys
 import types
 import typing
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, MutableSequence, Sequence
 from enum import Enum
+from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -144,6 +147,43 @@ def imported(path: str) -> Callable[..., Configured]:
     if not isinstance(held, (type, types.FunctionType, types.BuiltinFunctionType, types.MethodType)):
         raise ValueError(f"{path!r} names {held!r}, which is neither a class nor a function")
     return held
+
+
+_FILES: dict[str, Path] = {}
+"""The modules `module_from_file` imported, by name, each its file."""
+
+
+def module_from_file(path: str | os.PathLike[str], name: str) -> types.ModuleType:
+    """The Python file at `path` imported as the module `name`, which `sys.modules` holds before it runs,
+    so what it defines is named by `name` (`import_path`) and a record of it reads back here
+    (`imported`). Each call runs the file again; a file this imported before under `name` gives way
+    to this one. A name that is another module's, imported or importable (the standard library's
+    `json` for a `json.py`), or a package's module (a dotted name), is refused rather than shadowed
+    or read in its place."""
+    location = Path(path).resolve()
+    if "." in name:
+        raise ValueError(f"{location} would import as {name}, a module of the package "
+                         f"{name.rpartition('.')[0]}, which a file cannot stand in for; rename the file")
+    held = sys.modules.get(name)
+    if held is not None and _FILES.get(name) is None:
+        other = (held.__spec__.origin if held.__spec__ is not None else None) or "a module without a file"
+    elif held is None and name.isidentifier() and (found := importlib.util.find_spec(name)) is not None:
+        other = found.origin or "a namespace package"
+    else:
+        other = None
+    if other is not None and (other in ("built-in", "frozen") or Path(other).resolve() != location):
+        raise ValueError(f"{location} would import as {name}, which names {other}; rename the file")
+    spec = importlib.util.spec_from_file_location(name, location)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"{location} is not a Python file")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name], _FILES[name] = module, location
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        del sys.modules[name], _FILES[name]
+        raise
+    return module
 
 
 _TRUSTED: set[str] = {"flax"}

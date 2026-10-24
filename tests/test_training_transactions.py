@@ -323,7 +323,7 @@ def test_an_accumulating_step_updates_the_optimizer_in_its_commit_alone():
 
     model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
                               max_seq_len=8)
-    train = Trainer(LMObjective(model, 8), OptimConfig(rate=1e-3).build(10),
+    train = Trainer(LMObjective(model, 8), OptimConfig(learning_rate=1e-3).build(10),
                     key=jax.random.PRNGKey(0), accumulation=2)
     state = train.initial_state()
     rows = jax.device_count()

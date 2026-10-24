@@ -1,6 +1,7 @@
 """recipes/lm/train.py: what it refuses, and a run over real token files."""
 
 import dataclasses
+import importlib
 import json
 from pathlib import Path
 
@@ -139,6 +140,18 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
     expected = trained("the ", key=11).host()
     np.testing.assert_array_equal(actual.tokens, expected.tokens)
     np.testing.assert_allclose(actual.behavior_log_probs, expected.behavior_log_probs, atol=1e-7, rtol=1e-7)
+
+
+def test_the_recipe_trains_an_lm_objective_it_names_by_import_path(tmp_path):
+    """An objective Dew does not ship, named by its import path, builds from the arguments the recipe
+    gives an LM objective and trains, with no edit to the recipe."""
+    # A run names a package outside Dew once it is imported.
+    importlib.import_module("lm_objectives")
+
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    config = run_config(tokens, "--trainer.steps", "1", "--trainer.name", "own", "--objective",
+                        "lm_objectives:Anchored")
+    assert int(config.run().step) == 1
 
 
 def test_a_token_budget_alone_trains_over_data_with_no_epoch_length(tmp_path):
@@ -570,7 +583,7 @@ def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
         "--trainer.steps", "1", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "masked",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--objective.ema-decay", "None", "--max-new-tokens", "0", "--optim.rate", "0.001"],
+        "--objective.ema-decay", "None", "--max-new-tokens", "0", "--optim.learning-rate", "0.001"],
         default=LMRunConfig(data=data))
 
     state = config.run()
@@ -612,7 +625,7 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
         "--trainer.steps", "1", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "block",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--max-new-tokens", "0", "--optim.rate", "0.001"], default=LMRunConfig(data=spans))
+        "--max-new-tokens", "0", "--optim.learning-rate", "0.001"], default=LMRunConfig(data=spans))
     state = config.run()
     assert int(state.updates) == 1
     original = Pretrained.load(checkpoint, dtype="float32", attention_impl="xla", max_seq_len=12)
@@ -649,7 +662,7 @@ def test_block_diffusion_trains_quantized_as_any_lm_recipe_does(tmp_path):
             "--trainer.steps", "1", "--trainer.log-every", "1",
             "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", name,
             "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-            "--max-new-tokens", "0", "--optim.rate", "0.001", *quantized],
+            "--max-new-tokens", "0", "--optim.learning-rate", "0.001", *quantized],
             default=LMRunConfig(data=spans))
 
     quantized = run("quantized")

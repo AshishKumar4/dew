@@ -66,7 +66,7 @@ def main(config: Config, data=None, inputs=None):
     objective = DiffusionObjective(model, EDM(regime="pixel"), inputs,
                                    solver=Heun(), guidance=CFG(3.0), steps=40)
 
-    trainer = Trainer(objective, OptimConfig(rate=config.learning_rate), key=jax.random.key(0),
+    trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate), key=jax.random.key(0),
                       mesh=MeshSpec(fsdp=config.fsdp),
                       checkpoints=Checkpoints(str(config.out / "checkpoints")))
     state = trainer.fit(train, validation=validation, steps=config.steps,

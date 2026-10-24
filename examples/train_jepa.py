@@ -71,7 +71,7 @@ def main(config: Config, data=None):
                               sample=Field("image", (config.image_size, config.image_size, 3)),
                               momentum_steps=steps)
 
-    trainer = Trainer(objective, OptimConfig(rate=config.learning_rate), key=jax.random.key(0),
+    trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate), key=jax.random.key(0),
                       checkpoints=Checkpoints(str(config.out / "checkpoints")))
     state = trainer.fit(data, steps=steps, log_every=50, eval_every=steps,
                         metrics=(LinearProbe(config.classes), KnnProbe(config.classes)))
