@@ -199,7 +199,7 @@ class Tokenizer(Protocol):
 @runtime_checkable
 class Offsets(Protocol):
     """A vocabulary that says which characters each token of a text covers (`offsets`): a layout that
-    encodes its prompt whole locates its spans by them (`dew.decision.render`)."""
+    encodes its prompt whole locates its spans by them (`dew.decision.renderer`)."""
 
     def offsets(self, text: str) -> tuple[list[int], list[int], list[int]]:
         """`text`'s ids without special tokens, and each token's first character and the character

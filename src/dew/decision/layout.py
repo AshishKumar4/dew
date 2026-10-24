@@ -31,7 +31,7 @@ from typing_extensions import get_protocol_members
 from dew import records
 from dew.data.text import HFTokenizer, Offsets, Tokenizer
 from dew.decision.questions import Choice, Noul, Question, Score, kind_of
-from dew.decision.render import Chunk, Rendered, Unit, render as rendered_chunks
+from dew.decision.renderer import Chunk, Rendered, Unit, render as rendered_chunks
 from dew.nn.inputs import Coordinates, coordinates, pad_token_rows
 from dew.records import JSON
 
@@ -459,10 +459,10 @@ class QuestionLayout(Layout):
     """Options rendered as lettered lines and read at an answer cue (`Labels`), or None for a marker
     after each option, read at the marker."""
     segments: "tuple[QuestionSegment, ...] | None" = None
-    """A row's text as segments of its own (`dew.decision.render`), read at its labels' readout at the
+    """A row's text as segments of its own (`dew.decision.renderer`), read at its labels' readout at the
     row's last token, or None for the layout's own text."""
     unit: Unit = "pieces"
-    """How `segments`' text is encoded: piece by piece, or whole (`dew.decision.render`)."""
+    """How `segments`' text is encoded: piece by piece, or whole (`dew.decision.renderer`)."""
     framing: "Framing | None" = None
     """The conversation `segments`' text is the user's turn of, or None for none."""
 
@@ -503,7 +503,7 @@ class QuestionLayout(Layout):
     def _segmented(self, encoder: Tokenizer, specials: Specials, state: JSON, question: Question,
                    order: Sequence[int] | None, name: str) -> Encoded:
         """A row of `question` written by `self.segments`, framed by `self.framing` and encoded by
-        `self.unit` (`dew.decision.render`), read at its last token. A whole row encodes its state
+        `self.unit` (`dew.decision.renderer`), read at its last token. A whole row encodes its state
         with the rest of its text, never the request's state ids alone.
 
         A row past `max_len` cuts its state as its `State` segment keeps it (`_cut`), or none, and a
@@ -520,8 +520,7 @@ class QuestionLayout(Layout):
             elif isinstance(segment, State):
                 chunks.append(segment)
             elif isinstance(segment, Instructions):
-                instructions = (rendered(question.instructions, segment.render, specials)
-                                or segment.defaults.get(question.kind, ""))
+                instructions = rendered(question.instructions, segment.render, specials)
                 head, tail = segment.headers[question.kind].split("{}")
                 chunks.extend([Chunk(head), Chunk(instructions, marks=(("question", 0, len(instructions)),)),
                                Chunk(tail)])
@@ -543,52 +542,72 @@ class QuestionLayout(Layout):
                 chunks.append(Chunk(template.format(labels=segment.join.join(names))))
         held = next((segment for segment in self.segments if isinstance(segment, State)), None)
         text = "" if held is None else rendered(state, held.render, specials)
+        keep = "all" if held is None else held.keep
 
-        def built(kept: str) -> Rendered:
-            pieces = [Chunk(kept, marks=(("state", 0, len(kept)),) if kept else ()) if isinstance(part, State)
-                      else part for part in chunks]
+        def built(kept: str | tuple[int, ...]) -> Rendered:
+            # Under pieces the state is its own piece, its ids; whole, its text read with the rest.
+            state_chunk = Chunk(ids=kept) if isinstance(kept, tuple) else Chunk(kept)
+            pieces = [state_chunk if isinstance(part, State) else part for part in chunks]
             return rendered_chunks(self._framed(encoder, pieces), encoder, self.unit)
 
-        laid, kept = self._cut(built, text, "all" if held is None else held.keep, encoder)
+        ids = tuple(encoder.encode(text, add_special_tokens=False)) if text else ()
+        laid, state_kept = (self._cut_ids(built, ids, keep) if self.unit == "pieces"
+                            else self._cut(built, text, keep, encoder))
         tokens = laid.tokens
-        whole = len(encoder.encode(text, add_special_tokens=False)) if text else 0
-        state_kept = len(encoder.encode(kept, add_special_tokens=False)) if kept else 0
+        whole = len(ids)
         row = Laid(name, kind_of(question), laid.marks["question"],
                    tuple(laid.marks[("option", index)] for index in range(len(slots))), tuple(slots),
                    readout=len(tokens) - 1, label_ids=self.labels.ids(encoder, len(slots)))
         return Encoded(tokens, (row,), None, None, whole, state_kept)
 
+    def _cut_ids(self, built: Callable[[tuple[int, ...]], Rendered], ids: tuple[int, ...],
+                 keep: Literal["start", "end", "all"]) -> tuple[Rendered, int]:
+        """The row `built` over the state's own piece `ids`, cut to `max_len` keeping its `keep`, and the
+        ids it keeps: a piece's ids add to the row as they are, so what the rest of the row leaves is
+        exactly what the state keeps, as a question layout cuts its state. A state kept whole is never
+        cut, and a row it leaves too long is `fits`' to refuse."""
+        full = built(ids)
+        excess = len(full.tokens) - self.max_len
+        if excess <= 0 or keep == "all" or not ids:
+            return full, len(ids)
+        kept = ids[:max(len(ids) - excess, 0)] if keep == "start" else ids[min(excess, len(ids)):]
+        return built(kept), len(kept)
+
     def _cut(self, built: Callable[[str], Rendered], text: str, keep: Literal["start", "end", "all"],
-             encoder: Tokenizer) -> tuple[Rendered, str]:
-        """The row `built` over the state `text`, cut to `max_len` keeping its `keep`: the longest of the
-        state's own token boundaries (`Offsets`) reached from budget subtraction's estimate whose row
-        fits, each candidate's row encoded whole, as a merge across the cut changes its length; the
-        row of no state where none fits, which `fits` refuses. A state kept whole is never cut."""
+             encoder: Tokenizer) -> tuple[Rendered, int]:
+        """The row `built` over the state `text`, encoded whole with the rest, cut to `max_len` keeping
+        its `keep`, and the tokens the kept state encodes to alone: the longest prefix (or suffix) ending
+        at one of the state's own token boundaries (`Offsets`) whose row fits, reached from budget
+        subtraction's estimate, each candidate's row encoded whole, as a merge across the cut changes
+        its length; the row of no state where none fits, which `fits` refuses. Only the boundaries and
+        the last row that fit are held. A state kept whole is never cut."""
         full = built(text)
         if len(full.tokens) <= self.max_len or keep == "all" or not text:
-            return full, text
+            return full, len(encoder.encode(text, add_special_tokens=False)) if text else 0
         if not isinstance(encoder, Offsets):
-            raise TypeError(f"a row of segments cuts its state at the tokenizer's character offsets, which a "
-                            f"{type(encoder).__name__} does not keep")
+            raise TypeError(f"a row encoded whole cuts its state at the tokenizer's character offsets, "
+                            f"which a {type(encoder).__name__} does not keep")
         ids, starts, ends = encoder.offsets(text)
+        # Each candidate is a character boundary of the state's own tokens, in the order a cut keeps more.
         bounds = sorted({0, *ends}) if keep == "start" else sorted({len(text), *starts}, reverse=True)
-        candidates = [text[:at] if keep == "start" else text[at:] for at in bounds]
-        index = min(max(len(ids) - (len(full.tokens) - self.max_len), 0), len(candidates) - 1)
-        rows: dict[int, Rendered] = {}
 
-        def fits(at: int) -> bool:
-            if at not in rows:
-                rows[at] = built(candidates[at])
-            return len(rows[at].tokens) <= self.max_len
+        def candidate(at: int) -> str:
+            return text[:bounds[at]] if keep == "start" else text[bounds[at]:]
 
-        if fits(index):
-            while index + 1 < len(candidates) and fits(index + 1):
-                index += 1
-        else:
-            while index > 0 and not fits(index):
-                index -= 1
-        fits(index)
-        return rows[index], candidates[index]
+        def row(at: int) -> Rendered | None:
+            laid = built(candidate(at))
+            return laid if len(laid.tokens) <= self.max_len else None
+
+        index = min(max(len(ids) - (len(full.tokens) - self.max_len), 0), len(bounds) - 1)
+        fitting = row(index)
+        while fitting is None and index > 0:
+            index -= 1
+            fitting = row(index)
+        while fitting is not None and index + 1 < len(bounds) and (longer := row(index + 1)) is not None:
+            index, fitting = index + 1, longer
+        kept = candidate(index)
+        laid = fitting if fitting is not None else built(kept)
+        return laid, len(encoder.encode(kept, add_special_tokens=False)) if kept else 0
 
     def _framed(self, encoder: Tokenizer, chunks: list[Chunk]) -> list[Chunk]:
         """`chunks` as the user's turn of `self.framing`, none without one: under a whole unit the turn
@@ -610,12 +629,10 @@ class QuestionLayout(Layout):
         if self.framing.template and isinstance(encoder, HFTokenizer) and templated:
             from dew.data.chat import framed_turn
 
-            text, start, dropped = framed_turn(encoder.tokenizer, self.framing.system, content,
-                                               where=encoder.name,
-                                               thinking=self.framing.thinking,
-                                               chat_template=self.framing.chat_template,
-                                               options=self.framing.options)
-            kept = len(content.strip())
+            text, start, dropped, kept = framed_turn(encoder.tokenizer, self.framing.system, content,
+                                                     where=encoder.name, thinking=self.framing.thinking,
+                                                     chat_template=self.framing.chat_template,
+                                                     options=self.framing.options)
             moved = tuple((key, start + min(max(first - dropped, 0), kept),
                            start + min(max(last - dropped, 0), kept)) for key, first, last in marks)
             return [Chunk(text + self.framing.prefill, marks=moved)]
@@ -916,12 +933,12 @@ type Segment = Text | Media | State | Schema
 @dataclass(frozen=True)
 class Instructions:
     """A question's instructions under a header of its kind (`headers`, `{}` the rendered
-    instructions), rendered by `render` (`rendered`); `defaults` are a kind's instructions where its
-    question's render empty. The question's span is its instructions'."""
+    instructions), rendered by `render` (`rendered`). The question's span is its instructions'. A
+    question always has instructions, as its protocol requires them (`Question`), so a release's
+    default instructions for a question of none are never written."""
 
     headers: Mapping[str, str]
     render: Render = "question"
-    defaults: Mapping[str, str] = dataclasses.field(default_factory=dict)
 
 
 @dataclass(frozen=True)
