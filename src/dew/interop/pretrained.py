@@ -880,6 +880,20 @@ def _assembled_pipeline(directory: Path, index: Mapping[str, object], commit: st
     return replace(loaded, variables=placed(loaded.variables), revision=commit)
 
 
+def _wrapper_attention(config: decoder_parts.DecoderFields, names: Sequence[str],
+                        fields: Mapping[str, object]) -> None:
+    """Compose a wrapper's attention metadata with each kind's source-declared mixer fields."""
+    kinds = decoder_parts.kinds_of(config).copy()
+    for name in names:
+        kind = kinds.get(name, {})
+        mixer = records.record(kind.get("mixer") or config.get("mixer")
+                               or {"class": "attention", "fields": {}}, "mixer")
+        held = records.record(mixer.get("fields", {}), "mixer.fields")
+        kinds[name] = NativeFields(LayerKind, {
+            **kind, "mixer": {**mixer, "fields": {**held, **fields}}})
+    config["kinds"] = kinds
+
+
 def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.WrapperFields,
                          max_seq_len: int | None) -> decoder_parts.DecoderFields:
     """Read the decoder fields a wrapper's text_config states, with the corrections
@@ -897,30 +911,17 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.Wra
         text_fields["max_seq_len"] = max_seq_len
     if family == "gemma3":
         text_fields["final_logit_softcap"] = None
-        text_fields["mixer"] = {"class": "attention", "fields": {"bidirectional_images": True}}
+        names = records.strings(text_fields["layer_types"], "layer_types")
+        _wrapper_attention(text_fields, tuple(dict.fromkeys(names)), {"bidirectional_images": True})
     if family == "gemma4" and text_config.get("use_bidirectional_attention") == "vision":
-        kinds = decoder_parts.kinds_of(text_fields).copy()
-        sliding = NativeFields(LayerKind, {
-            **kinds.get("sliding_attention", {}),
-            "mixer": {"class": "attention", "fields": {"bidirectional_images": True}}})
-        kinds["sliding_attention"] = sliding
-        text_fields["kinds"] = kinds
+        _wrapper_attention(text_fields, ("sliding_attention",), {"bidirectional_images": True})
     if family in QWEN35_TYPES:
         rope = records.record(text_config.get("rope_parameters") or {}, "rope_parameters")
         sections = rope.get("mrope_section", [11, 11, 10])
         if (not isinstance(sections, (list, tuple)) or len(sections) != 3
                 or any(type(value) is not int or value < 0 for value in sections)):
             raise ValueError("mrope_section must contain three nonnegative integer widths")
-        kinds = decoder_parts.kinds_of(text_fields).copy()
-        kind = kinds.get("full_attention", {})
-        mixer = records.record(kind.get("mixer", {"class": "attention", "fields": {}}), "mixer")
-        fields = records.record(mixer.get("fields", {}), "mixer.fields")
-        full = NativeFields(LayerKind, {
-            **kind,
-            "mixer": {**mixer, "fields": {**fields,
-                      "mrope_section": [sections[0], sections[1], sections[2]]}}})
-        kinds["full_attention"] = full
-        text_fields["kinds"] = kinds
+        _wrapper_attention(text_fields, ("full_attention",), {"mrope_section": list(sections)})
     return text_fields
 
 

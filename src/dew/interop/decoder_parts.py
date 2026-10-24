@@ -876,8 +876,10 @@ def modeling_overrides(source: Mapping[str, object], config: DecoderFields, used
             refuse(f"attention override for {name}", "the decoder has no such layer kind")
         if mode not in ("causal", "block_bidirectional"):
             refuse(f"attention override {mode!r}", "the supported modes are causal and block_bidirectional")
-        kind = kinds.setdefault(name, native_fields(LayerKind)())
+        kind = kinds.get(name, native_fields(LayerKind)())
         specified = kind.get("mixer", config.get("mixer"))
+        if mode == "causal" and specified is None:
+            continue
         mixer = AttentionMixer() if specified is None else from_record(MixerBase, specified)
         if not isinstance(mixer, AttentionMixer):
             if mode != "causal":
@@ -886,6 +888,7 @@ def modeling_overrides(source: Mapping[str, object], config: DecoderFields, used
         fields = record_fields(mixer, AttentionMixer)
         fields["bidirectional_blocks"] = mode == "block_bidirectional"
         kind["mixer"] = {"class": "attention", "fields": fields}
+        kinds[name] = kind
 
 
 # Every wrapper record carries the audio fields; families without an audio
