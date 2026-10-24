@@ -8,7 +8,9 @@ so the mixed f32 x bf16 backward products run at the fp32 rate. XLA's
 `BF16_BF16_F32` dot algorithm names the arithmetic instead (bf16 operands,
 fp32 accumulation, whatever the storage), and jax carries `precision` into
 the transpose rules, so the backward follows; jax's own xla attention sets it
-for this reason (jax-ml/jax#24047).
+for this reason (jax-ml/jax#24047). The vocabulary head's product types its
+operands bf16 instead (`bf16_einsum`): an A100 computes that algorithm wrong
+where a dot has a vector side or sits below XLA's GEMM rewrite threshold.
 
 A CPU sums every float32 product of the dot family, dot_general, einsum and matmul, in float64 and
 rounds once (`accumulated`): XLA:CPU chooses its fp32 dot accumulation by shape, instruction set and
@@ -650,15 +652,6 @@ def bf16_logits(logits: jax.Array) -> jax.Array:
         default=lambda x: rounded_to(x, jnp.bfloat16))
 
 
-def _algorithm_operand(value: jax.Array) -> jax.Array:
-    """`value` as a bf16-algorithm product reads it. GPU and TPU round inside
-    the product, so the value passes as it is and no rounded copy is written;
-    the CPU backend ignores the algorithm, so there it is rounded first."""
-    return jax.lax.platform_dependent(
-        value, cpu=lambda value: jnp.asarray(rounded_operand(value, jnp.bfloat16)),
-        default=lambda value: value)
-
-
 def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
     """A flax layer's `dot_general` for a vocabulary head: a result at
     least fp32 whose operands are the compute dtype's values, in both
@@ -677,11 +670,8 @@ def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
                     preferred_element_type=None):
         del precision, preferred_element_type  # this head's policy, not the layer's
         if rounds:
-            # The BF16 algorithm's product, exact in fp32 by design (`bf16_product`).
-            return bf16_logits(jax.lax.dot_general(
-                lhs, _algorithm_operand(rhs), dimension_numbers,
-                precision=float32_products(products_dtype(lhs, rhs), resolved),
-                preferred_element_type=at_least_fp32(lhs.dtype)))
+            # The bf16 product, exact in fp32 (`bf16_product`).
+            return bf16_logits(bf16_einsum(_subscripts(dimension_numbers, lhs.ndim, rhs.ndim), lhs, rhs))
         return accumulated(functools.partial(
             jax.lax.dot_general, dimension_numbers=dimension_numbers,
             precision=float32_products(products_dtype(lhs, rhs), resolved)),
@@ -734,11 +724,57 @@ def bf16_product(subscripts: str, hidden: jax.Array, head: jax.Array) -> jax.Arr
     """`jnp.einsum(subscripts, hidden, head)` multiplied as bf16 and its result rounded to bf16, held
     in fp32: the one product a bf16 head computes (`head_product`) and a tiled head computes over
     each tile, so the two round each logit alike."""
-    states = _algorithm_operand(hidden.astype(jnp.float32))
-    logits = jnp.einsum(subscripts, states, _algorithm_operand(head.astype(at_least_fp32(head.dtype))),
-                        precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
-                        preferred_element_type=jnp.float32)
-    return bf16_logits(logits)
+    return bf16_logits(bf16_einsum(subscripts, hidden, head))
+
+
+def _bf16_einsum(subscripts: str, lhs: jax.Array, rhs: jax.Array) -> jax.Array:
+    """`jnp.einsum(subscripts, lhs, rhs)` of the operands rounded to bf16 (to nearest even), each
+    product exact and summed in fp32 to an fp32 result; backward, the cotangent rounds to bf16 once
+    and each product multiplies bf16 operands alike, as XLA's `BF16_BF16_F32` dot algorithm states
+    the arithmetic. Every index of an operand is in the result or the other operand.
+
+    The operands are bf16 arrays rather than fp32 ones under that algorithm. On an A100, XLA's dot
+    with a vector side (one row or one column) or below its GEMM rewrite threshold (6 x 3 x 8)
+    rounded fp32 operands otherwise and moved bf16 results off round-to-nearest-even at their ties,
+    on fp32 operands and on bf16 ones alike, at the default precision and at the highest; with bf16
+    operands and no algorithm every shape was exact (node receipts SF-a100-tie-probe3 and 4). A
+    one-token tile of the chunked head and a one-row decode are such dots."""
+    return jnp.einsum(subscripts, lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16),
+                      preferred_element_type=jnp.float32)
+
+
+def _bf16_einsum_fwd(subscripts: str, lhs: jax.Array, rhs: jax.Array):
+    return bf16_einsum(subscripts, lhs, rhs), (lhs, rhs)
+
+
+def _bf16_einsum_bwd(subscripts: str, residuals, cotangent: jax.Array):
+    lhs, rhs = residuals
+    operands, result = subscripts.split("->")
+    left, right = operands.split(",")
+    rounded = cotangent.astype(jnp.bfloat16)
+    return (bf16_einsum(f"{result},{right}->{left}", rounded, rhs).astype(lhs.dtype),
+            bf16_einsum(f"{result},{left}->{right}", rounded, lhs).astype(rhs.dtype))
+
+
+# `jax.custom_vjp` is generic in its return type, and a `functools.partial`
+# decorator loses that binding, so it is built by hand.
+bf16_einsum = jax.custom_vjp(_bf16_einsum, nondiff_argnums=(0,))
+bf16_einsum.defvjp(_bf16_einsum_fwd, _bf16_einsum_bwd)
+
+
+def _subscripts(dimension_numbers, lhs_rank: int, rhs_rank: int) -> str:
+    """`jax.lax.dot_general`'s `dimension_numbers` over operands of these ranks as an einsum's
+    subscripts: its result's batch axes, then the left operand's free axes, then the right's."""
+    (lhs_contracting, rhs_contracting), (lhs_batch, rhs_batch) = dimension_numbers
+    letters = iter("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    left = [next(letters) for _ in range(lhs_rank)]
+    shared = dict(zip(rhs_contracting, lhs_contracting, strict=True)) | dict(
+        zip(rhs_batch, lhs_batch, strict=True))
+    right = [left[shared[axis]] if axis in shared else next(letters) for axis in range(rhs_rank)]
+    free_left = [left[axis] for axis in range(lhs_rank) if axis not in (*lhs_contracting, *lhs_batch)]
+    free_right = [right[axis] for axis in range(rhs_rank) if axis not in shared]
+    result = [left[axis] for axis in lhs_batch] + free_left + free_right
+    return f"{''.join(left)},{''.join(right)}->{''.join(result)}"
 
 
 def at_default_precision[Output](fn: Callable[..., Output]) -> Callable[..., Output]:
