@@ -31,10 +31,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from dew._records import record as section
 from dew.inference.clients import decode_routed_experts
 from dew.objectives.rl.records import messages
 from dew.objectives.rl.sessions import Call, Transcript
-from dew.records import record as section
 
 if TYPE_CHECKING:
     import httpx

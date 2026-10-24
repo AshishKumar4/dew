@@ -56,7 +56,7 @@ import numpy as np
 from jax.typing import DTypeLike
 from typing_extensions import Format, get_annotations, is_protocol
 
-from dew.records import JSON
+from dew._records import JSON
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -446,7 +446,7 @@ def to_record(value, annotation) -> JSON:
     """
     from flax import linen as nn
 
-    from dew.records import recorded_duration
+    from dew._records import recorded_duration
 
     if isinstance(value, datetime.timedelta):
         return recorded_duration(value)

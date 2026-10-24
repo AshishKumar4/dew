@@ -17,8 +17,8 @@ from flax import linen as nn
 
 from dew.batch import VALID_ROWS
 from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
-from dew.model_config import ModelConfig
 from dew.inputs import Field, InputSpec
+from dew.model_config import ModelConfig
 from dew.objectives.base import Step
 from dew.objectives.supervised import Accuracy, CrossEntropy, Supervised
 from dew.training import Trainer

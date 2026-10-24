@@ -26,6 +26,7 @@ import jax
 import optax
 from flax import linen as nn
 
+from dew._records import integer, record, text
 from dew.batch import Variables
 from dew.data.chat import Role
 from dew.data.pipeline import Dataset
@@ -44,7 +45,6 @@ from dew.objectives.rl import (
     Verifier,
 )
 from dew.objectives.rl.rollout import Reward
-from dew.records import integer, record, text
 from dew.sampling import Sampling, with_ids_of
 from dew.state import TrainState
 from dew.training import Checkpoints, Layout, Rollout, Trainer

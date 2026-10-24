@@ -12,10 +12,10 @@ import dataclasses
 from typing import ClassVar
 
 from dew.config import ObjectiveConfig, OptimConfig, Prepared, RunConfig, media_field
-from dew.model_config import JsonDict, ModelConfig
 from dew.data.compile import fitted
 from dew.data.pipeline import ObjectiveData
 from dew.inputs import Field
+from dew.model_config import JsonDict, ModelConfig
 from dew.objectives.jepa.masking import MultiBlockMask
 from dew.objectives.jepa.probes import KnnProbe, LinearProbe
 from dew.registry import models

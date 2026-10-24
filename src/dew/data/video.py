@@ -163,7 +163,7 @@ class Row(grain.MapTransform):
     caption: str = ""
 
     def map(self, element: Batch) -> Batch:
-        from dew.records import text
+        from dew._records import text
 
         path = text(element.get("video_path", element.get("path")), "video_path")
         return {"mp4": path, "caption": element.get("caption", self.caption)}

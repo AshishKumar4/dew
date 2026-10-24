@@ -21,7 +21,7 @@ import numpy as np
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
-from dew import records
+from dew import _records
 from dew.interop.weights import ParamTree, placed
 from dew.nn.dense import Dense
 from dew.nn.inputs import sequence_blocks
@@ -549,7 +549,7 @@ class Gemma4AudioEncoder(nn.Module):
         return AudioEncoding(x, mask)
 
 
-_METADATA = records.HF_METADATA | {"model_type"}
+_METADATA = _records.HF_METADATA | {"model_type"}
 
 
 def audio_config(record: Mapping[str, object]) -> Gemma3nAudio | Gemma4Audio:

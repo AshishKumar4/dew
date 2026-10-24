@@ -24,7 +24,7 @@ import logging
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, Self, TypeGuard, runtime_checkable
 
-from dew.records import JSON, json_value
+from dew._records import JSON, json_value
 
 if TYPE_CHECKING:
     import grain.python as pygrain

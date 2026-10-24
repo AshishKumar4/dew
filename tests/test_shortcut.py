@@ -16,9 +16,9 @@ def test_a_run_config_trains_a_shortcut_model_on_its_own_targets():
     from diffusion_support import images_of
 
     from dew.config import ObjectiveConfig
-    from dew.model_config import ModelConfig
     from dew.config.diffusion import DiffusionRunConfig
     from dew.inputs import TextCondition
+    from dew.model_config import ModelConfig
     from dew.sampling import Euler
     from dew.training import Trainer
 

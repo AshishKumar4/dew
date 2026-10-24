@@ -36,15 +36,14 @@ import tyro
 import dew
 from dew.batch import VALID_ROWS
 from dew.config import ObjectiveConfig, OptimConfig, RunConfig, TrainerConfig
-from dew.model_config import ModelConfig
 from dew.data import ByteTokenizer, Concatenate, Dataset, Files, Hub, Loading, Source, images, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader
 from dew.interop.diffusion_gemma import build
+from dew.model_config import ModelConfig
 from dew.nn.inputs import ModelInputs
 from dew.objectives.lm import Perplexity
 from dew.optim import Cosine
-from dew.records import record as read_record, strings
 from dew.training import MeshSpec, prepare_process
 
 EOS, PAD, IMAGE = 256, 257, 258
@@ -194,8 +193,7 @@ def sized(config: Config) -> Config:
 
 def class_names(parts: dict[str, Source]) -> tuple[str, ...]:
     """The label names the dataset's Hugging Face schema records, as its source reads them."""
-    names = read_record(parts["train"].metadata().get("class_names", {}), "class names").get("label")
-    return tuple(name.strip() for name in strings(names, "class_names.label"))
+    return tuple(name.strip() for name in parts["train"].metadata()["class_names"]["label"])
 
 
 def caption_data(config: Config, parts: dict[str, Source], labels: tuple[str, ...]) -> Loader:

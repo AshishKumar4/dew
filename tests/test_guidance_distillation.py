@@ -14,12 +14,12 @@ from diffusion_stubs import batch_for
 from diffusion_support import images_of, saved_after_one_step
 
 from dew.config import ObjectiveConfig, TrainerConfig
-from dew.model_config import ModelConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.diffusion import broadcast_rates
 from dew.diffusion.presets import EDM, Flow
 from dew.diffusion.process import aligned_conditions
 from dew.inputs import TextCondition, unit_range
+from dew.model_config import ModelConfig
 from dew.objectives.base import TEACHER, Step
 from dew.objectives.diffusion import GuidanceDistillationObjective
 from dew.objectives.diffusion.guidance_distillation import with_guidance

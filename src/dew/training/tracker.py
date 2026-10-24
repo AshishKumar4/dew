@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Protocol, TextIO
 import jax
 import numpy as np
 
+from dew._records import integer, record
 from dew.artifacts import (
     Artifact,
     Decisions,
@@ -39,7 +40,6 @@ from dew.artifacts import (
     uint8_pixels,
 )
 from dew.cleanup import attempted
-from dew.records import integer, record
 from dew.telemetry.records import RECORD_TYPES, FitEnded, Record, RunRecord, json_value, reported_number
 
 if TYPE_CHECKING:

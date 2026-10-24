@@ -1,6 +1,6 @@
 """Host-only run records carried by Tracker.artifact, not training pytrees.
 
-`json_value` here runs the opposite direction from `dew.records`: that module
+`json_value` here runs the opposite direction from `dew._records`: that module
 narrows a config field a published file handed over, this one encodes a
 finished record on its way out to a tracker.
 """
@@ -19,8 +19,8 @@ from collections.abc import Mapping, Sequence
 from typing import Literal
 
 from dew import _checkout
+from dew._records import JSON
 from dew.pool import PREEMPTED_EXIT
-from dew.records import JSON
 
 _log = logging.getLogger(__name__)
 

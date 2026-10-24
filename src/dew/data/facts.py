@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 
+from dew._records import integer, record
 from dew.data.pipeline import (
     Artifact,
     Declares,
@@ -25,7 +26,6 @@ from dew.data.pipeline import (
     runs,
 )
 from dew.data.sources.base import stated
-from dew.records import integer, record
 
 # Stages that order, select, drop, repeat or place records, and change none of them.
 _KEEPS = (Shuffle, Repeat, Slice, Limit, Filter, Prefetch, Workers, Interleave, Artifact, TokenSplit)

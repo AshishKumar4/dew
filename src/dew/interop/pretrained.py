@@ -26,7 +26,7 @@ from flax import linen as nn
 from flax.traverse_util import unflatten_dict
 from jax.typing import DTypeLike
 
-from dew import records
+from dew import _records
 from dew._model_types import QWEN35_TYPES
 from dew.batch import Variables
 from dew.diffusion.process import Process
@@ -898,9 +898,9 @@ def _wrapper_attention(config: decoder_parts.DecoderFields, names: Sequence[str]
     kinds = decoder_parts.kinds_of(config).copy()
     for name in names:
         kind = kinds.get(name, {})
-        mixer = records.record(kind.get("mixer") or config.get("mixer")
+        mixer = _records.record(kind.get("mixer") or config.get("mixer")
                                or {"class": "attention", "fields": {}}, "mixer")
-        held = records.record(mixer.get("fields", {}), "mixer.fields")
+        held = _records.record(mixer.get("fields", {}), "mixer.fields")
         kinds[name] = NativeFields(LayerKind, {
             **kind, "mixer": {**mixer, "fields": {**held, **fields}}})
     config["kinds"] = kinds
@@ -917,18 +917,18 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.Wra
     into the three mrope sections its wrapper positions rows with.
     """
     family = config.get("model_type")
-    text_config = records.record(config["text_config"], "text_config")
+    text_config = _records.record(config["text_config"], "text_config")
     text_fields = record["text"].copy()
     if max_seq_len is not None:
         text_fields["max_seq_len"] = max_seq_len
     if family == "gemma3":
         text_fields["final_logit_softcap"] = None
-        names = records.strings(text_fields["layer_types"], "layer_types")
+        names = _records.strings(text_fields["layer_types"], "layer_types")
         _wrapper_attention(text_fields, tuple(dict.fromkeys(names)), {"bidirectional_images": True})
     if family == "gemma4" and text_config.get("use_bidirectional_attention") == "vision":
         _wrapper_attention(text_fields, ("sliding_attention",), {"bidirectional_images": True})
     if family in QWEN35_TYPES:
-        rope = records.record(text_config.get("rope_parameters") or {}, "rope_parameters")
+        rope = _records.record(text_config.get("rope_parameters") or {}, "rope_parameters")
         sections = rope.get("mrope_section", [11, 11, 10])
         if (not isinstance(sections, (list, tuple)) or len(sections) != 3
                 or any(type(value) is not int or value < 0 for value in sections)):
@@ -941,8 +941,8 @@ def _wrapper_model(config: Mapping[str, object], record: decoder_parts.WrapperFi
                    language_model: CausalTransformer, *, dtype: str) -> MultimodalTransformer:
     """Build the wrapper its record describes: the decoder above, the towers and
     projectors it names, and the placeholder ids its prompts carry."""
-    family = records.text(config["model_type"], "model_type")
-    text_config = records.record(config["text_config"], "text_config")
+    family = _records.text(config["model_type"], "model_type")
+    text_config = _records.record(config["text_config"], "text_config")
     audio_record = record["audio"]
     audio_projector = record["audio_projector"]
     return MultimodalTransformer(
@@ -951,7 +951,7 @@ def _wrapper_model(config: Mapping[str, object], record: decoder_parts.WrapperFi
         record["image_token_id"], dtype=resolve_dtype(dtype),
         # A text_config that states a null pad id states none, and the
         # wrapper's own field defaults to 0 for exactly that.
-        pad_token_id=records.integer(text_config.get("pad_token_id") or 0, "pad_token_id"),
+        pad_token_id=_records.integer(text_config.get("pad_token_id") or 0, "pad_token_id"),
         extra_placeholder_ids=record["extra_placeholder_ids"],
         audio=None if audio_record is None else towers.from_record(audio_record),
         audio_projection=(None if audio_projector is None
@@ -1080,7 +1080,7 @@ def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | Non
 def _names_a_model(directory: Path) -> bool:
     """Whether `directory`'s own config.json names a model by its `model_type`."""
     path = directory / "config.json"
-    return path.is_file() and "model_type" in records.record(json.loads(path.read_text()), "config.json")
+    return path.is_file() and "model_type" in _records.record(json.loads(path.read_text()), "config.json")
 
 
 def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
@@ -1098,7 +1098,7 @@ def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
         raise FileNotFoundError(f"{name_or_dir} has no config.json, which says what model its weights "
                                 f"are; {shipped}")
     with open(directory / "config.json") as handle:
-        config = records.record(json.load(handle), "config.json")
+        config = _records.record(json.load(handle), "config.json")
     return config, None
 
 
@@ -1289,7 +1289,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
             # The route's record is its own; this load edits a copy of it.
             record = NativeFields(CausalTransformer, translated)
             # translate_config refused every model_type but a registered family's name.
-            family = records.text(config.get("model_type"), "model_type")
+            family = _records.text(config.get("model_type"), "model_type")
         case VerifiedRoute(verified=verified):
             record = verified.translate(config, tensors)
             family = verified.family

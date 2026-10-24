@@ -17,7 +17,8 @@ from etils import epath
 from jax.typing import DTypeLike
 from PIL import Image
 
-from dew import records
+from dew import _records
+from dew._records import JSON, json_value, record
 from dew.batch import Variables
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Reader
@@ -67,7 +68,6 @@ from dew.interop.processors import Processor
 from dew.nn.inputs import ModelInputs, RowPlan, mesh_of
 from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import Metric, Objective
-from dew.records import JSON, json_value, record
 
 if TYPE_CHECKING:
     from jax.sharding import Mesh
@@ -223,7 +223,7 @@ class Decide:
         settings = saved_settings(run.record, DecideSettings)
         backbone = saved_model(run.record, dtype).build()
         width, head_dtype = DecisionModel.head_size(backbone)
-        head = Head.from_record(records.json_value(settings.head, "head"), width)
+        head = Head.from_record(_records.json_value(settings.head, "head"), width)
         # The head computes in the dtype it recorded, or as a fresh head over
         # the backbone would where the caller overrides the compute dtype.
         model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype))
@@ -243,17 +243,17 @@ class Decide:
         saved = epath.Path(directory) / TASK_FILE
         if not saved.exists():
             return task
-        settings = records.record(json.loads(saved.read_text()), TASK_FILE)
-        fitted = from_record(Weights, records.json_value(settings["weights"], "weights"))
+        settings = _records.record(json.loads(saved.read_text()), TASK_FILE)
+        fitted = from_record(Weights, _records.json_value(settings["weights"], "weights"))
         if fitted != task.weights:
             raise ValueError(
                 f"{TASK_FILE} was fitted on step {fitted.step}'s {'averaged' if fitted.ema else 'live'} "
                 f"weights, and this loads step {step}'s {'averaged' if averaged else 'live'} ones; "
                 "fit them again with `calibrated` and `save`, or load the step it was fitted on")
-        return replace(task, calibration=from_record(Calibration, records.json_value(settings["calibration"],
+        return replace(task, calibration=from_record(Calibration, _records.json_value(settings["calibration"],
                                                                                     "calibration")),
-                       budget=from_record(Budget, records.json_value(settings["budget"], "budget")),
-                       name=records.text(settings["name"], "name"))
+                       budget=from_record(Budget, _records.json_value(settings["budget"], "budget")),
+                       name=_records.text(settings["name"], "name"))
 
     def save_pretrained(self, directory: str | Path) -> None:
         """Write this task as a released checkpoint, which `from_pretrained` reads back.

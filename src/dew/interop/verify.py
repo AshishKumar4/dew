@@ -37,7 +37,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew import records
+from dew import _records
 from dew.interop import decoder_parts, hf_decoders as decoders, sources
 from dew.interop.decoder_families import ENTRIES
 from dew.registry import models
@@ -146,10 +146,10 @@ def shrink(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     length so it acts, and a token id past the probe's vocabulary moves
     inside it.
     """
-    heads = records.integer(hf_config['num_attention_heads'], 'num_attention_heads')
-    kv_heads = records.integer(hf_config.get('num_key_value_heads') or heads, 'num_key_value_heads')
-    hidden = records.integer(hf_config['hidden_size'], 'hidden_size')
-    head_dim = records.integer(hf_config.get('head_dim') or hidden // heads, 'head_dim')
+    heads = _records.integer(hf_config['num_attention_heads'], 'num_attention_heads')
+    kv_heads = _records.integer(hf_config.get('num_key_value_heads') or heads, 'num_key_value_heads')
+    hidden = _records.integer(hf_config['hidden_size'], 'hidden_size')
+    head_dim = _records.integer(hf_config.get('head_dim') or hidden // heads, 'head_dim')
     small_kv = min(kv_heads, 2)
     small_heads = small_kv * (heads // kv_heads)
     small_hidden = small_heads * _HEAD_DIM * (1 if hidden == heads * head_dim else 2)
@@ -165,7 +165,7 @@ def shrink(hf_config: Mapping[str, object]) -> Mapping[str, object]:
              'qk_rope_head_dim': _HEAD_DIM // 2, 'v_head_dim': _HEAD_DIM, 'n_group': 1, 'topk_group': 1}
     fields.update({key: value for key, value in small.items() if key in hf_config})
     if 'first_k_dense_replace' in hf_config:
-        fields['first_k_dense_replace'] = min(records.integer(hf_config['first_k_dense_replace'],
+        fields['first_k_dense_replace'] = min(_records.integer(hf_config['first_k_dense_replace'],
                                                               'first_k_dense_replace'), 1)
     if 'num_key_value_heads' in hf_config:
         fields['num_key_value_heads'] = small_kv
@@ -178,7 +178,7 @@ def shrink(hf_config: Mapping[str, object]) -> Mapping[str, object]:
         if isinstance(value, int):
             fields[key] = min(value, _VOCAB - 1)
         elif isinstance(value, list):
-            fields[key] = [min(token, _VOCAB - 1) for token in records.integers(value, key)]
+            fields[key] = [min(token, _VOCAB - 1) for token in _records.integers(value, key)]
     return fields
 
 
@@ -364,7 +364,7 @@ def verify_mapping(hf_config: Mapping[str, object]) -> VerifiedMapping:
         raise _refuse(model_type, f"its config reads as no registered family's: {_listed(reasons)}")
     try:
         fields = shrink(hf_config)
-        layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
+        layers = _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     except KeyError as error:
         # A reader may take a config by its own names or its defaults (OPT's
         # defaults every size); the probe shrinks it by the shared names.

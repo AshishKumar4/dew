@@ -37,10 +37,10 @@ from flax import struct
 from jax import lax
 
 from dew._distributions import wellformed
+from dew._records import finite
 from dew.batch import token_ids, valid_order
 from dew.nn import categorical
 from dew.nn.scatter import DROPPED
-from dew.records import finite
 from dew.sampling.vocabulary import (
     Referencing,
     Tokenizing,

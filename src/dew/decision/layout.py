@@ -28,12 +28,12 @@ import numpy as np
 from flax import struct
 from typing_extensions import get_protocol_members
 
-from dew import records
+from dew import _records
+from dew._records import JSON
 from dew.batch import Coordinates, coordinates
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.questions import Choice, Noul, Question, Score, kind_of
 from dew.nn.inputs import pad_token_rows
-from dew.records import JSON
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -128,7 +128,7 @@ class Specials:
 
         def first(*names: str) -> int | None:
             ids = [getattr(hf, name) for name in names]
-            return next((records.integer(value, name) for value, name in zip(ids, names, strict=True)
+            return next((_records.integer(value, name) for value, name in zip(ids, names, strict=True)
                          if value is not None), None)
 
         end = first("sep_token_id", "eos_token_id")
@@ -141,7 +141,7 @@ class Specials:
 
         marker = or_end("mask_token_id")
         return cls(begin=first("cls_token_id", "bos_token_id"), separator=end, marker=marker,
-                   marker_text=records.text(hf.convert_ids_to_tokens(marker), "marker"),
+                   marker_text=_records.text(hf.convert_ids_to_tokens(marker), "marker"),
                    pad=or_end("pad_token_id"))
 
 

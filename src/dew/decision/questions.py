@@ -17,7 +17,7 @@ from typing import ClassVar
 
 import numpy as np
 
-from dew.records import JSON, json_value, record, strings
+from dew._records import JSON, json_value, record, strings
 
 
 class Question(ABC):

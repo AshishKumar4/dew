@@ -26,7 +26,7 @@ A layout is an ordered tuple of segments and a row budget (`max_len`). A segment
 
 Each segment has a budget (a token cap, or none) and a cut rule (`start`, `end`, `never`). Budgets settle in one pass: segments that never cut take their tokens first, and the rest share what remains of `max_len` in their declared priority. That is the rule each class encodes today: a schema is never cut, and the state takes what the schema leaves.
 
-A layout is either joint (every question in one row) or per question (one row a question, the schema segment rendering that question alone). Its record is its segment tuple, each segment a frozen dataclass, recorded and rebuilt through `dew.records` with no closed registry. A composition a user writes reloads as written.
+A layout is either joint (every question in one row) or per question (one row a question, the schema segment rendering that question alone). Its record is its segment tuple, each segment a frozen dataclass, recorded and rebuilt by its import path through `dew.registry`'s typed records (`to_record`, `from_record`), with no closed registry. A composition a user writes reloads as written.
 
 The three layouts become three configurations of these segments. The proof: each configuration lays out the existing fixtures' rows byte for byte as its class does today: tokens, spans, positions and option slots, including the parallel layout and the cut cases. That test lands before the classes go.
 

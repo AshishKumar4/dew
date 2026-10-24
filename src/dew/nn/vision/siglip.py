@@ -14,7 +14,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew import records
+from dew import _records
 from dew.batch import Variables
 from dew.interop.weights import checkpoint_array
 from dew.nn.attention import LayerNorm, RMSNorm
@@ -243,10 +243,10 @@ def translate_siglip_vision_config(hf_config: Mapping[str, object]) -> Record:
         **trunk_geometry(vision),
         "image_size": _side(vision.get("image_size", 224), "image_size"),
         "patch_size": _side(vision.get("patch_size", 16), "patch_size"),
-        "num_channels": records.integer(vision.get("num_channels", 3), "num_channels"),
+        "num_channels": _records.integer(vision.get("num_channels", 3), "num_channels"),
         "hidden_act": activation_name(vision, TOWER_ACTIVATIONS, "gelu_pytorch_tanh",
                                       ("hidden_act", "hidden_activation")),
-        "layer_norm_eps": records.number(vision.get("layer_norm_eps", 1e-6), "layer_norm_eps"),
+        "layer_norm_eps": _records.number(vision.get("layer_norm_eps", 1e-6), "layer_norm_eps"),
     }}
 
 
@@ -262,7 +262,7 @@ def translate_gemma_projector_config(vision: Mapping[str, object], text_width: i
         raise ValueError(
             f"mm_tokens_per_image ({mm_tokens_per_image}) is not a square, this "
             "projector pools a grid into a grid")
-    patches = records.integer(vision["image_size"], "image_size") // records.integer(
+    patches = _records.integer(vision["image_size"], "image_size") // _records.integer(
         vision["patch_size"], "patch_size"
     )
     if patches % side:
@@ -273,7 +273,7 @@ def translate_gemma_projector_config(vision: Mapping[str, object], text_width: i
         "text_width": int(text_width),
         "patches_per_side": patches,
         "tokens_per_side": side,
-        "norm_eps": records.number(vision.get("layer_norm_eps", 1e-6), "layer_norm_eps"),
+        "norm_eps": _records.number(vision.get("layer_norm_eps", 1e-6), "layer_norm_eps"),
     }}
 
 

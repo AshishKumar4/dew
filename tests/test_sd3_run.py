@@ -42,11 +42,11 @@ import optax
 from diffusion_support import images_of
 
 from dew.config import ObjectiveConfig, TrainerConfig
-from dew.model_config import ModelConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader
 from dew.diffusion.presets import Flow
 from dew.inputs import TextCondition
+from dew.model_config import ModelConfig
 from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
 from dew.objectives.base import Step
 from dew.objectives.diffusion.objective import VALIDATION_SAMPLES

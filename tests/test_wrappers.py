@@ -82,8 +82,8 @@ def test_an_explicit_causal_source_override_exports_through_the_native_decoder(t
 def test_a_wrapper_dtype_change_reaches_the_decoder_that_computes_its_logits():
     """Changing the multimodal model's run dtype changes its native text decoder too, while the
     fp32 master variables remain reusable by the original model."""
-    from dew.model_config import ModelConfig
     from dew.interop import Pretrained
+    from dew.model_config import ModelConfig
 
     loaded = Pretrained.load(FIXTURES / "qwen35-tiny-mm", dtype="float32", attention_impl="reference")
     changed = ModelConfig.from_model(loaded.model).with_dtype("bfloat16").build()

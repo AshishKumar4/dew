@@ -5,7 +5,7 @@ an ungated feed-forward, every map biased under `use_bias`."""
 from collections.abc import Mapping
 from functools import partial
 
-from dew import records
+from dew import _records
 from dew.interop.decoder_parts import (
     GPT_MLP,
     PLAIN_SPELLING,
@@ -21,10 +21,10 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
 def _starcoder2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
-    activation = records.text(hf.get('hidden_act', 'gelu_pytorch_tanh'), 'hidden_act')
+    activation = _records.text(hf.get('hidden_act', 'gelu_pytorch_tanh'), 'hidden_act')
     mlp = ungated_mlp(activation, ('gelu_pytorch_tanh', 'gelu_new', 'gelu', 'relu'), 'hidden_act',
                       'Starcoder2')
-    layers = records.integer(hf['num_hidden_layers'], 'num_hidden_layers')
+    layers = _records.integer(hf['num_hidden_layers'], 'num_hidden_layers')
     # Starcoder2Model masks every layer by the window when one is set.
     window = hf.get('sliding_window')
     # base_config reads the gated activations; the ungated one is set below.
@@ -39,10 +39,10 @@ def _starcoder2_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
     config.update({
         'mlp': mlp, 'mlp_bias': biased, 'attention_bias': biased,
         'norm_type': 'layer', 'norm_bias': True,
-        'norm_eps': records.number(hf.get('norm_epsilon', 1e-5), 'norm_epsilon'),
-        'dropout_rate': records.number(hf.get('residual_dropout', 0.), 'residual_dropout'),
-        'embedding_dropout_rate': records.number(hf.get('embedding_dropout', 0.), 'embedding_dropout'),
-        'attention_dropout_rate': records.number(hf.get('attention_dropout', 0.), 'attention_dropout'),
+        'norm_eps': _records.number(hf.get('norm_epsilon', 1e-5), 'norm_epsilon'),
+        'dropout_rate': _records.number(hf.get('residual_dropout', 0.), 'residual_dropout'),
+        'embedding_dropout_rate': _records.number(hf.get('embedding_dropout', 0.), 'embedding_dropout'),
+        'attention_dropout_rate': _records.number(hf.get('attention_dropout', 0.), 'attention_dropout'),
     })
     return config
 

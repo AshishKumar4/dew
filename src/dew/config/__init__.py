@@ -46,6 +46,7 @@ from etils import epath
 
 import dew.io
 from dew import registry
+from dew._records import JSON, duration, record, recorded_duration
 from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
@@ -72,7 +73,6 @@ from dew.optim import (
     weight_decay_mask,
 )
 from dew.quantization import Quantization
-from dew.records import JSON, duration, record, recorded_duration
 from dew.registry import (
     Annotation,
     declared_type,

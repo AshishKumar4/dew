@@ -19,7 +19,7 @@ import jax
 import numpy as np
 from flax.traverse_util import flatten_dict
 
-from dew import records
+from dew import _records
 from dew._model_types import SANDWICH_NORMS
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.safetensors_io import LazyTensors, tensor_specs
@@ -114,7 +114,7 @@ LINEAR_FIELDS = ('linear_num_key_heads', 'linear_num_value_heads',
 # These fields have no effect on an eval-time forward pass: metadata, token
 # ids, or runtime knobs of the reference implementation (Gemma 3 ships
 # cache_implementation 'hybrid', which describes transformers' KV cache).
-IGNORED_FIELDS = set(records.HF_METADATA) | {
+IGNORED_FIELDS = set(_records.HF_METADATA) | {
     'attention_dropout', 'attn_implementation', 'auto_map', 'bos_token_id', 'cache_implementation',
     'eos_token_id', 'initializer_range', 'max_window_layers', 'pad_token_id', 'pretraining_tp',
     'use_cache', 'use_sliding_window', 'unk_token_id',
@@ -309,8 +309,8 @@ def kinds_of(config: DecoderFields) -> dict[str, KindFields]:
     kinds = config.get('kinds')
     if kinds is None:
         refuse('kinds', 'the shared decoder fields carry one record per named kind')
-    parsed = {name: NativeFields(LayerKind, records.record(kind, f'kinds.{name}'))
-              for name, kind in records.record(kinds, 'kinds').items()}
+    parsed = {name: NativeFields(LayerKind, _records.record(kind, f'kinds.{name}'))
+              for name, kind in _records.record(kinds, 'kinds').items()}
     config['kinds'] = parsed
     return parsed
 
@@ -355,7 +355,7 @@ def _rope_entry(entry: Mapping[str, object] | None, field: str,
         refuse(f"{field} (rope_type {rope_type!r})",
                 f"this family applies plain rotary positions or {list(ramps)} ramps")
     theta = entry.get('rope_theta')
-    theta = None if theta is None else records.number(theta, 'rope_theta')
+    theta = None if theta is None else _records.number(theta, 'rope_theta')
     if rope_type == 'llama3':
         missing = sorted(set(_LLAMA3_FIELDS) - set(entry))
         extra = sorted(set(entry) - set(_LLAMA3_FIELDS) - {'rope_type', 'type', 'rope_theta'})
@@ -367,10 +367,10 @@ def _rope_entry(entry: Mapping[str, object] | None, field: str,
             theta,
             native_fields(RopeScaling)(
                 rope_type="llama3",
-                factor=records.number(entry["factor"], "factor"),
-                low_freq_factor=records.number(entry["low_freq_factor"], "low_freq_factor"),
-                high_freq_factor=records.number(entry["high_freq_factor"], "high_freq_factor"),
-                original_max_position_embeddings=records.integer(
+                factor=_records.number(entry["factor"], "factor"),
+                low_freq_factor=_records.number(entry["low_freq_factor"], "low_freq_factor"),
+                high_freq_factor=_records.number(entry["high_freq_factor"], "high_freq_factor"),
+                original_max_position_embeddings=_records.integer(
                     entry["original_max_position_embeddings"], "original_max_position_embeddings"
                 ),
             ),
@@ -438,13 +438,13 @@ def partial_rope(hf_config: Mapping[str, object], spelling: RopeSpelling | None,
     `rope_records` reads it, and `default_factor`. A None default is a class that has none, whose
     config states the value or is refused. The rest is the entry without its factor, which a family
     whose rotary may scale hands `base_config`'s rope reader."""
-    entry = records.record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
+    entry = _records.record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
 
     def stated(key: str, field: str, default: float | None) -> float:
         value = entry.get(key, hf_config.get(field, default))
         if value is None:
             refuse(f"a config without {field}", "its config class has no default for it")
-        return records.number(value, field)
+        return _records.number(value, field)
     theta = stated('rope_theta', theta_field, None if spelling is None else spelling.theta)
     factor = stated('partial_rotary_factor', factor_field, default_factor)
     return theta, factor, {key: value for key, value in entry.items() if key != 'partial_rotary_factor'}
@@ -489,34 +489,34 @@ def rope_records(hf_config: Mapping[str, object], spelling: RopeSpelling
     scaling, parameters = hf_config.get('rope_scaling'), hf_config.get('rope_parameters')
     base = hf_config.get('rope_theta')
     stated = hf_config.get('layer_types')
-    kinds = {*(records.strings(stated, 'layer_types') if stated is not None else ()),
+    kinds = {*(_records.strings(stated, 'layer_types') if stated is not None else ()),
              'full_attention', 'sliding_attention'}
-    record = records.record(parameters, 'rope_parameters') if parameters is not None else {}
+    record = _records.record(parameters, 'rope_parameters') if parameters is not None else {}
     nested = not record or set(record) <= kinds
     if spelling.per_kind:
         # A flat record lands on the full layers, as a legacy rope_scaling does.
-        full = dict(records.record(record.get('full_attention') or {'rope_type': 'default'},
+        full = dict(_records.record(record.get('full_attention') or {'rope_type': 'default'},
                                    'rope_parameters.full_attention') if nested else record)
         if scaling is not None:
-            full.update(records.record(scaling, 'rope_scaling'))
+            full.update(_records.record(scaling, 'rope_scaling'))
         full.setdefault('rope_theta', spelling.theta if base is None else base)
-        sliding = dict(records.record((record.get('sliding_attention') if nested else None)
+        sliding = dict(_records.record((record.get('sliding_attention') if nested else None)
                                       or {'rope_type': 'default'}, 'rope_parameters.sliding_attention'))
         if scaling is not None and 'sliding_attention' in spelling.legacy_kinds:
-            sliding.update(records.record(scaling, 'rope_scaling'))
+            sliding.update(_records.record(scaling, 'rope_scaling'))
         local = hf_config.get(spelling.local_field) if spelling.local_field is not None else None
         sliding.setdefault('rope_theta', local if local is not None else
                            spelling.local_theta if spelling.local_theta is not None else full['rope_theta'])
         return ('rope_parameters.full_attention', full), ('rope_parameters.sliding_attention', sliding)
     field = 'rope_scaling' if scaling else 'rope_parameters'
-    record = records.record(scaling or parameters or {}, field)
+    record = _records.record(scaling or parameters or {}, field)
     theta = spelling.theta if base is None else base
     if record and set(record) <= kinds:
-        full = dict(records.record(record.get('full_attention') or {}, f'{field}.full_attention'))
+        full = dict(_records.record(record.get('full_attention') or {}, f'{field}.full_attention'))
         full.setdefault('rope_theta', theta)
         if record.get('sliding_attention') is None:
             return (f'{field}.full_attention', full), None
-        sliding = dict(records.record(record['sliding_attention'], f'{field}.sliding_attention'))
+        sliding = dict(_records.record(record['sliding_attention'], f'{field}.sliding_attention'))
         sliding.setdefault('rope_theta', theta)
         return (f'{field}.full_attention', full), (f'{field}.sliding_attention', sliding)
     return (field, {**record, 'rope_theta': record.get('rope_theta', theta)}), None
@@ -545,13 +545,13 @@ def read_rope(hf_config: Mapping[str, object], used: set, spelling: RopeSpelling
     if not per_kind and '.' in full_field:
         refuse(full_field, 'this family reads one rotary record for every layer')
     full = _rope_entry(full_record, full_field, yarn_max_pos, ramps=ramps)
-    theta = records.number(full_record['rope_theta'], f'{full_field} rope_theta')
+    theta = _records.number(full_record['rope_theta'], f'{full_field} rope_theta')
     full_ramp = full.scaling
     if sliding is None:
         return Ropes(theta, full_ramp)
     sliding_field, sliding_record = sliding
     local = _rope_entry(sliding_record, sliding_field, yarn_max_pos, ramps=ramps)
-    sliding_theta = records.number(sliding_record['rope_theta'], f'{sliding_field} rope_theta')
+    sliding_theta = _records.number(sliding_record['rope_theta'], f'{sliding_field} rope_theta')
     sliding_ramp = local.scaling
     return Ropes(theta, full_ramp, None if sliding_theta == theta else sliding_theta,
                   None if sliding_ramp == full_ramp else sliding_ramp,
@@ -565,9 +565,9 @@ def specified_layer_types(hf_config: Mapping[str, object], used: set[str],
     layers = hf_config.get('layer_types')
     if layers is not None:
         used.add('layer_types')
-        return records.strings(layers, 'layer_types')
+        return _records.strings(layers, 'layer_types')
     cycle = ("full_attention",) if pattern is None else pattern
-    count = records.integer(hf_config["num_hidden_layers"], "num_hidden_layers")
+    count = _records.integer(hf_config["num_hidden_layers"], "num_hidden_layers")
     return tuple(cycle[index % len(cycle)] for index in range(count))
 
 
@@ -632,28 +632,28 @@ def yarn_record(entry: Mapping[str, object], field: str, max_pos: int) -> YarnRa
                 "the mixer's YaRN ramp runs over the whole rope width")
     factor = entry.get('factor')
     if factor is None:
-        factor = float(max_pos) / records.number(
+        factor = float(max_pos) / _records.number(
             entry["original_max_position_embeddings"], "original_max_position_embeddings"
         )
     return native_fields(YarnScaling)(
         rope_type="yarn",
-        factor=records.number(factor, f"{field} factor"),
-        original_max_position_embeddings=records.integer(
+        factor=_records.number(factor, f"{field} factor"),
+        original_max_position_embeddings=_records.integer(
             entry["original_max_position_embeddings"], "original_max_position_embeddings"
         ),
-        beta_fast=records.number(entry.get("beta_fast") or 32, "beta_fast"),
-        beta_slow=records.number(entry.get("beta_slow") or 1, "beta_slow"),
-        mscale=(None if entry.get("mscale") is None else records.number(entry["mscale"], "mscale")),
+        beta_fast=_records.number(entry.get("beta_fast") or 32, "beta_fast"),
+        beta_slow=_records.number(entry.get("beta_slow") or 1, "beta_slow"),
+        mscale=(None if entry.get("mscale") is None else _records.number(entry["mscale"], "mscale")),
         mscale_all_dim=(
             None
             if entry.get("mscale_all_dim") is None
-            else records.number(entry["mscale_all_dim"], "mscale_all_dim")
+            else _records.number(entry["mscale_all_dim"], "mscale_all_dim")
         ),
         truncate=bool(entry.get("truncate", True)),
         attention_factor=(
             None
             if entry.get("attention_factor") is None
-            else records.number(entry["attention_factor"], "attention_factor")
+            else _records.number(entry["attention_factor"], "attention_factor")
         ),
     )
 
@@ -666,9 +666,9 @@ def _mlp_features(hf_config: Mapping[str, object]) -> int | tuple[int, ...]:
     """
     stated = hf_config['intermediate_size']
     if isinstance(stated, (list, tuple)):
-        widths = records.integers(stated, 'intermediate_size')
+        widths = _records.integers(stated, 'intermediate_size')
         return widths[0] if len(set(widths)) == 1 else widths
-    return records.integer(stated, 'intermediate_size')
+    return _records.integer(stated, 'intermediate_size')
 
 
 _OPTIONAL_FIELDS = frozenset({'layer_types', 'sliding_window', 'rope_local_base_freq', 'attention_bias',
@@ -691,7 +691,7 @@ def context_lengths(hf_config: Mapping[str, object], default: int | None = None)
     `DEFAULT_MAX_SEQ_LEN`, and the context (`max_position_embeddings`, its `context_length`): the
     stated one, else `default`, the source config class's own, None where neither is."""
     stated = hf_config.get('max_position_embeddings', default)
-    context = None if stated is None else records.integer(stated, 'max_position_embeddings')
+    context = None if stated is None else _records.integer(stated, 'max_position_embeddings')
     return min(context or DEFAULT_MAX_SEQ_LEN, DEFAULT_MAX_SEQ_LEN), context
 
 
@@ -718,13 +718,13 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
     for unread in _OPTIONAL_FIELDS - reads:
         if unread in hf_config and _neutral(hf_config, unread):
             used.add(unread)
-    hidden = records.integer(hf_config['hidden_size'], 'hidden_size')
-    heads = records.integer(hf_config['num_attention_heads'], 'num_attention_heads')
+    hidden = _records.integer(hf_config['hidden_size'], 'hidden_size')
+    heads = _records.integer(hf_config['num_attention_heads'], 'num_attention_heads')
     kv_heads = hf_config.get('num_key_value_heads')
-    head_dim = records.integer(hf_config.get('head_dim') or hidden // heads, 'head_dim')
+    head_dim = _records.integer(hf_config.get('head_dim') or hidden // heads, 'head_dim')
     used.update(('hidden_size', 'num_attention_heads', 'num_key_value_heads', 'head_dim'))
 
-    activation = records.text(hf_config.get('hidden_act', hf_config.get('hidden_activation', 'silu')),
+    activation = _records.text(hf_config.get('hidden_act', hf_config.get('hidden_activation', 'silu')),
                       'hidden_act/hidden_activation')
     used.update(('hidden_act', 'hidden_activation'))
     mapped = ACTIVATIONS.get(activation)
@@ -737,7 +737,7 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
     if 'layer_types' in reads:
         layer_types = specified_layer_types(hf_config, used, layer_types)
     elif layer_types is None:
-        layer_types = ("full_attention",) * records.integer(
+        layer_types = ("full_attention",) * _records.integer(
             hf_config["num_hidden_layers"], "num_hidden_layers"
         )
     stated_window = hf_config.get('sliding_window') if 'sliding_window' in reads else None
@@ -746,17 +746,17 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
     if 'sliding_attention' in layer_types and stated_window is None:
         refuse("layer_types with sliding attention",
                 "sliding_window is not set, so the window has no size")
-    sliding_window = (records.integer(stated_window, 'sliding_window')
+    sliding_window = (_records.integer(stated_window, 'sliding_window')
                       if 'sliding_attention' in layer_types else None)
 
     kinds = decoder_kinds(layer_types, sliding_window, rope_local_theta, None, None)
     capacity, context = context_lengths(hf_config)
     config: DecoderFields = native_fields(CausalTransformer)(
-        vocab_size=records.integer(hf_config['vocab_size'], 'vocab_size'),
+        vocab_size=_records.integer(hf_config['vocab_size'], 'vocab_size'),
         emb_features=hidden,
-        num_layers=records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers'),
+        num_layers=_records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers'),
         num_heads=heads,
-        num_kv_heads=heads if kv_heads is None else records.integer(kv_heads, 'num_key_value_heads'),
+        num_kv_heads=heads if kv_heads is None else _records.integer(kv_heads, 'num_key_value_heads'),
         head_dim=head_dim,
         mlp=mapped,
         mlp_features=_mlp_features(hf_config),
@@ -765,7 +765,7 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
         rope_theta=rope_theta,
         layer_types=layer_types,
         kinds={},
-        norm_eps=records.number(hf_config.get('rms_norm_eps', 1e-6), 'rms_norm_eps'),
+        norm_eps=_records.number(hf_config.get('rms_norm_eps', 1e-6), 'rms_norm_eps'),
         # LlamaRMSNorm, Qwen3RMSNorm and DeepseekV3RMSNorm multiply the scale
         # into the activations after casting them (modeling_qwen3.py:61-64,
         # modeling_deepseek_v3.py:47-52); Gemma3's, Gemma4's and Qwen3.5's
@@ -813,7 +813,7 @@ def softmax_top_k(hf_config: Mapping[str, object], used: set[str]) -> int:
     as model fields. Each family's native Mixture owns its routing options."""
     used.update(('num_experts_per_tok', 'output_router_logits',
                  'router_aux_loss_coef'))
-    return records.integer(hf_config['num_experts_per_tok'], 'num_experts_per_tok')
+    return _records.integer(hf_config['num_experts_per_tok'], 'num_experts_per_tok')
 
 
 def translated(hf_config: Mapping[str, object], family: "DecoderFamily") -> DecoderFields:
@@ -864,13 +864,13 @@ def modeling_overrides(source: Mapping[str, object], config: DecoderFields, used
     if "modeling_overrides" not in source:
         return
     used.add("modeling_overrides")
-    overrides = records.record(source["modeling_overrides"], "modeling_overrides")
+    overrides = _records.record(source["modeling_overrides"], "modeling_overrides")
     if set(overrides) - {"attention"}:
         refuse("modeling_overrides", "only its attention record is supported")
-    attention = records.record(overrides.get("attention", {}), "modeling_overrides.attention")
+    attention = _records.record(overrides.get("attention", {}), "modeling_overrides.attention")
     kinds = kinds_of(config)
     declared = config.get("layer_types")
-    declared = ("full_attention",) if declared is None else records.strings(declared, "layer_types")
+    declared = ("full_attention",) if declared is None else _records.strings(declared, "layer_types")
     for name, mode in attention.items():
         if name not in declared:
             refuse(f"attention override for {name}", "the decoder has no such layer kind")
@@ -899,7 +899,7 @@ NO_AUDIO: AudioFields = {"audio": None, "audio_projector": None,
 
 def _recorded[T](record: Mapping[str, object], field: str, default: T | None, used: set[str] | None,
                  read: Callable[..., T]) -> T:
-    """`field`'s value in `record`, or `default`, checked by `read` (`dew.records`' readers); a None
+    """`field`'s value in `record`, or `default`, checked by `read` (`dew._records`' readers); a None
     default makes it required. `used`, when given, takes the field as read (the set
     `translate_family_config` checks the rest against)."""
     if used is not None:
@@ -910,19 +910,19 @@ def _recorded[T](record: Mapping[str, object], field: str, default: T | None, us
 def record_int(record: Mapping[str, object], field: str, default: int | None = None, *,
                used: set[str] | None = None) -> int:
     """Read an int field out of a record by name (`_recorded`)."""
-    return _recorded(record, field, default, used, records.integer)
+    return _recorded(record, field, default, used, _records.integer)
 
 
 def record_float(record: Mapping[str, object], field: str, default: float | None = None, *,
                  used: set[str] | None = None) -> float:
     """Read a real field out of a record by name (`_recorded`)."""
-    return _recorded(record, field, default, used, records.number)
+    return _recorded(record, field, default, used, _records.number)
 
 
 def record_bool(record: Mapping[str, object], field: str, default: bool | None = None, *,
                 used: set[str] | None = None) -> bool:
     """Read a boolean field out of a record by name (`_recorded`)."""
-    return _recorded(record, field, default, used, records.boolean)
+    return _recorded(record, field, default, used, _records.boolean)
 
 
 # Where a layer's norms sit in the two trees: without the sandwich the names
@@ -1167,12 +1167,12 @@ def layer_depth_path(name: str, config: Mapping[str, object]) -> tuple[str, ...]
     does; an untied one has the head's own kernel, which stores its
     transpose. Any other name is the trunk's, `dew_path`'s."""
     parts = name.split('.')
-    trunk = records.integer(config['num_layers'], 'num_layers')
+    trunk = _records.integer(config['num_layers'], 'num_layers')
     if not (len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()
             and int(parts[2]) >= trunk):
         return dew_path(name, config)
     tail = '.'.join(parts[3:])
-    depths = records.integer(config.get('num_nextn_predict_layers', 0), 'num_nextn_predict_layers')
+    depths = _records.integer(config.get('num_nextn_predict_layers', 0), 'num_nextn_predict_layers')
     depth = _declared_depth(name, int(parts[2]) - trunk, depths)
     if tail == 'embed_tokens.weight':
         return ('params', 'embed_tokens', 'embedding')
@@ -1239,7 +1239,7 @@ def _layer_param_path(parts: list[str], config: Mapping[str, object]) -> tuple[s
         # config counts.
         return ('mlp', 'shared_experts', parts[5], 'kernel')
     if (module == 'linear_attn'
-            and records.strings(config['layer_types'], 'layer_types')[int(parts[2])] == 'linear_attention'):
+            and _records.strings(config['layer_types'], 'layer_types')[int(parts[2])] == 'linear_attention'):
         tail = tuple(parts[4:])
         if len(tail) == 2 and tail[0] in _LINEAR_PROJECTIONS and leaf == 'weight':
             return ('self_attn', tail[0], 'kernel')
@@ -1637,25 +1637,25 @@ _QKV = ('q_proj', 'k_proj', 'v_proj')
 
 def qkv_widths(config: Mapping[str, object]) -> tuple[int, int, int]:
     """The contiguous query, key and value row counts of a fused projection."""
-    head_dim = records.integer(config['head_dim'], 'head_dim')
-    query = records.integer(config['num_heads'], 'num_heads') * head_dim
-    key = records.integer(config['num_kv_heads'], 'num_kv_heads') * head_dim
-    value = records.integer(config['num_kv_heads'], 'num_kv_heads') * records.integer(
+    head_dim = _records.integer(config['head_dim'], 'head_dim')
+    query = _records.integer(config['num_heads'], 'num_heads') * head_dim
+    key = _records.integer(config['num_kv_heads'], 'num_kv_heads') * head_dim
+    value = _records.integer(config['num_kv_heads'], 'num_kv_heads') * _records.integer(
         config.get('value_head_dim') or head_dim, 'value_head_dim')
     return query, key, value
 
 
 def _key_runs(config: Mapping[str, object]) -> int:
     """A grouped qkv's runs: one a key head."""
-    return records.integer(config['num_kv_heads'], 'num_kv_heads')
+    return _records.integer(config['num_kv_heads'], 'num_kv_heads')
 
 
 def _key_run_widths(config: Mapping[str, object]) -> tuple[int, int, int]:
     """One run's query, key and value rows: its key head's group of query heads, then the key and
     value head."""
-    head_dim = records.integer(config['head_dim'], 'head_dim')
-    return (records.integer(config['num_heads'], 'num_heads') // _key_runs(config) * head_dim, head_dim,
-            records.integer(config.get('value_head_dim') or head_dim, 'value_head_dim'))
+    head_dim = _records.integer(config['head_dim'], 'head_dim')
+    return (_records.integer(config['num_heads'], 'num_heads') // _key_runs(config) * head_dim, head_dim,
+            _records.integer(config.get('value_head_dim') or head_dim, 'value_head_dim'))
 
 
 def grouped_qkv(name: str) -> tuple[Packed, Packed]:

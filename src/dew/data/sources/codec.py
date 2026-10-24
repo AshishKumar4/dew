@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 import jax
 import numpy as np
 
-from dew.records import JSON
+from dew._records import JSON
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance

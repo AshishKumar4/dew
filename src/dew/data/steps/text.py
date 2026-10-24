@@ -9,9 +9,9 @@ from typing import Literal
 import grain.python as grain
 import numpy as np
 
+from dew._records import boolean, integer, record, text
 from dew.batch import Batch
 from dew.data.pipeline import Rejected
-from dew.records import boolean, integer, record, text
 
 
 @dataclasses.dataclass(frozen=True)

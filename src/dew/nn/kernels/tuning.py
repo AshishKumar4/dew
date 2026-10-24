@@ -64,9 +64,9 @@ import numpy as np
 import tokamax
 from jax.extend.backend import get_default_device
 
-from dew import cache, coordination, records
+from dew import _records, cache, coordination
+from dew._records import JSON
 from dew.files import write_atomically
-from dew.records import JSON
 
 from . import generation
 
@@ -145,7 +145,7 @@ def encoded(value: object) -> JSON:
     raise TypeError(f"{type(value).__name__} has no JSON form in a kernel's picks: {value!r}")
 
 
-def decoded(value: records.JSON) -> Rebuilt:
+def decoded(value: _records.JSON) -> Rebuilt:
     """What `encoded` wrote, rebuilt. A class it names that this checkout lacks, a dataclass whose
     stored fields are not this checkout's, or JSON it did not write raises `Unreadable`; whatever the
     rebuilt classes raise propagates."""
@@ -154,22 +154,22 @@ def decoded(value: records.JSON) -> Rebuilt:
     if not isinstance(value, dict):
         return value
     if "shape" in value:
-        return jax.ShapeDtypeStruct(_field(records.integers, value.get("shape"), "shape"),
-                                    _dtype(_field(records.text, value.get("dtype"), "dtype")))
+        return jax.ShapeDtypeStruct(_field(_records.integers, value.get("shape"), "shape"),
+                                    _dtype(_field(_records.text, value.get("dtype"), "dtype")))
     if "dtype" in value:
-        return _dtype(_field(records.text, value.get("dtype"), "dtype"))
+        return _dtype(_field(_records.text, value.get("dtype"), "dtype"))
     if "enum" in value:
-        members = _located(_field(records.text, value.get("enum"), "enum")).__dict__
-        member = members.get(_field(records.text, value.get("name"), "name"))
+        members = _located(_field(_records.text, value.get("enum"), "enum")).__dict__
+        member = members.get(_field(_records.text, value.get("name"), "name"))
         if not isinstance(member, enum.Enum):
             raise Unreadable(f"no such member in this checkout: {value!r}")
         return member
     if "class" in value:
-        return _located(_field(records.text, value.get("class"), "class"))
+        return _located(_field(_records.text, value.get("class"), "class"))
     if "function" in value:
-        return _located_function(_field(records.text, value.get("function"), "function"))
+        return _located_function(_field(_records.text, value.get("function"), "function"))
     if "dataclass" in value:
-        cls, fields = _located(_field(records.text, value.get("dataclass"), "dataclass")), value.get("fields")
+        cls, fields = _located(_field(_records.text, value.get("dataclass"), "dataclass")), value.get("fields")
         if not dataclasses.is_dataclass(cls) or not isinstance(fields, dict) or set(fields) != {
                 field.name for field in dataclasses.fields(cls) if field.init}:
             raise Unreadable(f"{cls.__qualname__}'s stored fields are not this checkout's: {fields!r}")
@@ -190,8 +190,8 @@ def decoded(value: records.JSON) -> Rebuilt:
     return rebuilt
 
 
-def _field[T](reader: Callable[[records.JSON, str], T], value: records.JSON, key: str) -> T:
-    """`value` read by `dew.records`' `reader`; `Unreadable` where it refuses it."""
+def _field[T](reader: Callable[[_records.JSON, str], T], value: _records.JSON, key: str) -> T:
+    """`value` read by `dew._records`' `reader`; `Unreadable` where it refuses it."""
     try:
         return reader(value, key)
     except ValueError as error:
@@ -314,11 +314,11 @@ def _timings(entries: object) -> Timings:
             raise Unreadable(f"a stored timing's metadata is no mapping: {metadata!r}")
         peak = fields["peak_memory_mb"]
         measured[_key(decoded(config))] = tokamax.BenchmarkData(
-            compile_time_ms=_field(records.number, fields["compile_time_ms"], "compile_time_ms"),
-            lower_time_ms=_field(records.number, fields["lower_time_ms"], "lower_time_ms"),
-            evaluation_times_ms=_field(records.numbers, fields["evaluation_times_ms"], "evaluation_times_ms"),
+            compile_time_ms=_field(_records.number, fields["compile_time_ms"], "compile_time_ms"),
+            lower_time_ms=_field(_records.number, fields["lower_time_ms"], "lower_time_ms"),
+            evaluation_times_ms=_field(_records.numbers, fields["evaluation_times_ms"], "evaluation_times_ms"),
             metadata=metadata,
-            peak_memory_mb=None if peak is None else _field(records.number, peak, "peak_memory_mb"))
+            peak_memory_mb=None if peak is None else _field(_records.number, peak, "peak_memory_mb"))
     return Timings(measured)
 
 

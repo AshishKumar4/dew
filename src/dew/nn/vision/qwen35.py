@@ -7,7 +7,7 @@ from collections.abc import Mapping
 
 from flax import linen as nn
 
-from dew import records
+from dew import _records
 from dew._model_types import _QWEN35_VISION_TYPES
 from dew.nn.text_encoders import TOWER_ACTIVATIONS
 from dew.registry import Record
@@ -125,22 +125,22 @@ def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Record:
     if vision.get("model_type", "qwen3_5_vision") not in _QWEN35_VISION_TYPES:
         raise ValueError(
             f"vision model_type {vision.get('model_type')!r} is not the Qwen 3.5 tower")
-    table = records.integer(vision["num_position_embeddings"], "num_position_embeddings")
+    table = _records.integer(vision["num_position_embeddings"], "num_position_embeddings")
     if int(table ** 0.5) ** 2 != table:
         raise ValueError(
             f"num_position_embeddings ({table}) is not a square, this trunk "
             "resamples a square table")
     return {
         "class": "qwen3_5", "fields": {
-        "depth": records.integer(vision["depth"], "depth"),
-        "hidden_size": records.integer(vision["hidden_size"], "hidden_size"),
+        "depth": _records.integer(vision["depth"], "depth"),
+        "hidden_size": _records.integer(vision["hidden_size"], "hidden_size"),
         "hidden_act": activation_name(vision, TOWER_ACTIVATIONS, "gelu_pytorch_tanh"),
-        "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
-        "num_heads": records.integer(vision["num_heads"], "num_heads"),
-        "in_channels": records.integer(vision.get("in_channels", 3), "in_channels"),
-        "patch_size": records.integer(vision["patch_size"], "patch_size"),
-        "spatial_merge_size": records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
-        "temporal_patch_size": records.integer(vision["temporal_patch_size"], "temporal_patch_size"),
+        "intermediate_size": _records.integer(vision["intermediate_size"], "intermediate_size"),
+        "num_heads": _records.integer(vision["num_heads"], "num_heads"),
+        "in_channels": _records.integer(vision.get("in_channels", 3), "in_channels"),
+        "patch_size": _records.integer(vision["patch_size"], "patch_size"),
+        "spatial_merge_size": _records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
+        "temporal_patch_size": _records.integer(vision["temporal_patch_size"], "temporal_patch_size"),
         "num_position_embeddings": table,
     }}
 

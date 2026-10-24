@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from dew import records
+from dew import _records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import record_bool, record_int
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -88,7 +88,7 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None
         if not isinstance(limit, (list, tuple)) or len(limit) != 2:
             raise ValueError(f"time_step_limit is a (lower, upper) pair, got {limit!r}")
         lower, upper = (math.inf if isinstance(bound, float) and bound == math.inf
-                        else records.number(bound, "time_step_limit") for bound in limit)
+                        else _records.number(bound, "time_step_limit") for bound in limit)
     mixer = Mamba2Mixer(
         num_heads=heads, head_dim=head_dim,
         state_size=integer("state_size", 128),
@@ -114,7 +114,7 @@ def mixer_decoder(hf_config: Mapping[str, object], hidden: int, mixer: MixerBase
     return native_fields(CausalTransformer)(
         vocab_size=vocab_size, emb_features=hidden, num_layers=num_layers, num_heads=1, num_kv_heads=1,
         head_dim=hidden, mlp_features=0, qk_norm=False,
-        norm_eps=records.number(hf_config.get("layer_norm_epsilon", 1e-5), "layer_norm_epsilon"),
+        norm_eps=_records.number(hf_config.get("layer_norm_epsilon", 1e-5), "layer_norm_epsilon"),
         tie_embeddings=tie_embeddings, residual_in_fp32=residual_in_fp32, mixer=mixer)
 
 
@@ -199,7 +199,7 @@ def config_from_mamba_ssm(config: Mapping[str, object]) -> Mapping[str, object]:
     if unknown:
         raise ValueError(f"mamba_ssm config fields {unknown} are not MambaConfig's; remove them or load a "
                          "transformers Mamba2 conversion of the checkpoint")
-    ssm = records.record(config["ssm_cfg"], "ssm_cfg")
+    ssm = _records.record(config["ssm_cfg"], "ssm_cfg")
     if ssm.get("layer") != "Mamba2":
         raise ValueError(f"ssm_cfg layer {ssm.get('layer', 'Mamba1')!r} is not Mamba2; only mamba_ssm's "
                          "Mamba2 checkpoints read as the mamba2 family")
@@ -218,11 +218,11 @@ def config_from_mamba_ssm(config: Mapping[str, object]) -> Mapping[str, object]:
     fields = {field: ssm.get(key, default) for key, (field, default) in _SSM_FIELDS.items()}
     if "dt_limit" in ssm:
         fields["time_step_limit"] = ssm["dt_limit"]
-    hidden, expand, head_dim = (records.integer(value, name) for name, value in (
+    hidden, expand, head_dim = (_records.integer(value, name) for name, value in (
         ("d_model", config["d_model"]), ("expand", fields["expand"]), ("headdim", fields["head_dim"])))
     # MambaConfig's defaults.
-    vocab = records.integer(config.get("vocab_size", 50277), "vocab_size")
-    multiple = records.integer(config.get("pad_vocab_size_multiple", 8), "pad_vocab_size_multiple")
+    vocab = _records.integer(config.get("vocab_size", 50277), "vocab_size")
+    multiple = _records.integer(config.get("pad_vocab_size_multiple", 8), "pad_vocab_size_multiple")
     return {"model_type": MODEL_TYPE, "hidden_size": hidden, "num_hidden_layers": config["n_layer"],
             "num_heads": hidden * expand // head_dim, **fields,
             "vocab_size": vocab + (-vocab % multiple),

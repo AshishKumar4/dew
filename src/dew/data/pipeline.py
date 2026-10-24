@@ -837,9 +837,9 @@ class Dataset:
         settings default to none, while workers or prefetching the chain writes run as written),
         and for token rows, under "text", the tokens they hold (`data/tokens`) and the share of
         their places that pad a row (`data/padding`)."""
+        from dew._records import record
         from dew.data.compile import _diagnostic
         from dew.data.mixing import data_metrics, state_counts
-        from dew.records import record
 
         chain = self._chain()
         if any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages):

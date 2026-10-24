@@ -17,6 +17,7 @@ from jax.experimental import multihost_utils
 from jax.typing import ArrayLike, DTypeLike
 from typing_extensions import TypeVar
 
+from dew._records import JSON
 from dew.artifacts import uint8_pixels
 from dew.batch import Variables, thaw
 from dew.coordination import agreed
@@ -26,7 +27,6 @@ from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, local_rows, mesh_of, request_key
 from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import OMITTED, Omitted
-from dew.records import JSON
 from dew.registry import dtype_name, resolve_dtype
 from dew.sampling.guidance import CFG, Guidance, guidance_modules
 from dew.sampling.sample import sample
@@ -148,7 +148,7 @@ class ImageSettings:
     grid: JSON = None
 
     def __post_init__(self) -> None:
-        from dew.records import integer
+        from dew._records import integer
 
         integer(self.sampling_steps, "sampling_steps")
 
@@ -251,12 +251,12 @@ class TextToImage:
         the checkpoint's dtypes exactly. `trust` names the packages outside
         Dew the run's record may import (`TextGeneration.from_run`).
         """
-        from dew.model_config import ModelConfig
+        from dew._records import record as fields
         from dew.diffusion.schedules.source import SourceGrid
         from dew.inference.tasks import SavedRun, saved_settings
+        from dew.model_config import ModelConfig
         from dew.nn.autoencoders import AutoEncoder
         from dew.objectives.diffusion.objective import without_loss_heads
-        from dew.records import record as fields
         from dew.registry import from_record
 
         run = SavedRun.pinned(directory, step, trust)
@@ -709,8 +709,8 @@ def _parameter_roots(inputs: Mapping[str, object], autoencoder: Mapping[str, obj
     """The parameter roots of a recorded run's tree, which a storage override
     casts: the denoiser's, each condition encoder's own collections and the
     autoencoder's. The rest keep the dtypes they were saved in."""
+    from dew._records import record, text
     from dew.batch import PARAMETER_ROOTS
-    from dew.records import record, text
     from dew.registry import encoders
 
     roots: list[tuple[str, ...]] = list(PARAMETER_ROOTS)
@@ -727,7 +727,7 @@ def _parameter_roots(inputs: Mapping[str, object], autoencoder: Mapping[str, obj
 def _computing(owner: Mapping[str, object], compute: str) -> Mapping[str, object]:
     """A recorded encoder or autoencoder computing in `compute`: its own
     `dtype`, and the dtype of the model it wraps where it records one."""
-    from dew.records import record
+    from dew._records import record
 
     recorded = dict(record(owner['fields'], 'fields'))
     if 'dtype' in recorded:

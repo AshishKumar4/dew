@@ -44,10 +44,10 @@ from typing import Protocol
 
 from websockets.exceptions import ConnectionClosed
 
+from dew._records import JSON
 from dew.inference.rollouts import Draw, InfrastructureError
 from dew.objectives.rl.episodes import EpisodeId, EpisodeStatus, Observation
 from dew.objectives.rl.sessions import Task
-from dew.records import JSON
 
 
 class StepResult[ObservationT](Protocol):

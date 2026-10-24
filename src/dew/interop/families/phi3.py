@@ -3,7 +3,7 @@
 import dataclasses
 from collections.abc import Mapping
 
-from dew import records
+from dew import _records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
     PLAIN_SPELLING,
@@ -27,11 +27,11 @@ def _phi3_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     if sliding is not None:
         # Phi3Config's model applies one rotary to every layer, so a second record has no layer to take it.
         refuse(sliding[0], 'Phi-3 applies one rotary record to every layer')
-    theta = records.number(parameters['rope_theta'], f'{field} rope_theta')
-    partial = records.number(parameters.get('partial_rotary_factor', hf.get('partial_rotary_factor', 1.)),
+    theta = _records.number(parameters['rope_theta'], f'{field} rope_theta')
+    partial = _records.number(parameters.get('partial_rotary_factor', hf.get('partial_rotary_factor', 1.)),
                               'partial_rotary_factor')
-    rotated = int(records.integer(hf.get('head_dim') or records.integer(hf['hidden_size'], 'hidden_size')
-                                   // records.integer(hf['num_attention_heads'], 'num_attention_heads'),
+    rotated = int(_records.integer(hf.get('head_dim') or _records.integer(hf['hidden_size'], 'hidden_size')
+                                   // _records.integer(hf['num_attention_heads'], 'num_attention_heads'),
                                    'head_dim') * partial)
     if not 0 < partial <= 1 or rotated < 2 or rotated % 2:
         refuse('partial_rotary_factor', 'the rotated head width must be positive and even')
@@ -41,7 +41,7 @@ def _phi3_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     if (hf.get('full_attn_mod', 1) != 1 or hf.get('interpolate_factor', 1) != 1
             or hf.get('lm_head_bias', False)):
         refuse('full_attn_mod/interpolate_factor/lm_head_bias', 'Phi-3 uses one window and no head bias')
-    layers = records.integer(hf['num_hidden_layers'], 'num_hidden_layers')
+    layers = _records.integer(hf['num_hidden_layers'], 'num_hidden_layers')
     config = base_config({**hf, 'rope_scaling': None,
                            'rope_parameters': {'rope_type': 'default', 'rope_theta': theta}}, used,
                           rope=PLAIN_SPELLING,
@@ -52,18 +52,18 @@ def _phi3_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     if rope_type in ('su', 'yarn', 'longrope'):
         # The class's own field, 4096 when omitted, replaces whatever the record
         # names (modeling_rope_utils.py:790-797, standardize_rope_params).
-        original = records.integer(hf.get('original_max_position_embeddings', 4096),
+        original = _records.integer(hf.get('original_max_position_embeddings', 4096),
                                    'original_max_position_embeddings')
         rope = native_fields(LongRopeScaling)(
             rope_type='longrope',
-            short_factor=records.numbers(parameters['short_factor'], 'short_factor'),
-            long_factor=records.numbers(parameters['long_factor'], 'long_factor'),
+            short_factor=_records.numbers(parameters['short_factor'], 'short_factor'),
+            long_factor=_records.numbers(parameters['long_factor'], 'long_factor'),
             original_max_position_embeddings=original,
-            factor=records.number(parameters.get('factor',
-                                   records.integer(hf.get('max_position_embeddings', 4096),
+            factor=_records.number(parameters.get('factor',
+                                   _records.integer(hf.get('max_position_embeddings', 4096),
                                                    'max_position_embeddings') / original), 'factor'),
             attention_factor=(None if parameters.get('attention_factor') is None else
-                              records.number(parameters['attention_factor'], 'attention_factor')),
+                              _records.number(parameters['attention_factor'], 'attention_factor')),
         )
         if len(rope.value.short_factor) != rotated // 2:
             refuse('short_factor/long_factor', 'LongRoPE has one factor per rotated head-dimension pair')
@@ -80,9 +80,9 @@ def _phi3_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     elif partial != 1 and hf.get('sliding_window') is not None:
         refuse('partial_rotary_factor', 'partial rotary on sliding layers requires its LongRoPE factors')
     config.update({
-        'dropout_rate': records.number(hf.get('resid_pdrop', 0.), 'resid_pdrop'),
-        'embedding_dropout_rate': records.number(hf.get('embd_pdrop', 0.), 'embd_pdrop'),
-        'attention_dropout_rate': records.number(hf.get('attention_dropout', 0.), 'attention_dropout'),
+        'dropout_rate': _records.number(hf.get('resid_pdrop', 0.), 'resid_pdrop'),
+        'embedding_dropout_rate': _records.number(hf.get('embd_pdrop', 0.), 'embd_pdrop'),
+        'attention_dropout_rate': _records.number(hf.get('attention_dropout', 0.), 'attention_dropout'),
         'partial_rotary_factor': None if partial == 1 else partial,
         'partial_rotary_type': 'default',
     })

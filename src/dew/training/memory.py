@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding
 
+from dew._records import JSON, integers, json_value
 from dew.batch import Batch, Variables
 from dew.data.dataset import rows_of
 from dew.devices import gpu_free_bytes, xla_flag
@@ -25,7 +26,6 @@ from dew.nn.kernels.generation import backend, device_generation, gpu_target
 from dew.nn.kernels.options import compiler_options
 from dew.nn.protocols import Recomputing, TritonGemm
 from dew.objectives.base import Objective
-from dew.records import JSON, integers, json_value
 from dew.state import TrainState
 from dew.training.distributed import parameter_axes
 

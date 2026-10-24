@@ -41,6 +41,7 @@ from flax import struct
 from jax.tree_util import Partial
 from typing_extensions import TypeIs, TypeVar
 
+from dew._records import JSON
 from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Variables, everything, part
 from dew.nn import categorical
@@ -48,7 +49,6 @@ from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import accumulated, at_least_fp32, compensated_sum
 from dew.nn.protocols import HiddenStates, ProjectsParameters
 from dew.nn.sharding import rows_taken
-from dew.records import JSON
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance

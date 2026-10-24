@@ -805,8 +805,8 @@ def test_trained_factors_over_a_bf16_base_resume_on_the_rebuilt_model_as_an_unin
     run's step-2 state bit for bit, and its next two steps reach every leaf and the outputs an
     uninterrupted four-step run reaches, bit for bit. A template whose factors took the base's
     bfloat16 would round the restored factors; a resume that drew afresh would start elsewhere."""
-    from dew.model_config import ModelConfig
     from dew.inputs import Field, InputSpec
+    from dew.model_config import ModelConfig
     from dew.objectives.base import Objective
 
     model = nn.Sequential([nn.Dense(8, param_dtype=jnp.bfloat16), nn.Dense(4, param_dtype=jnp.bfloat16)])

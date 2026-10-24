@@ -14,7 +14,7 @@ from typing import Annotated, ClassVar, Self
 import tyro
 
 from dew import registry
-from dew.records import JSON
+from dew._records import JSON
 from dew.registry import (
     Annotation,
     Configured,

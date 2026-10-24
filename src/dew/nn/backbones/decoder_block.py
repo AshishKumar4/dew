@@ -15,8 +15,8 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew._records import JSON
 from dew.nn.dense import Dense
-from dew.records import JSON
 
 from ..activations import GatedActivation, gated_product
 from ..attention import LayerNorm, RMSNorm

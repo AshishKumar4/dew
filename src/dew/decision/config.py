@@ -25,8 +25,8 @@ from typing import TYPE_CHECKING, Annotated, ClassVar
 
 import jax
 
+from dew._records import number, record
 from dew.config import ObjectiveConfig, OptimConfig, Prepared, RunConfig
-from dew.model_config import ModelConfig
 from dew.data.compile import fitted
 from dew.data.dataset import record_argument
 from dew.data.text import HFTokenizer
@@ -37,10 +37,10 @@ from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
+from dew.model_config import ModelConfig
 from dew.nn.backbones.decoder_block import remat_policy
 from dew.nn.cross_attention import CrossAttention
 from dew.nn.protocols import RematChoosing
-from dew.records import number, record
 from dew.state import TrainState
 
 if TYPE_CHECKING:

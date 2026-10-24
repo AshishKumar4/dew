@@ -18,10 +18,10 @@ from reference_error import assert_as_exact_as_the_reference, float64_terms, wid
 
 import dew
 from dew.config import ObjectiveConfig, TrainerConfig
-from dew.model_config import ModelConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.diffusion.presets import Flow
 from dew.inputs import TextCondition
+from dew.model_config import ModelConfig
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import TEACHER, Step
 from dew.objectives.diffusion import AdversarialDistillationObjective

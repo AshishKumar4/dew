@@ -17,7 +17,7 @@ pass, so another threshold, or an `early_exit_step` before the last, is refused.
 from collections.abc import Mapping
 from functools import partial
 
-from dew import records
+from dew import _records
 from dew.interop.decoder_parts import (
     PLAIN_SPELLING,
     DecoderFamily,
@@ -45,12 +45,12 @@ _REMOTE = 'ByteDance/Ouro-1.4B'
 
 
 def _ouro_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
-    steps = records.integer(hf.get('total_ut_steps', 4), 'total_ut_steps')
+    steps = _records.integer(hf.get('total_ut_steps', 4), 'total_ut_steps')
     threshold = hf.get('early_exit_threshold', 1.0)
-    if threshold is not None and records.number(threshold, 'early_exit_threshold') != 1.0:
+    if threshold is not None and _records.number(threshold, 'early_exit_threshold') != 1.0:
         refuse(f'early_exit_threshold {threshold!r}', 'the decoder reads the last pass, which 1.0 exits at')
     exit_step = hf.get('early_exit_step')
-    if exit_step is not None and records.integer(exit_step, 'early_exit_step') != steps - 1:
+    if exit_step is not None and _records.integer(exit_step, 'early_exit_step') != steps - 1:
         refuse(f'early_exit_step {exit_step!r}', f'the decoder reads the last pass, step {steps - 1}')
     used.update(('total_ut_steps', 'early_exit_threshold', 'early_exit_step'))
     # OuroConfig drops the window unless use_sliding_window is set, and

@@ -15,9 +15,9 @@ from flax import linen as nn
 import dew.config
 import dew.nn.backbones
 from dew.config import OptimConfig, RunConfig, TrainerConfig
-from dew.model_config import ModelConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader, Ramp
+from dew.model_config import ModelConfig
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.registry import Aliases, projectors, towers

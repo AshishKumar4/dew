@@ -21,9 +21,9 @@ import jax
 import ml_dtypes
 import numpy as np
 
+from dew._records import JSON
 from dew.files import replacing, write_atomically
 from dew.interop.weights import ParamTree, insert
-from dew.records import JSON
 
 SEPARATOR = "/"
 WEIGHTS_FILE = "model.safetensors"

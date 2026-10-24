@@ -38,7 +38,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew import records
+from dew import _records
 from dew.batch import coordinates
 from dew.interop.components import bind_component, component_source
 from dew.interop.config_records import NativeFields, native_fields
@@ -346,9 +346,9 @@ def translate_config(hf_config: Mapping[str, object]) -> NativeFields[CLIPTextTr
     4.16 dump of it; the loaded tree is checked against the module afterwards,
     so a config that disagrees with its weights fails there.
     """
-    text = records.record(hf_config.get("text_config", hf_config), "text_config")
+    text = _records.record(hf_config.get("text_config", hf_config), "text_config")
 
-    activation = records.text(text.get("hidden_act", "quick_gelu"), "hidden_act")
+    activation = _records.text(text.get("hidden_act", "quick_gelu"), "hidden_act")
     eos_token_id = text.get("eos_token_id", 49407)
     if isinstance(eos_token_id, bool) or not isinstance(eos_token_id, int):
         raise ValueError(
@@ -356,15 +356,15 @@ def translate_config(hf_config: Mapping[str, object]) -> NativeFields[CLIPTextTr
             "pooled row has no position")
 
     return native_fields(CLIPTextTransformer)(
-        vocab_size=records.integer(text["vocab_size"], "vocab_size"),
-        hidden_size=records.integer(text["hidden_size"], "hidden_size"),
-        intermediate_size=records.integer(text["intermediate_size"], "intermediate_size"),
-        num_layers=records.integer(text["num_hidden_layers"], "num_hidden_layers"),
-        num_heads=records.integer(text["num_attention_heads"], "num_attention_heads"),
-        max_position_embeddings=records.integer(
+        vocab_size=_records.integer(text["vocab_size"], "vocab_size"),
+        hidden_size=_records.integer(text["hidden_size"], "hidden_size"),
+        intermediate_size=_records.integer(text["intermediate_size"], "intermediate_size"),
+        num_layers=_records.integer(text["num_hidden_layers"], "num_hidden_layers"),
+        num_heads=_records.integer(text["num_attention_heads"], "num_attention_heads"),
+        max_position_embeddings=_records.integer(
             text["max_position_embeddings"], "max_position_embeddings"
         ),
-        layer_norm_eps=records.number(text.get("layer_norm_eps", 1e-5), "layer_norm_eps"),
+        layer_norm_eps=_records.number(text.get("layer_norm_eps", 1e-5), "layer_norm_eps"),
         eos_token_id=eos_token_id,
         activation=activation,
     )
@@ -374,18 +374,18 @@ def translate_vision_config(hf_config: Mapping[str, object]) -> NativeFields[CLI
     """A CLIP config into `CLIPVisionTransformer` fields, read the way
     `translate_config` reads the text ones: from `vision_config` of a full
     config or from a `CLIPVisionConfig` on its own."""
-    vision = records.record(hf_config.get("vision_config", hf_config), "vision_config")
+    vision = _records.record(hf_config.get("vision_config", hf_config), "vision_config")
 
     return native_fields(CLIPVisionTransformer)(
-        hidden_size=records.integer(vision["hidden_size"], "hidden_size"),
-        intermediate_size=records.integer(vision["intermediate_size"], "intermediate_size"),
-        num_layers=records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
-        num_heads=records.integer(vision["num_attention_heads"], "num_attention_heads"),
-        image_size=records.integer(vision["image_size"], "image_size"),
-        patch_size=records.integer(vision["patch_size"], "patch_size"),
-        num_channels=records.integer(vision.get("num_channels", 3), "num_channels"),
-        layer_norm_eps=records.number(vision.get("layer_norm_eps", 1e-5), "layer_norm_eps"),
-        activation=records.text(vision.get("hidden_act", "quick_gelu"), "hidden_act"),
+        hidden_size=_records.integer(vision["hidden_size"], "hidden_size"),
+        intermediate_size=_records.integer(vision["intermediate_size"], "intermediate_size"),
+        num_layers=_records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
+        num_heads=_records.integer(vision["num_attention_heads"], "num_attention_heads"),
+        image_size=_records.integer(vision["image_size"], "image_size"),
+        patch_size=_records.integer(vision["patch_size"], "patch_size"),
+        num_channels=_records.integer(vision.get("num_channels", 3), "num_channels"),
+        layer_norm_eps=_records.number(vision.get("layer_norm_eps", 1e-5), "layer_norm_eps"),
+        activation=_records.text(vision.get("hidden_act", "quick_gelu"), "hidden_act"),
     )
 
 
@@ -395,7 +395,7 @@ def translate_clip_config(hf_config: Mapping[str, object]) -> CLIPFields:
     return {
         "text": translate_config(hf_config),
         "vision": translate_vision_config(hf_config),
-        "projection_dim": records.integer(hf_config["projection_dim"], "projection_dim"),
+        "projection_dim": _records.integer(hf_config["projection_dim"], "projection_dim"),
     }
 
 
@@ -544,7 +544,7 @@ def bind_text_tower[Tower: nn.Module](
     bound unchanged with only the configuration read, or the checkpoint's at
     `param_dtype`, FP32 masters by default whatever the checkpoint stores."""
     directory, stored_config = component_source(name_or_dir, revision, weights=variables is None)
-    config = translate(records.record(stored_config, "config.json"))
+    config = translate(_records.record(stored_config, "config.json"))
     transformer = config.value.clone(dtype=resolve_dtype(dtype))
     params = None
     if variables is not None:
@@ -585,7 +585,7 @@ class CLIPModel:
                         revision: str | None = None) -> "CLIPModel":
         """Load full CLIP with independent compute and parameter precision."""
         directory, stored_config = component_source(name_or_dir, revision, weights=True)
-        config = translate_clip_config(records.record(stored_config, "config.json"))
+        config = translate_clip_config(_records.record(stored_config, "config.json"))
 
         module = CLIP(
             text_model=config["text"].value.clone(dtype=dtype),
@@ -746,19 +746,19 @@ def translate_t5_config(hf_config: Mapping[str, object]) -> NativeFields[T5Encod
     """A T5 or UMT5 config into `T5EncoderTransformer` fields; a `umt5`
     model gives every layer its own relative bias."""
     return native_fields(T5EncoderTransformer)(
-        vocab_size=records.integer(hf_config["vocab_size"], "vocab_size"),
-        d_model=records.integer(hf_config["d_model"], "d_model"),
-        d_ff=records.integer(hf_config["d_ff"], "d_ff"),
-        num_layers=records.integer(hf_config["num_layers"], "num_layers"),
-        num_heads=records.integer(hf_config["num_heads"], "num_heads"),
-        head_dim=records.integer(hf_config["d_kv"], "d_kv"),
-        num_buckets=records.integer(hf_config.get("relative_attention_num_buckets", 32),
+        vocab_size=_records.integer(hf_config["vocab_size"], "vocab_size"),
+        d_model=_records.integer(hf_config["d_model"], "d_model"),
+        d_ff=_records.integer(hf_config["d_ff"], "d_ff"),
+        num_layers=_records.integer(hf_config["num_layers"], "num_layers"),
+        num_heads=_records.integer(hf_config["num_heads"], "num_heads"),
+        head_dim=_records.integer(hf_config["d_kv"], "d_kv"),
+        num_buckets=_records.integer(hf_config.get("relative_attention_num_buckets", 32),
                             "relative_attention_num_buckets"),
-        max_distance=records.integer(hf_config.get("relative_attention_max_distance", 128),
+        max_distance=_records.integer(hf_config.get("relative_attention_max_distance", 128),
                              "relative_attention_max_distance"),
-        feed_forward_proj=records.text(hf_config.get("feed_forward_proj", "relu"), "feed_forward_proj"),
-        dropout_rate=records.number(hf_config.get("dropout_rate", 0.0), "dropout_rate"),
-        layer_norm_epsilon=records.number(hf_config.get("layer_norm_epsilon", 1e-6), "layer_norm_epsilon"),
+        feed_forward_proj=_records.text(hf_config.get("feed_forward_proj", "relu"), "feed_forward_proj"),
+        dropout_rate=_records.number(hf_config.get("dropout_rate", 0.0), "dropout_rate"),
+        layer_norm_epsilon=_records.number(hf_config.get("layer_norm_epsilon", 1e-6), "layer_norm_epsilon"),
         per_layer_bias=hf_config.get("model_type") == "umt5",
     )
 

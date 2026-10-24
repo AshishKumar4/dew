@@ -23,12 +23,12 @@ from diffusion_support import images_of
 from reference_error import assert_as_exact
 
 from dew.config import ObjectiveConfig, TrainerConfig
-from dew.model_config import ModelConfig
 from dew.config.diffusion import DiffusionRunConfig, FlowRolloutConfig
 from dew.diffusion.presets import Flow, ResolutionShift
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.inputs import TextCondition
+from dew.model_config import ModelConfig
 from dew.objectives import Step
 from dew.objectives.diffusion import Alignment, DiffusionObjective
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, TUNED_WEIGHTS, EndToEnd

@@ -51,6 +51,7 @@ from dew.nn.inputs import ModelKwarg
 from dew.nn.precision import capped_logits, head_product, scaled_logits
 
 if TYPE_CHECKING:
+    from dew._records import JSON
     from dew.diffusion.process import DenoisingCondition
     from dew.inputs.encoders import ConditionWork
     from dew.nn.backbones.decoder_block import RematPolicy
@@ -61,7 +62,6 @@ if TYPE_CHECKING:
     from dew.nn.kv_cache import KVCache
     from dew.nn.mla import MLAMixer
     from dew.quantization import InputQuantizer
-    from dew.records import JSON
 
 __all__ = [
     "AffineHead",

@@ -15,7 +15,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew import records
+from dew import _records
 from dew._model_types import SANDWICH_NORMS
 from dew.batch import Variables, coordinates
 from dew.interop.weights import native_layouts, placed
@@ -380,18 +380,18 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Record:
     return {
         "class": "gemma4", "fields": {
         **geometry,
-        "num_key_value_heads": records.integer(
+        "num_key_value_heads": _records.integer(
             vision.get("num_key_value_heads", heads), "num_key_value_heads"
         ),
-        "head_dim": records.integer(vision.get("head_dim", geometry["hidden_size"] // heads), "head_dim"),
-        "patch_size": records.integer(vision.get("patch_size", 16), "patch_size"),
-        "pooling_kernel_size": records.integer(vision.get("pooling_kernel_size", 3), "pooling_kernel_size"),
-        "position_embedding_size": records.integer(
+        "head_dim": _records.integer(vision.get("head_dim", geometry["hidden_size"] // heads), "head_dim"),
+        "patch_size": _records.integer(vision.get("patch_size", 16), "patch_size"),
+        "pooling_kernel_size": _records.integer(vision.get("pooling_kernel_size", 3), "pooling_kernel_size"),
+        "position_embedding_size": _records.integer(
             vision.get("position_embedding_size", 10240), "position_embedding_size"
         ),
         "hidden_act": activation_name(vision, ("gelu_pytorch_tanh", "gelu"), "gelu_pytorch_tanh",
                                       ("hidden_activation", "hidden_act")),
-        "rms_norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
+        "rms_norm_eps": _records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
         "rope_theta": rope_base(vision, 100.0, axial=True),
         "standardize": bool(vision.get("standardize", False)),
         "use_clipped_linears": bool(vision.get("use_clipped_linears", False)),
@@ -427,7 +427,7 @@ def translate_gemma4_projector_config(vision: Mapping[str, object],
     return {
         "class": "gemma4", "fields": {
         "text_width": int(text_width),
-        "norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
+        "norm_eps": _records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
     }}
 
 

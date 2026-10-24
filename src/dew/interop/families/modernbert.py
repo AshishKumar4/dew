@@ -17,7 +17,7 @@ from functools import partial
 
 import numpy as np
 
-from dew import records
+from dew import _records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
     ACTIVATIONS,
@@ -81,20 +81,20 @@ def _modernbert_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
         # never reads: it attends both ways whatever they say (is_causal = False).
         'causal_mask', 'is_causal'))
     for dropout in ('attention_dropout', 'mlp_dropout'):
-        if records.number(hf.get(dropout, 0.0), dropout):
+        if _records.number(hf.get(dropout, 0.0), dropout):
             refuse(dropout, "ModernBERT drops inside its attention and MLP where the blocks here do not")
     if hf.get('classifier_bias'):
         refuse('classifier_bias', "the prediction head's dense layer is bias-free")
-    hidden = records.integer(hf['hidden_size'], 'hidden_size')
-    heads = records.integer(hf['num_attention_heads'], 'num_attention_heads')
-    layers = records.integer(hf['num_hidden_layers'], 'num_hidden_layers')
+    hidden = _records.integer(hf['hidden_size'], 'hidden_size')
+    heads = _records.integer(hf['num_attention_heads'], 'num_attention_heads')
+    layers = _records.integer(hf['num_hidden_layers'], 'num_hidden_layers')
     if hidden % heads:
         refuse('hidden_size/num_attention_heads', 'the hidden width must divide into whole heads')
-    activation = records.text(hf.get('hidden_activation', 'gelu'), 'hidden_activation')
+    activation = _records.text(hf.get('hidden_activation', 'gelu'), 'hidden_activation')
     if activation not in ACTIVATIONS:
         refuse(f'hidden_activation={activation!r}', f'the GLU supports {sorted(ACTIVATIONS)}')
 
-    every = records.integer(hf.get('global_attn_every_n_layers', 3), 'global_attn_every_n_layers')
+    every = _records.integer(hf.get('global_attn_every_n_layers', 3), 'global_attn_every_n_layers')
     layer_types = specified_layer_types(hf, used, ('full_attention',) + ('sliding_attention',) * (every - 1))
     # ModernBertConfig keeps a record per layer type, filling the full one's base from
     # global_rope_theta and the sliding one's from local_rope_theta, else its defaults
@@ -104,26 +104,26 @@ def _modernbert_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
     if ropes.scaling is not None or ropes.local_scaling is not None:
         refuse('rope_parameters', 'ModernBERT rotates at its plain frequencies')
     theta, local_theta = ropes.theta, ropes.local_theta
-    window = records.integer(hf.get('local_attention', 128), 'local_attention') // 2 + 1
+    window = _records.integer(hf.get('local_attention', 128), 'local_attention') // 2 + 1
 
-    head = records.strings(hf.get('architectures', [_MASKED_LM]), 'architectures') != (_ENCODER,)
-    head_activation = records.text(hf.get('classifier_activation', 'gelu'), 'classifier_activation')
+    head = _records.strings(hf.get('architectures', [_MASKED_LM]), 'architectures') != (_ENCODER,)
+    head_activation = _records.text(hf.get('classifier_activation', 'gelu'), 'classifier_activation')
     transform = (ungated_mlp(head_activation, ('gelu', 'gelu_pytorch_tanh'), 'classifier_activation',
                              "ModernBERT's prediction head") if head else None)
     config: DecoderFields = native_fields(CausalTransformer)(
-        vocab_size=records.integer(hf['vocab_size'], 'vocab_size'),
+        vocab_size=_records.integer(hf['vocab_size'], 'vocab_size'),
         emb_features=hidden, num_layers=layers, num_heads=heads, num_kv_heads=heads,
         head_dim=hidden // heads, mlp=ACTIVATIONS[activation],
-        mlp_features=records.integer(hf['intermediate_size'], 'intermediate_size'),
+        mlp_features=_records.integer(hf['intermediate_size'], 'intermediate_size'),
         max_seq_len=context_lengths(hf, 8192)[0],
         rope_theta=theta, layer_types=layer_types,
         norm_type='layer', norm_bias=bool(hf.get('norm_bias', False)),
-        norm_eps=records.number(hf.get('norm_eps', 1e-5), 'norm_eps'),
+        norm_eps=_records.number(hf.get('norm_eps', 1e-5), 'norm_eps'),
         embedding_norm=True, first_attention_norm=False, qk_norm=False,
         attention_bias=bool(hf.get('attention_bias', False)), mlp_bias=bool(hf.get('mlp_bias', False)),
         causal=False,
         tie_embeddings=bool(hf.get('tie_word_embeddings', True)),
-        embedding_dropout_rate=records.number(hf.get('embedding_dropout', 0.0), 'embedding_dropout'),
+        embedding_dropout_rate=_records.number(hf.get('embedding_dropout', 0.0), 'embedding_dropout'),
     )
     kinds = decoder_kinds(layer_types, window, local_theta, None, None)
     if 'sliding_attention' in kinds:

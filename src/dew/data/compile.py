@@ -23,6 +23,7 @@ from typing import ClassVar, Literal, Protocol, runtime_checkable
 import grain.python as pygrain
 import numpy as np
 
+from dew._records import JSON, integer, json_value
 from dew.batch import Batch
 from dew.data.analysis import (
     Measuring,
@@ -123,7 +124,6 @@ from dew.data.sources.base import (
     tokenizer_contract,
 )
 from dew.data.steps.generic import Coordinated
-from dew.records import JSON, integer, json_value
 
 _DEFAULT_LOADING = Loading()
 

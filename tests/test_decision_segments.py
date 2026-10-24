@@ -10,11 +10,11 @@ import dataclasses
 
 import pytest
 
+from dew._records import JSON
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, JointLayout, Layout, Media, Noul, Schema, State, Text
 from dew.decision.head import Head, JointSchemaHead
 from dew.decision.layout import JOINT_SEGMENTS, Specials
-from dew.records import JSON
 from dew.registry import from_record, to_record
 
 QUESTIONS = {"pick": Choice("Which one?", ["a", "b", "c"]), "holds": Noul("Does it hold?")}

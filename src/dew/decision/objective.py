@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
+from dew._records import integer, record
 from dew.artifacts import Decisions
 from dew.batch import FROZEN, Batch, Variables, part
 from dew.data.pipeline import Configured, ObjectiveData, Pack, Rejected
@@ -57,7 +58,6 @@ from dew.objectives.base import (
     joined,
     model_rngs,
 )
-from dew.records import integer, record
 
 if TYPE_CHECKING:
     from dew.state import TrainState
