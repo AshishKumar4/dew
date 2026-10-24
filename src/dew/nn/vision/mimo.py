@@ -12,14 +12,17 @@ from dew.registry import Record
 
 from .common import (
     ProjectorBase,
+    ProjectorLayout,
     TowerBase,
     TowerGeometry,
+    TowerLayout,
     _vision_section,
     activation_name,
     block_tensor_path,
+    in_params,
     merger_projector,
 )
-from .vit import MergeProjector, VisionTransformer, ViTLayout
+from .vit import MergeProjector, VisionTransformer, ViTLayout, translate_vit_weights
 
 
 @dataclasses.dataclass(frozen=True)
@@ -147,3 +150,10 @@ def translate_mimo_vision_config(hf_config: Mapping[str, object]) -> Record:
 def translate_mimo_projector_config(hf_config: Mapping[str, object], text_width: int) -> Record:
     """A MiMo-V2 wrapper's merger fields (`merger_projector`)."""
     return merger_projector(hf_config, text_width, "mimo")
+
+
+MiMoVision.checkpoint = TowerLayout("visual.", in_params(mimo_vision_path), read=translate_vit_weights)
+# MiMo's merger stores no biases (MiMoVisionPatchMerger's released tensors).
+MiMoProjector.checkpoint = ProjectorLayout("visual.merger.", {
+    "ln_q.weight": ("norm", "scale"), "mlp.0.weight": ("fc1", "kernel"), "mlp.2.weight": ("fc2", "kernel"),
+}, strip="merger.")

@@ -4,6 +4,7 @@ answer read from its own context."""
 
 import dataclasses
 import itertools
+from collections.abc import Sequence
 from pathlib import Path
 
 import jax
@@ -14,12 +15,13 @@ import pytest
 from decision_support import decision_rows
 from model_support import flat_tree
 from recording import RecordingTracker
-from reference_error import assert_as_exact, widened
+from reference_error import assert_as_exact, widened, without_ynn
 
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, Decide, Example
-from dew.decision.layout import Specials
+from dew.decision.images import Images
+from dew.decision.layout import DecisionInputs, Specials
 from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.questions import ChoiceAnswer
@@ -50,9 +52,9 @@ QUESTION = {"pick": Choice("Which one?", ["a", "b", "c"])}
 
 WORDS = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "note", "first"]
 
-CONTEXT_SEEDS = 32
+CONTEXT_SEEDS = 8
 """Check 1's declared seeds for the batched answers with their contexts, sized paired (`seeds_for`
-with the batch as `dew_fn`, 2026-10-23 on armada)."""
+with the batch as `dew_fn`, 2026-10-23 on armada, both arms without YNNPACK's fusions)."""
 
 
 def conditioned(length: int = 16, layers: tuple[int, ...] = (0, 1)) -> DecisionObjective:
@@ -77,11 +79,30 @@ def in_float64(task: Decide) -> Decide:
     return dataclasses.replace(task, model=model, variables=widened(task.variables))
 
 
-def asked(task: Decide, state: str, context=None, images=()) -> np.ndarray:
-    """`task`'s probabilities over QUESTION's options for `state`."""
-    answer = task(state, QUESTION, context=context, images=images)["pick"]
-    assert isinstance(answer, ChoiceAnswer)
-    return np.asarray(answer.probabilities)
+COMPILED = {}
+"""Each model's forward (`DecisionModel.logits`), compiled once without YNNPACK's fusions
+(`without_ynn`): the numerical checks here compare two Dew programs."""
+
+
+def scored(task: Decide, asked: Sequence[tuple[str, str | None]], images=()) -> np.ndarray:
+    """The real options' logits of `asked`'s requests, each a state and a context, laid out by `task`
+    and collated into one pass (each request's images beside it where given, one request a pass),
+    through its model compiled without YNNPACK's fusions."""
+    forward = COMPILED.setdefault(id(task.model), without_ynn(task.model.logits))
+    if images:
+        [(state, context)] = asked
+        assert task.processor is not None and task.layout.images
+        media = Images.of(task.processor, images, task.processor.image_text())
+        [row] = task._encoded(state, QUESTION, media.tokens, context=context)
+        inputs = DecisionInputs.collate([row], task.specials.pad, context_length=task.context_length)
+        logits = forward(task.variables, inputs, media=media.inputs(task.processor, row))
+    else:
+        # Laid out as `Decide.batch` lays a batch out (`Decide.rows`).
+        rows = [row for own in task.rows([(state, QUESTION) for state, _ in asked],
+                                         contexts=[context for _, context in asked]) for row in own]
+        inputs = DecisionInputs.collate(rows, task.specials.pad, context_length=task.context_length)
+        logits = forward(task.variables, inputs)
+    return np.asarray(logits)[np.asarray(inputs.options)]
 
 
 def drawn(seed) -> tuple[str, str]:
@@ -130,14 +151,14 @@ def test_a_backbone_with_fresh_context_layers_scores_every_row_as_its_source_doe
     def truth(seed):
         with jax.enable_x64(new_val=True):
             if "task" not in wide:
-                wide["task"] = in_float64(source_task)
-            return asked(wide["task"], drawn(seed)[0])
+                wide["task"] = in_float64(asked_task)
+            return scored(wide["task"], [(drawn(seed)[0], None)])
 
-    source_task = asked_task
-    for read in (lambda seed: asked(reading, drawn(seed)[0]),
-                 lambda seed: asked(reading, *drawn(seed))):
-        assert_as_exact(read, lambda seed: asked(source_task, drawn(seed)[0]), lambda seed: (np.int64(seed),),
-                        "shut gates against the source", seeds=FRESH_SEEDS, truth_fn=truth)
+    for read in (lambda seed: scored(reading, [(drawn(seed)[0], None)]),
+                 lambda seed: scored(reading, [drawn(seed)])):
+        assert_as_exact(read, lambda seed: scored(asked_task, [(drawn(seed)[0], None)]),
+                        lambda seed: (np.int64(seed),), "shut gates against the source", seeds=FRESH_SEEDS,
+                        truth_fn=truth)
 
 
 def test_a_conditioned_run_logs_its_training_work_and_serves_with_its_context():
@@ -197,8 +218,10 @@ def test_the_context_layers_work_is_counted_in_a_conditioned_batch():
 
 def test_a_batch_answers_each_request_from_its_own_context():
     """With the gates open, a request's answer reads its context: another context, or none, answers it
-    otherwise. In a batch, each request's every option probability is on par from float64 with its
-    answer alone (check 1), so each row reads its own context and not a neighbour's."""
+    otherwise. A batch lays each request out with its own context (`Decide.rows`, which `Decide.batch`
+    scores), each request's rows exactly its lone call's; and in one pass of four, each request's every
+    option logit is on par from float64 with its pass alone (check 1), so each row reads its own
+    context and not a neighbour's."""
     objective = conditioned(16, (0, 1))
     variables = opened(objective.init(jax.random.key(0)))
     task = Decide(objective.model, variables, objective.layout, objective.tokenizer, objective.specials)
@@ -218,29 +241,34 @@ def test_a_batch_answers_each_request_from_its_own_context():
         rng = np.random.default_rng([0xC0E7, int(seed)])
         states = [" ".join(rng.choice(WORDS, 6)) for _ in range(3)]
         contexts = [" ".join(rng.choice(WORDS, int(rng.integers(1, 6)))) for _ in range(3)]
-        return [(states[0], QUESTION), (states[0], QUESTION), (states[1], QUESTION), (states[2], QUESTION)], [
-            contexts[0], contexts[1], None, contexts[2]]
+        return [(states[0], contexts[0]), (states[0], contexts[1]), (states[1], None),
+                (states[2], contexts[2])]
 
-    def scored(reading: Decide, seed, *, together: bool) -> np.ndarray:
-        asked, contexts = requests(seed)
-        answered = (reading.batch(asked, contexts=contexts) if together else
-                    [reading.batch([one], contexts=[context])[0]
-                     for one, context in zip(asked, contexts, strict=True)])
-        return np.concatenate([answer.probabilities for answers, _ in answered
-                               for answer in answers.values()])
+    asked = requests(0)
+    together = [row.context for own in task.rows([(state, QUESTION) for state, _ in asked],
+                                                 contexts=[context for _, context in asked]) for row in own]
+    alone = [row.context for state, context in asked
+             for row in task.rows([(state, QUESTION)], contexts=[context])[0]]
+    assert together == alone and len(set(together)) == len(asked)
+
+    def read(reading: Decide, seed, *, together: bool) -> np.ndarray:
+        asked = requests(seed)
+        if together:
+            return scored(reading, asked)
+        return np.concatenate([scored(reading, [one]) for one in asked])
 
     def truth(seed):
         with jax.enable_x64(new_val=True):
             if "task" not in wide:
                 wide["task"] = in_float64(task)
-            return scored(wide["task"], seed, together=False)
+            return read(wide["task"], seed, together=False)
 
     def draw(seed):
         # The draw is its seed; the requests are made from it, their text no array the check widens.
         return (np.int64(seed),)
 
-    assert_as_exact(lambda seed: scored(task, seed, together=True),
-                    lambda seed: scored(task, seed, together=False), draw,
+    assert_as_exact(lambda seed: read(task, seed, together=True),
+                    lambda seed: read(task, seed, together=False), draw,
                     "batched answers with their contexts", seeds=CONTEXT_SEEDS, truth_fn=truth)
 
 
@@ -272,11 +300,12 @@ def test_a_request_with_images_reads_its_context_beside_them():
         with jax.enable_x64(new_val=True):
             if "task" not in wide:
                 wide["task"] = in_float64(shut)
-            return asked(wide["task"], drawn(seed)[0], images=images)
+            return scored(wide["task"], [(drawn(seed)[0], None)], images)
 
-    assert_as_exact(lambda seed: asked(shut, *drawn(seed), images=images),
-                    lambda seed: asked(shut, drawn(seed)[0], images=images), lambda seed: (np.int64(seed),),
-                    "shut gates beside images", seeds=FRESH_SEEDS, truth_fn=truth)
+    assert_as_exact(lambda seed: scored(shut, [drawn(seed)], images),
+                    lambda seed: scored(shut, [(drawn(seed)[0], None)], images),
+                    lambda seed: (np.int64(seed),), "shut gates beside images", seeds=FRESH_SEEDS,
+                    truth_fn=truth)
     reading = task(opened(variables))
-    assert not np.array_equal(asked(reading, "one two three", "a first note", images),
-                              asked(reading, "one two three", "ten", images))
+    assert not np.array_equal(scored(reading, [("one two three", "a first note")], images),
+                              scored(reading, [("one two three", "ten")], images))

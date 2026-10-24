@@ -36,10 +36,12 @@ from dew.nn.dense import Dense
 from .activations import GatedActivation, gated_product, relu2, swiglu_clamped
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
-from .kernels.generation import backend, ran_kernel, route, triton_runs
-from .kernels.grouped_matmul import portable_projection
-from .kernels.selection import forced
+from .kernels import grouped_matmul
+from .kernels.generation import backend, triton_runs
+from .kernels.grouped_matmul import GROUPED, portable_projection
+from .kernels.selection import select, selected
 from .kernels.templates.gemm import template
+from .kernels.templates.product import declared
 from .precision import at_least_fp32, float32_dot_general, float32_einsum, float32_products, rounded_operand
 from .protocols import ProjectionGroup, Routes, declared_groups
 from .sharding import (
@@ -346,15 +348,21 @@ class Router(nn.Module):
             return self.tid2eid.value[jnp.asarray(tokens)]
         if tokens is not None:
             raise ValueError("only a hash router reads the token ids")
+        selection = self.selection(scores, media, blocks)
+        if self.expert_groups > 1:
+            selection = jnp.where(self.group_mask(selection), selection, -jnp.inf)
+        _, indices = jax.lax.top_k(selection, self.top_k)
+        return indices
+
+    def selection(self, scores, media=None, blocks=None):
+        """What a token's experts are chosen by before its groups are: its scores with the balancing
+        bias (a media token's own bias), and outside each block's shortlist -inf."""
         selection = scores if not self.expert_bias else scores + self.bias.value
         if media is not None:
             selection = jnp.where(media[..., None], scores + self.bias_vl.value, selection)
         if blocks is not None and self.block_experts is not None:
             selection = jnp.where(self.block_mask(selection, blocks, self.block_experts), selection, -jnp.inf)
-        if self.expert_groups > 1:
-            selection = jnp.where(self.group_mask(selection), selection, -jnp.inf)
-        _, indices = jax.lax.top_k(selection, self.top_k)
-        return indices
+        return selection
 
     def logits(self, x):
         """Each token's gate logit for every expert, in fp32 (`at_least_fp32`):
@@ -378,16 +386,20 @@ class Router(nn.Module):
         `n_group` means.
         """
         per_group = self.num_experts // self.expert_groups
-        grouped = selection.reshape(*selection.shape[:-1], self.expert_groups, per_group)
-        if self.group_score == 'max':
-            group_scores = jnp.max(grouped, axis=-1)
-        else:
-            best_two, _ = jax.lax.top_k(grouped, 2)
-            group_scores = jnp.sum(best_two, axis=-1)
-        _, groups = jax.lax.top_k(group_scores, self.groups_per_token)
+        _, groups = jax.lax.top_k(self.group_scores(selection), self.groups_per_token)
         kept = jnp.sum(
             jax.nn.one_hot(groups, self.expert_groups, dtype=jnp.int32), axis=-2)
         return jnp.repeat(kept > 0, per_group, axis=-1)
+
+    def group_scores(self, selection):
+        """Each expert group's score, by which a token's best groups are chosen (`group_mask`): its
+        best expert's selection score, or its two best's sum. `[..., expert_groups]`."""
+        grouped = selection.reshape(*selection.shape[:-1], self.expert_groups,
+                                    self.num_experts // self.expert_groups)
+        if self.group_score == 'max':
+            return jnp.max(grouped, axis=-1)
+        best_two, _ = jax.lax.top_k(grouped, 2)
+        return jnp.sum(best_two, axis=-1)
 
     @staticmethod
     def block_mask(selection, blocks, experts: int):
@@ -443,36 +455,40 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     the call (a GPU of sm80 on that states the tensor rate their cost model
     reads, and for 'pallas' a CPU, which interprets them) and XLA's program
     elsewhere, a TPU's above all, which the route reports with the reason; both
-    hold it in every differentiation mode. A product the kernels cannot compute
-    exactly (`ragged_dot_refusal`), or a trace they cannot take (`seen_whole`),
-    runs 'xla'; `generation.chosen(grouped_matmul=...)` decides first, a kernel's
-    name raising where it cannot run the call. XLA's ragged dot runs a product
-    over every expert, 70 to 200 times the kernels' time on an H100 at
-    Qwen3-30B-A3B's and Kimi Linear's experts (GMM-h100-2), so where the kernels
-    run they are the choice. tests/test_moe_precision.py measures it against
-    float64 sums and three Adam steps on every expert/fsdp layout.
+    hold it in every differentiation mode. A call no launch takes here (the
+    grouped selector's requirements, `grouped_matmul.GROUPED`: a product the
+    kernels cannot compute exactly, a trace they cannot take, `seen_whole`)
+    runs 'xla', reported; `generation.chosen(grouped_matmul=...)` names a kernel
+    after the call's own 'xla', a launch's name raising where it cannot run the
+    call (`selection.KernelRefused`). XLA's ragged dot runs a product over every
+    expert, 70 to 200 times the kernels' time on an H100 at Qwen3-30B-A3B's and
+    Kimi Linear's experts (GMM-h100-2), so where the kernels run they are the
+    choice. tests/test_moe_precision.py measures it against float64 sums and
+    three Adam steps on every expert/fsdp layout.
     """
     if implementation not in GROUPED_MATMULS:
         raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
     compute = canonicalize_dtype(x, kernel, dtype=dtype)
     resolved = float32_products(compute, precision)
-    named = forced('grouped_matmul')
-    # The kernels run in a GPU's process, or interpreted in a CPU's where 'pallas' asks; what they compute
-    # is the template's to refuse (`template.gemm`).
-    placed = triton_runs() or (implementation == 'pallas' and backend() == 'cpu')
-    refusal = None if placed else "the Pallas kernels need a GPU of sm80 or later"
-    if named == 'xla' or (named is None and implementation == 'xla'):
-        route('grouped_matmul', kernel='xla')
-    elif refusal is not None and named is not None:
-        raise ValueError(f"grouped_matmul's implementation {named!r} is chosen and does not run this call: "
-                         f"{refusal}")
-    elif refusal is not None:
-        ran_kernel('grouped_matmul', 'xla', refusal)
-    elif seen_whole(x) and seen_whole(kernel):
+    named = 'xla' if implementation == 'xla' else None
+    # The template's forward launches as the call leaves them, which take it or leave it to XLA here,
+    # before the template's dispatch selects each of its launches: the kernels run in a GPU's process,
+    # or interpreted in a CPU's where 'pallas' asks.
+    def spec(array):
+        return jax.ShapeDtypeStruct(array.shape, compute)
+
+    product = declared(compute, resolved, outputs=(compute,), operands=(compute, kernel.dtype))
+    case = grouped_matmul.grouped_case(*grouped_matmul.gmm_call(
+        spec(x), spec(kernel), jax.ShapeDtypeStruct(group_sizes.shape, jnp.int32), out_dtype=compute,
+        trans_rhs=False, interpret=not triton_runs(), promoted=product.promoted), product=product,
+        whole=seen_whole(x) and seen_whole(kernel),
+        placed=triton_runs() or (implementation == 'pallas' and backend() == 'cpu'))
+    if not selected(GROUPED, case, named).generic:
         # The GEMM template: its launches where they run the call (each reports its route), XLA's
         # program elsewhere, differentiable at every order.
         return template.gemm(x, kernel, group_sizes, compute=compute, out_dtype=compute, precision=resolved,
                              interpret_on_cpu=implementation == 'pallas')
+    select(GROUPED, case, named)
     return portable_projection(x, kernel, group_sizes, dtype, resolved)
 
 

@@ -7,6 +7,8 @@ import numpy as np
 
 from dew import records
 from dew.interop.decoder_parts import (
+    MEGATRON_MLP,
+    PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
     Renames,
@@ -15,6 +17,7 @@ from dew.interop.decoder_parts import (
     fixed_attention_buffer,
     grouped_qkv,
     hf_ungated,
+    partial_rope,
     renamed_name,
     renamed_path,
     ungated_mlp,
@@ -24,14 +27,13 @@ from dew.nn.rope import inverse_frequencies
 
 
 def _gpt_neox_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
-    parameters = records.record(hf.get('rope_parameters') or {}, 'rope_parameters')
-    partial = records.number(parameters.get('partial_rotary_factor', hf.get('rotary_pct', .25)), 'rotary_pct')
-    theta = records.number(parameters.get('rope_theta', hf.get('rotary_emb_base', 10000.)), 'rotary_emb_base')
+    theta, partial, rope = partial_rope(hf, PLAIN_SPELLING, default_factor=.25, factor_field='rotary_pct',
+                                        theta_field='rotary_emb_base')
     activation = records.text(hf.get('hidden_act', 'gelu'), 'hidden_act')
     mlp = ungated_mlp(activation, ('gelu', 'gelu_new', 'gelu_pytorch_tanh', 'relu'), 'hidden_act', 'GPT-NeoX')
-    rope = {key: value for key, value in parameters.items() if key != 'partial_rotary_factor'}
     config = base_config({**hf, 'hidden_act': 'gelu', 'rope_theta': theta,
-                           'rope_parameters': rope or None}, used, reads=frozenset({'attention_bias'}))
+                           'rope_parameters': rope or None}, used, rope=PLAIN_SPELLING,
+                         reads=frozenset({'attention_bias'}))
     used.update(('rotary_pct', 'rotary_emb_base', 'use_parallel_residual', 'layer_norm_eps',
                  'hidden_dropout', 'classifier_dropout', 'is_decoder'))
     config.update({
@@ -78,13 +80,12 @@ def _gpt_neox_buffers(tensors: Mapping[str, np.ndarray],
 _GPT_NEOX_NAMES: Renames = (
     ('embed_out', 'lm_head'), ('gpt_neox.embed_in', 'model.embed_tokens'),
     ('gpt_neox.final_layer_norm', 'model.norm'), ('gpt_neox.layers', 'model.layers'),
-    ('attention.dense', 'self_attn.o_proj'), ('mlp.dense_h_to_4h', 'mlp.up_proj'),
-    ('mlp.dense_4h_to_h', 'mlp.down_proj'))
+    ('attention.dense', 'self_attn.o_proj'), *MEGATRON_MLP)
 
 
 def _gpt_neox_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    if '.attention.query_key_value.' in name or name.endswith((
-            '.attention.bias', '.attention.masked_bias', '.attention.rotary_emb.inv_freq')):
+    # Alias inspection sees raw names before preparation, which validates and drops the buffers.
+    if name.endswith(('.attention.bias', '.attention.masked_bias', '.attention.rotary_emb.inv_freq')):
         return None
     return renamed_path(_GPT_NEOX_NAMES, name, config)
 

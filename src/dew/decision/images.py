@@ -19,7 +19,7 @@ class Images:
     """A request's images as the backbone's processor prepares them.
 
     That is the tokens it expands them to, which a layout places in the row
-    (`Layout.image`), each of its per-token fields over those tokens, and its
+    (`Layout.images`), each of its per-token fields over those tokens, and its
     pixel fields. The processor runs over the images' texts and a newline,
     and the row's text tokens take 0 in every per-token field.
     """
@@ -31,8 +31,8 @@ class Images:
     @classmethod
     def of(cls, processor: Processor, images: Sequence[Image.Image], text: str) -> Self:
         """Run `processor` over `images`, each standing in the text as `text`."""
-        values = processor.media(text=[text * len(images) + "\n"], images=list(images),
-                                 return_tensors="np")
+        # In the tensor type the processor computes in, read on the host as its model inputs are.
+        values = processor.host_media([text * len(images) + "\n"], images=list(images))
         ids = np.asarray(values["input_ids"])
         arrays = {name: np.asarray(value) for name, value in values.items()
                   if name not in ("input_ids", "attention_mask")}
