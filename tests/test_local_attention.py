@@ -309,7 +309,8 @@ def test_row_fields_split_as_the_query_rows_do_where_the_heads_contend_for_the_a
         with jax.set_mesh(mesh), nn.logical_axis_rules(rules):
             return banded(query, key, value)
 
-    assert_as_exact(split, jax.jit(attend), draw, "local attention under contending heads", seeds=FEWEST_SEEDS)
+    assert_as_exact(split, jax.jit(attend), draw, "local attention under contending heads",
+                    seeds=FEWEST_SEEDS)
 
 
 @pytest.mark.parametrize("layout", [KVCache(), KVCache(page_size=4)], ids=["dense", "paged"])
