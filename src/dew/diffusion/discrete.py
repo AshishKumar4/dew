@@ -29,6 +29,7 @@ from dataclasses import dataclass, replace
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 
 from dew._distributions import categorical, row_categorical, wellformed
@@ -37,6 +38,7 @@ from dew.diffusion.process import Conditioning
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import (
     RESPONSE_FIELDS,
+    Coordinates,
     ModelInputs,
     Request,
     continuation_keys,
@@ -47,9 +49,10 @@ from dew.nn.inputs import (
     real_slots,
     token_id,
     token_ids,
+    token_layout,
 )
 from dew.nn.kernels.options import compiler_options
-from dew.nn.protocols import Logits, TokenModel
+from dew.nn.protocols import Logits, ShiftsLogits, TokenModel
 from dew.nn.sharding import explicit_spec
 from dew.objectives.base import Variables
 
@@ -214,6 +217,27 @@ REVEALED_UNDEFINED = "the model left a position it reveals without a distributio
 """What a masked walk raises when a revealed position's scores hold no distribution."""
 
 
+def aligned(model: nn.Module, scores: jax.Array,
+            fields: Mapping[str, jax.Array | np.ndarray | Coordinates] | None = None) -> jax.Array:
+    """`scores` `[B, S, ...]` per position as the model's predictions of each position's token: its
+    own for a model whose logits line up with its inputs (LLaDA's, MDLM's), and for one that declares
+    `shifted_logits` (Dream-v0's) the position before's, as its reference shifts them. A position
+    that opens its text, the row's first, the first real one after padding and each packed
+    document's first in the token `fields`' layout (`token_layout`), reads its own, as the
+    reference repeats a row's first: no document reads another's."""
+    if not (isinstance(model, ShiftsLogits) and model.shifted_logits):
+        return scores
+    before = jnp.concatenate([scores[:, :1], scores[:, :-1]], axis=1)
+    valid, documents = token_layout(fields or {})
+    opens = jnp.zeros(scores.shape[:2], bool).at[:, 0].set(True)
+    if valid is not None:
+        opens |= valid & ~jnp.concatenate([jnp.zeros_like(valid[:, :1]), valid[:, :-1]], axis=1)
+    if documents is not None:
+        changes = documents[:, 1:] != documents[:, :-1]
+        opens |= jnp.concatenate([jnp.ones_like(documents[:, :1], bool), changes], axis=1)
+    return jnp.where(opens.reshape(opens.shape + (1,) * (scores.ndim - 2)), scores, before)
+
+
 @dataclass(frozen=True)
 class DiscreteDenoiser:
     """Maps `(x_t, t)` to `(argmax fill, log-probabilities)` for `model` under `params`.
@@ -249,7 +273,9 @@ class DiscreteDenoiser:
         assert not isinstance(logits, tuple)  # no mutable collections were asked for
         # Normalized in fp32, as `token_log_probs` does: the reveal draws its
         # categorical from these, and a bf16 log partition would quantize it.
-        logits = logits.astype(jnp.float32).at[..., self.process.mask_id].set(-jnp.inf)
+        logits = aligned(self.model, logits, None if self.inputs is None else self.inputs.token_fields)
+        logits = logits.astype(jnp.float32)
+        logits = logits.at[..., self.process.mask_id].set(-jnp.inf)
         log_probs = jax.nn.log_softmax(logits, axis=-1)
         # A masked position whose scores hold no distribution stays masked: its argmax is no token.
         masked = self.masked(x_t) & wellformed(log_probs)
@@ -435,4 +461,4 @@ def _compiled(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str,
     )
 
 
-__all__ = ["MDLM", "DiscreteDenoiser", "DiscreteProcess", "LogLinear", "MaskingSchedule", "Unmask"]
+__all__ = ["MDLM", "DiscreteDenoiser", "DiscreteProcess", "LogLinear", "MaskingSchedule", "Unmask", "aligned"]

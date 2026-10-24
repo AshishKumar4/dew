@@ -6,6 +6,7 @@ Each group's update is asserted against the transform it is supposed to be,
 because a parameter in the wrong group still trains, only worse.
 """
 import dataclasses
+import importlib
 import json
 import typing
 from pathlib import Path
@@ -310,6 +311,22 @@ def test_an_expert_stack_placed_over_the_mesh_is_orthogonalized_one_expert_at_a_
         expected, _ = reference.update(one, reference.init(one), one)
         np.testing.assert_allclose(np.asarray(at(updates, path)[expert]),
                                    np.asarray(expected['kernel']), atol=1e-8)
+
+
+def test_a_matrix_declared_with_no_axis_named_is_orthogonalized_as_one_matrix():
+    """Gemma 3n's AltUp declares its coefficient matrices (None, None), whole on every device: that
+    says how they shard, not which axes form the matrix, so Muon steps the kernel as optax steps one
+    undeclared matrix, contracting its rows into its columns."""
+    # Gemma 3n's modules declare AltUp's axes as they are defined.
+    importlib.import_module("dew.nn.gemma3n")
+
+    params = {'params': {'layers_0': {'altup': {'prediction_coefs': {'kernel': jnp.zeros((16, 4))}}}}}
+    path = ('params', 'layers_0', 'altup', 'prediction_coefs', 'kernel')
+    updates, grads = group_updates(params)
+    reference = optax.contrib.muon(LR)
+    one = {'kernel': at(grads, path)}
+    expected, _ = reference.update(one, reference.init(one), one)
+    np.testing.assert_array_equal(np.asarray(at(updates, path)), np.asarray(expected['kernel']))
 
 
 def test_the_router_gate_takes_the_adamw_update():
@@ -851,3 +868,20 @@ def test_adamw_steps_land_as_near_float64_as_torchs():
         updates, state = solver.update(jnp.asarray(grad), state, ours)
         ours = optax.apply_updates(ours, updates)
     assert_as_exact_as_the_reference(np.asarray(ours), tensor.detach().numpy(), params, "adamw steps")
+
+
+@pytest.mark.parametrize("optimizer", ["adam", "adamw"])
+@pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16])
+def test_narrow_weights_step_on_float32_moments_as_float32_weights_do(optimizer, dtype):
+    """With `state_dtype='float32'`, the default, weights in float16 or bfloat16 keep their moments in
+    float32: a gradient of 1e-4, whose square is below float16's smallest number, steps them as the
+    same gradient steps float32 weights, by the rate and not by the rate over eps. (A decay of the
+    weights themselves reads them in their own dtype, so none is taken here.)"""
+    solver = OptimConfig(optimizer=optimizer, rate=1e-3, clip_grads=0, weight_decay=0.0).build(4)
+    weights = {"w": jnp.full((4, 4), 0.5, dtype)}
+    gradient = {"w": jnp.full((4, 4), 1e-4, dtype)}
+    narrow, _ = solver.update(gradient, solver.init(weights), weights)
+    wide_weights = jax.tree.map(lambda leaf: leaf.astype(jnp.float32), weights)
+    wide, _ = solver.update(jax.tree.map(lambda leaf: leaf.astype(jnp.float32), gradient),
+                            solver.init(wide_weights), wide_weights)
+    np.testing.assert_array_equal(np.asarray(narrow["w"], np.float32), np.asarray(wide["w"]))

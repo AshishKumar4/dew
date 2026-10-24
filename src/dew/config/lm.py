@@ -47,8 +47,11 @@ class LMRunConfig(RunConfig):
     RESUMABLE: ClassVar[tuple[str, ...]] = (*RunConfig.RESUMABLE, "prompt", "max_new_tokens", "sampling")
 
     objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("lm"))
-    """The objective and its arguments: lm, masked_diffusion (MDLM), or
-    block_diffusion (the official DiffusionGemma fine-tuning objective)."""
+    """The objective and its arguments: lm, masked_diffusion (MDLM),
+    block_diffusion (the official DiffusionGemma fine-tuning objective), or
+    any objective by its import path that `LMObjective`'s arguments build:
+    the decoder, `seq_len`, its starting `variables`, `samples`, `processor`
+    and `qk_stats`."""
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
     optim: OptimConfig = dataclasses.field(
@@ -77,10 +80,6 @@ class LMRunConfig(RunConfig):
         if self.pretrained is None and self.pretrained_param_dtype != "float32":
             raise ValueError("--pretrained-param-dtype stores a --pretrained checkpoint's parameters; "
                              "this run loads none")
-        if self.objective.name not in (objectives.paths[name] for name in ("lm", "masked_diffusion",
-                                                                             "block_diffusion")):
-            raise ValueError(
-                f"--objective {self.objective.name!r} is not lm, masked_diffusion or block_diffusion")
         if self.objective.name == objectives.paths["block_diffusion"] and self.pretrained is None:
             raise ValueError("block_diffusion fine-tuning requires --pretrained")
 
