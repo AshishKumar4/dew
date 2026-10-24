@@ -507,14 +507,17 @@ class CausalSelfAttention(nn.Module):
         return tuple(name for name, reads in (("image_groups", self.bidirectional_images),
                                               ("block_groups", self.bidirectional_blocks)) if reads)
 
-    def _key_groups(self, metadata: AttentionMetadata | None, slots, keys: int, decode: bool) -> _Groups:
-        """The block and image groups the layer reads, over its call's `keys` keys, by their field's name:
-        an uncached call's own tokens', a cached call's tokens' at their `slots` `[B, S]` and -1 elsewhere.
-        A cached call matches its whole pass where each block lies in one call, since a call's queries were
-        computed before any later one's keys: the keys of its own block it reads are then the call's
-        tokens. So no cache keeps the groups, and a layer sharing another's keys reads them as its own."""
+    def _key_groups(self, metadata: AttentionMetadata | None, slots, keys: int, decode: bool,
+                    length: int) -> _Groups:
+        """The block and image groups the layer reads, over its call's `keys` keys: an uncached call's own
+        tokens', a cached call's tokens' at their `slots` `[B, S]` and -1 elsewhere, and none for a single
+        decode step of `length` 1, whose keys are those before it, so its block's later ones are not yet
+        there. A cached call matches its whole pass where each block lies in one call, since a call's
+        queries were computed before any later one's keys: the keys of its own block it reads are then the
+        call's tokens. So no cache keeps the groups, and a layer sharing another's keys reads them as its
+        own."""
         read = {}
-        for name in self._group_fields():
+        for name in self._group_fields() if not (decode and length == 1) else ():
             groups = None if metadata is None else getattr(metadata, name)
             if groups is None:
                 continue
@@ -757,13 +760,9 @@ class CausalSelfAttention(nn.Module):
         layer's visibility comes to (the canvas prefix, a shared or cached decode
         step, packed documents, metadata, a pairwise mask, a chunk). `places` are
         the queries' places counted over their documents' tokens
-        (`counted_places`), and `held_places` a sharing layer's keys'. A single
-        decode step reads no block groups: its keys are those before it, so its
-        block's later ones are not yet there."""
+        (`counted_places`), and `held_places` a sharing layer's keys'."""
         B, S = query.shape[:2]
         causal, mask, documents, implementation = self.ctx.causal, None, None, self.ctx.attention_impl
-        # The canvas and a single decode step read none (`_key_groups` past the branches).
-        groups = _Groups() if prefix is not None else None
         # An uncached call's keys are its own tokens; a cached call's keys are
         # at the places their cache keeps beside them where the layer reads
         # them (`Append.places`), else at their slots, which nothing reads.
@@ -801,7 +800,6 @@ class CausalSelfAttention(nn.Module):
             # The provider's stashed keys carry the full history, read as its own cache is.
             if S == 1:
                 mask, causal = causal_attention_mask(positions, kv_len, self.ctx.sliding_window), False
-                groups = _Groups()
             else:
                 last = jnp.max(jnp.asarray(positions).reshape(B, S), axis=-1, keepdims=True)
                 documents, causal, window = self._cached_call(
@@ -816,7 +814,7 @@ class CausalSelfAttention(nn.Module):
             query = append.query(query)
             if S == 1:
                 (mask, starts), causal = self._decode_masks(positions, key.shape[0], key.shape[-3]), False
-                cursor, groups = mask, _Groups()
+                cursor = mask
             else:  # several tokens appended after the keys their rows held
                 documents, causal, window = self._cached_call(positions, cached_validity(self, key.shape[-3]))
             key_places = append.places(places) if self._reads_places else jnp.arange(key.shape[-3])
@@ -828,8 +826,8 @@ class CausalSelfAttention(nn.Module):
             # them per block, and every other kernel builds the document mask
             # from them (`attention_kernel`).
             documents = segment_ids
-        if groups is None:
-            groups = self._key_groups(attention_metadata, positions, key.shape[-3], decode)
+        groups = (_Groups() if prefix is not None  # the canvas reads its prefix whole
+                  else self._key_groups(attention_metadata, positions, key.shape[-3], decode, S))
         # Over the keys the call reads, the cache's or the prefix's joined.
         masked = self._mask_kernel(query, key, decode)
         cached = isinstance(documents, CrossDocuments)
