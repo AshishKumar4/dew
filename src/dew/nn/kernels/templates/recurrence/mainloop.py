@@ -320,6 +320,12 @@ def _merges(call: _Call) -> tuple:
     return tuple(tuple(plgpu.SMEM(tile, dtype) for _ in range(parts)) for _ in range(3))
 
 
+def _summing() -> tuple:
+    """`algebra.summed_back`'s staging tiles ('summed', an fp32 operand against a triangle or the identity):
+    two sets, each `[C, C]` tile a bf16 part of three, an fp32 operand's exact parts."""
+    return _staging(_Operand(CHUNK, PARTS, jnp.dtype(jnp.float32)), (CHUNK, CHUNK), (CHUNK, CHUNK))
+
+
 def _merging(staging, call: _Call) -> _Issuer:
     """The inverse's products on `_merges`' staging tiles."""
     return _Issuer(call, {"merge": list(staging)})
@@ -917,25 +923,13 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, starts=None, max_segments: in
     dk_w, dv, decay_w, dbeta = _weighted_back(run.a, run.k, run.v, dw, dv2, run.hi, run.lo, run.beta,
                                               run.taken, call)
     chunks = call.chunks
-
-    def per_chunk(x):
-        """`[R, HV * C]` as `[chunks, HV, C, C]`."""
-        return jnp.moveaxis(x.reshape(chunks, CHUNK, heads, CHUNK), 2, 1)
-
-    terms = per_chunk(decay.sum(0) + decay_w)
-    diagonal = jnp.eye(CHUNK, dtype=bool)
-    after = jnp.sum(jnp.where(diagonal, terms, 0.0), -1)
-    leaving = jnp.sum(jnp.where(jnp.eye(CHUNK, k=1, dtype=bool), terms, 0.0), -1)
-    pairs = jnp.tril(terms, -1)
-    dg = jax.vmap(jax.vmap(algebra.summed_back))(pairs, after, leaving)
-    # The memory's decay across each chunk: its gradient `sum(S dS)` through the decay `exp(g_last)` from
-    # the chunk's start, every token's.
+    # Each token's decay's gradient, the launches' (`algebra.summed_back` is linear in its terms) and the
+    # memory's decay across each chunk: its gradient `sum(S dS)` through the decay `exp(g_last)` from the
+    # chunk's start, every token's.
     memory = jnp.sum((run.h.astype(jnp.float32) * dh.astype(jnp.float32)).reshape(chunks, heads, -1), -1)
     ending = (run.hi + run.lo).reshape(heads, chunks, CHUNK)[..., -1]
-    dg = dg + (memory * jnp.exp2(ending.T))[..., None]
-    dg = jnp.moveaxis(dg, 1, 2).reshape(rows, heads)
-    dbeta = jnp.sum(jnp.where(diagonal, per_chunk(dbeta), 0.0), -1)
-    dbeta = jnp.moveaxis(dbeta, 1, 2).reshape(rows, heads)
+    dg = (decay.sum(0) + decay_w).reshape(heads, chunks, CHUNK) + (memory.T * jnp.exp2(ending))[..., None]
+    dg, dbeta = dg.reshape(heads, rows).T, dbeta.T
 
     def headed(x, size):
         """`[R, HV * size]` laid back as `[B, T, HV, size]`."""
@@ -945,6 +939,8 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, starts=None, max_segments: in
         """A value head's gradient `[B, T, HV, Dk]` summed onto its key head's."""
         return x.reshape(*x.shape[:2], heads // call.group, call.group, width).sum(3)[..., :run.key_width]
 
+    # The launches' gradients in the operands' dtype (fla's), summed in fp32.
+    dq, dk, dk_w, dv = (x.astype(jnp.float32) for x in (dq, dk, dk_w, dv))
     dq = keyed(headed(dq, width))
     dk = keyed(headed(dk, width) + headed(dk_w, width))
     dv = headed(dv, columns)[..., :run.value_width]
@@ -958,10 +954,8 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, starts=None, max_segments: in
 # The fast backward of a decay a head under the delta rule (fla's DAG through the algebra's backward tile
 # functions, `algebra.local_gradient` ... `algebra.summed_back`), a 16-bit call's: the memory's reverse
 # recurrence a sequence at a time (`_reverse`), the queries', keys' and weights' gradients a key block of a
-# chunk at a time (`_query_key`), and the WY representation's (`_weighted_back`); the decay's gradient summed
-# token by token in XLA. A decay's terms leave a launch as a `[C, C]` tile a chunk and value head, its pairs
-# strictly lower and each token's terms from its chunk's start on its diagonal, which `summed_back` never
-# reads as a pair.
+# chunk at a time (`_query_key`), and the WY representation's (`_weighted_back`); each launch sums its decay's
+# terms token by token (`summed_back`) and writes a vector a chunk and value head, which XLA adds.
 
 
 def _flipped(x, call: _Call):
@@ -1051,12 +1045,11 @@ def _reverse(q, k, w, do, hi, lo, dht, sequences, call: _Call, *, scale: float):
 
 
 def _query_key(q, k, corrected, do, dv, h, dh, hi, lo, taken, call: _Call, *, scale: float):
-    """`(dq, dk [R, HV * Dk] fp32, dw [R, HV * Dk] as call.held, decay [blocks, R, HV * C] fp32)`: each
+    """`(dq, dk, dw [R, HV * Dk] as call.held, decay [blocks, HV, R] fp32)`: each
     chunk's and key block's queries', keys' and weights' gradients a value head's (fla's dqkwg,
-    `algebra.query_key_gradients`), and its decay's terms over the block's key columns, the pairs strictly
-    lower, the terms from the chunk's start on the diagonal and each token's write to the chunk's end just
-    above it. `h` and `dh` the memories each chunk enters
-    and its leaving memory's gradient (`call.memories`)."""
+    `algebra.query_key_gradients`), and each token's decay's gradient from the terms over the block's key
+    columns (`algebra.summed_back`, in the launch). `h` and `dh` the memories each chunk enters and its
+    leaving memory's gradient (`call.memories`)."""
     width, value_width, family = call.width, call.value_width, call.family
     held, memories, given = dataclasses.replace(call.held, rows=call.rows), call.memories, call.given
     blocks = value_width // BLOCK
@@ -1065,7 +1058,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, hi, lo, taken, call: _Call, *, sc
                 column_lo_ref, taken_ref, dq_ref, dk_ref, dw_ref, decay_ref, *, streams, staging):
         c, n, h = lax.axis_index("blocks"), lax.axis_index("chunks"), lax.axis_index("heads")
         row, span, last = n * CHUNK, pl.ds(n * CHUNK, CHUNK), n * CHUNK + CHUNK - 1
-        (staged,) = staging
+        staged, *summing = staging
         key_columns = h // call.group * width + c * BLOCK
         memory = (n * call.heads + h) * width + c * BLOCK
         views = _views(queries=given.views(q_ref, row, CHUNK, key_columns, BLOCK),
@@ -1096,16 +1089,11 @@ def _query_key(q, k, corrected, do, dv, h, dh, hi, lo, taken, call: _Call, *, sc
                 blocks, gate, low, ending, ending_low, None, scale, held.dtype,
                 _Issuer(call, {"scores_dq": [staged]}), laid=(family.columns_of(column_hi_ref.at[h, span]),
                                                               family.columns_of(column_lo_ref.at[h, span])))
-            out_columns = pl.ds(h * width + c * BLOCK, BLOCK)
-            dq_ref.at[span, out_columns][...] = dq
-            dk_ref.at[span, out_columns][...] = dk
-            held.store(dw_ref, dw, row, CHUNK, h * width + c * BLOCK, BLOCK)
-            # Each token's terms from the chunk's start on the diagonal, its write's to the chunk's end
-            # beside it (a vector a row each, which a tile's last row would take as a column's).
-            rows, cols = family.iota((CHUNK, CHUNK), 0), family.iota((CHUNK, CHUNK), 1)
-            terms = jnp.where(cols == rows + 1, leaving[:, None], pairs)
-            decay_ref.at[c, span, pl.ds(h * CHUNK, CHUNK)][...] = jnp.where(rows == cols, after[:, None],
-                                                                            terms)
+            # In the operands' dtype, as fla's dqkwg writes them.
+            for ref, grad in ((dq_ref, dq), (dk_ref, dk), (dw_ref, dw)):
+                held.store(ref, grad, row, CHUNK, h * width + c * BLOCK, BLOCK)
+            decay_ref.at[c, h, span][...] = algebra.summed_back(pairs, after, leaving,
+                                                                _Issuer(call, {"summed": summing}))
             return carry, accumulators
 
         _walk(streams, views, step, call)
@@ -1114,21 +1102,20 @@ def _query_key(q, k, corrected, do, dv, h, dh, hi, lo, taken, call: _Call, *, sc
                       values=((CHUNK, value_width), held), out=((CHUNK, value_width), given),
                       value_grads=((CHUNK, value_width), held), entered=((BLOCK, value_width), memories),
                       leaving=((BLOCK, value_width), memories))
-    wide = jax.ShapeDtypeStruct((call.rows, call.heads * width), jnp.float32)
-    out_type = (wide, wide, held.shape(call.heads * width),
-                jax.ShapeDtypeStruct((width // BLOCK, call.rows, call.heads * CHUNK), jnp.float32))
+    out_type = (held.shape(call.heads * width),) * 3 + (
+        jax.ShapeDtypeStruct((width // BLOCK, call.heads, call.rows), jnp.float32),)
     return _kernel(program, call, out_type=out_type, grid=(width // BLOCK, call.chunks, call.heads),
                    grid_names=("blocks", "chunks", "heads"), blocks=tiles, stages=1, live=_taken(11),
-                   staging=_staging(held, (CHUNK, CHUNK)))(q, k, corrected, do, dv, h, dh, hi, lo, hi, lo,
-                                                           taken)
+                   staging=_staging(held, (CHUNK, CHUNK)) + _summing())(q, k, corrected, do, dv, h, dh, hi,
+                                                                         lo, hi, lo, taken)
 
 
 def _weighted_back(a, k, v, dw, du, hi, lo, beta, taken, call: _Call):
-    """`(dk [R, HV * Dk], dv [R, HV * Dv], decay [R, HV * C], dbeta [R, HV * C])`, fp32: the WY
+    """`(dk [R, HV * Dk], dv [R, HV * Dv])` as `call.held` and `(decay, dbeta [HV, R])` fp32: the WY
     representation's backward a chunk and value head at a time (fla's prepare_wy_repr_bwd,
     `algebra.weighted_gradient`) from `w`'s and `u`'s gradients `dw`, `du` (`call.held`), the inverse `a` less
-    its unit diagonal (`_solve`'s); the decay's terms as `_query_key`'s, the write gate's gradient on a
-    tile's diagonal."""
+    its unit diagonal (`_solve`'s); each token's decay's gradient from its terms as `_query_key`'s, and its
+    write gate's."""
     width, value_width, family = call.width, call.value_width, call.family
     held, given = dataclasses.replace(call.held, rows=call.rows), call.given
 
@@ -1136,7 +1123,7 @@ def _weighted_back(a, k, v, dw, du, hi, lo, beta, taken, call: _Call):
                 taken_ref, dk_ref, dv_ref, decay_ref, dbeta_ref, *, streams, staging):
         n, h = lax.axis_index("chunks"), lax.axis_index("heads")
         row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
-        (staged,) = staging
+        staged, *summing = staging
         views = _views(lower=held.views(a_ref, row, CHUNK, h * CHUNK, CHUNK),
                        keys=given.views(k_ref, row, CHUNK, h // call.group * width, width),
                        values=given.views(v_ref, row, CHUNK, h * value_width, value_width),
@@ -1159,13 +1146,14 @@ def _weighted_back(a, k, v, dw, du, hi, lo, beta, taken, call: _Call):
                 gate, low, held.dtype, _Issuer(call, dict.fromkeys(names, staged)),
                 laid=(family.columns_of(column_hi_ref.at[h, span]),
                       family.columns_of(column_lo_ref.at[h, span])))
+            # In the operands' dtype, as fla's prepare_wy_repr_bwd writes them.
             for i, grad in enumerate(key_grads):
-                dk_ref.at[span, pl.ds(h * width + i * BLOCK, BLOCK)][...] = grad
+                held.store(dk_ref, grad, row, CHUNK, h * width + i * BLOCK, BLOCK)
             for j, grad in enumerate(value_grads):
-                dv_ref.at[span, pl.ds(h * value_width + j * BLOCK, BLOCK)][...] = grad
-            diagonal = _diagonal(CHUNK, family)
-            decay_ref.at[span, pl.ds(h * CHUNK, CHUNK)][...] = jnp.where(diagonal, after[:, None], pairs)
-            dbeta_ref.at[span, pl.ds(h * CHUNK, CHUNK)][...] = jnp.where(diagonal, d_beta[:, None], 0.0)
+                held.store(dv_ref, grad, row, CHUNK, h * value_width + j * BLOCK, BLOCK)
+            summed = _Issuer(call, {"summed": summing})
+            decay_ref.at[h, span][...] = algebra.summed_back(pairs, after, issue=summed)
+            dbeta_ref.at[h, span][...] = d_beta
             return carry, accumulators
 
         _walk(streams, views, step, call)
@@ -1174,10 +1162,9 @@ def _weighted_back(a, k, v, dw, du, hi, lo, beta, taken, call: _Call):
                       values=((CHUNK, value_width), given), w_grads=((CHUNK, width), held),
                       u_grads=((CHUNK, value_width), held))
 
-    def wide(columns):
-        return jax.ShapeDtypeStruct((call.rows, call.heads * columns), jnp.float32)
-
-    out_type = (wide(width), wide(value_width), wide(CHUNK), wide(CHUNK))
+    tokens = jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32)
+    out_type = (held.shape(call.heads * width), held.shape(call.heads * value_width), tokens, tokens)
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=_taken(10),
-                   staging=_staging(held, (CHUNK, CHUNK)))(a, k, v, dw, du, hi, lo, beta, hi, lo, taken)
+                   staging=_staging(held, (CHUNK, CHUNK)) + _summing())(a, k, v, dw, du, hi, lo, beta, hi, lo,
+                                                                         taken)

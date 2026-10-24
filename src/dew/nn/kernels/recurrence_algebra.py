@@ -813,12 +813,13 @@ def summed_back(pairs, after, leaving=None, issue: Issue = portable):
     prefix: `pairs` `[C, C]` fp32, each `(i, j)` a term through `(j, i]` (strictly lower), `after` `[C]`,
     each `s` a term through the chunk's start to `s`, and `leaving` `[C]` where given, each `t` a term
     through `(t, C - 1]`, a pair of the chunk's last row. Each token sums only the terms whose range holds it,
-    `sum_{j < t <= i} pairs + sum_{s >= t} after`: each row's pairs before `t` a product with the strictly
-    upper ones ('summed', no pair added and taken back), and each column's sum the transpose's row sums (a
-    product with the identity, exact)."""
+    `sum_{j < t <= i} pairs + sum_{s >= t} after + sum_{j < t} leaving`: each row's pairs before `t` a
+    product with the strictly upper ones ('summed', no pair added and taken back), each `leaving` term in its
+    own row above the diagonal (a vector a row each, as a mainloop's registers lay it), and each column's sum
+    the transpose's row sums (a product with the identity, exact). Linear in its terms: a sum of launches'
+    terms sums the same as their sums."""
     rows, cols = _grid(pairs.shape)
-    if leaving is not None:
-        pairs = pairs + jnp.where((rows == pairs.shape[0] - 1) & (rows > cols), leaving[None, :], 0.0)
     through = issue("summed", pairs, jnp.where(rows < cols, 1.0, 0.0))
-    held = jnp.where(rows >= cols, through + after[:, None], 0.0)
+    above = 0.0 if leaving is None else leaving[:, None]
+    held = jnp.where(rows >= cols, through + after[:, None], above)
     return jnp.sum(issue("summed", Transposed(held), jnp.where(rows == cols, 1.0, 0.0)), axis=1)
