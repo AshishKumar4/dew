@@ -26,7 +26,7 @@ from dew.nn.documents import (
     document_mask,
     with_documents,
 )
-from dew.nn.inputs import coordinates
+from dew.nn.inputs import coordinates, counted_places
 from dew.nn.kernels.templates import attention as template
 from dew.nn.visibility import windowed
 
@@ -90,15 +90,15 @@ def geometry(case: dict) -> tuple[int, int]:
     return (QUERIES, QUERIES) if own else (QUERIES, KEYS)
 
 
-def block_groups(keys: int = QUERIES) -> tuple[np.ndarray, ...]:
-    """Two layouts of contiguous blocks over a call's first `keys` keys `[2, keys]`, -1 outside any: blocks
-    of a token, blocks across `own_documents`' boundaries (at 30 and 70 in the first row, 55 in the second)
-    and `cross_documents`' (at 60 in the first, 70 in the second), a block of padding, blocks ending the
-    row; and the second layout's blocks over the first's, as a kind with both image groups and decision
-    blocks reads them."""
+def block_groups(keys: int = QUERIES) -> tuple[np.ndarray, np.ndarray]:
+    """Two layouts of contiguous blocks over a call's first `keys` keys `[2, keys]`, -1 outside any, read as
+    whole blocks and as images: blocks of a token, blocks across `own_documents`' boundaries (at 30 and 70 in
+    the first row, 55 in the second) and `cross_documents`' (at 60 in the first, 70 in the second), a block
+    of padding, blocks ending the row, blocks longer than the cases' window; and the images over the
+    blocks, as a kind reading both does."""
     first = np.full((ROWS, QUERIES), -1, np.int32)
     for row, runs in enumerate((((3, 4), (10, 22), (25, 35), (50, 60), (58, 64), (68, 72), (90, 100)),
-                                ((0, 1), (40, 50), (52, 58), (60, 61), (66, 75), (80, 99)))):
+                                ((0, 1), (40, 50), (52, 58), (60, 61), (66, 99)))):
         for group, (lo, hi) in enumerate(runs):
             first[row, lo:hi] = group
     second = np.full((ROWS, QUERIES), -1, np.int32)
@@ -118,7 +118,7 @@ def arguments(case: dict) -> dict:
     if case.get("starts"):
         keywords["starts"] = STARTS
     if case.get("block_groups"):
-        keywords["block_groups"] = block_groups(geometry(case)[1])
+        keywords["block_groups"], keywords["image_groups"] = block_groups(geometry(case)[1])
     if case.get("positions"):
         # Each token's place in its own document, as a packed row's coordinates count it.
         places = coordinates(segments=keywords["segment_ids"]).positions
@@ -151,12 +151,15 @@ def dews_mask(case: dict) -> np.ndarray:
     else:
         mask = combined_attention_mask(queries, keys, causal, window, None)
     held = (slots >= 0) & (slots < keys)
-    for groups in keywords.get("block_groups", ()):
-        # A block's keys are seen by every query whose own key is in it, a causal window bounding only
-        # the keys behind (`AttentionMixer`'s image groups).
+    for groups, whole in ((keywords.get("block_groups"), True), (keywords.get("image_groups"), False)):
+        if groups is None or not causal:
+            continue
+        # A block's keys are seen by every query of its document whose own key is in it: a whole
+        # block's whatever the window (transformers' `block_sequence_ids`), an image's within the
+        # window, which bounds the keys behind (Gemma's).
         own = np.where(held, np.take_along_axis(groups, np.clip(slots, 0, keys - 1), axis=1), -1)
         same = (own[:, :, None] == groups[:, None, :]) & (own[:, :, None] >= 0)
-        if window is not None:
+        if window is not None and not whole:
             same = same & windowed(slots[:, :, None], np.arange(keys)[None, None, :], window, causal=causal)
         if ids is not None:
             same = same & np.asarray(document_mask(ids))
@@ -186,6 +189,13 @@ def test_key_spans_keep_the_keys_dews_masks_keep(case):
     if case is CASES["block-causal"]:
         # A block runs to its end, past the query's own place.
         assert expected[0, 10, 21] and not expected[0, 9, 10]
+    if case is CASES["documents-block-causal-window"]:
+        # The second row's image of 15 to 40 sees ahead and, behind, only within the window of 24, and its
+        # whole block of 66 to 99 past the window too, but no further; the first row's image stops at the
+        # document's end at 30.
+        assert expected[1, 16, 39] and expected[1, 39, 16] and not expected[1, 39, 15]
+        assert expected[1, 98, 66] and not expected[1, 98, 65]
+        assert expected[0, 16, 29] and not expected[0, 16, 30]
     if case is CASES["cross-block-causal-window"]:
         # A cache call's query 68 sits at slot 58, whose block runs to 64 past its document's last key
         # at 59: it sees 59 and not 60. The second row's first 30 queries hold no slot, so see nothing.
@@ -510,10 +520,54 @@ def test_reads_count_the_keys_of_interleaved_documents(ids, keywords):
                                   np.asarray(template.dense(spans)).any(-1))
 
 
-def test_a_blocks_end_is_one_past_the_last_token_of_its_run():
-    """`template.block_ends`: each token's run of equal ids ends one past its last token, a run of -1 as
-    any other."""
+@pytest.mark.parametrize("valid, ids", [
+    ([[1, 0, 0, 1, 1, 1, 0, 1]], None),
+    ([[1, 0, 0, 1, 1, 1, 0, 1], [1, 1, 0, 0, 0, 1, 1, 1]],
+     [[1, 1, 1, 1, 2, 2, 2, 2], [3, 3, 3, 4, 4, 4, 4, 4]]),
+], ids=["padding-inside", "documents"])
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "two-sided"])
+def test_a_window_counts_the_places_it_is_given(valid, ids, causal):
+    """A window over a call's places (`counted_places`, each padding slot at the place before it) keeps the
+    real keys within w - 1 places of the query, in its document: behind query 3 of the first row, padding
+    inside, a window of two keeps key 0, where one over slots would drop it. The second row's second
+    document opens with padding that took the first document's place, which no real key's window reads."""
+    valid = jnp.asarray(valid, bool)
+    ids = None if ids is None else jnp.asarray(ids, jnp.int32)
+    places = counted_places(ids, valid)
+    assert places is not None
+    real = np.asarray(valid)[:, None, :]
+    for window in (1, 2, 3):
+        spans = template.spans(8, 8, valid.shape[0], causal=causal, sliding_window=window,
+                               positions=(places, places), segment_ids=ids)
+        expected = windowed(places[:, :, None], places[:, None, :], window, causal=causal)
+        if causal:
+            expected = expected & np.tril(np.ones((8, 8), bool))
+        if ids is not None:
+            expected = expected & document_mask(ids)
+        np.testing.assert_array_equal(np.asarray(template.dense(spans)) & real, np.asarray(expected) & real)
+        if window == 2 and causal:
+            assert np.asarray(template.dense(spans))[0, 3, 0]
+
+
+@pytest.mark.parametrize("window", [2 ** 31, 2 ** 32 - 1, 2 ** 32 + 7], ids=["half", "span", "past"])
+def test_a_window_over_the_widest_places_neither_wraps_nor_aliases(window):
+    """Places at both ends of int32, under windows as wide as their whole range and past it, keep the keys
+    the window keeps counted exactly (in int64), causal and two-sided: no bound wraps around the dtype."""
+    places = jnp.asarray([[-2 ** 31, -2 ** 31 + 5, -1, 0, 2 ** 31 - 6, 2 ** 31 - 1]], jnp.int32)
+    wide = np.asarray(places, np.int64)
+    for causal in (True, False):
+        spans = template.spans(6, 6, 1, causal=causal, sliding_window=window, positions=(places, places))
+        distance = wide[:, :, None] - wide[:, None, :]
+        expected = (distance < window) & (distance >= 0) if causal else np.abs(distance) < window
+        np.testing.assert_array_equal(np.asarray(template.dense(spans)), expected)
+
+
+def test_a_blocks_bounds_are_its_runs_first_token_and_one_past_its_last():
+    """`template.block_starts` and `block_ends`: each token's run of equal ids starts at its first token and
+    ends one past its last, a run of -1 as any other."""
     groups = jnp.asarray([[-1, 0, 0, -1, -1, 3, 3, 3], [5, 5, 5, 5, 1, 1, 1, 1]], jnp.int32)
+    np.testing.assert_array_equal(np.asarray(template.block_starts(groups)),
+                                  [[0, 1, 1, 3, 3, 5, 5, 5], [0, 0, 0, 0, 4, 4, 4, 4]])
     np.testing.assert_array_equal(np.asarray(template.block_ends(groups)),
                                   [[1, 3, 3, 5, 5, 8, 8, 8], [4, 4, 4, 4, 8, 8, 8, 8]])
 

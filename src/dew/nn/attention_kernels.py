@@ -100,9 +100,9 @@ class AttentionCase:
     over `[B, S, K, D]` keys, dtypes and validity, which comes as coordinates, never a mask a cache
     built: causality and a window, packed documents (a call's own or another sequence's, `aligned`
     to their last keys under causality or a window, `CrossDocuments`), key lengths and key starts
-    (a windowed decode step's first key, `key_value_seq_starts`), and `blocks`, a causal call's block
-    groups, whose queries also see their block's later keys (`template.spans`), which the template reads
-    and the generic paths take as their mask; `mask` is an arbitrary mask only the generic path takes.
+    (a windowed decode step's first key, `key_value_seq_starts`), and `blocks`, a causal call's block or
+    image groups, whose queries also see their block's later keys (`template.spans`), which the template
+    reads and the generic paths take as their mask; `mask` is an arbitrary mask only the generic path takes.
     `arithmetic` is a call asking what only the
     reference path computes (`reference_only`), `narrows` one jax.nn's xla kernel would compute
     below its precision or a CPU's reference path (`_xla_kernel_narrows`, `_xla_kernel_on_cpu`),

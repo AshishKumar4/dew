@@ -81,7 +81,8 @@ def keywords(case: dict) -> dict:
     if case.get("starts"):
         keywords["key_value_seq_starts"] = STARTS
     if case.get("block_groups"):
-        keywords["block_groups"] = tuple(jnp.asarray(groups) for groups in block_groups(geometry(case)[1]))
+        keywords["block_groups"], keywords["image_groups"] = (jnp.asarray(groups)
+                                                              for groups in block_groups(geometry(case)[1]))
     return keywords
 
 
@@ -346,25 +347,30 @@ def test_no_target_prefers_the_template_so_only_a_named_call_takes_it():
             assert attention.resolve_implementation("auto", query, key, **call) == "template", call
 
 
-def test_a_gpu_prefers_the_template_for_a_call_with_block_groups():
-    """A causal call with block groups: flash and tokamax's Triton kernel refuse it by their inherent limits,
-    and cuDNN takes it only as its mask, by measurement. On every target whose Triton mainloop runs (a GPU of
-    sm80 or later) 'auto' resolves it to the template, and elsewhere to a path that reads the mask its spans
-    mean. Without causality block groups add no key, so the call is an ordinary one."""
+@pytest.mark.parametrize("kind", ["block_groups", "image_groups"])
+def test_a_gpu_prefers_the_template_for_a_call_with_block_groups(kind):
+    """A causal call with block or image groups: flash and tokamax's Triton kernel refuse it by their
+    inherent limits, and cuDNN takes it only as its mask, by measurement. On every target whose Triton
+    mainloop runs (a GPU of sm80 or later) 'auto' resolves it to the template, and elsewhere to a path that
+    reads the mask its spans mean. Without causality the groups add no key, so the call is an ordinary
+    one."""
     query = jnp.zeros((ROWS, QUERIES, HEADS, WIDTH), jnp.bfloat16)
     key = jnp.zeros((ROWS, QUERIES, KV_HEADS, WIDTH), jnp.bfloat16)
-    groups = tuple(jnp.asarray(blocks) for blocks in block_groups())
-    case = attention.attention_case(query, key, causal=True, block_groups=groups, named="template")
+    groups = jnp.asarray(block_groups()[0])
+    blocks, images = (groups, None) if kind == "block_groups" else (None, groups)
+    case = attention.attention_case(query, key, causal=True, block_groups=blocks, image_groups=images,
+                                    named="template")
     assert case.blocks and kernel_refusals(ATTENTION, "template", case) == []
     for kernel in ("flash", "triton"):
         assert ("blocks", INHERENT) in [(refusal.code, refusal.row)
                                         for refusal in kernel_refusals(ATTENTION, kernel, case)]
     assert ("blocks", "measured") in [(requirement.code, requirement.kind) for requirement
                                       in ATTENTION.kernel("cudnn").failed(case)]
-    assert not attention.attention_case(query, key, block_groups=groups).blocks
+    assert not attention.attention_case(query, key, block_groups=blocks, image_groups=images).blocks
     for target in generation.TARGETS:
         with generation.assumed(target):
-            auto = attention.resolve_implementation("auto", query, key, causal=True, block_groups=groups)
+            auto = attention.resolve_implementation("auto", query, key, causal=True, block_groups=blocks,
+                                                    image_groups=images)
             fused = generation.backend() == "gpu" and generation.bf16_dot_runs()
             assert (auto == "template") == fused, (target, auto)
 

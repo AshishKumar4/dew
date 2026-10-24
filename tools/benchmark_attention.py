@@ -83,8 +83,8 @@ class BenchmarkConfig:
     """Gemma 2's tanh logit cap. The reference, xla and tpu paths and tokamax_triton take it."""
     blocks: int | None = None
     """Blocks of this many tokens, every other run of that length one, whose tokens a causal call's queries
-    read whole (`block_groups`: an image's tokens, a prompt's blocks). The template reads them as its spans,
-    cuDNN as the dense bias their mask is, and xla and the reference path as that mask."""
+    read whole (`block_groups`: a prompt's blocks, a unified model's media). The template reads them as its
+    spans, cuDNN as the dense bias their mask is, and xla and the reference path as that mask."""
     forward_only: bool = False
     """Skip the gradient timings; the fwd row is the cheaper question."""
     reference_error: bool = False
@@ -104,13 +104,13 @@ class BenchmarkConfig:
 
 
 def attention_fn(implementation: str, config: BenchmarkConfig, causal: bool, sinks=None, dtype=None,
-                 block_groups=()):
+                 block_groups=None):
     from dew.nn.attention import scaled_dot_product_attention
     from dew.nn.local_attention import local_attention
     window, softcap = config.sliding_window, config.softcap
     if sinks is not None and implementation in ('jax_cudnn', 'tokamax_triton'):
         raise ValueError(f"{implementation} takes no attention sinks")
-    if block_groups and implementation in ('jax_cudnn', 'tokamax_triton'):
+    if block_groups is not None and implementation in ('jax_cudnn', 'tokamax_triton'):
         raise ValueError(f"{implementation} takes no block groups")
     if implementation == 'jax_cudnn':
         # jax.nn's own cuDNN call, which takes heads wider than Dew's cudnn path does.
@@ -120,7 +120,7 @@ def attention_fn(implementation: str, config: BenchmarkConfig, causal: bool, sin
         return lambda q, k, v: tokamax.dot_product_attention(
             q, k, v, is_causal=causal, local_window_size=local,
             logits_soft_cap=softcap, implementation='triton')
-    if causal and window is not None and not block_groups:
+    if causal and window is not None and block_groups is None:
         return lambda q, k, v: local_attention(
             q, k, v, window=window, implementation=implementation, sinks=sinks, softcap=softcap, dtype=dtype)
     return lambda q, k, v: scaled_dot_product_attention(
@@ -164,10 +164,10 @@ def measure(case: dict, config: BenchmarkConfig) -> dict:
     v = jax.random.normal(keys[2], (batch, seq, heads // config.kv_groups, value_dim), jnp.bfloat16)
     cotangent = jax.random.normal(keys[3], (*q.shape[:-1], value_dim), jnp.float32)
     sinks = jax.random.normal(keys[4], (heads,), jnp.float32) if config.sinks else None
-    block_groups = ()
+    block_groups = None
     if config.blocks is not None:
         run = jnp.arange(seq) // config.blocks
-        block_groups = (jnp.broadcast_to(jnp.where(run % 2 == 1, run, -1).astype(jnp.int32), (batch, seq)),)
+        block_groups = jnp.broadcast_to(jnp.where(run % 2 == 1, run, -1).astype(jnp.int32), (batch, seq))
     causal = case['causal']
     row = {**case, 'heads': heads, 'kv_heads': heads // config.kv_groups}
 

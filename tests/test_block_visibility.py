@@ -1,9 +1,10 @@
 """Block-causal attention layers (`AttentionMixer.bidirectional_blocks`, `bidirectional_images`): each token
 of a block (`AttentionMetadata.block_groups`, `image_groups`) sees the block's later tokens too, within its
-document, on the layers that read them, and every other layer stays causal. A layer reads exactly the keys
-the rule keeps, written out here apart from Dew (`block_causal`), its QK-Clip maxima taken over them: over
-packed documents, over a window with padding inside the row, and on a layer reading both groups. A cached
-call over its blocks decodes on par with the full pass (check 1), the cache keeping each slot's groups.
+document, on the layers that read them, and every other layer stays causal; a window bounds an image's keys
+behind the query and not a block's. A layer reads exactly the keys the rule keeps, written out here apart
+from Dew (`block_causal`), its QK-Clip maxima taken over them: over packed documents, over windows shorter
+than a block or an image, with padding inside the row, and on a layer reading both groups. A cached call
+over its blocks decodes on par with the full pass (check 1), its groups at its tokens' slots.
 """
 import jax
 import jax.numpy as jnp
@@ -26,23 +27,29 @@ def model(layers: int = TINY_DECODER["num_layers"], **kinds):
                                 "layer_types": types, "kinds": kinds})
 
 
-def block_causal(*groups, segments=None, valid=None, window=None) -> np.ndarray:
-    """The keys each query keeps, `[B, Q, K]`, as transformers' `create_causal_mask(block_sequence_ids)` says:
-    a key at or before the query, or of a block of the query's (equal ids, -1 none), inside the query's
-    document (0 padding, which sees nothing) and among the real keys `valid`; a causal window of w keeps the
-    keys fewer than w real tokens behind the query, and every one ahead of it."""
-    rows, length = np.shape(groups[0])
-    keep = np.broadcast_to(np.tril(np.ones((length, length), bool)), (rows, length, length)).copy()
-    for blocks in groups:
-        blocks = np.asarray(blocks)
-        keep |= (blocks[:, :, None] == blocks[:, None, :]) & (blocks[:, :, None] >= 0)
+def block_causal(blocks=None, images=None, *, segments=None, valid=None, window=None) -> np.ndarray:
+    """The keys each query keeps, `[B, Q, K]`: a key at or before the query, or of an image of the query's
+    (equal ids, -1 none), within a causal window of w, which keeps the keys fewer than w real tokens behind
+    the query and every one ahead (Gemma's `AND(sliding_window, OR(causal, blockwise))`); or of a block of
+    the query's, whatever the window (transformers' `block_sequence_ids`); inside the query's document (0
+    padding, which sees nothing) and among the real keys `valid`."""
+    rows, length = np.shape(next(groups for groups in (blocks, images) if groups is not None))
+
+    def same(groups):
+        if groups is None:
+            return np.zeros((rows, length, length), bool)
+        groups = np.asarray(groups)
+        return (groups[:, :, None] == groups[:, None, :]) & (groups[:, :, None] >= 0)
+
+    keep = np.tril(np.ones((length, length), bool))[None] | same(images)
     real = np.ones((rows, length), bool) if valid is None else np.asarray(valid, bool)
     if window is not None:
         places = np.maximum(np.cumsum(real, axis=1) - 1, 0)
-        keep &= (places[:, :, None] - places[:, None, :]) < window
+        keep = keep & ((places[:, :, None] - places[:, None, :]) < window)
+    keep = keep | same(blocks)
     if segments is not None:
         segments = np.asarray(segments)
-        keep &= (segments[:, :, None] == segments[:, None, :]) & (segments[:, :, None] != 0)
+        keep = keep & (segments[:, :, None] == segments[:, None, :]) & (segments[:, :, None] != 0)
     return keep & real[:, None, :]
 
 
@@ -61,13 +68,24 @@ LAYOUTS = {
     "images-and-blocks": ({"full_attention": {"mixer": AttentionMixer(bidirectional_images=True,
                                                                       bidirectional_blocks=True)}},
                           {"block_groups": BLOCKS, "image_groups": IMAGES}, block_causal(BLOCKS, IMAGES)),
+    "images-and-blocks-past-a-window": (
+        {"sliding_attention": {"window": 2, "mixer": AttentionMixer(bidirectional_images=True,
+                                                                    bidirectional_blocks=True)}},
+        {"block_groups": BLOCKS, "image_groups": IMAGES}, block_causal(BLOCKS, IMAGES, window=2)),
     "window-over-padding": ({"sliding_attention": {"window": 2,
                                                    "mixer": AttentionMixer(bidirectional_blocks=True)}},
                             {"block_groups": WINDOWED, "attention_mask": GAPS},
                             block_causal(WINDOWED, valid=GAPS, window=2)),
+    "images-over-padding": ({"sliding_attention": {"window": 2,
+                                                   "mixer": AttentionMixer(bidirectional_images=True)}},
+                            {"image_groups": WINDOWED, "attention_mask": GAPS},
+                            block_causal(images=WINDOWED, valid=GAPS, window=2)),
 }
-"""Each layout's kind, call fields and the keys the rule keeps. The window's first row holds padding between
-query 3 and key 0, which its window of two real tokens keeps, where one of two slots would drop it."""
+"""Each layout's kind, call fields and the keys the rule keeps. Past a window of two, the first row's image
+of five tokens sees only its keys ahead and the one behind, and its second row's block of four sees all of
+itself. Over padding, the first row holds padding between query 3 and key 0, which a window of two real
+tokens keeps, where one of two slots would drop it; the second row's three-token run is a block read whole
+or an image its window cuts."""
 
 
 @pytest.mark.parametrize("layout", LAYOUTS.values(), ids=list(LAYOUTS))
@@ -88,6 +106,8 @@ def test_a_block_layer_reads_the_keys_the_block_causal_rule_keeps(layout):
     masked, maxima = decoder.apply(params, ids, segment_ids=segment_ids, attention_mask=attention_mask,
                                    attention_pairwise_mask=jnp.asarray(rule), mutable=["qk"])
     assert (rule & ~np.tril(np.ones((LENGTH, LENGTH), bool))).any()
+    if layout is LAYOUTS["images-and-blocks-past-a-window"]:
+        assert not rule[0, 4, 1] and rule[0, 1, 4] and rule[1, 6, 3]
     np.testing.assert_array_equal(np.asarray(blocked), np.asarray(masked))
     jax.tree.map(lambda mine, theirs: np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs)),
                  sown, maxima)
