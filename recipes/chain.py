@@ -19,7 +19,7 @@ the reward lives.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Literal
 
 import jax
@@ -216,7 +216,7 @@ class Recipe:
         if stage.loss == "grpo":
             if stage.reward is None:
                 raise ValueError(f"stage {stage.name!r} samples without a reward; name one")
-            prompt = int(_stated(_stated(facts, "fields", Mapping), "prompt", list)[-1])
+            prompt = _last_dimension(_stated(_stated(facts, "fields", Mapping), "prompt", Sequence))
             objective = GRPOObjective(self.model, prompt + stage.max_new_tokens - 1, beta=beta,
                                       variables=None)
             tokenizer = tokenizer_for(_stated(facts, "tokenizer", str))
@@ -243,6 +243,14 @@ def _stated[Value](facts: Mapping[str, object], name: str, kind: type[Value]) ->
     if not isinstance(value, kind):
         raise ValueError(f"the chain states its {name} as {value!r}, not a {kind.__name__}")
     return value
+
+
+def _last_dimension(shape: Sequence[object]) -> int:
+    """The last dimension of a stated field shape (a list or a tuple), refused unless it is a whole number."""
+    length = shape[-1] if shape else None
+    if not isinstance(length, int) or isinstance(length, bool):
+        raise ValueError(f"the chain states the prompt's shape as {shape!r}, which ends in no length")
+    return length
 
 
 def _scored(model: nn.Module | Source, stage: Stage, facts: Mapping[str, object],
