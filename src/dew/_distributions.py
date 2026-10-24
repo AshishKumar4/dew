@@ -33,8 +33,8 @@ def categorical(key: jax.Array, scores: jax.Array, where: jax.Array | None = Non
                 message: str = "a row drawn from holds no distribution") -> jax.Array:
     """One draw from each row of `scores` `[..., V]` under `key`, as `jax.random.categorical` draws
     it, int32. Every row `where` marks (each row when None) must hold a distribution
-    (`wellformed`), checked with `message` where the caller's program is checked; a row it leaves out is drawn and not checked, its
-    draw the caller's to discard."""
+    (`wellformed`), checked with `message` where the caller's program is checked; a row it leaves
+    out is drawn and not checked, its draw the caller's to discard."""
     held = wellformed(scores)
     checkify.debug_check(jnp.all(held if where is None else held | ~where), message)
     return jax.random.categorical(key, scores, axis=-1).astype(jnp.int32)
