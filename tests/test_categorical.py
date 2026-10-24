@@ -214,7 +214,7 @@ def test_the_divergences_derivative_stays_finite_wherever_its_rows_are():
     offset = jax.grad(lambda rows: categorical.kl_divergence(rows, far[1]).sum())(far[0])
     np.testing.assert_array_equal(offset, np.zeros((1, 2), np.float32))
     apart = jnp.asarray([200.0, 0.0]), jnp.asarray([-200.0, 0.0])
-    for hessian in (jax.hessian, jax.jacfwd(jax.jacrev), jax.jacrev(jax.jacrev)):
+    for hessian in (jax.hessian, lambda f: jax.jacfwd(jax.jacrev(f)), lambda f: jax.jacrev(jax.jacrev(f))):
         held = hessian(lambda row: categorical.kl_divergence(row, apart[1]))(apart[0])
         assert np.all(np.isfinite(np.asarray(held)))
     student, reference = jnp.asarray([-jnp.inf, 0.0]), jnp.asarray([0.0, 0.0])

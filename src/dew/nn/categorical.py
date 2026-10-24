@@ -151,9 +151,9 @@ def _divergence_tangent(primals, tangents):
 
 def _divergence_derivative(logits: jax.Array, reference: jax.Array) -> jax.Array:
     """`p - q` over the last axis, `p` the softmax of `logits`, `q` of `reference`, from their difference
-    (arXiv:2610.31642, eq. 9, its `p` here `q` and its `q` here `p`): `delta`, the rows' difference, each
-    row first moved to its own largest held logit, which neither softmax reads, so finite rows never
-    overflow it; `d`, `delta` less its mean under `q`; `s = log(p / q)`, `d` less the log of `q`'s mean
+    (arXiv:2610.31642, eq. 9, its `p` here `q` and its `q` here `p`): `delta`, the rows' difference,
+    taken of the rows each moved to its own largest held logit where it overflows, which neither softmax
+    reads; `d`, `delta` less its mean under `q`; `s = log(p / q)`, `d` less the log of `q`'s mean
     of `exp(d)`, through `log1p` of the mean of `expm1(d)` where every `d` is small and as a log-sum-exp
     where one is not; `u = q expm1(s)`; and `u` less `p` times its sum, which makes the derivative sum to
     zero."""
@@ -168,7 +168,11 @@ def _divergence_derivative(logits: jax.Array, reference: jax.Array) -> jax.Array
 
     log_q = jax.nn.log_softmax(reference, axis=-1)
     q, p = jnp.exp(log_q), jax.nn.softmax(logits, axis=-1)
-    delta = moved(logits) - moved(reference)
+    # Subtracted directly, the difference of near rows is exact; a row whose difference overflows takes
+    # it of the rows moved to their maxima, which shifts it by a constant `d` removes.
+    direct = jnp.where(both, logits - reference, 0.0)
+    overflow = jnp.any(~jnp.isfinite(direct), axis=-1, keepdims=True)
+    delta = jnp.where(overflow, moved(logits) - moved(reference), jnp.where(overflow, 0.0, direct))
     d = delta - jnp.sum(q * delta, axis=-1, keepdims=True)
     near = jnp.max(d, axis=-1, keepdims=True) < 1
     small, large = jnp.where(near, d, 0.0), jnp.where(near, 0.0, d)
