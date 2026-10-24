@@ -8,10 +8,14 @@ import math
 from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import numpy as np
 import torch
+
+if TYPE_CHECKING:
+    from recorded_draws import Tape
 
 
 def restore_transformers_names() -> None:
@@ -53,25 +57,24 @@ def step_noise(shape: tuple[int, ...], count: int,
 
 
 @contextlib.contextmanager
-def fed_noise(module: ModuleType, noises: list[np.ndarray]) -> Iterator[list[int]]:
-    """Replay draws in the requested dtype and count successful draws.
+def fed_noise(module: ModuleType, noises: list[np.ndarray]) -> Iterator[Tape]:
+    """Replay draws in the requested dtype, on a tape that counts them.
 
     An omitted dtype keeps the input array's dtype. Modules without
     `randn_tensor` take no draws; the original function is restored on exit.
     """
-    taken: list[int] = []
+    from recorded_draws import Tape
+
+    tape = Tape(noises)
 
     def draw(shape, generator=None, device=None, dtype=None, layout=None):
-        noise = torch.tensor(noises[len(taken)], dtype=dtype)
-        assert tuple(noise.shape) == tuple(shape), (noise.shape, shape)
-        taken.append(1)
-        return noise
+        return torch.tensor(tape.next(shape=shape), dtype=dtype)
 
     if getattr(module, "randn_tensor", None) is None:
-        yield taken
+        yield tape
         return
     with patch.object(module, "randn_tensor", draw):
-        yield taken
+        yield tape
 
 
 def recording(destination: str, cohort: str) -> Path:

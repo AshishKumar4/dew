@@ -271,7 +271,7 @@ def test_bf16_logits_round_as_rounded_to_and_are_held_as_bf16_under_cuda():
 @pytest.mark.gpu(reason="the GPU's fp32 division is what `import dew` sets; a CPU's rounds to the nearest")
 def test_the_gpu_divides_fp32_to_the_nearest_float():
     """`import dew` has XLA:GPU divide fp32 to the nearest float
-    (`dew.telemetry.devices.divide_exactly`): over 2^20 quotients of operands
+    (`dew.devices.divide_exactly`): over 2^20 quotients of operands
     from 1e-4 to 10 apart, each is the float64 quotient rounded to fp32, as a
     CPU's and the references' are. XLA's own `div.full` left 28% of them off
     by up to 2 ulps on an H100."""
@@ -283,7 +283,7 @@ def test_the_gpu_divides_fp32_to_the_nearest_float():
 
 
 def test_quantizer_division_rounds_midpoint_neighbours_as_ieee_division():
-    from dew.nn.fake_quant import correctly_rounded_divide
+    from dew.nn.precision import correctly_rounded_divide
 
     rng = np.random.default_rng(411)
     denominator = rng.uniform(1e-4, 10, (1, 16384)).astype(np.float32)

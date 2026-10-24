@@ -356,7 +356,7 @@ def run(dtype, drawn: dict[str, np.ndarray], pixels: np.ndarray, classes: np.nda
     # `Tensor.float()`, which `preprocess_imgs_vae` and the loss's forward call, as the run's precision.
     with replaced(float_as(dtype)):
         ran(statements, scope, "train_repae.py")
-    assert not tape.replayed, "the step drew fewer times than DiffusionObjective.loss"
+    tape.spent()
 
     tail = "_f64" if dtype == torch.float64 else ""
     result = {f"grad/vae.{name}{tail}": accelerator.gradients[value].numpy()

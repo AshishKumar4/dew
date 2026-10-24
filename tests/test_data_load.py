@@ -34,7 +34,7 @@ def batches(data, *, held=False):
     assert reader is not None
     stream = reader(DataPartition())
     try:
-        taken = list(itertools.islice(stream, 1000 if held else data.records // data.batch))
+        taken = list(itertools.islice(stream, 1000 if held else data.steps_per_epoch))
         if held:
             assert next(stream, None) is None
         return taken

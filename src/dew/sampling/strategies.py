@@ -175,19 +175,9 @@ def as_pytree(value: Strategy) -> Strategy:
     return jax.tree_util.Partial(value) if jax.tree_util.all_leaves([value]) else value
 
 
-def wellformed(scores: jax.Array) -> jax.Array:
-    """Which rows hold a distribution: every score finite or `-inf`, one finite.
-
-    A NaN or a `+inf` beside a finite score makes the softmax undefined and
-    the draw arbitrary; a row with nothing finite has no distribution at all.
-    """
-    return (jnp.all(jnp.isfinite(scores) | jnp.isneginf(scores), axis=-1)
-            & jnp.any(jnp.isfinite(scores), axis=-1))
-
-
 def select(keys: jax.Array, scores: jax.Array, active: jax.Array) -> jax.Array:
     """One categorical draw per row from `scores`, refusing an undefined row."""
-    checkify.check(jnp.all(wellformed(scores) | ~active),
+    checkify.check(jnp.all(decoding.wellformed(scores) | ~active),
                    "the transform chain left an active row without a distribution to draw from")
     return jax.vmap(jax.random.categorical)(keys, scores).astype(jnp.int32)
 
@@ -204,11 +194,11 @@ def draw(state: StepState, logits: jax.Array,
     rather than returning a NaN, whatever a later repair does to the scores.
     """
     raw = logits.astype(jnp.float32)
-    checkify.check(jnp.all(wellformed(raw) | ~state.active),
+    checkify.check(jnp.all(decoding.wellformed(raw) | ~state.active),
                    "the model produced an active row without a distribution to score")
     if isinstance(transform, decoding.LogitsChain) and transform.greedy:
         scores = decoding.chain(transform.transforms[:-1])(state, raw)
-        checkify.check(jnp.all(wellformed(scores) | ~state.active),
+        checkify.check(jnp.all(decoding.wellformed(scores) | ~state.active),
                        "the transform chain left an active row without a distribution to draw from")
         token = jnp.argmax(scores, axis=-1).astype(jnp.int32)
         behavior = jnp.zeros(token.shape, jnp.float32)
@@ -219,6 +209,36 @@ def draw(state: StepState, logits: jax.Array,
         behavior = token_log_probs(scores, token)
     selected = token_log_probs(raw, token)
     return token, behavior, selected
+
+
+@struct.dataclass
+class RowStep:
+    """One draw of every row (`row_step`): the token each drew, its behaviour and raw likelihoods
+    (zero where the row did not draw), the state committed with it, how the stopping criteria finish
+    it, and the grammar's state after it (None without one)."""
+
+    token: jax.Array
+    behavior: jax.Array
+    raw: jax.Array
+    committed: StepState
+    finished: Finish
+    automaton: jax.Array | None
+
+
+def row_step(state: StepState, logits: jax.Array, transform: Callable[[StepState, jax.Array], jax.Array],
+             stopping: Callable[[StepState, jax.Array], Finish],
+             guide: tuple[Grammar, jax.Array] | None = None) -> RowStep:
+    """Every active row of `state` draws its next token from `logits` (`draw`), under `transform`
+    guided by a grammar from each row's automaton state where `guide` gives them, and commits it: the
+    step both decoding loops take, `Sample`'s scan and the server's (`dew.inference.serving_kernel`),
+    each keeping its own model call and its own rule for which rows go on drawing."""
+    active = state.active
+    guided = transform if guide is None else guide[0].guiding(transform, guide[1])
+    token, behavior, raw = draw(state, logits, guided)
+    committed = state.commit(token, active)
+    return RowStep(token, jnp.where(active, behavior, 0.0), jnp.where(active, raw, 0.0), committed,
+                   stopping(committed, token),
+                   None if guide is None else guide[0].advanced(guide[1], token, active))
 
 
 def continuations(start: StepState, n: int,
@@ -270,16 +290,13 @@ def _sample_rows(state: DecoderState, start: StepState, ops: DecodeOps,
     def step(carry, _):
         state, step_state, terminated, automaton = carry
         active = step_state.active
-        chain = transform if grammar is None else grammar.guiding(transform, automaton)
-        token, behavior, raw = draw(step_state, state.logits, chain)
-        committed = step_state.commit(token, active)
-        finished = stopping(committed, token)
-        stopped = active & finished.done
-        following = ops.advance(state, token, active)
-        carry = (following, dataclasses.replace(committed, active=active & ~stopped),
-                 terminated | (active & finished.ended),
-                 None if grammar is None else grammar.advanced(automaton, token, active))
-        return carry, (token, active, jnp.where(active, behavior, 0.0), jnp.where(active, raw, 0.0))
+        drew = row_step(step_state, state.logits, transform, stopping,
+                        None if grammar is None else (grammar, automaton))
+        stopped = active & drew.finished.done
+        following = ops.advance(state, drew.token, active)
+        carry = (following, dataclasses.replace(drew.committed, active=active & ~stopped),
+                 terminated | (active & drew.finished.ended), drew.automaton)
+        return carry, (drew.token, active, drew.behavior, drew.raw)
 
     initial = (state, start, jnp.zeros(start.rows, bool),
                None if grammar is None else grammar.start(start.rows))
@@ -498,12 +515,12 @@ def _beam_candidates(state: DecoderState, beams: StepState, transform, live, rea
     refused rather than searched.
     """
     genuine = real.reshape(prompts, width) & (live > DEAD / 2) & extending
-    checkify.check(jnp.all(wellformed(state.logits.astype(jnp.float32)).reshape(
+    checkify.check(jnp.all(decoding.wellformed(state.logits.astype(jnp.float32)).reshape(
         prompts, width) | ~genuine),
         "the model produced a live beam without a distribution to score")
     raw = jax.nn.log_softmax(state.logits.astype(jnp.float32))
     scores = transform(beams, raw)
-    checkify.check(jnp.all(wellformed(scores).reshape(prompts, width) | ~genuine),
+    checkify.check(jnp.all(decoding.wellformed(scores).reshape(prompts, width) | ~genuine),
                    "the transform chain left a live beam without a distribution to search")
     vocab = scores.shape[-1]
     best, index = lax.top_k((scores.reshape(prompts, width, vocab)
@@ -826,7 +843,7 @@ def _block(carry: _SpeculativeCarry, plan: Speculative, ops: DecodeOps, transfor
     committed, count, terminated = _committed(block_size, step, emitted, carry.out.terminated, budget,
                                               stopping, matched)
     checkify.check(
-        jnp.all(jnp.stack([wellformed(raw[at]) | ~(at < count) for at in range(block_size + 1)])),
+        jnp.all(jnp.stack([decoding.wellformed(raw[at]) | ~(at < count) for at in range(block_size + 1)])),
         "the model produced an emitted position without a distribution to score")
     keep = slots < count[:, None]
     out = _written(carry.out, emitted, behavior, original, keep, step, slots, index, terminated)

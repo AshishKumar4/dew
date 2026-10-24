@@ -17,16 +17,17 @@ from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
     FUSED_EXPERTS,
+    MOE_NAMES,
     DecoderFamily,
     DecoderFields,
     Packed,
     base_config,
-    dew_path,
     every_layer_windowed,
     read_rope,
     refuse,
     renamed,
     renamed_name,
+    renamed_path,
     softmax_top_k,
 )
 from dew.interop.families.qwen import qwen35_moe_path
@@ -68,13 +69,6 @@ def _mistral_config(hf_config, used):
     return base_config(hf_config, used, layer_types=(
         'full_attention' if window is None else 'sliding_attention',) * layers,
         reads=frozenset({'sliding_window'}))
-
-
-def _mixtral_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    name = name.replace('.block_sparse_moe.', '.mlp.')
-    for theirs, ours in (('w1', 'gate_proj'), ('w2', 'down_proj'), ('w3', 'up_proj')):
-        name = name.replace(f'.{theirs}.weight', f'.{ours}.weight')
-    return dew_path(name, config)
 
 
 def _granitemoe_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -139,7 +133,7 @@ MIXTRAL = DecoderFamily(
     'mixtral',
     'MixtralForCausalLM',
     lambda model: {},
-    weight_path=_mixtral_path,
+    weight_path=partial(renamed_path, MOE_NAMES),
     preserve_source_layout=True,
 )
 

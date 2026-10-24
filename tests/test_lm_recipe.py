@@ -12,13 +12,14 @@ from token_support import write_token_corpus
 from tool_support import load
 
 import dew
+from dew.config.lm import LMRunConfig
 from dew.data import Loading, presets
 from dew.data.compile import compile, held
 from dew.data.dataset import Loader
 from dew.data.pipeline import Dataset
 from dew.data.sources.tokens import TokenFiles
 from dew.inference import TextGeneration
-from dew.objectives.lm import LMObjective, LMRunConfig
+from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling
 
 pytestmark = pytest.mark.mesh
@@ -47,7 +48,8 @@ def test_rigel_leading_empty_phases_take_the_first_available_mixture():
 def test_the_recipes_default_chain_trains_an_epoch_of_another_store(tmp_path):
     """recipes/lm/train.py's default chain, pointed at another store with `--set`, trains by epochs:
     its windows are read by index and ordered after, so the run knows an epoch's length. 40 x SEQ
-    tokens are 39 windows of SEQ inputs and their targets, four batches of eight."""
+    tokens are 39 windows of SEQ inputs and their targets: five batches of eight, the fifth holding
+    the last seven and the next epoch's first, as an order that repeats for ever reads on."""
     recipe = load("train", "recipes/lm")
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ)
     config = LMRunConfig.cli(recipe_args(
@@ -55,7 +57,7 @@ def test_the_recipes_default_chain_trains_an_epoch_of_another_store(tmp_path):
         "--set", "data.token_windows.batch=8", "--trainer.epochs", "1", "--trainer.name", "default",
         "--max-new-tokens", "0", model_config='{"emb_features": 16, "num_layers": 1, "num_heads": 2}'),
         default=LMRunConfig(data=recipe.WINDOWS))
-    assert int(config.run().step) == 4
+    assert int(config.run().step) == 5
 
 
 # The committed byte-level BPE a run can train with offline.
@@ -524,7 +526,7 @@ def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
         "--trainer.steps", "1", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "masked",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--objective.ema-decay", "None", "--max-new-tokens", "0", "--optim.learning-rate", "0.001"],
+        "--objective.ema-decay", "None", "--max-new-tokens", "0", "--optim.rate", "0.001"],
         default=LMRunConfig(data=data))
 
     state = config.run()
@@ -566,7 +568,7 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
         "--trainer.steps", "1", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "block",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--max-new-tokens", "0", "--optim.learning-rate", "0.001"], default=LMRunConfig(data=spans))
+        "--max-new-tokens", "0", "--optim.rate", "0.001"], default=LMRunConfig(data=spans))
     state = config.run()
     assert int(state.updates) == 1
     original = Pretrained.load(checkpoint, dtype="float32", attention_impl="xla", max_seq_len=12)
@@ -603,7 +605,7 @@ def test_block_diffusion_trains_quantized_as_any_lm_recipe_does(tmp_path):
             "--trainer.steps", "1", "--trainer.log-every", "1",
             "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", name,
             "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-            "--max-new-tokens", "0", "--optim.learning-rate", "0.001", *quantized],
+            "--max-new-tokens", "0", "--optim.rate", "0.001", *quantized],
             default=LMRunConfig(data=spans))
 
     quantized = run("quantized")
