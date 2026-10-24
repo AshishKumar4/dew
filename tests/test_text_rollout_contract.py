@@ -89,17 +89,27 @@ def forward(model):
 
 
 def row_logits(model, params, prompt, lengths, tokens, positions=None):
-    """Each row's logits for its drawn `tokens`, from one full forward over its unpadded prompt and the
-    tokens drawn before each, at `positions` where given (one row each, the prompt's and the tokens'),
-    in the model's dtype: an array a row, a step each."""
-    apply = forward(model)
-    width = prompt.shape[1]
-    found = []
-    for row, length in enumerate(np.asarray(lengths)):
-        context = jnp.asarray(np.concatenate([prompt[row, width - length:], tokens[row, :-1]])[None])
-        extra = {} if positions is None else {"positions": jnp.asarray(positions[row:row + 1])}
-        found.append(apply(params, context, **extra)[0, length - 1:])
-    return found
+    """Each row's logits for its drawn `tokens`, from one full forward over every row's unpadded prompt and
+    the tokens drawn before each, right-padded to the longest as a learner scores a batch of rollouts, at
+    `positions` where given (a row each, the prompt's and the tokens', continued past the row's end): a
+    causal model reads no padding at a real position, and the batch's products take a learner's shapes.
+    In the model's dtype: an array a row, a step each."""
+    width, lengths = prompt.shape[1], np.asarray(lengths)
+    contexts = [np.concatenate([prompt[row, width - length:], tokens[row, :-1]])
+                for row, length in enumerate(lengths)]
+    longest = max(len(context) for context in contexts)
+    rows = np.zeros((len(contexts), longest), np.int32)
+    for row, context in enumerate(contexts):
+        rows[row, :len(context)] = context
+    extra = {}
+    if positions is not None:
+        placed = np.asarray(positions)
+        extra["positions"] = jnp.asarray(np.stack([
+            np.concatenate([placed[row, :len(context)],
+                            placed[row, len(context) - 1] + np.arange(1, longest - len(context) + 1)])
+            for row, context in enumerate(contexts)]))
+    logits = forward(model)(params, jnp.asarray(rows), **extra)
+    return [logits[row, length - 1:length - 1 + tokens.shape[1]] for row, length in enumerate(lengths)]
 
 
 def policy_scores(model, params, prompt, lengths, tokens, sampling, positions=None) -> dict:
