@@ -17,6 +17,7 @@ to a budget with a mask. These tests convert with the arithmetic written out
 here.
 """
 
+import contextlib
 import json
 from pathlib import Path
 
@@ -217,20 +218,31 @@ def source_pipelines(source):
         return ZImagePipeline.from_pretrained(source / "pipeline", torch_dtype=dtype, local_files_only=True)
 
     narrow = loaded(torch.float32)
-    with float64():
+    with float64(), widened_schedulers():
         wide = loaded(torch.float64)
     for pipe in (narrow, wide):
         pipe.set_progress_bar_config(disable=True)
     return narrow, wide
 
 
+@contextlib.contextmanager
+def widened_schedulers():
+    """The pipeline's and its FlowMatch scheduler's float32 pins widened (`float64_scheduler`): the
+    scheduler forms its shifted sigmas, timesteps and steps in float32 otherwise."""
+    from diffusers.pipelines.z_image import pipeline_z_image
+    from diffusers.schedulers import scheduling_flow_match_euler_discrete
+
+    from tools.diffusers_wan_reference import float64_scheduler
+
+    with float64_scheduler(pipeline_z_image), float64_scheduler(scheduling_flow_match_euler_discrete):
+        yield
+
+
 def widened_call(pipe, run):
     """`run(pipe)` with the source's float32 pins widened, as its float64 truth runs."""
-    from diffusers.pipelines.z_image import pipeline_z_image
+    from tools.diffusers_wan_reference import float64
 
-    from tools.diffusers_wan_reference import float64, float64_scheduler
-
-    with float64(), float64_scheduler(pipeline_z_image):
+    with float64(), widened_schedulers():
         return run(pipe)
 
 
