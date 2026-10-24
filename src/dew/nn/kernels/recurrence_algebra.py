@@ -426,14 +426,16 @@ SUB = 16
 """Rows of a sub-chunk: the diagonal blocks the triangular inverse is built from (fla's BC)."""
 
 class Tile(Protocol):
-    """A tile a mainloop holds in memory: an operand its products take as it is or transposed, whose
-    registers `value()` loads where the algebra needs them elementwise."""
+    """A tile a mainloop holds in memory: an operand its products take as it is, transposed or read in
+    another dtype, whose registers `value()` loads where the algebra needs them elementwise."""
 
     @property
     def shape(self) -> tuple: ...
 
     @property
     def T(self) -> "Tile": ...
+
+    def astype(self, dtype) -> "Tile": ...
 
     def value(self) -> jax.Array: ...
 
@@ -644,8 +646,8 @@ def key_decayed_write(key, gate, low, last, last_low):
     return key * raised(last - gate, last_low - low)
 
 
-def key_decayed_output(queries: Load, gates: Callable[..., tuple], entered: Load, columns: int, scores, value,
-                       scale: float, issue: Issue):
+def key_decayed_output(queries: Callable[..., jax.Array], gates: Callable[..., tuple], entered: Load,
+                       columns: int, scores, value, scale: float, issue: Issue):
     """A chunk's output `[C, BV]`, fp32, a decay a key dimension: `scale (q exp2(g))_narrow S + tril(Aqk) v`,
     each key block's gated queries `queries(c) exp2(gates(c))` (`gates(c)` the prefix's halves, `raised`)
     rounded to their dtype against the memory entered `entered(c)` ('memory'), the scores `scores` (`Aqk`,

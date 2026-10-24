@@ -185,13 +185,6 @@ class MmaSync(mosaic.Family[dict, dict, jax.Array]):
     def held(self, ref):
         return ref
 
-    def staged(self, value: jax.Array, buffer):
-        """Mosaic GPU brackets a store with the warpgroup's barriers (its automatic barriers), so every warp's
-        reads of `buffer` are done before it and its writes seen after; sm80 has no async proxy to fence
-        (`commit_smem`'s fence.proxy.async does not select there)."""
-        buffer[...] = value.astype(buffer.dtype)
-        return buffer
-
     def operand(self, ref, side: str):
         """A shared-memory tile `ref` (a transposed view too) in the left or right operand's layout."""
         layout = plgpu.Layout.MMA_LHS if side == "lhs" else plgpu.Layout.MMA_RHS
@@ -202,10 +195,6 @@ class MmaSync(mosaic.Family[dict, dict, jax.Array]):
         if then is not None:
             then()
         return out
-
-    def summed(self, shape: tuple[int, int], issue, interpret: bool) -> jax.Array:
-        del interpret
-        return issue(self.zeros(shape))
 
     def products(self, acc, lhs, rhs, interpret: bool) -> jax.Array:
         # Mosaic GPU's interpreter lowers no mma.sync: the dot it computes.

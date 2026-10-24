@@ -420,20 +420,26 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         """An operand every step reads (`ref`, in shared memory) where the family keeps it: shared memory,
         or registers."""
 
-    @abc.abstractmethod
     def staged(self, value: jax.Array, buffer) -> Ref:
         """`value` in the shared-memory tile `buffer`, in its dtype, for a product to read: a register right
-        operand's way to an MMA (`staged_products` stages left ones)."""
+        operand's way to an MMA (`staged_products` stages left ones). Mosaic GPU brackets a store with the
+        warpgroup's barriers (its automatic barriers), so every warp's reads of `buffer` are done before it
+        and its writes seen after; a family whose MMA reads shared memory through an async proxy fences it
+        too (wgmma's)."""
+        buffer[...] = value.astype(buffer.dtype)
+        return buffer
 
     @abc.abstractmethod
     def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
         """`lhs @ rhs` into a fresh fp32 accumulator of `shape`, its value, with `then` issued while the
         product runs."""
 
-    @abc.abstractmethod
     def summed(self, shape: tuple[int, int], issue, interpret: bool) -> jax.Array:
         """`issue(acc) -> acc` issuing products in place (`products`) into a fresh fp32 accumulator of
-        `shape` (zero), its value once they are done."""
+        `shape` (zero), its value once they are done: a register accumulator's, which a family whose
+        accumulator is a ref scopes (wgmma's)."""
+        del interpret
+        return issue(self.zeros(shape))
 
     @abc.abstractmethod
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
