@@ -189,8 +189,9 @@ row's cutoff is past KEPT_BOUND of the row's deviation. Ten times the largest di
 moved a gate value from its float64 value over 48 draws of both parameter sets at 32 rows a draw, 4.8e-5
 of the deviation (median 6.1e-6). No margin rule admits Gemma 3n's draws: at 32 rows none of those 96
 cleared it, the median draw's least margin being 7.3e-6, since every draw holds some of its 460,000 gate
-values near a cutoff. Its runs chose alike all the same: over those draws, at 8 rows and at 32, the
-float32 runs kept exactly the units float64 kept in 192 of 192."""
+values near a cutoff. Its runs choose alike all the same, but for rounding's rare disagreement: over
+128 draws at 32 rows, both runs and both parameter sets, one draw kept other units than float64 (two, at
+float64 margins up to 1.3e-6), and over 48 draws of the plain loop at 8 rows and at 32 none did."""
 SCAN_SEEDS = {"gemma4": 256, "gemma3n": 64, "deepseek": 8, "deepseek_widths": 8}
 """Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada, paired
 with the scanned stack, whose arms share every upstream rounding (the same weights, rows and arithmetic,
