@@ -1536,6 +1536,17 @@ def refinement(residual: jax.Array, mass: jax.Array, peak0: jax.Array, shares: t
     return jnp.where(whole_mass > 0, whole_residual / jnp.where(whole_mass > 0, whole_mass, 1.0), 0.0)
 
 
+def dropout_centre(sums: DqSums, state_total: jax.Array, initial: jax.Array) -> jax.Array:
+    """Dropout's D about zero, from a dQ pass over the keys whose cotangents are unscaled (`sums` with unit
+    `total`): the weighted mean of its dropped score products, `sums.residual` over `sums.mass`, with the
+    initial state's share as `refinement` takes it (`state_total` its weight, `initial` its values' mean's
+    product with the cotangent). A ratio of the pass's own sums and no denominator from the forward, so a row
+    of one key, or of keys whose products agree, centres on their product exactly."""
+    total = sums.mass + state_total
+    numerator = sums.residual + state_total * initial
+    return jnp.where(total > 0, numerator / jnp.where(total > 0, total, 1.0), 0.0)
+
+
 def _scaled(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     """`x` (fp32) times the power of two that puts its largest magnitude at 2^14, fp32, and that power's
     negated exponent, which takes a product of it back (`_fp16_scaled` before its rounding)."""

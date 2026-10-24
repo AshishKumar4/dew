@@ -309,10 +309,10 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                                      for ours, theirs in zip((anchor, delta, chosen), first, strict=True))
         m = maxima
 
-        def sweep(anchor, delta, chosen):
-            # One pass over the keys: each cotangent over the prior denominator, in the reference's order, and
-            # taken to the pass's own at the end (`algebra.dq_finish`); the weights' sums unnormalized, as the
-            # Triton mainloop's dQ launch.
+        def sweep(anchor, delta, chosen, total):
+            # One pass over the keys: each cotangent over `total`, in the reference's order, and taken to
+            # the pass's own at the end (`algebra.dq_finish`); the weights' sums unnormalized, as the Triton
+            # launch's.
             def step(j, carry):
                 columns, seen, params, k_tile, v_tile = tile(j)
                 logits, slopes = algebra.tile_logits(score_mod, interpreted_dot(q, k_tile.T), seen, q_pos,
@@ -320,9 +320,9 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                 weights = algebra.normalized(logits, m, jnp.ones_like(m), how)[0]
                 zt = None if draw is None else draw(q_pos, columns[None, :])
                 cotangents = algebra.grad_scores(weights, interpreted_dot(do, v_tile.T), anchor, delta, seen,
-                                                 columns[None, :] == chosen[:, None], algebra.inverse(prior),
+                                                 columns[None, :] == chosen[:, None], algebra.inverse(total),
                                                  multiplier=zt)
-                return algebra.dq_step(carry, weights, cotangents, slopes, seen, k_tile, prior,
+                return algebra.dq_step(carry, weights, cotangents, slopes, seen, k_tile, total,
                                        scale=scale, kinds=score_kinds, summed=summed, dot=interpreted_dot,
                                        accurate=accurate)
 
@@ -334,16 +334,15 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             return jax.lax.fori_loop(lo, hi, step, start)
 
         if draw is not None:
-            # Dropout's D is the mean of its dropped score products, the cotangents' centre. A first sweep
-            # with no D yields that mean through `algebra.dq_finish`'s refinement. The split sums give the
-            # denominator alone: their narrowed dropped weights leave dS off zero where the products agree
-            # (identical keys), so no key is forced to the anchor.
+            # Dropout's D is the weighted mean of its dropped score products: a first sweep with unit `total`
+            # gives the products' weighted sum as its residual and the weights' sum as its mass
+            # (`algebra.dropout_centre`), so a row of one key, or of keys whose products agree, centres
+            # on the product exactly. The forward's denominator and its narrowed split sums enter no ratio.
             zero = jnp.zeros((block_q,), jnp.float32)
             none = jnp.full_like(chosen, -1)
-            _, centre, *_ = algebra.dq_finish(sweep(zero, zero, none), prior, state_total, peak0,
-                                              (total0, mean0), m, zero, zero, accurate=accurate)
+            centre = algebra.dropout_centre(sweep(zero, zero, none, jnp.ones_like(prior)), state_total, mean0)
             anchor, delta, chosen = zero, centre, none
-        found = sweep(anchor, delta, chosen)
+        found = sweep(anchor, delta, chosen, prior)
         dq, delta, denominator, mass, grads = algebra.dq_finish(found, prior, state_total, peak0,
                                                                 (total0, mean0), m, anchor, delta,
                                                                 accurate=accurate)

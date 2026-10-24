@@ -631,17 +631,17 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     peak = maximum
     summed = tuple(kind in (Kind.HEAD, Kind.QUERY) for kind in score_kinds)
 
-    def sweep(anchor, delta, key_index):
-        # Each cotangent over the prior denominator, in the reference's order, and taken to the pass's own at
-        # the end (`algebra.dq_finish`); the weights' sums unnormalized.
+    def sweep(anchor, delta, key_index, total):
+        # One pass over the keys: each cotangent over `total`, in the reference's order, and taken to
+        # the pass's own at the end (`algebra.dq_finish`); the weights' sums unnormalized.
         def step(index, carry):
             keys, k_pos, seen, params = tile(index)
             key, value = key_ref[keys, :], value_ref[keys, :]
             zt = None if draw is None else draw(q_pos, k_pos)
             weights, _, cotangents, slopes = _tile_scores(
-                score_mod, query, key, value, dout, peak, prior, anchor, delta, seen, q_pos, k_pos, params,
+                score_mod, query, key, value, dout, peak, total, anchor, delta, seen, q_pos, k_pos, params,
                 key_index=key_index, scale=scale, how=how, interpret=interpret, multiplier=zt)
-            return algebra.dq_step(carry, weights, cotangents, slopes, seen, key, prior, scale=scale,
+            return algebra.dq_step(carry, weights, cotangents, slopes, seen, key, total, scale=scale,
                                    kinds=score_kinds, summed=summed, dot=product, accurate=accurate)
 
         nothing = jnp.zeros((block_q,), jnp.float32)
@@ -652,15 +652,14 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
                                                 jnp.full((block_q,), algebra.NO_SHIFT, jnp.float32)))
 
     if draw is not None:
-        # Dropout's D is the mean of its dropped score products, the cotangents' centre, as the portable
-        # launch takes it: a first sweep with no D, whose refinement (`algebra.dq_finish`) is that mean.
+        # Dropout's D is the weighted mean of its dropped score products, from a first sweep with unit `total`
+        # (`algebra.dropout_centre`), as the portable launch takes it.
         zero = jnp.zeros((block_q,), jnp.float32)
         none = jnp.full_like(key_index, -1)
-        _, delta, *_ = algebra.dq_finish(sweep(zero, zero, none), prior, state_total, peak0, shares, peak,
-                                         zero, zero, accurate=accurate)
-        anchor, key_index = zero, none
+        centre = algebra.dropout_centre(sweep(zero, zero, none, jnp.ones_like(prior)), state_total, shares[1])
+        anchor, key_index, delta = zero, none, centre
     index_out_ref[...] = key_index
-    sums = sweep(anchor, delta, key_index)
+    sums = sweep(anchor, delta, key_index, prior)
     dq, delta, total, mass, grads = algebra.dq_finish(sums, prior, state_total, peak0, shares, peak, anchor,
                                                       delta, accurate=accurate)
     dq_ref[...] = dq
