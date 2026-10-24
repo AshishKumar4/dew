@@ -1406,6 +1406,9 @@ def _load_composite_source(name_or_dir: str | Path, root: Path, commit: str | No
             weights_folder = ""
         root = sources.snapshot(str(name_or_dir), commit,
                                 weights=True if not weights_folder else (weights_folder,))
+        directory = root / folder
+        if commit is not None:
+            commit = root.name
         shared = sources.load_shards(root / weights_folder)
         prefix = component.tensor_prefix
         tensors = ({name[len(prefix):]: tensor for name, tensor in shared.items() if name.startswith(prefix)}
