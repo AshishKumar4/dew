@@ -239,11 +239,11 @@ def test_the_loaded_slot_runtime_matches_author_scores_and_readout_vjps(tmp_path
             ids = head.tied_labels()
             tied = None if ids is None else task.model.label_logits(task.variables, hidden, inputs, ids)
             scores = head.apply({"params": params}, hidden, inputs, table, tied=tied)[:, 0]
-            return jnp.sum(scores * probe), scores
+            return jnp.sum(scores * probe)
 
-        (_, scores), (gradient, hidden) = jax.value_and_grad(observed, (0, 1), has_aux=True)(
+        gradient, hidden = jax.grad(observed, (0, 1))(
             part(task.variables, "head").get("params", {}), states)
-        result = {"scores": scores, "gradient.hidden": hidden}
+        result = {"scores": task.model.logits(task.variables, inputs)[:, 0], "gradient.hidden": hidden}
         if mode == "head":
             result.update({f"gradient.{name}": gradient[native] for name, native in
                            (("slot", "slots"), ("q.weight", "q"), ("k.weight", "k"))})
@@ -269,6 +269,7 @@ def test_the_loaded_slot_runtime_matches_author_scores_and_readout_vjps(tmp_path
         probe = np.zeros(held["options"].shape, np.float32)
         probe[held["options"]] = held["probe"]
         result = forward(inputs, jnp.asarray(probe))
+        assert np.isneginf(np.asarray(result["scores"])[~held["options"]]).all()
         return {**result, "scores": np.asarray(result["scores"])[held["options"]]}
 
     assert_as_exact(native, reference, draw, f"released slot runtime {site}", seeds=seeds, truth_fn=truth)
