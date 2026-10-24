@@ -93,10 +93,13 @@ def published_layout() -> tuple[dict, dict]:
     import jax
     from flax.traverse_util import unflatten_dict
 
+    from dew.inference.tasks import earlier_shapes
+
     fixture = json.loads(LAYOUT.read_text())
     variables = unflatten_dict({path: jax.ShapeDtypeStruct(tuple(shape), dtype)
                                 for path, (shape, dtype) in fixture["variables"].items()}, sep="/")
-    return fixture["artifact"], variables
+    # The published run's record, as a run loader reads it (`SavedRun.pinned`).
+    return earlier_shapes(fixture["artifact"]), variables
 
 
 def test_the_published_runs_weights_are_the_ones_its_models_read():

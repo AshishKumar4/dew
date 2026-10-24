@@ -151,12 +151,12 @@ class AutoEncoder(ABC):
         return replaced
 
     def to_json(self) -> dict:
-        """Return the record of this built-in autoencoder's constructor, without its parameters: its
-        registration's name (`pretrained.REGISTRATIONS`), its module's fields and `record_arguments`.
-
-        One no registration names raises `TypeError`.
+        """Return the record of this built-in autoencoder's constructor, without its parameters, as a
+        registry class record (`dew.registry.Record`): its wrapper class by import path, its module's
+        fields and `record_arguments`. One no registration declares (`pretrained.REGISTRATIONS`)
+        raises `TypeError`.
         """
-        from dew.registry import record_fields
+        from dew.registry import import_path, record_fields
 
         from .pretrained import registration
         registered = registration(type(self))
@@ -165,20 +165,23 @@ class AutoEncoder(ABC):
                             "(`pretrained.REGISTRATIONS`)")
         arguments = {name: np.asarray(value).tolist() if isinstance(value, np.ndarray | jax.Array) else value
                      for name, value in self.record_arguments().items()}
-        return {'name': registered.record,
+        return {'class': import_path(type(self)),
                 'fields': {'model': record_fields(self.model, registered.module), **arguments}}
 
     @classmethod
     def from_json(cls, record, *, params: Variables) -> AutoEncoder:
         """Rebuild a built-in autoencoder from its `record`, around the checkpoint's own `params`,
-        reading no source. A name no built-in declares raises `ValueError`.
+        reading no source; its registration (`pretrained.REGISTRATIONS`) gives the module its wrapper
+        builds. A class no built-in registers raises `ValueError`.
         """
-        from dew.registry import from_record
+        from dew.registry import from_record, imported
 
         from .pretrained import registration
-        registered = registration(record['name'])
+        wrapper = imported(record['class'])
+        built_in = isinstance(wrapper, type) and issubclass(wrapper, AutoEncoder)
+        registered = registration(wrapper) if built_in else None
         if registered is None:
-            raise ValueError(f"{record['name']!r} is not a registered built-in autoencoder "
+            raise ValueError(f"{record['class']!r} is not a registered built-in autoencoder "
                              "(`pretrained.REGISTRATIONS`)")
         fields = dict(record['fields'])
         model = from_record(registered.module, fields.pop('model'))
