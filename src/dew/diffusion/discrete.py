@@ -249,7 +249,8 @@ class DiscreteDenoiser:
         # categorical from these, and a bf16 log partition would quantize it.
         logits = logits.astype(jnp.float32).at[..., self.process.mask_id].set(-jnp.inf)
         log_probs = jax.nn.log_softmax(logits, axis=-1)
-        masked = self.masked(x_t)
+        # A masked position whose scores hold no distribution stays masked: its argmax is no token.
+        masked = self.masked(x_t) & wellformed(log_probs)
         filled = jnp.where(masked, jnp.argmax(log_probs, axis=-1), x_t)
         return filled, log_probs
 
