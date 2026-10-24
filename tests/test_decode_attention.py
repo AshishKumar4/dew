@@ -378,6 +378,23 @@ def decode_step(lengths):
     return attended, folded
 
 
+def test_a_decode_step_traced_with_x64_on_runs_the_decode_kernel():
+    """A float32 decode step traced with x64 on, as a float64 truth around a served model traces it,
+    lowers for the GPU on this CPU through the decode kernel: its block and slice counts take the span's
+    integer type, not the int64 a Python int becomes."""
+    from dew.nn.kernels.generation import assumed, gpu_mesh
+    from dew.training._lowering import triton_kernels
+
+    with jax.enable_x64(new_val=True):
+        attended, _ = decode_step(jnp.asarray([1, 20], jnp.int32))
+        query = jax.ShapeDtypeStruct((2, 4, 2, 64), jnp.float32)
+        key = jax.ShapeDtypeStruct((2, 64, 2, 64), jnp.float32)
+        mesh = gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), "sm80")
+        with assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
+            lowered = jax.jit(attended).trace(query, key, key).lower(lowering_platforms=("cuda",))
+    assert triton_kernels(lowered) == {"decode_attention": 1}
+
+
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
 def test_attention_the_decode_kernel_takes_lowers_for_the_gpu_differentiated_in_both_modes(generation):
     """Lowered for the GPU on this CPU, a decode step's attention runs the decode kernel for its value

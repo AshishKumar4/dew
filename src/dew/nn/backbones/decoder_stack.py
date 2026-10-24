@@ -50,7 +50,14 @@ def _fetched_layer(tree, index):
 
     TPU host tiles cannot in general be bitcast to the lower-rank shape.
     The bank's layer-major physical layout also keeps the copied tile valid.
+    The index reaches the slice through an optimization barrier, so the
+    slice stays the dynamic one a scanned layer takes: at a constant index
+    (a run's first layer) over host rows a call stacks itself, XLA:GPU
+    folds the slice to the row and the squeeze into the host parameter's
+    own bitcast, which its layout assignment refuses ("Bitcast cannot have
+    different memory spaces").
     """
+    index = jax.lax.optimization_barrier(jnp.asarray(index, jnp.int32))
     return jax.tree.map(
         lambda leaf: jax.lax.squeeze(jax.device_put(jax.lax.dynamic_index_in_dim(leaf, index, 0),
                                                     jax.memory.Space.Device), (0,)), tree)
