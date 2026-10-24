@@ -90,15 +90,23 @@ def placed_leaves(tree: Variables, place: Callable[[tuple[str, ...], Leaf], Leaf
     twice. With `in_place`, the tree's plain dict nodes are written in place, so every holder of one
     sees the placed leaves and no host leaf outlives its copy, and any other mapping (a FrozenDict)
     is rebuilt as a dict over the same children; otherwise every node is rebuilt, the caller's tree
-    left as it was."""
+    left as it was. Any other node JAX flattens (a quantized array's buffers) is rebuilt over its
+    leaves placed, each under its key path (`jax.tree_util.keystr`) below the node's."""
+    def landed(path: tuple[str, ...], leaf: Leaf) -> Leaf:
+        placed = place(path, leaf)
+        if placed is not leaf:
+            jax.block_until_ready(placed)
+            if isinstance(leaf, np.ndarray):
+                evict(leaf)
+        return placed
+
     def walk(node: Mapping | Leaf, path: tuple[str, ...]) -> dict | Leaf:
         if not isinstance(node, Mapping):
-            landed = place(path, node)
-            if landed is not node:
-                jax.block_until_ready(landed)
-                if isinstance(node, np.ndarray):
-                    evict(node)
-            return landed
+            leaves, structure = jax.tree_util.tree_flatten_with_path(node)
+            if jax.tree_util.treedef_is_leaf(structure):
+                return landed(path, node)
+            return structure.unflatten([landed((*path, jax.tree_util.keystr(keys)), leaf)
+                                        for keys, leaf in leaves])
         held = node if in_place and type(node) is dict else dict(node)
         for name in list(held):
             held[name] = walk(held[name], (*path, name))
