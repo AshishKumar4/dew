@@ -114,9 +114,9 @@ def report_table(path: Path, index: int = 0) -> tuple[list[str], list[dict[str, 
 
 def program_kernels(capture: Path, programs: Sequence[str]) -> dict[str, list[dict[str, JSON]]]:
     """A capture's kernels (one of `Profiler.captures`; XProf's kernel_stats, `report_table`), each row
-    filed under the first of `programs`, in their order, whose name one of its values holds: the jitted
-    program it ran in, which XProf's op name begins with (`jit(<name>)/...`), so callers name each program
-    for what it runs (`fn.__name__`). The order decides between names one holds another of (`step` before
+    filed under the first of `programs`, in their order, whose name its op name holds: the jitted program
+    it ran in, which XProf's `op_name` begins with (`jit(<name>)/...`), so callers name each program for
+    what it runs (`fn.__name__`). The order decides between names one holds another of (`step` before
     `step_eval` files both under `step`). The rest go under `''`; each list by total time, longest first.
     A capture whose export failed has no kernel_stats: FileNotFoundError naming it."""
     stats = capture / "reports" / "kernel_stats.json"
@@ -126,8 +126,8 @@ def program_kernels(capture: Path, programs: Sequence[str]) -> dict[str, list[di
     _, rows = report_table(stats)
     found: dict[str, list[dict[str, JSON]]] = {name: [] for name in (*programs, "")}
     for row in rows:
-        values = [str(value) for value in row.values()]
-        owner = next((name for name in programs if any(name in value for value in values)), "")
+        op = str(row.get("op_name") or "")
+        owner = next((name for name in programs if name in op), "")
         found[owner].append(row)
     for kernels in found.values():
         kernels.sort(key=lambda row: -float(str(row.get("total_duration_us") or 0)))
