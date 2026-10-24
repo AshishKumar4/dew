@@ -1216,11 +1216,6 @@ class Trainer(Generic[Loss, Effects]):
         placement = batch_shardings(mesh, batch)
         candidates = splits(self._rows, batch, mesh, self.microbatches, self._split)
         shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
-        # What a step holds between steps, its accumulator and copies included, at the fewest
-        # microbatches, the least any plan holds, fits the devices before any plan compiles.
-        _, _, least = self._prepared(state, microbatch_shapes(batch, candidates[0]), schedule,
-                                     candidates[0] * self.accumulation)
-        self._validation(placed_shapes(least, self.shardings(least)))
 
         def lower(split: int) -> Candidate:
             return self._candidate(state, batch, schedule, placement, replicated, split,
@@ -1246,6 +1241,8 @@ class Trainer(Generic[Loss, Effects]):
         seconds = timed([self._runner(plan, mesh) for plan in plans]) if len(plans) > 1 and timed else []
         # Every process runs the plan process zero timed fastest.
         planned = plans[broadcast_from_process_zero(seconds.index(min(seconds)) if seconds else 0)]
+        # The state the chosen plan holds between steps, its accumulator and copies included; the
+        # plan's fit check counted them before any is built (`Candidate.held`).
         self.validation = self._validation(planned.candidate.prepared)
         self.objective.substitute(list(planned.modules))
         self.objective.restore_head(planned.tile, fused=planned.fused)
