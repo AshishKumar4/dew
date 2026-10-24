@@ -15,7 +15,7 @@ from dew.nn.dense import Dense, DenseGeneral
 from .attention import GroupNorm, RMSNorm
 from .conv import Conv
 from .flops import projection_flops
-from .precision import at_least_fp32, float32_dot_general
+from .precision import at_least_fp32, float32_dot_general, float32_einsum
 from .rope import sinusoid_frequencies, sinusoids
 from .sharding import constrain, explicit_spec, rows_taken, whole_spec
 
@@ -281,7 +281,7 @@ def torch_bicubic_resize(x, height: int, width: int, *, antialias: bool = False)
     reference only through this arithmetic."""
     rows = _torch_bicubic_weights(x.shape[1], height, antialias)
     columns = _torch_bicubic_weights(x.shape[2], width, antialias)
-    return jnp.einsum("oh,bhwc,pw->bopc", rows, x, columns, precision=jax.lax.Precision.HIGHEST)
+    return float32_einsum("oh,bhwc,pw->bopc", rows, x, columns, precision=jax.lax.Precision.HIGHEST)
 
 
 class Upsample(nn.Module):

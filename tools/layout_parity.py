@@ -406,7 +406,6 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
     import optax
 
     from dew.training import Layout, MeshSpec, Trainer
-    from dew.training.memory import refuse_wide_floats
 
     class Drawn(Trainer):
         def initial_state(self, initializer=None, key=None):
@@ -424,10 +423,8 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
                 if one_device:
                     _initial[(repr(case), accumulation)] = jax.tree.map(lambda leaf: leaf.copy(), state)
                 return state, shardings, position
-            abstract = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), held)
-            refuse_wide_floats(abstract, self.device_mesh)
-            shardings = self.shardings(abstract)
-            self.check(abstract.variables, shardings.variables)
+            shardings, _ = self._validated(jax.tree.map(
+                lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), held))
             # The mesh axes the variables split over, with their sizes: an
             # initializer drawn under a split the case has not drawn under
             # yet could come out different, so that split draws its own.

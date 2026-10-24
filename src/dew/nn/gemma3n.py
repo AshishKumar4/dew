@@ -28,6 +28,7 @@ from dew.nn.dense import Dense
 from dew.nn.fake_quant import straight_through
 from dew.nn.flops import projection_flops
 from dew.nn.precision import (
+    accumulated,
     at_least_fp32,
     float32_dot_general,
     float32_einsum,
@@ -142,8 +143,8 @@ class _Coefficients(nn.Module):
             clipped = jnp.clip(kernel, -self.clip, self.clip)
             kernel = straight_through(kernel, clipped) if self.stored else clipped
         dtype = x.dtype if self.dtype is None else self.dtype
-        return jnp.dot(x.astype(dtype), kernel.astype(dtype),
-                       precision=float32_products(dtype, self.precision))
+        return accumulated(functools.partial(jnp.dot, precision=float32_products(dtype, self.precision)),
+                           x.astype(dtype), kernel.astype(dtype))
 
 
 def clamped_predictions(params, clip: float):

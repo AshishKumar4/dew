@@ -78,7 +78,9 @@ class Benchmark:
     warmup: int = 5
     """Steps to run before timing starts."""
     read: Literal["memory", "indexed", "streamed"] = "indexed"
-    loading: Loading = field(default_factory=Loading)
+    loading: Loading | None = None
+    """How to load the chain, turned on by its own flags (`--loading.workers 8`), which takes it over
+    the chain's own `loading(...)`; none times the chain as a run reads it, under its own."""
 
 
 def measure(batches: Iterable, steps: int, warmup: int) -> list[float]:
@@ -108,6 +110,14 @@ def report(latencies: list[float], batch_size: int) -> None:
     print(f"samples/sec:      {len(latencies) * batch_size / sum(latencies):.1f}")
     print(f"step latency p50: {percentile(latencies, 0.5) * 1e3:.2f} ms")
     print(f"step latency p95: {percentile(latencies, 0.95) * 1e3:.2f} ms")
+
+
+def benchmark(args: list[str]) -> Benchmark:
+    """The benchmark `args` ask for, a `--loading.` flag turning on the tool's own loading."""
+    from dew.config import flag_selected
+
+    return tyro.cli(tyro.conf.CascadeSubcommandArgs[Benchmark],
+                    args=flag_selected(args, {"loading": "loading"}))
 
 
 def main(config: Benchmark) -> None:
@@ -789,4 +799,4 @@ if __name__ == "__main__":
     elif sys.argv[1:2] == ["scaling"]:
         run_scaling(tyro.cli(Scaling, args=sys.argv[2:]))
     else:
-        main(tyro.cli(tyro.conf.CascadeSubcommandArgs[Benchmark]))
+        main(benchmark(sys.argv[1:]))

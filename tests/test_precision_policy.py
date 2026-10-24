@@ -301,12 +301,13 @@ def test_quantizer_division_rounds_midpoint_neighbours_as_ieee_division():
 def dot_precisions(function, *arguments) -> list:
     """The precision of every dot_general `function` traces over `arguments` under JAX's own default
     precision (the test lane sets 'highest' for every product that states none), with the dtype its
-    operands promote to, sub-jaxprs included."""
+    operands promote to, sub-jaxprs included, as a GPU runs them: a CPU's float64 sums
+    (`dew.nn.precision.accumulated`) are tests/test_cpu_accumulation.py's."""
     with jax.default_matmul_precision(None):
         graph = jax.make_jaxpr(function)(*arguments)
     return [(equation.params["precision"],
              jnp.result_type(*(variable.aval.dtype for variable in equation.invars)))
-            for equation in equations(graph) if equation.primitive.name == "dot_general"]
+            for equation in equations(graph, platform="cuda") if equation.primitive.name == "dot_general"]
 
 
 HIGHEST = (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)

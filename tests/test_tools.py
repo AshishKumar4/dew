@@ -1613,6 +1613,17 @@ def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_pat
 # tools/benchmark_data.py
 # ---------------------------------------------------------------------------
 
+def test_the_data_benchmark_times_a_chain_under_its_own_loading_unless_its_flags_set_one():
+    """Without a `--loading.` flag the benchmark compiles the chain with no loading of its own, so the
+    chain's `loading(...)` is what it times, as a run reads it; a flag sets the tool's, which the
+    compile takes over the chain's."""
+    from dew.data.dataset import Loading
+
+    tool = load("benchmark_data")
+    assert tool.benchmark(["--steps", "3"]).loading is None
+    assert tool.benchmark(["--loading.workers", "2", "--steps", "3"]).loading == Loading(workers=2)
+
+
 def test_the_data_benchmark_counts_a_grain_packing_and_dews_alike_as_the_objective_counts_them():
     """The data benchmark counts a batch's tokens and work as the run's objective counts them
     (`real_lengths`, `training_flops`), whichever packer laid the batch out: Grain's first-fit

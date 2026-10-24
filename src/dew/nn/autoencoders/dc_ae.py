@@ -33,7 +33,7 @@ from dew.objectives.base import Variables
 from ..activations import gated_product
 from ..attention import rms_normalized
 from ..conv import Conv
-from ..precision import at_least_fp32, float32_dot_general, float32_products
+from ..precision import at_least_fp32, float32_dot_general, float32_einsum
 from ..scan_orders import pixel_shuffle, pixel_unshuffle
 from .api import LatentNormalization, ModuleAutoEncoder, published_source
 
@@ -160,15 +160,13 @@ class _LinearAttention(nn.Module):
         qkv = qkv.reshape(batch, positions, -1, 3, self.head_dim)
         query, key, value = nn.relu(qkv[..., 0, :]), nn.relu(qkv[..., 1, :]), qkv[..., 2, :]
         if quadratic:
-            products = float32_products(query.dtype)
-            scores = jnp.einsum("bmgd,bngd->bgmn", key, query, precision=products).astype(jnp.float32)
+            scores = float32_einsum("bmgd,bngd->bgmn", key, query).astype(jnp.float32)
             scores = scores / (jnp.sum(scores, axis=2, keepdims=True) + _ATTENTION_EPS)
-            attended = jnp.einsum("bmgd,bgmn->bngd", value, scores.astype(value.dtype), precision=products)
+            attended = float32_einsum("bmgd,bgmn->bngd", value, scores.astype(value.dtype))
         else:
             value = jnp.concatenate([value, jnp.ones_like(value[..., :1])], axis=-1)
-            products = float32_products(query.dtype)
-            scores = jnp.einsum("bngd,bnge->bgde", value, key, precision=products)
-            attended = jnp.einsum("bgde,bnge->bngd", scores, query, precision=products)
+            scores = float32_einsum("bngd,bnge->bgde", value, key)
+            attended = float32_einsum("bgde,bnge->bngd", scores, query)
             attended = (attended[..., :-1] / (attended[..., -1:] + _ATTENTION_EPS)).astype(x.dtype)
         attended = attended.reshape(batch, height, width, -1)
         out = Dense(self.features, use_bias=False, dtype=self.dtype, name="to_out",

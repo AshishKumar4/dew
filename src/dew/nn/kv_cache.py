@@ -46,6 +46,7 @@ from jax.sharding import PartitionSpec as P
 from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.generation import INHERENT, backend
 from dew.nn.kernels.selection import Kernel, Op, Requirement, selected
+from dew.nn.precision import float32_einsum
 from dew.nn.scatter import DROPPED
 from dew.nn.sharding import logical_spec, manual_map, mesh_axes
 
@@ -63,7 +64,10 @@ ROW_CURSORS = frozenset({CURSOR, POSITION})
 """The per-row cursors a paged server seats a row at, from the row's own place in its pages."""
 PLACES = "cached_places"
 """Each cached key's place, kept beside the key where a chunk or ALiBi reads it (`Append.places`)."""
-POOLED = frozenset({"cached_key", "cached_value", "key_scale", "value_scale", PLACES})
+GROUPS = {"image_groups": "cached_image_groups", "block_groups": "cached_block_groups"}
+"""Each cached key's image or block group (`dew.nn.inputs.AttentionMetadata`), kept beside the key where a
+layer reads it (`Append.groups`), by the field's name."""
+POOLED = frozenset({"cached_key", "cached_value", "key_scale", "value_scale", PLACES, *GROUPS.values()})
 """The leaves a paged cache keeps in its shared pool rather than per row."""
 
 _LIMITS = {"int8": 127.0, "float8_e4m3fn": float(jnp.finfo(jnp.float8_e4m3fn).max)}
@@ -175,8 +179,8 @@ def hadamard(size: int) -> jax.Array:
 
 def rotated(values: jax.Array, rotation: jax.Array) -> jax.Array:
     """`values` `[..., head_dim]` times the rotation, computed in float32, in `values`' dtype."""
-    product = jnp.einsum("...d,de->...e", values.astype(jnp.float32), rotation,
-                         precision=jax.lax.Precision.HIGHEST)
+    product = float32_einsum("...d,de->...e", values.astype(jnp.float32), rotation,
+                             precision=jax.lax.Precision.HIGHEST)
     return product.astype(values.dtype)
 
 
@@ -314,11 +318,13 @@ class KVStore:
     @classmethod
     def open(cls, module: nn.Module, layout: KVCache, rows: int, capacity: int, kv_heads: int,
              head_dim: int, dtype: jnp.dtype, *, value_dim: int | None = None,
-             places: bool = False) -> KVStore:
+             places: bool = False, groups: tuple[str, ...] = ()) -> KVStore:
         """Declare the module's cache variables, allocating them on first use, and return the store.
 
         Values are `value_dim` wide, None for the keys' `head_dim`. `places`
-        also keeps each token's place beside its key (`Append.places`). A paged
+        also keeps each token's place beside its key (`Append.places`), and
+        `groups` each token's group of the fields it names (`GROUPS`,
+        `Append.groups`), -1 where none has been written. A paged
         layout raises `ValueError` when `capacity` is not a multiple of
         `page_size`, or when `rows` does not split into the pool's groups.
         """
@@ -343,10 +349,12 @@ class KVStore:
         if layout.quantized is not None:
             for name in ("key_scale", "value_scale"):
                 module.variable("cache", name, jnp.ones, shape[:-1], jnp.float32)
+        # A scale's storage with one head: every key head of a token sits at its place and in its group.
+        held = (*shape[:2], 1) if layout.page_size is None else (1, *shape[1:3])
         if places:
-            # A scale's storage with one head: every key head of a token sits at its place.
-            held = (*shape[:2], 1) if layout.page_size is None else (1, *shape[1:3])
             module.variable("cache", PLACES, jnp.zeros, held, jnp.int32)
+        for name in groups:
+            module.variable("cache", GROUPS[name], jnp.full, held, -1, jnp.int32)
         return store
 
     @property
@@ -415,7 +423,21 @@ class KVStore:
 
     def read_places(self) -> jax.Array:
         """Every slot's kept place, `[rows, capacity]`."""
-        held = self._get(PLACES)
+        return self._read_slots(PLACES)
+
+    def write_groups(self, name: str, groups: jax.Array, positions: jax.Array) -> None:
+        """Keep the tokens' groups of field `name` `[rows, tokens]` at their slots `positions`, where their
+        keys go (`GROUPS`)."""
+        self._put(GROUPS[name], self._written(self._get(GROUPS[name]), groups[..., None].astype(jnp.int32),
+                                              positions))
+
+    def read_groups(self, name: str) -> jax.Array:
+        """Every slot's kept group of field `name`, `[rows, capacity]`."""
+        return self._read_slots(GROUPS[name])
+
+    def _read_slots(self, name: str) -> jax.Array:
+        """Every slot's entry of the one-head leaf `name`, `[rows, capacity]`."""
+        held = self._get(name)
         return (held if self.layout.page_size is None else self._gathered(held))[..., 0]
 
     def write_tokens(self, key: jax.Array, value: jax.Array, rows: jax.Array, positions: jax.Array) -> None:
@@ -725,6 +747,15 @@ class Append:
         if self.allocated:
             self.store.write_places(jnp.broadcast_to(places, self.positions.shape), self.positions)
         return self.store.read_places()
+
+    def groups(self, name: str, groups: jax.Array | None) -> jax.Array:
+        """Store the call's tokens' groups of field `name` `[rows, tokens]` beside their keys, -1 where it
+        carries none, and return every slot's, `[rows, capacity]`: a later call's token reads its block's
+        earlier keys by them, and a layer sharing these keys reads them too."""
+        if self.allocated:
+            written = jnp.full(self.positions.shape, -1, jnp.int32) if groups is None else groups
+            self.store.write_groups(name, written, self.positions)
+        return self.store.read_groups(name)
 
 
 def gather_cache_rows(cache, rows):

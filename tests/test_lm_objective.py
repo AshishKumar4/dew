@@ -735,16 +735,19 @@ def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
 
 
 def vocabulary_products(jaxpr, vocab: int) -> int:
-    """The products in `jaxpr` and every program inside it that read or write a vocabulary-sized array."""
+    """The products in `jaxpr` and every program inside it that read or write a vocabulary-sized array,
+    a cond counted by the branch with the most, the one a run takes at most (as test_model_flops'
+    `jaxpr_products` counts): a product's platform choice is a cond of both."""
     count = 0
     for eqn in jaxpr.eqns:
         shapes = [getattr(var.aval, "shape", ()) for var in (*eqn.invars, *eqn.outvars)]
         count += eqn.primitive.name == "dot_general" and any(vocab in shape for shape in shapes)
-        for value in jax.tree.leaves(eqn.params, is_leaf=lambda leaf: hasattr(leaf, "eqns")
-                                     or hasattr(getattr(leaf, "jaxpr", None), "eqns")):
-            inner = value if hasattr(value, "eqns") else getattr(value, "jaxpr", None)
-            if hasattr(inner, "eqns"):
-                count += vocabulary_products(inner, vocab)
+        inner = [value if hasattr(value, "eqns") else value.jaxpr
+                 for value in jax.tree.leaves(eqn.params, is_leaf=lambda leaf: hasattr(leaf, "eqns")
+                                              or hasattr(getattr(leaf, "jaxpr", None), "eqns"))
+                 if hasattr(value, "eqns") or hasattr(getattr(value, "jaxpr", None), "eqns")]
+        counts = [vocabulary_products(program, vocab) for program in inner]
+        count += max(counts, default=0) if eqn.primitive.name == "cond" else sum(counts)
     return count
 
 

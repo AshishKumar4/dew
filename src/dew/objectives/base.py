@@ -44,7 +44,7 @@ from typing_extensions import TypeIs, TypeVar
 
 from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.nn.kernels.options import compiler_options
-from dew.nn.precision import compensated_sum
+from dew.nn.precision import accumulated, compensated_sum
 from dew.nn.protocols import HiddenStates, ProjectsParameters
 from dew.nn.sharding import rows_taken
 from dew.records import JSON, strings
@@ -760,7 +760,7 @@ def _ruled(value: jax.Array, rule: Variables, params: Variables) -> jax.Array:
 def _ruled_jvp(primals, tangents):
     value, rule, _ = primals
     moved_value, _, moved = tangents
-    return value, moved_value + sum(jnp.vdot(leaf, change) for leaf, change in
+    return value, moved_value + sum(accumulated(jnp.vdot, leaf, change) for leaf, change in
                                     zip(jax.tree.leaves(rule), jax.tree.leaves(moved), strict=True))
 
 

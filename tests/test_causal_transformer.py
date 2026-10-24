@@ -29,6 +29,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.mixers import AttentionMixer
+from dew.nn.precision import FP32_SUMS
 from dew.nn.rope import YarnScaling
 
 VOCAB = 37
@@ -169,7 +170,10 @@ def test_old_decoder_record_keeps_zero_dropout_and_bitwise_outputs():
                                  for name, leaf in held.items() if name.startswith("params/")})
 
         expected = before.call(params, ids)
-        actual = jax.jit(forward_and_gradient(model))(params, ids)
+        # The export's bits are XLA's fp32 sums, which `before.call` runs as serialized; the model
+        # states those sums (`FP32_SUMS`) to be held to them bit for bit.
+        with jax.default_matmul_precision(FP32_SUMS):
+            actual = jax.jit(forward_and_gradient(model))(params, ids)
         assert jax.tree.structure(actual) == jax.tree.structure(expected)
         for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
             assert np.asarray(left).tobytes() == np.asarray(right).tobytes()

@@ -34,6 +34,7 @@ kernels.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import json
 import math
 import numbers
@@ -63,7 +64,7 @@ from dew.nn.flops import (
     parameter_flops,
     projection_flops,
 )
-from dew.nn.precision import float32_dot_general
+from dew.nn.precision import accumulated, float32_dot_general
 from dew.nn.protocols import (
     Counted,
     CountedConditionedSpatial,
@@ -470,7 +471,8 @@ def _updated(kernel: jax.Array, a: jax.Array, b: jax.Array, scale: float) -> jax
     """`kernel` plus `scale` times the factors' product, summed in at least fp32 at full precision
     and stored in the kernel's dtype, as PEFT's `merge_and_unload` does."""
     dtype = jnp.promote_types(kernel.dtype, jnp.float32)
-    delta = jnp.tensordot(a.astype(dtype), b.astype(dtype), axes=1, precision=jax.lax.Precision.HIGHEST)
+    delta = accumulated(functools.partial(jnp.tensordot, axes=1, precision=jax.lax.Precision.HIGHEST),
+                        a.astype(dtype), b.astype(dtype))
     return (kernel.astype(dtype) + scale * delta).astype(kernel.dtype)
 
 

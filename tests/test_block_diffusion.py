@@ -45,6 +45,34 @@ def prefill(model, variables, prompt):
                        mutable=["cache"])[1]["cache"]
 
 
+def test_diffusion_gemma_deferred_translation_materializes_the_same_model(system):
+    """Text checkpoint leaves stay deferred until placement asks for their arrays, while their
+    materialized tree retains the eager decoder's parameter values."""
+    from dew.interop.streaming import SourceLeaf, materialize
+
+    _, eager, _, _, config = system
+    tensors = load_file(str(WORKFLOW / "model.safetensors"))
+    deferred, _ = adapter.translate_weights(tensors, config, lazy=True)
+    assert any(isinstance(leaf, SourceLeaf) for leaf in jax.tree.leaves(deferred["params"]["text"]))
+    restored = materialize(deferred)
+    for actual, expected in zip(jax.tree.leaves(restored), jax.tree.leaves(eager), strict=True):
+        np.testing.assert_array_equal(actual, expected)
+
+
+def test_diffusion_gemma_export_reads_only_the_requested_decoder_tensor(system):
+    """A resident model's export can name and plan its tensors without transferring values back
+    to the host. Looking up a tensor later yields the stored source's values."""
+    model, variables, _, _, config = system
+    resident = jax.tree.map(jax.device_put, variables)
+    with jax.transfer_guard_device_to_host("disallow"):
+        result = adapter.export_weights(model, resident, config)
+        specs = result.specs
+        assert specs
+    original = load_file(str(WORKFLOW / "model.safetensors"))
+    name = next(name for name in result if name in original and name.startswith("model.decoder."))
+    np.testing.assert_array_equal(result[name], original[name])
+
+
 def test_native_shared_model_forward_matches_reference(system):
     """Bare and self-conditioned canvas logits, held to twice the fp32
     reference's own distance from its float64 run (tests/reference_error.py).

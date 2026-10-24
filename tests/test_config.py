@@ -144,6 +144,27 @@ def test_the_model_config_builds_with_its_own_dtype_and_attention():
     assert jnp.array_equal(logits, expected)
 
 
+@pytest.mark.parametrize("scaling", ["llama3", "longrope"])
+def test_dtype_changes_preserve_union_held_rotary_policies(scaling):
+    """Model metadata may hold either rotary policy. It survives a compute-dtype override while
+    the model can still run on the same parameter tree."""
+    import jax
+
+    from dew.nn.rope import LongRopeScaling, RopeScaling
+
+    policy = (RopeScaling(8.0, 1.0, 4.0, 16) if scaling == "llama3" else
+              LongRopeScaling((1.0,) * 4, (2.0,) * 4, 16, factor=2.0))
+    model = CausalTransformer(vocab_size=16, emb_features=16, num_layers=1, num_heads=2,
+                              head_dim=8, mlp_features=32, max_seq_len=32, rope_scaling=policy,
+                              dtype="float32", attention_impl="reference")
+    configured = ModelConfig.from_model(model).with_dtype("bfloat16").build()
+    ids = jnp.asarray([[1, 2, 3]], jnp.int32)
+    variables = model.init(jax.random.key(0), ids)
+    expected = model.clone(dtype=jnp.bfloat16).apply(variables, ids)
+    actual = configured.apply(variables, ids)
+    assert jnp.array_equal(actual, expected)
+
+
 class Unprecise(nn.Module):
     """A model that declares none of the precision fields, as a plugin's may."""
 

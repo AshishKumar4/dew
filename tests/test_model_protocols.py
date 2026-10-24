@@ -70,6 +70,7 @@ from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.dit import TextContext
 from dew.nn.inputs import ModelInputs
+from dew.nn.precision import FP32_SUMS
 from dew.nn.protocols import IntervalModel, OutputTable, Recomputing, RequiresText, TimeScaled
 from dew.registry import models
 
@@ -427,8 +428,10 @@ def test_a_jepa_encoders_hidden_states_are_its_representation(case):
 
 def test_a_torchax_models_reads_are_its_forward(tmp_path):
     """A tiny random GPT-NeoX through transformers' own forward: the logits
-    read is the call's, its plain head's stored weight contracts to them,
-    it writes no cache, and every field past the tokens is refused by name."""
+    read is the call's, its plain head's stored weight contracts to them
+    where both sum as XLA does (torchax's products are XLA's own; Dew's state
+    those sums, `FP32_SUMS`), it writes no cache, and every field past the
+    tokens is refused by name."""
     import torch
     import transformers
 
@@ -446,7 +449,8 @@ def test_a_torchax_models_reads_are_its_forward(tmp_path):
     table = model.apply(variables, method="output_table")
     assert table is not None
     hidden = model.apply(variables, tokens, method="hidden_states")
-    same(contracted(hidden, table, variables), logits)
+    with jax.default_matmul_precision(FP32_SUMS):
+        same(contracted(hidden, table, variables), logits)
     for method in ("logits", "hidden_states"):
         with pytest.raises(ValueError):
             model.apply(variables, tokens, method=method, positions=tokens)

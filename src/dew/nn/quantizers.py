@@ -12,6 +12,8 @@ from collections.abc import Sequence
 import jax
 import jax.numpy as jnp
 
+from dew.nn.precision import float32_einsum
+
 
 def nearest_codewords(x, codebook) -> jax.Array:
     """Each row of `x` `[..., width]`'s nearest codeword index in `codebook` `[size, width]`: the
@@ -19,7 +21,7 @@ def nearest_codewords(x, codebook) -> jax.Array:
     x = x.astype(jnp.float32)
     codebook = codebook.astype(jnp.float32)
     score = -(jnp.sum(x * x, axis=-1, keepdims=True)
-              - 2 * jnp.matmul(x, codebook.T, precision=jax.lax.Precision.HIGHEST)
+              - 2 * float32_einsum('...d,vd->...v', x, codebook, precision=jax.lax.Precision.HIGHEST)
               + jnp.sum(codebook * codebook, axis=-1))
     return jnp.argmax(score, axis=-1)
 

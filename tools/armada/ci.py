@@ -951,9 +951,10 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                 fits = next((name for name in waiting if holds[name] <= free), None)
                 if fits is not None and len(running) < processes:
                     waiting.remove(fits)
+                    # Its pool taken at its first op, or grown where it holds the whole share, as this lane
+                    # says whatever its own environment does: a GPU node's session grows every job's pool.
                     environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total),
-                               **({"XLA_PYTHON_CLIENT_PREALLOCATE": "false"} if shares[fits] >= budget
-                                  else {})}
+                               "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true"}
                     running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache,
                                         session.GRACE, common, environ)] = fits
                     continue
