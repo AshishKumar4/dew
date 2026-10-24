@@ -321,8 +321,9 @@ def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
     steps make, not the windows a pack lays them in. A repeat without end goes before the bound
     where none is written, so the records may span passes, and the batch keeps the short one the
     bound ends inside, filled and marked, so each record bounded is read once (`Loader.examples`).
-    Refuses a bound it cannot place: a repeat with a count before it, or any repeat after it, a
-    mixed corpus that packs on its own, and phases, which end by steps."""
+    Refuses a bound it cannot place: a repeat with a count before it, or any repeat after it, the
+    batch's included, a mixed corpus that packs on its own, and phases, which end by steps. A chain
+    without a batch is left for `compile` to refuse."""
     if examples < 1:
         raise ValueError(f"examples must be at least 1, got {examples}")
     if isinstance(pipeline.source, Phases):
@@ -330,17 +331,26 @@ def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
     if any(isinstance(stage, (Pack, Windows)) for child in children(pipeline) for stage in _steps(child)):
         raise ValueError(f"{_name(pipeline)} packs inside a corpus it mixes, so its records reach the mix as "
                          "windows; pack after the mix to bound the run in examples")
-    batched = _until(pipeline.stages, BatchStage)
+    batched = _until(pipeline.stages, (BatchStage, TokenBudget))
+    if batched == len(pipeline.stages):
+        return pipeline
     at = _until(pipeline.stages[:batched], (Pack, Windows))
-    repeats = [stage for stage in pipeline.stages[:batched] if isinstance(stage, Repeat)]
+    repeats = [stage for stage in pipeline.stages[:at] if isinstance(stage, Repeat)]
     if any(stage.epochs is not None for stage in repeats) or any(
-            isinstance(stage, Repeat) for stage in pipeline.stages[at:batched]):
-        raise ValueError(f"{_name(pipeline)} repeats with a count or after it packs, which a bound of "
-                         f"{examples} examples would cut or repeat; leave the repeat out")
+            isinstance(stage, Repeat) for stage in pipeline.stages[at:]):
+        raise ValueError(f"{_name(pipeline)} repeats with a count, or after the records it packs or batches, "
+                         f"which a bound of {examples} examples would cut or repeat; leave the repeat out")
     bound = (Limit(examples),) if repeats else (Repeat(None), Limit(examples))
     batch = dataclasses.replace(pipeline.stages[batched], drop_remainder=False)
     return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], *bound, *pipeline.stages[at:batched],
                                                  batch, *pipeline.stages[batched + 1:]))
+
+
+def _lays_out(pipeline: Pipeline) -> bool:
+    """Whether `pipeline` packs or windows its records itself, before its batch, which its preparation
+    may move into its source (`_promoted`), where a bound would come after the windows."""
+    return any(isinstance(stage, (Pack, Windows))
+               for stage in pipeline.stages[:_until(pipeline.stages, (BatchStage, TokenBudget))])
 
 
 _KEYED_ABOVE = (Map, RandomMap, Filter, BatchStage, Prefetch, Workers, Repeat, Limit, Slice, MapBatch)
@@ -584,6 +594,11 @@ def _staged(
     batch_tokens = None if stated is None else stated.tokens
     counts: dict[str, CorpusCounts] = {}
     validation_counts: dict[str, CorpusCounts] = {}
+    # A chain's own layout is bounded as written, before preparation could plan it into its source; the
+    # objective's goes in with its preparation, so the bound follows that.
+    written = examples is not None and _lays_out(train)
+    if written:
+        train = _bounded(train, examples)
     branches = _prepared(
         (train,) if validation is None else (train, validation),
         read,
@@ -594,7 +609,7 @@ def _staged(
     )
     if not any(isinstance(stage, BatchStage) for stage in branches[0].stages):
         raise ValueError("compile needs one batch(global_size) stage on the training pipeline")
-    if examples is not None:
+    if examples is not None and not written:
         branches = (_bounded(branches[0], examples), *branches[1:])
     original = branches[0]
     train, *scored = _made(branches, read, (counts, validation_counts)[: len(branches)], training=True)

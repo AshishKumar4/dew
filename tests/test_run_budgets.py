@@ -1,4 +1,5 @@
-"""A run's length as a count of examples, and a pause partway through its budget."""
+"""A run's length as a count of examples, a pause partway through its budget, and a run whose data
+runs out before its length."""
 
 import collections
 import dataclasses
@@ -17,7 +18,7 @@ from dew.data.pipeline import Pipeline
 from dew.objectives import Aux, Objective
 from dew.objectives.base import VALID_ROWS
 from dew.optim import Linear
-from dew.training import Checkpoints, Pause, Trainer
+from dew.training import Best, Checkpoints, Pause, Trainer
 
 FEATURES = 4
 RECORDS = 10
@@ -28,8 +29,10 @@ three updates of two steps."""
 ACCUMULATION = 2
 PEAK = 0.2
 
-SEEDS = 8
-"""Check 1's declared seeds for an examples run and for its pause, sized by `seeds_for` on armada."""
+EXAMPLES_SEEDS = 64
+"""Check 1's declared seeds for an examples run against the reference's Adam, sized by `seeds_for`."""
+PAUSE_SEEDS = 8
+"""Check 1's declared seeds for a paused run against the whole one, sized by `seeds_for`."""
 
 
 class Pulled(Objective):
@@ -145,7 +148,7 @@ def test_an_examples_run_trains_each_record_once_under_the_schedule_its_plan_siz
     """An examples run takes the steps its data plan counts, sizes its schedule's horizon from them and
     trains on each record as many times as the bound reaches it: its losses and weight match SGD on
     the same records at a rate falling to 0 over those updates (check 1)."""
-    assert_as_exact(trained, descended, records, "examples run", seeds=SEEDS)
+    assert_as_exact(trained, descended, records, "examples run", seeds=EXAMPLES_SEEDS)
 
 
 def test_a_paused_run_resumed_trains_on_as_one_that_never_paused(tmp_path):
@@ -154,7 +157,7 @@ def test_a_paused_run_resumed_trains_on_as_one_that_never_paused(tmp_path):
     schedule, and its checkpoint held its data position."""
     directories = iter(range(1 << 20))
     assert_as_exact(lambda x: trained(x, tmp_path / str(next(directories)), (Pause(0.5), None)), trained,
-                    records, "paused run", seeds=SEEDS, truth_fn=descended)
+                    records, "paused run", seeds=PAUSE_SEEDS, truth_fn=descended)
 
 
 def test_a_run_paused_where_it_already_stands_trains_nothing_more(tmp_path):
@@ -167,12 +170,40 @@ def test_a_run_paused_where_it_already_stands_trains_nothing_more(tmp_path):
     assert Checkpoints(str(tmp_path)).latest == 2 * ACCUMULATION
 
 
+def test_a_pause_on_a_step_that_ranks_a_weights_only_best_writes_the_whole_state(tmp_path):
+    """A pause whose step also ranks a best kept as weights alone writes that step's whole state and
+    data position, which the run resumed without the pause goes on from to the end of its budget."""
+    (x,) = records(0)
+    objective = Pulled()
+
+    def fitted(stop):
+        return Trainer(objective, OptimConfig(optimizer="adam", rate=Linear(peak=PEAK)), key=0,
+                       accumulation=ACCUMULATION, checkpoints=Checkpoints(str(tmp_path))).fit(
+            chain(x), examples=EXAMPLES, stop=stop, eval_every=2 * ACCUMULATION,
+            best=Best(objective.loss, weights_only=True))
+
+    assert int(fitted(Pause(0.5)).step) == Checkpoints(str(tmp_path)).latest == 2 * ACCUMULATION
+    assert int(fitted(None).step) == 3 * ACCUMULATION
+
+
 def test_an_examples_count_whose_last_steps_make_no_whole_update_is_refused():
     """Thirty-five records fill five batches, which leave a step no update takes, so the run is refused
     before it trains rather than read records it never learns from."""
     (x,) = records(0)
     with pytest.raises(ValueError):
         trainer().fit(chain(x), examples=35)
+
+
+def test_a_stream_that_runs_out_on_an_evaluated_step_scores_that_step_once():
+    """A stream of three batches under a run of five steps, evaluated at every step, ends at step 3,
+    whose evaluation on its cadence is the run's last: each step's split is scored once."""
+    (x,) = records(0)
+    tracker = RecordingTracker()
+    batch = {"x": x[:BATCH]}
+    finite = Loader(lambda partition: iter([batch] * 3), lambda partition: iter([batch]), None, BATCH)
+    Trainer(Pulled(), OptimConfig(optimizer="adam", rate=0.1), key=0, tracker=tracker).fit(
+        finite, steps=5, eval_every=1, log_every=1)
+    assert [step for step, scalars in tracker.scalars if "val/loss" in scalars] == [1, 2, 3]
 
 
 def test_a_run_config_counts_examples_and_pauses_as_a_fit_does(tmp_path):
@@ -183,6 +214,8 @@ def test_a_run_config_counts_examples_and_pauses_as_a_fit_does(tmp_path):
         checkpoint_dir=str(tmp_path), examples=EXAMPLES, stop=Pause(0.5), accumulation=ACCUMULATION,
         log_every=1, eval_every=None, checkpoint_every=None))
     assert RunConfig.from_dict(config.to_dict()) == config
+    flags = RunConfig.cli(["--trainer.examples", str(EXAMPLES), "--trainer.stop.fraction", "0.5"]).trainer
+    assert (flags.examples, flags.stop) == (EXAMPLES, Pause(0.5))
     paused = config.train(Pulled(), chain(x), name="budget")
     resumed = dataclasses.replace(config, trainer=dataclasses.replace(config.trainer, stop=None)).train(
         Pulled(), chain(x), name="budget")

@@ -696,7 +696,7 @@ class TrainerConfig:
     examples: int | None = None
     """The run length as the first this many records of the data, each read once, counted before
     they are packed (`Trainer.fit`'s `examples`); `steps` or `epochs` set it instead."""
-    stop: Pause | None = None
+    stop: Annotated[Pause, tyro.conf.subcommand("pause")] | None = None
     """End the run at a fraction of its length, to resume it later as if it had never stopped
     (`Pause`): `--trainer.stop.fraction 0.5`."""
     log_every: int = 100
@@ -1168,7 +1168,7 @@ class RunConfig:
     settings and builds what it trains from them (`prepare`); `run` trains it.
     """
 
-    _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {"lora": "lora"}
+    _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {"lora": "lora", "trainer.stop": "pause"}
     """The optional settings `cli` turns on by their own flags, each with the
     subcommand its flags imply."""
 

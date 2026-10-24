@@ -275,24 +275,29 @@ class Plateau:
 @dataclasses.dataclass(frozen=True)
 class Pause:
     """Ends the run once it has trained `fraction` of its budget, its state and data position
-    written, so a run resumed from that checkpoint trains on as one that never paused: the budget
-    still sizes the learning-rate schedule. A budget of steps, epochs or examples pauses at the
-    whole update nearest the fraction, a token budget at the first update whose tokens reach it,
-    and with both the first reached. Resume without it, or with a later fraction, to go on; with
-    the same one the run is already where it pauses, so nothing trains."""
+    written in full, so a run resumed from that checkpoint trains on as one that never paused: the
+    budget still sizes the learning-rate schedule. A budget of steps, epochs or examples pauses at
+    the whole update nearest the fraction, a token budget at the first update whose tokens reach
+    it, and with both the first reached. Resume without it, or with a later fraction, to go on;
+    with the same one the run is already where it pauses, so nothing trains."""
     fraction: float
 
     def __post_init__(self):
-        if not 0 < self.fraction <= 1:
-            raise ValueError(f"Pause needs a fraction of the budget in (0, 1], got {self.fraction}")
+        if not 0 < self.fraction < 1:
+            raise ValueError(f"Pause needs a fraction of the budget in (0, 1), got {self.fraction}")
 
     def at(self, steps: int | None, tokens: int | None, accumulation: int) -> tuple[int | None, int | None]:
         """The step and the real tokens a run of `steps` microsteps, `accumulation` an update, and of
-        `tokens` pauses at, each None where that budget is not set."""
-        step = None if steps is None else round(self.fraction * (steps // accumulation)) * accumulation
-        if step == 0:
-            raise ValueError(f"Pause({self.fraction}) of {steps} steps ends before the first update")
-        return step, None if tokens is None else math.ceil(self.fraction * tokens)
+        `tokens` pauses at, each None where that budget is not set. Refuses a pause before the first
+        update or at the budget's end, where the run ends anyway."""
+        updates = None if steps is None else steps // accumulation
+        step = None if updates is None else round(self.fraction * updates) * accumulation
+        real = None if tokens is None else math.ceil(self.fraction * tokens)
+        if step == 0 or (updates is not None and step is not None and step >= updates * accumulation) or (
+                tokens is not None and real is not None and real >= tokens):
+            raise ValueError(f"Pause({self.fraction}) of {steps} steps and {tokens} tokens falls before the "
+                             "first update or at the budget's end; pause between them")
+        return step, real
 
 
 def _split_metrics(suites: Mapping[str, EvalSuite]) -> dict[str, tuple[Metric, ...]]:
@@ -1843,6 +1848,7 @@ class Trainer(Generic[Loss, Effects]):
         current, checkpoints = run.current, self.checkpoints
         real = plan.real(interval)
         ending = plan.finished(current, real)
+        paused = not ending and plan.paused(current, real)
         record, aux = taken_record(aux)
         if record is not None:
             self.records.append(record)
@@ -1876,7 +1882,8 @@ class Trainer(Generic[Loss, Effects]):
             {} if run.evaluation is None or run.evaluation.step != current else dict(run.evaluation.scores)
         )
         if not ending:
-            self._saves(plan, run, interval, state, position, scores, evaluation_due=evaluation_due)
+            self._saves(plan, run, interval, state, position, scores, evaluation_due=evaluation_due,
+                        full=paused)
         if plan.observe:
             plan.observe.at(current, state)
         # Asked at every step on every process, as JAX's agreement needs; the last step ends the run.
@@ -1884,8 +1891,7 @@ class Trainer(Generic[Loss, Effects]):
         if run.stopped:
             return True
         assert run.notice is not None
-        paused = plan.paused(current, real)
-        if not ending and (paused or run.notice.reached(current)):
+        if paused or (not ending and run.notice.reached(current)):
             self._take(plan, run, interval, state, unlogged=True)
             if checkpoints is not None and interval.last_saved != current:
                 self._read_taken(run)
@@ -1931,8 +1937,10 @@ class Trainer(Generic[Loss, Effects]):
                                   plan.dataset.statistics())
 
     def _saves(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState, position,
-               scores: Mapping[str, float], *, evaluation_due: bool, final: bool = False) -> None:
-        """Resolve cadence, ranking, stopping and unconditional final saves in one place."""
+               scores: Mapping[str, float], *, evaluation_due: bool, final: bool = False,
+               full: bool = False) -> None:
+        """Resolve cadence, ranking, stopping and unconditional final saves in one place; with `full`,
+        the step's save holds the whole state and the data position, as a pause's must."""
         checkpoints, current = self.checkpoints, run.current
         ranking = rankings(plan.best, scores, validation=next(iter(plan.suites)) if plan.validation else None,
                            declared=plan.declared, objective=self.objective)
@@ -1948,12 +1956,12 @@ class Trainer(Generic[Loss, Effects]):
             self._display.note("Stopped: validation plateau")
             candidate = checkpoints is not None
         if (checkpoints is not None and interval.last_saved != current
-                and (run.checkpoint_due or candidate or (final and plan.checkpoint_final))):
+                and (run.checkpoint_due or candidate or (final and plan.checkpoint_final) or full)):
             self._read_taken(run)
             run.other += self._saved_checkpoint(
                 checkpoints, current, state, position, interval, scores=scores, ranking=ranking,
                 training_best=not plan.validation and not plan.best, control=run.stop_control,
-                weights_only=not run.checkpoint_due and not run.stopped
+                weights_only=not run.checkpoint_due and not run.stopped and not full
                 and not (final and plan.checkpoint_final) and bool(winners)
                 and all(rank.weights_only for rank in winners))
             run.last_checkpoint = time.perf_counter()
@@ -2002,14 +2010,19 @@ class Trainer(Generic[Loss, Effects]):
             # The last step has to land before the wall time is read.
             loss.block_until_ready()
         scores: Mapping[str, float] = {}
+        # A stream that ran out ends a run whose last step may have evaluated every suite already.
+        scored = (set() if run.evaluation is None or run.evaluation.step != current
+                  else {name.split("/", 1)[0] for name in run.evaluation.scores})
         if (
             (plan.validation or plan.eval_every or plan.best or plan.stop or plan.held_best)
             and run.preempted is None
             and run.paused is None
             and not run.stopped
         ):
-            run.evaluation = self._evaluation(plan, state, shardings, run.training)
-            run.other += run.evaluation.elapsed_seconds
+            if not plan.suites or not scored.issuperset(plan.suites):
+                run.evaluation = self._evaluation(plan, state, shardings, run.training)
+                run.other += run.evaluation.elapsed_seconds
+            assert run.evaluation is not None
             scores = run.evaluation.scores
         self._saves(plan, run, interval, state, position, scores, evaluation_due=bool(scores), final=True)
         if plan.observe:
