@@ -63,7 +63,7 @@ from flax import core, linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 
 from dew.cache import QUANTIZED_TRACE
-from dew.nn.kernels.generation import backend
+from dew.nn.kernels.generation import backend, linear_tangent
 from dew.nn.precision import accumulated, correctly_rounded_divide
 
 if TYPE_CHECKING:
@@ -347,26 +347,42 @@ def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.
     return product * scales * row_scales.T
 
 
-@jax.custom_vjp
+def _frozen_fp8_forward(x, forward, forward_scale, dgrad, dgrad_scale):
+    """The forward FP8 product; its backward reads the operands alone."""
+    return _fp8_rows(x, forward, forward_scale), ()
+
+
+def _frozen_fp8_backward(saved, operands, cotangent, live):
+    """The cotangents at `live`: `x`'s the FP8 product of the cotangent's rows and the input
+    gradient's packed rows, in `x`'s dtype, and zero for the packed leaves, which are frozen."""
+    x, _, _, dgrad, dgrad_scale = operands
+    return tuple(_fp8_rows(cotangent, dgrad, dgrad_scale).astype(x.dtype) if index == 0
+                 else jnp.zeros_like(operands[index]) for index in live)
+
+
+def _frozen_fp8_decoded(x, forward, forward_scale, dgrad, dgrad_scale):
+    """The linear map in `x` the FP8 products stand for: `x` times the forward rows, each code times
+    its row's scale, in float32, the packed leaves held constant. Its tangent is the product's in
+    forward mode, the input's tangent times the decoded kernel, and its transpose the input gradient
+    the FP8 backward forms."""
+    rows = jax.lax.stop_gradient(forward.astype(jnp.float32) * forward_scale.astype(jnp.float32))
+    return accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((1,), (1,)), ((), ()))),
+                       x.astype(jnp.float32), rows, preferred_element_type=jnp.float32)
+
+
+_FROZEN_FP8_PRODUCT = linear_tangent(_frozen_fp8_forward, _frozen_fp8_backward, _frozen_fp8_decoded,
+                                     live_cotangents=True)
+
+
 def frozen_fp8_product(x: jax.Array, forward: jax.Array, forward_scale: jax.Array, dgrad: jax.Array,
                        dgrad_scale: jax.Array) -> jax.Array:
     """`x @ kernel` in float32, `[M, in]` by a frozen kernel packed as
     `frozen_fp8_leaves`: FP8 products forward and for `x`'s gradient, and no
-    gradient for the kernel, which is frozen."""
-    return _fp8_rows(x, forward, forward_scale)
-
-
-def _frozen_fp8_forward(x, forward, forward_scale, dgrad, dgrad_scale):
-    # The input's dtype rides as an empty array, a residual JAX can hold.
-    return _fp8_rows(x, forward, forward_scale), (jnp.zeros((0,), x.dtype), dgrad, dgrad_scale)
-
-
-def _frozen_fp8_backward(residuals, cotangent):
-    like, dgrad, dgrad_scale = residuals
-    return _fp8_rows(cotangent, dgrad, dgrad_scale).astype(like.dtype), None, None, None, None
-
-
-frozen_fp8_product.defvjp(_frozen_fp8_forward, _frozen_fp8_backward)
+    gradient for the kernel, which is frozen. Forward mode (`jax.jvp`, MeanFlow's
+    target) takes the input's tangent times the decoded kernel
+    (`frozen_fp8_kernel`) in float32, the map the FP8 products stand for, and
+    reverse mode runs the FP8 input gradient (`linear_tangent`)."""
+    return _FROZEN_FP8_PRODUCT(x, forward, forward_scale, dgrad, dgrad_scale)
 
 
 def frozen_fp8_dense(module: nn.Module, inputs: jax.Array) -> jax.Array:
