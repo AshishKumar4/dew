@@ -90,9 +90,9 @@ def test_greedy_generation_and_decode_steps_match_the_reference(source):
     MLA cache, held as tests/test_generate_reference.py holds greedy decoding.
     E is the reference's largest decode logit error from the float64 logits
     teacher-forced over the same path (2.28e-5). Every step's float64 top-2
-    margin exceeds 2 FACTOR E (smallest 6.2e-4 against 9.1e-5), so the ids
+    margin exceeds 2 PARITY E (smallest 6.2e-4 against 9.1e-5), so the ids
     must be exact, and each chosen token's log probability is within 2
-    FACTOR E of float64's (observed 3.1e-6)."""
+    PARITY E of float64's (observed 3.1e-6)."""
     assert_greedy_as_exact(source)
 
 

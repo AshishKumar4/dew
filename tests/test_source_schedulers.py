@@ -99,8 +99,8 @@ def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
     CPU codegen. Thresholding's maximum is 1 in these cases, so the
     quantile is clamped to a constant and the limit is a pointwise clip.
     CFG epsilon instead averages 52 pixel orders of its per-sample variance
-    reductions; the rest are held to twice the source's own distance on
-    their one recorded draw.
+    reductions; the rest are held to PARITY times the source's own
+    distance on their one recorded draw.
     """
     schedule, process, times, x_T = source_case(name)
     rescale = SOURCE["cases"][name]["guidance"]

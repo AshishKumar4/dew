@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import flat_tree
-from reference_error import FACTOR, assert_as_exact_as_the_reference, distance
+from reference_error import PARITY, assert_as_exact_as_the_reference, distance
 from test_hf_decoders import (
     GEMMA4_MOE,
     assert_padded_speculation_is_greedy,
@@ -496,7 +496,7 @@ def test_deepseek_v4_a_left_padded_row_pools_its_compressed_windows_over_its_own
     """Uncached, rows padded on the left by three tokens pool the HCA windows and the CSA
     windows its lightning indexer scores over their real tokens at their ranks, as a cache appends
     them: the real tokens' logits lie as close to the reference's as the unpadded rows' do, within
-    FACTOR."""
+    PARITY."""
     model, variables = fp32_decoder(DEEPSEEK_V4)
     ids = jnp.asarray(np.load(DEEPSEEK_V4 / "input_ids.npy"), jnp.int32)
     reference = np.load(DEEPSEEK_V4 / "logits.npy")
@@ -504,7 +504,7 @@ def test_deepseek_v4_a_left_padded_row_pools_its_compressed_windows_over_its_own
     valid = jnp.broadcast_to(jnp.arange(ids.shape[1] + pad) >= pad, (ids.shape[0], ids.shape[1] + pad))
     padded = model.apply(variables, jnp.pad(ids, ((0, 0), (pad, 0))), attention_mask=valid)
     alone = model.apply(variables, ids)
-    assert distance(padded[:, pad:], reference) <= FACTOR * distance(alone, reference)
+    assert distance(padded[:, pad:], reference) <= PARITY * distance(alone, reference)
 
 
 @pytest.mark.parametrize('saved_spelling', [False, True], ids=['released', 'hf_saved'])

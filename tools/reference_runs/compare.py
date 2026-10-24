@@ -5,13 +5,13 @@ Every run is measured from the truth, the reference framework's fp32 run
 (TF32 off) on the same weights, batches and schedule. The bound in each
 window of steps is the reference's own bf16 run's distance from that truth:
 
-    rms_w(run - truth) <= FACTOR * rms_w(reference_bf16 - truth)
+    rms_w(run - truth) <= PARITY * rms_w(reference_bf16 - truth)
 
 the root mean square taken over the window's steps. It is the rule
-tests/reference_error.py applies to single forwards, read over a training
-trajectory: a run that rounds where the reference rounds, or at as many
-points of the same size, lands near a ratio of one; FACTOR 2 admits three
-roundings of the reference's size per one of its own, and a dropped term,
+tests/reference_error.py applies to single forwards (its PARITY), read over a
+training trajectory: a run that rounds where the reference rounds, or at as
+many points of the same size, lands near a ratio of one; PARITY 1.5 admits
+1.25 roundings of the reference's size per one of its own, and a dropped term,
 a wrong scale or a different optimizer moves the ratio by more. Losses are
 compared as differences (nats), gradient norms as relative differences.
 
@@ -34,6 +34,7 @@ reference runs' distance from each other, the reference's run-to-run spread.
 import argparse
 import json
 import math
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -41,7 +42,9 @@ from common import kernel_summary, trimmed_kernels
 
 from dew.accuracy import rms
 
-FACTOR = 2.0
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tests"))
+from reference_error import PARITY
+
 CONDITIONS = ("batch", "seq", "schedule_steps", "data_sha256", "lr_peak", "lr_init", "lr_end", "warmup",
               "b1", "b2", "eps", "weight_decay", "clip")
 
@@ -220,7 +223,7 @@ def main() -> None:
     parser.add_argument("--run", action="append", default=[], metavar="NAME=PATH",
                         help="a run held to the bound; repeat for several")
     parser.add_argument("--window", type=int, default=16)
-    parser.add_argument("--factor", type=float, default=FACTOR)
+    parser.add_argument("--factor", type=float, default=PARITY)
     parser.add_argument("--pair", action="append", default=[], metavar="LEFT=RIGHT",
                         help="kernel-category gaps of LEFT against RIGHT; unset is every run "
                              "against the reference")
@@ -250,16 +253,17 @@ def main() -> None:
         unit_name = "reference" if rerun is None else "max(reference, spread)"
         print(f"\n{key} ({unit}) measured from the truth, rms per window; bound = "
               f"{args.factor:g} x {unit_name}")
-        print(f"  step 0: truth {result['step0']['truth']:.6f}, reference {result['step0']['reference']:+.3e}, "
-              + ", ".join(f"{name} {result['step0'][name]:+.3e}" for name in runs))
+        step0 = result["step0"]
+        print(f"  step 0: truth {step0['truth']:.6f}, reference {step0['reference']:+.3e}, "
+              + ", ".join(f"{name} {step0[name]:+.3e}" for name in runs))
         spread_head = "" if rerun is None else f" {'spread':>10}"
         header = f"  {'steps':>9} {'reference':>10}{spread_head} {'bound':>10}" + "".join(
             f" {name:>18}" for name in runs)
         print(header)
         for row in result["windows"]:
             cells = "".join(
-                f" {row[name]['rms']:>10.3e} {row[name]['ratio']:>5.2f}{'  ' if row[name]['within'] else ' !'}"
-                for name in runs)
+                f" {row[name]['rms']:>10.3e} {row[name]['ratio']:>5.2f}"
+                f"{'  ' if row[name]['within'] else ' !'}" for name in runs)
             spread = "" if row["spread"] is None else f" {row['spread']:>10.3e}"
             print(f"  {row['steps'][0]:>4}-{row['steps'][1]:<4} {row['reference']:>10.3e}{spread} "
                   f"{row['bound']:>10.3e}{cells}")

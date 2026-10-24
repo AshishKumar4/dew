@@ -9,7 +9,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from reference_error import FACTOR, distance, float64_forward
+from reference_error import PARITY, distance, float64_forward
 from tool_support import load
 
 from dew.interop.pretrained import PretrainedDecoder
@@ -50,7 +50,7 @@ def test_an_unchanged_decoder_meets_the_gate_on_the_tokens_it_decoded(tmp_path):
     rows = np.asarray(bf16.apply(narrow, jnp.asarray(sequence[:, :-1]))[0, PROMPT - 1:], np.float64)
     shifted = rows - rows.max(-1, keepdims=True)
     forward = (shifted - np.log(np.exp(shifted).sum(-1, keepdims=True)))[np.arange(STEPS), scored["tokens"]]
-    assert distance(scored["reference"], oracle) <= FACTOR * distance(forward, oracle)
+    assert distance(scored["reference"], oracle) <= PARITY * distance(forward, oracle)
     assert record["gate"]["accuracy"]["reference"] > 0, "a reference at the truth measures nothing"
     assert (done.returncode, record["passes"]) == (0, True), record["gate"]
     assert record["reference_embedding_ulp"]["rms"] > 0
@@ -58,16 +58,17 @@ def test_an_unchanged_decoder_meets_the_gate_on_the_tokens_it_decoded(tmp_path):
 
 
 def test_the_gate_fails_a_server_further_from_float64_or_from_the_reference_than_it_allows():
-    """The gate's two halves on arrays: a server twice as far from float64 as the reference fails the
-    accuracy half while it sits within the reference's noise; a server within accuracy but further from
-    the reference than the reference wavers fails the noise half; and a NaN fails both."""
+    """The gate's two halves on arrays: a server 1.75 times as far from float64 as the reference, past
+    the gate's PARITY, fails the accuracy half while it sits within the reference's noise; a server within
+    accuracy but further from the reference than the reference wavers fails the noise half; and a NaN
+    fails both."""
     gate = load("decode_drift").gate
     rng = np.random.default_rng(0)
     true = rng.normal(-3, 1, 256)
     reference = true + rng.normal(0, 1e-3, 256)
     noise = np.full(256, 1e-2)
     assert gate(reference, reference, noise, true)["passes"]
-    far = true + 2.5 * (reference - true)
+    far = true + 1.75 * (reference - true)
     assert not gate(far, reference, noise, true)["accuracy"]["passes"]
     assert gate(far, reference, noise, true)["noise"]["passes"]
     quiet = np.full(256, 1e-4)

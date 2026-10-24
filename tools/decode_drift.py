@@ -46,15 +46,18 @@ from dew.objectives.base import token_log_probs
 from dew.sampling import Sampling
 from dew.sampling.text import decode_ops, prefill_state
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+from reference_error import PARITY, ROW_FACTOR
+
 REFERENCE_KERNELS = {"rms_norm": "xla", "swiglu": "xla", "gated_delta_rule": "xla"}
 BATCH = 4
 DELTA_RULE_FAMILIES = ("qwen3_next", "qwen3_5_text", "qwen3_5_moe_text")
 """The families whose layers decode a gated delta rule (dew.interop.families.qwen)."""
 BLOCK = 64
 """Steps a block of the accuracy gate covers (`gate`)."""
-FACTOR, BLOCK_FACTOR = 2.0, 4.0
-"""The accuracy rule's FACTOR and ROW_FACTOR (tests/reference_error.py), its whole RMS and its worst row,
-here the decode's RMS and its worst block."""
+FACTOR, BLOCK_FACTOR = PARITY, ROW_FACTOR
+"""The accuracy gate's own factors (tests/reference_error.py), PARITY over its whole RMS and ROW_FACTOR
+over its worst row, here the decode's RMS and its worst block."""
 
 
 def greedy(task):

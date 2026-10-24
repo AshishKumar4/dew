@@ -10,8 +10,9 @@ logits of the same model teacher-forced over the same path.
 Greedy: Dew's cached decode from the same padded prompts must emit the same
 tokens. That is well posed only where fp32 rounding cannot swap the top two
 logits, so each fixture's smallest float64 top-2 margin along the path is
-asserted to exceed four times the largest fp32 logit error transformers'
-own decode makes (Dew is held to twice that error, and two logits move).
+asserted to exceed 2 PARITY (three) times the largest fp32 logit error
+transformers' own decode makes (Dew is held to PARITY times that error, and
+two logits move).
 
 Sampled: two random streams cannot be matched, so Dew is forced along
 transformers' sampled path with a strategy that feeds the recorded tokens
@@ -19,8 +20,9 @@ through the same cached decode loop and records what `Sample` records: each
 token's log probability under the raw model and under the filtered chain.
 A log probability log_softmax(z)_i moves by at most 2 max |dz|, and the
 filtered one, computed on z / T over the kept support, by at most
-2 max |dz| / T; with Dew's logits held to twice transformers' fp32 error E
-(tests/reference_error.py), the raw bound is 4 E and the filtered 4 E / T.
+2 max |dz| / T; with Dew's logits held to PARITY times transformers' fp32
+error E (tests/reference_error.py), the raw bound is 2 PARITY E and the
+filtered 2 PARITY E / T.
 Both are measured against the float64 path, where E is transformers' own
 largest decode error on that path.
 
@@ -47,7 +49,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import FACTOR
+from reference_error import PARITY
 
 from dew.inference import TextGeneration
 from dew.inference.serving import Server
@@ -90,7 +92,7 @@ def test_greedy_generation_emits_transformers_tokens(family):
     error = decode_error(fixture, "greedy")
     ranked = np.sort(fixture["greedy_f64"], -1)
     margin = float(np.min(ranked[..., -1] - ranked[..., -2]))
-    assert margin > 2 * FACTOR * error, (name, margin, error)
+    assert margin > 2 * PARITY * error, (name, margin, error)
 
     result = generate(pretrained.model, pretrained.variables, prompts(fixture), NEW_TOKENS,
                       key=jax.random.key(0), sampling=Sampling(temperature=0))
@@ -98,7 +100,7 @@ def test_greedy_generation_emits_transformers_tokens(family):
     width = fixture["prompt"].shape[1]
     np.testing.assert_array_equal(np.asarray(result.tokens)[:, width:], fixture["greedy_tokens"])
     raw = selected(float64_log_softmax(fixture["greedy_f64"]), fixture["greedy_tokens"])
-    assert np.max(np.abs(np.asarray(result.raw_log_probs, np.float64) - raw)) <= 2 * FACTOR * error
+    assert np.max(np.abs(np.asarray(result.raw_log_probs, np.float64) - raw)) <= 2 * PARITY * error
 
     assert result.tokens.shape == (fixture["prompt"].shape[0], width + NEW_TOKENS)
     assert result.tokens.dtype == jnp.int32
@@ -159,9 +161,9 @@ def test_rows_stop_pad_and_count_as_transformers_generate_ends_them(name):
         fixture = {key: stored[key] for key in stored.files}
     with np.load(directory / "stopping.npz") as stored:
         stopping = {key: stored[key] for key in stored.files}
-    # Every path's float64 top-2 margin clears four fp32 decode errors, so
+    # Every path's float64 top-2 margin clears 2 PARITY fp32 decode errors, so
     # each greedy choice is the model's and not a rounding.
-    assert float(stopping["margin"]) > 2 * FACTOR * decode_error(fixture, "greedy")
+    assert float(stopping["margin"]) > 2 * PARITY * decode_error(fixture, "greedy")
     eos, pad = tuple(int(token) for token in stopping["eos"]), int(stopping["pad"])
     width = fixture["prompt"].shape[1]
 

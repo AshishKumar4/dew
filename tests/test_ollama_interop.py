@@ -258,8 +258,8 @@ def test_the_daemon_reports_dews_own_logprobs(imported, client):
     logprobs; what it may cost is what the conversion costs. Dew's own
     forward over the weights rounded to F16 measures that, from
     transformers' float64 forward of the export, and the daemon has to be
-    within tests/reference_error.py's FACTOR of it, RMS over every drawn
-    token. FACTOR also has to hold what llama.cpp rounds beyond the
+    within tests/reference_error.py's PARITY of it, RMS over every drawn
+    token. PARITY also has to hold what llama.cpp rounds beyond the
     conversion, its F16 activations and KV cache: on Ollama 0.32.9 the
     daemon is 9.0e-4 from float64 and the conversion alone 6.5e-4 (ratio
     1.39), Dew's float32 forward 8.6e-7. A daemon that rounds more, or a
@@ -267,7 +267,7 @@ def test_the_daemon_reports_dews_own_logprobs(imported, client):
     before it flipped a token.
     """
     import torch
-    from reference_error import FACTOR, distance
+    from reference_error import PARITY, distance
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     from tools.diffusers_wan_reference import float64
@@ -298,6 +298,6 @@ def test_the_daemon_reports_dews_own_logprobs(imported, client):
         truth += drawn_logprobs(logits, head, theirs)
 
     mine, conversion = distance(daemon, truth), distance(converted, truth)
-    assert mine <= FACTOR * conversion, (
+    assert mine <= PARITY * conversion, (
         f"the daemon is {mine:.3e} from float64 (rms logprob), the F16 conversion alone "
-        f"{conversion:.3e} (ratio {mine / conversion:.2f}, allowed {FACTOR})")
+        f"{conversion:.3e} (ratio {mine / conversion:.2f}, allowed {PARITY})")

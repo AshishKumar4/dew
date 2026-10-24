@@ -864,7 +864,7 @@ def judged(errors: dict[str, float], floors: dict[str, float], loss: float,
 def judged_orders(reference: Mapping[str, Sequence[float]], layout: Mapping[str, Sequence[float]]) -> dict:
     """K-order RMS distances to fp64, held to the shared reference rule per leaf.
 
-    ORDERS=52 is the smallest K for which F(K,K) exceeds FACTOR² with
+    ORDERS=52 is the smallest K for which F(K,K) exceeds ORDER_FACTOR² with
     probability at most FALSE_FAILURE=1e-6, even when a squared error has
     only one degree of freedom. tests/reference_error.py owns that derivation
     and assertion; row-permutation floors and picked leaf tolerances play no
@@ -873,7 +873,7 @@ def judged_orders(reference: Mapping[str, Sequence[float]], layout: Mapping[str,
     import numpy as np
 
     sys.path.insert(0, str(REPO / "tests"))
-    from reference_error import FACTOR, assert_as_exact_over_orders
+    from reference_error import ORDER_FACTOR, assert_as_exact_over_orders
 
     if reference.keys() != layout.keys():
         raise ValueError('ordered gradients hold different leaves')
@@ -881,7 +881,7 @@ def judged_orders(reference: Mapping[str, Sequence[float]], layout: Mapping[str,
     for leaf in reference:
         mine, theirs = (float(np.sqrt(np.mean(np.square(values))))
                         for values in (layout[leaf], reference[leaf]))
-        ratios[leaf] = mine / (FACTOR * theirs) if theirs else 0.0 if mine == 0 else float('inf')
+        ratios[leaf] = mine / (ORDER_FACTOR * theirs) if theirs else 0.0 if mine == 0 else float('inf')
         try:
             assert_as_exact_over_orders(layout[leaf], reference[leaf], leaf)
         except AssertionError as error:

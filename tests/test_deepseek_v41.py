@@ -9,7 +9,7 @@ taken with the quantizers off and repeated with them on (`qat_*`), and every
 quantizer and top-k call of both forwards is recorded. reference_f64.npz is
 the same run widened to fp64 (`--fp64`), the truth Dew and the reference are
 both measured from by tests/reference_error.py's rule: Dew's RMS distance
-from it at most FACTOR times the reference's own, for every output and for
+from it at most PARITY times the reference's own, for every output and for
 the inputs of every quantizer and top-k call. Dew's quantizers are held bit
 for bit to each recorded call.
 
@@ -37,7 +37,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 from flax.traverse_util import flatten_dict, unflatten_dict
-from reference_error import FACTOR, distance
+from reference_error import PARITY, distance
 
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import families, translate_config, translate_wrapper_config
@@ -74,7 +74,7 @@ def source():
 
 def rounding(name: str) -> float:
     """The reference's own RMS distance from the float64 truth for `name`:
-    the fp32 rounding two runs of one computation may each carry FACTOR
+    the fp32 rounding two runs of one computation may each carry PARITY
     times of."""
     return distance(np.load(TINY / "vision.npz")[name] if name.startswith("vision_")
                     else np.load(TINY / "reference.npz")[name], TRUTH[name])
@@ -193,7 +193,7 @@ def test_the_candidate_pool_decides_the_logits(source):
             kinds["csa2_ratio_1_reindex"].mixer, candidates=None, candidate_blocks=None,
             candidate_block_size=None))
     unpooled = plain.clone(kinds=flax.core.freeze(kinds))
-    assert distance(unpooled.apply(loaded.variables, ids), TRUTH["logits"]) > FACTOR * rounding("logits")
+    assert distance(unpooled.apply(loaded.variables, ids), TRUTH["logits"]) > PARITY * rounding("logits")
 
 
 def test_left_padding_changes_no_row(source):
@@ -223,21 +223,21 @@ def test_an_uncached_left_padded_row_pools_its_windows_over_its_own_tokens(sourc
     pool their compressed windows (CSA2's entries and index keys, HCA's) and hash their n-grams
     (Engram) over their real tokens at their ranks, as a cache appends them, whether the padding
     comes as a raw mask or as the tokens' coordinates alone: the real tokens' logits lie within
-    FACTOR of the reference's rounding of the float64 truth of the rows unpadded."""
+    PARITY of the reference's rounding of the float64 truth of the rows unpadded."""
     loaded, plain, reference = source
     ids, pad = jnp.asarray(reference["input_ids"]), 3
     valid = jnp.broadcast_to(jnp.arange(ids.shape[1] + pad) >= pad, (ids.shape[0], ids.shape[1] + pad))
     padding = {"attention_mask": valid} if given == "attention_mask" else {
         "coordinates": coordinates(valid=valid)}
     logits = plain.apply(loaded.variables, jnp.pad(ids, ((0, 0), (pad, 0))), **padding)
-    assert distance(logits[:, pad:], TRUTH["logits"]) <= FACTOR * rounding("logits")
+    assert distance(logits[:, pad:], TRUTH["logits"]) <= PARITY * rounding("logits")
 
 
 def test_an_uncached_draft_reads_a_padded_context_at_its_real_positions(source):
     """Uncached, DSpark drafts after a context whose padding `valid` marks, after it in one row and
     before it in the other, as after the context alone: its real positions keep their ranks, the
     padding is no key, and the block follows the last real position. The two drafts' logits, each
-    within FACTOR of the reference's rounding, lie within twice that of each other."""
+    within PARITY of the reference's rounding, lie within twice that of each other."""
     loaded, plain, reference = source
     ids, prompt, pad = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"]), 3
     _, sown = plain.apply(loaded.variables, ids[:, :prompt], mutable=["prediction_inputs"])
@@ -248,7 +248,7 @@ def test_an_uncached_draft_reads_a_padded_context_at_its_real_positions(source):
     places = jnp.arange(prompt + pad)
     valid = jnp.stack([places < prompt, places >= pad])
     _, drafted, _ = plain.apply(loaded.variables, padded, drawn, decode=False, valid=valid, method="draft")
-    assert distance(drafted, alone) <= 2 * FACTOR * rounding("draft_logits")
+    assert distance(drafted, alone) <= 2 * PARITY * rounding("draft_logits")
 
 
 def test_speculative_decoding_drafts_with_dspark_and_emits_the_greedy_walk(source):
@@ -271,7 +271,7 @@ def test_the_decode_ops_draft_what_dspark_drafts_over_the_history(source):
     counts, the block the decode ops draft is the one the drafter drafts
     uncached over each row's real history: the prompt's and the stretch's
     context reach its windows at their own positions. Two runs each within
-    FACTOR of the reference's rounding lie within twice that of each other."""
+    PARITY of the reference's rounding lie within twice that of each other."""
     from dew.sampling.text import decode_ops, prefill_state
 
     loaded, plain, reference = source
@@ -297,7 +297,7 @@ def test_the_decode_ops_draft_what_dspark_drafts_over_the_history(source):
         whole = plain.apply(loaded.variables, sown["prediction_inputs"], method="draft_context")
         _, logits, _ = plain.apply(loaded.variables, whole, drawn[row:row + 1], decode=False,
                                    method="draft")
-        assert distance(jnp.stack(scored, 1)[row], logits[0]) <= 2 * FACTOR * rounding("draft_logits")
+        assert distance(jnp.stack(scored, 1)[row], logits[0]) <= 2 * PARITY * rounding("draft_logits")
 
 
 def test_consecutive_reindex_layers_publish_their_selections_under_scan_layers():
@@ -314,7 +314,7 @@ def test_consecutive_reindex_layers_publish_their_selections_under_scan_layers()
     unrolled, scanned = (models.build("causal_transformer", **{**fields, "scan_layers": scan})
                          for scan in (False, True))
     variables = unrolled.init(jax.random.key(0), ids)
-    assert distance(scanned.apply(variables, ids), unrolled.apply(variables, ids)) <= 2 * FACTOR * rounding(
+    assert distance(scanned.apply(variables, ids), unrolled.apply(variables, ids)) <= 2 * PARITY * rounding(
         "logits"
     )
 
@@ -338,7 +338,7 @@ def test_a_reindex_layer_reads_its_full_layers_publications_with_no_reuse_layer(
     unrolled, scanned = (models.build("causal_transformer", **{**fields, "scan_layers": scan})
                          for scan in (False, True))
     variables = unrolled.init(jax.random.key(0), ids)
-    assert distance(scanned.apply(variables, ids), unrolled.apply(variables, ids)) <= 2 * FACTOR * rounding(
+    assert distance(scanned.apply(variables, ids), unrolled.apply(variables, ids)) <= 2 * PARITY * rounding(
         "logits"
     )
 
@@ -382,7 +382,7 @@ def test_the_image_bias_and_the_dead_image_positions_decide_the_prefill(tmp_path
     routers.update({path: routers[(*path[:-1], "e_score_correction_bias")]
                     for path in routers if path[-1] == "media_bias"})
     _, moved, _ = vision_run(loaded.model, {**loaded.variables, "moe": unflatten_dict(routers)}, reference)
-    assert distance(moved, TRUTH["vision_prompt_logits"]) > FACTOR * rounding("vision_prompt_logits")
+    assert distance(moved, TRUTH["vision_prompt_logits"]) > PARITY * rounding("vision_prompt_logits")
     ids = jnp.asarray(reference["input_ids"])
     media = jnp.asarray(reference["token_types"] >= 0)
     language = {collection: tree["language_model"] for collection, tree in loaded.variables.items()}

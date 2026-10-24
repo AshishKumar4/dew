@@ -67,6 +67,14 @@ COMPARISONS = {
                                      "keep = np.abs(rows - 1) < window", 1),
     "a mask of positions changed in place": ("import numpy as np\nrows = np.arange(n)\nrows[0] = 0.5\n"
                                              "keep = np.abs(rows - 1) < window", 1),
+    # The gate's one-draw rules, a comparison each call until it judges through check 1.
+    "the one-draw rule": ("from reference_error import assert_as_exact_as_the_reference\n"
+                          "assert_as_exact_as_the_reference(dew, reference, truth, 'leaf')", 1),
+    # Outside its named sites, the retiring helper is also refused as a caller (`_retiring`).
+    "the retiring one-draw helper, by its module": ("import reference_error\n"
+                                                    "reference_error.assert_leaves_as_exact(a, b, c)", 2),
+    "check 1": ("from reference_error import assert_as_exact\n"
+                "assert_as_exact(dew, reference, draw, 'leaf', seeds=8)", 0),
     # A band around a float target, in an assertion (`_band`), each way round and as a conjunction.
     "a time bounded on both sides": ("assert 2.25 <= long_seconds / short_seconds <= 3.75", 1),
     "a band written the other way": ("assert 3.75 >= ratio >= 2.25", 1),
@@ -475,3 +483,20 @@ def test_the_ratchet_holds_a_branch_to_its_base_and_refuses_a_shallow_history(li
     subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{repo}", str(shallow)], check=True)
     [refused] = list(lint.ratchet(shallow))
     assert "shallow" in refused.message
+
+
+def test_the_retiring_helper_is_refused_outside_its_named_sites(lint, tmp_path):
+    """The retiring one-draw helper imported or called anywhere but its named sites is a finding; at a
+    named site it is not; and the lint's sites are the gate's own."""
+    import reference_error
+
+    body = "from reference_error import assert_leaves_as_exact\nassert_leaves_as_exact(a, b, c)\n"
+    refused = "the retiring one-draw rule, kept only"
+    outside = [finding for finding in lint.tolerances(_module(lint, tmp_path, "tests/test_case.py", body))
+               if refused in finding.message]
+    assert len(outside) == 2
+    named = sorted(lint.RETIRING_SITES)[0]
+    inside = [finding for finding in lint.tolerances(_module(lint, tmp_path, named, body))
+              if refused in finding.message]
+    assert inside == []
+    assert lint.RETIRING_SITES == reference_error.RETIRING_SITES
