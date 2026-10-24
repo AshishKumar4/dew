@@ -14,7 +14,6 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
-import time
 from collections.abc import Callable, Mapping, Sequence
 
 import jax
@@ -27,6 +26,7 @@ from dew.nn.kernels.options import compiler_options
 from dew.nn.sharding import LayoutRefused
 from dew.objectives.base import RECORD, Batch, Objective
 from dew.records import JSON
+from dew.telemetry.benchmark import samples
 from dew.training.distributed import Placement, batch_divisor
 from dew.training.host import snapshot
 from dew.training.memory import (
@@ -220,16 +220,16 @@ warmup ones, each plan's own: a split step's first call builds its window."""
 
 def step_seconds(step: Callable, state: TrainState, batch: Batch) -> float:
     """Seconds a step of `step` takes on `batch` from `state`, the mean of
-    `TIMED_STEPS` after `TIMED_WARMUP`, which consumes `state` as training
-    does."""
-    for _ in range(TIMED_WARMUP):
-        state, *_ = step(state, batch)
-    jax.block_until_ready(state)
-    began = time.perf_counter()
-    for _ in range(TIMED_STEPS):
-        state, *_ = step(state, batch)
-    jax.block_until_ready(state)
-    return (time.perf_counter() - began) / TIMED_STEPS
+    `TIMED_STEPS` queued and synchronized once after `TIMED_WARMUP`
+    (`dew.telemetry.benchmark.samples`), each step consuming the state the
+    one before it returned, as training does."""
+    held = [state]
+
+    def stepped() -> TrainState:
+        held[0], *_ = step(held[0], batch)
+        return held[0]
+
+    return samples(stepped, warmup=TIMED_WARMUP, repeats=1, calls=TIMED_STEPS)[0]
 
 
 @dataclasses.dataclass

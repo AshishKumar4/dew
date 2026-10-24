@@ -225,8 +225,9 @@ class Decide:
         # the backbone would where the caller overrides the compute dtype.
         model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype))
         laid = records.record(settings.layout, "layout")
+        # A layout is plain data, its framing's template variables included: no field is a dtype.
         rows = from_record(_LAYOUTS[records.text(laid["name"], "layout.name")],
-                           records.json_value(laid["fields"], "layout.fields"))
+                           records.json_value(laid["fields"], "layout.fields"), dtypes=False)
         if settings.tokenizer is None:
             raise ValueError("the run records no tokenizer to lay its rows out with")
         processor = None if settings.processor is None else load_processor(settings.processor, backbone)
@@ -298,7 +299,7 @@ class Decide:
                  images: Sequence[Image.Image] = (), context: JSON | None = None) -> dict[str, Answer]:
         """Return one answer per question in `questions`, about `state` and any `images`.
 
-        Images need a layout with a place for them (`Layout.image`) and the
+        Images need a layout with a place for them (`Layout.images`) and the
         backbone's processor, as a joint-head release brings. `context` is a
         sequence the decision reads beside the state through the backbone's
         cross-attention (`Example.context`).
@@ -357,9 +358,9 @@ class Decide:
     def _shown(self, state: JSON, questions: Mapping[str, Question], images: Sequence[Image.Image],
                context: JSON | None = None) -> tuple[Encoded, Images]:
         """A request's one row with its images laid out before the state, and the images."""
-        if self.processor is None or self.layout.image is None:
+        if self.processor is None or not self.layout.images:
             raise ValueError("images need a backbone with a vision encoder, which this task does not have")
-        media = Images.of(self.processor, images, self.layout.image)
+        media = Images.of(self.processor, images, self.processor.image_text())
         rows = self._encoded(state, questions, media.tokens, context=context)
         if len(rows) != 1:
             raise ValueError("a request's images go in a layout of one row")

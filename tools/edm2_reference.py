@@ -30,12 +30,11 @@ from __future__ import annotations
 import json
 import sys
 import types
-import urllib.request
 from pathlib import Path
 
 import numpy as np
 import torch
-from reference_source import stub_torch_utils
+from reference_source import fetched, stub_torch_utils
 
 COMMIT = "4bf8162f601bcc09472ce8a32dd0cbe8889dc8fc"
 SOURCE = f"https://raw.githubusercontent.com/NVlabs/edm2/{COMMIT}/training/networks_edm2.py"
@@ -56,7 +55,7 @@ def networks(dtype: str) -> types.ModuleType:
     rounding error a float32 evaluation makes."""
     stub_torch_utils()
     module = types.ModuleType("networks_edm2")
-    source = urllib.request.urlopen(SOURCE).read().decode()
+    source = fetched(SOURCE)
     exec(source.replace("torch.float32", f"torch.{dtype}"), module.__dict__)
     return module
 

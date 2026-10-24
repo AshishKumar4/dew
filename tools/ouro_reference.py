@@ -21,8 +21,6 @@ loaded checkpoint to.
 
 import argparse
 import shutil
-import sys
-import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +28,7 @@ import torch
 import transformers
 from diffusers_wan_reference import float64
 from huggingface_hub import hf_hub_download
+from reference_source import hub_modules
 
 from dew.interop.verify import probe_ids, scatter_weights
 
@@ -40,13 +39,7 @@ COLUMNS = np.random.RandomState(11).choice(49152, 64, replace=False)
 
 def remote():
     """Ouro's modeling module, imported from the pinned remote code as a package."""
-    package = Path(tempfile.mkdtemp()) / 'ouro_remote'
-    package.mkdir()
-    (package / '__init__.py').write_text('')
-    for name in ('configuration_ouro.py', 'modeling_ouro.py'):
-        shutil.copy(hf_hub_download(REPO, name, revision=REVISION), package / name)
-    sys.path.insert(0, str(package.parent))
-    import ouro_remote.modeling_ouro as modeling
+    _, modeling = hub_modules('ouro_remote', REPO, REVISION, ('configuration_ouro.py', 'modeling_ouro.py'))
     return modeling
 
 

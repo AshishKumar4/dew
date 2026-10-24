@@ -85,21 +85,27 @@ def denoised(x, sigma):
     return bent / (SIGMA_DATA ** 2 + sigma ** 2)
 
 
-def walk(scope: dict, name: str, x_T, steps):
-    """`generate_samples`' loop over every interval of `steps`, as written,
-    with the stand-in as the sampler's model."""
+def sampler_of(scope: dict, name: str):
+    """The sampler `name` over the Karras VE schedule, and the stand-in as its model, which takes
+    `x_t` at `t` to the clean estimate, the noise it implies and no state."""
     schedule = scope["KarrasVENoiseScheduler"](timesteps=1.0, sigma_max=SIGMA_MAX, rho=RHO,
                                                 sigma_data=SIGMA_DATA)
-    sampler = scope[SAMPLERS[name][1]](schedule)
 
-    def sample_model_fn(x_t, t):
+    def model(x_t, t):
         _, sigma = schedule.get_rates(t, scope["get_coeff_shapes_tuple"](x_t))
         x_0 = denoised(x_t, sigma)
         return x_0, (x_t - x_0) / sigma, None
 
+    return scope[SAMPLERS[name][1]](schedule), model
+
+
+def walk(scope: dict, name: str, x_T, steps):
+    """`generate_samples`' loop over every interval of `steps`, as written,
+    with the stand-in as the sampler's model."""
+    sampler, model = sampler_of(scope, name)
     latents, samples = [], x_T
     for i in range(len(steps) - 1):
-        samples, _ = sampler.sample_step(sample_model_fn, samples, steps[i], (),
+        samples, _ = sampler.sample_step(model, samples, steps[i], (),
                                          next_step=steps[i + 1], state=None)
         latents.append(samples)
     return jnp.stack(latents)
@@ -113,16 +119,8 @@ def closed(scope: dict, name: str, x_T, steps: int, clipped: bool):
     autoencoder and no conditions, and `post_process`, with no autoencoder
     `clip_images` to [-1, 1], when `clipped`; without it the result is the
     walk's own closing prediction, before the output's clip."""
-    schedule = scope["KarrasVENoiseScheduler"](timesteps=1.0, sigma_max=SIGMA_MAX, rho=RHO,
-                                                sigma_data=SIGMA_DATA)
-    sampler = scope[SAMPLERS[name][1]](schedule)
-
-    def sample_model(params, x_t, t):
-        _, sigma = schedule.get_rates(t, scope["get_coeff_shapes_tuple"](x_t))
-        x_0 = denoised(x_t, sigma)
-        return x_0, (x_t - x_0) / sigma, None
-
-    sampler.sample_model = sample_model
+    sampler, model = sampler_of(scope, name)
+    sampler.sample_model = lambda params, x_t, t: model(x_t, t)
     sampler.post_process = scope["clip_images"] if clipped else (lambda samples: samples)
     sampler.autoencoder = sampler.input_config = None
     return sampler.generate_samples(None, x_T.shape[0], x_T.shape[1], diffusion_steps=steps, priors=x_T)

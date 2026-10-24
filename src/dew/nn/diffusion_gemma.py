@@ -22,6 +22,7 @@ from flax.typing import Dtype, PrecisionLike, VariableDict
 from dew.interop.weights import ParamTree, translate_parameters
 from dew.nn.attention import RMSNorm
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import LAYER_SCALAR_COLLECTIONS
 from dew.nn.mlp import GatedMLP
 from dew.nn.multimodal import VisionConditioner
 from dew.nn.precision import at_least_fp32, float32_einsum
@@ -138,10 +139,11 @@ class DiffusionGemma(DecoderWrapper):
         if self.text.layer_scalar != "frozen":
             raise ValueError(f"layer_scalar is {self.text.layer_scalar!r}, so this model's tree holds "
                              f"no layer scalars to move")
+        trainable, frozen = LAYER_SCALAR_COLLECTIONS["trainable"], LAYER_SCALAR_COLLECTIONS["frozen"]
         values = dict(variables)
-        params = dict(values["params"])
+        params = dict(values[trainable])
         text = dict(params["text"])
-        constants = dict(values["constants"])
+        constants = dict(values[frozen])
         text_constants = dict(constants["text"])
         for index in range(self.text.num_layers):
             layer = f"layers_{index}"
@@ -156,15 +158,15 @@ class DiffusionGemma(DecoderWrapper):
             else:
                 del text_constants[layer]
         params["text"] = text
-        values["params"] = params
+        values[trainable] = params
         if text_constants:
             constants["text"] = text_constants
         else:
             del constants["text"]
         if constants:
-            values["constants"] = constants
+            values[frozen] = constants
         else:
-            del values["constants"]
+            del values[frozen]
         return values
 
     def init_cache(self, batch_size: int):
