@@ -482,15 +482,33 @@ def gpu_target(identifier: str | None = None) -> GpuTarget:
     return GpuTarget(identifier, identifier)
 
 
+@functools.cache
+def _cuda_device() -> type:
+    """jax's abstract device with the compute capability a CUDA device states ('8.0'), one class a process
+    (equal devices, equal meshes)."""
+    from jax.sharding import AbstractDevice
+
+    @dataclasses.dataclass(frozen=True, slots=True)
+    class CudaDevice(AbstractDevice):
+        compute_capability: str
+
+    return CudaDevice
+
+
 def gpu_mesh(mesh: Mesh, generation: str) -> AbstractMesh:
     """`mesh`'s axes over abstract devices of the CUDA `generation` ('sm80'), none of which this process
-    needs: a program traced on it, under `assumed(generation)`, lowers its Pallas kernels to Triton
-    for that GPU on any host (`TrainerConfig.lower_for`; the kernel lab's oracle)."""
-    from jax.sharding import AbstractDevice, AbstractMesh
+    needs: a program traced on it, under `assumed(generation)`, lowers its Pallas kernels to Triton, and
+    its Mosaic GPU kernels to that GPU's instructions, for that GPU on any host (`TrainerConfig.lower_for`;
+    the kernel lab's oracle; tests/kernel_compile.py). Its devices state their compute capability, which
+    Mosaic GPU lowers for (its `utils._infer_arch`; a device that states none it takes for sm90's, and an
+    sm80 kernel's cp.async waits do not lower)."""
+    from jax.sharding import AbstractMesh
     target = gpu_target(generation)
-    if not target.generation.startswith('sm') or target.shared_limit is None:
+    version = capability(generation)
+    if not target.generation.startswith('sm') or target.shared_limit is None or version is None:
         raise ValueError(f"no CUDA target for {generation!r}")
-    device = AbstractDevice(device_kind=target.device_kind, num_cores=None, platform='cuda')
+    device = _cuda_device()(device_kind=target.device_kind, num_cores=None, platform='cuda',
+                            compute_capability='.'.join(map(str, version)))
     return AbstractMesh(mesh.axis_sizes, mesh.axis_names, axis_types=mesh.axis_types, abstract_device=device)
 
 
