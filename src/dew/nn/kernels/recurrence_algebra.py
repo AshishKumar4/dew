@@ -93,12 +93,25 @@ class Transposed:
         return (*self.value.shape[:-2], self.value.shape[-1], self.value.shape[-2])
 
 
+class Exact:
+    """A register operand exact in a 16-bit dtype (a mask of zeros and ones): a mainloop stages it as one
+    part, where an fp32 operand takes three."""
+
+    def __init__(self, value: jax.Array):
+        self.value = value
+
+    @property
+    def shape(self) -> tuple:
+        return self.value.shape
+
+
 def portable(name: str, left, right):
     """XLA's product, the portable math's issuer: `left @ right`, float32 products in float32 on a GPU, as
     torch's are, not TF32 (`dew.nn.precision.float32_matmul`); the portable math takes its operands in at
     least float32 (`recurrence_chunk.chunked`), a `Transposed` one transposed."""
     del name
-    left, right = (jnp.swapaxes(x.value, -1, -2) if isinstance(x, Transposed) else x for x in (left, right))
+    left, right = (jnp.swapaxes(x.value, -1, -2) if isinstance(x, Transposed) else
+                   x.value if isinstance(x, Exact) else x for x in (left, right))
     return float32_matmul(left, right)
 
 
@@ -447,7 +460,7 @@ backward's loads a `Tile`."""
 TileLoad = Callable[..., Tile]
 """A load of a `Tile` (the backward's operands)."""
 
-Operand = jax.Array | Tile | Transposed
+Operand = jax.Array | Tile | Transposed | Exact
 """A product's operand (`Issue`'s): registers, a tile in memory, or registers taken transposed."""
 
 
@@ -814,12 +827,11 @@ def summed_back(pairs, after, leaving=None, issue: Issue = portable):
     each `s` a term through the chunk's start to `s`, and `leaving` `[C]` where given, each `t` a term
     through `(t, C - 1]`, a pair of the chunk's last row. Each token sums only the terms whose range holds it,
     `sum_{j < t <= i} pairs + sum_{s >= t} after + sum_{j < t} leaving`: each row's pairs before `t` a
-    product with the strictly upper ones ('summed', no pair added and taken back), each `leaving` term in its
-    own row above the diagonal (a vector a row each, as a mainloop's registers lay it), and each column's sum
-    the transpose's row sums (a product with the identity, exact). Linear in its terms: a sum of launches'
-    terms sums the same as their sums."""
+    product with the strictly upper ones ('summed', an `Exact` triangle: no pair added and taken back), each
+    `leaving` term in its own row above the diagonal (a vector a row each, as a mainloop's registers lay
+    it), and each token's sum its column's. Linear in its terms: a sum of launches' terms sums the same as
+    their sums."""
     rows, cols = _grid(pairs.shape)
-    through = issue("summed", pairs, jnp.where(rows < cols, 1.0, 0.0))
+    through = issue("summed", pairs, Exact(jnp.where(rows < cols, 1.0, 0.0)))
     above = 0.0 if leaving is None else leaving[:, None]
-    held = jnp.where(rows >= cols, through + after[:, None], above)
-    return jnp.sum(issue("summed", Transposed(held), jnp.where(rows == cols, 1.0, 0.0)), axis=1)
+    return jnp.sum(jnp.where(rows >= cols, through + after[:, None], above), axis=0)

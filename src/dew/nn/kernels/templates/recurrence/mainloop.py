@@ -160,6 +160,10 @@ class _Issuer:
     def _operand(self, x, name: str, other=None) -> tuple:
         if isinstance(x, _Parts):
             return x.refs
+        if isinstance(x, algebra.Exact):
+            # One part, in the product's own tile for exact operands (`{name}.exact`).
+            (buffer,) = self.buffers[f"{name}.exact"]
+            return (self.call.family.staged(x.value, buffer),)
         if isinstance(x, algebra.Transposed):
             # Staged as it is and read transposed (`algebra.Transposed`).
             return tuple(ref.T for ref in self._operand(x.value, name, other))
@@ -323,9 +327,16 @@ def _merges(call: _Call) -> tuple:
 
 
 def _summing() -> tuple:
-    """`algebra.summed_back`'s staging tiles ('summed', an fp32 operand against a triangle or the identity):
-    two sets, each `[C, C]` tile a bf16 part of three, an fp32 operand's exact parts."""
-    return _staging(_Operand(CHUNK, PARTS, jnp.dtype(jnp.float32)), (CHUNK, CHUNK), (CHUNK, CHUNK))
+    """`algebra.summed_back`'s staging tiles ('summed', an fp32 operand against a triangle): the fp32
+    operand's three bf16 parts, and the triangle's one (`algebra.Exact`)."""
+    return (*_staging(_Operand(CHUNK, PARTS, jnp.dtype(jnp.float32)), (CHUNK, CHUNK)),
+            (plgpu.SMEM((CHUNK, CHUNK), jnp.bfloat16),))
+
+
+def _summed(staging: tuple, call: _Call) -> _Issuer:
+    """`algebra.summed_back`'s products on `_summing`'s tiles."""
+    parts, exact = staging
+    return _Issuer(call, {"summed": parts, "summed.exact": exact})
 
 
 def _merging(staging, call: _Call) -> _Issuer:
@@ -1071,6 +1082,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, hi, lo, taken, call: _Call, *, sc
         c, n, h = lax.axis_index("blocks"), lax.axis_index("chunks"), lax.axis_index("heads")
         row, span, last = n * CHUNK, pl.ds(n * CHUNK, CHUNK), n * CHUNK + CHUNK - 1
         staged, *summing = staging
+        summed = _summed(tuple(summing), call)
         key_columns = h // call.group * width + c * BLOCK
         memory = (n * call.heads + h) * width + c * BLOCK
         views = _views(queries=given.views(q_ref, row, CHUNK, key_columns, BLOCK),
@@ -1104,8 +1116,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, hi, lo, taken, call: _Call, *, sc
             # In the operands' dtype, as fla's dqkwg writes them.
             for ref, grad in ((dq_ref, dq), (dk_ref, dk), (dw_ref, dw)):
                 held.store(ref, grad, row, CHUNK, h * width + c * BLOCK, BLOCK)
-            decay_ref.at[c, h, span][...] = algebra.summed_back(pairs, after, leaving,
-                                                                _Issuer(call, {"summed": summing}))
+            decay_ref.at[c, h, span][...] = algebra.summed_back(pairs, after, leaving, summed)
             return carry, accumulators
 
         _walk(streams, views, step, call)
@@ -1163,7 +1174,7 @@ def _weighted_back(a, k, v, dw, du, hi, lo, beta, taken, call: _Call):
                 held.store(dk_ref, grad, row, CHUNK, h * width + i * BLOCK, BLOCK)
             for j, grad in enumerate(value_grads):
                 held.store(dv_ref, grad, row, CHUNK, h * value_width + j * BLOCK, BLOCK)
-            summed = _Issuer(call, {"summed": summing})
+            summed = _summed(tuple(summing), call)
             decay_ref.at[h, span][...] = algebra.summed_back(pairs, after, issue=summed)
             dbeta_ref.at[h, span][...] = d_beta
             return carry, accumulators
