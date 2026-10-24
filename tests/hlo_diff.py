@@ -6,6 +6,7 @@ unfused dots and custom calls only it has."""
 import collections
 import glob
 import re
+from pathlib import Path
 
 
 def pytest_addoption(parser):
@@ -53,8 +54,15 @@ def _summary(signature) -> str:
 
 
 def pytest_terminal_summary(terminalreporter, config):
-    modules = {path: open(path).read() for path in glob.glob("/tmp/dew-hlo/*after_optimizations.txt")}
-    lambdas = [path for path, text in modules.items() if "jit__lambda" in path and "f64[" not in text]
+    paths = glob.glob("/tmp/dew-hlo/*cpu_after_optimizations.txt") or glob.glob(
+        "/tmp/dew-hlo/*after_optimizations.txt")
+    modules = {path: Path(path).read_text() for path in paths}
+
+    def entry(text):
+        return next((line for line in text.splitlines() if line.startswith("ENTRY")), "")
+
+    # The fp32 arm's parameters are fp32; the float64 truth's are f64 (a CPU's fp32 program holds f64 sums).
+    lambdas = [path for path, text in modules.items() if "jit__lambda" in path and "f64[" not in entry(text)]
     steps = [path for path in modules if ".jit_step." in path]
     if not lambdas or not steps:
         terminalreporter.write_line(f"HLODIFF none: {len(lambdas)} lambdas {len(steps)} steps")
@@ -69,6 +77,7 @@ def pytest_terminal_summary(terminalreporter, config):
     step = max(steps, key=overlap)
     step_c = _computations(modules[step])
     step_f = _fusions(step_c)
+    terminalreporter.write_line(f"HLODIFF lambdas {len(lambdas)} steps {len(steps)}")
     terminalreporter.write_line(f"HLODIFF lambda {lam.split('/')[-1]} step {step.split('/')[-1]} shared "
                                 f"{sum((step_f & lam_f).values())} step-only {sum((step_f - lam_f).values())} "
                                 f"lambda-only {sum((lam_f - step_f).values())}")
