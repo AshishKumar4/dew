@@ -30,10 +30,11 @@ TABLE_JITTER = 0.01
 """How far a walk's draw scales its beta table's ends. A walk's rounding is dominated by its few
 per-step coefficients, which the table fixes: a draw of the initial rows alone holds each arm to one
 rounding of each coefficient, a coin flip no count of draws resolves (pndm-linspace's walk at a pooled
-1.80 times diffusers' over 40 draws of one table, Dew's coefficients correctly rounded and diffusers'
-not, nearer the float64 table's by chance). Each draw rounds its own table's coefficients."""
-SEEDS = {"ddim-linspace": 8, "pndm-linspace": 8, "ddim-clip": 8, "euler-zero-snr": 8, "dpm-karras": 8,
-         "norm": 8, "odd": 8}
+1.80 times diffusers' over 40 draws of one table: at its second step Dew's transfer coefficient is the
+correctly rounded one and diffusers' a step off, nearer the float64 table's by chance). Each draw rounds
+its own table's coefficients, and the walk holds check 1 at 128 draws."""
+SEEDS = {"ddim-linspace": 32, "pndm-linspace": 128, "ddim-clip": 8, "euler-zero-snr": 8, "dpm-karras": 128,
+         "norm": 64, "odd": 64}
 """Each case's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada."""
 
 
