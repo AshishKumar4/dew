@@ -1,8 +1,24 @@
 # Dew's kernel templates: design
 
-Approved 2026-10-21 (§13). This document is the one source for the templates' structure: the algebra,
-hooks, structure, toolkit, mainloops and choice layer of attention, linear recurrence and GEMM. Its
-appendix maps every variant each template covers, and every current dispatch it replaces, to the design.
+Approved 2026-10-21, updated with the owner's decisions through 2026-10-23 (§13). This document is the one source for the templates' structure: the algebra, hooks, structure, toolkit, mainloops and choice layer of attention, linear recurrence and GEMM. Its appendix maps every variant each template covers, and every current dispatch it replaces, to the design.
+
+## 0. The vision
+
+Three templates, attention, linear recurrence and GEMM, replace every hand kernel and every vendored kernel Dew uses, with no selector in the end (owner, 2026-10-19). A template is one algorithm, written once as Tokamax Ops in Pallas, that compiles a kernel tailored to the device it runs on, generating equivalent or better kernels than the ones it absorbs.
+
+- **The bar.** On every row it serves, on every architecture it claims, a template matches or beats the best existing kernel at that shape, in compute time and peak memory, while passing the accuracy gate and the stability invariant (no NaN or inf where the reference is finite). Matching the reference's accuracy is the minimum; where a cheap gain makes Dew more accurate, it takes it (owner, 2026-10-21, 10-22).
+
+- **General before fast.** A template's first duty is coverage: every variant in its coverage table (Appendices A to C), every consumer that calls it, every form (forward, backward, decode), on every architecture family it claims. Speed comes on top of a covered cell, never instead of one. Progress is measured as a coverage matrix (rows: variants and consumers; columns: architecture families; each cell: supported, passing the gate, and its time and memory against the route it replaces), not as one shape's number.
+- **One algebra, one toolkit, thin mainloops.** The math lives once in each template's algebra. Variants are hooks traced into the kernel, never per-model kernels. Everything that differs by architecture lives once in the shared Mosaic toolkit, as one Family bundle per architecture (operand loader, matrix-instruction issuer, accumulator home, barriers and roles), used by all three templates. A mainloop holds no math and no pipeline machinery, only the order of its bundle's steps around the algebra. One mainloop skeleton per template serves every architecture whose overlap structure is the same, and a separate thin mainloop exists only where the structure differs, with the difference stated (attention's tcgen05 mainloop, for its tensor-memory accumulator and correction role).
+- **Mosaic everywhere.** Mosaic GPU on every NVIDIA family (mma.sync, wgmma, tcgen05) and Mosaic TPU on TPU. Pallas Triton is deprecated upstream: the existing Triton kernels stay in use as production routes and as speed references, unmaintained, and each is deleted when its template cell matches or beats it.
+- **Configs from the device, never tables.** Device attributes are read at runtime; architecture facts follow the instruction family; facts that need measuring default to the family's value and are refined only by opt-in calibration. Legality prunes and one shared analytic cost model ranks. A template claims instruction families, not devices, so a GPU nobody has measured (a B300, a future part of a known family) compiles a kernel tailored to its own facts by default. Only a GPU outside every claimed family runs XLA.
+- **Vendored kernels and XLA are candidates, not a table.** FlashAttention 2/3, cuDNN, CUTLASS's grouped GEMM, the Triton references and XLA are routes the same chooser ranks by predicted time and memory, until the template beats each one on its rows and the route is deleted. Where XLA or a vendored kernel wins, the template's loss is a defect to find and fix (owner, 2026-10-20). Today's fixed preference order goes.
+- **Tuning beyond the model is opt-in.** Measured tuning (Tokamax's autotuner, `dew tune`) is the user's choice, cached per device kind, never silent at startup. A learned ranker may replace the analytic ordering only where it beats it on held-out models and GPUs (owner, 2026-10-21).
+- **Two measures only.** The accuracy gate (testing.md: float64 truth, check 1 at 1.5× the reference, check 2 per element) and performance, meaning compute time and peak memory, measured on clean exclusive runs at the chooser's default pick, in operator rows and in the model step. Nothing else decides whether code lands or a route is replaced: not code equality, not bitwise agreement between implementations.
+- **Fast by default, accurate one option away.** The default is the fastest form that passes the gate on ordinary inputs and stays finite at adversarial ones: attention's base-2 fold and its fast backward (FlashAttention's arithmetic, with the anchored D for dQ). The accurate forms hold 1.5× and no merging at adversarial inputs too. Deterministic mode is one flag away.
+- **Fusion is the payoff.** Hooks, and Pallas's fuser through `gemm/fused.py`, pull neighbouring operations into the kernel: norms, activations, gating, routing weights, biases, LoRA's low-rank product. That is what makes a template more than XLA or a fixed vendored kernel can be (owner, 2026-10-19, 10-22).
+- **Every accelerator, built in parallel.** Each template targets every architecture family Dew runs on, NVIDIA and TPU, built at once rather than one generation after another, with one scoreboard GPU per family (owner, 2026-10-21, 10-22). Kernel work lands in base/kernels on the hardware-free gates and reaches main through GPU-validated promotion; hardware never blocks writing it.
+- **Templates first, then the megakernel.** Tile functions keep explicit operands, outputs and resources, so Dew's own persistent runtime can later schedule them as instructions across a layer or a decode step.
 
 ## 1. The bar, with the comparison defined
 
@@ -16,7 +32,7 @@ There are three templates: attention, linear recurrence and GEMM. Each one meets
 4. **There is no duplication:** every hand kernel and external route it replaces is deleted once its scoreboard row is met. One owner exists per math (§9).
 5. **It meets the gate, both checks, as `tests/reference_error.py` states them ([Numerical accuracy](testing.md#numerical-accuracy)):** check 1 (parity against independent float64 truth) and check 2 (every element within its certified bound), for every form, hook and gradient on every target. Check 2 is required wherever the zero-element certificate covers the operations, and its coverage grows with the template rather than waiting. The reference is never changed to match an implementation ([testing](testing.md#numerical-accuracy)'s ban).
 
-**One consequence needs the owner** (§13, question 1). FlashAttention's backward computes D = rowsum(dO·O), which fails check 1 on peaked rows: 5–50× in fp32, up to 1,400× in bf16. Every D form that passes costs products FA skips; the anchored pass adds +1.03 ms on the H100, 79% of FA3's whole backward. The gate stands. The speed bar stands too, until the owner changes it: the attention backward must beat FA2/FA3 while passing both checks. The +1.03 ms is one measured form, not a lower bound on every accurate one. Candidate (b′), a masked-column P·V, could make an accurate D nearly free; it is the first measurement. The FA2/FA3 routes stay until the template beats them, and §13 question 1 asks the owner what happens if no accurate form can.
+**The attention backward's forms (the owner's answer to §13 question 1, 2026-10-23).** FlashAttention's backward computes D = rowsum(dO·O), which fails check 1 on peaked rows (5–50× in fp32, up to 1,400× in bf16), and its score cotangents without the anchor test fail it at a query of one key. So the default is the fast form: FlashAttention's arithmetic wherever it passes the gate (one 16-bit product for each score cotangent's product with the keys and queries, dK/dV at the refined D), with D about each query's anchor key from the forward's split sums for dQ, the score cotangents in the reference's order with the anchor test (§3; `ACCURATE`). The accurate form, one option away (`natural=True, accurate=True`), takes the cotangents' products to fp32's accuracy and dQ at the refined D, and holds check 1 on every stability family. Both pass check 1 on ordinary draws. The FA2/FA3 routes stay until the template's default beats them at the gate, in time and in memory (§9).
 
 ## 2. Boundaries
 
@@ -53,7 +69,7 @@ Coordinates and row vectors come from the toolkit, because Mosaic GPU iotas need
 - Functions:
   - `modify(s, coords, params)`: the score hooks plus the partial-block mask;
   - `peak(m, s) -> (m', alpha[, rescale?])`: FA4's lazy rescale is an option of `peak`;
-  - `weights(s, m') -> p`, in base 2 with log2(e) folded into the scale;
+  - `weights(s, m') -> p`, in base 2 with log2(e) folded into the scale by default, or natural (see "The exponent's forms" below); a logit at its row's maximum weighs 1 exactly, however a compiler contracts its scaling into the subtraction;
   - a weights hook between `weights` and `narrow`, for scales along P·V's contraction (a quantized V's per-token scales), which no output or product scale can apply;
   - `narrow(p) -> p16`, or `(p8, scale)` for FP8;
   - `total(l, alpha, p)`;
@@ -62,9 +78,30 @@ Coordinates and row vectors come from the toolkit, because Mosaic GPU iotas need
 - Q and K prologues are hooks: RoPE and QK-norm. MLA's q·W_uk is a declared product, not a hook.
 - **Partial state:** an unhooked `Partial(acc, m, l)`, wide enough for its role (fp32), with an empty identity and an ordered, associative `merge`. Split-KV decode, ring and context parallelism, chunked prefill and resumed state all produce and merge Partials. Sinks and the resumed state enter exactly once (today's `_first_slice_sink` rule). `finish(partial) -> (out, lse)` and the output hooks run once, after the final merge, because a pointwise output hook doesn't distribute over a merge. The Partial has its own residuals and VJP, separate from the finished output.
 - Every function stays valid on value-width slices, for MLA's Dv 512 and d256 split across consumer warpgroups.
+- **Headroom** (the accurate form's): the weighted values can pass fp32's largest only where the values are near it. A program walks as ever and writes which of its rows' sums overflowed; a second launch walks again only the programs with one, those rows alone shifting by a power of two (`room`), exact and leaving every ratio, at most 2^-64 of it on the weights and the rest on the tile's product. Its residual carries the shift to the backward's split sums. A call whose values can't overflow (fp16, no initial state) compiles no check.
+
+**The exponent's forms.** The default folds log2(e) into the scale (exp2 of `s·c − m`, which a compiler contracts to `fma(s, c, −m)`), FA2's and jax's mha arithmetic, and is the fast form; `natural=True` is the accurate form:
+- its logits stay raw products, each exponent their difference scaled after it is taken, `exp2((s − m)·c)` (`Forward.raw`): the largest logit's weight is 1 exactly and no multiply precedes the subtraction to contract into it. Under a score hook or an initial state its logits are scaled, the largest's weight held to 1 by a select;
+- the backward recomputes its weights in the forward's units from its raw maximum (`Recompute`);
+- its sums carry the headroom (above).
+
+The default carries two guards of its own, in the shared algebra (`walked`), so every mainloop composing it walks under them by construction: the headroom (above) wherever its values can overflow the sums (bf16 and fp32), and the fold's reach, a program one of whose rows' maximum passes `FOLD_REACH` (a folded logit of 2^16) walking again in the natural form, its logits scaled (`unfolded`), so the backward recomputes those rows as the fold's. Ordinary inputs take the plain walk alone.
+
+Both forms pass check 1 on drawn inputs. The stability suite (tests/test_attention_stability.py) holds the accurate form to check 1 on every family; the default, on the mainloops that compose the guards (the plain-JAX one, the Mosaic ones), to finiteness wherever the reference is finite and to its exact-zero claims on every family, its ties there documented in docs/design/testing.md (the owner's ruling, 2026-10-23); and the frozen Triton mainloop's default, which walks without the guards, to the same on all but the fold's divergences at extreme inputs, which are:
+- logits a ulp apart near 2^30, at scales below 1: the fold rounds each logit at log2(e) times its size, so two the reference keeps apart can tie, and a large cotangent then overflows the backward;
+- logits near fp32's largest: the contracted exponent of the largest logit is its product's rounding, up to an ulp of the logit, so its weight is 0 or infinite (with one key, its weight is 1 within an ulp of that exponent);
+- values near fp32's largest: the weighted values' sum overflows where the reference's normalized one does not (the headroom is the accurate form's), and so does a sink near fp32's largest;
+- in fp32, a row whose output one weight carries over values near fp32's largest (a weight of e^-12 to e^-26 on values of 2^120 to 2^126): the fold's extra rounding of that weight's logit is the row's error, 2.04 times the reference's; bf16 hides it in the weight's rounding to 16 bits;
+- a maximum that jumps far within a row (logits 50 above the keys before them): every earlier weight shares the one rounded exponent of the rescale, which doesn't average out over them as the reference's per-key exponents do, 9.8 times the reference's error over 32 keys; the accurate form compensates that exponent (TwoSum, and TwoProduct for the raw scale; `carried`), 0.28 times the reference's;
+- logits near 1e30 and beyond: the backward takes the base-2 maximum back to natural units, which moves the anchor's own weight away from 1.
+
+Measured on an H100 at qwen3-8b and gpt-oss-20b shapes, 4k and 32k tokens, the accurate form's raw arithmetic costs 1–5% of the forward and the headroom guard 2–6%; the training step's backward is within 2%. The fold needs `scale·log2(e) < 1` in fp32, so every folded logit is an ulp of fp32's largest below it, and an initial maximum (a sink) past fp32's largest in base 2 saturates exactly (`base2_maximum`).
 
 **Backward.**
 - Products: dP = dO·Vᵀ, dV += Pᵀ·dO, dK += dSᵀ·Q, dQ += dS·K, plus whatever D's form needs.
+- Two forms (`ACCURATE`; the owner's ruling, 2026-10-23). Both take D about each query's anchor key from the forward's split sums (`split_delta`), not FlashAttention's rowsum(dO·O), and give dK/dV, the hook parameters' gradients and the initial state's at that D refined once from the dQ scan's own sums (`refinement`).
+  - The default, the fast form: FlashAttention's arithmetic for dQ and dK, each bf16 score cotangent narrowed for one product, and dQ at the first D. fp16 keeps the accurate form's two scaled products in both forms: one fp16 product of cotangents that cancel against equal keys near fp16's largest leaves a gradient past fp16's largest where the reference's is finite. It holds check 1 on drawn inputs, and the stability suite holds it to finiteness, its ties at extreme inputs documented.
+  - The accurate form, one option away (`natural=True, accurate=True`: natural logits in the forward, whose residuals the backward reads, and the accurate products): the cotangents' products to fp32's accuracy (bf16's three bf16 products, fp16's two scaled ones) and dQ at the refined D, less the refinement times the weights' product with the keys (`keyed`). `accurate=True` alone takes the accurate products over the fold. It holds check 1 on drawn inputs and on every stability family. On an H100 at llama-d128, causal bf16, 2 × 4096, its pieces cost 2.24 ms of a 5.15 ms backward against the fast form's 2.91 (dQ's refinement 0.64, dQ's product 0.57, dK's 0.75).
 - Functions:
   - `delta`, in the form §8 chooses;
   - `grad_scores(p, dp, D) -> ds`, through the hook's VJP;
@@ -76,15 +113,16 @@ Coordinates and row vectors come from the toolkit, because Mosaic GPU iotas need
 The update is `S' = T·S·E + W`, with the transitions as values.
 
 **Functions.**
-- `decays(g, resets) -> pairs`: difference-first within a sub-chunk of 16, factored across sub-chunks. The factorization is chosen statically from the decay parameterization's declared range bound, because it is exact only within fp32's exponent range.
+- `decays(g, resets) -> pairs`: the log decay cumulated as a compensated pair (hi, lo), and each pair of positions' decay the exponential of its difference's two halves, each: an exponent rounded to one fp32 loses up to half its ulp, which put the decay's and the write gate's gradients under aligned keys 1.6 to 2.1 times the reference's distance from float64. A kernel takes a base-2 exponent as its fraction's exp2 times its integer's exact power of two (`recurrence_algebra.raised`, `decayed`). The decay from a chunk's start takes both halves too. No factoring across sub-chunks: the KDA port's factored intra backward put the decay gradient at its -5 floor 468 times the reference's.
 - `intra(q, k, beta, pairs, erase=(a, b)) -> (A_kk, A_qk)`, one pass for both the solve and the readout. Untied erase vectors (RWKV7, GDN-2, Comba) are `erase=(a, b)`; tied ones pass k twice. `pairs` carries the value side too, for two-sided decay (GLA value gates), and `carry` and `readout` apply E.
 - `factor(A_kk) -> L`: the triangular factorization (WY/UT). It is statically skipped for identity-inverse families (SSD, GLA, RetNet), which skip only the inverse, not their writes.
 - `normalize(o, groups)`: Mamba2's grouped output norm across heads. It is a cross-head reduction, so it is algebra, not a hook.
 - `apply(L, k, v, beta, g) -> (W, U)`: W = L·(kβ·exp(g)) and U = L·(vβ), as fla_gdn's `_w_u_kernel` computes them. Changing v changes U and not L.
-- `carry(S, W, U) -> (S', v_new)`.
-- `readout(q, S, A_qk, v_new) -> o`.
+- `carry(S, W, U) -> (S', v_new)`, the chunk's last real token's write by the token update itself (the WY write alone put the final memory under aligned keys 1.54 to 1.57 times the reference's distance).
+- `readout(q, S, A_qk, v_new) -> o`, whose gradient in the memory and the corrected values sums the chunk's tokens from its last, the smallest terms first (`remembered`): from the first, the initial memory's gradient sat 1.8 to 1.9 times the reference's.
 - `compose`: a chunk's transition as the factored triple (T, E, W), composed associatively by (T₂T₁, E₁E₂, T₂W₁E₂ + W₂). It serves sequence and context parallelism and parallel state passing at small B·H. Its cost comes from its actual products: T₂T₁, E₁E₂, T₂W₁ and its product with E₂, the write addition, and their bytes. Where transitions or writes are diagonal or low-rank, the factors simplify. Compose is used only where that cost measures below the sequential carry.
-- Each function's backward, with its rounding and order stated: the decay's summed-back gradient, and the GVA sum as an in-program loop.
+- Each function's backward, with its rounding and order stated: the delta rule's is the recurrence's own adjoint a token at a time within every chunk at once (memories checkpointed every 16 tokens, chunks in groups of 16), where differentiating the WY products cancelled independently rounded paths under aligned keys (the decay's gradient 1.9 to 2.9 times the reference's, now 0.99 to 1.07); the GVA sum as an in-program loop.
+- The chunk length: at most twice the keys' width (`held_chunk`), a measured policy (64-token chunks of 16-wide keys lost 1.7 to 1.8 times over a long sequence).
 
 **Transition values:**
 - T in two parts, in a stated order: the diagonal decay kind (none, scalar, per-key, per-value, two-sided, separable) times the erase kind (identity plus low rank, or additive DPLR). It has independent erase, write and read vectors.
@@ -106,7 +144,7 @@ Auxiliary scans (a normalizer z, LSE pre-passes) are an algebra extension point,
 - scale granularity;
 - cast sites.
 
-Exact-sum promotion and FP8 block scales (DeepSeek-V3's 1×128 and 128×128; sm100's MX scales) are one mechanism, promoting the partial into the fp32 accumulator every block. Promotion can't recover mantissa bits a TF32 multiply discarded. So an fp32 product above default precision is computed with exactly the algorithm it declares, or routed to XLA until the template computes it, as `_kernels_take` does today. `F32_F32_F32` means fp32 multiplies. `TF32_TF32_F32_X3` is a distinct, cheaper algorithm, used only where it is declared and certified on its own error. It is never a substitute. The declaration is preserved through every mainloop and VJP.
+Exact-sum promotion and FP8 block scales (DeepSeek-V3's 1×128 and 128×128; sm100's MX scales) are one mechanism, promoting the partial into the fp32 accumulator every block. Promotion can't recover mantissa bits a TF32 multiply discarded. So an fp32 product above default precision is computed with exactly the algorithm it declares, or routed to XLA until the template computes it, as the grouped selector's 'product' requirement does today (`grouped_matmul.GROUPED`). `F32_F32_F32` means fp32 multiplies. `TF32_TF32_F32_X3` is a distinct, cheaper algorithm, used only where it is declared and certified on its own error. It is never a substitute. The declaration is preserved through every mainloop and VJP.
 
 **Functions.**
 - `prologue(lhs_tile, side)` and `epilogue(acc..., side) -> outputs`. Several accumulators are allowed, for the paired gate|up.
@@ -185,6 +223,25 @@ Rule 0 applies: use Splash's MaskInfo, with its empty/partial/full classes and p
 - **Machine primitives, only where JAX has none:** layout-aware coordinates and row vectors; the promoted, scaled `mma`.
 - **The cost features (§7).**
 
+**One mainloop per overlap structure, one bundle per family (the owner's ruling, 2026-10-23).** CUTLASS and FA3 share the pipeline, scheduler and warp roles and keep a collective mainloop per kind and architecture, because the overlap structures differ. Here everything per architecture that is not an overlap structure is a `Family` bundle in the toolkit, a mainloop holds no math and no pipeline machinery, only the order of the bundle's steps around the algebra, and a template has one mainloop for every family whose overlap structure is the same, a separate thin one only where it is not.
+
+*The bundle* (`templates/mosaic.py` declares `Family`; `mosaic_sm80.py`, `mosaic_sm90.py`, `mosaic_sm100.py` and `mosaic_tpu.py` each give one) holds only what the hardware decides:
+- **Facts:** the MMA's row unit (sm80 16, sm90 64, sm100 128, TPU 8 by 128 lanes), the shared-memory (VMEM) budget, the register budget per role, the MMAs a role may have in flight, and the stages and consumers its loader and roles allow.
+- **Roles** (`roles(consumers, consumer, producer)`): sm90 a producer warpgroup and one or two consumers at `setmaxnreg` budgets; sm100 an issuing warpgroup (a load warp and an MMA warp) beside the compute warpgroups; sm80 and TPU one role, its loads its pipeline's.
+- **The walk** (`walk(streams, segments, step, carry, accumulators)`): streams each operand's blocks through the family's loader (sm90 and sm100 TMA into mbarrier rings, multicast across a cluster; sm80 `emit_pipeline`'s cp.async stages; TPU `emit_pipeline`'s DMA), calls the mainloop's `step(index, slots, carry, accumulators)` over each `(lo, hi)` segment (a runtime count; the counters run on across a persistent loop's tiles), releases a step's slots once its MMAs have read them, drains, and returns the carry and the accumulators' values. Every ring count, phase and wait is the bundle's; a mainloop never touches a barrier.
+- **The accumulator's home** (`accumulators(shapes)` within the walk): a wgmma accumulator ref on sm90, a register carry on sm80, tensor memory on sm100, VMEM scratch on TPU.
+- **The issuer** (`issue(acc, lhs, rhs, *, transpose_lhs, transpose_rhs)`): mma.sync, wgmma, tcgen05, the MXU's dot, in place into a home; `product(lhs, rhs, shape)` the same into a fresh one, its value returned (attention's S and dP).
+- **Operand movement:** `relayout(value, dtype)`, an accumulator's value as the next product's left operand in registers where the family can (wgmma's register A; sm80 with the relayout patch), else None; `stage(value, buffer)`, registers to operand memory otherwise (shared memory, or tensor memory for sm100's P).
+- **Vectors and stores:** the accumulator's layout and a row's and a column's in it (`zeros`, `iota`, row and column broadcasts, masks), whole loads (`loaded`) and stores (`stored`: the TMA rung ladder on sm90 and sm100, register rungs on sm80, a BlockSpec out on TPU), a ragged tile's predicated load and row-count store.
+
+*The mainloops by overlap structure.*
+- **Attention: sm80, sm90 and TPU share one** (`attention_mosaic.py`). Their compute role issues its own products, holds the output accumulator where the algebra's step updates it (registers, VMEM), and takes P from registers or a staged tile: a step is `product(Q, Kᵀ)`, the algebra, then `issue(O, P, V)`; whether loads come from a producer warpgroup's TMA ring or a cp.async pipeline is the walk's. **sm100 has its own thin one** (`attention_sm100.py`): FA4's structure differs in kind, not in instruction. One thread of an MMA warp issues every tcgen05 product into tensor memory a step ahead of the softmax, which never issues one; the output accumulator lives in tensor memory, where the algebra's step cannot rescale it, so a correction role rescales it between products. Its compute role reads S and writes P through tensor memory and signals the MMA warp. It shares the algebra, the bundle and the program grid with the other.
+- **GEMM: one for every family** (`gemm/mosaic_gpu.py`): stream A and B, issue into the accumulator's home, finish into the epilogue; sm100's MMA-warp issue is the bundle's roles and issuer, its tensor-memory accumulator the bundle's home, the epilogue reading it back through the bundle.
+- **Recurrence: one** (`recurrence/mainloop.py`): its chunk's product DAG through `issue`, the carried state in the bundle's home.
+- The duplicate gates run on every mainloop and bundle: no mainloop repeats toolkit code.
+
+*Gotchas the bundles own* (measured): a ring's load is waited for once, a second wait taking the barrier's next phase (sm90); a walk of two loops into one wgmma accumulator, the first empty, faults on an H100 under jax 0.11.2, so a skeleton's masked and whole tiles are one walk chosen a tile at a time; an sm80 zero store needs an MMA-laid zero, and sub-8-row register loads have no layout; Mosaic's warpgroup lowering takes no `is_finite` (the algebra's `finite` is `|x| < inf`).
+
 **Mainloop, per template per generation.** It is built from the toolkit and the algebra, and its parameters are configuration:
 - consumers;
 - cooperative (split M, so register-A prologues need no duplication) or ping-pong (the epilogue overlaps the next tile);
@@ -194,20 +251,20 @@ Rule 0 applies: use Splash's MaskInfo, with its empty/partial/full classes and p
 - the epilogue overlap;
 - for recurrence, its launch DAG: a fused or split solve (FlashQLA's fused prologue and fused scan against fla's four launches), and sequential or parallel state passing, chosen by B·H. Its sm90 shape includes a compute-producer warpgroup role, like FA4's correction warpgroup.
 
-**Every accelerator.** The templates target every accelerator Dew runs on, on par with the best framework on each. Each mainloop claims the generations below. A claim holds only with a measured scoreboard row on one GPU of that generation (booked through the GPU lane), in one session against the best kernel there. Until a generation has its measured row, its calls stay on today's routes (the interim selector, §7) or XLA, never on an unmeasured mainloop; a generation the template never claims runs XLA by a fixed capability rule.
+**Every accelerator.** The templates target every accelerator Dew runs on, on par with the best framework on each. A mainloop claims an instruction family, never a list of devices: on any GPU of a family it has a mainloop for, seen or unseen (a B300, sm103, is in sm100's tcgen05 family), the template compiles a kernel tailored to that device's facts and the cost model, and runs it by default. The family is the compute capability's (`generation.family`), and the facts are the device's own attributes, read free at runtime, with its family's (`generation.architecture`: tensor rates, warpgroup MMA, tensor memory, and model values of what only a measurement states, which the opt-in calibration replaces per device kind). Correctness on a new member comes from the hardware-free gates for that exact target: its deviceless compile and resource checks, and the interpret checks. The scoreboard GPUs validate the family and the cost model, one measured row per family. Only a GPU outside every claimed family runs XLA. While the interim selector stands (§7), an external route keeps a family's calls only where its measured row beats the template there, by the owner's deletion rule.
 
-| Mainloop | Backend | Claims | Instructions it relies on | One GPU per claim |
+| Mainloop | Backend | Claims (family) | Instructions it relies on | Scoreboard GPU of the family |
 |---|---|---|---|---|
-| Triton | Pallas Triton | sm80, sm86, sm89, sm120 | mma.sync, cp.async, ldmatrix | A100; A10 or RTX 3090; L4 or RTX 4090; RTX 5090 or RTX PRO 6000 |
-| Hopper | Mosaic GPU | sm90 | wgmma, TMA, warp specialization, clusters | H100 |
-| Blackwell | Mosaic GPU | sm100 | tcgen05, TMEM, 2-CTA | B200 |
+| Triton | Pallas Triton | mma.sync (sm80, sm86, sm89, sm120 and every 8.x/12.x) | mma.sync, cp.async, ldmatrix | A100; A10 or RTX 3090; L4 or RTX 4090; RTX 5090 or RTX PRO 6000 |
+| Hopper | Mosaic GPU | wgmma (9.0) | wgmma, TMA, warp specialization, clusters | H100 |
+| Blackwell | Mosaic GPU | tcgen05 (10.x/11.x: B200, B300, ...) | tcgen05, TMEM, 2-CTA | B200 |
 | TPU | Mosaic TPU | v5e, v6e and later | MXU, DMA pipeline | one chip per generation |
 
 Mosaic GPU takes each of the Triton row's claims when its scoreboard row there meets Triton's (the decision below); until then that row holds them.
 
-- **sm120 (consumer Blackwell: RTX 50, RTX PRO 6000) has no tcgen05 and no TMEM.** Its tensor cores take sm80's mma.sync forms (with FP8/FP4 additions), so it runs the mma.sync mainloop (Triton's until Mosaic's measures at or under it there), not the tcgen05 one.
-- **sm86/sm89/sm120 differ from sm80 in shared memory per SM** (99–100 KB a block against the A100's 163 KB) and in SM count. So their tile spaces and picks are their own TARGETS rows (`generation.shared_budget`), and their scoreboard rows are measured, not inferred from the A100.
-- **sm75 (T4) and older** have no bf16 tensor cores, and Pallas Triton doesn't compile there (`generation.py`, the sm75 row of TARGETS). They run XLA.
+- **sm120 (consumer Blackwell: RTX 50, RTX PRO 6000) has no tcgen05 and no TMEM.** Its tensor cores take sm80's mma.sync forms (with FP8/FP4 additions), so it is in the mma.sync family and runs that family's mainloop (Triton's until Mosaic's measures at or under it there), not the tcgen05 one.
+- **sm86/sm89/sm120 differ from sm80 in shared memory per SM** (99–100 KB a block against the A100's 163 KB) and in SM count. So their tile spaces and picks follow the device's own shared memory and SMs (`generation.shared_budget`, `runtime_facts`), and their family's scoreboard rows are measured, not inferred from the A100.
+- **sm75 (T4) and older** are outside every claimed family: no bf16 tensor cores, and Pallas Triton doesn't compile there (`generation.triton_runs`). They run XLA.
 
 Each mainloop's shape comes from the fastest known kernel on its hardware, built rung by rung against it:
 
@@ -251,20 +308,24 @@ Mosaic lowers and compiles in 0.9–2.9 s against Pallas Triton's 0.4–0.8 s. T
 A second copy of the algebra written in triton.language is not an acceptable answer.
 
 **Boundary tests.**
-1. **Bitwise across mainloops** (a semantics-drift guard): Mosaic GPU interpret mode and Triton interpret mode, at the same tiles, the same key order and the same algebra options. Where product shapes must differ, it falls back to check 1.
-2. **Check 1 per mainloop on GPU,** plus a same-schedule reproducibility test.
-3. **Zero cost, per scoreboard row:** with no hooks, at a given configuration, the template runs within noise of its named comparator:
+Two measures decide whether a mainloop lands and whether it replaces a route: the accuracy gate (check 1 against float64, and the stability suite), and performance, compute time and peak memory, on the operator rows and the model step. No code-equality or bitwise agreement between implementations is a gate; a bitwise comparison of two mainloops in interpret mode may stay as a cheap debugging aid, never blocking.
+
+1. **Check 1 per mainloop**, in interpret mode on a CPU and compiled on a GPU, and the stability suite.
+2. **A same-schedule reproducibility test**: one mainloop, one schedule, the same bits run to run (determinism, not a comparison of implementations).
+3. **Zero cost, per scoreboard row,** in compute time and peak memory: with no hooks, at a given configuration, the template runs within noise of its named comparator:
    - sm80: jax mha, then FA2;
    - sm90: Tokamax Mosaic, then FA3.
+
+   A variant's scoreboard row also names the best kernel for that variant: FlagAttention's Triton kernels for SageAttention, piecewise attention, MiniMax M3's sparse attention, parallel NSA, split-KV and paged decode (they run on NVIDIA, AMD, Intel and several other vendors' accelerators); SageAttention's own kernels; FlashMLA for MLA and DSA.
 
    Today's A100 forward meets this at the best configuration (template 1.730 ms vs jax 1.709 ms, causal). It misses at some configurations: V loaded early stays live through the softmax, and the fix is being measured.
 
 ## 7. Choice: the config chooser inside each template
 
-**No kernel tables and, in the end, no selector.** The end state is one implementation per operation, the template. What stays is the config chooser inside each template: legality, then a model over device facts that picks tiles and formulations (§3), like any kernel's heuristics, with no per-GPU entries. Measured tuning is opt-in, cached per device kind, and the user's choice. Scoreboards are evidence, never routing data: no runtime table of measured routes is built.
+**No kernel tables and, in the end, no selector.** The end state is one implementation per operation, the template. What stays is the config chooser inside each template: legality, then a model over device facts that picks tiles and formulations (§3), like any kernel's heuristics, with no per-GPU entries. Measured tuning is opt-in, cached per device kind, and the user's choice. Scoreboards are evidence and calibrate the model's facts (a vendored kernel's measured rows among them, below), never routing data: no runtime table of measured routes is built.
 
-- **Interim:** today's typed selector (`selection`, `generation.route`) keeps serving the hand-kernel and external routes until each is deleted (§9). It isn't extended, and it goes with the last route.
-- **A generation the template doesn't claim** (§6) runs XLA by a fixed capability rule, not a measured choice. Where XLA beats the template on a claimed generation, that's a template defect to fix (§6, "debug where XLA wins"), not a route.
+- **Interim:** today's typed selector (`selection`, `generation.route`) keeps serving the hand-kernel and external routes until each moves to the ranking below or is deleted (§9); its fixed preference order goes with the last.
+- **A GPU outside every family the template claims** (§6) runs XLA by a fixed capability rule, not a measured choice. Where XLA beats the template on a claimed family's GPU, that's a template defect to fix (§6, "debug where XLA wins"), not a route.
 - **Legality prunes; predictions rank.** Only hard constraints remove a configuration: it fits shared memory, registers and TMEM, and respects layout and instruction rules. Residency, predicted spills and roofline estimates are predictions, so they rank the legal space and never prune it. Today's analytic model ties all 36 attention configurations and ties the dense pick with the best tile; pruning on it would keep an arbitrary subset.
 - **Rank with complete analytic features**, one schema for all templates:
   - work per pipe and bytes per memory level;
@@ -285,7 +346,7 @@ A second copy of the algebra written in triton.language is not an acceptable ans
   - outside its training range, the analytic estimate decides alone.
 
   Budget: about 2,000 configurations timed per GPU-hour, shape diversity before configuration count, and active collection where the model is unsure.
-- **External kernels are not configurations.** The template against cuBLAS, FA3 or CUTLASS is scoreboard evidence for deleting a route, never a routing choice. Each template's chooser replaces `templates/base.choose` and the per-template cost formulas.
+- **Vendored kernels are candidates until the template beats them** (owner, 2026-10-23). A vendored kernel (CUTLASS, FlashAttention, cuDNN, the Triton references) declares its legality like any launch and is ranked by the same model: its own cost terms where the model has them, else the model's estimate at its geometry scaled by its measured scoreboard rows, a calibrated fact per generation, so it is a candidate only where its rows were measured. The template's launch replaces it, and the vendored kernel is deleted, where the template matches it on the gate. CUTLASS's grouped GEMMs are the first (`grouped_matmul.CutlassGmm`, `CutlassTgmm`); the fixed preference order of the typed selector's other ops moves to this ranking after them. The grouped GEMM's launches are the first ranked so: kernels of one `selection.Op` whose costs are their estimates (`grouped_matmul.GROUPED`, `templates/base.choose` deleted); each template's chooser replaces the per-template cost formulas.
 
 ## 8. Determinism, D and the backward
 
@@ -300,7 +361,7 @@ A second copy of the algebra written in triton.language is not an acceptable ans
 
 ## 9. One owner per math, and the deletions
 
-- **The portable CPU and TPU path is the algebra, run by a plain-JAX reference mainloop,** not a second implementation. Each template exposes it as one public `xla_mainloop(config)`, bitwise with the Triton and Mosaic interpret modes at the same configuration (§6, test 1). Check 2's certificate interprets this mainloop and witnesses each kernel's native output against it, so the algebra is certified once. Tests hold every template to independent oracles:
+- **The portable CPU and TPU path is the algebra, run by a plain-JAX reference mainloop,** not a second implementation. Each template exposes it as one public `xla_mainloop(config)`, held to check 1 as every mainloop is (§6). Check 2's certificate interprets this mainloop and witnesses each kernel's native output against it, so the algebra is certified once. Tests hold every template to independent oracles:
   - naive softmax attention;
   - the token-by-token recurrence update;
   - `jnp.dot` at float64;
@@ -314,7 +375,7 @@ A second copy of the algebra written in triton.language is not an acceptable ans
   - `fla_gdn.py`, `fla_kda.py`, `mamba_ssd.py`, `ssd.py`, and the portable chunk math as a separate algebra;
   - `ragged_dot.py`, `triton_dense.py`, `norm_swiglu.py` (once its callers outside GEMM move), and the per-template cost formulas;
   - `KeySpans`, when MaskInfo takes over;
-  - each external route when its row is met, and with the last of them the typed selector itself: one implementation per operation remains, the template, with XLA by a fixed capability rule on a generation it doesn't claim (§7).
+  - each external route when its row is met, and with the last of them the typed selector itself: one implementation per operation remains, the template, with XLA by a fixed capability rule on a GPU outside every family it claims (§7).
 
 ## 10. Sharding, remat and compile
 
@@ -324,17 +385,17 @@ A second copy of the algebra written in triton.language is not an acceptable ans
 
 ## 11. How it gets built
 
-Built in parallel. Each piece lands when it meets its gates: bitwise, zero cost, check 1, and the scoreboard.
+Built in parallel. Each piece lands when it meets its gates: the accuracy gate (check 1 and the stability suite), and its scoreboard rows' compute time and peak memory against the named comparators.
 
 **Risks retired first, as measurements:**
 1. sm80 attention backward against FA2. Today no Pallas Triton backward is within 2× of FA2 (10.0 vs 4.3 ms). Profile jax's Pallas backward against FA2 at the same tiles.
 2. Traced hooks on Mosaic GPU, forward and backward (§4).
 3. The D candidates, (a), (b) and (b′), on A100 and H100.
-4. The bitwise interpret harness, on today's two forward forms.
+4. The interpret-mode check 1 harness for every mainloop, on today's two forward forms.
 
 **Then the rungs:**
-- **Toolkit and attention:** sm90 attention reaching Tokamax Mosaic, then FA3; the decode mainloop; the fused ticket backward.
-- **Recurrence:** the one chunk algebra absorbing the four ports, then FlashQLA's fused launch DAG and `compose`.
+- **Toolkit and attention:** sm90 attention reaching Tokamax Mosaic, then FA3; the decode mainloop; the fused ticket backward. The sm90 mainloop (`attention_mosaic.py`) holds the forward (full and causal calls, 16-bit operands, the fold and fp16's natural form, no hooks yet) and the backward in both forms (bf16, from the Triton training forward's split sums), both on par by check 1, interpreted and on an H100; on an H100 at llama-d128, causal bf16, 2 × 4096, its backward takes 2.63 ms in the fast form and 4.81 in the accurate one, against the Triton mainloop's 2.96 and 5.06 in the same session. It runs on no route yet: its forward's guards, hooks, the remaining call forms and its training forward come next.
+- **Recurrence:** one Mosaic GPU mainloop skeleton over the chunk algebra for every variant (GDN, KDA, the delta rule, gated writes, SSD), on the mma.sync and wgmma Family bundles, keeping the ports' optimizations (the fused solve, the launch DAG, chunk sizing); then FlashQLA's fused launch DAG and `compose`. The four ports (`fla_gdn`, `fla_kda`, `mamba_ssd`, the TPU `ssd`) are frozen references until each cell matches or beats them.
 - **GEMM and the choice layer:** the M-split, register-A cooperative mainloop and the reduce pass before norm and SwiGLU fusion, then split-K for dW, then CUTLASS's rungs; the analytic features, the logging and the ranker.
 
 GPU time is reserved daily on an H100 and an A100 for the rungs.
@@ -370,9 +431,18 @@ A row that needs a signature change is designed now, not retrofitted: rank-2 W, 
 
 Each entry also names the deletion it enables.
 
-## 13. Owner decisions (2026-10-21)
+## 13. Owner decisions
 
-Questions 1 and 2 as recommended. Question 3: support all of them (§12). Question 4: not deterministic by default; the fastest passing form is the default, and deterministic mode is one flag away (§8).
+Questions 1 and 2 as recommended. Question 3: support all of them (§12). Question 4: not deterministic by default; the fastest passing form is the default, and deterministic mode is one flag away (§8). Question 1, answered again (2026-10-23): the attention backward's default is the fast form, FlashAttention's arithmetic where it passes the gate with the anchored D for dQ, and the accurate form is one option away (§1).
+
+Later decisions (2026-10-22 and 2026-10-23), which §0 states as the design; where a section below still says otherwise, §0 wins until the section is updated:
+- Attention's default is the fast form: the base-2 fold, and FlashAttention's backward arithmetic with the anchored D for dQ. The accurate form is one option away and holds 1.5× and no merging at adversarial inputs; the default stays finite there.
+- Mosaic GPU on every NVIDIA family; the Triton kernels stay as unmaintained references until replaced.
+- Per-architecture Family bundles in the shared toolkit and thin mainloops, not a full mainloop per template per generation (§6).
+- Templates claim instruction families; unseen GPUs of a claimed family get tailored kernels by default (§6, §7).
+- Vendored kernels, CUTLASS's grouped GEMM included, are candidates the chooser ranks by the cost model (§7, superseding "external kernels are not configurations").
+- The only measures are the accuracy gate and performance (time and peak memory); no code-equality or bitwise cross-implementation gate (§1, §9).
+- The megakernel is Dew's own persistent runtime, after the templates; no XLA patches and no Dew-built jaxlib.
 
 ## Appendix A. Coverage: attention
 
@@ -399,7 +469,7 @@ Questions 1 and 2 as recommended. Question 3: support all of them (§12). Questi
 | 5 | packed documents | structure + runtime plan | spans from the document starts; ids compared in `modify` on partial blocks only | The plan is built on device per tile config (§5). `max_segments` stops being a refusal: FLASH_SUPPORTS' `document_bound`/`packed_documents` go. |
 | 6 | cross documents (another sequence's ids, aligned) | structure | spans + ids, query permutation (`query_order`) for the transpose | Intervals aren't monotone in the query (§5's case). |
 | 7 | key lengths and starts (varlen, ragged) | structure | spans per batch row: `[starts[b], lengths[b])` | |
-| 8 | compositions of 2–7 | structure | intersection of spans | `KeySpans` composes today. |
+| 8 | compositions of 2–7 | structure | intersection of spans | `KeySpans` composes today. Block groups (images and blocks a causal query reads whole, `block_groups`) widen a causal query's end to its block's end within its document: a block is a contiguous run holding the query's key, so the keys stay one interval. |
 | 9 | arbitrary dense mask (`AttentionCase.mask`) | hook | TILE-kind bool param in `modify`, every block partial | Expressible but nothing is skipped. Kept for correctness, not speed: today only xla/reference take it. |
 | 10 | speculative tree masks | structure + hook | spans for the prefix, plus a TILE-kind mask param over the tree's own tail block | ⚑ "spans ∪ a tail TILE mask" isn't a stated composition. The tail is ≤ 64 keys, so one partial block. Name the composition in §5. |
 
@@ -413,6 +483,7 @@ Questions 1 and 2 as recommended. Question 3: support all of them (§12). Questi
 | 14 | temperature | score hook | HEAD or QUERY param | |
 | 15 | any pointwise `score_mod` | score hook | traced callable + typed params | Identity is its traced-program fingerprint (§4). |
 | 16 | custom_vjp hooks | hook backward | `jax.vjp` of the callable in the backward kernel | Honours the hook's own custom_vjp. |
+| 16a | Piecewise attention: two Q/K pairs selected by token distance, `s = q1·k1` where `|i − j| ≤ w`, else `q2·k2`, one V | structure + two declared score products | a tile wholly within distance w takes only the first product, one wholly beyond it only the second (the window form's full and partial classes, #3), and a tile the boundary cuts takes both and selects by coordinates in `modify`; the backward gives dq1, dk1 from the near entries' cotangents and dq2, dk2 from the far ones' | ⚑ The design declares one score product a step; this needs a step's score products declared as a list with their combine: a sum (absorbed MLA, #25) or a selection by coordinates (here). Comparator: FlagAttention's `piecewise_attention`, forward and backward. |
 
 #### Softmax state
 
@@ -459,6 +530,7 @@ Questions 1 and 2 as recommended. Question 3: support all of them (§12). Questi
 | 35 | DSA top-k (2048 keys a query, a query's own selection) | structure + load contract | indexed at (query, key) granularity: a query tile is one query × its heads (MLA's 128 heads over one latent), and its keys are gathered by index (FlashMLA sparse) | ⚑ The design's indexed form is block lists per query block. DSA selects tokens per query, so it needs a token-granular gathered K/V tile: TMA gather4 on sm100, cp.async on sm90. |
 | 36 | NSA (compressed + selected + sliding, gated) | three calls + pointwise | compressed: plain attention on the compressed K/V; selected: indexed blocks per (query, group); sliding: spans. The gate combine runs in XLA. | Selection is per query, like #35. A one-kernel fused combine is a proposed non-goal. |
 | 37 | MoBA | structure | indexed blocks per query plus causal in its own block | Per-query granularity, like #35. |
+| 37a | MiniMax M3 sparse attention (128-token page scoring, top-k pages, sparse prefill and decode) | structure + a scoring pass | the scoring pass is a product (each query block or decode query against a summary per 128-token page) and a top-k, run as the GEMM template plus XLA's `top_k`; attention then runs the indexed form over the selected pages, block-granular at page size 128, and over a paged cache in decode (#27, #30) | Page-granular, so the design's indexed block lists hold it directly, unlike DSA's token granularity (#35). Comparator: FlagAttention's `minimax_m3_*`, inference only. |
 
 #### Backward
 
@@ -478,6 +550,7 @@ Questions 1 and 2 as recommended. Question 3: support all of them (§12). Questi
 |---|---|---|---|---|
 | 45 | FA3 e4m3 Q/K/V with block scales; P quantized | product declaration + algebra | scales in `mma`; `narrow(p)` to e4m3 | ⚑ `narrow(p)` returns no scale, but P quantization needs `narrow(p) -> (p8, scale)`, which the P·V declaration consumes. V transposed for an fp8 wgmma is a mainloop matter. |
 | 46 | fp8 KV cache | hooks | as #28 | |
+| 46a | SageAttention: per-block INT8 Q and K with fp32 block scales, K smoothed by its mean over tokens; P·V in 16-bit or FP8 | product declaration + a K pre-pass | the Q·Kᵀ product declared INT8 with per-block scales (`Product.scales`, the mechanism FP8 block scales use), the scales applied to a tile's products before `modify`; smoothing K by its token mean shifts each query's logits by one constant, which the softmax drops, so it is a pre-pass that changes no output | ⚑ `Product` names FP8 and 16-bit operands; INT8 (mma.sync s8 on sm80+, wgmma s8 on sm90) must join it. The token mean is a cross-tile reduction, so it is an algebra pre-pass, not a hook. Comparators: FlagAttention's `sage_attention` (forward only) and SageAttention's own kernels. |
 
 #### Training features
 
@@ -494,6 +567,29 @@ Questions 1 and 2 as recommended. Question 3: support all of them (§12). Questi
 | 50 | check 1 and check 2 for every form and hook, bf16 included | gate |
 | 51 | bitwise reproducible runs | the same-schedule reproducibility test |
 
+#### Survey additions (FlagAttention, fla and tokamax)
+
+Variants these libraries ship that rows 1–51 did not name, each against the design's signatures. Sources: FlagAttention's `conf/operators.yaml`, fla's `fla/layers` and `fla/ops`, and tokamax's `docs/supported_ops.md`.
+
+| # | Variant | Maps to | Signature | Notes |
+|---|---|---|---|---|
+| 52 | Forgetting Transformer (FoX): a per-head forget gate `f = sigmoid(W·x)`, logits `+ G_i − G_j` with `G = cumsum(log f)` | score hook | QUERY param `G_q`, KEY param `G_k` (the prefix sum taken in XLA before the call), `modify`: `s + G_q − G_k` | The prefix sum is a cross-token reduction, so it stays outside the kernel; the backward's QUERY and KEY gradients (rows 13, 39) are the prefix sum's cotangents, which XLA transposes. Comparators: fla `forgetting_attn`, FlagAttention `forgetting_attention` (its ACP pruning threshold is a block-skip on `G`, a structure question). arXiv 2503.02130. |
+| 53 | Differential attention: `softmax(Q1K1ᵀ) − λ·softmax(Q2K2ᵀ)`, `λ` a head's scalar | algebra: two softmax states | two score products a step, each its own `Partial` (its own maximum and denominator) over one V tile load; `finish` combines `o1 − λ·o2`, `λ` a HEAD param; the backward runs each state's `grad_scores` with its own D and sums their dV | ⚑ The design's step holds one softmax state. Two independent states over one V stream need the state declared as a list; the cheaper route is two calls composed in XLA (each the template), at twice V's loads. Not in the three libraries; from arXiv 2410.05258. |
+| 54 | Parallax: a second, unscaled query `r`, `p2 = p1 ∘ (r·kᵀ)`, `out = O1/d1·(1 + d2/d1) − O2/d1` | algebra: one softmax state, two accumulators | two score products a step (`q·kᵀ` for the weights, `r·kᵀ` for the second sums), one maximum and denominator, two weighted-value accumulators and two denominators, combined in `finish` | ⚑ As row 16a, a step's score products declared as a list; here the second feeds an accumulator, not the logits. Comparators: fla `parallax`, FlagAttention `parallel_parallax` and its decode forms. arXiv 2605.29157. |
+| 55 | Wall attention: a learned per-channel decay inside the product, `s_ij = scale·Σ_n q_in·k_jn·2^(P_in − P_jn)`, `P = cumsum(g)`, `g ≤ 0` | Q and K prologues | `q̃ = q·2^(P_i − P_ref)`, `k̃ = k·2^(P_ref − P_j)` with `P_ref` a reference per (query block, key block) tile, so neither factor leaves fp32's range; then a plain product | ⚑ A per-tile reference makes the prologue a function of the tile pair, not of one operand: a product declaration with per-tile row and column scales (the mechanism of row 46a's block scales, per channel). Optional sink (row 17) and a head's output gate (row 21). Comparators: fla `wall_attn`, FlagAttention `parallel_wall_attn`. |
+| 56 | PaTH attention: positions as cumulative Householder products, `s_ij = q_iᵀ·(Π_{t=j+1..i} (I − β_t w_t w_tᵀ))·k_j` | structure: a carried key transform | the walk goes from the diagonal backward over key blocks, carrying the product of the Householder updates between the key block and the query block and applying it to each key tile before its score product; within the diagonal tile, the triangular part by the UT transform | ⚑ Not a hook: the transform depends on the (query, key) pair. It needs a key-tile prologue whose operator the walk carries (a low-rank update per block, the recurrence template's transition, §App. B). Optional FoX gate (row 52). Comparator: fla `path_attn`. arXiv 2505.16381. |
+| 57 | Stick-breaking attention: no softmax, `β_ij = sigmoid(s_ij)`, `A_ij = β_ij·Π_{j<k≤i} (1 − β_ik)`, `o = Σ A·v` | algebra: a state other than softmax's | the walk goes from the diagonal backward, its state the row's log remainder `Σ log(1 − β)` and the weighted values; `merge` of a nearer slice before a farther one scales the farther by the nearer's remainder (ordered, associative) | ⚑ A second state type beside `Partial`, and a reverse walk order. Comparator: fla `stickbreaking_attn` (fp16/bf16, no decode). arXiv 2410.17980. |
+| 58 | Relative-position logits by offset (FlagAttention's Inkling FA4 `rel_logits [q, H, extent]`) | score hook, a new parameter kind | a RELATIVE param kind `[H, extent]` (or per query) read at `k_pos − q_pos` in `modify`; its backward a scatter-add over offsets | ⚑ `Kind` has no offset-indexed form; TILE would materialize `[Q, K]`. Paged varlen, causal or window, split-KV: rows 3, 27, 29, 31. |
+| 59 | MiniMax Sparse Attention (MSA): a learned token indexer max-pooled to blocks, top-k blocks per GQA group plus a forced local block | structure + a scoring pass | as row 37a: the indexer pass (the GEMM template and XLA's `top_k`), then the indexed form over the selected blocks per group | Group-granular selection, so the design's block lists hold it (unlike DSA's tokens, row 35). Source: fla `ops/dsa` README. arXiv 2606.13392. |
+| 60 | InfLLM-V2: keys pooled by two sliding windows into block scores, top-64 blocks per query with the first and local blocks forced; dense below 8192 keys | structure + a scoring pass | as row 59, the pooling and scoring in XLA, then the indexed form; the dense path is the plain call | Selection takes no gradient. Comparator: FlagAttention `infllmv2_attention`. |
+| 61 | Compress and Attend (CAT): causal within a query's local block plus the compressed positions (`kv % block == 0`) | structure: two key sources | the local part as spans (row 3), the compressed keys as a second call over the compressed K/V, the two states merged (`merge`, row 19) | A strided key set is not spans; two sources merged keep each one plain. Comparator: fla `models/cat` (FlexAttention block masks). arXiv 2511.05313. |
+| 62 | Total attention: `Σ_q P[q, k]`, the probability each key receives over the queries, returned beside the output | a key-major pass | the dK/dV program's walk (keys resident, query tiles streamed) over the forward's maxima and denominators, summing the normalized weights per key | The forward can't form it: each weight needs its row's final denominator. Comparator: FlagAttention `return_total_attention`. |
+| 63 | MLA over a sliding window of a paged latent cache, returning partial accumulators (tokamax `mla_swa`) | composition | rows 25, 3, 27, and the partial state out (row 19) for the merge with the sparse part | |
+| 64 | Block-mask sparse prefill with FP8 operands (FlagAttention's Hy3) | structure + product declaration | a caller's block mask as the indexed block lists, rows 45 and 46 for the operands | The mask's density buckets are the scheduler's. |
+| 65 | KV sharing across layers: YOCO's cross-decoder layers, Gemma 3n/4's shared caches | consumer contract | a layer attends over another layer's cache, read only: the K/V source is a cache it does not write (prefill and decode, rows 27 and 30), its spans that cache's | No new math; the contract is that a call's K/V may be a cache another layer owns, which the work list's per-item K/V source (row 33) already allows. Comparator: fla `yoco`. arXiv 2405.05254. |
+
+Not attention variants, so in other templates: BitAttention changes the projections (the GEMM template's 1.58-bit weights), not attention; tokamax's DeepSeek-V4 compressor writes the cache. DeltaFormer and log-linear attention are Appendix B's (§App. B, C-class).
+
 ### Table 2: consumer → op map
 
 The template enters each Op as one `Kernel('template', TEMPLATE_SUPPORTS)`. Its refusals are typed Requirements with rows; nothing raises untyped.
@@ -502,7 +598,7 @@ The template enters each Op as one `Kernel('template', TEMPLATE_SUPPORTS)`. Its 
 
 | Kernel today | Replaced by | Deletion it enables (when its scoreboard row is met) |
 |---|---|---|
-| `flash` (FA2/FA3 wheel) | template | `flash_attention`, `FLASH_SUPPORTS`, `flash_architectures`/`flash_built_for`, `FLASH_PACKED_SEGMENTS`, the dew_flash_attn wheel and its build. Per §13 Q1, these go once an accurate template backward is within reach. |
+| `flash` (FA2/FA3 wheel) | template | `flash_attention`, `FLASH_SUPPORTS`, `flash_architectures`/`flash_built_for`, `FLASH_PACKED_SEGMENTS`, the dew_flash_attn wheel and its build. Per §1 and §13 Q1, these go once the template's default beats them at the gate, in time and in memory. |
 | `triton` (tokamax Triton) | template | `triton_attention`, `TRITON_SUPPORTS`, the `attention_narrow` rows in TARGETS. |
 | `cudnn` | template | `cudnn_attention`, `CUDNN_SUPPORTS`, `cudnn_takes_mask`, `kernel_for_materialized_mask`, `widen_value_heads`, `cudnn_max_head_dim`. |
 | `tpu` (Splash, Pallas flash interpreted) | template's TPU mainloop (Splash's MaskInfo adopted) | `splash_attention`, `splash_mask_descriptor`, `splash_dense_mask`, `splash_block_sizes`, `pallas_flash_attention`, `TPU_SUPPORTS`. |
@@ -569,10 +665,14 @@ Each ⚑ in the tables above is closed by the matching item below.
 7. A named composition of spans with a tail TILE mask, for speculative trees (#10). **Closed in the design.**
 8. A named owner for the sinks' gradient (#17). **Closed in the design.**
 9. Keep 'reference' as the naive oracle, distinct from the algebra's plain-JAX mainloop (Table 2). **Closed in the design.**
+10. INT8 operands with per-block scales in the product declaration, and a K pre-pass for SageAttention's smoothing (#46a). Open.
+11. A step's score products as a declared list with their combine (sum or selection by coordinates), for piecewise attention (#16a) and absorbed MLA (#25). Open.
 
 ## Appendix B. Coverage: linear recurrence
 
 Notation: `S' = T·S·E + W` with S of shape K×V per value head. "Values" are §3's transition values, "hooks" are §4's traced callables, "structure" is §5's, and "DAG" is §6's mainloop parameter (fused/split solve; sequential/parallel carry). A row the design's signatures cannot express is marked **⚠ signature**.
+
+Every family below runs on one Mosaic mainloop skeleton per overlap structure (§6), its Family bundle per architecture, the math only in the chunk algebra. The ports a row names (`fla_gdn`, `fla_kda`, `mamba_ssd`, the TPU `ssd`, `short_conv`) stay production routes and speed references, unmaintained, until the row's cell on each family matches or beats them in time and memory with the gate passing; a deletion below happens in that head. Progress is the coverage matrix (§0): rows these families and consumers, columns sm80, sm90 and TPU.
 
 ### Table 1: families → template
 
@@ -595,13 +695,13 @@ Notation: `S' = T·S·E + W` with S of shape K×V per value head. "Values" are �
 | Decode (T=1, all R rows) | the same transition values | the same hooks, inlined (today's `recurrence.step`) | paused rows (`active`), conv history, bf16 state rounding | decode mainloop: one launch per token | definitional token update | covered (exists) |
 | Sequence/context parallel, chunked prefill | — | — | shard boundaries | `compose` (the design) | compose over (T, E, W) | covered; for the delta rule T is K×K dense — cost measured per §3 |
 
-### Table 2: consumers → op, contracts to keep, deletion enabled
+### Table 2: consumers → op, contracts to keep, deletion enabled (when the row's cells meet the port)
 
 | Consumer (today) | Op it becomes | Contracts it must keep | Deletion it enables |
 |---|---|---|---|
 | `linear.on_the_port` / `GatedDeltaNet.__call__` → `recurrence_chunk.chunk_gated_delta_rule` (→ `fla_rule` or `chunk_delta_rule`) | `recurrence.chunk(GDN values, operands)`; decode → `recurrence.step` (exists) | **Route reporting**: `route('gated_delta_rule', kernel, refusal)` and SUPPORTS; `chosen(gated_delta_rule='xla')` reaches the reference; refusals: JVP (`FORWARD_MODE`, the port's custom VJP gives no tangent → today the portable math, which has a custom JVP for `chunk_decay`), varying-axes shard_map, float64, key width. **Cached state**: `recurrent_state` in `state_dtype` (fp32, or bf16 rounded stochastically by `round_to_bf16` from the step's k, v); conv history in the projections' dtype; the first decode call allocates only. **Paused rows**: `valid=False` → g=0, β=0 (memory kept, no write), output masked. **Packed resets**: `starts` per row with `max_segments` bounding varlen grids. **Remat**: residual names `delta_decay`, `delta_inverse`, `delta_memory`; `recomputing(('delta_memory',))` recomputes the memory in the backward. **Mesh**: rows split by data/fsdp, value heads with their key heads by tensor (`grouped_heads`); a split that doesn't divide key heads keeps heads whole; zero states placed with `rows_like`. **Dtype contract**: the output in the operands' common dtype (ledger 730), the memory in ≥ fp32; with an epilogue, unrounded until after it. **jit/vmap/JVP**: jit everywhere; vmap — **not established today** (no test vmaps the port; the custom VJP and `manual_map` need a batching rule) — the template must state it; JVP via the portable route; higher-order derivatives — **not established** (custom VJP of the port; the portable math is plain JAX) | `fla_gdn.py`, `linear.chunk_delta_rule`'s duplicate algebra (rows 952–954), `on_the_port`'s selector (row 959) |
 | `kda.KimiDeltaAttention` → `chunk_gated_delta_rule` with per-key g (→ `fla_kda`) | `recurrence.chunk(KDA values)`; decode → `recurrent_delta_rule` today, → `recurrence.step` (vector decay is supported there) | as GDN, plus: the decay's **lower bound** (−5) is the range bound for the factored decays; forward-mode and float64 refusals as GDN; KDA's first-token decay gradient (`first_decay_grad`) exactly zero where no memory enters | `fla_kda.py`; `recurrent_delta_rule` (row 955) |
-| `mixers/mamba2.chunk_ssd` | `recurrence.chunk(SSD values)` (already a row of `chunk`) | **Output unrounded** in ≥ fp32 for the sequence-shard correction added after it; **zero-start final state** (`_entering_state` composes shards: `out += C·exp(acs)·entering`, `final += exp(Σ log_decay)·entering`) — this is `compose` with scalar T and must stay exact under `RESET_DECAY` resets (−1e4, finite so a 0/1-triangle matmul never makes NaN); the rated decay's **contraction domain** (rate ≤ 0, dt ≥ 0) the port's clamp assumes; `ssd_port_refusal` (forward mode, varying axes, float64, chunk power of two); TPU kernel route (`ssd_kernel_platform`); state layout `[B,H,P,N]` vs the template's `[B,H,N,P]` (a swap at the boundary, no copy at a kernel edge) | `mamba_ssd.py` (GPU), `ssd.py` (TPU), `_rated_scan`/`_ssd_ported`/`_ssd_tpu` in recurrence_chunk (rows 952, 954, 967, 971) |
+| `mixers/mamba2.chunk_ssd` | `recurrence.chunk(SSD values)` (already a row of `chunk`) | **Output unrounded** in ≥ fp32 for the sequence-shard correction added after it; **zero-start final state** (`_entering_state` composes shards: `out += C·exp(acs)·entering`, `final += exp(Σ log_decay)·entering`) — this is `compose` with scalar T and must stay exact under `RESET_DECAY` resets (−1e4, finite so a 0/1-triangle matmul never makes NaN); the rated decay's **contraction domain** (rate ≤ 0, dt ≥ 0) the port's clamp assumes; the port's requirements (`recurrence_chunk.SCAN`: forward mode, varying axes, float64, chunk power of two); TPU kernel route (`ssd_kernel_platform`); state layout `[B,H,P,N]` vs the template's `[B,H,N,P]` (a swap at the boundary, no copy at a kernel edge) | `mamba_ssd.py` (GPU), `ssd.py` (TPU), `_rated_scan`/`_ssd_ported`/`_ssd_tpu` in recurrence_chunk (rows 952, 954, 967, 971) |
 | `mixers/mamba2._ssd` (the layer's scan: conv, dt, the time-step limit, `held` decode state, `valid`, sequence shards) | `recurrence.chunk` for the chunk, `recurrence.step(SSD values with Gates(write='step', limit))` for decode, `compose` for shards | **Cached state**: conv history (projections' dtype) and SSM state (`mamba_ssm_cache_dtype`, fp32 in Nemotron-H 30B); **paused rows**: a zero step (dt=0 where invalid) neither decays nor writes; **packed resets** as above; **sequence parallelism**: the shard correction (`_over_sequence`/`_entering_state`) moves into `compose`; **decode** today runs `recurrent_ssd` — it moves to `recurrence.step` (the step gates with `limit` exist and are gated on the launch, FORMED sites in tests/test_recurrence.py) | `recurrent_ssd`'s duplicate token step (row 955), `_entering_state` / `_over_sequence` duplicate carry (row 952) |
 | `linear.causal_conv1d` / `held_conv1d` (prologue of all three) | the prologue hook's conv with its **halo state** (the design) | packed documents (`segments`: a tap reads only its own document), `valid`, the decode history (K−1 tokens, the projections' dtype), the split into q/k/v pieces with l2norm per head (`parts`), FORWARD_MODE refusal, mesh rows | `short_conv.py` once the fused prologue meets its row (A100 0.74 ms, H100 0.35 ms: it beats fla today, so the template's bar is our own kernel) (row 963) |
 
@@ -716,7 +816,7 @@ Status says what exists today on feat/gemm-template, abbreviated "feat": built (
 | 17 | SwiGLU/GeGLU/clamped/gpt-oss gate as the down GEMM's prologue | prologue over the LHS `g` plus side `(u, ("rows", "depth"))`; **its backward is the dx GEMM's epilogue**: `(dg, du) = swiglu_vjp(g, u, dh)` with sides g, u in dx's output space and two outputs | keeps activations.py's rounding (projections rounded, the activation rounded before the product; dh rounded before the VJP). Clamps (`swiglu_limit`, gpt-oss's 7.0) are pointwise | P: prologue B; dx-epilogue form N |
 | 18 | Paired gate\|up up GEMM with a SwiGLU epilogue | `rhs = (W_g, W_u)` sharing the TileMap → `accs = (acc_g, acc_u)`; or one weight with `layout = interleaved` (gpt-oss: even/odd columns) or `concatenated` (mlp's 'joined' gate_up: halves) → output tile width `bn/2` | the backward needs `g, u` (saved 2N or recomputed): the choice layer picks between rows 17 and 18 per shape | N |
 | 19 | relu², GeLU (erf), tanh-GeLU, sigmoid | pointwise epilogue or prologue | the fuser needs fork rules for `erf`/`erfc`/`reduce_precision` (VitalStoat finding 8); Pallas Triton's 16-bit division, `logistic` and negative powers go through fp32 (fix/gemm-tests-a100) | P |
-| 20 | fp32 outputs at 'highest' (IEEE sums) | `Product(promote_every=64)` | the same mechanism as FP8 block scales; an fp32×fp32 product above default precision is computed at it or routed to XLA (`_kernels_take`) | B |
+| 20 | fp32 outputs at 'highest' (IEEE sums) | `Product(promote_every=64)` | the same mechanism as FP8 block scales; an fp32×fp32 product above default precision is computed at it or routed to XLA (`grouped_matmul.GROUPED`) | B |
 | 21 | FP8 E4M3/E5M2: per-tensor, per-row/column, 1×128 and 128×128 block scales (DeepSeek-V3) | `Product(scales=..., promote_every=128)`; per-tensor/row/column scales are epilogue sides (rows 12/13); block scales in `mma` | built after InjuredGoat defines the FP8 gate contract (§8) | N |
 | 22 | MXFP8/NVFP4 (sm100) | `Product.scales` + layout; tcgen05's scaled MMA | deferred until the sm100 mainloop | N, deferred |
 | 23 | Mixed dtypes, fp32 master | operands cast to compute outside; dW written at the master dtype by `out_dtype`; accumulation fp32 | `Q(kernel)` rounding stays the caller's (`rounded_operand`) | B |
@@ -724,13 +824,13 @@ Status says what exists today on feat/gemm-template, abbreviated "feat": built (
 | 25 | Fused linear + cross-entropy (LM head; vocab ≫) | epilogue per column tile emits attention's `Partial(m, l)` plus the target logit → `merge` over column tiles → `finish` → loss; backward recomputes the logits tile and forms `softmax − onehot` as the epilogue of a recompute GEMM feeding dx and dW | shares attention's Partial and merge. Today `objectives/lm/chunked.chunked_cross_entropy` (Training's) | N; proposed later, not a non-goal |
 | 26 | LoRA (`x·W + s·(x·A)·B`), supported (owner, 2026-10-21) | two strategies, both expressible, picked by measurement (§7): **(a)** an extra operand pair: the template computes `t = x·A` (`[M, r]`, small r) in the same launch as `acc = x·W`, sharing x's loaded tiles, and the epilogue adds `s·(t·B)` with B a `("rank", "columns")` side tile (`epilogue(acc, t_row_tile, B_tile, s)`); **(b)** K-concatenation: `[x | s·x·A] · [W ; B]`, one product of depth K + r on the LHS `[x | t]` and the stacked weight. Backward: dW and dB as `gemm_t` over the same tile map; dA = xᵀ·(dy·Bᵀ)·s; dx gains `s·(dy·Bᵀ)·Aᵀ` (a second small pair in the dx launch, or the K-concatenated transpose). `t` is saved (r columns) or recomputed by the choice layer. Frozen W: no dW launch. | N |
 | 27 | Sharded weights (fsdp all-gather, tensor-parallel splits) | outside the template: per shard in `shard_map` | | B |
-| 28 | Mainloop parameters | `Mainloop(consumers, mode ∈ {cooperative (split M), ping_pong}, cluster=(m, n), multicast ∈ {A, B}, stages, block=(m, n, k), raster, swizzle, scheduler, epilogue_overlap, registers=(40, 232))` | feat's cooperative tile splits N, which must become split M (register-A prologues, no duplicated work) | P |
+| 28 | Mainloop parameters | `Mainloop(consumers, mode ∈ {cooperative (split M), ping_pong}, cluster=(m, n), multicast ∈ {A, B}, stages, block=(m, n, k), raster, swizzle, scheduler, epilogue_overlap, registers=(40, 232))` | the cooperative tile splits M: each consumer's half of the rows is one MMA a step, CUTLASS's split, so a prologue rewrites only its own half (2–7% faster than splitting N on the H100 rows, bitwise equal) | P |
 
 ### Table 2: consumer-to-op map
 
 | Consumer (origin/main) | Uses | Contracts the template must keep | Deletion it enables |
 |---|---|---|---|
-| `moe.expert_projection`, from `ExpertMLP._project` (gate, up, down; relu² variant; `swiglu_limit`) and `GptOssExperts._project` (interleaved gate_up + per-expert biases, gpt-oss activation, down + bias), via `expert_dispatch` global and exchange | rows 5–8, 10, 12, 17/18, 20, 23 | **Precision:** operands cast to the compute dtype, accumulation in at least fp32, one rounding; dk in the master dtype, dx in the input dtype, both accumulated over the widest of compute/input/kernel; 'highest' fp32 exact or XLA. **Dropped tails:** rows past `sum(sizes)` are zero with zero cotangents; empty groups. **Expert parallelism:** per-shard metadata inside `shard_map`; fsdp layouts; `seen_whole` traces only. **Master gradient:** fp32 dk feeding the optimizer (tests/test_moe_precision.py: float64 sums and three Adam steps on every expert/fsdp layout). **Routes:** `route('grouped_matmul', kernel, target)`, `ran_kernel`'s reason, `chosen(grouped_matmul='xla'\|'triton'\|'mosaic_gpu')`, `kernel_refusal` codes. **AD:** today 'xla' holds every mode (`_projection` custom_jvp) but 'pallas' only first-order reverse. The template (feat's `linear_tangent`) gives every order, jit and vmap. **Remat:** `checkpoint_name` residuals 'gate_proj'/'up_proj'/'down_proj' (`decoder_block.MLP_RESIDUALS`) survive fusion: a fused row saves residuals under those names or the policy names the template's | `grouped_projection`'s custom_vjp and its 'pallas' first-order-only limit; `_projection`/`_projection_jvp` as an implementation (it becomes the plain-JAX reference mainloop, §9); the six launch classes in `grouped_matmul.py` become one mainloop's configurations; vendored `ragged_dot.py`; `gather_expert_bias` + the activation passes in gpt-oss and ExpertMLP (rows 10, 17/18); `jnp.sum(slots * weights)` in gpt-oss (row 12) |
+| `moe.expert_projection`, from `ExpertMLP._project` (gate, up, down; relu² variant; `swiglu_limit`) and `GptOssExperts._project` (interleaved gate_up + per-expert biases, gpt-oss activation, down + bias), via `expert_dispatch` global and exchange | rows 5–8, 10, 12, 17/18, 20, 23 | **Precision:** operands cast to the compute dtype, accumulation in at least fp32, one rounding; dk in the master dtype, dx in the input dtype, both accumulated over the widest of compute/input/kernel; 'highest' fp32 exact or XLA. **Dropped tails:** rows past `sum(sizes)` are zero with zero cotangents; empty groups. **Expert parallelism:** per-shard metadata inside `shard_map`; fsdp layouts; `seen_whole` traces only. **Master gradient:** fp32 dk feeding the optimizer (tests/test_moe_precision.py: float64 sums and three Adam steps on every expert/fsdp layout). **Routes:** `route('grouped_matmul', kernel, target)`, `ran_kernel`'s reason, `chosen(grouped_matmul='xla'\|'triton'\|'mosaic_gpu'\|'cutlass')`, `kernel_refusal` codes; CUTLASS's grouped GEMMs (dew-cutlass) are a candidate the chooser ranks by its measured rows (§7) until the template's launch beats them. **AD:** today 'xla' holds every mode (`_projection` custom_jvp) but 'pallas' only first-order reverse. The template (feat's `linear_tangent`) gives every order, jit and vmap. **Remat:** `checkpoint_name` residuals 'gate_proj'/'up_proj'/'down_proj' (`decoder_block.MLP_RESIDUALS`) survive fusion: a fused row saves residuals under those names or the policy names the template's | `grouped_projection`'s custom_vjp and its 'pallas' first-order-only limit; `_projection`/`_projection_jvp` as an implementation (it becomes the plain-JAX reference mainloop, §9); the six launch classes in `grouped_matmul.py` become one mainloop's configurations; vendored `ragged_dot.py`; `gather_expert_bias` + the activation passes in gpt-oss and ExpertMLP (rows 10, 17/18); `jnp.sum(slots * weights)` in gpt-oss (row 12) |
 | `generation.linear_tangent` in `norm_swiglu.rms_norm` (from `attention.rms_normalized`: attention, linear, dc_ae) | rows 15, 1/2 | stored dtype, `offset` (Gemma's 1+w), `after_cast` (Llama vs Gemma order), `epsilon`, fp32 statistics, the inverse rounded once, the mean square saved (7d76cb049); JVP of every order through `linear_tangent`; `axes` sharding; route `rms_norm` | norm_swiglu's `RmsForward`/`RmsBackward` launches where a GEMM follows (the norm becomes row 15's pre-pass plus prologue). Norms followed by no GEMM (Gemma's post-attention and post-feedforward norms, sandwich norms) keep the algebra's row functions, run by a toolkit row loop or XLA's fusion, whichever measures faster |
 | `linear_tangent` in `norm_swiglu.stream_rms_norm` (from `attention.stream_rms_normalized`) | row 16 | as above, plus the summed stream stored rounded and its cotangent joined to the branch's | the stream-norm launch, replaced by the pre-pass writing `s` and `ms` |
 | `linear_tangent` in `norm_swiglu.gated_rms_norm` (from `attention.gated_rms_normalized`: linear/Mamba2 out-norm) | row 15 with a gate side | the gate activation (silu/sigmoid) and its rounding; ledger 962 makes it one gated-RMS primitive with SilentEel (recurrence's epilogue) | the gated-norm launch, once recurrence's epilogue and the GEMM prologue share the primitive (row 962) |

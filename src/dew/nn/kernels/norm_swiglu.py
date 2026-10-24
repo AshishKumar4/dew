@@ -77,7 +77,7 @@ from jax.custom_derivatives import SymbolicZero
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
-from ..precision import at_least_fp32, compensated_add, rounded_to, two_product
+from ..precision import at_least_fp32, compensated_add, compensated_total, rounded_to, two_product
 from ..sharding import logical_spec, manual_map
 from . import generation, tuning
 from .generation import INHERENT, measured_kernel
@@ -601,10 +601,13 @@ def _rms_backward(x_ref, scale_ref, gate_ref, mean_square_ref, dy_ref, stream_re
 
 def _scale_sum(partial, correction):
     """The programs' compensated parts summed over programs as compensated
-    pairs (`compensated_add`), one XLA column reduction."""
+    pairs (`compensated_add`), one XLA column reduction, read as every
+    compensated sum is (`compensated_total`): the pair rounded once, or the
+    programs' plain sum where that reaches an infinity, whose residual is
+    inf - inf."""
     zero = jnp.zeros((), jnp.float32)
-    total, lost = jax.lax.reduce((partial, correction), (zero, zero), compensated_add, (0,))
-    return total + lost
+    pair = jax.lax.reduce((partial, correction), (zero, zero), compensated_add, (0,))
+    return compensated_total(pair, jnp.sum(partial, axis=0))
 
 
 class _Norm(NamedTuple):

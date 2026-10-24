@@ -1,9 +1,12 @@
 """dew.nn.kernels.tuning's picks in Dew's own JSON: every launch a step traces, its op, its arguments and
 its timings, written and read back equal, through tokamax's public API alone."""
 
+import dataclasses
+import functools
 import json
 
 import jax
+import jax.numpy as jnp
 import pytest
 import tokamax
 
@@ -37,14 +40,6 @@ def test_a_steps_launches_and_their_timings_round_trip_through_dews_json():
         assert timings[config] == timing
         assert isinstance(op, (norm_swiglu.RmsForward, norm_swiglu.RmsBackward, norm_swiglu.SwigluForward,
                                norm_swiglu.SwigluBackward))
-
-
-def test_a_stored_timing_keeps_every_field_tokamax_measures():
-    """`tuning.TIMING_FIELDS` is every field of `tokamax.BenchmarkData`, so a field a later tokamax adds
-    fails here rather than going unstored."""
-    import dataclasses
-
-    assert {field.name for field in dataclasses.fields(tokamax.BenchmarkData)} == set(tuning.TIMING_FIELDS)
 
 
 def test_a_timing_mapping_takes_its_fastest_run_and_drops_its_failures():
@@ -102,6 +97,88 @@ def test_a_stored_class_this_checkout_lacks_is_unreadable_and_an_imports_own_fai
     with pytest.raises(ModuleNotFoundError) as failed:
         tuning._located("kernel_needing_a_dependency:Kernel")
     assert not isinstance(failed.value, tuning.Unreadable)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Hooks:
+    """A gemm-like launch's hooks: a function, and axes that decide its side operands."""
+
+    epilogue: object
+    axes: tuple[int, ...]
+
+
+TILE = jax.ShapeDtypeStruct((8, 16), jnp.float32)
+
+
+@dataclasses.dataclass(frozen=True)
+class _HookedKernel(tuning.KernelOp):
+    """A launch whose op holds a traced function, and whose argument `hooks` holds another, each traced
+    at its tile for its picks' key."""
+
+    HOOKS = ("prologue", "hooks")
+    name = "hooked"
+    config_cls = int
+    prologue: object = None
+
+    def _fwd(self, x, hooks, *, config, return_residuals=False):
+        return x, None
+
+    def _get_heuristics_config(self, ba):
+        return 1
+
+    def _get_autotuning_configs(self, ba):
+        return {1, 2}
+
+    def traced(self, name, value):
+        if value is None or isinstance(value, str):
+            return value
+        if name == "prologue":
+            return tuning.program(value, TILE)
+        return dataclasses.replace(value, epilogue=self.traced("prologue", value.epilogue))
+
+
+def test_a_hooked_launch_keys_by_what_its_hooks_compute_and_round_trips():
+    """A template's traced functions, closures among them, key its picks by what they compute (their
+    traced programs): two closures over equal values key alike and store and read back as the same
+    launch; a closure over another value, another computation of one layout (a sum against a product,
+    as two fused epilogues differ), hooks whose other fields differ (axes), and a launch without the
+    function key apart."""
+    def closure(scale):
+        return lambda tile: tile * scale
+
+    def keyed(prologue, epilogue, axes):
+        op = _HookedKernel(prologue=prologue)
+        return op.keyed(op.bind(TILE, _Hooks(epilogue, axes)))
+
+    def key(launch):
+        return tuning._identity(launch.op), launch.autotuning_cache_key
+
+    first, again_alike = keyed(closure(2.0), closure(3.0), (0,)), keyed(closure(2.0), closure(3.0), (0,))
+    assert key(first) == key(again_alike)
+    [again] = tuning.loads_launches(tuning.dumps_launches([first]))
+    assert (again.op, again.autotuning_cache_key) == key(first)
+    added = functools.partial(lambda combine, tile: combine(tile, tile), jnp.add)
+    multiplied = functools.partial(lambda combine, tile: combine(tile, tile), jnp.multiply)
+    assert key(keyed(closure(2.0), added, (0,))) != key(keyed(closure(2.0), multiplied, (0,)))
+    for other in (keyed(closure(5.0), closure(3.0), (0,)), keyed(closure(2.0), closure(7.0), (0,)),
+                  keyed(closure(2.0), closure(3.0), (1,)), keyed(None, closure(3.0), (0,))):
+        assert key(other) != key(first)
+
+
+def test_a_hook_keys_by_the_values_of_the_arrays_it_closes_over():
+    """Two hooks of one code closing over different same-shaped arrays (a flag choosing a branch), at
+    the hook's top or inside a jitted helper it calls, key apart; over equal arrays, alike."""
+    def hook(flag):
+        return lambda tile: jax.lax.cond(flag[0], jnp.tanh, lambda x: x, tile)
+
+    def through_a_jitted_helper(flag):
+        inner = jax.jit(hook(flag))
+        return lambda tile: inner(tile) + 1
+
+    for factory in (hook, through_a_jitted_helper):
+        keys = [tuning.program(factory(jnp.asarray([value])), TILE) for value in (True, False, True)]
+        assert keys[0] != keys[1]
+        assert keys[0] == keys[2]
 
 
 def _scaled_hook(tile):

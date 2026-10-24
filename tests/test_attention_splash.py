@@ -405,7 +405,8 @@ def test_splash_keeps_the_kernel_contract_on_a_mesh(axis, key_heads, packed):
     splash = functools.partial(scaled_dot_product_attention, implementation='tpu', **structure)
     assert_runs_per_shard(with_gradients(splash), draw, [queries, keys, keys, queries], mesh,
                           f"splash split over {axis}, {key_heads} key heads", seeds=SHARDED_SEEDS,
-                          truth_fn=with_gradients(lambda q, k, v: exact_attention(q, k, v, **structure)))
+                          truth_fn=with_gradients(lambda q, k, v: exact_attention(q, k, v, anchored=True,
+                                                                                    **structure)))
 
 
 @pytest.mark.mesh(devices=4)

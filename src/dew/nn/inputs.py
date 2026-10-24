@@ -255,11 +255,9 @@ class ModelInputs:
         """
         if left_padding.shape != (self.tokens.shape[0],):
             raise ValueError("left_padding must have one count per token row")
-        slots = (jnp.arange(self.tokens.shape[1])[None, :] + left_padding[:, None]) % self.tokens.shape[1]
 
         def shift(value: jax.Array) -> jax.Array:
-            indices = slots.reshape(slots.shape + (1,) * (value.ndim - 2))
-            return jnp.take_along_axis(value, indices, axis=1)
+            return rotate_rows(value, left_padding)
 
         return replace(self, tokens=shift(self.tokens),
                             token_fields={name: jax.tree.map(shift, value)
@@ -304,6 +302,14 @@ class ModelInputs:
         return replace(
             self, tokens=jnp.concatenate([self.tokens, tokens.astype(self.tokens.dtype)], axis=1),
             token_fields={name: continued(name, value) for name, value in self.token_fields.items()})
+
+
+def rotate_rows(values: jax.Array, shifts: jax.Array) -> jax.Array:
+    """Each row of `values` `[B, S, ...]` rotated left by its own count in `shifts` `[B]`: slot `i`
+    reads slot `(i + shift) % S`, so a row's first `shift` slots move to its end, and a negative
+    count rotates it back."""
+    slots = (jnp.arange(values.shape[1])[None, :] + shifts[:, None]) % values.shape[1]
+    return jnp.take_along_axis(values, slots.reshape(slots.shape + (1,) * (values.ndim - 2)), axis=1)
 
 
 def shifted_span(shape: tuple[int, ...], shift: int, *, valid=None, segments=None, xp=jnp):
@@ -587,6 +593,14 @@ class AttentionMetadata:
     (`numbered_blocks`), which the model computes once for its layers.
     `context` is the sequence its cross-attention layers read (`CrossContext`).
 
+    `image_groups` and `block_groups` `[B, S]` int32 number the tokens' blocks,
+    each a run of contiguous tokens, an image's or a prompt's, and -1 for a
+    token outside any, padding among them. A causal attention layer that reads them
+    (`bidirectional_images`, `bidirectional_blocks`) lets each token of a block
+    see the block's later tokens too, within its document; a layer reading
+    both sees the union, and every other layer stays causal
+    (`dew.nn.attention.scaled_dot_product_attention`'s `block_groups`).
+
     `coordinates` are the tokens' documents, validity, positions and cache
     slots (`Coordinates`). Their `right_padded` says each row's real tokens
     come first, its padding after them, as a training batch pads its rows. A
@@ -599,6 +613,7 @@ class AttentionMetadata:
 
     coordinates: Coordinates | None = None
     image_groups: jax.Array | None = None
+    block_groups: jax.Array | None = None
     rotary_positions: jax.Array | None = None
     pairwise_mask: jax.Array | None = None
     key_positions: jax.Array | None = None
@@ -627,8 +642,9 @@ read, or how much: a call's own mask and the key positions it is read by, an
 additive bias, a server's mixed layout. A mixer runs a call that sets one only
 where it reads it (`MixerCall`). The rest describe the tokens themselves, which
 a mixer reads as far as its form uses them: their coordinates, rotary
-positions and image groups, which only attention that sees an image whole
-reads, and the ids the block reads for its feed-forward and n-gram lookup."""
+positions, and image and block groups, which only attention that sees an image
+or a block whole reads, and the ids the block reads for its feed-forward and
+n-gram lookup."""
 
 TOKENWISE = frozenset(MIXING)
 """The `MIXING` fields a mixer that reads no other token holds to: every one,
@@ -826,7 +842,7 @@ def _response_document(value: jax.Array, valid: jax.Array, width: int) -> jax.Ar
 
 
 def _response_text(value: jax.Array, valid: jax.Array, width: int) -> jax.Array:
-    """Text: no media feature, no image group (-1)."""
+    """Text: no media feature, no image or block group (-1)."""
     return jnp.full((value.shape[0], width, *value.shape[2:]), -1, value.dtype)
 
 
@@ -854,6 +870,7 @@ RESPONSE_FIELDS: Mapping[str, FieldExtension] = {
     "image_indices": _response_text,
     "audio_indices": _response_text,
     "image_groups": _response_text,
+    "block_groups": _response_text,
 }
 """How each token field Dew's processors write continues into a response."""
 
