@@ -84,7 +84,7 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     # left the launch it waited on one device short, and the rendezvous
     # aborted the process (tests/test_discrete.py's toy run on CI, three
     # times). Two threads per device hold both launches.
-    environ.setdefault("PJRT_NPROC", str(max(len(os.sched_getaffinity(0)), 2 * cpu_devices)))
+    environ.setdefault("PJRT_NPROC", str(max(len(os.sched_getaffinity(0)), 4 * cpu_devices)))
     # Parity tests assert fp32 against references computed in fp32. Ampere and
     # later GPUs default fp32 matmuls to TF32, a 10-bit mantissa, which puts
     # 1e-2 between two correct implementations.
