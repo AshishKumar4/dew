@@ -18,6 +18,8 @@ no term to a sum over the classes.
 
 from __future__ import annotations
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import optax
@@ -48,8 +50,25 @@ def probabilities(logits: jax.Array, where: jax.Array | None = None) -> jax.Arra
 def cross_entropy(logits: jax.Array, labels: jax.Array, where: jax.Array | None = None) -> jax.Array:
     """`-log p[labels]` over the last axis, `labels` of `logits.shape[:-1]`: the log partition less the
     label's logit, as Optax takes it, which reads the label's logit without building the normalized
-    row."""
-    return optax.softmax_cross_entropy_with_integer_labels(widened(logits, where), labels)
+    row. Its derivative is Barron, Gnanapragasam and Tschannen's (arXiv:2610.31642, eq. 7): each other
+    class's probability, and at the label minus their sum, so the row's derivative sums to zero. The
+    label's `p - 1` collapses to 0 once its margin over the other classes passes the dtype's precision
+    (eq. 4; 16.6 in float32), while the others' probabilities stay until they underflow."""
+    return _label_loss(widened(logits, where), labels)
+
+
+@jax.custom_jvp
+def _label_loss(logits: jax.Array, labels: jax.Array) -> jax.Array:
+    return optax.softmax_cross_entropy_with_integer_labels(logits, labels)
+
+
+@_label_loss.defjvp
+def _label_loss_tangent(primals, tangents):
+    logits, labels = primals
+    label = jax.nn.one_hot(labels, logits.shape[-1], dtype=logits.dtype)
+    others = jnp.where(label > 0, 0.0, jax.nn.softmax(logits, axis=-1))
+    derivative = others - label * others.sum(axis=-1, keepdims=True)
+    return _label_loss(logits, labels), jnp.sum(derivative * tangents[0], axis=-1)
 
 
 def soft_cross_entropy(logits: jax.Array, targets: jax.Array, where: jax.Array | None = None) -> jax.Array:
@@ -60,13 +79,63 @@ def soft_cross_entropy(logits: jax.Array, targets: jax.Array, where: jax.Array |
 
 def kl_divergence(logits: jax.Array, reference: jax.Array, where: jax.Array | None = None) -> jax.Array:
     """`KL(q || p)` over the last axis, `p` the categorical of `logits` and `q` that of the `reference`
-    logits (Optax's `kl_divergence` of the two), the classes `where` excludes adding no term."""
-    log_p, q = log_probs(logits, where), probabilities(reference, where)
-    if where is not None:
-        # An excluded class enters Optax's sum as log 1 against a log probability of 0, so neither its
-        # value nor its gradient meets 0 * inf.
-        log_p, q = jnp.where(where, log_p, 0.0), jnp.where(where, q, 1.0)
-    return optax.kl_divergence(log_p, q, where=where)
+    logits (Optax's `kl_divergence` of the two), the classes `where` excludes adding no term.
+
+    Its derivative in `logits`, `p - q`, is taken from the two rows' difference in log space, as Barron,
+    Gnanapragasam and Tschannen take it (arXiv:2610.31642, eq. 9), not by subtracting two softmaxes
+    (eq. 8), which near each other keep only their own rounding: logits equal to the reference's have
+    derivative exactly zero, and near them it keeps the difference's precision. A row where a class is
+    -inf in one and not the other takes `p - q`; the derivative in `reference` is autodiff's."""
+    held = jnp.ones(logits.shape, bool) if where is None else where
+    return _divergence(widened(logits, where), widened(reference, where), held, where is not None)
+
+
+def _divergence_value(logits: jax.Array, reference: jax.Array, where: jax.Array, masked: bool) -> jax.Array:
+    log_p, q = jax.nn.log_softmax(logits, axis=-1), jax.nn.softmax(reference, axis=-1)
+    if not masked:
+        return optax.kl_divergence(log_p, q)
+    # An excluded class enters Optax's sum as log 1 against a log probability of 0, so neither its value
+    # nor its gradient meets 0 * inf.
+    return optax.kl_divergence(jnp.where(where, log_p, 0.0), jnp.where(where, q, 1.0), where=where)
+
+
+@functools.partial(jax.custom_jvp, nondiff_argnums=(3,))
+def _divergence(logits: jax.Array, reference: jax.Array, where: jax.Array, masked: bool) -> jax.Array:
+    return _divergence_value(logits, reference, where, masked)
+
+
+@_divergence.defjvp
+def _divergence_tangent(masked, primals, tangents):
+    logits, reference, where = primals
+    d_logits, d_reference, _ = tangents
+    value, moved = jax.jvp(lambda reference: _divergence_value(logits, reference, where, masked),
+                           (reference,), (d_reference,))
+    return value, moved + jnp.sum(_divergence_derivative(logits, reference) * d_logits, axis=-1)
+
+
+def _divergence_derivative(logits: jax.Array, reference: jax.Array) -> jax.Array:
+    """`p - q` over the last axis, `p` the softmax of `logits`, `q` of `reference`, from their difference
+    `delta` (arXiv:2610.31642, eq. 9, its `p` here `q` and its `q` here `p`): `d`, `delta` less its mean
+    under `q`; `s = log(p / q)`, `d` less `log1p` of `q`'s mean of `expm1(d)`; `u = q expm1(s)`; and
+    `u` less `p` times its sum, which makes the derivative sum to zero."""
+    log_q = jax.nn.log_softmax(reference, axis=-1)
+    q, p = jnp.exp(log_q), jax.nn.softmax(logits, axis=-1)
+    both = jnp.isfinite(logits) & jnp.isfinite(reference)
+    alike = jnp.all(both | (jnp.isneginf(logits) & jnp.isneginf(reference)), axis=-1, keepdims=True)
+    delta = jnp.where(both, logits - reference, 0.0)
+    d = delta - jnp.sum(q * delta, axis=-1, keepdims=True)
+    s = d - jnp.log1p(jnp.sum(_scaled_expm1(q, log_q, d), axis=-1, keepdims=True))
+    u = _scaled_expm1(q, log_q, s)
+    return jnp.where(alike, u - p * jnp.sum(u, axis=-1, keepdims=True), p - q)
+
+
+def _scaled_expm1(q: jax.Array, log_q: jax.Array, x: jax.Array) -> jax.Array:
+    """`q expm1(x)`: through `expm1` where `x` is small, whose precision is the point, and as
+    `exp(log q + x) - q` where it is large, so a class whose `q` underflowed meets no `0 * inf`. Each
+    branch reads `x` only where it is taken, so neither's derivative meets the other's overflow."""
+    small = x < 1
+    return jnp.where(small, q * jnp.expm1(jnp.where(small, x, 0.0)),
+                     jnp.exp(log_q + jnp.where(small, 0.0, x)) - q)
 
 
 def entropy(logits: jax.Array, where: jax.Array | None = None) -> jax.Array:
