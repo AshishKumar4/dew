@@ -563,16 +563,6 @@ def test_a_window_over_the_widest_places_neither_wraps_nor_aliases(window):
         np.testing.assert_array_equal(np.asarray(template.dense(spans)), expected)
 
 
-def test_a_blocks_bounds_are_its_runs_first_token_and_one_past_its_last():
-    """`template.block_starts` and `block_ends`: each token's run of equal ids starts at its first token and
-    ends one past its last, a run of -1 as any other."""
-    groups = jnp.asarray([[-1, 0, 0, -1, -1, 3, 3, 3], [5, 5, 5, 5, 1, 1, 1, 1]], jnp.int32)
-    np.testing.assert_array_equal(np.asarray(template.block_starts(groups)),
-                                  [[0, 1, 1, 3, 3, 5, 5, 5], [0, 0, 0, 0, 4, 4, 4, 4]])
-    np.testing.assert_array_equal(np.asarray(template.block_ends(groups)),
-                                  [[1, 3, 3, 5, 5, 8, 8, 8], [4, 4, 4, 4, 8, 8, 8, 8]])
-
-
 def test_hooks_are_a_pytree_whose_values_a_compiled_call_takes():
     """A compiled call takes the hooks as its argument: new parameter and state values run the one
     program it traced, and their gradients flow back into a `Hooks` of the same structure."""

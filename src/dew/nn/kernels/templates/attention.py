@@ -155,7 +155,7 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     stay one interval, the union of both kinds' among them. Lengths and starts are int32 token coordinates;
     places and ids keep their own dtypes."""
     from dew.nn.documents import CrossDocuments, aligned_places, document_ids
-    from dew.nn.visibility import window_sides
+    from dew.nn.visibility import block_ends, block_starts, window_sides
 
     index = jnp.broadcast_to(jnp.arange(queries, dtype=jnp.int32)[None, :], (batch, queries))
     place = index
@@ -243,28 +243,6 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     narrowed = (sliding_window, chunk, segment_ids, lengths, starts, blocks)
     form = "spans" if any(narrowing is not None for narrowing in narrowed) else "causal" if causal else "full"
     return KeySpans(start, end, query_ids, key_ids, keys, form)
-
-
-def block_ends(groups: jax.Array) -> jax.Array:
-    """Each token's block's end, `[B, S]` int32 of `groups` `[B, S]`: one past the last token of the run of
-    equal ids that holds it (a block is such a run)."""
-    groups = jnp.asarray(groups)
-    batch, length = groups.shape
-    index = jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
-    # A run's last token: the next one's id differs, or the row ends there.
-    last = jnp.concatenate([groups[:, 1:] != groups[:, :-1], jnp.ones((batch, 1), bool)], axis=1)
-    return jax.lax.cummin(jnp.where(last, index, length), axis=1, reverse=True) + 1
-
-
-def block_starts(groups: jax.Array) -> jax.Array:
-    """Each token's block's start, `[B, S]` int32 of `groups` `[B, S]`: the first token of the run of equal
-    ids that holds it (`block_ends`)."""
-    groups = jnp.asarray(groups)
-    batch, length = groups.shape
-    index = jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
-    # A run's first token: the previous one's id differs, or the row starts there.
-    first = jnp.concatenate([jnp.ones((batch, 1), bool), groups[:, 1:] != groups[:, :-1]], axis=1)
-    return jax.lax.cummax(jnp.where(first, index, 0), axis=1)
 
 
 def _least_after(places: jax.Array, ids: jax.Array | None) -> jax.Array:
