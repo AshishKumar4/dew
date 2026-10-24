@@ -5,13 +5,21 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype
 
 from dew.decision.head import Head
 from dew.decision.layout import DecisionInputs
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, ModelInputs
-from dew.nn.protocols import CrossAttending, HiddenStates, VocabularyRows
+from dew.nn.protocols import (
+    AffineHead,
+    CrossAttending,
+    HiddenStates,
+    LogitsFromHidden,
+    OutputTable,
+    VocabularyRows,
+)
 from dew.objectives.base import Variables, part, thaw
 
 
@@ -125,10 +133,50 @@ class DecisionModel:
                train: bool = False, rngs: dict[str, jax.Array] | None = None) -> jax.Array:
         """Return the `[B, Q, K]` fp32 option logits, with -inf past each question's options."""
         states = self.states(variables, inputs, media=media, train=train, rngs=rngs)
-        table = self.table(variables) if self.head.reads_table else None
-        logits = _array(self.head.apply(thaw(part(variables, "head")), states, inputs, table, train=train,
-                                        rngs=rngs))
+        head = thaw(part(variables, "head"))
+        if self.head.reads_labels:
+            labels = self.head.tied_labels()
+            tied = None if labels is None else self.label_logits(variables, states, inputs, labels)
+            logits = _array(self.head.apply(head, states, inputs, self.output_table(variables), train=train,
+                                            tied=tied, rngs=rngs))
+        else:
+            table = self.table(variables) if self.head.reads_table else None
+            logits = _array(self.head.apply(head, states, inputs, table, train=train, rngs=rngs))
         return jnp.where(inputs.options, logits, -jnp.inf)
+
+    def output_table(self, variables: Variables) -> OutputTable | None:
+        """The backbone's head as one matrix (`AffineHead`), or None where no matrix alone is it."""
+        if not isinstance(self.backbone, AffineHead):
+            return None
+        table = self.backbone.apply(thaw(part(variables, "backbone")), method="output_table")
+        if table is not None and not isinstance(table, OutputTable):
+            raise TypeError(f"output_table returned a {type(table).__name__}, not an OutputTable")
+        return table
+
+    def label_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
+                     labels: tuple[tuple[int, ...], ...]) -> jax.Array:
+        """The backbone's own logits `[B, Q, K, V]` at each label's ids of each question's answer
+        state (`DecisionInputs.readout`): its output table at the labels' columns alone, computed in
+        fp32 (`OutputTable.columns`), where one matrix is its head; else its exact head over the
+        answer states, a few rows (`LogitsFromHidden`), the labels' columns taken. No product is
+        rebuilt from the vocabulary's rows, which carry no bias and no softcap."""
+        if inputs.readout is None:
+            raise ValueError("a readout of labels reads rows whose options stand under labels (Labels)")
+        answers = jnp.take_along_axis(states, inputs.readout[..., None], axis=1)
+        ids = np.asarray(labels, np.int64)
+        width = inputs.options.shape[-1]
+        table = self.output_table(variables)
+        if table is not None:
+            return table.columns(answers, ids.reshape(-1).tolist(), exact=True).reshape(
+                *answers.shape[:2], *ids.shape)[:, :, :width]
+        if not isinstance(self.backbone, LogitsFromHidden):
+            raise TypeError(f"a readout of labels reads its backbone's exact head, which a "
+                            f"{type(self.backbone).__name__} does not give (AffineHead, LogitsFromHidden)")
+        full = jnp.asarray(self.backbone.apply(thaw(part(variables, "backbone")), answers,
+                                               method="logits_from_hidden"))
+        picked = jnp.take(full, jnp.asarray(ids.reshape(-1)), axis=-1)
+        return picked.astype(jnp.promote_types(picked.dtype, jnp.float32)).reshape(
+            *answers.shape[:2], *ids.shape)[:, :, :width]
 
 
 def _array(applied: object) -> jax.Array:

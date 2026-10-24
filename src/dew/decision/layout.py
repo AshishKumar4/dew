@@ -159,6 +159,12 @@ class Laid:
     span: tuple[int, int]
     options: tuple[tuple[int, int], ...]
     order: tuple[int, ...]
+    readout: int | None = None
+    """Where a readout of labels reads the question's answer (`Labels`): the position of the row's
+    answer cue's last token, or None where the options are read at their own tokens."""
+    label_ids: tuple[tuple[int, ...], ...] | None = None
+    """Each option slot's label as the token ids a readout reads at `readout`, one a variant
+    (`Labels.variants`), or None where no label stands for the options."""
 
 
 @dataclass(frozen=True)
@@ -185,19 +191,25 @@ class Encoded:
     cross-attention, or None for none."""
 
 
-def question_fields(row: Encoded, count: int, width: int) -> dict[str, np.ndarray]:
+def question_fields(row: Encoded, count: int, width: int, labelled: bool = False) -> dict[str, np.ndarray]:
     """`row`'s questions as fixed-shape arrays, `count` question slots of
     `width` option slots each: `kinds` [Q], `questions` [Q] (the real ones),
     `spans` [Q, 2], `option_spans` [Q, K, 2] and `options` [Q, K] (the real
-    ones). A training row (`Encoding`) and a served batch
+    ones), and where its options stand under labels (`labelled`, `Labels`),
+    `readout` [Q]. A training row (`Encoding`) and a served batch
     (`DecisionInputs.collate`) both read a row through this."""
     fields = {"kinds": np.zeros(count, np.int32), "questions": np.zeros(count, bool),
               "spans": np.zeros((count, 2), np.int32), "option_spans": np.zeros((count, width, 2), np.int32),
               "options": np.zeros((count, width), bool)}
+    if labelled:
+        fields["readout"] = np.zeros(count, np.int32)
     for slot, laid in enumerate(row.questions):
         fields["kinds"][slot], fields["questions"][slot], fields["spans"][slot] = laid.kind, True, laid.span
         fields["option_spans"][slot, : len(laid.options)] = laid.options
         fields["options"][slot, : len(laid.options)] = True
+        if labelled:
+            assert laid.readout is not None, "a labelled row says where its answer is read"
+            fields["readout"][slot] = laid.readout
     return fields
 
 
@@ -319,6 +331,47 @@ class Layout:
                       options)
 
 
+LETTERS = tuple(chr(ord("A") + index) for index in range(26))
+
+
+def label_names(count: int) -> tuple[str, ...]:
+    """The first `count` labels: `A` to `Z`, then `AA`, `AB`, ..., as a release's slots name them."""
+    names = list(LETTERS)
+    for first in LETTERS:
+        names.extend(first + second for second in LETTERS)
+    if count > len(names):
+        raise ValueError(f"{count} options outnumber the {len(names)} labels")
+    return tuple(names[:count])
+
+
+@dataclass(frozen=True)
+class Labels:
+    """Options rendered as lettered lines, read at the row's answer cue by a readout of the labels'
+    logits (`dew.decision.head.LabelReadout`, `SlotReadout`): slot s as `{name}. {text}` on a line of
+    its own, its span the whole line, and after the options the `cue`, whose last token the readout
+    reads. Each label is read as the token id of each of `variants`, a template of its name (`{}`): a
+    release's slot is one variant, its name after a space; a readout groups several as one. A variant
+    that spells as other than one token is refused."""
+
+    cue: str = "\nAnswer:"
+    variants: tuple[str, ...] = (" {}",)
+
+    def ids(self, encoder: Tokenizer, count: int) -> tuple[tuple[int, ...], ...]:
+        """Each of the first `count` labels' ids, one a variant."""
+        same = _same(encoder)
+        found = []
+        for name in label_names(count):
+            ids = []
+            for variant in self.variants:
+                spelled = variant.format(name)
+                pieces = _piece(same, spelled)
+                if len(pieces) != 1:
+                    raise ValueError(f"the label {spelled!r} spells as {len(pieces)} tokens, not one")
+                ids.append(pieces[0])
+            found.append(tuple(ids))
+        return tuple(found)
+
+
 @dataclass(frozen=True)
 class QuestionLayout(Layout):
     """A layout of one row per question, scored at one marker token per option.
@@ -339,6 +392,9 @@ class QuestionLayout(Layout):
     head_max_len: int = 192
     option_tokens: int = 48
     parallel: bool = False
+    labels: Labels | None = None
+    """Options rendered as lettered lines and read at an answer cue (`Labels`), or None for a marker
+    after each option, read at the marker."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -374,6 +430,8 @@ class QuestionLayout(Layout):
         instructions = render(question.instructions).replace(specials.marker_text, " ")
         same = _same(encoder)
         head = list(_piece(same, f"{question.kind} question: {instructions}"))
+        if self.labels is not None:
+            return self._labelled(encoder, specials, question, head, texts, slots, state, conversation, name)
         whole = [list(_piece(same, " " + texts[slot].replace(specials.marker_text, " "))) for slot in slots]
         options = [option[:self.option_tokens] for option in whole]
         # Each option's budget counts its marker.
@@ -394,6 +452,51 @@ class QuestionLayout(Layout):
             None if positions is None else positions[:self.max_len],
             None if option_slots is None else option_slots[:self.max_len], len(state), kept,
             trimmed=trimmed)
+
+    def _labelled(self, encoder: Tokenizer, specials: Specials, question: Question, head: list[int],
+                  texts: tuple[str, ...], slots: Sequence[int], state: Sequence[int], conversation: bool,
+                  name: str) -> Encoded:
+        """A row of `question` whose options stand under labels (`self.labels`): the state and the
+        question, ordered as the layout orders them (`_state_first`), each option slot a line
+        `{label}. {text}`, its span the whole line, and the answer cue last, at which the labels'
+        readout reads the answer."""
+        assert self.labels is not None
+        if self.parallel:
+            raise ValueError("labelled options are read at one answer cue after them all, which the parallel "
+                             "layout, each option apart, has none of")
+        same = _same(encoder)
+        names = label_names(len(slots))
+        lines = [list(_piece(same, f"\n{label}. " + texts[slot].replace(specials.marker_text, " ")))
+                 [:self.option_tokens] for label, slot in zip(names, slots, strict=True)]
+        cue = list(_piece(same, self.labels.cue))
+        budget = self.head_max_len - sum(map(len, lines)) - len(cue)
+        kept_head = head[:max(8, budget)]
+        trimmed = len(kept_head) < len(head)
+        begin = _begin(specials)
+        fixed = len(begin) + len(kept_head) + sum(map(len, lines)) + len(cue) + 2
+        kept = self._kept(state, self.max_len - fixed, conversation)
+        if self._state_first:
+            tokens = [*begin, *kept, specials.separator]
+            span = (len(tokens), len(tokens) + len(kept_head))
+            tokens.extend([*kept_head, specials.separator])
+        else:
+            tokens = [*begin, *kept_head, specials.separator]
+            span = (len(begin), len(begin) + len(kept_head))
+        spans = []
+        for line in lines:
+            spans.append((len(tokens), len(tokens) + len(line)))
+            tokens.extend(line)
+        if not self._state_first:
+            tokens.extend([specials.separator, *kept])
+        tokens.extend(cue)
+        if len(tokens) > self.max_len:
+            raise ValueError(f"a labelled row of {len(tokens)} tokens does not fit max_len={self.max_len}")
+        laid = Laid(name, kind_of(question), span, tuple(spans), tuple(slots), readout=len(tokens) - 1,
+                    label_ids=self.labels.ids(encoder, len(slots)))
+        return Encoded(tuple(tokens), (laid,), None, None, len(state), len(kept), trimmed=trimmed)
+
+    _state_first: ClassVar[bool] = True
+    """Whether a row starts with the state, before the question; a marker layout puts it after."""
 
     def _row(self, specials: Specials, head: list[int], options: list[list[int]], state: Sequence[int],
              conversation: bool) -> tuple[list[int], tuple[int, int], list[int], list[tuple[int, int]], int]:
@@ -428,6 +531,8 @@ class MarkerLayout(QuestionLayout):
     `parallel` is Laya's `option_layout="parallel"`; the published checkpoints
     are sequential.
     """
+
+    _state_first: ClassVar[bool] = False
 
     def _row(self, specials, head, options, state, conversation):
         tokens = [*_begin(specials), *head, specials.separator]
@@ -735,6 +840,9 @@ class DecisionInputs:
     slotted: jnp.ndarray | None = None
     context: jnp.ndarray | None = None
     context_lengths: jnp.ndarray | None = None
+    readout: jnp.ndarray | None = None
+    """`[B, Q]` where a readout of labels reads each question's answer (`Laid.readout`), or None; the
+    labels' ids are the readout head's own (`LabelReadout.label_ids`)."""
     max_segments: int = struct.field(pytree_node=False, default=1)
 
     @property
@@ -784,7 +892,8 @@ class DecisionInputs:
         valid = padded.get("attention_mask", np.ones(tokens.shape, bool))
         count = max(questions or 1, *(len(row.questions) for row in rows))
         width = max(options or 1, *(len(laid.options) for row in rows for laid in row.questions))
-        laid = [question_fields(row, count, width) for row in rows]
+        labelled = labelled_rows(rows)
+        laid = [question_fields(row, count, width, labelled) for row in rows]
         kinds, real, spans, option_spans, real_options = (
             np.stack([fields[name] for fields in laid])
             for name in ("kinds", "questions", "spans", "option_spans", "options"))
@@ -810,7 +919,17 @@ class DecisionInputs:
                    jnp.asarray(padded["slots"], jnp.int32) if parallel else None,
                    None if indexed is None else jnp.asarray(np.stack([slots for slots, _ in indexed])),
                    None if indexed is None else jnp.asarray(np.stack([real for _, real in indexed])),
-                   context, lengths)
+                   context, lengths,
+                   jnp.asarray(np.stack([fields["readout"] for fields in laid])) if labelled else None)
+
+
+def labelled_rows(rows: Sequence[Encoded]) -> bool:
+    """Whether `rows`' options stand under labels (`Labels`), read at an answer cue; one batch reads
+    its rows' options one way."""
+    labelled = {laid.readout is not None for row in rows for laid in row.questions}
+    if len(labelled) > 1:
+        raise ValueError("one batch reads its rows' options one way, under labels or at their markers")
+    return bool(labelled) and labelled.pop()
 
 
 OPTION_TILE = 128

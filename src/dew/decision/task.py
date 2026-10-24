@@ -833,7 +833,7 @@ def laid_out(batch: Mapping[str, object], max_segments: int) -> DecisionInputs:
                           positions=array("positions"), slots=given("slots"),
                           option_slots=given("option_slots"), slotted=given("slotted"),
                           context=given("context"), context_lengths=given("context_lengths"),
-                          max_segments=max_segments)
+                          readout=given("readout"), max_segments=max_segments)
 
 
 def _widened(leaf: jax.Array, length: int, fill: int = 0) -> jax.Array:

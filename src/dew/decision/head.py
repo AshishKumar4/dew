@@ -53,11 +53,21 @@ class Head(nn.Module):
     """
 
     reads_table: ClassVar[bool] = False
+    reads_labels: ClassVar[bool] = False
+    """Whether the head reads the answer state of each question at its row's answer cue
+    (`DecisionInputs.readout`) against labels (`Labels`), the backbone's output table its `table`
+    (`OutputTable`, None where no matrix alone is the backbone's head)."""
     one_question: ClassVar[bool] = False
     """Whether the head reads one question a row, refusing a joint row's several
     questions at the host boundary (`validate_rows`)."""
     width_field: ClassVar[str] = "features"
     """The field holding the width of the states the head reads."""
+
+    @nn.nowrap
+    def tied_labels(self) -> tuple[tuple[int, ...], ...] | None:
+        """The label ids, `[K][V]`, at which the head reads the backbone's own logits (`tied`), or
+        None where it reads none."""
+        return None
 
     @nn.nowrap
     def validate_rows(self, rows: Sequence[Encoded]) -> None:
@@ -436,5 +446,115 @@ def decision_geometry(lengths, questions, options):
     return geometry
 
 
-HEADS: Mapping[str, type[Head]] = {head.__name__: head for head in (DecisionHead, JointSchemaHead)}
+def _answers(states: jax.Array, inputs: DecisionInputs) -> jax.Array:
+    """Each question's answer state `[B, Q, D]`, at its row's answer cue (`DecisionInputs.readout`)."""
+    if inputs.readout is None:
+        raise ValueError("a readout of labels reads rows whose options stand under labels (Labels)")
+    return _gathered(states, inputs.readout)
+
+
+class LabelReadout(Head):
+    """Dew's readout of labels: each option slot's logit is the backbone's own logit for its label at
+    the question's answer cue (`dew.decision.layout.Labels`), through the output table's input QDQ,
+    scale, bias and softcap, computed in fp32 (`DecisionModel.label_logits`, `OutputTable.columns`).
+    A label read as several token variants (`label_ids[k]`, one id a variant) is their grouped logit,
+    the logsumexp of theirs. Untrained, the head is the backbone's own readout.
+
+    `untied` gives each slot's every variant a trainable row and bias of its own, drawn from its
+    variant's output row (scale folded in) and bias, read through the same input QDQ and softcap and
+    grouped alike, so at its draw it is the tied readout at every state; it needs the backbone's
+    output table to draw from (`table`)."""
+
+    features: int
+    label_ids: tuple[tuple[int, ...], ...]
+    untied: bool = False
+    reads_labels: ClassVar[bool] = True
+
+    @nn.nowrap
+    def tied_labels(self) -> tuple[tuple[int, ...], ...] | None:
+        return None if self.untied else self.label_ids
+
+    @nn.nowrap
+    def decision_flops(self, lengths, questions, options) -> float:
+        """The labels' product over each answer state: its slots' variants, a row each."""
+        decision_geometry(lengths, questions, options)
+        variants = len(self.label_ids[0]) if self.label_ids else 1
+        return projection_flops(questions, self.features, len(self.label_ids) * variants)
+
+    @nn.compact
+    def __call__(self, states: jax.Array, inputs: DecisionInputs, table=None, train: bool = False, *,
+                 tied: jax.Array | None = None) -> jax.Array:
+        width = inputs.options.shape[-1]
+        if width > len(self.label_ids):
+            raise ValueError(f"{width} option slots outnumber the readout's {len(self.label_ids)} labels")
+        ids = jnp.asarray(self.label_ids, jnp.int32)
+        if not self.untied:
+            assert tied is not None, "a tied readout reads the backbone's own label logits"
+            return jax.nn.logsumexp(tied[..., :width, :], axis=-1)
+        if table is None:
+            raise TypeError("an untied readout draws its rows from the backbone's output table, which a head "
+                            "past a transform, an adapter or a code has not; read the labels tied instead")
+        rows = self.param("rows", lambda key: jnp.take(table.rows(), ids.reshape(-1), axis=0).astype(
+            jnp.float32).reshape(*ids.shape, -1))
+        bias = self.param("bias", lambda key: (jnp.zeros(ids.shape, jnp.float32) if table.bias is None else
+                                               jnp.take(table.bias, ids.reshape(-1)).reshape(ids.shape)
+                                               .astype(jnp.float32)))
+        answers = table.states(_answers(states, inputs)).astype(jnp.float32)
+        logits = jnp.einsum("bqd,kvd->bqkv", answers, rows, precision=jax.lax.Precision.HIGHEST) + bias
+        capped = logits if table.softcap is None else table.softcap * jnp.tanh(logits / table.softcap)
+        return jax.nn.logsumexp(capped[..., :width, :], axis=-1)
+
+
+class SlotReadout(Head):
+    """A published slot release's head, its law as the release's runtime computes it: slot i's score
+    is `<slot_i, h> + <q(h), k(m_i)> / sqrt(head_dim)`, `h` the question's answer state
+    (`DecisionInputs.readout`), `m_i` the mean of the final states over option i's whole rendered line
+    (its span), `q` and `k` each a `[head_dim, features]` projection, with no slot bias and no softcap on
+    the sum. Its slot rows are drawn from the backbone's output rows of the slots' label ids, `q` from a
+    normal of std `features ** -0.5` and `k` at zero, so at its draw it scores the labels' rows alone;
+    a release's reader loads all three (`readout_head.pt`)."""
+
+    features: int
+    label_ids: tuple[int, ...]
+    head_dim: int = 64
+    reads_labels: ClassVar[bool] = True
+
+    @nn.nowrap
+    def decision_flops(self, lengths, questions, options) -> float:
+        """The slots' rows and the query over each answer state, the key over each option's pooled line,
+        and the line pooling."""
+        decision_geometry(lengths, questions, options)
+        return (projection_flops(questions, self.features, len(self.label_ids) + self.head_dim)
+                + projection_flops(options, self.features, self.head_dim)
+                + 2 * np.sum(options) * self.head_dim)
+
+    @nn.compact
+    def __call__(self, states: jax.Array, inputs: DecisionInputs, table=None, train: bool = False, *,
+                 tied: jax.Array | None = None) -> jax.Array:
+        width = inputs.options.shape[-1]
+        if width > len(self.label_ids):
+            raise ValueError(f"{width} option slots outnumber the release's {len(self.label_ids)} slots")
+        ids = jnp.asarray(self.label_ids, jnp.int32)
+
+        def drawn(key):
+            if table is None:
+                return jax.random.normal(key, (len(self.label_ids), self.features), jnp.float32) * (
+                    self.features ** -0.5)
+            return jnp.take(table.rows(), ids, axis=0).astype(jnp.float32)
+
+        slots = self.param("slots", drawn)
+        q = self.param("q", nn.initializers.normal(self.features ** -0.5), (self.head_dim, self.features),
+                       jnp.float32)
+        k = self.param("k", nn.initializers.zeros, (self.head_dim, self.features), jnp.float32)
+        answers = _answers(states, inputs).astype(jnp.float32)
+        pooled = _span_means(states.astype(jnp.float32), inputs.option_spans)
+        highest = jax.lax.Precision.HIGHEST
+        score = jnp.einsum("bqd,kd->bqk", answers, slots[:width], precision=highest)
+        query = jnp.einsum("bqd,hd->bqh", answers, q, precision=highest)
+        key = jnp.einsum("bqkd,hd->bqkh", pooled, k, precision=highest)
+        return score + jnp.einsum("bqh,bqkh->bqk", query, key, precision=highest) / math.sqrt(self.head_dim)
+
+
+HEADS: Mapping[str, type[Head]] = {head.__name__: head for head in (DecisionHead, JointSchemaHead,
+                                                                    LabelReadout, SlotReadout)}
 """The heads a run may record, by name."""
