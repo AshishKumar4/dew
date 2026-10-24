@@ -35,7 +35,7 @@ class Gemma4UnifiedVision(TowerBase):
     def build(self) -> nn.Module:
         return AxialPatchEmbedding(
             self.mm_embed_dim, self.patch_size * self.pooling_kernel_size, self.mm_posemb_size,
-            use_bias=True, table_axis=1, axis_validity=True,
+            use_bias=True, table_axis=1, position_validity="axis",
             norm=functools.partial(nn.LayerNorm, epsilon=1e-5, use_fast_variance=False),
             initializer=nn.initializers.zeros)
 
