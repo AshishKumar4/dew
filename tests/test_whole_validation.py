@@ -167,7 +167,7 @@ def evaluated(name: str, windows, tmp_path) -> dict:
                   "batches": [result.coordinated_batches for result in passes], "unbatched": None}
         # The pass scores the averaged weights, unless the average is the
         # objective's frozen reference.
-        scored = variables if objective._ema_is_reference else averaged
+        scored = variables if objective.ema_is_reference else averaged
 
         def statistics(rows, key: int):
             return objective._loss(scored, rows, Step(jnp.asarray(0), jax.random.key(key), averaged))[0]

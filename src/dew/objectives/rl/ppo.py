@@ -123,7 +123,7 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
 
     saved_task = TextGeneration
     settings = TextSettings
-    _ema_is_reference = True
+    ema_is_reference = True
     _model_part = "policy"
 
     def __init__(self, model, seq_len: int, *, critic: nn.Module,

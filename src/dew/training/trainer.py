@@ -1749,7 +1749,7 @@ class Trainer(Generic[Loss, Effects]):
         agreed("training announcement", functools.partial(
             self._display.start, started, model=type(trained[0] if trained else self.objective).__name__,
             batch=plan.dataset.batch, precision=precision, shown=shown,
-            averaged=self.objective.ema is not None and not self.objective._ema_is_reference))
+            averaged=self.objective.ema is not None and not self.objective.ema_is_reference))
         return False
 
     def _local_devices(self) -> list:

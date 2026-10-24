@@ -158,7 +158,7 @@ class GRPOObjective(TokenScorer):
     # progress, so it is shown without a direction.
     shown: Mapping[str, Shown] = {"loss": Shown()}
 
-    _ema_is_reference = True
+    ema_is_reference = True
 
     counts_tokens = False
     """Rollout/packing geometry is supplied by its own objective count, not inherited LM rows."""

@@ -42,23 +42,13 @@ from jax.tree_util import Partial
 from typing_extensions import TypeIs, TypeVar
 
 from dew.artifacts import Artifact, Artifacts, TokenScores
-from dew.batch import (
-    EXAMPLE_ROWS,
-    FROZEN,
-    PARAMETER_ROOTS,
-    VALID_ROWS,
-    Batch,
-    PathFilter,
-    Variables,
-    everything,
-    part,
-)
+from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Variables, everything, part
 from dew.nn import categorical
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import accumulated, at_least_fp32, compensated_sum
 from dew.nn.protocols import HiddenStates, ProjectsParameters
 from dew.nn.sharding import rows_taken
-from dew.records import JSON, strings
+from dew.records import JSON
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -499,7 +489,7 @@ TEACHER = "teacher"
 
 UNREAD = "unread"
 """The field of an inference record naming the parts of the run's tree its model does not read
-(`without`), which a loader leaves unrestored (`Objective._saved_variables`): a distillation's
+(`without`), which a loader leaves unrestored (`dew.inference.tasks.SavedRun.variables`): a distillation's
 teacher and projections beside the student it saves."""
 
 
@@ -668,7 +658,9 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     A subclass inherits its parent's. None means a saved run of this
     objective loads as no task."""
-    _ema_is_reference: ClassVar[bool] = False
+    ema_is_reference: ClassVar[bool] = False
+    """Whether the objective's average is the frozen reference its loss compares against (an RL
+    policy's), which validation, `pipeline` and a saved run's loader never read as the trained weights."""
     # The name an objective that trains other networks beside its model nests
     # the model under in every collection, as PPO nests its policy beside the
     # critic; None when the saved tree is the model's.
@@ -1272,44 +1264,18 @@ class Objective(ABC, Generic[Loss, Effects]):
     def evaluation_variables(self, variables: Variables, step: Step) -> Variables:
         """Return the weights a validation pass and a preview score: the
         step's average when the run keeps one, unless that average is the
-        objective's frozen reference (`_ema_is_reference`), else `variables`."""
-        return variables if step.ema is None or self._ema_is_reference else step.ema
+        objective's frozen reference (`ema_is_reference`), else `variables`."""
+        return variables if step.ema is None or self.ema_is_reference else step.ema
 
     def _pipeline_weights(self, state: TrainState, ema: bool | None) -> Variables:
-        if self._ema_is_reference or ema is False or (ema is None and state.ema is None):
+        if self.ema_is_reference or ema is False or (ema is None and state.ema is None):
             return state.variables
         return state.averaged
 
     @classmethod
-    def _saved_variables(cls, directory: str, *, step: int | str | None, ema: bool | None,
-                         mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
-                         param_dtype: DTypeLike | None = None,
-                         parameter_roots: tuple[tuple[str, ...], ...] = PARAMETER_ROOTS
-                         ) -> Variables:
-        """Return the model's variables from a run of this objective, as every run loader reads them.
-
-        The arguments are `Checkpoints.variables`'. An objective whose average
-        is its frozen reference gives the trained weights whatever `ema` asks,
-        and one that nests the model beside other networks gives the model's
-        own part, its trained and frozen collections together.
-        """
-        from dew.checkpoints import Checkpoints
-
-        with Checkpoints(directory) as checkpoints:
-            step = checkpoints.pinned(step)
-            record = checkpoints.artifact(step)
-            unread = record.get(UNREAD, []) if isinstance(record, Mapping) else []
-            if not isinstance(unread, list):
-                raise ValueError(f"{UNREAD} must be a list of paths")
-            variables = checkpoints.variables(
-                step=step, ema=False if cls._ema_is_reference else ema, mesh=mesh, layout=layout,
-                param_dtype=param_dtype, parameter_roots=parameter_roots,
-                unread=tuple(strings(path, UNREAD) for path in unread))
-        return cls._model_tree(variables)
-
-    @classmethod
-    def _model_tree(cls, variables: Variables) -> Variables:
-        """The `_model_part` subtree of `variables`, or the whole tree when the objective names none."""
+    def model_tree(cls, variables: Variables) -> Variables:
+        """The model's own subtree of a tree this objective's class trains (`_model_part`), or the whole
+        tree when the objective names none: what a saved run's loader reads (`SavedRun.variables`)."""
         return variables if cls._model_part is None else part(variables, cls._model_part)
 
     def model_variables(self, variables: Variables) -> Variables:
@@ -1320,7 +1286,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         part, trained and frozen collections together, of an objective that
         nests the model beside other networks or frozen ones.
         """
-        return self._model_tree(variables)
+        return self.model_tree(variables)
 
     def task_settings(self) -> DataclassInstance | None:
         """Return the task settings a saved step records beside its model, an

@@ -885,7 +885,7 @@ class DiffusionObjective(Objective[Ratio]):
         """Sample the batch's conditions on every rank, agreeing at each phase.
 
         The weights are the EMA copy when the step carries one and it is not
-        the objective's reference (`_ema_is_reference`), else the live ones.
+        the objective's reference (`ema_is_reference`), else the live ones.
         `limit` caps the rows drawn, which is what a preview takes. Returns
         the samples and the condition tokens behind them.
         """

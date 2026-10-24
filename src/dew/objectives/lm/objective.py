@@ -1106,7 +1106,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         """Sample the configured prompt once, then decode only on process zero.
 
         An objective whose EMA holds a frozen reference draws from the live
-        policy instead, which is what `_ema_is_reference` says.
+        policy instead, which is what `ema_is_reference` says.
         """
         settings = self.samples
 
