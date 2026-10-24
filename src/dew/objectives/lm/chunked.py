@@ -41,7 +41,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
-from dew.nn.categorical import rescaled, target_loss
+from dew.nn.categorical import rescaled, segment_log_partition, target_loss
 from dew.nn.kernels.generation import gpu_target
 from dew.nn.precision import (
     at_least_fp32,
@@ -1176,18 +1176,11 @@ def _over_supports(logits, ids, columns, targets):
     def row(logits, ids, columns, labels):
         real = columns >= 0
         segment = jnp.where(real, columns, width)
-        peak = jax.ops.segment_max(jnp.where(real, jax.lax.stop_gradient(logits), -jnp.inf),
-                                   segment, num_segments=width + 1)
-        present = jnp.isfinite(peak)
-        peak = jnp.where(present, peak, 0.0)
-        # Padding exponentiates -inf, so no overflowed entry reaches the backward.
-        mass = jax.ops.segment_sum(jnp.exp(jnp.where(real, logits - peak[segment], -jnp.inf)),
-                                   segment, num_segments=width + 1)[:width]
-        log_z = jnp.log(jnp.where(present[:width], mass, 1.0)) + peak[:width]
+        log_z, present = segment_log_partition(logits, segment, width)
         match = real & (ids == labels)
         inside = jax.ops.segment_max(match.astype(jnp.int32), segment, num_segments=width + 1)[:width] > 0
         target = jax.ops.segment_sum(jnp.where(match, logits, 0.0), segment, num_segments=width + 1)[:width]
-        filtered = jnp.where(present[:width], jnp.where(inside, target - log_z, -jnp.inf), 0.0)
-        return filtered, present[:width]
+        filtered = jnp.where(present, jnp.where(inside, target - log_z, -jnp.inf), 0.0)
+        return filtered, present
 
     return jax.vmap(row)(logits, ids, columns, labels)
