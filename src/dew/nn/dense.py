@@ -137,6 +137,11 @@ def _contractions(module: nn.Dense | nn.DenseGeneral, ndim: int
     return (ndim - 1,), ()
 
 
+def _plain_dense(module: nn.Module) -> bool:
+    """A bare Dense call, with no subclass envelope for a joined projection to bypass."""
+    return type(module) is Dense
+
+
 def _linear_site(context: InterceptorContext, target: str) -> bool:
     """Whether this targeted call is the managed linear arithmetic, rather than its envelope.
 

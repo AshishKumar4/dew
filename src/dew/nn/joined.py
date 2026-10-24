@@ -15,7 +15,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.core import meta
 
-from dew.nn.dense import Dense
+from dew.nn.dense import _plain_dense
 from dew.nn.precision import biased, float32_dot_general
 
 from ..registry import wrapper_layers
@@ -38,7 +38,7 @@ def _intercepted() -> bool:
 def join_refusal(projections: Sequence[nn.Module]) -> str | None:
     """Why one GEMM cannot stand in for `projections`' own calls, or None."""
     return first_refusal(
-        (all(type(projection) is Dense for projection in projections),
+        (all(_plain_dense(projection) for projection in projections),
          "a projection is not a plain Dense, whose call the join reproduces"),
         (all(projection.dot_general in (None, float32_dot_general) and projection.dot_general_cls is None
              for projection in projections),
