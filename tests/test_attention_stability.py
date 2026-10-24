@@ -742,10 +742,10 @@ def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
         return attention_mosaic.forward(*operands, **forward_options)
 
     def mosaic_backward(query, key, value, spans, hooks, dout):
-        # From the plain-JAX training forward's residuals, a guarded one's (the Triton forward walks without
-        # the guards, so an overflowing row's split sums would be infinite).
-        residuals = attention_portable.attend(query, key, value, spans, hooks, **tiles, residuals=True,
-                                              **forward_options)[1:]
+        # From the mainloop's own training forward's residuals, a guarded one's (its overflowed rows walk
+        # again guarded, in the launch's form).
+        residuals = attention_mosaic.forward(query, key, value, spans, hooks, residuals=True,
+                                             **forward_options)[1:]
         return attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
                                          **options)
 
