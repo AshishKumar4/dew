@@ -158,6 +158,8 @@ class LayerSpec:
     unrolled, as a `provider` does; None for the rest."""
     attention_norm: bool = True
     """Whether the block norms its attention input; ModernBERT's first block does not."""
+    cross: bool = False
+    """Whether the layer reads the call's context through a gated cross-attention block first."""
 
 
 def scan_groups(specs: Sequence[Hashable],

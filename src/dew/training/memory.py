@@ -18,13 +18,13 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding
 
 from dew.data.dataset import rows_of
+from dew.devices import gpu_free_bytes, xla_flag
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
 from dew.nn.kernels.options import compiler_options
 from dew.nn.protocols import Recomputing, TritonGemm
 from dew.nn.sharding import mesh_axes
 from dew.objectives.base import Batch, Objective, Variables
 from dew.records import JSON, integers, json_value
-from dew.telemetry.devices import gpu_free_bytes, xla_flag
 from dew.training.distributed import parameter_axes
 from dew.training.state import TrainState
 

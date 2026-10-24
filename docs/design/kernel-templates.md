@@ -1,8 +1,24 @@
 # Dew's kernel templates: design
 
-Approved 2026-10-21 (§13). This document is the one source for the templates' structure: the algebra,
-hooks, structure, toolkit, mainloops and choice layer of attention, linear recurrence and GEMM. Its
-appendix maps every variant each template covers, and every current dispatch it replaces, to the design.
+Approved 2026-10-21, updated with the owner's decisions through 2026-10-23 (§13). This document is the one source for the templates' structure: the algebra, hooks, structure, toolkit, mainloops and choice layer of attention, linear recurrence and GEMM. Its appendix maps every variant each template covers, and every current dispatch it replaces, to the design.
+
+## 0. The vision
+
+Three templates, attention, linear recurrence and GEMM, replace every hand kernel and every vendored kernel Dew uses, with no selector in the end (owner, 2026-10-19). A template is one algorithm, written once as Tokamax Ops in Pallas, that compiles a kernel tailored to the device it runs on, generating equivalent or better kernels than the ones it absorbs.
+
+- **The bar.** On every row it serves, on every architecture it claims, a template matches or beats the best existing kernel at that shape, in compute time and peak memory, while passing the accuracy gate and the stability invariant (no NaN or inf where the reference is finite). Matching the reference's accuracy is the minimum; where a cheap gain makes Dew more accurate, it takes it (owner, 2026-10-21, 10-22).
+
+- **General before fast.** A template's first duty is coverage: every variant in its coverage table (Appendices A to C), every consumer that calls it, every form (forward, backward, decode), on every architecture family it claims. Speed comes on top of a covered cell, never instead of one. Progress is measured as a coverage matrix (rows: variants and consumers; columns: architecture families; each cell: supported, passing the gate, and its time and memory against the route it replaces), not as one shape's number.
+- **One algebra, one toolkit, thin mainloops.** The math lives once in each template's algebra. Variants are hooks traced into the kernel, never per-model kernels. Everything that differs by architecture lives once in the shared Mosaic toolkit, as one Family bundle per architecture (operand loader, matrix-instruction issuer, accumulator home, barriers and roles), used by all three templates. A mainloop holds no math and no pipeline machinery, only the order of its bundle's steps around the algebra. One mainloop skeleton per template serves every architecture whose overlap structure is the same, and a separate thin mainloop exists only where the structure differs, with the difference stated (attention's tcgen05 mainloop, for its tensor-memory accumulator and correction role).
+- **Mosaic everywhere.** Mosaic GPU on every NVIDIA family (mma.sync, wgmma, tcgen05) and Mosaic TPU on TPU. Pallas Triton is deprecated upstream: the existing Triton kernels stay in use as production routes and as speed references, unmaintained, and each is deleted when its template cell matches or beats it.
+- **Configs from the device, never tables.** Device attributes are read at runtime; architecture facts follow the instruction family; facts that need measuring default to the family's value and are refined only by opt-in calibration. Legality prunes and one shared analytic cost model ranks. A template claims instruction families, not devices, so a GPU nobody has measured (a B300, a future part of a known family) compiles a kernel tailored to its own facts by default. Only a GPU outside every claimed family runs XLA.
+- **Vendored kernels and XLA are candidates, not a table.** FlashAttention 2/3, cuDNN, CUTLASS's grouped GEMM, the Triton references and XLA are routes the same chooser ranks by predicted time and memory, until the template beats each one on its rows and the route is deleted. Where XLA or a vendored kernel wins, the template's loss is a defect to find and fix (owner, 2026-10-20). Today's fixed preference order goes.
+- **Tuning beyond the model is opt-in.** Measured tuning (Tokamax's autotuner, `dew tune`) is the user's choice, cached per device kind, never silent at startup. A learned ranker may replace the analytic ordering only where it beats it on held-out models and GPUs (owner, 2026-10-21).
+- **Two measures only.** The accuracy gate (testing.md: float64 truth, check 1 at 1.5× the reference, check 2 per element) and performance, meaning compute time and peak memory, measured on clean exclusive runs at the chooser's default pick, in operator rows and in the model step. Nothing else decides whether code lands or a route is replaced: not code equality, not bitwise agreement between implementations.
+- **Fast by default, accurate one option away.** The default is the fastest form that passes the gate on ordinary inputs and stays finite at adversarial ones: attention's base-2 fold and its fast backward (FlashAttention's arithmetic, with the anchored D for dQ). The accurate forms hold 1.5× and no merging at adversarial inputs too. Deterministic mode is one flag away.
+- **Fusion is the payoff.** Hooks, and Pallas's fuser through `gemm/fused.py`, pull neighbouring operations into the kernel: norms, activations, gating, routing weights, biases, LoRA's low-rank product. That is what makes a template more than XLA or a fixed vendored kernel can be (owner, 2026-10-19, 10-22).
+- **Every accelerator, built in parallel.** Each template targets every architecture family Dew runs on, NVIDIA and TPU, built at once rather than one generation after another, with one scoreboard GPU per family (owner, 2026-10-21, 10-22). Kernel work lands in base/kernels on the hardware-free gates and reaches main through GPU-validated promotion; hardware never blocks writing it.
+- **Templates first, then the megakernel.** Tile functions keep explicit operands, outputs and resources, so Dew's own persistent runtime can later schedule them as instructions across a layer or a decode step.
 
 ## 1. The bar, with the comparison defined
 
@@ -97,15 +113,16 @@ Measured on an H100 at qwen3-8b and gpt-oss-20b shapes, 4k and 32k tokens, the a
 The update is `S' = T·S·E + W`, with the transitions as values.
 
 **Functions.**
-- `decays(g, resets) -> pairs`: difference-first within a sub-chunk of 16, factored across sub-chunks. The factorization is chosen statically from the decay parameterization's declared range bound, because it is exact only within fp32's exponent range.
+- `decays(g, resets) -> pairs`: the log decay cumulated as a compensated pair (hi, lo), and each pair of positions' decay the exponential of its difference's two halves, each: an exponent rounded to one fp32 loses up to half its ulp, which put the decay's and the write gate's gradients under aligned keys 1.6 to 2.1 times the reference's distance from float64. A kernel takes a base-2 exponent as its fraction's exp2 times its integer's exact power of two (`recurrence_algebra.raised`, `decayed`). The decay from a chunk's start takes both halves too. No factoring across sub-chunks: the KDA port's factored intra backward put the decay gradient at its -5 floor 468 times the reference's.
 - `intra(q, k, beta, pairs, erase=(a, b)) -> (A_kk, A_qk)`, one pass for both the solve and the readout. Untied erase vectors (RWKV7, GDN-2, Comba) are `erase=(a, b)`; tied ones pass k twice. `pairs` carries the value side too, for two-sided decay (GLA value gates), and `carry` and `readout` apply E.
 - `factor(A_kk) -> L`: the triangular factorization (WY/UT). It is statically skipped for identity-inverse families (SSD, GLA, RetNet), which skip only the inverse, not their writes.
 - `normalize(o, groups)`: Mamba2's grouped output norm across heads. It is a cross-head reduction, so it is algebra, not a hook.
 - `apply(L, k, v, beta, g) -> (W, U)`: W = L·(kβ·exp(g)) and U = L·(vβ), as fla_gdn's `_w_u_kernel` computes them. Changing v changes U and not L.
-- `carry(S, W, U) -> (S', v_new)`.
-- `readout(q, S, A_qk, v_new) -> o`.
+- `carry(S, W, U) -> (S', v_new)`, the chunk's last real token's write by the token update itself (the WY write alone put the final memory under aligned keys 1.54 to 1.57 times the reference's distance).
+- `readout(q, S, A_qk, v_new) -> o`, whose gradient in the memory and the corrected values sums the chunk's tokens from its last, the smallest terms first (`remembered`): from the first, the initial memory's gradient sat 1.8 to 1.9 times the reference's.
 - `compose`: a chunk's transition as the factored triple (T, E, W), composed associatively by (T₂T₁, E₁E₂, T₂W₁E₂ + W₂). It serves sequence and context parallelism and parallel state passing at small B·H. Its cost comes from its actual products: T₂T₁, E₁E₂, T₂W₁ and its product with E₂, the write addition, and their bytes. Where transitions or writes are diagonal or low-rank, the factors simplify. Compose is used only where that cost measures below the sequential carry.
-- Each function's backward, with its rounding and order stated: the decay's summed-back gradient, and the GVA sum as an in-program loop.
+- Each function's backward, with its rounding and order stated: the delta rule's is the recurrence's own adjoint a token at a time within every chunk at once (memories checkpointed every 16 tokens, chunks in groups of 16), where differentiating the WY products cancelled independently rounded paths under aligned keys (the decay's gradient 1.9 to 2.9 times the reference's, now 0.99 to 1.07); the GVA sum as an in-program loop.
+- The chunk length: at most twice the keys' width (`held_chunk`), a measured policy (64-token chunks of 16-wide keys lost 1.7 to 1.8 times over a long sequence).
 
 **Transition values:**
 - T in two parts, in a stated order: the diagonal decay kind (none, scalar, per-key, per-value, two-sided, separable) times the erase kind (identity plus low rank, or additive DPLR). It has independent erase, write and read vectors.
@@ -305,9 +322,9 @@ Two measures decide whether a mainloop lands and whether it replaces a route: th
 
 ## 7. Choice: the config chooser inside each template
 
-**No kernel tables and, in the end, no selector.** The end state is one implementation per operation, the template. What stays is the config chooser inside each template: legality, then a model over device facts that picks tiles and formulations (§3), like any kernel's heuristics, with no per-GPU entries. Measured tuning is opt-in, cached per device kind, and the user's choice. Scoreboards are evidence, never routing data: no runtime table of measured routes is built.
+**No kernel tables and, in the end, no selector.** The end state is one implementation per operation, the template. What stays is the config chooser inside each template: legality, then a model over device facts that picks tiles and formulations (§3), like any kernel's heuristics, with no per-GPU entries. Measured tuning is opt-in, cached per device kind, and the user's choice. Scoreboards are evidence and calibrate the model's facts (a vendored kernel's measured rows among them, below), never routing data: no runtime table of measured routes is built.
 
-- **Interim:** today's typed selector (`selection`, `generation.route`) keeps serving the hand-kernel and external routes until each is deleted (§9). It isn't extended, and it goes with the last route.
+- **Interim:** today's typed selector (`selection`, `generation.route`) keeps serving the hand-kernel and external routes until each moves to the ranking below or is deleted (§9); its fixed preference order goes with the last.
 - **A GPU outside every family the template claims** (§6) runs XLA by a fixed capability rule, not a measured choice. Where XLA beats the template on a claimed family's GPU, that's a template defect to fix (§6, "debug where XLA wins"), not a route.
 - **Legality prunes; predictions rank.** Only hard constraints remove a configuration: it fits shared memory, registers and TMEM, and respects layout and instruction rules. Residency, predicted spills and roofline estimates are predictions, so they rank the legal space and never prune it. Today's analytic model ties all 36 attention configurations and ties the dense pick with the best tile; pruning on it would keep an arbitrary subset.
 - **Rank with complete analytic features**, one schema for all templates:
@@ -329,7 +346,7 @@ Two measures decide whether a mainloop lands and whether it replaces a route: th
   - outside its training range, the analytic estimate decides alone.
 
   Budget: about 2,000 configurations timed per GPU-hour, shape diversity before configuration count, and active collection where the model is unsure.
-- **External kernels are not configurations.** The template against cuBLAS, FA3 or CUTLASS is scoreboard evidence for deleting a route, never a routing choice. Each template's chooser replaces `templates/base.choose` and the per-template cost formulas.
+- **Vendored kernels are candidates until the template beats them** (owner, 2026-10-23). A vendored kernel (CUTLASS, FlashAttention, cuDNN, the Triton references) declares its legality like any launch and is ranked by the same model: its own cost terms where the model has them, else the model's estimate at its geometry scaled by its measured scoreboard rows, a calibrated fact per generation, so it is a candidate only where its rows were measured. The template's launch replaces it, and the vendored kernel is deleted, where the template matches it on the gate. CUTLASS's grouped GEMMs are the first (`grouped_matmul.CutlassGmm`, `CutlassTgmm`); the fixed preference order of the typed selector's other ops moves to this ranking after them. Each template's chooser replaces `templates/base.choose` and the per-template cost formulas.
 
 ## 8. Determinism, D and the backward
 
@@ -377,8 +394,13 @@ Built in parallel. Each piece lands when it meets its gates: the accuracy gate (
 4. The interpret-mode check 1 harness for every mainloop, on today's two forward forms.
 
 **Then the rungs:**
+<<<<<<< HEAD
 - **Toolkit and attention:** sm90 attention reaching Tokamax Mosaic, then FA3; the decode mainloop; the fused ticket backward. The sm90 mainloop (`attention_mosaic.py`) holds the forward (full and causal calls, 16-bit operands, the fold and fp16's natural form, no hooks yet) and the backward in both forms (bf16, from the Triton training forward's split sums), both on par by check 1, interpreted and on an H100 for hookless calls. Under every score hook and the initial state, the backward is on par interpreted in both forms, and it lowers for an H100 under every hook but two: `temperature`, whose derivative divides by the parameter (`integer_pow` with exponent -2, which jax 0.11.2's Mosaic GPU lowering rejects), and `row-indexed` (layout inference, as the forward's known red); its H100 runs are pending. On an H100 at llama-d128, causal bf16, 2 × 4096, its backward takes 2.63 ms in the fast form and 4.81 in the accurate one, against the Triton mainloop's 2.96 and 5.06 in the same session. It runs on no route yet: its forward's guards, hooks, the remaining call forms and its training forward come next.
 - **Recurrence:** the one chunk algebra absorbing the four ports, then FlashQLA's fused launch DAG and `compose`.
+=======
+- **Toolkit and attention:** sm90 attention reaching Tokamax Mosaic, then FA3; the decode mainloop; the fused ticket backward. The sm90 mainloop (`attention_mosaic.py`) holds the forward (full and causal calls, 16-bit operands, the fold and fp16's natural form, no hooks yet) and the backward in both forms (bf16, from the Triton training forward's split sums), both on par by check 1, interpreted and on an H100; on an H100 at llama-d128, causal bf16, 2 × 4096, its backward takes 2.63 ms in the fast form and 4.81 in the accurate one, against the Triton mainloop's 2.96 and 5.06 in the same session. It runs on no route yet: its forward's guards, hooks, the remaining call forms and its training forward come next.
+- **Recurrence:** one Mosaic GPU mainloop skeleton over the chunk algebra for every variant (GDN, KDA, the delta rule, gated writes, SSD), on the mma.sync and wgmma Family bundles, keeping the ports' optimizations (the fused solve, the launch DAG, chunk sizing); then FlashQLA's fused launch DAG and `compose`. The four ports (`fla_gdn`, `fla_kda`, `mamba_ssd`, the TPU `ssd`) are frozen references until each cell matches or beats them.
+>>>>>>> d4ab3e4db
 - **GEMM and the choice layer:** the M-split, register-A cooperative mainloop and the reduce pass before norm and SwiGLU fusion, then split-K for dW, then CUTLASS's rungs; the analytic features, the logging and the ranker.
 
 GPU time is reserved daily on an H100 and an A100 for the rungs.
@@ -414,9 +436,18 @@ A row that needs a signature change is designed now, not retrofitted: rank-2 W, 
 
 Each entry also names the deletion it enables.
 
-## 13. Owner decisions (2026-10-21)
+## 13. Owner decisions
 
 Questions 1 and 2 as recommended. Question 3: support all of them (§12). Question 4: not deterministic by default; the fastest passing form is the default, and deterministic mode is one flag away (§8). Question 1, answered again (2026-10-23): the attention backward's default is the fast form, FlashAttention's arithmetic where it passes the gate with the anchored D for dQ, and the accurate form is one option away (§1).
+
+Later decisions (2026-10-22 and 2026-10-23), which §0 states as the design; where a section below still says otherwise, §0 wins until the section is updated:
+- Attention's default is the fast form: the base-2 fold, and FlashAttention's backward arithmetic with the anchored D for dQ. The accurate form is one option away and holds 1.5× and no merging at adversarial inputs; the default stays finite there.
+- Mosaic GPU on every NVIDIA family; the Triton kernels stay as unmaintained references until replaced.
+- Per-architecture Family bundles in the shared toolkit and thin mainloops, not a full mainloop per template per generation (§6).
+- Templates claim instruction families; unseen GPUs of a claimed family get tailored kernels by default (§6, §7).
+- Vendored kernels, CUTLASS's grouped GEMM included, are candidates the chooser ranks by the cost model (§7, superseding "external kernels are not configurations").
+- The only measures are the accuracy gate and performance (time and peak memory); no code-equality or bitwise cross-implementation gate (§1, §9).
+- The megakernel is Dew's own persistent runtime, after the templates; no XLA patches and no Dew-built jaxlib.
 
 ## Appendix A. Coverage: attention
 
@@ -623,6 +654,8 @@ Each ⚑ in the tables above is closed by the matching item below.
 
 Notation: `S' = T·S·E + W` with S of shape K×V per value head. "Values" are §3's transition values, "hooks" are §4's traced callables, "structure" is §5's, and "DAG" is §6's mainloop parameter (fused/split solve; sequential/parallel carry). A row the design's signatures cannot express is marked **⚠ signature**.
 
+Every family below runs on one Mosaic mainloop skeleton per overlap structure (§6), its Family bundle per architecture, the math only in the chunk algebra. The ports a row names (`fla_gdn`, `fla_kda`, `mamba_ssd`, the TPU `ssd`, `short_conv`) stay production routes and speed references, unmaintained, until the row's cell on each family matches or beats them in time and memory with the gate passing; a deletion below happens in that head. Progress is the coverage matrix (§0): rows these families and consumers, columns sm80, sm90 and TPU.
+
 ### Table 1: families → template
 
 | Family (models) | Transition values | Hooks (kind) | Structure | DAG / mainloop | Signatures it exercises | Status |
@@ -644,7 +677,7 @@ Notation: `S' = T·S·E + W` with S of shape K×V per value head. "Values" are �
 | Decode (T=1, all R rows) | the same transition values | the same hooks, inlined (today's `recurrence.step`) | paused rows (`active`), conv history, bf16 state rounding | decode mainloop: one launch per token | definitional token update | covered (exists) |
 | Sequence/context parallel, chunked prefill | — | — | shard boundaries | `compose` (the design) | compose over (T, E, W) | covered; for the delta rule T is K×K dense — cost measured per §3 |
 
-### Table 2: consumers → op, contracts to keep, deletion enabled
+### Table 2: consumers → op, contracts to keep, deletion enabled (when the row's cells meet the port)
 
 | Consumer (today) | Op it becomes | Contracts it must keep | Deletion it enables |
 |---|---|---|---|
@@ -779,7 +812,7 @@ Status says what exists today on feat/gemm-template, abbreviated "feat": built (
 
 | Consumer (origin/main) | Uses | Contracts the template must keep | Deletion it enables |
 |---|---|---|---|
-| `moe.expert_projection`, from `ExpertMLP._project` (gate, up, down; relu² variant; `swiglu_limit`) and `GptOssExperts._project` (interleaved gate_up + per-expert biases, gpt-oss activation, down + bias), via `expert_dispatch` global and exchange | rows 5–8, 10, 12, 17/18, 20, 23 | **Precision:** operands cast to the compute dtype, accumulation in at least fp32, one rounding; dk in the master dtype, dx in the input dtype, both accumulated over the widest of compute/input/kernel; 'highest' fp32 exact or XLA. **Dropped tails:** rows past `sum(sizes)` are zero with zero cotangents; empty groups. **Expert parallelism:** per-shard metadata inside `shard_map`; fsdp layouts; `seen_whole` traces only. **Master gradient:** fp32 dk feeding the optimizer (tests/test_moe_precision.py: float64 sums and three Adam steps on every expert/fsdp layout). **Routes:** `route('grouped_matmul', kernel, target)`, `ran_kernel`'s reason, `chosen(grouped_matmul='xla'\|'triton'\|'mosaic_gpu')`, `kernel_refusal` codes. **AD:** today 'xla' holds every mode (`_projection` custom_jvp) but 'pallas' only first-order reverse. The template (feat's `linear_tangent`) gives every order, jit and vmap. **Remat:** `checkpoint_name` residuals 'gate_proj'/'up_proj'/'down_proj' (`decoder_block.MLP_RESIDUALS`) survive fusion: a fused row saves residuals under those names or the policy names the template's | `grouped_projection`'s custom_vjp and its 'pallas' first-order-only limit; `_projection`/`_projection_jvp` as an implementation (it becomes the plain-JAX reference mainloop, §9); the six launch classes in `grouped_matmul.py` become one mainloop's configurations; vendored `ragged_dot.py`; `gather_expert_bias` + the activation passes in gpt-oss and ExpertMLP (rows 10, 17/18); `jnp.sum(slots * weights)` in gpt-oss (row 12) |
+| `moe.expert_projection`, from `ExpertMLP._project` (gate, up, down; relu² variant; `swiglu_limit`) and `GptOssExperts._project` (interleaved gate_up + per-expert biases, gpt-oss activation, down + bias), via `expert_dispatch` global and exchange | rows 5–8, 10, 12, 17/18, 20, 23 | **Precision:** operands cast to the compute dtype, accumulation in at least fp32, one rounding; dk in the master dtype, dx in the input dtype, both accumulated over the widest of compute/input/kernel; 'highest' fp32 exact or XLA. **Dropped tails:** rows past `sum(sizes)` are zero with zero cotangents; empty groups. **Expert parallelism:** per-shard metadata inside `shard_map`; fsdp layouts; `seen_whole` traces only. **Master gradient:** fp32 dk feeding the optimizer (tests/test_moe_precision.py: float64 sums and three Adam steps on every expert/fsdp layout). **Routes:** `route('grouped_matmul', kernel, target)`, `ran_kernel`'s reason, `chosen(grouped_matmul='xla'\|'triton'\|'mosaic_gpu'\|'cutlass')`, `kernel_refusal` codes; CUTLASS's grouped GEMMs (dew-cutlass) are a candidate the chooser ranks by its measured rows (§7) until the template's launch beats them. **AD:** today 'xla' holds every mode (`_projection` custom_jvp) but 'pallas' only first-order reverse. The template (feat's `linear_tangent`) gives every order, jit and vmap. **Remat:** `checkpoint_name` residuals 'gate_proj'/'up_proj'/'down_proj' (`decoder_block.MLP_RESIDUALS`) survive fusion: a fused row saves residuals under those names or the policy names the template's | `grouped_projection`'s custom_vjp and its 'pallas' first-order-only limit; `_projection`/`_projection_jvp` as an implementation (it becomes the plain-JAX reference mainloop, §9); the six launch classes in `grouped_matmul.py` become one mainloop's configurations; vendored `ragged_dot.py`; `gather_expert_bias` + the activation passes in gpt-oss and ExpertMLP (rows 10, 17/18); `jnp.sum(slots * weights)` in gpt-oss (row 12) |
 | `generation.linear_tangent` in `norm_swiglu.rms_norm` (from `attention.rms_normalized`: attention, linear, dc_ae) | rows 15, 1/2 | stored dtype, `offset` (Gemma's 1+w), `after_cast` (Llama vs Gemma order), `epsilon`, fp32 statistics, the inverse rounded once, the mean square saved (7d76cb049); JVP of every order through `linear_tangent`; `axes` sharding; route `rms_norm` | norm_swiglu's `RmsForward`/`RmsBackward` launches where a GEMM follows (the norm becomes row 15's pre-pass plus prologue). Norms followed by no GEMM (Gemma's post-attention and post-feedforward norms, sandwich norms) keep the algebra's row functions, run by a toolkit row loop or XLA's fusion, whichever measures faster |
 | `linear_tangent` in `norm_swiglu.stream_rms_norm` (from `attention.stream_rms_normalized`) | row 16 | as above, plus the summed stream stored rounded and its cotangent joined to the branch's | the stream-norm launch, replaced by the pre-pass writing `s` and `ms` |
 | `linear_tangent` in `norm_swiglu.gated_rms_norm` (from `attention.gated_rms_normalized`: linear/Mamba2 out-norm) | row 15 with a gate side | the gate activation (silu/sigmoid) and its rounding; ledger 962 makes it one gated-RMS primitive with SilentEel (recurrence's epilogue) | the gated-norm launch, once recurrence's epilogue and the GEMM prologue share the primitive (row 962) |

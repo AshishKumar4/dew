@@ -262,6 +262,39 @@ def test_a_hook_that_forms_a_unit_axis_is_refused():
 
 
 @INTERPRETS
+def test_a_hook_shaped_to_the_launchs_tile_is_taken():
+    """An output hook that reshapes its gate to the value width, legal on the launch's `[64, 128]` output
+    tile as on the reference's rows: the legality rule traces it at the tile and value width the launch
+    runs (`attention_mosaic.refused`), and the forward is on par under it."""
+    queries = 128
+    spans = template.spans(queries, queries, 1, causal=True)
+    draw_operands = _drawn((1, queries, 2, 1), jnp.bfloat16, width=128, keys=queries)
+
+    def draw(seed):
+        query, key, value, _ = draw_operands(seed)
+        gate = jax.random.normal(jax.random.PRNGKey(seed), (1, queries, 2, 128), jnp.float32)
+        return query, key, value, gate
+
+    def hooked(gate):
+        return template.Hooks(output_mod=lambda out, g: out * jax.nn.sigmoid(g.reshape((-1, 128))),
+                              output_params=(template.Param(gate, template.Kind.OUTPUT),))
+
+    tiles = attention_mosaic.DEFAULTS["wgmma"]
+    assert attention_mosaic.refused(jnp.bfloat16, 128, 128, hooked(draw(0)[3]), backward=False,
+                                    tile=(tiles.block_q, tiles.block_k)) is None
+
+    def ours(query, key, value, gate):
+        return attention_mosaic.forward(query, key, value, spans, hooked(gate), interpret=True,
+                                        family=mosaic_sm90.WGMMA)
+
+    def reference(query, key, value, gate):
+        return template.reference(query, key, value, spans, hooked(gate))
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "mosaic forward, a gate shaped to the tile",
+                    seeds=SEEDS)
+
+
+@INTERPRETS
 @pytest.mark.parametrize(("accurate", "fused"), BACKWARD_FORMS.values(), ids=BACKWARD_FORMS)
 @pytest.mark.parametrize("form", CASES)
 def test_the_backward_is_on_par_over_every_call_form_interpreted(form, accurate, fused):

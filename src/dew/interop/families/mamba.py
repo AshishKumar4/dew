@@ -17,7 +17,14 @@ from functools import partial
 
 from dew import records
 from dew.interop import mamba2
-from dew.interop.decoder_parts import DecoderFamily, DecoderFields, decoder_tensors, refuse
+from dew.interop.decoder_parts import (
+    DecoderFamily,
+    DecoderFields,
+    decoder_tensors,
+    record_bool,
+    record_int,
+    refuse,
+)
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.mamba import MambaMixer
 
@@ -41,13 +48,7 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     backbone validates takes one head of the model width; the mixer reads
     none of it.
     """
-    def integer(key: str, default: int) -> int:
-        used.add(key)
-        return records.integer(hf_config.get(key, default), key)
-
-    def flag(key: str, *, default: bool) -> bool:
-        used.add(key)
-        return records.boolean(hf_config.get(key, default), key)
+    integer, boolean = partial(record_int, hf_config, used=used), partial(record_bool, hf_config, used=used)
 
     hidden, expand = integer("hidden_size", 768), integer("expand", 2)
     stated = hf_config.get("intermediate_size")
@@ -71,12 +72,12 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
         state_size=integer("state_size", 16),
         time_step_rank=math.ceil(hidden / 16) if rank == "auto" else records.integer(rank, "time_step_rank"),
         conv_kernel=integer("conv_kernel", 4),
-        use_bias=flag("use_bias", default=False),
-        use_conv_bias=flag("use_conv_bias", default=True))
+        use_bias=boolean("use_bias", default=False),
+        use_conv_bias=boolean("use_conv_bias", default=True))
     return mamba2.mixer_decoder(hf_config, hidden, mixer, vocab_size=integer("vocab_size", 50280),
                                 num_layers=integer("num_hidden_layers", 32),
-                                tie_embeddings=flag("tie_word_embeddings", default=True),
-                                residual_in_fp32=flag("residual_in_fp32", default=True))
+                                tie_embeddings=boolean("tie_word_embeddings", default=True),
+                                residual_in_fp32=boolean("residual_in_fp32", default=True))
 
 
 def _export(model: CausalTransformer) -> Mapping[str, object]:

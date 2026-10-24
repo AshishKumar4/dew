@@ -88,14 +88,17 @@ def finite(value: object, what: str) -> float:
 def number(value: object, key: str) -> float:
     """One real field: an epsilon, a rate, a frequency. An integer is one.
 
-    transformers writes a non-finite bound as `{"__float__": "Infinity"}`
-    rather than as JSON's out-of-spec `Infinity` literal, so that record is
-    the one spelling of an infinity a config carries, and the only one read
-    here; a bare non-finite number reached this field from somewhere else.
+    transformers writes an infinite bound as `{"__float__": "Infinity"}` or
+    `{"__float__": "-Infinity"}` rather than as JSON's out-of-spec literal
+    (`PreTrainedConfig._encode_special_floats`, 5.16.1), so those two
+    records are the one spelling of an infinity a config carries, and the
+    only ones read here. Its NaN record, any other mapping and a bare
+    non-finite number are refused: no field here is NaN.
     """
     if isinstance(value, Mapping):
-        if "__float__" not in value:
-            raise ValueError(f"{key}={value!r}: this field is a finite number")
+        if dict(value) not in ({"__float__": "Infinity"}, {"__float__": "-Infinity"}):
+            raise ValueError(f"{key}={value!r}: this field is a finite number or transformers' "
+                             "record of an infinity")
         return float(str(value["__float__"]))
     return finite(value, key)
 

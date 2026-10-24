@@ -382,6 +382,28 @@ def _bf16_operands(x, w):
                          preferred_element_type=jnp.float32)}
 
 
+@jax.jit
+def _broadcast(x, w):
+    """The product with a singleton axis before it: the reference's values, not its shape."""
+    return {"y": jnp.dot(x, w, precision="highest")[None]}
+
+
+@jax.jit
+def _renamed(x, w):
+    return {"z": jnp.dot(x, w, precision="highest")}
+
+
+def test_check_one_holds_each_leaf_to_its_truths_path_and_shape():
+    """A result with a singleton axis added, whose values broadcast against the truth, or with its key
+    renamed, whose values pair with the truth's by position, is not the reference's output: check 1
+    fails it before any arithmetic. So does a reference whose shape is not its truth's."""
+    for dew_fn in (_broadcast, _renamed):
+        with pytest.raises(AssertionError):
+            assert_as_exact(dew_fn, _product, _draw, "another tree", seeds=8)
+    with pytest.raises(AssertionError):
+        assert_as_exact(_product, _broadcast, _draw, "another reference", seeds=8, truth_fn=_product)
+
+
 def test_check_one_passes_an_equally_exact_sum_over_the_seeds_its_own_reference_resolves():
     """The product summed in reverse rounds as exactly as the reference, by other partial sums: over the
     seeds the reference compared with itself needs (`seeds_for`), its pooled RMS error sits within
@@ -394,7 +416,8 @@ def test_check_one_passes_an_equally_exact_sum_over_the_seeds_its_own_reference_
 def test_a_committed_fixture_is_its_references_output_within_twice_a_fresh_runs_error():
     """An artifact check, not a parity (`assert_same_artifact`): a committed fixture whose largest error
     from float64 is up to twice a fresh run's is the reference's output; one further is not, even where
-    only one element moves, which an RMS would let through."""
+    only one element moves, which an RMS would let through, nor one not finite, or held to a fresh run
+    that is not."""
     f64 = np.linspace(-1, 1, 101)
     fresh = f64 + 1e-7
     assert_same_artifact(fresh, f64 - 2e-7, f64, "twice as far")
@@ -405,6 +428,11 @@ def test_a_committed_fixture_is_its_references_output_within_twice_a_fresh_runs_
     assert np.sqrt(np.mean(np.square(corrupted - f64))) < 1e-7
     with pytest.raises(AssertionError):
         assert_same_artifact(fresh, corrupted, f64, "one element moved")
+    # Neither a NaN nor an infinity on either side is an evaluation of the reference.
+    for committed, recomputed in ((np.full_like(f64, np.nan), fresh), (f64 + 1e-7, np.full_like(f64, np.inf)),
+                                  (np.full_like(f64, np.inf), np.full_like(f64, np.inf))):
+        with pytest.raises(AssertionError):
+            assert_same_artifact(recomputed, committed, f64, "not finite")
 
 
 def test_a_runs_learning_rates_part_from_the_base_at_any_float32_difference(monkeypatch):
@@ -880,13 +908,13 @@ def test_the_procedure_before_the_two_stages_draws_again_as_it_did():
     """Compared against, the procedure before check 1's two stages (`_staged(two_stage=False)`) draws
     the second set wherever a leaf's ratio is over PARITY, a value not finite included, and only there:
     an inconclusive leaf is final at its declared seeds."""
-    from reference_error import _Draws, _staged
+    from reference_error import NO_ZERO_ROWS, _Draws, _staged
 
     def law(dew):
         def drawn(start, stop):
             count = stop - start
             return _Draws(["leaf"], np.full((count, 1), dew), np.ones((count, 1)), np.zeros((count, 1, 2)),
-                          np.zeros((count, 1), int), np.full((count, 1), np.isfinite(dew)))
+                          [[NO_ZERO_ROWS]] * count, np.full((count, 1), np.isfinite(dew)), (0,))
         return drawn
 
     with np.errstate(invalid="ignore"):
@@ -945,3 +973,26 @@ def test_a_change_moves_by_its_intervals_lower_end_and_one_leaf_is_enough():
 
     with pytest.raises(AssertionError):
         assert_moves(reference, infinite, errors, "infinite", seeds=8, truth_fn=truth)
+
+
+def test_a_row_of_float64_zero_is_judged_over_the_runs_seeds():
+    """A row of float64 zero is held to the reference's residue on it pooled over the run's seeds
+    (`pooled_zero_rows`): one seed's residue far past the reference's own, where the other seeds' are
+    alike, passes; Dew ten times the reference's residue on every seed fails, and so does a residue
+    where the reference holds the row at exactly zero on every seed."""
+    from reference_error import ROW_FACTOR, pooled_zero_rows
+
+    rows = np.asarray([3, 7])
+
+    def seed(mine, theirs):
+        return rows, np.asarray(mine, np.float64), np.asarray(theirs, np.float64)
+
+    alike = [seed([1.0, 2.0], [1.0, 2.0]) for _ in range(7)]
+    assert pooled_zero_rows([*alike, seed([1.0, 2.0 * ROW_FACTOR * 1.5], [1.0, 2.0])]) == []
+    tenfold = [seed([10.0, 2.0], [1.0, 2.0]) for _ in range(8)]
+    assert [row for row, _, _ in pooled_zero_rows(tenfold)] == [3]
+    exact = [seed([0.0, 1e-30], [0.0, 0.0]) for _ in range(8)]
+    assert [row for row, _, _ in pooled_zero_rows(exact)] == [7]
+    # A row zero on some seeds alone pools over those.
+    assert pooled_zero_rows([seed([1.0, 1.0], [1.0, 1.0]), (np.asarray([3]), np.asarray([5.0]),
+                                                             np.asarray([1.0]))]) == []

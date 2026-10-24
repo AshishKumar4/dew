@@ -69,10 +69,11 @@ class NGPT:
 
 
 def stepped(residual: jax.Array, branch: jax.Array, alpha: jax.Array, scale: float) -> jax.Array:
-    """The residual after a sublayer's `branch` joins it: both ends unit-normed in the residual's
-    dtype, a step of `|alpha * scale|` from the residual toward the branch in at least fp32, and the
-    result unit-normed back to the residual's dtype (Dory's `slerp_alpha`)."""
-    wide = at_least_fp32(residual.dtype)
+    """The residual after a sublayer's `branch` joins it: both ends unit-normed in their own dtypes,
+    a step of `|alpha * scale|` from the residual toward the branch in at least fp32 of the residual,
+    the branch and the rate, and the result unit-normed back to the residual's dtype (Dory's
+    `slerp_alpha`)."""
+    wide = at_least_fp32(jnp.result_type(residual, branch, alpha))
     start = l2norm(residual).astype(wide)
     end = l2norm(branch).astype(wide)
     rate = jnp.abs(alpha.astype(wide) * scale)

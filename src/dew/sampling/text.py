@@ -18,7 +18,6 @@ from __future__ import annotations
 import dataclasses
 import functools
 import hashlib
-import math
 import types
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -63,6 +62,7 @@ from dew.nn.protocols import (
     Serving,
 )
 from dew.objectives.base import Variables
+from dew.records import finite
 from dew.sampling import decoding, strategies
 from dew.sampling.decoding import (
     EndOfSequence,
@@ -156,20 +156,20 @@ class Sampling:
     stop: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if not math.isfinite(self.temperature) or self.temperature < 0:
+        # A rate is any real number, Python's or NumPy's (a config's or a sweep's), held as a float; zero
+        # is greedy decoding, so the temperature is the one rate the controls' own checks do not cover.
+        rates = {name: decoding.unit_interval(name, getattr(self, name))
+                 for name in ("top_p", "min_p", "typical_p")}
+        rates["temperature"] = finite(self.temperature, "temperature")
+        if rates["temperature"] < 0:
             raise ValueError("temperature must be finite and non-negative")
-        if self.top_k is not None and (type(self.top_k) is not int or self.top_k < 1):
-            raise ValueError("top_k must be a positive integer or None")
-        for name, value in (("top_p", self.top_p), ("min_p", self.min_p), ("typical_p", self.typical_p)):
-            if isinstance(value, (bool, np.bool_)) or not math.isfinite(value) or not 0 <= value <= 1:
-                raise ValueError(f"{name} must be finite and between zero and one")
-        if isinstance(self.repetition_penalty, bool) or not (
-                math.isfinite(self.repetition_penalty) and self.repetition_penalty > 0):
-            raise ValueError("repetition_penalty must be finite and positive")
-        for name, value in (("presence_penalty", self.presence_penalty),
-                            ("frequency_penalty", self.frequency_penalty)):
-            if isinstance(value, bool) or not math.isfinite(value):
-                raise ValueError(f"{name} must be finite")
+        rates["repetition_penalty"] = decoding.positive("repetition_penalty", self.repetition_penalty)
+        for name in ("presence_penalty", "frequency_penalty"):
+            rates[name] = finite(getattr(self, name), name)
+        if self.top_k is not None:
+            object.__setattr__(self, "top_k", decoding.positive_size("top_k", self.top_k))
+        for name, rate in rates.items():
+            object.__setattr__(self, name, rate)
         for name, value in (("no_repeat_ngram_size", self.no_repeat_ngram_size),
                             ("min_new_tokens", self.min_new_tokens)):
             if type(value) is not int or value < 0:
@@ -177,11 +177,7 @@ class Sampling:
         if self.pad_token_id is not None and (type(self.pad_token_id) is not int or self.pad_token_id < 0):
             raise ValueError("pad_token_id must be a non-negative token id")
         if self.eos_token_ids is not None:
-            eos = self.eos_token_ids
-            stops = (eos,) if isinstance(eos, int) else tuple(eos)
-            if not stops or any(type(token) is not int or token < 0 for token in stops):
-                raise ValueError("eos_token_ids must contain non-negative token ids")
-            object.__setattr__(self, "eos_token_ids", stops)
+            object.__setattr__(self, "eos_token_ids", decoding.id_row("eos_token_ids", self.eos_token_ids))
         if isinstance(self.stop, str):
             raise ValueError(f"stop is a tuple of strings; write stop=({self.stop!r},)")
         if any(not isinstance(string, str) or not string for string in self.stop):

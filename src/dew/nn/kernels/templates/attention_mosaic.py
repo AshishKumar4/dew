@@ -95,7 +95,8 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     tiles = DEFAULTS[family.name] if tiles is None else tiles
     hooks = Hooks() if hooks is None else hooks
     width, value_width = query.shape[3], value.shape[3]
-    if reason := refused(query.dtype, width, value_width, hooks, backward=False):
+    if reason := refused(query.dtype, width, value_width, hooks, backward=False,
+                         tile=(tiles.block_q, tiles.block_k)):
         raise NotImplementedError(reason)
     block = max(family.consumers * tiles.block_q, tiles.block_k)
     call = padded_call(query, key, value, spans, hooks, block)
@@ -129,10 +130,11 @@ def _columns(array: jax.Array) -> jax.Array:
     return jnp.pad(array, ((0, 0),) * (array.ndim - 1) + ((0, -array.shape[-1] % COLUMNS),))
 
 
-def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backward: bool) -> str | None:
+def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backward: bool,
+            tile: tuple[int, int]) -> str | None:
     """Why this mainloop takes no call of `dtype` operands, head widths `width` and `value_width` and `hooks`
-    (its forward, or with `backward` its backward), or None: its legality rule, which `forward` and
-    `backward` refuse by and the route's chooser and the stability suite read."""
+    (its forward, or with `backward` its backward) at `tile`'s queries by keys, or None: its legality rule,
+    which `forward` and `backward` refuse by and the route's chooser and the stability suite read."""
     hooks = Hooks() if hooks is None else hooks
     sixteen = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
     if backward and jnp.dtype(dtype) != jnp.dtype(jnp.bfloat16):
@@ -142,7 +144,8 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     if width != value_width:
         return ("the Mosaic mainloop's output reuses the query's stage, and its backward stages dK and dV "
                 "through one buffer: equal head widths")
-    return unlowered(hooks, (COLUMNS, COLUMNS), COLUMNS)
+    # The hooks as the launch runs them: its tile, its values padded to whole `COLUMNS` rows (`_columns`).
+    return unlowered(hooks, tile, -(-value_width // COLUMNS) * COLUMNS)
 
 
 def unlowered(hooks: Hooks, tile: tuple[int, int], value_width: int) -> str | None:
@@ -979,7 +982,8 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
         raise NotImplementedError("the fused Mosaic backward is a hookless call's fast form: the accurate "
                                   "form's dK/dV, and a hook's and an initial state's gradients, take the D "
                                   "the dQ program refines")
-    if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=True):
+    if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=True,
+                         tile=(tiles.block_q, tiles.block_k)):
         raise NotImplementedError(reason)
     count = min(BACKWARD_CONSUMERS[accurate], family.consumers) if consumers is None else consumers
     factor = query.shape[3] ** -0.5 if scale is None else scale

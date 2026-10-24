@@ -1,15 +1,21 @@
-"""Per-operation certificates (a prototype, not a gate the suite uses): each value a kernel rounds is
-checked on its own native parents against a contract for that one operation.
+"""Check 2 of the gate: every element within a certified roundoff bound for its own operation.
 
-A node of a kernel's graph (`dew.nn.kernels.graph`) is one value the kernel rounds and holds. Given
-the node's parents as the kernel computed them, its contract says what the native value may be:
+A site's computation runs one primitive at a time, each executed alone and natively, and each equation
+is held on the operands that execution gave it to its primitive's contract (tests/certified.py's
+`certified` and CONTRACTS, from this module's exact oracles):
 
-- an IEEE operation (add, sub, mul, fma, a correctly rounded divide or square root, a cast) must be
-  the round to nearest even of its exact result in its own format, subnormal cells included
-  (`Exact`);
-- an approximate or library primitive must be within its vendor-specified error of the true value
-  (`Ulps`);
-- a sum of n terms must be within the bound of the algorithm that sums it (`Sum`, `Dot`).
+- an IEEE operation (add, sub, mul, a correctly rounded divide or square root, a cast) must be the
+  round to nearest even of its exact result in its own format, read as the lane computes
+  (tests/certified.py's `FLUSHES`);
+- a library primitive, a transcendental included, must be faithful: one of the two values of its
+  format around the exact value, whatever its vendor documents;
+- a sum of n terms, a dot product's included, must be within γ_n of its terms' magnitudes of their
+  exact sum, in any order;
+- a comparison, a selection, a move of data or an integer operation must be its result bit for bit.
+
+A primitive no contract covers fails the site (tests/certified.py's `assert_certified`). This
+certifies the program run one operation at a time; a fused program's internals are check 1's
+(tests/reference_error.py).
 
 The exact results come from exact arithmetic, not from float64 rounding: a product of two fp32 or
 bf16 values is exact in float64, a sum or a fused multiply-add is carried as a double-double by
@@ -351,17 +357,24 @@ def _enclosure_rounded(x, hi, lo, inside, beyond, exact, name: str, fmt: Format)
     return result
 
 
+EXP_RANGE = (-110.0, 90.0)
+"""Where exp's results in a format no wider than fp32 lie strictly between the same two neighbours:
+below it every exp is under exp(-110), below half fp32's least subnormal (bf16's is larger), so
+between +0 and the least subnormal, and above it every exp is over exp(90), past fp32's and bf16's
+largest finite values, so between the largest finite value and inf."""
+
+
 def exp_rounded(x, fmt: Format) -> np.ndarray:
     """RN(exp(x)) in `fmt` for values of a format no wider than fp32, verified: a double-double exp
     with a proven relative bound (`_exp_enclosed`, EXP_BOUND) decides every element whose enclosure
     rounds one way, and mpmath's interval exp at rising precision decides the rest (exp of a nonzero
     rational is never a midpoint, so the precision needed is finite). No library exp is trusted.
-    Beyond [-110, 90] the result is 0 or inf in every format no wider than fp32 (exp(-110) is below
-    half fp32's least subnormal, exp(90) past its largest finite value); NaN is NaN."""
+    Beyond EXP_RANGE the result is 0 or inf in every format no wider than fp32; NaN is NaN."""
     x = np.asarray(x, np.float64)
-    inside = (x >= -110) & (x <= 90)
+    low, high = EXP_RANGE
+    inside = (x >= low) & (x <= high)
     hi, lo = _exp_enclosed(np.where(inside, x, 0.0))
-    return _enclosure_rounded(x, hi, lo, inside, x > 90, lambda iv, value: iv.exp(value), "exp", fmt)
+    return _enclosure_rounded(x, hi, lo, inside, x > high, lambda iv, value: iv.exp(value), "exp", fmt)
 
 
 def exp2_rounded(x, fmt: Format) -> np.ndarray:

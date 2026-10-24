@@ -22,6 +22,7 @@ import optax
 from dew.artifacts import Artifact, Representations
 from dew.eval.common import metric_device
 from dew.objectives.base import Batch, Objective, Shown, mean_of_totals, merge_totals
+from dew.optim import OPTIMIZER_MAP
 
 
 class ProbeParams(NamedTuple):
@@ -51,8 +52,6 @@ def linear_probe_accuracy(embeddings, labels, num_classes: int, steps: int = 100
     fit_x, fit_y, test_x, test_y = _split(embeddings, labels)
     mean, std = jnp.mean(fit_x, axis=0), jnp.std(fit_x, axis=0) + 1e-6
     fit_x, test_x = (fit_x - mean) / std, (test_x - mean) / std
-
-    from dew.training.optim import OPTIMIZER_MAP
 
     params = ProbeParams(jnp.zeros((embeddings.shape[-1], num_classes)), jnp.zeros((num_classes,)))
     # Dew's AdamW, the one a run's config builds (`OPTIMIZER_MAP`), its bias corrections formed in double.
