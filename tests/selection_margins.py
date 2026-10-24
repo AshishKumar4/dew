@@ -35,7 +35,7 @@ def selects(config) -> bool:
 
 def capture(model):
     """`model`'s forward capturing its discontinuous selections, compiled once: the lightning indexer's
-    scores from its `scores` method and its heads' agreements from its `agreements`, Gemma 3n's gate
+    scores from its `scores` method and its heads' agreements as it sows them, Gemma 3n's gate
     from its gated MLP's Dense, a Router's selection scores, group scores and group mask from its own
     methods, and gpt-oss's and Gemma 4's router logits from their Dense. One compiled forward rather
     than an op at a time: XLA:CPU's JIT failed to materialize a gather fusion among the many small
@@ -48,7 +48,7 @@ def capture(model):
 
     def selecting(module, method):
         if isinstance(module, SparseIndexer):
-            return method in ("scores", "agreements")
+            return method == "scores"
         if isinstance(module, Router):
             return method in ("selection", "group_scores", "group_mask")
         if isinstance(module, nn.Dense) and method == "__call__" and (

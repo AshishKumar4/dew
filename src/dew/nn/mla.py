@@ -174,16 +174,16 @@ class IndexerFront:
         batch, length = q_resid.shape[:2]
         return self.wq_b(jax.lax.stop_gradient(q_resid)).reshape(batch, length, self.n_heads, self.head_dim)
 
-    def agreements(self, query, keys):
-        """Each head's `q_h . k` of `query` against `keys` before the relu, `[B, S, n_heads, T]`
-        (`index_agreements`): a key scores zero where every head's is at most zero."""
-        return index_agreements(query, keys, self.precision)
-
     def scored(self, query, keys, hidden):
         """`query`'s scores against `keys` `[B, S, T]`, its heads weighted by `weights_proj` of the
-        detached `hidden` (`index_scores`, its heads' `agreements` weighted)."""
+        detached `hidden` (`index_scores`). Each head's agreement before the relu,
+        `[B, S, n_heads, T]` (`index_agreements`), is sown as `agreements` in `intermediates` for a
+        caller that reads the forward's selections: a key scores zero where every head's is at most
+        zero."""
         weights = self.weights_proj(jax.lax.stop_gradient(hidden))
-        return weighted_agreements(self.agreements(query, keys), weights, query.shape[-1], self.precision)
+        agreements = index_agreements(query, keys, self.precision)
+        self.sow("intermediates", "agreements", agreements)
+        return weighted_agreements(agreements, weights, query.shape[-1], self.precision)
 
 
 @logical_axes({
