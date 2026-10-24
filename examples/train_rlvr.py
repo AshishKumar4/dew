@@ -589,7 +589,7 @@ def main(config: Config) -> dict:
         Asynchronous(sessions, server, objective, width=width, rows=config.prompts * config.groups,
                      max_lag=config.max_lag, ahead=config.max_lag),
         tasks=prompt_tasks, groups=config.groups, truncation="score", log=history.append)
-    optimizer = OptimConfig(rate=config.learning_rate, b2=0.99, weight_decay=0.0, clip_grads=1.0)
+    optimizer = OptimConfig(learning_rate=config.learning_rate, b2=0.99, weight_decay=0.0, clip_grads=1.0)
     trainer = Trainer(objective, optimizer, key=jax.random.key(config.seed), rollout=rollout,
                       accumulation=config.accumulation)
     began = time.perf_counter()
