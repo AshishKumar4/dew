@@ -108,6 +108,9 @@ class Wgmma(mosaic.RingFamily):
         layout = self.layout if len(shape) == 2 else self.row
         return plgpu.layout_cast(jnp.full(shape, value, jnp.float32), layout)
 
+    def column_zeros(self, count: int) -> jax.Array:
+        return plgpu.layout_cast(jnp.zeros((count,), jnp.float32), self.column)
+
     def iota(self, shape: tuple[int, int], dimension: int) -> jax.Array:
         return plgpu.broadcasted_iota(jnp.int32, shape, dimension, layout=self.layout)
 

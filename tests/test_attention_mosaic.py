@@ -16,7 +16,7 @@ from generation_support import INTERPRETS
 from jax.sharding import Mesh
 from reference_error import assert_as_exact
 from test_attention_template import CASES, ROWS, arguments, geometry as core_geometry
-from test_attention_triton import HOOKS, SCORE_HOOKS, gate_of, hooks_for, score_hooks
+from test_attention_triton import BACKWARD_SEEDS, HOOKS, SCORE_HOOKS, gate_of, hooks_for, score_hooks
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import (
@@ -42,7 +42,11 @@ SEEDS = 8
 against the reference's own."""
 ALL_HOOKS_SEEDS = 32
 """The draws of a site with every hook at once (`test_attention_triton.ALL_HOOKS_SEEDS`)."""
-FORWARD_HOOKS = {**{name: (names, False) for name, names in SCORE_HOOKS.items() if name != "row-indexed"},
+BACKWARD_HOOKS = [name for name in SCORE_HOOKS if name != "row-indexed"]
+"""The backward's score hooks: every one the backward differentiates (`test_attention_triton.SCORE_HOOKS`) but
+the hook indexed off the query's coordinates' column, which forms a unit axis the mainloop refuses
+(`attention_mosaic.unlowered`, ledger row 1428): `test_a_hook_that_forms_a_unit_axis_is_refused`."""
+FORWARD_HOOKS = {**{name: (SCORE_HOOKS[name], False) for name in BACKWARD_HOOKS},
                  "gate": ((), True),
                  "all": (("softcap", "custom", "sinks", "alibi", "temperature", "key", "tile"), True)}
 """The forward's hooks: each score hook the backward differentiates (`test_attention_triton.SCORE_HOOKS`:
@@ -101,14 +105,13 @@ def _check_forward(call: str, dtype, shape, *, natural: bool, interpret: bool):
 
 def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool, backward: bool = False,
                  accurate: bool = False, fused: bool = False, score: tuple = (), gate: bool = False,
-                 dtype=jnp.bfloat16,
-                 natural: bool = False):
+                 dtype=jnp.bfloat16, natural: bool = False):
     """The forward, or the backward in the form `accurate` names (`fused`, its one launch), over `spans` at
-    `FORM_TILES` under the
-    score hooks `score` (`test_attention_triton.score_hooks`, their parameters and initial state drawn with
-    the operands) and with `gate` an output gate (`hooks_for`), draws of `shape` (rows, queries, query and
-    key heads, four and two under a hook) over the spans' keys in `dtype`, the forward's logits `natural` or
-    folded."""
+    `FORM_TILES` under the score hooks `score` (`test_attention_triton.score_hooks`, their parameters and
+    initial state drawn with the operands) and with `gate` an output gate (`hooks_for`), draws of `shape`
+    (rows, queries, query and key heads, four and two under a hook) over the spans' keys in `dtype`, the
+    forward's logits `natural` or folded. The backward differentiates the queries, keys, values, the hook's
+    parameters and the initial state."""
     queries = shape[1]
     score_mod, kinds, draw_hooks = score_hooks(score, queries, spans.keys, 64)
     output = hooks_for(HOOKS["gate" if gate else "none"], queries, 64, gate_of(queries, 64))
@@ -132,20 +135,24 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
         grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
                                           accurate=accurate, fused=fused, tiles=FORM_TILES,
                                           interpret=interpret, family=_family(interpret))
-        return grads.query, grads.key, grads.value
+        return grads.query, grads.key, grads.value, grads.score_params, grads.initial
 
     def reference(query, key, value, dout, params, initial):
-        hooks = hooked(params, initial)
         if not backward:
-            return template.reference(query, key, value, spans, hooks)
-        _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, hooks), query, key, value)
+            return template.reference(query, key, value, spans, hooked(params, initial))
+
+        def attend(query, key, value, params, initial):
+            return template.reference(query, key, value, spans, hooked(params, initial))
+
+        _, pull = jax.vjp(attend, query, key, value, params, initial)
         return pull(dout)
 
     name = (f"mosaic {'backward' if backward else 'forward'} {label} {score}{' gate' if gate else ''} "
             f"{jnp.dtype(dtype).name}{' accurate' if accurate else ''}{' fused' if fused else ''}"
             f"{' natural' if natural else ''}")
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, name,
-                    seeds=ALL_HOOKS_SEEDS if len(score) + gate > 1 else SEEDS)
+    seeds = (BACKWARD_SEEDS.get((score, jnp.dtype(dtype).name), SEEDS) if backward
+             else ALL_HOOKS_SEEDS if len(score) + gate > 1 else SEEDS)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, name, seeds=seeds)
 
 
 def _check_hooks(hooks: str, dtype, natural: bool, *, interpret: bool):
@@ -157,6 +164,17 @@ def _check_hooks(hooks: str, dtype, natural: bool, *, interpret: bool):
     score, gate = FORWARD_HOOKS[hooks]
     _check_spans("causal-documents-window", spans, (ROWS, queries, 4, 2), interpret=interpret, score=score,
                  gate=gate, dtype=dtype, natural=natural)
+
+
+def _check_hooked_backward(hooks: str, *, accurate: bool, interpret: bool):
+    """The backward in the form `accurate` names under the score hook `SCORE_HOOKS[hooks]` over the template
+    core's causal packed documents under a window (`_check_hooks`' site): the gradients of the queries, keys,
+    values, of the hook's parameters and of the initial state."""
+    case = CASES["causal-documents-window"]
+    queries, keys = core_geometry(case)
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
+    _check_spans("causal-documents-window", spans, (ROWS, queries, 4, 2), interpret=interpret, backward=True,
+                 accurate=accurate, score=SCORE_HOOKS[hooks])
 
 
 def _check_call_form(form: str, *, interpret: bool, backward: bool = False, accurate: bool = False,
@@ -222,6 +240,37 @@ def test_the_forward_is_on_par_under_every_hook_interpreted(hooks, dtype, natura
     """The forward under each hook (`FORWARD_HOOKS`) over causal packed documents under a window, under the
     interpreter, in each of `HOOK_FORMS`."""
     _check_hooks(hooks, dtype, natural, interpret=True)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
+def test_padding_rows_reach_no_hook_gradient_interpreted(accurate):
+    """A call of one query and one key, padded to whole tiles, under a hook dividing by a query's
+    parameter and adding a head's: the padding rows' parameter is 0, so the hook is 0/0 there, and a
+    padding row that saw a key would carry its NaN into the head's gradient, a sum over the rows. Padding
+    rows see no key (`algebra.Forward.queries`), and every gradient is the reference's, the head's 0."""
+    spans = template.spans(1, 1, 1)
+    query, key, value = (jnp.zeros((1, 1, 1, 64), jnp.bfloat16) for _ in range(3))
+    dout = jnp.ones((1, 1, 1, 64), jnp.bfloat16)
+
+    def score_mod(s, q_pos, k_pos, temperature, bias):
+        del q_pos, k_pos
+        return s / temperature + bias
+
+    def hooked(temperature, bias):
+        return template.Hooks(score_mod, (template.Param(temperature, template.Kind.QUERY),
+                                          template.Param(bias, template.Kind.HEAD)))
+
+    params = (jnp.ones((1, 1, 1), jnp.float32), jnp.zeros((1,), jnp.float32))
+    hooks = hooked(*params)
+    residuals = attention_triton.forward(query, key, value, spans, hooks, residuals=True, interpret=True)[1:]
+    grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
+                                      accurate=accurate, interpret=True, family=mosaic_sm90.WGMMA)
+    _, pull = jax.vjp(lambda q, k, v, t, b: template.reference(q, k, v, spans, hooked(t, b)), query, key,
+                      value, *params)
+    for found, expected in zip((grads.query, grads.key, grads.value, *grads.score_params), pull(dout),
+                               strict=True):
+        np.testing.assert_array_equal(np.asarray(found, np.float32), np.asarray(expected, np.float32))
 
 
 def test_a_hook_that_forms_a_unit_axis_is_refused():
@@ -312,6 +361,16 @@ def test_a_causal_backward_of_more_keys_than_queries_is_on_par_interpreted():
         _check_backward("causal", (1, 64, 2, 1), accurate=False, interpret=True, keys=256, fused=fused)
 
 
+@INTERPRETS
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
+@pytest.mark.parametrize("hooks", BACKWARD_HOOKS)
+def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, accurate):
+    """The backward in both forms under each score hook over causal packed documents under a window, under
+    the interpreter: the gradients of the queries, keys and values, of each hook parameter and of the initial
+    state."""
+    _check_hooked_backward(hooks, accurate=accurate, interpret=True)
+
+
 @pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
 @pytest.mark.parametrize("call", ["causal", "causal-documents-window"])
 def test_the_launches_lower_for_an_h100(call, accurate):
@@ -344,6 +403,35 @@ def test_the_launches_lower_for_an_h100(call, accurate):
         jax.jit(lambda q, k, v, dout, residuals: attention_mosaic.backward(
             q, k, v, spans, None, dout, residuals=residuals, accurate=accurate)).trace(
             q, kv, kv, q, residuals).lower(lowering_platforms=("cuda",))
+
+
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
+@pytest.mark.parametrize("hooks", BACKWARD_HOOKS)
+def test_the_backward_under_every_score_hook_lowers_for_an_h100(hooks, accurate):
+    """The backward under each score hook lowers for an H100 on any host, as the GPU gate runs it: each hook
+    parameter and the initial state read per tile by the dQ and dK/dV programs."""
+    case = CASES["causal-documents-window"]
+    queries, keys = core_geometry(case)
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
+    q = jax.ShapeDtypeStruct((ROWS, queries, 4, 128), jnp.bfloat16)
+    kv = jax.ShapeDtypeStruct((ROWS, keys, 2, 128), jnp.bfloat16)
+    rows_shape = jnp.zeros((ROWS, 4, queries), jnp.float32)
+    split = template.Split(jnp.zeros((ROWS, 4, queries, 128), jnp.float32), rows_shape, rows_shape,
+                           rows_shape)
+    residuals = (rows_shape, rows_shape, jnp.zeros((ROWS, 4, queries), jnp.int32), split)
+    score_mod, kinds, draw_hooks = score_hooks(SCORE_HOOKS[hooks], queries, keys, 128)
+    params, initial = draw_hooks(0)
+
+    def backward_of(q, k, v, dout, residuals, params, initial):
+        hooked = template.Hooks(score_mod, tuple(template.Param(value, kind)
+                                                 for value, kind in zip(params, kinds, strict=True)),
+                                initial)
+        return attention_mosaic.backward(q, k, v, spans, hooked, dout, residuals=residuals, accurate=accurate)
+
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(backward_of).trace(q, kv, kv, q, residuals, params, initial).lower(
+            lowering_platforms=("cuda",))
 
 
 @ON_HOPPER
@@ -406,3 +494,12 @@ def test_a_causal_backward_of_more_keys_than_queries_is_on_par_on_an_h100():
 def test_the_backward_is_on_par_on_an_h100(call, accurate, fused):
     """The backward in both forms compiled on an H100."""
     _check_backward(call, SHAPES["compiled"], accurate=accurate, interpret=False, fused=fused)
+
+
+@ON_HOPPER
+@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
+@pytest.mark.parametrize("hooks", BACKWARD_HOOKS)
+def test_the_backward_is_on_par_under_every_score_hook_on_an_h100(hooks, accurate):
+    """The backward in both forms under each score hook compiled on an H100."""
+    _check_hooked_backward(hooks, accurate=accurate, interpret=False)

@@ -307,9 +307,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     own. Its facts (`name`, the MMA's row unit `rows`), its launch and roles (`kernel`, `roles`), its operand
     streams (`streams`, `opened`, `stream` the producer's, `walk` and `passed` the consumer's), its products
     (`product` into a fresh accumulator, `register_products` and `staged_products` in place, `settled`), and
-    its accumulator's layouts (`zeros`, `full`, `iota`, `rows_of`, `as_row`). It is generic in its streams'
-    allocations (`Allocated`, `streams`'), its opened streams (`Opened`, `opened`'s) and the accumulator its
-    products issue into in place (`Accumulator`: a warpgroup accumulator ref, or a register array)."""
+    its accumulator's layouts (`zeros`, `full`, `column_zeros`, `iota`, `rows_of`, `as_row`). It is generic in
+    its streams' allocations (`Allocated`, `streams`'), its opened streams (`Opened`, `opened`'s) and the
+    accumulator its products issue into in place (`Accumulator`: a warpgroup accumulator ref, or a register
+    array)."""
 
     name: str
     rows: int
@@ -425,6 +426,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     @abc.abstractmethod
     def columns_of(self, ref) -> jax.Array:
         """A column vector read from `ref` (`[columns]`) in a column's layout (a tile's keys')."""
+
+    @abc.abstractmethod
+    def column_zeros(self, count: int) -> jax.Array:
+        """fp32 zeros `[count]` in a column's layout (`columns_of`'s), the carry of a tile's key sums."""
 
     @abc.abstractmethod
     def tile_of(self, ref) -> jax.Array:
