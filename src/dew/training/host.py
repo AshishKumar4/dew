@@ -83,11 +83,13 @@ type Leaf = jax.Array | np.ndarray | np.generic | HostSource
 source a placement reads one device shard at a time (`HostSource`)."""
 
 
-def placed_leaves(tree: Variables, place: Callable[[KeyPath, Leaf], Leaf], *, in_place: bool) -> Variables:
+def placed_leaves(tree: Variables, place: Callable[[KeyPath, Leaf], Leaf], *, in_place: bool,
+                  rebuilt: Callable[[object, object], None] | None = None) -> Variables:
     """`tree` with each leaf replaced by what `place(path, leaf)` returns, `path` the leaf's key path
     as `jax.tree_util.tree_flatten_with_path` names it, one leaf at a time: a leaf placed lands
     (`block_until_ready`) before the next is read. A node JAX flattens that is not a mapping (a
-    list, a quantized array's buffers) is rebuilt over its placed leaves once they have all landed.
+    list, a quantized array's buffers) is rebuilt over its placed leaves once they have all landed,
+    and `rebuilt(node, placed)` hears of it then.
 
     With `in_place` the tree is the caller's to give up: each plain dict it reaches through mappings
     alone is written in place, so every holder of one sees the placed leaves, any other mapping (a
@@ -115,7 +117,10 @@ def placed_leaves(tree: Variables, place: Callable[[KeyPath, Leaf], Leaf], *, in
         leaves, structure = jax.tree_util.tree_flatten_with_path(node)
         if jax.tree_util.treedef_is_leaf(structure):
             return landed(path, node)
-        return structure.unflatten([landed((*path, *keys), leaf) for keys, leaf in leaves])
+        placed = structure.unflatten([landed((*path, *keys), leaf) for keys, leaf in leaves])
+        if rebuilt is not None:
+            rebuilt(node, placed)
+        return placed
 
     return mapping(tree, ())
 
@@ -144,33 +149,28 @@ def stream(tree: Variables, placement, held: Variables | None = None) -> Variabl
     """
     holders: dict[int, list[tuple[dict, object]]] = {}
 
-    def index(node, into: dict[int, list[tuple[dict, object]]]):
+    def index(node):
         if not isinstance(node, dict):
             return
         for name, child in node.items():
             if isinstance(child, Mapping):
-                index(child, into)
+                index(child)
             else:
-                into.setdefault(id(child), []).append((node, name))
+                holders.setdefault(id(child), []).append((node, name))
 
     if held is not None:
-        index(held, holders)
-    # Where `tree` holds each node `held` shares, to hand `held` a rebuilt node once it is placed.
-    owners: dict[int, list[tuple[dict, object]]] = {}
-    index(tree, owners)
+        index(held)
+
+    def handed(source, placed):
+        for holder, key in holders.get(id(source), ()):
+            holder[key] = placed
 
     def landed(path: KeyPath, leaf):
         placed = place_leaf(leaf, target(placement, path))
-        for holder, key in holders.pop(id(leaf), ()):
-            holder[key] = placed
+        handed(leaf, placed)
         return placed
 
-    placed = placed_leaves(tree, landed, in_place=True)
-    for shared, places in holders.items():
-        for owner, name in owners.get(shared, ())[:1]:
-            for holder, key in places:
-                holder[key] = owner[name]
-    return placed
+    return placed_leaves(tree, landed, in_place=True, rebuilt=handed)
 
 
 def target(placement, path: KeyPath) -> Sharding | Format:
