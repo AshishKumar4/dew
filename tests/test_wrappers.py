@@ -26,12 +26,57 @@ from pathlib import Path
 
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from safetensors.numpy import load_file
 
 from dew.interop.hf_decoders import translate_wrapper_config, translate_wrapper_weights
 from dew.registry import projectors, towers
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
+
+
+@pytest.mark.parametrize("family", ["gemma3-tiny-mm", "gemma4-tiny-mm"])
+def test_a_gemma_wrapper_keeps_image_and_source_block_visibility_together(tmp_path, family):
+    import shutil
+
+    from dew.interop import Pretrained
+
+    directory = tmp_path / "source"
+    shutil.copytree(FIXTURES / family, directory)
+    config = json.loads((directory / "config.json").read_text())
+    config["modeling_overrides"] = {"attention": {"sliding_attention": "block_bidirectional"}}
+    (directory / "config.json").write_text(json.dumps(config))
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    tokens = jnp.asarray([[10, 11, 12, 13]], jnp.int32)
+    altered = tokens.at[0, 1].set(14)
+    groups = jnp.asarray([[0, 0, -1, -1]], jnp.int32)
+
+    def first(ids, **metadata):
+        return np.asarray(loaded.model.apply(loaded.variables, ids, **metadata))[0, 0]
+
+    np.testing.assert_array_equal(first(tokens), first(altered))
+    for field in ("image_groups", "block_groups"):
+        assert np.any(first(tokens, **{field: groups}) != first(altered, **{field: groups})), field
+
+
+def test_an_explicit_causal_source_override_exports_through_the_native_decoder(tmp_path):
+    import shutil
+
+    from dew.interop import Pretrained
+    from dew.interop.pretrained import PretrainedDecoder
+
+    directory = tmp_path / "source"
+    shutil.copytree(FIXTURES / "llama-tiny", directory)
+    config = json.loads((directory / "config.json").read_text())
+    config["modeling_overrides"] = {"attention": {"full_attention": "causal"}}
+    (directory / "config.json").write_text(json.dumps(config))
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    exported = tmp_path / "derived"
+    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(exported)
+    restored = Pretrained.load(exported, dtype="float32", attention_impl="reference")
+    tokens = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
+    np.testing.assert_array_equal(restored.model.apply(restored.variables, tokens),
+                                  loaded.model.apply(loaded.variables, tokens))
 
 
 def test_a_wrapper_dtype_change_reaches_the_decoder_that_computes_its_logits():
