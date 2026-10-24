@@ -22,10 +22,10 @@ from tools.torch_precision import default_dtype
 FIXTURE = Path(__file__).parent / "fixtures" / "hf" / "gemma4-unified-native-tiny"
 
 
-def source_pair(directory):
-    native = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+def source_pair(directory, dtype="float32"):
+    native = Pretrained.load(directory, dtype=dtype, param_dtype=dtype, attention_impl="reference")
     reference = Gemma4UnifiedForConditionalGeneration.from_pretrained(
-        directory, dtype=torch.float32, attn_implementation="eager").eval()
+        directory, dtype=getattr(torch, dtype), attn_implementation="eager").eval()
     with float64(), default_dtype(torch.float64):
         truth = Gemma4UnifiedForConditionalGeneration(copy.deepcopy(reference.config)).double().eval()
     truth.load_state_dict(reference.state_dict(), strict=True)
@@ -37,7 +37,7 @@ def source():
     return source_pair(FIXTURE)
 
 
-def assert_forward(source, draw, label):
+def forward_functions(source):
     native, reference, truth = source
     processor = native.processor
 
@@ -60,15 +60,21 @@ def assert_forward(source, draw, label):
             tensors = {name: value.double() if value.is_floating_point() else value
                        for name, value in tensors.items()}
         with torch.no_grad():
-            return {f"row{row}": model(**single, use_cache=False).logits.numpy()
+            return {f"row{row}": model(**single, use_cache=False).logits.to(
+                torch.float64 if wide else torch.float32).numpy()
                     for row, single in enumerate(_row_slices(tensors, model))}
 
     def oracle(inputs):
         with float64():
             return theirs(truth, inputs, wide=True)
 
-    assert_as_exact(ours, lambda inputs: theirs(reference, inputs), lambda seed: (draw(seed),),
-                    label, seeds=8, truth_fn=oracle)
+    return ours, lambda inputs: theirs(reference, inputs), oracle
+
+
+def assert_forward(source, draw, label):
+    ours, reference, truth = forward_functions(source)
+    assert_as_exact(ours, reference, lambda seed: (draw(seed),),
+                    label, seeds=8, truth_fn=truth)
 
 
 def test_unified_processor_and_native_forward_follow_the_published_forward(source):
@@ -79,6 +85,12 @@ def test_unified_processor_and_native_forward_follow_the_published_forward(sourc
 def test_vision_blocks_longer_than_the_window_keep_their_whole_block(source):
     assert_forward(source, lambda seed: unified_draw(source[1].config, seed, side=4),
                     "Gemma4 Unified long vision block")
+
+
+def test_a_bfloat16_unified_source_uses_the_same_media_and_decoder_policy():
+    source = source_pair(FIXTURE, "bfloat16")
+    assert_forward(source, lambda seed: unified_draw(source[1].config, seed),
+                    "Gemma4 Unified bfloat16 source forward")
 
 
 def gradient_functions(source):
@@ -168,9 +180,12 @@ def gradient_functions(source):
             return theirs(truth, inputs, probe, wide=True)
 
     def draw(seed):
-        pairs = [unified_draw(reference.config, 4 * seed + index) for index in range(4)]
+        """Each draw sums more independent rows so one row's conditioning holds less of its error.
+        Cotangents use their own tagged stream; every per-example VJP remains in the result."""
+        pairs = [unified_draw(reference.config, 16 * seed + index) for index in range(16)]
         inputs = {name: np.concatenate([pair[name] for pair in pairs]) for name in pairs[0]}
-        probe = np.random.default_rng(seed + 73).standard_normal((8, 14, 64), np.float32)
+        probe = np.random.default_rng([0xBACC, seed]).standard_normal(
+            (*inputs["input_ids"].shape, reference.config.text_config.vocab_size), np.float32)
         return inputs, probe
 
     return ours, lambda *args: theirs(reference, *args), oracle, draw
@@ -216,13 +231,14 @@ def test_raw_media_train_and_reload_through_the_public_source(source, tmp_path):
                                   expected)
 
 
-def test_cached_unified_calls_keep_the_ordinary_forward_mask(source):
+def cached_functions(source):
     native, reference, truth = source
     model = native.model.clone(language_model=native.model.language_model.clone(max_seq_len=32))
 
     @jax.jit
     def ours_cached(batch, continuation):
-        cache = model.apply(native.variables, 1, method="init_cache", mutable=["cache"])[1]["cache"]
+        cache = model.apply(native.variables, batch.tokens.shape[0],
+                            method="init_cache", mutable=["cache"])[1]["cache"]
         prefill, changed = model.apply({**native.variables, "cache": cache}, batch.tokens,
                                        **batch.kwargs(), decode=True, mutable=["cache"])
         outputs = {"prefill": prefill}
@@ -233,38 +249,49 @@ def test_cached_unified_calls_keep_the_ordinary_forward_mask(source):
         return outputs
 
     def ours(inputs, continuation):
-        batch = native.processor.from_hf(inputs).take_rows(jnp.asarray([1])).slice_tokens(0, 10)
+        rows = jnp.arange(1, inputs["input_ids"].shape[0], 2)
+        batch = native.processor.from_hf(inputs).take_rows(rows).slice_tokens(0, 10)
         return ours_cached(batch, continuation)
 
     def theirs(model, inputs, continuation, *, wide=False):
         tensors = {name: torch.tensor(value, dtype=torch.float64 if wide and np.issubdtype(
             value.dtype, np.floating) else None) for name, value in inputs.items()}
-        single = _row_slices(tensors, model)[1]
+        observations = []
         with torch.no_grad():
-            result = model(**single, use_cache=True)
-            outputs = {"prefill": result.logits.numpy()}
-            for step in range(continuation.shape[1]):
-                result = model(input_ids=torch.from_numpy(continuation[:, step:step + 1]),
-                               attention_mask=torch.ones((1, single["input_ids"].shape[1] + step + 1),
-                                                         dtype=torch.bool),
-                               past_key_values=result.past_key_values, use_cache=True)
-                outputs[f"step{step}"] = result.logits.numpy()
-        return outputs
+            for row, single in enumerate(_row_slices(tensors, model)[1::2]):
+                result = model(**single, use_cache=True)
+                outputs = {"prefill": result.logits.numpy()}
+                for step in range(continuation.shape[1]):
+                    result = model(input_ids=torch.from_numpy(continuation[row:row + 1, step:step + 1]),
+                                   attention_mask=torch.ones((1, single["input_ids"].shape[1] + step + 1),
+                                                             dtype=torch.bool),
+                                   past_key_values=result.past_key_values, use_cache=True)
+                    outputs[f"step{step}"] = result.logits.numpy()
+                observations.append(outputs)
+        return {name: np.concatenate([row[name] for row in observations]) for name in observations[0]}
 
     def oracle(inputs, continuation):
         with float64():
             return theirs(truth, inputs, continuation, wide=True)
 
     def draw(seed):
-        return unified_draw(reference.config, seed), np.random.default_rng(seed + 83).integers(
-            4, 50, (1, 3), dtype=np.int32)
+        """Four independent rows retain every cached output while diluting one row's conditioning.
+        Continuations use a separate tagged stream from all media draws."""
+        pairs = [unified_draw(reference.config, 4 * seed + index) for index in range(4)]
+        inputs = {name: np.concatenate([pair[name] for pair in pairs]) for name in pairs[0]}
+        continuation = np.random.default_rng([0xCAC4, seed]).integers(4, 50, (4, 3), dtype=np.int32)
+        return inputs, continuation
 
-    assert_as_exact(ours, lambda *args: theirs(reference, *args), draw,
-                    "Gemma4 Unified cached ordinary forward", seeds=8, truth_fn=oracle)
+    return ours, lambda *args: theirs(reference, *args), oracle, draw
 
 
-@pytest.mark.parametrize("media", ["text", "vision", "audio"])
-def test_a_unified_source_can_omit_either_media_component(source, tmp_path, media):
+def test_cached_unified_calls_keep_the_ordinary_forward_mask(source):
+    ours, reference, truth, draw = cached_functions(source)
+    assert_as_exact(ours, reference, draw,
+                    "Gemma4 Unified cached ordinary forward", seeds=8, truth_fn=truth)
+
+
+def optional_source(source, directory, media):
     original = source[1]
     config = copy.deepcopy(original.config)
     if media != "vision":
@@ -275,10 +302,10 @@ def test_a_unified_source_can_omit_either_media_component(source, tmp_path, medi
     names = reference.state_dict().keys()
     reference.load_state_dict({name: value for name, value in original.state_dict().items() if name in names},
                                strict=True)
-    reference.save_pretrained(tmp_path, safe_serialization=True)
-    reference.config.to_json_file(tmp_path / "config.json", use_diff=False)
+    reference.save_pretrained(directory, safe_serialization=True)
+    reference.config.to_json_file(directory / "config.json", use_diff=False)
     for name in ("processor_config.json", "tokenizer_config.json", "tokenizer.json"):
-        shutil.copyfile(FIXTURE / name, tmp_path / name)
+        shutil.copyfile(FIXTURE / name, directory / name)
 
     def draw(seed):
         values = unified_draw(original.config, seed)
@@ -296,10 +323,16 @@ def test_a_unified_source_can_omit_either_media_component(source, tmp_path, medi
             del values["input_features"], values["input_features_mask"]
         return values
 
-    assert_forward(source_pair(tmp_path), draw, f"Gemma4 Unified {media} source")
+    return source_pair(directory), draw
 
 
-def test_equal_attention_geometries_still_use_the_full_layer_vision_mask(source, tmp_path):
+@pytest.mark.parametrize("media", ["text", "vision", "audio"])
+def test_a_unified_source_can_omit_either_media_component(source, tmp_path, media):
+    pair, draw = optional_source(source, tmp_path, media)
+    assert_forward(pair, draw, f"Gemma4 Unified {media} source")
+
+
+def equal_geometry_source(source, directory):
     from dew.interop.verify import scatter_weights
 
     config = source[1].config.to_dict()
@@ -309,10 +342,15 @@ def test_equal_attention_geometries_still_use_the_full_layer_vision_mask(source,
     torch.manual_seed(502)
     reference = Gemma4UnifiedForConditionalGeneration(config).float().eval()
     scatter_weights(reference)
-    reference.save_pretrained(tmp_path, safe_serialization=True)
+    reference.save_pretrained(directory, safe_serialization=True)
     # Preserve the explicitly empty per-layer geometry instead of reconstructing default global heads.
-    reference.config.to_json_file(tmp_path / "config.json", use_diff=False)
+    reference.config.to_json_file(directory / "config.json", use_diff=False)
     for name in ("processor_config.json", "tokenizer_config.json", "tokenizer.json"):
-        shutil.copyfile(FIXTURE / name, tmp_path / name)
-    assert_forward(source_pair(tmp_path), lambda seed: unified_draw(config, seed),
+        shutil.copyfile(FIXTURE / name, directory / name)
+    return source_pair(directory), lambda seed: unified_draw(config, seed)
+
+
+def test_equal_attention_geometries_still_use_the_full_layer_vision_mask(source, tmp_path):
+    pair, draw = equal_geometry_source(source, tmp_path)
+    assert_forward(pair, draw,
                     "Gemma4 Unified equal attention geometries")
