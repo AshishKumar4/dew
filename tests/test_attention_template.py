@@ -54,6 +54,16 @@ LENGTHS = jnp.asarray([96, 61], jnp.int32)
 STARTS = jnp.asarray([0, 17], jnp.int32)
 
 
+def key_validity(keys: int) -> jax.Array:
+    """Which of a call's first `keys` keys are real `[2, keys]`: holes of a key and of five in the first row,
+    one across `own_documents`' boundary at 30; every seventh key in the second, and a run of thirty from
+    60, longer than the cases' window, so the queries late in it whose window it covers read no key."""
+    index = np.arange(QUERIES)
+    first = ~((index == 5) | ((index >= 28) & (index < 33)) | ((index >= 40) & (index < 45)))
+    second = (index % 7 != 3) & ~((index >= 60) & (index < 90))
+    return jnp.asarray(np.stack([first, second])[:, :keys])
+
+
 CASES = {
     "full": {},
     "causal": {"causal": True},
@@ -80,6 +90,13 @@ CASES = {
                                       "block_groups": True},
     "cross-block-causal-window": {"causal": True, "sliding_window": 24, "segment_ids": "cross",
                                   "block_groups": True},
+    "valid": {"valid": True},
+    "causal-window-valid": {"causal": True, "sliding_window": 24, "valid": True},
+    "documents-causal-valid": {"causal": True, "segment_ids": "own", "valid": True},
+    "cross-causal-window-valid": {"causal": True, "sliding_window": 24, "segment_ids": "cross",
+                                  "valid": True},
+    "documents-window-valid-places": {"causal": True, "sliding_window": 24, "segment_ids": "own",
+                                      "valid": True, "positions": True},
 }
 
 
@@ -119,9 +136,13 @@ def arguments(case: dict) -> dict:
         keywords["starts"] = STARTS
     if case.get("block_groups"):
         keywords["block_groups"], keywords["image_groups"] = block_groups(geometry(case)[1])
+    if case.get("valid"):
+        keywords["valid"] = key_validity(geometry(case)[1])
     if case.get("positions"):
-        # Each token's place in its own document, as a packed row's coordinates count it.
-        places = coordinates(segments=keywords["segment_ids"]).positions
+        # Each token's place in its own document, as a packed row's coordinates count it, over its real
+        # tokens where only some are (`counted_places`).
+        places = (coordinates(segments=keywords["segment_ids"]).positions if "valid" not in keywords
+                  else counted_places(keywords["segment_ids"], keywords["valid"]))
         keywords["positions"] = (places, places)
     return keywords
 
@@ -132,7 +153,8 @@ def dews_mask(case: dict) -> np.ndarray:
     window aligned to their last keys (`cross_document_mask`), else causality and a window on the
     indices (`combined_attention_mask`) narrowed to the documents (`with_documents`); a chunk as
     `chunk_mask` keeps it over the call's places (the attention layer's `_chunked`), its indices where it
-    names none; then key lengths and starts."""
+    names none, as a window does where the call names places and real keys (the layer's counted places);
+    then key lengths and starts, and the real keys."""
     keywords = arguments(case)
     queries, keys = geometry(case)
     ids = keywords.get("segment_ids")
@@ -148,6 +170,11 @@ def dews_mask(case: dict) -> np.ndarray:
         first = np.argmax(key_ids[:, None, :] == query_ids[:, :, None], axis=-1)
         ranks = np.asarray(aligned_places(ids))
         slots = np.where(ranks >= 0, first + ranks, -1)
+    elif window is not None and "positions" in keywords:
+        query_places, key_places = (np.asarray(x) for x in keywords["positions"])
+        counted = windowed(query_places[:, :, None], key_places[:, None, :], window, causal=causal)[:, None]
+        base = combined_attention_mask(queries, keys, causal, None, None)
+        mask = counted if base is None else base & counted
     else:
         mask = combined_attention_mask(queries, keys, causal, window, None)
     held = (slots >= 0) & (slots < keys)
@@ -173,6 +200,9 @@ def dews_mask(case: dict) -> np.ndarray:
     if "lengths" in keywords:
         mask = with_key_lengths(mask, keywords["lengths"], keys)
     mask = with_key_starts(mask, keywords.get("starts"), keys)
+    if "valid" in keywords:
+        real = jnp.asarray(keywords["valid"])[:, None, None, :]
+        mask = real if mask is None else jnp.logical_and(mask, real)
     full = np.ones((ROWS, queries, keys), bool)
     return full if mask is None else np.broadcast_to(np.asarray(mask)[:, 0], full.shape)
 
@@ -196,6 +226,14 @@ def test_key_spans_keep_the_keys_dews_masks_keep(case):
         assert expected[1, 16, 39] and expected[1, 39, 16] and not expected[1, 39, 15]
         assert expected[1, 98, 66] and not expected[1, 98, 65]
         assert expected[0, 16, 29] and not expected[0, 16, 30]
+    if case is CASES["causal-window-valid"]:
+        # The second row's queries 84 to 89, whose window of 24 behind holds only the run of invalid keys
+        # from 60, read none; query 90 reads itself.
+        assert not expected[1, 84:90].any() and expected[1, 90, 90]
+    if case is CASES["documents-window-valid-places"]:
+        # The window counts real tokens: query 27, across the hole at 5, keeps key 3, 23 real tokens behind
+        # it and 24 slots, and not key 2.
+        assert expected[0, 27, 3] and not expected[0, 27, 2]
     if case is CASES["cross-block-causal-window"]:
         # A cache call's query 68 sits at slot 58, whose block runs to 64 past its document's last key
         # at 59: it sees 59 and not 60. The second row's first 30 queries hold no slot, so see nothing.
@@ -499,6 +537,25 @@ def test_a_query_reads_a_key_exactly_where_its_spans_hold_one(case):
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     np.testing.assert_array_equal(np.asarray(template.reads(spans)),
                                   np.asarray(template.dense(spans)).any(-1))
+
+
+def test_key_validity_hides_keys_by_their_ids_and_keeps_a_cross_calls_alignment():
+    """Key validity is the documents' padding id on the invalid keys (`template.spans`): a cross call's
+    spans, which its alignment to the documents' last keys bounds, are the same with it and without it, its
+    invalid keys id 0, its queries' ids its own; a call of no documents gives its queries and valid keys 1."""
+    case = CASES["cross-causal-window-valid"]
+    queries, keys = geometry(case)
+    given = arguments(case)
+    valid = given.pop("valid")
+    plain = template.spans(queries, keys, ROWS, **given)
+    hidden = template.spans(queries, keys, ROWS, **given, valid=valid)
+    for field in ("start", "end", "query_ids"):
+        np.testing.assert_array_equal(np.asarray(getattr(hidden, field)), np.asarray(getattr(plain, field)))
+    assert plain.key_ids is not None
+    np.testing.assert_array_equal(np.asarray(hidden.key_ids), np.where(valid, plain.key_ids, 0))
+    bare = template.spans(queries, keys, ROWS, causal=True, valid=valid)
+    np.testing.assert_array_equal(np.asarray(bare.query_ids), 1)
+    np.testing.assert_array_equal(np.asarray(bare.key_ids), np.asarray(valid, np.int32))
 
 
 @pytest.mark.parametrize("ids, keywords", [
