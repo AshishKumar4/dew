@@ -9,6 +9,8 @@ import tempfile
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 
 def torch_stages(source, destination):
     import torch
@@ -69,6 +71,7 @@ def main():
     from dew.nn.kernels import fla_gdn, fla_kda, recurrence
     from dew.nn.precision import l2norm
     from test_kda import operands
+    from kda_precision_experiment import install_dot
 
     seeds = 40
     arrays = {'seeds': np.array(seeds)}
@@ -82,7 +85,7 @@ def main():
             arrays[f'{seed}/{name}'] = value
 
     def port(q, k, v, g, beta, h0, *, mode):
-        if mode == 'prefix64':
+        if mode.startswith('prefix64'):
             with jax.enable_x64():
                 cg = (jnp.cumsum(g.astype(jnp.float64), axis=1) / np.log(2.0)).astype(jnp.float32)
         else:
@@ -98,7 +101,9 @@ def main():
         np.savez(source, **arrays)
         subprocess.run([os.environ['DEW_FLA_PYTHON'], __file__, '--fla', source, destination], check=True)
         upstream = np.load(destination)
-        for mode in ('baseline', 'prefix64'):
+        for mode in ('baseline', 'prefix64', 'bf16x6', 'prefix64-bf16x6'):
+            if mode == 'bf16x6':
+                install_dot()
             measured = {}
             run = jax.jit(lambda *args: port(*args, mode=mode))
             for seed in range(seeds):

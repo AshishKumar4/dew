@@ -12,6 +12,25 @@ from jax.experimental import pallas as pl
 from dew.nn.kernels import chunked_launch, recurrence
 
 
+def install_dot(algorithm='bf16x6'):
+    from dew.nn.kernels import fla_gdn, fla_kda
+
+    original = fla_gdn._dot
+    presets = {
+        'bf16x6': jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6,
+        'bf16x9': jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X9,
+        'ieee': jax.lax.Precision.HIGHEST,
+    }
+
+    def dot(a, b, *, exact, ieee=False, solve=None):
+        if a.dtype == jnp.float32 and not exact and not ieee and (
+                solve is None or jnp.dtype(solve).itemsize == 4):
+            return jnp.dot(a, b, preferred_element_type=jnp.float32, precision=presets[algorithm])
+        return original(a, b, exact=exact, ieee=ieee, solve=solve)
+
+    fla_gdn._dot = fla_kda._dot = dot
+
+
 def log_measurements():
     import reference_error
 
@@ -83,6 +102,11 @@ def test_short_forward_prefix_precision(mode, monkeypatch):
 if __name__ == '__main__':
     if sys.argv[1] in ('prefix64', 'sum64', 'scale64'):
         install_prefix64(sys.argv[1])
+    elif sys.argv[1] in ('bf16x6', 'bf16x9', 'ieee'):
+        install_dot(sys.argv[1])
+    elif sys.argv[1] == 'prefix64-bf16x6':
+        install_prefix64()
+        install_dot()
     elif sys.argv[1] == 'baseline':
         pass
     else:
