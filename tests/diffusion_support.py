@@ -56,6 +56,30 @@ def apg_walked(case, label, x_T):
                   final_denoise=False)
 
 
+def source_final(schedule, process, times, rescale, label, scale):
+    """The last latent of a published scheduler's walk as `tools/diffusers_source_reference.py`
+    walks it, as Dew's function of the initial one: `schedule`'s own solver over `process`'s grid
+    `times` on `SourceOracle`, or, where the case guides (`rescale`, CFG's rescale, not None),
+    classifier-free guidance at `scale` on `ConditionalSourceOracle` at `label`."""
+    from dew.sampling import CFG
+
+    if rescale is None:
+        model = SourceOracle()
+        return lambda value: walk(schedule.solver, process, model, value, times)[-1]
+    model = ConditionalSourceOracle()
+
+    def final(value):
+        rows = value.shape[0]
+        params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *value.shape[1:])), jnp.ones((1,)),
+                            jnp.ones((1,)))
+        denoise = process.denoiser(model, params, {"label": jnp.full((rows,), label)},
+                                   {"label": jnp.zeros((rows,))})
+        return sample(denoise, value, solver=schedule.solver, guidance=CFG(scale, rescale=rescale),
+                      key=jax.random.PRNGKey(0), times=times, final_denoise=False)
+
+    return final
+
+
 def walk(solver, process, model, x_T, times, key=0):
     """Each solver interval's new state, without the closing denoise, through `sample`'s own walk with
     its folded per-step keys (`sample(record=...)`)."""
