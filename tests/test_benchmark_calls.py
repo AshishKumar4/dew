@@ -42,6 +42,23 @@ def test_a_benchmark_times_each_call_until_its_output_is_ready_after_untimed_war
         benchmark({"cumsum": lambda: step(x)}, repeats=0)
 
 
+def test_a_carried_window_hands_each_call_the_last_state_and_times_the_wait_for_it():
+    """Calls that carry a state get the state the last returned; one window waits once at its end,
+    each call's wait inside it, and a window of samples waits on every call, one sample apiece."""
+    from dew.telemetry.benchmark import carried
+
+    def step(carried_state):
+        count, _ = carried_state
+        return count + 1, Slow(0.02)
+
+    (count, _), (window,) = carried(step, (0, None), 3)
+    assert count == 3 and window >= 0.02
+    (count, _), each = carried(step, (count, None), 2, each=True)
+    assert count == 5 and len(each) == 2 and min(each) >= 0.02
+    with pytest.raises(ValueError):
+        carried(step, (0, None), 0)
+
+
 def test_pair_labels_lay_out_as_rows_by_columns_in_one_unit():
     """Medians laid out by label: pairs as a grid of rows by columns, a pair that never ran left
     empty, and one unit a table, milliseconds until a median reaches ten seconds."""
