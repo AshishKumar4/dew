@@ -640,7 +640,7 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
 
 
 BUILT_INS = tuple(entry.wrapper for entry in REGISTRATIONS)
-"""Every built-in autoencoder, one per registration (`AutoEncoder.from_json`'s)."""
+"""Every built-in autoencoder, one per registration (the sources `pretrained.REGISTRATIONS` loads)."""
 
 
 def test_only_the_kl_autoencoders_with_a_posterior_reach_end_to_end_tuning():

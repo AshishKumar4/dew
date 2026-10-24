@@ -459,9 +459,12 @@ def to_record(value, annotation) -> JSON:
         return value.name if isinstance(value, jax.lax.DotAlgorithmPreset) else value.name.lower()
     if isinstance(value, Recorded) and not isinstance(value, type):
         # A component built around parameters (an encoder, an autoencoder) records the constructor
-        # view it is rebuilt from, never its parameters, always naming its class (`component`).
-        return {"class": import_path(type(value)),
-                "fields": {name: to_record(entry, object) for name, entry in value.recorded_fields().items()}}
+        # view it is rebuilt from, never its parameters, always naming its class (`component`), in
+        # one record, so a module its view holds twice is written once (`recording`).
+        with recording():
+            fields = value.recorded_fields()
+            return {"class": import_path(type(value)),
+                    "fields": {name: to_record(entry, object) for name, entry in fields.items()}}
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         with recording() as written:
             if isinstance(value, nn.Module) and id(value) in written.modules:
@@ -591,9 +594,13 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
         inner = [member for member in _union_members(annotation) if member is not type(None)]
         if len(inner) == 1:
             return _rebuilt(inner[0], value, dtypes=dtypes)
-        classes = tuple(member for member in inner if isinstance(member, type))
+        # A class record builds one of the union's classes; a JSON union (`dew._records.JSON`) declares
+        # none but scalars and keeps a mapping, a class record among them, as the record it is.
+        classes = tuple(member for member in inner
+                        if isinstance(member, type) and member not in (bool, int, float, str))
+        mappings = [member for member in inner if typing.get_origin(member) in _MAPPINGS]
         named = class_record(value) if isinstance(value, Mapping) else None
-        if named is not None:
+        if named is not None and (classes or not mappings):
             if not classes:
                 raise ValueError(f"{annotation} declares no class, so nothing builds the record {value!r}")
             return _built(_member(named[0], classes), named[1], dtypes=dtypes)
@@ -993,7 +1000,13 @@ def _read(member: type | Callable[..., Configured], name: str, value, *, dtypes:
     dtype, any other value, a scalar or a value the caller built, as given."""
     held = record_class(member)
     if held is not None:
-        return _rebuilt(declared_type(held, name), configured(value), dtypes=dtypes, name=name)
+        declared = declared_type(held, name)
+        if (isinstance(declared, type) and not issubclass(declared, (Mapping, Sequence))
+                and isinstance(value, declared)):
+            # A value the caller built, of the field's own class (an encoder a binder made), is kept
+            # as it is, whatever its kind.
+            return value
+        return _rebuilt(declared, configured(value), dtypes=dtypes, name=name)
     if not (isinstance(value, (Mapping, list)) or (dtypes and name == "dtype")):
         return value
     named = parameters(member)[0]
