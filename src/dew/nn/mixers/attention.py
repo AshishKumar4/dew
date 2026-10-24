@@ -867,8 +867,9 @@ class CausalSelfAttention(nn.Module):
         in (`visibility_mask`, the window counting real tokens where validity is given), joined with the
         layer's chunks of `chunk` places: the decode and diagnostic paths, each query and key in the chunk
         of its counted place, never its cache slot."""
-        seen = visibility_mask(length, keys, causal, window, mask, documents, groups.block_groups,
-                               groups.image_groups, valid, None if valid is None else places)
+        seen = visibility_mask(length, keys, causal, window, mask, documents,
+                               block_groups=groups.block_groups, image_groups=groups.image_groups,
+                               key_valid=valid, places=None if valid is None else places)
         return seen & chunk_mask(places, key_places, chunk)
 
     def _pairwise_mask(self, metadata: AttentionMetadata, rotary_positions, B: int, S: int, keys: int):
@@ -911,8 +912,8 @@ class CausalSelfAttention(nn.Module):
         sowing = not self.is_initializing() and self.is_mutable_collection("qk")
         if sowing:
             # Over the keys the call sees, as its spans say them (`visibility_mask`).
-            seen = visibility_mask(S, key.shape[-3], causal, window, mask, documents, blocks, images, valid,
-                                   held)
+            seen = visibility_mask(S, key.shape[-3], causal, window, mask, documents, block_groups=blocks,
+                                   image_groups=images, key_valid=valid, places=held)
             self.sow("qk", "max_logits", max_attention_logits(query, key, mask=seen, bias=bias))
             self.sow("qk", "kv_heads", jnp.asarray(key.shape[-2]))
             self.sow("qk", "head_dim", jnp.asarray(query.shape[-1]))
