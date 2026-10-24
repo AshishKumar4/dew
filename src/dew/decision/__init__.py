@@ -6,7 +6,9 @@ The model lays the questions out with the state (Laya's `MarkerLayout`, the
 `StateFirstLayout` for a causal backbone, or the `JointLayout`, every
 question of a request in one row), reads the rows with a backbone, scores
 every option with a head (Laya's `DecisionHead`, or the `JointSchemaHead`,
-which decides a row's questions together), and answers with a distribution
+which decides a row's questions together, or a readout of options written under
+`Labels`: `LabelReadout`, the backbone's own logits at them, and a slot release's
+`SlotReadout`), and answers with a distribution
 over exactly the options each question names. `Decide` is the task that
 answers requests, and `DecisionObjective` trains one on proper scoring
 rules. `LayaCheckpoint` reads convaiinnovations/laya's released
@@ -17,7 +19,7 @@ reads.
 
 from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures, bucket
 from dew.decision.data import Example, corpus, decisions, mixture
-from dew.decision.head import HEADS, DecisionHead, Head, JointSchemaHead
+from dew.decision.head import HEADS, DecisionHead, Head, JointSchemaHead, LabelReadout, SlotReadout
 from dew.decision.joint_checkpoint import JointCheckpoint, StoredJointHead
 from dew.decision.laya import LayaCheckpoint
 from dew.decision.layout import (
@@ -25,6 +27,7 @@ from dew.decision.layout import (
     Encoded,
     Framing,
     JointLayout,
+    Labels,
     Laid,
     Layout,
     MarkerLayout,
@@ -89,6 +92,8 @@ __all__ = [
     "JointCheckpoint",
     "JointLayout",
     "JointSchemaHead",
+    "LabelReadout",
+    "Labels",
     "Laid",
     "LayaCheckpoint",
     "Layout",
@@ -103,6 +108,7 @@ __all__ = [
     "ScoreAnswer",
     "Scored",
     "ScoringRule",
+    "SlotReadout",
     "Specials",
     "Spherical",
     "StateFirstLayout",
