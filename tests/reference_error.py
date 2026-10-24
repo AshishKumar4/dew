@@ -1082,9 +1082,10 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     Dew's errors against the reference's on the same draws, the two resampled by the same seeds as the
     verdict resamples them (`_interval`), on draws from SIZING_FROM on that no verdict takes. A pair
     that shares its upstream rounding, the same inputs through the same upstream arithmetic, has errors
-    whose sizes vary across draws together: their ratio resolves where each alone does not (heavy-tailed
-    across draws, never), and the verdict judges that same paired ratio, so a paired count is the one
-    its verdict needs (docs/design/testing.md states how it was validated). The width asked of it is PARITY
+    whose sizes vary across draws together: their ratio resolves in fewer draws than each alone does, or
+    where each alone, heavy-tailed across draws, never does, and the verdict judges that same paired
+    ratio, so a paired count is the one its verdict needs (docs/design/testing.md states how it was
+    validated). The width asked of it is PARITY
     either way. Paired sizing holds out its draws only where `draw` keys an independent stream by the
     whole seed: a draw that enumerates finitely or by a modulus (`(arange(n) + seed) % vocab`) repeats a
     verdict's inputs at SIZING_FROM and needs a pilot stream of its own first, and a recorded reference
