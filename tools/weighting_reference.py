@@ -31,9 +31,6 @@ Run with Torch 2.14.0 CPU and NumPy:
 
 import argparse
 import importlib
-import sys
-import tempfile
-import urllib.request
 from functools import partial
 from pathlib import Path
 
@@ -45,6 +42,15 @@ REPOS = {
     "p2": ("jychoi118/P2-weighting", "3da0947ac350072e457c211401218175bc94e137"),
     "min_snr": ("TiankaiHang/Min-SNR-Diffusion-Training", "5189997d6bbde5a1301bcf31a54d2b3589f7309c"),
 }
+FILES = {
+    "p2": {"gaussian_diffusion.py": "19b3a2a9612b5d658bc6f169958cdebe14a42e9ec1a1173ee1aec6b494a5ebae",
+           "nn.py": "d9547fb22b421a16dc079cb82a9d98630100b5e1b2a710d343f4d3f90b8661f3",
+           "losses.py": "0b0f5a5532910fbc7f16d30f2b891d8f1e20aa88881589ce4eacc2cc6ce06026"},
+    "min_snr": {"gaussian_diffusion.py": "8a58f1e4f42dc4ec5908fa7688cc9b9e8b1bb530b4cc8448a82f6ef45be7ed5d",
+                "nn.py": "d9547fb22b421a16dc079cb82a9d98630100b5e1b2a710d343f4d3f90b8661f3",
+                "losses.py": "0b0f5a5532910fbc7f16d30f2b891d8f1e20aa88881589ce4eacc2cc6ce06026"},
+}
+"""Each repo's guided_diffusion files its gaussian_diffusion module reads, to their SHA-256."""
 CASES = {
     "p2": (("EPSILON", {"p2_k": 1, "p2_gamma": 1}), ("EPSILON", {"p2_k": 1, "p2_gamma": 0.5}),
            ("EPSILON", {"p2_k": 2, "p2_gamma": 1})),
@@ -97,17 +103,12 @@ def closed_form(name: str, mean: str, options: dict, inputs: dict, dtype) -> dic
     return {"weight": jnp.where(snr == 0, 1.0, weight).astype(dtype)}
 
 
-def guided_diffusion(name: str, directory: Path):
+def guided_diffusion(name: str):
     """The repo's own gaussian_diffusion module, imported from its files."""
-    repo, commit = REPOS[name]
-    package = directory / f"guided_diffusion_{name}"
-    package.mkdir()
-    (package / "__init__.py").write_text("")
-    for file in ("gaussian_diffusion.py", "nn.py", "losses.py"):
-        url = f"https://raw.githubusercontent.com/{repo}/{commit}/guided_diffusion/{file}"
-        with urllib.request.urlopen(url, timeout=60) as response:
-            (package / file).write_bytes(response.read())
-    sys.path.insert(0, str(directory))
+    from reference_source import package, published_files
+
+    files = {f"guided_diffusion/{file}": digest for file, digest in FILES[name].items()}
+    package(f"guided_diffusion_{name}", published_files(*REPOS[name], files) / "guided_diffusion")
     return importlib.import_module(f"guided_diffusion_{name}.gaussian_diffusion")
 
 
@@ -143,9 +144,9 @@ def main() -> None:
     from recorded_references import provenance, record_case, save
 
     recorded = {}
-    with tempfile.TemporaryDirectory() as directory, jax.enable_x64(new_val=True):
+    with jax.enable_x64(new_val=True):
         for name, cases in CASES.items():
-            module = guided_diffusion(name, Path(directory))
+            module = guided_diffusion(name)
             for mean, options in cases:
                 for table in TABLES:
                     label = label_of(name, mean, options, table)
