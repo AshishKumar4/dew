@@ -690,8 +690,7 @@ def _mosaic_backward_rule(query, key, value, g, beta, state, starts, *, document
     chooser ranks per shape): `_blocked_rule`'s values, the port's forward, with the recurrence template's
     fast backward
     (`mainloop.gradients`, fla's DAG through the algebra's tile functions, recomputing the forward's values as
-    fla's does): on an A100 the 27B gated delta net's training pass at 0.93 times the port's time and 1.14
-    times its peak memory, its gradient held to the port's by check 1 (tests/test_recurrence_mosaic.py)."""
+    fla's does), its gradient held to the port's by check 1 (tests/test_recurrence_mosaic.py)."""
     from .templates.recurrence import mainloop
 
     @jax.custom_vjp

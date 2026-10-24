@@ -208,7 +208,14 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_shared_memory(target):
     budget: a launch past an A100's shared memory lowered and failed on the GPU (the fast backward's
     readout's third staging tile). The gate's third resource, no register spilled, the mainloop does not
     meet yet (ledger: the recurrence mainloop's register spills), and this test turns into the whole gate
-    (`mosaic_failures`) when it does."""
+    (`mosaic_failures`) when it does. A GPU host's ptxas builds for its own GPU and those before it, not a
+    newer one's (an A100's refuses sm_90a), so there the newer targets are the CPU suite's alone."""
+    from dew.nn.kernels import generation
+
+    if jax.default_backend() == 'gpu':
+        local = generation.capability(generation.device_generation())
+        if local is not None and local < generation.capability(target):
+            pytest.skip(f"this host's ptxas builds for its {local} GPU and before, not {target}")
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 

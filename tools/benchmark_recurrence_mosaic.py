@@ -71,8 +71,11 @@ def row(name: str, arm: str, dtype, warmup: int, repeats: int, training: bool = 
 
     if training:
         def trained(*args):
+            # The forward's results returned with the gradients, as a training step reads both: a pass
+            # returning the gradients alone leaves XLA to drop every forward launch the backward does not
+            # read (each arm's output launch, and the hybrid's whole port forward).
             out, pull = jax.vjp(forward, *args)
-            return pull(jax.tree.map(jnp.ones_like, out))
+            return out, pull(jax.tree.map(jnp.ones_like, out))
         timed = trained
     else:
         timed = forward
