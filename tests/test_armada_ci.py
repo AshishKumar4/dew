@@ -67,7 +67,8 @@ def armada_task(ci, monkeypatch, out: Path, policy: str = "on") -> list[dict]:
     rows = []
     for entry in entries:
         values = {**entry, "out": out}
-        filled = [re.sub(r"\{(\w+)\}", lambda field: str(values[field[1]]), word) for word in command]
+        filled = [re.sub(r"\{(\w+)\}", lambda field, values=values: str(values[field[1]]), word)
+                  for word in command]
         monkeypatch.setattr(sys, "argv", ["ci.py", *filled[2:]])
         assert ci.main() == 0
         rows += json.loads(out.read_text())["rows"]
