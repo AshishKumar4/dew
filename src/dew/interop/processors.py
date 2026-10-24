@@ -462,9 +462,10 @@ class Processor:
         padded_positions = (None if patch_positions is None else np.full(
             (tokens.shape[0], width, shape[0], 2), -1, np.int32))
         selected = [np.arange(length) for length in lengths]
-        if (patch_positions is not None
-                and towers.from_record(self.record["tower"]).geometry().retains_patch_slots):
-            selected = [np.flatnonzero((position >= 0).all(axis=-1)) for position in patch_positions]
+        if patch_positions is not None:
+            geometry = towers.from_record(records.record(self.record["tower"], "tower")).geometry()
+            if geometry.retains_patch_slots:
+                selected = [np.flatnonzero((position >= 0).all(axis=-1)) for position in patch_positions]
         indices, places = _placed(runs, selected, capacity, tokens.shape, "projector's feature count")
         groups = None if gemma else np.full(tokens.shape, -1, np.int32)
         token_lengths = np.zeros((tokens.shape[0], width), np.int32)
@@ -502,7 +503,7 @@ class Processor:
         each image or video's patches, their positions and placeholder count,
         and the vision pooling kernel that sets how many slots one fills."""
         # The tower's geometry as its translation reads it, the reference's defaults included.
-        tower = towers.from_record(self.record["tower"]).geometry()
+        tower = towers.from_record(records.record(self.record["tower"], "tower")).geometry()
         kernel, patch_size, table_size = tower.block_size, tower.patch_size, tower.position_size
         if kernel is None or patch_size is None or table_size is None:
             raise ValueError("positioned image patches require patch, pooling and position-table geometry")
@@ -530,7 +531,7 @@ class Processor:
             raise ValueError("this source has no audio projector")
         stride = 1
         if audio is not None:
-            encoder = towers.from_record(audio)
+            encoder = towers.from_record(records.record(audio, "audio"))
             if not isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
                 raise ValueError("audio conditioning requires a Gemma audio encoder")
             stride = audio_nn.encoded_frame_stride(encoder)

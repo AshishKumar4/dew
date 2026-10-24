@@ -257,7 +257,7 @@ def _gemma4_unified_wrapper(hf_config: Mapping[str, object], used: set[str]) -> 
         tower = unified_vision(vision)
         projector = unified_projector(vision, width, record_int(tower['fields'], 'mm_embed_dim'))
     audio = hf_config.get('audio_config')
-    audio_fields = NO_AUDIO
+    audio_fields: AudioFields = NO_AUDIO
     audio_id = records.integer(hf_config.get('audio_token_id', 258881), 'audio_token_id')
     if audio is not None:
         audio = records.record(audio, 'audio_config')
