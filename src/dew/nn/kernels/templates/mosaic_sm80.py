@@ -247,8 +247,10 @@ class Mma(mosaic.Family):
             return plgpu.layout_cast(lhs.astype(self.dtype), self.lhs)
         return plgpu.load(lhs, layout=self.lhs)
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0) -> jax.Array:
-        del pending
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0,
+                interpret: bool = False) -> jax.Array:
+        # Its products are synchronous, issued in the caller's trace.
+        del pending, interpret
         out = plgpu.mma(self.zeros(shape), self._left(lhs), plgpu.load(rhs, layout=self.rhs))
         if then is not None:
             then()

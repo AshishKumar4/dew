@@ -238,7 +238,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         # them, `then` issued while its product runs (`Family.product`). A tile every query sees whole takes
         # no mask: one walk, the choice a tile's (a walk of each, these rings' waits and arrivals in two
         # loops, faulted on an H100 under jax 0.11.2's lowering).
-        s = family.product(q, slots["keys"].transpose((1, 0)), shape, then, pending=pending)
+        s = family.product(q, slots["keys"].transpose((1, 0)), shape, then, pending=pending,
+                           interpret=interpret)
         slots.release("keys")
         k_first = index * tiles.block_k
         coords = _coords(family, spans, row, first, k_first, shape, q_pos, columns)

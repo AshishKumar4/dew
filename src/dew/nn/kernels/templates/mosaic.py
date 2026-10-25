@@ -517,11 +517,14 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         or registers."""
 
     @abc.abstractmethod
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0) -> jax.Array:
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0,
+                interpret: bool = False) -> jax.Array:
         """`lhs @ rhs` into a fresh fp32 accumulator of `shape`, its value, with `then` issued while the
-        product runs. The value is read once at most `pending` of the role's products issued after it (by
-        `then`) still run: it is valid only once its own group retires, which a count of the products `then`
-        issues keeps (an asynchronous family's, `asynchronous`; a synchronous one's are done as issued)."""
+        product runs, in the caller's own trace (what it takes into a walk's accumulators, values where
+        `interpret`, stays the walk's). The value is read once at most `pending` of the role's products
+        issued after it (by `then`) still run: it is valid only once its own group retires, which a count of
+        the products `then` issues keeps (an asynchronous family's, `asynchronous`; a synchronous one's are
+        done as issued)."""
 
     @abc.abstractmethod
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
