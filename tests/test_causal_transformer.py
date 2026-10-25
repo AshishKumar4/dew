@@ -149,8 +149,9 @@ def test_attention_dropout_reaches_local_and_grouped_heads(rng, geometry):
 def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
     """A decoder record from before dropout builds with every rate zero and computes what its
     serialized pre-dropout forward and gradient compute: the export run as serialized is check 1's
-    reference, from the record's model in float64, over the export's own weights and drawn ids (the
-    two are different programs, which no bits bind)."""
+    reference, and the same pre-dropout program exported in float64 from the same source its truth,
+    over the export's own weights and drawn ids (the two are different programs, which no bits
+    bind)."""
     from flax.traverse_util import unflatten_dict
     from jax import export
 
@@ -164,10 +165,8 @@ def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
     assert model.embedding_dropout_rate == model.attention_dropout_rate == 0
     directory = Path(__file__).with_name("fixtures")
     held = np.load(directory / "decoder-default-dropout.npz")
-    try:
-        before = export.deserialize((directory / "decoder-default-dropout.jaxexport").read_bytes())
-    except Exception as error:
-        pytest.fail(f"cannot deserialize the pre-dropout forward/gradient export: {error}")
+    before, wide = (export.deserialize((directory / f"decoder-default-dropout{suffix}.jaxexport")
+                                       .read_bytes()) for suffix in ("", "-float64"))
     cpu = jax.devices("cpu")[0]
     params = unflatten_dict({tuple(name.split("/")[1:]): np.asarray(leaf)
                              for name, leaf in held.items() if name.startswith("params/")})
@@ -175,7 +174,6 @@ def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
         assert jax.tree.structure(jax.jit(forward_and_gradient(model))(params, held["ids"])) == \
             jax.tree.structure(before.call(params, held["ids"]))
     current = jax.jit(forward_and_gradient(model))
-    wide = jax.jit(forward_and_gradient(model.clone(dtype=jnp.float64, precision="highest")))
 
     def draw(seed):
         ids = np.random.default_rng([0x0D, seed]).integers(0, 17, held["ids"].shape)
@@ -191,7 +189,7 @@ def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
 
     def truth(ids):
         with jax.enable_x64(new_val=True), jax.default_device(cpu):
-            return jax.device_get(wide(widened(params), ids))
+            return jax.device_get(wide.call(widened(params), ids))
 
     assert_as_exact(ours, theirs, draw, "an old record against its export", seeds=SEEDS["old record"],
                     truth_fn=truth)
