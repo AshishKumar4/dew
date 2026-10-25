@@ -62,7 +62,7 @@ from dew.objectives.base import (
     model_rngs,
     part,
 )
-from dew.records import integer, record
+from dew.records import JSON, integer, record
 
 if TYPE_CHECKING:
     from dew.training.state import TrainState
@@ -694,7 +694,7 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
                  label_smoothing: float = 0.0, shuffle_options: bool = True,
                  none_of_the_above: float = 0.0, temperatures: Temperatures | None = None,
                  segments: int | None = 16, context_encoder: ContextEncoder | None = None,
-                 consistency: float = 0.0):
+                 consistency: float = 0.0, head_seed: int | None = None):
         held: Variables | None = None
         self.image_processor = None
         match backbone:
@@ -743,6 +743,7 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
         if not consistency >= 0.0:
             raise ValueError(f"consistency weighs a divergence, so it is nonnegative, got {consistency}")
         self.consistency = consistency
+        self.head_seed = head_seed
         self.shuffle_options = shuffle_options
         self.none_of_the_above = none_of_the_above
         self.temperatures = temperatures
@@ -948,7 +949,21 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
             # A decision task reads text through its own tokenizer, so only a media processor is kept.
             None if self.image_processor is None or self.image_processor.directory is None
             else self.image_processor.source,
-            self.model.context_encoder)
+            self.model.context_encoder,
+            self._head_identity())
+
+    def _head_identity(self) -> JSON:
+        """Where this objective's head starts (`DecideSettings.head_identity`): the digest of a head it
+        holds, every leaf's path, dtype, shape and bytes, or the seed a fresh head is drawn from."""
+        from dew.data.plan import fingerprint
+
+        held = None if self.variables is None else {name: collection["head"] for name, collection
+                                                     in self.variables.items() if "head" in collection}
+        if held:
+            leaves = jax.tree_util.tree_leaves_with_path(held)
+            return {"held": fingerprint({jax.tree_util.keystr(path): fingerprint(np.asarray(leaf))
+                                         for path, leaf in leaves})}
+        return None if self.head_seed is None else {"drawn": self.head_seed}
 
     def recorded_model(self) -> nn.Module:
         """The backbone; the head is a task setting of its own."""
