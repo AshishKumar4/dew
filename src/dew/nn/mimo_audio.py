@@ -249,8 +249,12 @@ class MiMoAudioCodeEncoder(nn.Module):
                                   dot_general=float32_dot_general)
         if cfg.projection_layers == 1:
             return dense(cfg.out_hidden_size, name="projection")(x)
-        hidden = dense(4 * cfg.group_size * cfg.input_local_dim, name="projection_fc1")(x)
-        return dense(cfg.out_hidden_size, name="projection_fc2")(gelu_exact(hidden))
+        mlp = GatedMLP(4 * cfg.group_size * cfg.input_local_dim, cfg.out_hidden_size,
+                        in_features=x.shape[-1], activation=gelu_exact,
+                        names=("projection_fc1", "projection_fc2"), dtype=self.dtype,
+                        precision=self.precision)
+        nn.share_scope(self, mlp)
+        return mlp(x)
 
 
 class MiMoAudioTower(nn.Module):

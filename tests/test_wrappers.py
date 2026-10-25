@@ -184,7 +184,7 @@ def test_wrapper_tower_and_projector_match_the_reference():
         tower = towers.from_record(record["tower"]).build()
         assert np.max(np.abs(np.asarray(
             tower.apply(variables["tower"], pixels)) - tower_ref)) < tolerance
-        projector = projectors.from_record(record["projector"]).build()
+        projector = projectors.from_record(record["projector"])
         assert np.max(np.abs(np.asarray(
             projector.apply(variables["projector"], tower_ref))
             - projector_ref)) < tolerance

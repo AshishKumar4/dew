@@ -566,7 +566,7 @@ class Processor:
         default of 2 included."""
         projector = records.record(records.record(self.record["projector"], "projector")["fields"],
                                    "projector fields")
-        return records.integer(projector["merge_size"], "merge_size")
+        return records.integer(projector["spatial_merge_size"], "spatial_merge_size")
 
     def _qwen_frames(self, values: Mapping[str, object], tokens: np.ndarray, runs):
         """Return views of packed image/video patches in text order, one item per frame.

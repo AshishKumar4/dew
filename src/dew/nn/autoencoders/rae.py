@@ -32,22 +32,22 @@ from flax.typing import Dtype
 from dew import records
 from dew.interop.components import bind_component, component_source
 from dew.nn.activations import activation
-from dew.nn.attention import LayerNorm, projected_heads, projected_output, scaled_dot_product_attention
+from dew.nn.attention import LayerNorm
 from dew.nn.backbones.sd3 import sincos_position
 from dew.nn.blocks import IMAGENET_MEAN, IMAGENET_STD, torch_bicubic_resize
 from dew.nn.dense import Dense
-from dew.nn.mlp import GatedMLP
 from dew.nn.precision import float32_dot_general
+from dew.nn.text_encoders import clip_layer
+from dew.nn.vision.vit import LearnedPositions, SpecialTokens, VisionTransformer, ViTLayout
 from dew.objectives.base import Variables
 
-from ..conv import Conv
 from .api import LatentNormalization, ModuleAutoEncoder, RecordValue, published_source
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
 
 HEAD_WIDTH = 64
-"""Every encoder's attention head width; the source sets the heads from it."""
+"""The source's divisor for deriving the number of attention heads from its encoder width."""
 
 
 PUBLISHED = ("AutoencoderRAE",)
@@ -84,49 +84,6 @@ ENCODERS = {
 RAE_ENCODERS = ("dinov2", "siglip2", "mae")
 
 
-class _Attention(nn.Module):
-    width: int
-    heads: int
-    dtype: Dtype = jnp.float32
-
-    @nn.compact
-    def __call__(self, x):
-        query, key, value = (projected_heads(x, name, self.heads, self.width // self.heads, flat=True,
-                                             dtype=self.dtype)
-                             for name in ("query", "key", "value"))
-        attended = scaled_dot_product_attention(query, key, value, dtype=self.dtype)
-        return projected_output(attended, "out", self.width, flat=True, dtype=self.dtype)
-
-
-class _Block(nn.Module):
-    """Pre-norm attention and feed-forward, each residual branch optionally
-    scaled by a learned vector."""
-
-    width: int
-    heads: int
-    intermediate: int
-    epsilon: float
-    activation: str
-    layer_scale: bool = False
-    dtype: Dtype = jnp.float32
-
-    @nn.compact
-    def __call__(self, x):
-        def scaled(branch, name):
-            if not self.layer_scale:
-                return branch
-            return branch * self.param(name, nn.initializers.ones, (self.width,))
-
-        norm = LayerNorm(epsilon=self.epsilon, dtype=self.dtype, name="norm1")
-        x = x + scaled(
-            _Attention(self.width, self.heads, self.dtype, name="attention")(norm(x)), "layer_scale1"
-        )
-        mlp = GatedMLP(self.intermediate, self.width, activation=activation(self.activation), use_bias=True,
-                       dtype=self.dtype, name="mlp")
-        normed = LayerNorm(epsilon=self.epsilon, dtype=self.dtype, name="norm2")(x)
-        return x + scaled(mlp(normed), "layer_scale2")
-
-
 class RepresentationEncoder(nn.Module):
     """A frozen encoder: normalized `[B, S, S, 3]` pixels at its input size
     to its patch tokens `[B, grid, grid, width]`."""
@@ -138,40 +95,33 @@ class RepresentationEncoder(nn.Module):
     input_size: int
     dtype: Dtype = jnp.float32
 
-    @nn.compact
-    def __call__(self, pixels):
+    @nn.nowrap
+    def layout(self) -> ViTLayout:
         spec = ENCODERS[self.kind]
-        grid, table = self.input_size // self.patch, spec.table_size // self.patch
-        tokens = Conv(self.width, (self.patch, self.patch), strides=(self.patch, self.patch), padding="VALID",
-                      dtype=self.dtype, name="patch")(pixels)
-        batch = tokens.shape[0]
-        classes = int(spec.leading > 0)
-        positions = self.param(
-            "position_embeddings",
-            nn.initializers.zeros,
-            (1, classes + table * table, self.width) if classes else (table * table, self.width),
-        )
-        positions = positions.reshape(classes + table * table, self.width)
-        patches = positions[classes:].reshape(1, table, table, self.width)
-        if table != grid:
-            patches = torch_bicubic_resize(patches, grid, grid, antialias=spec.antialias)
-        tokens = (tokens + patches).reshape(batch, grid * grid, self.width)
-        if classes:
-            cls_token = self.param("cls_token", nn.initializers.zeros, (1, 1, self.width)) + positions[:1]
-            leading = [jnp.broadcast_to(cls_token, (batch, 1, self.width))]
-            if spec.leading > 1:
-                registers = self.param(
-                    "register_tokens", nn.initializers.zeros, (1, spec.leading - 1, self.width)
-                )
-                leading.append(jnp.broadcast_to(registers, (batch, spec.leading - 1, self.width)))
-            tokens = jnp.concatenate([*leading, tokens], axis=1)
-        intermediate = spec.intermediate or 4 * self.width
-        for index in range(self.layers):
-            tokens = _Block(self.width, self.width // HEAD_WIDTH, intermediate, spec.epsilon, spec.activation,
-                            spec.layer_scale, self.dtype, name=f"layers_{index}")(tokens)
-        tokens = LayerNorm(epsilon=spec.epsilon, use_scale=spec.final_affine, use_bias=spec.final_affine,
-                           dtype=self.dtype, name="norm")(tokens)
-        return tokens[:, spec.leading:].reshape(batch, grid, grid, self.width)
+        heads = self.width // HEAD_WIDTH
+        return ViTLayout(
+            depth=self.layers, hidden_size=self.width, num_heads=heads,
+            num_kv_heads=heads, head_dim=self.width // heads,
+            intermediate_size=spec.intermediate or 4 * self.width, activation=activation(spec.activation),
+            in_channels=3, patch_size=self.patch, temporal_patch_size=1, spatial_merge_size=1,
+            norm_type="fast_layer", norm_eps=spec.epsilon, norm_bias=True, mlp_bias=True,
+            packed=False, patch_bias=True, attention=("full",) * self.layers,
+            order=("patches",) * self.layers, sinks=(False,) * self.layers,
+            positions=LearnedPositions(spec.table_size // self.patch, "bicubic",
+                                       singleton=spec.leading > 0, compute_dtype=False,
+                                       antialias=spec.antialias, initializer=nn.initializers.zeros),
+            special_tokens=SpecialTokens("first" if spec.leading else None, max(0, spec.leading - 1),
+                                         singleton=True, compute_dtype=False),
+            patch_projection="conv", image_size=self.input_size, rotary=None, post_norm="layer",
+            post_norm_affine=spec.final_affine, outer_norm_eps=spec.epsilon,
+            output="patch_grid", branch_scale=1.0 if spec.layer_scale else None, merge_blocks=False)
+
+    def setup(self):
+        self.trunk = VisionTransformer(self.layout(), dtype=self.dtype)
+        nn.share_scope(self, self.trunk)
+
+    def __call__(self, pixels):
+        return self.trunk(jnp.asarray(pixels).transpose(0, 3, 1, 2))
 
 
 class _Decoder(nn.Module):
@@ -204,8 +154,9 @@ class _Decoder(nn.Module):
         positions = sincos_position(self.width, self.grid, base_size=16)
         tokens = tokens + jnp.concatenate([jnp.zeros((1, 1, self.width)), positions], axis=1)
         for index in range(self.layers):
-            tokens = _Block(self.width, self.heads, self.intermediate, 1e-12, "gelu", dtype=self.dtype,
-                            name=f"layers_{index}")(tokens)
+            tokens = clip_layer(self.width, self.heads, self.intermediate, self.grid ** 2 + 1,
+                                eps=1e-12, activation=activation("gelu"), dtype=self.dtype,
+                                name=f"blocks_{index}")(tokens)
         tokens = LayerNorm(epsilon=1e-12, dtype=self.dtype, name="norm")(tokens)
         patches = Dense(self.patch * self.patch * self.channels, dtype=self.dtype, name="pred",
                         dot_general=float32_dot_general)(
@@ -331,30 +282,30 @@ def rae_fields(config: Mapping[str, object]) -> RAEFields:
     return fields
 
 _LAYER = {
-    "norm1": "norm1",
-    "layernorm_before": "norm1",
-    "layer_norm1": "norm1",
-    "norm2": "norm2",
-    "layernorm_after": "norm2",
-    "layer_norm2": "norm2",
-    "attention.attention.query": "attention.query",
-    "attention.attention.key": "attention.key",
-    "attention.attention.value": "attention.value",
-    "attention.output.dense": "attention.out",
-    "self_attn.q_proj": "attention.query",
-    "self_attn.k_proj": "attention.key",
-    "self_attn.v_proj": "attention.value",
-    "self_attn.out_proj": "attention.out",
-    "attention.to_q": "attention.query",
-    "attention.to_k": "attention.key",
-    "attention.to_v": "attention.value",
-    "attention.to_out.0": "attention.out",
+    "norm1": "input_layernorm",
+    "layernorm_before": "input_layernorm",
+    "layer_norm1": "input_layernorm",
+    "norm2": "post_attention_layernorm",
+    "layernorm_after": "post_attention_layernorm",
+    "layer_norm2": "post_attention_layernorm",
+    "attention.attention.query": "self_attn.q_proj",
+    "attention.attention.key": "self_attn.k_proj",
+    "attention.attention.value": "self_attn.v_proj",
+    "attention.output.dense": "self_attn.o_proj",
+    "self_attn.q_proj": "self_attn.q_proj",
+    "self_attn.k_proj": "self_attn.k_proj",
+    "self_attn.v_proj": "self_attn.v_proj",
+    "self_attn.out_proj": "self_attn.o_proj",
+    "attention.to_q": "self_attn.q_proj",
+    "attention.to_k": "self_attn.k_proj",
+    "attention.to_v": "self_attn.v_proj",
+    "attention.to_out.0": "self_attn.o_proj",
     "mlp.fc1": "mlp.up_proj",
     "intermediate.dense": "mlp.up_proj",
     "mlp.fc2": "mlp.down_proj",
     "output.dense": "mlp.down_proj",
-    "layer_scale1": "layer_scale1",
-    "layer_scale2": "layer_scale2",
+    "layer_scale1": "attention_scale",
+    "layer_scale2": "mlp_scale",
 }
 """A layer's module, after its index, in each source's naming, and the port's."""
 
@@ -362,18 +313,18 @@ _LAYERS = {"encoder.encoder.layer": "encoder", "encoder.vision_model.encoder.lay
            "decoder.decoder_layers": "decoder"}
 
 _MODULES = {
-    "encoder.embeddings.patch_embeddings.projection": ("encoder", "patch"),
-    "encoder.vision_model.embeddings.patch_embedding": ("encoder", "patch"),
-    "encoder.layernorm": ("encoder", "norm"),
+    "encoder.embeddings.patch_embeddings.projection": ("encoder", "patch_embed"),
+    "encoder.vision_model.embeddings.patch_embedding": ("encoder", "patch_embed"),
+    "encoder.layernorm": ("encoder", "post_norm"),
     "decoder.decoder_embed": ("decoder", "embed"), "decoder.decoder_norm": ("decoder", "norm"),
     "decoder.decoder_pred": ("decoder", "pred"),
 }
 
 _TENSORS = {
-    "encoder.embeddings.cls_token": ("encoder", "cls_token"),
+    "encoder.embeddings.cls_token": ("encoder", "class_token"),
     "encoder.embeddings.register_tokens": ("encoder", "register_tokens"),
-    "encoder.embeddings.position_embeddings": ("encoder", "position_embeddings"),
-    "encoder.vision_model.embeddings.position_embedding.weight": ("encoder", "position_embeddings"),
+    "encoder.embeddings.position_embeddings": ("encoder", "position_table", "embedding"),
+    "encoder.vision_model.embeddings.position_embedding.weight": ("encoder", "position_table", "embedding"),
     "decoder.trainable_cls_token": ("decoder", "cls_token"),
 }
 
@@ -403,8 +354,8 @@ def rae_path(name: str, ndim: int) -> tuple[str, ...] | None:
         index, _, inner = module.removeprefix(prefix + ".").partition(".")
         if module.startswith(prefix + ".") and index.isdigit() and inner in _LAYER:
             renamed = tuple(_LAYER[inner].split("."))
-            return (owner, f"layers_{index}", *renamed) if leaf == "lambda1" else (
-                owner, f"layers_{index}", *renamed, leaf)
+            return (owner, f"blocks_{index}", *renamed) if leaf == "lambda1" else (
+                owner, f"blocks_{index}", *renamed, leaf)
     raise ValueError(f"{name!r} is not an AutoencoderRAE tensor")
 
 
