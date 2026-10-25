@@ -686,7 +686,7 @@ def scheduled_solver(make: Callable[..., optax.GradientTransformation], rate: fl
     at different rates of one schedule's timings lower to one executable, and each update's rate is
     the schedule's own value from those fields, Optax's arithmetic where it is Optax's schedule.
 
-    Optax injects the rate and a `b1` schedule (`optax.inject_stateful_hyperparams`), and rebuilds the
+    Optax injects the rate and a `b1` schedule (`optax.inject_hyperparams`), and rebuilds the
     factory from their traced values; every other option keeps the Python value the factory branches
     on. The rate reaches the factory as a schedule, so Optax casts it to each update leaf's dtype, and
     the injected values are at least float32 on a bf16 tree. The factory is built once here too, so a
@@ -699,7 +699,7 @@ def scheduled_solver(make: Callable[..., optax.GradientTransformation], rate: fl
         return make(lambda count: learning_rate, **given)
 
     def injected(dtype):
-        return optax.inject_stateful_hyperparams(factory, hyperparam_dtype=dtype)(
+        return optax.inject_hyperparams(factory, hyperparam_dtype=dtype)(
             learning_rate=_Rate(rate, steps, dtype, multiplier),
             b1=None if b1 is None else b1.schedule(steps))
 
