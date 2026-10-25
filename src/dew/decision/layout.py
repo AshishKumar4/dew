@@ -588,26 +588,22 @@ class QuestionLayout(Layout):
                  copies: "Sequence[State]", encoder: Tokenizer) -> tuple[Rendered, tuple[int, int]]:
         """The row `built` over each copy of the state, its own text (`texts`) its own piece of ids,
         each cut to its share of what the rest of the row leaves of `max_len` and to its own budget
-        (`shared_budgets`), keeping its `keep`; and the least-kept copy's tokens and how many it keeps
+        (`allocated`), keeping its `keep`; and the least-kept copy's tokens and how many it keeps
         (`_least_kept`): a piece's ids add to the row as they are, so the shares are exact. A copy kept
         whole is never cut, and a row it leaves too long is `fits`' to refuse."""
         ids = [tuple(encoder.encode(text, add_special_tokens=False)) if text else () for text in texts]
         if not copies:
             return built([]), (0, 0)
         rest = len(built([()] * len(copies)).tokens)
-        whole = sum(len(own) for own, copy in zip(ids, copies, strict=True) if copy.keep == "all")
-        cut = [(own, copy) for own, copy in zip(ids, copies, strict=True) if copy.keep != "all"]
-        shares = iter(shared_budgets([len(own) for own, _ in cut], [copy.max_tokens for _, copy in cut],
-                                     self.max_len - rest - whole))
-        kept = [_kept(own, len(own) if copy.keep == "all" else next(shares), copy.keep)
-                for own, copy in zip(ids, copies, strict=True)]
+        counts = allocated([len(own) for own in ids], copies, self.max_len - rest)
+        kept = [_kept(own, count, copy.keep) for own, count, copy in zip(ids, counts, copies, strict=True)]
         return built(kept), _least_kept([(len(own), len(held)) for own, held in zip(ids, kept, strict=True)])
 
     def _cut(self, built: Callable[[Sequence[str]], Rendered], texts: Sequence[str],
              copies: "Sequence[State]", encoder: Tokenizer) -> tuple[Rendered, tuple[int, int]]:
         """The row `built` over each copy of the state, its own text (`texts`), encoded whole with the
         rest, each copy cut to its share of what the rest of the row leaves of `max_len` and its own
-        budget (`shared_budgets`, counted in its own tokens) at one of its token boundaries
+        budget (`allocated`, counted in its own tokens) at one of its token boundaries
         (`Offsets`), keeping its `keep`; and the least-kept copy's tokens and how many it keeps,
         encoded alone (`_least_kept`). A merge across a cut can lengthen the row, so while it does not
         fit the copy that keeps the most steps back one boundary, the row encoded whole again each
@@ -627,22 +623,28 @@ class QuestionLayout(Layout):
         offsets = [encoder.offsets(text) if text else ([], [], []) for text in texts]
         rest = len(built([""] * len(copies)).tokens)
         lengths = [len(own) for own, _, _ in offsets]
-        whole = sum(length for length, copy in zip(lengths, copies, strict=True) if copy.keep == "all")
-        cut = [(length, copy) for length, copy in zip(lengths, copies, strict=True) if copy.keep != "all"]
-        shares = iter(shared_budgets([length for length, _ in cut], [copy.max_tokens for _, copy in cut],
-                                     self.max_len - rest - whole))
-        kept = [length if copy.keep == "all" else next(shares)
-                for length, copy in zip(lengths, copies, strict=True)]
+        kept = allocated(lengths, copies, self.max_len - rest)
 
-        def piece(at: int) -> str:
-            # A copy's first (or last) `kept[at]` tokens, at the character boundary their offsets give.
-            text, (own, starts, ends), copy, count = texts[at], offsets[at], copies[at], kept[at]
+        def piece(at: int, count: int | None = None) -> str:
+            # A copy's first (or last) `count` tokens, at the character boundary their offsets give.
+            text, (own, starts, ends), copy = texts[at], offsets[at], copies[at]
+            count = kept[at] if count is None else count
             if count >= len(own):
                 return text
             if count <= 0:
                 return ""
             return text[:ends[count - 1]] if copy.keep != "end" else text[starts[len(own) - count]:]
 
+        def own_fits(at: int, count: int) -> bool:
+            # A capped copy's slice, re-encoded alone, holds no more than its cap: a slice at a
+            # character boundary may encode to more tokens than it was counted by.
+            cap = copies[at].max_tokens
+            sliced = piece(at, count)
+            return cap is None or not sliced or len(encoder.encode(sliced, add_special_tokens=False)) <= cap
+
+        for at, copy in enumerate(copies):
+            while copy.keep != "all" and kept[at] > 0 and not own_fits(at, kept[at]):
+                kept[at] -= 1
         laid = built([piece(at) for at in range(len(copies))])
         while len(laid.tokens) > self.max_len:
             movable = [at for at, copy in enumerate(copies) if copy.keep != "all" and kept[at] > 0]
@@ -650,6 +652,16 @@ class QuestionLayout(Layout):
                 break
             kept[max(movable, key=lambda at: kept[at])] -= 1
             laid = built([piece(at) for at in range(len(copies))])
+        # A merge across a cut may let a longer cut fit than the share counted: each copy takes the
+        # longest that still fits, its own cap and the row's length both held.
+        for at, copy in enumerate(copies):
+            while (len(laid.tokens) <= self.max_len and copy.keep != "all" and kept[at] < lengths[at]
+                   and own_fits(at, kept[at] + 1)):
+                longer = built([piece(other, kept[other] + (other == at)) for other in range(len(copies))])
+                if len(longer.tokens) > self.max_len:
+                    break
+                kept[at] += 1
+                laid = longer
         alone = [len(encoder.encode(own, add_special_tokens=False)) if (own := piece(at)) else 0
                  for at in range(len(copies))]
         return laid, _least_kept(list(zip(counts, alone, strict=True)))
@@ -995,6 +1007,20 @@ def shared_budgets(lengths: Sequence[int], caps: Sequence[int | None], room: int
     return shares
 
 
+def allocated(lengths: Sequence[int], copies: "Sequence[State]", room: int,
+              default_cap: int | None = None) -> list[int]:
+    """How many of its own tokens each copy of the state keeps, the one allocation every row's copies
+    read: a copy kept whole (`keep="all"`) takes all of its `lengths` first, and the others share what
+    is left of `room` (`shared_budgets`), each at most its own cap (`max_tokens`, or `default_cap`
+    where it gives none)."""
+    whole = sum(length for length, copy in zip(lengths, copies, strict=True) if copy.keep == "all")
+    cut = [(length, copy) for length, copy in zip(lengths, copies, strict=True) if copy.keep != "all"]
+    caps = [default_cap if copy.max_tokens is None else copy.max_tokens for _, copy in cut]
+    shares = iter(shared_budgets([length for length, _ in cut], caps, room - whole))
+    return [length if copy.keep == "all" else next(shares)
+            for length, copy in zip(lengths, copies, strict=True)]
+
+
 def _least_kept(pairs: Sequence[tuple[int, int]]) -> tuple[int, int]:
     """Of each copy's tokens and how many it keeps, the copy that keeps the least share of its own
     (the first of equals), so `Encoded.state_kept < state_tokens` says whether any copy was cut;
@@ -1177,14 +1203,9 @@ class JointLayout(Layout):
             index += 1
         room = self.max_len - sum(len(ids) for segment, ids in laid_out if not isinstance(segment, State))
         copies = [segment for segment, _ in laid_out if isinstance(segment, State)]
-        # A copy kept whole is never cut: it takes its tokens first, and the others share what is left.
-        whole_copies = sum(whole for copy in copies if copy.keep == "all")
-        cut = [copy for copy in copies if copy.keep != "all"]
-        shares = iter(shared_budgets([whole] * len(cut), [
-            self.max_state_tokens if copy.max_tokens is None else copy.max_tokens for copy in cut],
-            room - whole_copies))
-        kept_ids = [list(_kept(state_ids, whole if copy.keep == "all" else next(shares), copy.keep))
-                    for copy in copies]
+        counts = allocated([whole] * len(copies), copies, room, self.max_state_tokens)
+        kept_ids = [list(_kept(state_ids, count, copy.keep))
+                    for count, copy in zip(counts, copies, strict=True)]
         # A row without a state segment keeps none of the state.
         kept_count = min((len(ids) for ids in kept_ids), default=0)
         copied = iter(kept_ids)
