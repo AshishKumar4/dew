@@ -175,24 +175,25 @@ def test_a_fit_whose_whole_state_overflows_its_devices_is_refused_before_it_init
 
 
 @pytest.mark.mesh(devices=8)
-def test_the_preflight_holds_a_run_whose_plan_may_split_where_its_whole_batch_does_not_fit():
-    """A run that leaves its split to the plan is held by devices whose whole state, accumulator and
-    all, fits read in two microbatches though not whole: the check before placing tries the splits the
-    plan may take (`Trainer.validate`, as `fit` does); a run fixed to one is refused there."""
-    mesh, layout, accumulation = CASES["fsdp_tensor_accumulating"]
+def test_the_check_before_placing_reads_a_run_in_the_splits_its_plan_may_take():
+    """The whole state a run is checked for before anything is placed is read in the splits its plan
+    may take: a run left to the plan in its first that fits, here the batch whole, which pools no
+    accumulator; a run fixed to two microbatches in those two, whose window pools one. On devices that
+    hold the whole batch's state, the first passes and the second is refused (`Trainer.validate`, as
+    `fit` checks)."""
+    mesh, layout, _ = CASES["fsdp_tensor_accumulating"]
 
     def peak(split: int | None, capacity: int | None = None) -> int:
         model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
         trainer = Trainer(LMObjective(model, SEQ_LEN, ema_decay=0.999), optax.adam(1e-3),
-                          key=jax.random.key(0), mesh=mesh(), layout=layout, accumulation=accumulation,
-                          split=split)
+                          key=jax.random.key(0), mesh=mesh(), layout=layout, split=split)
         return max(trainer.validate(step_batch(), capacity=capacity).device_bytes.values())
 
-    halves = peak(2)
-    assert peak(1) > halves
-    assert peak(None, capacity=halves) == halves
+    whole = peak(1)
+    assert peak(2) > whole
+    assert peak(None, capacity=whole) == whole
     with pytest.raises(LayoutRefused):
-        peak(1, capacity=halves)
+        peak(2, capacity=whole)
 
 
 @pytest.mark.mesh(devices=8)
