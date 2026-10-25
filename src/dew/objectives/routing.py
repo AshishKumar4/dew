@@ -38,8 +38,8 @@ from dew.nn.moe import (
 from dew.nn.precision import at_least_fp32
 from dew.objectives.base import Batch, Objective, Ratio, Variables, leaves_by_path, merge, sown_nodes
 
-__all__ = ["ExpertBalance", "RoutedStatistics", "router_counts", "router_moments", "router_scores",
-           "router_z_terms"]
+__all__ = ["ExpertBalance", "RoutedStatistics", "apply_routed", "reduce_routed", "router_counts",
+           "router_moments", "router_scores", "router_z_terms"]
 
 
 @struct.dataclass
@@ -210,6 +210,27 @@ class ExpertBalance:
         balanced = {path: _updated_bias(biases[path], count, self.balance_rate)
                     for path, count in leaves_by_path(effects).items()}
         return {EXPERT_BIAS_COLLECTION: merge(moe, unflatten_dict(balanced))}
+
+
+def reduce_routed(balance: ExpertBalance | None,
+                  stats: Ratio | RoutedStatistics) -> tuple[jax.Array, jax.Array]:
+    """The objective value of a loss's statistics, and whether they have any mass.
+
+    A `Ratio` reduces by its own mean, and routed statistics by `balance` (`ExpertBalance.reduce`), which
+    a routed loss has to name.
+    """
+    if isinstance(stats, Ratio):
+        return stats.mean()
+    if balance is None:
+        raise ValueError("routed statistics require a balance (ExpertBalance)")
+    return balance.reduce(stats)
+
+
+def apply_routed(balance: ExpertBalance | None, variables: Variables, effects: Variables) -> Variables:
+    """`variables` with the router counts `balance` took applied (`ExpertBalance.apply`)."""
+    if balance is None:
+        raise ValueError("router count effects require a balance (ExpertBalance)")
+    return balance.apply(variables, effects)
 
 
 def _router_queries(shape: tuple[int, ...], queries: jax.Array | None,
