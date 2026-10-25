@@ -187,6 +187,7 @@ def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
         ids = np.random.default_rng([0x0D, seed]).integers(0, 17, held["ids"].shape)
         return (ids.astype(held["ids"].dtype),)
 
+    @as_given
     def ours(ids):
         with jax.default_device(cpu), jax.default_matmul_precision(FP32_SUMS):
             return jax.device_get(current(params, ids))

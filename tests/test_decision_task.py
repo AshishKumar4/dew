@@ -342,8 +342,8 @@ def test_score_is_a_validation_pass_through_the_task_s_temperatures(decide):
 
     assert_as_exact(as_given(lambda variables: np.concatenate(
                         [found for _, _, found in passed(objective, variables, examples)])),
-                    lambda variables: tempered(variables, float32_softmax), draw, "tempered probabilities",
-                    seeds=TEMPERED_SEEDS,
+                    as_given(lambda variables: tempered(variables, float32_softmax)), draw,
+                    "tempered probabilities", seeds=TEMPERED_SEEDS,
                     truth_fn=lambda variables: tempered(variables, lambda logits, scale: softmax(
                         logits.astype(np.float64), scale)))
     scores = decide.score(examples)
@@ -585,6 +585,7 @@ def test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh(decide):
         return (jax.tree.map(lambda leaf: leaf * (1 + 0.05 * jax.random.normal(key, np.shape(leaf))),
                              decide.variables),)
 
+    @as_given
     def alone(variables) -> np.ndarray:
         return held_logits(replace(task, variables=variables))
 

@@ -151,7 +151,7 @@ def assert_as_exact_as_transformers(ours, names, source, draw, label: str) -> No
     import torch
 
     def theirs(dtype):
-        return lambda inputs: transformers_clip(source, inputs, dtype, names)
+        return as_given(lambda inputs: transformers_clip(source, inputs, dtype, names))
 
     assert_as_exact(as_given(lambda inputs: {name: np.asarray(value)
                                              for name, value in ours(inputs).items()}),
@@ -473,6 +473,7 @@ def test_a_t5_tower_computes_in_its_compute_dtype_as_the_reference_does():
         with precision(dtype):
             model = T5EncoderModel.from_pretrained(directory, dtype=dtype).eval()
 
+        @as_given
         def run(inputs):
             ids, mask = (torch.from_numpy(np.asarray(inputs[name], np.int64))
                          for name in ("input_ids", "attention_mask"))

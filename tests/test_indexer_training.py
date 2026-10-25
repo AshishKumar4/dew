@@ -146,6 +146,7 @@ def test_the_loss_its_gradient_and_the_selection_are_maxtexts(name):
         scores = np.maximum(rng.normal(scale=1.5, size=(transcription.BATCH, length, length)), 0)
         return scores.astype(np.float32), query, key
 
+    @as_given
     def transcribed(scores, query, key):
         dtype = np.asarray(scores).dtype
         indexer_mask, masked_scores = transcription.indexer_call(np.asarray(scores), additive,

@@ -1283,6 +1283,7 @@ def test_a_confident_targets_rest_of_the_row_leaves_an_excluded_column_out(path,
         tile = (3, 3) if path == "tiled" else None
         return chunked_cross_entropy(logits, head, targets, 1, tile=tile, excluded=excluded)[0].sum()
 
+    @as_given
     def reference(logits):
         kept = label_derivative(np.delete(logits, excluded, axis=-1), label)
         return np.concatenate([kept[:, :excluded], np.zeros((len(kept), 1), kept.dtype), kept[:, excluded:]],

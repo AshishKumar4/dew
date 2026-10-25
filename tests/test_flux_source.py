@@ -159,7 +159,7 @@ def test_native_flux_matches_the_source_forward_and_every_gradient(name, source)
         return (*values, {tensor: layout["transformer/" + tensor].export({"params": gradients})
                           for tensor in tensors})
 
-    assert_as_exact(native, lambda inputs: reference_walk(narrow_model, inputs), draw,
+    assert_as_exact(native, as_given(lambda inputs: reference_walk(narrow_model, inputs)), draw,
                     f"Flux {name}", seeds=CASE_SEEDS[name], truth_fn=truth)
 
 

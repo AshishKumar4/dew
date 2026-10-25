@@ -23,6 +23,7 @@ import pytest
 from model_support import decode_through
 from reference_error import (
     FACTOR,
+    as_given,
     assert_as_exact,
     assert_as_exact_as_the_reference,
     declared_seeds,
@@ -318,6 +319,7 @@ def test_a_layer_split_over_the_sequence_runs_padded_and_packed_rows_as_whole_on
             return out, *pull(cotangent)
         if mesh is None:
             return jax.jit(pulled)
+        @as_given
         def split(hidden, cotangent):
             with jax.set_mesh(mesh):
                 return jax.jit(pulled)(hidden, cotangent)

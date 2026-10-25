@@ -422,6 +422,7 @@ def test_prompt_perplexity_uses_unpadded_context_and_real_transitions(kind):
     def full(model, params):
         apply = forward(model)
 
+        @as_given
         def run(prompt, lengths):
             losses = []
             for row, length in enumerate(np.asarray(lengths)):
@@ -481,7 +482,7 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
 
     def by_hand(dtype=None):
         if dtype is None:
-            return lambda key, rolled: stepped(objective, params, rolled)
+            return as_given(lambda key, rolled: stepped(objective, params, rolled))
         weights = widened(params)
         # Built under x64, as it computes, so nothing it holds narrows to float32.
         with jax.enable_x64(new_val=True):
@@ -542,6 +543,7 @@ def test_padding_slots_do_not_consume_cache_capacity(kind):
         np.testing.assert_array_equal(result.behavior_log_probs, 0)
         return {"raw": result.raw_log_probs}
 
+    @as_given
     def unpadded(prompt, tokens):
         result = generate(model, params, prompt, steps, key=jax.random.key(1), sampling=greedy)
         return {"raw": result.raw_log_probs}

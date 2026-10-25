@@ -92,6 +92,7 @@ def test_a_yarn_phi_trains_as_transformers_computes_it_and_writes_it_back(tmp_pa
             layout.name: np.asarray(layout.export({'params': gradient})).reshape(layout.shape)
             for layout in loaded.weight_layouts}}
 
+    @as_given
     def reference(ids, wide=False):
         with float64() if wide else contextlib.nullcontext():
             model = AutoModelForCausalLM.from_pretrained(source, dtype=torch.float32)

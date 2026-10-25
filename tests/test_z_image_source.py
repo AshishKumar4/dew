@@ -146,6 +146,7 @@ def test_the_flow_and_its_gradients_match_the_source(source, arrays, record, nam
     weights = {model: {key: value.detach().numpy() for key, value in model.named_parameters()}
                for model in (narrow_model, wide_model)}
 
+    @as_given
     def reference_walk(model, drawn):
         """The source's call in the draw's dtype, and the same gradients under the same cotangent as
         `z_image_walk`'s (`torch_with_gradients`), channels last."""
@@ -183,7 +184,7 @@ def test_the_flow_and_its_gradients_match_the_source(source, arrays, record, nam
                 "grad_params": {tensor: np.asarray(layout.export({"params": grad_params}))
                                 for tensor, layout in tensors.items()}}
 
-    assert_as_exact(native, lambda inputs: reference_walk(narrow_model, inputs), draw,
+    assert_as_exact(native, as_given(lambda inputs: reference_walk(narrow_model, inputs)), draw,
                     f"Z-Image {name}", seeds=CASE_SEEDS[name], truth_fn=truth)
 
 
@@ -283,7 +284,7 @@ def test_prompt_encoding_matches_the_source_pipeline(pipeline, source, record):
     lengths = [np.count_nonzero(np.abs(row).sum(-1)) for row in source_encoded(narrow, prompts)]
     np.testing.assert_array_equal(mask, np.arange(encoder.tokens)[None] < np.asarray(lengths)[:, None])
     assert_as_exact(as_given(lambda seed: encoded(prompts_of(seed))[0]),
-                    lambda seed: source_encoded(narrow, prompts_of(seed)), draw, "Z-Image prompts",
+                    as_given(lambda seed: source_encoded(narrow, prompts_of(seed))), draw, "Z-Image prompts",
                     seeds=PIPELINE_SEEDS["prompts"],
                     truth_fn=lambda seed: widened_call(
                         wide, lambda pipe: source_encoded(pipe, prompts_of(seed))))
@@ -326,6 +327,6 @@ def test_pipeline_walk_matches_the_source(load, source, record, request):
                 images.append(pipe(**call, latents=start.clone(), output_type="np").images[0])
         return {"latents": np.stack(latents).transpose(0, 2, 3, 1), "images": np.stack(images)}
 
-    assert_as_exact(native, lambda x_T: source_walk(narrow, x_T), draw, f"Z-Image {load} walk",
+    assert_as_exact(native, as_given(lambda x_T: source_walk(narrow, x_T)), draw, f"Z-Image {load} walk",
                     seeds=PIPELINE_SEEDS["walk"],
                     truth_fn=lambda x_T: widened_call(wide, lambda pipe: source_walk(pipe, x_T)))

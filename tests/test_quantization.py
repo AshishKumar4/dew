@@ -828,6 +828,7 @@ def test_quantizing_packed_pipeline_weights_matches_the_canonical_quantized_mode
         return {"logits": np.asarray(served.model.apply(served.variables, prompt_of(seed))),
                 "task": raw(actual), "server": raw(from_server)}
 
+    @as_given
     def canonical_side(seed):
         expected, _, _ = drawn(int(seed))
         return {"logits": np.asarray(reference.model.apply(reference.variables, prompt_of(seed))),

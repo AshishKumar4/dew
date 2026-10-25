@@ -220,6 +220,7 @@ def tangents(x, forward, forward_scale, dgrad, dgrad_scale, direction):
 fp8_tangents = without_ynn(tangents)
 
 
+@as_given
 def default_precision_tangents(*inputs):
     """`fp8_tangents` compiled under JAX's default matmul precision, not the suite's highest
     (`lane_environment`): the products state their own."""
