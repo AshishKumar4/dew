@@ -366,6 +366,7 @@ def _gmm_step(_, slots, nothing, accumulators, *, family: mosaic.Family, prologu
         tiles_of = {i: fixed_tiles[i] if i in fixed_tiles else slots[f'side_{i}']
                     for i in range(len(prologue_axes))}
         _rewritten(prologue, prologue_axes, stage.at[mine_rows], tiles_of, 'rows', mine_rows)
+        family.published()
     matrix = slots['matrix'].transpose((1, 0)) if transpose_rhs else slots['matrix']
     (acc,) = accumulators
     return nothing, (family.products(acc, stage.at[mine_rows], matrix, interpret),)
@@ -373,11 +374,11 @@ def _gmm_step(_, slots, nothing, accumulators, *, family: mosaic.Family, prologu
 
 def _rewritten(prologue, axes_of: tuple, mine, tiles_of: dict, halved: str, half) -> None:
     """Dew: `mine`, this warpgroup's half of a stage, rewritten by the prologue on its side tiles
-    (`tiles_of`, by operand) cut to the same half along the `halved` launch axis."""
+    (`tiles_of`, by operand) cut to the same half along the `halved` launch axis; its reader publishes
+    the writes (`mosaic.Family.published`)."""
     cut = [tiles_of[i].at[tuple(half if axis == halved else slice(None) for axis in axes)][...]
            for i, axes in enumerate(axes_of)]
     mine[...] = prologue(mine[...], *cut).astype(mine.dtype)
-    plgpu.commit_smem()
 
 
 _IN_FLIGHT = 1
@@ -399,26 +400,6 @@ def _matrix_columns(gmem, column_tile, *, block_n: int, transpose_rhs: bool):
 def _rhs_index(transpose_rhs: bool):
     """A pipeline step's block of the matrix's column tile: its depth block `step`."""
     return (lambda step: (0, step)) if transpose_rhs else (lambda step: (step, 0))
-
-
-def _epilogue(epilogue, acc, gmems, axes_of, row_start, column_start, block_m: int, block_n: int):
-    """Dew: `epilogue(acc, *side_tiles)` as a tuple of outputs, each side operand's tile brought to shared
-    memory by TMA at the output tile's rows and columns first."""
-    origins = {'rows': (row_start, block_m), 'columns': (column_start, block_n)}
-    shapes = [tuple(origins[axis][1] for axis in axes) for axes in axes_of]
-
-    smems = [plgpu.SMEM(shape, gmem.dtype) for shape, gmem in zip(shapes, gmems, strict=True)]
-
-    @functools.partial(pl.run_scoped, smems=smems, barriers=[plgpu.Barrier() for _ in gmems])
-    def scope(smems, barriers):
-        for gmem, smem, barrier, axes in zip(gmems, smems, barriers, axes_of, strict=True):
-            plgpu.copy_gmem_to_smem(gmem.at[tuple(pl.ds(*origins[axis]) for axis in axes)], smem, barrier)
-        for barrier in barriers:
-            plgpu.barrier_wait(barrier)
-        outs = epilogue(acc, *(smem[...] for smem in smems))
-        return outs if isinstance(outs, tuple) else (outs,)
-
-    return scope
 
 
 def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles, out_dtype,
@@ -546,7 +527,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                            in_flight=_IN_FLIGHT)
 
         family.scoped(scope, fixed_staging['fixed_smems'], fixed_staging['fixed_barriers'],
-                      plgpu.Barrier(num_arrivals=consumers, num_barriers=2),
+                      mosaic.meeting(consumers),
                       streams=family.streams({f'ring_{i}': (block, gmem.dtype)
                                               for i, (block, gmem) in enumerate(blocks)}, tiles.stages,
                                              consumers))
@@ -582,7 +563,7 @@ def _staged_halves(family: mosaic.Family, stages: list, group: tuple, mine: tupl
     shares += [(cotangent_stage.at[:, pl.ds((first_atom + j) * atom, atom)],
                 first_atom + j < atoms if short else None) for j in range(atoms_each)]
     boundary = _zero_neighbours_of(family, shares, *group)
-    plgpu.commit_smem()
+    family.published()
     if halves is not None:
         pl.when(boundary)(lambda: mosaic.meet(halves))
     return rows_stage.at[:, mine_depth].transpose((1, 0)), cotangent_stage
