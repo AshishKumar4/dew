@@ -117,7 +117,7 @@ class Example:
         context = row.get("context")
         return cls(json_value(row.get("state"), "state"), questions, answers, targets,
                    None if context is None else json_value(context, "context"),
-                   groups_of(row.get("groups")))
+                   groups_of(json_value(row.get("groups"), "groups")))
 
     def group_of(self, name: str) -> tuple[int, Group] | None:
         """The index and group question `name` stands in, or None."""
@@ -140,13 +140,7 @@ class Example:
         return np.eye(len(self.questions[name].options))[self.labels()[name]]
 
 
-def _named(value: object, where: str) -> str:
-    if not isinstance(value, str):
-        raise ValueError(f"{where} names a canonical option by a string, got {value!r}")
-    return value
-
-
-def groups_of(value: object) -> tuple[Group, ...]:
+def groups_of(value: JSON) -> tuple[Group, ...]:
     """A row's `groups`, as `Example.groups` holds them: a mapping of each group's name to its members,
     each member's option keys mapped to canonical keys, or None for none."""
     if value is None:
@@ -155,7 +149,7 @@ def groups_of(value: object) -> tuple[Group, ...]:
     for name, members in record(value, "groups").items():
         mapped = {}
         for question, options in record(members, f"groups.{name}").items():
-            mapped[question] = {key: _named(canonical, f"groups.{name}.{question}.{key}")
+            mapped[question] = {key: records.text(canonical, f"groups.{name}.{question}.{key}")
                                 for key, canonical in record(options, f"groups.{name}.{question}").items()}
         groups.append(Group(name, mapped))
     return tuple(groups)
