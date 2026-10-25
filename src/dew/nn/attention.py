@@ -25,6 +25,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
 from dew.nn.dense import Dense, DenseGeneral
+from dew.nn.dropout import Dropout, kept
 
 from .attention_kernels import (
     ATTENTION,
@@ -1228,7 +1229,7 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
         if dropout_rng is None:
             raise ValueError("training attention dropout requires dropout_rng")
         keep = 1.0 - dropout_rate
-        drawn = jax.random.bernoulli(dropout_rng, keep, weights.shape)
+        drawn = kept(dropout_rng, keep, weights.shape)
         weights = weights * (drawn.astype(dtype) / jnp.asarray(keep, dtype))
     if sinks is None:
         return weighted_values('...hqk,...khd->...qhd', weights, value, precision=precision)
@@ -2205,7 +2206,7 @@ class BasicTransformerBlock(nn.Module):
         norm = RMSNorm if self.norm == "rms" else LayerNorm
         self.norm1, self.norm2, self.norm3 = (norm(epsilon=self.norm_epsilon, dtype=self.dtype)
                                               for _ in range(3))
-        self.dropout = nn.Dropout(self.dropout_rate)
+        self.dropout = Dropout(self.dropout_rate)
 
     def _dropped(self, x, train: bool):
         return self.dropout(x, deterministic=not train)
