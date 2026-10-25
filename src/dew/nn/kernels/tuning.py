@@ -652,7 +652,9 @@ def materialized(op: KernelOp, ba: tokamax.BoundArguments, arrays: list | None =
 
 def measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None, *,
              arrays: list | None = None, outputs: Callable[[Hashable, jax.Array], None] | None = None,
-             configs: Collection[Hashable] | None = None) -> Timings:
+             configs: Collection[Hashable] | None = None,
+             gpu: Callable[[], contextlib.AbstractContextManager] = contextlib.nullcontext,
+             compilers: int | None = None) -> Timings:
     """Every config of `ba`'s launch (at its key's shapes), each compiled on a
     thread and timed alone: the device time CUPTI reads for the launch's own
     kernels, each run after `FLUSH_BYTES` are read, so every config starts
@@ -663,7 +665,10 @@ def measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None, *,
     first run, which it reads before the next config runs (they are freed
     after), so a caller checking them compiles nothing more and holds one
     config's outputs at a time; `configs`, the configs to time where not every
-    one (a sweep's sample of them)."""
+    one (a sweep's sample of them); `gpu`, held around each config's runs (and
+    the flush's), where processes beside this one time on the same GPU (a
+    sweep's lock: their compiles run beside these runs, never their launches);
+    `compilers`, the threads compiling (every CPU's where unsaid)."""
     if profiler is None:
         from jax.experimental.mosaic.gpu import profiler
 
@@ -688,7 +693,7 @@ def measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None, *,
 
     timings: dict[Hashable, tokamax.BenchmarkData | Exception] = {}
     read = {}
-    with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as pool:
+    with concurrent.futures.ThreadPoolExecutor(compilers or os.cpu_count()) as pool:
         timed = ba.autotuning_configs if configs is None else configs
         futures = {config: pool.submit(compiled, config) for config in timed}
     # CUPTI reads every run, the flush's own first, subscribing for each and
@@ -698,16 +703,18 @@ def measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None, *,
     cupti = profiler.Cupti(finalize=False)
     flushes: set[str] = set()
     try:
-        flushes = {name for name, _ in _kernel_times(cupti, evicting, flush)}
+        with gpu():
+            flushes = {name for name, _ in _kernel_times(cupti, evicting, flush)}
         for config, future in futures.items():
             try:
                 executable, lowering, compiling = future.result()
-                (_, launched), first = cupti.measure(executable, aggregate=False)(flush, arrays)
+                with gpu():
+                    (_, launched), first = cupti.measure(executable, aggregate=False)(flush, arrays)
+                    runs = [first if isinstance(first, list) else [],
+                            *(_kernel_times(cupti, executable, flush, arrays) for _ in range(REPEATS - 1))]
                 if outputs is not None:
                     outputs(config, launched)
                 del launched
-                runs = [first if isinstance(first, list) else [],
-                        *(_kernel_times(cupti, executable, flush, arrays) for _ in range(REPEATS - 1))]
             except jax.errors.JaxRuntimeError as error:
                 if not _resource_exhausted(error):
                     raise
