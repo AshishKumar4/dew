@@ -51,7 +51,6 @@ from .kernels import decode_attention, generation, norm_swiglu
 from .kernels.generation import bf16_dot_runs, gpu_placed
 from .kernels.selection import forced, select, selected
 from .kernels.templates import attention as template, attention_route
-from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import (
     asks_default_precision,
     at_default_precision,
@@ -650,67 +649,6 @@ class GroupNorm(nn.Module):
                                 canonicalize_dtype(x, scale, bias, dtype=self.dtype))
 
 
-def cache_positions(module: nn.Module, batch: int, length: int, valid):
-    """Allocate compact cache slots for real tokens, independently per row.
-
-    A row's tokens fill its slots in order, so the cursor alone says which
-    hold one (`cached_validity`)."""
-    valid = jnp.ones((batch, length), bool) if valid is None else jnp.asarray(valid, bool)
-    if valid.shape != (batch, length):
-        raise ValueError(f"cache validity must be {(batch, length)}, got {valid.shape}")
-    allocated = module.has_variable("cache", "cache_index")
-    index = module.variable("cache", "cache_index", jnp.zeros, (batch,), jnp.int32)
-    positions = index.value[:, None] + jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
-    positions = jnp.where(valid, positions, -1)
-    if allocated:
-        index.value = index.value + jnp.sum(valid, axis=1, dtype=jnp.int32)
-    return positions, allocated
-
-
-def cached_validity(module: nn.Module, length: int) -> jax.Array:
-    """Which of `module`'s `length` cache slots hold a token, `[rows, length]`:
-    those before the row's cursor, which `cache_positions` fills in order.
-
-    Derived where it is read rather than stored beside the cursor, so a
-    decode step writes no `[rows, capacity]` copy of it a layer: 28 kernels
-    a step on Qwen3-0.6B, 0.6% of a 32-slot serving step on an RTX 4080
-    (docs/performance.md)."""
-    return filled_slots(module.get_variable("cache", "cache_index"), length)
-
-
-_DEFAULT_CACHE = KVCache()
-
-
-def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KVCache = _DEFAULT_CACHE,
-                  value_dim: int | None = None, places: bool = False, groups: tuple[str, ...] = ()):
-    """Fixed-size K/V with a cursor and cached validity for each batch row.
-
-    Returns [B, S] compact slot positions and a writer. Invalid tokens have
-    position -1 and do not advance the cursor. The allocation-only call leaves
-    every row empty. The writer returns full cache arrays, including unused
-    slots which the caller excludes with `cached_validity`. `layout` chooses the
-    storage behind the slots, dense or paged, full or quantized
-    (`dew.nn.kv_cache`); the slots and the cursor are the same for all. Values
-    are `value_dim` wide, None for the keys' width. `places` also keeps each
-    token's place beside its key (`dew.nn.kv_cache.Append.places`), and
-    `groups` its groups of the fields named (`Append.groups`).
-    """
-    shards = sequence_shards()
-    if shards > 1:
-        raise LayoutRefused(
-            f"decoding is not supported under a sequence axis of {shards}: the KV "
-            "cache holds whole sequences. Generate on a mesh with sequence=1.")
-    if max_seq_len is None:
-        raise ValueError("decoding needs max_seq_len for its fixed-capacity cache")
-    batch, length, heads, head_dim = key.shape
-    if valid is None and length > max_seq_len:
-        raise ValueError(f"{length} tokens do not fit a KV cache of {max_seq_len}.")
-    store = KVStore.open(module, layout, batch, max_seq_len, heads, head_dim, key.dtype, value_dim=value_dim,
-                         places=places, groups=groups)
-    positions, allocated = cache_positions(module, batch, length, valid)
-    return positions, Append(store, positions, allocated)
-
-
 def _pad_rows(x, rows: int):
     """`x` with `rows` zero rows appended on its sequence axis, [B, S, H, D]."""
     return x if rows == 0 else jnp.pad(x, ((0, 0), (0, rows), (0, 0), (0, 0)))
@@ -902,7 +840,7 @@ def split_with_queries(key, value, split: int):
     return repeat_kv_heads(key, heads), repeat_kv_heads(value, heads)
 
 
-def _per_shard(local, query, key, value, **extras):
+def _per_shard(local, query, key, value, *, coordinates: bool = False, **extras):
     """`local(query, key, value, **extras)` on each shard's rows and heads
     (`manual_map`). The key heads a shard reads are the ones its key shard holds,
     at their offset in that shard, where the key heads' split begins with the query
@@ -920,16 +858,24 @@ def _per_shard(local, query, key, value, **extras):
     and the logical axes it splits on: a dimension named for the rows or the query heads splits as the
     query's own rows or heads do (`query_split`), whatever the rules give that name alone, so a shard's
     coordinates are its own rows' and heads' where axes contend for them.
+    With `coordinates`, `local` also takes `global_rows` and `global_heads`, the shard's global batch rows
+    and query heads from the query's own split, so a draw keyed on them is the same whatever the rules give
+    the rows and heads alone.
     """
     given = {name: pair for name, pair in extras.items() if pair[0] is not None}
     queries, keys = logical_spec(HEADS, query.shape), logical_spec(KV_HEADS, key.shape)
     query_axes, key_axes = mesh_axes(_entry(queries, 2)), mesh_axes(_entry(keys, 2))
+    row_axes = mesh_axes(_entry(queries, 0))
     if key_axes and query_axes[: len(key_axes)] != key_axes:
         keys, key_axes = P(*keys[:2]), ()
     split, kv_heads = tensor_shards(query), key.shape[-2]
     heads = math.lcm(kv_heads, split)
     share, copies = heads // split, heads // kv_heads
     names = tuple(given)
+
+    def shard_start(axes, extent):
+        # Where a shard's extent begins along the mesh axes that split it (0 where no axis does).
+        return jax.lax.axis_index(axes) * extent if axes else 0
 
     def shard(query, key, value, *arrays):
         if copies > 1 or key.shape[-2] != share:
@@ -939,7 +885,13 @@ def _per_shard(local, query, key, value, **extras):
             if key_axes:
                 read = read - jax.lax.axis_index(key_axes) * key.shape[-2]
             key, value = (jnp.take(array, read, axis=-2) for array in (key, value))
-        return local(query, key, value, **dict(zip(names, arrays, strict=True)))
+        arguments = dict(zip(names, arrays, strict=True))
+        if coordinates:
+            rows_at = shard_start(row_axes, query.shape[0])
+            arguments["global_rows"] = rows_at + jnp.arange(query.shape[0], dtype=jnp.int32)
+            heads_at = shard_start(query_axes, query.shape[2])
+            arguments["global_heads"] = heads_at + jnp.arange(query.shape[2], dtype=jnp.int32)
+        return local(query, key, value, **arguments)
 
     # An extra may be a tree of arrays (`CrossDocuments`), each leaf split on its axes.
     specs = (queries, keys, keys,
@@ -1184,20 +1136,22 @@ def triton_attention(query, key, value, causal: bool):
 
 def template_attention(query, key, value, causal: bool, sliding_window, *, sinks, softcap, segment_ids,
                        lengths, starts, block_groups=None, image_groups=None, key_valid=None, key_runs=None,
-                       places=None):
+                       places=None, dropout_rate=0.0, dropout_seed=None):
     """The attention template's route (`attention_route.attend`) over the call's visibility as spans
     (`key_spans`): its causality, window, documents (`segment_ids`, or `CrossDocuments` aligned to their last
-    keys), key lengths and starts, block and image groups, and key validity and counted places. A softcap is
-    a score hook and sinks are the softmax's initial state. On a mesh it runs per shard (`_per_shard`), as
-    the decode kernel does: the key heads repeat until the tensor axes split them, the sinks split with their
-    heads, and the ids, lengths, starts, groups, validity and places with their rows. Its requirements
+    keys), key lengths and starts, block and image groups, and key validity and counted places, with
+    probability dropout at `dropout_rate` drawn from `dropout_seed`. A softcap is a score hook and sinks are
+    the softmax's initial state. On a mesh it runs per shard (`_per_shard`), as the decode kernel does: the
+    key heads repeat until the tensor axes split them, the sinks split with their heads, and the ids, lengths,
+    starts, groups, validity and places with their rows. Its requirements
     (`attention_kernels.TEMPLATE_SUPPORTS`) keep it off a sharded sequence axis.
     """
     if sinks is not None and sinks.shape != (query.shape[2],):
         raise ValueError(f"sinks must have one logit per query head, got {sinks.shape}")
 
     def local(query, key, value, sinks=None, segment_ids=None, lengths=None, starts=None,
-              block_groups=None, image_groups=None, key_valid=None, key_runs=None, places=None):
+              block_groups=None, image_groups=None, key_valid=None, key_runs=None, places=None,
+              global_rows=None, global_heads=None, seed=None):
         batch, queries, keys = query.shape[0], query.shape[1], key.shape[1]
         spans = key_spans(queries, keys, causal, sliding_window, segment_ids, lengths, starts,
                           block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
@@ -1205,19 +1159,23 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
                           places=places, rows=batch)
         hooks = template.Hooks(
             score_mod=None if softcap is None else functools.partial(template.capped, softcap),
-            initial=None if sinks is None else template.sinks(sinks, batch, queries, value.shape[-1]))
+            initial=None if sinks is None else template.sinks(sinks, batch, queries, value.shape[-1]),
+            drop=None if seed is None or global_rows is None or global_heads is None
+            else template.Dropout(seed, global_rows, global_heads, dropout_rate))
         return attention_route.attend(query, key, value, spans, hooks)
 
     # The GPU arms are Pallas launches, which have no partitioning rule, so each shard runs them on its own
-    # rows and heads.
+    # rows and heads. A dropping call's draw takes each shard's global rows and heads from the query's own
+    # split (`_per_shard`'s coordinates), so it does not depend on the mesh or on the rules of the other axes.
     rows = ("activation_batch",)
-    return _per_shard(local, query, key, value, sinks=(sinks, ("activation_heads",)),
+    return _per_shard(local, query, key, value, coordinates=dropout_seed is not None,
+                      sinks=(sinks, ("activation_heads",)),
                       segment_ids=(segment_ids, ("activation_batch", None)), lengths=(lengths, rows),
                       starts=(starts, rows), block_groups=(block_groups, ("activation_batch", None)),
                       image_groups=(image_groups, ("activation_batch", None)),
                       key_valid=(key_valid, ("activation_batch", None)),
                       key_runs=(key_runs, ("activation_batch", None, None, None)),
-                      places=(places, ("activation_batch", None)))
+                      places=(places, ("activation_batch", None)), seed=(dropout_seed, (None,)))
 
 
 VALUE_BLOCK = 256
@@ -1270,14 +1228,14 @@ def _blocked_values(weights, value, precision) -> jax.Array:
 
 
 def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, softcap=None, dtype=None,
-                        precision=None, force_fp32_for_softmax=True, dropout_rate=0.0, dropout_rng=None,
+                        precision=None, force_fp32_for_softmax=True, dropout_rate=0.0, dropout_seed=None,
                         wide_logits=False):
     """Attend over [B, S, H, D] in plain XLA ops, every score policy on one pipeline.
 
     It is flax's reference attention, op for op: the query scaled by
     1/sqrt(D) in its dtype, the logits, the additive `bias`, the structural
     `mask`, the softmax (in at least fp32 under `force_fp32_for_softmax`), a
-    probability draw at `dropout_rate` from `dropout_rng`, each weight its own,
+    probability draw at `dropout_rate` from `dropout_seed`, each weight its own,
     and the value product (`weighted_values`). Gemma 2's `softcap` squashes the
     scaled logits into (-softcap, softcap) before the bias and mask
     (modeling_gemma2.py:192-208), and `sinks` `[H]` put one value-free logit
@@ -1334,11 +1292,15 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
         # A bias wider than the logits widens them; the softmax runs there and its weights round after.
         weights = jax.nn.softmax(logits).astype(dtype)
     if dropout_rate:
-        if dropout_rng is None:
-            raise ValueError("training attention dropout requires dropout_rng")
-        keep = 1.0 - dropout_rate
-        drawn = jax.random.bernoulli(dropout_rng, keep, weights.shape)
-        weights = weights * (drawn.astype(dtype) / jnp.asarray(keep, dtype))
+        if dropout_seed is None:
+            raise ValueError("training attention dropout requires dropout_seed")
+        # The keep bits are the draw's, shared with the kernels; the scale 1 / (1 - rate) takes the product's
+        # dtype, rounded once from its double (ledger 1533: a bf16 1 / (1 - rate) biases every kept weight).
+        # The weights round once, to their dtype.
+        wide = at_least_fp32(dtype)
+        keep = template.dropout_keep(dropout_seed, dropout_rate, weights.shape)
+        scale = jnp.asarray(1.0 / (1.0 - dropout_rate), wide)
+        weights = (weights.astype(wide) * jnp.where(keep, scale, 0)).astype(dtype)
     if sinks is None:
         return weighted_values('...hqk,...khd->...qhd', weights, value, precision=precision)
     if kv_heads == 1:
@@ -1393,15 +1355,20 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     window counts (`counted_places`). The template reads these as its spans
     (`key_spans`); every other path takes the mask they mean (`visibility_mask`).
 
-    A mesh sequence axis above one runs `sequence_parallel_attention`. Active
-    dropout runs `reference_attention`, independently per row, head and
-    query, and refuses explicit fused kernels and sequence parallelism. The
+    A mesh sequence axis above one runs `sequence_parallel_attention`. Active dropout draws each weight
+    from `dropout_rng` on the route the selector takes for it (`reference`, or `template` where named),
+    and refuses explicit fused kernels and a sequence axis above one. The
     result carries the checkpoint name 'attention_output', so a remat policy
     can save it instead of replaying the kernel (`remat_block` in dit.py).
     """
     shards = sequence_shards()
     if not 0 <= dropout_rate < 1:
         raise ValueError(f"dropout_rate must be within [0, 1), got {dropout_rate}")
+    dropping = bool(dropout_rate) and not deterministic
+    if dropping and shards > 1:
+        raise ValueError("attention probability dropout requires sequence_shards=1")
+    if dropping and dropout_rng is None:
+        raise ValueError("training attention dropout requires dropout_rng")
     if key_segment_ids is not None:
         if segment_ids is None:
             raise ValueError("key_segment_ids are the keys' documents beside the queries' segment_ids")
@@ -1413,36 +1380,29 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     spanned = {"block_groups": block_groups, "image_groups": image_groups, "key_valid": key_valid,
                "key_runs": key_runs,
                "places": places}
-    if any(x is not None for x in spanned.values()) and ((dropout_rate and not deterministic) or shards > 1):
-        # Only a single device's template reads groups, key validity and places; elsewhere the call's
-        # spans are the mask they mean, its causality, window, documents, key lengths and starts among them.
+    if any(x is not None for x in spanned.values()) and shards > 1:
+        # Only a single device's template reads groups, key validity and places; across sequence shards the
+        # call's spans are the mask they mean, its causality, window, documents, key lengths and starts among
+        # them. On one device a route other than the template's takes them so (`_attention_kernel`).
         mask = visibility_mask(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids,
                                key_value_seq_lengths, key_value_seq_starts, **spanned)
         causal, sliding_window, segment_ids, block_groups, image_groups = False, None, None, None, None
         key_value_seq_lengths = key_value_seq_starts = key_valid = key_runs = places = None
-        if shards > 1:
-            implementation = kernel_for_materialized_mask(
-                implementation, query, key, dtype=dtype, precision=precision,
-                force_fp32_for_softmax=force_fp32_for_softmax)
+        implementation = kernel_for_materialized_mask(
+            implementation, query, key, dtype=dtype, precision=precision,
+            force_fp32_for_softmax=force_fp32_for_softmax)
     if (isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None)
-            and ((dropout_rate and not deterministic) or shards > 1)):
+            and shards > 1):
         # Only a single device's kernels read documents aligned to their last keys; elsewhere they
         # are the mask they mean.
         aligned = cross_document_mask(segment_ids, causal=causal, sliding_window=sliding_window)
         mask = aligned if mask is None else jnp.logical_and(aligned, mask)
         causal, sliding_window, segment_ids = False, None, None
-    if key_value_seq_starts is not None and ((dropout_rate and not deterministic) or shards > 1):
+    if key_value_seq_starts is not None and shards > 1:
         # Only a single device's decode kernel reads starts; elsewhere they are the mask they mean.
         mask = with_key_starts(mask, key_value_seq_starts, key.shape[-3])
         key_value_seq_starts = None
-    if dropout_rate and not deterministic:
-        out = _dropout_attention(
-            query, key, value, dtype, precision, force_fp32_for_softmax, implementation,
-            causal, sliding_window, mask, bias, sinks, softcap, segment_ids,
-            key_value_seq_lengths, dropout_rate, dropout_rng, shards)
-        live = visible_rows(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids,
-                            key_value_seq_lengths)
-        return checkpoint_name(_read_nothing(out, live), 'attention_output')
+    words = template.dropout_seed(dropout_rng) if dropping else None
     if shards > 1 and segment_ids is not None:
         # The exchanges split an explicit mask along the sequence and have no
         # split for the ids, so the documents travel as the mask they stand
@@ -1467,7 +1427,8 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                      mask=mask, bias=bias, sinks=sinks, segment_ids=segment_ids,
                      max_segments=max_segments, key_value_seq_lengths=key_value_seq_lengths,
                      key_value_seq_starts=key_value_seq_starts, block_groups=block_groups,
-                     image_groups=image_groups, key_valid=key_valid, key_runs=key_runs, places=places)
+                     image_groups=image_groups, key_valid=key_valid, key_runs=key_runs, places=places,
+                     dropout_rate=dropout_rate if dropping else 0.0, dropout_seed=words)
     return checkpoint_name(out, 'attention_output')
 
 
@@ -1477,32 +1438,11 @@ def _read_nothing(out: jax.Array, live: jax.Array | None) -> jax.Array:
     return out if live is None else jnp.where(live, out, jnp.zeros((), out.dtype))
 
 
-def _dropout_attention(query, key, value, dtype, precision, force_fp32_for_softmax, implementation,
-                       causal, sliding_window, mask, bias, sinks, softcap, segment_ids,
-                       key_value_seq_lengths, dropout_rate, dropout_rng, shards):
-    """Apply one reference probability draw, retaining visibility and projection precision."""
-    if implementation not in ('auto', 'reference', 'xla'):
-        raise ValueError(
-            f"{implementation} attention cannot apply probability dropout; use reference or auto"
-        )
-    if shards > 1:
-        raise ValueError("attention probability dropout requires sequence_shards=1")
-    mask = combined_attention_mask(
-        query.shape[-3], key.shape[-3], causal, sliding_window,
-        mask if segment_ids is None else with_documents(mask, segment_ids))
-    if key_value_seq_lengths is not None:
-        mask = with_key_lengths(mask, key_value_seq_lengths, key.shape[-3])
-    return reference_attention(query, key, value, mask=mask, bias=bias, sinks=sinks, softcap=softcap,
-                               dtype=dtype, precision=precision,
-                               force_fp32_for_softmax=force_fp32_for_softmax,
-                               dropout_rate=dropout_rate, dropout_rng=dropout_rng)
-
-
 def _fused_attention(query, key, value, bias, mask, causal, sliding_window, implementation, *,
                      softcap, sinks, segment_ids, key_value_seq_lengths, max_segments=None,
                      key_value_seq_starts=None, block_groups=None, image_groups=None, key_valid=None,
                      key_runs=None,
-                     places=None):
+                     places=None, dropout_rate=0.0, dropout_seed=None):
     """Run the kernel `implementation` names, at the query's head width: the executor of what the
     attention selector chose (`resolve_implementation`, `_attention_kernel`), which held the call to
     the kernel's requirements (`attention_kernels.ATTENTION`) before it reaches here.
@@ -1572,7 +1512,7 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
                                  segment_ids=segment_ids, lengths=key_value_seq_lengths,
                                  starts=key_value_seq_starts, block_groups=block_groups,
                                  image_groups=image_groups, key_valid=key_valid, key_runs=key_runs,
-                                 places=places)
+                                 places=places, dropout_rate=dropout_rate, dropout_seed=dropout_seed)
     else:  # 'tpu'
         if key_value_seq_lengths is not None:
             mask = with_key_lengths(mask, key_value_seq_lengths, key.shape[-3])
@@ -1608,7 +1548,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
                      softcap=None, segment_ids=None, max_segments=None, key_value_seq_lengths=None,
                      key_value_seq_starts=None, block_groups=None, image_groups=None, key_valid=None,
                      key_runs=None,
-                     places=None):
+                     places=None, dropout_rate=0.0, dropout_seed=None):
     """Dispatch one whole-sequence attention call to the kernel it names,
     differentiable in forward mode under `forward_mode_attention`.
 
@@ -1622,15 +1562,14 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     if (key_value_seq_lengths is not None and query.shape[-3] == 1 and not causal
             and sliding_window is None and mask is None and bias is None and sinks is None
             and segment_ids is None and query.shape[-2] > key.shape[-2]
-            and query.shape[-2] % key.shape[-2] == 0):
+            and query.shape[-2] % key.shape[-2] == 0 and dropout_seed is None):
         # The key heads repeated as each shard would hold them (`_per_shard`), so the tensor axes
         # split the groups as they split the query heads.
         key, value = split_with_queries(key, value, tensor_shards(query))
         return decode_attention.grouped_query(functools.partial(
             attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
             implementation=implementation, softcap=softcap, key_value_seq_lengths=key_value_seq_lengths,
-            key_value_seq_starts=key_value_seq_starts),
-            query, key, value)
+            key_value_seq_starts=key_value_seq_starts), query, key, value)
     lengths = (None if key_value_seq_lengths is None
                else jnp.asarray(key_value_seq_lengths, jnp.int32))
     starts = None if key_value_seq_starts is None else jnp.asarray(key_value_seq_starts, jnp.int32)
@@ -1642,13 +1581,13 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         causal=causal, sliding_window=sliding_window, mask=mask, bias=bias,
         segment_ids=segment_ids, max_segments=max_segments, key_value_seq_lengths=lengths,
         key_value_seq_starts=starts, block_groups=block_groups, image_groups=image_groups,
-        key_valid=key_valid, key_runs=key_runs, places=places)
+        key_valid=key_valid, key_runs=key_runs, places=places, dropout=dropout_seed is not None)
     call = functools.partial(
         _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
         causal=causal, sliding_window=sliding_window, mask=mask, masked=masked, softcap=softcap,
         segment_ids=segment_ids, max_segments=max_segments, lengths=lengths, starts=starts,
         block_groups=block_groups, image_groups=image_groups, key_valid=key_valid, key_runs=key_runs,
-        places=places)
+        places=places, dropout_rate=dropout_rate, dropout_seed=dropout_seed)
     live = visible_rows(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids, lengths,
                         starts, block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
                         key_runs=key_runs,
@@ -1689,7 +1628,7 @@ def forward_differentiable(value, tangent, *arrays, precision: str | None = None
 def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, precision,
                       force_fp32_for_softmax, causal, sliding_window, mask, masked, softcap,
                       segment_ids, max_segments, lengths, starts, block_groups=None, image_groups=None,
-                      key_valid=None, key_runs=None, places=None):
+                      key_valid=None, key_runs=None, places=None, dropout_rate=0.0, dropout_seed=None):
     """Run one whole-sequence attention call on the kernel `attention_kernel` resolved.
 
     `masked` is `mask` with the key `lengths` and `starts` in it. Splash takes sinks, a
@@ -1727,12 +1666,13 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
             masked = with_documents(masked, segment_ids)
         # cuDNN takes the documents as their mask, an additive bias (`kernel_for_materialized_mask`):
         # a cache's aligned ones as it took a cache's mask, a call's own where cuDNN is named.
-    if implementation == 'reference' or (implementation == 'xla'
-                                         and (sinks is not None or softcap is not None)):
+    if implementation == 'reference' or (implementation == 'xla' and (
+            sinks is not None or softcap is not None or dropout_seed is not None)):
         mask = combined_attention_mask(query.shape[-3], key.shape[-3], causal, sliding_window, masked)
         return reference_attention(query, key, value, mask=mask, bias=bias, sinks=sinks, softcap=softcap,
                                    dtype=dtype, precision=precision,
-                                   force_fp32_for_softmax=force_fp32_for_softmax)
+                                   force_fp32_for_softmax=force_fp32_for_softmax,
+                                   dropout_rate=dropout_rate, dropout_seed=dropout_seed)
 
     # The decode kernel and the template read key starts as their own spans; elsewhere they are the mask.
     if implementation not in ('decode', 'template'):
@@ -1744,7 +1684,7 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
                             key_value_seq_lengths=lengths, key_value_seq_starts=starts,
                             block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
                             key_runs=key_runs,
-                            places=places)
+                            places=places, dropout_rate=dropout_rate, dropout_seed=dropout_seed)
 
 
 def reference_only(query, dtype, precision, force_fp32_for_softmax) -> bool:
@@ -1786,7 +1726,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
                    sinks=None, causal=False, sliding_window=None, mask=None, bias=None, segment_ids=None,
                    max_segments=None, key_value_seq_lengths=None, key_value_seq_starts=None,
                    block_groups=None, image_groups=None, key_valid=None, key_runs=None, places=None,
-                   named: str = 'auto') -> AttentionCase:
+                   dropout: bool = False, named: str = 'auto') -> AttentionCase:
     """The `AttentionCase` of a call `scaled_dot_product_attention` takes under the `named`
     `AttentionImpl`, which decides whether splash might run it."""
     cross = isinstance(segment_ids, CrossDocuments)
@@ -1807,7 +1747,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax),
         narrows=_xla_kernel_narrows(query) or _xla_kernel_on_cpu(),
         folds=folds(query, key, bias, mask, causal, sliding_window),
-        splash_mask=False, shards=sequence_shards())
+        splash_mask=False, shards=sequence_shards(), dropout=dropout)
     # Splash's descriptor reads a concrete mask on the host, so it is built only where splash may run,
     # under a name that may choose it on a TPU (`TPU_BACKEND`); its tiling and every other requirement
     # read the case (`TPU_SUPPORTS`).
@@ -1821,7 +1761,8 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
                            force_fp32_for_softmax=True, softcap=None, sinks=None, causal=False,
                            sliding_window=None, mask=None, bias=None, segment_ids=None, max_segments=None,
                            key_value_seq_lengths=None, key_value_seq_starts=None, block_groups=None,
-                           image_groups=None, key_valid=None, key_runs=None, places=None) -> str:
+                           image_groups=None, key_valid=None, key_runs=None, places=None,
+                           dropout: bool = False) -> str:
     """The kernel an `AttentionImpl` names for this call on this host, as the attention selector
     reports it (`select`, over `attention_case`): 'auto' takes the kernel the target's row measured
     fastest for the call where it takes it, else the first that does; a named kernel is forced, and
@@ -1840,7 +1781,7 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
                           key_value_seq_lengths=key_value_seq_lengths,
                           key_value_seq_starts=key_value_seq_starts, block_groups=block_groups,
                           image_groups=image_groups, key_valid=key_valid, key_runs=key_runs, places=places,
-                          named=implementation)
+                          dropout=dropout, named=implementation)
     if not (decodes(case) and implementation in ('auto', 'cudnn', 'xla')):
         return select(ATTENTION, case, None if implementation == 'auto' else implementation).ran
     named = {'auto': None, 'cudnn': 'cudnn'}.get(implementation)

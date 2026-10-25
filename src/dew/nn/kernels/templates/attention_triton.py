@@ -85,13 +85,17 @@ def _eligible(ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
             and ba.arguments["start"].ndim == 2)
 
 
-def refused(spans: KeySpans) -> str | None:
-    """Why this mainloop takes no call over `spans`, or None: a call's runs, several key intervals a query
-    (`KeySpans`), which the frozen mainloop does not walk; the Mosaic and plain-JAX mainloops do (ledger
-    956, `attention_route`)."""
+def refused(spans: KeySpans, hooks: Hooks | None = None) -> str | None:
+    """Why this mainloop takes no call over `spans` under `hooks`, or None: a call's runs, several key
+    intervals a query (`KeySpans`), which the frozen mainloop does not walk, the Mosaic and plain-JAX
+    mainloops do (ledger 956, `attention_route`); probability dropout (`Hooks.drop`), which it does not
+    draw, the plain-JAX mainloop does (ledger row 1521)."""
     if spans.start.ndim == 3:
         return ("the Triton mainloop walks one key interval a query; a call's runs take the Mosaic or the "
                 "plain-JAX mainloop")
+    if hooks is not None and hooks.drop is not None:
+        return ("the Triton mainloop is frozen and takes no probability dropout (the route runs a dropping "
+                "call on the reference path, ledger row 1521)")
     return None
 
 
@@ -442,8 +446,8 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     denominators `[B, H, Q]` too, and each query's anchor key `[B, H, Q]` int32 (`backward` reads them
     all). The operands pad to whole blocks of the largest tile and to power-of-two
     head widths (`padded_call`). `natural` keeps the logits natural (`algebra.Forward.base2`).
-    `interpret` runs it on the CPU. A call over runs is refused (`refused`)."""
-    if reason := refused(spans):
+    `interpret` runs it on the CPU. A call over runs or under dropout is refused (`refused`)."""
+    if reason := refused(spans, hooks):
         raise NotImplementedError(reason)
     hooks = Hooks() if hooks is None else hooks
     call = padded_call(query, key, value, spans, hooks, BLOCK)
@@ -1000,9 +1004,9 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     `residuals`: its maxima, denominators, anchor keys and split sums (`forward`'s, which it takes again
     where None). With `split`, D comes from the split sums; without, the dQ launch takes its own first pass
     over the keys (`algebra.off_anchor`). `natural` keeps the forward's logits natural; `accurate` takes
-    the backward's accurate form (`ACCURATE`). `interpret` runs it on the CPU. A call over runs is refused
-    (`refused`)."""
-    if reason := refused(spans):
+    the backward's accurate form (`ACCURATE`). `interpret` runs it on the CPU. A call over runs or under
+    dropout is refused (`refused`)."""
+    if reason := refused(spans, hooks):
         raise NotImplementedError(reason)
     if residuals is None:
         plain = Hooks() if hooks is None else Hooks(hooks.score_mod, hooks.score_params, hooks.initial)

@@ -48,6 +48,7 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
 )
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BUNDLES,
+    DROPPING,
     BackwardTiles,
     Tiles,
     _block,
@@ -391,8 +392,11 @@ def forward_takes(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
 
 def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
                   scale: float | None, natural: bool) -> tuple[MosaicForward, tuple]:
-    """`forward`'s op and its arguments."""
+    """`forward`'s op and its arguments; a dropping call refused before one is built, as its op carries no
+    draw (`refused`)."""
     hooks = Hooks() if hooks is None else hooks
+    if hooks.drop is not None:
+        raise NotImplementedError(DROPPING)
     op = MosaicForward(score_mod=hooks.score_mod, output_mod=hooks.output_mod,
                        score_kinds=tuple(param.kind for param in hooks.score_params),
                        output_kinds=tuple(param.kind for param in hooks.output_params),
@@ -658,8 +662,10 @@ def backward_takes(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
 def _backward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
                    dout: jax.Array, residuals: tuple, *, scale: float | None, natural: bool,
                    accurate: bool) -> tuple[MosaicBackward, tuple]:
-    """`backward`'s op and its arguments."""
+    """`backward`'s op and its arguments; a dropping call refused before one is built (`_forward_call`)."""
     hooks = Hooks() if hooks is None else hooks
+    if hooks.drop is not None:
+        raise NotImplementedError(DROPPING)
     op = MosaicBackward(score_mod=hooks.score_mod,
                         score_kinds=tuple(param.kind for param in hooks.score_params),
                         score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score_params),

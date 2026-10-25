@@ -99,6 +99,11 @@ def _parts(accurate: bool, dtype) -> int:
     return len(jax.eval_shape(lambda c: algebra.cotangent_parts(c, dtype, accurate=accurate), tile))
 
 
+DROPPING = ("the Mosaic mainloop takes no probability dropout yet (the route runs a dropping call on the "
+            "reference path, ledger row 1521)")
+"""Why this mainloop refuses a dropping call (`refused`): its ops carry no draw."""
+
+
 def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backward: bool,
             family: mosaic.Family) -> str | None:
     """Why this mainloop takes no call of `dtype` operands, head widths `width` and `value_width` and `hooks`
@@ -107,6 +112,8 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     suite read."""
     hooks = Hooks() if hooks is None else hooks
     sixteen = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
+    if hooks.drop is not None:
+        return DROPPING
     if backward and jnp.dtype(dtype) != jnp.dtype(jnp.bfloat16):
         return f"the Mosaic backward takes bf16 operands, not {jnp.dtype(dtype)}"
     if jnp.dtype(dtype) not in sixteen:
