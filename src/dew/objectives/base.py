@@ -950,6 +950,13 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return 3 * self.model_flops(model, batch)
 
+    @classmethod
+    def earlier_arguments(cls, arguments: Mapping[str, object]) -> Mapping[str, object]:
+        """An earlier run's recorded constructor arguments as the class takes them now
+        (`dew.config.ObjectiveConfig`): a class that retires an argument reads a record of it here,
+        until the ledger row it names deletes the reading. The default takes them as they are."""
+        return arguments
+
     def program_key(self) -> tuple[ProgramModule, ...]:
         """Every module this objective's compiled programs execute, in an order its configuration fixes.
 

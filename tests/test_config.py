@@ -14,7 +14,7 @@ from flax import linen as nn
 
 import dew.config
 import dew.nn.backbones
-from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
+from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, RunConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader, Ramp
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -555,3 +555,12 @@ def test_param_groups_with_schedules_momentum_and_bounds_round_trip():
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
     assert loaded == config
     assert loaded.optim.param_groups[0].bounds == (0.0, 24.0)
+
+
+def test_a_run_recorded_with_its_qk_statistics_switch_reads_as_one_whose_step_asks():
+    """A run recorded while its LM objective took `qk_stats`, which the step whose optimizer clips by the
+    attention maxima now asks for (`Step.qk_stats`), reads as today's objective: the switch, stated or
+    defaulted, is dropped, where the record was refused as one of an argument the class no longer takes."""
+    for recorded in ({"defaults": {"qk_stats": False}}, {"fields": {"qk_stats": True}}):
+        config = ObjectiveConfig("lm", **recorded)
+        assert "qk_stats" not in {**config.fields, **config.defaults}
