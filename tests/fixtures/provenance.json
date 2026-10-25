@@ -531,6 +531,10 @@
    ],
    "note": "Calls AutoencoderDC encode/decode; bundle contains both conv and shuffle cases."
   },
+  "decoder-default-dropout-float64.jaxexport": {
+   "generator": "dew",
+   "note": "The same pre-dropout CPU forward and gradient graph at 42ddfc1, exported in float64 over the weights widened (tools/generate_decoder_dropout_fixture.py --dtype float64): the float32 export's float64 truth for check 1."
+  },
   "decoder-default-dropout.jaxexport": {
    "generator": "dew",
    "note": "Dew's serialized pre-dropout CPU forward and gradient graph at 42ddfc1 (tools/generate_decoder_dropout_fixture.py); a Dew regression golden."
