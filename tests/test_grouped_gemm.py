@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS, generations, lowers
+from generation_support import INTERPRETS, generations, lowers, runs
 from jax.sharding import Mesh
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference, equations, with_gradients
 
@@ -258,6 +258,23 @@ smaller block of an sm86 than an A100's, and a Hopper-class one with fewer multi
 block and another L2 bandwidth than an H100's."""
 
 
+def test_a_program_traced_for_one_gpu_traces_again_for_another_of_its_family():
+    """Two GPUs of one family whose facts differ key a jitted program's traces apart
+    (`generation.assumed`), so neither's launches are sized and picked by the other's facts."""
+    traced = []
+
+    @jax.jit
+    def program(x):
+        traced.append(generation.gpu_target())
+        return x + 1
+
+    targets = (UNSEEN["hopper-class"], generation.TARGETS["sm90"])
+    for target in targets:
+        with generation.assumed(target):
+            program(jnp.zeros(2))
+    assert traced == list(targets)
+
+
 @INTERPRETS
 @pytest.mark.parametrize("unseen", UNSEEN)
 def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
@@ -321,7 +338,41 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
     mosaic = [(launch, ba) for launch, ba in launches if isinstance(launch, grouped_matmul._Mosaic)]
     assert {type(launch).__name__ for launch, _ in mosaic} == launched
     with generation.assumed(target):
-        assert all(ba.heuristics_config == launch.estimate(ba, target)[1] for launch, ba in mosaic)
+        assert all(launch.chosen(ba) == launch.estimate(ba, target)[1] for launch, ba in mosaic)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("unseen", UNSEEN)
+def test_a_gpu_no_one_measured_runs_the_triton_tiles_its_facts_fit_exactly(unseen):
+    """On a GPU no row measured, each Triton launch's tiles are generated from the MMA's and Triton's
+    facts (`grouped_matmul.triton_tiles`), those it keeps fit the GPU's block, and the call takes the
+    cost model's pick on the GPU's own facts; the projection's forward and both gradients through them
+    are as exact as XLA's ragged dot from float64."""
+    target = UNSEEN[unseen]
+    group_sizes = jnp.asarray(SIZES["ragged"], jnp.int32)
+
+    def projection(dtype=jnp.bfloat16):
+        return lambda x, w: expert_projection(x, w, group_sizes, dtype, "xla", None)
+
+    def through_triton(x, w, dy):
+        with generation.assumed(target), generation.chosen(grouped_matmul="triton"):
+            return with_gradients(lambda x, w: template.gemm(x, w, group_sizes, out_dtype=jnp.bfloat16,
+                                                             precision="default",
+                                                             interpret_on_cpu=True))(x, w, dy)
+
+    with tuning.seen() as launches:
+        assert_as_exact(jax.jit(through_triton), jax.jit(with_gradients(projection())), ragged_draw,
+                        f"unseen {unseen} Triton", seeds=SEEDS,
+                        truth_fn=with_gradients(projection(jnp.float64)))
+    triton = [(launch, ba) for launch, ba in launches if isinstance(launch, grouped_matmul._Triton)]
+    assert {type(launch).__name__ for launch, _ in triton} == {"Gmm", "Tgmm"}
+    budget = generation.shared_budget(target)
+    with generation.assumed(target):
+        for launch, ba in triton:
+            fits = launch.fitting(ba, target)
+            assert set(fits) <= set(launch.space(ba))
+            assert all(launch.staged_bytes(ba, tile, target) <= budget for tile in fits)
+            assert launch.chosen(ba) == launch.estimate(ba, target)[1]
 
 
 @INTERPRETS
@@ -351,6 +402,7 @@ def test_a_frozen_matrix_forms_no_kernel_gradient():
     assert {type(launch).__name__ for launch, _ in launches} == {"MosaicGmm"}
 
 
+@runs("sm80")
 def test_the_kernels_forward_mode_keeps_the_projections_law():
     """An expert projection's tangent through the template (its launches interpreted, as an A100 runs
     them) is the XLA projection's, bit for bit: `dx @ Q(kernel) + Q(x) @ dkernel` with the tangents
@@ -379,6 +431,7 @@ def test_a_named_kernel_refuses_where_the_kernels_do_not_run():
         expert_projection(x, w, sizes, jnp.bfloat16, "auto", None)
 
 
+@runs("sm80")
 def test_a_call_of_no_rows_runs_xla_or_refuses_a_named_kernel():
     """A projection of no rows launches nothing: XLA gives its empty value, the route saying why, and a
     kernel `generation.chosen` names for it raises rather than running XLA."""

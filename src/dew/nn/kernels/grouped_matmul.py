@@ -25,7 +25,6 @@ import dataclasses
 import functools
 import importlib
 import importlib.util
-import itertools
 import math
 from collections.abc import Callable, Hashable
 from typing import ClassVar
@@ -63,16 +62,73 @@ class Tile:
     stages: int
 
 
-TILES = tuple(Tile(*shape) for shape in itertools.product((64, 128, 256), (128, 256), (128, 64, 32), (8, 4),
-                                                            (3, 4, 2)))
-"""Every tile the Triton launches may take: the ones the A100 and H100 sweeps found fastest lie inside.
-Where the cost model ties, the first wins: the deeper step, which synchronizes its pipeline fewer times
-a tile (at 128 x 256 on an H100, a step of 64 took 1.56 ms where 32 took 1.78, GMM-h100-2), and the
-more warps."""
+def _doubling(least: int, most: int) -> tuple[int, ...]:
+    """`least` and its doublings up to `most`, ascending."""
+    return tuple(least << power for power in range(max(most // least, 1).bit_length())
+                 if least << power <= most)
 
-TPU_BLOCKS = tuple(mosaic_tpu.Blocks(*shape) for shape in itertools.product((128, 256, 512), repeat=3))
-"""Every block the TPU launches may take: multiples of the MXU's 128 (Megablox's default is 128 cubed),
-none past the 16 MiB a v5e's kernel holds at XLA's default (`_MosaicTpu.staged_bytes`)."""
+
+def triton_tiles(dtype, depth: int, width: int) -> tuple[Tile, ...]:
+    """Every tile a Triton launch may take for operands of `dtype` at a call whose step and column axes
+    span `depth` and `width` (`_Triton._dense_extents`), from the MMA's facts and Triton's alone (no table
+    of tiles): each axis a power of two (`tl.arange`'s extents are); rows from one warpgroup's MMA rows
+    (`mosaic.Family.role_rows`: wgmma's 64, four warps of mma.sync's 16) and columns from a swizzled row's
+    elements (`mosaic.SWIZZLE_BYTES`) to the call's `width` (Triton masks a block past it), while a
+    thread's share of the fp32 accumulator stays within its registers at the most warps
+    (`cost.THREAD_REGISTERS`); a step from half a swizzled row to the call's `depth`; one warpgroup a
+    program or as many as warpgroup MMA's consumer roles
+    (`mosaic.Family.consumers`), over which Triton spreads a dot; and stages from two to as many steps as
+    a block of the roomiest family holds (`mosaic.Family.most_shared`). A target's launch keeps those that
+    fit it (`_Triton.fitting`) and ranks those its cost model is calibrated over (`_Triton.calibrated`).
+    Where the model ties (it charges a compute-bound tile's work alike), the first wins: the fewest rows,
+    which a group's boundary tile computes past its group's; the deeper step, which synchronizes its
+    pipeline fewer times a tile (at 128 x 256 on an H100, a step of 64 took 1.56 ms where 32 took 1.78,
+    GMM-h100-2); the more warps; and three stages, then deeper, then two: three ran the fastest of a tile's
+    stage counts most often in the sweeps (30 of their 56 records, GMMT-a100 and GMM-h100-2)."""
+    family = mosaic_sm90.WGMMA
+    size = jnp.dtype(dtype).itemsize
+    row = mosaic.SWIZZLE_BYTES // size
+    warps = [mosaic.THREADS // 32 * consumers for consumers in range(family.consumers, 0, -1)]
+    held = max(warps) * 32 * cost.THREAD_REGISTERS
+    tiles = []
+    for block_m in _doubling(family.role_rows, held // row):
+        for block_n in _doubling(row, max(row, min(_covering(width), held // block_m))):
+            if block_m * block_n >= held:
+                continue
+            for block_k in reversed(_doubling(row // 2, max(row // 2, _covering(depth)))):
+                # A step's blocks, a product's (`Gmm.loaded`) or a kernel gradient's (`Tgmm.loaded`).
+                step = min((block_m + block_n) * block_k, block_m * (block_k + block_n)) * size
+                deepest = max(mosaic_sm90.WGMMA.most_shared, mosaic_sm80.Mma.most_shared) // step + 1
+                stages = [count for count in (3, *range(4, deepest + 1), 2) if count <= deepest]
+                tiles += [Tile(block_m, block_n, block_k, warp_count, count)
+                          for warp_count in warps for count in stages]
+    return tuple(tiles)
+
+
+def _covering(extent: int) -> int:
+    """The least power of two at least `extent`."""
+    return 1 << (max(extent, 1) - 1).bit_length()
+
+
+TRITON_CALIBRATED = {'block_m': (64, 256), 'block_n': (128, 256), 'block_k': (32, 128), 'stages': (2, 4)}
+"""The least and most of each tile axis the Triton sweeps measured (GMMT-a100, GMM-h100-2; the steps
+those of 16-bit operands): the region `_Triton.calibrated` holds its cost model to."""
+
+
+TPU_CALIBRATED_EXTENT = 4 * mosaic_tpu.LANES
+"""The longest axis of a TPU block the launches have taken (Megablox's default is 128 cubed), past which
+no measurement has calibrated the cost model (`_MosaicTpu.calibrated`)."""
+
+
+def tpu_blocks(extents: tuple[int, int, int]) -> tuple[mosaic_tpu.Blocks, ...]:
+    """Every block a TPU launch may take on a call whose `block_m`, `block_n` and `block_k` axes span
+    `extents`, from Mosaic TPU's facts alone (no table of blocks): each axis a vreg's lanes
+    (`mosaic_tpu.LANES`) doubled to its extent, smaller first where the cost model ties; a target's launch
+    keeps those whose buffers fit its scoped VMEM (`_MosaicTpu.fitting`)."""
+    axes = [_doubling(mosaic_tpu.LANES, max(_covering(extent), mosaic_tpu.LANES)) for extent in extents]
+    return tuple(mosaic_tpu.Blocks(block_m, block_n, block_k)
+                 for block_m in axes[0] for block_n in axes[1] for block_k in axes[2])
+
 
 INTERPRETED = plgpu.InterpretGPUParams(out_of_bounds_reads="uninitialized")
 """How a CPU interprets the Mosaic GPU launches: a read past an operand's rows, which a TMA load zeroes,
@@ -362,7 +418,11 @@ class _Triton(_GroupedLaunch[Tile]):
         """The depth and width a dense call's tiles divide."""
 
     def space(self, ba) -> tuple[Tile, ...]:
-        return TILES
+        return triton_tiles(ba.arguments['tokens'].dtype, *self._dense_extents(ba))
+
+    def calibrated(self, config: Tile) -> bool:
+        return all(least <= getattr(config, axis) <= most
+                   for axis, (least, most) in TRITON_CALIBRATED.items())
 
     def fitting(self, ba, target) -> tuple[Tile, ...]:
         """The tiles that fit `target` (`Template.fitting`) whose accumulator (two with `exact_sums`)
@@ -645,6 +705,11 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
                 and self._hooks_lower(ba, first, target)
                 and (self.EXACT_SUMS or not ba.arguments.get('exact_sums')))
 
+    def calibrated(self, config: mosaic_gpu.Tiles) -> bool:
+        return (max(config.block_m, config.block_n) <= mosaic_gpu.CALIBRATED_EXTENT
+                and config.stages <= mosaic_gpu.CALIBRATED_STAGES
+                and config.grid_block_n <= mosaic_gpu.CALIBRATED_BAND)
+
     @staticmethod
     def _family_tiles(tiles, target) -> tuple[mosaic_gpu.Tiles, ...]:
         """The tiles of `tiles` of `target`'s instruction family (its `effective` target's, a CPU
@@ -690,11 +755,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         sides = [2 * _side_tile_bytes((side,), (axes,), extents)
                  for side, axes in zip(epilogue_sides, hooks.epilogue_axes, strict=True)]
         barriers = 2 * config.stages * len(streams) + 2 * (len(epilogue_sides) + len(prologue_sides) + 1)
-        if config.family == 'mma.sync':
-            # Its pipeline's stages are scoped within the walk and each output's staging after it, so the
-            # block holds the larger (`mosaic_sm80.Mma.persist`).
-            return max(mosaic.allocated(*(config.stages * stream for stream in streams)),
-                       mosaic.allocated(max(staged)))
+        # mma.sync's too, though its output's staging is scoped after its pipeline's stages: Mosaic places
+        # both at once (an L4 refused 114688 bytes for a 98304-byte pipeline and its 16384-byte output,
+        # GEN4-gpu-l4).
         return (mosaic.allocated(*(config.stages * stream for stream in streams), *staged, *sides)
                 + mosaic.BARRIER_BYTES * barriers)
 
@@ -1014,6 +1077,9 @@ class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
                 and bool(self.space(ba)) and _hooks_lower(ba, first, rules)
                 and not ba.arguments.get('exact_sums'))
 
+    def calibrated(self, config: mosaic_tpu.Blocks) -> bool:
+        return max(config.block_m, config.block_n, config.block_k) <= TPU_CALIBRATED_EXTENT
+
     def fitting(self, ba, target) -> tuple[mosaic_tpu.Blocks, ...]:
         """The blocks whose double-buffered operands, outputs and accumulator fit the TPU's scoped VMEM
         (`Template.fitting`'s rule, VMEM for a block's shared memory)."""
@@ -1092,7 +1158,8 @@ class MosaicTpuGmm(_MosaicTpu):
     def space(self, ba) -> tuple[mosaic_tpu.Blocks, ...]:
         kernel = ba.arguments['kernel']
         depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
-        return tuple(blocks for blocks in TPU_BLOCKS
+        extents = (ba.arguments['tokens'].shape[0], width, depth)
+        return tuple(blocks for blocks in tpu_blocks(extents)
                      if depth % blocks.block_k == 0 and width % blocks.block_n == 0
                      and self._lays_out(ba, blocks))
 
@@ -1146,7 +1213,8 @@ class MosaicTpuTgmm(_MosaicTpu):
 
     def space(self, ba) -> tuple[mosaic_tpu.Blocks, ...]:
         depth, width = ba.arguments['tokens'].shape[1], ba.arguments['cotangent'].shape[1]
-        return tuple(blocks for blocks in TPU_BLOCKS
+        extents = (depth, width, ba.arguments['tokens'].shape[0])
+        return tuple(blocks for blocks in tpu_blocks(extents)
                      if depth % blocks.block_m == 0 and width % blocks.block_n == 0
                      and self._lays_out(ba, blocks))
 
