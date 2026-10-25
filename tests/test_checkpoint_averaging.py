@@ -158,3 +158,14 @@ def test_one_run_or_runs_of_other_models_do_not_average(tmp_path):
     other = trained(tmp_path / "other", 1, adapted=False, mlp_features=32)
     with pytest.raises(ValueError):
         averaged([run, other])
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float8_e4m3fn])
+def test_a_narrow_floating_leaf_averages_in_fp32(dtype):
+    """A leaf a run keeps in bf16 or float8, as a collection beside the parameters may, is floating
+    and averages in fp32, as the parameters do."""
+    from dew.checkpoints import _on_host, _taken
+
+    one, other = (_on_host(jnp.asarray(values, dtype)) for values in ([1, 3], [3, 6]))
+    assert one.dtype == np.float32
+    assert _taken(one, other, 2, "run", "first").tolist() == [2.0, 4.5]
