@@ -24,6 +24,8 @@ class Wgmma(mosaic.RingFamily):
     rows = 64
     consumers = 2
     role_rows = 64
+    widest_product = 256
+    most_shared = 227 * 1024  # sm90's (and sm100's) opt-in block
 
     @property
     def layout(self):

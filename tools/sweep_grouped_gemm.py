@@ -1,16 +1,17 @@
-"""Times every fitting config of the grouped GEMM's launches on this GPU, the records the cost model's
+"""Times every searched config of the grouped GEMM's launches on this GPU, the records the cost model's
 ranking test reads (tests/fixtures/gemm_sweeps/<generation>.json).
 
     python tools/sweep_grouped_gemm.py --out records.json [--implementations mosaic_gpu triton]
         [--products forward ...] [--shapes NAME ...]
 
 For each swept shape (the fixture's seven MoE projections) and product (forward, input_gradient,
-kernel_gradient, kernel_gradient_fp32), each launch's fitting configs (`Template.fitting` on this device's
-facts) are timed as the tuner times them (`tuning.measured`: compiled in parallel, each run after the L2
-is flushed, the device time CUPTI reads) on the fixture's draw, each checked against float32 host
-products. The output is the fixture's form: provenance (the device, jax and the commit) and one record a
-shape, product and implementation, its median times by config repr, the configs that failed apart, its
-worst error and the config the cost model picks.
+kernel_gradient, kernel_gradient_fp32), each launch's searched configs (`Template.searched` on this
+device's facts: the fitting ones its cost model is calibrated over) are timed as the tuner times them
+(`tuning.measured`: compiled in parallel, each run after the L2 is flushed, the device time CUPTI reads)
+on the fixture's draw, each checked against float32 host products. The output is the fixture's form:
+provenance (the device, jax and the commit) and one record a shape, product and implementation, its
+median times by config repr, the configs that failed apart, its worst error and the config the cost
+model picks.
 """
 
 from __future__ import annotations
