@@ -12,8 +12,10 @@ from reference_error import assert_as_exact, seeds_for
 
 from dew.optim import delta_gradient_descent, newton_schulz, scale_by_m3
 
-M3_FACTORS = {"beta1": 0.9, "beta2": 0.99, "beta3": 0.5, "alpha": 0.3, "eps": 1e-8, "frequency": 3}
-"""M3's factors in the proofs below: three updates a chunk, so seven updates close two chunks."""
+M3_FACTORS = {"beta1": 0.9, "beta2": 0.99, "beta3": 0.5, "alpha": 0.3, "eps": 1e-2, "frequency": 3}
+"""M3's factors in the proofs below: three updates a chunk, so seven updates close two chunks. An `eps`
+of 1e-2 keeps an entry whose early gradients are near zero from dividing its direction by a near-zero
+root, which would let one entry's rounding stand for a draw's whole error."""
 NESTED_SEEDS = 8
 """Check 1's declared seeds for M3's directions and delta gradient descent's step."""
 
@@ -96,13 +98,13 @@ def test_m3s_directions_are_algorithm_1s_across_its_chunks():
 
     def draw(seed):
         rng = np.random.default_rng(seed)
-        return ({"attention": {"kernel": rng.standard_normal((7, 6, 4)).astype(np.float32)},
-                 "head": rng.standard_normal((7, 4, 6)).astype(np.float32)},)
+        return ({"attention": {"kernel": rng.standard_normal((7, 16, 12)).astype(np.float32)},
+                 "head": rng.standard_normal((7, 12, 16)).astype(np.float32)},)
 
     def reference(gradients):
         return jax.tree.map(m3_directions, gradients)
 
-    seeds = seeds_for(reference, draw, "M3 directions", dew_fn=directions)
+    seeds = seeds_for(reference, draw, "M3 directions")
     assert_as_exact(directions, reference, draw, "M3 directions", seeds=seeds)
     (gradients,) = draw(0)
     gradients = gradients["head"]
