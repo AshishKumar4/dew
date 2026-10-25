@@ -366,7 +366,10 @@ def test_a_clipped_run_stores_its_stepped_kernels_times_the_clip():
     constant = optax.stateless(lambda updates, _: jax.tree.map(lambda g: jnp.full_like(g, step), updates))
     train = Trainer(objective_of(model), optax.chain(constant, scale_by_qk_clip(tau)),
                     key=jax.random.PRNGKey(7))
-    host = jax.device_get(train.initial_state())
+    initial = train.initial_state()
+    # The key as its bits, wrapped again each run: a key array reads back as the device array itself.
+    impl = jax.random.key_impl(initial.key)
+    host = jax.device_get(initial.replace(key=jax.random.key_data(initial.key)))
     roles = np.full((rows, 11), int(Role.ASSISTANT), np.int32)
     compiled = {}
 
@@ -383,8 +386,9 @@ def test_a_clipped_run_stores_its_stepped_kernels_times_the_clip():
         return params["layers_0"]["self_attn"]
 
     def trained(params, tokens):
-        # The step donates its state, so each run places its own copy, its key too.
-        state = jax.device_put(host.replace(variables={**host.variables, "params": params}), may_alias=False)
+        # The step donates its state, so each run places its own copy.
+        key = jax.random.wrap_key_data(host.key, impl=impl)
+        state = jax.device_put(host.replace(variables={**host.variables, "params": params}, key=key))
         if "step" not in compiled:
             compiled["step"] = train.compile(state, batch_of(tokens))
         after, *_ = compiled["step"](state, batch_of(tokens))
