@@ -1151,7 +1151,7 @@ Dew's seams today, for reference:
   (`scaled_dot_product_attention` in `src/dew/nn/attention.py`), which is
   where sinks and top-k masks go.
 - The decode cache is opened per module in the flax style
-  (`open_kv_cache` in `src/dew/nn/attention.py`).
+  (`open_kv_cache` in `src/dew/nn/kv_cache.py`).
 
 > 2026-09-22: this list describes Dew on 2026-09-02. The feed-forward can
 > be a `moe.SparseMLP`, `LAYER_TYPES` is gone and the mixer is a registry. See the
@@ -1213,7 +1213,7 @@ output gate.
 This is the step that needs a new cache kind: a conv state of shape
 `[B, conv_dim, kernel - 1]` and a recurrent state of shape
 `[B, heads, k_dim, v_dim]`, both written every step. Dew's
-`open_kv_cache` in `src/dew/nn/attention.py` is the place that has to
+`open_kv_cache` in `src/dew/nn/kv_cache.py` is the place that has to
 learn about non-KV state.
 
 Unlocks: Qwen3-Next, Qwen3.5, Qwen3.6, Qwen3.8 dense (with step 4),

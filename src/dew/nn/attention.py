@@ -51,7 +51,6 @@ from .kernels import decode_attention, generation, norm_swiglu
 from .kernels.generation import bf16_dot_runs, gpu_placed
 from .kernels.selection import forced, select, selected
 from .kernels.templates import attention as template, attention_route
-from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import (
     asks_default_precision,
     at_default_precision,
@@ -648,67 +647,6 @@ class GroupNorm(nn.Module):
         bias = self.param('bias', nn.initializers.zeros, width, self.param_dtype)
         return group_normalized(x, scale, bias, self.num_groups, self.epsilon, self.activation, self.dtype,
                                 canonicalize_dtype(x, scale, bias, dtype=self.dtype))
-
-
-def cache_positions(module: nn.Module, batch: int, length: int, valid):
-    """Allocate compact cache slots for real tokens, independently per row.
-
-    A row's tokens fill its slots in order, so the cursor alone says which
-    hold one (`cached_validity`)."""
-    valid = jnp.ones((batch, length), bool) if valid is None else jnp.asarray(valid, bool)
-    if valid.shape != (batch, length):
-        raise ValueError(f"cache validity must be {(batch, length)}, got {valid.shape}")
-    allocated = module.has_variable("cache", "cache_index")
-    index = module.variable("cache", "cache_index", jnp.zeros, (batch,), jnp.int32)
-    positions = index.value[:, None] + jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
-    positions = jnp.where(valid, positions, -1)
-    if allocated:
-        index.value = index.value + jnp.sum(valid, axis=1, dtype=jnp.int32)
-    return positions, allocated
-
-
-def cached_validity(module: nn.Module, length: int) -> jax.Array:
-    """Which of `module`'s `length` cache slots hold a token, `[rows, length]`:
-    those before the row's cursor, which `cache_positions` fills in order.
-
-    Derived where it is read rather than stored beside the cursor, so a
-    decode step writes no `[rows, capacity]` copy of it a layer: 28 kernels
-    a step on Qwen3-0.6B, 0.6% of a 32-slot serving step on an RTX 4080
-    (docs/performance.md)."""
-    return filled_slots(module.get_variable("cache", "cache_index"), length)
-
-
-_DEFAULT_CACHE = KVCache()
-
-
-def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KVCache = _DEFAULT_CACHE,
-                  value_dim: int | None = None, places: bool = False, groups: tuple[str, ...] = ()):
-    """Fixed-size K/V with a cursor and cached validity for each batch row.
-
-    Returns [B, S] compact slot positions and a writer. Invalid tokens have
-    position -1 and do not advance the cursor. The allocation-only call leaves
-    every row empty. The writer returns full cache arrays, including unused
-    slots which the caller excludes with `cached_validity`. `layout` chooses the
-    storage behind the slots, dense or paged, full or quantized
-    (`dew.nn.kv_cache`); the slots and the cursor are the same for all. Values
-    are `value_dim` wide, None for the keys' width. `places` also keeps each
-    token's place beside its key (`dew.nn.kv_cache.Append.places`), and
-    `groups` its groups of the fields named (`Append.groups`).
-    """
-    shards = sequence_shards()
-    if shards > 1:
-        raise LayoutRefused(
-            f"decoding is not supported under a sequence axis of {shards}: the KV "
-            "cache holds whole sequences. Generate on a mesh with sequence=1.")
-    if max_seq_len is None:
-        raise ValueError("decoding needs max_seq_len for its fixed-capacity cache")
-    batch, length, heads, head_dim = key.shape
-    if valid is None and length > max_seq_len:
-        raise ValueError(f"{length} tokens do not fit a KV cache of {max_seq_len}.")
-    store = KVStore.open(module, layout, batch, max_seq_len, heads, head_dim, key.dtype, value_dim=value_dim,
-                         places=places, groups=groups)
-    positions, allocated = cache_positions(module, batch, length, valid)
-    return positions, Append(store, positions, allocated)
 
 
 def _pad_rows(x, rows: int):
