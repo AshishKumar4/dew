@@ -699,7 +699,7 @@ def clipped_run(obj, batch, limit):
                 **example_fields(initial, 0, 1, batch))
     start = jax.tree.map(np.asarray, initial.variables)
     opt_state = jax.tree.map(np.asarray, initial.opt_state)
-    passes = sown_passes(obj, jax.tree.map(jnp.asarray, start), batch, step)
+    passes = jax.jit(sown_passes, static_argnums=(0,))(obj, jax.tree.map(jnp.asarray, start), batch, step)
     final, *_ = train.compile(initial, batch)(initial, batch)
     return start, opt_state, passes, jax.tree.map(np.asarray, final.variables), int(final.updates)
 
