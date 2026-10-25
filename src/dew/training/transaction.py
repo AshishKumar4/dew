@@ -231,15 +231,20 @@ def _all_finite(tree) -> jax.Array:
 
 
 def compact_qk(tree):
-    """Reduce every sowed `max_logits` leaf over its rows, keeping the heads.
+    """Reduce every sowed `max_logits` leaf over its rows, keeping the heads, and a layer's geometry
+    (`kv_heads`, `head_dim`, `qk_nope`) to the one count it is.
 
     The clip reads each head's strongest logit alone, so a retained window
-    holds one row per layer instead of the batch's.
+    holds one row per layer instead of the batch's. A pipelined layer sows
+    its geometry once a microbatch (`StackView`), the same count each time,
+    and the clip reads it as one.
     """
     def compact(path, leaf):
         is_maximum = any(isinstance(entry, jax.tree_util.DictKey) and entry.key == "max_logits"
                          for entry in path)
-        return jnp.max(leaf, axis=-2, keepdims=True) if is_maximum and leaf.ndim > 1 else leaf
+        if is_maximum:
+            return jnp.max(leaf, axis=-2, keepdims=True) if leaf.ndim > 1 else leaf
+        return jnp.max(leaf) if leaf.ndim else leaf
     return jax.tree_util.tree_map_with_path(compact, tree)
 
 
