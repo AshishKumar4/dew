@@ -1239,12 +1239,14 @@ def source_route(config: Mapping[str, object], *,
                  admitted: Callable[[verify.Unmapped], Admitted] | None = None) -> SourceRoute:
     """The route `Pretrained.load` reads `config`'s source by, or the refusal it raises for it, on the
     config alone: a storage format the codecs cannot decode, a registered family's or wrapper's own
-    refusal of the config (`decoder_parts.DrafterRefused` among them), or an unregistered model_type
-    no registered family's convention computes and tier 3 does not run (`torchax_fallback.admitted`).
+    refusal of the config, a speculative drafter of any model_type (`decoder_parts.DrafterRefused`),
+    or an unregistered model_type no registered family's convention computes and tier 3 does not run
+    (`torchax_fallback.admitted`; tier 3 reads float weights only).
     `verified` checks an unregistered decoder against transformers (`verify.verify_mapping`), and
     `admitted` decides whether tier 3 runs one it leaves unmapped (`torchax_fallback.admitted` when
     None); a census over many configs passes a memo of each."""
     source_quantization(config)
+    decoder_parts.refuse_drafter(config)
     family = config.get("model_type")
     if family == "diffusion_gemma":
         return DiffusionGemmaRoute()
@@ -1255,9 +1257,10 @@ def source_route(config: Mapping[str, object], *,
             case verify.VerifiedMapping() as mapping:
                 return VerifiedRoute(mapping)
             case verify.Unmapped() as unmapped:
-                if admitted is None:
-                    from dew.interop.torchax_fallback import admitted
-                return TorchRoute(admitted(unmapped))
+                from dew.interop import torchax_fallback
+
+                torchax_fallback.refuse_quantized(config)
+                return TorchRoute((admitted or torchax_fallback.admitted)(unmapped))
     return DecoderRoute(decoders.translate_config(config))
 
 

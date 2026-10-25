@@ -11,11 +11,11 @@ architectures, or why no config was read (gated, missing). `classify`
 sorts every model into the route that loads it: a registered family (tier
 1, `hf_decoders.translate_config` or the wrapper table), a registered
 family's verified convention (tier 2, `verify.verify_mapping` on the shrunk
-config, no weights; run once per model_type), transformers' own forward run
-by torchax (tier 3, `torchax_fallback.admitted` on the same shrunk config,
-once per model_type), a GGUF repo's stub config, a refusal with its reason,
-or a refusal by design (`DrafterRefused`, a speculative drafter that is no
-model on its own). Types
+config, no weights), transformers' own forward run by torchax (tier 3,
+`torchax_fallback.admitted` on the same shrunk config), each run once per
+model_type and computational config (`_probed`), a GGUF repo's stub config,
+a refusal with its reason, or a refusal by design (`DrafterRefused`, a
+speculative drafter that is no model on its own). Types
 transformers does not know (remote code only) have no reference to verify
 against and are counted apart. The shares are of downloads, over all types
 and over the most downloaded 200 and 50. Writes coverage.json.
@@ -55,6 +55,20 @@ def census(out: Path, limit: int) -> None:
         print(len(rows), row["id"], row.get("model_type", row.get("unread")), flush=True)
     out.mkdir(parents=True, exist_ok=True)
     (out / "census.json").write_text(json.dumps(rows))
+
+
+ROUTES = ("tier 1", "tier 2", "tier 3", "gguf", "refused", "by design", "remote code")
+"""Every route `_route` sorts a model into, which each summary counts."""
+
+
+def _probed(config: dict) -> tuple[str, str]:
+    """The key a probe's verdict is kept under: the model_type and the config's computational fields,
+    those past `decoder_parts.IGNORED_FIELDS` (ids, metadata), so two configs of a type that compute
+    alike share one probe and two that differ (BERT as a decoder and as an encoder) do not."""
+    from dew.interop import decoder_parts
+
+    computed = {key: value for key, value in config.items() if key not in decoder_parts.IGNORED_FIELDS}
+    return config["model_type"], json.dumps(computed, sort_keys=True, default=str)
 
 
 class NoReference(ValueError):
@@ -114,39 +128,41 @@ def classify(out: Path) -> None:
 
     from dew.interop import verify
 
-    probed: dict[str, VerifiedMapping | Unmapped | tuple[type[Exception], tuple]] = {}
-    admissions: dict[str, Admitted | tuple[type[Exception], tuple]] = {}
+    probed: dict[tuple[str, str], VerifiedMapping | Unmapped | tuple[type[Exception], tuple]] = {}
+    admissions: dict[tuple[str, str], Admitted | tuple[type[Exception], tuple]] = {}
 
     def admitted(unmapped: Unmapped) -> Admitted:
-        """`torchax_fallback.admitted`, once per model_type, its decision or its refusal reused after
-        as `verified` reuses its own."""
+        """`torchax_fallback.admitted`, once per shrunken config (`_probed`), its decision or its refusal
+        reused after as `verified` reuses its own."""
         from dew.interop import torchax_fallback
 
-        if unmapped.model_type not in admissions:
+        key = _probed({**unmapped.fields, "model_type": unmapped.model_type})
+        if key not in admissions:
             try:
-                admissions[unmapped.model_type] = torchax_fallback.admitted(unmapped)
+                admissions[key] = torchax_fallback.admitted(unmapped)
             except (KeyError, ValueError, TypeError) as error:
-                admissions[unmapped.model_type] = (type(error), error.args)
-        found = admissions[unmapped.model_type]
+                admissions[key] = (type(error), error.args)
+        found = admissions[key]
         if isinstance(found, tuple):
             kind, arguments = found
             raise kind(*arguments)
         return found
 
     def verified(config: dict) -> VerifiedMapping | Unmapped:
-        """`verify.verify_mapping`, run once per model_type on its most downloaded model that no
-        registered family reads (the rows come ranked), its mapping or its refusal reused after; a
-        refusal is kept as its type and arguments, not the probe's frames, and raised afresh."""
+        """`verify.verify_mapping`, run once per model_type and computational config (`_probed`), its
+        mapping, verdict or refusal reused after; a refusal is kept as its type and arguments, not the
+        probe's frames, and raised afresh."""
         model_type = config["model_type"]
         if model_type not in CONFIG_MAPPING:
             # Asked only once the loader has passed the storage format and the registered families.
             raise NoReference(model_type)
-        if model_type not in probed:
+        key = _probed(config)
+        if key not in probed:
             try:
-                probed[model_type] = verify.verify_mapping(config)
+                probed[key] = verify.verify_mapping(config)
             except (KeyError, ValueError, TypeError) as error:
-                probed[model_type] = (type(error), error.args)
-        found = probed[model_type]
+                probed[key] = (type(error), error.args)
+        found = probed[key]
         if isinstance(found, tuple):
             kind, arguments = found
             raise kind(*arguments)
@@ -174,7 +190,7 @@ def classify(out: Path) -> None:
         summary[scope] = {route: {"models": sum(model["route"] == route for model in scoped),
                                   "download_share": sum(model["downloads"] for model in scoped
                                                         if model["route"] == route) / downloads}
-                          for route in ("tier 1", "tier 2", "gguf", "refused", "by design", "remote code")}
+                          for route in ROUTES}
     report = [{"model_type": name, "downloads": entry["downloads"], "share": entry["downloads"] / total,
                "models": entry["models"], "routes": dict(entry["routes"]),
                "detail": next((model["detail"] for model in models

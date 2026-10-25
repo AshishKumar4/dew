@@ -174,10 +174,11 @@ class _Sizes:
         return self.keys.get(name, name)
 
     def given(self, name: str) -> int | None:
-        """The size `name` as the config states it under its own key, else None; a stated size that is
-        no whole number is a ValueError."""
-        if self.key(name) in self.config:
-            return records.integer(self.config[self.key(name)], self.key(name))
+        """The size `name` as the config states it under its own key or the standard one, which its
+        class reads alike, else None; a stated size that is no whole number is a ValueError."""
+        for spelled in (self.key(name), name):
+            if spelled in self.config:
+                return records.integer(self.config[spelled], spelled)
         return None
 
     def stated(self, name: str) -> int:
@@ -212,8 +213,11 @@ def shrink(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     small_kv = min(kv_heads, 2)
     small_heads = small_kv * (heads // kv_heads)
     small_hidden = small_heads * _HEAD_DIM * (1 if hidden == heads * head_dim else 2)
+    # Each spelled size is written once, under the config's own key: a standard name its class
+    # aliases (`_SPELLED`) would set the size again over it.
+    aliases = {name for name in _SPELLED if key(name) != name}
     fields = {key: value for key, value in hf_config.items()
-              if key not in _PROBE_DROPPED and key != 'model_type'}
+              if key not in _PROBE_DROPPED and key != 'model_type' and key not in aliases}
     fields.update({key('hidden_size'): small_hidden, key('num_attention_heads'): small_heads,
                    key('intermediate_size'): 2 * small_hidden, key('vocab_size'): _VOCAB})
     # A routed or latent-attention type keeps its structure at small widths:
@@ -459,7 +463,7 @@ def verify_mapping(hf_config: Mapping[str, object]) -> VerifiedMapping | Unmappe
                                "by") from error
         config, size, name = _reference_config(model_type, fields)
         # A candidate that builds another architecture is dismissed on its
-        # parameter count before the reference is allocated or run.
+        # parameter count before its own model is run.
         sized = []
         for convention, family in candidates:
             try:
@@ -472,18 +476,20 @@ def verify_mapping(hf_config: Mapping[str, object]) -> VerifiedMapping | Unmappe
             else:
                 reasons[convention] = (f"{name} holds {size} parameters at the probe's sizes where "
                                        f"{convention}'s model holds {expected_size}")
-        if sized:
-            import torch
-            from transformers import AutoModelForCausalLM
+        import torch
+        from transformers import AutoModelForCausalLM
 
-            try:
-                reference = AutoModelForCausalLM.from_config(config, trust_remote_code=False,
-                                                             dtype=torch.float32)
-                scatter_weights(reference)
-                expected = reference_logits(reference, probe_ids(_VOCAB).astype(np.int64))
-            except Exception as error:
-                raise _unavailable(model_type, f"{name} does not run its shrunken config "
-                                   f"({type(error).__name__}: {error})") from error
+        # The probe runs whether or not a candidate is left, so a type no convention computes is
+        # one whose shrunken model ran (`Unmapped`), and one whose model does not run is
+        # `ProbeUnavailable`, whatever the candidates.
+        try:
+            reference = AutoModelForCausalLM.from_config(config, trust_remote_code=False, dtype=torch.float32)
+            scatter_weights(reference)
+            expected = reference_logits(reference, probe_ids(_VOCAB).astype(np.int64))
+        except Exception as error:
+            raise _unavailable(model_type, f"{name} does not run its shrunken config "
+                               f"({type(error).__name__}: {error})") from error
+        if sized:
             with tempfile.TemporaryDirectory() as scratch:
                 reference.save_pretrained(scratch)
                 for convention, family, model, record, inert in sized:
