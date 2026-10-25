@@ -678,8 +678,11 @@ def test_runs_that_share_a_head_average_their_weights_in_fp32_as_float64_does(de
     assert np.array_equal(np.asarray(mean["w"]), np.full(4, biggest))
     opposite = _running_mean({"w": jnp.full(4, -biggest)}, {"w": jnp.full(4, biggest)}, 2, "run", "first")
     assert np.array_equal(np.asarray(opposite["w"]), np.zeros(4, np.float32))
-    calibrated = Decide.averaged(runs[:2], calibrate_on=answered())
+    # Enough held-out answers that every question kind clears its calibration minimum (TYPE_MINIMUM).
+    held_out = answered() * 10
+    calibrated = Decide.averaged(runs[:2], calibrate_on=held_out)
     assert calibrated.calibration != Calibration()
+    assert calibrated.calibration == two.calibrated(held_out).calibration
 
 
 def test_runs_whose_heads_started_apart_do_not_average(decide, tmp_path):
