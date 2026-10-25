@@ -38,6 +38,7 @@ from dew.nn.inputs import (
     ModelInputs,
     PredictionPhase,
     Request,
+    host_rows,
     local_rows,
     mesh_of,
     next_position,
@@ -317,7 +318,7 @@ class Generation(Generic[ArrayT]):
 
     def host(self) -> Generation[np.ndarray]:
         """Return this process's real rows as host arrays, without the padding rows that fill the devices."""
-        return jax.tree.map(lambda leaf: local_rows(leaf)[:self.rows], self)
+        return jax.tree.map(lambda leaf: host_rows(leaf, self.rows), self)
 
     @functools.cached_property
     def text(self) -> tuple[str, ...]:

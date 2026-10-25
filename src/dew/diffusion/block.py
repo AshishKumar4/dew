@@ -28,6 +28,7 @@ from dew.nn.inputs import (
     ModelInputs,
     Request,
     continuation_keys,
+    host_rows,
     local_rows,
     mesh_of,
     next_position,
@@ -73,7 +74,7 @@ class CanvasGeneration(Generic[ArrayT]):
     def host(self) -> CanvasGeneration[np.ndarray]:
         """This process's real rows as host arrays, without the padding a
         row plan added to fill the devices."""
-        return jax.tree.map(lambda leaf: local_rows(leaf)[:self.rows], self)
+        return jax.tree.map(lambda leaf: host_rows(leaf, self.rows), self)
 
     @functools.cached_property
     def text(self) -> tuple[str, ...]:
