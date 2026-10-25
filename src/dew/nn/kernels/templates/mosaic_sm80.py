@@ -261,10 +261,9 @@ class Mma(mosaic.Family):
 
     def register_products(self, acc, parts, rhs, interpret: bool):
         del interpret
-        mosaic.unscaled(parts)
         operand = plgpu.load(rhs, layout=self.rhs)
-        for part, _ in parts:
-            acc = plgpu.mma(acc, self._left(part), operand)
+        for formed in parts:
+            acc = plgpu.mma(acc, self._left(mosaic.unscaled_part(formed)), operand)
         return acc
 
     def staged_products(self, acc, parts, rhs, buffers, interpret: bool, *, transposed: bool = False):
