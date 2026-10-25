@@ -13,15 +13,15 @@ MESH_DEVICES = 8
 
 
 DETERMINISTIC_OPS = "--xla_gpu_deterministic_ops=true"
-"""Under it a process keeps no XLA picks (`dew.cache.enable_compilation_cache`) and XLA refuses cudnn
-attention (openxla/xla#46500)."""
+"""Under it a process keeps no picks (`dew.cache.keeps_picks`) and XLA refuses cudnn attention
+(openxla/xla#46500)."""
 
 REPEATABLE_GPU_FLAGS = (DETERMINISTIC_OPS, "--xla_gpu_autotune_level=0", "--xla_gpu_enable_triton_gemm=false")
 """The cuda lane's flags for steps repeatable across processes. Deterministic
 ops order the reductions; autotuning off leaves every cuBLAS and cuDNN call
 the configuration it was emitted with, so no process chooses one; and such
-a run keeps no stored picks (`dew.cache.enable_compilation_cache`), which
-XLA would take instead. Deterministic ops take Triton out of the GEMM
+a run keeps no stored picks (`dew.cache.keeps_picks`), which XLA and Dew's
+kernels would take instead. Deterministic ops take Triton out of the GEMM
 configurations (`GetEnabledBackends` in
 xla/service/gpu/autotuning/config_assigner_pass.cc) while XLA still fuses
 dots for Triton, and the mean-flow hybrid DiT's jvp dot over a

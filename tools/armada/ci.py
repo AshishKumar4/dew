@@ -850,8 +850,8 @@ EXHAUSTED = re.compile(r"(?:[\w.]+\.)?(?:XlaRuntimeError|JaxRuntimeError|Runtime
 """An exception that is the GPU's device memory running out, as pytest gives it: XLA's runtime error whose
 status is RESOURCE_EXHAUSTED for an allocation (out of memory, or a failed allocation), or the CUDA driver's
 out-of-memory error, raised as such. A block past the GPU's own resources (XLA's RESOURCE_EXHAUSTED for a
-shared memory size limit) is none, as no larger share helps it; nor is an assertion, whatever its message
-says."""
+shared memory size limit, as `dew.nn.kernels.tuning` reads it) is none, as no larger share helps it; nor is an
+assertion, whatever its message says."""
 
 
 def exhausted(failure: str | None) -> bool:

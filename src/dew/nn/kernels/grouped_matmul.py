@@ -654,6 +654,21 @@ class _Mosaic(base.Template[mosaic_gpu.Tiles]):
                                   multiprocessors=_multiprocessors(generation.effective(target)),
                                   holds=lambda tile: self.legal(ba, tile, target), grouped=depth is not None)
 
+    def neighbours(self, ba, config: mosaic_gpu.Tiles) -> tuple[mosaic_gpu.Tiles, ...]:
+        # The derived tile with one of its choices moved a step either way: a stage more or fewer, the
+        # band halved or doubled, the columns or the rows the next block either side (a column unit, a
+        # role of rows).
+        family = _bundle(config, ba.arguments['tokens'].dtype)
+        unit = family.column_unit(ba.arguments['tokens'].dtype)
+        role = family.role_rows * config.warpgroups
+        band = config.grid_block_n
+        moves = [{'stages': config.stages - 1}, {'stages': config.stages + 1},
+                 {'grid_block_n': max(1, band // 2)}, {'grid_block_n': band * 2},
+                 {'block_n': config.block_n - unit}, {'block_n': config.block_n + unit},
+                 {'block_m': config.block_m - role}, {'block_m': config.block_m + role}]
+        return tuple(dataclasses.replace(config, **move) for move in moves
+                     if min(move.values()) > 0 and dataclasses.replace(config, **move) != config)
+
     def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         """Whether `config` runs the call on `target` (`Template.legal`): of the launch's family there, in
         its granularity (whole roles of rows for each consumer, whole column units, one of its depths, at
@@ -1051,6 +1066,12 @@ class _MosaicTpu(base.Template[mosaic_tpu.Blocks]):
             axis = max(halved, key=lambda axis: blocks[axis])
             blocks[axis] //= 2
         return config
+
+    def neighbours(self, ba, config: mosaic_tpu.Blocks) -> tuple[mosaic_tpu.Blocks, ...]:
+        # The derived blocks with one axis halved or doubled.
+        return tuple(dataclasses.replace(config, **{name: value})
+                     for name in ('block_m', 'block_n', 'block_k')
+                     for value in (getattr(config, name) // 2, getattr(config, name) * 2) if value > 0)
 
     def _least_blocks(self, ba) -> list[int]:
         """The least block of each axis (`block_m`, `block_n`, `block_k`): a vreg's lanes, or the row of

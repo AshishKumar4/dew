@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from dew.config import RETIRED, ObjectiveConfig, RunConfig
+from dew.config import ObjectiveConfig, RunConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.config.jepa import JepaRunConfig
 from dew.config.lm import LMRunConfig
@@ -67,11 +67,10 @@ def changed(written, held, at: str = "") -> list[str]:
 def test_the_published_run_reads_back_as_it_was_written(live):
     """dewml/hybrid-dit-176m's run.json, as the revision the live image pins
     publishes it, is a current record: every field it states loads and writes
-    back as it states it. A field added since is written beside them, and one
-    retired since (`dew.config.RETIRED`) reads and is not written back; a
-    rename, another removal or a rewrite fails here, and the fix is to
-    re-export the published run in the same change, since the site, the quick
-    start and the live sampler all load it."""
+    back as it states it. A field added since is written beside them; a
+    rename, a removal or a rewrite fails here, and the fix is to re-export the
+    published run in the same change, since the site, the quick start and the
+    live sampler all load it."""
     held = json.loads(PUBLISHED.read_text())
     if live:
         from huggingface_hub import hf_hub_download
@@ -79,32 +78,10 @@ def test_the_published_run_reads_back_as_it_was_written(live):
         repo, revision = LIVE_PIN.read_text().strip().split("@")
         published = Path(hf_hub_download(repo, "run.json", revision=revision))
         assert json.loads(published.read_text()) == held
-    current = json.loads(json.dumps(held))
-    for name, fields in RETIRED.items():
-        current["fields"][name] = {field: value for field, value in current["fields"][name].items()
-                                   if field not in fields}
-    assert changed(json.loads(json.dumps(RunConfig.read(held).record())), current) == []
+    assert changed(json.loads(json.dumps(RunConfig.read(held).record())), held) == []
     stated = held["fields"]["objective"]["fields"]
     built = RunConfig.read(held).objective.arguments
     assert (built["guidance"], built["steps"]) == (stated["guidance"], stated["steps"])
-
-
-def test_a_saved_runs_retired_field_reads_in_either_encoding_and_a_fresh_run_refuses_it():
-    """A saved run's `trainer.tune_kernels` (`RETIRED`) reads through `RunConfig.read`, the saved run's
-    reader, and resumes through it (`check_resume`), whether its trainer is a plain mapping of fields or
-    a class record (as a TrainerConfig subclass's is written); a run's own fields stating it are
-    refused, the field gone."""
-    held = json.loads(PUBLISHED.read_text())
-    assert "tune_kernels" in held["fields"]["trainer"]
-    as_class = json.loads(json.dumps(held))
-    as_class["fields"]["trainer"] = {"class": "dew.config:TrainerConfig", "fields": held["fields"]["trainer"]}
-    run = RunConfig.read(held)
-    assert RunConfig.read(as_class).trainer == run.trainer
-    # Resuming reads the saved record as a saved run's too: the same run resumes from either encoding.
-    run.check_resume(held)
-    run.check_resume(as_class)
-    with pytest.raises(ValueError):
-        type(run).from_dict({**run.to_dict(), "trainer": held["fields"]["trainer"]})
 
 
 LAYOUT = ROOT / "tests" / "fixtures" / "runs" / "hybrid-dit-176m" / "layout.json"
