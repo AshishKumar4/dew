@@ -32,7 +32,7 @@ from dew.data.text import HFTokenizer
 from dew.decision.head import DecisionHead, JointSchemaHead
 from dew.decision.laya import LAYA, LayaCheckpoint
 from dew.decision.layout import Framing, Layout, Schema, Segment, default_layout
-from dew.decision.model import DecisionModel
+from dew.decision.model import ContextEncoder, DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
@@ -128,13 +128,19 @@ class DecisionRunConfig(RunConfig):
     None keeps the layout's own, the tokenizer's template with thinking off."""
     context_layers: tuple[int, ...] | None = None
     """The backbone layers that read each example's context (`Example.context`)
-    through gated cross-attention, the context embedded by the backbone's own
-    token table; the blocks train from zero gates beside the head, the loaded
-    backbone frozen (`Pretrained.with_cross_attention`), with `lora` its adapter
-    beside them. None reads no context."""
+    through gated cross-attention, the context encoded as `context_encoder` says;
+    the blocks train from zero gates beside the head, the loaded backbone frozen
+    (`Pretrained.with_cross_attention`), with `lora` its adapter beside them. None
+    reads no context."""
     context_length: int = 256
-    """The most tokens of an example's context the cross-attention reads, its
-    first; with `context_layers` alone."""
+    """The most tokens of an example's context the cross-attention reads; an
+    example with a longer context refuses the run where its data reads it,
+    before training for data read into memory, as a request with one is
+    refused. With `context_layers` alone."""
+    context_encoder: ContextEncoder = "table"
+    """How a context becomes the states its cross-attention reads
+    (`DecisionModel.context_encoder`): the backbone's token table, or the
+    backbone's own pass over it. With `context_layers` alone."""
     def prepare(self) -> Prepared:
         """The objective over the backbone `pretrained` names, on the table's
         or the mixture's rows, scored on the held-out ones, which calibrate the
@@ -158,7 +164,11 @@ class DecisionRunConfig(RunConfig):
         if in_context and self.context_layers is None:
             raise ValueError("a schema read as the row's context is read by context layers; set "
                              "--context-layers")
+        if self.context_encoder != "table" and self.context_layers is None:
+            raise ValueError("--context-encoder says how context layers read a context; set --context-layers")
         derived = {}
+        if self.context_layers is not None:
+            derived["context_encoder"] = self.context_encoder
         if LayaCheckpoint.exists(self.pretrained, subfolder=self.subfolder, revision=self.revision):
             if any(choice is not None for choice in (self.lora, self.head, self.loop_steps,
                                                     self.loop_layers, self.loop_backprop_steps,
