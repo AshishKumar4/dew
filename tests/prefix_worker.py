@@ -32,28 +32,28 @@ def mode_prefix_generation(args) -> dict:
     model = block_model(1, full_attention={"mixer": AttentionMixer(bidirectional_blocks=True)})
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     placed = place(params, MeshSpec(fsdp=args.fsdp_size), Layout(min_shard=TINY))
-    mesh = mesh_of(placed)
     task = TextGeneration(model, placed, prefix=3)
     prompts, lengths = continuation_prompts()
-    rows = len(prompts) // processes
-    local = slice(rank * rows, (rank + 1) * rows)
     mask = np.arange(prompts.shape[1])[None, :] >= prompts.shape[1] - lengths[:, None]
 
-    def request(chosen):
-        placed_rows = shard_batch(mesh, {"ids": prompts[chosen][local], "mask": mask[chosen][local]})
-        return ModelInputs(placed_rows["ids"], {"attention_mask": placed_rows["mask"]})
+    def share(chosen):
+        rows = len(chosen) // processes
+        return chosen[rank * rows:(rank + 1) * rows]
 
-    # Rows 0-2 and 4 hold at least three real tokens; rows 3 and 5, both in rank 1's share of the six, fewer.
-    result = task(request(np.asarray([0, 1, 2, 4, 0, 2])), 3, key=7).host()
+    # Rows 0-2 and 4 hold at least three real tokens: served as one global array, each process placing its
+    # share. Rows 3 and 5 hold fewer, both in rank 1's half of the six, which each process hands in as its
+    # own rows.
+    served = share(np.asarray([0, 1, 2, 4]))
+    placed_rows = shard_batch(mesh_of(placed), {"ids": prompts[served], "mask": mask[served]})
+    result = task(ModelInputs(placed_rows["ids"], {"attention_mask": placed_rows["mask"]}), 3, key=7).host()
+    own = share(np.arange(len(prompts)))
     try:
-        task(request(np.arange(len(prompts))), 3, key=7)
-    except ValueError as failure:
+        task(ModelInputs(jnp.asarray(prompts[own]), {"attention_mask": jnp.asarray(mask[own])}), 3, key=7)
+    except ValueError:
         refused = True
-        del failure
     else:
         refused = False
-    return {"rows": rows, "tokens": result.tokens.tolist(), "lengths": result.lengths.tolist(),
-            "refused": refused}
+    return {"tokens": result.tokens.tolist(), "lengths": result.lengths.tolist(), "refused": refused}
 
 
 MODES = {"prefix_generation": mode_prefix_generation}
