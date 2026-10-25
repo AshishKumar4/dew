@@ -788,6 +788,13 @@ class TrainerConfig:
     compile of the whole step still needs one. The program exits with status
     0 once the step lowers, and opens no W&B run.
     """
+    tune_kernels: bool = False
+    """Measure each Pallas launch of the step that has no config measured on this GPU.
+
+    Only a process with the GPU to itself measures, and the picks persist beside
+    the compilation cache for every later run. Unset, such a launch runs the
+    nearest measured shape's config or its heuristic, and the run says how many.
+    """
 
     def accumulating(self, dataset: Loader) -> Self:
         """This config with the accumulation its token budget sets over `dataset`'s token batches:
@@ -996,26 +1003,6 @@ def _chain_label(chain: Dataset | None) -> str:
 
 _CHAINS = ("data", "validation")
 """A run's fields that hold chains, which its record writes through the data's codec (`_chain_record`)."""
-
-RETIRED = {"trainer": frozenset({"tune_kernels"})}
-"""The fields a saved run's record written before their removal may hold, by the run's field they sit in,
-which reading the record (`RunConfig.read`) drops, its field's value a plain mapping of fields or a class
-record: `trainer.tune_kernels`, the opt-in kernel tuner's switch, removed with the tuner. The one
-translation of a saved run's record (BIBLE §1), deleted at 1.0."""
-
-
-def _unretired(fields: Mapping[str, object]) -> Mapping[str, object]:
-    """A saved run's fields with each `RETIRED` field dropped from the field holding it."""
-    current = dict(fields)
-    for name, retired in RETIRED.items():
-        held = current.get(name)
-        if not isinstance(held, Mapping):
-            continue
-        named = registry.class_record(held)
-        values = held if named is None else named[1]
-        kept = {field: value for field, value in values.items() if field not in retired}
-        current[name] = kept if named is None else {"class": named[0], "fields": kept}
-    return current
 
 
 def _chain_record(value: Dataset | Mapping[str, Dataset] | None) -> JSON:
@@ -1314,14 +1301,14 @@ class RunConfig:
         """Refuse to resume the run whose record is `saved` as this one where they train different
         things: another class, or a field outside `RESUMABLE` that differs. A changed `rope_theta`
         keeps every shape, so it would otherwise continue the old weights under new semantics. The
-        saved fields are read back as a saved run's are (`read`), so a field the record predates takes
-        its default and one retired since is dropped."""
+        saved fields are read back as this class reads them (`from_dict`), so a field the record
+        predates takes its default."""
         named = registry.class_record(saved)
         if named is None or registry.runs[named[0]] is not type(self):
             raise ValueError(f"the run to resume is no {type(self).__name__}; resume it as the run it "
                              "records, or train under another name")
-        fields = {name: value for name, value in named[1].items() if name not in _CHAINS}
-        recorded = type(self).read({"class": named[0], "fields": fields})
+        recorded = type(self).from_dict({name: value for name, value in named[1].items()
+                                         if name not in _CHAINS})
         before, now = recorded._fields_record(), self._fields_record()
         changed = sorted(name for name in now.keys() | before.keys()
                          if name not in self.RESUMABLE and now.get(name) != before.get(name))
@@ -1420,8 +1407,7 @@ class RunConfig:
     @classmethod
     def read(cls, record: Mapping[str, object], *, trust: Sequence[str] = ()) -> Self:
         """The run a class record (`record`) names, as its class, which must be
-        this one or derive from it, a field retired since a saved run wrote it
-        dropped (`RETIRED`)."""
+        this one or derive from it."""
         if record.get("rebuildable") is False:
             raise ValueError("this run was defined in Python, so no record rebuilds it; it loads for "
                              "inference through dew.pipeline or a task's from_run")
@@ -1432,7 +1418,7 @@ class RunConfig:
         run_class = registry.runs[named[0]]
         if not (isinstance(run_class, type) and issubclass(run_class, cls)):
             raise ValueError(f"the record names {named[0]}, which is no {cls.__name__}")
-        return run_class.from_dict(_unretired(named[1]))
+        return run_class.from_dict(named[1])
 
     def prepare(self) -> Prepared:
         """Build what this run trains: the objective its record names around
@@ -1575,7 +1561,7 @@ class RunConfig:
             agreed("run resume", check_resumed)
             agreed("run metadata", record_run)
             # The trainer holds mesh, microbatches, layout, accumulation, split,
-            # dynamic_scale and profile; prepare_process read the
+            # dynamic_scale, profile and tune_kernels; prepare_process read the
             # process fields, and the rest are fit's arguments or built the
             # checkpoints and the tracker.
             state = Trainer(
@@ -1583,6 +1569,7 @@ class RunConfig:
                 microbatches=trainer.microbatches, layout=trainer.layout, accumulation=trainer.accumulation,
                 split=trainer.split, dynamic_scale=trainer.dynamic_scale, checkpoints=checkpoints,
                 tracker=tracker, rollout=rollout, profile=trainer.profile, lower_for=trainer.lower_for,
+                tune_kernels=trainer.tune_kernels,
             ).fit(
                 dataset, steps=steps, tokens=trainer.tokens,
                 log_every=trainer.log_every,

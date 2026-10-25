@@ -100,6 +100,22 @@ kernel's best (forward 0.323 against 0.315 ms on the A100, 0.181 against 0.178 o
 512 columns, the largest power of two dividing the width, lost 3 to 10%."""
 
 
+def _neighbours[C: (RowsConfig, ReverseConfig, BlockConfig)](config: C,
+                                                               **steps: tuple[int, int]) -> tuple[C, ...]:
+    """`config` first, then each field of `steps` halved and doubled alone, within its `(least, most)`:
+    a launch's variants (`tuning.KernelOp.variants`), the configs an opt-in tuning run times beside it."""
+    found = [config]
+    for name, (least, most) in steps.items():
+        value = getattr(config, name)
+        found += [dataclasses.replace(config, **{name: other}) for other in (value // 2, value * 2)
+                  if least <= other <= most]
+    return tuple(dict.fromkeys(found))
+
+
+WARPS = (1, 8)
+"""The warps a program's variants range over: at least one, at most eight."""
+
+
 def _row_block(width: int) -> int:
     """The heuristic's rows a program holds: at most sixteen, the tile at most
     `ROW_ELEMENTS` elements except when a single row is wider. A 4096-wide
@@ -651,6 +667,11 @@ class RmsForward(tuning.KernelOp):
     def _get_heuristics_config(self, ba) -> RowsConfig:
         return RowsConfig(_row_block(ba.arguments['x'].shape[1]), 4)
 
+    def variants(self, ba) -> tuple[RowsConfig, ...]:
+        # A program's rows within twice the heuristic's register tile.
+        rows = max(1, 2 * ROW_ELEMENTS // pl.next_power_of_2(ba.arguments['x'].shape[1]))
+        return _neighbours(ba.heuristics_config, rows=(1, rows), warps=WARPS)
+
 
 @dataclasses.dataclass(frozen=True)
 class RmsBackward(tuning.KernelOp):
@@ -683,6 +704,11 @@ class RmsBackward(tuning.KernelOp):
         rows, width = ba.arguments['x'].shape
         block = _row_block(width)
         return ReverseConfig(block, max(1, min(MAX_PROGRAMS, pl.cdiv(rows, block * ROW_BLOCKS))), 4)
+
+    def variants(self, ba) -> tuple[ReverseConfig, ...]:
+        rows = max(1, 2 * ROW_ELEMENTS // pl.next_power_of_2(ba.arguments['x'].shape[1]))
+        return _neighbours(ba.heuristics_config, rows=(1, rows), programs=(1, 2 * MAX_PROGRAMS),
+                           warps=WARPS)
 
 
 _RMS_FORWARD = RmsForward()
@@ -876,6 +902,9 @@ class _Elementwise(tuning.KernelOp):
 
     def _get_heuristics_config(self, ba) -> BlockConfig:
         return BlockConfig(ELEMENT_BLOCK, 4)
+
+    def variants(self, ba) -> tuple[BlockConfig, ...]:
+        return _neighbours(ba.heuristics_config, block=(128, 4 * PACKED_BLOCK), warps=WARPS)
 
 
 def _launch(kernel, name: str, operands, outputs, grid: tuple[int, ...], config: BlockConfig,

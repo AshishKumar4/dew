@@ -72,7 +72,8 @@ def splits(rows: Sequence[int] | None, batch: Batch, mesh: Mesh | AbstractMesh, 
 class Candidate:
     """A step a plan compiles: the shapes of the microbatch it reads, the
     loss's shapes, the narrow copies, the state's placement and shapes as it
-    traces them, the bytes held beside it and the program lowered."""
+    traces them, the bytes held beside it, the program lowered and its kernel
+    launches (`dew.nn.kernels.tuning.tune`)."""
     micro: Batch
     shapes: object
     copies: dict
@@ -80,6 +81,7 @@ class Candidate:
     prepared: TrainState
     held: int
     program: jax.stages.Lowered
+    launches: str
 
 
 @jax.jit

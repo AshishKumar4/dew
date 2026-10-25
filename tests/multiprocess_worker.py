@@ -754,6 +754,33 @@ def mode_pool_refusals(args) -> dict:
     return outcomes
 
 
+def mode_fp8_sites(args) -> dict:
+    """How the pool ends `measured_fp8_sites` on CPUs, which have no FP8
+    tensor cores, and when process 1's tree lacks a site the others hold:
+    each outcome is the error's type and text, and every process then
+    passes one more agreement, which a rank left behind would block."""
+    import jax
+
+    from dew import coordination
+    from dew.quantization import measured_fp8_sites
+
+    full = {"params": {"wide": {"kernel": np.zeros((64, 96), np.float32)},
+                       "narrow": {"kernel": np.zeros((32, 32), np.float32)}}}
+    lacking = {"params": {"wide": full["params"]["wide"]}}
+
+    def outcome(variables) -> str:
+        try:
+            measured_fp8_sites(variables, ("wide", "narrow"), 8)
+        except (ValueError, coordination.PeerFailure) as error:
+            return f"{type(error).__name__}: {error}"
+        return "measured"
+
+    unsupported = outcome(full)
+    missing = outcome(lacking if jax.process_index() == 1 else full)
+    after = coordination.agreed("after the refusals", lambda: True)
+    return {"unsupported": unsupported, "missing": missing, "after": after}
+
+
 def mode_profile_failure(args) -> dict:
     """A scheduled profile window whose directory is a file on rank 0 only.
 
@@ -2390,7 +2417,8 @@ MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget,
          "evaluation_replicas": mode_evaluation_replicas,
          "evaluation_clocks": mode_evaluation_clocks,
          "builtin_preview_failures": mode_builtin_preview_failures,
-         "profile_failure": mode_profile_failure, "pool_refusals": mode_pool_refusals}
+         "profile_failure": mode_profile_failure, "pool_refusals": mode_pool_refusals,
+         "fp8_sites": mode_fp8_sites}
 
 
 def parse_args(argv=None):

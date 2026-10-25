@@ -13,13 +13,22 @@ from pathlib import Path
 from types import TracebackType
 
 import pytest
-from lane_environment import MESH_DEVICES
+from lane_environment import MESH_DEVICES, without_deterministic_ops
 from tool_support import load
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKER = Path(__file__).with_name("multiprocess_worker.py")
 groups = load("child_groups", "tools/armada")
 """The children's group ownership Dew's CI uses too."""
+
+
+READ_ONLY = "--xla_gpu_experimental_autotune_cache_mode=AUTOTUNE_CACHE_MODE_READ"
+"""The flag `gpu-run -n 0.5` adds beside other work on a GPU, under which no process measures."""
+
+def keeping_picks() -> str:
+    """This process's XLA flags without the cuda lane's deterministic-ops flag: a process keeps and
+    measures picks only without it (`dew.cache.keeps_picks`)."""
+    return without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))
 
 
 def fresh(script: str, *arguments: str, cache_dir, flags: str, source: Path = REPO_ROOT / "src"):

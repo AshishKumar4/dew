@@ -132,7 +132,7 @@ def _step_lowered(generation: str):
     """A bf16 Qwen 3.5 hybrid's language-model training step (tests/fixtures/hf/qwen35-tiny: three gated
     delta net layers and one attention layer, its delta nets' heads 32 wide, a power of two as a real
     model's and the short conv's kernels take), lowered for `generation` from abstract state as
-    `Trainer(lower_for=...)` lowers one."""
+    tools/kernel_picks.py lowers one (`Trainer(lower_for=...)`)."""
     import optax
 
     from dew.interop.hf_decoders import translate_config
@@ -233,7 +233,9 @@ def test_an_expert_layer_lowers_for_the_gpu_with_the_grouped_matmul_its_generati
 
 def _mamba2_lowered(generation: str):
     """A bf16 Mamba-2 layer's forward and backward, as a hybrid's step runs them, lowered for
-    `generation`."""
+    `generation` after its launches are settled as the trainer settles a step's (`tuning.tune`, which
+    lowers it with every launch's description and reads them back)."""
+    from dew.nn.kernels import tuning
     from dew.nn.mixers.mamba2 import Mamba2
 
     layer = Mamba2(emb_features=128, num_heads=4, head_dim=64, state_size=64, chunk_size=64,
@@ -249,12 +251,12 @@ def _mamba2_lowered(generation: str):
 
     mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation)
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
-        return lower()
+        return tuning.tune(lower)[0]
 
 
 @pytest.mark.parametrize("generation", GPUS)
 def test_a_mamba2_layer_lowers_for_the_gpu_with_the_ssd_scan_its_generation_chooses(generation):
-    """A Mamba-2 layer lowers to the short conv's
+    """A Mamba-2 layer, its launches settled as the trainer settles them, lowers to the short conv's
     kernels and, where the row names the port for the scan, mamba_ssm's fourteen ported kernels; where
     it does not, to none of them. Its unweighted norm takes the fused RMSNorm where the row names it."""
     expected = SHORT_CONV.union(*(FAMILIES[key][1] for key in chosen(generation, "mamba2")))

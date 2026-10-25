@@ -16,6 +16,7 @@ from generation_support import INTERPRETS, SUMS_IN_IEEE, generations, lowers, ru
 from jax.experimental.pallas import fuser
 from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from reference_error import assert_as_exact, with_gradients
+from tuned import each_config
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
 from dew.nn.kernels.templates import mosaic, product
@@ -248,6 +249,52 @@ def test_the_templates_gradients_hold_check_1(generation_name, case):
                         f"{case} gradients on {generation_name}", seeds=SEEDS,
                         truth_fn=_gradients(_plain(spec, truth=True)))
 
+
+
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
+def test_every_variant_of_the_mosaic_launches_holds_check_1(generation_name):
+    """Each config an opt-in tuning run may time (`KernelOp.variants`: the derived tile and its legal
+    neighbours) of the Mosaic GPU forward, and on warpgroup MMA of its kernel gradient, pinned in turn
+    and interpreted: as exact as the plain program from float64 truth, so the tuner times only configs
+    proven here."""
+    rows, depth, width = 136, 128, 256
+    sizes, split = jnp.asarray([70, 66], jnp.int32), 70
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(rows, depth)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(2, depth, width)) / 8, jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(rows, width)), jnp.bfloat16))
+
+    def forward(x, w, dy):
+        del dy
+        return template.gemm(x, w, sizes, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+
+    def plain_forward(x, w, dy, wide=jnp.float32, out=jnp.bfloat16):
+        del dy
+        w = w.astype(wide)
+        return jnp.concatenate([x[:split].astype(wide) @ w[0], x[split:].astype(wide) @ w[1]]).astype(out)
+
+    def gradient(x, w, dy):
+        del w
+        return template.gemm_t(x, dy, sizes, out_dtype=jnp.float32, interpret_on_cpu=True)
+
+    def plain_gradient(x, w, dy, wide=jnp.float32, out=jnp.float32):
+        del w
+        x, dy = x.astype(wide), dy.astype(wide)
+        return jnp.stack([x[:split].T @ dy[:split], x[split:].T @ dy[split:]]).astype(out)
+
+    calls = [(grouped_matmul.MosaicGmm, forward, plain_forward)]
+    if generation.gpu_target(generation_name).wgmma:
+        calls.append((grouped_matmul.MosaicTgmm, gradient, plain_gradient))
+    with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic_gpu"):
+        for kernel, dew, plain in calls:
+            configs = each_config(kernel, dew, *draw(0))
+            assert len(configs) > 1, kernel.__name__
+            for config in configs:
+                with tuning.pinned({kernel: config}):
+                    assert_as_exact(dew, jax.jit(plain), draw, f"{kernel.__name__} at {config}", seeds=2,
+                                    truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))

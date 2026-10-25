@@ -53,8 +53,9 @@ dependencies = [
     "s3fs>=2026.6.0",
     "pyarrow>=25.0.1",
     "array-record>=0.8.3; sys_platform != 'win32'",
-    # dew.nn.kernels.tuning: every Pallas launch is a tokamax Op. 0.0.13 and
-    # 0.0.14 pin typeguard==2.13.3, which tyro excludes.
+    # dew.nn.kernels.tuning: every Pallas launch is a tokamax Op, whose config
+    # is measured per GPU model and shape. 0.0.13 and 0.0.14 pin
+    # typeguard==2.13.3, which tyro excludes.
     "tokamax>=0.0.15",
 ]
 license = "MIT"
