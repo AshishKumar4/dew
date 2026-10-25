@@ -26,7 +26,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import NamedSharding, PartitionSpec
 from model_support import TINY_DECODER
 from process_support import READ_ONLY, fresh, keeping_picks
-from reference_error import assert_as_exact, widened, with_gradients
+from reference_error import assert_as_exact, widened, with_gradients, without_ynn
 
 from dew.data.dataset import Loader
 from dew.interop.codecs import fp8_block_cast, quantize_fp8_blocks
@@ -210,11 +210,14 @@ def tangent_case(seed=1):
     return x, *leaves, direction
 
 
-@jax.jit
-def fp8_tangents(x, forward, forward_scale, dgrad, dgrad_scale, direction):
+def tangents(x, forward, forward_scale, dgrad, dgrad_scale, direction):
     """Dew's frozen product in forward mode (`jax.jvp`): its value and its tangent along `direction`."""
     return jax.jvp(lambda x: frozen_fp8_product(x, forward, forward_scale, dgrad, dgrad_scale), (x,),
                    (direction,))
+
+
+# Both arms of the forward-mode check are Dew programs, compiled alike (docs/design/testing.md).
+fp8_tangents = without_ynn(tangents)
 
 
 def default_precision_tangents(*inputs):
@@ -248,7 +251,7 @@ def test_the_frozen_product_in_forward_mode_is_the_decoded_kernels_tangent():
     tangent as the input's direction times the decoded kernel (`frozen_fp8_kernel`), the linear map the
     FP8 products stand for, each on par with the dequantized float32 products by check 1 from float64,
     whatever JAX's default matmul precision; the packed leaves take no tangent."""
-    assert_as_exact(default_precision_tangents, jax.jit(decoded_tangents), tangent_case,
+    assert_as_exact(default_precision_tangents, without_ynn(decoded_tangents), tangent_case,
                     "the frozen FP8 product in forward mode", seeds=TANGENT_SEEDS, truth_fn=exact_tangents)
     x, *leaves, _ = tangent_case()
     _, along_leaves = jax.jvp(frozen_fp8_product, (x, *leaves),
@@ -256,20 +259,16 @@ def test_the_frozen_product_in_forward_mode_is_the_decoded_kernels_tangent():
     assert not np.any(np.asarray(along_leaves))
 
 
-def test_the_frozen_products_backward_keeps_its_packed_leaves_and_not_its_input(capsys):
-    """Reverse mode reads the input's dtype alone, so the residuals its pullback keeps are the packed
-    leaves and never the `[M, in]` input, as a staged pullback, a remat or a scan would hold them."""
-    from jax.ad_checkpoint import print_saved_residuals
-
+def test_the_frozen_products_backward_keeps_its_packed_leaves_and_not_its_input():
+    """Reverse mode reads the input's dtype alone, so the residuals its pullback keeps (the leaves of
+    the `jax.vjp` pullback, a `jax.tree_util.Partial`) are the packed leaves and never the `[M, in]`
+    input, as a staged pullback, a remat or a scan would hold them."""
     x, *leaves, _ = product_case()
-
-    def loss(x, *leaves):
-        return jnp.sum(frozen_fp8_product(x, *leaves))
-
-    capsys.readouterr()
-    print_saved_residuals(loss, x, *leaves)
-    saved = capsys.readouterr().out
-    assert saved.strip() and f"bf16[{x.shape[0]},{x.shape[1]}]" not in saved, saved
+    _, pullback = jax.vjp(lambda x, *leaves: jnp.sum(frozen_fp8_product(x, *leaves)), x, *leaves)
+    saved = jax.tree.leaves(pullback)
+    assert saved
+    kept = [(leaf.shape, leaf.dtype) for leaf in saved]
+    assert (x.shape, x.dtype) not in kept and all((held.shape, held.dtype) in kept for held in leaves[2:]), kept
 
 
 def test_meanflow_trains_an_adapter_over_an_fp8_base():
