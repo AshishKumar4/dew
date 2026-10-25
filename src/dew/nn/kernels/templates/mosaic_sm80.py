@@ -297,14 +297,16 @@ class Mma(mosaic.Family):
             ref[...] = plgpu.load(view, layout=layout, optimized=False)
 
     def stored(self, parts, views, *, smem) -> None:
-        # Through `smem` where given, copied out in whole rows (an MMA-layout tile stored from registers
-        # writes partial 32-byte sectors, which JAX 0.12's global transfers refuse).
+        # Through `smem` where given, copied out in row blocks as `persist`'s stores are (`store_rows`): an
+        # MMA-layout tile stored from registers writes partial 32-byte sectors, which JAX 0.12's global
+        # transfers refuse, and its row-sliced copies lay out whole ones.
         for part, view in zip(parts, views, strict=True):
             if smem is None:
                 view[...] = part.astype(view.dtype)
-            else:
-                smem[...] = part.astype(smem.dtype)
-                mosaic.copied(smem, view)
+                continue
+            smem[...] = part.astype(smem.dtype)
+            rows = smem.shape[0]
+            mosaic.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows, copy=mosaic.copied)
 
     def added(self, value: jax.Array, view, interpret: bool, *, smem) -> None:
         # Element-wise atomic adds into global memory (`red.global`; no TMA reduction before Hopper), so
