@@ -1067,19 +1067,14 @@ def optax_schedule(name: str, multiplier: float, steps: int = 10) -> optax.Sched
                                      lambda count: law(count + warmup),
                                      optax.linear_schedule(law(start), tail, steps - start)],
                                     [warmup, start])
+    # torch's two half cosines (`OneCycle`) as optax's cosine decays, from `init` up to the peak at
+    # `rise` and down to `end` at the run's last step, where this run's phase ends fall on steps.
     peak = schedule.peak_value * m
     init = peak / 25
     end = init / 1e4
-    rise, last = schedule.warmup_fraction * steps - 1, steps - 1
-
-    def anneal(start, stop, done):
-        return stop + (start - stop) / 2 * (jnp.cos(jnp.pi * done) + 1)
-
-    def one_cycle(count):
-        step = jnp.minimum(jnp.asarray(count, jnp.result_type(float)), last)
-        return jnp.where(step <= rise, anneal(init, peak, step / rise),
-                         anneal(peak, end, (step - rise) / (last - rise)))
-    return one_cycle
+    rise, last = round(schedule.warmup_fraction * steps - 1), steps - 1
+    return optax.join_schedules([optax.cosine_decay_schedule(init, rise, alpha=peak / init),
+                                 optax.cosine_decay_schedule(peak, last - rise, alpha=end / peak)], [rise])
 
 
 RATE_SEEDS = 8
