@@ -54,7 +54,7 @@ An example's questions that ask the same thing, one negated, paraphrased or with
 
 ### Averaging runs
 
-`Decide.averaged(runs, step=, ema=, calibrate_on=)` is the task over the runs' `dew.checkpoints.averaged` mean, its calibration the identity, refit on `calibrate_on`, as temperatures belong to one set of weights. The runs' recorded task settings (`DecideSettings`) must be the same, else the run is refused (ValueError). Its `Weights.averaged` records each run's directory, step and average read, and `Decide.save` refuses it, as no one run holds its weights.
+`Decide.averaged(runs, step=, ema=, calibrate_on=)` is the task over the runs' `dew.checkpoints.averaged` mean, its calibration the identity, refit on `calibrate_on`, as temperatures belong to one set of weights. The runs' recorded task settings (`DecideSettings`) must be the same, else the run is refused (ValueError). Its `Weights.averaged` records each run's directory, step and average read. As no one run holds its weights, `Decide.save(directory)` writes the average to a directory of its own as a run: its calibration, then one checkpoint of the average (its optimizer state empty) under the record its runs share, its model the base an adapter merged into, and its calibration, which `Decide.from_run` and `dew.pipeline` read back for any layout; a directory holding another run's checkpoints is refused.
 
 ### Options read at labels
 
@@ -119,7 +119,7 @@ Trainer(objective, opt, key=0, accumulation=4)                    # fix the micr
 Trainer(objective, opt, key=0, layout=Layout(host=("optimizer",)))  # keep optimizer state in host memory
 ```
 
-Every eligible model takes the planner's path: no model family needs a planner of its own. Kernels are chosen per GPU generation from one table (`dew.nn.kernels`): FlashAttention 3 on Hopper, FlashAttention 2 on Ampere and Blackwell workstations, fla's gated delta rule, fused norms and SwiGLU. A kernel replaces the XLA path only when it is measured faster and passes the float64 accuracy gate on that GPU. Tile sizes come from one autotuner per GPU and shape, cached with XLA's own autotune results.
+A state kept in host memory (`Layout(host=("variables",))`) steps on the accelerator through programs compiled under the resident step's own XLA options (`step_compiler_options`: the dot merger, collectives and Triton GEMM choices), so a host step differs from a resident one by the host boundary alone. Every eligible model takes the planner's path: no model family needs a planner of its own. Kernels are chosen per GPU generation from one table (`dew.nn.kernels`): FlashAttention 3 on Hopper, FlashAttention 2 on Ampere and Blackwell workstations, fla's gated delta rule, fused norms and SwiGLU. A kernel replaces the XLA path only when it is measured faster and passes the float64 accuracy gate on that GPU. Tile sizes come from one autotuner per GPU and shape, cached with XLA's own autotune results.
 
 ## 4. `fit`
 
@@ -160,7 +160,7 @@ Trainer(objective, opt, key=0,
 - A resumed run skips loading pretrained weights it is about to overwrite, and its first step hits the compile cache.
 - `Keep` decides retention; `where=` sees each checkpoint's real record (kind, step, metrics).
 - The directory is a plain Orbax `CheckpointManager` directory, readable without Dew.
-- `dew.checkpoints.averaged(runs, step=, ema=)` averages runs trained apart from one start, any objective's: each run's model tree as its loaders read it (its average where it keeps one, unless `ema=False`), in fp32, its frozen leaves back in `params` and a LoRA run's factors merged into their kernels first, so a LoRA run, a partly frozen one and a whole fine-tune of one base average. The mean is taken on the host, one run's tree beside it at a time: each floating leaf a running mean that cannot overflow, float64's mean rounded once for two runs, subnormals included, and on par with a stacked fp32 mean for more; an integer or boolean leaf must agree. Runs of another model record (adapters aside) or other leaves are refused; where each run started is the caller's to know. The result carries the mean, placed as the first run's leaves are, the model record it applies to and each run's directory, step and average read.
+- `dew.checkpoints.averaged(runs, step=, ema=)` averages runs trained apart from one start, any objective's: each run's model tree as its loaders read it (its average where it keeps one, unless `ema=False`), in fp32, its frozen leaves back in `params` and a LoRA run's factors merged into their kernels first, so a LoRA run, a partly frozen one and a whole fine-tune of one base average. The mean is elementwise, so each process takes it over the shards it holds of the runs read onto `mesh` and `layout`, a replicated block once, on the host, one run's shards beside it at a time, and a pool averages runs no one process holds whole: each floating leaf a running mean that cannot overflow, float64's mean rounded once for two runs, subnormals included, and on par with a stacked fp32 mean for more; an integer or boolean leaf must agree. Runs of another model record (adapters aside) or other leaves are refused; where each run started is the caller's to know. The result carries the mean, placed as the first run's leaves are, the model record it applies to and each run's directory, step and average read.
 
 ## 6. Compilation
 

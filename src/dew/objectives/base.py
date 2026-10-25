@@ -713,6 +713,18 @@ class SavedTask(Protocol):
 
 
 @runtime_checkable
+class SettingsTask(SavedTask, Protocol):
+    """A saved task that builds from the settings its run records (`Objective.task_settings`), over a
+    model, its variables and a processor: a live objective builds it as a saved run loads it
+    (`Objective.build_task`). Dew's token tasks (`TextGeneration`, `BlockGeneration`,
+    `MaskedGeneration`) are such classes."""
+
+    @classmethod
+    def from_settings(cls, model: nn.Module, variables: Variables, settings,
+                      processor: Processor | None) -> Self: ...
+
+
+@runtime_checkable
 class ReleasedTask(SavedTask, Protocol):
     """A saved task that publishes its run as a released checkpoint of its own layout
     (`Decide.save_pretrained`), which `dew export` writes in place of its model's source layout."""
@@ -1049,7 +1061,7 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     def program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (),
                 holds: tuple[DeviceStep | AutoEncoder | Guidance, ...] = (),
-                modules: tuple[nn.Module, ...] = ()):
+                modules: tuple[nn.Module, ...] = (), step: Mapping[str, bool | int] | None = None):
         """`function` jitted as this objective's program `name`, reused only while its modules and head
         tiles stay fixed (`program_key`), and under the context it traced in (`trace_context`).
 
@@ -1062,8 +1074,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         step runs or a sample's guidance and autoencoder, whose numbers it bakes in: the program is
         reused only while they are the same objects, and one over others replaces it. `modules` are
         the networks it runs beside the objective's own, an autoguide's or an autoencoder's: they key
-        it as `holds` do, and its options cover them. Keep only the current specialization, not a
-        history of old models or steps.
+        it as `holds` do, and its options cover them. `step` are the XLA options of the training step
+        the program is part of (`dew.training.memory.step_compiler_options`), beside its modules' own,
+        so a host step's programs compile as the resident step does. Keep only the current
+        specialization, not a history of old models or steps.
         """
         programs = tuple((program.module, (program.head_tile, program.head_fused))
                          for program in self.program_key())
@@ -1075,8 +1089,8 @@ class Objective(ABC, Generic[Loss, Effects]):
             self._program_cache = cached
         from dew.nn.sharding import trace_context
         # The options follow where the program runs (`compiler_options`), so they key it too.
-        options = compiler_options(*(module for module, _ in programs), *modules)
-        key = (name, trace_context(), tuple(options.items()))
+        options = {**compiler_options(*(module for module, _ in programs), *modules), **(step or {})}
+        key = (name, trace_context(), tuple(sorted(options.items())))
         held = cached[1].get(key)
         kept = (*holds, *modules)
         if held is None or len(held[0]) != len(kept) or any(
@@ -1513,11 +1527,18 @@ class Objective(ABC, Generic[Loss, Effects]):
         """Return the task over `variables`, the trained tree as the run keeps it.
 
         `processor` encodes and decodes in place of the objective's own, an
-        explicit None included. Objectives without a generation task raise
-        `TypeError`. A plugin objective returns its own `saved_task` class, so
-        the return type also allows a `SavedTask` besides Dew's own tasks.
+        explicit None included. An objective whose `saved_task` builds from
+        the settings its run records (`SettingsTask`) builds it from its own
+        (`task_settings`) over its model, as a saved run of it loads; any other
+        overrides this, or has no inference task and raises `TypeError`. A
+        plugin objective's task is its own `saved_task` class, so the return
+        type also allows a `SavedTask` besides Dew's own tasks.
         """
-        raise TypeError(f"{type(self).__name__} has no inference task")
+        task, settings, model = self.saved_task, self.task_settings(), vars(self).get("model")
+        if task is None or settings is None or model is None or not isinstance(task, SettingsTask):
+            raise TypeError(f"{type(self).__name__} has no inference task")
+        return task.from_settings(model, variables, settings,
+                                  self.processor if processor is OMITTED else processor)
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None,
                  processor: Processor | None | Omitted = OMITTED) -> Task | SavedTask:

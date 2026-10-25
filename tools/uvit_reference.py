@@ -8,7 +8,7 @@ initialization (and rounded to bfloat16-representable values, so the fixture
 compresses). Each is called as U-ViT's continuous-time SDE calls it, on the
 time t times 999, and the tool records, against a fixed cotangent, the
 gradients of the image, the text states and every parameter: once in float32
-and once in float64 (`diffusers_wan_reference.widened`, which widens the
+and once in float64 (`torch_precision.widened`, which widens the
 sinusoids' float32 `arange` and `.float()`), the truth tests/reference_error.py
 measures both from. Attention runs U-ViT's "math" mode: its "flash" mode
 casts q, k and v to float32.
@@ -72,7 +72,7 @@ def walk(model, inputs, probe, dtype):
 
 
 def main():
-    from diffusers_wan_reference import widened
+    from torch_precision import widened
 
     if len(sys.argv) != 2:
         raise SystemExit(__doc__)
