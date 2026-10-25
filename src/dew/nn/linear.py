@@ -242,6 +242,24 @@ def _stream_order(valid):
     return rank, jnp.where(jnp.arange(length)[None, :] < counts[:, None], order, length).astype(jnp.int32)
 
 
+def real_tail(x, valid, segments, width: int):
+    """The last `width` real tokens of each row of `x` `[B, S, D]` (`valid` `[B, S]`), zeros in front
+    where the row holds fewer, with their documents (`segments` `[B, S]`, -1 in front; all 0 where
+    None) and the row's real count `[B]`: what a later slice of the row's sequence reads as the history
+    behind its first real token (`held_conv1d`'s `held`)."""
+    length = x.shape[1]
+    order, count = valid_order(jnp.asarray(valid, bool))
+    # Each tail column's place among the row's real tokens, negative in front of the first, and the
+    # slot it reads: the real token's own, or the appended zero (document -1) in front.
+    places = count[:, None] - width + jnp.arange(width)[None, :]
+    slots = jnp.where(places >= 0, jnp.take_along_axis(order, jnp.maximum(places, 0), axis=1), length)
+    padded = jnp.pad(x, ((0, 0), (0, 1), (0, 0)))
+    tail = jnp.take_along_axis(padded, slots[:, :, None], axis=1, mode='promise_in_bounds')
+    owners = (jnp.zeros(valid.shape, jnp.int32) if segments is None else jnp.asarray(segments, jnp.int32))
+    documents = jnp.take_along_axis(jnp.pad(owners, ((0, 0), (0, 1)), constant_values=-1), slots, axis=1)
+    return tail, documents, count
+
+
 def held_conv1d(x, kernel, valid, held=None, *, bias=None, segments=None, right_padded: bool = False,
                 parts=None, dtype=None):
     """`[B, S, D]` convolved causally after the `held` history, `[B, K - 1, D]`
