@@ -40,7 +40,7 @@ print(len(ids) - held_out, "training tokens,", held_out, "validation tokens")
 import jax
 
 from dew import Trainer
-from dew.config import OptimConfig
+from dew.optim import OptimConfig
 from dew.data import presets
 from dew.data.sources import TokenFiles
 from dew.nn.backbones import CausalTransformer

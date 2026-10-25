@@ -13,8 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from dew.config import OptimConfig
-from dew.optim import Cosine, Exponential, OneCycle, ParamGroup
+from dew.optim import Cosine, Exponential, OneCycle, OptimConfig, ParamGroup
 
 TORCH = np.load(Path(__file__).resolve().parent / "fixtures" / "torch_optim" / "reference.npz")
 EPOCHS, PER_EPOCH = 6, 2

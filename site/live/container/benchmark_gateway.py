@@ -115,7 +115,7 @@ except MemoryError:
 else:
     raise AssertionError("a training context exceeded its memory allowance")
 from dew import Trainer
-from dew.config import OptimConfig
+from dew.optim import OptimConfig
 from dew.data import Hub, presets
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective

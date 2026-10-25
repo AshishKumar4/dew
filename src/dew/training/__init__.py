@@ -15,11 +15,11 @@ from .observe import Observe
 from .profiling import ProfileWindow
 from .runtime import Preempted, prepare_process, run_timestamp
 from .selection import Best
-from .tracker import LocalTracker, MLflowTracker, TensorBoardTracker, Tracker, Trackers, WandbTracker
+from .tracker import LocalTracker, MLflowTracker, TensorBoardTracker, Tracker, Trackers, Wandb, WandbTracker
 from .trainer import Rollout, Trainer
 from .transaction import ema_update
 
 __all__ = ["Aux", "Best", "Checkpoints", "EMASpec", "EvalSuite", "Evaluation", "Keep", "Layout",
            "LocalTracker", "MLflowTracker", "MeshSpec", "Metric", "Objective", "Observe", "Pause", "Plateau",
            "Preempted", "ProfileWindow", "Rollout", "Step", "TensorBoardTracker", "Tracker", "Trackers",
-           "Trainer", "WandbTracker", "ema_update", "prepare_process", "run_timestamp"]
+           "Trainer", "Wandb", "WandbTracker", "ema_update", "prepare_process", "run_timestamp"]

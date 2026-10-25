@@ -86,7 +86,7 @@ A confidence is a statistic of the answer's distribution, and the task decides w
 <!-- not run: fine-tunes Qwen3-0.6B on BANKING77 for 2,000 steps, a GPU job -->
 ```python
 from dew import Trainer
-from dew.config import OptimConfig
+from dew.optim import OptimConfig
 from dew.data import Hub
 from dew.data.compile import held
 from dew.decision import ECE, Accuracy, Brier, DecisionObjective, LogLoss, decisions

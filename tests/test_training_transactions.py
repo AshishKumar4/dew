@@ -316,9 +316,9 @@ def test_an_accumulating_step_updates_the_optimizer_in_its_commit_alone():
     simplifier runs a branch of elementwise ops and reductions, as a clipped
     AdamW's update is (`OptimConfig`'s), on every call and selects its
     result; on Qwen3.5-0.8B that was the whole update every microbatch."""
-    from dew.config import OptimConfig
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
+    from dew.optim import OptimConfig
     from dew.telemetry.instrumentation import hlo_instructions
 
     model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,

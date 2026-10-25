@@ -22,7 +22,7 @@ import numpy as np
 
 from dew import Trainer
 from dew.data.dataset import Loader
-from dew.config import OptimConfig
+from dew.optim import OptimConfig
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec

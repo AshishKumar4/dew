@@ -22,7 +22,6 @@ from dew._records import number, record
 from dew.batch import Variables, merge
 from dew.checkpoints import Checkpoints
 from dew.config import MetricConfig, ObjectiveConfig, Prepared, RunConfig, media_field
-from dew.data.dataset import record_argument
 from dew.diffusion.presets import EDM, Flow, build_process
 from dew.diffusion.process import Process
 from dew.inputs import AudioCondition, Field, InputSpec, TextCondition
@@ -51,6 +50,7 @@ from dew.registry import (
     models,
     objectives,
     presets,
+    record_argument,
     resolve_dtype,
     to_record,
 )

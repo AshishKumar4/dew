@@ -24,9 +24,10 @@ import jax
 import jax.numpy as jnp
 
 from dew._records import integer, text
-from dew.config import ObjectiveConfig, OptimConfig, Prepared, RunConfig
+from dew.config import ObjectiveConfig, Prepared, RunConfig
 from dew.data.text import HFTokenizer, tokenizer_for
 from dew.objectives.lm.objective import Perplexity, Samples
+from dew.optim import OptimConfig
 from dew.registry import DtypeName, ModelConfig, objectives, resolve_dtype
 from dew.sampling.text import Sampling
 
