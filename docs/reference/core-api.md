@@ -192,7 +192,7 @@ Import `ExpertBalance` from `dew.objectives.routing`.
 
 <!-- api: dew.objectives.routing.ExpertBalance -->
 
-`ExpertBalance` holds how a run trains its routers. `LMObjective(balance=...)`, `MaskedDiffusionObjective(balance=...)`, `GRPOObjective(balance=...)`, `DPOObjective(balance=...)` and `PPOObjective(balance=...)` (through its policy) compose it: `balance_rate` moves each balancing bias against its load at every committed update (it needs a mixture with `bias=True`), `aux_loss_alpha` and `seq_aux` add DeepSeek V2's balance loss, and `router_z_loss` adds ST-MoE's z-loss. Each term is optional.
+`ExpertBalance` holds how a run trains its routers. `LMObjective(balance=...)`, `MaskedDiffusionObjective(balance=...)`, `GRPOObjective(balance=...)`, `DPOObjective(balance=...)` and `PPOObjective(balance=...)` compose it: `balance_rate` moves each balancing bias against its load at every committed update (it needs a mixture with `bias=True`), `aux_loss_alpha` and `seq_aux` add DeepSeek V2's balance loss, and `router_z_loss` adds ST-MoE's z-loss. Each term is optional.
 
 Import `generate`, `Sampling` and `Generation` from `dew.sampling`:
 
