@@ -648,6 +648,8 @@ class RmsForward(tuning.KernelOp):
 
     config_cls: ClassVar[type[RowsConfig]] = RowsConfig
 
+    ROWS: ClassVar[tuple[str, ...]] = ('x', 'branch', 'gate')
+
     def _fwd(self, x: jax.Array, branch: jax.Array | None, scale: jax.Array | None, gate: jax.Array | None, *,
              epsilon: float, dtype: str, offset: bool, stored: str, after_cast: bool, activation: str,
              interpret: bool, inverse_rounded: bool, config: RowsConfig, return_residuals: bool = False):
@@ -680,6 +682,8 @@ class RmsBackward(tuning.KernelOp):
     compensated partial sums of the weight's."""
 
     config_cls: ClassVar[type[ReverseConfig]] = ReverseConfig
+
+    ROWS: ClassVar[tuple[str, ...]] = ('x', 'gate', 'mean_square', 'dy', 'ds')
 
     def _fwd(self, x: jax.Array, scale: jax.Array | None, gate: jax.Array | None, mean_square: jax.Array,
              dy: jax.Array, ds: jax.Array | None, *, offset: bool, stored: str, after_cast: bool,
@@ -920,6 +924,8 @@ def _launch(kernel, name: str, operands, outputs, grid: tuple[int, ...], config:
 class SwigluForward(_Elementwise):
     """SwiGLU's forward launch over flat `gate` and `up` (`_swiglu_forward`)."""
 
+    ROWS: ClassVar[tuple[str, ...]] = ('gate', 'up')
+
     def _fwd(self, gate: jax.Array, up: jax.Array, *, interpret: bool, config: BlockConfig,
              return_residuals: bool = False):
         return _launch(_swiglu_forward, "swiglu_forward", (gate, up),
@@ -930,6 +936,8 @@ class SwigluForward(_Elementwise):
 @dataclasses.dataclass(frozen=True)
 class SwigluBackward(_Elementwise):
     """SwiGLU's reverse launch (`_swiglu_backward`): both inputs' gradients."""
+
+    ROWS: ClassVar[tuple[str, ...]] = ('gate', 'up', 'dy')
 
     def _fwd(self, gate: jax.Array, up: jax.Array, dy: jax.Array, *, interpret: bool, config: BlockConfig,
              return_residuals: bool = False):
@@ -951,6 +959,8 @@ class _Packed(_Elementwise):
 class PackedSwigluForward(_Packed):
     """SwiGLU's forward launch over a packed projection's output, read in place (`_packed_forward`)."""
 
+    ROWS: ClassVar[tuple[str, ...]] = ('gate_up',)
+
     def _fwd(self, gate_up: jax.Array, *, interpret: bool, config: BlockConfig,
              return_residuals: bool = False):
         rows, width = gate_up.shape[0], gate_up.shape[1] // 2
@@ -962,6 +972,8 @@ class PackedSwigluForward(_Packed):
 @dataclasses.dataclass(frozen=True)
 class PackedSwigluBackward(_Packed):
     """The packed SwiGLU's reverse launch (`_packed_backward`): the gradient in its input's layout."""
+
+    ROWS: ClassVar[tuple[str, ...]] = ('gate_up', 'dy')
 
     def _fwd(self, gate_up: jax.Array, dy: jax.Array, *, interpret: bool, config: BlockConfig,
              return_residuals: bool = False):

@@ -499,6 +499,14 @@ class StepLaunch(tuning.KernelOp):
 
     config_cls: ClassVar[type[Launch]] = Launch
 
+    ROWS: ClassVar[tuple[str, ...]] = ('active', 'query', 'key', 'value', 'token', 'held', 'log_decay',
+                                       'gate', 'beta', 'z', 'state')
+
+    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
+        """Normal floats and every row active, so a timed launch steps each row's state and history."""
+        return [jnp.ones(spec.shape, spec.dtype) if jnp.issubdtype(spec.dtype, jnp.integer) else array
+                for spec, array in zip(specs, super().operands(specs, seed), strict=True)]
+
     def _fwd(self, active: jax.Array, state: jax.Array, query: jax.Array | None, key: jax.Array | None,
              value: jax.Array | None, token: jax.Array | None, held: jax.Array | None, taps: jax.Array | None,
              log_decay: jax.Array | None, gate: jax.Array | None, beta: jax.Array | None,
@@ -687,6 +695,8 @@ def _cumsum_kernel(chunk_ref, s_ref, o_ref, *, chunk: int, aligned: bool, scale:
 @dataclasses.dataclass(frozen=True)
 class ChunkLocalCumsum(chunked_launch._Launch):
     """`cumulated`'s launch (tuning.KernelOp), fla's `chunk_local_cumsum`."""
+
+    revision: int = 2
 
     NAME = "cumulated"
     KEYS, VALUES = None, None
