@@ -30,9 +30,9 @@ with CI's selection, and writes a verdict row for each. A row is red on a
 failed or erroring test, on a test skipped because its import failed (a file
 CI would never have run), or when pytest left no report of it. A task still
 running at its deadline, short of armada's own timeout, is interrupted and
-every row it holds is red, so a hang is graded with its traceback rather
-than leaving the task without a verdict. Each row also carries its tests' own
-times, which `durations` folds into tests/test_durations.json from main's CI
+every row it holds is red, so a hang is graded, with what pytest reports as
+it is interrupted, rather than leaving the task without a verdict. Each row
+also carries its tests' own times, which `durations` folds into tests/test_durations.json from main's CI
 (`armada verdict <sha> --json`): a file whose record no longer cuts it as it
 runs takes what its tests took (`folded`). The land queue folds main's CI so
 at each train, as a head of its own, and no hand edits the record.
