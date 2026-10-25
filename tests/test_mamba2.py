@@ -339,7 +339,8 @@ def test_a_layer_split_over_the_sequence_runs_padded_and_packed_rows_as_whole_on
 def test_a_layer_split_over_the_sequence_names_its_scan_for_remat(reference, geometry, masked, capsys):
     """Under a sequence axis of 4, the layer's scan output carries both names a remat policy keeps it by,
     a mixer's 'context' and a recurrence's 'scan', with or without the rows' validity, as on one device
-    (`Mamba2.residuals`): a checkpoint saving either name alone saves it for the backward."""
+    (`Mamba2.residuals`): a checkpoint saving either name alone keeps more of the `shard_map` the layer
+    runs in for the backward than one saving nothing."""
     from jax.ad_checkpoint import print_saved_residuals
 
     from dew.nn.backbones.decoder_block import RematPolicy
@@ -355,12 +356,15 @@ def test_a_layer_split_over_the_sequence_names_its_scan_for_remat(reference, geo
     def loss(params):
         return jnp.sum(module.apply(params, hidden, call) ** 2)
 
-    for name in ("context", "scan"):
+    def kept(names) -> int:
         capsys.readouterr()
         with jax.set_mesh(mesh):
-            print_saved_residuals(jax.checkpoint(loss, policy=RematPolicy(save=(name,)).checkpoint_policy()),
+            print_saved_residuals(jax.checkpoint(loss, policy=RematPolicy(save=names).checkpoint_policy()),
                                   variables)
-        assert f"named '{name}'" in capsys.readouterr().out, name
+        return capsys.readouterr().out.count("output of shard_map")
+
+    nothing = kept(())
+    assert [name for name in ("context", "scan") if kept((name,)) <= nothing] == []
 
 
 def test_packed_documents_run_as_if_each_ran_alone(reference, geometry):
