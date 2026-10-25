@@ -26,7 +26,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import transformers
-from diffusers_wan_reference import float64
+from torch_precision import float64, float64_twin
 from huggingface_hub import hf_hub_download
 from reference_source import hub_modules
 
@@ -84,12 +84,10 @@ def write_tiny(modeling) -> None:
     with torch.no_grad():
         arrays['generated'] = model.generate(torch.from_numpy(ids[:, :4]).long(), do_sample=False,
                                              max_new_tokens=6, eos_token_id=None, pad_token_id=0).numpy()
+    # Its float64 twin (`float64_twin`): built inside the widening, so the rotary table is computed in
+    # float64 rather than widened from fp32; the weights are the same.
+    truth = last_pass(float64_twin(model, lambda: modeling.OuroForCausalLM(config)))
     with float64():
-        # Built inside the widening, so the rotary table is computed in
-        # float64 rather than widened from fp32; the weights are the same.
-        truth = modeling.OuroForCausalLM(config).double()
-        truth.load_state_dict(model.state_dict())
-        truth = last_pass(truth)
         arrays['logits_f64'], arrays['exit_logits_f64'] = outputs(truth, ids)
         arrays['padded_logits_f64'], _ = outputs(truth, padded, mask, positions)
     for name, array in arrays.items():
