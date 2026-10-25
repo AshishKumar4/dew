@@ -4,12 +4,12 @@ import dataclasses
 import json
 from pathlib import Path
 
+import grain.python as grain
 import jax
 import numpy as np
 import optax
 import pytest
 from recording import RecordingTracker
-from reference_error import assert_as_exact
 
 from dew import Field, InputSpec, Trainer
 from dew.data import Files, Loading, Memory, images, mix, presets
@@ -235,16 +235,13 @@ def sft_tokens(marker, targets, *, empty_rows=0):
     return Memory(rows).named(f"sft-{marker}").pack(9, fields=("text", "text_roles")).shuffle(marker).repeat()
 
 
-MIXTURE_SEEDS = 256
-"""The token mixture's shares' declared draws (`seeds_for`, the drawn rows against themselves)."""
-
-
 @pytest.mark.parametrize("weights", [(0.5, 0.5), (0.25, 0.75)])
 @pytest.mark.parametrize("empty_rows", [0, 32])
 @pytest.mark.parametrize("projected", [False, True])
 def test_sft_token_mixture_weighs_final_assistant_targets_and_resumes(weights, empty_rows, projected):
-    """One versus seven assistant targets per packed row get the requested scored-token shares: as
-    exactly as rows drawn each from its corpus at the chance that weighs its tokens (check 1)."""
+    """One versus seven assistant targets per packed row get the requested scored-token shares: the
+    rows come member for member as Grain's proportional mix weighs them, a row of each the weight of
+    its member's tokens."""
     model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2,
                               mlp_features=16, max_seq_len=8)
     policy = LMObjective(model, seq_len=8, loss_role=Role.ASSISTANT).data()
@@ -257,30 +254,26 @@ def test_sft_token_mixture_weighs_final_assistant_targets_and_resumes(weights, e
     data = compile(train.batch(8), objective=policy, read="memory", loading=Loading(workers=0))
     reader = data.train(DataPartition())
     targets = ValidTargets(field=field, role=int(Role.ASSISTANT), measured=False)
-    delivered = {1: 0, 2: 0}
+    delivered, picked = {1: 0, 2: 0}, []
     try:
         for _ in range(64):
             batch = next(reader)
             for index, marker in enumerate(batch[field][:, 0]):
                 row = jax.tree.map(lambda values, index=index: values[index], batch)
                 delivered[int(marker)] += targets(row)
+                picked.append(int(marker))
         saved = reader.get_state()
         remaining = [next(reader)[field].tolist() for _ in range(3)]
     finally:
         reader.close()
-    # The shares Dew delivers against an independent draw of each delivered row's corpus, its chance
-    # the token weight over the targets a row of it holds (check 1, the weights the truth).
-    shares = np.asarray([delivered[marker] for marker in (1, 2)], np.float64) / sum(delivered.values())
-    rows, targets = 64 * 8, np.asarray([1.0, 7.0])
-    chances = np.asarray(weights) / targets / np.sum(np.asarray(weights) / targets)
-
-    def drawn(seed):
-        counts = np.random.default_rng([0x3A11, int(seed)]).multinomial(rows, chances) * targets
-        return {"shares": counts / np.sum(counts)}
-
-    assert_as_exact(lambda seed: {"shares": shares}, drawn, lambda seed: (np.int64(seed),),
-                    f"token mixture shares {weights}", seeds=MIXTURE_SEEDS,
-                    truth_fn=lambda seed: {"shares": np.asarray(weights, np.float64)})
+    # The member each delivered row comes from, row for row, is Grain's proportional mix of the two at
+    # the token weights over the targets a row of each holds: one and seven. Its token shares then are
+    # the requested ones to within a row of each.
+    proportions = [weight / held for weight, held in zip(weights, (1, 7), strict=True)]
+    grains = grain.MapDataset.mix([grain.MapDataset.source([marker]).repeat() for marker in (1, 2)],
+                                  weights=proportions)
+    assert picked == [grains[index] for index in range(len(picked))]
+    assert delivered == {1: picked.count(1), 2: 7 * picked.count(2)}
     assert data.counts["sft-1"].accepted == 64 - empty_rows
     assert data.counts["sft-1"].rejected["zero_targets"] == empty_rows
     resumed = compile(train.batch(8), objective=policy, read="memory",

@@ -94,8 +94,10 @@ def test_filtered_memory_roots_compact_before_global_counts_and_share_cuts(grain
 HOLDOUT_SHARES = (0.85, 0.05, 0.1)
 """The 3-way holdout's requested shares: train, validation and test."""
 
-HOLDOUT_RECORDS = 200
-"""The records of each drawn corpus the holdout's shares are read over."""
+HOLDOUT_RECORDS = 500
+"""The records of each drawn corpus the holdout's shares are read over: as many as hold a part
+favoured by 0.02 of the records over check 1's PARITY of an independent draw's error (5,000 records read
+whole in one corpus held it to 0.02 by hand)."""
 
 HOLDOUT_SEEDS = 256
 """The holdout-shares site's declared draws (`seeds_for`, the drawn split against itself)."""
