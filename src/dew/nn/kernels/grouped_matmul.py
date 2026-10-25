@@ -496,7 +496,18 @@ class _Triton(_GroupedLaunch[Tile]):
         held = 0 if generation.effective(target).wgmma else 1
         step = self.loaded(config) * jnp.dtype(ba.arguments['tokens'].dtype).itemsize + _side_tile_bytes(
             ba.arguments['prologue_operands'], ba.arguments['hooks'].prologue_axes, self.extents(config))
-        return step * (config.stages - held)
+        # A contraction of one step has no loop whose dead stages the output's layout conversion reuses:
+        # it takes a 16-bit output tile beside them (an L4 refused 114688 bytes for a 64 x 128 tile's
+        # 98304 at a depth of one step, either output dtype, GEN6-gpu-l4; at four steps it asked the
+        # stages' alone, TSMEM-l4).
+        single = self._contracted(ba) is not None and self._contracted(ba) <= self.contraction(config)
+        rows, columns = self.output(config)
+        return step * (config.stages - held) + (2 * rows * columns if single else 0)
+
+    @staticmethod
+    def _contracted(ba) -> int | None:
+        """The contraction a call's every tile steps over, None where its groups' rows set it."""
+        return None
 
     @staticmethod
     @abc.abstractmethod
@@ -532,6 +543,10 @@ class Gmm(_Triton):
         """The depth and width of a dense call's product, which `block_k` and `block_n` tile."""
         kernel = ba.arguments['kernel']
         return (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
+
+    @staticmethod
+    def _contracted(ba) -> int | None:
+        return Gmm._dense_extents(ba)[0]
 
     @staticmethod
     def loaded(tile: Tile) -> int:
