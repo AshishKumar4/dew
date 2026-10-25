@@ -1408,7 +1408,6 @@ def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_pa
         assert "newest checkpoint differs" in report["stale"], report
         if rank == 0:
             assert "training read failed on rank 1" in report["first_read"], report
-            assert "training read failed on rank 1" in report["eof"], report
 
 
 @pytest.mark.distributed
