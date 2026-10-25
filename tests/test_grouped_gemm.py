@@ -244,8 +244,7 @@ UNSEEN = {
     "ampere-class": generation.GpuTarget("sm80", "Unmeasured Ampere-class GPU", shared_limit=99 * 1024,
                                          multiprocessors=46, clock_hz=1.4e9, memory_bandwidth=0.45e12),
     "hopper-class": generation.GpuTarget("sm90", "Unmeasured Hopper-class GPU", shared_limit=180 * 1024,
-                                         multiprocessors=78, clock_hz=1.6e9, memory_bandwidth=2.4e12,
-                                         calibration={"l2_bandwidth": 4.0e12}),
+                                         multiprocessors=78, clock_hz=1.6e9, memory_bandwidth=2.4e12),
 }
 """GPUs no row measured, one of each family: an Ampere-class part with fewer multiprocessors and the
 smaller block of an sm86 than an A100's, and a Hopper-class one with fewer multiprocessors, a smaller
@@ -255,7 +254,7 @@ block and another L2 bandwidth than an H100's."""
 def test_a_program_traced_for_one_gpu_traces_again_for_another_of_its_family():
     """Two GPUs of one family whose facts differ key a jitted program's traces apart
     (`generation.assumed`), so neither's launches are sized and picked by the other's facts; the same
-    facts, their measurements stated in another order, share one trace."""
+    facts, stated again, share one trace."""
     traced = []
 
     @jax.jit
@@ -263,9 +262,8 @@ def test_a_program_traced_for_one_gpu_traces_again_for_another_of_its_family():
         traced.append(generation.gpu_target())
         return x + 1
 
-    measured = dataclasses.replace(UNSEEN["hopper-class"], calibration={"load_latency": 600.0,
-                                                                         "l2_bandwidth": 4.0e12})
-    restated = dataclasses.replace(measured, calibration={"l2_bandwidth": 4.0e12, "load_latency": 600.0})
+    measured = dataclasses.replace(UNSEEN["hopper-class"], memory_bandwidth=3.0e12)
+    restated = dataclasses.replace(measured)
     targets = (UNSEEN["hopper-class"], generation.TARGETS["sm90"], measured, restated)
     for target in targets:
         with generation.assumed(target):
@@ -551,11 +549,11 @@ def ampere(generation_name: str = "sm80"):
 @pytest.mark.skipif(not AMPERE_CLASS, reason="no mma.sync kernel this GPU and JAX lower")
 @pytest.mark.parametrize("out_dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("sizes", [name for name in SIZES if any(SIZES[name])])
-def test_an_ampere_gpu_runs_the_launch_its_facts_rank_first(sizes, out_dtype):
-    """Without warpgroup MMA, the Mosaic GPU forward's mma.sync tile (`mosaic_gpu.derived`) and Triton's
-    launch are ranked by the cost model on the GPU's own facts (its family's single-warp issue among them):
-    unnamed, the call runs the one estimated faster; named, each is as exact as XLA's ragged dot rounded to
-    its output dtype from float64, unrouted rows and empty groups included."""
+def test_an_ampere_gpu_runs_mosaics_launch_first(sizes, out_dtype):
+    """Without warpgroup MMA, the Mosaic GPU forward's mma.sync tile (`mosaic_gpu.derived`) comes before
+    Triton's launch in the grouped selector's order: unnamed, the call runs Mosaic's; named, each is as
+    exact as XLA's ragged dot rounded to its output dtype from float64, unrouted rows and empty groups
+    included."""
     x, w, dy, group = operands(SIZES[sizes], jnp.bfloat16)
     truth = oracle.products(x, w, dy, SIZES[sizes])
     group_sizes = jnp.asarray(SIZES[sizes], jnp.int32)
@@ -577,15 +575,12 @@ def test_an_ampere_gpu_runs_the_launch_its_facts_rank_first(sizes, out_dtype):
                if ba.arguments["interpret"] == (jax.default_backend() == "cpu")]
         return got, ran
 
-    estimated = {}
     for named, kernel in (("triton", "Gmm"), ("mosaic_gpu", "MosaicGmm")):
         got, ran = running(grouped_matmul=named)
         assert {type(launch).__name__ for launch, _ in ran} == {kernel} and got.dtype == out_dtype
         check(got, reference, truth[0], group, f"sm80 forward through {kernel} to {jnp.dtype(out_dtype)}")
-        with ampere():
-            estimated[kernel] = sum(launch.estimate(ba, generation.gpu_target())[0] for launch, ba in ran)
     _, ran = running()
-    assert {type(launch).__name__ for launch, _ in ran} == {min(estimated, key=estimated.__getitem__)}
+    assert {type(launch).__name__ for launch, _ in ran} == {"MosaicGmm"}
 
 
 @pytest.mark.skipif(not AMPERE_CLASS, reason="no mma.sync kernel this GPU and JAX lower")
@@ -597,6 +592,21 @@ def test_an_mma_sync_forward_of_no_depth_is_zero():
         got = jax.jit(lambda x, w: template.gemm(x, w, jnp.asarray([128], jnp.int32), out_dtype=jnp.float32,
                                                  precision="default", interpret_on_cpu=True))(lhs, rhs)
     assert not np.any(np.asarray(got))
+
+
+def test_a_launch_of_fewer_programs_than_its_slots_costs_one_programs_service():
+    """A lone program costs its own service, however many a multiprocessor could hold, and its pipeline
+    hides no more steps' latency than it takes: the estimate is the same at any residency, and at any
+    stage count past its steps."""
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+
+    def seconds(**fields):
+        return cost.seconds(cost.Cost(**{"programs": 1, "device_bytes": 1.0, "program_flops": 1e6, "steps": 2,
+                                         "stages": 3, "resident": 1} | fields), target)
+
+    assert seconds(resident=12) == seconds(resident=1)
+    assert seconds(stages=9) == seconds(stages=3) < seconds(stages=2)
 
 
 def test_the_cost_model_names_a_fact_its_target_lacks():

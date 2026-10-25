@@ -34,7 +34,7 @@ Scope is per rule, because the rules are not all about the same thing:
 - SLOP016 is about `src/<package>`: a choice keyed on which device runs (its
   hardware generation) lives in one table, `nn/kernels/generation.py`'s
   `TARGETS`; any other module reads that table's facts, a library's support
-  rule the compute capability, and a launch config the autotuner.
+  rule the compute capability, and a launch config its launch's rule from the facts.
 - SLOP018 and SLOP019 are about `src/<package>`, the code a user's process
   runs: it sleeps, polls and retries only where it deals with what leaves
   the process, and it detects no feature by the exception its absence raises.
@@ -1360,7 +1360,8 @@ def authorities(module: Module) -> Iterator[Finding]:
     for node in found:
         yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP016",
                       "chooses by the device's generation; read the target table's fact (`gpu_target()`), "
-                      "a library's rule the compute capability (`capability`), a launch config the autotuner")
+                      "a library's rule the compute capability (`capability`), a launch config its "
+                      "launch's rule")
 
 
 EXTERNAL = ("subprocess.", "socket.", "ssl.", "select.", "urllib.", "http.", "requests.", "httpx.",

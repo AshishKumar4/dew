@@ -63,9 +63,10 @@ from .sharding import (
 # where a sigmoid saturates.
 SCORE_FUNCTIONS = ('softmax', 'sigmoid', 'sqrtsoftplus')
 
-# 'pallas' is the kernels, each launch running the implementation its cost model picks or
-# `generation.chosen(grouped_matmul=...)` names ('triton', 'mosaic_gpu'); 'auto' is the kernels where they
-# run the call, else XLA (`expert_projection`, through the GEMM template).
+# 'pallas' is the kernels, each launch running the first implementation that takes it
+# (`grouped_matmul.GROUPED`) or the one `generation.chosen(grouped_matmul=...)` names ('triton',
+# 'mosaic_gpu', 'cutlass'); 'auto' is the kernels where they run the call, else XLA
+# (`expert_projection`, through the GEMM template).
 GROUPED_MATMULS = ('auto', 'xla', 'pallas')
 EXPERT_DISPATCHES = ('global', 'exchange')
 

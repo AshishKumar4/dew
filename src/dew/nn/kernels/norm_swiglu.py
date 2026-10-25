@@ -93,7 +93,7 @@ partial rows it writes stay a small share of what it reads."""
 MAX_PROGRAMS = 1024
 ELEMENT_BLOCK = 1024
 PACKED_BLOCK = 4096
-"""The packed SwiGLU's heuristic columns a program. Over every config of its space at Qwen3.5-0.8B's
+"""The packed SwiGLU's heuristic columns a program. Of the configs measured at Qwen3.5-0.8B's
 24576 rows of 2 x 3584 (bf16, 2026-10-15), a whole row of 4096 with four warps was the fastest
 forward on an A100 80GB and an H100 and within 1% of the fastest reverse, level with the apart
 kernel's best (forward 0.323 against 0.315 ms on the A100, 0.181 against 0.178 on the H100), where
@@ -631,7 +631,6 @@ class RmsForward(tuning.KernelOp):
     row's mean square with epsilon, whose inverse root the norm multiplies by."""
 
     config_cls: ClassVar[type[RowsConfig]] = RowsConfig
-    ROWS: ClassVar[tuple[str, ...]] = ('x', 'branch', 'gate')
 
     def _fwd(self, x: jax.Array, branch: jax.Array | None, scale: jax.Array | None, gate: jax.Array | None, *,
              epsilon: float, dtype: str, offset: bool, stored: str, after_cast: bool, activation: str,
@@ -652,11 +651,6 @@ class RmsForward(tuning.KernelOp):
     def _get_heuristics_config(self, ba) -> RowsConfig:
         return RowsConfig(_row_block(ba.arguments['x'].shape[1]), 4)
 
-    def _get_autotuning_configs(self, ba) -> set[RowsConfig]:
-        width = pl.next_power_of_2(ba.arguments['x'].shape[1])
-        return {RowsConfig(rows, warps) for rows in (1, 2, 4, 8, 16, 32)
-                if rows == 1 or rows * width <= 16384 for warps in (1, 2, 4, 8)}
-
 
 @dataclasses.dataclass(frozen=True)
 class RmsBackward(tuning.KernelOp):
@@ -665,7 +659,6 @@ class RmsBackward(tuning.KernelOp):
     compensated partial sums of the weight's."""
 
     config_cls: ClassVar[type[ReverseConfig]] = ReverseConfig
-    ROWS: ClassVar[tuple[str, ...]] = ('x', 'gate', 'mean_square', 'dy', 'ds')
 
     def _fwd(self, x: jax.Array, scale: jax.Array | None, gate: jax.Array | None, mean_square: jax.Array,
              dy: jax.Array, ds: jax.Array | None, *, offset: bool, stored: str, after_cast: bool,
@@ -690,12 +683,6 @@ class RmsBackward(tuning.KernelOp):
         rows, width = ba.arguments['x'].shape
         block = _row_block(width)
         return ReverseConfig(block, max(1, min(MAX_PROGRAMS, pl.cdiv(rows, block * ROW_BLOCKS))), 4)
-
-    def _get_autotuning_configs(self, ba) -> set[ReverseConfig]:
-        width = pl.next_power_of_2(ba.arguments['x'].shape[1])
-        return {ReverseConfig(rows, programs, warps) for rows in (1, 2, 4, 8, 16)
-                if rows == 1 or rows * width <= 8192
-                for programs in (256, 512, 1024, 2048) for warps in (2, 4, 8)}
 
 
 _RMS_FORWARD = RmsForward()
@@ -883,15 +870,12 @@ def _packed_backward(gate_up_ref, dy_ref, d_ref, *, block: int, interpret: bool)
 @dataclasses.dataclass(frozen=True)
 class _Elementwise(tuning.KernelOp):
     """An elementwise launch over flat operands: `ELEMENT_BLOCK` elements and
-    four warps a program unless measured."""
+    four warps a program."""
 
     config_cls: ClassVar[type[BlockConfig]] = BlockConfig
 
     def _get_heuristics_config(self, ba) -> BlockConfig:
         return BlockConfig(ELEMENT_BLOCK, 4)
-
-    def _get_autotuning_configs(self, ba) -> set[BlockConfig]:
-        return {BlockConfig(block, warps) for block in (256, 512, 1024, 2048, 4096) for warps in (1, 2, 4, 8)}
 
 
 def _launch(kernel, name: str, operands, outputs, grid: tuple[int, ...], config: BlockConfig,
@@ -907,8 +891,6 @@ def _launch(kernel, name: str, operands, outputs, grid: tuple[int, ...], config:
 class SwigluForward(_Elementwise):
     """SwiGLU's forward launch over flat `gate` and `up` (`_swiglu_forward`)."""
 
-    ROWS: ClassVar[tuple[str, ...]] = ('gate', 'up')
-
     def _fwd(self, gate: jax.Array, up: jax.Array, *, interpret: bool, config: BlockConfig,
              return_residuals: bool = False):
         return _launch(_swiglu_forward, "swiglu_forward", (gate, up),
@@ -920,8 +902,6 @@ class SwigluForward(_Elementwise):
 class SwigluBackward(_Elementwise):
     """SwiGLU's reverse launch (`_swiglu_backward`): both inputs' gradients."""
 
-    ROWS: ClassVar[tuple[str, ...]] = ('gate', 'up', 'dy')
-
     def _fwd(self, gate: jax.Array, up: jax.Array, dy: jax.Array, *, interpret: bool, config: BlockConfig,
              return_residuals: bool = False):
         outputs = (jax.ShapeDtypeStruct(gate.shape, gate.dtype), jax.ShapeDtypeStruct(up.shape, up.dtype))
@@ -932,7 +912,7 @@ class SwigluBackward(_Elementwise):
 @dataclasses.dataclass(frozen=True)
 class _Packed(_Elementwise):
     """A packed projection's launch over `[rows, 2 * width]`, gate then up in each row: a program a
-    row's block of columns, unless measured the whole row up to `PACKED_BLOCK` columns."""
+    row's block of columns, the whole row up to `PACKED_BLOCK` columns."""
 
     def _get_heuristics_config(self, ba) -> BlockConfig:
         return BlockConfig(min(PACKED_BLOCK, pl.next_power_of_2(ba.arguments['gate_up'].shape[1] // 2)), 4)
@@ -941,8 +921,6 @@ class _Packed(_Elementwise):
 @dataclasses.dataclass(frozen=True)
 class PackedSwigluForward(_Packed):
     """SwiGLU's forward launch over a packed projection's output, read in place (`_packed_forward`)."""
-
-    ROWS: ClassVar[tuple[str, ...]] = ('gate_up',)
 
     def _fwd(self, gate_up: jax.Array, *, interpret: bool, config: BlockConfig,
              return_residuals: bool = False):
@@ -955,8 +933,6 @@ class PackedSwigluForward(_Packed):
 @dataclasses.dataclass(frozen=True)
 class PackedSwigluBackward(_Packed):
     """The packed SwiGLU's reverse launch (`_packed_backward`): the gradient in its input's layout."""
-
-    ROWS: ClassVar[tuple[str, ...]] = ('gate_up', 'dy')
 
     def _fwd(self, gate_up: jax.Array, dy: jax.Array, *, interpret: bool, config: BlockConfig,
              return_residuals: bool = False):

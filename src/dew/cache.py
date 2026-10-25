@@ -16,7 +16,7 @@ from collections.abc import Callable
 import jax
 
 from dew._host import cpu_class
-from dew.devices import deterministic_ops_requested, xla_flag
+from dew.devices import deterministic_ops_requested
 
 
 def dew_cache_dir() -> str:
@@ -123,10 +123,12 @@ def enable_compilation_cache(path: str):
     that compiled its programs ahead of it share executables. XLA reads its
     flags at the first compile; a directory the run names is kept.
 
-    A run under `--xla_gpu_deterministic_ops` keeps no picks (`keeps_picks`):
-    jax 0.11.2's XLA measures nothing there and gives each instruction the
-    first configuration that compiles, but would still take a stored pick
-    over that one, so such a run names an empty directory.
+    A run under `--xla_gpu_deterministic_ops` keeps no picks: jax 0.11.2's
+    XLA measures nothing there and gives each instruction the first
+    configuration that compiles, but would still take a stored pick over
+    that one, so such a run names an empty directory, and its kernels stay
+    the same between a run and its resumption while other runs measure
+    into the cache.
     """
     os.makedirs(path, exist_ok=True)
     jax.config.update('jax_compilation_cache_dir', path)
@@ -140,52 +142,26 @@ def enable_compilation_cache(path: str):
     jax.config.update('jax_persistent_cache_min_compile_time_secs', 0.0)
     flags = os.environ.get('XLA_FLAGS', '')
     if '--xla_gpu_per_fusion_autotune_cache_dir' not in flags:
-        picks = autotune_dir(path) if keeps_picks() else ''
+        picks = '' if deterministic_ops_requested() else autotune_dir(path)
         if picks:
             os.makedirs(picks, exist_ok=True)
         os.environ['XLA_FLAGS'] = f"{flags} --xla_gpu_per_fusion_autotune_cache_dir={picks}".strip()
 
 
 def autotune_dir(path: str) -> str:
-    """Where the GPU picks of the executables cached under `path` go, for this
-    jaxlib alone: XLA's per fusion, and Dew's kernels' beside them
-    (`kernel_picks_path`). jaxlib pins XLA, Triton and Mosaic, which each
-    pick's speed depends on."""
+    """Where XLA's GPU picks of the executables cached under `path` go, one
+    file a fusion, for this jaxlib alone: jaxlib pins XLA, whose picks'
+    speed depends on it."""
     return os.path.join(path, 'autotune', f"jaxlib-{importlib.metadata.version('jaxlib')}")
 
 
-def kernel_picks_path(device_kind: str) -> str:
-    """The file of Dew's kernel configs measured on GPUs of `device_kind`
-    (`dew.nn.kernels.tuning`), beside XLA's picks in the cache this process
-    compiles to."""
-    name = device_kind.lower().replace(' ', '_').replace('/', '_')
-    return os.path.join(autotune_dir(default_compilation_cache_dir()), 'kernels', f"{name}.json")
-
-
-def device_facts_path(device_kind: str) -> str:
-    """The file of a GPU's calibrated facts (`dew.nn.kernels.tuning.calibration`) for `device_kind`,
-    beside its kernel picks."""
-    return kernel_picks_path(device_kind).removesuffix('.json') + '.facts.json'
-
-
-KERNEL_TUNES = jax.make_user_context(0)
-"""How many times this process's kernel picks changed (`dew.nn.kernels.tuning.tune`):
-a context JAX keys its trace and compile caches on, so a program lowered
-after picks change traces again. Made at `import dew`, as JAX makes a user
-context only beside no other JAX call."""
-
-KERNEL_LAUNCHES = jax.make_user_context(default_value=False)
-"""Whether a traced kernel launch carries tokamax's description of itself
-(`dew.nn.kernels.tuning.launches`), keyed on as `KERNEL_TUNES` is. Only a
-lowering made to read its launches out of carries it, never a step's: jaxlib
-0.11.2 writes a compiled program holding it to the persistent cache and cannot
-read it back ("Invalid metadata payload id")."""
-
 KERNEL_SEEN = jax.make_user_context(default_value=None)
 """The collection a lowering records its kernel launches into as it traces them
-(`dew.nn.kernels.tuning.seen`): JAX keys its trace caches on its identity, so a
-trace cached before traces, and records, again. The program is the same, and so
-is its key in the persistent cache, which reads no user context."""
+(`dew.nn.kernels.tuning.seen`): a context JAX keys its trace and compile caches
+on, by its identity, so a trace cached before traces, and records, again. The
+program is the same, and so is its key in the persistent cache, which reads no
+user context. Made at `import dew`, as JAX makes a user context only beside no
+other JAX call."""
 
 KERNEL_ROUTES = jax.make_user_context(())
 """The collections each open `dew.nn.kernels.generation.routes` block records its dispatches' routes
@@ -194,46 +170,26 @@ traces, and reports its routes, again."""
 
 KERNEL_PINS = jax.make_user_context(())
 """The `(kernel, config)` pairs `dew.nn.kernels.tuning.pinned` holds in this
-thread, keyed on as `KERNEL_TUNES` is."""
+thread, keyed on as `KERNEL_SEEN` is."""
 
 KERNEL_ASSUMED = jax.make_user_context(default_value=None)
 """The device `dew.nn.kernels.generation.assumed` stands in for in this thread, its generation and its
-facts where given them, keyed on as `KERNEL_TUNES` is, so a program traced for one device's launches
+facts where given them, keyed on as `KERNEL_SEEN` is, so a program traced for one device's launches
 traces again for another's."""
 
 KERNEL_CHOICES = jax.make_user_context(())
 """The `(choice, kernel)` pairs `dew.nn.kernels.generation.chosen` holds in
-this thread, keyed on as `KERNEL_TUNES` is, so a program traced before a
+this thread, keyed on as `KERNEL_SEEN` is, so a program traced before a
 choice traces again within it."""
 
 QUANTIZED_TRACE = jax.make_user_context(default_value=None)
 """What a quantized model's methods trace under, its provider's kind and spec
-(`dew.quantization`), keyed on as `KERNEL_TUNES` is. Qwix intercepts
+(`dew.quantization`), keyed on as `KERNEL_SEEN` is. Qwix intercepts
 `jax.lax.dot_general` by swapping its code while a wrapped method runs, and
 `jnp.matmul`, `jnp.dot` and the other contractions that reach it are jitted,
 so a trace of one taken under the swap holds its quantized product, which JAX's
 cache would hand a later plain call of the same shapes, and a plain trace a
 quantized call. In this context their traces are kept apart."""
-
-
-def keeps_picks() -> bool:
-    """Whether this process reads and stores GPU picks, XLA's and the
-    kernels' alike: not under `--xla_gpu_deterministic_ops`, whose kernels
-    must stay the same between a run and its resumption while other runs
-    measure into the cache. There XLA takes the first configuration that
-    compiles (`enable_compilation_cache`) and Dew's kernels their heuristic
-    ones (`dew.nn.kernels.tuning`), the same in every process."""
-    return not deterministic_ops_requested()
-
-
-def measures_picks() -> bool:
-    """Whether this process may measure GPU picks and store them, XLA's and
-    the kernels' alike: where it keeps picks at all (`keeps_picks`), and
-    not beside other work on its GPU, where `gpu-run -n 0.5` asks XLA to
-    read its picks and write none (AUTOTUNE_CACHE_MODE_READ), since a
-    measurement there is unfair."""
-    mode = xla_flag('xla_gpu_experimental_autotune_cache_mode')
-    return keeps_picks() and mode != 'AUTOTUNE_CACHE_MODE_READ'
 
 
 def persist_compilations() -> None:

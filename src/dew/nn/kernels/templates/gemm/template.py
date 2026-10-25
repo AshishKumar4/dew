@@ -15,16 +15,14 @@ axis it follows ('rows', 'depth' for the prologue's; 'rows', 'columns' for the e
 a dimension of one the hook broadcasts; the kernels load each side tile at their own origins and the
 hook broadcasts a vector itself (`ms[:, None]`). The epilogue applies to every row: a row past the
 routed ones sums nothing, so `gemm(..., epilogue=e)` is `e` of the plain product, and a function
-`jax.experimental.pallas.fuser` hands over keeps its value (`fused`). A measured pick for a launch
-with a hook needs a module-level hook (`tuning.encoded`).
+`jax.experimental.pallas.fuser` hands over keeps its value (`fused`).
 
-Each call runs the launch the cost model picks among the implementations that take it
-(`grouped_matmul.GROUPED`: its Triton, Mosaic GPU and CUTLASS launches) where it lowers for CUDA,
-interpreted on the CPU where `interpret_on_cpu` asks (an assumed TPU's, the TPU launches on Megablox's
-schedule), and XLA's ragged dot with the hooks applied around it everywhere else, a TPU's own lowering
-included until a scoreboard row measures its launches, and for a product no launch takes (the route
-says why), or where `generation.chosen` names XLA; a launch it names that does not take the call
-raises (`selection.KernelRefused`).
+Each call runs the first of the implementations that takes it, in a fixed order
+(`grouped_matmul.GROUPED`: its Mosaic GPU launches, the TPU's on Megablox's schedule, then Triton's;
+CUTLASS's only by name) where it lowers for its target's platform, interpreted on the CPU where
+`interpret_on_cpu` asks, and XLA's ragged dot with the hooks applied around it everywhere else, for a
+product no launch takes (the route says why), or where `generation.chosen` names XLA; a launch it
+names that does not take the call raises (`selection.KernelRefused`).
 `gemm` is differentiable at every order (`generation.linear_tangent`): its reverse mode runs the
 template's own launches with the arithmetic of the portable program's derivative, the products'
 cotangents through `gemm` and `gemm_t` and the hooks' through their VJPs in XLA, recomputing the
@@ -167,8 +165,7 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
 
     def kernel(lhs, rhs, group_sizes, prologue_arrays, *, interpret):
         sides, axes, broadcast = _launchable(prologue_arrays, prologue_axes)
-        hooks = grouped_matmul.Hooks(prologue, axes, prologue_broadcast=broadcast,
-                                     prologue_dtypes=_dtypes(prologue, lhs, sides))
+        hooks = grouped_matmul.Hooks(prologue, axes, prologue_broadcast=broadcast)
         product = declared(lhs.dtype, precision, outputs=(out_dtype,), operands=(lhs.dtype, rhs.dtype))
         call = grouped_matmul.tgmm_call(lhs, rhs.astype(lhs.dtype), group_sizes, sides, out_dtype=out_dtype,
                                         hooks=hooks, interpret=interpret, promoted=product.promoted,
@@ -190,16 +187,6 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays)
 
 
-_ACCUMULATOR = jax.ShapeDtypeStruct((), jnp.float32)
-"""An epilogue's tile: the fp32 accumulator's."""
-
-
-def _dtypes(hook, tile, sides: tuple) -> tuple[str, ...]:
-    """The dtypes a kernel traces `hook` at: its tile's (`tile`'s), then each side operand's; none without
-    a hook."""
-    return () if hook is None else tuple(jnp.dtype(array.dtype).name for array in (tile, *sides))
-
-
 def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
           epilogue_axes, dtypes, *, several: bool, transpose_rhs: bool, interpret_on_cpu: bool,
           precision: PrecisionLike, dense: bool = False):
@@ -209,9 +196,7 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
         after_sides, after_axes, after_broadcast = _launchable(epilogue_arrays, epilogue_axes)
         hooks = grouped_matmul.Hooks(prologue, before_axes, epilogue, after_axes,
                                      tuple(dtype.name for dtype in dtypes) if several else None,
-                                     prologue_broadcast=before_broadcast, epilogue_broadcast=after_broadcast,
-                                     prologue_dtypes=_dtypes(prologue, lhs, before_sides),
-                                     epilogue_dtypes=_dtypes(epilogue, _ACCUMULATOR, after_sides))
+                                     prologue_broadcast=before_broadcast, epilogue_broadcast=after_broadcast)
         product = declared(lhs.dtype, precision, outputs=dtypes, operands=(lhs.dtype, rhs.dtype))
         call = grouped_matmul.gmm_call(lhs, rhs.astype(lhs.dtype), group_sizes, before_sides, after_sides,
                                        out_dtype=dtypes[0], trans_rhs=transpose_rhs, hooks=hooks,

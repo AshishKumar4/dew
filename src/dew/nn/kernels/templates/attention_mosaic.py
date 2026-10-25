@@ -25,7 +25,6 @@ from dew.nn.kernels.templates.attention import (
     DQ_GRADS,
     NATURAL,
     TRACED_TILE,
-    AttentionLaunch,
     Gradients,
     Hooks,
     KeySpans,
@@ -164,12 +163,12 @@ def _read_bytes(ba: tokamax.BoundArguments) -> int:
 
 
 @dataclasses.dataclass(frozen=True)
-class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config]):
+class _Mainloop[Config: (Tiles, BackwardTiles)](Template[Config]):
     """What this mainloop's launches share as Template implementations (`MosaicForward`, `MosaicBackward`):
     the call's own arrays as arguments, padded by a launch to its config's blocks; the score hook (and the
-    forward's output hook) as fields keyed by what they compute (`hook_program`); the configs of the
-    target's family (`fits`), a consumer's registers its roles' share (`register_budget`), where its bundle
-    is one of `BUNDLES` and the call is one it takes (`refused`)."""
+    forward's output hook) as fields; the configs of the target's family (`fits`), a consumer's registers
+    its roles' share (`register_budget`), where its bundle is one of `BUNDLES` and the call is one it
+    takes (`refused`)."""
 
     name = "mosaic_gpu"
     score_mod: Callable | None = None
@@ -252,7 +251,6 @@ class MosaicForward(_Mainloop[Tiles]):
     (`derived`), legal within the device's block and a consumer's registers (`legal`); its cost record
     (`costed`) reports its predicted time."""
 
-    HOOKS = ("score_mod", "output_mod")
     config_cls = Tiles
     output_mod: Callable | None = None
     output_kinds: tuple[Kind, ...] = ()
@@ -458,10 +456,6 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     legal within the device's block and a consumer's registers (`legal`); its cost (both launches') reports
     its predicted time."""
 
-    HOOKS = ("score_mod",)
-    DIFFERENTIATED = True
-    SPANS = 4
-    """Its arrays' spans after the queries, keys, values and the output's cotangent (`_fwd`)."""
     config_cls = BackwardTiles
     accurate: bool = ACCURATE
 

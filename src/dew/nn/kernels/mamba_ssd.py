@@ -29,9 +29,9 @@ step and its decay cumulated within each chunk go heads-first `[B, H, Tp]` (padd
 out of the cumsum kernel, as mamba_ssm lays them out, so that a program reads its head's steps whole,
 and the states the chunks enter are `[B, T // chunk, H, P, N]`.
 
-Each kernel is a launch the tuner times (`dew.nn.kernels.tuning.KernelOp`) over the configs mamba_ssm's
-own autotuner lists for it (its `SPACE`), the tuner's pick at Nemotron 3's shapes on an H100 its heuristic
-(its `PICKS`, `_picks`).
+Each kernel is a launch (`dew.nn.kernels.tuning.KernelOp`) whose config is the fastest measured at
+Nemotron 3's shapes on an H100 among those mamba_ssm's own autotuner lists for it (its `PICKS`,
+`_picks`).
 """
 
 import dataclasses
@@ -64,16 +64,11 @@ class Tiles:
 
 @dataclasses.dataclass(frozen=True)
 class _Launch(tuning.KernelOp):
-    """One of the port's fourteen launches, its `Tiles` measured per GPU model and shape over its
-    `SPACE` by the tuner, `PICKS` its heuristic by operand dtype (`_picks`). A subclass names its
-    kernel, its tiles and what each block spans (`SPANS`)."""
+    """One of the port's fourteen launches, its `Tiles` by operand dtype `PICKS` (`_picks`), fitted to
+    the call (`_fitted`). A subclass names its kernel, its tiles and what each block spans (`SPANS`)."""
 
     config_cls: ClassVar[type[Tiles]] = Tiles
     NAME: ClassVar[str]
-    SPACE: ClassVar[frozenset[Tiles]]
-    """mamba_ssm's own autotune list for the kernel, `heads` over `_HEADED` for the kernels that sum a
-    group's heads, every config Triton's default four warps and three stages where mamba_ssm's names
-    none."""
     PICKS: ClassVar[Mapping[str, Tiles]]
     HEADS: ClassVar[str] = "x"
     """The argument whose third axis counts the heads a summing kernel's `heads` splits."""
@@ -103,9 +98,6 @@ class _Launch(tuning.KernelOp):
         dtype = "float32" if operand is None or jnp.dtype(operand.dtype).itemsize == 4 else "bfloat16"
         return self._fitted(ba, self.PICKS[dtype])
 
-    def _get_autotuning_configs(self, ba) -> set[Tiles]:
-        return {self._fitted(ba, tiles) for tiles in self.SPACE}
-
 
 def _operand(ba):
     """A call's first `[B, T, H, P]`-like operand, None for the step's own kernels: its dtype picks the
@@ -115,32 +107,10 @@ def _operand(ba):
                  and jnp.issubdtype(value.dtype, jnp.floating) and value.ndim == 4), None)
 
 
-def _tiles(blocks, warps: int, stages: int, heads=(0,)) -> frozenset[Tiles]:
-    return frozenset(Tiles(m, n, k, warps, stages, h) for m, n, k in blocks for h in heads)
-
-
-_MATMUL = frozenset({Tiles(128, 256, 64, 8, 3), Tiles(64, 256, 32, 4, 4), Tiles(128, 128, 32, 4, 4),
-                     Tiles(128, 64, 32, 4, 4), Tiles(64, 128, 32, 4, 4), Tiles(128, 32, 32, 4, 4),
-                     Tiles(64, 32, 32, 2, 5), Tiles(32, 64, 32, 2, 5), Tiles(64, 64, 32, 2, 4)})
-"""mamba_ssm's nine-config matmul list (ssd_chunk_state.py:177-188, ssd_bmm.py:22-33 and 96-107,
-ssd_chunk_scan.py:434-445); the chunk scan's adds two (ssd_chunk_scan.py:32-45) and the combined
-`dx`'s runs its two-warp configs at four (ssd_combined.py:78-89)."""
-
-_HEADED = (2, 4, 8, 16, 32, 64)
-"""The heads of a group one program of a summing kernel takes (mamba_ssm's `nheads_per_program`,
-which it derives from the SM count), clipped to the group's (`_Launch._fitted`)."""
-
-_SUMMING = [(32, 128), (128, 32), (64, 128), (128, 64), (64, 64), (64, 32), (32, 64), (32, 32)]
-
-
-_STATES = (64, 128, 256, 512, 1024, 2048)
-"""The state blocks mamba_ssm's state passing tries."""
-
-
 def _picks(tiles: Tiles, fp32: Tiles | None = None) -> Mapping[str, Tiles]:
-    """A launch's config without a measurement, by operand dtype, `fp32` where it differs from
-    `tiles`: the tuner's pick on an H100 at Nemotron 3 Ultra's shapes (one row of 4096 tokens, 256 heads
-    of 64 over 8 groups, a state of 128, chunks of 128), each summing kernel taking a group's every head.
+    """A launch's config by operand dtype, `fp32` where it differs from `tiles`: the fastest measured
+    on an H100 at Nemotron 3 Ultra's shapes (one row of 4096 tokens, 256 heads of 64 over 8 groups, a
+    state of 128, chunks of 128), each summing kernel taking a group's every head.
     fp32's TF32x3 products want smaller blocks: at bf16's picks its launches summed 10.6 ms against 5.9.
     mamba_ssm's own autotuner picks the same for seven of the twelve it tunes; its picks for the chunk
     state, the state passing, both `C B^T` products and the chunk scan ran 4% to 70% slower on the port
@@ -231,7 +201,6 @@ class ChunkCumsum(_Launch):
     """`chunk_cumsum`'s launch (tuning.KernelOp)."""
 
     NAME = "chunk_cumsum"
-    SPACE = _tiles([(heads, 0, 0) for heads in (1, 2, 4, 8, 16, 32, 64)], 4, 3)
     PICKS = _picks(Tiles(16, 0, 0, 4, 3))
     SPANS = (("dt", 2), None, None)
 
@@ -276,7 +245,6 @@ class ChunkCumsumBwd(_Launch):
     """`chunk_cumsum_bwd`'s launch (tuning.KernelOp)."""
 
     NAME = "chunk_cumsum_bwd"
-    SPACE = _tiles([(heads, 0, 0) for heads in (1, 2, 4, 8, 16, 32, 64)], 4, 3)
     PICKS = _picks(Tiles(16, 0, 0, 4, 3))
     SPANS = (("dt", 2), None, None)
 
@@ -330,7 +298,6 @@ class ChunkState(_Launch):
     """`chunk_state`'s launch (tuning.KernelOp)."""
 
     NAME = "chunk_state"
-    SPACE = _MATMUL
     PICKS = _picks(Tiles(64, 128, 64, 8, 3), Tiles(64, 64, 32, 2, 4))
     SPANS = (("x", 3), ("b", 3), "chunk")
 
@@ -390,7 +357,6 @@ class StatePassing(_Launch):
     """`state_passing`'s launch (tuning.KernelOp)."""
 
     NAME = "state_passing"
-    SPACE = _tiles([(size, 0, 0) for size in _STATES], 4, 3)
     PICKS = _picks(Tiles(512, 0, 0, 4, 3))
     SPANS = ("state", None, None)
 
@@ -444,7 +410,6 @@ class BmmChunk(_Launch):
     """`bmm_chunk`'s launch (tuning.KernelOp)."""
 
     NAME = "bmm_chunk"
-    SPACE = _MATMUL
     PICKS = _picks(Tiles(128, 128, 64, 8, 3), Tiles(64, 128, 32, 4, 4))
     SPANS = ("chunk", "chunk", ("a", 3))
 
@@ -519,7 +484,6 @@ class ChunkScan(_Launch):
     """`chunk_scan`'s launch (tuning.KernelOp)."""
 
     NAME = "chunk_scan"
-    SPACE = _MATMUL | {Tiles(128, 64, 64, 4, 4), Tiles(64, 128, 64, 4, 4)}
     PICKS = _picks(Tiles(64, 64, 32, 2, 4), Tiles(64, 64, 32, 4, 4))
     SPANS = ("chunk", ("x", 3), "chunk")
 
@@ -588,7 +552,6 @@ class ChunkScanBwdDstates(_Launch):
     """`chunk_scan_bwd_dstates`'s launch (tuning.KernelOp)."""
 
     NAME = "chunk_scan_bwd_dstates"
-    SPACE = _MATMUL
     PICKS = _picks(Tiles(64, 128, 32, 4, 4), Tiles(64, 64, 32, 2, 4))
     SPANS = (("dout", 3), ("c", 3), "chunk")
 
@@ -653,7 +616,6 @@ class StatePassingBwd(_Launch):
     """`state_passing_bwd`'s launch (tuning.KernelOp)."""
 
     NAME = "state_passing_bwd"
-    SPACE = _tiles([(size, 0, 0) for size in _STATES], 4, 3)
     PICKS = _picks(Tiles(512, 0, 0, 4, 3))
     SPANS = ("state", None, None)
 
@@ -761,7 +723,6 @@ class ChunkScanChunkStateBwdDx(_Launch):
     """`chunk_scan_chunk_state_bwd_dx`'s launch (tuning.KernelOp)."""
 
     NAME = "chunk_scan_chunk_state_bwd_dx"
-    SPACE = frozenset(dataclasses.replace(tiles, warps=max(tiles.warps, 4)) for tiles in _MATMUL)
     PICKS = _picks(Tiles(32, 64, 32, 4, 5), Tiles(64, 64, 32, 4, 4))
     SPANS = ("chunk", ("x", 3), "chunk")
 
@@ -902,7 +863,6 @@ class ChunkStateBwdDb(_Launch):
     """`chunk_state_bwd_db`'s launch (tuning.KernelOp, `_state_gradient`)."""
 
     NAME = "chunk_state_bwd_db"
-    SPACE = _tiles([(m, n, 0) for m, n in _SUMMING], 4, 3, _HEADED)
     PICKS = _picks(Tiles(64, 128, 0, 4, 3, 64), Tiles(64, 64, 0, 4, 3, 64))
     SPANS = ("chunk", ("b", 3), None)
 
@@ -918,7 +878,6 @@ class ChunkScanBwdDc(_Launch):
     """`chunk_scan_bwd_dc`'s launch (tuning.KernelOp, `_state_gradient`)."""
 
     NAME = "chunk_scan_bwd_dc"
-    SPACE = _tiles([(m, n, 0) for m, n in _SUMMING], 4, 3, _HEADED)
     PICKS = _picks(Tiles(64, 128, 0, 4, 3, 64), Tiles(64, 64, 0, 4, 3, 64))
     HEADS = "dout"
     SPANS = ("chunk", ("c", 3), None)
@@ -971,8 +930,6 @@ class ChunkScanBwdDcb(_Launch):
     """`chunk_scan_bwd_dcb`'s launch (tuning.KernelOp)."""
 
     NAME = "chunk_scan_bwd_dcb"
-    SPACE = _tiles([(32, 128, 0), (128, 32, 0), (64, 64, 0), (64, 32, 0), (32, 64, 0), (32, 32, 0)], 4, 3,
-                   _HEADED)
     PICKS = _picks(Tiles(64, 64, 0, 4, 3, 64))
     SPANS = ("chunk", "chunk", None)
 
@@ -1034,7 +991,6 @@ class BmmChunkBwd(_Launch):
     """`bmm_chunk_bwd`'s launch (tuning.KernelOp)."""
 
     NAME = "bmm_chunk_bwd"
-    SPACE = _MATMUL
     PICKS = _picks(Tiles(64, 128, 32, 4, 4), Tiles(128, 64, 32, 4, 4))
     SPANS = ("chunk", ("a", 3), "chunk")
 
@@ -1104,8 +1060,6 @@ class ChunkScanBwdDdacsStable(_Launch):
     """`chunk_scan_bwd_ddacs_stable`'s launch (tuning.KernelOp)."""
 
     NAME = "chunk_scan_bwd_ddacs_stable"
-    SPACE = _tiles([(32, 32, 0), (64, 32, 0), (64, 64, 0), (128, 32, 0), (128, 64, 0), (128, 128, 0)],
-                   4, 3)
     PICKS = _picks(Tiles(64, 32, 0, 4, 3))
     SPANS = ("chunk", "chunk", None)
 

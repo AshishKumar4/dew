@@ -16,11 +16,11 @@ import numpy as np
 import pytest
 from delta_rule_support import NAMES, fla_side, float64_truth, math, plain_prefix, recurrence, through
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference, distance
-from tuned import each_config
+from tuned import taken
 
 from dew.nn import kernels
 from dew.nn.kda import KimiDeltaAttention
-from dew.nn.kernels import chunked_launch, fla_kda, tuning
+from dew.nn.kernels import chunked_launch, fla_kda
 from dew.nn.kernels.recurrence_chunk import fla_rule
 from dew.nn.precision import l2norm
 
@@ -121,7 +121,7 @@ GPU_CASES = {
     # Packed documents as fla's varlen sequences, on and off the chunk grid, one shorter than a chunk,
     # two value heads a key head.
     "packed": ((4096, 4, 8, 128, 128), (0, 1000, 1037, 2500)),
-    # Every tile the tuner may pick: a partial last chunk, eight value heads a program can block.
+    # Each launch's tiles: a partial last chunk, eight value heads a program can block.
     "tiles": ((1000, 8, 8, 128, 128), None),
 }
 
@@ -157,17 +157,15 @@ def tiles_case():
 
 @pytest.mark.gpu(reason="float64 distances against fla's own on this GPU")
 @pytest.mark.parametrize("launch", LAUNCHES, ids=lambda kind: kind.__name__)
-def test_each_tile_the_tuner_may_pick_is_as_exact_as_fla(launch, tiles_case):
-    """Every tile in the space of each of the port's own launches on this GPU (tests/tuned.py's
-    `each_config`), pinned (`tuning.pinned`), keeps each output and gradient as near the float64
-    recurrence as fla's own, at a partial last chunk."""
+def test_each_launchs_tiles_are_as_exact_as_fla(launch, tiles_case):
+    """The tiles each of the port's own launches takes on this GPU (tests/tuned.py's `taken`) keep
+    each output and gradient as near the float64 recurrence as fla's own, at a partial last chunk."""
     inputs, run, theirs, truth, terms = tiles_case
-    for tiles in each_config(launch, run, *inputs[:-2]):
-        with tuning.pinned({launch: tiles}):
-            mine = [np.asarray(x, np.float64) for x in jax.jit(lambda *a: run(*a))(*inputs[:-2])]
-        for name, dew, fla, value, summed in zip(NAMES, mine, theirs, truth, terms, strict=True):
-            label = f"{launch.__name__}/{tiles}/{name}"
-            assert_as_exact_as_the_reference(dew, fla, value, label, terms=summed)
+    tiles = taken(launch, run, *inputs[:-2])
+    mine = [np.asarray(x, np.float64) for x in jax.jit(lambda *a: run(*a))(*inputs[:-2])]
+    for name, dew, fla, value, summed in zip(NAMES, mine, theirs, truth, terms, strict=True):
+        label = f"{launch.__name__}/{tiles}/{name}"
+        assert_as_exact_as_the_reference(dew, fla, value, label, terms=summed)
 
 
 def gpu_case(case, dtype):

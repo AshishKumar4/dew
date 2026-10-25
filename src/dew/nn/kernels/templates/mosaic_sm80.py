@@ -1,8 +1,9 @@
 """The mma.sync instruction family's bundle (Ampere and its consumer kin, sm80 to sm89 and consumer
 Blackwell; `generation.family` 'mma.sync') for the templates' Mosaic mainloops (`mosaic.Family`): one
-warpgroup a program, its operand tiles streamed into shared memory by `plgpu.emit_pipeline` (cp.async),
-read into registers in the MMA layouts (ldmatrix), and multiplied synchronously (mma.sync) into an
-accumulator the walk carries in registers. An accumulator's value is the next product's left operand in
+warpgroup a program, its operand tiles streamed into rings of shared-memory slots by cp.async (no TMA before
+Hopper) over segments whose bounds may be traced (a packed document's chunks), read into registers in the
+MMA layouts (ldmatrix), and multiplied synchronously (mma.sync) into an accumulator the walk carries in
+registers. An accumulator's value is the next product's left operand in
 registers (the fork's relayout, jax 0.11.2.post13 and later), as FlashAttention-2 reuses its fragments.
 Its layouts are its operands' dtype's (`Layout.MMA_ACC(dtype)`), so a bundle is a dtype's (`Mma`)."""
 
@@ -12,6 +13,7 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
@@ -30,37 +32,33 @@ def swizzled(shape: tuple[int, int], dtype) -> tuple:
     return _TILING((8, swizzle // jnp.dtype(dtype).itemsize)), _SWIZZLE(swizzle)
 
 
-class Slots:
-    """A pipelined step's operand slots by stream name (`mosaic.Slots`'s interface): `emit_pipeline` hands
-    the step its shared-memory tiles and takes them back when the step returns, so releasing one early is
-    nothing."""
+@dataclasses.dataclass(frozen=True)
+class Stream:
+    """One operand's stream (`Mma.opened`): its ring of `stages` swizzled shared-memory slots and its view
+    `(ref, index_map)`, each step's tile of which the walk copies into a slot (one role loads and
+    computes)."""
 
-    def __init__(self, refs: dict):
-        self._refs = refs
+    smem: mosaic.Ref
+    view: tuple | None
+
+    @property
+    def stages(self) -> int:
+        return int(self.smem.shape[0])
+
+
+class Slots:
+    """A walk step's slots by stream name (`mosaic.Slots`' reading side): each step's tiles are in shared
+    memory before the step runs, and a slot is refilled only after every warp passed the wait of the step
+    whose copy refills it, so releasing one early is nothing."""
+
+    def __init__(self, streams: dict, slot):
+        self._streams, self._slot = streams, slot
 
     def __getitem__(self, name: str):
-        return self._refs[name]
+        return self._streams[name].smem.at[self._slot]
 
     def release(self, name: str) -> None:
         del name
-
-
-@dataclasses.dataclass(frozen=True)
-class Pipeline:
-    """A program's operand streams as `Mma.streams` describes them: each stream's tile `(shape, dtype)` by
-    name and the tiles `emit_pipeline` keeps in flight (`stages`); it allocates their slots itself."""
-
-    blocks: dict
-    stages: int
-
-
-@dataclasses.dataclass(frozen=True)
-class Streams:
-    """A program's operand streams (`Mma.opened`): its pipeline and each stream's view `(ref, block)` by
-    name, the `[S, D]` operand its steps' tiles come from in `block` rows."""
-
-    pipeline: Pipeline
-    views: dict
 
 
 STAGING_SOLVED = (0, 11, 2, 20)
@@ -81,8 +79,8 @@ def staging_solved() -> bool:
 
 @dataclasses.dataclass(frozen=True)
 class Mma(mosaic.Family):
-    """mma.sync's bundle for operands of `dtype`: one compute warpgroup a program and no producer
-    (`emit_pipeline` issues its loads), accumulators in registers, products synchronous."""
+    """mma.sync's bundle for operands of `dtype`: one compute warpgroup a program and no producer (its walk
+    issues its own copies), accumulators in registers, products synchronous."""
 
     dtype: jnp.dtype
 
@@ -94,6 +92,8 @@ class Mma(mosaic.Family):
     operands_in_registers = True
     rhs_copies = 4
     most_shared = 163 * 1024  # sm80's and sm87's opt-in block (sm86's and sm89's 99 KiB)
+    reduction_scratch = plgpu.CompilerParams().reduction_scratch_bytes  # its kernels' default parameters
+    column_scratch = 0  # its column sums take its kernels' reduction scratch
 
     def registers(self, consumers: int) -> int:
         del consumers  # one role, at a thread's whole budget
@@ -136,30 +136,30 @@ class Mma(mosaic.Family):
                             interpret=mosaic.interpreted(interpret), kernel_name=name)
 
     def scoped(self, body, *allocations, streams) -> None:
-        pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)
+        pl.run_scoped(lambda *refs, **slots: body(*refs, streams=slots), *allocations, **streams)
 
     def roles(self, consumers: int, consumer, producer) -> None:
         _one(consumers)
         del producer
         consumer(0)
 
-    def streams(self, blocks: dict, stages: int, consumers: int):
+    def streams(self, blocks: dict, stages: int, consumers: int) -> dict:
         _one(consumers)
-        return Pipeline(blocks, stages)
+        return {name: plgpu.SMEM((stages, *shape), dtype, transforms=swizzled(shape, dtype))
+                for name, (shape, dtype) in blocks.items()}
 
-    def opened(self, allocated, views: dict | None = None):
-        if views is None:
-            raise ValueError("a pipelined family's streams take their views where they open (its walk loads)")
-        return Streams(allocated, views)
+    def opened(self, allocated: dict, views: dict | None = None) -> dict:
+        return {name: Stream(smem, None if views is None else views[name])
+                for name, smem in allocated.items()}
 
     def stream(self, streams, views, lo, hi) -> None:
         del streams, views, lo, hi
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, consumer: Callable, *,
                 consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0) -> None:
-        # Each tile's pipeline is its own (`emit_pipeline` fills and drains it), its step count static; an
-        # output is staged after it, scoped apart from its stages though Mosaic reserves both at once
-        # (`grouped_matmul._Mosaic.staged_bytes`), and stored through registers (no TMA before Hopper).
+        # Each tile's walk fills its rings and waits out its copies; an output is staged after it, scoped
+        # apart from the rings though Mosaic reserves both at once (`grouped_matmul._Mosaic.staged_bytes`),
+        # and stored through registers (no TMA before Hopper).
         _one(consumers)
         del in_flight
 
@@ -185,32 +185,58 @@ class Mma(mosaic.Family):
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None
                 ) -> tuple[C, tuple[jax.Array, ...]]:
-        # Its products are synchronous: none stays in flight past its step, and `emit_pipeline` gives
-        # each stage back as its step ends.
-        del first, in_flight
-        blocks = streams.pipeline.blocks
-        names = tuple(blocks)
+        # Its products are synchronous: none stays in flight past its step. Step `index` reads slot
+        # `(index - first) % stages`, the copies of the `stages - 1` steps ahead in flight while it runs.
+        del in_flight
+        names = tuple(streams)
+        stages = min(stream.stages for stream in streams.values())
+        ahead = stages - 1
+
+        def copy(index, slot):
+            for name in names:
+                stream = streams[name]
+                view = mosaic.viewed(stream.view, stream.smem.shape[1:], index)
+                if interpret:
+                    # Mosaic GPU's interpreter lowers no cp.async: a plain copy.
+                    stream.smem.at[slot][...] = view[...]
+                else:
+                    plgpu.copy_gmem_to_smem(view, stream.smem.at[slot], None,
+                                            oob_mode=plgpu.OOBFillMode.PROMISE_IN_BOUNDS)
+
+        def waited(groups) -> None:
+            if not interpret:
+                plgpu.wait_gmem_to_smem(groups)
+
         initial = (None,) * len(shapes) if initial is None else initial
         carry = (start, tuple(self.zeros(shape) if value is None else value
                               for shape, value in zip(shapes, initial, strict=True)))
         for step, lo, hi in segments:
             if isinstance(lo, int) and isinstance(hi, int) and hi <= lo:
-                # No steps: the carry and its zero accumulators as they start (`emit_pipeline` takes no
-                # empty grid).
                 continue
 
-            def body(indices, *refs, step=step, lo=lo):
-                (index,), (carried, accumulators) = indices, refs[-1]
-                slots = Slots(dict(zip(names, refs[:-1], strict=True)))
-                return step(index + lo, slots, carried, accumulators)
+            # A copy past the segment loads its last step again into a slot no step reads (cp.async takes
+            # no predicate), so every step commits one group a stream, and the groups in flight past a
+            # step's are always the steps ahead's. An empty segment (traced bounds) copies nothing.
+            @pl.when(hi > lo)
+            def _(lo=lo, hi=hi):
+                for back in range(ahead):
+                    copy(jnp.minimum(lo + back, hi - 1), (lo + back - first) % stages)
 
-            specs = [plgpu.BlockSpec(blocks[name][0],
-                                     lambda j, lo=lo, index_map=streams.views[name][1]: index_map(j + lo),
-                                     transforms=swizzled(*blocks[name]))
-                     for name in names]
-            carry = plgpu.emit_pipeline(body, grid=(hi - lo,), in_specs=specs,
-                                        max_concurrent_steps=streams.pipeline.stages,
-                                        init_carry=carry)(*(streams.views[name][0] for name in names))
+            def stepped(index, carry, step=step, hi=hi):
+                if not ahead:
+                    # One slot: the last step's reads done (no copy in flight) before its next load.
+                    waited(0)
+                    copy(index, 0)
+                # The wait's barrier also ends every warp's reads of the slot the next copy refills.
+                waited(ahead * len(names))
+                if ahead:
+                    copy(jnp.minimum(index + ahead, hi - 1), (index + ahead - first) % stages)
+                carried, accumulators = carry
+                return step(index, Slots(streams, (index - first) % stages), carried, accumulators)
+
+            carry = lax.fori_loop(lo, hi, stepped, carry)
+        # No copy left in flight past the walk: its slots are free for whatever the program scopes next.
+        waited(0)
         return carry
 
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
@@ -232,6 +258,17 @@ class Mma(mosaic.Family):
             # lowering (jax 0.11.2).
             raise NotImplementedError("mma.sync's bundle adds into global memory only interpreted")
         view[...] = view[...] + value
+
+    def column_sums(self, value: jax.Array, scratch, interpret: bool) -> jax.Array:
+        # One warpgroup a program: Mosaic GPU's own reduction across its warps, through the scratch its
+        # kernels' parameters reserve (`reduction_scratch`).
+        del scratch, interpret
+        return value.sum(axis=0)
+
+    def published(self) -> None:
+        # Its products read shared memory through ldmatrix, the warpgroup's own loads, which the store's
+        # automatic barriers order.
+        pass
 
     def held(self, ref):
         return plgpu.load(ref, layout=self.lhs, optimized=False)
@@ -284,8 +321,8 @@ class Mma(mosaic.Family):
 
 
 def _one(consumers: int) -> None:
-    """mma.sync's programs take one compute warpgroup (`emit_pipeline`'s stages are no thread-collective
-    allocation)."""
+    """mma.sync's programs take one compute warpgroup: its walk's copies and waits are one warpgroup's
+    (cp.async groups are a thread's), and no producer role splits them from the products."""
     if consumers != 1:
         raise NotImplementedError(f"an mma.sync program takes one consumer warpgroup, not {consumers}")
 
