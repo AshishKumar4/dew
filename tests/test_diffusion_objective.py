@@ -540,8 +540,8 @@ def test_a_host_master_step_draws_each_examples_noise_as_the_resident_step_does(
     """A step whose variables live on the host runs its loss on the accelerator with the examples'
     draws the step carries, so it takes the update a resident step takes: on par with it over drawn
     weights (check 1), the objective's float64 twin at the step's draws the truth. The two steps are
-    two programs, which round otherwise: the host's update is its CPU's, and on a GPU its accelerator
-    programs take the modules' kernel options without the step's (ledger 1547). A host-master run's
+    two programs, which round otherwise: the host's update is its CPU's, though its accelerator
+    programs compile under the resident step's options (`step_compiler_options`). A host-master run's
     draws by the attempt would read other times, noise and dropped conditions, and step elsewhere."""
     import optax
     from reference_error import assert_as_exact

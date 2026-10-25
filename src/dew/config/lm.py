@@ -205,8 +205,9 @@ class LMRunConfig(RunConfig):
         loaded = Pretrained.load(name, dtype=jnp.bfloat16 if dtype is None else dtype,
                                  param_dtype=self.pretrained_param_dtype,
                                  attention_impl=str(self.model.fields.get("attention_impl", "auto")),
-                                 max_seq_len=reach, revision=revision, weights=not self.trainer.resumes(),
-                                 on_host=True)
+                                 max_seq_len=reach, revision=revision,
+                                 # An adapter keeps its source as it is.
+                                 **self.trainer.source_placement(frozen=self.lora is not None))
         if not same_vocabulary(written, loaded, name):
             raise ValueError(f"the token files were written with {written}, and {self.pretrained} "
                              f"expects its own tokenizer's ids. Retokenize with --tokenizer {name}.")

@@ -35,6 +35,7 @@ from dew._distributions import draw, row_draw, wellformed
 from dew.batch import Coordinates, Variables, coordinates, real_slots, token_id, token_ids, token_layout
 from dew.diffusion.block import CanvasGeneration, through_eos
 from dew.diffusion.process import Conditioning
+from dew.diffusion.schedules import common
 from dew.interop.weights import decoding_storage
 from dew.nn import categorical
 from dew.nn.inputs import (
@@ -87,10 +88,10 @@ class LogLinear(MaskingSchedule):
     eps: float = 1e-3
 
     def alpha(self, t):
-        return 1 - (1 - self.eps) * jnp.asarray(t, jnp.float32)
+        return 1 - (1 - self.eps) * common.times(t)
 
     def alpha_prime(self, t):
-        return jnp.full_like(jnp.asarray(t, jnp.float32), -(1 - self.eps))
+        return jnp.full_like(common.times(t), -(1 - self.eps))
 
 
 @dataclass(frozen=True)
@@ -134,7 +135,7 @@ class DiscreteProcess:
         The weight is exactly zero at t = 0. Nothing is masked there, so no
         token contributes, and the quotient itself is undefined.
         """
-        t = jnp.asarray(t, jnp.float32)
+        t = common.times(t)
         return jnp.where(t > 0, -self.schedule.alpha_prime(t) / (1 - self.schedule.alpha(t)), 0.0)
 
     def times(self, steps: int) -> jax.Array:

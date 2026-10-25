@@ -6,6 +6,7 @@
     python3 tools/armada/ci.py durations VERDICT
     python3 tools/armada/ci.py gpu-tier [--marked] [--evidence] [--shards=N]
     python3 tools/armada/ci.py gpu-lane --tests="tests/a.py tests/b.py" --out=FILE --cache=on --processes=N
+    python3 tools/armada/ci.py gpu-lane --network [--tests=...] --out=FILE --cache=on --processes=N
     python3 tools/armada/ci.py coverage items --target=SECONDS --timings=FILE > ITEMS
     python3 tools/armada/ci.py coverage report DIR
     python3 tools/armada/ci.py gangs
@@ -62,7 +63,9 @@ A row's record also says where its tests read the backend and which are
 marked to run on a GPU, from which `gpu-tier` names the files that take
 another path on a GPU (all of them daily, the marked ones per batch). A GPU
 node runs them with `gpu-lane`, each as a task of a CUDA lane, whose rows are
-recorded and reused on the GPU's class as a CPU task's are on the CPU's.
+recorded and reused on the GPU's class as a CPU task's are on the CPU's. With `--network`, a GPU node that
+reaches the Hub runs every file's network-marked tests, which every other task sets aside, as one lane of
+their own, recorded on a class of their own, so each train reruns only the files whose inputs changed.
 
 `coverage` measures src/dew's branch coverage over the suite, on demand and never
 per batch: `items` prints the plan's tasks for the oldest Python as armada map
@@ -276,15 +279,19 @@ def cpu_class() -> str:
     return host.cpu_class()
 
 
-def device_class() -> str:
+def device_class(network: bool = False) -> str:
     """The class a task's results belong to: on a CUDA lane (`JAX_PLATFORMS`, as
     tests/lane_environment.py reads it) the models of the GPUs it sees as the driver names them,
     before the CPU's class, whose float32 the lane's CPU devices compute (`cpu_class`); else the
-    CPU's class alone."""
+    CPU's class alone. A network lane's (`gpu_lane`) is a class of its own, `network` after it: its
+    records hold the network-marked tests alone, run with the Hub open, apart from the same file's
+    other tests and their peaks."""
     if "cuda" not in os.environ.get("JAX_PLATFORMS", "").split(","):
-        return cpu_class()
-    return "-".join([*(re.sub(r"[^A-Za-z0-9.]+", "-", model) for model in sorted(set(gpu_query("name")))),
-                     cpu_class()])
+        held = cpu_class()
+    else:
+        held = "-".join([*(re.sub(r"[^A-Za-z0-9.]+", "-", model) for model in sorted(set(gpu_query("name")))),
+                         cpu_class()])
+    return f"{held}-network" if network else held
 
 
 def gpu_query(field: str) -> list[str]:
@@ -334,7 +341,7 @@ def record_of(key: str, token: str) -> bytes | None:
         return None
 
 
-def reused(python: str, name: str, split: str, common: str) -> dict | None:
+def reused(python: str, name: str, split: str, common: str, network: bool = False) -> dict | None:
     """The green row of test file `name` (in `split`'s group) recorded on this host's class
     (`device_class`), if it ran green there on exactly these inputs; else None. The record of the last
     run on these shared inputs decides: a key hashes them (`cache_key`), so no run on others, whose
@@ -342,7 +349,7 @@ def reused(python: str, name: str, split: str, common: str) -> dict | None:
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
-    found = recorded(record_key(python, row(python, name, split), device_class(), common), token)
+    found = recorded(record_key(python, row(python, name, split), device_class(network), common), token)
     if found is None or not fresh(found, name, common):
         return None
     return found["row"]
@@ -622,15 +629,18 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
 
 
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
-           common: str, environ: Mapping[str, str], coverage: Path | None = None) -> int:
+           common: str, environ: Mapping[str, str], coverage: Path | None = None,
+           network: bool = False) -> int:
     """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's, a green row
-    reused as the cache's policy (`policy`) allows."""
+    reused as the cache's policy (`policy`) allows. With `network`, the network-marked tests alone, with the
+    Hub open, recorded on the network lane's class (`device_class`)."""
     began = time.monotonic()
     rows = [found for name in tests
-            if cache != "off" and (found := reused(python, name, split, common))]
+            if cache != "off" and (found := reused(python, name, split, common, network))]
     tests = [name for name in tests if row(python, name, split) not in {found["name"] for found in rows}]
     if rows:
-        print(f"{len(rows)} files ran green on these inputs on {device_class()}; their rows are reused")
+        print(f"{len(rows)} files ran green on these inputs on {device_class(network)}; "
+              "their rows are reused")
     if not tests:
         out.write_text(json.dumps({"rows": rows}))
         return 0
@@ -644,13 +654,16 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # its data where COVERAGE_FILE says.
     measured = [] if coverage is None else ["-m", "coverage", "run"]
     environ = environ if coverage is None else {**environ, "COVERAGE_FILE": str(coverage / ".coverage")}
-    command = [*session.pytest_run(python, report, *measured), "-p", "executed", *tests, *grouping]
+    command = [*selected(session.pytest_run(python, report, *measured), network), "-p", "executed", *tests,
+               *grouping]
     # pytest leads a process group of its own, so what its tests start ends with it. Its output is
     # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
     # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
     lines: list[str] = []
     environment = session.pytest_environment({**environ, "DEW_EXECUTED": str(executed_report),
                                               "DEW_COLLECTED": str(collection)})
+    if network:
+        environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
     done = child_groups.start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                               env=environment)
 
@@ -725,11 +738,11 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     out.write_text(json.dumps({"rows": rows + ran}))
     if coverage is None:
         # A traced run's rows, timed under tracing, are no rows to reuse.
-        record(python, ran, executed_report, common)
+        record(python, ran, executed_report, common, network)
     return 0
 
 
-def record(python: str, rows: list[dict], executed_report: Path, common: str) -> None:
+def record(python: str, rows: list[dict], executed_report: Path, common: str, network: bool = False) -> None:
     """Keep each row a task ran with the files its tests executed, where they read the backend and
     its peak memory on a GPU and its children's pools: `gpu_tier` reads the reads, `gpu_needs` the
     memory. A green row keeps
@@ -740,7 +753,7 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str) ->
         return
     # A run cut short, or whose collection failed, may have written no report, or none for a file.
     executed = json.loads(executed_report.read_text()) if executed_report.is_file() else {}
-    held = device_class()
+    held = device_class(network)
     for row_ in rows:
         name = parsed_row(row_["name"])[1]
         ran = executed.get(name, {"depends": None, "reads": [], "peak": None, "shares": 0, "pools": 0})
@@ -820,18 +833,39 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
 def marked(python: str) -> dict[str, int]:
     """Each test file of this checkout with tests marked one of `session.MARKS`, and how many, as pytest
     collects it on the CPU: what a batch's GPU run holds, whatever the records say."""
+    return collected(python, " or ".join(session.MARKS))
+
+
+def network_files(python: str) -> dict[str, int]:
+    """Each test file of this checkout with tests marked network, and how many: what the network lane runs
+    (`gpu_lane`)."""
+    return collected(python, "network")
+
+
+def collected(python: str, marks: str) -> dict[str, int]:
+    """Each test file of this checkout with tests pytest's `-m marks` selects, and how many, as pytest
+    collects it on the CPU."""
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
-    done = subprocess.run([f".venv-{python}/bin/python", "-m", "pytest", "--collect-only", "-q",
-                           "-m", " or ".join(session.MARKS), *every],
-                          capture_output=True, text=True, env={**os.environ, "JAX_PLATFORMS": "cpu"})
+    done = subprocess.run([f".venv-{python}/bin/python", "-m", "pytest", "--collect-only", "-q", "-m", marks,
+                           *every], capture_output=True, text=True,
+                          env={**os.environ, "JAX_PLATFORMS": "cpu"})
     if done.returncode not in (0, 5):
-        raise SystemExit(f"collecting the marked tests exited {done.returncode}\n"
+        raise SystemExit(f"collecting the tests marked {marks} exited {done.returncode}\n"
                          f"{done.stdout[-4000:]}{done.stderr[-2000:]}")
     counts: dict[str, int] = {}
     for node in done.stdout.splitlines():
         if "::" in node:
             counts[node.split("::")[0]] = counts.get(node.split("::")[0], 0) + 1
     return counts
+
+
+def selected(command: list[str], network: bool) -> list[str]:
+    """CI's pytest `command` (`session.pytest_run`), or with `network` the same selecting the network-marked
+    tests alone, every one the rest of CI sets aside."""
+    if not network:
+        return command
+    at = command.index(session.SELECTION[1])
+    return [*command[:at], "network", *command[at + 1:]]
 
 
 GPU_HEADROOM = (1.25, 2 ** 30)
@@ -908,9 +942,13 @@ def borrowed_records(names: list[str], python: str, held: str, token: str) -> di
 
 
 def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes: int,
-             deadline: float) -> int:
+             deadline: float, network: bool = False) -> int:
     """Run `tests` on this process's share of the one GPU it sees, each file once, as a task of its
-    own (`tested`), and write their verdict rows to `out`.
+    own (`tested`), and write their verdict rows to `out`. With `network`, the network lane: each file's
+    network-marked tests alone, which every other task deselects (`session.SELECTION`), run with the Hub
+    open on a node that reaches it, their records on a class of their own (`device_class`), so the test
+    cache reruns only those whose inputs changed (Main, 2026-10-25: no CI run reached the published
+    checkpoints' parity tests).
 
     A file's process is given the share its last run on this GPU's class measured, green or red,
     and files start heaviest first while what they hold with their children (`gpu_needs`) fits
@@ -937,7 +975,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     token = os.environ["DEW_XLA_CACHE_TOKEN"]
     [total] = (int(megabytes) * 2 ** 20 for megabytes in gpu_query("memory.total"))
     budget = float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) * total
-    held = device_class()
+    held = device_class(network)
     threads = str(max(1, len(os.sched_getaffinity(0)) // processes))
 
     def needs(name: str) -> dict | None:
@@ -970,7 +1008,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                                "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true",
                                "OMP_NUM_THREADS": threads}
                     running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache,
-                                        session.GRACE, common, environ)] = fits
+                                        session.GRACE, common, environ, None, network)] = fits
                     continue
                 done, _ = concurrent.futures.wait(running, return_when=concurrent.futures.FIRST_COMPLETED)
                 for future in done:
@@ -1190,7 +1228,10 @@ def main() -> int:
                           help="only the files with a test marked to run on a GPU, as collected here")
     choosing.add_argument("--shards", type=int, default=1, help="how many GPUs share the tier")
     lane = operations.add_parser("gpu-lane")
-    lane.add_argument("--tests", required=True)
+    lane.add_argument("--tests", help="the test files; with --network, every file holding a "
+                                       "network-marked test by default (`network_files`)")
+    lane.add_argument("--network", action="store_true",
+                      help="the network-marked tests alone, with the Hub open, on the network lane's class")
     lane.add_argument("--out", type=Path, required=True)
     lane.add_argument("--cache", required=True, help="the test cache's policy (`policy`)")
     lane.add_argument("--processes", type=int, required=True, help="the most test files running at once")
@@ -1235,8 +1276,12 @@ def main() -> int:
         arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
         return targeted(args.python, arguments, args.report)
     if args.operation == "gpu-lane":
-        return gpu_lane(PYTHONS[0], args.tests.split(), args.out, cache=args.cache,
-                        processes=args.processes, deadline=args.deadline)
+        if args.tests is None and not args.network:
+            parser.error("gpu-lane names its --tests; only the network lane (--network) takes every file "
+                         "holding a network-marked test by default")
+        tests = args.tests.split() if args.tests is not None else list(network_files(PYTHONS[0]))
+        return gpu_lane(PYTHONS[0], tests, args.out, cache=args.cache, processes=args.processes,
+                        deadline=args.deadline, network=args.network)
     if args.operation == "coverage":
         if args.stage == "report":
             return coverage_report(args.directory)

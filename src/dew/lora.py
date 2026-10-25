@@ -54,7 +54,7 @@ from flax.linen.module import Interceptor
 from flax.nnx import bridge
 
 from dew._records import finite
-from dew.batch import FROZEN, Path, Variables, freeze, merge as overlay, select, thaw
+from dew.batch import FROZEN, Path, Variables, freeze, merge as overlay, part, select, thaw
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_plan import group_layers
@@ -337,8 +337,10 @@ class Adapter:
 
         It holds the adapted model, the checkpoint's variables and the bindings the
         run recorded, so `save` writes the factors under the source's names without
-        the source at hand. A recorded binding whose shapes do not fit the restored
-        factors is refused by name. `trust` is as `TextGeneration.from_run` takes it.
+        the source at hand: the recorded model's own part of a tree that nests it
+        beside others (`Objective._recorded_part`, a decision's backbone). A recorded
+        binding whose shapes do not fit the restored factors is refused by name.
+        `trust` is as `TextGeneration.from_run` takes it.
         """
         from dew.inference.tasks import SavedRun, saved_model
 
@@ -347,7 +349,11 @@ class Adapter:
         adapter = recorded_adapter(config.wrappers)
         if adapter is None:
             raise ValueError(f"{directory} trained no adapter")
-        return cls.recorded(config.build(), run.variables(ema=ema), adapter)
+        variables = run.variables(ema=ema)
+        # The recorded model's own tree, where the objective's nests it beside parts the record leaves out.
+        if run.objective._recorded_part is not None:
+            variables = part(variables, run.objective._recorded_part)
+        return cls.recorded(config.build(), variables, adapter)
 
     @classmethod
     def recorded(cls, model: nn.Module, variables: Variables, adapter: AdapterRecord) -> Adapter:

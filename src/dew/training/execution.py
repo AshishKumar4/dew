@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 import os
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
@@ -43,10 +44,12 @@ from dew.inference.banks import (
     narrowed,
     one_layer,
 )
+from dew.mesh import batch_axes
 from dew.nn.backbones.layer_plan import group_name, layer_index
 from dew.nn.kernels.options import program
 from dew.training.distributed import batch_shardings
 from dew.training.host import transfer
+from dew.training.memory import device_tokens, step_compiler_options
 from dew.training.transaction import Realization, placed_as_rows
 
 if TYPE_CHECKING:
@@ -306,15 +309,25 @@ class HostExecution:
         self.device = device
         self.unstack = jax.jit(functools.partial(_logical, sites=self.sites))
 
-    @property
-    def forward(self):
-        """The loss and its pullback, compiled for the objective's modules as they are now: the
-        objective owns the program, which its fit ladder replaces with its model. The dataset's
-        device steps run in it, on the accelerator, before the loss, so it holds them (`holds`)."""
+    def forward(self, step: Mapping[str, bool | int]):
+        """The loss and its pullback, compiled for the objective's modules as they are now, under the
+        `step`'s XLA options (`step_options`): the objective owns the program, which its fit ladder
+        replaces with its model. The dataset's device steps run in it, on the accelerator, before the
+        loss, so it holds them (`holds`)."""
         return self.objective.program(
             "host_forward",
             functools.partial(_forward, functools.partial(_after, self.device, self.objective._loss)),
-            static_argnames=("layout",), holds=self.device)
+            static_argnames=("layout",), holds=self.device, step=step)
+
+    def step_options(self, variables, batch) -> dict[str, bool | int]:
+        """The XLA options the resident step compiles under (`step_compiler_options`), which the host
+        step's forward and pullback take too, so the two differ by the host boundary alone: the
+        tokens each accelerator device steps of `batch`, whether the step trains next to frozen
+        weights, and the accelerator's devices."""
+        shards = math.prod(self.accelerator.shape[axis] for axis in batch_axes(self.accelerator))
+        options = step_compiler_options(self.objective, device_tokens(self.objective, batch, shards),
+                                        FROZEN in variables, self.accelerator.devices.size)
+        return dict(options or {})
 
     def snapshot(self, variables):
         """The declared stacks as banks, everything else as it is stored.
@@ -422,13 +435,14 @@ class HostExecution:
         layout = (treedef, held)
         with jax.set_mesh(self.accelerator):
             batch = transfer(batch, batch_shardings(self.accelerator, batch))
+            options = self.step_options(variables, batch)
             # The step crosses whole, so its examples' draws are the resident step's (`Step.sample`);
             # its averaged weights are the snapshot's, and its places the batch's rows'.
             here = self.on_accelerator(step.replace(ema=None)).replace(ema=ema)
             if here.example_index is not None:
                 here = here.replace(example_index=placed_as_rows(here.example_index, batch))
             rest = {name: tree for name, tree in store.items() if name != "params"}
-            stats, back, aux = self.forward(primal, frozen, rest, batch, here, layout=layout)
+            stats, back, aux = self.forward(options)(primal, frozen, rest, batch, here, layout=layout)
         stats, aux = self.on_cpu((stats, aux))
         if aux.variables is not None:
             with jax.set_mesh(self.cpu):
@@ -441,7 +455,7 @@ class HostExecution:
                 # The pullback runs its int8 dots here, apart from the forward's program, with an
                 # int8 backward (`Quantization.bwd_qtype`) on the options that ask for it.
                 pulled = program(_trainable_cotangent,
-                                 *(entry.module for entry in self.objective.program_key()),
+                                 *(entry.module for entry in self.objective.program_key()), step=options,
                                  static_argnames=("sites", "paths", "layout"))
                 gradient = pulled(back, self.on_accelerator(cotangent), sites=self.sites, paths=moving,
                                   layout=layout)

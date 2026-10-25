@@ -202,3 +202,40 @@ def test_a_checkpoint_loops_at_the_passes_and_over_the_block_asked():
 def test_a_decision_run_refuses_memory_options_without_their_backbone(fields, checkpoint, message):
     with pytest.raises(ValueError):
         DecisionRunConfig(pretrained=str(checkpoint), **fields).prepare()
+
+
+class Started(DecisionRunConfig):
+    """A decision run that hands back the objective it would train, rather than training it."""
+
+    def train(self, objective, dataset, **settings):
+        return objective
+
+
+def test_a_lora_decision_runs_source_loads_onto_its_trainers_mesh():
+    """A decision run that trains an adapter over a source reads the source onto its trainer's mesh
+    (`TrainerConfig.source_placement`), as an LM run does: its objective's frozen base is device
+    arrays, which the start shares as they are."""
+    import jax
+    import optax
+
+    from dew.batch import FROZEN
+    from dew.decision import DecisionObjective
+    from dew.lora import LoRA
+    from dew.training import Trainer
+
+    rows = Memory([{"text": text, "label": label} for text, label in
+                   [("charged twice", "billing"), ("site down", "technical"), ("pro price", "sales")] * 4])
+    asked = rows.pipe(decisions, question="team").read("memory").batch(4).loading(Loading(workers=0))
+    default = Started(data=asked)
+    config = dataclasses.replace(default, pretrained=str(QWEN), lora=LoRA(rank=2, modules=("q_proj",)),
+                                 trainer=dataclasses.replace(default.trainer, multi_host=False,
+                                                             compilation_cache_dir=None))
+    objective = config.prepare().train("placed")
+    assert isinstance(objective, DecisionObjective)
+    held = objective.held_variables()
+    assert held is not None and FROZEN in held
+    base = jax.tree.leaves(held[FROZEN])
+    assert base and all(isinstance(leaf, jax.Array) for leaf in base)
+    state = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0), mesh=config.trainer.mesh,
+                    layout=config.trainer.layout).place()[0]
+    assert {id(leaf) for leaf in jax.tree.leaves(state.variables[FROZEN])} == {id(leaf) for leaf in base}

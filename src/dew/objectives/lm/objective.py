@@ -78,6 +78,7 @@ from dew.nn.protocols import (
     LayerStates,
     OutputTable,
     TokenModel,
+    head_table,
 )
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
@@ -100,7 +101,6 @@ from dew.objectives.lm.chunked import (
     final_read,
     fused_head_loss,
     head_cross_entropy,
-    head_table,
     logits_cross_entropy,
     logits_support_log_probs,
     model_logits,
@@ -816,15 +816,6 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
                             sampling=self.sampled(Sampling() if samples is None else samples.sampling),
                             tokenizer=recorded_tokenizer(self.processor),
                             processor=recorded_processor(self.processor))
-
-    def build_task(self, variables: Variables, *,
-                   processor: Processor | None | Omitted = OMITTED) -> TextGeneration:
-        """Return the decoder over `variables` as a generation task.
-
-        It samples, and uses the same token budget, as this objective's previews do.
-        """
-        return TextGeneration.from_settings(self.model, variables, self.task_settings(),
-                                            self.processor if processor is OMITTED else processor)
 
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
                      segment_ids=None, positions=None, routing: bool = False,

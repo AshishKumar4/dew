@@ -275,10 +275,12 @@ def columns(vocab: int, seed: int = 0):
 SEEDS = {'bias': 128, 'fused': 512, 'quantized': 64, 'scale and bias': 128, 'vocabulary split': 512,
          'column orders': 32, 'split bias': 32, 'quantized split': 32, 'backbone states': 16, 'backbone': 128,
          'small vocabulary': 128, 'small vocabulary training': 128, 'bounded': 32, 'saturated': 256,
-         'excluded': 32, 'token tiles': 16, 'both outputs': 64, 'gemma': 16, 'bf16 cotangent': 8,
+         'excluded': 32, 'token tiles': 16, 'both outputs': 64, 'gemma': 256, 'bf16 cotangent': 256,
          'whole logits': 512}
-"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada):
-the most any of a site's cases took."""
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` on each platform the site
+runs on, the most any of its cases took: on armada, and paired (Dew's arm as `dew_fn`) on an A100 under
+JAX 0.12 for 'bf16 cotangent', 256 at the first tile, and for 'gemma', which runs on a GPU alone, 256 at
+softcap 30."""
 
 
 @pytest.mark.parametrize('dtype', [jnp.float32, jnp.bfloat16])
@@ -679,10 +681,19 @@ def test_the_gradient_reaches_the_backbone_through_the_states_and_the_head():
 # --- the chunk arithmetic itself -------------------------------------------
 
 @pytest.mark.parametrize("chunks", [0, -1])
-def test_nonpositive_chunk_counts_are_refused(chunks):
-    hidden, head, targets = inputs()
+def test_an_lm_run_of_a_nonpositive_chunk_count_is_refused_where_its_step_compiles(chunks):
+    """An LM objective asked to score its head in no vocabulary slices, or fewer, is refused
+    (ValueError) where a run's step compiles, through the trainer, before it takes any step."""
+    from dew.objectives.lm import LMObjective
+    from dew.training import Trainer
+
+    model = CausalTransformer(vocab_size=5, emb_features=8, num_layers=1, num_heads=1,
+                              mlp_features=16, max_seq_len=8, attention_impl="xla")
+    trainer = Trainer(LMObjective(model, seq_len=4, head_chunks=chunks, ema_decay=None), optax.sgd(.01),
+                      key=jax.random.key(0))
+    initial = trainer.initial_state()
     with pytest.raises(ValueError):
-        chunked_cross_entropy(hidden, OutputTable(head, vocab_major=False), targets, chunks)
+        trainer.compile(initial, {"text": jnp.zeros((jax.device_count(), 5), jnp.int32)})
 
 
 @pytest.mark.parametrize("chunks", [4, 8])
@@ -1054,6 +1065,9 @@ TILE = (1024, 8192)
 """The tiled head's tile on the Gemma-sized vocabulary: 1024 tokens by 8192 columns."""
 
 
+# A Gemma-sized vocabulary's float64 truth over the seeds its softcapped cases need is numeric work at
+# model size, a GPU's: on a CPU each case takes about eleven minutes.
+@pytest.mark.gpu(reason="a Gemma-sized vocabulary's float64 truth at the seeds it needs")
 @pytest.mark.parametrize("softcap", [None, 30.0], ids=["plain", "softcap-30"])
 @pytest.mark.parametrize("chunks", [4, 16], ids=["4-chunks", "16-chunks"])
 def test_a_gemma_sized_vocabulary_is_as_exact_as_the_whole_logits(chunks, softcap):

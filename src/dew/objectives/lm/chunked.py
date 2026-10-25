@@ -38,7 +38,6 @@ from typing import NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
 from dew.mesh import logical_spec, mesh_axes
@@ -58,8 +57,17 @@ from dew.nn.precision import (
     running_sum,
     running_total,
     scaled_logits,
+    wide_cpu_arithmetic,
 )
-from dew.nn.protocols import AffineHead, HiddenStates, Lacks, Logits, LogitsFromHidden, OutputTable
+from dew.nn.protocols import (
+    AffineHead,
+    HiddenStates,
+    Lacks,
+    Logits,
+    LogitsFromHidden,
+    OutputTable,
+    head_table,
+)
 
 
 def tile_columns(vocab_size: int, chunks: int, columns: int) -> int:
@@ -95,16 +103,6 @@ def _logits_cotangent(cotangent, precision: jax.lax.PrecisionLike):
     that one copy. Otherwise it stays in its own dtype, fp32 or wider. The
     cast is round-to-nearest-even, as `bf16_dot_general` rounds its operands."""
     return cotangent.astype(jnp.bfloat16) if precision is BF16 else cotangent
-
-
-def head_table(model: nn.Module, variables) -> OutputTable | None:
-    """`model`'s head over `variables` as one matrix (`AffineHead.output_table`),
-    or None for a model whose head no matrix alone is, or that names none."""
-    table = model.apply(variables, method="output_table") if isinstance(model, AffineHead) else None
-    if table is not None and not isinstance(table, OutputTable):
-        raise TypeError(f"{type(model).__name__}.output_table gives a {type(table).__name__}, "
-                        f"not an OutputTable")
-    return table
 
 
 def reads_states(model) -> bool:
@@ -219,7 +217,8 @@ def _row_terms(logits, predict: bool) -> tuple[
     logits of 4096 x 151936 took 3.9 ms against `jax.nn.logsumexp` and
     `jnp.argmax`'s 7.6, and 8192 x 50304 2.6 against 5.0.
 
-    On CPU the row reduces in levels of `ROW_BLOCK` columns, each level's
+    In a process running wide CPU arithmetic (`dew.nn.precision.WIDE_CPU_ARITHMETIC`,
+    Dew's test setting), on a CPU the row reduces in levels of `ROW_BLOCK` columns, each level's
     blocks' terms the next level's row, until one block is left
     (`_row_blocks`): XLA's CPU compiler runs a reduction with a combine of
     its own as one loop over the row, whose sum of exponentials rescales its
@@ -260,7 +259,8 @@ def _row_terms(logits, predict: bool) -> tuple[
             row = [jnp.concatenate([first[index] for first in firsts], axis=-1) for index in range(len(row))]
         return reduced(*row)
 
-    terms = jax.lax.platform_dependent(*operands, cpu=blocked, default=reduced)
+    terms = (jax.lax.platform_dependent(*operands, cpu=blocked, default=reduced) if wide_cpu_arithmetic()
+             else reduced(*operands))
     return terms[0] + jnp.log(terms[1]), ((terms[0], terms[2]) if predict else None), terms[:2]
 
 
@@ -399,6 +399,29 @@ def _shared_cotangents(cotangents, group: tuple[str, ...]):
     return first, best, jax.lax.psum(partition, group)
 
 
+def _capped(raw, cap, columns: _Columns, temperature: float):
+    """A tile's logits from its fp32 head product `raw`, through the per-column terms, the softcap and
+    the temperature (`capped_logits`), and the pullback `_head_backward` takes their cotangent through:
+    the one head calculus the bounded, whole and fused heads share, each a schedule over it."""
+    return jax.vjp(lambda raw, cap, terms: capped_logits(terms.logits(raw), cap, temperature), raw, cap,
+                   columns)
+
+
+def _head_backward(pullback, cotangent, product_matrix, states, precision: jax.lax.PrecisionLike, work,
+                   width: int | None = None):
+    """A tile's gradients from its logits' `cotangent` (`_softmax_cotangent`): pulled back through the
+    terms and the cap (`_capped`'s `pullback`) to the product's, rounded once as both backward products
+    read it (`_logits_cotangent`), then the state gradient against `product_matrix` (over its column
+    tiles of `width` where given, `_state_product`) and the head's against `states`, the forward's
+    operands; and the cap's and the per-column terms' gradients. Returns `(d_states, d_matrix, d_cap,
+    d_terms)`."""
+    d_raw, d_cap, d_terms = pullback(cotangent)
+    d_raw = _logits_cotangent(d_raw, precision)
+    d_states = _state_product(d_raw, product_matrix, precision, work, width)
+    d_matrix = float32_einsum('tv,td->vd', d_raw, states, precision=precision, preferred_element_type=work)
+    return d_states, d_matrix, d_cap, d_terms
+
+
 def _bounded_head_impl(hidden, table, targets, excluded, chunks: int, tile: tuple[int, int],
                        softcap, precision: jax.lax.PrecisionLike, predict: bool, temperature: float,
                        columns: _Columns, picked: bool, group: tuple[str, ...]):
@@ -464,22 +487,17 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, gro
             token_loss = jax.lax.dynamic_slice_in_dim(d_loss, start, size)
             token_partition = jax.lax.dynamic_slice_in_dim(d_partition, start, size)
 
-            logits, pullback = jax.vjp(
-                lambda raw, cap, terms: capped_logits(terms.logits(raw), cap, temperature),
-                _tile_logits(states, matrix, precision), softcap, columns_tile)
-            d_raw, cap_tile, terms_tile = pullback(_softmax_cotangent(
-                logits, first, excluded, token_peak, token_mass,
-                jax.lax.dynamic_slice_in_dim(labels, start, size), token_loss, token_partition, picked))
+            logits, pullback = _capped(_tile_logits(states, matrix, precision), softcap, columns_tile,
+                                       temperature)
             # The scale and the bias act after the bf16 product rounds. Their
             # cotangents stay fp32; only the product's two backward operands round.
+            states_tile, matrix_tile, cap_tile, terms_tile = _head_backward(
+                pullback, _softmax_cotangent(logits, first, excluded, token_peak, token_mass,
+                                             jax.lax.dynamic_slice_in_dim(labels, start, size), token_loss,
+                                             token_partition, picked),
+                product_matrix, jax.lax.dynamic_slice_in_dim(flat, start, size).astype(operands), precision,
+                work)
             d_tile = jax.tree.map(added_to, d_tile, terms_tile)
-            d_raw = _logits_cotangent(d_raw, precision)
-            states_tile = float32_einsum('tv,vd->td', d_raw, product_matrix, precision=precision,
-                                     preferred_element_type=work)
-            matrix_tile = float32_einsum(
-                'tv,td->vd', d_raw,
-                jax.lax.dynamic_slice_in_dim(flat, start, size).astype(operands), precision=precision,
-                preferred_element_type=work)
             # The state and head gradients run over the vocabulary and token tiles as the whole
             # head's products sum them (`running_sum`; the forms' axis comes first).
             prior = jax.lax.dynamic_slice_in_dim(d_states, start, size, axis=1)
@@ -594,16 +612,12 @@ def _whole_head_bwd(chunks, precision, predict, temperature, picked, group, resi
     work = at_least_fp32(hidden.dtype)
     operands = _operand_dtype(precision, work)
     features = table.shape[1]
-    logits, pullback = jax.vjp(
-        lambda raw, cap, terms: capped_logits(terms.logits(raw), cap, temperature), raw, softcap, columns)
-    d_raw, d_cap, d_columns = pullback(_softmax_cotangent(
-        logits, 0, excluded, peaks, masses, targets.reshape(-1), loss_cotangent.reshape(-1),
-        partition_cotangent.reshape(-1), picked))
-    d_raw = _logits_cotangent(d_raw, precision)
+    logits, pullback = _capped(raw, softcap, columns, temperature)
     width = None if precision is BF16 else tile_columns(table.shape[0], chunks, chunked_tile()[1])
-    d_states = _state_product(d_raw, table.astype(operands), precision, work, width)
-    d_table = float32_einsum('tv,td->vd', d_raw, hidden.reshape(-1, features).astype(operands),
-                         precision=precision, preferred_element_type=work)
+    d_states, d_table, d_cap, d_columns = _head_backward(
+        pullback, _softmax_cotangent(logits, 0, excluded, peaks, masses, targets.reshape(-1),
+                                     loss_cotangent.reshape(-1), partition_cotangent.reshape(-1), picked),
+        table.astype(operands), hidden.reshape(-1, features).astype(operands), precision, work, width)
     return (d_states.reshape(hidden.shape).astype(hidden.dtype), d_table.astype(table.dtype),
             None, None, d_cap, d_columns)
 
@@ -708,9 +722,10 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
     block: both passes walk tokens in the first and columns in the second
     or a chunk, whichever is narrower, and the backward holds nothing
     wider, so it is the only knob on the backward's temporaries. On a CPU
-    the backward's running sums of the state and head gradients keep what
-    each tile's addition drops (`dew.nn.precision.running_sum`), three
-    times their bytes, so they round once as the whole head's products do.
+    under Dew's wide arithmetic (`dew.nn.precision.WIDE_CPU_ARITHMETIC`, its
+    test setting) the backward's running sums of the state and head gradients
+    keep what each tile's addition drops (`dew.nn.precision.running_sum`),
+    three times their bytes, so they round once as the whole head's products do.
     The default is measured; a tile wider than the input is one
     tile. A `tile` of None keeps the whole fp32 logits for the backward
     instead of recomputing them, which is faster wherever they fit: on one
@@ -795,8 +810,7 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, columns: _C
         outputs, d_table, d_columns = carry
         states = rounded_operand(jax.lax.dynamic_slice_in_dim(hidden, start, size).astype(work), operands)
         targets = jax.lax.dynamic_slice_in_dim(labels, start, size)
-        logits, pullback = jax.vjp(lambda raw, terms: capped_logits(terms.logits(raw), cap, temperature),
-                                   _tile_logits(states, matrix, precision), columns)
+        logits, pullback = _capped(_tile_logits(states, matrix, precision), cap, columns, temperature)
         # One masked row for the partition and the target: a target at the excluded column scores
         # +inf, as the chunked heads score it, and its gradient moves no logit.
         kept = _without(logits, 0, excluded)
@@ -807,17 +821,15 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, columns: _C
             values.append(top[1])
         if gradients:
             weight = jax.lax.dynamic_slice_in_dim(weights, start, size).astype(work)
-            cotangent = _softmax_cotangent(logits, 0, excluded, peaks, masses, targets, weight,
-                                           2 * z_loss * log_z * weight)
-            d_raw, terms = pullback(cotangent)
+            d_states, d_matrix, _, terms = _head_backward(
+                pullback, _softmax_cotangent(logits, 0, excluded, peaks, masses, targets, weight,
+                                             2 * z_loss * log_z * weight),
+                product_matrix, jax.lax.dynamic_slice_in_dim(hidden, start, size).astype(operands), precision,
+                work)
             d_columns = jax.tree.map(added_to, d_columns, terms)
-            d_raw = _logits_cotangent(d_raw, precision)
-            values.append(float32_einsum('tv,vd->td', d_raw, product_matrix, precision=precision,
-                                     preferred_element_type=work))
-            operand = jax.lax.dynamic_slice_in_dim(hidden, start, size).astype(operands)
+            values.append(d_states)
             # Summed over the token tiles as the bounded head sums them (`_token_sum`).
-            d_table = added_to(d_table, float32_einsum('tv,td->vd', d_raw, operand, precision=precision,
-                                                       preferred_element_type=work))
+            d_table = added_to(d_table, d_matrix)
         outputs = tuple(jax.lax.dynamic_update_slice_in_dim(out, value, start, axis=0)
                         for out, value in zip(outputs, values, strict=True))
         return outputs, d_table, d_columns

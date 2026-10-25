@@ -23,7 +23,7 @@ from dew.objectives.lm import LMObjective
 from dew.optim import OptimConfig
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer
-from dew.training.distributed import placed_shapes
+from dew.training.distributed import STEP_BATCH, placed_shapes
 
 pytestmark = pytest.mark.mesh
 
@@ -102,7 +102,8 @@ def test_a_validated_fine_tune_is_placed_and_held_as_its_report_said(case):
         assert validation.device_bytes == held
 
     arguments, _ = run.executable.input_shardings
-    rows = {mesh_axes(sharding.spec[0]) for sharding in jax.tree.leaves(arguments[1]) if sharding.spec}
+    rows = {mesh_axes(sharding.spec[0]) for sharding in jax.tree.leaves(arguments[STEP_BATCH])
+            if sharding.spec}
     assert rows == {report.batch_axes}
     # Every collective the report says an axis implies, the compiled step runs over that axis.
     ran = collective_axes(run.executable.as_text(), run.device_mesh)

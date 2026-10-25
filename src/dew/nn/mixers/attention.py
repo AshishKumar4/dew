@@ -467,9 +467,9 @@ class CausalSelfAttention(nn.Module):
 
     def _rotary_tables(self, rotary_positions, dtype, reach=None):
         """The rotary cos and sin at `dtype`. Interleaved mRoPE, YaRN and the
-        plain rope each build their own angles; YaRN rotates whole heads at
-        its own frequencies, so it takes neither a partial rotary nor a
-        Llama 3.1 ramp."""
+        plain rope each build their own angles; YaRN ramps the rotated width,
+        a whole head or a 'default' partial rotary's (`rotary_freqs`), at its
+        own frequencies, so it takes no Llama 3.1 ramp."""
         if self.rotary_axes is not None:
             if rotary_positions is None or rotary_positions.ndim != 3:
                 raise ValueError(f"a rotary over {len(self.rotary_axes)} axes reads their ids "

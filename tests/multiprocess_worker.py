@@ -488,15 +488,16 @@ def mode_reads(args) -> dict:
     rows = len(mesh.local_devices)
     batch = {"x": np.ones((rows, 3), np.float32), "unused": np.arange(rows)}
     first = shard_batch(mesh, batch)
-    step = jax.jit(lambda state, batch: state + jnp.sum(batch["x"]))
-    compiled = step.lower(jnp.zeros(()), first).compile()
+    # A step's arguments as the trainer's: the moving state, the frozen tree, then the batch.
+    step = jax.jit(lambda state, frozen, batch: state + frozen + jnp.sum(batch["x"]))
+    compiled = step.lower(jnp.zeros(()), jnp.zeros(()), first).compile()
     signature = batch_signature(first)
     placed = shard_batch(mesh, batch, {signature: step_reads(compiled, signature)})
     return {"read_differs_from_placed": batch_signature(batch) != batch_signature(first),
             "unused_on_host": isinstance(placed["unused"], np.ndarray),
             "unused_shape": list(np.shape(placed["unused"])),
             "x_placed": isinstance(placed["x"], jax.Array),
-            "sum": float(compiled(jnp.zeros(()), placed))}
+            "sum": float(compiled(jnp.zeros(()), jnp.zeros(()), placed))}
 
 
 def mode_packed_fit(args) -> dict:
