@@ -336,7 +336,8 @@ def test_a_pretrained_run_distills_the_model_it_loads_without_a_teacher_run(tmp_
     teacher is the model the run loads, its weights bitwise the source's,
     and the student starts as it. The run samples by what the same objective
     built over the pipeline directly samples by: rCM's own few steps, solver
-    and unguided draw, on the pipeline's grid."""
+    and unguided draw, on the pipeline's grid, and its published task draws
+    the direct one's images, bit for bit, from the same weights and key."""
     import tarfile
     from pathlib import Path
 
@@ -372,6 +373,10 @@ def test_a_pretrained_run_distills_the_model_it_loads_without_a_teacher_run(tmp_
         assert jax.tree.structure(tree) == jax.tree.structure(expected)
         for got, want in zip(jax.tree.leaves(tree), jax.tree.leaves(expected), strict=True):
             np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    prompt = ["a red bird"]
+    published = objective.build_task(held)(prompt, key=9).host().images
+    alone = direct.build_task(direct.init(jax.random.PRNGKey(0)))(prompt, key=9).host().images
+    np.testing.assert_array_equal(published, alone)
 
 
 def test_a_reverse_only_kernel_takes_forward_mode_through_its_reference():
