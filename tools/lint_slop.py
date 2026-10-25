@@ -1774,9 +1774,13 @@ GATE = frozenset({"tests/reference_error.py", "tests/op_certificates.py", "tests
                   "tests/selection_margins.py", "tests/test_selection_margins.py",
                   "tests/test_reference_error.py", "tests/test_op_certificates.py",
                   "tests/test_reference_orders.py", "tests/test_reference_graph.py",
-                  "tests/test_gate_calibration.py", "tests/test_float64_terms.py"})
+                  "tests/test_gate_calibration.py", "tests/test_float64_terms.py",
+                  "tests/sampling_gate.py", "tests/test_sampling_gate.py",
+                  "tests/learning_gate.py", "tests/test_learning_gate.py"})
 """The gate's modules and the tests of the gate itself, the one place a float is compared within a
-bound: every other comparison goes through its assertion. The selection margins
+bound: every other comparison goes through its assertion; the sampling gate (tests/sampling_gate.py)
+compares a statistic's rarity with its level, and the learning gate (tests/learning_gate.py) a claim's t
+over its runs with its threshold, each its verdict. The selection margins
 (tests/selection_margins.py) are the gate's preconditions for check 1 on a model that selects: their
 bounds hold a draw's discrete choices to float64's, and live with it."""
 INVENTORY = "tools/tolerance_inventory.json"

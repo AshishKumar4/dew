@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import pytest
 
 from dew.batch import everything, merge, select, under
 from dew.data import Memory
@@ -228,3 +229,51 @@ def test_a_supplied_gradient_binds_each_rule_to_its_own_parameter_in_any_mapping
     gradient = jax.grad(lambda p: Objective.with_gradients(jnp.float32(0), rule, p))(params)
     np.testing.assert_array_equal(gradient["left"], [5.0, 6.0])
     np.testing.assert_array_equal(gradient["right"], [0.0, 1.0, 2.0])
+
+
+def test_an_objective_whose_saved_task_builds_from_its_settings_builds_its_task_from_them():
+    """An objective, any package's, whose saved task builds from the settings a run records
+    (`from_settings`) builds its live task from its own settings, as a saved run of it loads: the
+    task holds the objective's model, the variables given and the settings' budget, its processor the
+    objective's unless the caller gives one, None included. An objective whose saved task does not
+    build from settings has no task to build (TypeError)."""
+    import dataclasses
+
+    from dew.inference.tasks import TextGeneration, TextSettings
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.sampling.text import Sampling
+
+    model = CausalTransformer(vocab_size=11, emb_features=8, num_layers=1, num_heads=1, mlp_features=16,
+                              max_seq_len=8, attention_impl="xla")
+
+    class Decoding(Objective):
+        saved_task = TextGeneration
+        settings = TextSettings
+
+        def __init__(self):
+            self.model = self.bind_model(model)
+
+        def loss(self, variables, batch, step):
+            return jnp.zeros(())
+
+        def task_settings(self):
+            return TextSettings(seq_len=8, max_new_tokens=3, sampling=Sampling(), tokenizer=None,
+                                processor=None)
+
+    variables = model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+    task = Decoding().build_task(variables)
+    assert isinstance(task, TextGeneration) and task.model is model
+
+    def leaves(tree):
+        return {jax.tree_util.keystr(path): id(leaf)
+                for path, leaf in jax.tree_util.tree_leaves_with_path(tree)}
+
+    # The task holds the variables' own arrays, in a mapping of its own.
+    assert leaves(task.variables) == leaves(variables)
+    assert task.max_new_tokens == 3 and task.processor is None
+
+    class Unbuilt(Decoding):
+        saved_task = dataclasses.make_dataclass("Loaded", [])
+
+    with pytest.raises(TypeError):
+        Unbuilt().build_task(variables)

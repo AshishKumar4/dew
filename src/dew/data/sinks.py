@@ -25,7 +25,7 @@ from dew.data.steps.text import count_rules, stated_rules
 from dew.data.storage import ObjectRef, Store, commit_export
 
 if TYPE_CHECKING:
-    from dew.data.pipeline import Pipeline
+    from dew.data.pipeline import Dataset, Pipeline
 
 
 def _chunks(values: Iterable[Batch | bytes | None], rows: int) -> Iterator[list[Batch | bytes | None]]:
@@ -142,6 +142,19 @@ def _parquet_shard(target: Store, number: int, batch, partitioning: tuple[str, .
     )
 
 
+def passed(values: Source | Dataset) -> Iterator[Batch]:
+    """One pass over a store's or a chain's records, in their one order, as `export` writes them: a
+    store as a chain of it, by a read it supports, physical shards or none. Close it when done."""
+    from dew.data.analysis import _preferred_read
+    from dew.data.compile import iterate
+    from dew.data.dataset import Loading
+    from dew.data.pipeline import Dataset, Pipeline
+
+    chain = values._chain() if isinstance(values, Dataset) else Pipeline(values)
+    read = chain.mode or _preferred_read((chain,), provision=True)
+    return iter(iterate(chain, read=read, provision=True, loading=chain._loading or Loading()))
+
+
 def export(
     values: Source | grain.IterDataset | Iterable[Batch | bytes | None] | Pipeline,
     url: str,
@@ -175,19 +188,9 @@ def export(
             metadata=metadata,
             length_field=length_field,
         )
-    from dew.data.pipeline import Dataset, Pipeline
+    from dew.data.pipeline import Dataset
 
-    if isinstance(values, (Source, Dataset)):
-        from dew.data.analysis import _preferred_read
-        from dew.data.compile import iterate
-        from dew.data.dataset import Loading
-
-        # A store exports as a chain of it does, by a read it supports, physical shards or none.
-        chain = values._chain() if isinstance(values, Dataset) else Pipeline(values)
-        read = chain.mode or _preferred_read((chain,), provision=True)
-        rows = iter(iterate(chain, read=read, provision=True, loading=chain._loading or Loading()))
-    else:
-        rows = iter(values)
+    rows = passed(values) if isinstance(values, (Source, Dataset)) else iter(values)
     root = Store(url, storage_options)
     writer = uuid.uuid4().hex
     target = root.child(f"shards/{writer}")

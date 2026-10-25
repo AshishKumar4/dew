@@ -131,16 +131,29 @@ class Modulation(nn.Module):
 class TokenEmbedding(nn.Embed):
     """Token lookup with cotangent accumulation in the parameter dtype."""
 
+    padding_idx: int | None = None
+    """The id whose row this lookup reads but never trains, as torch's `nn.Embedding(padding_idx=...)`
+    leaves it: the row's gradient takes nothing from the places that read that id. A negative id
+    counts from the table's end, as torch counts it; one outside the table is refused. None trains
+    every row it reads."""
+
     def __call__(self, inputs: jax.Array) -> jax.Array:
         if not jnp.issubdtype(inputs.dtype, jnp.integer):
             raise ValueError("Input type must be an integer or unsigned integer.")
         if self.num_embeddings == 1:
             values = jnp.broadcast_to(self.embedding, (*inputs.shape, self.features))
-            promoted, = self.promote_dtype(values, dtype=self.dtype, inexact=False)
-            if promoted is None:
+            rows, = self.promote_dtype(values, dtype=self.dtype, inexact=False)
+            if rows is None:
                 raise ValueError("Embedding dtype promotion must return an array")
-            return promoted
-        return table_rows(self.embedding, inputs, self.dtype or self.embedding.dtype)
+        else:
+            rows = table_rows(self.embedding, inputs, self.dtype or self.embedding.dtype)
+        if self.padding_idx is None:
+            return rows
+        if not -self.num_embeddings <= self.padding_idx < self.num_embeddings:
+            raise ValueError(f"padding_idx {self.padding_idx} is outside the table of "
+                             f"{self.num_embeddings} rows")
+        padding = self.padding_idx % self.num_embeddings
+        return jnp.where((inputs == padding)[..., None], jax.lax.stop_gradient(rows), rows)
 
 
 class FourierEmbedding(nn.Module):
@@ -201,15 +214,23 @@ class TimeProjection(nn.Module):
     precision: PrecisionLike = None
 
     @nn.nowrap
+    def _mlp(self, input_features: int):
+        from .mlp import GatedMLP  # mlp reads this module's initializers
+
+        return GatedMLP(self.features, self.features, in_features=input_features,
+                        activation=self.activation, activation_after=True, use_bias=True,
+                        names=("DenseGeneral_0", "DenseGeneral_1"), dtype=self.dtype,
+                        precision=self.precision)
+
+    @nn.nowrap
     def model_flops(self, lengths, input_features: int) -> float:
-        return projection_flops(lengths, input_features + self.features, self.features)
+        return self._mlp(input_features).model_flops(lengths)
 
     @nn.compact
     def __call__(self, x):
-        dense = partial(DenseGeneral, self.features,
-                        dtype=self.dtype, precision=self.precision, dot_general=float32_dot_general)
-        x = self.activation(dense()(x))
-        return self.activation(dense()(x))
+        mlp = self._mlp(x.shape[-1])
+        nn.share_scope(self, mlp)
+        return mlp(x)
 
 
 def torch_nearest_resize(x, height: int, width: int):

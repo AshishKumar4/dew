@@ -39,17 +39,20 @@ than torch's cascade sum over 640 terms, and its dot as close as torch's.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.batch import coordinates
+
 from .activations import GatedActivation
 from .attention import projected_heads, projected_output, scaled_dot_product_attention
 from .flops import counted_flops, cross_attention_flops, projection_flops
-from .inputs import CrossContext
+from .inputs import CONTEXT, CONTEXT_LENGTHS, CrossContext
 from .precision import L2NORM_EPS, at_least_fp32, float32_dot_general, l2norm, sqrt_or_zero
 from .sharding import HEADS, KV_HEADS, constrain
 
@@ -76,6 +79,52 @@ def crosses_alone(trained) -> bool:
     (`dew.batch.FROZEN`), is a cross-attention block's (`crossing`)."""
     return all(crossing(tuple(entry.key for entry in path))
                for path, _ in jax.tree_util.tree_leaves_with_path(trained))
+
+
+type ContextEncoder = Literal["table", "backbone"]
+"""How a context of token ids becomes the states a model's cross-attention reads (`encode_context`):
+`table`, its tokens through the model's own token table, or `backbone`, the model's own final states
+over it in a pass of its own."""
+
+
+def encode_context(model: nn.Module, variables: Mapping, tokens: jax.Array, lengths: jax.Array, *,
+                   encoder: ContextEncoder, train: bool = False,
+                   rngs: dict[str, jax.Array] | None = None) -> dict[str, jax.Array]:
+    """The conditioning a model's cross-attention layers read (`CrossAttending`) for contexts of
+    token ids: `tokens` `[B, C]`, each row's first `lengths` real, as `encoder` says.
+
+    `table` gives each token's row of the model's own table (`token_embeddings`); `backbone` the
+    model's final states over each context alone (`HiddenStates`), its real tokens one document, with
+    the weights of the model's own pass, an adapter's included. Where the model trains nothing but its
+    cross-attention blocks (`crosses_alone`), which a pass without a context runs none of, that pass
+    trains nothing and its gradient is not taken. The states keep the dtype they are computed in, and
+    the model casts them to its blocks' (`context_dtype`). `variables` are the model's own, whole or
+    split from a frozen rest (`dew.objectives.base.FROZEN`). A model without cross-attention layers is
+    refused (TypeError), as is a backbone pass over one without final states; another encoder is
+    refused (ValueError)."""
+    from dew.batch import thaw
+    from dew.nn.protocols import CrossAttending, HiddenStates
+
+    if not isinstance(model, CrossAttending) or model.cross_attention is None:
+        raise TypeError(f"a context is read by cross-attention layers, which a {type(model).__name__} "
+                        "does not have")
+    whole = thaw(dict(variables))
+    if encoder == "table":
+        states = model.apply(whole, tokens, method="token_embeddings")
+    elif encoder == "backbone":
+        if not isinstance(model, HiddenStates):
+            raise TypeError(f"a context's own pass reads final states, which a {type(model).__name__} "
+                            "does not give (HiddenStates)")
+        real = jnp.arange(tokens.shape[1])[None, :] < lengths[:, None]
+        laid = coordinates(segments=real.astype(jnp.int32), max_segments=1, right_padded=True)
+        states = model.apply(whole, tokens, train=train, coordinates=laid, method="hidden_states", rngs=rngs)
+        if crosses_alone(variables.get("params", {})):
+            states = jax.lax.stop_gradient(states)
+    else:
+        raise ValueError(f"a context is encoded by the model's table or its own pass, not {encoder!r}")
+    if not isinstance(states, jax.Array):
+        raise TypeError(f"expected an array of context states, got {type(states).__name__}")
+    return {CONTEXT: states, CONTEXT_LENGTHS: lengths}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -291,5 +340,5 @@ def _gated(branch: jax.Array, gate: jax.Array, precision: PrecisionLike) -> jax.
     return product[..., 0]
 
 
-__all__ = ["CROSS_CACHE", "CROSS_KEY", "CROSS_LENGTHS", "CROSS_VALUE", "NAME", "CrossAttention",
-           "GatedCrossAttention", "crossing", "gated_join"]
+__all__ = ["CROSS_CACHE", "CROSS_KEY", "CROSS_LENGTHS", "CROSS_VALUE", "NAME", "ContextEncoder",
+           "CrossAttention", "GatedCrossAttention", "crossing", "encode_context", "gated_join"]

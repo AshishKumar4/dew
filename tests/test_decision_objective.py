@@ -373,8 +373,12 @@ def test_a_saved_vision_run_answers_image_rows(tmp_path, separate_tokenizer):
 
     assert reloaded.processor is not None
     np.testing.assert_array_equal(second, first)
-    assert reloaded.processor.source == str(directory)
-    assert objective.inference_record()["processor"] == str(directory)
+    from dew.interop.sources import SourceReference
+    from dew.registry import from_record
+
+    assert reloaded.processor.source == SourceReference(str(directory))
+    held_source = from_record(SourceReference, objective.inference_record()["processor"])
+    assert held_source == reloaded.processor.source
     assert not np.array_equal(second, reloaded("charged twice!", asked)["team"].probabilities)
 
 
@@ -516,7 +520,9 @@ def test_a_calibration_comes_back_with_the_weights_it_was_fitted_on(tmp_path):
     calibrated.save(str(tmp_path))
     reloaded = Decide.from_run(str(tmp_path))
     assert reloaded.calibration == calibrated.calibration
-    assert json.loads((tmp_path / "decide.json").read_text())["weights"] == {"step": 1, "ema": False}
+    # One run's weights average no runs; a file written before the field reads as one that names none.
+    assert json.loads((tmp_path / "decide.json").read_text())["weights"] == {"step": 1, "ema": False,
+                                                                           "averaged": []}
 
     trainer.fit(data, steps=2, log_every=100, checkpoint_every=1)
     checkpoints.wait()

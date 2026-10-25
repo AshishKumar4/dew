@@ -41,6 +41,59 @@ def decide() -> Decide:
     return Decide.from_pretrained(TINY, attention_impl="xla")
 
 
+def test_a_decision_source_loads_through_pretrained_and_its_declared_pipeline(decide, tmp_path):
+    """A Laya component release loads through the public source loader, including a subfolder,
+    and its declared task retains the same answers through export."""
+    from shutil import copytree
+
+    from dew import pipeline
+    from dew.interop import Pretrained
+
+    copytree(TINY, tmp_path / "release")
+    bundle = Pretrained.load(tmp_path, subfolder="release", dtype="float32", attention_impl="xla")
+    task = replace(Decide.of(bundle), name=decide.name)
+    request = CASES["quickstart"]
+    assert task.systemone(request) == decide.systemone(request)
+    original = jax.tree.map(lambda value: np.asarray(value).copy(), bundle.variables)
+    for _ in range(2):
+        assert_same_rounded_answers(replace(bundle.pipeline(), name=decide.name).systemone(request),
+                                    decide.systemone(request), "borrowed bundle task")
+    for held, expected in zip(jax.tree.leaves(bundle.variables), jax.tree.leaves(original), strict=True):
+        np.testing.assert_array_equal(held, expected)
+    bundle.save(tmp_path / "export", variables=bundle.variables, max_shard_size="10KB")
+    served = pipeline(str(tmp_path / "export"), dtype="float32")
+    assert_same_rounded_answers(replace(served, name=decide.name).systemone(request),
+                                decide.systemone(request), "public source pipeline")
+
+
+_ANSWERED = """
+import json
+import sys
+from dew.decision import Decide
+task = Decide.from_pretrained("dew/tiny-laya", subfolder="release", attention_impl="xla")
+print(json.dumps(task.systemone(json.loads(sys.argv[1]))))
+"""
+
+
+def test_a_hub_folder_release_answers_under_the_name_it_was_asked_by(tmp_path):
+    """A release in a folder of a Hub repo answers under the repo and folder it was loaded by, not
+    the cache directory it resolved to, as Laya's server names the model it serves."""
+    import os
+    import subprocess
+    import sys
+    from shutil import copytree
+
+    from interop_support import hub_cache
+
+    copytree(TINY, tmp_path / "repo" / "release")
+    hub_cache(tmp_path / "hub", "dew/tiny-laya", tmp_path / "repo")
+    env = {**os.environ, "HF_HUB_CACHE": str(tmp_path / "hub"), "HF_HUB_OFFLINE": "1", "JAX_PLATFORMS": "cpu"}
+    run = subprocess.run([sys.executable, "-c", _ANSWERED, json.dumps(CASES["quickstart"])],
+                         capture_output=True, text=True, env=env)
+    assert run.returncode == 0, run.stderr[-2000:]
+    assert json.loads(run.stdout.splitlines()[-1])["model"] == "dew/tiny-laya/release"
+
+
 def assert_same_rounded_answers(found: dict, expected: dict, case: str) -> None:
     """Two `systemone(details=True)` answers to `case` from logits that differ
     by fp32 rounding: the same choices, and every reported number within one
@@ -602,3 +655,102 @@ def test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh(decide):
     alone, scores = task.score(examples), spread(decide.variables).score(examples)
     assert set(scores) == set(alone) and all(np.isfinite(value) for value in scores.values())
     assert scores["accuracy"] == alone["accuracy"]
+
+
+def trained_runs(decide, tmp_path, count: int, *, name: str = "run") -> list[str]:
+    """`count` runs of the task trained apart, one more step each, from one head (the task's own, held):
+    each a checkpoint of its own, as averaging reads them."""
+    import optax
+
+    from dew.checkpoints import Checkpoints
+    from dew.decision import DecisionObjective
+    from dew.training.trainer import Trainer
+
+    runs = []
+    for index in range(count):
+        objective = DecisionObjective(decide)
+        data = decision_rows(answered() * 2, 8, answered(), objective=objective.data())
+        directory = str(tmp_path / f"{name}{index}")
+        checkpoints = Checkpoints(directory, keep=1)
+        Trainer(objective, optax.adam(1e-3), key=index, checkpoints=checkpoints).fit(
+            data, steps=index + 1, log_every=100, checkpoint_every=index + 1, eval_every=100)
+        checkpoints.wait()
+        runs.append(directory)
+    return runs
+
+
+def test_runs_that_share_a_head_average_as_the_checkpoints_average_them_and_refit_their_temperatures(
+        decide, tmp_path):
+    """Runs trained apart from one held head average: the task's weights are the runs' fp32 mean as
+    any run's average takes it (`dew.checkpoints.averaged`), each floating leaf float64's mean of the
+    two rounded to fp32; the task's weights record every run's step and read, so no one run's
+    directory may hold its calibration (`save` refuses), and `calibrate_on` refits it as the average's
+    own calibration."""
+    from etils import epath
+
+    from dew.checkpoints import averaged
+
+    runs = trained_runs(decide, tmp_path, 2)
+    tasks = [Decide.from_run(run) for run in runs]
+    two = Decide.averaged(runs)
+    trees = (two.variables, averaged(runs).variables, tasks[0].variables, tasks[1].variables)
+    for leaf, general, one, other in zip(*(jax.tree.leaves(tree) for tree in trees), strict=True):
+        assert np.array_equal(np.asarray(leaf), np.asarray(general))
+        if np.issubdtype(np.asarray(leaf).dtype, np.floating):
+            halves = (np.asarray(one, np.float64) + np.asarray(other, np.float64)) / 2
+            assert np.array_equal(np.asarray(leaf), halves.astype(np.float32))
+    assert two.weights is not None
+    assert [entry[0] for entry in two.weights.averaged] == [str(epath.Path(run)) for run in runs]
+    assert two.calibration == Calibration()
+    with pytest.raises(ValueError):
+        two.save(runs[0])
+    # Enough held-out answers that every question kind clears its calibration minimum (TYPE_MINIMUM).
+    held_out = answered() * 10
+    calibrated = Decide.averaged(runs, calibrate_on=held_out)
+    assert calibrated.calibration != Calibration()
+    assert calibrated.calibration == two.calibrated(held_out).calibration
+
+
+def test_runs_of_other_task_settings_or_a_single_run_do_not_average(decide, tmp_path):
+    """Runs average where their recorded task settings are one task's: a run laid out otherwise does
+    not average with the others, nor does a single run."""
+    runs = trained_runs(decide, tmp_path, 1)
+    with pytest.raises(ValueError):
+        Decide.averaged(runs)
+    other = replace(decide, layout=replace(decide.layout, head_max_len=decide.layout.head_max_len // 2))
+    runs += trained_runs(other, tmp_path, 1, name="other")
+    with pytest.raises(ValueError):
+        Decide.averaged(runs)
+
+
+def test_an_averaged_task_of_any_layout_saves_reloads_and_serves_as_it_was(decide, tmp_path):
+    """An average of runs over a question layout other than Laya's, its temperatures refit on held-out
+    answers, saves to a directory of its own as a run (`save`), which `from_run` reads back with its
+    weights, calibration and provenance, answering every case as the task it was. Saving it there
+    again keeps it; a run's own directory, which holds other weights, refuses it."""
+    import dataclasses
+
+    from dew.decision import StateFirstLayout
+
+    other = replace(decide, layout=StateFirstLayout(max_len=decide.layout.max_len,
+                                                    head_max_len=decide.layout.head_max_len))
+    runs = trained_runs(other, tmp_path, 2)
+    held_out = answered() * 10
+    task = Decide.averaged(runs, calibrate_on=held_out)
+    assert task.calibration != Calibration()
+    directory = str(tmp_path / "averaged")
+    task.save(directory)
+    reloaded = Decide.from_run(directory)
+    assert reloaded.layout == task.layout and reloaded.weights == task.weights
+    assert reloaded.calibration == task.calibration
+    for leaf, own in zip(jax.tree.leaves(reloaded.variables), jax.tree.leaves(task.variables), strict=True):
+        assert np.array_equal(np.asarray(leaf), np.asarray(own))
+    for request in CASES.values():
+        questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
+        found, expected = reloaded(request["state"], questions), task(request["state"], questions)
+        assert found.keys() == expected.keys()
+        for name in expected:
+            np.testing.assert_equal(dataclasses.asdict(found[name]), dataclasses.asdict(expected[name]))
+    reloaded.save(directory)
+    with pytest.raises(ValueError):
+        task.save(runs[0])

@@ -14,6 +14,7 @@ from dew.nn.blocks import ResidualBlock, sinusoidal_time
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, projection_flops
+from dew.nn.mlp import GatedMLP
 from dew.nn.precision import at_least_fp32, float32_dot_general
 
 from .spatial import SpatialCount, SpatialForward, SpatialShape
@@ -48,16 +49,16 @@ class _TimeMLP(nn.Module):
 
     @nn.nowrap
     def model_flops(self, lengths, input_features: int) -> float:
-        return projection_flops(lengths, input_features + self.features, self.features)
+        return GatedMLP(self.features, self.features, activation=nn.silu, in_features=input_features,
+                        parent=None).model_flops(lengths)
 
     @nn.compact
     def __call__(self, x):
-        x = Dense(self.features, dtype=self.dtype, precision=self.precision, name="in_proj",
-                  dot_general=float32_dot_general)(x)
-        return Dense(self.features, dtype=self.dtype, precision=self.precision, name="out_proj",
-                     dot_general=float32_dot_general)(
-            nn.silu(x)
-        )
+        mlp = GatedMLP(self.features, self.features, activation=nn.silu, use_bias=True,
+                        in_features=x.shape[-1], names=("in_proj", "out_proj"), dtype=self.dtype,
+                        precision=self.precision)
+        nn.share_scope(self, mlp)
+        return mlp(x)
 
 
 class _SpatialAttention(nn.Module):

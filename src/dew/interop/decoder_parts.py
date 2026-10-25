@@ -24,6 +24,7 @@ from dew._model_types import SANDWICH_NORMS
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.streaming import WeightLayout
+from dew.interop.weights import check_tree
 from dew.nn.activations import GatedActivation, Situ
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import LAYER_SCALAR_COLLECTIONS, Mixture
@@ -31,7 +32,6 @@ from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mixers import AttentionMixer, MixerBase
 from dew.nn.rope import RopeScaling, YarnScaling
-from dew.nn.text_encoders import check_tree
 from dew.registry import from_record, record_fields
 
 # The KV cache is allocated at the full decode length, so a 128k-context
@@ -218,7 +218,7 @@ class DrafterRefused(ValueError):
     """
 
 
-def _refuse_drafter(hf_config: Mapping[str, object]) -> None:
+def refuse_drafter(hf_config: Mapping[str, object]) -> None:
     """Refuse a SpecForge DFlash drafter, DSpark's among them, by the
     `num_target_layers` it places its target layers by (dflash.py:256-298 in
     RadixArk/Kimi-K3-DSpark at 3c5bac3). DFlashDraftModel, DFlash2DraftModel,
@@ -819,7 +819,7 @@ def softmax_top_k(hf_config: Mapping[str, object], used: set[str]) -> int:
 def translated(hf_config: Mapping[str, object], family: "DecoderFamily") -> DecoderFields:
     """Translate a config as `family` reads it, refusing a drafter and any
     setting Dew does not compute."""
-    _refuse_drafter(hf_config)
+    refuse_drafter(hf_config)
     config, unknown = translate_family_config(hf_config, family)
     if unknown:
         refuse(f"config fields {sorted(unknown)}",

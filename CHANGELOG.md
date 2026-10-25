@@ -59,6 +59,7 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   over its accumulation, where it ramped over its steps; its `--lora` adapts
   the encoder, which the run used to record and ignore. An LM run bounded by
   `--trainer.tokens` alone trains over data with no epoch length.
+- A confident target's loss gradient is the rest of its row's probability summed directly, as arXiv:2610.31642's eq. 7 takes it, through every chunked head (the tiled, whole, fused and vocabulary-split heads) and the whole-logits loss (`logits_cross_entropy`). Each took the target's entry as its share less one, which rounds to 0 once the share rounds to 1, so the row's gradient stopped summing to zero by the rest mass, about 2e-9 at a margin of 20 and 4e-18 at 40. The forward pass reduces one more operand per row for it, and the loss values are unchanged.
 - A filtered or packed read resumes on any number of readers once it is prepared: publish its rows (and
   a terminal pack's plan) as a generation with `dew data publish` and read it by index, and a new run
   lowers to the global order. A per-share read refused on another topology now says so.
@@ -68,6 +69,11 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   `bidirectional_images` keeps Gemma's images, read whole within the window. A kind may read both,
   and every other kind stays causal. A cached call reads the groups of its own tokens, so no cache
   keeps them, and a layer that shares another's keys and values reads them too.
+- `dew.nn.categorical.cross_entropy` and `kl_divergence` differentiate by Barron,
+  Gnanapragasam and Tschannen's fix (arXiv:2610.31642): a label whose margin
+  rounds Optax's `p - 1` to 0 keeps its derivative, each row's derivative sums to
+  zero, and a divergence from logits equal to its reference has derivative
+  exactly zero. Their values are unchanged.
 - A joint decision row's user turn is composed of segments, `JointLayout.segments`, a tuple of
   `Text`, `Media`, `State` and `Schema` in the order the row writes them: the default is the Laya
   joint release's turn, and another writes the schema before the state, or text of its own

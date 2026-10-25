@@ -36,9 +36,9 @@ import types
 
 import numpy as np
 import torch
-import transformers
 import transformers.generation.utils as generation
 from numerics_reference import FIXTURES, decoder, prompts
+from torch_precision import float64, float64_twin
 
 FAMILIES = ("llama-tiny", "qwen3-tiny")
 WIDTH, NEW_TOKENS = 3, 6
@@ -77,8 +77,16 @@ def searched(model, ids, mask, eos, pad, penalty, early, **shaping) -> tuple[np.
 
 
 def write(name: str) -> None:
-    model, exact = decoder(name, torch.float32), decoder(name, torch.float64)
-    for each in (model, exact):
+    model = decoder(name, torch.float32)
+    # The float64 truth, its twin (`float64_twin`), built and run inside `float64`: built outside it, its
+    # rotary table would be float32's, the `arange` its constructor pins.
+    float64_model = float64_twin(model, lambda: decoder(name, torch.float64))
+
+    def exact(*arguments, **shaping):
+        with float64():
+            return searched(float64_model, *arguments, **shaping)
+
+    for each in (model, float64_model):
         each.generation_config.eos_token_id = None
     ids, mask = prompts(model.config.vocab_size)
     free, _ = searched(model, ids, mask, None, 0, 1.0, early=False)
@@ -90,7 +98,7 @@ def write(name: str) -> None:
     ended = 0
     for index, (penalty, early) in enumerate(SETTINGS):
         tokens, scores = searched(model, ids, mask, eos, pad, penalty, early)
-        wide, scores_f64 = searched(exact, ids, mask, eos, pad, penalty, early)
+        wide, scores_f64 = exact(ids, mask, eos, pad, penalty, early)
         if not np.array_equal(tokens, wide):
             raise SystemExit(f"{name} {penalty} {early}: float32 and float64 searches return other beams")
         ended += int(np.isin(tokens, eos).any(-1).sum())
@@ -102,7 +110,7 @@ def write(name: str) -> None:
     bias = [[[int(free[0, 2])], BIASES[0]], [[int(free[1, 3]), int(free[1, 4])], BIASES[1]]]
     shaping = {"sequence_bias": bias, "renormalize_logits": True}
     tokens, _ = searched(model, ids, mask, eos, pad, *SHAPED, **shaping)
-    wide, _ = searched(exact, ids, mask, eos, pad, *SHAPED, **shaping)
+    wide, _ = exact(ids, mask, eos, pad, *SHAPED, **shaping)
     if not np.array_equal(tokens, wide):
         raise SystemExit(f"{name} shaped: float32 and float64 searches return other beams")
     plain, _ = searched(model, ids, mask, eos, pad, *SHAPED)

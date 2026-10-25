@@ -15,7 +15,8 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import _records
-from dew.interop.weights import placed
+from dew.interop.config_records import NativeFields
+from dew.interop.weights import in_params, placed
 from dew.nn.attention import RMSNorm
 from dew.nn.blocks import TokenEmbedding
 from dew.nn.dense import Dense
@@ -23,15 +24,7 @@ from dew.nn.precision import float32_dot_general
 from dew.registry import Record, from_record
 
 from ..mobilenet import _ARCHITECTURE, MobileNetV5, MobileNetV5Encoder
-from .common import (
-    ProjectorBase,
-    ProjectorLayout,
-    TowerBase,
-    TowerGeometry,
-    TowerLayout,
-    _vision_section,
-    in_params,
-)
+from .common import ProjectorBase, ProjectorLayout, TowerBase, TowerGeometry, TowerLayout, _vision_section
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
@@ -49,7 +42,7 @@ class Gemma3nVision(MobileNetV5, TowerBase):
         return TowerGeometry(channels=self.in_chans)
 
 
-class Gemma3nProjectorModule(nn.Module):
+class Gemma3nProjector(ProjectorBase):
     """Gemma3nMultimodalEmbedder's vision hard and soft token paths."""
 
     vision_width: int
@@ -114,18 +107,6 @@ class Gemma3nProjectorModule(nn.Module):
         chosen = jnp.where(mask, ids, self.vocab_offset + self.vocab_size - 1)
         hard = self.embed_hard(chosen).astype(token_embeddings.dtype)
         return jnp.where(mask[..., None], hard, token_embeddings)
-
-
-@dataclasses.dataclass(frozen=True)
-class Gemma3nProjector(ProjectorBase):
-    vision_width: int
-    text_width: int
-    vocab_size: int = 128
-    vocab_offset: int = 262144
-    norm_eps: float = 1e-6
-
-    def build(self) -> nn.Module:
-        return Gemma3nProjectorModule(**dataclasses.asdict(self))
 
 
 def gemma3n_vision_path(hf_name: str) -> tuple[str, ...]:
@@ -241,8 +222,8 @@ def translate_gemma3n_vision_config(hf_config: Mapping[str, object]) -> Record:
 def translate_gemma3n_projector_config(hf_config: Mapping[str, object],
                                        text_width: int) -> Record:
     embedder, _ = _gemma3n_vision_record(hf_config)
-    value: Gemma3nProjector = from_record(Gemma3nProjector, {**embedder, "text_width": text_width})
-    return {"class": "gemma3n", "fields": {**dataclasses.asdict(value)}}
+    return {"class": "gemma3n", "fields": NativeFields(Gemma3nProjector,
+                                                       {**embedder, "text_width": text_width})}
 
 
 Gemma3nVision.checkpoint = TowerLayout("vision_tower.", in_params(gemma3n_vision_path))

@@ -156,24 +156,29 @@ def at_offset(batch, window: int, row: int) -> dict:
     return one | {"segments": (before + mine * (1 + before.any())).astype(np.int32)[None]}
 
 
-def in_place(batch, window: int, row: int) -> dict:
-    """`batch` with row `row` alone in window `window` where the window packed it (`at_offset`) and
-    every other window empty: the packed batch's shapes, so every product a row's tokens enter runs
-    at the packed run's shapes."""
+def in_place(batch, placed: list[tuple[int, int]]) -> dict:
+    """`batch` with each `(window, row)` of `placed`, at most one a window, alone in its window where
+    the window packed it (`at_offset`), and every other window empty: the packed batch's shapes, so
+    every product a row's tokens enter runs at the packed run's shapes. A window reads no other, so
+    rows of different windows run alone together."""
+    assert len({window for window, _ in placed}) == len(placed), "one row a window"
     one = {name: np.zeros_like(value) for name, value in batch.items()}
-    for name, value in at_offset(batch, window, row).items():
-        one[name][window, :value.shape[1]] = value[0]
-    if "option_slots" in batch:
-        one["option_slots"][window], one["slotted"][window] = compacted(one["options"][window],
-                                                                        batch["option_slots"].shape[1])
+    for window, row in placed:
+        for name, value in at_offset(batch, window, row).items():
+            one[name][window, :value.shape[1]] = value[0]
+        if "option_slots" in batch:
+            one["option_slots"][window], one["slotted"][window] = compacted(
+                one["options"][window], batch["option_slots"].shape[1])
     return one
 
 
 def apart(batch) -> dict:
     """Each row of the batch's windows in a window of its own, as the packer lays out a window that
-    holds one row: the row, then segment-0 padding to the window's length, and its question slots
-    first. Every row's window has one shape, so the rows alone run as one batch."""
-    length, questions = batch["tokens"].shape[1], batch["kinds"].shape[1]
+    holds one row: the row, then segment-0 padding to the longest row's length, which no real token
+    reads, and its question slots first. Every row's window has one shape, so the rows alone run as
+    one batch."""
+    length = max(int(np.count_nonzero(batch["segments"][window] == row)) for window, row in rows_of(batch))
+    questions = batch["kinds"].shape[1]
 
     def widened(name, value):
         """`value` padded with zeros along the row's tokens or questions to the window's."""
@@ -276,22 +281,28 @@ def rows_alone(decide, batch):
     the packed batch's shapes (`in_place`), by `decide(batch)`, the logits at their questions' options
     and the gradients summed over the rows: the packed run's own arithmetic, its products' shapes, the
     rule's chunks and attention's row length the window's, so the two differ only where another row
-    enters, and in how the rows' gradients add."""
-    logits, grads = [], None
-    for window, row in rows_of(batch):
-        one = in_place(batch, window, row)
+    enters, and in how the rows' gradients add. Each call holds one row of every window that has one
+    left, the windows' `k`th rows together, as no window reads another."""
+    every = rows_of(batch)
+    rounds = [[(window, row) for window, row in every if row == index]
+              for index in range(1, max(row for _, row in every) + 1)]
+    logits, grads = {}, None
+    for placed in rounds:
+        one = in_place(batch, placed)
         row_logits, row_grads = decide(one)
-        logits.append(np.asarray(row_logits)[window][one["options"][window]])
+        for window, row in placed:
+            logits[window, row] = np.asarray(row_logits)[window][one["options"][window]]
         grads = row_grads if grads is None else jax.tree.map(jnp.add, grads, row_grads)
-    return np.concatenate(logits), grads
+    return np.concatenate([logits[place] for place in every]), grads
 
 
-PACKING_SEEDS = {"joint": 128, "marker": 256, "parallel": 256, "flash": 8, "readout": 8}
+PACKING_SEEDS = {"joint": 256, "marker": 256, "parallel": 256, "flash": 8, "readout": 8}
 """Check 1's declared seeds for each arm's packed window: the most paired sizing (`seeds_for` with the
-packed window as `dew_fn`) gives on any platform the site runs on. An A100 took 128 for the joint arm and
-256 for the marker and parallel arms (node receipts SF-a100-packing-seeds), armada 16, 8 and 8
-(run-tests sf-packing-cpu-sizing-898ec4ac6); the flash arm's is an A100's, and the readout arm's 8 is an
-A100's (node receipt SF-readout-sizing) and armada's. The A100's are the head's gradients whose float64
+packed window as `dew_fn`) gives on any platform the site runs on. An H100 took 256 for the joint arm
+and 128 for the marker and parallel arms (node receipts TL-h100-packing-size-*-3), an A100 128 for the
+joint arm and 256 for the marker and parallel arms (SF-a100-packing-seeds), armada 16, 8 and 8 (run-tests
+sf-packing-cpu-sizing-898ec4ac6); the flash arm's is an A100's, and the readout arm's 8 is an A100's
+(SF-readout-sizing), an H100's and armada's. The A100's are the head's gradients whose float64
 truth is zero by symmetry, which both arms err at by 0 to 3 fp32 ulps: the marker and parallel arms'
 scorer_out bias, shared by a question's options, and the joint arm's attention key biases (ledger
 1548). Twice the rows a draw took the same counts on an A100 (node receipts SF-packing-scale2-sizing),

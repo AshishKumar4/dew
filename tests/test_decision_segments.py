@@ -63,11 +63,12 @@ def test_the_state_takes_what_the_rest_of_the_row_leaves_wherever_it_stands():
             laid.span[1] - laid.span[0] for laid in whole.questions]
 
 
-def test_a_row_holds_the_schema_once_and_the_state_and_images_at_most_once():
-    """Segments without the schema, or with two states, or two places for images, are refused when
-    the layout is built; images given to segments with no place for them are refused when a row is
-    laid out."""
-    refused = ((State(),), (Schema(), Schema()), (Schema(), State(), State()), (Schema(), Media(), Media()))
+def test_a_row_holds_the_schema_once_and_the_images_at_most_once():
+    """Segments without the schema, or with two places for images, are refused when the layout is
+    built, and two states are not; images given to segments with no place for them are refused when a
+    row is laid out."""
+    refused = ((State(),), (Schema(), Schema()), (Schema(), Media(), Media()))
+    JointLayout(segments=(Schema(), State(), State()))
     for segments in refused:
         with pytest.raises(ValueError):
             JointLayout(segments=segments)
@@ -161,3 +162,35 @@ def test_a_whole_request_whose_row_leaves_its_state_out_is_refused():
     body = {"state": "one two three", "questions": asked}
     with pytest.raises(ValueError):
         scoring.admit(body)
+
+
+def test_copies_of_the_state_share_the_room_as_any_rows_segments_do():
+    """A row's copies of the state share its room as any row's segments do (`share_tokens`): each its
+    cap, its own or the joint layout's, a whole copy all it holds (row 1616)."""
+    from dew.data.tokens import share_tokens
+    from dew.decision.layout import allocated
+
+    copies = [State(max_tokens=4), State(keep="all", max_tokens=2), State()]
+    assert allocated([10, 6, 10], copies, 12, default_cap=5) == share_tokens(
+        [10, 6, 10], 12, caps=[4, 2, 5], whole=[False, True, False]) == [3, 6, 3]
+
+
+def test_a_joint_row_holds_the_state_twice_each_copy_cut_to_its_own_budget():
+    """A joint row may hold the state more than once: each copy cut from the whole state to its own
+    budget and keeping its own end, the row's kept count its least-kept copy's; a layout of one state
+    lays its rows out as it did, and its record reloads it."""
+    state = "one two three four five six seven"
+    twice = (Text("FIRST:"), State(max_tokens=5), Text("\nLAST:"), State(keep="end", max_tokens=9), Schema())
+    layout = JointLayout(max_len=1 << 20, segments=twice)
+    [row] = layout.rows(TOKENIZER, SPECIALS, state, QUESTIONS)
+    written = text(row.tokens)
+    # A string state is its own compact text (`_compact`), each byte a token of the byte vocabulary.
+    assert ("FIRST:" + state[:5] + "\nLAST:" + state[-9:]) in written
+    assert (row.state_tokens, row.state_kept) == (len(state), 5)
+    assert from_record(Layout, to_record(layout, Layout), dtypes=False) == layout
+    once = JointLayout(max_len=1 << 20, segments=(State(), Schema()))
+    again = JointLayout(max_len=1 << 20, segments=(State(max_tokens=None), Schema()))
+    assert (once.rows(TOKENIZER, SPECIALS, state, QUESTIONS)
+            == again.rows(TOKENIZER, SPECIALS, state, QUESTIONS))
+    with pytest.raises(ValueError):
+        JointLayout(segments=(State(render="state"), Schema()))

@@ -24,7 +24,7 @@ What lands, beside each fixture's own files:
   on the committed `input_ids.npy` with weights and activations in float64
   and in bfloat16 (stored as float32, which holds every bfloat16 exactly).
   The float64 run is the truth both precisions are measured from, with every
-  float32 pin of the model widened (`diffusers_wan_reference.float64`):
+  float32 pin of the model widened (`torch_precision.float64`):
   its norms', rotary tables' and attention softmax's casts, which otherwise
   round the truth at float32 where Gemma-family models pin them (the
   diffusion-gemma truth moved 1.7e-7 to 2.4e-7 RMS, about half the fp32
@@ -58,9 +58,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import transformers
-from diffusers_wan_reference import float64
 from safetensors.torch import load_file
+from torch_precision import float64
 from transformers import AutoModelForCausalLM
 from transformers.generation.logits_process import TemperatureLogitsWarper, TopKLogitsWarper, TopPLogitsWarper
 
