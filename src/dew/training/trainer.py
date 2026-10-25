@@ -1657,7 +1657,9 @@ class Trainer(Generic[Loss, Effects]):
         notice stops the run at this step, whose checkpoint is then written."""
         current, checkpoints = run.current, self.checkpoints
         real = plan.real(interval)
-        ending = plan.finished(current, real)
+        # A run's last step, its budget's or the step after which its stream runs out (`_ends_here`), is
+        # scored and saved once, by `_wind_down`, with every suite: never here before a rarer suite has.
+        ending = plan.finished(current, real) or self._ends_here(run, interval)
         paused = not ending and plan.paused(current, real)
         record, aux = taken_record(aux)
         if record is not None:
@@ -1759,13 +1761,16 @@ class Trainer(Generic[Loss, Effects]):
             run.best.offer(ranking, dataclasses.replace(state, compute=None))
         winners = checkpoints._candidates(ranking) if (
             evaluation_due and checkpoints is not None and (plan.checkpoint_every or plan.best)) else ()
-        candidate = bool(winners)
-        if scores and self._plateau(plan, run, scores):
+        if not run.stopped and scores and self._plateau(plan, run, scores):
             self._take(plan, run, interval, state, unlogged=True)
             run.stopped = True
             run.stop_control['stop_reason'] = 'validation plateau'
             self._display.note("Stopped: validation plateau")
-            candidate = checkpoints is not None
+            if not final:
+                # The step the plateau stops at is the run's last: `_wind_down` scores every suite there
+                # and saves it (`final`), as it does a budget's last step.
+                return
+        candidate = bool(winners) or (run.stopped and checkpoints is not None)
         if (checkpoints is not None and interval.last_saved != current
                 and (run.checkpoint_due or candidate or (final and plan.checkpoint_final) or full)):
             self._read_taken(run)
@@ -1787,8 +1792,11 @@ class Trainer(Generic[Loss, Effects]):
     def _wind_down(self, plan: FitPlan, run: FitRun, interval: Interval, state: TrainState,
                    shardings: Placement[TrainState], position, profiler: Profiler | None) -> None:
         """`fit` after its last step: the stream closed, a preemption
-        announced, the trace window stopped, the final validation (skipped on
-        a preemption) and the checkpoint of the state the run ends on."""
+        announced, the trace window stopped, the final validation of every
+        suite the step has not scored (skipped on a preemption or a pause,
+        which a resume continues) and the checkpoint of the state the run ends
+        on, ranked by them: a budget's last step, a stream's that ran out and a
+        plateau's (`_between_steps`)."""
         profile, checkpoints, current, loss = self.profile, self.checkpoints, run.current, run.loss
         self._take(plan, run, interval, state, unlogged=True)
         self._read_taken(run)
@@ -1829,7 +1837,6 @@ class Trainer(Generic[Loss, Effects]):
             (plan.validation or plan.eval_every or plan.best or plan.stop or plan.held_best)
             and run.preempted is None
             and run.paused is None
-            and not run.stopped
         ):
             missing = [name for name in plan.suites if name not in scored]
             if not plan.suites or len(missing) == len(plan.suites):
