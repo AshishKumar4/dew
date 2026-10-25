@@ -250,6 +250,40 @@ def test_the_templates_gradients_hold_check_1(generation_name, case):
 
 
 
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
+def test_a_stacked_matrix_is_read_in_place_at_a_layer(generation_name):
+    """A layer of a stacked `[layers, groups, depth, width]` matrix picked by an index (`gemm`'s `layer`):
+    as exact as the plain program's product with that layer's matrices from float64 truth, the stack's
+    gradient included (zero at every other layer), and the launch reads the whole stack in place, its
+    matrix operand the stack's every group, no slice of it made. The gradients run eagerly, as the
+    Mosaic interpreters' ordered callbacks need."""
+    layers, groups, rows, depth, width = 3, 2, 136, 64, 128
+    sizes, layer, split = jnp.asarray([70, 66], jnp.int32), jnp.asarray(1, jnp.int32), 70
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(rows, depth)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(layers, groups, depth, width)) / 8, jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(rows, width)), jnp.bfloat16))
+
+    def dew(x, stack):
+        return template.gemm(x, stack, sizes, layer=layer, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+
+    def plain(x, stack, wide=jnp.float32, out=jnp.bfloat16):
+        matrices = stack[1].astype(wide)
+        return jnp.concatenate([x[:split].astype(wide) @ matrices[0],
+                                x[split:].astype(wide) @ matrices[1]]).astype(out)
+
+    with generation.assumed(generation_name):
+        assert_as_exact(with_gradients(dew), jax.jit(with_gradients(plain)), draw,
+                        f"stacked layer on {generation_name}", seeds=SEEDS,
+                        truth_fn=with_gradients(functools.partial(plain, wide=jnp.float64, out=jnp.float64)))
+        with tuning.seen() as launches:
+            jax.jit(dew).trace(*draw(0)[:2])
+    read = {ba.arguments['kernel'].shape for op, ba in launches if isinstance(op, grouped_matmul.MosaicGmm)}
+    assert read == {(layers * groups, depth, width)}
+
+
 @runs("v5e")
 def test_a_tpu_runs_an_exactly_summed_product_in_xla():
     """A kernel gradient into fp32 above the default precision adds each step's products apart, which

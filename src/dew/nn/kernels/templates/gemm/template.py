@@ -49,7 +49,7 @@ LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
 def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *, transpose_rhs: bool = False,
          prologue=None, prologue_operands: tuple = (), epilogue=None, epilogue_operands: tuple = (),
          out_dtype, out_dtypes: tuple | None = None, precision: PrecisionLike = None,
-         interpret_on_cpu: bool = False, prologue_jvp=None, compute=None):
+         interpret_on_cpu: bool = False, prologue_jvp=None, compute=None, layer: jax.Array | None = None):
     """Each group's rows of `lhs` times its matrix of `rhs`, through the hooks (the module's docstring):
     `[rows, width]` in `out_dtype`, or a tuple in `out_dtypes`. A `precision` above the default
     (explicitly or through `jax_default_matmul_precision`) sums an fp32 output in IEEE fp32, in XLA as in
@@ -61,14 +61,18 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
     dtype the products take, `lhs` rounded to it as `rhs` is, where `lhs`'s own dtype is what its
     cotangent takes, summed in fp32 and rounded once to it (an fp32 input's of a bf16 product); the
     rounding passes tangents through unrounded, the MoE projection's law
-    (`grouped_matmul.portable_projection`), and there is no prologue."""
+    (`grouped_matmul.portable_projection`), and there is no prologue. `layer`, where given (a traced
+    index), picks one layer of a stacked `rhs` (`[layers, *matrices]`: a layer's groups, or its one
+    matrix for a dense product), read in place: the stack's matrices are the call's groups, every other
+    layer's empty, so every launch reads the layer's matrices where they lie and no slice of the stack
+    is made (`_grouped`). Its gradient is the stack's, every other layer's zero."""
     if compute is not None and prologue is not None:
         raise ValueError("a prologue's operand is multiplied in its own dtype, not a named `compute`")
     straight = compute is not None
     compute = jnp.dtype(lhs.dtype if compute is None else compute)
-    dense = group_sizes is None
+    dense = group_sizes is None and layer is None
     prologue = _prologued(prologue, prologue_jvp)
-    rhs, group_sizes = _grouped(lhs, rhs, group_sizes)
+    rhs, group_sizes = _grouped(lhs, rhs, group_sizes, layer)
     prologue_arrays, prologue_axes = _split(prologue_operands, 'prologue')
     epilogue_arrays, epilogue_axes = _split(epilogue_operands, 'epilogue')
     dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
@@ -335,11 +339,18 @@ def _tupled(hook, *args) -> tuple:
     return _as_tuple(hook(*args))
 
 
-def _grouped(lhs, rhs, group_sizes):
-    """`rhs` with a group axis and the group sizes: a dense product is one group of every row."""
-    if group_sizes is None:
-        return rhs[None], jnp.full((1,), lhs.shape[0], jnp.int32)
-    return rhs, group_sizes.astype(jnp.int32)
+def _grouped(lhs, rhs, group_sizes, layer=None):
+    """`rhs` with a group axis and the group sizes: a dense product is one group of every row. A stacked
+    `rhs` at `layer` (`gemm`) is its every layer's groups as one axis, the sizes `group_sizes` at the
+    layer's and zero at every other's, so a launch reads the layer's matrices in place."""
+    sizes = (jnp.full((1,), lhs.shape[0], jnp.int32) if group_sizes is None
+             else group_sizes.astype(jnp.int32))
+    if layer is None:
+        return (rhs[None] if group_sizes is None else rhs), sizes
+    stack = rhs[:, None] if group_sizes is None else rhs
+    layers, groups = stack.shape[:2]
+    stacked = jnp.zeros((layers, groups), jnp.int32).at[layer].set(sizes)
+    return stack.reshape(layers * groups, *stack.shape[2:]), stacked.reshape(layers * groups)
 
 
 def _split(operands: tuple, hook: str) -> tuple[tuple, tuple]:
