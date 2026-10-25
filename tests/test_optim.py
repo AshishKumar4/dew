@@ -40,6 +40,7 @@ from dew.optim import (
     muon_weight_dimension_numbers,
     scale_by_qk_clip,
     scaled,
+    stepped,
     weight_decay_mask,
 )
 from dew.training import MeshSpec
@@ -419,25 +420,25 @@ def qk_stats(layers=1, heads=4, rows=3, values=None, nope=None, kv_heads=None, h
 
 def test_muonclip_without_stats_steps_like_muon():
     """No maxima, no clip: the transform steps aside bitwise, leaving every
-    run whose loss never opened the collection on Muon's update."""
+    run whose loss never opened the collection on Muon's step."""
     params, grads = qk_tree()
     muon = muon_solver()
     clipped = muonclip_solver()
     expected, _ = muon.update(grads, muon.init(params), params)
-    updates, _ = clipped.update(grads, clipped.init(params), params)
-    assert largest_difference(updates, expected) == 0.0
+    updates, state = clipped.update(grads, clipped.init(params), params)
+    assert largest_difference(stepped(params, updates, state), optax.apply_updates(params, expected)) == 0.0
 
 
 def test_a_quiet_clip_steps_like_muon():
-    """Maxima below the threshold rescale nothing: bitwise the Muon update."""
+    """Maxima below the threshold rescale nothing: bitwise the Muon step."""
     params, grads = qk_tree()
     muon = muon_solver()
     clipped = muonclip_solver()
     expected, _ = muon.update(grads, muon.init(params), params)
-    updates, _ = clipped.update(
+    updates, state = clipped.update(
         grads, clipped.init(params), params,
         qk_stats=qk_stats(values=[[10.0] * 4] * 3))
-    assert largest_difference(updates, expected) == 0.0
+    assert largest_difference(stepped(params, updates, state), optax.apply_updates(params, expected)) == 0.0
 
 
 CLIP_SEEDS = 8
@@ -454,8 +455,8 @@ def test_the_clip_matches_the_paper_equations():
     tx = scale_by_qk_clip(100.0)
 
     def applied(params, grads):
-        updates, _ = tx.update(grads, tx.init(params), params, qk_stats=stats)
-        return optax.apply_updates(params, updates)
+        updates, state = tx.update(grads, tx.init(params), params, qk_stats=stats)
+        return stepped(params, updates, state)
 
     def paper(params, grads):
         s_max = jnp.max(jnp.asarray(stats['layers_0']['self_attn']['max_logits'][0], params[
@@ -489,8 +490,8 @@ def test_a_query_group_clips_as_megatron_clips_it(case):
     stats = {"attn": {"max_logits": (jnp.asarray(MEGATRON[f"{case}/max_logits"])[None],),
                       "kv_heads": jnp.asarray(width // head_dim), "head_dim": jnp.asarray(head_dim)}}
     tx = scale_by_qk_clip(100.0)
-    updates, _ = tx.update(jax.tree.map(jnp.zeros_like, params), tx.init(params), params, qk_stats=stats)
-    applied = optax.apply_updates(params, updates)
+    updates, state = tx.update(jax.tree.map(jnp.zeros_like, params), tx.init(params), params, qk_stats=stats)
+    applied = stepped(params, updates, state)
     for proj, part in parts.items():
         got = np.asarray(applied["attn"][proj]["kernel"])
         if part == "v":
@@ -517,8 +518,8 @@ def test_a_gated_query_clips_its_query_half_and_bounds_the_logits():
     tau = float(np.mean(before.reshape(2, 2).max(axis=1)))
     tx = scale_by_qk_clip(tau)
     params = variables["params"]
-    updates, _ = tx.update(jax.tree.map(jnp.zeros_like, params), tx.init(params), params, qk_stats=stats)
-    clipped = optax.apply_updates(params, updates)
+    updates, state = tx.update(jax.tree.map(jnp.zeros_like, params), tx.init(params), params, qk_stats=stats)
+    clipped = stepped(params, updates, state)
     query, query_after = (np.asarray(tree["layers_0"]["self_attn"]["q_proj"]["kernel"]).reshape(16, 4, 2, -1)
                           for tree in (params, clipped))
     np.testing.assert_array_equal(query_after[:, :, 1], query[:, :, 1])
@@ -544,8 +545,9 @@ def test_a_gated_query_clips_its_query_half_and_bounds_the_logits():
         stats, _ = maxima(model, variables, ids)
         tx = scale_by_qk_clip(float(tau))
         params = variables["params"]
-        updates, _ = tx.update(jax.tree.map(jnp.zeros_like, params), tx.init(params), params, qk_stats=stats)
-        return maxima(model, {**variables, "params": optax.apply_updates(params, updates)}, ids)[1]
+        updates, state = tx.update(jax.tree.map(jnp.zeros_like, params), tx.init(params), params,
+                                   qk_stats=stats)
+        return maxima(model, {**variables, "params": stepped(params, updates, state)}, ids)[1]
 
     def paper(of):
         def clipped_then_read(variables, ids, tau):
@@ -587,8 +589,8 @@ def test_a_biased_projection_clips_its_bias_with_its_kernel_and_bounds_the_logit
     before = np.max(np.asarray(stats["layers_0"]["self_attn"]["max_logits"][0]), axis=0)
     tau = float(np.mean(before.reshape(2, 2).max(axis=1)))
     tx = scale_by_qk_clip(tau)
-    updates, _ = tx.update(jax.tree.map(jnp.zeros_like, params), tx.init(params), params, qk_stats=stats)
-    clipped = optax.apply_updates(params, updates)
+    updates, state = tx.update(jax.tree.map(jnp.zeros_like, params), tx.init(params), params, qk_stats=stats)
+    clipped = stepped(params, updates, state)
     _, resown = model.apply({**variables, "params": clipped}, ids, mutable=["qk"])
     firing = (before.reshape(2, 2).max(axis=1) > tau).repeat(2)
     assert 0 < np.sum(firing) < 4
@@ -618,8 +620,8 @@ def test_the_latent_branches_match_maxtext():
         max_logits = np.asarray(case['max_logits'], np.float32)
         stats = {'l': {'m': {'max_logits': (jnp.asarray(max_logits),),
                              'qk_nope': jnp.asarray(case['qk_nope'])}}}
-        updates, _ = tx.update(grads, tx.init(params), params, qk_stats=stats)
-        applied = np.asarray(optax.apply_updates(params, updates)['l']['m'][proj]['kernel'])
+        updates, state = tx.update(grads, tx.init(params), params, qk_stats=stats)
+        applied = np.asarray(stepped(params, updates, state)['l']['m'][proj]['kernel'])
         applied = applied.reshape(param.shape)
         with jax.enable_x64(new_val=True):
             scale = np.asarray(clip_scale(np.max(max_logits.astype(np.float64), axis=0), case['tau']))
@@ -628,33 +630,39 @@ def test_the_latent_branches_match_maxtext():
                                          f"MaxText's {case['layer']}, case {index}")
 
 
+THRESHOLD_SEEDS = 8
+"""Check 1's declared seeds for the clip at a configured threshold against the paper's (`seeds_for`)."""
+
+
 def test_the_threshold_rides_optimizer_opts():
     """`--optim.optimizer-opts '{"qk_clip_threshold": 5.0}'` reaches the
-    transform: maxima of 50 clip nothing at the default 100, and rescale
-    each side by sqrt(5/50) at 5, so their product carries the tenth. Held
-    to its prior bound: as an additive update, the clip's kernel loses about
-    one over the root of its scale of the accuracy the paper's direct rescale
-    keeps (3.1 times its distance from float64 at a tenth, over 40 draws),
-    a finding of its own (ledger 1659)."""
-    params, grads = qk_tree()
+    transform: maxima of 50 clip nothing at the default 100, which steps as
+    Muon bit for bit, and at 5 rescale each side of the Muon-stepped kernels
+    by sqrt(5/50), so their product carries the tenth: on par with the
+    paper's rescale of the stepped kernels over drawn kernels and gradients
+    (check 1), the clip rounding `gamma * (W + update)` once."""
     stats = qk_stats(values=[[50.0] * 4] * 3)
-    default = muonclip_solver()
-    muon = muon_solver()
+    params, grads = qk_tree()
+    default, muon = muonclip_solver(), muon_solver()
     plain, _ = muon.update(grads, muon.init(params), params)
-    updates, _ = default.update(grads, default.init(params), params,
-                                qk_stats=stats)
-    assert largest_difference(updates, plain) == 0.0
-    low = OptimConfig(
-        optimizer='muonclip', learning_rate=LR,
-        optimizer_opts={'qk_clip_threshold': 5.0}).build(10)
-    clipped, _ = low.update(grads, low.init(params), params, qk_stats=stats)
-    factor = float(np.sqrt(5.0 / 50.0))
-    stepped = (np.asarray(params['layers_0']['self_attn']['q_proj']['kernel'])
-               + np.asarray(plain['layers_0']['self_attn']['q_proj']['kernel']))
-    assert float(np.max(np.abs(
-        np.asarray(params['layers_0']['self_attn']['q_proj']['kernel'])
-        + np.asarray(clipped['layers_0']['self_attn']['q_proj']['kernel'])
-        - factor * stepped))) < 1e-6
+    updates, state = default.update(grads, default.init(params), params, qk_stats=stats)
+    assert largest_difference(stepped(params, updates, state), optax.apply_updates(params, plain)) == 0.0
+    low = muonclip_solver(optimizer_opts={'qk_clip_threshold': 5.0})
+
+    def clipped(params, grads):
+        updates, state = low.update(grads, low.init(params), params, qk_stats=stats)
+        return stepped(params, updates, state)
+
+    def paper(params, grads):
+        moved = optax.apply_updates(params, muon.update(grads, muon.init(params), params)[0])
+        s_max = jnp.max(jnp.asarray(stats['layers_0']['self_attn']['max_logits'][0], params[
+            'layers_0']['self_attn']['q_proj']['kernel'].dtype), axis=0)
+        gamma = clip_scale(s_max, 5.0)
+        return {'layers_0': {'self_attn': {proj: {'kernel': clip_qk_kernel(
+            moved['layers_0']['self_attn'][proj]['kernel'], gamma, 4)} for proj in ('q_proj', 'k_proj')}}}
+
+    assert_as_exact(without_ynn(clipped), without_ynn(paper), lambda seed: qk_tree(seed=seed),
+                    "the clip at a configured threshold", seeds=THRESHOLD_SEEDS, truth_fn=paper)
 
 
 def tiny_decoder(**overrides):
