@@ -537,3 +537,24 @@ def test_a_tiled_head_takes_each_tile_as_the_whole_head_takes_its_logits(tied):
     for chunks in (1, 4):
         _, predicted, _ = chunked_cross_entropy(states, table, targets, chunks)
         np.testing.assert_array_equal(np.asarray(predicted).reshape(-1), logits.argmax(-1))
+
+
+@pytest.mark.parametrize("axis", [None, 1, (0, 1), -1])
+def test_a_weighted_total_rounds_once_and_keeps_excluded_values_out(axis):
+    """`weighted_total` sums its weighted values and their weights each rounded once, as float64's
+    sum rounded to float32: a row of one large value and 4095 ones, whose running float32 sum drops
+    every one, totals as the exact sum does, whatever the axes; a NaN or infinity under weight zero
+    reaches neither the total nor the mass."""
+    from dew.nn.precision import weighted_total
+
+    rows = np.ones((3, 4096), np.float32)
+    rows[:, 0] = 2.0 ** 25
+    weights = np.ones_like(rows)
+    weights[:, -2:] = 0
+    rows[:, -1], rows[:, -2] = np.nan, np.inf
+    total, mass = jax.jit(lambda x, w: weighted_total(x, w, axis))(rows, weights)
+    reduced = tuple(range(rows.ndim)) if axis is None else axis
+    kept = np.where(weights != 0, rows, 0).astype(np.float64) * weights
+    np.testing.assert_array_equal(np.asarray(total), np.sum(kept, axis=reduced).astype(np.float32))
+    exact_mass = np.sum(weights.astype(np.float64), axis=reduced).astype(np.float32)
+    np.testing.assert_array_equal(np.asarray(mass), exact_mass)
