@@ -71,9 +71,10 @@ from dew.nn.protocols import (
     Lacks,
     LayerStates,
     TokenModel,
+    block_chunks_of,
     head_table,
-    reads_blocks,
     refuse_prefix,
+    whole_block,
 )
 from dew.nn.sharding import LOGITS, constrain
 from dew.nn.visibility import same_group
@@ -690,16 +691,24 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                                             self.processor if processor is OMITTED else processor)
 
     def _refuse_blocks(self, prepared: ModelInputs, depths: bool) -> None:
-        """Refuse a batch's blocks where the model reads none, or its prediction depths would read them beyond
-        their source, which the loss's exclusion does not cover (`scored_targets`)."""
+        """Refuse a batch's blocks where no trunk layer reads them, or where prediction depths would read
+        them beyond their source, which `scored_targets` does not account for. A prefix run's blocks were
+        checked where the run was built. Any other batch's blocks are runs of any place in a row, which a
+        layer's chunk can cut, so they need a layer reading every run whole. The check is static, since a
+        trace cannot read the runs' places."""
         if BLOCKS_FIELD not in prepared.token_fields:
             return
         if depths:
             raise ValueError("a batch's blocks train the trunk's targets alone: a prediction depth reads "
                              "blocks beyond its own source, so depths are refused with blocks")
-        if not reads_blocks(self.model):
-            raise ValueError("the batch's blocks reach a model none of whose layers reads blocks "
+        chunks = block_chunks_of(self.model)
+        if not chunks:
+            raise ValueError("the batch's blocks reach a model none of whose trunk layers reads blocks "
                              "(AttentionMixer.bidirectional_blocks), where they would drop targets")
+        if self.prefix is None and not whole_block(chunks, self.seq_len):
+            raise ValueError("a batch's blocks are runs of any place, which a layer's chunk can cut; "
+                             "a run is read whole only by a layer with no chunk, or one of "
+                             f"{self.seq_len} places or more")
 
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
                      segment_ids=None, positions=None, routing: bool = False,
@@ -1058,10 +1067,12 @@ class LMObjective(TokenScorer):
     sees the block's later tokens too. The loss scores no target in its source's block, which the state
     would read off; every other target counts as usual. Serving reads the same blocks (`TextGeneration`'s
     `prefix`): a prompt's first `prefix` tokens, or the whole prompt under "prompt", are one block. None, the
-    default, trains causally. A model none of whose layers reads blocks is refused, as are an int above
-    `seq_len` and `mtp_weight`, whose prediction depths read blocks beyond their source. A batch carrying
-    `text_block_groups` (the data stage `dew.data.steps.blocks.Blocks`) trains the same way, whatever `prefix`
-    says.
+    default, trains causally. A model none of whose trunk layers reads blocks is refused, as is an int above
+    `seq_len`, and `mtp_weight`, whose prediction depths read blocks beyond their source. A layer's
+    attention chunk (`LayerKind.chunk`) that cuts a block refuses it: a prefix's block is read whole only by
+    a trunk layer with no chunk, or one at least as long as the block (a prompt's block runs to `seq_len`).
+    A batch carrying `text_block_groups` (the data stage `dew.data.steps.blocks.Blocks`) trains the same way,
+    whatever `prefix` says.
 
     `model` may be a loaded source (`LMObjective(qwen, seq_len=512)`), and
     `variables` and `processor` override its own (`Objective.bind_model`).
@@ -1107,12 +1118,10 @@ class LMObjective(TokenScorer):
                          variables=variables, processor=processor)
         self.pad_id = pad_id
         self.token_accuracy = token_accuracy
-        refuse_prefix(self.model, prefix)
+        refuse_prefix(self.model, prefix, longest=seq_len)
         if prefix is not None and mtp_weight is not None:
             raise ValueError("a prefix run trains the trunk's targets alone: a prediction depth reads "
                              "blocks beyond its own source, so mtp_weight is refused with prefix")
-        if isinstance(prefix, int) and prefix > seq_len:
-            raise ValueError(f"prefix {prefix} is more tokens than the row's seq_len, {seq_len}")
         self.prefix = prefix
         _check_terms(self.model, mtp_weight=mtp_weight, z_loss=z_loss)
         self.balance = balance

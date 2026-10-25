@@ -8,7 +8,6 @@ from typing import Literal
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
 
 def windowed(query, key, window: int, *, causal: bool):
@@ -52,13 +51,12 @@ def prefix_blocks(segments, places, prefix: int, *, xp=jnp):
 def prompt_blocks(valid, prefix: int | Literal["prompt"], *, xp=jnp):
     """The blocks a served prompt's real tokens `valid` `[B, S]` make under a prefix run, as a training row's
     do (`prefix_blocks`): the first `prefix` tokens under an int, the whole prompt under "prompt". Each row is
-    one document of its own. A row with fewer than `prefix` real tokens is refused, since the training block
-    would cover tokens the prompt lacks."""
+    one document of its own. It reads no host value, so a trace makes the blocks the host does; a caller
+    refuses a row with fewer than `prefix` real tokens on the count it holds, since the trained block would
+    cover tokens the prompt lacks."""
     valid = xp.asarray(valid, bool)
     if prefix == "prompt":
         return xp.where(valid, 1, -1).astype(xp.int32)
-    if (np.asarray(valid).sum(axis=1) < prefix).any():
-        raise ValueError(f"a prompt under prefix {prefix} needs at least {prefix} real tokens in every row")
     return prefix_blocks(valid.astype(xp.int32), xp.cumsum(valid, axis=1, dtype=xp.int32) - 1, prefix, xp=xp)
 
 

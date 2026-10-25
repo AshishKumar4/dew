@@ -599,7 +599,7 @@ class TextGeneration(_NativeTextTask):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        refuse_prefix(self.model, self.prefix)
+        refuse_prefix(self.model, self.prefix, longest=cache_ceiling(self.model))
         object.__setattr__(self, "_stops", self._stop_criteria(self.sampling.stop))
 
     def _stop_criteria(self, strings: tuple[str, ...]) -> tuple[Stopping, ...]:
@@ -681,12 +681,16 @@ class TextGeneration(_NativeTextTask):
                    max_new_tokens=settings.max_new_tokens or None, prefix=settings.prefix)
 
     def _blocked(self, inputs: ModelInputs) -> ModelInputs:
-        """`inputs` with the blocks its prefix run gives each prompt (`prompt_blocks`), unless the request has
-        its own blocks, which stand."""
+        """`inputs` with the blocks its prefix run gives each prompt (`prompt_blocks`), unless the request
+        has its own blocks, which stand. Counted on the host: a prompt shorter than an int prefix is refused,
+        since its trained block would cover tokens it lacks."""
         if self.prefix is None or BLOCKS_FIELD in inputs.token_fields:
             return inputs
-        valid = real_slots(inputs.token_fields, inputs.tokens.shape)
-        fields = {**inputs.token_fields, BLOCKS_FIELD: prompt_blocks(valid, self.prefix)}
+        real = np.asarray(real_slots(inputs.token_fields, inputs.tokens.shape))
+        if self.prefix != "prompt" and (real.sum(axis=1) < self.prefix).any():
+            raise ValueError(f"a prompt under prefix {self.prefix} needs {self.prefix} real tokens in every "
+                             "row")
+        fields = {**inputs.token_fields, BLOCKS_FIELD: prompt_blocks(real, self.prefix)}
         return replace(inputs, token_fields=fields)
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,

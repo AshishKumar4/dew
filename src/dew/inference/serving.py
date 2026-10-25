@@ -786,10 +786,14 @@ class Server:
 
     def _blocks_of(self, prompt: np.ndarray) -> np.ndarray | None:
         """The blocks a request's prompt makes under the prefix run (`prompt_blocks`), None where the server
-        runs causally. A block a layer reads whole is prefilled in one piece, so a server that prefills
-        in pieces of `chunk` tokens refuses a longer block."""
+        runs causally. A prompt shorter than an int prefix is refused: its trained block would cover tokens
+        it lacks. A block a layer reads whole is prefilled in one piece, so a server that prefills in pieces
+        of `chunk` tokens refuses a longer block."""
         if self.prefix is None:
             return None
+        if self.prefix != "prompt" and len(prompt) < self.prefix:
+            raise ValueError(f"a prompt under prefix {self.prefix} needs at least {self.prefix} tokens, got "
+                             f"{len(prompt)}")
         block = len(prompt) if self.prefix == "prompt" else self.prefix
         if self.rows.chunk is not None and block > self.rows.chunk:
             raise ValueError(f"a prefix block of {block} tokens would be prefilled in pieces of at most "

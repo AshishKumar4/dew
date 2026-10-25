@@ -714,30 +714,50 @@ class Serving(Protocol):
 
 @runtime_checkable
 class BlockReading(Protocol):
-    """A decoder whose layers may read a block whole (`AttentionMixer.bidirectional_blocks`, a block's tokens
-    seeing each other both ways). `reads_blocks` says whether one of them does. A prefix run needs one, since
-    its blocks reach a model call as `block_groups` and a layer that reads none computes them causally."""
+    """A decoder whose trunk layers may read a block whole (`AttentionMixer.bidirectional_blocks`: a block's
+    tokens see each other both ways). `block_chunks` lists each trunk layer that reads blocks by its attention
+    chunk, None where it has none. A prefix run needs one: its blocks reach a model call as `block_groups`,
+    and a layer that reads none computes them causally."""
 
-    def reads_blocks(self) -> bool: ...
-
-
-def reads_blocks(model: nn.Module) -> bool:
-    """Whether `model` says one of its layers reads blocks whole (`BlockReading`); a model that says nothing
-    reads none."""
-    return isinstance(model, BlockReading) and model.reads_blocks()
+    def block_chunks(self) -> tuple[int | None, ...]: ...
 
 
-def refuse_prefix(model: nn.Module, prefix: int | Literal["prompt"] | None) -> None:
-    """Refuse a prefix run the model or its value cannot take: a prefix is "prompt" or a positive number of
-    tokens (None is no prefix), and its blocks are read whole only by a layer that reads blocks, so the model
-    needs one (`reads_blocks`)."""
+def block_chunks_of(model: nn.Module) -> tuple[int | None, ...]:
+    """The attention chunk of each trunk layer that reads blocks whole, None where a layer has none; empty for
+    a model that says nothing, or whose layers read none (`BlockReading`)."""
+    return model.block_chunks() if isinstance(model, BlockReading) else ()
+
+
+def whole_block(chunks: tuple[int | None, ...], extent: int | None) -> bool:
+    """Whether a layer that reads blocks reads a block of `extent` places whole: one with no chunk, or a
+    chunk of `extent` places or more. A document's places count from 0 (`counted_places`), so such a block
+    lies in one chunk, and every target in it is visible to that layer. None is unbounded: only a layer with
+    no chunk reads any block whole."""
+    return any(chunk is None or (extent is not None and chunk >= extent) for chunk in chunks)
+
+
+def refuse_prefix(model: nn.Module, prefix: int | Literal["prompt"] | None, *, longest: int | None) -> None:
+    """Refuse a prefix run the model or its values cannot take. A prefix is "prompt" or a positive number of
+    tokens, at most `longest` where a longest row is declared. Its blocks are read whole only by a trunk layer
+    that reads blocks (`block_chunks_of`), and only if its chunks do not cut the block: the loss drops the
+    targets inside a block, which the trunk sees only where a layer reads the whole block (`whole_block`).
+    A prompt's block is the whole prompt, up to `longest` tokens."""
     if prefix is None:
         return
     if prefix != "prompt" and (type(prefix) is not int or prefix < 1):
         raise ValueError(f"prefix is 'prompt' or a positive number of tokens, got {prefix!r}")
-    if not reads_blocks(model):
-        raise ValueError("prefix needs a layer that reads blocks (AttentionMixer.bidirectional_blocks), "
-                         f"and {type(model).__name__} has none")
+    if isinstance(prefix, int) and longest is not None and prefix > longest:
+        raise ValueError(f"prefix {prefix} is more tokens than the longest row, {longest}")
+    chunks = block_chunks_of(model)
+    if not chunks:
+        raise ValueError("prefix needs a trunk layer that reads blocks "
+                         "(AttentionMixer.bidirectional_blocks), and "
+                         f"{type(model).__name__} has none")
+    extent = prefix if isinstance(prefix, int) else longest
+    if not whole_block(chunks, extent):
+        length = "any length" if extent is None else f"{extent} tokens"
+        raise ValueError(f"a prefix block of {length} crosses the attention chunks of every layer that "
+                         f"reads blocks ({list(chunks)})")
 
 
 @runtime_checkable
