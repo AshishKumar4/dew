@@ -173,19 +173,6 @@ def across(x: jax.Array, like: jax.Array) -> jax.Array:
     return jax.lax.broadcast_in_dim(x, like.shape, (like.ndim - 1,))
 
 
-def per_query(x: jax.Array, like: jax.Array, keyed: bool = False) -> jax.Array:
-    """A per-query `x` broadcast over a tile `like`: along its rows (`expand`), or where its rows are its
-    keys (`keyed`, `[bk, bq]`: a product that takes the keys as M, FlashAttention-3's dK/dV), along its
-    columns (`across`)."""
-    return across(x, like) if keyed else expand(x, like)
-
-
-def per_key(x: jax.Array, like: jax.Array, keyed: bool = False) -> jax.Array:
-    """A per-key `x` broadcast over a tile `like`, its keys its columns or, `keyed`, its rows
-    (`per_query`)."""
-    return expand(x, like) if keyed else across(x, like)
-
-
 class Coords(NamedTuple):
     """A tile's coordinates as the mainloop provides them (in the layout its products give): the query
     indices `q_pos` `[bq, 1]` and key indices `k_pos` `[1, bk]`, and where the spans narrow, each
@@ -652,25 +639,23 @@ def _masked(spec: Forward, s: jax.Array, coords: Coords, unseen: float) -> jax.A
     return s if visible is None else jnp.where(visible, s, unseen)
 
 
-def seen(spec: Forward, coords: Coords, like: jax.Array, keyed: bool = False) -> jax.Array | None:
-    """Whether each query of a tile `like` `[bq, bk]` (`[bk, bq]` where `keyed`, `per_query`) sees each key
-    (`within`), every mainloop's one predicate, forward and backward; None where each sees every key. A
-    spans call's intervals, the union of its runs' where it has them, and, with documents, ids (its
-    mainloops give each tile its queries' intervals and both blocks' ids); a causal call's diagonal; the
-    call's keys, where a tile reaches past them: no walk visits a tile wholly past them, so a call whose
-    keys are whole tiles reads no padding; and, where the spec names them, its queries (a padding row sees
-    no key, so a score hook's derivative there, undefined at its padded parameters, reaches no reduction
-    over the rows)."""
+def seen(spec: Forward, coords: Coords, like: jax.Array) -> jax.Array | None:
+    """Whether each query of a tile `like` `[bq, bk]` sees each key (`within`), every mainloop's one
+    predicate, forward and backward; None where each sees every key. A spans call's intervals, the union
+    of its runs' where it has them, and, with documents, ids (its mainloops give each tile its queries'
+    intervals and both blocks' ids); a causal call's diagonal; the call's keys, where a tile reaches past
+    them: no walk visits a tile wholly past them, so a call whose keys are whole tiles reads no padding;
+    and, where the spec names them, its queries (a padding row sees no key, so a score hook's derivative
+    there, undefined at its padded parameters, reaches no reduction over the rows)."""
     visible = None
     if coords.spans is not None:
-        ids = None if coords.ids is None else (per_query(coords.ids[0], like, keyed),
-                                                per_key(coords.ids[1], like, keyed))
-        visible = functools.reduce(jnp.logical_or, (within(coords.k_pos, per_query(start, like, keyed),
-                                                           per_query(end, like, keyed), ids)
+        ids = None if coords.ids is None else (expand(coords.ids[0], like), across(coords.ids[1], like))
+        visible = functools.reduce(jnp.logical_or, (within(coords.k_pos, expand(start, like),
+                                                           expand(end, like), ids)
                                                     for start, end in coords.spans))
     elif spec.form == "causal":
         visible = coords.k_pos <= coords.q_pos
-    if spec.form != "spans" and spec.keys % like.shape[0 if keyed else 1]:
+    if spec.form != "spans" and spec.keys % like.shape[1]:
         # A tile past the call's last key reads padding.
         visible = coords.k_pos < spec.keys if visible is None else visible & (coords.k_pos < spec.keys)
     if spec.form != "spans" and spec.queries is not None:
@@ -1237,28 +1222,23 @@ def scored(score_mod, logits, q_pos, k_pos, params, *, slopes: bool):
                                                   for index in range(len(params))))
 
 
-def pulled(cotangents, slopes, seen, kinds: tuple[Kind, ...], *, keyed: bool = False,
-           graded: tuple[Kind, ...] | None = None):
+def pulled(cotangents, slopes, seen, kinds: tuple[Kind, ...],
+           column_sums: Callable[[jax.Array], jax.Array] | None = None):
     """The score cotangents `cotangents` through `score_mod`, its entries' derivatives `slopes`
     (`scored`; None without a hook): the logits' tile, and each parameter's, a head's or a query's its
-    queries' sums `[block_q]`, a key's its keys' `[block_k]`, a tile's the tile. Each entry is masked before
+    queries' sums `[block_q]`, a key's its keys' `[block_k]` (`column_sums`, the mainloop's sum over a
+    tile's rows where it takes one: `Family.column_sums`), a tile's the tile. Each entry is masked before
     any sum, so one the call never sees (padding, another document) adds nothing even where the hook's
-    derivative there is not finite. fp32. A `keyed` tile's rows are its keys (`per_query`): its keys' sums
-    are its rows', its queries' its columns', and its tile pieces `[bk, bq]`. Where `graded` names the kinds
-    whose pieces the caller writes, every other kind's piece is None, no sum of it taken: a mainloop sums a
-    tile's rows within a thread's fragments alone (Mosaic GPU's, `mosaic`)."""
+    derivative there is not finite. fp32."""
     if slopes is None:
         return cotangents, ()
     logits = where_seen(seen, cotangents * slopes[0], 0.0)
-    query_axis, key_axis = (-1, 0) if not keyed else (0, -1)
     pieces = []
     for slope, kind in zip(slopes[1:], kinds, strict=True):
-        if graded is not None and kind not in graded:
-            pieces.append(None)
-            continue
         entries = where_seen(seen, cotangents * slope, 0.0)
-        pieces.append(entries.sum(axis=key_axis) if kind == Kind.KEY else entries if kind == Kind.TILE
-                      else entries.sum(axis=query_axis))
+        key_sums = (lambda x: x.sum(axis=0)) if column_sums is None else column_sums
+        pieces.append(key_sums(entries) if kind == Kind.KEY else entries if kind == Kind.TILE
+                      else entries.sum(axis=-1))
     return logits, tuple(pieces)
 
 
@@ -1581,19 +1561,18 @@ def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax
     return dq, delta + refined, total, mass, grads
 
 
-def below(logits: jax.Array, peak: jax.Array, how: Recompute = PLAIN, keyed: bool = False) -> jax.Array:
+def below(logits: jax.Array, peak: jax.Array, how: Recompute = PLAIN) -> jax.Array:
     """`exp(s - m)` for a tile's logits recomputed in the backward against the forward's maximum `m`,
     fp32, in the forward's units (`Recompute`): `m` is every key's maximum, so a logit past it by the
     rounding the two passes do not share (the forward's maximum taken in base 2 and back, or another tile
     shape's product) is the maximum itself, its weight 1, never past it; in the accurate form one at it
-    weighs 1 however a compiler contracts its scaling into the subtraction (`weights`). A `keyed` tile's
-    rows are its keys (`per_query`)."""
-    return jnp.exp(exponent(logits, peak, how, keyed))
+    weighs 1 however a compiler contracts its scaling into the subtraction (`weights`)."""
+    return jnp.exp(exponent(logits, peak, how))
 
 
-def exponent(logits: jax.Array, peak: jax.Array, how: Recompute = PLAIN, keyed: bool = False) -> jax.Array:
+def exponent(logits: jax.Array, peak: jax.Array, how: Recompute = PLAIN) -> jax.Array:
     """The natural exponent `s - m` (at most 0) of `below`'s weights."""
-    peak = per_query(peak, logits, keyed)
+    peak = expand(peak, logits)
     if how.factor is not None:
         # Raw products: the difference is taken first, so the largest's is exactly 0.
         return jnp.minimum(logits - peak, 0.0) * how.factor
@@ -1602,12 +1581,11 @@ def exponent(logits: jax.Array, peak: jax.Array, how: Recompute = PLAIN, keyed: 
     return jnp.minimum(logits - peak, 0.0)
 
 
-def normalized(logits: jax.Array, peak: jax.Array, total: jax.Array, how: Recompute = PLAIN,
-               keyed: bool = False) -> tuple[jax.Array, jax.Array]:
-    """A tile's unnormalized weights `exp(s - m)` (`below`) and its weights `p`, fp32, its rows its keys
-    where `keyed` (`per_query`)."""
-    exponentials = below(logits, peak, how, keyed)
-    return exponentials, exponentials * per_query(inverse(total), exponentials, keyed)
+def normalized(logits: jax.Array, peak: jax.Array, total: jax.Array, how: Recompute = PLAIN
+               ) -> tuple[jax.Array, jax.Array]:
+    """A tile's unnormalized weights `exp(s - m)` (`below`) and its weights `p`, fp32."""
+    exponentials = below(logits, peak, how)
+    return exponentials, exponentials * expand(inverse(total), exponentials)
 
 
 def dropped_products(products: jax.Array, multiplier: jax.Array | None) -> jax.Array:
@@ -1621,7 +1599,7 @@ def dropped_products(products: jax.Array, multiplier: jax.Array | None) -> jax.A
 
 def grad_scores(exponentials: jax.Array, products: jax.Array, anchor: jax.Array, delta: jax.Array,
                 seen: jax.Array | None, at_anchor: jax.Array | None, inverse_total: jax.Array,
-                multiplier: jax.Array | None = None, keyed: bool = False) -> jax.Array:
+                multiplier: jax.Array | None = None) -> jax.Array:
     """The score cotangents `p (dP - D)` of a tile in the reference's own order, as JAX differentiates
     `exp(s - m) / T`: each query's `(dP - c) - (D - c)` about its anchor c (`off_anchor_delta`) over its
     denominator (`inverse_total`), then times the unnormalized weights `exp(s - m)`, so every intermediate
@@ -1630,13 +1608,12 @@ def grad_scores(exponentials: jax.Array, products: jax.Array, anchor: jax.Array,
     `dP - c` is 0 by definition where `at_anchor` names it, whatever its product's rounding, so a query that
     sees one key has no cotangent, as the reference's: FlashAttention's order, `(dP - D) / T` with no anchor
     test, fails check 1 there in both dQ and dK (a query of one key, the stability suite's ordinary "one
-    key" and causal windows' first queries: rows whose float64 gradient is exactly 0). A `keyed` tile's
-    rows are its keys (`per_query`)."""
+    key" and causal windows' first queries: rows whose float64 gradient is exactly 0)."""
     products = dropped_products(products, multiplier)
-    relative = products - per_query(anchor, products, keyed)
+    relative = products - expand(anchor, products)
     if at_anchor is not None:
         relative = jnp.where(at_anchor, 0.0, relative)
-    centred = (relative - per_query(delta, relative, keyed)) * per_query(inverse_total, relative, keyed)
+    centred = (relative - expand(delta, relative)) * expand(inverse_total, relative)
     return where_seen(seen, exponentials * centred, 0.0)
 
 
