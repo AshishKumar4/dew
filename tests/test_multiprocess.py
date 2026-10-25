@@ -1441,9 +1441,10 @@ def test_runs_average_across_a_pool_each_process_its_own_shards(tmp_path):
 
 @pytest.mark.distributed
 def test_runs_one_process_refuses_are_refused_by_every_process_of_the_pool(tmp_path):
-    """Two runs whose integer counts differ in an entry the first process alone holds: that process
-    refuses them (ValueError), and its peer hears the refusal where the pool agrees on each run
-    (PeerFailure), rather than reading on alone to hang or average."""
+    """Two runs whose integer counts differ in an entry the first process alone holds, one with its
+    token table frozen and kept whole, the other training and splitting it: that process refuses them
+    (ValueError), and its peer, whose placement of the table gathers it, hears the refusal where the
+    pool agrees on each run (PeerFailure), rather than waiting in the gather alone or averaging."""
     corpus = document_corpus(tmp_path / "corpus", 24, length=7)
     reports = run_pool("averaged_refused", tmp_path / "out", 2, script=AVERAGING, run_dir=tmp_path / "runs",
                        fsdp_size=MESH_DEVICES, tokens=corpus.train, seq_len=7)
