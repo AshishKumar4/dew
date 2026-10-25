@@ -305,11 +305,22 @@ def _clip_leaf(qk_stats, tau: float, normed: set[tuple[str, ...]], path: jax.tre
 
 
 class QKClipState(NamedTuple):
-    """The rescale QK-Clip leaves for the stepped weights (`stepped`): each query and key leaf's factor
-    a column of its last axis by its path, every factor one before the first update or where no
-    maxima were sown, so the state keeps one structure."""
+    """The rescale QK-Clip leaves for the stepped weights (`stepped`): the updates the clip has taken
+    part in, `steps`, and each query and key leaf's factor a column of its last axis by its path,
+    every factor one before the first update or where no maxima were sown, so the state keeps one
+    structure."""
 
+    steps: jax.Array
     rescales: Mapping[str, jax.Array]
+
+
+class BoundsState(NamedTuple):
+    """The clamp a bounded param group leaves for the stepped weights (`stepped`, `_keep_within`): the
+    updates the group has taken part in, `steps`, and each of its leaves' `[lower, upper]` in the
+    leaf's dtype, by its path."""
+
+    steps: jax.Array
+    bounds: Mapping[str, jax.Array]
 
 
 def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArgs:
@@ -329,12 +340,13 @@ def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArg
         raise ValueError(f"the clip threshold bounds positive logits, got {tau}")
 
     def init_fn(params) -> QKClipState:
-        return QKClipState(_rescales(params, None, tau))
+        return QKClipState(jnp.zeros([], jnp.int32), _rescales(params, None, tau))
 
     def update_fn(updates, state, params=None, qk_stats=None):
         if params is None:
             return updates, state
-        return updates, QKClipState(_rescales(params, qk_stats, tau))
+        return updates, state._replace(steps=optax.safe_increment(state.steps),
+                                       rescales=_rescales(params, qk_stats, tau))
 
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)
 
@@ -353,28 +365,42 @@ def _rescales(params, qk_stats, tau: float) -> dict[str, jax.Array]:
     return held
 
 
-def stepped(params, updates, opt_state):
-    """`params` moved by `updates`, then each leaf the optimizer's state holds a post-step rescale for
-    (`QKClipState`, anywhere in a chain's state) rescaled once: the weights a step stores, and the
-    only way to form them (the trainer's transaction, `power_profiles`' averages)."""
+POST_STEP = (QKClipState, BoundsState)
+"""The optimizer states whose effect acts on the weights an update moved (`stepped`)."""
+
+
+def stepped(params, updates, before, after):
+    """`params` moved by `updates`, then each post-step effect of the update that took the optimizer's
+    state from `before` to `after`, in the chain's order: QK-Clip's rescale (`QKClipState`), one
+    rounding of `gamma * (W + update)`, and a bounded group's clamp (`BoundsState`), exact. The
+    weights a step stores, and the only way to form them (the trainer's transaction,
+    `power_profiles`' averages). An effect whose transform the update did not run, a group a mask
+    left out or an update a wrapper deferred or rejected (`optax.MultiSteps`, `optax.apply_if_finite`),
+    whose state comes back as it was, leaves the weights as the update moved them."""
     moved = optax.apply_updates(params, updates)
-    rescales: dict[str, jax.Array] = {}
-    for held in jax.tree_util.tree_leaves(opt_state, is_leaf=lambda node: isinstance(node, QKClipState)):
-        if isinstance(held, QKClipState):
-            rescales.update(held.rescales)
-    if not rescales:
+
+    def effects(state):
+        held = jax.tree_util.tree_leaves(state, is_leaf=lambda node: isinstance(node, POST_STEP))
+        return [node for node in held if isinstance(node, POST_STEP)]
+
+    pairs = list(zip(effects(before), effects(after), strict=True))
+    if not pairs:
         return moved
-    lacking = rescales.keys() - {jax.tree_util.keystr(path)
-                                 for path, _ in jax.tree_util.tree_leaves_with_path(moved)}
-    if lacking:
-        raise ValueError(f"the optimizer's state rescales {sorted(lacking)}, which the stepped "
-                         "parameters lack: step the tree the optimizer was updated with")
-
-    def rescaled(path, leaf):
-        key = jax.tree_util.keystr(path)
-        return _rescaled(leaf, rescales[key]) if key in rescales else leaf
-
-    return jax.tree_util.tree_map_with_path(rescaled, moved)
+    paths, leaves = zip(*jax.tree_util.tree_leaves_with_path(moved), strict=True)
+    held = dict(zip(map(jax.tree_util.keystr, paths), leaves, strict=True))
+    for previous, current in pairs:
+        taken = current.steps != previous.steps
+        acted = current.rescales if isinstance(current, QKClipState) else current.bounds
+        lacking = acted.keys() - held.keys()
+        if lacking:
+            raise ValueError(f"the optimizer's state acts on {sorted(lacking)} after a step, which the "
+                             "stepped parameters lack: step the tree the optimizer was updated with")
+        for path, operand in acted.items():
+            leaf = held[path]
+            done = (_rescaled(leaf, operand) if isinstance(current, QKClipState)
+                    else jnp.clip(leaf, operand[0], operand[1]))
+            held[path] = jnp.where(taken, done, leaf)
+    return jax.tree_util.tree_unflatten(jax.tree_util.tree_structure(moved), list(held.values()))
 
 
 def _muonclip_groups(learning_rate, qk_clip_threshold: float = 100.0, **opts):
@@ -608,7 +634,7 @@ def power_profiles(solver: optax.GradientTransformation,
         if params is None:
             raise ValueError("power_profiles averages the parameters, so its update needs them")
         updates, inner = solver.update(updates, state.inner, params, **extra_args)
-        produced = stepped(params, updates, inner)
+        produced = stepped(params, updates, state.inner, inner)
         averages = tuple(ema_update(average, produced, powered_decay(state.powers[index])(state.updates))
                          for index, average in enumerate(state.averages))
         return updates, PowerProfilesState(state.updates + 1, state.stds, state.powers, averages, inner)
@@ -754,29 +780,27 @@ def with_rate_scales(opt_state: optax.OptState, scales: Mapping[str | None, floa
 
 
 def _keep_within(lower: float, upper: float) -> optax.GradientTransformation:
-    """Shorten each update so that the parameter it moves lands within `[lower, upper]`.
+    """Clamp each parameter of a group into `[lower, upper]` once its update has moved it.
 
     torch recipes clamp parameters in place after `optimizer.step()`, as
-    DCLS's `clamp_parameters` does its kernel positions. Written as an
-    update, `clip(param + update) - param`, the clamp runs inside the
-    optimizer chain, so a group's projection applies to its parameters alone
-    and lands on the same values to within one rounding of the subtraction.
-    optax's `projections.projection_box` clamps a parameter tree outside the
-    chain, where it would reach every group at once.
+    DCLS's `clamp_parameters` does its kernel positions. The update passes
+    through and the clamp rides the state (`BoundsState`), which `stepped`
+    applies to the stepped weights exactly, after the group's other post-step
+    effects (QK-Clip's rescale), so a group's projection reaches its
+    parameters alone. optax's `projections.projection_box` clamps a parameter
+    tree outside the chain, where it would reach every group at once.
     """
     if not lower < upper:
         raise ValueError(f"the bounds run from a lower to a higher value, got [{lower}, {upper}]")
 
-    def init_fn(params) -> optax.EmptyState:
-        del params
-        return optax.EmptyState()
+    def init_fn(params) -> BoundsState:
+        return BoundsState(jnp.zeros([], jnp.int32), {
+            jax.tree_util.keystr(path): jnp.asarray([lower, upper], leaf.dtype)
+            for path, leaf in jax.tree_util.tree_leaves_with_path(params)})
 
     def update_fn(updates, state, params=None):
-        if params is None:
-            raise ValueError("a bounded group reads the parameters, so its update needs them")
-        kept = jax.tree.map(lambda update, param: jnp.clip(param + update, lower, upper) - param,
-                            updates, params)
-        return kept, state
+        del params
+        return updates, state._replace(steps=optax.safe_increment(state.steps))
 
     return optax.GradientTransformation(init_fn, update_fn)
 
@@ -1146,5 +1170,17 @@ class Exponential(ScheduleBase):
         return lambda count: self.offset + decay(count)
 
 
-__all__ = ["Cosine", "Exponential", "Linear", "OneCycle", "ParamGroup", "Power", "PowerProfilesState",
-           "PowerTail", "QKClipState", "ScheduleBase", "stepped"]
+__all__ = [
+    "BoundsState",
+    "Cosine",
+    "Exponential",
+    "Linear",
+    "OneCycle",
+    "ParamGroup",
+    "Power",
+    "PowerProfilesState",
+    "PowerTail",
+    "QKClipState",
+    "ScheduleBase",
+    "stepped",
+]
