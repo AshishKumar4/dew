@@ -21,7 +21,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference, chain_roundings
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, chain_roundings
+from test_chunked_cross_entropy import EXERCISED, eighths
 from test_moe import OUTPUT_TOLERANCE, ROUTER_TOLERANCE
 from test_t5_encoders import TOLERANCE as T5_TOLERANCE
 from test_text_encoders import transformers_clip
@@ -301,38 +302,57 @@ def test_lm_step_parity_records_a_repeatable_fixed_batch_run():
 # tools/benchmark_lm_head.py
 # ---------------------------------------------------------------------------
 
+LM_HEAD_SEEDS = 16
+"""Check 1's declared seeds for each lm head variant against the baseline, sized paired (`seeds_for`
+with the variant as `dew_fn`)."""
+
+
 @pytest.mark.parametrize("states_dtype", ["float32", "bfloat16"])
 def test_lm_head_variants_compute_the_same_loss_accuracy_and_gradients(states_dtype):
     """stored and remat are the baseline head rearranged into vocabulary
-    tiles, so on one small case all three agree on the loss, the top-1
-    accuracy and both gradients, in the states' own precision: bf16 states
-    take the bf16 head product in every variant. The vocabulary of 12 does
-    not split into 4 equal tiles, so the short last tile is on the path."""
+    tiles, so each takes the baseline's loss and both gradients on par over
+    drawn states and tables (check 1), the baseline in float64 the truth, in
+    the states' own precision: bf16 states take the bf16 head product in every
+    variant. The vocabulary of 12 does not split into 4 equal tiles, so the
+    short last tile is on the path. Over eighths (`eighths`), whose products
+    sum exactly in any order, a tile's bf16 logits are the whole product's
+    whatever order a device's GEMM of the tile's shape sums in, so every
+    variant takes the baseline's top-1 accuracy exactly."""
     tool = load("benchmark_lm_head")
-    key = jax.random.PRNGKey(0)
-    states = jax.random.normal(key, (2, 3, 8), jnp.float32).astype(states_dtype)
-    table = jax.random.normal(jax.random.fold_in(key, 1), (12, 8), jnp.float32)
+    dtype = jnp.float32 if states_dtype == "float32" else jnp.bfloat16
     targets = jnp.array([[0, 5, 11], [3, 11, 4]], jnp.int32)
     variant = tool.parse_variant("stored4-fp32" if states_dtype == "float32" else "stored4")
 
-    outputs = {}
-    for name in ("baseline", "stored", "remat"):
-        head = tool.HEADS[name]
-        (loss, accuracy), (d_states, d_table) = jax.value_and_grad(
-            lambda s, t, head=head: head(s, t, targets, variant), argnums=(0, 1), has_aux=True)(states, table)
-        outputs[name] = (float(loss), float(accuracy), np.asarray(d_states), np.asarray(d_table))
+    def draw(seed):
+        key = jax.random.PRNGKey(seed)
+        return (jax.random.normal(key, (2, 3, 8), jnp.float32).astype(dtype),
+                jax.random.normal(jax.random.fold_in(key, 1), (12, 8), jnp.float32))
 
-    reference = outputs["baseline"]
-    # The loop adds each tile's state gradient in the states' dtype, one rounding a tile, where the
-    # baseline's one product rounds once: in bf16 up to a 2^-8 of the largest entry each.
-    states_bound = 1e-5 if states_dtype == "float32" else 4 * 2**-8 * np.abs(reference[2]).max()
+    def taken(name):
+        """The variant's loss, top-1 accuracy and gradients of the states and the table."""
+        def run(states, table):
+            with jax.default_matmul_precision(EXERCISED[dtype]):
+                (loss, accuracy), (d_states, d_table) = jax.value_and_grad(
+                    lambda s, t: tool.HEADS[name](s, t, targets, variant), argnums=(0, 1),
+                    has_aux=True)(states, table)
+            return {"loss": loss, "accuracy": accuracy, "states": d_states, "table": d_table}
+
+        return jax.jit(run)
+
+    # Each arm compiled once, so every draw runs its one program.
+    arms = {name: taken(name) for name in ("baseline", "stored", "remat")}
+
+    def compared(name):
+        def run(states, table):
+            return {key: value for key, value in arms[name](states, table).items() if key != "accuracy"}
+
+        return run
+
+    exact = eighths(*draw(0))
     for name in ("stored", "remat"):
-        loss, accuracy, d_states, d_table = outputs[name]
-        assert loss == pytest.approx(reference[0], abs=1e-5), name
-        assert accuracy == reference[1], name
-        np.testing.assert_allclose(np.asarray(d_states, np.float32), np.asarray(reference[2], np.float32),
-                                   atol=states_bound, err_msg=name)
-        np.testing.assert_allclose(d_table, reference[3], atol=1e-5, err_msg=name)
+        assert_as_exact(compared(name), compared("baseline"), draw, f"{states_dtype} {name} lm head",
+                        seeds=LM_HEAD_SEEDS)
+        assert arms[name](*exact)["accuracy"] == arms["baseline"](*exact)["accuracy"], name
 
 
 # ---------------------------------------------------------------------------
