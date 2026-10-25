@@ -143,24 +143,12 @@ def on_default_device(variables: Variables) -> Variables:
     jitted call reads it where it is and a placement moves it, one leaf at a time: a leaf's transfer
     completes before the next starts, and its host copy is released (a memory-mapped one's pages
     evicted, `dew.training.host.evict`) once its device copy is written back in its place."""
-    from dew.training.host import evict
+    from dew.training.host import placed_leaves
 
-    def placed(node):
-        if not isinstance(node, Mapping):
-            if not isinstance(node, (np.ndarray, np.generic)):
-                return node
-            landed = jax.block_until_ready(jax.device_put(node))
-            if isinstance(node, np.ndarray):
-                evict(node)
-            return landed
-        # A freshly loaded tree's nodes are its own plain dicts, written in place so that no host leaf
-        # outlives its device copy; any other mapping is rebuilt.
-        held = node if type(node) is dict else dict(node)
-        for name in list(held):
-            held[name] = placed(held[name])
-        return held
-
-    return placed(variables)
+    # A freshly loaded tree's nodes are its own plain dicts, written in place so that no host leaf
+    # outlives its device copy.
+    return placed_leaves(variables, lambda _, leaf: jax.device_put(leaf)
+                         if isinstance(leaf, (np.ndarray, np.generic)) else leaf, in_place=True)
 
 
 @dataclass(frozen=True)

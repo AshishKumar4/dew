@@ -214,7 +214,7 @@ def main(config: Config) -> None:
         mlp_features=128, max_seq_len=64, dtype=jnp.float32, attention_impl="xla",
         mixture=Mixture(experts=config.experts, top_k=config.top_k, dispatch=config.dispatch))
     objective = LMObjective(model, config.sequence_length, aux_loss_alpha=0.01)
-    optimizer = OptimConfig(optimizer="adam", rate=config.learning_rate).build(config.steps)
+    optimizer = OptimConfig(optimizer="adam", learning_rate=config.learning_rate).build(config.steps)
     trainer = Trainer(objective, optimizer, key=jax.random.key(config.seed),
                       mesh=MeshSpec(fsdp=config.fsdp, expert=config.expert), layout=Layout(min_shard=1))
     mesh = trainer.device_mesh

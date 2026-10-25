@@ -760,10 +760,14 @@ class Store:
 
 @functools.cache
 def _registered() -> None:
-    """Register the profiles the storage config names (DEW_STORAGE_CONFIG, else
-    ~/.config/dew/storage.toml) with fsspec, once, as the first store resolves: the configuration is
-    read where it is first used, so a broken one fails that store, not the import."""
-    config = Path(os.environ.get("DEW_STORAGE_CONFIG", "~/.config/dew/storage.toml")).expanduser()
+    """Register the profiles the storage config names (DEW_STORAGE_CONFIG, else storage.toml in Dew's
+    configuration directory, `dew.cache.dew_config_dir`) with fsspec, once, as the first store
+    resolves: the configuration is read where it is first used, so a broken one fails that store,
+    not the import."""
+    from dew.cache import dew_config_dir
+
+    named = os.environ.get("DEW_STORAGE_CONFIG")
+    config = Path(named).expanduser() if named else dew_config_dir() / "storage.toml"
     if config.is_file():
         for name, values in tomllib.loads(config.read_text()).items():
             options = dict(values)

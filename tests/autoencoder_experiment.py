@@ -68,5 +68,5 @@ def run() -> RunConfig:
         validation=Files(files["validation"]).map(Formatting()).batch(32),
         objective=ObjectiveConfig("supervised", {"loss": evidence_bound, "metrics": (reconstruction_error,),
                                                  "inputs": InputSpec(Field("x", (FEATURES,)))}),
-        optim=OptimConfig(rate=1e-2),
+        optim=OptimConfig(learning_rate=1e-2),
         trainer=TrainerConfig(steps=40, log_every=1, eval_every=None, checkpoint_every=40))

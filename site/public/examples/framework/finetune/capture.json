@@ -1,7 +1,7 @@
 {
 	"about": "The screen finetune.py left on a terminal, written by site/scripts/capture_snippets.py.",
 	"arguments": [],
-	"script_sha256": "c9360efa7e0796f52738a5f6cb2355348013c2afbc049b6316d60d2138ab4fc1",
+	"script_sha256": "7391c46e1b1d1dba1d88df8206d0c6c3f659154ecf9784828ac1c09774914707",
 	"meta": {
 		"where": "a 4-vCPU Cloudflare container",
 		"python": "3.12.15",

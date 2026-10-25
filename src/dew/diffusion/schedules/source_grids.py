@@ -25,6 +25,7 @@ import numpy as np
 from dew import records
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.common import GeneralizedNoiseScheduler, NoiseScheduler, ancestral_variance
+from dew.diffusion.schedules.cosine import cosine_beta_schedule
 from dew.diffusion.schedules.discrete import DiscreteNoiseScheduler
 from dew.diffusion.schedules.flow import RectifiedFlow, static_shift
 from dew.diffusion.schedules.karras import rho_ramp
@@ -276,11 +277,13 @@ def published_betas(*, count: JSON, start: JSON, end: JSON, schedule: JSON,
         elif kind == "sigmoid":
             ramp = _published_linspace(-6, 6, length)
             betas = 1 / (1 + np.exp(-ramp)) * (final - first) + first
-        else:
+        elif kind == "exp":
             steps = np.arange(length + 1, dtype=np.float64) / length
-            bars = (np.exp(steps * -12.0) if kind == "exp"
-                    else np.cos((steps + 0.008) / 1.008 * np.pi / 2) ** 2)
+            bars = np.exp(steps * -12.0)
             betas = np.minimum(1 - bars[1:] / bars[:-1], 0.999).astype(np.float32)
+        else:
+            # squaredcos_cap_v2 is Nichol and Dhariwal's table, which Diffusers casts to float32.
+            betas = cosine_beta_schedule(length).astype(np.float32)
     if betas.shape != (length,) or not np.all(np.isfinite(betas)) or np.any((betas < 0) | (betas > 1)):
         raise ValueError("The beta table must have num_train_timesteps finite entries in [0,1]")
     if zero_snr:
