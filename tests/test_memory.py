@@ -200,3 +200,67 @@ def test_a_zero_step_reads_the_initial_network():
 
     assert_as_exact(jax.jit(lambda x: module.apply(params, x)), jax.jit(initial), draw, "zero-step memory",
                     seeds=MEMORY_SEEDS, truth_fn=initial)
+
+
+def decoder(**fields):
+    """A tiny decoder alternating attention and Titans-style memory layers."""
+    from model_support import TINY_DECODER
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    memory = {"mixer": {"class": "memory", "fields": {
+        "network": "mlp", "widths": (16,), "activation": "silu", "momentum": True, "retention": True,
+        "heads": 2, "head_dim": 8, "chunk": 4, "learning_rate_scale": 0.5}}}
+    return CausalTransformer(**{"vocab_size": 37, **TINY_DECODER, "num_layers": 4, "dtype": "float32",
+                                "layer_types": ("memory", "attention") * 2,
+                                "kinds": {"memory": memory, "attention": {}}, **fields})
+
+
+def test_a_memory_layer_kind_trains_scans_and_decodes_in_a_decoder():
+    """A decoder whose layer kind is a memory: its scanned stack computes the plain loop's logits bit for
+    bit from the same tree; one gradient step changes the memories' initial networks and projections;
+    and its cached decode, token by token after a prefill, gives the full pass's last logits on par
+    against float64 (check 1)."""
+    plain, scanned = decoder(), decoder(scan_layers=True)
+    ids = jax.random.randint(jax.random.key(1), (2, LENGTH), 0, 37)
+    variables = plain.init(jax.random.key(0), ids)
+    np.testing.assert_array_equal(np.asarray(plain.apply(variables, ids)),
+                                  np.asarray(scanned.apply(variables, ids)))
+    loss = jax.jit(jax.grad(lambda held: jnp.mean(plain.apply(held, ids) ** 2)))
+    gradient = loss(variables)["params"]
+    memory = gradient["layers_0"]["self_attn"]
+    assert {"initial", "q_proj", "k_proj", "v_proj", "o_proj", "learning_rate", "momentum",
+            "retention"} <= set(memory)
+    assert all(np.abs(np.asarray(leaf)).max() > 0 for leaf in jax.tree.leaves(memory["initial"]))
+
+    def decoded(tokens):
+        cache = plain.apply(variables, tokens.shape[0], method=plain.init_cache, mutable=["cache"])[1]
+        logits, cache = plain.apply({**variables, **cache}, tokens[:, :6], decode=True, mutable=["cache"])
+        for t in range(6, LENGTH):
+            logits, cache = plain.apply({**variables, **cache}, tokens[:, t:t + 1], decode=True,
+                                        mutable=["cache"])
+        return logits[:, -1]
+
+    def full(tokens):
+        return plain.apply(variables, tokens)[:, -1]
+
+    def draw_ids(seed):
+        return (np.random.default_rng([1646, seed]).integers(0, 37, (2, LENGTH), dtype=np.int32),)
+
+    wide = decoder(dtype="float64")
+
+    def truth(tokens):
+        widened = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
+        return wide.apply(widened, tokens)[:, -1]
+
+    assert_as_exact(jax.jit(decoded), jax.jit(full), draw_ids, "memory decoder decode", seeds=MEMORY_SEEDS,
+                    truth_fn=truth)
+
+
+def test_a_memory_layer_kind_records_and_rebuilds():
+    """The kind is a record: a decoder's config holding it rebuilds the same model."""
+    from dew.config import ModelConfig
+
+    model = decoder()
+    rebuilt = ModelConfig.from_model(model).build()
+    assert rebuilt == model
