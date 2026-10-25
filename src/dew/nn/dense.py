@@ -2,7 +2,8 @@
 
 `Dense` and `DenseGeneral` are flax 0.12's layers, fields, parameter names,
 shapes, initializers, promotion and product hooks alike, so checkpoints,
-LoRA and Qwix see the layers they did. Their call is their own: the same
+LoRA and Qwix see the layers they did, but for a batched `DenseGeneral`'s
+kernel, which draws each batch member alone (`_members`). Their call is their own: the same
 product, rounded to its dtype as flax's is, then the bias added by `biased`,
 which adds it in the dtype flax's addition gives them and broadcasts it at
 fp32, so its gradient sums at fp32 as torch's addmm sums it, and in float64 on a CPU under
@@ -112,8 +113,24 @@ class Dense(_LinearEnvelope, nn.Dense):
         return _biased(self, inputs, kernel, (((inputs.ndim - 1,), (0,)), ((), ())), bias, lambda bias: bias)
 
 
+def _members(init, batched: int, flat_shape):
+    """`init` drawn for each member of a kernel's `batched` leading batch axes alone, at `flat_shape`
+    of the rest, and stacked: each member's own fan-in, its inputs', where flax draws the whole kernel
+    at `[batch * inputs, features]` and a variance-scaling initializer counts the batch members as
+    inputs (DeepSeek V4's grouped `o_a_proj`, eight groups, would start sqrt(8) narrower than one
+    group's lecun init). A boxed draw (a partitioned initializer's) is reshaped inside its box, as
+    `_reshaped` reshapes it."""
+    def drawn(rng, shape, dtype=jnp.float32):
+        member = tuple(int(size) for size in flat_shape(shape[batched:]))
+        keys = jax.random.split(rng, int(np.prod(shape[:batched])))
+        stacked = jax.vmap(lambda key: init(key, member, dtype))(keys)
+        return jax.tree.map(lambda value: jnp.reshape(value, shape), stacked)
+    return drawn
+
+
 class DenseGeneral(_LinearEnvelope, nn.DenseGeneral):
-    """Flax's DenseGeneral, its bias added by `biased` (the module docstring)."""
+    """Flax's DenseGeneral, its bias added by `biased` (the module docstring), and a batched kernel
+    drawn a batch member at a time (`_members`)."""
 
     def _linear(self, inputs: Array) -> jax.Array:
         features, batch_dims = _axes(self.features), _axes(self.batch_dims)
@@ -123,11 +140,14 @@ class DenseGeneral(_LinearEnvelope, nn.DenseGeneral):
         axis, batch_dims = _contractions(self, inputs.ndim)
         batched = len(batch_dims)
         batch_shape = tuple(inputs.shape[dim] for dim in batch_dims)
-        kernel = self.param(
-            'kernel',
-            _reshaped(self.kernel_init, lambda shape: (np.prod(shape[:batched + len(axis)]),
-                                                       np.prod(shape[-len(features):]))),
-            batch_shape + tuple(inputs.shape[dim] for dim in axis) + features, self.param_dtype)
+
+        def flat(shape):
+            """`shape` as `[inputs, features]`, the contracted axes and the features each flattened."""
+            return np.prod(shape[:len(shape) - len(features)]), np.prod(shape[-len(features):])
+
+        drawn = _members(self.kernel_init, batched, flat) if batched else _reshaped(self.kernel_init, flat)
+        shape = batch_shape + tuple(inputs.shape[dim] for dim in axis) + features
+        kernel = self.param('kernel', drawn, shape, self.param_dtype)
         bias = self.param(
             'bias', _reshaped(self.bias_init, lambda shape: (np.prod(shape[:batched])
                                                              * np.prod(shape[-len(features):]),)),

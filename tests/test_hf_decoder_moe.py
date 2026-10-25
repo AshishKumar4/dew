@@ -492,6 +492,29 @@ def test_a_moe_decoders_logits_match_the_reference_implementation(directory):
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
 
 
+def test_deepseek_v4_draws_each_output_group_at_its_own_fan_in():
+    """A from-scratch DeepSeek V4's grouped output projection (`o_a_proj`, one `[in, o_lora_rank]`
+    block per head group) starts each group at lecun's variance over that group's inputs, as
+    `DeepseekV4GroupedLinear`'s per-group blocks are each a projection of their own: at eight groups
+    of 128 inputs, each group's 8,192 entries pass the chi-square test of variance 1 / 128 at one in a
+    billion each side, where counting the groups as inputs starts them at 1 / 1024."""
+    import jax
+    from scipy import stats
+
+    from dew.registry import models
+
+    config = translate_config({**fixture_config("deepseek-v4-tiny"), "num_attention_heads": 16,
+                               "head_dim": 64, "o_groups": 8, "o_lora_rank": 64})
+    model = models.build("causal_transformer", config)
+    params = jax.jit(model.init)(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))["params"]
+    kernels = [leaf for path, leaf in flat_tree(params).items() if "o_a_proj" in path]
+    assert kernels and all(kernel.shape == (8, 128, 64) for kernel in kernels)
+    low, high = stats.chi2.ppf([1e-9, 1 - 1e-9], 128 * 64 - 1)
+    for kernel in kernels:
+        statistics = (128 * 64 - 1) * 128 * np.var(np.asarray(kernel, np.float64), axis=(1, 2), ddof=1)
+        assert np.all((low < statistics) & (statistics < high)), (statistics, low, high)
+
+
 def test_deepseek_v4_a_left_padded_row_pools_its_compressed_windows_over_its_own_tokens():
     """Uncached, rows padded on the left by three tokens pool the HCA windows and the CSA
     windows its lightning indexer scores over their real tokens at their ranks, as a cache appends
