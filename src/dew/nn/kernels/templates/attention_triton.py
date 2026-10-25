@@ -364,13 +364,13 @@ class TritonForward(Template[Tiles]):
         first = len(arrays) + 1
 
         def rewalked(out):
-            return launch(functools.partial(kernel, guard="rewalk"),
-                          in_specs=[*in_specs, per_row, *out_specs], out_specs=out_specs, out_shape=out_shape,
-                          name="attention_forward_headroom",
-                          input_output_aliases={first + index: index for index in range(len(out))},
-                          )(*arrays, flags, *out)
+            return tuple(launch(functools.partial(kernel, guard="rewalk"),
+                                in_specs=[*in_specs, per_row, *out_specs], out_specs=out_specs,
+                                out_shape=out_shape, name="attention_forward_headroom",
+                                input_output_aliases={first + index: index for index in range(len(out))},
+                                )(*arrays, flags, *out))
 
-        out = jax.lax.cond(jnp.max(flags) > 0, rewalked, lambda out: list(out), list(out))
+        out = jax.lax.cond(jnp.max(flags) > 0, rewalked, lambda out: out, tuple(out))
         return (tuple(out) if residuals else out[0]), None
 
     def space(self, ba: tokamax.BoundArguments) -> Sequence[Tiles]:
