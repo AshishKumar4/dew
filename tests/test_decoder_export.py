@@ -546,7 +546,7 @@ def test_a_decoder_stating_a_full_width_rotary_exports_and_transformers_reads_it
     from transformers import AutoModelForCausalLM
 
     from dew.interop import PretrainedDecoder
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     loaded = Pretrained.load(FIXTURES / "qwen3-tiny", dtype="float32", attention_impl="reference")
     model = loaded.model.clone(partial_rotary_factor=1.0)
