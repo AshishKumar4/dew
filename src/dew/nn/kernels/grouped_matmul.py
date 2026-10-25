@@ -500,7 +500,8 @@ class _Triton(_GroupedLaunch[Tile]):
         # it takes a 16-bit output tile beside them (an L4 refused 114688 bytes for a 64 x 128 tile's
         # 98304 at a depth of one step, either output dtype, GEN6-gpu-l4; at four steps it asked the
         # stages' alone, TSMEM-l4).
-        single = self._contracted(ba) is not None and self._contracted(ba) <= self.contraction(config)
+        contracted = self._contracted(ba)
+        single = contracted is not None and contracted <= self.contraction(config)
         rows, columns = self.output(config)
         return step * (config.stages - held) + (2 * rows * columns if single else 0)
 
