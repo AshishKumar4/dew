@@ -79,7 +79,8 @@ def pytest_runtest_makereport(item, call):
         from reference_error import GateFailure
 
         if isinstance(call.excinfo.value, GateFailure):
-            outcome.get_result().user_properties.append(("gate_findings", json.dumps(
+            # The JUnit report writes a test's properties from its item's, read at its teardown.
+            item.user_properties.append(("gate_findings", json.dumps(
                 [{"leaf": finding.leaf, "rule": finding.rule, "measure": finding.measure}
                  for finding in call.excinfo.value.findings])))
 
