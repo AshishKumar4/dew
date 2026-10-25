@@ -299,8 +299,8 @@ class Decide:
         The runs are one task's: their recorded settings (`DecideSettings`: head, layout, tokenizer,
         special tokens, processor and context encoder) the same; a run whose settings differ is
         refused (ValueError), naming them. The task's `weights` record each run's directory, step and
-        whether its average was read, so it is no one run's: `save` refuses it, and `save_pretrained`
-        releases it."""
+        whether its average was read, so it is no one run's: `save` writes it to a directory of its own
+        as a run, which `from_run` and `dew.pipeline` then load, whatever its layout."""
         from dew.checkpoints import averaged
         from dew.inference.tasks import run_record
 
