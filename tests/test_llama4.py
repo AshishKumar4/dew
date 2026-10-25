@@ -189,6 +189,20 @@ by `seeds_for` (8 each)."""
 TUNED_WINDOW, TUNED_FLOOR, TUNED_SCALE, TUNED_THETA = 4, 3.0, 0.5, 10000.0
 
 
+TUNED_LENGTH = 12
+"""The tokens a row of the temperature checks draws."""
+
+
+def drawn_layer(module, stream: int):
+    """A draw for a layer's check: `seed`'s two rows of `TUNED_LENGTH` hidden states from stream
+    `stream`, and the layer's own weights initialized at `seed`."""
+    def draw(seed):
+        rows = np.random.default_rng([stream, seed]).standard_normal((2, TUNED_LENGTH, HIDDEN))
+        params = module.init(jax.random.key(seed), jnp.zeros((1, TUNED_LENGTH, HIDDEN)))
+        return rows.astype(np.float32), jax.tree.map(np.asarray, params)
+    return draw
+
+
 def tuned_layer(dtype=jnp.float32):
     """A windowed kind's attention rotating halves and tuning its temperature, which no Llama 4 layer
     combines: the options compose as any attention's."""
@@ -235,12 +249,8 @@ def test_a_windowed_kind_tunes_its_temperature_as_written():
     equation (`tuned_equation`), full and through a cache (a prefill, then a token a call), on par
     with the equation in float32 against float64 (check 1)."""
     module = tuned_layer()
-    length = 12
-
-    def draw(seed):
-        hidden = np.random.default_rng([1614, seed]).standard_normal((2, length, HIDDEN)).astype(np.float32)
-        params = jax.tree.map(np.asarray, module.init(jax.random.key(seed), jnp.zeros((1, length, HIDDEN))))
-        return hidden, params
+    length = TUNED_LENGTH
+    draw = drawn_layer(module, 1614)
 
     @jax.jit
     def full(hidden, params):
@@ -308,12 +318,8 @@ def test_a_tuned_temperature_holds_through_an_ngpt_query():
     from dew.nn.mixers.attention import temperature_scale
 
     tuned, _ = ngpt_layers()
-    length = 12
-
-    def draw(seed):
-        hidden = np.random.default_rng([1615, seed]).standard_normal((2, length, HIDDEN)).astype(np.float32)
-        params = jax.tree.map(np.asarray, tuned.init(jax.random.key(seed), jnp.zeros((1, length, HIDDEN))))
-        return hidden, params
+    length = TUNED_LENGTH
+    draw = drawn_layer(tuned, 1615)
 
     def regained(dtype):
         _, untuned = ngpt_layers(dtype)
