@@ -1465,7 +1465,8 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
 def _load_native_source(source: sources.SourceReference, root: Path, *,
                         gguf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
                         dtype: str, param_dtype: str, attention_impl: str,
-                        max_seq_len: int | None, weights: bool = True, component: NativeComponent | None = None,
+                        max_seq_len: int | None, weights: bool = True,
+                        component: NativeComponent | None = None,
                         tensors: Mapping[str, np.ndarray] | None = None) -> Pretrained:
     """Decode native source weights and bind their processors and export layout.
 
