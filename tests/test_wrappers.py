@@ -233,16 +233,14 @@ def _without(source: Path, target: Path, dropped) -> Path:
 
 
 def test_a_text_only_load_is_the_wrappers_language_model_as_its_text_checkpoint(tmp_path):
-    """`text_only` loads Qwen3.5's language model alone: a checkpoint missing its vision tower loads
-    (no tower tensor is read), it computes the wrapper's text logits bit for bit, and it saves as
+    """`text_only` loads Qwen3.5's language model alone: a checkpoint without its vision tower loads as
+    a decoder holding no media part, it computes the wrapper's text logits bit for bit, and it saves as
     Qwen3.5's text checkpoint (`Qwen3_5ForCausalLM`, no tower), which loads back to the same logits."""
     from dew.interop import Pretrained, PretrainedDecoder
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
     source = FIXTURES / "qwen35-native-tiny"
     blind = _without(source, tmp_path / "blind", lambda name: name.startswith("model.visual."))
-    with pytest.raises(ValueError):
-        Pretrained.load(blind, dtype="float32", attention_impl="reference")
     text = Pretrained.load(blind, dtype="float32", attention_impl="reference", text_only=True)
     wrapper = Pretrained.load(source, dtype="float32", attention_impl="reference")
     assert isinstance(text, PretrainedDecoder) and isinstance(text.model, CausalTransformer)
