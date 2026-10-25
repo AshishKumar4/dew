@@ -1125,12 +1125,12 @@ def _overridden(config: Mapping[str, object], overrides: Mapping[str, object] | 
     checks the result (`decoder_parts.modeling_overrides`)."""
     if overrides is None:
         return config
-    own = records.record(config.get("modeling_overrides", {}), "modeling_overrides")
-    given = records.record(overrides, "modeling_overrides")
+    own = _records.record(config.get("modeling_overrides", {}), "modeling_overrides")
+    given = _records.record(overrides, "modeling_overrides")
     merged = {**own, **given}
     if "attention" in own and "attention" in given:
-        merged["attention"] = {**records.record(own["attention"], "modeling_overrides.attention"),
-                               **records.record(given["attention"], "modeling_overrides.attention")}
+        merged["attention"] = {**_records.record(own["attention"], "modeling_overrides.attention"),
+                               **_records.record(given["attention"], "modeling_overrides.attention")}
     return {**config, "modeling_overrides": merged}
 
 
