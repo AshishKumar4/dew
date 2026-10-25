@@ -56,7 +56,7 @@ A GPU-touching change lands by its row:
 | Destination | Change | Before it lands |
 |---|---|---|
 | `base/kernels` | kernel and template pieces | the hardware-free gates: interpret-mode check 1 and the stability suite, the deviceless compile with its resource gate |
-| `main`, from `base/kernels` | the composed kernel base | the GPU gate green on `base/kernels`' tip on A100 and H100, with its tiers and scoreboards; A10, L4 and TPU v5e right after it lands, a red there fixed forward at once |
+| `main`, from `base/kernels` | the composed kernel base | the GPU gate on `base/kernels`' tip on A100 and H100, its tiers and scoreboards, with no red against main, the parent it merges onto: each red case is red there alike, the same test and settings, in the same phase (collection, setup, call, teardown), with the same exception and message (an accuracy gate's failure, each of its findings of the same site, leaf and rule with a ratio no larger), as its bisection reruns it at main; a case red only at the tip, or in a file main lacks, holds the tip, and main's own reds stay their owners' P1s; A10, L4 and TPU v5e right after it lands, a red there fixed forward at once |
 | `main` | a dependency or environment change (JAX, locks) | once, natively on an A100, every file that can take another path on a GPU (below), and the H100's marked native tier; the marked tier on A10, L4 and TPU v5e right after it lands, a red there fixed forward at once |
 | `main` | a Hopper-only path | its real H100 run |
 | `main` | any other GPU-touching or performance-critical change | the CPU CI; the next native wave validates it, and a red is fixed at once |
