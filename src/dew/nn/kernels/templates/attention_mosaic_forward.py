@@ -223,27 +223,30 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     q = family.held(q_smem)
     # The output's sums are as wide as its stage, the values' width whatever the query's.
     value_width = out_smem.shape[-1]
-    start = _started(spec, family, hooked, guard, (row, head, pl.ds(first, tiles.block_q)),
-                     (tiles.block_q, value_width))
+    # The weighted values' running sums live in the family's accumulator (`Family.walk`), from the initial
+    # state's where there is one; the walk carries the maxima and denominators, the state's `acc` an empty
+    # place the algebra passes through (`algebra.Keys.accumulate`), a constant no loop may carry.
+    state_rows = (row, head, pl.ds(first, tiles.block_q))
+    live = None if guard is None else family.rows_of(guard.live.at[state_rows]) > 0
+    if hooked.initial is not None:
+        m0, total0, acc0 = hooked.initial
+        start = algebra.resumed(spec, family.rows_of(m0.at[state_rows]),
+                                family.rows_of(total0.at[state_rows]), family.tile_of(acc0.at[state_rows]),
+                                live=live)
+    else:
+        # `algebra.started`'s empty state, in the family's layouts.
+        start = algebra.Partial(family.zeros((tiles.block_q, value_width)),
+                                family.full((tiles.block_q,), -jnp.inf), family.zeros((tiles.block_q,)))
+        start = start if live is None else algebra.headroomed(start, live)
     pl.when(consumer == 1)(turn)
-    # FlashAttention-3's order where the family's products run on beside the role's work (`_owed`): a
-    # step's two products issued in one turn on the tensor cores, which a passed step takes too.
-    owing = family.asynchronous and guard is None and residuals is None
-
-    def passed_turns():
-        for _ in range(1 if owing else 2):
-            turn()
-
     # The slots before this block's first tile its partner reads, the turns it would have taken.
-    family.passed(streams, streamed[0], lo, first=streamed[0], before=passed_turns)
+    family.passed(streams, streamed[0], lo, first=streamed[0], between=lambda: (turn(), turn()))
 
-    def scored(index, slots, then=turn, pending: int = 0):
+    def scored(index, slots):
         # A key tile's logits under the score hook, and their products where the logits are a factor of
-        # them, `then` issued while its product runs (`Family.product`). A tile every query sees whole takes
-        # no mask: one walk, the choice a tile's (a walk of each, these rings' waits and arrivals in two
-        # loops, faulted on an H100 under jax 0.11.2's lowering).
-        s = family.product(q, slots["keys"].transpose((1, 0)), shape, then, pending=pending,
-                           interpret=interpret)
+        # them. A tile every query sees whole takes no mask: one walk, the choice a tile's (a walk of each,
+        # these rings' waits and arrivals in two loops, faulted on an H100 under jax 0.11.2's lowering).
+        s = family.product(q, slots["keys"].transpose((1, 0)), shape, turn)
         slots.release("keys")
         k_first = index * tiles.block_k
         # The tile's places formed a step, not held across the walk beside its sums (`_coords`).
@@ -295,16 +298,13 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         state = state._replace(acc=algebra.split_output(state.acc, own, kept))
     elif guard is not None:
         state, _ = family.walk(streams, ((step, lo, hi),), start, (), interpret, first=streamed[0])
-    elif owing:
-        state = _owed(spec, family, start, scored, turn, (lo, hi), streams, streamed[0], shape=shape,
-                      dtype=q_smem.dtype, interpret=interpret)
     else:
         rows, (acc,) = family.walk(streams, ((step, lo, hi),), (start.m, start.total),
                                    ((tiles.block_q, value_width),), interpret, first=streamed[0],
                                    initial=(start.acc,))
         state = algebra.Partial(acc, *rows)
     # The slots past this block's last tile (a causal block whose diagonal ends first) its partner reads.
-    family.passed(streams, hi, streamed[1], first=streamed[0], before=passed_turns)
+    family.passed(streams, hi, streamed[1], first=streamed[0], between=lambda: (turn(), turn()))
     pl.when(consumer == 0)(turn)
     overflowed = jnp.where(algebra.overflowed(state.acc), 1.0, 0.0)
     family.stored((family.as_row(state.m), family.as_row(overflowed)), status_views, smem=row_smem)
@@ -318,77 +318,6 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         rows = (maximum, denominator, own, others_total, family.zeros((tiles.block_q,)))
         family.stored(tuple(family.as_row(part) for part in rows), residuals.rows, smem=row_smem)
         family.stored((family.as_row(key),), (residuals.keys,), smem=residuals.keys_smem)
-
-
-def _started(spec: algebra.Forward, family: mosaic.Family, hooked: _Hooked, guard: _Guard | None,
-             state_rows: tuple, shape: tuple[int, int]) -> algebra.Partial:
-    """A consumer's walk's start for its query rows `state_rows` of the state's arrays, its sums of `shape`:
-    the initial state's where there is one, else `algebra.started`'s empty state, in the family's layouts;
-    on the guarded walk its rows `live` shifting under headroom. The weighted values' running sums then live
-    in the family's accumulator (`Family.walk`), the walk carrying the maxima and denominators, the state's
-    `acc` an empty place the algebra passes through (`algebra.Keys.accumulate`)."""
-    live = None if guard is None else family.rows_of(guard.live.at[state_rows]) > 0
-    if hooked.initial is not None:
-        m0, total0, acc0 = hooked.initial
-        return algebra.resumed(spec, family.rows_of(m0.at[state_rows]), family.rows_of(total0.at[state_rows]),
-                               family.tile_of(acc0.at[state_rows]), live=live)
-    rows = (shape[0],)
-    start = algebra.Partial(family.zeros(shape), family.full(rows, -jnp.inf), family.zeros(rows))
-    return start if live is None else algebra.headroomed(start, live)
-
-
-def _owed(spec: algebra.Forward, family: mosaic.Family, start: algebra.Partial, scored, turn, reach, streams,
-          first, *, shape: tuple[int, int], dtype, interpret: bool) -> algebra.Partial:
-    """A consumer's plain walk of its key tiles `reach` (`[lo, hi)`, the streams' steps from `first`) from
-    `start` in FlashAttention-3's order, for a family whose products run on beside the role's work
-    (`Family.asynchronous`): a step issues its logits' product, then the product the step before owes (its
-    weights with its value slot, kept a step, `Family.walk`'s `kept`; the running sums taken by its factor
-    first), takes its turn on the tensor cores, and reads its logits while that product runs, so its softmax
-    (`algebra.owed_step`) runs under it; the walk's last product is issued past its last step (`last`). The
-    running sums are `plain_step`'s, each tile's product a step later. `scored(index, slots, then, pending)`
-    gives a tile's place, coordinates, logits and products of `shape`, `turn()` a turn, and `dtype` is the
-    values'. Returns the state after the walk."""
-    lo, hi = reach
-
-    def owe(index, slots, carry, then, pending: int):
-        # A tile's softmax, its product owed the next step, read while `then`'s products run.
-        _, _, logits, products = scored(index, slots, then, pending)
-        state = algebra.Partial(jnp.zeros((), jnp.float32), carry[0], carry[1])
-        state, factor, p = algebra.owed_step(spec, state, logits, products, dtype)
-        return state.m, state.total, factor, p
-
-    def pay(acc, carry, slots, pending: int = 0):
-        # The product the step before owes: its weights with its kept value slot into the running sums,
-        # taken by its factor first.
-        _, _, factor, p = carry
-        return family.rescaled_products(acc, lambda acc: algebra.carry_factor(acc, factor, None),
-                                        ((p, None),), slots.previous("values"), interpret, pending=pending)
-
-    def opening(index, slots, carry, accumulators):
-        # The walk's first tile: no product owed yet.
-        return owe(index, slots, carry, turn, 0), accumulators
-
-    def owed(index, slots, carry, accumulators):
-        held = list(accumulators)
-
-        def then():
-            # Issued under the logits' product, which the running sums' read lets run (one group).
-            held[0] = pay(held[0], carry, slots, pending=1)
-            turn()
-
-        # The logits read once only the owed product still runs.
-        return owe(index, slots, carry, then, 1), tuple(held)
-
-    def last(index, slots, carry, accumulators):
-        del index
-        return carry, (pay(accumulators[0], carry, slots),)
-
-    second = jnp.minimum(lo + 1, hi)
-    owing = (start.m, start.total, family.full((shape[0],), 1.0), family.zeros(shape).astype(dtype))
-    (m, total, _, _), (acc,) = family.walk(streams, ((opening, lo, second), (owed, second, hi)), owing,
-                                           (start.acc.shape,), interpret, first=first, initial=(start.acc,),
-                                           kept=("values",), last=last)
-    return algebra.Partial(acc, m, total)
 
 
 def _trained(spec: algebra.Forward, family: mosaic.Family, start: algebra.Partial, scored, value_of, reach,

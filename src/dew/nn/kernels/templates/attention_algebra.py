@@ -778,21 +778,6 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     return stepped(state, m, factor, p, times(p), held, times)
 
 
-def owed_step(spec: Forward, state: Partial, logits: jax.Array, products: jax.Array | None, dtype
-              ) -> tuple[Partial, jax.Array, jax.Array]:
-    """`plain_step` on the plain walk with its product owed, which the mainloop issues a step later
-    (FlashAttention-3's order: a tile's softmax under the product of the tile before): the state after a
-    tile of `logits` (and the `products` they are a factor of, `Keys`), its running sums not yet taken, and
-    what they owe it, the factor they take and the tile's weights narrowed to the values' `dtype`, as
-    `plain_step` hands them `Keys.accumulate` (the next step's or the walk's last). The guarded walk's sums
-    take their tile's product at once (`plain_step`)."""
-    if state.guard is not None:
-        raise ValueError("the guarded walk's running sums take their tile's product at once")
-    m, alpha = peak(spec, state.m, logits, products)
-    p = weights(spec, logits, m)
-    return Partial(state.acc, m, denominator_after(state.total, alpha, p)), alpha, narrow(p, dtype)
-
-
 def training_step(spec: Forward, carry: Carry, keys: Keys, rows: Callable[[jax.Array], jax.Array]) -> Carry:
     """A training walk's carry after a tile `keys`: the anchor key and the split sums the backward reads
     (`split_accumulate`), `rows(key)` each row's value row at its key `[bq]`, the old anchor's where it
