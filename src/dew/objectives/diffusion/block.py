@@ -120,6 +120,14 @@ def _row_losses(losses: jax.Array, mask: jax.Array, batch: Batch) -> Ratio:
                               batch)
 
 
+def _elementwise_max(*passes: Variables) -> Variables:
+    """The elementwise maximum of one tree over several passes: each leaf's largest value in any of them.
+
+    `jnp.maximum` takes two arrays, so the passes reduce their stacked leaves instead.
+    """
+    return jax.tree.map(lambda *leaves: jnp.max(jnp.stack(leaves), axis=0), *passes)
+
+
 class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
     """Fine-tunes DiffusionGemma on clean ``text`` rows split into a prompt and canvases.
 
@@ -468,7 +476,7 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         states, second_sown = denoise(sc_logits)
         qk = None
         if step.qk_stats:
-            qk = jax.tree.map(jnp.maximum, mutated["qk"], first_sown["qk"], second_sown["qk"])
+            qk = _elementwise_max(mutated["qk"], first_sown["qk"], second_sown["qk"])
         chosen = jnp.arange(response.shape[1])[None, :] // self.canvas_size == selected[:, None]
         target_mask = canvas_mask & chosen
         if text_slots is not None:

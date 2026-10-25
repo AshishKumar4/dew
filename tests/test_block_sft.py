@@ -567,7 +567,7 @@ def test_a_canvas_rows_context_reads_an_id_its_vocabulary_also_pads_with(source)
 
 def merged(passes):
     """The objective's maxima over its passes: each head's largest logit in any of them, elementwise."""
-    return jax.tree.map(jnp.maximum, *passes)
+    return jax.tree.map(lambda *leaves: np.max(np.stack(leaves), axis=0), *passes)
 
 
 def peaks(tree):

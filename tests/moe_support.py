@@ -1,6 +1,7 @@
-"""Router parity readings and the two-process expert-exchange launch the MoE
-tests share. The routers stay with their tests: V2's softmax and best-expert
-group score and V3's sigmoid, two-best group score and bias differ."""
+"""Router parity readings, the router fixtures the balance tests share (`favour_expert_zero` and
+`uniform_gates`), and the two-process expert-exchange launch the MoE tests share. The routers stay
+with their tests: V2's softmax and best-expert group score and V3's sigmoid, two-best group score and
+bias differ."""
 
 import sys
 from pathlib import Path
@@ -9,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from flax.traverse_util import flatten_dict, unflatten_dict
 from process_support import start_process
 
 
@@ -30,6 +32,23 @@ def router_variables(tensors, bias=False):
         variables["moe"] = {"e_score_correction_bias": jnp.asarray(
             tensors["mlp.gate.e_score_correction_bias"])}
     return variables
+
+
+def favour_expert_zero(variables, amount):
+    """`variables` with expert 0's balancing bias raised in every router, so every token favours it."""
+    moe = flatten_dict(variables["moe"])
+    moe = {path: leaf.at[0].add(amount) if path[-1] == "e_score_correction_bias" else leaf
+           for path, leaf in moe.items()}
+    return {**variables, "moe": unflatten_dict(moe)}
+
+
+def uniform_gates(variables):
+    """`variables` with every router's gate at zero. Its scores are then the same for every token, so its
+    choice is its balancing bias alone, and no mask a microbatch draws can change what it counts."""
+    params = flatten_dict(variables["params"])
+    params = {path: jnp.zeros_like(leaf) if path[-2:] == ("gate", "kernel") else leaf
+              for path, leaf in params.items()}
+    return {**variables, "params": unflatten_dict(params)}
 
 
 def exchange_worker(script, out, processes, process_id, coordinator):

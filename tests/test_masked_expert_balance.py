@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from flax.traverse_util import flatten_dict, unflatten_dict
+from moe_support import favour_expert_zero, uniform_gates
 
 from dew.diffusion.discrete import MDLM
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -41,23 +41,6 @@ def initial(length=SEQ):
     return routed().init(jax.random.key(0), jnp.zeros((1, length), jnp.int32))
 
 
-def skewed(variables, amount):
-    """`variables` with expert 0's balancing bias raised in every router, so every token favours it."""
-    moe = flatten_dict(variables["moe"])
-    moe = {path: leaf.at[0].add(amount) if path[-1] == "e_score_correction_bias" else leaf
-           for path, leaf in moe.items()}
-    return {**variables, "moe": unflatten_dict(moe)}
-
-
-def uniform(variables):
-    """`variables` with every router's gate at zero. Its scores are then the same for every token, so its
-    choice is its balancing bias alone, and no mask a microbatch draws can change what it counts."""
-    params = flatten_dict(variables["params"])
-    params = {path: jnp.zeros_like(leaf) if path[-2:] == ("gate", "kernel") else leaf
-              for path, leaf in params.items()}
-    return {**variables, "params": unflatten_dict(params)}
-
-
 def objective(variables, length=SEQ):
     return MaskedDiffusionObjective(routed(max_seq_len=length), MDLM(mask_id=MASK)(), seq_len=length,
                                     head_chunks=1, variables=variables, ema_decay=None,
@@ -78,7 +61,7 @@ def test_a_masked_run_moves_each_balancing_bias_once_per_committed_update():
     its routers selected over both. The commit must equal that one step exactly, so applying the counts per
     microbatch, which moves the bias twice, fails it. Two commits run, the second from the bias the first
     left."""
-    obj = objective(uniform(skewed(initial(), 1.0)))
+    obj = objective(uniform_gates(favour_expert_zero(initial(), 1.0)))
     rows = 2 * jax.device_count()
     train = Trainer(obj, optax.sgd(0.0), key=jax.random.PRNGKey(3), accumulation=2)
     state = train.initial_state()
@@ -108,7 +91,7 @@ def test_a_masked_run_narrows_the_load_its_routers_carry():
     spread is the step's own report, read on one fixed batch and key."""
     probe = text(9, 8)
     probe_step = Step(step=jnp.asarray(0), key=jax.random.key(9), ema=None, training=False)
-    obj = objective(skewed(initial(), 0.5))
+    obj = objective(favour_expert_zero(initial(), 0.5))
 
     def spread(variables):
         _, aux = obj.scalar_loss(variables, probe, probe_step)
@@ -140,7 +123,7 @@ def test_padding_adds_nothing_to_a_masked_runs_router_counts_or_bias(kind):
     else:
         padded = {"text": jnp.concatenate([ids, extra], axis=1),
                   "text_coordinates": coordinates(valid=valid, right_padded=True)}
-    variables = uniform(skewed(initial(), 1.0))
+    variables = uniform_gates(favour_expert_zero(initial(), 1.0))
     _, plain_aux = objective(variables).scalar_loss(variables, {"text": ids}, STEP)
     _, padded_aux = objective(variables, SEQ + pad).scalar_loss(variables, padded, STEP)
     for before, after in zip(leaves(plain_aux.effects), leaves(padded_aux.effects), strict=True):
