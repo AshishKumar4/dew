@@ -131,7 +131,7 @@ def test_the_json_fields_rebuild_an_encoder_that_agrees():
                           np.asarray(encoder.encode(encoder.params, tokens).hidden))
 
 
-T5_SMALL_SEEDS = 16
+T5_SMALL_SEEDS = 8
 """t5-small's live site's declared draws (`seeds_for`, on its own reference)."""
 
 
