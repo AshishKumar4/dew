@@ -24,6 +24,8 @@ from dew.nn.kernels.templates.attention import (
     ACCURATE,
     DQ_GRADS,
     NATURAL,
+    TRACED_TILE,
+    AttentionLaunch,
     Gradients,
     Hooks,
     KeySpans,
@@ -31,6 +33,8 @@ from dew.nn.kernels.templates.attention import (
     Param,
     Split,
     gradients,
+    kept_dtype,
+    power_of_two,
 )
 from dew.nn.kernels.templates.attention_mosaic_backward import (
     _dkv_allocations,
@@ -147,12 +151,12 @@ def _read_bytes(ba: tokamax.BoundArguments) -> int:
 
 
 @dataclasses.dataclass(frozen=True)
-class _Mainloop[Config: (Tiles, BackwardTiles)](Template[Config]):
+class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config]):
     """What this mainloop's launches share as Template implementations (`MosaicForward`, `MosaicBackward`):
     the call's own arrays as arguments, padded by a launch to its config's blocks; the score hook (and the
-    forward's output hook) as fields; the configs of the target's family (`fits`), a consumer's registers
-    its roles' share (`register_budget`), where its bundle is one of `BUNDLES` and the call is one it
-    takes (`refused`)."""
+    forward's output hook) as fields keyed by what they compute (`hook_program`); the configs of the
+    target's family (`fits`), a consumer's registers its roles' share (`register_budget`), where its bundle
+    is one of `BUNDLES` and the call is one it takes (`refused`)."""
 
     name = "mosaic_gpu"
     GENERATES = True
@@ -160,6 +164,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](Template[Config]):
     form: str = "spans"
     keys: int = 0
     score_kinds: tuple[Kind, ...] = ()
+    score_dtypes: tuple[str, ...] = ()
     scale: float = 1.0
     natural: bool = NATURAL
 
@@ -234,9 +239,12 @@ class MosaicForward(_Mainloop[Tiles]):
     (`derived`), legal within the device's block and a consumer's registers (`legal`); its cost record
     (`costed`) reports its predicted time."""
 
+    HOOKS = ("score_mod", "output_mod")
     config_cls = Tiles
     output_mod: Callable | None = None
     output_kinds: tuple[Kind, ...] = ()
+    output_dtypes: tuple[str, ...] = ()
+    output_width: int = TRACED_TILE
 
     def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial, *,
              residuals: bool, interpret: bool, config: Tiles, return_residuals: bool = False):
@@ -388,7 +396,9 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     op = MosaicForward(score_mod=hooks.score_mod, output_mod=hooks.output_mod,
                        score_kinds=tuple(param.kind for param in hooks.score_params),
                        output_kinds=tuple(param.kind for param in hooks.output_params),
-                       form=spans.form, keys=spans.keys,
+                       score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score_params),
+                       output_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.output_params),
+                       output_width=power_of_two(value.shape[3]), form=spans.form, keys=spans.keys,
                        scale=query.shape[3] ** -0.5 if scale is None else scale, natural=natural)
     return op, (query, key, value, spans.start, spans.end, spans.query_ids, spans.key_ids,
                 tuple(param.value for param in hooks.score_params),
@@ -422,6 +432,10 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     legal within the device's block and a consumer's registers (`legal`); its cost (both launches') reports
     its predicted time."""
 
+    HOOKS = ("score_mod",)
+    DIFFERENTIATED = True
+    SPANS = 4
+    """Its arrays' spans after the queries, keys, values and the output's cotangent (`_fwd`)."""
     config_cls = BackwardTiles
     WALKED = "block_q"
     accurate: bool = ACCURATE
@@ -648,6 +662,7 @@ def _backward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     hooks = Hooks() if hooks is None else hooks
     op = MosaicBackward(score_mod=hooks.score_mod,
                         score_kinds=tuple(param.kind for param in hooks.score_params),
+                        score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score_params),
                         form=spans.form, keys=spans.keys,
                         scale=query.shape[3] ** -0.5 if scale is None else scale, natural=natural,
                         accurate=accurate)

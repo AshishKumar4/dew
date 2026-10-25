@@ -27,6 +27,8 @@ from dew.nn.kernels.templates.attention import (
     DKV_GRADS,
     DQ_GRADS,
     NATURAL,
+    TRACED_TILE,
+    AttentionLaunch,
     Gradients,
     Hooks,
     KeySpans,
@@ -34,6 +36,7 @@ from dew.nn.kernels.templates.attention import (
     Split,
     block_map,
     gradients,
+    kept_dtype,
     kernel_dot,
     padded_call,
     within,
@@ -231,7 +234,7 @@ def _written(spec, walked, *, rows, out_ref, residual_refs, flag_ref, residuals:
 
 
 @dataclasses.dataclass(frozen=True)
-class TritonForward(Template[Tiles]):
+class TritonForward(AttentionLaunch, Template[Tiles]):
     """The template's forward in Pallas Triton over padded operands (`forward` pads them): queries
     `[B, Qp, H, Dp]` over keys `[B, Kp, Hk, Dp]` and values `[B, Kp, Hk, Dvp]`, each query's keys
     `start` to `end` `[B, Qp]` and, with documents, its id `[B, Qp]` against the keys' `[B, Kp]`; the
@@ -241,6 +244,7 @@ class TritonForward(Template[Tiles]):
     holding the keys' maximum `[B, H, Qp]` int32, the backward's anchor (`algebra.Argmax`). `natural`
     keeps the logits natural (`algebra.Forward.base2`)."""
 
+    HOOKS = ("score_mod", "output_mod")
     name = "triton"
     config_cls = Tiles
     score_mod: Callable | None = None
@@ -249,6 +253,9 @@ class TritonForward(Template[Tiles]):
     keys: int | None = None
     score_kinds: tuple[Kind, ...] = ()
     output_kinds: tuple[Kind, ...] = ()
+    score_dtypes: tuple[str, ...] = ()
+    output_dtypes: tuple[str, ...] = ()
+    output_width: int = TRACED_TILE
     scale: float = 1.0
     natural: bool = NATURAL
 
@@ -449,6 +456,9 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     op = TritonForward(score_mod=hooks.score_mod, output_mod=hooks.output_mod,
                        score_kinds=tuple(param.kind for param in hooks.score_params),
                        output_kinds=tuple(param.kind for param in hooks.output_params),
+                       score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score_params),
+                       output_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.output_params),
+                       output_width=call.value.shape[-1],
                        scale=query.shape[3] ** -0.5 if scale is None else scale, form=spans.form,
                        keys=spans.keys, natural=natural)
     out = op(call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
@@ -682,15 +692,21 @@ its dK/dV launch, its default first."""
 
 
 @dataclasses.dataclass(frozen=True)
-class TritonBackward(Template[BackwardTiles]):
-    """The template's backward over padded operands (`backward` pads them), one config for its two
-    launches: the dQ launch (`_dq_launch`), then the dK/dV launch (`_dkv_launch`) under its softmax.
+class TritonBackward(AttentionLaunch, Template[BackwardTiles]):
+    """The template's backward over padded operands (`backward` pads them), one tuning decision for its
+    two launches: the dQ launch (`_dq_launch`), then the dK/dV launch (`_dkv_launch`) under its softmax.
     Returns the dQ launch's outputs, then the dK/dV launch's."""
 
+    HOOKS = ("score_mod",)
+    DIFFERENTIATED = True
+    SPANS = 15
+    """Its arrays' spans after the queries, keys, values, the output's cotangent and the forward's eleven
+    residual and state arrays (`_fwd`)."""
     name = "triton"
     config_cls = BackwardTiles
     score_mod: Callable | None = None
     score_kinds: tuple[Kind, ...] = ()
+    score_dtypes: tuple[str, ...] = ()
     scale: float = 1.0
     split: bool = True
     how: algebra.Recompute = algebra.PLAIN
@@ -965,13 +981,13 @@ def _key_param_spec(kind: Kind, param: jax.Array, queries: int, block_k: int) ->
             raise ValueError("an output hook's parameter has no score tile")
 
 
-def _launch(*arrays, score_mod, score_kinds: tuple[Kind, ...], scale: float,
+def _launch(*arrays, score_mod, score_kinds: tuple[Kind, ...], score_dtypes: tuple[str, ...], scale: float,
             split: bool, natural: bool, accurate: bool, initial: bool, interpret: bool):
     """The Triton mainloop's two launches under one tuning decision (`TritonBackward`), recomputing the
     weights as a forward of the call's form computed them (`algebra.recompute`)."""
     how = algebra.recompute(algebra.Forward("full", 0, ids=False, scale=scale, score_mod=score_mod,
                                             natural=natural, initial=initial))
-    op = TritonBackward(score_mod=score_mod, score_kinds=score_kinds, scale=scale,
+    op = TritonBackward(score_mod=score_mod, score_kinds=score_kinds, scale=scale, score_dtypes=score_dtypes,
                         split=split, how=how, accurate=accurate)
     return op(*arrays, interpret=interpret)
 

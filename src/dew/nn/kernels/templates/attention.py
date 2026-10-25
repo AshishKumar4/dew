@@ -27,13 +27,15 @@ rounds to the query's dtype (`reference`).
 import dataclasses
 import enum
 import functools
+import math
 import operator
 from collections.abc import Callable
-from typing import NamedTuple
+from typing import ClassVar, NamedTuple
 
 import jax
 import jax.numpy as jnp
 
+from dew.nn.kernels import tuning
 from dew.nn.precision import at_least_fp32
 
 
@@ -812,6 +814,88 @@ def differentiable(score_mod: Callable, q_pos, k_pos, params, floating: list[int
     return hooked
 
 
+TRACED_TILE = 16
+"""The tile a hook is traced at for its picks' key (`hook_program`)."""
+
+
+def hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, ...], *,
+                 differentiated: bool = False, width: int = TRACED_TILE) -> str | None:
+    """What a score or output hook computes, as its launch's picks key it (`tuning.program`): a score
+    hook traced at a `TRACED_TILE` square fp32 tile, an output hook at `TRACED_TILE` queries of the
+    call's padded value `width`, the entries' indices and each parameter as its kind lays it out there,
+    in its dtype in the kernels (`dtypes`); `differentiated`, its pullback too, so a hook whose
+    derivative is its own rule (`jax.custom_vjp`) keys by that rule. None or an already traced key as
+    it is."""
+    if hook is None or isinstance(hook, str):
+        return hook
+    tile = TRACED_TILE
+    layouts = {Kind.HEAD: (), Kind.QUERY: (tile, 1), Kind.KEY: (1, tile), Kind.TILE: (tile, tile),
+               Kind.OUTPUT: (tile, width)}
+    params = [jax.ShapeDtypeStruct(layouts[kind], dtype) for kind, dtype in zip(kinds, dtypes, strict=True)]
+    square = jax.ShapeDtypeStruct((tile, tile), jnp.float32)
+    if name == "output_mod":
+        return tuning.program(hook, jax.ShapeDtypeStruct((tile, width), jnp.float32), *params)
+    positions = (jax.ShapeDtypeStruct((tile, 1), jnp.int32), jax.ShapeDtypeStruct((1, tile), jnp.int32))
+    if not differentiated:
+        return tuning.program(hook, square, *positions, *params)
+    floating = floating_params(params)
+
+    def pulled(s, q_pos, k_pos, *values):
+        hooked = differentiable(hook, q_pos, k_pos, values, floating)
+        out, pull = jax.vjp(hooked, s, *(values[index] for index in floating))
+        return out, pull(jnp.ones_like(out))
+
+    return tuning.program(pulled, square, *positions, *params)
+
+
+class AttentionLaunch(tuning.KernelOp):
+    """What every launch of the template shares as the tuner sees it (ahead of the op's own bases): its hooks
+    keyed by what each computes (`tuning.KernelOp.traced`, `hook_program`), a score hook at its parameters'
+    kinds and dtypes (`score_kinds`, `score_dtypes`) and with its pullback where the launch differentiates
+    it (`DIFFERENTIATED`, a backward's), a forward's output hook at its parameters' and the padded value
+    width (`output_kinds`, `output_dtypes`, `output_width`); and its timing operands' spans whole
+    (`tuning.KernelOp.operands`, `spanned`), the spans' starts at its arrays' place `SPANS`."""
+
+    DIFFERENTIATED: ClassVar[bool] = False
+    SPANS: ClassVar[int] = 3
+    """The place of the spans' starts among the launch's array arguments, their ends the next, then the
+    queries' and keys' ids where the call has them (a forward's after its queries, keys and values)."""
+    score_kinds: tuple[Kind, ...] = ()
+    score_dtypes: tuple[str, ...] = ()
+    output_kinds: tuple[Kind, ...] = ()
+    output_dtypes: tuple[str, ...] = ()
+    output_width: int = TRACED_TILE
+
+    def traced(self, name: str, value: Callable | str | None) -> str | None:
+        if name == "output_mod":
+            return hook_program(name, value, self.output_kinds, self.output_dtypes, width=self.output_width)
+        return hook_program(name, value, self.score_kinds, self.score_dtypes,
+                            differentiated=self.DIFFERENTIATED)
+
+    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
+        return spanned(specs, super().operands(specs, seed), self.SPANS)
+
+
+def spanned(specs: list[jax.ShapeDtypeStruct], arrays: list[jax.Array], first: int) -> list[jax.Array]:
+    """A launch's timing operands with its spans whole, so a timed launch visits every tile a dense call
+    does: its spans' starts and ends at `specs[first]` and the next (`[B, Q]`, or a call's runs `[B, Q, R]`),
+    each query's interval, or its first run, every key (`specs[1]` being the keys) and its other runs
+    empty past them; and its queries' and keys' ids where the call has them, the two integer arrays after
+    them, one document. Every other operand keeps its draw."""
+    keys = specs[1].shape[1]
+    start, end = specs[first], specs[first + 1]
+    runs = start.shape[2:]
+    opened = (jnp.arange(math.prod(runs)) == 0).reshape(runs)
+    arrays[first] = jnp.broadcast_to(jnp.where(opened, 0, keys), start.shape).astype(start.dtype)
+    arrays[first + 1] = jnp.full(end.shape, keys, end.dtype)
+    ids = [index for index in (first + 2, first + 3)
+           if index < len(specs) and jnp.issubdtype(specs[index].dtype, jnp.integer)]
+    if len(ids) == 2:
+        for index in ids:
+            arrays[index] = jnp.ones(specs[index].shape, specs[index].dtype)
+    return arrays
+
+
 class Split(NamedTuple):
     """A training forward's split sums (`attention_algebra.split_accumulate`), residuals the backward
     reads in place of its first pass: the weighted values of every key but each query's anchor key,
@@ -857,7 +941,7 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     `launch` (the Triton one, `attention_triton.backward`; the plain-JAX one,
     `attention_portable.backward`): the call padded to whole `block`s (`padded_call`), `launch(query, key,
     value, dout, peak0, total0, initial_term, maximum, key_index, anchor_value, others, own, others_total,
-    total, start, end, query_ids, key_ids, score_params, *, score_mod, score_kinds, scale)`
+    total, start, end, query_ids, key_ids, score_params, *, score_mod, score_kinds, score_dtypes, scale)`
     giving dQ, the softmax's rows (`D - c`, `c`, `m`, `T`, the keys' mass), each query's anchor key as it
     chose it, the dQ program's hook gradients (`DQ_GRADS`), then dK, dV and the dK/dV program's
     (`DKV_GRADS`); each gradient fp32, then rounded to its input's dtype. D is taken two ways, about 0 and
@@ -897,6 +981,7 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     operands = (call.query, call.key, call.value, padded_dout)
     rows = (call.start, call.end, call.query_ids, call.key_ids, call.score_params)
     kinds = tuple(param.kind for param in hooks.score_params)
+    dtypes = tuple(kept_dtype(param.value.dtype) for param in hooks.score_params)
     maxima, totals, anchors, split = residuals
     key_index = call.rows(anchors.astype(jnp.int32))
     widened = ((0, 0),) * 3 + ((0, call.value.shape[-1] - value_width),)
@@ -909,7 +994,7 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     maximum = call.rows(maxima.astype(jnp.float32))
     outputs = launch(*operands, *(call.rows(start) for start in starts), maximum, key_index, anchor_value,
                      shift, others, own, others_total, call.rows(totals.astype(jnp.float32)), *rows,
-                     score_mod=hooks.score_mod, score_kinds=kinds, scale=scale)
+                     score_mod=hooks.score_mod, score_kinds=kinds, score_dtypes=dtypes, scale=scale)
     dq, softmax = outputs[0], outputs[1:6]
     grads_out = list(outputs[7:])
     dq_grads = [grads_out.pop(0) for kind in kinds if kind in DQ_GRADS]
