@@ -414,37 +414,11 @@ class Pretrained:
         directory, commit, folder, composite = _source_metadata(
             name_or_dir, revision, subfolder, selected, fallback)
         reference = sources.SourceReference(str(name_or_dir), commit, folder or None)
-        if composite is not None:
-            loaded = _load_composite_source(reference, directory, composite,
-                                            placed=placed, streaming=streaming or not weights, dtype=dtype,
-                                            param_dtype=param_dtype, attention_impl=attention_impl,
-                                            max_seq_len=max_seq_len, weights=weights,
-                                            overrides=modeling_overrides)
-        elif fallback is not None:
-            from dew.interop import torchax_fallback
-
-            _unread_overrides(modeling_overrides, "the transformers forward")
-            loaded = torchax_fallback.load(reference, directory, dtype=dtype, param_dtype=param_dtype,
-                                           attention_impl=attention_impl, max_seq_len=max_seq_len,
-                                           weights=weights)
-            loaded = replace(loaded, variables=placed(loaded.variables))
-        elif gguf_file is None:
-            # A selected GGUF file is a decoder, whatever pipeline index the repo also ships.
-            loaded = _pipeline_source(reference, directory, single_file, dduf_file, placed,
-                                      dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
-                                      streaming=streaming or not weights)
-            if loaded is not None:
-                _unread_overrides(modeling_overrides, "a diffusion pipeline")
-        else:
-            loaded = None
-        if loaded is None:
-            # Without its weights, a decoder's leaves are translated as streaming translates them, each
-            # a view of its stored tensor that nothing reads.
-            loaded = _load_native_source(reference, directory, gguf_file=gguf_file, placed=placed,
-                                         streaming=streaming or not weights, dtype=dtype,
-                                         param_dtype=param_dtype, attention_impl=attention_impl,
-                                         max_seq_len=max_seq_len, weights=weights,
-                                         overrides=modeling_overrides)
+        loaded = _loaded_kind(reference, directory, composite, fallback=fallback, gguf_file=gguf_file,
+                              single_file=single_file, dduf_file=dduf_file, placed=placed,
+                              streaming=streaming or not weights, weights=weights, dtype=dtype,
+                              param_dtype=param_dtype, attention_impl=attention_impl,
+                              max_seq_len=max_seq_len, overrides=modeling_overrides)
         if not isinstance(loaded, cls):
             raise TypeError(f"{name_or_dir} is a {type(loaded).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
@@ -1092,6 +1066,47 @@ def _names_a_model(directory: Path) -> bool:
     """Whether `directory`'s own config.json names a model by its `model_type`."""
     path = directory / "config.json"
     return path.is_file() and "model_type" in records.record(json.loads(path.read_text()), "config.json")
+
+
+def _loaded_kind(reference: sources.SourceReference, directory: Path, composite: CompositeSource | None, *,
+                 fallback: str | None, gguf_file: str | None, single_file: str | None,
+                 dduf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
+                 weights: bool, dtype: str, param_dtype: str, attention_impl: str,
+                 max_seq_len: int | None, overrides: Mapping[str, object] | None) -> Pretrained:
+    """The source `Pretrained.load` resolved, loaded as its kind loads: a composite release, the
+    transformers forward it asks for, a diffusion pipeline, or a natively translated model."""
+    if composite is not None:
+        loaded = _load_composite_source(reference, directory, composite,
+                                        placed=placed, streaming=streaming, dtype=dtype,
+                                        param_dtype=param_dtype, attention_impl=attention_impl,
+                                        max_seq_len=max_seq_len, weights=weights,
+                                        overrides=overrides)
+    elif fallback is not None:
+        from dew.interop import torchax_fallback
+
+        _unread_overrides(overrides, "the transformers forward")
+        loaded = torchax_fallback.load(reference, directory, dtype=dtype, param_dtype=param_dtype,
+                                       attention_impl=attention_impl, max_seq_len=max_seq_len,
+                                       weights=weights)
+        loaded = replace(loaded, variables=placed(loaded.variables))
+    elif gguf_file is None:
+        # A selected GGUF file is a decoder, whatever pipeline index the repo also ships.
+        loaded = _pipeline_source(reference, directory, single_file, dduf_file, placed,
+                                  dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
+                                  streaming=streaming)
+        if loaded is not None:
+            _unread_overrides(overrides, "a diffusion pipeline")
+    else:
+        loaded = None
+    if loaded is None:
+        # Without its weights, a decoder's leaves are translated as streaming translates them, each
+        # a view of its stored tensor that nothing reads.
+        loaded = _load_native_source(reference, directory, gguf_file=gguf_file, placed=placed,
+                                     streaming=streaming, dtype=dtype,
+                                     param_dtype=param_dtype, attention_impl=attention_impl,
+                                     max_seq_len=max_seq_len, weights=weights,
+                                     overrides=overrides)
+    return loaded
 
 
 def _overridden(config: Mapping[str, object], overrides: Mapping[str, object] | None) -> Mapping[str, object]:

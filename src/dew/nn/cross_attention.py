@@ -185,28 +185,29 @@ class GatedCrossAttention(nn.Module):
     precision: PrecisionLike = None
 
     @nn.nowrap
-    def attention(self) -> NormalAttention:
+    def attention(self, **parent) -> NormalAttention:
         """The block's attention over its context: the attention every cross-attention runs
         (`NormalAttention`), its projections flat under the decoder's names, grouped over the
-        decoder's key-value heads, keeping a cached call's keys and values."""
+        decoder's key-value heads, keeping a cached call's keys and values. `parent` is flax's: None for
+        the unbound description its maps and work are read from."""
         return NormalAttention(self.emb_features, self.heads, self.head_dim, dtype=self.dtype,
                                precision=self.precision, use_bias=False,
                                force_fp32_for_softmax=self.force_fp32_for_softmax,
                                attention_impl=self.attention_impl, flat=True,
                                names=("q_proj", "k_proj", "v_proj", "o_proj"), kv_heads=self.kv_heads,
-                               cache_length=self.context_length, parent=None)
+                               cache_length=self.context_length, **parent)
 
     @nn.nowrap
     def projections(self) -> dict[str, tuple[int, int]]:
         """The attention's maps as `{name: (inputs, outputs)}`."""
-        return self.attention().projections(self.context_features)
+        return self.attention(parent=None).projections(self.context_features)
 
     @nn.nowrap
     def cross_flops(self, lengths, context_lengths) -> float:
         """The block's work over rows of `lengths` tokens reading contexts of
         `context_lengths`: the attention's (`NormalAttention.cross_flops`) and
         the feed-forward's per token."""
-        return (self.attention().cross_flops(lengths, context_lengths, self.context_features)
+        return (self.attention(parent=None).cross_flops(lengths, context_lengths, self.context_features)
                 + counted_flops(self.feedforward(parent=None), lengths))
 
     @nn.compact
