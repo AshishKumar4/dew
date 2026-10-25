@@ -139,10 +139,16 @@ def reference_logits(model: PreTrainedModel, ids: np.ndarray) -> np.ndarray:
     return out.logits.to(torch.float32).cpu().numpy()
 
 
+_SPELLED = frozenset({'hidden_size', 'num_attention_heads', 'num_hidden_layers'})
+"""The sizes a config class may spell under its own keys that the probe reads by the class's
+spelling (`PretrainedConfig.attribute_map`). A class's map also aliases other names to fields of
+another meaning (GLM-4.7-Flash's `head_dim` to its rotary width), which the probe reads as stated."""
+
+
 @dataclass(frozen=True)
 class _Sizes:
-    """A source config's standard sizes as its transformers config class reads them: each under the
-    config's own key for it (`PretrainedConfig.attribute_map`: OpenAI-GPT's `n_embd` for
+    """A source config's standard sizes as its transformers config class reads them: the width, the
+    heads and the depth under the config's own key for each (`_SPELLED`: OpenAI-GPT's `n_embd` for
     `hidden_size`), and one the config leaves unstated at the class's default."""
 
     config: Mapping[str, object]
@@ -160,24 +166,26 @@ class _Sizes:
         if not isinstance(model_type, str) or model_type not in CONFIG_MAPPING:
             return cls(hf_config, {}, None)
         defaults = AutoConfig.for_model(model_type)
-        return cls(hf_config, dict(type(defaults).attribute_map), defaults)
+        spelled = {name: key for name, key in type(defaults).attribute_map.items() if name in _SPELLED}
+        return cls(hf_config, spelled, defaults)
 
     def key(self, name: str) -> str:
         """The config's own key for the standard size `name`."""
         return self.keys.get(name, name)
 
     def given(self, name: str) -> int | None:
-        """The size `name` as the config states it, else its class's default, else None; a stated
-        size that is no whole number is a ValueError."""
+        """The size `name` as the config states it under its own key, else None; a stated size that is
+        no whole number is a ValueError."""
         if self.key(name) in self.config:
             return records.integer(self.config[self.key(name)], self.key(name))
-        if getattr(self.defaults, name, None) is not None:
-            return records.integer(getattr(self.defaults, name), name)
         return None
 
     def stated(self, name: str) -> int:
-        """The size `name` as `given` reads it, a KeyError naming it where neither gives it."""
+        """The size `name` as the config states it, else its class's default, a KeyError naming it
+        where neither gives it."""
         size = self.given(name)
+        if size is None and name in _SPELLED and getattr(self.defaults, name, None) is not None:
+            size = records.integer(getattr(self.defaults, name), name)
         if size is None:
             raise KeyError(name)
         return size
@@ -193,7 +201,8 @@ def shrink(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     is the heads' total width; a stated window shrinks below the probe's
     length so it acts, and a token id past the probe's vocabulary moves
     inside it. Each standard size is read and written under the source's own key for it (`_Sizes`),
-    a size the config leaves unstated at its class's default; a size neither states is a KeyError.
+    a size the network needs (the heads, the width, the depth) the config leaves unstated at its
+    class's default, and a size neither states is a KeyError.
     """
     sizes = _Sizes.of(hf_config)
     key = sizes.key

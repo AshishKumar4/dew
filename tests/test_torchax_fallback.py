@@ -299,10 +299,10 @@ def test_a_head_trains_as_transformers_does_by_what_it_is(head, tokens, tmp_path
         assert np.abs(dew["lm_head.bias"]).max() > 0
 
 
-BIOGPT = {"num_hidden_layers": 2, "hidden_size": 64, "num_attention_heads": 4, "intermediate_size": 256,
-          "vocab_size": 256, "max_position_embeddings": 64}
-"""A tiny BioGPT: learned positions offset by two over a scaled embedding, a type Dew registers no
-family for and no registered family's convention computes."""
+COHERE = {**TINY, "num_key_value_heads": 2}
+"""A tiny Cohere: parallel attention and feed-forward under one bias-free layer norm, rotary pairs
+interleaved and a scaled head, a type Dew registers no family for and no registered family's
+convention computes."""
 UNREGISTERED_SEEDS = 8
 """The unregistered type's check-1 seeds, sized by `seeds_for` on armada."""
 
@@ -313,7 +313,7 @@ def test_an_unregistered_causal_lm_loads_as_transformers_own_forward(tokens, tmp
     loss and the gradient of every parameter are as exact as transformers' own over the same
     stored weights, measured from transformers in float64 (check 1)."""
     torch.manual_seed(0)
-    model = transformers.BioGptForCausalLM(transformers.BioGptConfig(**BIOGPT)).eval()
+    model = transformers.CohereForCausalLM(transformers.CohereConfig(**COHERE)).eval()
     model.save_pretrained(tmp_path)
     with pytest.warns(TransformersTierWarning):
         loaded = Pretrained.load(tmp_path, dtype="float32")
@@ -331,7 +331,7 @@ def test_an_unregistered_causal_lm_loads_as_transformers_own_forward(tokens, tmp
             return torch_step(wide, ids, torch.float64)
 
     assert_as_exact(dew_fn, lambda ids: torch_step(reference, ids), token_draws(tokens),
-                    "tier 3 biogpt LM step", seeds=UNREGISTERED_SEEDS, truth_fn=truth_fn)
+                    "tier 3 cohere LM step", seeds=UNREGISTERED_SEEDS, truth_fn=truth_fn)
 
 
 @pytest.mark.parametrize("family", ["llama", "neox"])
