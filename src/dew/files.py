@@ -91,13 +91,23 @@ def staged(directory: Path) -> Iterator[Path]:
     staging.mkdir()
     try:
         yield staging
-        try:
-            os.replace(staging, directory)
-        except OSError:
-            if not directory.is_dir():
-                raise
+        published(staging, directory)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+
+
+def published(built: Path, directory: Path) -> bool:
+    """Publish the directory `built`, written on `directory`'s filesystem, as `directory` by one
+    rename, whether this call published it. A `directory` another writer published first is kept,
+    whole, and `built` removed: every writer of it publishes by the one rename (`staged`)."""
+    try:
+        os.replace(built, directory)
+    except OSError:
+        if not directory.is_dir():
+            raise
+        shutil.rmtree(built, ignore_errors=True)
+        return False
+    return True
 
 
 def _beside(target: Path, suffix: str) -> Path:
