@@ -135,15 +135,16 @@ def _check_forward(call: str, dtype, shape, *, natural: bool, interpret: bool, w
 
 def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool, backward: bool = False,
                  form: str = "default", score: tuple = (), gate: bool = False, dtype=jnp.bfloat16,
-                 natural: bool = False):
+                 natural: bool = False, seeds: int | None = None):
     """The forward, or the backward in the form `form` names (`BACKWARD_FORMS`), over `spans` at `FORM_TILES`
     under the score hooks `score` (`test_attention_triton.score_hooks`, their parameters and
     initial state drawn with the operands) and with `gate` an output gate (`hooks_for`), draws of `shape`
     (rows, queries, query and key heads, four and two under a hook) over the spans' keys in `dtype`, the
     forward's logits `natural` or folded. The backward differentiates the queries, keys, values, the hook's
-    parameters and the initial state."""
-    queries = shape[1]
-    score_mod, kinds, draw_hooks = score_hooks(score, queries, spans.keys, 64)
+    parameters and the initial state, over `seeds` draws where given (the site's own, else the template
+    site's)."""
+    rows, queries, heads, _ = shape
+    score_mod, kinds, draw_hooks = score_hooks(score, queries, spans.keys, 64, rows=rows, heads=heads)
     output = hooks_for(HOOKS["gate" if gate else "none"], queries, 64, gate_of(queries, 64))
     draw_operands = _drawn(shape, dtype, width=64, keys=spans.keys)
 
@@ -182,8 +183,9 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
 
     name = (f"mosaic {'backward' if backward else 'forward'} {label} {score}{' gate' if gate else ''} "
             f"{jnp.dtype(dtype).name}{f' {form}' if backward else ''}{' natural' if natural else ''}")
-    seeds = (BACKWARD_SEEDS.get((score, jnp.dtype(dtype).name), SEEDS) if backward
-             else ALL_HOOKS_SEEDS if len(score) + gate > 1 else SEEDS)
+    if seeds is None:
+        seeds = (BACKWARD_SEEDS.get((score, jnp.dtype(dtype).name), SEEDS) if backward
+                 else ALL_HOOKS_SEEDS if len(score) + gate > 1 else SEEDS)
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, name, seeds=seeds)
 
 
@@ -198,15 +200,35 @@ def _check_hooks(hooks: str, dtype, natural: bool, *, interpret: bool):
                  gate=gate, dtype=dtype, natural=natural)
 
 
+INTERPRETED_HOOK_SITES = {"none": ((1, 2, 1), 8), "alibi": ((1, 2, 1), 128), "key-bias": ((1, 2, 1), 16),
+                          "custom-vjp": ((1, 2, 1), 8), "softcap": ((1, 2, 1), 8), "sinks": ((1, 4, 2), 16),
+                          "temperature": ((1, 2, 1), 8), "tile-bias": ((1, 2, 1), 8),
+                          "resumed": ((1, 2, 1), 128), "softcap-sinks-alibi": ((2, 2, 1), 128)}
+"""The interpreted hooked backward's site under each hook: its rows, query heads and key heads, and its
+seeds, sized by `seeds_for` at that shape (the reference against itself), never the compiled site's. The
+claim interpreted is the hooked backward lowering and computing the template's gradients, so each site
+keeps its paths: the first row's three documents and its padding, their boundaries inside key blocks, two
+key blocks a query, more query heads than key heads, and the hook's every mode. Of the shapes that keep
+them, each takes the fewest seeds times the interpreter's seconds a seed (a row of two heads 1.9 s, of four
+3.8 s, two rows of four 7.5 s): a head's ALiBi slope or sink is one value a draw, so those hooks' seeds
+grow as heads shrink. The H100 site (`_check_hooked_backward`, compiled) keeps the template site's shape
+and seeds, at full resolution."""
+
+
 def _check_hooked_backward(hooks: str, *, form: str, interpret: bool):
     """The backward in the form `form` names (`BACKWARD_FORMS`) under the score hook `SCORE_HOOKS[hooks]` over
     the template core's causal packed documents under a window (`_check_hooks`' site): the gradients of the
-    queries, keys, values, of the hook's parameters and of the initial state."""
+    queries, keys, values, of the hook's parameters and of the initial state. Interpreted, at the hook's own
+    site (`INTERPRETED_HOOK_SITES`)."""
     case = CASES["causal-documents-window"]
     queries, keys = core_geometry(case)
-    spans = template.spans(queries, keys, ROWS, **arguments(case))
-    _check_spans("causal-documents-window", spans, (ROWS, queries, 4, 2), interpret=interpret, backward=True,
-                 form=form, score=SCORE_HOOKS[hooks])
+    (rows, heads, kv_heads), seeds = INTERPRETED_HOOK_SITES[hooks] if interpret else ((ROWS, 4, 2), None)
+    # The call's documents of its first `rows` rows.
+    called = {name: value[:rows] if hasattr(value, "shape") else value
+              for name, value in arguments(case).items()}
+    spans = template.spans(queries, keys, rows, **called)
+    _check_spans("causal-documents-window", spans, (rows, queries, heads, kv_heads), interpret=interpret,
+                 backward=True, form=form, score=SCORE_HOOKS[hooks], seeds=seeds)
 
 
 def _check_call_form(case: str, *, interpret: bool, backward: bool = False, form: str = "default"):
