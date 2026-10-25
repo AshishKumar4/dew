@@ -33,7 +33,7 @@ def test_a_shared_heavy_tail_resolves_paired_and_not_against_itself(heavy):
     seeds = seeds_for(reference, heavy, "heavy sums", truth_fn=_truth, dew_fn=twin)
     with pytest.raises(AssertionError) as raised:
         seeds_for(reference, heavy, "heavy sums", truth_fn=_truth, most=seeds)
-    assert raised.type is GateFailure
+    assert raised.type is AssertionError
     assert_as_exact(twin, reference, heavy, "heavy sums", seeds=seeds, truth_fn=_truth)
 
 
