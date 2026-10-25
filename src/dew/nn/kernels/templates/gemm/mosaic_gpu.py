@@ -112,7 +112,8 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
     - Columns: the widest the family's one product spans (`Family.widest_product`) that divides the
       call's width in its column unit, which reads its rows' slice fewest times a FLOP (each instruction
       reads the columns' block whole) and writes its output in the longest runs.
-    - Consumers: as many roles as the family has (`Family.consumers`), a warpgroup each.
+    - Consumers: as many roles as the family has (`Family.consumers`), a warpgroup each, or one where
+      rows a tile must divide (not grouped) take no whole role for each.
     - Rows: the most, in whole roles of its consumers, its consumers' registers hold
       (`mosaic.held_rows`, `mosaic.tile_registers`), and no more than the call's rows rounded up to a
       role's or, where grouped, half a group's in whole roles, at least one role (each group takes a
@@ -131,7 +132,8 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
     widest = min(width, family.widest_product or width)
     columns = [block_n for block_n in range(widest - widest % unit, 0, -unit) if width % block_n == 0]
     steps = [step for step in family.depths(dtype) if depth is None or depth % step == 0]
-    consumers = family.consumers
+    # Rows a tile divides (a kernel gradient's) that take no whole role for each consumer take one.
+    consumers = family.consumers if grouped or rows % (family.role_rows * family.consumers) == 0 else 1
     role = family.role_rows * consumers
     most_rows = max(role, rows // 2 // role * role if grouped else -(-rows // role) * role)
     busy = 2 + (0 if family.operands_in_registers else _IN_FLIGHT)

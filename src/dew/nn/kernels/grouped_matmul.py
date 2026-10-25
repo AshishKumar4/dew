@@ -678,7 +678,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
                 and _rated(target, first) and self._family(ba, target) is not None
                 and (generation.effective(target).wgmma or not hooked)
                 and self._hooks_lower(ba, first, target)
-                and (self.EXACT_SUMS or not ba.arguments.get('exact_sums')))
+                and (self.EXACT_SUMS or not ba.arguments.get('exact_sums'))
+                and self.derived(ba, target) is not None)
 
     def registers(self, ba, config: mosaic_gpu.Tiles) -> int:
         # A consumer thread's live set (`mosaic.tile_registers`), and where a prologue rewrites its share of
