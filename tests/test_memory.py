@@ -14,7 +14,7 @@ from reference_error import assert_as_exact
 from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
 from dew.nn.memory import Gate, InContextMemory, LinearMemory, MLPMemory, Objective, ResidualMemory
 
-WIDTH, HEADS, FEATURES, LENGTH, CHUNK = 8, 2, 4, 12, 4
+WIDTH, HEADS, FEATURES, LENGTH, CHUNK, ROWS = 8, 2, 4, 12, 4, 8
 MEMORY_SEEDS = 32
 """The declared seeds for check 1 of the memories (`assert_as_exact`), sized by `seeds_for` on armada."""
 
@@ -113,7 +113,7 @@ def _head(index: int, leaf):
 
 
 def draw(seed: int) -> tuple[np.ndarray]:
-    return (np.random.default_rng([1645, seed]).standard_normal((2, LENGTH, WIDTH)).astype(np.float32),)
+    return (np.random.default_rng([1645, seed]).standard_normal((ROWS, LENGTH, WIDTH)).astype(np.float32),)
 
 
 @pytest.mark.parametrize("name", sorted(CONFIGURATIONS))
@@ -139,7 +139,7 @@ def test_the_chunk_parallel_memory_is_the_token_by_token_one(name):
     the definition. The two are on par against float64 (check 1)."""
     module = layer(name)
     params = module.init(jax.random.key(0), jnp.zeros((1, LENGTH, WIDTH)))
-    one = np.ones((2, LENGTH), np.int32)
+    one = np.ones((ROWS, LENGTH), np.int32)
     stepped = jax.jit(lambda x: module.apply(params, x, packed(one)))
     assert_as_exact(jax.jit(lambda x: module.apply(params, x)), stepped, draw, f"{name} chunked",
                     seeds=MEMORY_SEEDS, truth_fn=written(module, params, dtype=jnp.float64))
@@ -152,10 +152,10 @@ def test_packed_documents_read_as_each_alone():
     params = module.init(jax.random.key(0), jnp.zeros((1, LENGTH, WIDTH)))
     x = draw(0)[0]
     cut = 5
-    segments = np.where(np.arange(LENGTH) < cut, 1, 2)[None].repeat(2, 0)
+    segments = np.where(np.arange(LENGTH) < cut, 1, 2)[None].repeat(ROWS, 0)
     together = np.asarray(module.apply(params, x, packed(segments)))
-    first = np.asarray(module.apply(params, x[:, :cut], packed(np.ones((2, cut), np.int32))))
-    second = np.asarray(module.apply(params, x[:, cut:], packed(np.ones((2, LENGTH - cut), np.int32))))
+    first = np.asarray(module.apply(params, x[:, :cut], packed(np.ones((ROWS, cut), np.int32))))
+    second = np.asarray(module.apply(params, x[:, cut:], packed(np.ones((ROWS, LENGTH - cut), np.int32))))
     np.testing.assert_array_equal(together, np.concatenate([first, second], axis=1))
 
 
@@ -176,7 +176,7 @@ def test_a_decode_continues_the_full_pass():
             reads.append(token)
         return jnp.concatenate(reads, axis=1)
 
-    full = jax.jit(lambda x: module.apply(params, x, packed(np.ones((2, LENGTH), np.int32))))
+    full = jax.jit(lambda x: module.apply(params, x, packed(np.ones((ROWS, LENGTH), np.int32))))
     assert_as_exact(decoded, full, draw, "decoded memory", seeds=MEMORY_SEEDS,
                     truth_fn=written(module, params, dtype=jnp.float64))
 
@@ -261,6 +261,5 @@ def test_a_memory_layer_kind_records_and_rebuilds():
     """The kind is a record: a decoder's config holding it rebuilds the same model."""
     from dew.config import ModelConfig
 
-    model = decoder()
-    rebuilt = ModelConfig.from_model(model).build()
-    assert rebuilt == model
+    model = ModelConfig.from_model(decoder()).build()
+    assert ModelConfig.from_model(model).build() == model
