@@ -529,7 +529,8 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
 
             def consumer(wg, tile, walk, store, *, active):
                 g_i, depth, columns, steps = tile
-                mine_depth, mine_columns = pl.ds(wg * depth_half, depth_half), (wg * atoms_each, atoms_each)
+                mine_depth = pl.ds(wg * depth_half, depth_half)
+                mine_columns = (wg * atoms_each, atoms_each, atoms_each * consumers > block_n // atom)
                 fixed_refs = [smem.at[wg] for smem in fixed_smems]
                 hook = None if prologue is None else (prologue, prologue_axes, stepped, fixed, fixed_refs)
                 group = (starts_gmem[g_i], ends_gmem[g_i], steps, block_k)
@@ -569,11 +570,12 @@ def _staged_halves(family: mosaic.Family, stages: list, group: tuple, mine: tupl
     the prologue (`hook`: it, its operands' axes, which are stepped and which fixed, and the fixed ones'
     tiles), and the whole cotangent, the neighbouring groups' rows zeroed in its shares of both (`group`:
     the step, the group's first and last row, its steps, the rows a step takes; `mine`: its depth half,
-    and its first swizzled row of the cotangent's and how many), the other's share awaited at `halves`
+    and its first swizzled row of the cotangent's, how many, and whether the last consumer's share runs
+    short of them), the other's share awaited at `halves`
     where it zeroed any. Both consumers' MMAs read the whole cotangent stage, so each zeroes its share of
     it and they meet where a group boundary falls in the step, the kernel's one exchange between them."""
     rows_stage, cotangent_stage, *side_stages = stages
-    mine_depth, (first_atom, atoms_each) = mine
+    mine_depth, (first_atom, atoms_each, short) = mine
     if hook is not None:
         prologue, axes_of, stepped, fixed, fixed_refs = hook
         tiles_of = dict(zip(stepped, side_stages, strict=True)) | dict(zip(fixed, fixed_refs, strict=True))
@@ -585,7 +587,7 @@ def _staged_halves(family: mosaic.Family, stages: list, group: tuple, mine: tupl
     shares = [(rows_stage.at[:, pl.ds(mine_depth.start + column, atom)], None)
               for column in range(0, mine_depth.size, atom)]
     shares += [(cotangent_stage.at[:, pl.ds((first_atom + j) * atom, atom)],
-                None if atoms % atoms_each == 0 else first_atom + j < atoms) for j in range(atoms_each)]
+                first_atom + j < atoms if short else None) for j in range(atoms_each)]
     boundary = _zero_neighbours_of(family, shares, *group)
     plgpu.commit_smem()
     if halves is not None:

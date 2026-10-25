@@ -35,6 +35,13 @@ LANES = 128
 is of whole multiples), and a v5e MXU's side."""
 
 
+def _exact(dtype) -> lax.Precision:
+    """The precision whose MXU product of `dtype` operands sums them exactly into fp32: a 16-bit operand's
+    one pass (Mosaic TPU refuses an fp32 contraction of bf16 operands, which a process's default precision
+    of 'highest' would ask), a wider one's six."""
+    return lax.Precision.DEFAULT if jnp.dtype(dtype).itemsize == 2 else lax.Precision.HIGHEST
+
+
 @dataclasses.dataclass(frozen=True)
 class Blocks:
     """One launch's output block (`block_m` x `block_n`) and contraction step (`block_k`); a kernel
@@ -97,7 +104,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
             if prologue is not None:
                 tile = prologue(tile, *(side[...] for side in prologue_refs)).astype(lhs_ref.dtype)
             acc_ref[...] += lax.dot_general(tile, rhs_ref[...], (((1,), (int(transpose_rhs),)), ((), ())),
-                                            preferred_element_type=jnp.float32)
+                                            precision=_exact(tile.dtype), preferred_element_type=jnp.float32)
 
         @pl.when(step == steps - 1)
         def _():
@@ -193,7 +200,8 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Bloc
             # Upstream's selection, in fp32: a neighbour's rows, a NaN or an infinity among them, are zeros.
             tile = jnp.where(mine, tile.astype(jnp.float32), 0.0).astype(lhs_ref.dtype)
             cotangent = jnp.where(mine, rhs_ref[...].astype(jnp.float32), 0.0).astype(rhs_ref.dtype)
-            acc_ref[...] += lax.dot(tile.swapaxes(0, 1), cotangent, preferred_element_type=jnp.float32)
+            acc_ref[...] += lax.dot(tile.swapaxes(0, 1), cotangent, precision=_exact(tile.dtype),
+                                    preferred_element_type=jnp.float32)
 
         @pl.when(last)
         def _():
