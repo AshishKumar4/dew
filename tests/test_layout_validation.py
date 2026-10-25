@@ -148,8 +148,8 @@ def capped(limit: int) -> type[Trainer]:
     """A trainer class on devices of `limit` bytes each, as a GPU's allocator states its limit."""
 
     class Capped(Trainer):
-        def _validation(self, state, capacity=None):
-            return super()._validation(state, limit)
+        def _validation(self, placed, capacity=None):
+            return super()._validation(placed, limit)
 
     return Capped
 
