@@ -165,6 +165,15 @@ class Probe:
     temp: int | None
     argument: int | None
 
+    @classmethod
+    def read(cls, split: int, candidate: Candidate, rung: Mapping[str, JSON], fit: bool,
+             headroom: int | None, executable: jax.stages.Compiled | None) -> Probe:
+        """The compile of `candidate` at `rung`, its memory as XLA reads it where it compiled."""
+        stats = None if executable is None else executable.memory_analysis()
+        return cls(split, rows_of(candidate.micro), rung, fit, headroom,
+                   None if stats is None else int(stats.temp_size_in_bytes),
+                   None if stats is None else int(stats.argument_size_in_bytes))
+
     def record(self) -> dict[str, JSON]:
         return {"split": self.split, "rows": self.rows, **self.rung, "fits": self.fits,
                 "headroom": self.headroom, "temp": self.temp, "argument": self.argument}
@@ -197,13 +206,15 @@ def unplanned(probes: Sequence[Probe]) -> str:
 @dataclasses.dataclass(frozen=True)
 class Planned:
     """A plan `plan_step` found: the step reading its batch in `split`
-    microbatches and its executable, whether it keeps XLA's default options,
-    and the rung it compiled at, as a record and as the objective's modules,
-    head tile and whether that head is fused."""
+    microbatches and its executable, whether it keeps XLA's default options
+    and reads the parameters through narrow copies, and the rung it compiled
+    at, as a record and as the objective's modules, head tile and whether that
+    head is fused."""
     split: int
     candidate: Candidate
     executable: jax.stages.Compiled
     xla_defaults: bool
+    narrow: bool
     rung: Mapping[str, JSON]
     modules: tuple
     tile: tuple[int, int] | None
@@ -314,34 +325,28 @@ def settled(planned: Planned, plans: Sequence[Planned], seconds: Sequence[float]
 
 
 def plan_step[LossT, EffectsT](
-        lower: Callable[[int], Candidate], options: Callable[[Candidate], jax.stages.CompilerOptions | None],
+        lower: Callable[[int, bool], Candidate],
+        options: Callable[[Candidate], jax.stages.CompilerOptions | None],
         candidates: Sequence[int], first: int, *, objective: Objective[LossT, EffectsT], mesh: Mesh,
-        xla_defaults: bool, base: tuple[int, int] | None, resumed: JSON,
+        xla_defaults: bool, narrow: bool, base: tuple[int, int] | None, resumed: JSON,
         frontier: bool) -> tuple[list[Planned], tuple[Probe, ...]]:
-    """The first of `candidates` (`splits`) and the objective's rungs to fit
-    the devices (`planned`), each lowered by `lower` at the objective's
-    current rung once, and compiled under its `options`, or under XLA's
-    defaults and `compiler_options` on the half rung above, the head
-    returning to the run's own tile `base` at each remat rung
-    (`recompute_more`). Where a split does not fit at a rung whose models
-    have a half rung above it (`remat_half`, a decoder's delta rule
-    recomputing its memory alone), the same split is compiled there, and the
-    plan stays there where it fits: no plan splits the batch further at a
-    rung where the half rung fits it whole, and climbing and the frontier
-    pass every half rung asked (`onward`). What each compile measured
-    (`Forecast`) orders the splits asked. `resumed`, the
-    rung a checkpoint trained the shape on, is warned of where it does not
-    fit. Where nothing fits, it raises with the closest candidate's numbers.
-    Beside the plans come every compile the search made, the frontier's too.
+    """The first of `candidates` (`splits`) and the objective's rungs to fit the devices (`planned`), each
+    lowered by `lower` at the objective's current rung and `narrow` once, and compiled under its
+    `options`, or under XLA's defaults and `compiler_options` on the half rung above, the head returning
+    to the run's own tile `base` at each remat rung (`recompute_more`). Where a split does not fit at a
+    rung whose models have a half rung above it (`remat_half`, a decoder's delta rule recomputing its
+    memory alone), the same split is compiled there, and the plan stays there where it fits: no plan
+    splits the batch further at a rung where the half rung fits it whole, and climbing and the frontier
+    pass every half rung asked (`onward`). What each compile measured (`Forecast`) orders the splits
+    asked. `resumed`, the rung a checkpoint trained the shape on, is warned of where it does not fit.
+    Where nothing fits, it raises with the closest candidate's numbers. Beside the plans come every
+    compile the search made, the frontier's too.
 
-    Where that plan splits the batch and `frontier` asks, the frontier's
-    other point follows, one compile more: the batch in `candidates[0]`
-    microbatches one remat rung up (`remat_more`) with the head tiled and
-    unfused, the most memory one rung frees, where that fits. Which runs
-    faster is measured, not ranked: on an A100-40, Qwen3.5-0.8B's full
-    fine-tune at 8 x 3072 ran 1205.6 ms a step in four microbatches without
-    recomputing, 1174.1 under 'minimal' whole, the head tiled. The objective
-    is left at the last plan's rung, each plan holding its own (`Planned`)."""
+    Where that plan splits the batch and `frontier` asks, the frontier's other point follows, one compile
+    more: the batch in `candidates[0]` microbatches one remat rung up (`remat_more`) with the head tiled
+    and unfused, the most memory one rung frees, where that fits. Which runs faster is measured, not
+    ranked (docs/performance.md). The objective is left at the last plan's rung, each plan holding its own
+    (`Planned`)."""
     probes: list[Probe] = []
     refusals: list[RuntimeError] = []
     lowered: dict[tuple[int, str], Candidate] = {}
@@ -352,8 +357,11 @@ def plan_step[LossT, EffectsT](
     # Every rung keeps, XLA's defaults' included, the options the modules need to compute right.
     required = compiler_options(*(entry.module for entry in objective.program_key())) or None
 
+    def current() -> dict[str, JSON]:
+        return rung_record(objective, xla_defaults, narrow=narrow)
+
     def rung() -> str:
-        return json.dumps(rung_record(objective, xla_defaults), sort_keys=True)
+        return json.dumps(current(), sort_keys=True)
 
     def remat_rung() -> str:
         return json.dumps(recompute_record(objective), sort_keys=True)
@@ -383,15 +391,12 @@ def plan_step[LossT, EffectsT](
         nonlocal resumed, chosen, fitted
         key = (split, rung())
         if key not in lowered:
-            lowered[key] = lower(split)
+            lowered[key] = lower(split, narrow)
         candidate = lowered[key]
         chosen = required if xla_defaults else options(candidate)
         executable = compiled_if_it_fits(candidate.program, chosen, refusals)
         fit, headroom = step_fits(executable, mesh, candidate.held)
-        stats = None if executable is None else executable.memory_analysis()
-        probes.append(Probe(split, rows_of(candidate.micro), rung_record(objective, xla_defaults), fit,
-                            headroom, None if stats is None else int(stats.temp_size_in_bytes),
-                            None if stats is None else int(stats.argument_size_in_bytes)))
+        probes.append(Probe.read(split, candidate, current(), fit, headroom, executable))
         forecast.read(rung(), split, executable, headroom, factor)
         if fit:
             assert executable is not None
@@ -403,9 +408,14 @@ def plan_step[LossT, EffectsT](
         return fit
 
     def climb() -> bool:
+        nonlocal xla_defaults, narrow
+        # The first rung drops the narrow copies, two bytes a parameter held all run for 1-2% of a step.
+        if narrow and any(candidate.copies for candidate in lowered.values()):
+            narrow = False
+            lowered.clear()
+            return True
         # XLA's default options, but `required`, are the half rung above the step's own where those
         # are another program: the Triton GEMM fusions they keep can take fewer temporaries (sm89).
-        nonlocal xla_defaults
         if not xla_defaults and chosen != required:
             xla_defaults = True
             return True
@@ -416,8 +426,8 @@ def plan_step[LossT, EffectsT](
     def found(split: int) -> Planned:
         assert fitted is not None
         modules = tuple(entry.module for entry in objective.program_key())
-        return Planned(split, *fitted, xla_defaults, rung_record(objective, xla_defaults), modules,
-                       head_tile_of(objective), head_fused_of(objective))
+        return Planned(split, *fitted, xla_defaults, narrow, current(), modules, head_tile_of(objective),
+                       head_fused_of(objective))
 
     split = planned(candidates, first, fits, climb, lambda split: forecast.likely(rung(), split))
     if split is None or fitted is None:

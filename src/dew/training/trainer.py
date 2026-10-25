@@ -515,10 +515,10 @@ class Trainer(Generic[Loss, Effects]):
         self._bandwidths: dict[tuple[Mesh, str], float | None] = {}
         self._display = TrainingDisplay()
         self._refusal: str | None = None
-        # The fit ladder's rung beyond the objective's own head and remat: a step that fit only under XLA's
-        # default options keeps them for later compiles. A resumed run starts at its checkpoint's rung, and
-        # says so if its first compile has to climb past it (`_climb_to`).
-        self._xla_defaults = False
+        # The fit ladder's rungs past the objective's head and remat: a step that fit only without its narrow
+        # copies, or under XLA's defaults, keeps that for later compiles. A resumed run starts at its
+        # checkpoint's rung, and says so if its first compile has to climb past it (`_climb_to`).
+        self._narrow, self._xla_defaults = True, False
         # Why this run's checkpoints describe no model to load, said once.
         self._unrecorded: str | None = None
         # The axes the objective's modules box on their own parameters, as the
@@ -832,7 +832,7 @@ class Trainer(Generic[Loss, Effects]):
         the step keeps XLA's default options, the half rung `compile` climbs
         to before the next. A checkpoint records it, since each decides the
         program a step runs."""
-        return rung_record(self.objective, self._xla_defaults)
+        return rung_record(self.objective, self._xla_defaults, narrow=self._narrow)
 
     def _checkpoint_rung(self) -> JSON:
         """The rung a checkpoint records: the run's own, which every newly met
@@ -876,7 +876,7 @@ class Trainer(Generic[Loss, Effects]):
             modules, tile, defaults, rung = self._base_rung
             self.objective.substitute(list(modules))
             self.objective.restore_head(tile, fused=bool(rung['head_fused']))
-            self._xla_defaults = defaults
+            self._xla_defaults, self._narrow = defaults, bool(rung['narrow'])
         recorded = self._resumed_shapes.get(batch_layout(batch))
         if recorded is None:
             return None
@@ -891,7 +891,7 @@ class Trainer(Generic[Loss, Effects]):
         that restores a state can find more than the one that built it and
         pick a lighter rung, another program. So the resumed run compiles the
         rung its checkpoint trained on, and climbs further only where that
-        does not fit."""
+        does not fit; a ladder rung the record does not name it never climbed."""
         if rung is None:
             return
         fields = record(rung, 'rung')
@@ -899,6 +899,7 @@ class Trainer(Generic[Loss, Effects]):
         self._xla_defaults = self._xla_defaults or boolean(
             fields.get("xla_defaults", False), "rung xla_defaults"
         )
+        self._narrow = self._narrow and boolean(fields.get("narrow", True), "rung narrow")
         self._resumed_rung = self._rung()
 
 
@@ -1224,9 +1225,10 @@ class Trainer(Generic[Loss, Effects]):
         candidates = splits(self._rows, batch, mesh, self.microbatches, self._split)
         shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
 
-        def lower(split: int) -> Candidate:
-            return self._candidate(state, batch, schedule, placement, replicated, split,
-                                   recorded_launches(recorded, {**self._rung(), 'split': split}))
+        def lower(split: int, narrow: bool) -> Candidate:
+            rung = {**self._rung(), 'narrow': narrow, 'split': split}
+            return self._candidate(state, batch, schedule, placement, replicated, split, narrow,
+                                   recorded_launches(recorded, rung))
 
         # Read before anything traces, so a recorded rung is the first one lowered.
         record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), candidates,
@@ -1242,7 +1244,7 @@ class Trainer(Generic[Loss, Effects]):
                 self.objective, device_tokens(self.objective, candidate.micro, shards),
                 FROZEN in candidate.prepared.variables, mesh.devices.size),
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0,
-            objective=self.objective, mesh=mesh, xla_defaults=self._xla_defaults,
+            objective=self.objective, mesh=mesh, xla_defaults=self._xla_defaults, narrow=self._narrow,
             base=None if self._base_rung is None else self._base_rung[1], resumed=resumed,
             frontier=timed is not None and recorded is None)
         seconds = timed([self._runner(plan, mesh) for plan in plans]) if len(plans) > 1 and timed else []
@@ -1253,7 +1255,7 @@ class Trainer(Generic[Loss, Effects]):
         self.validation = self._validation(planned.candidate.prepared)
         self.objective.substitute(list(planned.modules))
         self.objective.restore_head(planned.tile, fused=planned.fused)
-        self._xla_defaults = planned.xla_defaults
+        self._xla_defaults, self._narrow = planned.xla_defaults, planned.narrow
         chosen = {**self._rung(), 'split': planned.split}
         flops, counted = plan_flops(recorded, planned.executable)
         if record_path is not None:
@@ -1264,14 +1266,14 @@ class Trainer(Generic[Loss, Effects]):
         return planned, flops
 
     def _candidate(self, state: TrainState, batch: Batch, schedule: Schedule, placement, replicated,
-                   split: int, launches: str | None) -> Candidate:
+                   split: int, narrow: bool, launches: str | None) -> Candidate:
         """The step reading `batch` in `split` microbatches, lowered at the
         objective's current rung, with what the fit check holds beside it.
         `launches` are its kernel launches where a record holds them, which
         settle their configs before it lowers; otherwise, or where the run
         measures configs (`tune_kernels`), its lowering records them (`tune`)."""
         micro = microbatch_shapes(batch, split)
-        shapes, copies, prepared = self._prepared(state, micro, schedule, split * self.accumulation)
+        shapes, copies, prepared = self._prepared(state, micro, schedule, split * self.accumulation, narrow)
         shardings = self.shardings(prepared)
         prepared = placed_shapes(prepared, shardings)
         # The check reads the state's arguments as already on the devices. The copies and accumulators
@@ -1293,15 +1295,16 @@ class Trainer(Generic[Loss, Effects]):
             lowered = lower()
         return Candidate(micro, shapes, copies, shardings, prepared, held, lowered, launches)
 
-    def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, window: int):
+    def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, window: int,
+                  narrow: bool | None = None):
         """The loss's shapes (None under a custom step), the narrow copies and the state's shapes
         with the accumulation of a `window` of microbatches and the copies the step builds, as the
-        step traces them over microbatches of `batch`'s shapes."""
+        step traces them over microbatches of `batch`'s shapes, none where `narrow` (the trainer's) is off."""
         shapes = None if self.step is not None else self._loss_shape(state, batch)
         if shapes is not None:
             self._refuse_unpipelined(schedule)
         prepared = self._initialize_accumulation(state, batch, shapes, window=window, shape_only=True)
-        copies = self._narrow_copies(state, batch)
+        copies = self._narrow_copies(state, batch) if (self._narrow if narrow is None else narrow) else {}
         if copies:
             prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
                 lambda variables: narrowed(variables, copies), prepared.variables))
