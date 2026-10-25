@@ -232,50 +232,75 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
         np.testing.assert_allclose(expected_loss, numerator / jnp.sum(roles[:, 1:]), rtol=1e-6)
 
 
-def test_a_masked_diffusion_run_clips_its_attention_by_its_own_maxima():
+def _maxima(tree):
+    """The `max_logits` leaves of a `qk` collection."""
+    return [leaf for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]
+            if any(getattr(entry, "key", None) == "max_logits" for entry in path)]
+
+
+@pytest.mark.parametrize("staged", [False, pytest.param(True, marks=pytest.mark.mesh)],
+                         ids=["whole", "staged"])
+def test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima(staged):
     """An optimizer that holds a QK-Clip, composed however it is (`clips_qk`), has the run ask its
     objective for the attention logit maxima (`Step.qk_stats`), a masked-diffusion objective's as an
-    LM's: the window pools them from its first microbatch on, and at the update the clip rescales
-    the query and key kernels of the heads past its threshold and nothing else, where a threshold
-    none reaches leaves every weight as it was (the step's own update is zero)."""
+    LM's, and its update over two pooled microbatches is `scale_by_qk_clip`'s at both microbatches'
+    per-head maximum, bit for bit (the step's own update is zero). The second microbatch reads only a
+    token whose embedding, as the mask token's, is zero, so each of its logits is 0, which the run
+    shows reading it first; the first's maxima are the window's after it. A threshold no head reaches
+    moves nothing. Pipelined over two stages, each layer sows its geometry once a microbatch, and the
+    clip reads it as one count (`compact_qk`)."""
     from dew.diffusion.discrete import MDLM
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.diffusion.masked import MaskedDiffusionObjective
     from dew.optim import scale_by_qk_clip
-    from dew.training.transaction import compact_qk
+    from dew.training import MeshSpec
 
     # QK-Clip bounds logits only where no QK-norm divides the kernels' scale back out.
-    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=2, num_heads=2, mlp_features=16,
                               max_seq_len=8, causal=False, qk_norm=False)
-    objective = MaskedDiffusionObjective(model, MDLM(mask_id=15)(), seq_len=8, head_chunks=1,
-                                         ema_decay=None)
-    rng = np.random.default_rng(6)
-    data = [{"text": jnp.asarray(rng.integers(0, 15, size=(jax.device_count(), 8)), jnp.int32)}
-            for _ in range(2)]
+    silent, mask = 14, 15
+    variables = model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))
+    table = variables["params"]["embed_tokens"]["embedding"]
+    variables = {**variables, "params": {**variables["params"], "embed_tokens": {
+        "embedding": table.at[jnp.asarray([silent, mask])].set(0.0)}}}
+    objective = MaskedDiffusionObjective(model, MDLM(mask_id=mask)(), seq_len=8, head_chunks=1,
+                                         variables=variables, ema_decay=None)
+    rows = 2 * jax.device_count()
+    spoken = {"text": jnp.asarray(np.random.default_rng(6).integers(0, silent, size=(rows, 8)), jnp.int32)}
+    quiet = {"text": jnp.full((rows, 8), silent, jnp.int32)}
+    placement = {"mesh": MeshSpec(fsdp=2, stage=2), "microbatches": 2} if staged else {}
 
-    def trained(threshold):
-        train = Trainer(objective, optax.chain(optax.sgd(0.), scale_by_qk_clip(threshold)),
-                        key=jax.random.PRNGKey(3), accumulation=2)
+    def clip(threshold):
+        return optax.chain(optax.sgd(0.0), scale_by_qk_clip(threshold))
+
+    def trained(threshold, first, second):
+        train = Trainer(objective, clip(threshold), key=jax.random.PRNGKey(3), accumulation=2, **placement)
         initial = train.initial_state()
+        # The step consumes the state: what the expectation reads of it is taken first.
         start = jax.tree.map(np.asarray, initial.variables["params"])
-        run = train.compile(initial, data[0])
-        partial, *_ = run(initial, data[0])
-        pooled = jax.tree.map(np.asarray, compact_qk(partial.accumulation.qk_stats))
-        final, *_ = run(partial, data[1])
+        opt_state = jax.tree.map(np.asarray, initial.opt_state)
+        run = train.compile(initial, first)
+        partial, *_ = run(initial, first)
+        pooled = jax.tree.map(np.asarray, partial.accumulation.qk_stats)
+        final, *_ = run(partial, second)
         assert int(final.updates) == 1
-        return start, pooled, jax.tree.map(np.asarray, final.variables["params"])
+        return start, opt_state, pooled, jax.tree.map(np.asarray, final.variables["params"])
 
-    start, pooled, final = trained(.05)
-    peaks = pooled["layers_0"]["self_attn"]["max_logits"][0]
-    assert np.all(np.isfinite(peaks)) and np.max(peaks) > .05
-    moved = jax.tree_util.tree_flatten_with_path(final)[0]
-    for (path, before), (_, after) in zip(jax.tree_util.tree_flatten_with_path(start)[0], moved, strict=True):
-        if tuple(key.key for key in path[-2:]) in {("q_proj", "kernel"), ("k_proj", "kernel")}:
-            assert np.linalg.norm(after) < np.linalg.norm(before)
-        else:
-            np.testing.assert_array_equal(after, before)
-    start, _, final = trained(1e30)
-    jax.tree.map(np.testing.assert_array_equal, final, start)
+    _, _, heard, _ = trained(.05, quiet, spoken)
+    assert all(np.all(peak == 0) for peak in _maxima(heard))
+    start, opt_state, pooled, final = trained(.05, spoken, quiet)
+    assert max(float(np.max(peak)) for peak in _maxima(pooled)) > .05
+    both = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: np.maximum(leaf, 0) if any(getattr(entry, "key", None) == "max_logits"
+                                                      for entry in path) else leaf, pooled)
+    zero = jax.tree.map(np.zeros_like, start)
+    updates, _ = jax.jit(clip(.05).update)(zero, opt_state, start, qk_stats=both)
+    expected = jax.tree.map(np.asarray, optax.apply_updates(start, updates))
+    jax.tree.map(np.testing.assert_array_equal, final, expected)
+    assert any(not np.array_equal(after, before) for after, before in
+               zip(jax.tree.leaves(final), jax.tree.leaves(start), strict=True))
+    start, _, _, still = trained(1e30, spoken, quiet)
+    jax.tree.map(np.testing.assert_array_equal, still, start)
 
 
 def test_a_run_whose_objective_returns_no_maxima_is_refused_under_a_qk_clip():
