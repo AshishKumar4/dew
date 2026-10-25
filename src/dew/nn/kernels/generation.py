@@ -488,7 +488,7 @@ def _cuda_device() -> type:
     (equal devices, equal meshes)."""
     from jax.sharding import AbstractDevice
 
-    @dataclasses.dataclass(frozen=True, slots=True)
+    @dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
     class CudaDevice(AbstractDevice):
         compute_capability: str
 
