@@ -483,7 +483,11 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     _, m, n, g = shape
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     consumers = tiles.warpgroups
-    half, depth_half = block_n // consumers, block_m // consumers
+    depth_half = block_m // consumers
+    # Each consumer zeroes whole swizzled rows of the cotangent's stage (`_zeroed_share`), as many each as
+    # the stage's divide among them, the last's share short where they do not divide evenly.
+    atom = mosaic.SWIZZLE_BYTES // jnp.dtype(rhs.dtype).itemsize
+    atoms_each = -(-(block_n // atom) // consumers)
     part = (depth_half, block_n)
     grid = (m // block_m, n // block_n)
     stepped = tuple(i for i, axes in enumerate(prologue_axes) if 'rows' in axes)
@@ -525,7 +529,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
 
             def consumer(wg, tile, walk, store, *, active):
                 g_i, depth, columns, steps = tile
-                mine_depth, mine_columns = pl.ds(wg * depth_half, depth_half), pl.ds(wg * half, half)
+                mine_depth, mine_columns = pl.ds(wg * depth_half, depth_half), (wg * atoms_each, atoms_each)
                 fixed_refs = [smem.at[wg] for smem in fixed_smems]
                 hook = None if prologue is None else (prologue, prologue_axes, stepped, fixed, fixed_refs)
                 group = (starts_gmem[g_i], ends_gmem[g_i], steps, block_k)
@@ -563,19 +567,26 @@ def _staged_halves(family: mosaic.Family, stages: list, group: tuple, mine: tupl
     """Dew: a streamed kernel gradient step's operands for one consumer warpgroup, from its `stages` (the
     rows', the cotangent's, then each side operand's with rows): its depth half of the rows, rewritten by
     the prologue (`hook`: it, its operands' axes, which are stepped and which fixed, and the fixed ones'
-    tiles), and the whole cotangent, the neighbouring groups' rows zeroed in its halves of both (`group`:
-    the step, the group's first and last row, its steps, the rows a step takes; `mine`: its depth and
-    column halves), the other's cotangent half awaited at `halves` where it zeroed any. Both consumers'
-    MMAs read the whole cotangent stage, so each zeroes half of it and they meet where a group boundary
-    falls in the step, the kernel's one exchange between them."""
+    tiles), and the whole cotangent, the neighbouring groups' rows zeroed in its shares of both (`group`:
+    the step, the group's first and last row, its steps, the rows a step takes; `mine`: its depth half,
+    and its first swizzled row of the cotangent's and how many), the other's share awaited at `halves`
+    where it zeroed any. Both consumers' MMAs read the whole cotangent stage, so each zeroes its share of
+    it and they meet where a group boundary falls in the step, the kernel's one exchange between them."""
     rows_stage, cotangent_stage, *side_stages = stages
-    mine_depth, mine_columns = mine
+    mine_depth, (first_atom, atoms_each) = mine
     if hook is not None:
         prologue, axes_of, stepped, fixed, fixed_refs = hook
         tiles_of = dict(zip(stepped, side_stages, strict=True)) | dict(zip(fixed, fixed_refs, strict=True))
         _rewritten(prologue, axes_of, rows_stage.at[:, mine_depth], tiles_of, 'depth', mine_depth)
-    halves_of = (rows_stage.at[:, mine_depth], cotangent_stage.at[:, mine_columns])
-    boundary = _zero_neighbours_of(family, halves_of, *group)
+    atom = mosaic.SWIZZLE_BYTES // jnp.dtype(cotangent_stage.dtype).itemsize
+    atoms = cotangent_stage.shape[1] // atom
+    # Its depth half's swizzled rows, each its own, and its share of the cotangent's, the last consumer's
+    # past the stage's end held (`atoms_each` rounds the share up).
+    shares = [(rows_stage.at[:, pl.ds(mine_depth.start + column, atom)], None)
+              for column in range(0, mine_depth.size, atom)]
+    shares += [(cotangent_stage.at[:, pl.ds((first_atom + j) * atom, atom)],
+                None if atoms % atoms_each == 0 else first_atom + j < atoms) for j in range(atoms_each)]
+    boundary = _zero_neighbours_of(family, shares, *group)
     plgpu.commit_smem()
     if halves is not None:
         pl.when(boundary)(lambda: mosaic.meet(halves))
@@ -607,16 +618,24 @@ def _walked_gradient(family: mosaic.Family, walk, staged, shape: tuple, exact_su
     return summed
 
 
-def _zero_neighbours_of(family: mosaic.Family, refs: tuple, step, start, end, steps, block_k: int):
-    """Dew: in a group's first and last row blocks, zero each of `refs` (`[block_k, columns]` stages) on the
-    rows a neighbouring group holds, by selection; whether `step` is either block."""
+def _zero_neighbours_of(family: mosaic.Family, refs: list, step, start, end, steps, block_k: int):
+    """Dew: in a group's first and last row blocks, zero each of `refs` (`[block_k, columns]` stages, each
+    one swizzled row wide, so one holds a thread's few registers whatever the tile's width; each with
+    whether it is held, None where always) on the rows a neighbouring group holds, by selection; whether
+    `step` is either block."""
     first, last = step == 0, step == steps - 1
 
     def zero(kept):
-        for ref in refs:
-            values = family.tile_of(ref)
-            rows = family.iota((values.shape[0], values.shape[1]), 0)
-            ref[...] = jnp.where(kept(rows), values, jnp.zeros_like(values))
+        for ref, held in refs:
+            def zeroed(ref=ref):
+                values = family.tile_of(ref)
+                rows = family.iota((values.shape[0], values.shape[1]), 0)
+                ref[...] = jnp.where(kept(rows), values, jnp.zeros_like(values))
+
+            if held is None:
+                zeroed()
+            else:
+                pl.when(held)(zeroed)
 
     pl.when(first)(lambda: zero(lambda rows: rows >= lax.rem(start, block_k)))
     pl.when(last)(lambda: zero(lambda rows: rows <= lax.rem(end - 1, block_k)))

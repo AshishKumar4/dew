@@ -273,9 +273,12 @@ def _gemm_mainloop_cases(generation_name: str) -> list:
             if not launch.eligible(ba, target):
                 continue
             fits = launch.fitting(ba, target)
-            picked = launch.estimate(ba, target)[1]
-            largest = max(fits, key=lambda config, ba=ba: launch.staged_bytes(ba, config, target))
-            for role, config in (("picked", picked), ("largest", largest)):
+            roles = {"picked": launch.estimate(ba, target)[1],
+                     "largest": max(fits, key=lambda config, ba=ba: launch.staged_bytes(ba, config, target)),
+                     "most registers": max(fits, key=lambda config, ba=ba: launch.registers(ba, config))}
+            # Each config once: a second compile of one program is the first's, which reports no kernels.
+            for config in dict.fromkeys(roles.values()):
+                role = " and ".join(role for role, chosen in roles.items() if chosen == config)
                 configured = functools.partial(launch.replace(config=config), **options)
                 cases.append(support.KernelCase(f"{name} {role} {config}",
                                                 lambda configured=configured, args=args: (configured, args)))
@@ -297,7 +300,8 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
         pytest.skip("this JAX's layout inference places no mma.sync tile but its 128x256 (STAGING_SOLVED)")
     cases = _gemm_mainloop_cases(generation_name)
     found = compile_mosaic_kernels(cases, generation_name)
-    assert len(found) == len(cases) and all(record.get("kernels") for record in found), found
+    unreported = [record["name"] for record in found if not record.get("kernels")]
+    assert len(found) == len(cases) and not unreported, unreported
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
@@ -327,10 +331,11 @@ def test_each_gemm_tpu_mainloop_compiles_at_its_picks_with_libtpu(tpu):
             ba = launch.bind(*args, interpret=False, **options)
             if not launch.eligible(ba, target):
                 continue
-            picked = launch.estimate(ba, target)[1]
             fits = launch.fitting(ba, target)
-            largest = max(fits, key=lambda config, ba=ba: launch.staged_bytes(ba, config, target))
-            for role, config in (("picked", picked), ("largest", largest)):
+            roles = {"picked": launch.estimate(ba, target)[1],
+                     "largest": max(fits, key=lambda config, ba=ba: launch.staged_bytes(ba, config, target))}
+            for config in dict.fromkeys(roles.values()):
+                role = " and ".join(role for role, chosen in roles.items() if chosen == config)
                 configured = functools.partial(launch.replace(config=config), interpret=False, **options)
                 cases.append(support.KernelCase(f"{name} {role} {config}",
                                                 lambda configured=configured, args=args: (configured, args)))
@@ -338,7 +343,8 @@ def test_each_gemm_tpu_mainloop_compiles_at_its_picks_with_libtpu(tpu):
         assert generation.gpu_target(tpu).scoped_vmem is None
         pytest.skip(f"no measurement states {tpu}'s scoped VMEM, which the TPU launches fit their blocks to")
     found = compile_tpu_kernels(cases, tpu)
-    assert not [record for record in found if "error" in record], found
+    failed = [f"{record['name']}: {record['error']}" for record in found if "error" in record]
+    assert not failed, "\n".join(failed)
 
 
 def test_the_resource_gate_refuses_a_spilling_mosaic_kernel():
