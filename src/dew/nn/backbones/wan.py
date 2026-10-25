@@ -248,10 +248,10 @@ class WanTransformer(nn.Module):
         # `WanTimeTextImageEmbedding`: the time embedder in fp32, its output
         # in the model's dtype, and one projection of it into six pieces.
         sinusoids = sinusoidal_time(time, self.freq_dim, dtype=wide)
-        embedded = embedding(sinusoids, self.features, "time_embedder", dtype=wide,
+        embedded = embedding(self, sinusoids, self.features, "time_embedder", dtype=wide,
                              precision=self.precision).astype(tokens.dtype)
         modulation = jnp.stack(self._modulation()(embedded), axis=1)
-        context = embedding(conditioning.context, self.features, "text_embedder",
+        context = embedding(self, conditioning.context, self.features, "text_embedder",
                             activation=gelu_tanh, **dense)
         rotation = tuple(jnp.asarray(table[None], wide)
                          for table in wan_rotation(frames, rows, columns, self.attention_head_dim))
