@@ -57,6 +57,37 @@ def test_a_fair_sampler_fails_at_most_false_red_even_at_sparse_counts(total, cha
                                for head in itertools.product(range(total + 1), repeat=chances.size - 1)
                                if sum(head) <= total])
     statistic = statistics(compositions, chances)
-    failed = np.asarray([p_value(value, total, tuple(chances.tolist())) < LEVEL for value in statistic])
+    failed = np.asarray([p_value(value, (total,), (tuple(chances.tolist()),)) < LEVEL for value in statistic])
     rate = stats.multinomial.pmf(compositions[failed], total, chances).sum() if failed.any() else 0.0
     assert failed.any() and rate <= FALSE_RED
+
+
+def test_independent_rows_are_one_verdict_whose_false_red_rate_holds():
+    """Two independent categoricals, a token's mask at two times (0.1 and 0.5 masked), 20 draws each:
+    every pair of compositions, its chance under a fair sampler, and whether the gate's one verdict over
+    both fails it; the chances of those it fails sum to at most FALSE_RED. A fair pair passes over 64
+    seeds of 4000 tokens, the second time's share moved by 0.03 fails, and a row that does not sum
+    to one or counts of another shape are refused."""
+    chances = np.asarray([[0.1, 0.9], [0.5, 0.5]])
+    totals = (20, 20)
+    grid = np.asarray([[[a, 20 - a], [b, 20 - b]] for a in range(21) for b in range(21)])
+    statistic = statistics(grid, chances)
+    failed = np.asarray([p_value(value, totals, tuple(map(tuple, chances.tolist()))) < LEVEL
+                         for value in statistic])
+    rate = sum(stats.binom.pmf(pair[0, 0], 20, 0.1) * stats.binom.pmf(pair[1, 0], 20, 0.5)
+               for pair in grid[failed])
+    assert failed.any() and rate <= FALSE_RED
+
+    def times(shares):
+        def counts(seed):
+            masked = np.random.default_rng([0x71E, seed]).binomial(4000, shares)
+            return np.stack([masked, 4000 - masked], axis=-1)
+        return counts
+
+    assert_draws_as_declared(times(np.asarray([0.1, 0.5])), chances, "fair times", seeds=64)
+    with pytest.raises(SamplingFailure):
+        assert_draws_as_declared(times(np.asarray([0.1, 0.53])), chances, "moved", seeds=64)
+    with pytest.raises(ValueError):
+        assert_draws_as_declared(times(np.asarray([0.1, 0.5])), [[0.1, 0.9], [0.5, 0.4]], "typo", seeds=1)
+    with pytest.raises(ValueError):
+        assert_draws_as_declared(times(np.asarray([0.1, 0.5])), [[0.1, 0.9]], "rows", seeds=1)
