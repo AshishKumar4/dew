@@ -21,6 +21,7 @@ from reference_error import (
     distance,
     indexed_recording,
     recording,
+    without_ynn,
 )
 
 from dew.sampling import DPMSolverSDE, sample
@@ -298,3 +299,63 @@ def test_a_source_noise_sampler_seed_pins_the_brownian_path():
     np.testing.assert_array_equal(run(pinned, 0), run(pinned, 1))
     free = DPMSolverSDE()
     assert not np.allclose(run(free, 0), run(free, 1), atol=1e-3)
+
+
+BROWNIAN_SEEDS = 8
+"""Check 1's declared seeds for the Brownian walk against Levy's construction unrolled (`seeds_for`)."""
+
+
+def test_the_brownian_walk_descends_every_level_as_levys_construction_unrolled():
+    """The walk reads its point off Levy's construction to its depth (`_brownian_walk`), one level a
+    loop iteration: on par with the construction unrolled level by level in Python (check 1), at the
+    full depth and at one level, over drawn keys and queries of a grid's interval, its ends, its
+    middle and points between. A loop and its unrolled levels fuse apart, so they round apart. The
+    truth is the construction in float64 on the same float32 draws, its position and the branch
+    each level takes read in float64 too: the path is continuous, so where float32's rounding of the
+    position crosses a cell's end, the cell beside it meets it at the node they share."""
+    from dew.sampling.solvers.brownian import MAX_BROWNIAN_DEPTH, _Brownian, _brownian_walk
+
+    low, high, shape = np.float32(0.03), np.float32(14.6), (3, 4)
+
+    def draw(seed):
+        between = np.random.default_rng(seed).uniform(low, high, 9)
+        points = np.concatenate([[low, high, (low + high) / 2], between]).astype(np.float32)
+        return jax.random.PRNGKey(seed), points
+
+    def walked(depth):
+        def walk(key, points):
+            state = _Brownian(key, jnp.float32(low), jnp.float32(high))
+            return jax.vmap(lambda point: _brownian_walk(state, point, shape, depth))(points)
+        return walk
+
+    def unrolled(depth):
+        def construction(key, points):
+            # The values in the points' dtype, float32 for the reference and float64 for the truth.
+            dtype = points.dtype
+            span = jnp.asarray(high, dtype) - jnp.asarray(low, dtype)
+            root = jax.random.normal(jax.random.fold_in(key, 0), shape, dtype=jnp.float32)
+
+            def one(point):
+                position = jnp.clip((point - jnp.asarray(low, dtype)) / span, 0.0, 1.0)
+                start, end = jnp.zeros(shape, dtype), jnp.sqrt(span) * root.astype(dtype)
+                index = jnp.zeros((), jnp.int32)
+                for level in range(1, depth + 1):
+                    node = jax.random.fold_in(jax.random.fold_in(key, level), 2 * index + 1)
+                    deviation = 0.5 * jnp.sqrt(span * 2.0 ** (1 - level))
+                    middle = 0.5 * (start + end) + deviation * jax.random.normal(
+                        node, shape, dtype=jnp.float32).astype(dtype)
+                    position = position * 2.0
+                    # The next binary digit of the position, exact for a doubled value in [0, 2].
+                    right = jnp.floor(position).astype(bool)
+                    position = jnp.subtract(position, right.astype(dtype))
+                    start, end = jnp.where(right, middle, start), jnp.where(right, end, middle)
+                    index = 2 * index + right.astype(jnp.int32)
+                return start + position * (end - start)
+
+            return jax.vmap(one)(points)
+        return construction
+
+    for depth in (1, MAX_BROWNIAN_DEPTH):
+        assert_as_exact(without_ynn(walked(depth)), without_ynn(unrolled(depth)), draw,
+                        f"the Brownian walk at depth {depth}", seeds=BROWNIAN_SEEDS,
+                        truth_fn=jax.jit(unrolled(depth)))
