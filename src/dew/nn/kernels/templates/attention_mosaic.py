@@ -308,16 +308,21 @@ class MosaicForward(_Mainloop[Tiles]):
 
 def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool) -> int:
     """The registers a forward consumer holds at `tiles` (`mosaic.live_registers`): its weighted values' sums
-    `[bq, Dv]` fp32 carried, and a step's logits fp32 beside its weights in the operands' dtype; a training
-    forward's anchor value row carried too (`_trained`, in the operands' dtype), and its one-hot weights
-    beside the product picking the row, fp32."""
+    `[bq, Dv]` fp32 carried, and a step's logits fp32 beside its weights in the operands' dtype. A training
+    forward (`_trained`) carries its anchor value row too, in the operands' dtype, and holds its weights in
+    fp32 beside the logits until their sums and anchor split are taken; then, a block of its swizzled value
+    columns at a time, the other keys' weights and the one-hot ones beside the block's taken sums and picked
+    row, fp32."""
     block_q, block_k = tiles.block_q, tiles.block_k
     carried = [(block_q, value_width, jnp.float32)]
-    phases = [[(block_q, block_k, jnp.float32), (block_q, block_k, dtype)]]
-    if residuals:
-        carried.append((block_q, value_width, dtype))
-        phases.append([(block_q, block_k, dtype), (block_q, value_width, jnp.float32)])
-    return mosaic.live_registers(family, carried, *phases)
+    if not residuals:
+        step = [(block_q, block_k, jnp.float32), (block_q, block_k, dtype)]
+        return mosaic.live_registers(family, carried, step)
+    unit = min(value_width, family.column_unit(dtype))
+    carried.append((block_q, value_width, dtype))
+    weights = [(block_q, block_k, jnp.float32)] * 2
+    blocks = [(block_q, block_k, dtype)] * 2 + [(block_q, unit, jnp.float32)] * 2
+    return mosaic.live_registers(family, carried, weights, blocks)
 
 
 @overload
