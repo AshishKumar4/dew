@@ -49,6 +49,7 @@ from dew.inference.serving import Server
 from dew.nn.backbones import CausalTransformer, Mixture
 from dew.nn.sharding import RESIDUAL, logical_spec
 from dew.objectives.lm import LMObjective
+from dew.objectives.routing import ExpertBalance
 from dew.sampling import Sampling
 from dew.training.distributed import DevicePrefetchIterator, batch_shardings
 
@@ -213,7 +214,7 @@ def main(config: Config) -> None:
         vocab_size=256, emb_features=64, num_layers=2, num_heads=4,
         mlp_features=128, max_seq_len=64, dtype=jnp.float32, attention_impl="xla",
         mixture=Mixture(experts=config.experts, top_k=config.top_k, dispatch=config.dispatch))
-    objective = LMObjective(model, config.sequence_length, aux_loss_alpha=0.01)
+    objective = LMObjective(model, config.sequence_length, balance=ExpertBalance(aux_loss_alpha=0.01))
     optimizer = OptimConfig(optimizer="adam", learning_rate=config.learning_rate).build(config.steps)
     trainer = Trainer(objective, optimizer, key=jax.random.key(config.seed),
                       mesh=MeshSpec(fsdp=config.fsdp, expert=config.expert), layout=Layout(min_shard=1))

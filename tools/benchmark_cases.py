@@ -82,9 +82,8 @@ class Case:
     """For language models, canvases among them, the vocabulary slices the
     loss scores a batch in; None is the objective's own default."""
     objective: dict[str, object] = field(default_factory=dict)
-    """For language models, further keywords of the decoder's objective, such
-    as LMObjective's balance terms `aux_loss_alpha` and `balance_rate`, or of
-    a canvas's BlockDiffusionObjective, such as `encoder_loss_weight`."""
+    """For language models, further keywords of the decoder's objective, such as LMObjective's `balance`
+    (an `ExpertBalance` record), or of a canvas's BlockDiffusionObjective, such as `encoder_loss_weight`."""
     decoder_objective: Literal["lm", "sft", "dpo", "grpo", "mdlm"] = "lm"
     """For language models, what the decoder trains: next-token cross entropy
     ("lm"), the same over the assistant's turns only ("sft"), DPO over

@@ -44,6 +44,7 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
     ("Training", ["dew.training", "dew.training.state", "dew.optim", "dew.training.quantization",
                   "dew.training.runtime", "dew.training.distributed", "dew.training.posthoc"]),
     ("Objectives", ["dew.objectives", "dew.objectives.base", "dew.objectives.lm", "dew.objectives.diffusion",
+                    "dew.objectives.routing",
                     "dew.objectives.diffusion.adversarial",
                     "dew.objectives.diffusion.alignment", "dew.objectives.diffusion.consistency",
                     "dew.objectives.diffusion.end_to_end", "dew.objectives.diffusion.few_step",

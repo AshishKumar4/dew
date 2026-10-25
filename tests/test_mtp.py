@@ -25,6 +25,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs, coordinates
 from dew.objectives.base import Step
 from dew.objectives.lm import TEXT_KEY, LMObjective
+from dew.objectives.routing import ExpertBalance
 
 VOCAB = 37
 SEQ = 8
@@ -224,7 +225,7 @@ def test_a_routed_depth_balances_only_when_the_depths_run():
     model = tiny(num_nextn_predict_layers=1, num_kv_heads=4,
                  mixture={"experts": 4, "top_k": 2, "score_function": "sigmoid", "bias": True})
     batch = token_batch()
-    still = LMObjective(model, SEQ, balance_rate=0.1)
+    still = LMObjective(model, SEQ, balance=ExpertBalance(balance_rate=0.1))
     params = still.init(jax.random.key(0))
     _, aux = still.scalar_loss(params, batch, step_at())
     assert aux.effects is not None
@@ -234,7 +235,7 @@ def test_a_routed_depth_balances_only_when_the_depths_run():
     assert not jnp.array_equal(moved["layers_1"]["mlp"]["gate"]["e_score_correction_bias"],
                                params["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"])
 
-    running = LMObjective(model, SEQ, balance_rate=0.1, mtp_weight=0.3)
+    running = LMObjective(model, SEQ, balance=ExpertBalance(balance_rate=0.1), mtp_weight=0.3)
     _, aux = running.scalar_loss(params, batch, step_at())
     assert aux.effects is not None
     moved = running.apply_effects(params, aux.effects)["moe"]

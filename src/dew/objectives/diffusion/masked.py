@@ -36,6 +36,7 @@ from dew.diffusion.discrete import MDLM_STEPS, REVEALED_UNDEFINED, DiscreteProce
 from dew.inference.tasks import MaskedGeneration, MaskedSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import real_slots
+from dew.nn.moe import ROUTER_COLLECTION
 from dew.nn.protocols import Lacks, TokenModel
 from dew.objectives.base import (
     OMITTED,
@@ -53,6 +54,7 @@ from dew.objectives.base import (
 from dew.objectives.lm.chunked import final_read, refuse_without_logits
 from dew.objectives.lm.head import HeadedObjective
 from dew.objectives.lm.objective import TEXT_KEY, batch_text, text_preview
+from dew.objectives.routing import ExpertBalance, RoutedStatistics
 from dew.sampling.sample import sample
 
 if TYPE_CHECKING:
@@ -61,13 +63,14 @@ if TYPE_CHECKING:
 _DEFAULT_SOLVER = Unmask()
 
 
-class MaskedDiffusionObjective(HeadedObjective[Ratio]):
+class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variables]):
     """Trains a masked diffusion model on the MDLM negative ELBO.
 
     A batch holds `[B, seq_len]` token ids under `batch["text"]`, and packed
     windows also their `text_coordinates` (`dew.nn.inputs.Coordinates`).
     `head_chunks` and `head_tile` set how the head is scored, as an LM's
-    (`LMObjective`).
+    (`LMObjective`). `balance` trains the routers of a mixture as an LM's does
+    (`ExpertBalance`, `dew.objectives.routing`).
     """
 
     saved_task = MaskedGeneration
@@ -83,6 +86,7 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio]):
         *,
         head_chunks: int = 4,
         head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
+        balance: ExpertBalance | None = None,
         ema_decay: float | None = 0.999,
         solver: Unmask = _DEFAULT_SOLVER,
         steps: int = MDLM_STEPS,
@@ -114,6 +118,7 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio]):
         self.model = model
         self.process = process
         self.seq_len = seq_len
+        self.balance = balance
         self.use_head(head_chunks, head_tile)
         self.solver = solver
         self.steps = steps
@@ -166,23 +171,51 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio]):
         number MDLM reports."""
         return self._scored(params, batch, step, train=False)[2]
 
-    def _validation_scores(self, params, batch, step: Step) -> tuple[Ratio, TokenScores]:
+    def _validation_scores(self, params, batch, step: Step) -> tuple[Ratio | RoutedStatistics, TokenScores]:
         nelbo, _, scores = self._scored(params, batch, step, train=False)
         return nelbo, scores
 
-    def _scored(self, params, batch, step: Step, *, train: bool) -> tuple[Ratio, Aux, TokenScores]:
+    def reduce_loss(self, stats: Ratio | RoutedStatistics) -> tuple[jax.Array, jax.Array]:
+        if isinstance(stats, Ratio):
+            return stats.mean()
+        if self.balance is None:
+            raise ValueError("routed statistics require a balance (ExpertBalance)")
+        return self.balance.reduce(stats)
+
+    def apply_effects(self, variables: Variables, effects: Variables) -> Variables:
+        if self.balance is None:
+            raise ValueError("router count effects require a balance (ExpertBalance)")
+        return self.balance.apply(variables, effects)
+
+    def _scored(self, params, batch, step: Step, *, train: bool
+                ) -> tuple[Ratio | RoutedStatistics, Aux[Variables], TokenScores]:
         """The negative ELBO, its reports and the per-token scores, from one corruption of the batch,
-        with the attention logit maxima of its forward where the step asks for them (`Step.qk_stats`)."""
-        tokens, losses, weights, counted, predicted, real, qk = self._token_losses(params, batch, step,
+        with the attention logit maxima of its forward where the step asks for them (`Step.qk_stats`),
+        and the routers' balance terms where the objective balances them (`balance`)."""
+        tokens, losses, weights, counted, predicted, real, sown = self._token_losses(params, batch, step,
                                                                                    train=train)
-        nelbo = Ratio(self.row_mean(losses * weights, batch).total,
-                      self.row_mean(real.astype(jnp.float32), batch).total)
+        prediction = Ratio(self.row_mean(losses * weights, batch).total,
+                           self.row_mean(real.astype(jnp.float32), batch).total)
         correct = predicted == tokens
         accuracy, _ = self.accuracy(correct.astype(losses.dtype), batch, counted).mean()
-        return nelbo, Aux(metrics={
+        reported = {
             "masked_accuracy": accuracy,
             "masked_fraction": jnp.sum(counted) / jnp.maximum(jnp.sum(real, dtype=losses.dtype), 1.0),
-        }, qk_stats=qk), TokenScores(losses * weights, real.astype(losses.dtype), correct)
+        }
+        statistics: Ratio | RoutedStatistics = prediction
+        effects = None
+        if self.balance is not None:
+            fields = batch_text(batch).token_fields
+            rows = tokens.shape[0]
+            queries = real_slots(fields, tokens.shape) & (self.row_weights(batch, rows) > 0)[:, None]
+            routing = sown.get(ROUTER_COLLECTION, {})
+            statistics, balanced = self.balance.terms(prediction, routing, batch, queries, fields)
+            effects, load = self.balance.effects(params, routing, queries, fields)
+            reported.update(balanced)
+            reported.update(load)
+        qk = sown.get("qk", {}) if step.qk_stats else None
+        return statistics, Aux(metrics=reported, qk_stats=qk, effects=effects), TokenScores(
+            losses * weights, real.astype(losses.dtype), correct)
 
     def _token_losses(self, params, batch, step: Step, *, train: bool):
         """Corrupt the batch once, each row's noise level and mask its example's own (`Step.sample`),
@@ -190,8 +223,8 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio]):
 
         Returns the rows, their per-token cross entropies under that
         corruption, the time weight of each masked token, the mask itself,
-        the argmax prediction, which slots hold text, and the `qk` collection
-        the forward sowed where the step asks for it (`Step.qk_stats`), else None.
+        the argmax prediction, which slots hold text, and the collections the forward sowed: `qk` where
+        the step asks for it (`Step.qk_stats`) and the routers' where the objective balances them.
 
         The model reads every field the batch's `ModelInputs` carries, and a
         model that takes no such field refuses it. A packed batch
@@ -229,11 +262,12 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio]):
         masked = jnp.where(is_masked, self.process.mask_id, tokens)
 
         # Each position's prediction, as the checkpoint's logits line up with its inputs.
+        opened = (["qk"] if step.qk_stats else []) + ([ROUTER_COLLECTION] if self.balance is not None else [])
         observed = final_read(self.model, params, masked, train=train,
                               rngs=model_rngs(dropout_key, training=train),
-                              mutable=["qk"] if step.qk_stats else False, capture_intermediates=False,
+                              mutable=opened or False, capture_intermediates=False,
                               **prepared.kwargs())
-        read, sown = observed if step.qk_stats else (observed, {})
+        read, sown = observed if opened else (observed, {})
         read = aligned(self.model, read, fields)
         # MDLM's SUBS parameterization gives the mask token no mass: it is
         # never a target, so the partition and the prediction leave it out.
@@ -244,8 +278,7 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio]):
         losses = jnp.where(real, losses, 0.0)
         counted = is_masked.astype(losses.dtype)
         weights = step.boundary("loss weights", self.process.weight(t))
-        return (tokens, losses, counted * weights[:, None], counted, predicted, real,
-                sown.get("qk", {}) if step.qk_stats else None)
+        return (tokens, losses, counted * weights[:, None], counted, predicted, real, sown)
 
     def _sample_impl(self, params, key, *, count: int):
         """`count` rows sampled from noise, and whether a position stayed masked, its scores holding
