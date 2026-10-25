@@ -2265,12 +2265,18 @@ class CausalTransformer(nn.Module):
         return scaling.original_max_position_embeddings if isinstance(scaling, LongRopeScaling) else None
 
     @nn.nowrap
-    def reads_blocks(self) -> bool:
-        """Whether a layer reads a block whole (`AttentionMixer.bidirectional_blocks`): a trunk or prediction
-        depth layer kind's mixer, each kind's own mixer or else the model's (`BlockReading`)."""
-        kinds = self.layer_kinds(self.per_layer_types)
-        return any(isinstance(mixer, AttentionMixer) and mixer.bidirectional_blocks
-                   for mixer in (kind.mixer or self.mixer for kind in kinds.values()))
+    def block_chunks(self) -> tuple[int | None, ...]:
+        """The attention chunk of each trunk layer that reads a block whole
+        (`AttentionMixer.bidirectional_blocks`), None where a layer has none (`BlockReading`). Each layer's
+        mixer is `_layer_specs`' own, the kind's or the model's layer mixer, so a prediction depth's or the
+        drafter's kind, which the trunk never runs, reads none here."""
+        types = self.per_layer_types
+        kinds = self.layer_kinds(types)
+        default = self.layer_mixer
+        built = [(spec.kind.mixer or default, spec.kind.chunk)
+                 for spec in self._layer_specs(types, kinds, default)]
+        return tuple(chunk for mixer, chunk in built
+                     if isinstance(mixer, AttentionMixer) and mixer.bidirectional_blocks)
 
     @nn.nowrap
     def mixed_admission_refusal(self) -> str | None:
