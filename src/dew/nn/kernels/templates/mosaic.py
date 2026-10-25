@@ -168,13 +168,6 @@ def stored(parts, views, *, smem) -> None:
         plgpu.wait_smem_to_gmem(0)
 
 
-def load_fixed(views: list, refs: list, barriers: list, wg) -> None:
-    """Each operand a tile reads whole (`views`) into this warpgroup's `refs` (`staging`), awaited."""
-    for view, ref, barrier in zip(views, refs, barriers, strict=True):
-        plgpu.copy_gmem_to_smem(view, ref, barrier.at[wg])
-        plgpu.barrier_wait(barrier.at[wg])
-
-
 def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int,
                copy: Callable = plgpu.copy_smem_to_gmem) -> None:
     """Rows `first` to `first + stored` of `o_smem` to `o_gmem` at row `row_start + first` and `column`, in a

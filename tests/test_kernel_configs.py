@@ -198,10 +198,9 @@ a few tiles a group (the kernels' resources do not grow with them)."""
 
 def _gemm_mainloop_cases(generation_name: str) -> list:
     """Each GEMM Mosaic mainloop a `generation_name` GPU runs, at the one tile its launch derives from the
-    generation's facts (`Template.derived`): the forward and the input gradient (`MosaicGmm`, fp32 outputs,
-    which every family stores: `mosaic.Family.stores`), the kernel
-    gradient (`MosaicTgmm`) in bf16 and in fp32 with exact sums, and on warpgroup MMA the forward with an
-    RMS norm's prologue and a bias epilogue and the kernel gradient with the prologue; each a family's
+    generation's facts (`Template.derived`): the forward and the input gradient (`MosaicGmm`), the kernel
+    gradient (`MosaicTgmm`) in bf16 and in fp32 with exact sums, the forward with an RMS norm's prologue
+    and a bias epilogue and the kernel gradient with the prologue, on either family; each a family's
     mainloop only where it takes the call (`Template.eligible`)."""
     from test_gemm_template import biased, normed
 
@@ -260,10 +259,8 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
     cases = _gemm_mainloop_cases(generation_name)
     # Every form the generation's family runs derives a tile at these shapes: an eligibility regression
     # fails here rather than leaving the gate fewer cases.
-    forms = {"forward", "input gradient"}
-    if generation.gpu_target(generation_name).wgmma:
-        forms |= {"kernel gradient", "kernel gradient exact fp32", "normed biased forward",
-                  "normed kernel gradient"}
+    forms = {"forward", "input gradient", "kernel gradient", "kernel gradient exact fp32",
+             "normed biased forward", "normed kernel gradient"}
     assert {case.name.split(" Tiles(")[0] for case in cases} == forms
     found = compile_mosaic_kernels(cases, generation_name)
     unreported = [record["name"] for record in found if not record.get("kernels")]

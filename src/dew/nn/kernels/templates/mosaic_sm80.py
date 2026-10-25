@@ -237,9 +237,11 @@ class Mma(mosaic.Family):
                 slots = Slots(dict(zip(names, refs[:-1], strict=True)))
                 return step(index + lo, slots, carried, accumulators)
 
+            # A tile's blocks staged swizzled for ldmatrix; a side vector's untiled, in whole 16-byte
+            # cp.async chunks.
             specs = [plgpu.BlockSpec(blocks[name][0],
                                      lambda j, lo=lo, index_map=streams.views[name][1]: index_map(j + lo),
-                                     transforms=swizzled(*blocks[name]))
+                                     transforms=swizzled(*blocks[name]) if len(blocks[name][0]) > 1 else ())
                      for name in names]
             carry = plgpu.emit_pipeline(body, grid=(hi - lo,), in_specs=specs,
                                         max_concurrent_steps=streams.pipeline.stages,
@@ -250,8 +252,11 @@ class Mma(mosaic.Family):
         del streams, lo, hi, first, between
 
     def loaded(self, copies) -> None:
+        # Through registers (no TMA before Hopper), in a layout of the tile's rank: a side vector's the
+        # accumulator's column vector layout, a tile's the left operand's.
         for view, ref, _ in copies:
-            ref[...] = plgpu.load(view, layout=self.lhs, optimized=False)
+            layout = self.lhs if len(ref.shape) > 1 else self.column
+            ref[...] = plgpu.load(view, layout=layout, optimized=False)
 
     def stored(self, parts, views, *, smem) -> None:
         del smem
