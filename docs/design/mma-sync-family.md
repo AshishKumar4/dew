@@ -1,167 +1,190 @@
 # The canonical mma.sync Family (design note)
 
-Owner: NecessaryStoat (GEMM templates, the shared Mosaic toolkit). Status: proposed, for review before code.
-Branch: `feat/mma-sync-family`, on J (`feat/mma-sync-bundle` 068be8453).
+Owner: NecessaryStoat (GEMM templates, the shared Mosaic toolkit). Status: revised after review
+(ElatedFrog), for review before code. Branch: `feat/mma-sync-family`, on J (`feat/mma-sync-bundle`
+c5e14d67d).
 
-## 1. Goal
+## 1. Goal and scope
 
-One complete mma.sync Family bundle (`templates/mosaic_sm80.Mma`), the one every template's Ampere-class
-mainloop runs on (sm80, sm86, sm89, sm120). Main's order for this round:
+One complete mma.sync Family bundle (`templates/mosaic_sm80.Mma`): the one every template's Ampere-class
+mainloop runs on. This round: two consumer warpgroups, a collective cp.async pipeline, hooks, the kernel
+gradient (dW), one resource descriptor and one derived launch. It is measured on an A100 and an L4 against
+the frozen Triton route.
 
-1. Two consumer warpgroups.
-2. A collective cp.async pipeline.
-3. Hooks.
-4. The kernel gradient (dW).
-5. One resource descriptor.
-6. One derived launch.
-
-It is measured on an A100 and an L4 against the frozen Triton route.
+Scope is sm80, sm86 and sm89, the parts whose copies are cp.async. On sm120 (consumer Blackwell) JAX picks the
+copy transport by compute capability, not by the MMA family (`pipeline.py:331`, `primitives.py:1088`): cp.async
+only below 9.0. So sm120 takes the TMA path, where `emit_pipeline` keeps refusing collective specs. An
+sm120 mma.sync bundle is a separate item with its own compile gate, not this round's.
 
 Why: R7 (980286df9) measured the one-warpgroup Mosaic mma.sync forward at 1.24x Triton's time (geomean, 1/18
-rows within 1.10). CUTLASS's sm80 default and cuBLASLt's A100 choice for these rows are both 128x256x64 tiles
-with 3 stages over eight warps (PROF1; CUTLASS `default_gemm_configuration.h`, scout CleverRodent). Today mma.sync
-takes no hooks and no dW (`grouped_matmul.py:679`; `MosaicTgmm._families` is wgmma-only), so every hooked or dW
-Ampere call runs Triton.
+rows within 1.10). The best kernels for these rows run eight warps: CUTLASS's sm80 default is 128x256x64 with 3
+stages and 64x64 warp tiles, and cuBLASLt's A100 choice (PROF1) matches it. mma.sync takes no hooks and no dW
+today (`grouped_matmul.py:679`; `MosaicTgmm._families` is wgmma-only).
 
 ## 2. What exists, and what JAX already ships
 
-On J and this branch:
+J (c5e14d67d): `Mma.walk` is `plgpu.emit_pipeline` with `grid=(hi - lo,)`, one call per segment and one
+consumer warpgroup.
+- Commit 490f7a39d had replaced it with Dew's own cp.async ring. That ring waited for `ahead x streams` groups
+  before issuing the step's next copy, so a step could read a slot whose copy was still in flight
+  (`wait_gmem_to_smem(n)` leaves n groups pending).
+- The ring was reverted, and so was the two-warpgroup walk built on it (183c82b93, 5a7971e37).
+- Interpreted accuracy and the ptxas compile gate cannot show such a race. Native accuracy is the only proof.
 
-- `Mma.walk` (490f7a39d) is Dew's own cp.async ring under a `fori_loop`. It runs over segments whose bounds may
-  be traced, which the recurrence template's packed documents need, and it waits out its copies at the end.
-- Two consumer warpgroups (183c82b93, 5a7971e37):
-  - each copies its share of every block's rows (whole 8-row tiles), waits on its own groups and meets the other
-    (`mosaic.meet`);
-  - each stages its output in its share of one collective buffer.
-  - FAM-3 green: interpreted check 1 on sm80, and the sm80/86/89 ptxas compile gate.
-- The wgmma bundle's persistent rings (`mosaic.Ring`, `RingFamily.persist`): a producer warpgroup streams tiles
-  across the persistent loop without draining between tiles.
+JAX's `plgpu.emit_pipeline`, at 0.11.2 and at 0.12 (pyjax012 `jax/_src/pallas/mosaic_gpu/pipeline.py`):
+- Dynamic grids: traced step counts (`has_dynamic_grid`, :321-329, :415-427, :553).
+- cp.async below sm90 (`is_cp_async`, :331, :382, :450).
+- Its schedule is: wait for the step's copy, run `body`, then refill the same slot with step + stages
+  (:457-463, :498-516). It drains at its end.
+- It refuses a BlockSpec with `collective_axes` (:305-309).
+- It allocates its own slots and barriers (:353-388) and takes no external allocation.
 
-JAX 0.12's `plgpu.emit_pipeline` (pyjax012 `jax/_src/pallas/mosaic_gpu/pipeline.py`):
+`emit_pipeline_warp_specialized` (:660) is TMA-based: a producer warpgroup, barriers, one collective axis.
+- It has a pipeline-of-pipelines mode, `pipeline_state=START/STEADY/STOP` with `get_allocations` (:722-738).
+  This mode chains calls without a bubble, quiescing only on STOP (:1202-1214).
+- Limits (:1135-1149): static grids, a step count divisible by the stages, and no `delay_release`.
 
-- It takes dynamic grids: a traced step count (`has_dynamic_grid`, :321-329, :418, :553).
-- It has a cp.async path that waits with `wait_gmem_to_smem` instead of barriers (`is_cp_async`, :382, :450).
-- It refuses a BlockSpec with `collective_axes` (:305-309), so two threads cannot share one step's copy.
-- It drains at its end, so each call is one tile's pipeline.
+## 3. Decision: JAX's pipeline, fixed in the fork where it cannot express the need
 
-`emit_pipeline_warp_specialized` (:660) is TMA-based: a producer warpgroup, barriers, and one collective axis.
-It has no cp.async producer, and sm80 has no TMA.
+Bible §1 and the owner: integrate JAX's machinery where it is as good or better, and fix its gaps in the
+fork.
 
-## 3. Decision: integrate JAX's pipeline; keep our own only where it cannot express the need
-
-Main's rule, bible §1: integrate before building, and fix a gap in JAX's helper in the fork rather than
-duplicating it.
-
-1. **mma.sync walks through `plgpu.emit_pipeline`.**
-   - Each walk is one `emit_pipeline` call per segment.
-   - The grid is `(hi - lo,)`, dynamic where the bounds are traced, and the body offsets its step by `lo`.
-   - `max_concurrent_steps` is the derived stages; the in_specs are the streams' block specs, with
-     `swizzled(...)` transforms and `OOBFillMode.PROMISE_IN_BOUNDS`.
-   - `Mma.walk`'s own ring (490f7a39d) is then deleted.
-   - What is lost: today one walk's segments chain without a drain between them; `emit_pipeline` drains once per
-     segment. The GEMM walks have one segment. The recurrence's chunk walks have one segment a document range.
-     The drain's cost is measured in this round (§7); if it shows, the fix is a fork change to `emit_pipeline`
-     (a carried prologue), not our ring.
-2. **The fork gives `emit_pipeline`'s cp.async path collective copies** (JAX fork, then upstream).
-   - A BlockSpec with `collective_axes=("wg",)` on the cp.async path splits each block's first axis evenly over
-     the axis's threads: whole 8-row tiles of a 2-D block, whole 16-byte chunks of a vector.
-   - Each thread issues and waits on its own share's groups. Then a barrier of the axis's size, one per slot,
-     allocated by the pipeline, completes the step for every thread before the body reads it.
-   - The same barrier orders every thread's reads of a slot before its next refill: each thread arrives after
-     its previous step's reads, in program order.
-   - This is the scheme 183c82b93 implements in Dew today, moved where it belongs. The TMA path keeps its
-     refusal.
-   - Upstream fit: it is the general form of cp.async under warpgroup semantics with several threads, the only
-     way an sm80 kernel can split loads over warpgroups.
-   - Until the fork lands (post24), the branch keeps 183c82b93's walk. It is deleted in the same head that
-     takes the fork pin.
-3. **The wgmma bundle keeps its own persistent rings.**
-   - Measured need: BUNDLE-new against base2 (STATE.md:415) measured the persistent ring at a 0.947 geomean of
-     the per-tile `emit_pipeline_warp_specialized` mainloop's time over the H100 rows: no drain and no refill
-     bubble between a persistent kernel's tiles.
-   - `emit_pipeline_warp_specialized` drains each call, so it cannot stream across tiles.
-   - The ring stays as a named exception (`mosaic.Ring`, `RingFamily`). A fork feature for carrying a
-     warp-specialized pipeline across calls would replace it, which is unknown work, not this round's.
-4. **mma.sync stays per tile**, with no cross-tile streaming: each tile's `emit_pipeline` drains. Streaming
-   across mma.sync tiles would need the cp.async producer JAX lacks. It is a later measurement, not a need yet.
+1. **mma.sync walks through `emit_pipeline`** (J, c5e14d67d). This means one call per segment, a dynamic grid,
+   and the derived stages as `max_concurrent_steps`. A walk's segments each drain. GEMM walks have one segment
+   and the recurrence's have one a document range. The drain's cost is measured in this round (§8).
+2. **The fork gives `emit_pipeline`'s cp.async path collective specs** (JAX fork, then upstream). For a
+   BlockSpec with `collective_axes=("wg",)` on the cp.async path:
+   - **Copy.** The block's first axis splits evenly over the axis's threads: whole 8-row tiles of a 2-D block,
+     whole 16-byte chunks of a vector. Each thread issues its share as one cp.async group a stream a step.
+   - **Ready.** Before `body` reads step s, each thread waits for its own copies of s, then all threads meet
+     at a barrier of the axis's size (the "ready" meet). Past it, every thread's share of slot s has landed.
+   - **Consumed.** JAX's schedule refills slot s right after `body` (:498-516). So before that refill, all
+     threads meet again (the "consumed" meet): every thread has finished reading slot s. One such meet guards
+     each refill.
+   - **Waits.** Per thread, the counts are JAX's own (:450, :562): the prologue fills every stage, and the
+     steady state leaves `(stages - 1) x copies_per_step` groups pending, counted in the thread's own groups.
+   - **End.** A final consumed meet precedes the drain, so a later scope may reuse the slots.
+   - **Allocation.** The pipeline allocates its slots and barriers collectively over `wg`, as the interpreter
+     requires of any threaded scoped allocation.
+   - The TMA path keeps its refusal.
+   - Upstream fit: this is the general cp.async form for warpgroup semantics with several threads, the only
+     way an sm80 kernel splits its loads.
+   - The fork carries the change with its own pipeline test: interpreted, and native on an A100 in the round.
+3. **The wgmma bundle's persistent ring is re-evaluated, not assumed.**
+   - The cited BUNDLE-new/base2 0.947 is a historical whole-head aggregate. Its base already had a cross-tile
+     ring, and its head changed staging and tiles too, so it isolates nothing.
+   - This round measures, at one head and one JAX, the wgmma fixed-depth forward on
+     `emit_pipeline_warp_specialized` in START/STEADY/STOP mode against `RingFamily.persist`. Arms: H100,
+     route rows, time and peak.
+   - The ring stays only where a stated limit forces it: dynamic grouped step counts (static grids only),
+     step counts not divisible by the stages, or the in-flight wgmma release (`delay_release` refused). The
+     note then names that limit and the measurement.
+4. **mma.sync streaming across tiles.** Today each mma.sync tile's `emit_pipeline` drains. The existing
+   alternative is one flattened `emit_pipeline` over (tile, step), carrying the accumulator in `init_carry`,
+   storing and resetting it at tile boundaries while JAX prefetches across them (:320-323, :416-427,
+   :502-529). It is evaluated after the per-tile form is measured. No new producer machinery.
 
 ### Sources the derivation learns from (owner, bible §6)
 
-Use JAX's machinery where it is as good or better: `emit_pipeline` and its warp-specialized form, the fuser,
-and Tokamax. The derivation's rules are learned from what the best kernels choose on each family, and each
-rule cites its source:
+JAX's machinery first, where it is as good or better: `emit_pipeline` and its warp-specialized form, the
+fuser, and Tokamax. Then what the best kernels choose on each family, cited per rule:
 - CUTLASS's builders and schedulers: StageCountAutoCarveout, raster and swizzle, the sm80 defaults.
 - cuBLASLt's heuristic per shape (PROF1).
-- Triton's compiler: how it picks `num_stages`, layouts, and warp specialization (its `AccelerateMatmul`,
-  `Pipeliner` and `WarpSpecialization` passes).
+- Triton's compiler: `num_stages`, layouts and warp specialization (its `AccelerateMatmul`, `Pipeliner` and
+  `WarpSpecialization` passes).
 - ThunderKittens' kernels: tile shapes, producer and consumer counts, and the register split per family.
 
-## 4. Two warpgroups
+## 4. Two warpgroups, and the warp layout that makes eight warps pay
 
-- `Mma.consumers = 2`, with no producer. The kernel names its warpgroups `wg` (`num_threads` 1 or 2), and its
-  scoped allocations are collective (the interpreter's rule).
-- Each consumer computes its share of a tile's rows: the GEMM forward's `mine_rows`, as on wgmma.
-- Registers are 255 a thread either way: 256 threads x 255 fit in 64K.
-- Output staging is one collective buffer per output, `[consumers, rows / consumers, columns]`, each consumer
-  storing through its share.
-- `Tiles` takes `warpgroups=2` on mma.sync: `block_m` in whole 64-row roles, no 256-column cap (that cap is
-  wgmma's N), no cluster.
+- `Mma.consumers = 2`, with no producer.
+  - The kernel names its warpgroups `wg` (`num_threads` 1 or 2), and its scoped allocations are collective.
+  - Each consumer computes its share of a tile: the GEMM forward's `mine_rows`, as on wgmma.
+  - Output staging is one collective buffer per output, each consumer storing through its share.
+  - `Tiles` takes `warpgroups=2` on mma.sync: whole 64-row roles, no cluster.
+- **The register arithmetic shows two warpgroups alone do not reach CUTLASS's tile.** Today's layout puts
+  every warp along M: a warpgroup's 64 rows by the tile's whole width.
+  - For 128x256x64 on two consumers, a thread holds 128 accumulator registers, 16 left-fragment registers,
+    256 right-fragment registers (`rhs_copies = 4`) and 40 held ones: 440, against 255.
+  - Three bf16 stages (147,456 B) plus a whole-tile output staging (65,536 B) is 212,992 B, against the
+    A100's 166,912 B block.
+  - CUTLASS's 64x64 warp tiles split N too: eight warps as 2 x 4. In Mosaic that is the MMA layouts'
+    `m_warps` parameter (warps along M, the rest along N).
+- So the bundle gains:
+  - a warp-arrangement Family fact, warps along M and N, which `held_rows`/`tile_registers` read so each
+    warp's accumulator and right fragments shrink with its share of N;
+  - mma.sync's sub-tiled output staging (`Family.output_columns`), as on wgmma.
+  - The derivation then sees 128x256 at 64 accumulator registers a thread and 32 right-fragment ones, about
+    150 with the rest, and stages it 3 deep within the block. That is CUTLASS's choice, derived and not set.
+  - If Mosaic's mma lowering refuses `m_warps` splits, the fork adds it, with a compile probe first.
 
 ## 5. Hooks and the kernel gradient on mma.sync
 
-- **Hooks.** `_Mosaic.eligible` refuses a hooked call off wgmma (`grouped_matmul.py:679`), and `_hooks_lower`
-  checks Mosaic's WGxWG lowering rules alone (:795). This round:
-  - the forward's prologue on mma.sync: each consumer rewrites its rows of the left stage before its ldmatrix
-    reads. `Family.published` is a no-op here; the store's automatic barriers order it.
-  - the epilogue on the MMA_ACC register layout, its side tiles through `Mma.loaded`.
-  - `_hooks_lower` reads the lowering rules of the family's semantics.
-  - The gate is test_gemm_template's hooked check-1 cases, extended to sm80.
-- **dW (`tgmm`).** The product `xᵀ·dy` reads its left operand transposed out of shared memory. That is
-  ldmatrix.trans on mma.sync. Whether Mosaic GPU's mma.sync lowering takes a transposed left ref is unknown:
-  a compile-only probe through ptxas on the CPU is the first step. If it does not, the fork's lowering adds
-  it, alongside the collective cp.async.
-  - `MosaicTgmm._families` then includes mma.sync. Exact sums stay wgmma-only, since their register check is
-    wgmma's.
+Lifting the eligibility gate is not enough. The hooked paths today assume TMA and 2-D staging:
 
-## 6. One resource descriptor and one derived launch
+- **Fixed side loads.** Forward row-only prologue sides and dW depth-only sides call `mosaic.load_fixed`,
+  which passes a barrier to `copy_gmem_to_smem` (`gemm/mosaic_gpu.py:314-315`, `:522-523`). sm80 rejects that
+  (`primitives.py:1095-1099`). Fixed loads move behind a Family load operation: cp.async plus a wait on mma.sync.
+- **Vector staging.** A 1-D streamed prologue side reaches `Mma.streams -> swizzled`, which reads `shape[1]`.
+  `Mma.loaded` gives every side the 2-D `MMA_LHS` layout. Vectors get their own staging (untiled, 16-byte
+  chunks) and their own load layouts: the row or column vector layout of the accumulator.
+- **Padding.** mma.sync's loads are unpredicated (`bounded_loads = False`). Every row-bearing hook side is
+  padded to the tile's extent, as the left operand is (`gemm/mosaic_gpu.py:277-279`). Today sides pad to 8
+  rows (`_side_padded`, :640-642), so a 17-row call stages 24 rows of side but reads 128. dW's sides pad to
+  `block_k`.
+- **Lowering.** `_hooks_lower` keeps its one WGxWG registry. Both bundles lower with Warpgroup semantics:
+  `plgpu.CompilerParams`' default and `mosaic.compiler_params`.
+- **Checks.** The gate is test_gemm_template's hooked check-1 cases on sm80 with row-only, depth-only and
+  two-axis sides, partial final tiles included, and native on the A100.
+- **dW.** `xᵀ·dy` reads its left operand transposed out of shared memory. Mosaic already lowers a transposed
+  ref load (`lowering.py:1785-1806`, `TransposeTransform`, then the vector load at :1999-2024). The tiled loader
+  takes transposed ldmatrix layouts (`fragmented_array.py:4550-4568`), and `Mma.staged_products` builds a
+  transposed left ref today. The open question is only whether the dW tiling compiles and holds native
+  accuracy, so a ptxas compile probe comes first, with fork work only for a concrete failure.
+  `MosaicTgmm._families` then includes mma.sync.
+- **Exact sums.** These come on mma.sync too. `_walked_gradient`'s exact loop is generic
+  (`running + family.product(...)`). The wgmma-only part is `MosaicTgmm.legal`'s register formula, which is
+  replaced by the shared live-set model (two fp32 accumulators plus Mma's fragments).
 
-- **The descriptor.** Port ledger 1604's launch plan (`mosaic.Scope`, `reserved`, `Plan`; feat/candidates
-  b61cc94a5): one declaration of every allocation a program scopes (rings, output staging, side staging,
-  barriers, reduction scratch).
-  - `staged_bytes` reads it.
-  - `legal` checks it against the block's shared memory (`generation.shared_budget`).
-  - The kernel allocates from it, so the count and the allocation cannot drift.
-  - feat/candidates is pruned once it is ported.
-- **The derivation.** `mosaic_gpu.derived` already reads Family facts. On mma.sync with two consumers it gives
-  an A100, at the R1 rows, 128x256x64 with 3 stages, CUTLASS's and cuBLASLt's choice, from these facts:
-  - `held_rows`: 255 registers over two consumers leaves 64 rows each at 256 columns;
-  - `depths`: 64;
-  - `deepest`: 163 KiB over (128 + 256) x 64 x 2 B is 3 stages;
-  - busy depth 2: mma.sync keeps no product in flight.
-  - On an L4 (99 KiB) it gives fewer stages or a narrower tile, which the measurement checks.
-  - No new constants: a measured miss is corrected as a rule from facts (kernel-templates.md §7).
+## 6. One resource descriptor
 
-## 7. Verification
+Port ledger 1604's launch plan (`mosaic.Scope`, `reserved`, `Plan`; feat/candidates b61cc94a5) for the
+allocations Dew owns: output and side staging, meeting barriers, reduction scratch.
+- `emit_pipeline` allocates its own slots and barriers, shortening its stages for a short static grid (:326-329,
+  :353-388), and it takes no external allocation.
+- So the fork gives plain `emit_pipeline` the allocation-spec entry its warp-specialized form has
+  (`get_allocations`, :820-942).
+- The descriptor then reads the pipeline's allocations from JAX's own builder, not from a copy of its rules.
+- `staged_bytes` and `legal` read the descriptor. feat/candidates is pruned once the port lands.
+
+## 7. One derived launch
+
+`mosaic_gpu.derived` reads Family facts; this round adds the warp arrangement (§4) and mma.sync's sub-tiled
+staging. The claimed A100 result is stated per R1 call after the arithmetic is redone with the full live set,
+`tile_registers` including the fragments. It must not be asserted from the accumulator alone. A measured
+miss is corrected as a rule from facts (kernel-templates.md §7).
+
+## 8. Verification
 
 Bible §8: no local tests. Each step goes to armada, then one GPU round for the whole batch.
 
 - CPU (armada):
-  - test_gemm_template (check 1, hooked cases on sm80, variants);
+  - test_gemm_template (check 1, hooked sm80 cases, variants);
   - test_grouped_gemm, test_kernel_configs (sm80/86/89 compile gates through ptxas), test_moe, test_recurrence;
-  - and, after the fork pin, the fork's own pipeline test for collective cp.async.
-- GPU, one round, A100 and L4:
-  - the GEMM GPU tier;
-  - time against Triton over the route rows (bench_route2, arms mosaic_gpu and triton);
-  - measured peak (tools/peak_memory.py);
-  - the per-segment drain cost (§3.1): a recurrence states walk with one segment against several.
-- Done means: two warpgroups, hooks and dW hold check 1 natively on the A100; the time ratio to Triton is
+  - the fork's pipeline test for collective cp.async.
+- GPU, one round:
+  - A100 and L4: the GEMM GPU tier, the fork's collective pipeline test natively, time against Triton
+    (bench_route2, arms mosaic_gpu and triton), measured peak (tools/peak_memory.py), and the per-segment
+    drain cost (a recurrence walk with one segment against several);
+  - H100: §3.3's ring against START/STEADY/STOP.
+- Done means: two warpgroups, hooks and dW hold check 1 natively on the A100. The time ratio to Triton is
   reported per row, and each row slower than 1.10x is profiled (ncu) as a template defect.
 
-## 8. Alternatives rejected
+## 9. Alternatives rejected
 
-- **Keeping Dew's own cp.async ring for every case.** It duplicates `emit_pipeline`'s cp.async path, which
-  Main and bible §1 rule out.
-- **A producer warpgroup on mma.sync.** cp.async has no async producer in JAX (no TMA on sm80), and CUTLASS's
-  sm80 kernels have none either: their warps load and compute.
-- **Splitting copies by stream instead of by rows** (one warpgroup loads A, the other B). It is unbalanced
-  wherever the blocks differ in size, and the barrier count is the same.
+- **Dew's own cp.async ring.** It duplicated JAX's pipeline and carried a wait race (§2).
+- **A producer warpgroup on mma.sync.** There is no async cp.async producer in JAX, and CUTLASS's sm80 kernels
+  have none either.
+- **Splitting copies by stream** (one warpgroup loads A, the other B). It is unbalanced wherever the blocks
+  differ, and needs the same meets.
+- **Two warpgroups without a warp arrangement.** The register and shared-memory arithmetic in §4 shows it
+  cannot hold CUTLASS's tile.
