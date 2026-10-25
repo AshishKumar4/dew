@@ -423,7 +423,8 @@ def test_a_type_whose_attention_asks_no_interface_runs_its_own_and_reads_no_pack
     with pytest.raises(Lacks):
         loaded.model.apply(loaded.variables, jnp.asarray(ids), segment_ids=jnp.asarray(segments),
                            method="logits")
-    with pytest.raises(ValueError), pytest.warns(TransformersTierWarning):
+    # Refused before the load warns of its tier.
+    with pytest.raises(ValueError):
         Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
 
 
