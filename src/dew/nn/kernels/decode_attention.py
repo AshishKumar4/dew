@@ -261,6 +261,15 @@ RESIDENT = 6
 """Programs a multiprocessor runs at once that a launch fills (`_heuristic`)."""
 
 
+def _variants(programs: int, steps: int, processors: int | None) -> tuple[Split, ...]:
+    """The rule's slices (`_heuristic`), then the counts of its space either side of them (`_space`): the
+    configs an opt-in tuning run times beside it (`tuning.KernelOp.variants`)."""
+    chosen = _heuristic(programs, steps, processors)
+    counts = sorted(split.splits for split in _space(programs, steps, processors))
+    at = counts.index(chosen.splits)
+    return (chosen, *(Split(count) for count in counts[max(at - 1, 0):at + 2] if count != chosen.splits))
+
+
 def _heuristic(programs: int, steps: int, processors: int | None) -> Split:
     """The most slices a launch may take (`_space`) whose programs fill at most `RESIDENT` a
     multiprocessor. A program of `WARPS` warps over `BLOCK` keys a step leaves a multiprocessor room
@@ -315,6 +324,9 @@ class DecodeAttention(tuning.KernelOp):
     def _get_heuristics_config(self, ba) -> Split:
         return _heuristic(*self._launch(ba))
 
+    def variants(self, ba) -> tuple[Split, ...]:
+        return _variants(*self._launch(ba))
+
     @staticmethod
     def _launch(ba) -> tuple[int, int, int | None]:
         """Its programs a slice at its rows' next power of two (`_rows`), a row's steps of the loop, and
@@ -364,6 +376,9 @@ class PagedDecodeAttention(tuning.KernelOp):
 
     def _get_heuristics_config(self, ba) -> Split:
         return _heuristic(*self._launch(ba))
+
+    def variants(self, ba) -> tuple[Split, ...]:
+        return _variants(*self._launch(ba))
 
     @staticmethod
     def _launch(ba) -> tuple[int, int, int | None]:
