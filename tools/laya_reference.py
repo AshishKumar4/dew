@@ -126,7 +126,7 @@ def write_tiny(directory: Path) -> None:
 
 def references(directory: Path, out: Path) -> None:
     """Laya's layouts, logits in fp32 and float64, and agent answers for `directory`."""
-    from diffusers_wan_reference import float64
+    from torch_precision import float64
 
     agent_module, common = _laya()
     agent = agent_module.Agent(str(directory), device="cpu")

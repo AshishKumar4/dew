@@ -20,7 +20,6 @@ transformers 5.16.1, compressed-tensors 0.17.1, diffusers 0.34.0. Run:
     PYTHONPATH=src ~/.cache/dew/reference-venvs/nvfp4-storage/bin/python tools/nvfp4_qdq_reference.py
 """
 
-import copy
 from pathlib import Path
 from unittest.mock import patch
 
@@ -30,7 +29,7 @@ from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
 from compressed_tensors.quantization.lifecycle.forward import forward_quantize
 from compressed_tensors.quantization.utils.helpers import generate_gparam
 from compressed_tensors_mxfp4_reference import TIES
-from diffusers_wan_reference import float64
+from torch_precision import float64
 from nvfp4_storage_reference import ARGS, compress
 from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
@@ -111,7 +110,19 @@ def checkpoint(e4m3: bool) -> None:
         arrays["probe/qdq"] = forward_quantize(module, probe, "input", inputs).numpy()
         arrays["probe/qdq_bf16"] = forward_quantize(module, probe.bfloat16(), "input", inputs).float().numpy()
         arrays["probe/global"] = module.input_global_scale.numpy()
-    exact = copy.deepcopy(model)
+    # The float64 truth read from the same files inside `float64`, so its rotary table is float64's (the
+    # float32 read cast afterwards keeps float32's), the float32 read's decoded weights and quantizer
+    # state loaded into it, its wrappers the same.
+    with float64():
+        exact = AutoModelForCausalLM.from_pretrained(directory, dtype=torch.float64,
+                                                     attn_implementation="eager").eval()
+    # The weights it decodes are bf16 whatever the dtype asked: promoted, which computes nothing a
+    # construction did, before the float32 read's values load into them.
+    torch.nn.Module.double(exact)
+    exact.load_state_dict(model.state_dict(), strict=True)
+    for module in exact.modules():
+        if hasattr(module, "quantization_status"):
+            module.quantization_status = QuantizationStatus.COMPRESSED
     direct_float = torch.Tensor.float
 
     def quantize_wide(module, value, base_name, args):
@@ -126,7 +137,7 @@ def checkpoint(e4m3: bool) -> None:
 
     with float64(), torch.no_grad(), patch(
             "compressed_tensors.quantization.lifecycle.forward.forward_quantize", quantize_wide):
-        arrays["logits_f64"] = torch.nn.Module.double(exact)(ids, use_cache=False).logits.numpy()
+        arrays["logits_f64"] = exact(ids, use_cache=False).logits.numpy()
     for module in model.modules():
         module.quantization_enabled = False
     with torch.no_grad():

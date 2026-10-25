@@ -74,7 +74,7 @@ def test_projection_biases_sum_their_gradients_over_the_batch_as_exactly_as_torc
     import torch
     from transformers import AutoModelForCausalLM
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     directory = FIXTURES / name
     batches = np.random.default_rng(0).integers(0, 256, (4, 64, 128))
