@@ -269,3 +269,41 @@ def test_a_text_only_load_takes_a_checkpoint_without_its_prediction_depth():
                            text_only=True)
     assert text.model.num_nextn_predict_layers == 0
     assert not any(str(name).startswith("mtp_") for name in text.variables["params"])
+
+
+def test_a_text_only_load_keeps_what_the_wrapper_declares_for_its_language_model(tmp_path):
+    """What a wrapper declares at its own scope governs its language model alone: block reading its
+    modeling overrides turn on still admits a future block mate, and its end-of-text id still ends
+    generation; and a vision tensor stored under two disagreeing names, which the full load refuses,
+    is never compared."""
+    import shutil
+
+    from safetensors.numpy import save_file
+
+    from dew.interop import Pretrained
+    from dew.interop.generation_config import eos_ids
+
+    directory = tmp_path / "source"
+    shutil.copytree(FIXTURES / "qwen35-tiny-mm", directory)
+    config = json.loads((directory / "config.json").read_text())
+    config["modeling_overrides"] = {"attention": {
+        "full_attention": "block_bidirectional", "linear_attention": "causal"}}
+    config["eos_token_id"] = 3
+    config["text_config"] = {**config["text_config"], "eos_token_id": None}
+    (directory / "config.json").write_text(json.dumps(config))
+    tensors = load_file(directory / "model.safetensors")
+    spelled = next(name for name in tensors if name.startswith("model.visual."))
+    tensors[spelled.removeprefix("model.")] = tensors[spelled] + 1
+    save_file(tensors, directory / "model.safetensors", metadata={"format": "pt"})
+    with pytest.raises(ValueError):
+        Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    text = Pretrained.load(directory, dtype="float32", attention_impl="reference", text_only=True)
+    ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
+    altered, blocked = ids.at[0, 1].set(7), jnp.asarray([[0, 0, -1, -1]], jnp.int32)
+
+    def first(tokens, groups=None):
+        return np.asarray(text.model.apply(text.variables, tokens, block_groups=groups))[0, 0]
+
+    np.testing.assert_array_equal(first(ids), first(altered))
+    assert np.any(first(ids, blocked) != first(altered, blocked))
+    assert eos_ids(text.config, text.generation_config) == (3,)

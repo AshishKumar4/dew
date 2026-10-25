@@ -397,11 +397,17 @@ def _wrapper_sources(names: Collection[str], read: Callable[[str], np.ndarray], 
 
 def language_model_config(hf_config: Mapping[str, object], record: WrapperFields) -> Mapping[str, object]:
     """The config a wrapper's language model states as its text family's own checkpoint: the text_config
-    typed as the wrapper's text model, with the wrapper's head policy, the storage the wrapper states
-    for it (its quantization and dtype), and its family's causal-LM class where it names none."""
+    typed as the wrapper's text model, with the wrapper's head policy, the dtype the wrapper states for
+    it, and its family's causal-LM class where it names none. What the wrapper declares at its own
+    scope governs its language model over the text_config: its modeling overrides (as
+    `translate_wrapper_config` applies them), and the token ids generation reads at wrapper scope
+    before the text config's (`generation_config`)."""
     text = dict(_text_config(hf_config, record["text_model_type"]))
-    for field in ("quantization_config", "torch_dtype", "dtype"):
+    for field in ("torch_dtype", "dtype"):
         if field in hf_config and field not in text:
+            text[field] = hf_config[field]
+    for field in ("modeling_overrides", "eos_token_id", "pad_token_id", "bos_token_id"):
+        if hf_config.get(field) is not None:
             text[field] = hf_config[field]
     family = families().get(records.text(text["model_type"], "model_type"))
     if family is not None and "architectures" not in text:
@@ -412,8 +418,10 @@ def language_model_config(hf_config: Mapping[str, object], record: WrapperFields
 def language_model_names(names: Collection[str], read: Callable[[str], np.ndarray], record: WrapperFields,
                          checked: Checked = NOTHING_CHECKED) -> dict[str, str]:
     """Each tensor name of a wrapper's language model, as its text family reads it, to the wrapper's
-    name of it (`wrapper_route`); the media towers' names are not among them."""
-    return _wrapper_sources(names, read, record, checked)[0]["language_model"]
+    name of it (`wrapper_route`). The media towers' names are not among them, nor read: only the
+    language model's spellings of one tensor are compared."""
+    own = [name for name in names if wrapper_route(name, record)[0] == "language_model"]
+    return _wrapper_sources(own, read, record, checked)[0]["language_model"]
 
 
 def _text_aliases(names: Collection[str], read: Callable[[str], np.ndarray], config,
