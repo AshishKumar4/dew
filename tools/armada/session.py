@@ -30,12 +30,15 @@ GRACE = 60.0
 
 def pytest_run(python: str, report: Path, *measured: str) -> list[str]:
     """CI's pytest under `python`, as every task runs it: CI's `SELECTION`, failures and errors summarized
-    with short tracebacks, a file that does not collect beside those that do, every thread's stack
-    printed when a test runs ten minutes, unbuffered (-u) so the output holds every test that finished
-    when a run is cut short, and pytest's JUnit report written to `report`."""
+    with short tracebacks, a file that does not collect beside those that do, unbuffered (-u) so the output
+    holds every test that finished when a run is cut short, and pytest's JUnit report written to `report`.
+    No timed dump of every thread's stack runs beside the tests, as walking threads that run killed the
+    process mid-dump (exit 245, a SIGSEGV, in 3 of 5 runs of a multithreaded interpreted kernel's test, Main
+    2026-10-25): a caller's deadline ends a hang (ci.py's `tested`: SIGINT, whose report pytest prints where
+    it can handle it, then the group killed past the grace), and a fatal signal still prints the stacks
+    (pytest's faulthandler)."""
     return [f".venv-{python}/bin/python", "-u", *measured, "-m", "pytest", "-q", *SELECTION, "-rfE",
-            "--tb=short", "--continue-on-collection-errors", "-o", "faulthandler_timeout=600",
-            f"--junitxml={report}"]
+            "--tb=short", "--continue-on-collection-errors", f"--junitxml={report}"]
 
 
 def pytest_environment(environ: Mapping[str, str]) -> dict[str, str]:
