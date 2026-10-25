@@ -901,6 +901,20 @@ def test_restore_preserves_the_optimizer_state_the_ema_and_the_key(tmp_path):
     assert json.loads(position)["index"] == 3
 
 
+def test_a_checkpoint_of_the_retired_rate_scale_and_shape_is_refused(tmp_path):
+    """Before 1.0 a configured rate was held as a scale times a schedule's shape, under
+    `learning_rate_scale` and `learning_rate_shape` in the optimizer's state, where Dew now holds the
+    schedule's own fields (`dew.optim.RateState`). Resuming such a checkpoint is refused (ValueError),
+    even by a run whose state has the same tree, rather than stepping at a rate it no longer forms."""
+    def factory(learning_rate_scale, learning_rate_shape):
+        return optax.sgd(learning_rate_scale * learning_rate_shape)
+
+    retired = optax.inject_hyperparams(factory)(learning_rate_scale=0.1, learning_rate_shape=1.0)
+    make_trainer(tmp_path, optimizer=retired).fit(dataset(), steps=1, log_every=1)
+    with pytest.raises(ValueError):
+        make_trainer(tmp_path, optimizer=retired).place()
+
+
 def _rewrite_position(trainer, step, rows, shares):
     """Save `step` again with `rows` as the checkpoint's position table, each
     row read for the share `shares` names."""
