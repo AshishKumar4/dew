@@ -530,6 +530,8 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
 class ChunkBwdDhu(_Launch):
     """`chunk_bwd_dhu`'s launch (tuning.KernelOp)."""
 
+    revision: int = 2
+
     NAME = "chunk_bwd_dhu"
     KEYS, VALUES = 'k', 'do'
     # Measured at Qwen3.5-0.8B's shape (8 x 3072, 16 heads of 128, bf16), CUPTI, 2026-10-13: 0/64/4/3

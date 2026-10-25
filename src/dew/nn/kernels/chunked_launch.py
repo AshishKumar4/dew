@@ -35,12 +35,42 @@ class Tiles:
     bh: int = 0
 
 
+def _even(batch: int, length: int, count: int) -> jax.Array:
+    """`cu_seqlens` of `count` sequences over `batch` rows of `length` tokens, at least one a row as
+    every packed call's, none crossing a row: each row cut as evenly as its share, the first rows'
+    shares one larger."""
+    shares = [count // batch + (row < count % batch) for row in range(batch)]
+    cuts = [row * length + piece * length // share
+            for row, share in enumerate(shares) for piece in range(share)]
+    return jnp.asarray([*cuts, batch * length], jnp.int32)
+
+
 @dataclasses.dataclass(frozen=True)
 class _Launch(tuning.KernelOp):
     """One of the port's launches, its `Tiles` by activation dtype and GPU block `PICKS`. A subclass names
     its kernel, the arguments whose widths clip its blocks, and its tiles (`_picks`)."""
 
     config_cls: ClassVar[type[Tiles]] = Tiles
+
+    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
+        """Normal floats, and chunk and sequence descriptors (`Sequences`) a timed launch can run: the
+        rows' own where the descriptors count them, else as many sequences within the rows (`_even`)."""
+        arrays = super().operands(specs, seed)
+        batch, length = specs[0].shape[:2]
+        rows = {spec.shape[-1]: spec.shape[0] for spec in specs if spec.dtype == jnp.int32 and spec.ndim == 2}
+        if not rows:
+            return arrays
+        # A launch reads chunk descriptors `[NT, 4]`, sequence ones `[N, 5]` or both: a packed call's
+        # NT is the tokens' chunks and one more for each of its N sequences (`sequences`).
+        chunks, count = rows.get(4), rows.get(5)
+        if chunks in (None, batch * -(-length // 64)) and count in (None, batch):
+            drawn = sequences(batch, length)
+        else:
+            count = chunks - -(-batch * length // 64) if count is None else count
+            drawn = sequences(batch, length, _even(batch, length, count))
+        return [jnp.asarray(drawn.chunks if spec.shape[-1] == 4 else drawn.spans)
+                if spec.dtype == jnp.int32 and spec.ndim == 2 else array
+                for spec, array in zip(specs, arrays, strict=True)]
     NAME: ClassVar[str]
     KEYS: ClassVar[str | None] = None
     VALUES: ClassVar[str | None] = None
