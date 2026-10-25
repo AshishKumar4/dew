@@ -2349,27 +2349,48 @@ class Imaged:
         return {"image": np.resize(tokens % 256, (RES, RES, 3)).astype(np.uint8)}
 
 
-def matrix_data(read: str, cached: bool, rejecting: bool, packed: bool, cache_dir: Path):
-    """One cell of the data matrix compiled for training: records of one to
-    eight tokens, each holding its own id; a filter that rejects every third;
-    a cache filled by the pool; online packing into eight-token windows; then
-    a global shuffle where the order stays indexed and a windowed one where it
-    streams."""
+def matrix_prefix(rejecting: bool):
+    """The data matrix's records, of one to eight tokens each holding its own id, and the filter that
+    rejects every third where the cell has one."""
     from dew.data import Memory
-    from dew.data.cache import Cache
-    from dew.data.compile import compile
     from dew.data.pipeline import Pipeline
 
     records = [{"text": np.full(1 + index % 8, index, np.int32)} for index in range(MATRIX_RECORDS)]
     pipeline = Pipeline(Memory(records, shard_rows=16))
     if rejecting:
         pipeline = pipeline.filter(lambda row: int(row["text"][0]) % 3 != 0, identity="thirds@1")
-    if cached:
+    return pipeline
+
+
+def published_matrix(rejecting: bool, packed: bool, cache_dir: Path):
+    """The matrix prefix's rows published once as a sealed generation (`dew.data.compile.publish`),
+    with the packing plan of its windows where the cell packs: the preparation that makes a filtered or
+    packed read a global order."""
+    from dew.data.cache import Cache
+    from dew.data.compile import publish
+
+    prefix = matrix_prefix(rejecting)
+    return publish(prefix.pack(8, bins=2) if packed else prefix, Cache(str(cache_dir)), read="indexed")
+
+
+def matrix_data(read: str, cached: str, rejecting: bool, packed: bool, cache_dir: Path):
+    """One cell of the data matrix compiled for training: the matrix prefix; a cache the pool fills
+    (`cache`), or the prefix's published generation read in its place (`published`); online packing into
+    eight-token windows (from the published plan where published); then a global shuffle where the order
+    stays indexed and a windowed one where it streams."""
+    from dew.data.cache import Cache
+    from dew.data.compile import compile
+
+    pipeline = matrix_prefix(rejecting)
+    if cached == "cache":
         pipeline = pipeline.cache(Cache(str(cache_dir)))
+    elif cached == "published":
+        pipeline = pipeline.cache(published_matrix(rejecting, packed, cache_dir))
     if packed:
         pipeline = pipeline.pack(8, bins=2)
     pipeline = pipeline.map(Imaged(), identity="imaged@1")
-    indexed = read == "memory" or (read == "indexed" and not (cached or rejecting or packed))
+    indexed = read == "memory" or (read == "indexed" and (cached == "published"
+                                                          or not (cached == "cache" or rejecting or packed)))
     order = pipeline.shuffle(0, window=None if indexed else 8).repeat()
     return compile(order.batch(BATCH), read=read, seed=0,
                    loading=Loading(workers=0, threads=1, read_buffer=1))
@@ -2379,11 +2400,19 @@ def mode_matrix(args) -> dict:
     """Train one cell of the data matrix (`--cell read,cache,rejecting,packed`)
     for `--steps`, from where the run directory's checkpoint left it. `batches`
     is a digest of each batch this process read, in the order it read them."""
+    import jax
+    from jax.experimental import multihost_utils
+
     from dew.data.dataset import tapped
 
     read, cached, rejecting, packed = args.cell.split(",")
-    data = matrix_data(read, cached == "cache", rejecting == "rejecting", packed == "packed",
-                       Path(args.run_dir).parent / "cache")
+    cache_dir = Path(args.run_dir).parent / "cache"
+    if cached == "published":
+        # Published once, before any process reads it, as a preparation job would.
+        if jax.process_index() == 0:
+            published_matrix(rejecting == "rejecting", packed == "packed", cache_dir)
+        multihost_utils.sync_global_devices("matrix generation published")
+    data = matrix_data(read, cached, rejecting == "rejecting", packed == "packed", cache_dir)
     trainer = build_trainer(args.name, args.run_dir, args.fsdp_size)
     restored_step, _ = restored_state(trainer)
     batches = []

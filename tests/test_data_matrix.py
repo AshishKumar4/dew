@@ -54,6 +54,10 @@ ROWS = [
     ("indexed,nocache,all,rows", 4, 1),
     ("indexed,nocache,rejecting,rows", 2, 1),
     ("indexed,nocache,all,packed", 1, 2),
+    # The filtered and the packed read made global by preparation: their rows, and the plan of their
+    # windows, published once and read as a generation.
+    ("indexed,published,rejecting,rows", 2, 4),
+    ("indexed,published,rejecting,packed", 4, 1),
 ]
 
 
@@ -79,6 +83,8 @@ def test_a_saved_position_resumes_where_an_uninterrupted_pool_lands(tmp_path, un
     first = run_pool("matrix", tmp_path / "first", saved_by, run_dir=saved, cell=cell, name="matrix",
                      steps=STEPS, save_every=STEPS)
     elastic = first[0]["lowering"] == "global"
+    # A published generation is the preparation that makes a filtered or packed read global.
+    assert elastic or ",published," not in cell
     for processes in (saved_by, other):
         directory = tmp_path / f"resumed{processes}" / "run"
         shutil.copytree(saved, directory)
