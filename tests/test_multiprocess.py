@@ -1435,3 +1435,15 @@ def test_runs_average_across_a_pool_each_process_its_own_shards(tmp_path):
         for name, got in dumped.items():
             wide = (flat[0][name].astype(np.float64) + flat[1][name].astype(np.float64)) / 2
             np.testing.assert_array_equal(got, wide.astype(np.float32), err_msg=name)
+
+
+@pytest.mark.distributed
+def test_runs_one_process_refuses_are_refused_by_every_process_of_the_pool(tmp_path):
+    """Two runs whose integer counts differ in an entry the first process alone holds: that process
+    refuses them (ValueError), and its peer hears the refusal where the pool agrees on each run
+    (PeerFailure), rather than reading on alone to hang or average."""
+    corpus = document_corpus(tmp_path / "corpus", 24, length=7)
+    reports = run_pool("averaged_refused", tmp_path / "out", 2, run_dir=tmp_path / "runs",
+                       fsdp_size=MESH_DEVICES, tokens=corpus.train, seq_len=7)
+    assert all(report["split"] for report in reports)
+    assert [report["refused"] for report in reports] == ["ValueError", "PeerFailure"]
