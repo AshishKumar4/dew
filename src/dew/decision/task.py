@@ -143,7 +143,9 @@ class DecideSettings:
     segments with it), the special tokens, the text tokenizer's name, and an image processor's
     source, or None."""
 
-    head: JSON
+    head: Mapping[str, object]
+    """The head's class record (`Head.record`), which `Head.from_record` builds over the backbone it reads,
+    its one field the record leaves to the backbone: a record, not a value the settings build."""
     layout: Layout
     specials: Specials
     tokenizer: str | None
