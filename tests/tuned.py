@@ -34,10 +34,10 @@ def fitting(kernel, function, *args) -> list:
 
 def each_config(kernel, function, *args) -> list:
     """Every variant of `kernel` (`KernelOp.variants`) at the keys of the shapes `function(*args)`
-    launches it with, in field order: the configs a tuning run may pick, each of which the kernel's tests
-    hold to the gate."""
-    return sorted({config for ba in launches(function, *args) if type(ba.op) is kernel
-                   for config in ba.op.keyed(ba).autotuning_configs}, key=dataclasses.astuple)
+    launches it with as it traces (no lowering, which an interpreter's ordered callbacks refuse), in
+    field order: the configs a tuning run may pick, each of which the kernel's tests hold to the gate."""
+    return sorted({config for op, ba in _traced(function, *args) if type(op) is kernel
+                   for config in op.keyed(ba).autotuning_configs}, key=dataclasses.astuple)
 
 
 def launches(function, *args) -> list:
