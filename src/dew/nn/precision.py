@@ -63,12 +63,16 @@ def rms_statistics(x: jax.Array, epsilon: float, *, axis=-1, keepdims: bool = Tr
 
 
 def weighted_total(x: jax.Array, weights: jax.Array, axis=None) -> tuple[jax.Array, jax.Array]:
-    """Weighted total and mass along `axis`, in `x`'s dtype. Broadcastable weights mark excluded
-    values with zero; those values are selected away before multiplication, so their NaNs and
-    infinities cannot reach the sum. The caller owns its denominator policy."""
+    """Weighted total and mass along `axis` (an int, a tuple, or None for every axis), in `x`'s
+    dtype, each summed once rounded (`compensated_sum`), so a loss over many tokens rounds as its
+    exact sum does. Broadcastable weights mark excluded values with zero; those values are selected
+    away before multiplication, so their NaNs and infinities cannot reach the sum. The caller owns
+    its denominator policy."""
     weights = jnp.broadcast_to(jnp.asarray(weights, x.dtype), x.shape)
     kept = jnp.where(weights != 0, x, 0)
-    return jnp.sum(kept * weights, axis=axis), jnp.sum(weights, axis=axis)
+    axes = tuple(range(x.ndim)) if axis is None else tuple(
+        dimension % x.ndim for dimension in ((axis,) if isinstance(axis, int) else axis))
+    return compensated_sum(kept * weights, axes), compensated_sum(weights, axes)
 
 
 def biased(product: jax.Array, bias: jax.Array) -> jax.Array:

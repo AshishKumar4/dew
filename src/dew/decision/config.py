@@ -32,12 +32,12 @@ from dew.data.text import HFTokenizer
 from dew.decision.head import DecisionHead, JointSchemaHead
 from dew.decision.laya import LAYA, LayaCheckpoint
 from dew.decision.layout import Framing, Layout, Schema, Segment, default_layout
-from dew.decision.model import ContextEncoder, DecisionModel
+from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
 from dew.nn.backbones.decoder_block import remat_policy
-from dew.nn.cross_attention import CrossAttention
+from dew.nn.cross_attention import ContextEncoder, CrossAttention
 from dew.nn.protocols import RematChoosing
 from dew.records import number, record
 from dew.training.state import TrainState

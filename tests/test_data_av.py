@@ -97,7 +97,8 @@ def test_a_clip_s_frames_and_sound_come_from_the_window_one_draw_picks(media):
     assert len({float(record["clip"][0]) for record in records}) == 8
     for record in records:
         start, stop = record["clip"]
-        assert start >= 2 / FPS and stop <= (CLIP_FRAMES - 2) / FPS and stop - start == pytest.approx(8 / FPS)
+        # The window is written as [start, start + its length] seconds in float64.
+        assert start >= 2 / FPS and stop <= (CLIP_FRAMES - 2) / FPS and stop == start + 8 / FPS
         assert record["video"].shape == (8, 32, 32, 3) and record["video"].dtype == np.uint8
         assert _frame_indices(record["video"]) == [int(FPS * (start + i / FPS) + 1e-5) for i in range(8)]
         assert record["audio"].shape == (12 * SAMPLES_PER_FRAME,) and record["audio"].dtype == np.float32
@@ -174,7 +175,8 @@ def test_a_clip_that_fits_its_window_exactly_is_read(media):
 
     (record,) = _records(chain)
 
-    assert record["clip"].tolist() == pytest.approx([2 / FPS, 10 / FPS])
+    # Twelve frames hold one eight-frame window two frames clear of either end: it starts at the margin.
+    assert record["clip"].tolist() == [2 / FPS, 2 / FPS + 8 / FPS]
     assert _frame_indices(record["video"]) == list(range(2, 10))
     assert record["audio_valid"].all() and _sound_from(record["audio"], 0)
 

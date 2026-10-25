@@ -45,30 +45,31 @@ import torch
 import transformers
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file, save_file
+from torch_precision import float64, float64_twin
 from transformers import AutoConfig
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 RELEASES = {
     "llada-tiny": ("GSAI-ML/LLaDA-8B-Base", "0f2787f2d87eac5eed8a087d5ecd24277e6255b2",
-                   ("configuration_llada.py", "modeling_llada.py"), "AutoModel", False),
+                   ("configuration_llada.py", "modeling_llada.py"), "AutoModel"),
     "dream-tiny": ("Dream-org/Dream-v0-Base-7B", "6572adb5535263e4d1a337b56942ba48b6dee2a9",
                    ("configuration_dream.py", "modeling_dream.py", "generation_utils.py"),
-                   "AutoModel", False),
+                   "AutoModel"),
     "mimo-v2-tiny": ("XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "6a7f202e8dbd0e57b3fe1da03917d08d75abc4b8",
-                     ("configuration_mimo_v2.py", "modeling_mimo_v2.py"), "AutoModelForCausalLM", True),
+                     ("configuration_mimo_v2.py", "modeling_mimo_v2.py"), "AutoModelForCausalLM"),
 }
 """Each fixture's release: the Hub repo, the commit its code is read at, the
-files that code is, the auto class its language model registers as, and
-whether the code pins float32 (MiMo's router casts its logits with
-`.type(torch.float32)`), so its float64 run is built and run under
-`diffusers_wan_reference.float64`, which widens those pins and the rotary
-tables built at init."""
+files that code is, and the auto class its language model registers as. Each
+release's float64 run is built and run under `torch_precision.float64`, which
+widens the pins its code carries (MiMo's router casts its logits with
+`.type(torch.float32)`) and computes the tables its constructor builds (a
+rotary `inv_freq`) in float64."""
 
 
 def released_model(name: str, scratch: Path, draw: bool = False) -> torch.nn.Module:
     """The release's own model class over the fixture's config and weights,
     or, with `draw`, weights it draws and writes as the fixture's."""
-    repo, revision, files, auto, _ = RELEASES[name]
+    repo, revision, files, auto = RELEASES[name]
     directory = scratch / name
     directory.mkdir(parents=True)
     for file in files:
@@ -105,14 +106,12 @@ def main() -> None:
             ids = torch.from_numpy(np.load(FIXTURES / name / "input_ids.npy").astype(np.int64))
             with torch.no_grad():
                 fp32 = model.float()(input_ids=ids).logits.numpy()
-                if RELEASES[name][4]:
-                    from diffusers_wan_reference import float64
-
-                    with float64():
-                        wide = released_model(name, Path(scratch) / "f64").double()
-                        f64 = wide(input_ids=ids).logits.numpy()
-                else:
-                    f64 = model.double()(input_ids=ids).logits.numpy()
+                # Its float64 twin (`float64_twin`), so the rotary tables its constructor computes are
+                # float64's (a float32 build cast afterwards keeps float32's, Dream's `inv_freq`), run
+                # inside `float64`, so a pin its forward carries widens too.
+                wide = float64_twin(model, lambda: released_model(name, Path(scratch) / "f64"))
+                with float64():
+                    f64 = wide(input_ids=ids).logits.numpy()
             if arguments.check:
                 same = np.array_equal(np.load(FIXTURES / name / "logits.npy"), fp32)
                 print(name, "logits.npy bitwise" if same else "logits.npy differs")
