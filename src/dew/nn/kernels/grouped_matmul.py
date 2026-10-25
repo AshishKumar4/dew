@@ -748,10 +748,19 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
                 and (self.EXACT_SUMS or not ba.arguments.get('exact_sums')))
 
     def registers(self, ba, config: mosaic_gpu.Tiles) -> int:
-        # A consumer thread's live set (`mosaic.tile_registers`).
+        # A consumer thread's live set (`mosaic.tile_registers`), and where a prologue rewrites its share of
+        # the rows' stage, that share in fp32 beside the accumulator (ptxas spilled 384 bytes at a normed
+        # 192 x 128 forward and 156 at a normed 128 x 192 kernel gradient the plain estimate held: the
+        # compile gate's H100 run).
         dtype = ba.arguments['tokens'].dtype
-        return mosaic.tile_registers(_bundle(config, dtype), config.warpgroups,
-                                     (config.block_m, config.block_n, config.block_k), dtype)
+        family, block = _bundle(config, dtype), (config.block_m, config.block_n, config.block_k)
+        plain = mosaic.tile_registers(family, config.warpgroups, block, dtype)
+        if ba.arguments['hooks'].prologue is None:
+            return plain
+        # The rows' stage a consumer rewrites: its share of a product's rows by the step, or of a kernel
+        # gradient's depth by the step's rows, `block_m` by `block_k` over the consumers either way.
+        share = config.block_m * config.block_k // config.warpgroups
+        return plain + -(-share // mosaic.THREADS)
 
     def register_budget(self, config: mosaic_gpu.Tiles) -> int:
         # Its family's budget a consumer, whatever the operands' dtype (`mosaic.Family.registers`).
@@ -1180,7 +1189,9 @@ class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
 
     def staged_bytes(self, ba, config: mosaic_tpu.Blocks, target) -> int:
         # Pallas's pipeline holds two of each operand's and output's blocks (one in flight), beside the
-        # fp32 accumulator.
+        # fp32 accumulator; Mosaic TPU holds the rows' block it loads and the product's fp32 tile as
+        # temporaries beside them (a v5e refused 20.33 MiB for a 1024 x 512 x 2048 block the pipeline's
+        # buffers alone counted at 16.00, the compile gate's libtpu run).
         size = jnp.dtype(ba.arguments['tokens'].dtype).itemsize
         hooks = ba.arguments['hooks']
         extents = self.extents(config)
@@ -1189,7 +1200,8 @@ class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
                  + _side_tile_bytes(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes, extents))
         operands = self.loaded(config) * size + sides
         rows, columns = self.output(config)
-        return 2 * (operands + outs * rows * columns) + 4 * rows * columns
+        temporaries = config.block_m * config.block_k * size + 4 * rows * columns
+        return 2 * (operands + outs * rows * columns) + 4 * rows * columns + temporaries
 
     def _lays_out(self, ba, blocks: mosaic_tpu.Blocks) -> bool:
         """Whether Mosaic TPU lays out every side operand's block at `blocks`: a one-dimensional block

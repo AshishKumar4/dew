@@ -232,12 +232,13 @@ GEMM_ROWS, GEMM_DEPTH, GEMM_WIDTH, GEMM_GROUPS = 4096, 2048, 1536, 8
 a few tiles a group (the kernels' resources do not grow with them)."""
 
 
-def _gemm_mainloop_cases(generation_name: str) -> list:
+def _gemm_mainloop_cases(generation_name: str) -> tuple[list, set[str]]:
     """Each GEMM Mosaic mainloop a `generation_name` GPU runs, at the config its launch picks on the
     generation's facts and at its fitting config staging the most shared memory: the forward and the input
     gradient (`MosaicGmm`), the kernel gradient (`MosaicTgmm`) in bf16 and in fp32 with exact sums, and on
     warpgroup MMA the forward with an RMS norm's prologue and a bias epilogue and the kernel gradient with the
-    prologue; each a family's mainloop only where it takes the call (`Template.eligible`)."""
+    prologue; each a family's mainloop only where it takes the call (`Template.eligible`); with the names of
+    the cases whose register estimate passes its budget (a spill the cost model prices)."""
     from test_gemm_template import biased, normed
 
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
@@ -265,7 +266,7 @@ def _gemm_mainloop_cases(generation_name: str) -> list:
          (bf16((rows, depth)), bf16((rows, width)), sizes, (f32((rows,)), f32((depth,)))),
          {**plain, "out_dtype": "float32", "hooks": norm}),
     ]
-    cases = []
+    cases, predicted = [], set()
     with generation.assumed(generation_name):
         target = generation.gpu_target()
         for name, launch, args, options in calls:
@@ -282,7 +283,9 @@ def _gemm_mainloop_cases(generation_name: str) -> list:
                 configured = functools.partial(launch.replace(config=config), **options)
                 cases.append(support.KernelCase(f"{name} {role} {config}",
                                                 lambda configured=configured, args=args: (configured, args)))
-    return cases
+                if launch.registers(ba, config) > launch.register_budget(config):
+                    predicted.add(cases[-1].name)
+    return cases, predicted
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm86", "sm89", "sm90"))
@@ -290,19 +293,31 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
     """Every GEMM Mosaic GPU mainloop a generation runs (`_gemm_mainloop_cases`: warpgroup MMA's forward,
     input and kernel gradients and hooked forms on an H100; mma.sync's forward and input gradient on an
     A100, an A10 and an L4 where this JAX's layout inference places its tiles), at its launch's pick on the
-    generation's facts and at its fitting config staging the most, compiled by Mosaic for a compile-only
-    device of the generation on this CPU through ptxas: within the block's shared memory, no register
-    spilled."""
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+    generation's facts, its fitting config staging the most and the one holding the most registers,
+    compiled by Mosaic for a compile-only device of the generation on this CPU through ptxas: within the
+    block's shared memory, spilling only where the launch's register estimate passes its budget."""
+    from kernel_compile import compile_mosaic_kernels
 
     if not generation.gpu_target(generation_name).wgmma and not mosaic_sm80.staging_solved():
         # A CPU interprets mma.sync's tiles at any JAX; lowered for the GPU, they need its layout inference.
         pytest.skip("this JAX's layout inference places no mma.sync tile but its 128x256 (STAGING_SOLVED)")
-    cases = _gemm_mainloop_cases(generation_name)
+    cases, predicted = _gemm_mainloop_cases(generation_name)
     found = compile_mosaic_kernels(cases, generation_name)
     unreported = [record["name"] for record in found if not record.get("kernels")]
     assert len(found) == len(cases) and not unreported, unreported
-    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+    # A kernel may spill only where its launch's register estimate passes the budget, which the cost
+    # model prices (`Template.spilled`): ptxas's spills are the estimate's evidence.
+    failed = failures([record for record in found
+                       if "error" in record or record["shared"] > record["limit"]])
+    for record in found:
+        for kernel in record.get("kernels", ()):
+            outside = kernel["shared"] > record["limit"] or kernel["tmem"] > record["tmem_limit"]
+            unpredicted = kernel["spilled"] > 0 and record["name"] not in predicted
+            if kernel["unread"] or outside or unpredicted:
+                failed.append(f"{record['name']} {kernel['kernel']}: {kernel['shared']} shared bytes (limit "
+                              f"{record['limit']}), {kernel['spilled']} bytes spilled, "
+                              f"unread {kernel['unread']}")
+    assert not failed, "\n".join(failed)
 
 
 @pytest.mark.parametrize("tpu", ["v5e", "v6e"])
