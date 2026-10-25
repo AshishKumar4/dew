@@ -48,7 +48,6 @@ from dew.interop.decoder_parts import (
     DecoderFields,
     Reading,
     WrapperFields,
-    _refuse_drafter,
     _unread,
     held_parts,
     hf_activation,
@@ -56,6 +55,7 @@ from dew.interop.decoder_parts import (
     record_float,
     record_int,
     refuse,
+    refuse_drafter,
     translated,
 )
 from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout, materialize
@@ -85,7 +85,7 @@ type AttentionResidualsFields = NativeFields[AttentionResiduals]
 def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
     """Translate one registered family's config, refusing any setting Dew does not compute."""
 
-    _refuse_drafter(hf_config)
+    refuse_drafter(hf_config)
     model_type = hf_config.get('model_type')
     # A multimodal repo's config.json is a wrapper whose model_type names the
     # whole model and whose text_config holds the decoder;

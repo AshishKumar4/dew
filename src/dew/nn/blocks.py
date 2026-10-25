@@ -131,16 +131,29 @@ class Modulation(nn.Module):
 class TokenEmbedding(nn.Embed):
     """Token lookup with cotangent accumulation in the parameter dtype."""
 
+    padding_idx: int | None = None
+    """The id whose row this lookup reads but never trains, as torch's `nn.Embedding(padding_idx=...)`
+    leaves it: the row's gradient takes nothing from the places that read that id. A negative id
+    counts from the table's end, as torch counts it; one outside the table is refused. None trains
+    every row it reads."""
+
     def __call__(self, inputs: jax.Array) -> jax.Array:
         if not jnp.issubdtype(inputs.dtype, jnp.integer):
             raise ValueError("Input type must be an integer or unsigned integer.")
         if self.num_embeddings == 1:
             values = jnp.broadcast_to(self.embedding, (*inputs.shape, self.features))
-            promoted, = self.promote_dtype(values, dtype=self.dtype, inexact=False)
-            if promoted is None:
+            rows, = self.promote_dtype(values, dtype=self.dtype, inexact=False)
+            if rows is None:
                 raise ValueError("Embedding dtype promotion must return an array")
-            return promoted
-        return table_rows(self.embedding, inputs, self.dtype or self.embedding.dtype)
+        else:
+            rows = table_rows(self.embedding, inputs, self.dtype or self.embedding.dtype)
+        if self.padding_idx is None:
+            return rows
+        if not -self.num_embeddings <= self.padding_idx < self.num_embeddings:
+            raise ValueError(f"padding_idx {self.padding_idx} is outside the table of "
+                             f"{self.num_embeddings} rows")
+        padding = self.padding_idx % self.num_embeddings
+        return jnp.where((inputs == padding)[..., None], jax.lax.stop_gradient(rows), rows)
 
 
 class FourierEmbedding(nn.Module):

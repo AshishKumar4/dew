@@ -300,7 +300,7 @@ def run_record(directory: str, step: int | str | None = None, trust: Sequence[st
     return SavedRun(_earlier_projectors(record), step)
 
 
-def _earlier_projectors(record: Mapping[str, object]) -> dict[str, object]:
+def _earlier_projectors(record: Mapping[str, object]) -> Mapping[str, object]:
     """Read the earlier Qwen/MiMo merger fields once at the pinned run boundary.
 
     Carried until 1.0 (ledger 1622); current constructors and source codecs accept only their
@@ -308,17 +308,17 @@ def _earlier_projectors(record: Mapping[str, object]) -> dict[str, object]:
     """
     def current(value):
         if isinstance(value, Mapping):
-            result = {key: current(item) for key, item in value.items()}
-            name, fields = result.get("class"), result.get("fields")
+            component = {key: current(field) for key, field in value.items()}
+            name, fields = component.get("class"), component.get("fields")
             if name in ("dew.nn.vision.qwen35:Qwen35Projector", "dew.nn.vision.mimo:MiMoProjector") \
                     and isinstance(fields, dict) and "vision_width" in fields:
                 width, merge = fields.pop("vision_width"), fields.pop("merge_size")
-                result["fields"] = {**fields, "hidden_size": width, "spatial_merge_size": merge,
+                component["fields"] = {**fields, "hidden_size": width, "spatial_merge_size": merge,
                                      "width": width * merge ** 2,
                                      "bias": name == "dew.nn.vision.qwen35:Qwen35Projector"}
-            return result
+            return component
         if isinstance(value, list | tuple):
-            return [current(item) for item in value]
+            return [current(field) for field in value]
         return value
 
     return {**record, "model": current(record["model"])}
