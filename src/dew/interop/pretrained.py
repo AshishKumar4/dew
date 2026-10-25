@@ -58,7 +58,7 @@ from dew.interop.pipeline_assembly import (
     text_components,
 )
 from dew.interop.processors import Processor, hosts
-from dew.interop.safetensors_io import MAX_SHARD_SIZE
+from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, tensor_specs
 from dew.interop.streaming import WeightLayout
 from dew.interop.weights import AUTO, declared_dtype
 from dew.nn.autoencoders import AutoEncoder
@@ -321,7 +321,7 @@ class Pretrained:
              single_file: str | None = None, dduf_file: str | None = None,
              mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
              fallback: str | None = None, weights: bool = True, on_host: bool = False,
-             trust_remote_code: bool = False) -> Self:
+             trust_remote_code: bool = False, text_only: bool = False) -> Self:
         """Load a source as a native Flax model with explicit parameter trees, as the kind of source it is.
 
         `name_or_dir` is a local HF directory or a Hub model ID. Decoder, tower and
@@ -383,6 +383,11 @@ class Pretrained:
         Called on a specific kind (`PretrainedDecoder.load`), it refuses a source of
         another kind and names that kind.
 
+        `text_only=True` loads a multimodal wrapper's language model alone, as its text family's own
+        checkpoint states it (Qwen3.5's `Qwen3_5ForCausalLM`): no tower, projector or audio encoder is
+        built, nor their tensors read, and the source saves as that text checkpoint. A source that is
+        a decoder already loads as it is; a pipeline or a fallback has no language model to take.
+
         Without `weights`, the variables are their shapes and dtypes alone
         (`jax.ShapeDtypeStruct`), read from the source's headers through the same
         translation: what a run that resumes from its own checkpoint builds its state
@@ -407,32 +412,16 @@ class Pretrained:
         directory = sources.snapshot(str(name_or_dir), revision, weights=False)
         # A Hub snapshot directory is named by its commit.
         commit = None if os.path.isdir(name_or_dir) else directory.name
-        if fallback is not None:
-            from dew.interop import torchax_fallback
-            loaded = torchax_fallback.load(name_or_dir, directory, commit, dtype=dtype,
-                                           param_dtype=param_dtype, attention_impl=attention_impl,
-                                           max_seq_len=max_seq_len, weights=weights)
-            loaded = replace(loaded, variables=placed(loaded.variables))
-        elif gguf_file is None:
-            # A selected GGUF file is a decoder, whatever pipeline index the repo also ships.
-            loaded = _pipeline_source(name_or_dir, directory, commit, single_file, dduf_file, placed,
-                                      dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
-                                      streaming=streaming or not weights)
-        else:
-            loaded = None
-        if loaded is None:
-            # Without its weights, a decoder's leaves are translated as streaming translates them, each
-            # a view of its stored tensor that nothing reads.
-            remote = sources.remote_code(name_or_dir, directory) if trust_remote_code else None
-            loaded = _load_native_source(name_or_dir, directory, commit, gguf_file=gguf_file, placed=placed,
-                                         streaming=streaming or not weights, dtype=dtype,
-                                         param_dtype=param_dtype, attention_impl=attention_impl,
-                                         max_seq_len=max_seq_len, weights=weights, remote=remote)
+        loaded, extracted = _loaded_source(name_or_dir, directory, commit, placed, fallback=fallback,
+                                gguf_file=gguf_file, single_file=single_file, dduf_file=dduf_file,
+                                streaming=streaming, weights=weights, dtype=dtype, param_dtype=param_dtype,
+                                attention_impl=attention_impl, max_seq_len=max_seq_len,
+                                trust_remote_code=trust_remote_code, text_only=text_only)
         if not isinstance(loaded, cls):
             raise TypeError(f"{name_or_dir} is a {type(loaded).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
-        return _resident(_published(loaded, name_or_dir, selected=bool(selected)), weights=weights,
-                         placed=streaming or on_host)
+        published = _published(loaded, name_or_dir, selected=bool(selected) or extracted)
+        return _resident(published, weights=weights, placed=streaming or on_host)
 
     @property
     def layouts(self) -> Mapping[str, WeightLayout]:
@@ -850,7 +839,8 @@ def _published[K: Pretrained](loaded: K, name_or_dir: str | Path, *, selected: b
     """`loaded` naming the Hub id it resolved (`origin`) where a reader on any machine loads the
     same weights from that id at `revision`: a Hub load of the repo's own weights. A local
     directory resolves on no other machine, and a payload a selector chose (`gguf_file`,
-    `single_file`, `dduf_file`) is not what a reader of the id alone loads, so neither names one."""
+    `single_file`, `dduf_file`, a wrapper's language model `text_only` took) is not what a reader
+    of the id alone loads, so neither names one."""
     return loaded if loaded.revision is None or selected else replace(loaded, origin=str(name_or_dir))
 
 
@@ -1119,6 +1109,17 @@ def _decoded(tensors: Mapping[str, np.ndarray], config: Mapping[str, object], pa
     return tensors, quantized_tensors, scale_dtype, grid, decoders.checked_groups(aliases)
 
 
+def _language_model_tensors(tensors: Mapping[str, np.ndarray], record: decoder_parts.WrapperFields
+                            ) -> Mapping[str, np.ndarray]:
+    """A wrapper's language model's tensors under its text family's names
+    (`decoders.language_model_names`), each read only when the translation reads it; the media
+    towers' are neither among them nor read."""
+    names = decoders.language_model_names(tensors, tensors.__getitem__, record)
+    specs = tensor_specs(tensors)
+    return LazyTensors({local: specs[name] for local, name in names.items()},
+                       lambda local: tensors[names[local]])
+
+
 def _input_quantization(model: nn.Module, variables: Variables, layouts: tuple[WeightLayout, ...],
                         config: Mapping[str, object], grid: Mapping[str, np.ndarray]
                         ) -> tuple[nn.Module, Variables]:
@@ -1382,12 +1383,52 @@ def _selected_payload(fallback: str | None, **files: str | None) -> list[str]:
     return selected
 
 
+def _loaded_source(name_or_dir: str | Path, directory: Path, commit: str | None,
+                   placed: Callable[[Variables], Variables], *, fallback: str | None, gguf_file: str | None,
+                   single_file: str | None, dduf_file: str | None, streaming: bool, weights: bool, dtype: str,
+                   param_dtype: str, attention_impl: str, max_seq_len: int | None, trust_remote_code: bool,
+                   text_only: bool) -> tuple[Pretrained, bool]:
+    """The source `Pretrained.load` resolved, read by its kind: tier 3 where `fallback` asks, a
+    pipeline, or a natively translated decoder or wrapper (a wrapper's language model alone where
+    `text_only` asks); and whether it is that language model, taken out of its wrapper."""
+    pipeline = (single_file is not None or dduf_file is not None
+                or (gguf_file is None and (directory / "model_index.json").is_file()
+                    and not _names_a_model(directory)))
+    if text_only and fallback is None and pipeline:
+        raise ValueError(f"{name_or_dir} is a diffusion pipeline, which has no language model for "
+                         "text_only to take")
+    if fallback is not None:
+        from dew.interop import torchax_fallback
+        loaded = torchax_fallback.load(name_or_dir, directory, commit, dtype=dtype,
+                                       param_dtype=param_dtype, attention_impl=attention_impl,
+                                       max_seq_len=max_seq_len, weights=weights)
+        loaded = replace(loaded, variables=placed(loaded.variables))
+    elif gguf_file is None:
+        # A selected GGUF file is a decoder, whatever pipeline index the repo also ships.
+        loaded = _pipeline_source(name_or_dir, directory, commit, single_file, dduf_file, placed,
+                                  dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
+                                  streaming=streaming or not weights)
+    else:
+        loaded = None
+    if loaded is None:
+        # Without its weights, a decoder's leaves are translated as streaming translates them, each
+        # a view of its stored tensor that nothing reads.
+        remote = sources.remote_code(name_or_dir, directory) if trust_remote_code else None
+        return _load_native_source(name_or_dir, directory, commit, gguf_file=gguf_file, placed=placed,
+                                   streaming=streaming or not weights, dtype=dtype,
+                                   param_dtype=param_dtype, attention_impl=attention_impl,
+                                   max_seq_len=max_seq_len, weights=weights, remote=remote,
+                                   text_only=text_only)
+    return loaded, False
+
+
 def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | None, *,
                         gguf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
                         dtype: str, param_dtype: str, attention_impl: str,
                         max_seq_len: int | None, weights: bool = True,
-                        remote: Path | None = None) -> Pretrained:
-    """Decode native source weights and bind their processors and export layout.
+                        remote: Path | None = None, text_only: bool = False) -> tuple[Pretrained, bool]:
+    """Decode native source weights and bind their processors and export layout, and whether the
+    bundle is a wrapper's language model taken alone (`text_only`).
 
     Diffusers pipelines and the explicit torchax fallback have already taken
     their own routes; this boundary handles native decoders and media wrappers,
@@ -1402,17 +1443,33 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
     # Before any weight downloads, on the config alone: a format the codec cannot read, a family's
     # refusal, an unregistered decoder checked against transformers (tiers 2 and 3).
     route = source_route(config, remote=remote)
+    # A wrapper's language model alone reads as its text family's checkpoint.
+    language = route.wrapper if text_only and isinstance(route, WrapperRoute) else None
+    if language is not None:
+        if decoders.bundles(config):
+            raise ValueError(f"{family} reads its media bundle whole as one decoder family; text_only "
+                             "takes a wrapper whose language model is its own text family's checkpoint")
+        if source_quantization(config) is not None:
+            raise ValueError("text_only takes an unquantized wrapper: a quantized one's module selection "
+                             "names the wrapper's modules, which its text checkpoint renames")
+        config = decoders.language_model_config(config, language)
+        route = source_route(config, remote=remote)
+    elif text_only and isinstance(route, DiffusionGemmaRoute):
+        raise ValueError("text_only takes a media wrapper's language model; DiffusionGemma's decoder is "
+                         "its whole model")
     if isinstance(route, TorchRoute):
         from dew.interop import torchax_fallback
         loaded = torchax_fallback.load(name_or_dir, directory, commit, dtype=dtype, param_dtype=param_dtype,
                                        attention_impl=attention_impl, max_seq_len=max_seq_len,
                                        admission=route.admitted, weights=weights)
-        return replace(loaded, variables=placed(loaded.variables))
+        return replace(loaded, variables=placed(loaded.variables)), False
     if tensors is None:
         directory = sources.snapshot(str(name_or_dir), directory.name)
         tensors = sources.load_shards(directory)
     if mamba_ssm:
         tensors = mamba2.tensors_from_mamba_ssm(tensors)
+    if language is not None:
+        tensors = _language_model_tensors(tensors, language)
     tensors, quantized_tensors, scale_dtype, grid, checked = _decoded(
         tensors, config, declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype,
         media=isinstance(route, WrapperRoute))
@@ -1462,9 +1519,9 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
                     else None)
 
     if family == "diffusion_gemma":
-        return bundle(PretrainedBlockDecoder)
+        return bundle(PretrainedBlockDecoder), False
     # The masked-diffusion families' records attend both ways and reserve a
     # mask id to denoise; a wrapper's record nests its decoder's.
     if record.get("causal") is False and record.get("mask_token_id") is not None:
-        return bundle(PretrainedMaskedDecoder)
-    return bundle(PretrainedDecoder)
+        return bundle(PretrainedMaskedDecoder), language is not None
+    return bundle(PretrainedDecoder), language is not None

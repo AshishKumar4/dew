@@ -286,6 +286,16 @@ decoded whole on the host first. A source the run trains stays on the host, sinc
 it trains; so does one for a state that lives on the host or keeps its frozen tree whole. A run that
 resumes from its own checkpoint reads no weights.
 
+`Pretrained.load(source, text_only=True)` takes a multimodal wrapper's language model alone, as its
+text family's own checkpoint states it: the wrapper's text config typed as its text model, with the
+wrapper's head policy, dtype, modeling overrides and generation ids, and the language model's tensors
+under the text family's names. No tower, projector or audio encoder is built or read; the bundle is a
+decoder with the tokenizer, saves as that text checkpoint, and names no Hub origin, since the id alone
+loads the wrapper. A decoder or a fallback source is text already and loads as it is. A diffusion
+pipeline, a family that reads its media bundle as one decoder (DeepSeek-V4.1), and a quantized wrapper
+are refused. A checkpoint that holds none of the prediction depths its config names loads as its trunk,
+with or without `text_only`; one holding some of them must hold all.
+
 Serving is one engine of kinds (`dew.inference.Engine`). A kind (`Kind`) admits waiting requests
 within its own bounds, runs them with one bounded device call a `step`, and settles each request's
 `Timed` future. The engine steps each busy kind once a turn from one thread, so a long queue of one
