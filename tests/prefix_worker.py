@@ -21,6 +21,7 @@ def mode_prefix_generation(args) -> dict:
     import jax.numpy as jnp
     from block_support import model as block_model
 
+    from dew.coordination import PeerFailure
     from dew.inference import TextGeneration
     from dew.inference.pipeline import place
     from dew.nn.inputs import ModelInputs, mesh_of
@@ -49,7 +50,8 @@ def mode_prefix_generation(args) -> dict:
     own = share(np.arange(len(prompts)))
     try:
         task(ModelInputs(jnp.asarray(prompts[own]), {"attention_mask": jnp.asarray(mask[own])}), 3, key=7)
-    except ValueError:
+    # One process refuses the request itself; a pool's ranks each raise the refusal its agreed check names.
+    except (ValueError, PeerFailure):
         refused = True
     else:
         refused = False
