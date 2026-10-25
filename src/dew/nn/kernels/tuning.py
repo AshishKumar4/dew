@@ -665,15 +665,21 @@ def measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None, *,
     first run, which it reads before the next config runs (they are freed
     after), so a caller checking them compiles nothing more and holds one
     config's outputs at a time; `configs`, the configs to time where not every
-    one (a sweep's sample of them); `gpu`, held around each config's runs (and
-    the flush's), where processes beside this one time on the same GPU (a
-    sweep's lock: their compiles run beside these runs, never their launches);
+    one (a sweep's sample of them); `gpu`, held around every device operation
+    of the measurement (its operands' and flush's placement, each config's runs
+    and output reads, CUPTI's detaching read), where processes beside this one
+    time on the same GPU (a sweep's lock: their compiles run beside these runs,
+    never their device work);
     `compilers`, the threads compiling (every CPU's where unsaid)."""
     if profiler is None:
         from jax.experimental.mosaic.gpu import profiler
 
-    arrays, fill = materialized(op, ba, arrays)
-    flush = jnp.zeros(FLUSH_BYTES // 4, jnp.float32)
+    # Every device operation of a measurement runs under `gpu`, host compiles outside it.
+    with gpu():
+        arrays, fill = materialized(op, ba, arrays)
+        # A caller's host arrays are placed once here, never again in each run.
+        arrays = jax.block_until_ready(jax.device_put(arrays))
+        flush = jax.block_until_ready(jnp.zeros(FLUSH_BYTES // 4, jnp.float32))
     evicting = jax.jit(jnp.sum).lower(flush).compile()
 
     def compiled(config):
@@ -712,9 +718,10 @@ def measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None, *,
                     (_, launched), first = cupti.measure(executable, aggregate=False)(flush, arrays)
                     runs = [first if isinstance(first, list) else [],
                             *(_kernel_times(cupti, executable, flush, arrays) for _ in range(REPEATS - 1))]
-                if outputs is not None:
-                    outputs(config, launched)
-                del launched
+                    if outputs is not None:
+                        # Its read to the host is the device's work too.
+                        outputs(config, launched)
+                    del launched
             except jax.errors.JaxRuntimeError as error:
                 if not _resource_exhausted(error):
                     raise
@@ -726,7 +733,8 @@ def measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None, *,
             raise
         return Timings(dict.fromkeys(timed, error))
     finally:
-        _detach(profiler, evicting, flush)
+        with gpu():
+            _detach(profiler, evicting, flush)
         # Every config measured before an exit, a failed one's or another subscriber's too, is logged.
         observed(op, ba, {**timings, **_benchmarks(read, flushes)}, get_default_device())
     return Timings({**timings, **_benchmarks(read, flushes)})

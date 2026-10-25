@@ -38,18 +38,21 @@ SHAPES = {
 PRODUCTS = ("forward", "input_gradient", "kernel_gradient", "kernel_gradient_fp32")
 
 
-def operands(rows: int, depth: int, width: int, groups: int):
-    """The rows, each group's matrix, the cotangent and the group sizes, drawn as the fixture's were."""
+def operands(rows: int, depth: int, width: int, groups: int, *, host: bool = False):
+    """The rows, each group's matrix, the cotangent and the group sizes, drawn as the fixture's were: on the
+    device, or as host arrays where `host` (a process that places them under the GPU's lock,
+    `tuning.measured`)."""
     import jax.numpy as jnp
     import numpy as np
 
     rng = np.random.default_rng(0)
-    x = jnp.asarray(rng.normal(size=(rows, depth)), jnp.bfloat16)
-    w = jnp.asarray(rng.normal(size=(groups, depth, width)) / np.sqrt(depth), jnp.bfloat16)
-    dy = jnp.asarray(rng.normal(size=(rows, width)), jnp.bfloat16)
+    placed = (lambda array, dtype: np.asarray(array).astype(dtype)) if host else jnp.asarray
+    x = placed(rng.normal(size=(rows, depth)), jnp.bfloat16)
+    w = placed(rng.normal(size=(groups, depth, width)) / np.sqrt(depth), jnp.bfloat16)
+    dy = placed(rng.normal(size=(rows, width)), jnp.bfloat16)
     sizes = np.floor(rng.dirichlet(np.ones(groups) * 2) * rows).astype(np.int32)
     sizes[-1] += rows - sizes.sum()
-    return x, w, dy, jnp.asarray(sizes)
+    return x, w, dy, placed(sizes, np.int32)
 
 
 def references(x, w, dy, sizes) -> dict:
@@ -87,13 +90,14 @@ def _checking(want, errors: dict[str, float]):
     return check
 
 
-def _record(name: str, product: str, implementation: str):
-    """A record's launch, its bound key, its call's arrays and options, from the fixture's own draw."""
+def _record(name: str, product: str, implementation: str, *, host: bool = False):
+    """A record's launch, its bound key, its call's arrays and options, from the fixture's own draw (host
+    arrays where `host`)."""
     import jax
 
     from dew.nn.kernels import grouped_matmul as gm
 
-    x, w, dy, sizes = operands(*SHAPES[name])
+    x, w, dy, sizes = operands(*SHAPES[name], host=host)
     if product == "forward":
         launches, call, options = (gm.MosaicGmm(), gm.Gmm()), (x, w, sizes), {"trans_rhs": False}
     elif product == "input_gradient":
@@ -116,7 +120,8 @@ def _part(name, product, implementation, sample, part, parts, lock, wanted, resu
 
     from dew.nn.kernels import generation, tuning
 
-    launch, ba, call = _record(name, product, implementation)
+    # Host arrays: their placement on the device is the measurement's, under the lock.
+    launch, ba, call = _record(name, product, implementation, host=True)
     want = np.load(wanted, mmap_mode="r")
     target = generation.gpu_target()
     configs = list(sampled(launch, ba, target, sample) or launch.fitting(ba, target))
