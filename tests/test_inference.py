@@ -557,8 +557,9 @@ def test_an_lm_run_over_a_sources_own_processor_reloads_that_processor(tmp_path,
     run = tmp_path / "run"
     checkpoints = Checkpoints(str(run), keep=1)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0), checkpoints=checkpoints)
-    state = trainer.fit(Loader(train=lambda partition: Replaying(lambda position: batch), val=None, records=None,
-                               batch=8), steps=1, log_every=100, checkpoint_every=1)
+    state = trainer.fit(Loader(train=lambda partition: Replaying(lambda position: batch),
+                               val=None, records=None, batch=8),
+                        steps=1, log_every=100, checkpoint_every=1)
     checkpoints.wait()
     if earlier:
         record = {**objective.inference_record(), "processor": str(source)}

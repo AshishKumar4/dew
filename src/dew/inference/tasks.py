@@ -298,6 +298,14 @@ def run_record(directory: str, step: int | str | None = None, trust: Sequence[st
     if stray:
         raise ValueError(f"this {objective.__name__} run records fields its objective does not write: "
                          f"{sorted(stray)}")
+    if isinstance(record.get("processor"), str):
+        # The source identity was an encoded string before typed component references.
+        # Kept once at this pinned boundary until 1.0 (ledger 1637).
+        from dew.interop.sources import SourceReference
+        from dew.registry import to_record
+
+        record = {**record, "processor": to_record(SourceReference.parse(record["processor"]),
+                                                   SourceReference)}
     return SavedRun(record, step)
 
 
