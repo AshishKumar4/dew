@@ -5,6 +5,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A filtered or packed read resumes on any number of readers once it is prepared: publish its rows (and
+  a terminal pack's plan) as a generation with `dew data publish` and read it by index, and a new run
+  lowers to the global order. A per-share read refused on another topology now says so.
 - A causal attention kind may read blocks whole: `AttentionMixer(bidirectional_blocks=True)` lets
   each token of a block (`block_groups=`, `AttentionMetadata.block_groups`, `[B, S]`, -1 outside
   any) see its whole block, whatever its window, as transformers' `block_sequence_ids` does, while
