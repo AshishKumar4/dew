@@ -138,7 +138,7 @@ Hybrid sharding keeps fsdp inside a node and replicates across nodes, so only on
 ```python
 import jax
 from dew import Trainer
-from dew.config import OptimConfig
+from dew.optim import OptimConfig
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec

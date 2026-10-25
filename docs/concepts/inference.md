@@ -14,7 +14,7 @@ import numpy as np
 
 from dew import Trainer
 from dew.data.dataset import Loader
-from dew.config import OptimConfig
+from dew.optim import OptimConfig
 from dew.data import ByteTokenizer
 from dew.inference import RunProcessor
 from dew.nn.backbones import CausalTransformer

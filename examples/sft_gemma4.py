@@ -28,7 +28,7 @@ import jax
 import jax.numpy as jnp
 import tyro
 
-from dew.config import OptimConfig, TrainerConfig
+from dew.config import TrainerConfig
 from dew.config.lm import LMRunConfig
 from dew.data import HFTokenizer, Loading, presets
 from dew.data.chat import Role
@@ -36,6 +36,7 @@ from dew.data.sources import Read, source as data_source
 from dew.inference import RunProcessor
 from dew.interop import PretrainedDecoder
 from dew.objectives.lm import LMObjective, Perplexity, Samples
+from dew.optim import OptimConfig
 from dew.registry import ModelConfig
 from dew.state import TrainState
 from dew.training import MeshSpec, prepare_process

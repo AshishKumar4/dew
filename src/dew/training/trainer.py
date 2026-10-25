@@ -169,7 +169,7 @@ from dew.training.transaction import Committed, Transaction, compact_qk, outcome
 _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from dew.config import OptimConfig
+    from dew.optim import OptimConfig
     from dew.telemetry.profile import Profiler
 
 StepFn = Callable[[TrainState, Batch], tuple[TrainState, jax.Array, Aux]]

@@ -13,6 +13,7 @@ backend is imported when the first value is logged into it.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import hashlib
 import io
@@ -789,3 +790,17 @@ class Trackers(_OwnedTracker):
         if exc is None and error is not None:
             raise error
 
+
+@dataclasses.dataclass(frozen=True)
+class Wandb:
+    """Where a run reports to Weights & Biases.
+
+    Setting it turns tracking on; the entity and the offline switch have no effect
+    without a project. `name` is the run's display name there, apart from the name
+    its checkpoints are kept under; None shows it as the run is named.
+    """
+
+    project: str
+    entity: str | None = None
+    offline: bool = False
+    name: str | None = None

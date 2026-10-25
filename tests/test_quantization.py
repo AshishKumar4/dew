@@ -24,7 +24,7 @@ from flax import linen as nn
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference, assert_fp32_reduction_bound
 from token_support import token_rows
 
-from dew.config import ObjectiveConfig, OptimConfig
+from dew.config import ObjectiveConfig
 from dew.lora import _updated as lora_update
 from dew.nn.attention_residuals import depth_mixed
 from dew.nn.blocks import torch_bicubic_resize
@@ -35,6 +35,7 @@ from dew.nn.sharding import pipeline_microbatches
 from dew.nn.ssm import diagonal_recurrence
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
+from dew.optim import OptimConfig
 from dew.quantization import UNQUANTIZED, Quantization, quantize_for_serving, quantize_with
 from dew.registry import models
 from dew.training.distributed import Layout, MeshSpec, shard_batch
