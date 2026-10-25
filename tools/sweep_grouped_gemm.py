@@ -108,7 +108,7 @@ def main() -> None:
                 ba = launch.bind(*specs, **options)
                 if not launch.eligible(ba, target):
                     continue
-                # Each config's outputs from its first timed run (`tuning.measured`): checked with no compile of their own.
+                # Each config's outputs from its first timed run (`tuning.measured`), checked with no compile.
                 outputs: dict = {}
                 timings = tuning.measured(launch, ba, arrays=list(call), outputs=outputs)
                 times, failures, errors = {}, {}, {}
