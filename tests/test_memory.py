@@ -56,7 +56,7 @@ def layer(name: str, dtype=jnp.float32) -> InContextMemory:
     return InContextMemory(heads=HEADS, head_features=FEATURES, dtype=dtype, **fields)
 
 
-def written(module: InContextMemory, *, dtype, segments=None):
+def written(module: InContextMemory, *, dtype, segments=None, gradient=None):
     """The paper's update as a function of the stream, token by token, in `dtype` (float64 for the
     truth): the views and gates from the layer's projections, the state in at least float32, each
     gradient at its chunk's start counted from its document's first token (`segments` `[S]`, one
@@ -82,7 +82,8 @@ def written(module: InContextMemory, *, dtype, segments=None):
                 (head0, jax.tree.map(jnp.zeros_like, head0), head0, 0), (state, momentum, start, place))
             start = jax.tree.map(lambda w, s: jnp.where(place % module.chunk == 0, w, s), state, start)
             target = v_t if module.target == "given" else grad_net.apply({"params": start}, v_t)
-            g = jax.grad(lambda held: module.objective(grad_net.apply({"params": held}, k_t), target))(start)
+            g = (jax.grad(lambda held: module.objective(grad_net.apply({"params": held}, k_t), target))(start)
+                 if gradient is None else gradient(module.objective, grad_net, start, k_t, target))
             momentum = jax.tree.map(lambda s, gl: mu_t * s - theta_t * gl, momentum, g)
             state = jax.tree.map(lambda w, s: (1 - alpha_t) * w + s, state, momentum)
             cast = jax.tree.map(lambda leaf: leaf.astype(dtype), state)
@@ -223,6 +224,24 @@ def test_a_zero_step_reads_the_initial_network():
 
     assert_as_exact(applied(module), jax.jit(initial), drawn(module), "zero-step memory", seeds=MEMORY_SEEDS,
                     truth_fn=initial)
+
+
+def test_an_orthogonalized_step_follows_the_paper_with_muons_iteration():
+    """With `orthogonalize`, each matrix of a token's gradient steps as Muon's quintic Newton-Schulz of it
+    (`dew.optim.newton_schulz`, Nested Learning Sec 4.2) and its vectors as they are: the layer is the
+    paper's update with that map applied to its gradients, on par against float64 (check 1)."""
+    from dew.optim import newton_schulz
+
+    module = layer("titans").clone(orthogonalize=5)
+
+    def gradient(objective, network, start, k, target):
+        """The paper's gradient with Muon's map on each matrix, in the reference's own precision."""
+        g = jax.grad(lambda held: objective(network.apply({"params": held}, k), target))(start)
+        return jax.tree.map(lambda leaf: newton_schulz(leaf, 5) if leaf.ndim == 2 else leaf, g)
+
+    assert_as_exact(applied(module), written(module, dtype=jnp.float32, gradient=gradient), drawn(module),
+                    "orthogonalized memory", seeds=MEMORY_SEEDS,
+                    truth_fn=written(module, dtype=jnp.float64, gradient=gradient))
 
 
 def decoder(**fields):
