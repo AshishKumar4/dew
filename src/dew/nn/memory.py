@@ -227,7 +227,7 @@ class InContextMemory(nn.Module):
         def drawn(key: jax.Array) -> dict:
             keys = jax.random.split(key, self.heads)
             example = jnp.zeros((1, features), jnp.float32)
-            return jax.vmap(lambda one: network.init(one, example)["params"])(keys)
+            return jax.vmap(lambda one: dict(network.init(one, example)["params"]))(keys)
 
         return self.param("initial", drawn)
 
@@ -268,24 +268,29 @@ class InContextMemory(nn.Module):
 
     # The function, token by token and chunk by chunk.
 
+    def _applied(self, state: dict, x: jax.Array, *, wide: bool) -> jax.Array:
+        """The inner network at parameters `state` over one token's vector `x`."""
+        out = self._inner(wide=wide).apply({"params": state}, x)
+        if not isinstance(out, jax.Array):
+            raise TypeError(f"an in-context memory's network maps a vector to one, got {type(out).__name__}")
+        return out
+
     def _gradient(self, state: dict, key: jax.Array, target: jax.Array) -> dict:
         """One head's gradient of the objective at `state` for one token, in the state's precision."""
-        network = self._inner(wide=True)
-        return jax.grad(lambda held: self.objective(network.apply({"params": held}, key), target))(state)
+        return jax.grad(lambda held: self.objective(self._applied(held, key, wide=True), target))(state)
 
     def _target(self, state: dict, value: jax.Array) -> jax.Array:
         """A token's target: its value view, or the network's image of it at `state` (Nested Learning
         Eq 84), held fixed in the inner gradient."""
         if self.target == "given":
             return value
-        return jax.lax.stop_gradient(self._inner(wide=True).apply({"params": state}, value))
+        return jax.lax.stop_gradient(self._applied(state, value, wide=True))
 
     def _read(self, state: dict, query: jax.Array) -> jax.Array:
         """One head's readout of a token at `state`, at the layer's dtype."""
         dtype = self.dtype or query.dtype
-        network = self._inner(wide=False)
         cast = jax.tree.map(lambda leaf: leaf.astype(dtype) if self.dtype is not None else leaf, state)
-        return network.apply({"params": cast}, query.astype(dtype))
+        return self._applied(cast, query.astype(dtype), wide=False)
 
     def _token(self, carry: tuple, step: tuple) -> tuple:
         """One token's update and readout over every row and head: the definition."""
