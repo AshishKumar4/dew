@@ -75,7 +75,7 @@ from dew.sampling.text import Sampling
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
-    from dew.interop.torchax_fallback import Admitted
+    from dew.interop.torchax_fallback import TorchAdmission
     from dew.lora import Adapter, LoRA
     from dew.nn.cross_attention import CrossAttention
     from dew.training.distributed import Layout, MeshSpec
@@ -1225,7 +1225,7 @@ class TorchRoute:
     """An unregistered causal LM no registered convention computes, run as transformers' own forward
     by torchax (tier 3, `dew.interop.torchax_fallback`), `admitted` the decision that it runs."""
 
-    admitted: Admitted
+    admitted: TorchAdmission
 
 
 type SourceRoute = DecoderRoute | WrapperRoute | DiffusionGemmaRoute | VerifiedRoute | TorchRoute
@@ -1236,7 +1236,7 @@ type SourceRoute = DecoderRoute | WrapperRoute | DiffusionGemmaRoute | VerifiedR
 def source_route(config: Mapping[str, object], *,
                  verified: Callable[[Mapping[str, object]], verify.VerifiedMapping | verify.Unmapped]
                  = verify.verify_mapping,
-                 admitted: Callable[[verify.Unmapped], Admitted] | None = None) -> SourceRoute:
+                 admitted: Callable[[verify.Unmapped], TorchAdmission] | None = None) -> SourceRoute:
     """The route `Pretrained.load` reads `config`'s source by, or the refusal it raises for it, on the
     config alone: a storage format the codecs cannot decode, a registered family's or wrapper's own
     refusal of the config, a speculative drafter of any model_type (`decoder_parts.DrafterRefused`),

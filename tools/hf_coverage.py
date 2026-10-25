@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from dew.interop.torchax_fallback import Admitted
+    from dew.interop.torchax_fallback import TorchAdmission
     from dew.interop.verify import Unmapped, VerifiedMapping
 
 
@@ -126,9 +126,9 @@ def classify(out: Path) -> None:
     from dew.interop import verify
 
     probed: dict[tuple[str, str], VerifiedMapping | Unmapped | tuple[type[Exception], tuple]] = {}
-    admissions: dict[tuple[str, str], Admitted | tuple[type[Exception], tuple]] = {}
+    admissions: dict[tuple[str, str], TorchAdmission | tuple[type[Exception], tuple]] = {}
 
-    def admitted(unmapped: Unmapped) -> Admitted:
+    def admitted(unmapped: Unmapped) -> TorchAdmission:
         """`torchax_fallback.admitted`, once per shrunken config (`_probed`), its decision or its refusal
         reused after as `verified` reuses its own."""
         from dew.interop import torchax_fallback

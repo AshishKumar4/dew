@@ -85,7 +85,7 @@ def _summary(reasons: Mapping[str, str], shown: int = 3) -> str:
 
 
 @dataclass(frozen=True)
-class Admitted:
+class TorchAdmission:
     """An unregistered causal LM no registered convention computes that tier 3 runs (`admitted`):
     its model_type, and why each convention did not compute it (`verify.Unmapped.reasons`)."""
 
@@ -93,7 +93,7 @@ class Admitted:
     reasons: Mapping[str, str]
 
 
-def admitted(unmapped: verify.Unmapped) -> Admitted:
+def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
     """Tier 3's decision on an unregistered model_type no registered convention computes, on the
     probe's shrunken config with random weights (`verify.scatter_weights`), before any weight
     downloads: transformers builds the type as a causal LM (`AutoModelForCausalLM`); its forward is
@@ -154,7 +154,7 @@ def admitted(unmapped: verify.Unmapped) -> Admitted:
         raise ValueError(f"model_type {model_type!r}'s training forward draws on the host ({draws.host} "
                          "draws, BioGPT's layer drop among them), which a traced step would fix for every "
                          "step, and tier 3 trains the models it loads")
-    return Admitted(model_type, dict(unmapped.reasons))
+    return TorchAdmission(model_type, dict(unmapped.reasons))
 
 
 def _position_dependent_rope(config: PretrainedConfig) -> str | None:
@@ -669,7 +669,7 @@ def _refuse_packing(packing: Mapping[str, object]) -> None:
 
 def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtype: str,
          param_dtype: str, attention_impl: str, max_seq_len: int | None,
-         admission: Admitted | None = None) -> PretrainedFallback:
+         admission: TorchAdmission | None = None) -> PretrainedFallback:
     """Load `directory`'s causal LM through transformers and torchax.
 
     `directory` is the metadata snapshot `Pretrained.load` resolved and
