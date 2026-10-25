@@ -172,6 +172,8 @@ The metrics you pass are evaluated together, on the same weights. If a callable 
 
 `Plateau` stops the run after `evals` eligible evaluations without an improvement, and it counts evaluations, not training steps. An improvement must exceed `min_delta`, an absolute amount in the selected direction. Missing scores do not advance the patience count, and a non-finite objective validation loss is an error. The patience count and its policy are stored in the checkpoint metadata, so resuming with the same policy continues the same count. Resuming with a changed policy is refused. Stopping writes a final full checkpoint and reports "Stopped: validation plateau", and the checkpoint's control metadata records the reason. Nothing is added to `TrainState`.
 
+`Pause(fraction)` stops the run at that fraction of its budget instead, at the whole update nearest it (or the first update whose tokens reach it), which falls between the first update and the budget's end. It writes the whole state and the data position, even where the step also ranks a best kept as weights alone, and the budget still sizes the learning-rate schedule, so the run fitted again without the pause (`stop=None`) trains on as one that never paused. Fitted again with the same pause, the run is already there and trains nothing.
+
 The readers that take a step, such as `restore` and `from_run`, also accept best selectors. `"best"` chooses the first tracker's best step, and `"best:val/clip_score"` chooses the best step of the tracker for that metric. An aggregate is named by its position, such as `"best:aggregate:0"`.
 
 <!-- not run: a fragment of a long diffusion run; its trainer, data, metrics and directory are the run's -->

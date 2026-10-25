@@ -19,7 +19,7 @@ import socket
 import sys
 import threading
 import types
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import TYPE_CHECKING, Literal, overload
 
 import jax
@@ -204,6 +204,21 @@ def agreed[T](phase: str, operation: Callable[[], T]) -> T:
     the next collective. The peers raise `PeerFailure`; the failing rank
     re-raises its own error. On one process this is a plain call.
     """
+    return agreed_count(phase, operation, lambda _: True)[0]
+
+
+def agreed_next[T](phase: str, stream: Iterator[T]) -> T | None:
+    """`stream`'s next item, read on every rank and agreed (`agreed`), or None where it has ended on
+    every rank; refused on all of them where it ended on some and not the others."""
+    read, ended = agreed_count(phase, lambda: next(stream, None), lambda read: read is None)
+    if 0 < ended < jax.process_count():
+        raise ValueError(f"{phase}: the stream ended on {ended} of {jax.process_count()} processes and the "
+                         "others read on: each process's stream must hold as many items")
+    return read
+
+
+def agreed_count[T](phase: str, operation: Callable[[], T], counted: Callable[[T], bool]) -> tuple[T, int]:
+    """`agreed`, with how many ranks' outcomes `counted` holds for, learned in the same round."""
     held: tuple[T] | None = None
     error: BaseException | None = None
     try:
@@ -211,13 +226,13 @@ def agreed[T](phase: str, operation: Callable[[], T]) -> T:
     except BaseException as failure:
         error = failure
     try:
-        agree_process_phase(error, phase=phase)
+        count = agree_process_phase(error, phase=phase, available=held is not None and counted(held[0]))
     except BaseException as failure:
         if error is None:
             raise PeerFailure(str(failure)) from failure
         raise
     assert held is not None
-    return held[0]
+    return held[0], count
 
 
 def agreed_same[T](phase: str, find: Callable[[], T]) -> T:

@@ -244,6 +244,21 @@ def export_tiny_decoder(directory, *, tokenizer="byte", vocab_size=256):
     return directory
 
 
+def test_a_token_budget_trains_over_a_stream_with_no_epoch_length(tmp_path):
+    """`--trainer.tokens` alone bounds a run over windows read as a stream, each share its own order,
+    which has no epoch length to count: the run trains until its real tokens reach the budget, three
+    batches of eight windows of SEQ targets."""
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ)
+    streamed = windows(tokens).read("streamed")
+    assert compile(streamed).steps_per_epoch is None
+    model = '{"emb_features": 16, "num_layers": 1, "num_heads": 2}'
+    config = LMRunConfig.cli(recipe_args(
+        tokens, "--trainer.tokens", str(3 * 8 * SEQ), "--trainer.eval-every", "None",
+        "--trainer.checkpoint-every", "None", "--trainer.name", "tokens", "--max-new-tokens", "0",
+        model_config=model), default=LMRunConfig(data=streamed))
+    assert int(config.run().step) == 3
+
+
 def recipe_args(tokens, *args, model_config="{}"):
     return [*args, "--trainer.checkpoint-dir", str(Path(tokens.train).parents[1] / "runs"),
             "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
