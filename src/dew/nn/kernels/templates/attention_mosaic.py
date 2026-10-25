@@ -56,7 +56,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _width,
     refused,
 )
-from dew.nn.kernels.templates.base import Template
+from dew.nn.kernels.templates.base import Template, Unfitted
 
 
 def _extents(family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
@@ -83,6 +83,32 @@ def _stages(steps: int, staged) -> tuple[int, ...]:
     while counts[-1] < steps and staged(counts[-1] + 1) <= budget:
         counts.append(counts[-1] + 1)
     return tuple(counts)
+
+
+def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held: int, walked: int,
+                                                tiles: Callable[[int, int, int], Config],
+                                                fits: Callable[[Config], bool], depth: int,
+                                                steps: Callable[[Config], int]) -> Config | None:
+    """A launch's config from its family's facts and the call's extents (design §7), no space ranked: its
+    consumers the family's (`Family.consumers`), fewer where the `held` rows a consumer accumulates (a
+    forward's queries, a dK/dV launch's keys) fill fewer of the family's units; each consumer's rows the
+    family's unit (`_extents`' least: the rows its products cover, `Family.role_rows`, in whole swizzled
+    rows), so one consumer's softmax runs under its partner's products as FlashAttention-3's does; the tile
+    it walks the largest unit multiple of the `walked` extent whose live set a consumer's registers hold and
+    whose stages the block holds (`fits`); its stages the ring's busy depth (`depth`: two, one more where a
+    walk keeps a slot or a product past its step), at most the walk's `steps` and two at the least.
+    `tiles(rows, walked, consumers)` builds the config at two stages. None where no tile fits."""
+    rows = _extents(family, dtype, held)[-1]
+    consumers = max(1, min(family.consumers, -(-held // rows)))
+    for extent in _extents(family, dtype, walked):
+        config = tiles(rows, extent, consumers)
+        if not fits(config):
+            continue
+        for stages in range(max(2, min(depth, steps(config))), 1, -1):
+            staged = dataclasses.replace(config, stages=stages)
+            if fits(staged):
+                return staged
+    return None
 
 
 def _staged(allocations) -> int:
@@ -189,9 +215,35 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         # Interpreted only in a CPU process (`grouped_matmul._Mosaic.eligible`): the interpreter's callbacks
         # are ordered effects, which a GPU process's lowering cannot carry.
         interpretable = not ba.arguments["interpret"] or jax.default_backend() == "cpu"
+        return interpretable and self.derived(ba, target) is not None
+
+    def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Config | None:
+        """The launch's one config for the call `ba` on `target`, derived from the family's and the device's
+        facts and the call's extents (`_derived`), no space ranked; None where the target's family has no
+        bundle here (`BUNDLES`), the launch refuses the call (`refusal`), or no tile is legal."""
+        raise NotImplementedError
+
+    def legal(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> bool:
+        """Whether a launch of `ba` runs at `config` on `target`: the target's family's bundle, a call the
+        launch takes, its programs' shared memory within a block (`generation.shared_budget`) and a
+        consumer's registers within its share (`register_budget`). A config a test names is held to it too."""
+        family = BUNDLES.get(config.family)
+        return (family is not None and config.family == generation.family(target.generation)
+                and self.refusal(ba, family) is None
+                and self.staged_bytes(ba, config, target) <= generation.shared_budget(target)
+                and (self.registers(ba, config) or 0) <= self.register_budget(config))
+
+    def _family(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mosaic.Family | None:
+        """The target's family's bundle where the launch takes the call there, else None."""
         family = BUNDLES.get(generation.family(target.generation) or "")
-        return (interpretable and family is not None and self.refusal(ba, family) is None
-                and bool(self.fits(ba, target)))
+        return None if family is None or self.refusal(ba, family) is not None else family
+
+    def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> Config:
+        target = generation.gpu_target()
+        config = self.derived(ba, target)
+        if config is None:
+            raise Unfitted(type(self).__name__, None, generation.shared_budget(target), target.generation)
+        return config
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> str | None:
         """Why the launch takes no call of `ba` on `family`, or None (`refused`)."""
@@ -224,12 +276,32 @@ class MosaicForward(_Mainloop[Tiles]):
         return run(query, key, value, self.spans(start, end, query_ids, key_ids), hooks, scale=self.scale,
                    natural=self.natural, tiles=config, interpret=interpret), None
 
+    def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Tiles | None:
+        """Its tiles from the facts (`_derived`): each consumer a unit of queries, the key tile the largest
+        its registers and the block hold; three stages where its walk keeps the value slot a step past it (the
+        owed product of an asynchronous family's plain walk, `_consumer`), else two."""
+        family = self._family(ba, target)
+        if family is None:
+            return None
+        query, key = ba.arguments["query"], ba.arguments["key"]
+        owing = family.asynchronous and not ba.arguments.get("residuals")
+
+        def tiles(rows: int, walked: int, consumers: int) -> Tiles:
+            return Tiles(rows, walked, 2, consumers, family.name)
+
+        def steps(config: Tiles) -> int:
+            return _padded(query.shape[1], key.shape[1], config)[1] // config.block_k
+
+        return _derived(family, query.dtype, query.shape[1], key.shape[1], tiles,
+                        lambda config: self.legal(ba, config, target), 3 if owing else 2, steps)
+
     def space(self, ba: tokamax.BoundArguments) -> Sequence[Tiles]:
-        """Every tile the forward takes on each family of `BUNDLES` at the call's extents: each count of
-        consumers the family has, most first; each consumer's query block and the key tile in whole
-        multiples of the family's unit (`_extents`), largest first, so where the cost model ties the fewest
-        programs re-read the keys; at each stage count its walk and the device's block take (`_stages`). A
-        consumer thread's registers bound them where they fit (`fits`, `register_budget`)."""
+        """Every tile the forward takes on each family of `BUNDLES` at the call's extents, the configs a test
+        may name (`legal`): each count of consumers the family has, most first; each consumer's query block
+        and the key tile in whole multiples of the family's unit (`_extents`), largest first, so where the
+        cost model ties the fewest programs re-read the keys; at each stage count its walk and the device's
+        block take (`_stages`). A consumer thread's registers bound them where they fit (`fits`,
+        `register_budget`)."""
         query, key = ba.arguments["query"], ba.arguments["key"]
         configs = []
         for family in BUNDLES.values():
@@ -422,12 +494,32 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         return gradients(launch, query, key, value, spans, hooks, dout, residuals,
                          block=_block(config), scale=self.scale), None
 
+    def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> BackwardTiles | None:
+        """Its tiles from the facts (`_derived`): each dK/dV consumer a unit of keys, the query tile both
+        launches walk the largest their registers and the block hold, two stages, and two launches (the
+        dQ launch, then the dK/dV one): deterministic, and of the least memory; the one-launch schedule, which
+        adds dQ in shared order, runs where a test names it until FlashAttention-3's structure replaces it."""
+        family = self._family(ba, target)
+        if family is None:
+            return None
+        query, key = ba.arguments["query"], ba.arguments["key"]
+
+        def tiles(rows: int, walked: int, consumers: int) -> BackwardTiles:
+            return BackwardTiles(walked, rows, 2, consumers, fused=False, family=family.name)
+
+        def steps(config: BackwardTiles) -> int:
+            padded_q, padded_k = _padded(query.shape[1], key.shape[1], config)
+            return max(padded_q // config.block_q, padded_k // config.block_k)
+
+        return _derived(family, query.dtype, key.shape[1], query.shape[1], tiles,
+                        lambda config: self.legal(ba, config, target), 2, steps)
+
     def space(self, ba: tokamax.BoundArguments) -> Sequence[BackwardTiles]:
-        """Every config the backward takes on each family of `BUNDLES` at the call's extents: each count of
-        consumers the family has, most first; each query and key block in whole multiples of its unit
-        (`_extents`), largest first; the two launches, then the fast form's one where the call has no hook
-        (`fused`); at each stage count the walks and the device's block take (`_stages`). A consumer
-        thread's registers bound them where they fit (`fits`, `register_budget`)."""
+        """Every config the backward takes on each family of `BUNDLES` at the call's extents, the configs a
+        test may name (`legal`): each count of consumers the family has, most first; each query and key block
+        in whole multiples of its unit (`_extents`), largest first; the two launches, then the fast form's one
+        where the call has no hook (`fused`); at each stage count the walks and the device's block take
+        (`_stages`). A consumer thread's registers bound them where they fit (`fits`, `register_budget`)."""
         query, key = ba.arguments["query"], ba.arguments["key"]
         hooked = self.score_mod is not None or ba.arguments["initial"] is not None
         queries, keys, dtype = query.shape[1], key.shape[1], query.dtype
