@@ -217,3 +217,57 @@ def test_every_stored_spelling_of_a_media_tensor_writes_back_from_its_one_leaf(t
     np.testing.assert_array_equal(written[spelled], tensors[spelled] + 0.25)
     np.testing.assert_array_equal(written[spelled.removeprefix("model.")], written[spelled])
     Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
+
+
+def _without(source: Path, target: Path, dropped) -> Path:
+    """A copy of `source` whose weights omit every tensor `dropped` names."""
+    import shutil
+
+    from safetensors.numpy import save_file
+
+    shutil.copytree(source, target)
+    tensors = load_file(target / "model.safetensors")
+    save_file({name: array for name, array in tensors.items() if not dropped(name)},
+              target / "model.safetensors", metadata={"format": "pt"})
+    return target
+
+
+def test_a_text_only_load_is_the_wrappers_language_model_as_its_text_checkpoint(tmp_path):
+    """`text_only` loads Qwen3.5's language model alone: a checkpoint missing its vision tower loads
+    (no tower tensor is read), it computes the wrapper's text logits bit for bit, and it saves as
+    Qwen3.5's text checkpoint (`Qwen3_5ForCausalLM`, no tower), which loads back to the same logits."""
+    from dew.interop import Pretrained, PretrainedDecoder
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    source = FIXTURES / "qwen35-native-tiny"
+    blind = _without(source, tmp_path / "blind", lambda name: name.startswith("model.visual."))
+    with pytest.raises(ValueError):
+        Pretrained.load(blind, dtype="float32", attention_impl="reference")
+    text = Pretrained.load(blind, dtype="float32", attention_impl="reference", text_only=True)
+    wrapper = Pretrained.load(source, dtype="float32", attention_impl="reference")
+    assert isinstance(text, PretrainedDecoder) and isinstance(text.model, CausalTransformer)
+    ids = jnp.asarray(np.load(source / "input_ids.npy"))
+    ids = jnp.where(ids < text.model.vocab_size, ids, 0)
+    logits = np.asarray(text.model.apply(text.variables, ids))
+    np.testing.assert_array_equal(logits, np.asarray(wrapper.model.apply(wrapper.variables, ids)))
+
+    text.save(tmp_path / "export")
+    config = json.loads((tmp_path / "export" / "config.json").read_text())
+    assert (config["model_type"], config["architectures"]) == ("qwen3_5_text", ["Qwen3_5ForCausalLM"])
+    assert not any(name.startswith(("model.visual.", "visual.")) for name in load_file(
+        tmp_path / "export" / "model.safetensors"))
+    reloaded = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
+    np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)), logits)
+
+
+def test_a_text_only_load_takes_a_checkpoint_without_its_prediction_depth():
+    """A Qwen3.5 release whose config names one prediction depth but whose checkpoint holds the trunk
+    alone (re-saved by transformers, which builds no depth) loads text-only as that trunk."""
+    from dew.interop import Pretrained
+
+    config = json.loads((FIXTURES / "qwen35-blocks-tiny" / "config.json").read_text())
+    assert config["text_config"]["mtp_num_hidden_layers"] == 1
+    text = Pretrained.load(FIXTURES / "qwen35-blocks-tiny", dtype="float32", attention_impl="reference",
+                           text_only=True)
+    assert text.model.num_nextn_predict_layers == 0
+    assert not any(str(name).startswith("mtp_") for name in text.variables["params"])
