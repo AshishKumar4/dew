@@ -958,8 +958,10 @@ def test_a_configured_optimizer_is_optaxs_own_at_the_rate_its_state_holds(optimi
         expected, expected_state = reference.update(grads, expected_state, params)
         for have, want in zip(jax.tree.leaves(updates), jax.tree.leaves(expected), strict=True):
             np.testing.assert_array_equal(np.asarray(have), np.asarray(want))
-        # The reported rate is the rate the reference steps by, and near its schedule's float64 value:
-        # held to its prior bound, as the rate is a scale and a shape each rounded (ledger 1660).
+        # The reported rate is the rate the reference steps by, and near its schedule's float64 value by
+        # a derived bound: the scale's float32 cast and the product's rounding, half an ulp (2^-24) each,
+        # and optax's float32 schedule's few ulps of the shape, within 4 * 2^-24 = 2.4e-7 of the rate
+        # and the scale. A plain optax.adam(schedule) shares those roundings; accepted, row 1660.
         np.testing.assert_array_equal(learning_rate(state), np.float32(jnp.float32(scale) * ratio(step)))
         with jax.enable_x64(new_val=True):
             # optax counts in int32, which divides to float32: a float64 count keeps the schedule float64.
