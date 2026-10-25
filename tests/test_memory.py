@@ -13,24 +13,23 @@ from reference_error import assert_as_exact
 
 from dew.nn.inputs import PLAIN_CALL, AttentionMetadata, MixerCall, coordinates
 from dew.nn.memory import Gate, InContextMemory, LinearMemory, MLPMemory, Objective, ResidualMemory
+from dew.nn.precision import L2NORM_EPS
 
 WIDTH, HEADS, FEATURES, LENGTH, CHUNK, ROWS = 8, 2, 4, 12, 4, 8
 MEMORY_SEEDS = 32
 """The declared seeds for check 1 of the memories (`assert_as_exact`), sized by `seeds_for` on armada."""
 
 CONFIGURATIONS = {
-    # TTT-Linear (Sec 2.7): f(x) = x + LN(W x), the L2 reconstruction (Eq 4), eta(x) = sigmoid(theta_lr x).
+    # TTT-Linear (Sec 2.7): f(x) = x + LN(W x), the L2 reconstruction (Eq 4), eta(x) = eta_base sigmoid(.).
     "ttt_linear": {"network": functools.partial(ResidualMemory, hidden=None, norm=True)},
-    # TTT-MLP: a 4x GELU MLP inside the residual and norm, eta_base 0.1.
-    "ttt_mlp": {"network": functools.partial(ResidualMemory, hidden=4 * FEATURES, activation="gelu"),
-                "learning_rate": Gate(scale=0.1)},
+    # TTT-MLP: a 4x GELU MLP inside the residual and norm.
+    "ttt_mlp": {"network": functools.partial(ResidualMemory, hidden=4 * FEATURES, activation="gelu")},
     # Titans' deep memory with momentum and forgetting (Eq 12-14).
     "titans": {"network": functools.partial(MLPMemory, widths=(2 * FEATURES, FEATURES)),
-               "momentum": Gate(), "retention": Gate(bias=-2.0), "learning_rate": Gate(scale=0.5)},
+               "momentum": Gate(), "retention": Gate(bias=-2.0)},
     # Moneta: the lp bias with p = 3 (Miras Eq 10, 24) and retention.
     "moneta": {"network": functools.partial(ResidualMemory, hidden=4 * FEATURES),
-               "objective": Objective("lp", p=3.0), "retention": Gate(bias=-2.0),
-               "learning_rate": Gate(scale=0.1)},
+               "objective": Objective("lp", p=3.0), "retention": Gate(bias=-2.0)},
     # Yaad: Huber's bias (Miras Eq 13, 26).
     "yaad": {"network": functools.partial(ResidualMemory, hidden=4 * FEATURES),
              "objective": Objective("huber", delta=0.5), "retention": Gate(bias=-2.0)},
@@ -41,10 +40,14 @@ CONFIGURATIONS = {
     "linear_attention": {"network": functools.partial(LinearMemory, features=FEATURES),
                          "objective": Objective("dot"), "chunk": 1},
 }
+"""Each configuration with its paper's queries and keys l2-normalized (Titans Sec 4.4, TTT's views) and
+a step size of `STEP` times a sigmoid, the stable range the papers train in: an unnormalized key under
+a unit step drives the inner gradient descent off, where no precision computes the same update."""
+STEP = 0.1
 
 
 def layer(name: str, dtype=jnp.float32) -> InContextMemory:
-    fields = {"chunk": CHUNK, **CONFIGURATIONS[name]}
+    fields = {"chunk": CHUNK, "normalize": True, "learning_rate": Gate(scale=STEP), **CONFIGURATIONS[name]}
     return InContextMemory(heads=HEADS, head_features=FEATURES, dtype=dtype, **fields)
 
 
@@ -90,8 +93,11 @@ def written(module: InContextMemory, *, dtype, segments=None):
         initial = jax.tree.map(lambda leaf: jnp.asarray(leaf, wide), params["params"]["initial"])
         x = jnp.asarray(x, dtype)
         batch = x.shape[0]
-        q, k, v = ((x @ p[f"{name}_proj"]["kernel"]).reshape(batch, LENGTH, HEADS, FEATURES).astype(
-            wide if name != "q" else dtype) for name in ("q", "k", "v"))
+        q, k, v = ((x @ p[f"{name}_proj"]["kernel"]).reshape(batch, LENGTH, HEADS, FEATURES)
+                   for name in ("q", "k", "v"))
+        if module.normalize:
+            q, k = (unit(view) for view in (q, k))
+        q, k, v = q.astype(dtype), k.astype(wide), v.astype(wide)
 
         def gates(row):
             theta = gate("learning_rate", module.learning_rate, row, p)
@@ -106,6 +112,13 @@ def written(module: InContextMemory, *, dtype, segments=None):
         return reads.reshape(batch, LENGTH, -1) @ p["o_proj"]["kernel"]
 
     return run
+
+
+def unit(view):
+    """`view` over its length on its last axis, eps under the root (FLA's l2norm), in at least float32
+    and rounded once to its dtype."""
+    wide = view.astype(jnp.promote_types(view.dtype, jnp.float32))
+    return (wide / jnp.sqrt(jnp.sum(wide * wide, axis=-1, keepdims=True) + L2NORM_EPS)).astype(view.dtype)
 
 
 def _head(index: int, leaf):
