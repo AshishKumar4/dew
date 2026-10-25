@@ -28,7 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew import Trainer
-from dew.config import OptimConfig
+from dew.optim import OptimConfig
 from dew.data.dataset import Loader
 from dew.data import ByteTokenizer, Memory, presets
 from dew.data.chat import Role
@@ -201,7 +201,7 @@ import jax
 import numpy as np
 
 from dew import Trainer
-from dew.config import OptimConfig
+from dew.optim import OptimConfig
 from dew.data import Memory, presets
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.rl import DPOObjective
@@ -645,7 +645,7 @@ import itertools
 import jax
 import numpy as np
 from dew import Field, InputSpec, Trainer
-from dew.config import OptimConfig
+from dew.optim import OptimConfig
 from dew.data.dataset import Loader
 from dew.diffusion.presets import Flow
 from dew.nn.backbones import SimpleDiT

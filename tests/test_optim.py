@@ -21,7 +21,6 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from model_support import largest_difference
 from reference_error import assert_as_exact_as_the_reference, equations
 
-from dew.config import OptimConfig
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
 from dew.optim import (
@@ -30,6 +29,7 @@ from dew.optim import (
     Exponential,
     Linear,
     OneCycle,
+    OptimConfig,
     Optimizer,
     ParamGroup,
     Power,

@@ -26,8 +26,7 @@ from typing import TYPE_CHECKING, Annotated, ClassVar
 import jax
 
 from dew._records import number, record
-from dew.config import ObjectiveConfig, OptimConfig, Prepared, RunConfig
-from dew.data.dataset import record_argument
+from dew.config import ObjectiveConfig, Prepared, RunConfig
 from dew.data.text import HFTokenizer
 from dew.decision.head import DecisionHead, JointSchemaHead
 from dew.decision.laya import LAYA, LayaCheckpoint
@@ -39,7 +38,8 @@ from dew.decision.task import Decide
 from dew.nn.backbones.decoder_block import remat_policy
 from dew.nn.cross_attention import CrossAttention
 from dew.nn.protocols import RematChoosing
-from dew.registry import ModelConfig
+from dew.optim import OptimConfig
+from dew.registry import ModelConfig, record_argument
 from dew.state import TrainState
 
 if TYPE_CHECKING:

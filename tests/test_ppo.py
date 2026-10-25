@@ -274,8 +274,8 @@ def test_ppo_trains_policy_and_critic_with_a_frozen_policy_reference():
 
 
 def test_muonclip_steps_both_the_actor_and_a_transformer_critic():
-    from dew.config import OptimConfig
     from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.optim import OptimConfig
 
     model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1,
                               num_heads=2, mlp_features=16, max_seq_len=8, qk_norm=False)

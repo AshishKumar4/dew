@@ -5,6 +5,11 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- `OptimConfig` and `ScheduleSpec` move from `dew.config` to `dew.optim`, beside the optimizers and
+  schedules they build; `Wandb` moves to `dew.training` (`dew.training.tracker`), beside the tracker that
+  reads it; and
+  `record_argument` moves from `dew.data.dataset` to `dew.registry`, beside the records it reads and
+  writes. Import each from its new module.
 - Every component record is the registry's class record, `{"class", "fields"}`, written by
   `dew.registry.to_record` and its class found by `dew.registry.component`. A component built around
   parameters states its record as `recorded_fields()` (`dew.registry.Recorded`): a condition encoder's

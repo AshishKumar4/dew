@@ -40,8 +40,8 @@ from dew.pool import (
 _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from dew.config import Wandb
     from dew.distributed.placement import Layout
+    from dew.training.tracker import Wandb
 
 
 EXECUTION_TIMEOUT = "30m"
@@ -67,7 +67,7 @@ def prepare_process(wandb: Wandb | None = None,
     """Set the environment variables and XLA flags, raise the soft file
     descriptor limit, and join the JAX process pool.
 
-    `wandb` is the run's `dew.config.Wandb`, or None for a run without a
+    `wandb` is the run's `dew.training.tracker.Wandb`, or None for a run without a
     tracker. Only its offline switch is read, and it has to be read before
     wandb opens a run. `multi_host=True` requires a pool, False never joins
     one, and None joins the pool the environment describes, if any.

@@ -14,13 +14,14 @@ from flax import linen as nn
 
 import dew.config
 import dew.nn.backbones
-from dew.config import OptimConfig, RunConfig, TrainerConfig
+from dew.config import RunConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader, Ramp
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
+from dew.optim import OptimConfig
 from dew.registry import Aliases, ModelConfig, projectors, towers
-from dew.training import Checkpoints, Layout, MeshSpec
+from dew.training import Checkpoints, Layout, MeshSpec, Wandb
 
 
 @pytest.mark.parametrize("dataset", ["tfds", "arrayrecord_shards"])
@@ -328,7 +329,7 @@ def test_a_run_can_disable_final_checkpoint_saving(tmp_path):
 
 def test_publishing_requires_a_final_checkpoint_policy():
     with pytest.raises(ValueError):
-        TrainerConfig(publish=True, wandb=dew.config.Wandb(project="test"), checkpoint_final=False)
+        TrainerConfig(publish=True, wandb=Wandb(project="test"), checkpoint_final=False)
 
 
 def test_train_scores_every_named_validation_split(tmp_path):
