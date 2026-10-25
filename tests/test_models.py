@@ -14,7 +14,13 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from flax.core import freeze, unfreeze
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, float64_terms, widened
+from reference_error import (
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    float64_terms,
+    widened,
+    with_gradients,
+)
 
 from dew.nn.attention import GroupNorm, LayerNorm, Stage
 from dew.nn.autoencoders.vae import FlaxEncoder, translate_vae_weights
@@ -653,14 +659,15 @@ def test_layer_norm_is_flax_s_keeping_only_its_input_for_the_backward(rng, use_s
             np.asarray(cotangent)
 
     def observed(module):
+        """The module's output and the gradients of its input and parameters, under a cotangent of the
+        output's own dtype."""
+        run = with_gradients(lambda value, variables: module.apply(variables, value))
+
         def step(drawn, moved, cotangent):
-            output, pull = jax.vjp(lambda value, variables: module.apply(variables, value), drawn, moved)
-            gradient, parameters = pull(cotangent.astype(output.dtype))
-            return {"output": output, "input": gradient, **{
-                f"parameter.{jax.tree_util.keystr(path)}": leaf
-                for path, leaf in jax.tree_util.tree_leaves_with_path(parameters)}}
+            return run(drawn, moved, cotangent.astype(jax.eval_shape(module.apply, moved, drawn).dtype))
         return step
 
+    assert ours.apply(params, x).dtype == reference.apply(flax_params, x).dtype
     wide = nn.LayerNorm(**{**fields, "dtype": jnp.float64})
     assert_as_exact(jax.jit(observed(ours)), jax.jit(observed(reference)), draw,
                     f"layer norm {dtype} scale={use_scale} bias={use_bias}", seeds=LAYER_NORM_SEEDS,
