@@ -552,9 +552,15 @@ def mode_averaged(args) -> dict:
         runs.append(trainer.checkpoints.directory)
     average = averaged(runs, ema=False, mesh=MeshSpec(fsdp=args.fsdp_size), layout=Layout(min_shard=TINY))
     dump_params(args.out.with_suffix(".npz"), average.variables)
+    def split(leaf) -> bool:
+        # Whether this process holds only part of the leaf: its distinct blocks hold fewer values.
+        blocks = {tuple((part.start, part.stop) for part in shard.index): shard.data.size
+                  for shard in leaf.addressable_shards}
+        return sum(blocks.values()) < leaf.size
+
     return {"runs": runs, "read": [list(entry) for entry in average.runs],
-            "pool_sharded": any(isinstance(leaf, jax.Array) and not leaf.is_fully_addressable
-                                for leaf in jax.tree.leaves(average.variables))}
+            "split": any(isinstance(leaf, jax.Array) and split(leaf)
+                         for leaf in jax.tree.leaves(average.variables))}
 
 
 def restored_state(trainer):
