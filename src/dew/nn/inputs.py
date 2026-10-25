@@ -748,6 +748,10 @@ COORDINATES_FIELD = "coordinates"
 """The token field that holds the tokens' `Coordinates`, which a decoder reads in place of the
 validity field, `segment_ids` and `positions`."""
 
+BLOCKS_FIELD = "block_groups"
+"""The token field that numbers the tokens' blocks, which the attention layers that read blocks see whole
+(`AttentionMetadata.block_groups`, `dew.nn.visibility.prefix_blocks`)."""
+
 
 def token_validity(fields: Mapping[str, jax.Array | np.ndarray | Coordinates]):
     """The validity `[B, S]` a row's token fields hold, as given: their `Coordinates`' where the fields

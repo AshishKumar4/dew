@@ -46,6 +46,7 @@ from dew.inputs import Field, InputSpec
 from dew.nn.cross_attention import crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import (
+    BLOCKS_FIELD,
     CONTEXT,
     CONTEXT_LENGTHS,
     COORDINATES_FIELD,
@@ -71,8 +72,11 @@ from dew.nn.protocols import (
     LayerStates,
     TokenModel,
     head_table,
+    reads_blocks,
+    refuse_prefix,
 )
 from dew.nn.sharding import LOGITS, constrain
+from dew.nn.visibility import same_group
 from dew.objectives.base import (
     FROZEN,
     OMITTED,
@@ -117,6 +121,9 @@ TEXT_KEY = "text"
 
 _RETIRED_BALANCE = ("balance_rate", "aux_loss_alpha", "seq_aux", "router_z_loss")
 """The four arguments `ExpertBalance` replaced, which an earlier run's record may still hold."""
+
+BLOCKS_KEY = "text_block_groups"
+"""Batch key `[B, seq_len + 1]` int32 block ids are read under, written by `dew.data.steps.blocks.Blocks`."""
 
 
 @dataclass(frozen=True)
@@ -245,18 +252,21 @@ def _indexer_kls(sown: Variables) -> list[jax.Array]:
 
 
 def _prepared(tokens: ModelInputs | jax.Array, segment_ids: jax.Array | None = None,
-              positions: jax.Array | None = None, coordinates: Coordinates | None = None) -> ModelInputs:
+              positions: jax.Array | None = None, coordinates: Coordinates | None = None,
+              block_groups: jax.Array | None = None) -> ModelInputs:
     """The rows as `ModelInputs`, bare ids cast to int32, their packing among the token fields.
 
     A packed batch from a data pipeline carries its windows' `coordinates`
     (`dew.nn.inputs.Coordinates`, the packer's); a rollout's names each row's
-    `segment_ids` and `positions`. Either comes beside the ids or in the
+    `segment_ids` and `positions`. A batch's `block_groups` (a prefix run's
+    blocks) come the same way. Either comes beside the ids or in the
     `ModelInputs`; a field named both ways is refused. Everything after reads
     the packing off what this returns (`dew.nn.inputs.token_layout`).
     """
     prepared = tokens if isinstance(tokens, ModelInputs) else ModelInputs(jnp.asarray(tokens, jnp.int32))
     columns = {name: column for name, column in (("positions", positions), ("segment_ids", segment_ids),
-                                                 (COORDINATES_FIELD, coordinates))
+                                                 (COORDINATES_FIELD, coordinates),
+                                                 (BLOCKS_FIELD, block_groups))
                if column is not None}
     for name in columns:
         if name in prepared.token_fields:
@@ -307,14 +317,16 @@ def _unpadded(values: jax.Array, padding: jax.Array) -> tuple[jax.Array, jax.Arr
 
 
 def batch_text(batch) -> ModelInputs:
-    """The batch's `text` rows as `_prepared` gives them, a packed batch's
-    `text_coordinates` folded in."""
+    """The batch's `text` rows as `_prepared` gives them, a packed batch's `text_coordinates` folded in,
+    and its `text_block_groups` beside them."""
     stale = sorted({"text_segment_ids", "text_positions"} & set(batch))
     if stale:
         raise ValueError(f"a packed batch lays its documents out in text_coordinates "
                          f"(dew.nn.inputs.coordinates), not {', '.join(stale)}")
     laid = batch.get("text_coordinates")
-    return _prepared(batch[TEXT_KEY], coordinates=None if laid is None else jax.tree.map(jnp.asarray, laid))
+    blocks = batch.get(BLOCKS_KEY)
+    return _prepared(batch[TEXT_KEY], coordinates=None if laid is None else jax.tree.map(jnp.asarray, laid),
+                     block_groups=None if blocks is None else jnp.asarray(blocks, jnp.int32))
 
 
 def text_preview[S](phase: str, setup: Callable[[], S | None],
@@ -405,7 +417,7 @@ _DEFAULT_SAMPLING = Sampling()
 
 
 def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, depth: int = 0,
-                   roles=None, role: int | None = None):
+                   roles=None, role: int | None = None, blocks=None):
     """Whether each target the loss scores at prediction `depth` counts, as
     `[B, S - 1 - depth]` booleans, in `xp` (numpy for the host's FLOP
     geometry and the data's target counts, jax.numpy for the loss): the
@@ -413,7 +425,10 @@ def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, 
     not padding, when the attention mask keeps every position from the state
     to it, in a packed batch when the state and it share a document (segment
     0 is padding), and with a `role` (`loss_role`) when `roles`, one per
-    token, give the target that role."""
+    token, give the target that role. With `blocks`, each token's block (-1 none), a target in its state's
+    block does not count. Blocks are contiguous runs (`AttentionMetadata.block_groups`), so this is exact
+    for the trunk's targets (`depth` 0): a prediction depth reads blocks beyond its own source, so
+    `token_scores` refuses depths with blocks."""
     span = depth + 1
     counted = shifted_span(tokens.shape, span, valid=attention_mask, segments=segment_ids, xp=xp)
     if pad_id is not None:
@@ -422,6 +437,8 @@ def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, 
         counted = counted & (segment_ids[:, span:] != 0)
     if role is not None and roles is not None:
         counted = counted & (roles[:, span:] == role)
+    if blocks is not None:
+        counted = counted & ~same_group(blocks[:, :-span], blocks[:, span:])
     return counted
 
 class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
@@ -448,6 +465,9 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
 
     loss_role: Role | None = None
     """The role whose targets alone count (`LMObjective`); None counts every target."""
+
+    prefix: int | Literal["prompt"] | None = None
+    """The prefix run's blocks (`LMObjective`): a document's first tokens, or its prompt; None is causal."""
 
     mtp_weight: float | None = None
     """The multi-token prediction depths' weight (`LMObjective`); None trains none."""
@@ -501,13 +521,13 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         return None
 
     def _token_geometry(self, batch: Batch) -> tuple[np.ndarray, Mapping[str, jax.Array | Coordinates]]:
-        """The host's tokens and their fields, a packed batch's coordinates
-        among them: what the loss reads."""
+        """The host's tokens and their fields, a packed batch's coordinates and blocks among them: what the
+        loss reads."""
         raw = batch[TEXT_KEY]
         prepared = raw if isinstance(raw, ModelInputs) else ModelInputs(raw)
-        laid = batch.get("text_coordinates")
-        fields = prepared.token_fields if laid is None else {**prepared.token_fields, COORDINATES_FIELD: laid}
-        return np.asarray(prepared.tokens), fields
+        extra = {name: batch[key] for name, key in ((COORDINATES_FIELD, "text_coordinates"),
+                                                    (BLOCKS_FIELD, BLOCKS_KEY)) if key in batch}
+        return np.asarray(prepared.tokens), {**prepared.token_fields, **extra}
 
     def _counted_tokens(self, batch: Batch):
         """Host input geometry: each real token, and the documents."""
@@ -591,13 +611,12 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         """
         valid, documents = self._counted_tokens(batch)
         tokens, fields = self._token_geometry(batch)
-        mask, _ = token_layout(fields, xp=np)
         depth_rows = []
         for depth in range(1, model.num_nextn_predict_layers + 1):
             span = valid.shape[1] - 1 - depth
             admitted = shifted_span(valid.shape, depth, valid=valid, segments=documents, xp=np)[:, :-1]
             segments = None if documents is None else documents[:, :span]
-            scored = self._scored(np, tokens, mask, documents, self._batch_roles(batch, np), depth)
+            scored = self._scored(np, tokens, fields, self._batch_roles(batch, np), depth)
             depth_rows.append((self._row_lengths(admitted, segments), self._row_lengths(scored, segments)))
         return depth_rows
 
@@ -633,7 +652,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
     def _prediction_lengths(self, batch: Batch, depth: int = 0) -> np.ndarray:
         """Each row's targets the loss scores at `depth` (`scored_targets`)."""
         tokens, fields = self._token_geometry(batch)
-        scored = self._scored(np, tokens, *token_layout(fields, xp=np), self._batch_roles(batch, np), depth)
+        scored = self._scored(np, tokens, fields, self._batch_roles(batch, np), depth)
         return np.sum(scored, axis=-1, dtype=np.int64)
 
     @property
@@ -650,7 +669,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         the result records the actual and raw-policy likelihoods that the objective's
         ratio needs.
         """
-        return TextGeneration(self.model, params, sampling=sampling)
+        return TextGeneration(self.model, params, sampling=sampling, prefix=self.prefix)
 
     def task_settings(self) -> TextSettings:
         """The decoder's row length, preview budget, sampling policy, and tokenizer or source processor."""
@@ -659,7 +678,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                             max_new_tokens=0 if samples is None else samples.max_new_tokens,
                             sampling=Sampling() if samples is None else samples.sampling,
                             tokenizer=recorded_tokenizer(self.processor),
-                            processor=recorded_processor(self.processor))
+                            processor=recorded_processor(self.processor), prefix=self.prefix)
 
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> TextGeneration:
@@ -669,6 +688,18 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         """
         return TextGeneration.from_settings(self.model, variables, self.task_settings(),
                                             self.processor if processor is OMITTED else processor)
+
+    def _refuse_blocks(self, prepared: ModelInputs, depths: bool) -> None:
+        """Refuse a batch's blocks where the model reads none, or its prediction depths would read them beyond
+        their source, which the loss's exclusion does not cover (`scored_targets`)."""
+        if BLOCKS_FIELD not in prepared.token_fields:
+            return
+        if depths:
+            raise ValueError("a batch's blocks train the trunk's targets alone: a prediction depth reads "
+                             "blocks beyond its own source, so depths are refused with blocks")
+        if not reads_blocks(self.model):
+            raise ValueError("the batch's blocks reach a model none of whose layers reads blocks "
+                             "(AttentionMixer.bidirectional_blocks), where they would drop targets")
 
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
                      segment_ids=None, positions=None, routing: bool = False,
@@ -719,6 +750,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         every column, so the head is applied once.
         """
         prepared = _prepared(tokens, segment_ids, positions)
+        self._refuse_blocks(prepared, depths)
         inputs, targets = self._rows(prepared.tokens)
         packing = prepared.slice_tokens(stop=-1).kwargs()
         params = thaw(params)
@@ -794,19 +826,20 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                 f"text_roles has shape {tuple(roles.shape)} for "
                 f"{tuple(prepared.tokens.shape)} ids; the roles align with the input "
                 "tokens, one per token")
-        return self._scored(jnp, prepared.tokens, *token_layout(prepared.token_fields), roles).astype(dtype)
+        return self._scored(jnp, prepared.tokens, prepared.token_fields, roles).astype(dtype)
 
     def _depth_weights(self, prepared, roles, dtype, depth: int):
         """Weight the targets one prediction depth scores: depth d's state at
         p scores the target d further out (`scored_targets`)."""
-        return self._scored(jnp, prepared.tokens, *token_layout(prepared.token_fields), roles,
-                            depth).astype(dtype)
+        return self._scored(jnp, prepared.tokens, prepared.token_fields, roles, depth).astype(dtype)
 
-    def _scored(self, xp, tokens, mask, documents, roles, depth: int = 0):
+    def _scored(self, xp, tokens, fields, roles, depth: int = 0):
         """The targets this objective scores at `depth` (`scored_targets`), its `loss_role`'s alone,
         in `xp`: the loss's weights on the device and the FLOP count's on the host read one rule."""
+        mask, documents = token_layout(fields, xp=xp)
         return scored_targets(xp, tokens, self.pad_id, mask, documents, depth, roles=roles,
-                              role=None if self.loss_role is None else int(self.loss_role))
+                              role=None if self.loss_role is None else int(self.loss_role),
+                              blocks=fields.get(BLOCKS_FIELD))
 
     def _layer_states(self) -> LayerStates:
         """The model as the reader of its layers' states that a request for `layers` needs."""
@@ -1019,6 +1052,17 @@ class LMObjective(TokenScorer):
     keeps the logits from drifting away from normalised log
     probabilities. Zero adds nothing.
 
+    `prefix` trains a prefix run: the blocks a layer that reads blocks sees whole
+    (`AttentionMixer.bidirectional_blocks`). Each document's first `prefix` tokens, or with "prompt" its
+    tokens before the first assistant token (a chat row's roles), form one block, and each token of a block
+    sees the block's later tokens too. The loss scores no target in its source's block, which the state
+    would read off; every other target counts as usual. Serving reads the same blocks (`TextGeneration`'s
+    `prefix`): a prompt's first `prefix` tokens, or the whole prompt under "prompt", are one block. None, the
+    default, trains causally. A model none of whose layers reads blocks is refused, as are an int above
+    `seq_len` and `mtp_weight`, whose prediction depths read blocks beyond their source. A batch carrying
+    `text_block_groups` (the data stage `dew.data.steps.blocks.Blocks`) trains the same way, whatever `prefix`
+    says.
+
     `model` may be a loaded source (`LMObjective(qwen, seq_len=512)`), and
     `variables` and `processor` override its own (`Objective.bind_model`).
 
@@ -1051,6 +1095,7 @@ class LMObjective(TokenScorer):
         variables: Variables | None | Omitted = OMITTED,
         balance: ExpertBalance | None = None,
         loss_role: Role | None = None,
+        prefix: int | Literal["prompt"] | None = None,
         mtp_weight: float | None = None,
         z_loss: float = 0.0,
         indexer: IndexerTraining | None = None,
@@ -1062,6 +1107,13 @@ class LMObjective(TokenScorer):
                          variables=variables, processor=processor)
         self.pad_id = pad_id
         self.token_accuracy = token_accuracy
+        refuse_prefix(self.model, prefix)
+        if prefix is not None and mtp_weight is not None:
+            raise ValueError("a prefix run trains the trunk's targets alone: a prediction depth reads "
+                             "blocks beyond its own source, so mtp_weight is refused with prefix")
+        if isinstance(prefix, int) and prefix > seq_len:
+            raise ValueError(f"prefix {prefix} is more tokens than the row's seq_len, {seq_len}")
+        self.prefix = prefix
         _check_terms(self.model, mtp_weight=mtp_weight, z_loss=z_loss)
         self.balance = balance
         self.loss_role = loss_role
@@ -1108,15 +1160,21 @@ class LMObjective(TokenScorer):
 
     def data(self, tokenizer=None):
         from dew.data.pipeline import ObjectiveData
+        from dew.data.steps.blocks import Blocks
         from dew.data.steps.text import CountTargets, FixedTokens
 
         geometry = FixedTokens(self.seq_len, extra=1)
-        if self.loss_role is None and self.pad_id is None:
+        blocks: tuple[Blocks, ...] = ()
+        if self.prefix == "prompt":
+            blocks = (Blocks(prompt=True),)
+        elif self.prefix is not None:
+            blocks = (Blocks(prefix=self.prefix),)
+        if self.loss_role is None and self.pad_id is None and self.prefix is None:
             return ObjectiveData(train=(geometry,), evaluate=(geometry,))
         counted = CountTargets(
             role=None if self.loss_role is None else int(self.loss_role), pad_id=self.pad_id
         )
-        return ObjectiveData(train=(counted, geometry), evaluate=(counted, geometry))
+        return ObjectiveData(train=(*blocks, counted, geometry), evaluate=(*blocks, counted, geometry))
 
     def _indexer_term(self, sown, prepared: ModelInputs, batch: Batch) -> tuple[jax.Array, jax.Array]:
         """Sum the batch's indexer KL over the layers that sowed one, with

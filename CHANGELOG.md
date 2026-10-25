@@ -11,6 +11,12 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   logits where they fit, and the fit ladder tiles them where they do not, where they scored a fixed
   1024 x 8192 tile before; GRPO's evaluation scores at its own tile. `head_cross_entropy` takes the tile it
   scores in, with no default.
+- A prefix run trains and serves one mask: `LMObjective(prefix=N | "prompt")` makes each document's first
+  tokens, or its prompt, a block the model's block-reading layers see whole, scores no target in its
+  source's block, and gives a served prompt the same block (`TextSettings.prefix`, `TextGeneration`,
+  `Server`). The data stage `dew.data.steps.blocks.Blocks` makes blocks for any chain from a prefix, a
+  chat row's roles, or a user's per-token runs (`given=`), and a run with blocks refuses a model that
+  reads none. A prediction depth reads blocks beyond its source, so a prefix run refuses `mtp_weight`.
 - MuonClip clips the attention of whatever objective a run trains, or refuses it: a run whose optimizer
   holds a QK-Clip (`dew.optim.clips_qk`, its state a `QKClipState`) asks its objective for the step's
   attention logit maxima (`Step.qk_stats`), so a masked-diffusion run clips as an LM, RL or preference
@@ -26,6 +32,11 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   `bidirectional_images` keeps Gemma's images, read whole within the window. A kind may read both,
   and every other kind stays causal. A cached call reads the groups of its own tokens, so no cache
   keeps them, and a layer that shares another's keys and values reads them too.
+- `dew.nn.categorical.cross_entropy` and `kl_divergence` differentiate by Barron,
+  Gnanapragasam and Tschannen's fix (arXiv:2610.31642): a label whose margin
+  rounds Optax's `p - 1` to 0 keeps its derivative, each row's derivative sums to
+  zero, and a divergence from logits equal to its reference has derivative
+  exactly zero. Their values are unchanged.
 - A joint decision row's user turn is composed of segments, `JointLayout.segments`, a tuple of
   `Text`, `Media`, `State` and `Schema` in the order the row writes them: the default is the Laya
   joint release's turn, and another writes the schema before the state, or text of its own

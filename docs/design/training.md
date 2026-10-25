@@ -185,6 +185,7 @@ A reloaded run behaves like the live one: the same processor, chat template and 
 | Checkpoint state | Saving and restoring derive from the training state's own schema; restore casts and places once. |
 | Optimizer observations | An optimizer that reads what the step's model observed, a QK-Clip's attention logit maxima, says so in its own state (`clips_qk`), however it is composed; the run asks the objective for them through the step (`Step.qk_stats`) and pools them across microbatches, and a step whose objective returns none is refused, never left unclipped. No objective or run configuration carries a flag for it. |
 | Router training | One policy, `dew.objectives.routing.ExpertBalance`, trains the routers of every objective that composes it: the balancing bias, the balance loss and the z-loss, each optional. The model opens the routers' collection, the policy's terms join the loss statistics, and the bias counts commit once per update, however many microbatches the update pools. |
+| Block visibility | A prefix run trains and serves one mask: the blocks a layer that reads blocks sees whole come from one rule (`dew.nn.visibility.prefix_blocks`, `prompt_blocks`), which the data stage (`dew.data.steps.blocks.Blocks`), the loss's counted targets, `TextGeneration` and `Server` all read; off, no block field exists and every program is exactly causal. |
 
 Each seam requires one standing end-to-end test that runs every implementation registered for it. The [roadmap](../roadmap.md#ci-and-tooling) tracks the registry-wide coverage still to add.
 

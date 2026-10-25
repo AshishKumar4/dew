@@ -318,6 +318,11 @@ class CausalTransformer(nn.Module):
     embedding_zero_ids: tuple[int, ...] = ()
     """Placeholder ids that the embedding lookup reads as token zero. The labels
     keep the original ids."""
+    padding_idx: int | None = None
+    """The id whose token embedding rows (`embed_tokens`, `embed_tokens_per_layer`) the lookup reads
+    but never trains, as a source's `nn.Embedding(padding_idx=...)` leaves them (Gemma 3n's and Phi's
+    pad_token_id, `TokenEmbedding.padding_idx`); a tied head still trains the row. None trains every
+    row."""
     dropout_rate: float = 0.0
     embedding_dropout_rate: float = 0.0
     attention_dropout_rate: float = 0.0
@@ -853,7 +858,7 @@ class CausalTransformer(nn.Module):
 
         self.embed_tokens = TokenEmbedding(
             num_embeddings=self.vocab_size, features=self.emb_features,
-            dtype=self.dtype, name='embed_tokens',
+            dtype=self.dtype, name='embed_tokens', padding_idx=self.padding_idx,
             embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
                             else nn.initializers.normal(self.initializer_range)))
         if self.embedding_dropout_rate:
@@ -875,7 +880,7 @@ class CausalTransformer(nn.Module):
             # hidden_size_per_layer_input slice per layer.
             self.embed_tokens_per_layer = TokenEmbedding(
                 num_embeddings=self.per_layer_vocab, features=self.num_layers * ple,
-                dtype=self.dtype, name='embed_tokens_per_layer')
+                dtype=self.dtype, name='embed_tokens_per_layer', padding_idx=self.padding_idx)
             self.per_layer_model_projection = Dense(
                 projections['per_layer_model_projection'][1], use_bias=False,
                 dtype=self.dtype, precision=self.precision,
@@ -2258,6 +2263,14 @@ class CausalTransformer(nn.Module):
     def cache_rebuild_position(self) -> int | None:
         scaling = self.rope_scaling
         return scaling.original_max_position_embeddings if isinstance(scaling, LongRopeScaling) else None
+
+    @nn.nowrap
+    def reads_blocks(self) -> bool:
+        """Whether a layer reads a block whole (`AttentionMixer.bidirectional_blocks`): a trunk or prediction
+        depth layer kind's mixer, each kind's own mixer or else the model's (`BlockReading`)."""
+        kinds = self.layer_kinds(self.per_layer_types)
+        return any(isinstance(mixer, AttentionMixer) and mixer.bidirectional_blocks
+                   for mixer in (kind.mixer or self.mixer for kind in kinds.values()))
 
     @nn.nowrap
     def mixed_admission_refusal(self) -> str | None:

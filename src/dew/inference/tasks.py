@@ -17,7 +17,7 @@ import dataclasses
 import functools
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, Self
+from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, Protocol, Self
 
 import jax
 import jax.numpy as jnp
@@ -33,8 +33,17 @@ from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoi
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_causal
 from dew.inference.projections import packed_owned
 from dew.interop.weights import decoding_storage
-from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key
-from dew.nn.protocols import Bounded, CacheCapacity, TokenModel
+from dew.nn.inputs import (
+    BLOCKS_FIELD,
+    Media,
+    ModelInputs,
+    default_placement,
+    mesh_of,
+    real_slots,
+    request_key,
+)
+from dew.nn.protocols import Bounded, CacheCapacity, TokenModel, refuse_prefix
+from dew.nn.visibility import prompt_blocks
 from dew.objectives.base import UNREAD, Variables, thaw
 from dew.records import integer, record as named_fields, text as named
 from dew.sampling import decoding, vocabulary
@@ -338,6 +347,8 @@ class TextSettings(TaskSettings):
     policy beside the common ones."""
 
     sampling: Sampling
+    prefix: int | Literal["prompt"] | None = None
+    """The prefix run's blocks a served prompt takes (`TextGeneration.prefix`); None serves causally."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -581,10 +592,14 @@ class TextGeneration(_NativeTextTask):
     logits: tuple[LogitsTransform, ...] | None = None
     stopping: tuple[Stopping, ...] = ()
     strategy: Strategy | None = None
+    prefix: int | Literal["prompt"] | None = None
+    """The prefix run the model trained (`LMObjective(prefix=...)`): a prompt's first tokens, or all of it
+    under "prompt", form one block the model reads whole. A request's own blocks stand; None is causal."""
     _stops: tuple[Stopping, ...] = dataclasses.field(default=(), init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        refuse_prefix(self.model, self.prefix)
         object.__setattr__(self, "_stops", self._stop_criteria(self.sampling.stop))
 
     def _stop_criteria(self, strings: tuple[str, ...]) -> tuple[Stopping, ...]:
@@ -663,9 +678,16 @@ class TextGeneration(_NativeTextTask):
         `processor`: the previews' policy and budget become its defaults. A live objective
         (`LMObjective.build_task`) and a saved run (`from_run`) build it alike."""
         return cls(model, variables, processor, sampling=settings.sampling,
-                   max_new_tokens=settings.max_new_tokens or None)
+                   max_new_tokens=settings.max_new_tokens or None, prefix=settings.prefix)
 
-
+    def _blocked(self, inputs: ModelInputs) -> ModelInputs:
+        """`inputs` with the blocks its prefix run gives each prompt (`prompt_blocks`), unless the request has
+        its own blocks, which stand."""
+        if self.prefix is None or BLOCKS_FIELD in inputs.token_fields:
+            return inputs
+        valid = real_slots(inputs.token_fields, inputs.tokens.shape)
+        fields = {**inputs.token_fields, BLOCKS_FIELD: prompt_blocks(valid, self.prefix)}
+        return replace(inputs, token_fields=fields)
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
                  key: int | jax.Array | None = None, n: int | None = None,
@@ -678,6 +700,7 @@ class TextGeneration(_NativeTextTask):
                                           max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
                                           max_length=self.max_length, key=key)
             shaped, trips, capacity = _bucketed(inputs, budget, cache_ceiling(self.model))
+            shaped = self._blocked(shaped)
             policy, chain, criteria = self._controls(sampling, logits, stopping)
             generated = generate(cache_sized(self.model, capacity), self.placed, shaped, budget,
                                  key=random_key, sampling=policy, n=self.n if n is None else n, logits=chain,

@@ -713,6 +713,34 @@ class Serving(Protocol):
 
 
 @runtime_checkable
+class BlockReading(Protocol):
+    """A decoder whose layers may read a block whole (`AttentionMixer.bidirectional_blocks`, a block's tokens
+    seeing each other both ways). `reads_blocks` says whether one of them does. A prefix run needs one, since
+    its blocks reach a model call as `block_groups` and a layer that reads none computes them causally."""
+
+    def reads_blocks(self) -> bool: ...
+
+
+def reads_blocks(model: nn.Module) -> bool:
+    """Whether `model` says one of its layers reads blocks whole (`BlockReading`); a model that says nothing
+    reads none."""
+    return isinstance(model, BlockReading) and model.reads_blocks()
+
+
+def refuse_prefix(model: nn.Module, prefix: int | Literal["prompt"] | None) -> None:
+    """Refuse a prefix run the model or its value cannot take: a prefix is "prompt" or a positive number of
+    tokens (None is no prefix), and its blocks are read whole only by a layer that reads blocks, so the model
+    needs one (`reads_blocks`)."""
+    if prefix is None:
+        return
+    if prefix != "prompt" and (type(prefix) is not int or prefix < 1):
+        raise ValueError(f"prefix is 'prompt' or a positive number of tokens, got {prefix!r}")
+    if not reads_blocks(model):
+        raise ValueError("prefix needs a layer that reads blocks (AttentionMixer.bidirectional_blocks), "
+                         f"and {type(model).__name__} has none")
+
+
+@runtime_checkable
 class ShiftsLogits(Protocol):
     """A masked-diffusion model that declares how its logits line up with its inputs: with
     `shifted_logits`, position i's prediction is position i-1's logits (Dream-v0's). A model that
