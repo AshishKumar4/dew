@@ -103,10 +103,11 @@ _FALLBACK = 'Pretrained.load(..., fallback="torchax")'
 # computation moves the probe's logits by tenths or more: Granite's
 # multipliers by 4.2, SmolLM3's NoPE layers by 1.7.
 _ROUNDING = 6.46
-# How much farther the source's float32 gradients may be from the float64 truth than Dew's own float32
-# gradients are (`gradient_parity`, pooled over every element of every parameter's gradient on the
-# probe's draw): rounding alone puts the two arms alike whatever the model's conditioning, and a backward
-# the source's forward does not show (a hook, a custom autograd function) orders of magnitude apart.
+# How much farther the source's float32 gradient of any parameter may be from the float64 truth than
+# Dew's own float32 gradient of it is (`gradient_parity`, each parameter's pooled over its elements on
+# the probe's draw): rounding alone puts the two arms alike whatever the model's conditioning, and a
+# backward the source's forward does not show (a hook, a custom autograd function) orders of magnitude
+# apart.
 # Twice the largest tools/gradient_parity.py measured over the types and compositions that assemble
 # from parts: 1.112 (gemma; llama 0.962, mistral 0.962, mixtral 1.033, qwen2 0.932, qwen3 0.883,
 # qwen3_moe 0.902, Llama's attention with Mixtral's experts and Gemma's norms 0.973), transformers 5.16.1.
@@ -573,11 +574,13 @@ def _probe_gradients(model: PreTrainedModel, ids: np.ndarray, cotangent: np.ndar
 
 def gradient_parity(reference: PreTrainedModel, family: decoder_parts.DecoderFamily,
                     record: decoder_parts.DecoderFields, variables: Variables) -> float:
-    """How much farther the source's float32 gradient of every parameter is from the float64 truth than
-    Dew's float32 gradient is, pooled over every element on the probe's draw (the root of the ratio of
-    their summed squared errors): the source's eval-mode gradients read into Dew's tree as its weights
-    are (`translate_weights`; a gradient rearranges as its parameter does), the truth Dew's decoder of
-    the same record and weights in float64."""
+    """How much farther the source's float32 gradient of a parameter is from the float64 truth than
+    Dew's float32 gradient is, the largest over the parameters, each pooled over its elements on the
+    probe's draw (the root of the ratio of their summed squared errors, Dew's floored at the half ulp
+    float32 carries of each element of the truth): the source's eval-mode gradients read into Dew's tree
+    as its weights are (`translate_weights`; a gradient rearranges as its parameter does), the truth
+    Dew's decoder of the same record and weights in float64. Per parameter, so a wrong gradient of a
+    small one is not hidden by another's rounding."""
     ids = probe_ids(_VOCAB)
     cotangent = np.random.RandomState(11).standard_normal((BATCH, LENGTH, _VOCAB)).astype(np.float32)
     _, theirs = _probe_gradients(reference, ids, cotangent, train=False)
@@ -600,10 +603,17 @@ def gradient_parity(reference: PreTrainedModel, family: decoder_parts.DecoderFam
         truth = gradient('float64')
     if set(ours) != set(their_tree):
         raise _Mismatch(f"its gradients fill {sorted(set(ours) ^ set(their_tree))[:4]} apart")
-    source_error = sum(float(np.sum((np.asarray(their_tree[path], np.float64) - truth[path]) ** 2))
-                       for path in ours)
-    dew_error = sum(float(np.sum((ours[path] - truth[path]) ** 2)) for path in ours)
-    return math.sqrt(source_error / max(dew_error, np.finfo(np.float64).tiny))
+    eps = float(np.finfo(np.float32).eps)
+
+    def parity(path) -> float:
+        truth_leaf = truth[path]
+        source_error = float(np.sum((np.asarray(their_tree[path], np.float64) - truth_leaf) ** 2))
+        dew_error = float(np.sum((ours[path] - truth_leaf) ** 2))
+        # The least error float32 carries for the leaf, a rounding of each element of its truth.
+        floor = (eps / 2) ** 2 * float(np.sum(truth_leaf ** 2))
+        return math.sqrt(source_error / max(dew_error, floor, np.finfo(np.float64).tiny))
+
+    return max(parity(path) for path in ours)
 
 
 def _trained(reference: PreTrainedModel, assembly: parts.Assembly, family: decoder_parts.DecoderFamily,

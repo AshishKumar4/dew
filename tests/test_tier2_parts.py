@@ -350,3 +350,22 @@ def test_a_remote_causal_lm_over_a_built_in_config_is_its_own(tmp_path):
     verified = verify_mapping(config, remote=tmp_path / "renamed")
     assert isinstance(verified, VerifiedMapping) and verified.family == "parts"
     assert verified.source is not None and set(verified.source.references) == {"AutoModelForCausalLM"}
+
+
+def test_a_backward_its_forward_does_not_show_is_not_assembled(tmp_path):
+    """A source whose parts are the known ones by their code but whose one query projection's weight
+    takes no gradient (a tensor hook zeroing it, in training and evaluation alike) is refused: that
+    one parameter's gradient is far from the truth, however small beside the others'."""
+    def frozen(code):
+        changed = code.replace(
+            "        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)\n",
+            "        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)\n"
+            "        self.model.layers[0].attention.wq.weight.register_hook(\n"
+            "            lambda gradient: 0 * gradient)\n", 1)
+        assert changed != code
+        return changed
+
+    write_source(tmp_path / "frozen", "renamed", frozen)
+    config = json.loads((tmp_path / "frozen" / "config.json").read_text())
+    with pytest.raises(ValueError):
+        verify_mapping(config, remote=tmp_path / "frozen")
