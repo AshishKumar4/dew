@@ -21,7 +21,7 @@ from jax.experimental.layout import Format, Layout
 from jax.sharding import Mesh, NamedSharding
 
 from dew.inference.tasks import cache_sized
-from dew.nn.cross_attention import CROSS_KEY, CROSS_VALUE
+from dew.nn.attention import CROSS_KEY, CROSS_VALUE
 from dew.nn.inputs import Admitted, ModelInputs, default_placement
 from dew.nn.kernels.options import compiler_options
 from dew.nn.kernels.tuning import tune
