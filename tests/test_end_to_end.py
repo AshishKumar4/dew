@@ -176,8 +176,8 @@ def test_a_step_moves_the_running_statistics_and_the_task_decodes_with_them():
         for publication, statistics in ((published, after), (later, moved)):
             shift = np.asarray(statistics["mean"])
             scale = 1 / np.sqrt(np.asarray(statistics["var"]))
-            np.testing.assert_allclose(np.asarray(publication.autoencoder.running_normalization(
-                publication.variables["autoencoder"])[1]), scale, rtol=1e-6)
+            np.testing.assert_allclose(np.asarray(publication.autoencoder.latent_affine(
+                publication.variables["autoencoder"], jnp.float32).factor), scale, rtol=1e-6)
             weights = tuned[TUNED_WEIGHTS]
             expected = task.autoencoder.decode_batch(weights, z / jnp.asarray(scale) + jnp.asarray(shift))
             image = decode(publication.autoencoder, publication.variables["autoencoder"], z)
@@ -527,7 +527,8 @@ def test_a_repae_step_moves_the_running_statistics_as_train_repae_does(repae_ste
                                1 / np.sqrt(STEPPED["bn/running_var_f64"]), rtol=4 * np.finfo(np.float64).eps)
     decoder, decoding = task.published_autoencoder({**variables, "params": params, LATENT_STATS: statistics})
     assert isinstance(decoder, TunedAutoEncoder)
-    shift, scale = decoder.running_normalization(decoding["autoencoder"])
+    affine = decoder.latent_affine(decoding["autoencoder"], jnp.float32)
+    shift, scale = affine.shift, affine.factor
     np.testing.assert_array_equal(np.asarray(shift), np.asarray(statistics["mean"]))
     np.testing.assert_allclose(np.asarray(scale, np.float64),
                                1 / np.sqrt(np.asarray(statistics["var"], np.float64)), rtol=gamma(2), atol=0)
@@ -653,7 +654,7 @@ def test_only_the_kl_autoencoders_with_a_posterior_reach_end_to_end_tuning():
 def test_the_running_statistics_start_by_normalizing_as_the_autoencoder_does():
     """REPA-E's start, `normalized` by `initial_statistics` of the autoencoder's shift and scale with
     the batch norm's epsilon at zero, normalizes a posterior's latents as `encode` does
-    (`LatentNormalization.normalized`, which `encode` applies to its draw): neither the identity nor
+    (`AutoEncoder.latent_affine`, which `encode` applies to its draw): neither the identity nor
     twice."""
     autoencoder = objective(EndToEnd()).autoencoder
     tuning = EndToEnd(epsilon=0.0)
@@ -666,8 +667,10 @@ def test_the_running_statistics_start_by_normalizing_as_the_autoencoder_does():
     def started(latents):
         return tuning.normalized(latents, jax.tree.map(lambda value: value.astype(latents.dtype), statistics))
 
-    assert_as_exact(jax.jit(started), jax.jit(autoencoder.normalization.normalized), draw,
-                    "end-to-end start", seeds=8)
+    def encoded(latents):
+        return autoencoder.latent_affine(autoencoder.params, latents.dtype).normalized(latents)
+
+    assert_as_exact(jax.jit(started), jax.jit(encoded), draw, "end-to-end start", seeds=8)
 
 
 def test_a_tuned_autoencoder_has_no_fixed_normalization_to_read_or_replace():
