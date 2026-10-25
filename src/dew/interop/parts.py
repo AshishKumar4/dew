@@ -382,16 +382,20 @@ def _activation(module: torch.nn.Module) -> str:
     transformers' ACT2FN builds that same module for, read back by its class and state."""
     from transformers.activations import ACT2FN
 
-    def portable(value: object) -> object:
-        """A value as it computes: a partial by its function and arguments, a bound method by its
-        function, anything else as itself."""
-        if isinstance(value, functools.partial):
-            return value.func, value.args, tuple(sorted(value.keywords.items()))
-        return value.__func__ if isinstance(value, MethodType) else value
-
-    def state(activation: torch.nn.Module) -> Mapping[str, object]:
-        return {key: portable(value) for key, value in vars(activation).items() if not key.startswith('_')
-                and key != 'training'}
+    def state(activation: torch.nn.Module) -> dict[str, tuple]:
+        """Each public attribute as it computes: a partial by its function and arguments, a bound
+        method by its function, any other value by its class and value."""
+        held = {}
+        for key, value in vars(activation).items():
+            if key.startswith('_') or key == 'training':
+                continue
+            if isinstance(value, functools.partial):
+                held[key] = (value.func, value.args, tuple(sorted(value.keywords.items())))
+            elif isinstance(value, MethodType):
+                held[key] = (value.__func__,)
+            else:
+                held[key] = (type(value), value)
+        return held
 
     for name, gated in ACTIVATIONS.items():
         built = ACT2FN[name]
