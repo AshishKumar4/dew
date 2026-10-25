@@ -27,6 +27,7 @@ from test_mean_flow import CLASSES
 
 from dew.diffusion import presets
 from dew.eval.lpips import variables_from_torch
+from dew.inference import TextToImage
 from dew.inputs import Condition, Field, InputSpec, unit_range
 from dew.nn.autoencoders.api import AutoEncoder
 from dew.nn.autoencoders.dc_ae import DCAE, DCAutoencoder
@@ -48,7 +49,7 @@ from dew.objectives.diffusion.end_to_end import (
     TunedAutoEncoder,
 )
 from dew.objectives.diffusion.objective import DISCRIMINATOR
-from dew.sampling import Euler, TextToImage
+from dew.sampling import Euler
 from dew.telemetry.instrumentation import Compiles
 from dew.training import Trainer
 

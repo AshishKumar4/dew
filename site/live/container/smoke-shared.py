@@ -150,7 +150,8 @@ async def main():
         # The page's cells, as Dew code the context's model_client stands in for.
         cells = [
             TEXT,
-            "from dew.sampling import CFG, DPMSolverMultistep, TextToImage\n"
+            "from dew.inference import TextToImage\n"
+            "from dew.sampling import CFG, DPMSolverMultistep\n"
             "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m')\n"
             "pipe(['a lake beneath the northern lights'], key=3, steps=15, "
             "solver=DPMSolverMultistep(), guidance=CFG(6, interval=(0.15, 0.9))).pil()[0]",

@@ -18,11 +18,12 @@ from dew.config.diffusion import DiffusionRunConfig
 from dew.diffusion import broadcast_rates
 from dew.diffusion.presets import EDM, Flow
 from dew.diffusion.process import aligned_conditions
+from dew.inference import TextToImage
 from dew.inputs import TextCondition, unit_range
 from dew.objectives.base import TEACHER, Step
 from dew.objectives.diffusion import GuidanceDistillationObjective
 from dew.objectives.diffusion.guidance_distillation import with_guidance
-from dew.sampling import Euler, TextToImage
+from dew.sampling import Euler
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 FLUX = {

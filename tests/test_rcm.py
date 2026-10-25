@@ -176,12 +176,13 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
     from dew.config.diffusion import DiffusionRunConfig
     from dew.diffusion.presets import Flow
+    from dew.inference import TextToImage
     from dew.inputs import TextCondition
     from dew.lora import LoRA
     from dew.objectives.base import FROZEN, TEACHER, Step
     from dew.objectives.diffusion import ConsistencyDistillationObjective
     from dew.objectives.diffusion.objective import FAKE_SCORE
-    from dew.sampling import Consistency, Euler, TextToImage
+    from dew.sampling import Consistency, Euler
     from dew.training import Trainer
 
     teacher_run = DiffusionRunConfig(
@@ -345,12 +346,12 @@ def test_a_pretrained_run_distills_the_model_it_loads_without_a_teacher_run(tmp_
     from dew.config import ObjectiveConfig
     from dew.config.diffusion import DiffusionRunConfig
     from dew.diffusion.presets import Flow
+    from dew.inference.images import ImageSettings
     from dew.interop.pretrained import load_diffusion_source
     from dew.objectives.base import TEACHER
     from dew.objectives.diffusion import ConsistencyDistillationObjective
     from dew.objectives.diffusion.objective import model_part
     from dew.registry import to_record
-    from dew.sampling.pipelines import ImageSettings
 
     with tarfile.open(Path(__file__).resolve().parent / "fixtures" / "flux_source.tar.xz") as archive:
         archive.extractall(tmp_path, filter="data")
