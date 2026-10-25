@@ -340,7 +340,7 @@ def test_a_layer_split_over_the_sequence_names_its_scan_for_remat(reference, geo
     """Under a sequence axis of 4, the layer's scan output carries both names a remat policy keeps it by,
     a mixer's 'context' and a recurrence's 'scan', with or without the rows' validity, as on one device
     (`Mamba2.residuals`): a checkpoint saving either name alone holds more residuals for its backward
-    (the pullback's arrays) than one saving nothing."""
+    (the pullback's arrays, traced) than one saving nothing."""
     from dew.nn.backbones.decoder_block import RematPolicy
 
     module = layer(geometry)
@@ -355,9 +355,10 @@ def test_a_layer_split_over_the_sequence_names_its_scan_for_remat(reference, geo
         return jnp.sum(module.apply(params, hidden, call) ** 2)
 
     def kept(names) -> int:
+        """The residual arrays the pullback holds under a policy saving `names`, traced, not run."""
+        checkpointed = jax.checkpoint(loss, policy=RematPolicy(save=names).checkpoint_policy())
         with jax.set_mesh(mesh):
-            _, pull = jax.vjp(jax.checkpoint(loss, policy=RematPolicy(save=names).checkpoint_policy()),
-                              variables)
+            pull = jax.eval_shape(lambda params: jax.vjp(checkpointed, params)[1], variables)
         return len(jax.tree.leaves(pull))
 
     nothing = kept(())
