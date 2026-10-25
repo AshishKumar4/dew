@@ -9,7 +9,7 @@ set (`legal`): no table, no sweep, no space ranked. A GPU nobody measured of a f
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from typing import Literal, overload
 
 import jax
@@ -24,7 +24,6 @@ from dew.nn.kernels.templates.attention import (
     ACCURATE,
     DQ_GRADS,
     NATURAL,
-    TRACED_TILE,
     Gradients,
     Hooks,
     KeySpans,
@@ -32,8 +31,6 @@ from dew.nn.kernels.templates.attention import (
     Param,
     Split,
     gradients,
-    kept_dtype,
-    power_of_two,
 )
 from dew.nn.kernels.templates.attention_mosaic_backward import (
     _dkv_allocations,
@@ -69,19 +66,6 @@ def _extents(family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
     if family.copy_extent is not None:
         top = min(top, family.copy_extent // unit)
     return tuple(range(top * unit, 0, -unit))
-
-
-def _stages(steps: int, staged) -> tuple[int, ...]:
-    """The stage counts a launch walking `steps` tiles takes, fewest first: two, then each more up to its
-    steps (a slot past them loads past the operand, `_Program`) while its program's shared memory at that
-    count (`staged(stages)`) fits a block of the device's (`generation.gpu_target`, the facts
-    `generation.assumed` gives). Where the cost model ties, the fewest win: two stages ran fastest of two to
-    four on an H100 (the forward at llama-d128 causal bf16, 2 x 4096)."""
-    budget = generation.shared_budget(generation.gpu_target())
-    counts = [2]
-    while counts[-1] < steps and staged(counts[-1] + 1) <= budget:
-        counts.append(counts[-1] + 1)
-    return tuple(counts)
 
 
 def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held: int, walked: int,
@@ -171,27 +155,17 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](Template[Config]):
     takes (`refused`)."""
 
     name = "mosaic_gpu"
+    GENERATES = True
     score_mod: Callable | None = None
     form: str = "spans"
     keys: int = 0
     score_kinds: tuple[Kind, ...] = ()
-    score_dtypes: tuple[str, ...] = ()
     scale: float = 1.0
     natural: bool = NATURAL
 
     def spans(self, start, end, query_ids, key_ids) -> KeySpans:
         """The call's spans from its arrays and the op's static form and key count."""
         return KeySpans(start, end, query_ids, key_ids, self.keys, self.form)
-
-    def fits(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[Config, ...]:
-        family = generation.family(target.generation)
-        return tuple(config for config in super().fits(ba, target) if config.family == family)
-
-    def staged(self, ba: tokamax.BoundArguments, tiles: Config, steps: int) -> list[Config]:
-        """`tiles` at each stage count a walk of `steps` tiles and the device's block take (`_stages`)."""
-        target = generation.gpu_target()
-        return [dataclasses.replace(tiles, stages=stages) for stages in _stages(
-            steps, lambda stages: self.staged_bytes(ba, dataclasses.replace(tiles, stages=stages), target))]
 
     def register_budget(self, config: Config) -> int:
         """A consumer thread's share of the registers (`Family.registers`): the family's roles share the
@@ -204,21 +178,12 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](Template[Config]):
         interpretable = not ba.arguments["interpret"] or jax.default_backend() == "cpu"
         return interpretable and self.derived(ba, target) is not None
 
-    def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Config | None:
-        """The launch's one config for the call `ba` on `target`, derived from the family's and the device's
-        facts and the call's extents (`_derived`), no space ranked; None where the target's family has no
-        bundle here (`BUNDLES`), the launch refuses the call (`refusal`), or no tile is legal."""
-        raise NotImplementedError
-
     def legal(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> bool:
-        """Whether a launch of `ba` runs at `config` on `target`: the target's family's bundle, a call the
-        launch takes, its programs' shared memory within a block (`generation.shared_budget`) and a
-        consumer's registers within its share (`register_budget`). A config a test names is held to it too."""
+        """Whether a launch of `ba` runs at `config` on `target`: the target's family's bundle (`BUNDLES`), a
+        call the launch takes (`refusal`), and the block and registers `Template.legal` holds it to."""
         family = BUNDLES.get(config.family)
         return (family is not None and config.family == generation.family(target.generation)
-                and self.refusal(ba, family) is None
-                and self.staged_bytes(ba, config, target) <= generation.shared_budget(target)
-                and (self.registers(ba, config) or 0) <= self.register_budget(config))
+                and self.refusal(ba, family) is None and super().legal(ba, config, target))
 
     def _family(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mosaic.Family | None:
         """The target's family's bundle where the launch takes the call there, else None."""
@@ -254,8 +219,6 @@ class MosaicForward(_Mainloop[Tiles]):
     config_cls = Tiles
     output_mod: Callable | None = None
     output_kinds: tuple[Kind, ...] = ()
-    output_dtypes: tuple[str, ...] = ()
-    output_width: int = TRACED_TILE
 
     def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial, *,
              residuals: bool, interpret: bool, config: Tiles, return_residuals: bool = False):
@@ -281,24 +244,6 @@ class MosaicForward(_Mainloop[Tiles]):
 
         return _derived(family, query.dtype, query.shape[1], key.shape[1], tiles,
                         lambda config: self.legal(ba, config, target), 2, steps)
-
-    def space(self, ba: tokamax.BoundArguments) -> Sequence[Tiles]:
-        """Every tile the forward takes on each family of `BUNDLES` at the call's extents, the configs a test
-        may name (`legal`): each count of consumers the family has, most first; each consumer's query block
-        and the key tile in whole multiples of the family's unit (`_extents`), largest first, so where the
-        cost model ties the fewest programs re-read the keys; at each stage count its walk and the device's
-        block take (`_stages`). A consumer thread's registers bound them where they fit (`fits`,
-        `register_budget`)."""
-        query, key = ba.arguments["query"], ba.arguments["key"]
-        configs = []
-        for family in BUNDLES.values():
-            for consumers in range(family.consumers, 0, -1):
-                for block_q in _extents(family, query.dtype, -(-query.shape[1] // consumers)):
-                    for block_k in _extents(family, query.dtype, key.shape[1]):
-                        tiles = Tiles(block_q, block_k, 2, consumers, family.name)
-                        keys = _padded(query.shape[1], key.shape[1], tiles)[1]
-                        configs += self.staged(ba, tiles, keys // block_k)
-        return tuple(configs)
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         """The program's shared memory (`_forward_allocations`, `_staged`), at the call's widths as the launch
@@ -420,9 +365,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     op = MosaicForward(score_mod=hooks.score_mod, output_mod=hooks.output_mod,
                        score_kinds=tuple(param.kind for param in hooks.score_params),
                        output_kinds=tuple(param.kind for param in hooks.output_params),
-                       score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score_params),
-                       output_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.output_params),
-                       output_width=power_of_two(value.shape[3]), form=spans.form, keys=spans.keys,
+                       form=spans.form, keys=spans.keys,
                        scale=query.shape[3] ** -0.5 if scale is None else scale, natural=natural)
     return op, (query, key, value, spans.start, spans.end, spans.query_ids, spans.key_ids,
                 tuple(param.value for param in hooks.score_params),
@@ -478,6 +421,11 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         return gradients(launch, query, key, value, spans, hooks, dout, residuals,
                          block=_block(config), scale=self.scale), None
 
+    def legal(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget) -> bool:
+        # The one launch adds each tile's dQ under the first pass's D: the fast form's, a hookless call's.
+        hooked = self.score_mod is not None or ba.arguments["initial"] is not None
+        return (not config.fused or not (self.accurate or hooked)) and super().legal(ba, config, target)
+
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> BackwardTiles | None:
         """Its tiles from the facts (`_derived`): each dK/dV consumer a unit of keys, the query tile both
         launches walk the largest their registers and the block hold, two stages, and two launches (the
@@ -497,26 +445,6 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
 
         return _derived(family, query.dtype, key.shape[1], query.shape[1], tiles,
                         lambda config: self.legal(ba, config, target), 2, steps)
-
-    def space(self, ba: tokamax.BoundArguments) -> Sequence[BackwardTiles]:
-        """Every config the backward takes on each family of `BUNDLES` at the call's extents, the configs a
-        test may name (`legal`): each count of consumers the family has, most first; each query and key block
-        in whole multiples of its unit (`_extents`), largest first; the two launches, then the fast form's one
-        where the call has no hook (`fused`); at each stage count the walks and the device's block take
-        (`_stages`). A consumer thread's registers bound them where they fit (`fits`, `register_budget`)."""
-        query, key = ba.arguments["query"], ba.arguments["key"]
-        hooked = self.score_mod is not None or ba.arguments["initial"] is not None
-        queries, keys, dtype = query.shape[1], key.shape[1], query.dtype
-        configs = []
-        for family in BUNDLES.values():
-            for consumers in range(family.consumers, 0, -1):
-                for block_q in _extents(family, dtype, -(-queries // consumers)):
-                    for block_k in _extents(family, dtype, -(-keys // consumers)):
-                        for fused in (False,) if self.accurate or hooked else (False, True):
-                            tiles = BackwardTiles(block_q, block_k, 2, consumers, fused, family.name)
-                            padded_q, padded_k = _padded(queries, keys, tiles)
-                            configs += self.staged(ba, tiles, max(padded_q // block_q, padded_k // block_k))
-        return tuple(configs)
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles,
                      target: generation.GpuTarget) -> int:
@@ -696,7 +624,6 @@ def _backward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     hooks = Hooks() if hooks is None else hooks
     op = MosaicBackward(score_mod=hooks.score_mod,
                         score_kinds=tuple(param.kind for param in hooks.score_params),
-                        score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score_params),
                         form=spans.form, keys=spans.keys,
                         scale=query.shape[3] ** -0.5 if scale is None else scale, natural=natural,
                         accurate=accurate)

@@ -27,7 +27,6 @@ from dew.nn.kernels.templates.attention import (
     DKV_GRADS,
     DQ_GRADS,
     NATURAL,
-    TRACED_TILE,
     Gradients,
     Hooks,
     KeySpans,
@@ -35,7 +34,6 @@ from dew.nn.kernels.templates.attention import (
     Split,
     block_map,
     gradients,
-    kept_dtype,
     kernel_dot,
     padded_call,
     within,
@@ -251,9 +249,6 @@ class TritonForward(Template[Tiles]):
     keys: int | None = None
     score_kinds: tuple[Kind, ...] = ()
     output_kinds: tuple[Kind, ...] = ()
-    score_dtypes: tuple[str, ...] = ()
-    output_dtypes: tuple[str, ...] = ()
-    output_width: int = TRACED_TILE
     scale: float = 1.0
     natural: bool = NATURAL
 
@@ -454,9 +449,6 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     op = TritonForward(score_mod=hooks.score_mod, output_mod=hooks.output_mod,
                        score_kinds=tuple(param.kind for param in hooks.score_params),
                        output_kinds=tuple(param.kind for param in hooks.output_params),
-                       score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score_params),
-                       output_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.output_params),
-                       output_width=call.value.shape[-1],
                        scale=query.shape[3] ** -0.5 if scale is None else scale, form=spans.form,
                        keys=spans.keys, natural=natural)
     out = op(call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
@@ -699,7 +691,6 @@ class TritonBackward(Template[BackwardTiles]):
     config_cls = BackwardTiles
     score_mod: Callable | None = None
     score_kinds: tuple[Kind, ...] = ()
-    score_dtypes: tuple[str, ...] = ()
     scale: float = 1.0
     split: bool = True
     how: algebra.Recompute = algebra.PLAIN
@@ -974,13 +965,13 @@ def _key_param_spec(kind: Kind, param: jax.Array, queries: int, block_k: int) ->
             raise ValueError("an output hook's parameter has no score tile")
 
 
-def _launch(*arrays, score_mod, score_kinds: tuple[Kind, ...], score_dtypes: tuple[str, ...], scale: float,
+def _launch(*arrays, score_mod, score_kinds: tuple[Kind, ...], scale: float,
             split: bool, natural: bool, accurate: bool, initial: bool, interpret: bool):
     """The Triton mainloop's two launches under one tuning decision (`TritonBackward`), recomputing the
     weights as a forward of the call's form computed them (`algebra.recompute`)."""
     how = algebra.recompute(algebra.Forward("full", 0, ids=False, scale=scale, score_mod=score_mod,
                                             natural=natural, initial=initial))
-    op = TritonBackward(score_mod=score_mod, score_kinds=score_kinds, scale=scale, score_dtypes=score_dtypes,
+    op = TritonBackward(score_mod=score_mod, score_kinds=score_kinds, scale=scale,
                         split=split, how=how, accurate=accurate)
     return op(*arrays, interpret=interpret)
 

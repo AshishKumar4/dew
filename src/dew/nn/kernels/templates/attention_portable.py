@@ -480,11 +480,10 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
 
 def _launch(query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value, shift,
             others, own, others_total, forward_total, start, end, query_ids, key_ids, score_params, *,
-            score_mod, score_kinds: tuple[Kind, ...], score_dtypes: tuple[str, ...], scale: float,
+            score_mod, score_kinds: tuple[Kind, ...], scale: float,
             block_q: int, block_k: int, split: bool, natural: bool, accurate: bool, initial: bool):
     """The Triton backward's outputs (`TritonBackward`), from this mainloop's two launches, recomputing the
     weights as a forward of the call's form computed them (`algebra.recompute`)."""
-    del score_dtypes
     spans = start, end, query_ids, key_ids
     how = algebra.recompute(algebra.Forward("full", 0, ids=False, scale=scale, score_mod=score_mod,
                                             natural=natural, initial=initial))
