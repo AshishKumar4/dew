@@ -113,9 +113,11 @@ class Architecture:
     'fp32': IEEE fp32 on the CUDA cores, the rate a dot at Precision.HIGHEST takes), Hopper's warpgroup
     MMA, Blackwell's tensor memory columns (PTX ISA, tcgen05.alloc), and the model values of what only a
     measurement states, which the opt-in calibration replaces on a device (`GpuTarget.calibration`): the
-    global-memory load latency in multiprocessor clocks and the bytes the L2 serves a multiprocessor a
-    clock; on a TPU the scoped VMEM limit at XLA's default, the VMEM a kernel may raise its limit to
-    (`vmem_bytes`), and a grid step's fixed seconds."""
+    global-memory load latency in multiprocessor clocks, the bytes the L2 serves a multiprocessor a
+    clock, and the fraction of its tensor rate its products reach where each scheduler issues one warp's
+    products in order with the fragment loads feeding them (`single_warp_issue`); on a TPU the scoped
+    VMEM limit at XLA's default, the VMEM a kernel may raise its limit to (`vmem_bytes`), and a grid
+    step's fixed seconds."""
 
     family: str
     tensor_rates: Mapping[str, int] = dataclasses.field(default_factory=dict)
@@ -126,6 +128,7 @@ class Architecture:
     scoped_vmem: int | None = None
     vmem_bytes: int | None = None
     grid_step_seconds: float | None = None
+    single_warp_issue: float | None = None
 
 
 # Tensor FLOPs per clock per multiprocessor are a datasheet's dense peak over SMs x boost clock: A100 312 TF
@@ -139,13 +142,21 @@ class Architecture:
 # "Benchmarking and Dissecting the Nvidia Hopper GPU Architecture", IPDPS 2024, arXiv 2402.13499, Table
 # IV): A100 466.3, H800 478.8, RTX 4090 541.5. L2 bytes a multiprocessor a clock, Dew's streaming probe
 # (L2PROBE, probe_l2.py) over SMs x clock: A100 5.43 TB/s -> 35.7, A10 4.74 -> 38.8, H100 SXM 13.2 -> 54.6.
+# mma.sync's single-warp issue, the fraction of its tensor rate a program reaches where each scheduler issues
+# one warp's products in order with the fragment loads feeding them (Mosaic GPU's mma.sync tiles, one
+# warpgroup a multiprocessor): 0.57, the cost model's fit to an A100's 18 Mosaic forward and input-gradient
+# rows (FRAG-route-a100, rms log error 0.05), the family's on every member; held out, an L4's picks between
+# Triton's launch and Mosaic GPU's follow it (15 of 16 rows, the other a 0.7% tie; FRAG-route-l4), and
+# fitted on the L4's 16 rows instead (0.45) the A100's 18 picks are the same.
 # A family no device of which was measured takes its nearest measured family's model values, said so
 # below; the opt-in calibration measures the device's own.
+MMA_SYNC_SINGLE_WARP_ISSUE = 0.57
 _AMPERE = Architecture('mma.sync', {'16bit': 2048, 'tf32': 1024, 'fp32': 128}, load_latency=466.3,
-                       l2_bytes_per_clock=35.7)
+                       l2_bytes_per_clock=35.7, single_warp_issue=MMA_SYNC_SINGLE_WARP_ISSUE)
 _AMPERE_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256}, load_latency=541.5,
-                                l2_bytes_per_clock=38.8)
-_TURING = Architecture('mma.sync', {'16bit': 1024, 'fp32': 128}, load_latency=541.5, l2_bytes_per_clock=38.8)
+                                l2_bytes_per_clock=38.8, single_warp_issue=MMA_SYNC_SINGLE_WARP_ISSUE)
+_TURING = Architecture('mma.sync', {'16bit': 1024, 'fp32': 128}, load_latency=541.5, l2_bytes_per_clock=38.8,
+                       single_warp_issue=MMA_SYNC_SINGLE_WARP_ISSUE)
 _HOPPER = Architecture('wgmma', {'16bit': 4096, 'tf32': 2048, 'fp32': 256}, wgmma=True, load_latency=478.8,
                        l2_bytes_per_clock=54.6)
 # Blackwell's tcgen05 family: no member measured, its latency and L2 Hopper's.
@@ -153,7 +164,7 @@ _BLACKWELL = Architecture('tcgen05', {'16bit': 8192, 'tf32': 4096, 'fp32': 256},
                           load_latency=478.8, l2_bytes_per_clock=54.6)
 # Consumer Blackwell (RTX 50, RTX PRO 6000) runs sm80's mma.sync forms: Ada's rates and model values.
 _BLACKWELL_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256}, load_latency=541.5,
-                                   l2_bytes_per_clock=38.8)
+                                   l2_bytes_per_clock=38.8, single_warp_issue=MMA_SYNC_SINGLE_WARP_ISSUE)
 # A TPU's: its MXU's FLOPs a clock (v5e 197 TF over 1.5 GHz -> 131072), the scoped VMEM limit at XLA's
 # default (v5e 16 MiB, read from a Mosaic kernel's refusal: "limit 16.00M"; v6e's pending GEMMTPU-VMEM's),
 # and a grid step's fixed seconds, the slope of time over 1 to 65536 Pallas grid steps each issuing one
@@ -281,6 +292,14 @@ class GpuTarget:
         """A TPU grid step's fixed seconds beside its work (the cost model's step term); None on GPUs,
         whose pipelined steps the model prices by their latency."""
         return self.architecture.grid_step_seconds
+
+    @property
+    def single_warp_issue(self) -> float | None:
+        """The fraction of the tensor rate a program reaches where each scheduler issues one warp's
+        products in order with the fragment loads feeding them (the cost model's `Cost.single_warp`): the
+        device's calibrated one, else its family's model value; None where neither states it, the rate
+        then the peak."""
+        return self.calibration.get('single_warp_issue', self.architecture.single_warp_issue)
 
     @property
     def load_latency(self) -> float | None:
