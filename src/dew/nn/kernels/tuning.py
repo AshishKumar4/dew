@@ -413,7 +413,7 @@ class KernelOp(tokamax.Op):
                 collected.found.append((self, keyed))
             config = self._chosen(ba, keyed)
             if collected is not None:
-                collected.found.taken.append(config)
+                collected.found.taken.append((config, ba))
         if cache.KERNEL_LAUNCHES.value:
             # Dew chose the launch for this GPU (`generation`); tokamax's device check would ask
             # each traced array for its devices (`keyed`).
@@ -864,11 +864,12 @@ def launches() -> Iterator[None]:
 class Seen(list[Launch]):
     """The launches traced under `seen`, each its op and keyed arguments, in the order they traced, and
     `taken`, the config each took as it traced (`KernelOp._chosen`: a pin, a pick, the nearest pick or
-    its heuristic), in the same order."""
+    its heuristic) and the arguments it took it for (its own shapes, which its heuristic reads), in the
+    same order."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.taken: list[Hashable] = []
+        self.taken: list[tuple[Hashable, tokamax.BoundArguments]] = []
 
 
 class _Seen:

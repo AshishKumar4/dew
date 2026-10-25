@@ -63,9 +63,9 @@ def _facts(value):
         return (type(value).__name__, *((field.name, _facts(getattr(value, field.name)))
                                        for field in dataclasses.fields(value)))
     if isinstance(value, Mapping):
-        return tuple(sorted((key, _facts(item)) for key, item in value.items()))
+        return tuple(sorted((key, _facts(entry)) for key, entry in value.items()))
     if isinstance(value, (tuple, list)):
-        return tuple(_facts(item) for item in value)
+        return tuple(_facts(element) for element in value)
     return value
 
 
