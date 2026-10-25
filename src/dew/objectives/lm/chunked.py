@@ -216,16 +216,21 @@ def _row_terms(logits, predict: bool) -> tuple[
     logits of 4096 x 151936 took 3.9 ms against `jax.nn.logsumexp` and
     `jnp.argmax`'s 7.6, and 8192 x 50304 2.6 against 5.0.
 
-    On CPU the row reduces in two levels, blocks of about its square root's
-    width and then the blocks' terms (`_row_blocks`): XLA's CPU compiler
-    runs a reduction with a combine of its own as one loop over the row, and
-    over 512 columns that loop's sum of exponentials held a whole head's
-    state gradient 3.9 times as far from float64 as `jax.nn.logsumexp`'s
-    over 52 orders of its columns (tests/test_chunked_cross_entropy.py),
-    where the two levels' loops are each a block long. A GPU reduces a row
-    as a tree of its threads' partial sums already, where a second level is
-    another pass over the row's blocks for nothing, so other backends keep
-    the one reduction."""
+    On CPU the row reduces in levels of `ROW_BLOCK` columns, each level's
+    blocks' terms the next level's row, until one block is left
+    (`_row_blocks`): XLA's CPU compiler runs a reduction with a combine of
+    its own as one loop over the row, whose sum of exponentials rescales its
+    running total at each new maximum and rounds at each step, so its error
+    grows with the loop's length. Over 512 columns one loop held a whole
+    head's state gradient 3.9 times as far from float64 as
+    `jax.nn.logsumexp`'s over 52 orders of its columns; two levels of blocks
+    of the row's square root's width held a 2053-column head's 1.50 times as
+    far as the full pass's over drawn cotangents, where the vocabulary-tiled
+    head's 514-column tiles, each in shorter blocks, held 1.18 times
+    (tests/test_chunked_cross_entropy.py, row 1592). A GPU reduces a row as a
+    tree of its threads' partial sums already, where more levels are more
+    passes over the row for nothing, so other backends keep the one
+    reduction."""
     def combine(first, second):
         larger = jnp.maximum(first[0], second[0])
         total = rescaled(first[0], first[1], larger) + rescaled(second[0], second[1], larger)
@@ -246,20 +251,26 @@ def _row_terms(logits, predict: bool) -> tuple[
         return jax.lax.reduce(operands, tuple(initial), combine, (operands[0].ndim - 1,))
 
     def blocked(*operands):
-        firsts = [reduced(*part) for part in _row_blocks(list(operands))]
-        return reduced(*(jnp.concatenate([first[index] for first in firsts], axis=-1)
-                         for index in range(len(operands))))
+        row = list(operands)
+        while row[0].shape[-1] > ROW_BLOCK:
+            firsts = [reduced(*part) for part in _row_blocks(row)]
+            row = [jnp.concatenate([first[index] for first in firsts], axis=-1) for index in range(len(row))]
+        return reduced(*row)
 
     terms = jax.lax.platform_dependent(*operands, cpu=blocked, default=reduced)
     return terms[0] + jnp.log(terms[1]), ((terms[0], terms[2]) if predict else None), terms[:2]
 
 
+ROW_BLOCK = 16
+"""The columns a level of `_row_terms`' CPU reduction reduces in one loop."""
+
+
 def _row_blocks(operands: list[jax.Array]) -> list[list[jax.Array]]:
-    """`operands`, rows over their last axis, as the parts `_row_terms` reduces first, each part's
-    blocks on a new last axis: blocks of the power of two nearest the row's square root in width,
-    and the columns left past the last whole block as one more."""
+    """`operands`, rows over their last axis, as the parts one level of `_row_terms` reduces, each
+    part's blocks on a new last axis: blocks of `ROW_BLOCK` columns, and the columns left past the
+    last whole block as one more."""
     width = operands[0].shape[-1]
-    block = 1 << round(math.log2(width) / 2) if width > 1 else 1
+    block = ROW_BLOCK
     whole = width - width % block
     parts = [[x[..., :whole].reshape(*x.shape[:-1], whole // block, block) for x in operands]]
     if whole < width:
