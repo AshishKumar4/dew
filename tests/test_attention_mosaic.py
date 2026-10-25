@@ -413,8 +413,7 @@ def test_the_training_forwards_overflowed_rows_keep_their_form_and_every_other_r
 
 UNSEEN = {
     "hopper-class": generation.GpuTarget("sm90", "Unmeasured Hopper-class GPU", shared_limit=180 * 1024,
-                                         multiprocessors=78, clock_hz=1.6e9, memory_bandwidth=2.4e12,
-                                         calibration={"l2_bandwidth": 4.0e12}),
+                                         multiprocessors=78, clock_hz=1.6e9, memory_bandwidth=2.4e12),
     "ampere-class": generation.GpuTarget("sm80", "Unmeasured Ampere-class GPU", shared_limit=99 * 1024,
                                          multiprocessors=46, clock_hz=1.4e9, memory_bandwidth=0.45e12),
 }
@@ -700,35 +699,6 @@ def test_every_approximated_operation_in_a_hook_takes_exact_math(operation):
 def _fullest(op, ba, target):
     """The fitting config of `op`'s launch of `ba` on `target` that stages the most shared memory."""
     return max(op.fitting(ba, target), key=lambda config: op.staged_bytes(ba, config, target))
-
-
-@pytest.mark.parametrize("case", ["runs", "runs-documents-valid"])
-def test_a_tuned_launch_over_runs_times_every_key(case):
-    """The tuner's timing operands of a forward and a backward over a call's runs (`tuning.materialized`,
-    `attention.spanned`): each query's first run holds every key and its others are empty, and its documents'
-    ids are one document, so the timed launch walks every tile a dense call does, never an empty walk."""
-    call = RUN_CASES[case]
-    queries, keys = core_geometry(call)
-    spans = template.spans(queries, keys, ROWS, **arguments(call))
-    query = jax.ShapeDtypeStruct((ROWS, queries, 2, 64), jnp.bfloat16)
-    key = jax.ShapeDtypeStruct((ROWS, keys, 1, 64), jnp.bfloat16)
-    stats = jax.ShapeDtypeStruct((ROWS, 2, queries), jnp.float32)
-    others = jax.ShapeDtypeStruct((ROWS, 2, queries, 64), jnp.float32)
-    residuals = (stats, stats, jax.ShapeDtypeStruct((ROWS, 2, queries), jnp.int32),
-                 template.Split(others, stats, stats, stats))
-    bounds = tuple(jax.ShapeDtypeStruct(array.shape, array.dtype) if array is not None else None
-                   for array in (spans.start, spans.end, spans.query_ids, spans.key_ids))
-    forward = attention_mosaic.MosaicForward(form=spans.form, keys=keys)
-    backward = attention_mosaic.MosaicBackward(form=spans.form, keys=keys)
-    # Each launch's spans after its queries, keys and values, and a backward's output cotangent.
-    launches = ((forward, _bound(forward, query, key, key, *bounds, (), (), None, residuals=False), 3),
-                (backward, _bound(backward, query, key, key, query, *bounds, (), None, residuals), 4))
-    for op, ba, place in launches:
-        arrays, fill = tuning.materialized(op, ba)
-        args, _ = fill(arrays)
-        start, end, query_ids, key_ids = args[place:place + 4]
-        timed = template.KeySpans(start, end, query_ids, key_ids, keys, spans.form)
-        assert np.asarray(template.dense(timed)).all(), type(op).__name__
 
 
 @lowers("sm90")

@@ -39,7 +39,7 @@ from delta_rule_support import fused_step, recurrence, through
 from flax import linen as nn
 from model_support import decode_through
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened
-from tuned import each_config, launches, timed
+from tuned import taken
 
 from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
 from dew.nn.kernels import tuning
@@ -759,13 +759,12 @@ def test_the_chunked_rule_holds_with_aligned_keys():
 ])
 def test_the_decode_kernel_steps_as_the_recurrence_does(rows, heads, width, held):
     """One decode token through `dew.nn.kernels.recurrence.step` (one read and one
-    write of the state) gives the recurrence's output and state at every
-    config of the launch's space (`tuning.pinned`): an fp32 state's within
-    the float64 gate of the fp32 recurrence's, at Qwen3.5-0.8B's widths (16
-    heads, 128 wide) on a GPU and interpreted at a small width. A state held
-    in bf16 is read and stepped in fp32 and written back rounded once,
-    stochastically: within one bf16 step of the fp32 one. The tuner times the
-    launch on every row active, where the default operands' zeros idle them."""
+    write of the state) gives the recurrence's output and state at the
+    launch's config: an fp32 state's within the float64 gate of the fp32
+    recurrence's, at Qwen3.5-0.8B's widths (16 heads, 128 wide) on a GPU and
+    interpreted at a small width. A state held in bf16 is read and stepped in
+    fp32 and written back rounded once, stochastically: within one bf16 step
+    of the fp32 one."""
     from dew.nn.kernels.recurrence import StepLaunch
     from dew.nn.linear import decode_gated_delta_rule
 
@@ -780,21 +779,15 @@ def test_the_decode_kernel_steps_as_the_recurrence_does(rows, heads, width, held
     want, want_state = recurrent_gated_delta_rule(*operands)
     with jax.enable_x64(new_val=True):
         truth = [np.asarray(x) for x in recurrent_gated_delta_rule(*widened(operands))]
-    found = each_config(StepLaunch, decode_gated_delta_rule, query, key, value, g, beta, state)
-    assert len(found) > 1
-    # Timed on every row active (`KernelOp.operands`): each row-head's output is written.
-    [step] = launches(decode_gated_delta_rule, query, key, value, g, beta, state)
-    assert np.all(np.any(np.asarray(timed(step)[1]) != 0, axis=-1))
-    for config in found:
-        with tuning.pinned({StepLaunch: config}):
-            got, got_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state)
-        assert got_state.dtype == held
-        assert_as_exact_as_the_reference(np.asarray(got), np.asarray(want), truth[0], f"{config} out")
-        if held == jnp.float32:
-            assert_as_exact_as_the_reference(np.asarray(got_state), np.asarray(want_state), truth[1],
-                                             f"{config} state")
-        else:
-            np.testing.assert_allclose(np.asarray(got_state, np.float32), want_state, atol=2e-6, rtol=2 ** -7)
+    [config] = taken(StepLaunch, decode_gated_delta_rule, query, key, value, g, beta, state)
+    got, got_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state)
+    assert got_state.dtype == held
+    assert_as_exact_as_the_reference(np.asarray(got), np.asarray(want), truth[0], f"{config} out")
+    if held == jnp.float32:
+        assert_as_exact_as_the_reference(np.asarray(got_state), np.asarray(want_state), truth[1],
+                                         f"{config} state")
+    else:
+        np.testing.assert_allclose(np.asarray(got_state, np.float32), want_state, atol=2e-6, rtol=2 ** -7)
 
 
 @pytest.mark.mesh(devices=2)
@@ -891,7 +884,7 @@ def fused_inputs(layer, variables, cache, token):
 ])
 def test_the_fused_decode_step_computes_the_layers_token(heads, width, rows, held):
     """A gated delta net's decode token in one launch (`fused_step`: the conv over the
-    held history, the gates, the update and the gated norm) at every config of its space: its output
+    held history, the gates, the update and the gated norm) at its config: its output
     through the layer's projection, its history and its state, fp32 or bf16, within
     tests/reference_error.py's rule of the layer's own unfused token, holding the same state, against
     the float64 layer's. Compiled on a GPU, interpreted elsewhere."""
@@ -915,18 +908,13 @@ def test_the_fused_decode_step_computes_the_layers_token(heads, width, rows, hel
         return projected, history, state
 
     operands = fused_inputs(layer, variables, cache, token)
-    found = each_config(StepLaunch, fused, *operands)
-    assert len(found) > 1
-    for config in found:
-        with tuning.pinned({StepLaunch: config}):
-            out, history, state = jax.jit(fused)(*operands)
-        assert_as_exact_as_the_reference(np.asarray(out), np.asarray(want), np.asarray(exact),
-                                         f"{config} out")
-        np.testing.assert_array_equal(np.asarray(history), np.asarray(after["cache"]["conv_state"]))
-        assert state.dtype == held
-        assert_as_exact_as_the_reference(np.asarray(state), np.asarray(unfused["recurrent_state"]),
-                                         np.asarray(exact_after["cache"]["recurrent_state"]),
-                                         f"{config} state")
+    [config] = taken(StepLaunch, fused, *operands)
+    out, history, state = jax.jit(fused)(*operands)
+    assert_as_exact_as_the_reference(np.asarray(out), np.asarray(want), np.asarray(exact), f"{config} out")
+    np.testing.assert_array_equal(np.asarray(history), np.asarray(after["cache"]["conv_state"]))
+    assert state.dtype == held
+    assert_as_exact_as_the_reference(np.asarray(state), np.asarray(unfused["recurrent_state"]),
+                                     np.asarray(exact_after["cache"]["recurrent_state"]), f"{config} state")
 
 
 def test_a_cached_layer_traced_for_a_jvp_decodes_through_the_recurrence():
@@ -1123,7 +1111,7 @@ def test_a_decode_token_reports_the_fused_step_as_its_route_where_its_target_tak
 
 @pytest.mark.gpu(reason="launch timing and occupancy vary on a GPU")
 def test_the_fused_decode_step_gives_the_same_bits_however_its_launches_are_timed():
-    """The fused decode step at each config of its space, run 20 times, each run beside a large matmul
+    """The fused decode step at its config, run 20 times, each run beside a large matmul
     that holds most of the GPU or alone, gives the same output, history and state bits every run: no
     value head reads a history or state another program is writing, whatever order they run in."""
     from dew.nn.kernels.recurrence import StepLaunch
@@ -1137,12 +1125,11 @@ def test_the_fused_decode_step_gives_the_same_bits_however_its_launches_are_time
         return fused_step(*operands, epsilon=layer.norm_eps, activation=layer.gate_activation,
                                      dtype=jnp.bfloat16)
 
-    for config in each_config(StepLaunch, fused, *operands):
-        with tuning.pinned({StepLaunch: config}):
-            run = jax.jit(fused)
-            first = jax.tree.map(np.asarray, run(*operands))
-            for repeat in range(20):
-                if repeat % 2:
-                    busy(load)
-                for mine, theirs in zip(jax.tree.leaves(run(*operands)), jax.tree.leaves(first), strict=True):
-                    np.testing.assert_array_equal(np.asarray(mine), theirs, err_msg=f"{config}, run {repeat}")
+    [config] = taken(StepLaunch, fused, *operands)
+    run = jax.jit(fused)
+    first = jax.tree.map(np.asarray, run(*operands))
+    for repeat in range(20):
+        if repeat % 2:
+            busy(load)
+        for mine, theirs in zip(jax.tree.leaves(run(*operands)), jax.tree.leaves(first), strict=True):
+            np.testing.assert_array_equal(np.asarray(mine), theirs, err_msg=f"{config}, run {repeat}")

@@ -217,8 +217,8 @@ class Ring:
         return int(self.smem.shape[0])
 
     def slot(self, counter):
-        """The slot step `counter` uses."""
-        return lax.rem(counter, jnp.asarray(self.stages, counter.dtype))
+        """The slot step `counter` (traced, or a Python int) uses."""
+        return counter % self.stages
 
     def load(self, counter, view) -> None:
         """The producer's load of step `counter` from `view`, once its slot is free."""
@@ -483,6 +483,27 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     def column(self) -> plgpu_core.SomeLayout:
         """A column vector's layout: the accumulator's reduced over its rows."""
 
+    def warpgroups(self, consumers: int) -> int:
+        """The warpgroups a program of `consumers` compute roles runs: theirs, and a producer's where the
+        family streams from a role of its own (`roles`)."""
+        return consumers
+
+    def staged(self, value: jax.Array, buffer) -> Ref:
+        """`value` in the shared-memory tile `buffer`, in its dtype, for a product to read: a register right
+        operand's way to an MMA (`staged_products` stages left ones). Mosaic GPU brackets a store with the
+        warpgroup's barriers (its automatic barriers), so every warp's reads of `buffer` are done before it
+        and its writes seen after; the family publishes them to its asynchronous readers (`published`)."""
+        buffer[...] = value.astype(buffer.dtype)
+        self.published()
+        return buffer
+
+    def summed(self, shape: tuple[int, int], issue, interpret: bool) -> jax.Array:
+        """`issue(acc) -> acc` issuing products in place (`products`) into a fresh fp32 accumulator of
+        `shape` (zero), its value once they are done: a register accumulator's, which a family whose
+        accumulator is a ref scopes (wgmma's)."""
+        del interpret
+        return issue(self.zeros(shape))
+
     @abc.abstractmethod
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None) -> Callable:
@@ -558,7 +579,7 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     def published(self) -> None:
         """A consumer's writes to shared memory made visible to the readers that read it asynchronously
         (warpgroup MMA, TMA), before any of them reads it: a family whose products read shared memory
-        from its consumers' own loads (mma.sync's) overrides it."""
+        through its consumers' own loads (mma.sync's) has nothing to publish."""
         plgpu.commit_smem()
 
     @abc.abstractmethod
@@ -642,6 +663,11 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     """The fp32 entries of shared memory a consumer's `column_sums` takes: a reduction across the warps
     holding a tile's rows takes one register's partial sums at a time."""
 
+    reduction_scratch: int = 0
+    """The bytes of shared memory the family's kernels reserve for Mosaic GPU's implicit reductions across
+    warps (its compiler parameters' `reduction_scratch_bytes`): none where a reduction takes the consumer's
+    own (`column_sums`)."""
+
     def column_sums(self, value: jax.Array, scratch, interpret: bool) -> jax.Array:
         """The sums of `value`'s columns `[columns]` in a column's layout, `value` `[rows, columns]` in the
         accumulator's layout: across the warps holding its rows, through the consumer's own `scratch`
@@ -682,6 +708,9 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
     def depths(self, dtype) -> tuple[int, ...]:
         return (SWIZZLE_BYTES // jnp.dtype(dtype).itemsize,)
+
+    def warpgroups(self, consumers: int) -> int:
+        return consumers + 1
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None) -> Callable:

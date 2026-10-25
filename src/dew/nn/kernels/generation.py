@@ -111,13 +111,10 @@ class Architecture:
     generation): the family a template's mainloop claims (`family`), its dense tensor-core FLOPs per
     clock per multiprocessor by arithmetic mode ('16bit': fp16 or bf16 operands summed in fp32; 'tf32';
     'fp32': IEEE fp32 on the CUDA cores, the rate a dot at Precision.HIGHEST takes), Hopper's warpgroup
-    MMA, Blackwell's tensor memory columns (PTX ISA, tcgen05.alloc), and the model values of what only a
-    measurement states, which the opt-in calibration replaces on a device (`GpuTarget.calibration`): the
-    global-memory load latency in multiprocessor clocks, the bytes the L2 serves a multiprocessor a
-    clock, and the fraction of its tensor rate its products reach where each scheduler issues one warp's
-    products in order with the fragment loads feeding them (`single_warp_issue`); on a TPU the scoped
-    VMEM limit at XLA's default, the VMEM a kernel may raise its limit to (`vmem_bytes`), and a grid
-    step's fixed seconds."""
+    MMA, Blackwell's tensor memory columns (PTX ISA, tcgen05.alloc), and what only a measurement
+    states: the global-memory load latency in multiprocessor clocks and the bytes the L2 serves a
+    multiprocessor a clock; on a TPU the scoped VMEM limit at XLA's default, the VMEM a kernel may raise
+    its limit to (`vmem_bytes`), and a grid step's fixed seconds."""
 
     family: str
     tensor_rates: Mapping[str, int] = dataclasses.field(default_factory=dict)
@@ -128,7 +125,6 @@ class Architecture:
     scoped_vmem: int | None = None
     vmem_bytes: int | None = None
     grid_step_seconds: float | None = None
-    single_warp_issue: float | None = None
 
 
 # Tensor FLOPs per clock per multiprocessor are a datasheet's dense peak over SMs x boost clock: A100 312 TF
@@ -142,29 +138,20 @@ class Architecture:
 # "Benchmarking and Dissecting the Nvidia Hopper GPU Architecture", IPDPS 2024, arXiv 2402.13499, Table
 # IV): A100 466.3, H800 478.8, RTX 4090 541.5. L2 bytes a multiprocessor a clock, Dew's streaming probe
 # (L2PROBE, probe_l2.py) over SMs x clock: A100 5.43 TB/s -> 35.7, A10 4.74 -> 38.8, H100 SXM 13.2 -> 54.6.
-# mma.sync's single-warp issue, the fraction of its tensor rate a program reaches where each scheduler issues
-# one warp's products in order with the fragment loads feeding them (Mosaic GPU's mma.sync tiles, one
-# warpgroup a multiprocessor): 0.57, the cost model's fit to an A100's 18 Mosaic forward and input-gradient
-# rows (FRAG-route-a100, rms log error 0.05), the family's on every member; held out, an L4's picks between
-# Triton's launch and Mosaic GPU's follow it (15 of 16 rows, the other a 0.7% tie; FRAG-route-l4), and
-# fitted on the L4's 16 rows instead (0.45) the A100's 18 picks are the same.
-# A family no device of which was measured takes its nearest measured family's model values, said so
-# below; the opt-in calibration measures the device's own.
-MMA_SYNC_SINGLE_WARP_ISSUE = 0.57
+# A family no device of which was measured takes its nearest measured family's values, said so below.
 _AMPERE = Architecture('mma.sync', {'16bit': 2048, 'tf32': 1024, 'fp32': 128}, load_latency=466.3,
-                       l2_bytes_per_clock=35.7, single_warp_issue=MMA_SYNC_SINGLE_WARP_ISSUE)
+                       l2_bytes_per_clock=35.7)
 _AMPERE_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256}, load_latency=541.5,
-                                l2_bytes_per_clock=38.8, single_warp_issue=MMA_SYNC_SINGLE_WARP_ISSUE)
-_TURING = Architecture('mma.sync', {'16bit': 1024, 'fp32': 128}, load_latency=541.5, l2_bytes_per_clock=38.8,
-                       single_warp_issue=MMA_SYNC_SINGLE_WARP_ISSUE)
+                                l2_bytes_per_clock=38.8)
+_TURING = Architecture('mma.sync', {'16bit': 1024, 'fp32': 128}, load_latency=541.5, l2_bytes_per_clock=38.8)
 _HOPPER = Architecture('wgmma', {'16bit': 4096, 'tf32': 2048, 'fp32': 256}, wgmma=True, load_latency=478.8,
                        l2_bytes_per_clock=54.6)
 # Blackwell's tcgen05 family: no member measured, its latency and L2 Hopper's.
 _BLACKWELL = Architecture('tcgen05', {'16bit': 8192, 'tf32': 4096, 'fp32': 256}, tmem_columns=512,
                           load_latency=478.8, l2_bytes_per_clock=54.6)
-# Consumer Blackwell (RTX 50, RTX PRO 6000) runs sm80's mma.sync forms: Ada's rates and model values.
+# Consumer Blackwell (RTX 50, RTX PRO 6000) runs sm80's mma.sync forms: Ada's rates and measured values.
 _BLACKWELL_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256}, load_latency=541.5,
-                                   l2_bytes_per_clock=38.8, single_warp_issue=MMA_SYNC_SINGLE_WARP_ISSUE)
+                                   l2_bytes_per_clock=38.8)
 # A TPU's: its MXU's FLOPs a clock (v5e 197 TF over 1.5 GHz -> 131072), the scoped VMEM limit at XLA's
 # default (v5e 16 MiB, read from a Mosaic kernel's refusal: "limit 16.00M"; v6e's pending GEMMTPU-VMEM's),
 # and a grid step's fixed seconds, the slope of time over 1 to 65536 Pallas grid steps each issuing one
@@ -225,14 +212,13 @@ class GpuTarget:
     bytes per second, a real device's own likewise. Every other fact a kernel's
     cost model reads (`dew.nn.kernels.templates.cost`) is its instruction
     family's (`architecture`): its tensor rates, warpgroup MMA, tensor memory, and
-    the model values of its load latency and L2 bandwidth, which a device's
-    opt-in calibration replaces (`calibration`, `dew.nn.kernels.tuning`). A row
+    the measured values of its load latency and L2 bandwidth. A row
     states a device's datasheet alone: its peaks, which MFU reads, and what a
     compile-only target of it needs. This table and `architecture` are the one
     place a choice is keyed on the hardware; any other code reads their facts, a
     library's support rule the compute capability (`capability`), and a launch
-    config the autotuner (`dew.nn.kernels.tuning`), as tools/lint_slop.py's
-    SLOP016 holds.
+    config its launch's rule from those facts (`dew.nn.kernels.tuning`), as
+    tools/lint_slop.py's SLOP016 holds.
     """
 
     generation: str
@@ -245,10 +231,6 @@ class GpuTarget:
     multiprocessors: int | None = None
     clock_hz: float | None = None
     memory_bandwidth: float | None = None
-    calibration: Mapping[str, float] = dataclasses.field(default_factory=dict)
-    """The device's own measurements of what its family states a model value of ('load_latency',
-    'l2_bandwidth'), which the opt-in calibration takes (`dew.nn.kernels.tuning`) and caches per device
-    kind; empty, the family's values hold. Nothing measures silently."""
     int8_triton_gemm: bool = False
     """Whether XLA's Triton GEMM fusion computes int8 dots right on this GPU: on none measured, an
     A100 and an RTX PRO 6000 Blackwell, at jaxlib 0.11.2 (openxla/xla#51016;
@@ -294,26 +276,16 @@ class GpuTarget:
         return self.architecture.grid_step_seconds
 
     @property
-    def single_warp_issue(self) -> float | None:
-        """The fraction of the tensor rate a program reaches where each scheduler issues one warp's
-        products in order with the fragment loads feeding them (the cost model's `Cost.single_warp`): the
-        device's calibrated one, else its family's model value; None where neither states it, the rate
-        then the peak."""
-        return self.calibration.get('single_warp_issue', self.architecture.single_warp_issue)
-
-    @property
     def load_latency(self) -> float | None:
-        """The global-memory load latency in multiprocessor clocks (the cost model's waiting term): the
-        device's calibrated one, else its family's model value."""
-        return self.calibration.get('load_latency', self.architecture.load_latency)
+        """The global-memory load latency in multiprocessor clocks (the cost model's waiting term): its
+        family's."""
+        return self.architecture.load_latency
 
     @property
     def l2_bandwidth(self) -> float | None:
         """The bytes a second the L2 serves all multiprocessors' loads together (the cost model's L2
-        term): the device's calibrated one, else its family's bytes a multiprocessor a clock over its
-        multiprocessors and clock; None where neither states it, the term then dropped."""
-        if 'l2_bandwidth' in self.calibration:
-            return self.calibration['l2_bandwidth']
+        term): its family's bytes a multiprocessor a clock over its multiprocessors and clock; None where
+        any is unstated, the term then dropped."""
         rate = self.architecture.l2_bytes_per_clock
         if rate is None or self.multiprocessors is None or self.clock_hz is None:
             return None
@@ -386,8 +358,8 @@ class GpuTarget:
 # products, 8192 tokens x 2048 -> 768 over 64 experts: Dew's Pallas grouped matmul 0.60/2.41 on an
 # A100 and 0.27/0.86 on an H100, XLA's ragged dot 7.54/33.99 and 2.62/14.51; tokamax's ragged_dot
 # has no Triton kernel in 0.0.15 and its Mosaic one's backward takes no mixed dtypes. No tokamax
-# implementation is a row's kernel; Dew calls its own through tokamax's Op and tuning. Decode
-# (bf16, one query, A100-SXM4-40GB, 2026-10-21, ced5d3ad9, synchronized ms by tuning.samples): Qwen3-0.6B's
+# implementation is a row's kernel; Dew calls its own through tokamax's Op. Decode (bf16, one query,
+# A100-SXM4-40GB, 2026-10-21, ced5d3ad9, synchronized ms by dew.telemetry.benchmark.samples): Qwen3-0.6B's
 # 16/8 heads of 128 at 1 to 128 rows over 2048 to 131072 keys, the decode kernel 1.57x faster than
 # cuDNN in geometric mean over the 28 shapes, faster in 21, at most 1.19x the fastest arm (cuDNN
 # 2.78 ms and the decode kernel 0.42 at one row of 131072 keys; cuDNN's 7 wins at 4, 16 and 128 rows
@@ -583,39 +555,14 @@ def _one_kind(devices) -> None:
                          "be of one kind")
 
 
-CALIBRATED = frozenset({'load_latency', 'l2_bandwidth'})
-"""The facts a device's opt-in calibration measures in place of its family's model values
-(`Architecture`, `dew.nn.kernels.tuning.store_calibration`)."""
-
-
-def calibration(device_kind: str) -> dict[str, float]:
-    """The facts calibrated for GPUs of `device_kind` (`CALIBRATED`), read from the file the opt-in
-    calibration writes beside the kernel picks (`dew.cache.device_facts_path`): none where none was
-    written or the process keeps no picks (`dew.cache.keeps_picks`), its family's model values then
-    holding. Reading measures nothing: a process starts with no probe."""
-    import json
-    import os
-
-    from dew import cache
-
-    path = cache.device_facts_path(device_kind)
-    if not cache.keeps_picks() or not os.path.exists(path):
-        return {}
-    with open(path) as handle:
-        facts = json.load(handle)
-    return {name: float(facts[name]) for name in CALIBRATED if name in facts}
-
-
 def runtime_facts(target: GpuTarget, device) -> GpuTarget:
     """`target` with the facts a real CUDA `device` reports of itself in place of the table's: its
     multiprocessors, its block's shared memory, its clock and memory bandwidth (`_clocks`), read free at
-    runtime, its family's facts its capability's (`architecture`), and the opt-in calibration cached for
-    its kind (`calibration`). A GPU the table does not name so keeps every resource a kernel's
-    requirements and cost read."""
+    runtime, its family's facts its capability's (`architecture`). A GPU the table does not name so
+    keeps every resource a kernel's requirements and cost read."""
     facts = {'multiprocessors': _multiprocessors(device), 'shared_limit': _shared_memory(device),
              **dict(_clocks(device.local_hardware_id))}
-    return dataclasses.replace(target, **{name: value for name, value in facts.items() if value is not None},
-                               calibration=calibration(device.device_kind))
+    return dataclasses.replace(target, **{name: value for name, value in facts.items() if value is not None})
 
 
 SHARED_BUDGET = 99 * 1024
