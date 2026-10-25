@@ -603,7 +603,8 @@ class _Mosaic(base.Template[mosaic_gpu.Tiles]):
                 and _rated(target, first) and self._family(ba, target) is not None
                 and (generation.effective(target).wgmma or not hooked)
                 and self._hooks_lower(ba, first, target)
-                and (self.EXACT_SUMS or not ba.arguments.get('exact_sums')))
+                and (self.EXACT_SUMS or not ba.arguments.get('exact_sums'))
+                and self.derived(ba, target) is not None)
 
     def registers(self, ba, config: mosaic_gpu.Tiles) -> int:
         # A consumer thread's live set (`mosaic.tile_registers`), and where a prologue rewrites its share of
@@ -689,9 +690,10 @@ class _Mosaic(base.Template[mosaic_gpu.Tiles]):
     def staged_bytes(self, ba, config: mosaic_gpu.Tiles, target) -> int:
         # Each allocation a program scopes, rounded up to Mosaic's alignment (`mosaic.allocated`): each
         # stream's stages (both operand blocks and each prologue side's tile), each output's staging (every
-        # output's at once), each epilogue side's two staging copies (`mosaic.staging`), and the barriers:
-        # each stream stage's two and each staged side's two (at a block's edge, a Hopper tile's barriers
-        # alone took it 128 bytes past, the reason they are counted).
+        # output's at once, the columns its family stages at once: `mosaic.Family.output_columns`), each
+        # epilogue side's two staging copies (`mosaic.staging`), and the barriers: each stream stage's two
+        # and each staged side's two (at a block's edge, a Hopper tile's barriers alone took it 128 bytes
+        # past, the reason they are counted).
         size = jnp.dtype(ba.arguments['tokens'].dtype).itemsize
         hooks = ba.arguments['hooks']
         outs = [jnp.dtype(dtype).itemsize for dtype in (hooks.out_dtypes or (ba.arguments['out_dtype'],))]
@@ -701,7 +703,9 @@ class _Mosaic(base.Template[mosaic_gpu.Tiles]):
         streams = [config.block_m * config.block_k * size, config.block_k * config.block_n * size,
                    *(_side_tile_bytes((side,), (axes,), extents)
                      for side, axes in zip(prologue_sides, hooks.prologue_axes, strict=True))]
-        staged = [config.block_m * config.block_n * out for out in outs]
+        family = _bundle(config, ba.arguments['tokens'].dtype)
+        staged = [config.block_m * family.output_columns(config.block_n, (dtype,)) * out
+                  for dtype, out in zip(hooks.out_dtypes or (ba.arguments['out_dtype'],), outs, strict=True)]
         sides = [2 * _side_tile_bytes((side,), (axes,), extents)
                  for side, axes in zip(epilogue_sides, hooks.epilogue_axes, strict=True)]
         barriers = 2 * config.stages * len(streams) + 2 * (len(epilogue_sides) + len(prologue_sides) + 1)
@@ -987,9 +991,8 @@ class CutlassTgmm(_Cutlass):
 class _MosaicTpu(base.Template[mosaic_tpu.Blocks]):
     """The TPU mainloops (`templates.gemm.mosaic_tpu`, Megablox's schedule): bf16 operands, which the
     MXUs multiply exactly and sum in fp32, widths a vreg's lanes divide, and a TPU whose scoped VMEM a
-    measurement states; a CPU interprets them as the TPU runs them. A TPU's own lowering runs XLA's
-    ragged dot until a scoreboard row measures these (`_on_platform` has no TPU branch), so an assumed
-    TPU interprets them alone."""
+    measurement states; a CPU interprets them as the TPU runs them, and a TPU's own lowering runs them
+    (`_on_platform`'s TPU branch), their native qualification open until a scoreboard row measures them."""
     name: ClassVar[str] = 'mosaic_tpu'
     config_cls: ClassVar[type[mosaic_tpu.Blocks]] = mosaic_tpu.Blocks
     GENERATES: ClassVar[bool] = True
@@ -1392,11 +1395,12 @@ def tgmm_call(tokens, cotangent, sizes, prologue_operands: tuple = (), *, out_dt
 
 
 def _on_platform(kernel, fallback, interpret_on_cpu: bool):
-    """`kernel` where the call lowers for CUDA, interpreted on the CPU when
-    asked for, and `fallback` everywhere else: a TPU's program, which never runs
-    on CUDA, holds no CUDA branch."""
+    """`kernel` where the call lowers for its target's platform (CUDA, or a TPU's), interpreted on the
+    CPU when asked for, and `fallback` everywhere else: a TPU's program, which never runs on CUDA, holds
+    no CUDA branch, and a GPU's no TPU branch. A new family member runs its template after the
+    hardware-free checks, its native qualification an open item until measured (bible §6)."""
     tpu = generation.tpu(generation.gpu_target())
-    branches = {} if tpu else {'cuda': functools.partial(kernel, interpret=False)}
+    branches = {'tpu' if tpu else 'cuda': functools.partial(kernel, interpret=False)}
     if interpret_on_cpu:
         branches['cpu'] = functools.partial(kernel, interpret=True)
     return branches, fallback
