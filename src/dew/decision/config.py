@@ -180,9 +180,12 @@ class DecisionRunConfig(RunConfig):
                                            attention_impl=attention_impl)
             derived["layout"] = _budgeted(start.layout, budgets)
         else:
+            # An adapter, or context layers over it, keeps the source as it is (`FROZEN`), which a run
+            # reads onto its mesh; a source it trains stays on the host, as its start places it.
+            frozen = self.lora is not None or self.context_layers is not None
             start = Pretrained.load(self.pretrained, revision=self.revision, dtype=dtype,
                                     param_dtype=self.param_dtype, attention_impl=attention_impl,
-                                    weights=not self.trainer.resumes(), on_host=True)
+                                    **self.trainer.source_placement(frozen=frozen))
             if self.remat is not None:
                 if not isinstance(start.model, RematChoosing):
                     raise ValueError(f"--remat chooses a decoder's layer policy (RematChoosing), which "
