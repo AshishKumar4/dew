@@ -14,7 +14,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels.templates import attention_algebra as algebra, mosaic
-from dew.nn.kernels.templates.attention import DKV_GRADS, DQ_GRADS, Kind, PaddedCall
+from dew.nn.kernels.templates.attention import DKV_GRADS, DQ_GRADS, Hooks, Kind, PaddedCall, Param
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
     _columns,
@@ -27,6 +27,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _spans_of,
     _streamed,
     _views_of,
+    approximate,
 )
 
 
@@ -79,6 +80,8 @@ class _Backward:
     interpret: bool
     fused: bool
     kinds: tuple[Kind, ...]
+    approx_math: bool
+    """Whether its launches take the hardware's approximate transcendentals (`approximate`)."""
 
     @property
     def how(self) -> algebra.Recompute:
@@ -258,7 +261,8 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, s
     out = family.kernel(
         entry, out_type=(sums, sums, stats_shape) if walk.accurate else (sums, stats_shape),
         grid=(heads, queries // pair, batch), grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
-        interpret=walk.interpret)(query, key, value, dout, peak, prior, anchor, delta, key_index, *leaves)
+        interpret=walk.interpret, approx_math=walk.approx_math)(query, key, value, dout, peak, prior, anchor,
+                                                                delta, key_index, *leaves)
     dq, keyed, rows = out if walk.accurate else (out[0], None, out[1])
     return dq, keyed, rows
 
@@ -436,7 +440,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
     launch = family.kernel(
         entry, out_type=(gradient, gradient, *(grad_shapes[kind] for kind in graded)),
         grid=(heads, keys_padded // pair, batch), grid_names=("heads", "k_tiles", "batch"),
-        consumers=consumers, interpret=walk.interpret)
+        consumers=consumers, interpret=walk.interpret, approx_math=walk.approx_math)
     operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
     if not walk.fused:
         return launch(*operands)
@@ -466,7 +470,7 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     ranks them (`MosaicBackward.cost`). Returns what `gradients` takes: dQ, the softmax's rows, each query's
     anchor key, the dQ parameters' gradients (`DQ_GRADS`; a head's as per-query sums `[1, B, H, 1]`, which
     `gradients` sums over the batch), then dK, dV and the dK/dV parameters' (`DKV_GRADS`)."""
-    del score_mod, score_dtypes, scale
+    del scale
     width, value_width = query.shape[-1], value.shape[-1]
     _, state_total = algebra.off_anchor_start(peak0, total0, maximum, value_width, shift)
     cotangent = jnp.swapaxes(dout, 1, 2).astype(jnp.float32)
@@ -478,7 +482,10 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     steps = key.shape[1] // tiles.block_k
     program = _Program(family, tiles, steps, min(tiles.stages, steps), spec.keys, spec.form == "causal",
                        spec.queries)
-    walk = _Backward(program, spec, accurate, tiles.consumers, interpret, tiles.fused, score_kinds)
+    hooks = Hooks(score_mod, tuple(map(Param, score_params, score_kinds)))
+    approx_math = approximate(hooks, (tiles.block_q, tiles.block_k), value_width, differentiated=True)
+    walk = _Backward(program, spec, accurate, tiles.consumers, interpret, tiles.fused, score_kinds,
+                     approx_math)
     padded = PaddedCall(query, key, value, start, end, query_ids, key_ids, (), (), query.shape[1], spec.keys)
     spans = _spans_of(spec, padded, tiles.block_q, tiles.block_k)
     if walk.fused:
