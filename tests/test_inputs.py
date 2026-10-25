@@ -63,9 +63,9 @@ def test_shard_batch_preserves_resident_nested_inputs_without_host_transfer():
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
 
+    from dew.distributed.placement import MeshSpec, shard_batch
     from dew.mesh import batch_axes
     from dew.nn.inputs import ModelInputs
-    from dew.training.distributed import MeshSpec, shard_batch
 
     mesh = MeshSpec().build()
     rows = 2 * jax.device_count()

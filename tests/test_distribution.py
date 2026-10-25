@@ -26,8 +26,8 @@ import pytest
 from lane_environment import outside_any_cluster
 
 from dew._host import cpu_class
+from dew.distributed.placement import parameter_axes
 from dew.training import MeshSpec
-from dew.training.distributed import parameter_axes
 
 # Needs the eight simulated CPU devices conftest configures, except the tests
 # that name fewer: those of stand-in devices need none, and a four-GPU run

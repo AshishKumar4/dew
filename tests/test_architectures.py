@@ -34,6 +34,7 @@ from dew.config import MetricConfig, ObjectiveConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader
 from dew.diffusion import presets
+from dew.distributed.placement import shard_batch
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.attention import Stage
 from dew.nn.text_encoders import DEFAULT_MODEL as CLIP_CHECKPOINT
@@ -43,7 +44,6 @@ from dew.objectives.lm import LMObjective
 from dew.registry import ModelConfig, from_record, metrics, models, to_record
 from dew.sampling import CFG, Euler
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
-from dew.training.distributed import shard_batch
 from dew.training.model_flops import prepare_counts
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.

@@ -58,6 +58,7 @@ if TYPE_CHECKING:
 
     from dew.data.pipeline import DeviceStep, ObjectiveData
     from dew.data.text import Tokenizer
+    from dew.distributed.placement import Layout, MeshSpec
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, TextGeneration
     from dew.inputs import InputSpec
     from dew.nn.autoencoders import AutoEncoder
@@ -65,7 +66,6 @@ if TYPE_CHECKING:
     from dew.sampling.guidance import Guidance
     from dew.sampling.pipelines import TextToImage
     from dew.state import TrainState
-    from dew.training.distributed import Layout, MeshSpec
 
     type Task = TextGeneration | BlockGeneration | MaskedGeneration | TextToImage
 

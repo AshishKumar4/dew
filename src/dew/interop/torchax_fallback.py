@@ -39,6 +39,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.extend.core import Literal, primitives
 
+from dew.distributed.placement import Layout
 from dew.interop import sources
 from dew.interop.generation_config import read_generation_config
 from dew.interop.pickles import host_view
@@ -49,7 +50,6 @@ from dew.nn.precision import at_least_fp32, configured_precision, float32_produc
 from dew.nn.protocols import Lacks, OutputTable
 from dew.nn.sharding import Suffix, parameter_path
 from dew.registry import resolve_dtype
-from dew.training.distributed import Layout
 
 if TYPE_CHECKING:
     import torch
