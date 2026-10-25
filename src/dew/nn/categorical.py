@@ -28,8 +28,8 @@ from jax.custom_derivatives import SymbolicZero
 
 from dew.nn.precision import at_least_fp32
 
-__all__ = ["cross_entropy", "entropy", "group_divergence", "kl_divergence", "log_probs", "probabilities",
-           "rescaled", "segment_log_partition", "soft_cross_entropy", "target_loss"]
+__all__ = ["cross_entropy", "entropy", "group_divergence", "kl_divergence", "label_derivative", "log_probs",
+           "probabilities", "rescaled", "segment_log_partition", "soft_cross_entropy", "target_loss"]
 
 
 def widened(logits: jax.Array, where: jax.Array | None = None) -> jax.Array:
@@ -86,10 +86,19 @@ def _label_loss(logits: jax.Array, labels: jax.Array) -> jax.Array:
 @_label_loss.defjvp
 def _label_loss_tangent(primals, tangents):
     logits, labels = primals
-    label = jax.nn.one_hot(labels, logits.shape[-1], dtype=logits.dtype)
-    others = jnp.where(label > 0, 0.0, jax.nn.softmax(logits, axis=-1))
-    derivative = others - label * others.sum(axis=-1, keepdims=True)
+    derivative = label_derivative(jax.nn.softmax(logits, axis=-1), labels)
     return _label_loss(logits, labels), jnp.sum(derivative * tangents[0], axis=-1)
+
+
+def label_derivative(probability: jax.Array, labels: jax.Array) -> jax.Array:
+    """The derivative of `-log p[labels]` in its row's logits, from the row's `probability` over the
+    last axis: each other class's probability, and at the label minus their sum (arXiv:2610.31642,
+    eq. 7), never its `p - 1`, which rounds to 0 once the label's share rounds to 1, so the row's
+    derivative sums to zero in any rounding. A label outside the row one-hots to nothing, and its row's
+    derivative is the probabilities."""
+    label = jax.nn.one_hot(labels, probability.shape[-1], dtype=bool)
+    others = jnp.where(label, 0.0, probability)
+    return jnp.where(label, -jnp.sum(others, axis=-1, keepdims=True), others)
 
 
 def soft_cross_entropy(logits: jax.Array, targets: jax.Array, where: jax.Array | None = None) -> jax.Array:
