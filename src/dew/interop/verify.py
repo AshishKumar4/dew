@@ -108,8 +108,9 @@ _ROUNDING = 6.46
 # probe's draw): rounding alone puts the two arms alike whatever the model's conditioning, and a backward
 # the source's forward does not show (a hook, a custom autograd function) orders of magnitude apart.
 # Twice the largest tools/gradient_parity.py measured over the types and compositions that assemble
-# from parts.
-_GRADIENT_PARITY = 4.0
+# from parts: 1.112 (gemma; llama 0.962, mistral 0.962, mixtral 1.033, qwen2 0.932, qwen3 0.883,
+# qwen3_moe 0.902, Llama's attention with Mixtral's experts and Gemma's norms 0.973), transformers 5.16.1.
+_GRADIENT_PARITY = 2.23
 
 
 _REMOTE_CLASSES = ('AutoConfig', 'AutoModelForCausalLM')
