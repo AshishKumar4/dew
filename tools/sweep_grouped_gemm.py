@@ -73,7 +73,8 @@ def sampled(launch, ba, target, count: int):
         return None
     ranked = sorted(fits, key=lambda config: launch.cost(ba, config, target))
     rest = ranked[count:]
-    return ranked[:count] + [rest[round(index * (len(rest) - 1) / max(count - 1, 1))] for index in range(count)]
+    spacing = (len(rest) - 1) / max(count - 1, 1)
+    return ranked[:count] + [rest[round(index * spacing)] for index in range(count)]
 
 
 def main() -> None:
