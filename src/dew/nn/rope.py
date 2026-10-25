@@ -228,9 +228,12 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
     `rope_scaling` (Llama 3.1's ramp) applies before a proportional rope pads
     its zero-frequency tail, as the reference's `dim = head_dim *
     partial_rotary_factor` does. YaRN (`YarnScaling`) replaces the inverse
-    frequencies of a whole head with its ramp (`yarn_inv_freq`) and scales
-    cos and sin by its attention factor, as the reference's rotary embedding
-    does; it rotates whole heads, so a `rot_dim` beside it is refused.
+    frequencies of the rotated width with its ramp (`yarn_inv_freq`) and
+    scales cos and sin by its attention factor, as the reference's rotary
+    embedding does: over the whole head, or over `rot_dim` under 'default',
+    the reference's `dim = head_dim * partial_rotary_factor`
+    (`_compute_yarn_parameters`). A proportional rope has no YaRN form, so
+    YaRN beside a proportional `rot_dim` is refused.
     """
     if partial_rotary_type not in ('proportional', 'default'):
         raise ValueError(
@@ -250,10 +253,10 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
         expanded = furthest + 1 > rope_scaling.original_max_position_embeddings
         inv_freq = jnp.where(expanded[..., None], long, short)
     elif isinstance(rope_scaling, YarnScaling):
-        if rot_dim is not None:
-            raise ValueError(f"YaRN rotates whole heads at its own frequencies, so it takes no "
-                             f"rot_dim, got {rot_dim}")
-        inv_freq = yarn_inv_freq(head_dim, theta, rope_scaling, dtype=dtype)
+        if rot_dim is not None and partial_rotary_type == 'proportional':
+            raise ValueError(f"YaRN ramps the rotated width at its own frequencies and has no "
+                             f"proportional form, so it takes no proportional rot_dim, got {rot_dim}")
+        inv_freq = yarn_inv_freq(divisor, theta, rope_scaling, dtype=dtype)
     elif rope_scaling is not None:
         inv_freq = rope_scaling.apply(inv_freq)
     if rot_dim is not None and partial_rotary_type == 'proportional':
@@ -368,9 +371,10 @@ def yarn_inv_freq(head_dim: int, theta: float, yarn: YarnScaling, *,
                   dtype: DTypeLike) -> np.ndarray:
     """YaRN inverse frequencies over the rope width, `[head_dim // 2]`, in `dtype`.
 
-    Mirrors `modeling_rope_utils._compute_yarn_parameters` with `dim` at the
-    head dim, as DeepSeek's configs do by pointing `head_dim` at the rope
-    slice. Low dims interpolate towards `1 / (factor * pos_freqs)`,
+    Mirrors `modeling_rope_utils._compute_yarn_parameters` with `dim` at
+    `head_dim`, the rotated width: a whole head's, as DeepSeek's configs point
+    `head_dim` at the rope slice, or a partial rotary's `head_dim *
+    partial_rotary_factor`. Low dims interpolate towards `1 / (factor * pos_freqs)`,
     high dims keep extrapolating, and the linear ramp between the correction
     bounds blends them.
     """
