@@ -230,10 +230,11 @@ def test_a_modelopt_fp8_model_with_fused_projections_quantizes_every_member_inpu
     dense = Pretrained.load(tmp_path / 'decoded', **load)
     members = {'q_proj': 'qkv_proj', 'k_proj': 'qkv_proj', 'v_proj': 'qkv_proj', 'o_proj': 'o_proj',
                'gate_proj': 'gate_up_proj', 'up_proj': 'gate_up_proj', 'down_proj': 'down_proj'}
-    expected = {path[:-1]: scales[members[path[-2]]] for path in flatten_dict(dense.variables['params'])
+    expected = {path[:-1]: np.float32(scales[members[path[-2]]])
+                for path in flatten_dict(dense.variables['params'])
                 if path[-1] == 'kernel' and len(path) > 1 and path[-2] in members}
     held = flatten_dict(quantized.variables[QUANTIZATION])
-    assert {path[:-1]: float(value) for path, value in held.items()} == pytest.approx(expected)
+    assert {path[:-1]: np.float32(value) for path, value in held.items()} == expected
     assert {path[-1] for path in held} == {INPUT_SCALES['fp8']}
 
     scheme = InputQuantization(e4m3_scale=False, format='compressed-tensors',
