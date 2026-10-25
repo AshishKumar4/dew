@@ -303,7 +303,7 @@ COHERE = {**TINY, "num_key_value_heads": 2}
 """A tiny Cohere: parallel attention and feed-forward under one bias-free layer norm, rotary pairs
 interleaved and a scaled head, a type Dew registers no family for and no registered family's
 convention computes."""
-UNREGISTERED_SEEDS = 8
+UNREGISTERED_SEEDS = 256
 """The unregistered type's check-1 seeds, sized by `seeds_for` on armada."""
 
 
