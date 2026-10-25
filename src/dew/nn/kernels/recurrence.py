@@ -25,7 +25,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from dew.nn.precision import L2NORM_EPS, compensated_add, l2norm
+from dew.nn.precision import L2NORM_EPS, compensated_add, float32_einsum, l2norm
 
 from . import chunked_launch, norm_swiglu, short_conv, tuning
 from .generation import triton_runs
@@ -123,11 +123,16 @@ def update(state, query, key, value, decay, write, *, delta: bool):
     `[..., Dv]` and the updated state.
     Both readouts are products with the old state, `(q decay)^T S + (q . k) d` with `d = write (v -
     (k decay)^T S)` under the delta rule and `write v` without it, so one pass over the state serves
-    them and the write."""
+    them and the write. `q . k` is a product (`float32_einsum`), summed as Dew sums one, not a reduction
+    whose order XLA chooses by the shape it is batched at: under a skip that cancels it (`(q . k) write`
+    against `D`), a reduction a token at a time and the same in the portable rule's batched adjoint
+    rounded a last bit apart, which put the portable gradient's cancelled row 4.9 times the token
+    recurrence's distance from float64 (test_recurrence_stability's rated site under resets on chunk
+    edges, seed 6)."""
     read_query = jnp.sum((query * decay)[..., :, None] * state, axis=-2)
     corrected = value - jnp.sum((key * decay)[..., :, None] * state, axis=-2) if delta else value
     written = corrected * write
-    out = read_query + jnp.sum(query * key, axis=-1, keepdims=True) * written
+    out = read_query + float32_einsum('...d,...d->...', query, key)[..., None] * written
     return out, state * decay[..., :, None] + key[..., :, None] * written[..., None, :]
 
 
