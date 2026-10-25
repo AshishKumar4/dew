@@ -40,7 +40,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-from dew.nn.categorical import rescaled, segment_log_partition, target_loss
+from dew.nn.categorical import label_derivative, rescaled, segment_log_partition, target_loss
 from dew.nn.kernels.generation import gpu_target
 from dew.nn.precision import (
     added_to,
@@ -565,21 +565,27 @@ def _softmax_cotangent(logits, first, excluded, peaks, masses, rests, labels, d_
     vocabulary-split head's 8192 gradient elements more than twice as far from
     float64 as that reference's over 52 orders of its columns, against 5.
 
-    The target's entry is the rest of its row's share summed directly, `rests`
-    (the row's exponentials scaled to its maximum, the target's column left
-    out), never its share less one: once the share rounds to 1 that is 0, while
-    the rest of the row, arXiv:2610.31642's eq. 7, is not. Without `picked` the
-    entry is `d_partition - (d_first + d_partition) * rests / masses`, with it
-    `d_first + d_partition - d_partition * rests / masses`. A target outside
-    the tile one-hots to zero rather than to a wrapped column."""
+    The loss's part of the target's entry is the rest of its row's share summed
+    directly, `rests` (the row's exponentials scaled to its maximum, the
+    target's column left out), never its share less one: once the share rounds
+    to 1 that is 0, while the rest of the row, arXiv:2610.31642's eq. 7, is
+    not. The partition's part is the target's own share, never 1 less the
+    rest, which an unlikely target's share would cancel to 0. Without `picked`
+    the entry is `(d_partition * e_t - d_first * rests) / masses`; with it,
+    `d_first + d_partition * p_t` taken as `(d_first * rests + (d_first +
+    d_partition) * e_t) / masses`, where the loss's cotangents `d_first =
+    -d_partition` leave the rest alone. A target outside the tile one-hots to
+    zero rather than to a wrapped column."""
     exponentials = jnp.exp(_without(logits, first, excluded) - peaks[:, None])
     # A target at the excluded column scores a constant +inf, which no logit moves.
     selected = _without(jax.nn.one_hot(labels - first, logits.shape[-1], dtype=bool), first,
                         excluded, value=False)
     coefficient = d_partition if picked else d_first + d_partition
-    target = (d_first + d_partition if picked else d_partition) - coefficient * (rests / masses)
     share = exponentials * (coefficient / masses)[:, None]
-    return jnp.where(selected, target[:, None], share)
+    rest = (d_first * (rests / masses))[:, None]
+    target = (exponentials * ((d_first + d_partition) / masses)[:, None] + rest if picked
+              else exponentials * (d_partition / masses)[:, None] - rest)
+    return jnp.where(selected, target, share)
 
 
 def _whole_head_terms(hidden, table, targets, excluded, softcap, precision, predict, temperature,
@@ -1048,19 +1054,13 @@ def _whole_losses(logits, targets):
 
 @_whole_losses.defjvp
 def _whole_losses_tangent(primals, tangents):
-    """The derivatives of each row's loss and log partition.
-
-    Each other class's probability, and the target's entry the rest of the row's probability summed directly,
-    never its share less one, which rounds to 0 once the share rounds to 1 (arXiv:2610.31642, eq. 7): the
-    row's loss derivative then sums to 0 in any rounding.
-    """
+    """The derivatives of each row's loss, the categorical's own (`dew.nn.categorical.label_derivative`,
+    arXiv:2610.31642's eq. 7), and of its log partition, the row's probabilities."""
     logits, targets = primals
     losses, log_z = _whole_losses(logits, targets)
     _, mass, shifted = _whole_partition(logits)
     probability = shifted / mass[..., None]
-    target = jax.nn.one_hot(targets, logits.shape[-1], dtype=bool)
-    rests = jnp.sum(jnp.where(target, 0, probability), axis=-1)
-    d_losses = jnp.sum(jnp.where(target, -rests[..., None], probability) * tangents[0], axis=-1)
+    d_losses = jnp.sum(label_derivative(probability, targets) * tangents[0], axis=-1)
     d_log_z = jnp.sum(probability * tangents[0], axis=-1)
     return (losses, log_z), (d_losses, d_log_z)
 
