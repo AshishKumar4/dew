@@ -275,10 +275,11 @@ def columns(vocab: int, seed: int = 0):
 SEEDS = {'bias': 128, 'fused': 512, 'quantized': 64, 'scale and bias': 128, 'vocabulary split': 512,
          'column orders': 32, 'split bias': 32, 'quantized split': 32, 'backbone states': 16, 'backbone': 128,
          'small vocabulary': 128, 'small vocabulary training': 128, 'bounded': 32, 'saturated': 256,
-         'excluded': 32, 'token tiles': 16, 'both outputs': 64, 'gemma': 16, 'bf16 cotangent': 8,
+         'excluded': 32, 'token tiles': 16, 'both outputs': 64, 'gemma': 256, 'bf16 cotangent': 512,
          'whole logits': 512}
-"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada):
-the most any of a site's cases took."""
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` on each platform its suite
+runs on (armada; an A100 under JAX 0.12 for 'gemma', 256 at softcap 30, and 'bf16 cotangent', 512 at the
+first tile): the most any of a site's cases took."""
 
 
 @pytest.mark.parametrize('dtype', [jnp.float32, jnp.bfloat16])
