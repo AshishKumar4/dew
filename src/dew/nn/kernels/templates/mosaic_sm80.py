@@ -145,7 +145,7 @@ class Mma(mosaic.Family):
         # 8-row tiles allow (a swizzled row takes no slice narrower than its tile).
         return min(depth, 8 * max(32 // (jnp.dtype(self.dtype).itemsize * 8), 1))
     most_shared = 163 * 1024  # sm80's and sm87's opt-in block (sm86's and sm89's 99 KiB)
-    copy_unit = mosaic.THREADS  # cp.async spreads a copy over the warpgroup's threads
+    copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
     reduction_scratch = plgpu.CompilerParams().reduction_scratch_bytes  # its kernels' default parameters
     column_scratch = 0  # its column sums take its kernels' reduction scratch
 
