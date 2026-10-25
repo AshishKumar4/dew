@@ -211,19 +211,17 @@ class Decide:
                                   param_dtype=param_dtype, attention_impl=attention_impl)
         if not isinstance(bundle, PretrainedDecision):
             raise TypeError(f"{name} declares no decision task")
-        return cls.of(bundle)
+        # The name a caller asked for, a Hub folder included, not the cache path it resolved to.
+        return cls.of(bundle, name=str(name) if subfolder is None else f"{name}/{subfolder}")
 
     @classmethod
-    def of(cls, bundle: "PretrainedDecision") -> Self:
-        """Build the declared decision task from a loaded composite bundle, without loading again."""
-        from dew.registry import from_record
-
-        settings = from_record(DecideSettings, bundle.settings)
-        calibration = from_record(Calibration, bundle.calibration)
+    def of(cls, bundle: "PretrainedDecision", *, name: str | None = None) -> Self:
+        """Build the declared decision task from a loaded composite bundle, without loading again.
+        It answers under `name`, by default the Hub id the bundle resolved or else its directory."""
         return cls(DecisionModel(bundle.model, bundle.head),
                    joined({"backbone": bundle.variables, "head": bundle.head_variables}),
-                   settings.layout, bundle.decision_tokenizer, settings.specials, calibration,
-                   name=str(bundle.origin or bundle.source), processor=bundle.processor)
+                   bundle.layout, bundle.decision_tokenizer, bundle.specials, bundle.calibration,
+                   name=name or str(bundle.origin or bundle.source), processor=bundle.processor)
 
     @classmethod
     def _recorded(cls, directory: str, record: Mapping[str, object], backbone, variables: Variables,

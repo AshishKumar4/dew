@@ -178,7 +178,7 @@ class DecisionRunConfig(RunConfig):
                                                     self.loop_layers, self.loop_backprop_steps,
                                                     self.remat, self.context_layers)) or self.loop_remat:
                 raise ValueError("--lora, --head, --remat, --context-layers and the loop shape a fresh "
-                                 "backbone; a Laya checkpoint trains whole under its own head")
+                                 "backbone; a decision release trains whole under its own head")
             start = Decide.of(start)
             derived["layout"] = _budgeted(start.layout, budgets)
         else:

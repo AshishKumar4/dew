@@ -17,7 +17,7 @@ from dew.interop.composite import CompositeSource, HeadComponent, NativeComponen
 from dew.interop.pretrained import Pretrained
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.objectives.base import Variables
-from dew.registry import dtype_name, from_record, import_path, to_record
+from dew.registry import dtype_name, from_record, import_path
 
 from .calibration import Calibration
 from .head import Head, LabelReadout, SlotReadout
@@ -27,7 +27,6 @@ from .layout import (
     Framing,
     Instructions,
     Labels,
-    Layout,
     OptionLines,
     QuestionLayout,
     State,
@@ -35,7 +34,6 @@ from .layout import (
 )
 from .model import DecisionModel
 from .sources import PretrainedDecision
-from .task import DecideSettings
 
 SLOT_SYSTEM = ("Apply the question to the state. Choose exactly one of the listed options. Respond with only "
                "its uppercase letter, with no explanation or reasoning.")
@@ -109,13 +107,12 @@ class SlotSource(SourceKind):
         mode = names.get(records.text(head["name"], "head.name"))
         if mode is None or fields.get("untied", False):
             raise ValueError("the slot format holds its tied label readout or its slot-and-pointer head")
-        settings = from_record(DecideSettings, bundle.settings)
-        if not isinstance(settings.layout, QuestionLayout) or settings.layout.labels is None:
+        layout = bundle.layout
+        if not isinstance(layout, QuestionLayout) or layout.labels is None:
             raise ValueError("the slot format needs its whole-question layout")
-        labels = settings.layout.labels
-        expected = SlotSource.layout(max_len=settings.layout.max_len, labels=labels,
-                                     blocks=settings.layout.blocks)
-        if settings.layout != expected or from_record(Calibration, bundle.calibration) != Calibration():
+        labels = layout.labels
+        expected = SlotSource.layout(max_len=layout.max_len, labels=labels, blocks=layout.blocks)
+        if layout != expected or bundle.calibration != Calibration():
             raise ValueError("the slot format holds its release prompt and uncalibrated logits")
         ids = records.listed(fields["label_ids"], "label_ids", read=lambda value, _: value,
                              what="a list of label ids")
@@ -125,7 +122,7 @@ class SlotSource(SourceKind):
         if labels != canonical or actual != picked:
             raise ValueError("the slot format records its canonical bare labels in tokenizer order")
         readout = {"readout": mode, "head_dim": fields.get("head_dim", 256), "n_slots": len(ids)}
-        if settings.layout.blocks:
+        if layout.blocks:
             readout["attention"] = "noncausal"
         root = Path(directory)
         Pretrained.save(bundle, root, max_shard_size=max_shard_size)
@@ -212,6 +209,5 @@ class SlotSource(SourceKind):
                     _path, weight_file="readout_head.pt", initialize=_initialize))
         layout = SlotSource.layout(labels=labels, blocks=attention == "noncausal")
         return CompositeSource(NativeComponent(config), head, PretrainedDecision.from_components, "",
-                               {"layout_record": to_record(layout, Layout),
-                                "calibration_record": to_record(Calibration(), Calibration),
-                                "strict_specials": False})
+                               {"layout": layout, "calibration": Calibration(), "strict_specials": False,
+                                "writer": SlotSource.save})
