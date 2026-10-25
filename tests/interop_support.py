@@ -136,6 +136,24 @@ def packed(latent: np.ndarray) -> np.ndarray:
     return grouped.transpose(0, 1, 3, 5, 2, 4).reshape(batch, height * width // 4, channels * 4)
 
 
+def assert_published_checkpoint(measured, name: str) -> None:
+    """A published checkpoint's batches as `tools.wrapper_checkpoint_parity.measure_checkpoint` measures
+    them: each batch's logits at every position as near its float64 truth as the reference's fp32 run
+    (the gate's one-draw rule), and Dew's greedy continuation the reference's wherever every step's top
+    reference logit clears the next by the gate's selection margin (`selection_margins.MARGIN`), so that
+    float32 rounding cannot pick another token. A continuation with a step nearer a tie decides
+    nothing, and is not compared."""
+    from reference_error import assert_as_exact_as_the_reference
+    from selection_margins import MARGIN, top_margin
+
+    for row in measured:
+        assert row.truth.dtype == np.float64
+        label = f"published {name} {row.modality}"
+        assert_as_exact_as_the_reference(row.dew, row.reference, row.truth, label)
+        if np.all(top_margin(np.asarray(row.continuation_logits, np.float64), 1) > MARGIN):
+            np.testing.assert_array_equal(row.dew_continuation, row.reference_continuation)
+
+
 def assert_same_stored_tensors(written: dict, original: dict) -> None:
     """`written` holds every tensor of `original` and no other, each with its
     dtype, shape and bytes; a scalar's bytes are read through a flat view."""

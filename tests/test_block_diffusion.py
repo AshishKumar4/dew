@@ -359,3 +359,12 @@ def test_the_tempered_logits_divide_by_the_reference_temperature_at_every_step()
 
     assert_as_exact(tempered, reference, draw, "tempered logits", seeds=TEMPER_SEEDS)
 
+
+def test_a_canvas_whose_model_scores_nothing_refuses_rather_than_draw_a_token(system):
+    """A canvas refinement draws each unfinished position from the model's scores; scores of NaN
+    hold no distribution, so generation raises instead of committing arbitrary tokens."""
+    model, variables, process, reference, _ = system
+    poisoned = jax.tree.map(lambda leaf: jnp.full_like(leaf, jnp.nan), variables)
+    with pytest.raises(ValueError):
+        process.generate(model, poisoned, ModelInputs(jnp.asarray(reference["prompt"])), 3,
+                         key=jax.random.key(11))
