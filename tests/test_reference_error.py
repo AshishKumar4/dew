@@ -10,7 +10,9 @@ import pytest
 import torch
 from reference_error import (
     FACTOR,
+    PARITY,
     REDRAW,
+    GateFailure,
     Inconclusive,
     assert_as_exact,
     assert_as_exact_as_the_reference,
@@ -459,7 +461,43 @@ def test_check_one_fails_a_sum_that_differs_rather_than_rounds(wrong):
     REDRAW times as many seeds again does not bring it back."""
     with pytest.raises(AssertionError) as raised:
         assert_as_exact(wrong, _product, _draw, "wrong", seeds=seeds_for(_product, _draw, "product"))
-    assert raised.type is AssertionError
+    assert raised.type is GateFailure
+
+
+def test_a_failing_site_reports_its_findings_as_data(tmp_path):
+    """A site the gate fails raises its findings as data (`Finding`: the leaf, the rule, the measure), its
+    message theirs, one a line; and a test it fails reports them as the JUnit property `gate_findings`
+    (tests/conftest.py), what a promotion matches a candidate's failures to its parent's by."""
+    import json
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    from xml.etree import ElementTree
+
+    with pytest.raises(GateFailure) as raised:
+        assert_as_exact(_lost_term, _product, _draw, "lost", seeds=seeds_for(_product, _draw, "product"))
+    assert str(raised.value) == "\n".join(map(str, raised.value.findings))
+    pooled = [finding for finding in raised.value.findings if finding.rule == "pooled"]
+    assert pooled and all(finding.leaf.startswith("lost") and finding.measure > PARITY for finding in pooled)
+    site = tmp_path / "test_site.py"
+    site.write_text(
+        "import numpy as np\n"
+        "from reference_error import assert_as_exact_as_the_reference\n\n\n"
+        "def test_a_site_three_times_the_references_error():\n"
+        "    truth = np.linspace(1.0, 2.0, 64)\n"
+        "    reference = truth + 1e-3 * np.cos(np.arange(64))\n"
+        "    assert_as_exact_as_the_reference(truth + 3 * (reference - truth), reference, truth, 'site')\n")
+    report = tmp_path / "report.xml"
+    tests = Path(__file__).resolve().parent
+    path = os.pathsep.join([str(tests), os.environ.get("PYTHONPATH", "")])
+    subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "conftest", "-p", "no:cacheprovider",
+                    "-o", "junit_family=xunit1", f"--junitxml={report}", str(site)], cwd=tmp_path,
+                   env={**os.environ, "PYTHONPATH": path})
+    properties = {node.get("name"): node.get("value") for node in ElementTree.parse(report).iter("property")}
+    [finding] = json.loads(properties["gate_findings"])
+    assert (finding["leaf"], finding["rule"]) == ("site", "pooled")
+    assert finding["measure"] == pytest.approx(3.0)
 
 
 def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
@@ -553,7 +591,7 @@ def test_check_one_holds_dew_exact_where_the_reference_is_exact_on_every_seed():
     exact = jax.jit(lambda x, w: {"y": jnp.dot(x, w)})
     with pytest.raises(AssertionError) as raised:
         assert_as_exact(shifted, exact, integral, "shifted", seeds=8)
-    assert raised.type is AssertionError
+    assert raised.type is GateFailure
 
 
 @pytest.mark.parametrize("rank", [1, 2])
@@ -566,7 +604,7 @@ def test_check_one_fails_a_value_that_is_not_finite(rank):
     poisoned = shaped(lambda x, w: {"y": jnp.dot(x, w, precision="highest").at[0, 0].set(jnp.nan)})
     with pytest.raises(AssertionError) as raised:
         assert_as_exact(poisoned, shaped(_product), _draw, "poisoned", seeds=8)
-    assert raised.type is AssertionError
+    assert raised.type is GateFailure
 
 
 def test_check_one_holds_a_row_of_float64_zero_to_the_references_own():
@@ -579,7 +617,7 @@ def test_check_one_holds_a_row_of_float64_zero_to_the_references_own():
 
     with pytest.raises(AssertionError) as raised:
         assert_as_exact(zero_row(1e-12), zero_row(0.0), _draw, "zero row", seeds=8)
-    assert raised.type is AssertionError
+    assert raised.type is GateFailure
 
 
 def _tiny_row(dew_ulps):
@@ -612,7 +650,7 @@ def test_a_small_row_the_reference_measures_is_judged_at_its_own_size():
     further, reference = _tiny_row(4000)
     with pytest.raises(AssertionError) as raised:
         assert_as_exact(further, reference, _draw, "tiny row", seeds=8)
-    assert raised.type is AssertionError
+    assert raised.type is GateFailure
 
 
 def test_a_summarized_recording_keeps_the_zero_rows_rule_for_its_small_rows():
@@ -647,7 +685,7 @@ def test_a_summarized_recording_keeps_the_zero_rows_rule_for_its_small_rows():
     with pytest.raises(AssertionError) as raised:
         assert_as_exact(lambda index, inputs: as_inputs(dew)(inputs), reference, drawn, "summarized",
                         seeds=seeds, truth_fn=truth)
-    assert raised.type is AssertionError
+    assert raised.type is GateFailure
 
 
 def test_a_recorded_reference_is_drawn_by_its_index_and_covers_the_redraw(tmp_path):

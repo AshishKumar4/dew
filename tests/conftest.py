@@ -69,6 +69,21 @@ def pytest_runtest_protocol(item, nextitem):
         _remote.closed(bundle(item))
 
 
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """A test the gate fails reports its findings as data (`reference_error.Finding`), the JUnit property
+    `gate_findings`, a JSON list of each finding's leaf, rule and measure (an infinite one `Infinity`):
+    what a promotion matches a candidate's failures to its parent's by."""
+    outcome = yield
+    if call.excinfo is not None:
+        from reference_error import GateFailure
+
+        if isinstance(call.excinfo.value, GateFailure):
+            outcome.get_result().user_properties.append(("gate_findings", json.dumps(
+                [{"leaf": finding.leaf, "rule": finding.rule, "measure": finding.measure}
+                 for finding in call.excinfo.value.findings])))
+
+
 def pytest_sessionfinish(session, exitstatus):
     if _remote is not None:
         _remote.drain()

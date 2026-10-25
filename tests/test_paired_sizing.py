@@ -4,7 +4,7 @@ compared with itself does not, and a fault still fails at the count they declare
 
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, seeds_for
+from reference_error import GateFailure, assert_as_exact, seeds_for
 
 
 @pytest.fixture(scope="module")
@@ -33,7 +33,7 @@ def test_a_shared_heavy_tail_resolves_paired_and_not_against_itself(heavy):
     seeds = seeds_for(reference, heavy, "heavy sums", truth_fn=_truth, dew_fn=twin)
     with pytest.raises(AssertionError) as raised:
         seeds_for(reference, heavy, "heavy sums", truth_fn=_truth, most=seeds)
-    assert raised.type is AssertionError
+    assert raised.type is GateFailure
     assert_as_exact(twin, reference, heavy, "heavy sums", seeds=seeds, truth_fn=_truth)
 
 
@@ -50,7 +50,7 @@ def test_a_fault_fails_at_the_paired_count(heavy):
 
     with pytest.raises(AssertionError) as raised:
         assert_as_exact(coarse, reference, heavy, "heavy sums", seeds=seeds, truth_fn=_truth)
-    assert raised.type is AssertionError
+    assert raised.type is GateFailure
 
 
 def test_a_recorded_reference_is_refused_a_paired_sizing(heavy):
