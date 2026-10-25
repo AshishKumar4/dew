@@ -58,6 +58,7 @@ from dew.nn.precision import (
     running_sum,
     running_total,
     scaled_logits,
+    wide_cpu_arithmetic,
 )
 from dew.nn.protocols import AffineHead, HiddenStates, Lacks, Logits, LogitsFromHidden, OutputTable
 from dew.nn.sharding import logical_spec, mesh_axes
@@ -220,8 +221,9 @@ def _row_terms(logits, predict: bool) -> tuple[
     logits of 4096 x 151936 took 3.9 ms against `jax.nn.logsumexp` and
     `jnp.argmax`'s 7.6, and 8192 x 50304 2.6 against 5.0.
 
-    On CPU the row reduces in two levels, blocks of about its square root's
-    width and then the blocks' terms (`_row_blocks`): XLA's CPU compiler
+    In a process running wide CPU arithmetic (`dew.nn.precision.WIDE_CPU_ARITHMETIC`,
+    Dew's test setting), on a CPU the row reduces in two levels, blocks of about its
+    square root's width and then the blocks' terms (`_row_blocks`): XLA's CPU compiler
     runs a reduction with a combine of its own as one loop over the row, and
     over 512 columns that loop's sum of exponentials held a whole head's
     state gradient 3.9 times as far from float64 as `jax.nn.logsumexp`'s
@@ -254,7 +256,8 @@ def _row_terms(logits, predict: bool) -> tuple[
         return reduced(*(jnp.concatenate([first[index] for first in firsts], axis=-1)
                          for index in range(len(operands))))
 
-    terms = jax.lax.platform_dependent(*operands, cpu=blocked, default=reduced)
+    terms = (jax.lax.platform_dependent(*operands, cpu=blocked, default=reduced) if wide_cpu_arithmetic()
+             else reduced(*operands))
     return terms[0] + jnp.log(terms[1]), ((terms[0], terms[2]) if predict else None), terms[:2]
 
 

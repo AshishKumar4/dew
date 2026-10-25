@@ -89,6 +89,10 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     # later GPUs default fp32 matmuls to TF32, a 10-bit mantissa, which puts
     # 1e-2 between two correct implementations.
     environ.setdefault("JAX_DEFAULT_MATMUL_PRECISION", "highest")
+    # The arithmetic the suite holds a CPU to (`dew.nn.precision.WIDE_CPU_ARITHMETIC`): float32
+    # products summed in float64, a row's logsumexp in two levels, a float64 division as written.
+    # Dew's test setting, never the library's default.
+    environ.setdefault("DEW_WIDE_CPU_ARITHMETIC", "1")
 
 
 def configured(environ: Mapping[str, str]) -> dict[str, str]:

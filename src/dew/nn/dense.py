@@ -1,12 +1,12 @@
-"""Flax's dense layers, with their bias gradients summed at fp32, in float64 on a CPU.
+"""Flax's dense layers, with their bias gradients summed at fp32 (in float64 on a CPU under Dew's tests).
 
 `Dense` and `DenseGeneral` are flax 0.12's layers, fields, parameter names,
 shapes, initializers, promotion and product hooks alike, so checkpoints,
 LoRA and Qwix see the layers they did. Their call is their own: the same
 product, rounded to its dtype as flax's is, then the bias added by `biased`,
 which adds it in the dtype flax's addition gives them and broadcasts it at
-fp32, so its gradient sums at fp32 as torch's addmm sums it, and in float64 on a CPU, as
-a CPU sums every float32 product (`dew.nn.precision.accumulated`). The bias is
+fp32, so its gradient sums at fp32 as torch's addmm sums it, and in float64 on a CPU under
+Dew's tests, as such a CPU sums every float32 product (`dew.nn.precision.accumulated`). The bias is
 added inside the layer's own managed call, so a method interceptor (an
 adapter, an input quantization) and an intermediate capture see the
 output as they saw flax's.
