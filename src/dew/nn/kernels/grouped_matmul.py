@@ -1115,9 +1115,8 @@ class CutlassTgmm(_Cutlass):
 class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
     """The TPU mainloops (`templates.gemm.mosaic_tpu`, Megablox's schedule): bf16 operands, which the
     MXUs multiply exactly and sum in fp32, widths a vreg's lanes divide, and a TPU whose scoped VMEM a
-    measurement states; a CPU interprets them as the TPU runs them. A TPU's own lowering runs XLA's
-    ragged dot until a scoreboard row measures these (`_on_platform` has no TPU branch), so an assumed
-    TPU interprets them alone."""
+    measurement states; a CPU interprets them as the TPU runs them, and a TPU's own lowering runs them
+    (`_on_platform`'s TPU branch), their native qualification open until a scoreboard row measures them."""
     name: ClassVar[str] = 'mosaic_tpu'
     config_cls: ClassVar[type[mosaic_tpu.Blocks]] = mosaic_tpu.Blocks
     GENERATES: ClassVar[bool] = True
@@ -1517,11 +1516,12 @@ def tgmm_call(tokens, cotangent, sizes, prologue_operands: tuple = (), *, out_dt
 
 
 def _on_platform(kernel, fallback, interpret_on_cpu: bool):
-    """`kernel` where the call lowers for CUDA, interpreted on the CPU when
-    asked for, and `fallback` everywhere else: a TPU's program, which never runs
-    on CUDA, holds no CUDA branch."""
+    """`kernel` where the call lowers for its target's platform (CUDA, or a TPU's), interpreted on the
+    CPU when asked for, and `fallback` everywhere else: a TPU's program, which never runs on CUDA, holds
+    no CUDA branch, and a GPU's no TPU branch. A new family member runs its template after the
+    hardware-free checks, its native qualification an open item until measured (bible §6)."""
     tpu = generation.tpu(generation.gpu_target())
-    branches = {} if tpu else {'cuda': functools.partial(kernel, interpret=False)}
+    branches = {'tpu' if tpu else 'cuda': functools.partial(kernel, interpret=False)}
     if interpret_on_cpu:
         branches['cpu'] = functools.partial(kernel, interpret=True)
     return branches, fallback
