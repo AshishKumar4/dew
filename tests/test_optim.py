@@ -876,6 +876,10 @@ SCHEDULES = {
     "exponential": Exponential(init_value=1e-2, end_value=1e-3, offset=1e-4),
     "power": Power(peak_value=2e-2, warmup_steps=2, a=4e-2, tail=PowerTail(start=4, end_value=1e-3)),
     "one_cycle": OneCycle(peak_value=1e-2),
+    # A warmup from zero, a schedule of zeros, and ends forty decades apart.
+    "one_cycle_from_zero": OneCycle(peak_value=1e-2, init_value=0.0),
+    "one_cycle_zero": OneCycle(peak_value=0.0, init_value=0.0, end_value=0.0),
+    "one_cycle_wide": OneCycle(peak_value=1e20, init_value=1e-20, end_value=1e-20),
 }
 
 
@@ -927,8 +931,10 @@ def rate_fields(name: str, multiplier: float) -> dict[str, float]:
     if isinstance(schedule, Power):
         assert schedule.tail is not None
         return {"peak": schedule.peak_value * m, "a": schedule.a * m, "tail": schedule.tail.end_value * m}
-    peak = schedule.peak_value * m
-    return {"peak": peak, "init": peak / 25, "end": peak / 25 / 1e4}
+    # torch's defaults: the start the peak over 25, the end the start over 1e4.
+    init = schedule.peak_value / 25 if schedule.init_value is None else schedule.init_value
+    end = init / 1e4 if schedule.end_value is None else schedule.end_value
+    return {"peak": schedule.peak_value * m, "init": init * m, "end": end * m}
 
 
 def optax_schedule(name: str, fields, steps: int = 10) -> optax.Schedule:
@@ -967,14 +973,17 @@ def optax_schedule(name: str, fields, steps: int = 10) -> optax.Schedule:
                                      lambda count: law(count + warmup),
                                      optax.linear_schedule(law(start), f["tail"], steps - start)],
                                     [warmup, start])
-    # torch's two half cosines (`OneCycle`) as optax's cosine decays, from `init` up to the peak at
-    # `rise` and down to `end` at the run's last step, where this run's phase ends fall on steps.
+    # torch's two half cosines (`OneCycle`) as optax's cosine decays from the peak, up from `init` to it
+    # by the first read backwards from `rise` and down to `end` by the second at the run's last step,
+    # where this run's phase ends fall on steps; a schedule of zeros is zero throughout.
     rise, last = round(schedule.warmup_fraction * steps - 1), steps - 1
     configured = rate_fields(name, 1.0)
-    return optax.join_schedules([
-        optax.cosine_decay_schedule(f["init"], rise, alpha=configured["peak"] / configured["init"]),
-        optax.cosine_decay_schedule(f["peak"], last - rise, alpha=configured["end"] / configured["peak"]),
-    ], [rise])
+    if configured["peak"] == 0:
+        return optax.constant_schedule(f["peak"])
+    up, down = configured["init"] / configured["peak"], configured["end"] / configured["peak"]
+    rising = optax.cosine_decay_schedule(f["peak"], rise, alpha=up)
+    falling = optax.cosine_decay_schedule(f["peak"], last - rise, alpha=down)
+    return optax.join_schedules([lambda count: rising(rise - count), falling], [rise])
 
 
 RATE_SEEDS = 8
@@ -1058,9 +1067,10 @@ def test_a_scheduled_rate_is_as_near_float64_as_optaxs(name):
 @pytest.mark.parametrize("name", ["constant", "cosine"])
 def test_a_resumed_rate_reaches_a_solver_inside_an_injected_wrapper(name):
     """A resume sets a configured solver's rate (`with_rates`) where a run's own injected wrapper holds
-    the solver, as an objective may wrap the optimizer it is given: the wrapped run then steps at the
-    configured rate, the rate a run built at it steps at, bit for bit, and its wrapper's own
-    hyperparameter stays as it was."""
+    the solver, as an objective may wrap the optimizer it is given: the wrapped run then makes the
+    updates a run built at the configured rate makes, bit for bit, and reports that run's rate, read
+    through the wrapper (`learning_rate`), where the checkpoint's rate left in place makes others. Its
+    wrapper's own hyperparameter stays as it was."""
     def configured(scale):
         rate = 3e-3 * scale if name == "constant" else dataclasses.replace(
             SCHEDULES["cosine"], peak_value=1e-2 * scale, init_value=1e-4 * scale, end_value=1e-3 * scale)
@@ -1071,10 +1081,15 @@ def test_a_resumed_rate_reaches_a_solver_inside_an_injected_wrapper(name):
     params, grads = {"w": jnp.ones(3)}, {"w": jnp.ones(3)}
     _, wrapped = configured(1.0)
     doubled, fresh = configured(2.0)
-    state, want = with_rates(wrapped.init(params), doubled.rates()), fresh.init(params)
+    stale = wrapped.init(params)
+    state, want = with_rates(stale, doubled.rates()), fresh.init(params)
     for _ in range(3):
-        _, state = wrapped.update(grads, state, params)
-        _, want = fresh.update(grads, want, params)
+        updates, state = wrapped.update(grads, state, params)
+        expected, want = fresh.update(grads, want, params)
+        kept, stale = wrapped.update(grads, stale, params)
+        np.testing.assert_array_equal(updates["w"], expected["w"])
+        assert not np.array_equal(kept["w"], expected["w"])
+        assert learning_rate(state) is not None
         np.testing.assert_array_equal(learning_rate(state), learning_rate(want))
     np.testing.assert_array_equal(state.hyperparams["gain"], 2.0)
 
