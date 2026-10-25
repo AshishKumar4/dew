@@ -351,11 +351,17 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     and nowhere else (`SavedRun.pinned`), so no component keeps two readers: a decision head's
     `{"name"}` record, its class by import path or by class name alone in `dew.decision.head`, a
     built-in autoencoder's by its name with its module's bare fields (`_EARLIER_AUTOENCODERS`), a
-    decision layout's by class name in `dew.decision.layout`, each read as the registry's class record,
+    decision layout's by class name in `dew.decision.layout`, each read as the registry's class record
+    and refused where it holds more than its name and fields (ledger 1239),
     a processor's source as its encoded string (ledger 1641), and a Qwen or MiMo projector's earlier
     fields (`_earlier_projectors`, ledger 1622). A record in today's shapes passes as it is. Carried to
     1.0, when it is deleted (ledger 1552)."""
     current = dict(record)
+    for key in ("head", "layout"):
+        held = record.get(key)
+        if isinstance(held, Mapping) and "name" in held and not set(held) <= {"name", "fields"}:
+            raise ValueError(f"an earlier run's {key} names its class and its fields alone, not "
+                             f"{sorted(set(held) - {'name', 'fields'})}")
     head = record.get("head")
     if isinstance(head, Mapping) and "name" in head and "class" not in head:
         name = named(head["name"], "head.name")
