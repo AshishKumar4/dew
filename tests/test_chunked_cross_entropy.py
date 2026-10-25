@@ -680,10 +680,19 @@ def test_the_gradient_reaches_the_backbone_through_the_states_and_the_head():
 # --- the chunk arithmetic itself -------------------------------------------
 
 @pytest.mark.parametrize("chunks", [0, -1])
-def test_nonpositive_chunk_counts_are_refused(chunks):
-    hidden, head, targets = inputs()
+def test_an_lm_run_of_a_nonpositive_chunk_count_is_refused_where_its_step_compiles(chunks):
+    """An LM objective asked to score its head in no vocabulary slices, or fewer, is refused
+    (ValueError) where a run's step compiles, through the trainer, before it takes any step."""
+    from dew.objectives.lm import LMObjective
+    from dew.training import Trainer
+
+    model = CausalTransformer(vocab_size=5, emb_features=8, num_layers=1, num_heads=1,
+                              mlp_features=16, max_seq_len=8, attention_impl="xla")
+    trainer = Trainer(LMObjective(model, seq_len=4, head_chunks=chunks, ema_decay=None), optax.sgd(.01),
+                      key=jax.random.key(0))
+    initial = trainer.initial_state()
     with pytest.raises(ValueError):
-        chunked_cross_entropy(hidden, OutputTable(head, vocab_major=False), targets, chunks)
+        trainer.compile(initial, {"text": jnp.zeros((jax.device_count(), 5), jnp.int32)})
 
 
 @pytest.mark.parametrize("chunks", [4, 8])

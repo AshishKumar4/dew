@@ -194,7 +194,7 @@ def test_a_biased_mlp_loads_and_exports_where_the_reference_reads_mlp_bias(name,
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForMaskedLM
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     auto = AutoModelForCausalLM if head == "causal" else AutoModelForMaskedLM
     config = AutoConfig.from_pretrained(FIXTURES / name)
@@ -251,7 +251,7 @@ def test_a_float32_decoder_multiplies_float32_products_on_a_gpu():
     import torch
     from transformers import AutoModelForCausalLM
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     directory = FIXTURES / "qwen3-tiny"
     ids = np.load(directory / "input_ids.npy")
@@ -1438,7 +1438,7 @@ def test_a_nemotron_h_prediction_step_loads_computes_the_reference_and_trains(tm
     import torch
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     reference = nemotron_step_source(tmp_path / "ultra-step")
     model, variables = fp32_decoder(tmp_path / "ultra-step")

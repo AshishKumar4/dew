@@ -26,7 +26,6 @@ What lands:
   reference release.
 """
 
-import contextlib
 import json
 import sys
 from pathlib import Path
@@ -35,7 +34,7 @@ import numpy as np
 import torch
 import transformers
 from hf_reference import FIXTURES, write_tiny
-from torch_precision import default_dtype, float_as, replaced, widened_to
+from torch_precision import float64
 from transformers.models.mamba2.configuration_mamba2 import Mamba2Config
 from transformers.models.mamba2.modeling_mamba2 import (
     Mamba2ForCausalLM,
@@ -115,16 +114,6 @@ def write_ssd() -> None:
     np.savez(SSD / "ssd.npz", **{name: tensor.detach().numpy() for name, tensor in arrays.items()})
     (SSD / "config.json").write_text(json.dumps(geometry, indent=2) + "\n")
     print(f"{SSD / 'ssd.npz'}: {(SSD / 'ssd.npz').stat().st_size / 1e3:.0f} kB")
-
-
-@contextlib.contextmanager
-def float64():
-    """The reference in float64 throughout (tools/torch_precision.py): torch's default dtype float64,
-    and each of its casts to float32, `.float()` and the gated norm's `.to(torch.float32)`
-    (modeling_mamba2.py:113,116), casting to float64 instead."""
-    with default_dtype(torch.float64), replaced(float_as(torch.float64),
-                                                (torch.Tensor, "to", widened_to(torch.Tensor.to))):
-        yield
 
 
 def write_float64() -> None:

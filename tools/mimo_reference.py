@@ -124,7 +124,7 @@ def write(directory: Path, config: dict, tower: dict, projector: dict, arrays: d
 def write_mimo_vision_tiny() -> None:
     """MiMo ViT: the trunk sequence (the merger's input, caught by a hook) and the merger's output,
     the merger's biases zero as the release stores none."""
-    from diffusers_wan_reference import float64
+    from torch_precision import float64
 
     modeling = mimo_module()
     config = SimpleNamespace(**MIMO_VISION)
@@ -189,7 +189,7 @@ def write_mel() -> None:
 
 
 def write_mimo_audio_tiny() -> None:
-    from diffusers_wan_reference import float64
+    from torch_precision import float64
 
     modeling = mimo_module()
     grouping = modeling._at_group_by_length
