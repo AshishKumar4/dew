@@ -505,7 +505,8 @@ def consistency_divergence(logits: jax.Array, options: jax.Array, groups: jax.Ar
     categorical owner's); a group's divergence is the generalized Jensen-Shannon divergence of its
     members' answers, the mean of each one's KL divergence from their mean, so it is zero exactly
     where they agree, at most the log of the member count, and computed in at least float32 in the
-    log domain, finite at any finite logits."""
+    log domain, finite at any finite logits. Its gradient is the divergence's in closed form,
+    `sum_c dP_c (log P_c - log M_c)` for each member, whose terms through the logarithms are zero."""
     from dew.nn import categorical
 
     width = logits.shape[-1]
@@ -542,7 +543,11 @@ def consistency_divergence(logits: jax.Array, options: jax.Array, groups: jax.Ar
         log_mean = jax.vmap(mean_of, in_axes=(1, 1), out_axes=1)(given, held)
         log_mean = log_mean - jnp.log(jnp.maximum(sizes, 1.0))[:, None]
         theirs = log_mean[jnp.minimum(ids, count - 1)]
-        each = jnp.sum(jnp.where(present, probability * (log_answer - theirs), 0.0), axis=-1)
+        # The divergence's gradient is sum_c dP_c (log P_c - log M_c): its terms through the logarithms,
+        # sum_c P_c dlog P_c and the mean's sum_c dM_c, are each zero, as P and M are distributions,
+        # and differentiating them adds only their rounding. So the ratio carries no gradient.
+        ratio = jax.lax.stop_gradient(jnp.where(present, log_answer - theirs, 0.0))
+        each = jnp.sum(jnp.where(present, probability * ratio, 0.0), axis=-1)
         size = sizes[jnp.minimum(ids, count - 1)]
         return (jnp.where(member, each / jnp.maximum(size, 1.0), 0.0),
                 jnp.where(member, 1.0 / jnp.maximum(size, 1.0), 0.0))
