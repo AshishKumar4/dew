@@ -112,9 +112,9 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     if backward and width != value_width:
         return "the Mosaic backward stages dK and dV through one buffer: equal head widths"
     widest = max(_width(width, family, dtype), _width(value_width, family, dtype))
-    if widest > family.block_extent:
-        return (f"the Mosaic mainloop loads a head {widest} wide in one block, past the "
-                f"{family.block_extent} a load takes (`Family.block_extent`)")
+    if family.copy_extent is not None and widest > family.copy_extent:
+        return (f"the Mosaic mainloop loads a head {widest} wide in one copy, past the "
+                f"{family.copy_extent} one moves (`Family.copy_extent`)")
     # The hooks as a launch runs them: on its family's least tile, its values in whole swizzled rows.
     unit = math.lcm(family.role_rows, family.column_unit(dtype))
     return unlowered(hooks, (unit, unit), _width(value_width, family, dtype))
