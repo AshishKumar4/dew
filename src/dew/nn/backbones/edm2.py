@@ -22,6 +22,7 @@ from flax.typing import Dtype
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.dit import TextContext, masked_mean
+from dew.nn.dropout import Dropout
 from dew.nn.flops import MissingFlopsCount, attention_flops, patch_lengths
 from dew.nn.mp import MPConv, MPFourier, mp_cat, mp_silu, mp_sum, normalize
 
@@ -104,7 +105,7 @@ class Block(nn.Module):
         gain = self.param("emb_gain", nn.initializers.zeros, ())
         scale = MPConv(self.features, name="emb_linear")(emb, gain=gain) + 1
         y = mp_silu(y * scale[:, None, None, :].astype(y.dtype))
-        y = nn.Dropout(self.dropout)(y, deterministic=not train)
+        y = Dropout(self.dropout)(y, deterministic=not train)
         y = self._residual_conv(name="conv_res1")(y)
         if self.flavor == "dec" and skip:
             x = MPConv(self.features, (1, 1), name="conv_skip")(x)
