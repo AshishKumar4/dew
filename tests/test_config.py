@@ -579,3 +579,19 @@ def test_a_run_recorded_with_the_lm_balance_arguments_reads_as_one_balance_recor
     assert "balance_rate" not in stated.fields
     unset = ObjectiveConfig("lm", defaults={**balance, "balance_rate": None})
     assert unset.defaults.get("balance") is None
+
+
+def test_a_run_whose_balance_arguments_are_split_across_stated_and_default_ones_keeps_its_balance():
+    """A run recorded with `aux_loss_alpha` stated and its other three balance arguments among the recorded
+    defaults builds the balance it had, and reads back as the same run."""
+    from dew.objectives.routing import ExpertBalance
+
+    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=8, mixture={"experts": 4, "top_k": 2, "bias": True})
+    config = ObjectiveConfig("lm", {"aux_loss_alpha": 0.2},
+                             defaults={"balance_rate": 0.01, "seq_aux": False, "router_z_loss": 0.1})
+    objective = config.build(model=model, seq_len=8)
+    assert objective.balance == ExpertBalance(balance_rate=0.01, aux_loss_alpha=0.2, seq_aux=False,
+                                              router_z_loss=0.1)
+    saved = json.loads(json.dumps({"fields": config.fields, "defaults": config.defaults}))
+    assert ObjectiveConfig("lm", **saved) == config
