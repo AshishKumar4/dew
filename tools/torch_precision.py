@@ -125,6 +125,32 @@ def float64():
         yield
 
 
+def float64_twin(model: torch.nn.Module,
+                 build: Callable[[], torch.nn.Module] | None = None) -> torch.nn.Module:
+    """`model`'s float64 truth, the one way a truth's twin is made: built inside `float64`, so every value
+    its constructor computes (a rotary `inv_freq`, Gemma's `embed_scale`) is float64's where a float32
+    build cast afterwards keeps float32's, by `build` (a library's reader at float64, a head from its
+    config) or else its class from a copy of its config at float64 (Diffusers' `from_config` for a
+    config that is no transformers one), and promoted to float64 where a reader decodes another dtype,
+    which computes nothing a construction did; `model`'s weights and persistent buffers loaded into it
+    strictly, on `model`'s device, in eval mode. Run it inside `float64` too."""
+    import copy
+
+    with float64():
+        if build is not None:
+            twin = build()
+        else:
+            config = copy.deepcopy(model.config)
+            if hasattr(type(model), "from_config") and not hasattr(config, "to_dict"):
+                twin = type(model).from_config(config)
+            else:
+                config.dtype = torch.float64
+                twin = type(model)(config)
+        twin.to(torch.float64)
+    twin.load_state_dict(model.state_dict(), strict=True)
+    return twin.to(next(model.parameters()).device).eval()
+
+
 def recorded_matmuls(**solves) -> str:
     """What a reference's array file records of its run's matmuls (tests/reference_error.py's
     `PRECISION`): 'ieee' where torch, Triton's default and each of `solves` (its name to the mode it
