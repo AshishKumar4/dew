@@ -111,6 +111,45 @@ def test_the_counted_targets_leave_out_exactly_the_in_block_ones():
     np.testing.assert_array_equal(counts, [2, 3])
 
 
+PROMPT_ROLES = np.asarray(
+    [[Role.USER] * 3 + [Role.ASSISTANT] * 2 + [Role.USER, Role.ASSISTANT, Role.ASSISTANT, Role.PAD],
+     [Role.USER] * 4 + [Role.ASSISTANT] * 2 + [Role.USER, Role.ASSISTANT, Role.ASSISTANT]], np.int8)
+"""Each packed row's roles: each document's user tokens, then its assistant's."""
+
+
+@pytest.mark.parametrize("prefix", [PREFIX, "prompt"])
+def test_a_prefix_runs_batch_without_blocks_trains_on_the_blocks_it_serves(prefix):
+    """A prefix run's batch that carries no blocks, as a precompiled loader or a raw stream gives it,
+    trains on the prefix's blocks all the same: its loss, its gradient and the host's count of scored
+    targets are bit for bit those of the same rows given the data stage's blocks (`Blocks`), which the run
+    serves. A prompt run reads its blocks off the rows' roles, and a batch without them is refused."""
+    from dew.data.chat import ROLES_KEY
+    from dew.objectives.base import Step
+
+    decoder = blocky()
+    objective = LMObjective(decoder, SEQ, prefix=prefix)
+    tokens = jax.random.randint(jax.random.key(1), (BATCH, ROW), 0, VOCAB)
+    params = decoder.init(jax.random.key(0), tokens[:, :-1])
+    stage = Blocks(prefix=PREFIX) if prefix == PREFIX else Blocks(prompt=True)
+    staged = np.stack([stage.map({"text": np.zeros(ROW, np.int32), "text_segment_ids": segments,
+                                  "text_positions": positions, "text_roles": roles})["text_block_groups"]
+                       for segments, positions, roles in zip(SEGMENTS, POSITIONS, PROMPT_ROLES, strict=True)])
+    given = {**packed_batch(tokens), ROLES_KEY: PROMPT_ROLES, "text_block_groups": staged}
+    bare = {name: value for name, value in given.items() if name != "text_block_groups"}
+    step = Step(jnp.asarray(0), jax.random.key(2), None)
+
+    def trained(batch):
+        return jax.value_and_grad(objective.scalar_loss, has_aux=True)(params, batch, step)
+
+    for got, want in zip(jax.tree.leaves(trained(bare)), jax.tree.leaves(trained(given)), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    np.testing.assert_array_equal(objective.scored_tokens(bare), objective.scored_tokens(given))
+    if prefix == "prompt":
+        unroled = {name: value for name, value in bare.items() if name != ROLES_KEY}
+        with pytest.raises(ValueError):
+            objective.scored_tokens(unroled)
+
+
 def test_a_prefix_runs_task_serves_the_blocks_the_run_trained_on():
     """A prefix run's task serves the trained mask: its greedy cached rollout is bit for bit the rollout
     the same model's causal task gives a request that carries the run's blocks itself, each prompt's
@@ -268,23 +307,21 @@ def test_a_prefix_run_needs_a_trunk_layer_that_reads_blocks():
 
 
 def test_a_prefix_run_refuses_a_block_that_crosses_an_attention_chunk():
-    """A block-reading layer whose chunks cut a block reads it in part, so a target across the cut is
-    invisible to its source while the loss drops it. A training run's batch may carry blocks of its own
-    beside its prefix's, runs of any places of its row, so a prefix run needs a layer reading the whole row's
-    blocks: one with no chunk, or a chunk of the row's places. A chunk the prefix alone fits in is refused
-    too. Serving refuses a chunk its prompt's block crosses."""
+    """A block-reading layer with an attention chunk reads a block in part wherever the block crosses one
+    of the chunk's multiples, so a target across the cut is invisible to its source while the loss drops
+    it. A block at a shifted origin crosses one whatever the chunk's length: a row that continues its
+    document at place 6 under a chunk of 8 holds its block over places 6-8, which the chunk cuts at 8. So a
+    prefix run needs a block-reading layer with no chunk, and serving refuses the same."""
+    for chunk in (2, PREFIX, SEQ):
+        with pytest.raises(ValueError):
+            LMObjective(chunked(chunk), SEQ, prefix=PREFIX)
     with pytest.raises(ValueError):
-        LMObjective(chunked(2), SEQ, prefix=PREFIX)
-    with pytest.raises(ValueError):
-        LMObjective(chunked(2), SEQ, prefix="prompt")
-    decoder = chunked(2).clone(max_seq_len=128)
+        LMObjective(chunked(SEQ), SEQ, prefix="prompt")
+    decoder = chunked(SEQ).clone(max_seq_len=128)
     with pytest.raises(ValueError):
         TextGeneration(decoder, decoder.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)), prefix=PREFIX)
-    with pytest.raises(ValueError):
-        LMObjective(chunked(PREFIX), SEQ, prefix=PREFIX)
-    assert LMObjective(chunked(SEQ), SEQ, prefix=PREFIX).prefix == PREFIX
     assert LMObjective(chunked(2, unchunked=True), SEQ, prefix=PREFIX).prefix == PREFIX
-    assert LMObjective(chunked(SEQ), SEQ, prefix="prompt").prefix == "prompt"
+    assert LMObjective(chunked(2, unchunked=True), SEQ, prefix="prompt").prefix == "prompt"
 
 
 UNPACKED_BLOCKS = np.broadcast_to(np.where(np.arange(ROW) < PREFIX, 1, -1).astype(np.int32), (BATCH, ROW))
@@ -292,8 +329,9 @@ UNPACKED_BLOCKS = np.broadcast_to(np.where(np.arange(ROW) < PREFIX, 1, -1).astyp
 
 
 def test_a_batch_of_blocks_is_refused_where_every_layer_that_reads_them_is_chunked():
-    """A batch's blocks are runs of any place, which a chunk cuts unless a row fits in it: a model whose only
-    block-reading layer is chunked refuses them, and one with an unchunked layer beside it scores them."""
+    """A batch's blocks are runs of any places, which a chunk cuts wherever they cross its multiples: a
+    model whose only block-reading layer is chunked refuses them, and one with an unchunked layer beside it
+    scores them."""
     tokens = jax.random.randint(jax.random.key(1), (BATCH, ROW), 0, VOCAB)
     batch = batch_text({TEXT_KEY: tokens, "text_block_groups": UNPACKED_BLOCKS})
     cut = chunked(2)
