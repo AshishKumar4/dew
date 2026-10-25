@@ -252,7 +252,7 @@ class _Guard(NamedTuple):
     largest: jax.Array
 
 
-def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_first=None):
+def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_first=None, keyed: bool = False):
     """A hook parameter's values for a tile `like` of queries from `first` (and keys from `k_first`, a score
     tile's), as `kind` lays them out: the head's scalar, else the tile's entries (a score tile's `[bq, bk]`,
     an output tile's `[bq, Dv]`) in the accumulator's layout, its queries' and keys' broadcast. A score hook
@@ -260,17 +260,22 @@ def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_fir
     query's and a key's as `[bq, 1]` and `[1, bk]`: Mosaic GPU's layouts hold no singleton axis an elementwise
     operation takes (jax 0.11.2's layout inference finds none for a `[64, 1]` or `[1, 64]` array's convert or
     compare, a lowering probe for an H100), so a hook that reshapes or indexes an axis fails to lower here,
-    never silently; a pointwise hook is the same function of either."""
-    rows = pl.ds(first, like.shape[0])
+    never silently; a pointwise hook is the same function of either. A `keyed` score tile's rows are its
+    keys (`algebra.per_query`, `[bk, bq]`), its tile parameters laid keys by queries (`[B, H, Kp, Qp]`)."""
+    queries, keys = (like.shape[1], like.shape[0]) if keyed else like.shape
+    rows = pl.ds(first, queries)
+    along_queries, along_keys = (family.columns_of, family.rows_of) if keyed else (family.rows_of,
+                                                                                    family.columns_of)
     match kind:
         case Kind.HEAD:
             return ref[head]
         case Kind.QUERY:
-            return algebra.expand(family.rows_of(ref.at[row, head, rows]), like)
+            return algebra.per_query(along_queries(ref.at[row, head, rows]), like, keyed)
         case Kind.KEY:
-            return algebra.across(family.columns_of(ref.at[row, head, pl.ds(k_first, like.shape[1])]), like)
+            return algebra.per_key(along_keys(ref.at[row, head, pl.ds(k_first, keys)]), like, keyed)
         case Kind.TILE:
-            return family.tile_of(ref.at[row, head, rows, pl.ds(k_first, like.shape[1])])
+            return family.tile_of(ref.at[row, head, pl.ds(k_first, keys), rows] if keyed
+                                  else ref.at[row, head, rows, pl.ds(k_first, keys)])
         case Kind.OUTPUT:
             return family.tile_of(ref.at[row, rows, head])
 
@@ -420,34 +425,39 @@ def _streamed(reaches: list) -> tuple[jax.Array, jax.Array]:
 
 
 def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, shape: tuple[int, int],
-            q_pos=None, columns=None) -> algebra.Coords:
+            q_pos=None, columns=None, keyed: bool = False) -> algebra.Coords:
     """A tile's coordinates (`algebra.Coords`): its queries' and keys' places from `first` and `k_first`, the
     tile's entries in the accumulator's layout (`q_pos` the query places and `columns` the tile's key
     offsets, where the caller holds them; a hook reads them so, `_param`), and a spans call's queries'
-    intervals and, with documents, both blocks' ids."""
-    q_pos = first + family.iota(shape, 0) if q_pos is None else q_pos
-    k_pos = k_first + (family.iota(shape, 1) if columns is None else columns)
+    intervals and, with documents, both blocks' ids; a `keyed` tile's rows its keys (`algebra.per_query`,
+    `shape` `[bk, bq]`)."""
+    query_axis, key_axis = (1, 0) if keyed else (0, 1)
+    along_queries, along_keys = (family.columns_of, family.rows_of) if keyed else (family.rows_of,
+                                                                                    family.columns_of)
+    q_pos = first + family.iota(shape, query_axis) if q_pos is None else q_pos
+    k_pos = k_first + (family.iota(shape, key_axis) if columns is None else columns)
     if spans is None:
         return algebra.Coords(q_pos, k_pos)
-    rows = pl.ds(first, shape[0])
+    rows = pl.ds(first, shape[query_axis])
 
     def bounds_of(*run):
         # A query's interval, or a call's run's, one row of bounds a run (`_spans_of`).
-        return (family.rows_of(spans.start.at[(row, *run, rows)]),
-                family.rows_of(spans.end.at[(row, *run, rows)]))
+        return (along_queries(spans.start.at[(row, *run, rows)]),
+                along_queries(spans.end.at[(row, *run, rows)]))
 
     runs = [(run,) for run in range(spans.start.shape[1])] if spans.start.ndim == 3 else [()]
     bounds = tuple(bounds_of(*run) for run in runs)
     ids = None
     if spans.query_ids is not None and spans.key_ids is not None:
-        ids = (family.rows_of(spans.query_ids.at[row, rows]),
-               family.columns_of(spans.key_ids.at[row, pl.ds(k_first, shape[1])]))
+        ids = (along_queries(spans.query_ids.at[row, rows]),
+               along_keys(spans.key_ids.at[row, pl.ds(k_first, shape[key_axis])]))
     return algebra.Coords(q_pos, k_pos, bounds, ids)
 
 
-def _rows(family: mosaic.Family, ref, row, head, first, count: int):
-    """A query block's per-row statistic `[count]` of a `[B, H, Q]` array, in a row's layout."""
-    return family.rows_of(ref.at[row, head, pl.ds(first, count)])
+def _rows(family: mosaic.Family, ref, row, head, first, count: int, keyed: bool = False):
+    """A query block's per-row statistic `[count]` of a `[B, H, Q]` array, in a row's layout, or a column's
+    where a tile's rows are its keys (`keyed`, `algebra.per_query`)."""
+    return (family.columns_of if keyed else family.rows_of)(ref.at[row, head, pl.ds(first, count)])
 
 
 def _views_of(refs: dict, row, head) -> dict:
