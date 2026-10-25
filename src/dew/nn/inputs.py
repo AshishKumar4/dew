@@ -1003,10 +1003,10 @@ def local_rows(leaf: jax.typing.ArrayLike, *, host: bool = True) -> jax.Array | 
     return np.concatenate(blocks, axis=0)
 
 
-def host_rows[TreeT](tree: TreeT, rows: int | None) -> TreeT:
-    """This process's first `rows` real rows of every leaf of `tree`, as host arrays (`local_rows`): a
+def host_rows(leaf: jax.typing.ArrayLike, rows: int | None) -> np.ndarray:
+    """This process's first `rows` real rows of a result leaf, as a host array (`local_rows`): the
     result without the rows its batch was padded with to fill the devices. None keeps every row."""
-    return jax.tree.map(lambda leaf: local_rows(leaf)[:rows], tree)
+    return local_rows(leaf)[:rows]
 
 
 def request_key(key: int | jax.Array | None) -> jax.Array:
