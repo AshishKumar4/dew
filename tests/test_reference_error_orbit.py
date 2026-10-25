@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import RESOLUTION, _drawn, assert_as_exact, seeds_for
+from reference_error import RESOLUTION, GateFailure, _drawn, assert_as_exact, seeds_for
 
 ROWS = 64
 
@@ -65,7 +65,7 @@ def test_an_orbit_judges_each_arms_worst_row_over_the_same_orders():
     seeds = seeds_for(_outer_first, _cancelling_draw, "cancelling sums")
     with pytest.raises(AssertionError) as raised:
         assert_as_exact(_left_to_right, _outer_first, _cancelling_draw, "cancelling sums", seeds=seeds)
-    assert raised.type is AssertionError
+    assert raised.type is GateFailure
     assert_as_exact(_left_to_right, _outer_first, _cancelling_draw, "cancelling sums", seeds=seeds,
                     orders=_swapped)
     over = _drawn(_left_to_right, _outer_first, _cancelling_draw, range(8), orders=_swapped)
@@ -85,7 +85,7 @@ def test_an_orbit_fails_a_dew_wrong_only_at_another_order():
     with pytest.raises(AssertionError) as raised:
         assert_as_exact(_outer_first, _largest_first, _cancelling_draw, "largest first", seeds=seeds,
                         orders=_swapped)
-    assert raised.type is AssertionError
+    assert raised.type is GateFailure
 
 
 def test_an_orbit_judges_the_rows_of_a_leaf_the_reference_holds_exactly():
@@ -106,7 +106,7 @@ def test_an_orbit_judges_the_rows_of_a_leaf_the_reference_holds_exactly():
     assert_as_exact(middle_dropped, whole, draw, "exact leaf", seeds=8)
     with pytest.raises(AssertionError) as raised:
         assert_as_exact(middle_dropped, whole, draw, "exact leaf", seeds=8, orders=_swapped)
-    assert raised.type is AssertionError
+    assert raised.type is GateFailure
 
 
 def test_an_orbit_fails_a_value_not_finite_at_another_order():
@@ -121,7 +121,7 @@ def test_an_orbit_fails_a_value_not_finite_at_another_order():
     with pytest.raises(AssertionError) as raised:
         assert_as_exact(broken_when_swapped, _outer_first, _cancelling_draw, "nan", seeds=seeds,
                         orders=_swapped)
-    assert raised.type is AssertionError
+    assert raised.type is GateFailure
 
 
 def test_an_orbit_still_fails_a_sum_that_differs():
@@ -133,7 +133,7 @@ def test_an_orbit_still_fails_a_sum_that_differs():
     with pytest.raises(AssertionError) as raised:
         assert_as_exact(lost, _outer_first, _cancelling_draw, "lost term",
                         seeds=seeds_for(_outer_first, _cancelling_draw, "cancelling sums"), orders=_swapped)
-    assert raised.type is AssertionError
+    assert raised.type is GateFailure
 
 
 def test_an_orbit_of_a_recorded_reference_or_of_one_order_is_refused():
@@ -191,7 +191,7 @@ def test_a_narrow_rows_factor_holds_through_check_one():
         if fails:
             with pytest.raises(AssertionError) as raised:
                 assert_as_exact(dew, reference, draw, f"width {width}", seeds=8, truth_fn=truth)
-            assert raised.type is AssertionError
+            assert raised.type is GateFailure
         else:
             assert_as_exact(dew, reference, draw, f"width {width}", seeds=8, truth_fn=truth)
 
