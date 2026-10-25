@@ -341,9 +341,12 @@ def refused(refusal: dict) -> str:
 
 def unexplained(cell: dict) -> list[str]:
     """What of `cell` no row or reason explains: a route off its kernel with no row or inherent
-    refusal, a mixer's refusal no `LAYOUT_GAPS` row names, a mode refused otherwise, no fixture; a mode
-    the family's layers rule out (`absent`) is explained."""
+    refusal, a trace that took no kernel choice at all, a mixer's refusal no `LAYOUT_GAPS` row names, a mode
+    refused otherwise, no fixture; a mode the family's layers rule out (`absent`) is explained."""
     if "routes" in cell:
+        if not cell["routes"]:
+            return [f"{cell.get('family')} on {cell.get('target')} ({cell.get('mode')}): its trace took no "
+                    "kernel choice, so no route is judged (an empty inventory, ledger 1380)"]
         return [f"{route['choice']} at {route['site']}: {route['kernel']} for {route['preferred']}, "
                 f"{route['verdict']}" for route in cell["routes"]
                 if route["verdict"] == "undeclared"]
