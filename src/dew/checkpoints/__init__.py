@@ -1916,20 +1916,22 @@ def averaged(runs: Sequence[str | os.PathLike[str]], *, step: int | str | None =
     `ema` as its loaders read them (its average where None and it keeps one): a model soup of runs
     trained apart from one start, any objective's.
 
-    A run's weights are its model's tree (`Objective._saved_variables`) in fp32 with its frozen leaves
-    back in `params`, a LoRA run's factors merged into their kernels first (`Adapter.merge`), as the
-    mean of two runs' factors is not the mean of the weights they make: a LoRA run, a partly frozen
-    one and a whole fine-tune of one base average. The runs are of one model: their model records,
-    adapters aside, the same, and their trees of the same leaves and shapes; any other run is
-    refused (ValueError), naming it. Where each run started is the caller's to know: runs drawn from
-    other initial weights average to no model of either. The mean is taken on the host in fp32
-    (`_taken`), one run's tree beside it at a time, a subnormal kept as float64's mean rounds it
-    where a device may flush it, and placed as the first run's leaves are; an integer or boolean leaf
-    must agree across the runs. `trust` is as `run_record` takes it."""
+    A run's weights are its model's tree (`Objective._saved_variables`, read onto `mesh` as `layout`
+    places it, as a run's loaders take them) in fp32 with its frozen leaves back in `params`, a LoRA
+    run's factors merged into their kernels first (`Adapter.merge`), as the mean of two runs' factors
+    is not the mean of the weights they make: a LoRA run, a partly frozen one and a whole fine-tune of
+    one base average. The runs are of one model: their model records, adapters aside, the same, and
+    their trees of the same leaves and shapes; any other run is refused (ValueError), naming it. Where
+    each run started is the caller's to know: runs drawn from other initial weights average to no
+    model of either. The mean is elementwise, so each process takes it over the shards it holds, on
+    the host in fp32 (`_taken`), one run's shards beside it at a time, a subnormal kept as float64's
+    mean rounds it where a device may flush it, and assembles its leaves as the first run's are
+    placed: a pool averages runs no one process holds whole. An integer or boolean leaf must agree
+    across the runs. `trust` is as `run_record` takes it."""
     if len(runs) < 2:
         raise ValueError(f"an average is of two or more runs, got {len(runs)}")
-    means: list[np.ndarray] = []
-    structure, placements, model, read = None, [], None, []
+    means: list[list[np.ndarray]] = []
+    structure, firsts, model, read = None, [], None, []
     for count, run in enumerate(runs, start=1):
         tree, base, entry = _effective_weights(str(epath.Path(run)), step, ema, mesh, layout, trust)
         if model is not None and base != model:
@@ -1939,22 +1941,66 @@ def averaged(runs: Sequence[str | os.PathLike[str]], *, step: int | str | None =
         leaves, shape = jax.tree.flatten(tree)
         del tree
         if structure is None:
-            structure, placements = shape, [getattr(leaf, "sharding", None) for leaf in leaves]
-            means = [_on_host(leaf) for leaf in leaves]
-        elif shape != structure or any(np.shape(held) != np.shape(leaf) for held, leaf in zip(
-                means, leaves, strict=True)):
+            structure, firsts = shape, [_Placed.of(leaf) for leaf in leaves]
+            means = [first.local(leaf) for first, leaf in zip(firsts, leaves, strict=True)]
+        elif shape != structure or any(np.shape(leaf) != first.shape for first, leaf in zip(
+                firsts, leaves, strict=True)):
             raise ValueError(f"the run in {entry[0]} holds other variables than {read[0][0]}")
         else:
             # Each leaf is taken in and let go in turn, so the run's tree leaves as the mean takes it.
             for index, leaf in enumerate(leaves):
-                means[index] = _taken(means[index], _on_host(leaf), count, entry[0], read[0][0])
+                means[index] = [_taken(held, piece, count, entry[0], read[0][0])
+                                for held, piece in zip(means[index], firsts[index].local(leaf), strict=True)]
                 leaves[index] = None
         del leaves
         read.append(entry)
     assert structure is not None and model is not None
-    placed = [mean if sharding is None else jax.device_put(mean, sharding)
-              for mean, sharding in zip(means, placements, strict=True)]
+    placed = [first.assembled(pieces) for first, pieces in zip(firsts, means, strict=True)]
     return Averaged(jax.tree.unflatten(structure, placed), model, tuple(read))
+
+
+@dataclasses.dataclass(frozen=True)
+class _Placed:
+    """Where the first run's leaf is (`averaged`): its global shape and, for a device array, its
+    sharding, the devices of this process that hold its shards, and which distinct block of the leaf
+    each holds (`blocks`), a replicated block held by several devices taken once."""
+
+    shape: tuple[int, ...]
+    sharding: jax.sharding.Sharding | None
+    devices: tuple = ()
+    blocks: tuple[tuple, ...] = ()
+
+    @classmethod
+    def of(cls, leaf) -> _Placed:
+        if not isinstance(leaf, jax.Array):
+            return cls(tuple(np.shape(leaf)), None)
+        shards = leaf.addressable_shards
+        return cls(tuple(leaf.shape), leaf.sharding, tuple(shard.device for shard in shards),
+                   tuple(_block(shard.index) for shard in shards))
+
+    def local(self, leaf) -> list[np.ndarray]:
+        """`leaf` placed as the first run's, as each distinct block this process holds of it, on the
+        host, a floating one in fp32 (`_on_host`)."""
+        if self.sharding is None:
+            return [_on_host(leaf)]
+        if not isinstance(leaf, jax.Array) or leaf.sharding != self.sharding:
+            leaf = jax.device_put(leaf, self.sharding)
+        held = {_block(shard.index): shard.data for shard in leaf.addressable_shards}
+        return [_on_host(held[block]) for block in dict.fromkeys(self.blocks)]
+
+    def assembled(self, pieces: list[np.ndarray]):
+        """The leaf whose distinct blocks on this process are `pieces`, placed as the first run's."""
+        if self.sharding is None:
+            return pieces[0]
+        by_block = dict(zip(dict.fromkeys(self.blocks), pieces, strict=True))
+        return jax.make_array_from_single_device_arrays(
+            self.shape, self.sharding, [jax.device_put(by_block[block], device)
+                                        for block, device in zip(self.blocks, self.devices, strict=True)])
+
+
+def _block(index: tuple[slice, ...]) -> tuple:
+    """A shard's place in its leaf (`Shard.index`) as a key: each dimension's start, stop and step."""
+    return tuple((part.start, part.stop, part.step) for part in index)
 
 
 def _effective_weights(directory: str, step: int | str | None, ema: bool | None, mesh, layout,
