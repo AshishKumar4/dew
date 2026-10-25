@@ -47,6 +47,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _spans_of,
     _streamed,
     _views_of,
+    approximate,
     refused,
 )
 
@@ -492,6 +493,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
         out_type += (jax.ShapeDtypeStruct((5, batch, heads, queries), jnp.float32),
                      jax.ShapeDtypeStruct((batch, heads, queries), jnp.int32),
                      jax.ShapeDtypeStruct((batch, queries, heads, value.shape[-1]), jnp.float32))
+    approx_math = approximate(hooks, (block_q, block_k), value.shape[-1], differentiated=False)
     return family.kernel(entry, out_type=out_type, grid=(heads, queries // pair, batch),
-                         grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
-                         interpret=interpret)(query, key, value, *leaves)
+                         grid_names=("heads", "q_tiles", "batch"), consumers=consumers, interpret=interpret,
+                         approx_math=approx_math)(query, key, value, *leaves)

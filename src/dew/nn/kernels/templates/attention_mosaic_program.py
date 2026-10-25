@@ -22,6 +22,8 @@ from dew.nn.kernels.templates.attention import (
     Kind,
     PaddedCall,
     block_map,
+    differentiable,
+    floating_params,
     kept_dtype,
     power_of_two,
     whole,
@@ -126,6 +128,33 @@ def unlowered(hooks: Hooks, tile: tuple[int, int], value_width: int) -> str | No
     every operation jax 0.11.2's Mosaic GPU layout inference finds no layout for. A legality rule, which
     the route's chooser reads to send such a call to another route, until the fork's layout inference
     takes unit axes (ledger row 1428)."""
+    if any(_unit_axis(jaxpr) for jaxpr in _hook_jaxprs(hooks, tile, value_width)):
+        return ("the Mosaic mainloop takes no hook that forms a unit axis beside a longer one (Mosaic GPU's "
+                "layout inference finds no layout for it)")
+    return None
+
+
+APPROXIMATED = frozenset({"exp", "exp2", "log", "log1p", "tanh", "logistic", "sin", "cos", "sqrt", "rsqrt",
+                          "pow"})
+"""The operations Mosaic GPU computes in the hardware's approximate forms under `approx_math` (its lowering's
+exp, exp2, log, tanh, sin, cos, sqrt and rsqrt; jax's logistic, log1p and pow lower through them)."""
+
+
+def approximate(hooks: Hooks, tile: tuple[int, int], value_width: int, *, differentiated: bool) -> bool:
+    """Whether a launch running `hooks` on `tile` takes the hardware's approximate transcendentals
+    (`Family.kernel`'s `approx_math`): only where no hook computes one Mosaic GPU approximates
+    (`APPROXIMATED`), with `differentiated` the score hook's pullback too. The mainloop's own exponentials
+    hold check 1 at ex2.approx; a hook's need not: on an H100 a softcap's tanh.approx (2^-11 relative) beside
+    an initial state put the state's sums' gradient at 7.04 times the reference's error from float64, every
+    hook on par with exact math (the hooked backward, HOOKS-FIX-h100)."""
+    traced = _hook_jaxprs(hooks, tile, value_width, differentiated=differentiated)
+    return not any(_primitives(jaxpr) & APPROXIMATED for jaxpr in traced)
+
+
+def _hook_jaxprs(hooks: Hooks, tile: tuple[int, int], value_width: int, *,
+                 differentiated: bool = False) -> list[jax_core.Jaxpr]:
+    """`hooks` traced as a launch runs them on `tile`, its outputs `value_width` wide: the score hook (and,
+    `differentiated`, its pullback along the logits and its floating parameters) and the output hook."""
     rows, columns = tile
 
     def entries(kind: Kind, dtype, width: int) -> jax.ShapeDtypeStruct:
@@ -133,19 +162,35 @@ def unlowered(hooks: Hooks, tile: tuple[int, int], value_width: int) -> str | No
         return jax.ShapeDtypeStruct(() if kind == Kind.HEAD else (rows, width), kept_dtype(dtype))
 
     traced = []
-    if hooks.score_mod is not None:
+    score_mod = hooks.score_mod
+    if score_mod is not None:
         positions = jax.ShapeDtypeStruct(tile, jnp.int32)
-        traced.append(jax.make_jaxpr(hooks.score_mod)(
-            jax.ShapeDtypeStruct(tile, jnp.float32), positions, positions,
-            *(entries(param.kind, param.value.dtype, columns) for param in hooks.score_params)).jaxpr)
+        params = [entries(param.kind, param.value.dtype, columns) for param in hooks.score_params]
+        logits = jax.ShapeDtypeStruct(tile, jnp.float32)
+        traced.append(jax.make_jaxpr(score_mod)(logits, positions, positions, *params).jaxpr)
+        if differentiated:
+            floating = floating_params(params)
+
+            def pulled(s, q_pos, k_pos, *values):
+                hooked = differentiable(score_mod, q_pos, k_pos, values, floating)
+                out, pull = jax.vjp(hooked, s, *(values[index] for index in floating))
+                return pull(jnp.ones_like(out))
+
+            traced.append(jax.make_jaxpr(pulled)(logits, positions, positions, *params).jaxpr)
     if hooks.output_mod is not None:
         traced.append(jax.make_jaxpr(hooks.output_mod)(
             jax.ShapeDtypeStruct((rows, value_width), jnp.float32),
             *(entries(param.kind, param.value.dtype, value_width) for param in hooks.output_params)).jaxpr)
-    if any(_unit_axis(jaxpr) for jaxpr in traced):
-        return ("the Mosaic mainloop takes no hook that forms a unit axis beside a longer one (Mosaic GPU's "
-                "layout inference finds no layout for it)")
-    return None
+    return traced
+
+
+def _primitives(jaxpr: jax_core.Jaxpr) -> set[str]:
+    """The names of the operations of `jaxpr` and of every jaxpr inside it."""
+    names = {eqn.primitive.name for eqn in jaxpr.eqns}
+    for eqn in jaxpr.eqns:
+        for inner in jax_core.jaxprs_in_params(eqn.params):
+            names |= _primitives(inner)
+    return names
 
 
 def _unit_axis(jaxpr: jax_core.Jaxpr) -> bool:
