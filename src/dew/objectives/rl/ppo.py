@@ -30,7 +30,7 @@ from dew.objectives.base import (
     projected_draw,
     projected_parts,
 )
-from dew.objectives.routing import RoutedStatistics
+from dew.objectives.routing import ExpertBalance, RoutedStatistics
 from dew.rl.advantage import gae_advantages, masked_whiten
 from dew.rl.surrogate import clipped_value_loss_terms
 from dew.sampling.text import Generation, Sampling
@@ -108,10 +108,11 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
     at unit decay, tracks only the policy leaves. Rollout targets are
     detached.
 
-    The policy is a `GRPOObjective` built from `model`, `seq_len` and the
-    remaining keyword arguments, so its aggregation, sequence masks, `beta`
-    and clip settings, and its `balance`, work as they do there. The critic always averages
-    over the response tokens, independently of the actor's weighting.
+    The policy is a `GRPOObjective` built from `model`, `seq_len`, `balance` and the remaining keyword
+    arguments, so its aggregation, sequence masks, `beta` and clip settings work as they do there.
+    `balance` (`ExpertBalance`, `dew.objectives.routing`) is named here rather than left to
+    `policy_options`, so a run's record and its flags read it as the `ExpertBalance` it is. The critic
+    always averages over the response tokens, independently of the actor's weighting.
     `value_coefficient` weights verl's half-squared, clipped value error, and
     `value_clip` is that error's clip range.
 
@@ -135,11 +136,12 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         return GRPOObjective.earlier_arguments(arguments)
 
     def __init__(self, model, seq_len: int, *, critic: nn.Module,
-                 value_coefficient: float = .5, value_clip: float = .2, **policy_options):
+                 value_coefficient: float = .5, value_clip: float = .2,
+                 balance: ExpertBalance | None = None, **policy_options):
         for name, value in (("value_coefficient", value_coefficient), ("value_clip", value_clip)):
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")
-        self.actor = GRPOObjective(model, seq_len, **policy_options)
+        self.actor = GRPOObjective(model, seq_len, balance=balance, **policy_options)
         self.critic, self.seq_len = critic, seq_len
         self.value_coefficient, self.value_clip = value_coefficient, value_clip
         self.inputs = self.actor.inputs

@@ -96,7 +96,7 @@ Trained 10 steps in 0:00:03: first step after 2.58 s, then 29.9 step/s
 10.5% of the wall time in steps, final loss 0.008948
 ```
 
-`DPOObjective` and `GRPOObjective` score tokens through `TokenScorer`, the scoring machinery `LMObjective` also builds on. Besides their own loss arguments they take its options: `head_chunks`, `head_tile`, `samples`, `variables`, `processor` and `balance`, the MoE router training `ExpertBalance` describes (`dew.objectives.routing`). `PPOObjective` passes its policy options, `balance` among them, to its actor. The language-model loss's own options (`ema_decay`, `pad_id`, `token_accuracy`, `loss_role`, `mtp_weight`, `z_loss`, `indexer`) are `LMObjective`'s alone.
+`DPOObjective` and `GRPOObjective` score tokens through `TokenScorer`, the scoring machinery `LMObjective` also builds on. Besides their own loss arguments they take its options: `head_chunks`, `head_tile`, `samples`, `variables`, `processor` and `balance`, the MoE router training `ExpertBalance` describes (`dew.objectives.routing`). `PPOObjective` takes `balance` and passes it, with its other policy options, to its actor. The language-model loss's own options (`ema_decay`, `pad_id`, `token_accuracy`, `loss_role`, `mtp_weight`, `z_loss`, `indexer`) are `LMObjective`'s alone.
 
 The preset's `seq_len` is the full row width; shorter rows are padded to it, and the objective scores one position fewer because of the next-token shift.
 
