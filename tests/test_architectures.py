@@ -540,10 +540,16 @@ def test_a_residual_order_is_the_same_decoder(case):
     """The residual orders the layout cells draw (`permuted`) reorder sums only: each language cell's
     float64 logits under an order other than the identity are the identity's within float64's
     rounding of their own longest chain (`assert_computes_the_oracle`), so a draw over orders is a
-    draw of roundings and never another model."""
+    draw of roundings and never another model. Every parameter is drawn apart from its initial value,
+    a norm's or a router's scale as uneven as a trained one, so a residual-wide parameter `permuted`
+    leaves in place moves the logits; a step's state, which `in_identity_order` takes back, holds no
+    other."""
     model = models.build(case.architecture, **case.config)
     ids = np.random.default_rng(3).integers(0, LM["vocab_size"], (2, SEQ_LEN)).astype(np.int32)
-    variables = jax.jit(model.init)(jax.random.key(0), ids)
+    initial = jax.jit(model.init)(jax.random.key(0), ids)
+    rng = np.random.default_rng(4)
+    variables = jax.tree.map(lambda leaf: leaf + rng.normal(0, 0.1, leaf.shape).astype(leaf.dtype)
+                             if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, initial)
     width = residual_width(variables)
     with jax.enable_x64(new_val=True):
         wide = widened(variables)
