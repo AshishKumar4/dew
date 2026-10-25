@@ -123,7 +123,7 @@ def assert_transformers_reads(export, model, variables, reference):
     from test_block_diffusion import prefill
     from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     def theirs(dtype):
         loaded, report = DiffusionGemmaForBlockDiffusion.from_pretrained(

@@ -14,7 +14,7 @@ mistral-tiny (a sliding window of 4) checkpoints, transformers 5.16.1's own
   position and of every step; the tool checks they are the full sequence's.
 
 Each in float32 and in float64 (the model built and run under
-`diffusers_wan_reference.float64`, which widens its float32 pins, the
+`torch_precision.float64`, which widens its float32 pins, the
 rotary table and the eager attention's `softmax(dtype=torch.float32)`
 among them), the truth
 tests/reference_error.py measures both from. The packed call asks for no
@@ -76,7 +76,7 @@ def cached(net, ids: np.ndarray) -> torch.Tensor:
 
 
 def main():
-    from diffusers_wan_reference import float64
+    from torch_precision import float64
     from reference_source import saved_fixture
 
     if len(sys.argv) != 2:
