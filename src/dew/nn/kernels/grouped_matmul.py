@@ -818,6 +818,16 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # (a commit to shared memory): serial with the MMAs, not beside them
         # (GMMSB-h100-main: a gated prologue at 3.7x the Triton launch's time).
         step = 2 * (config.block_m + config.block_n) * config.block_k * size
+        family = _FAMILIES[config.family]
+        fragments = 0.0
+        if family.operands_in_registers:
+            # Its products read their operands from registers the consumer's warps load from the stage
+            # before each MMA, the left operand's rows once and the right operand's whole block in each of
+            # its `rhs_copies` warps: in the same warps as the MMAs they feed, serial with them, where
+            # warpgroup MMA reads the stage itself beside its products (an A100 ran mma.sync's tiles at
+            # 1.2 to 1.5 times Triton's time, an L4 at 0.5 to 0.9, GEN4-route-a100, GEN6-route-l4).
+            step = (config.block_m + config.block_n) * config.block_k * size
+            fragments = steps * (config.block_m + family.rhs_copies * config.block_n) * config.block_k * size
         rewritten = 0.0
         if hooks.prologue is not None:
             rewritten = steps * (2 * math.prod(lhs) * size
@@ -832,7 +842,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             program_flops=2 * steps * config.block_m * config.block_n * config.block_k,
             program_staged=steps * step + config.block_m * config.block_n * out,
             program_exponentials=epilogue_exponentials, mode=_mode(tokens.dtype), steps=steps,
-            stages=config.stages, serial_staged=rewritten, serial_exponentials=prologue_exponentials,
+            stages=config.stages, serial_staged=rewritten + fragments,
+            serial_exponentials=prologue_exponentials,
             serial_stored=(config.block_m * config.block_n * out
                            if self.STORES_SERIALLY and config.warpgroups == 1 else 0))
 
