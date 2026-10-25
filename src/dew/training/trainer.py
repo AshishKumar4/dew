@@ -121,7 +121,7 @@ from dew.telemetry.records import (
     Record,
     StepCompiled,
 )
-from dew.training._fit import FitPlan, FitRun, split_metrics, waited_read
+from dew.training._fit import FitPlan, FitRun, split_metrics, unrecorded_parts, waited_read
 from dew.training._lowering import Lowered
 from dew.training.budget import Pause, Plateau, run_length, run_steps
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
@@ -579,8 +579,9 @@ class Trainer(Generic[Loss, Effects]):
 
         The state is a fresh run's: its parameters, optimizer state and EMA, and, given one
         global `batch` as the run reads it, the accumulation its steps pool where `accumulation`
-        is above 1, read as its first step reads the batch (whole, or in the `split` the trainer
-        fixes). A CPU host leaves out the narrow copies a GPU step reads (`TrainState.compute`).
+        is above 1, read in the first of the splits its plan may take whose devices hold it, the
+        trainer's own where it fixes one (`splits`). A CPU host leaves out the narrow copies a GPU step
+        reads (`TrainState.compute`).
         An `OptimConfig` is built over `steps`, as `fit(steps=...)` builds it. `capacity` is the
         bytes each device has, for a mesh whose devices report none: a CPU mesh of
         `--xla_force_host_platform_device_count` devices standing in for GPUs.
@@ -1388,7 +1389,7 @@ class Trainer(Generic[Loss, Effects]):
         suites = _suites(loader, validation, metrics, eval_every)
         selection, plateau, pause = self._fit_policies(best, stop, metrics, suites, checkpoint_every,
                                                        steps, tokens)
-        self._preflight(loader, plateau, suites, preview=preview,
+        self._preflight(loader, plateau, suites, preview=preview, stated=dataset,
                         loss=(self.checkpoints is not None or restore_best) and not selection)
         preview = preview and self.tracker is not None
         run = FitRun(time.perf_counter())
@@ -2068,12 +2069,19 @@ class Trainer(Generic[Loss, Effects]):
         )
 
     def _preflight(self, dataset: Loader, stop, suites: Mapping[str, EvalSuite], *,
-                   preview: bool, loss: bool) -> None:
+                   preview: bool, stated: Dataset | Loader, loss: bool) -> None:
         """The refusals `fit` makes before it places anything: validation
         nothing reads, and a pipeline's batch, whose placement could take
         minutes or run out of memory before the error. Every other mesh's
         batch is checked with its stream (`check_stream`), a ramp's at each
-        of its stages."""
+        of its stages. The checkpoints learn why no record rebuilds a run of
+        this trainer on the data it was `stated` (`Checkpoints.python_run`)."""
+        if self.checkpoints is not None:
+            given = {"a custom step (step=)": self.step, "a rollout (rollout=)": self.rollout,
+                     "a tracker (tracker=)": self.tracker}
+            self.checkpoints.python_run(unrecorded_parts(
+                type(self.objective).__name__, stated, optimized=self._config is not None,
+                seeded=self.seed is not None, mesh=self.mesh, given=given))
         for name, suite in suites.items():
             if loss and not any(metric.name == 'loss' for metric in suite.metrics):
                 self.objective._check_validation_loss()

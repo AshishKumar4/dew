@@ -365,7 +365,7 @@ The first time a pool uses `Checkpoints`, process 0 writes a file into the direc
 
 ## What a checkpoint does not save
 
-`Checkpoints` does not write `run.json`. `RunConfig.train` and `RunConfig.save` write the run configuration separately, as the run's class and its fields. `RunConfig.load` builds the run as the class its record names. A field the record lacks takes its default, which matches how runs behaved before the field existed. The model and the objective also record the defaults their classes gave them, so a default changed since the run was written does not change what the record builds. `load` refuses a field it does not know, such as one a newer Dew wrote. A checkpoint also does not save source code, package versions, tokenizer files, the dataset revision, or the state of any external service, so record those in the experiment metadata.
+`RunConfig.train` and `RunConfig.save` write the run configuration, `run.json`, as the run's class and its fields. A run that `Trainer.fit` trains directly gets one from its first checkpoint instead, saying no record rebuilds it and why (docs/recipes.md, Python experiments). `RunConfig.load` builds the run as the class its record names. A field the record lacks takes its default, which matches how runs behaved before the field existed. The model and the objective also record the defaults their classes gave them, so a default changed since the run was written does not change what the record builds. `load` refuses a field it does not know, such as one a newer Dew wrote. A checkpoint also does not save source code, package versions, tokenizer files, the dataset revision, or the state of any external service, so record those in the experiment metadata.
 
 ## Limits
 
