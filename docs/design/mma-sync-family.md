@@ -122,11 +122,15 @@ fuser, and Tokamax. Then what the best kernels choose on each family, cited per 
   - At 64 x 256 per warpgroup with `m_warps = 1`, a thread holds 128 accumulator registers, 16 left (all 64
     rows by 16 deep, over 32 lanes) and 16 right (16 deep by its 64 columns), and 40 held: 200 within 255.
     With `m_warps = 4` and whole steps it holds 440.
-  - **Sub-tiled output staging** (`Family.output_columns`), as on wgmma. Three bf16 stages at 128 x 256 x 64
-    are 147,456 B, and two 128-byte chunk buffers of 128 rows are 65,536 B less a whole tile's, within the
-    A100's 166,912 B.
-  - The derivation then holds 128 x 256 x 64 at 3 stages on two consumers, CUTLASS's choice, derived and not
-    set. Whether Mosaic lowers a 16-deep slice of a swizzled operand tile, and `m_warps = 1` products, is a
+  - **Output staging that does not stack on the ring.** Three bf16 stages at 128 x 256 x 64 are 147,456 B.
+    Two 128-byte chunk buffers over 128 rows (`Family.output_columns`, as on wgmma) are 32,768 B more:
+    180,224 B, over the A100's 166,912 B. CUTLASS's epilogue reuses the mainloop's shared memory. mma.sync's
+    per-tile pipeline has drained before the tile's stores, so its slots are free. Whether Mosaic's
+    allocator gives a sibling scope after the pipeline's the same bytes, or reserves both (today's
+    `staged_bytes` assumes both), decides between staging in the drained ring (3 stages) and 2 stages
+    (131,072 B). That is a compile probe, and the descriptor (§6) states whichever holds.
+  - The derivation then gives two consumers 128 x 256 x 64 at 3 stages if the staging reuses the ring, else
+    at 2. Either way it is derived, not set. Whether Mosaic lowers a 16-deep slice of a swizzled operand tile, and `m_warps = 1` products, is a
     compile probe (the sm80 ptxas gate) before the GPU round. The fork adds what it refuses.
 
 ## 5. Hooks and the kernel gradient on mma.sync
