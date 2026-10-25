@@ -34,6 +34,7 @@ from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
+from dew.objectives.routing import ExpertBalance
 from dew.training.distributed import Layout, MeshSpec, shard_batch
 from dew.training.state import TrainState
 from dew.training.transaction import write_back
@@ -66,8 +67,7 @@ def batch():
 def objective_for(model):
     sparse = model.mixture is not None
     return LMObjective(model, 8,
-                       balance_rate=0.01 if sparse else None,
-                       aux_loss_alpha=0.001 if sparse else None,
+                       balance=ExpertBalance(balance_rate=0.01, aux_loss_alpha=0.001) if sparse else None,
                        mtp_weight=0.2 if model.num_nextn_predict_layers else None)
 
 

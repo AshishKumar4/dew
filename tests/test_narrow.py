@@ -130,12 +130,14 @@ def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1,
     step's loss and the trainer."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import TEXT_KEY, LMObjective
+    from dew.objectives.routing import ExpertBalance
     from dew.training import Layout, MeshSpec, Trainer
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=4 if scanned else 2, num_heads=2,
                               num_kv_heads=1, mlp="swiglu", mlp_features=64, max_seq_len=16, qk_norm=True,
                               tie_embeddings=True, dtype=jnp.bfloat16, scan_layers=scanned,
                               mixture={"experts": 4, "top_k": 2} if mixture else None)
-    objective = LMObjective(model, seq_len=8, pad_id=0, aux_loss_alpha=.01 if mixture else None)
+    objective = LMObjective(model, seq_len=8, pad_id=0,
+                            balance=ExpertBalance(aux_loss_alpha=.01) if mixture else None)
     batch = {TEXT_KEY: jnp.asarray(np.random.default_rng(0).integers(1, 64, (rows, 9)), jnp.int32)}
     with chosen(narrow_copies='on' if copies else 'off'):
         trainer = Trainer(objective, optimizer, key=jax.random.key(0), mesh=mesh or MeshSpec(),

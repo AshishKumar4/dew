@@ -170,6 +170,7 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives import Step
     from dew.objectives.lm import LMObjective
+    from dew.objectives.routing import ExpertBalance
     from dew.optim import scale_by_qk_clip
 
     # QK-Clip bounds logits only where no QK-norm divides the kernels' scale
@@ -180,9 +181,10 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
                               mixture={"experts": 4, "top_k": 2, "bias": True,
                                        "score_function": "softmax"})
     objective = LMObjective(model, 10, head_chunks=1, mtp_weight=.3,
-                            loss_role=Role.ASSISTANT, balance_rate=.02,
-                            aux_loss_alpha=None if auxiliary is None else .2,
-                            seq_aux=auxiliary != "global")
+                            loss_role=Role.ASSISTANT,
+                            balance=ExpertBalance(balance_rate=.02,
+                                                  aux_loss_alpha=None if auxiliary is None else .2,
+                                                  seq_aux=auxiliary != "global"))
     optimizer = optax.chain(optax.clip_by_global_norm(.5), optax.sgd(.03), scale_by_qk_clip(.05))
     train = Trainer(objective, optimizer, key=jax.random.PRNGKey(7), accumulation=2,
                     dynamic_scale=True)

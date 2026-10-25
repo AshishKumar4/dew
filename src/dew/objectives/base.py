@@ -649,6 +649,36 @@ def part(variables: Variables, name: str) -> Variables:
     return {collection: subtree[name] for collection, subtree in variables.items() if name in subtree}
 
 
+def leaves_by_path(tree: Variables) -> dict[tuple[str, ...], jax.Array]:
+    """Every leaf of a variables subtree, by its dict-key path."""
+    return {tuple(entry.key for entry in path): leaf
+            for path, leaf in jax.tree_util.tree_leaves_with_path(tree)}
+
+
+def sown_nodes(tree, *markers: str) -> list[tuple[tuple[str, ...], Mapping]]:
+    """Find every node of a sown collection that holds all of `markers`, with
+    its path: the module path that sowed it.
+
+    A sown collection nests by module path, so what a layer sowed is the
+    branch that names the keys it sowed under. The search stops at such a
+    branch rather than descending into the arrays below it, and walks the
+    children it does descend into in sorted key order.
+    """
+    found: list[tuple[tuple[str, ...], Mapping]] = []
+
+    def visit(node, path: tuple[str, ...]) -> None:
+        if not isinstance(node, Mapping):
+            return
+        if all(marker in node for marker in markers):
+            found.append((path, node))
+            return
+        for key in sorted(node):
+            visit(node[key], (*path, key))
+
+    visit(tree, ())
+    return found
+
+
 def projected_parts(params: Variables, owners: Mapping[str, ProjectsParameters | nn.Module | HiddenStates], *,
                     updated: bool) -> Variables:
     """`params` with each part `owners` names projected by its owner's constraint
@@ -1691,10 +1721,12 @@ __all__ = [
     "everything",
     "freeze",
     "joined",
+    "leaves_by_path",
     "merge",
     "model_rngs",
     "part",
     "select",
+    "sown_nodes",
     "thaw",
     "training_rngs",
     "under",

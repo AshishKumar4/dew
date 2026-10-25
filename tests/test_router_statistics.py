@@ -12,7 +12,7 @@ from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.inputs import ModelInputs, coordinates
 from dew.objectives.base import VALID_ROWS, Step
 from dew.objectives.lm import TEXT_KEY, LMObjective
-from dew.objectives.lm.objective import LMStatistics
+from dew.objectives.routing import ExpertBalance, RoutedStatistics
 
 
 @pytest.fixture(scope="module", params=[0, 1], ids=["trunk", "mtp"])
@@ -57,8 +57,8 @@ def test_router_terms_and_bias_updates_ignore_appended_padding(routed, seq_aux, 
     outcomes = []
     for extra in (0, 4):
         batch, pad_id = padded(kind, extra)
-        objective = LMObjective(model, 4 + extra, aux_loss_alpha=0.2, seq_aux=seq_aux,
-                                router_z_loss=0.1, balance_rate=0.05, pad_id=pad_id, **depths)
+        balance = ExpertBalance(aux_loss_alpha=0.2, seq_aux=seq_aux, router_z_loss=0.1, balance_rate=0.05)
+        objective = LMObjective(model, 4 + extra, balance=balance, pad_id=pad_id, **depths)
         _, aux = objective.scalar_loss(variables, batch, step())
         assert aux.effects is not None
         outcomes.append((aux, objective.apply_effects(variables, aux.effects)))
@@ -78,8 +78,8 @@ def test_router_terms_and_bias_updates_ignore_appended_padding(routed, seq_aux, 
 def test_all_padding_has_no_router_support_or_bias_effect(routed, seq_aux, kind):
     model, variables, depths = routed
     batch, pad_id = padded(kind, 0, empty=True)
-    objective = LMObjective(model, 4, aux_loss_alpha=0.2, seq_aux=seq_aux,
-                            router_z_loss=0.1, balance_rate=0.05, pad_id=pad_id, **depths)
+    balance = ExpertBalance(aux_loss_alpha=0.2, seq_aux=seq_aux, router_z_loss=0.1, balance_rate=0.05)
+    objective = LMObjective(model, 4, balance=balance, pad_id=pad_id, **depths)
     statistics, aux = objective.loss(variables, batch, step())
     value, supported = objective.reduce_loss(statistics)
     assert value.shape == supported.shape == ()
@@ -96,7 +96,7 @@ def test_all_padding_has_no_router_support_or_bias_effect(routed, seq_aux, kind)
 
 def test_global_router_validation_is_scalar_and_ignores_repeated_rows(routed):
     model, variables, depths = routed
-    objective = LMObjective(model, 8, aux_loss_alpha=0.2, seq_aux=False, **depths)
+    objective = LMObjective(model, 8, balance=ExpertBalance(aux_loss_alpha=0.2, seq_aux=False), **depths)
     batch = {TEXT_KEY: jnp.asarray([[1, 1, 2, 2, 2, 3, 3, 3, 3],
                                    [2, 2, 1, 1, 1, 3, 3, 3, 3],
                                    [1, 1, 1, 1, 1, 1, 1, 1, 1]]),
@@ -112,7 +112,7 @@ def test_global_router_validation_is_scalar_and_ignores_repeated_rows(routed):
     assert result.records == 2
     assert result.scores["val/loss"] == pytest.approx(float(expected), rel=1e-5)
     statistics, _ = objective.loss(variables, batch, step(training=False))
-    assert isinstance(statistics, LMStatistics)
+    assert isinstance(statistics, RoutedStatistics)
     value, supported = objective.reduce_loss(statistics)
     assert value.shape == supported.shape == ()
     assert all(term.positions.shape == () for term in statistics.global_routers)
@@ -130,18 +130,34 @@ def test_sequence_balance_normalizes_each_packed_document(routed):
                                                   max_segments=1, right_padded=True)}
     readings = []
     for batch in (packed, separate):
-        objective = LMObjective(model, batch[TEXT_KEY].shape[1] - 1, aux_loss_alpha=0.2,
-                                seq_aux=True, pad_id=0, **depths)
+        objective = LMObjective(model, batch[TEXT_KEY].shape[1] - 1, pad_id=0, **depths,
+                                balance=ExpertBalance(aux_loss_alpha=0.2, seq_aux=True))
 
         def balance(params, objective=objective, batch=batch):
             return objective.scalar_loss(params, batch, step())[1].metrics["aux_loss"]
 
         readings.append(jax.value_and_grad(balance)(variables))
         statistics, _ = objective.loss(variables, batch, step())
-        assert isinstance(statistics, LMStatistics)
+        assert isinstance(statistics, RoutedStatistics)
         assert all(float(term.mass) == 2 for term in statistics.sequence)
     assert float(readings[0][0]) > 0.35
     np.testing.assert_allclose(readings[0][0], readings[1][0], rtol=1e-5, atol=1e-6)
     for packed_grad, separate_grad in zip(jax.tree.leaves(readings[0][1]),
                                            jax.tree.leaves(readings[1][1]), strict=True):
         np.testing.assert_allclose(packed_grad, separate_grad, rtol=1e-4, atol=1e-6)
+
+
+@pytest.mark.parametrize("term", [
+    {"balance_rate": 0.0}, {"balance_rate": -0.1}, {"balance_rate": float("inf")},
+    {"balance_rate": float("nan")}, {"aux_loss_alpha": 0.0}, {"aux_loss_alpha": -0.2},
+    {"aux_loss_alpha": float("nan")}, {"router_z_loss": -0.1}, {"router_z_loss": float("inf")},
+    {"router_z_loss": float("nan")},
+])
+def test_expert_balance_refuses_a_term_it_cannot_weight(term):
+    """A balance rate and a balance loss weight are positive and finite, and the z-loss weight finite and
+    nonnegative, so a term that cannot carry its weight is refused at construction. The valid setup
+    differs from the refused one only in that term."""
+    valid = {"balance_rate": 0.01, "aux_loss_alpha": 0.1, "router_z_loss": 0.0}
+    ExpertBalance(**valid)
+    with pytest.raises(ValueError):
+        ExpertBalance(**{**valid, **term})

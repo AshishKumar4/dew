@@ -51,6 +51,7 @@ from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.precision import FP32_SUMS
 from dew.nn.rope import YarnScaling, rotary_freqs, yarn_attention_factor, yarn_inv_freq, yarn_query_scale
 from dew.objectives.lm import LMObjective
+from dew.objectives.routing import ExpertBalance
 from dew.training import Layout, MeshSpec, Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mla"
@@ -511,7 +512,7 @@ def test_the_deepseek_stack_fits_on_the_mesh(fsdp, expert):
     model = deepseek_stack()
     tracker = RecordingTracker()
     trainer = Trainer(
-        LMObjective(model, 16, balance_rate=0.01), optax.adam(1e-3),
+        LMObjective(model, 16, balance=ExpertBalance(balance_rate=0.01)), optax.adam(1e-3),
         key=jax.random.key(0), mesh=MeshSpec(fsdp=fsdp, expert=expert),
         layout=Layout(min_shard=TINY_SHARD), tracker=tracker)
 

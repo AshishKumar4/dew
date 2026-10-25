@@ -28,6 +28,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs, coordinates
 from dew.objectives.base import Step
 from dew.objectives.lm import TEXT_KEY, LMObjective, Perplexity, Samples
+from dew.objectives.routing import ExpertBalance
 from dew.sampling import Sampling
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 from dew.training.memory import climb_to
@@ -712,7 +713,7 @@ def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
                               max_seq_len=8, mixture=Mixture(experts=4, top_k=2, expert_features=16))
     tokens = jax.random.randint(jax.random.key(1), (2, 9), 0, 64)
     plain = LMObjective(model, 8, ema_decay=None)
-    zed = LMObjective(model, 8, ema_decay=None, router_z_loss=0.3)
+    zed = LMObjective(model, 8, ema_decay=None, balance=ExpertBalance(router_z_loss=0.3))
     params = plain.init(jax.random.key(0))
     base, _ = plain.reduce_loss(plain.loss(params, {TEXT_KEY: tokens}, step_at())[0])
     stats, aux = zed.loss(params, {TEXT_KEY: tokens}, step_at())

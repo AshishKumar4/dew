@@ -49,6 +49,7 @@ from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, sessions
+from dew.objectives.routing import ExpertBalance
 from dew.registry import models, projectors, resolve_dtype, towers
 from dew.telemetry.benchmark import carried
 from dew.training import Layout, MeshSpec, Trainer
@@ -145,9 +146,13 @@ def image_tokens(case: Case) -> int:
 
 def objective_keywords(case: Case) -> dict[str, Any]:
     """The case's own objective keywords (`Case.objective`), with its head chunking where it names one:
-    what every language-model objective it builds, a decoder's or a canvas's, is given."""
+    what every language-model objective it builds, a decoder's or a canvas's, is given. A `balance`
+    record reads as the `ExpertBalance` it names."""
     chunks: dict[str, Any] = {} if case.head_chunks is None else {"head_chunks": case.head_chunks}
-    return {**chunks, **case.objective}
+    keywords = {**chunks, **case.objective}
+    if "balance" in keywords:
+        keywords["balance"] = ExpertBalance(**keywords["balance"])
+    return keywords
 
 
 def decoder_objective(

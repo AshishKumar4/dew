@@ -184,6 +184,7 @@ A reloaded run behaves like the live one: the same processor, chat template and 
 | Loading readers | Every model family loads and exports through one reversible weight-layout plan. |
 | Checkpoint state | Saving and restoring derive from the training state's own schema; restore casts and places once. |
 | Optimizer observations | An optimizer that reads what the step's model observed, a QK-Clip's attention logit maxima, says so in its own state (`clips_qk`), however it is composed; the run asks the objective for them through the step (`Step.qk_stats`) and pools them across microbatches, and a step whose objective returns none is refused, never left unclipped. No objective or run configuration carries a flag for it. |
+| Router training | One policy, `dew.objectives.routing.ExpertBalance`, trains the routers of every objective that composes it: the balancing bias, the balance loss and the z-loss, each optional. The model opens the routers' collection, the policy's terms join the loss statistics, and the bias counts commit once per update, however many microbatches the update pools. |
 
 Each seam requires one standing end-to-end test that runs every implementation registered for it. The [roadmap](../roadmap.md#ci-and-tooling) tracks the registry-wide coverage still to add.
 

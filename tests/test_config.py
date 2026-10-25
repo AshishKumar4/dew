@@ -564,3 +564,18 @@ def test_a_run_recorded_with_its_qk_statistics_switch_reads_as_one_whose_step_as
     for recorded in ({"defaults": {"qk_stats": False}}, {"fields": {"qk_stats": True}}):
         config = ObjectiveConfig("lm", **recorded)
         assert "qk_stats" not in {**config.fields, **config.defaults}
+
+
+def test_a_run_recorded_with_the_lm_balance_arguments_reads_as_one_balance_record():
+    """A run recorded while its LM objective took the four balance arguments reads them as one `balance`
+    record, the `ExpertBalance` they made, where the record was refused as arguments the class no longer
+    takes. A run whose four were all at their defaults reads as no balance."""
+    balance = {"balance_rate": 0.01, "aux_loss_alpha": None, "seq_aux": True, "router_z_loss": 0.0}
+    defaulted = ObjectiveConfig("lm", defaults=balance)
+    assert defaulted.defaults["balance"] == balance
+    assert not set(balance) & set({**defaulted.fields, **defaulted.defaults})
+    stated = ObjectiveConfig("lm", {"balance_rate": 0.01})
+    assert stated.fields["balance"] == balance
+    assert "balance_rate" not in stated.fields
+    unset = ObjectiveConfig("lm", defaults={**balance, "balance_rate": None})
+    assert unset.defaults.get("balance") is None

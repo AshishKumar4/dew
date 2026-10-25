@@ -87,7 +87,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--remat", default=None, choices=sorted(REMAT_POLICIES),
                         help="the decoder's starting remat policy; unset, the model's")
     parser.add_argument("--aux-loss-alpha", type=float, default=None,
-                        help="MoE: LMObjective's aux_loss_alpha (Switch balance loss per router)")
+                        help="MoE: ExpertBalance's aux_loss_alpha (Switch balance loss per router)")
     parser.add_argument("--seq-aux", action="store_true",
                         help="MoE: the per-sequence balance loss instead of the batch-wide one")
     return parser.parse_args()
@@ -125,6 +125,7 @@ def build(args: argparse.Namespace) -> Run:
     from dew.nn.inputs import coordinates
     from dew.nn.multimodal import MultimodalTransformer
     from dew.objectives.lm import TEXT_KEY, LMObjective
+    from dew.objectives.routing import ExpertBalance
     from dew.optim import Cosine, ParamGroup
     from dew.training import MeshSpec, Trainer
     from dew.training.distributed import batch_shardings
@@ -155,9 +156,10 @@ def build(args: argparse.Namespace) -> Run:
         if not isinstance(model, CausalTransformer) or model.mixture is None:
             raise SystemExit(f"--dispatch sets a mixture's dispatch, and {args.model} builds no mixture")
         model = model.clone(mixture=dataclasses.replace(model.mixture, dispatch=args.dispatch))
+    balance = None if args.aux_loss_alpha is None else ExpertBalance(
+        aux_loss_alpha=args.aux_loss_alpha, seq_aux=args.seq_aux)
     objective = LMObjective(model, seq, ema_decay=None, head_chunks=args.head_chunks,
-                            variables=variables, aux_loss_alpha=args.aux_loss_alpha,
-                            seq_aux=args.seq_aux)
+                            variables=variables, balance=balance)
     def rows(indices) -> dict:
         """The windows' rows, a packed run's documents laid out beside them."""
         if segments is None:
@@ -199,7 +201,7 @@ class RouterProbe:
     it is called on."""
 
     def __init__(self, run: Run, rows: int):
-        from dew.objectives.lm.objective import _router_scores
+        from dew.objectives.routing import router_scores
 
         objective = run.trainer.objective
         self.mesh = run.trainer.device_mesh
@@ -210,7 +212,7 @@ class RouterProbe:
         def scores(params, tokens):
             routing = objective.token_scores(params, tokens, routing=True).routing
             loads, entropies = [], []
-            for probs, indices in _router_scores(routing):
+            for probs, indices in router_scores(routing):
                 loads.append(jnp.bincount(indices.ravel(), length=probs.shape[-1]) / indices.size)
                 p = probs.astype(jnp.float32)
                 entropies.append(-jnp.mean(jnp.sum(p * jnp.log(jnp.maximum(p, 1e-30)), axis=-1)))

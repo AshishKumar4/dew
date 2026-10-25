@@ -161,7 +161,8 @@ def run_config(args: RigelArgs) -> LMRunConfig:
         data=phased(args.corpora, args.steps, args.seq_len, args.batch_size),
         optim=optim_config(args.width, args.steps, args.batch_size, args.seq_len),
         trainer=TrainerConfig(steps=args.steps, eval_every=None, checkpoint_every=5_000),
-        objective=ObjectiveConfig("lm", {"aux_loss_alpha": 0.001, "seq_aux": False, "router_z_loss": 0.0001}),
+        objective=ObjectiveConfig("lm", {"balance": {
+            "aux_loss_alpha": 0.001, "seq_aux": False, "router_z_loss": 0.0001}}),
         tokenizer=args.tokenizer, max_new_tokens=0)
 
 
