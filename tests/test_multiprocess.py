@@ -1113,6 +1113,23 @@ def test_a_pool_agrees_one_validity_schema_when_only_some_ranks_padded(tmp_path)
 
 
 @pytest.mark.distributed
+def test_a_pool_trains_a_hybrid_split_over_the_sequence(tmp_path):
+    """Two processes of one device each train a hybrid decoder's Mamba-2 and attention layers split
+    over the sequence, each half of every sequence on another process: the pool fills validity on
+    both, so the Mamba-2 layers take their padded-row path under the sequence axis, its halo and state
+    crossing the processes (tests/test_mamba2.py holds that path's output and gradients to the unsplit
+    layer's by check 1), and the processes report one finite loss and a finite, real update."""
+    worker_script = Path(__file__).with_name("sequence_worker.py")
+    reports = run_pool("sequence_hybrid", tmp_path / "pool", 2, script=worker_script, devices=1, fsdp_size=1,
+                       timeout=180)
+    assert [report["sequence_processes"] for report in reports] == [[[0, 1]]] * 2
+    assert [report["placed_fields"] for report in reports] == [["attention_mask"]] * 2
+    assert reports[0]["loss"] == reports[1]["loss"], "the processes disagreed with each other"
+    assert np.isfinite(reports[0]["loss"]) and np.isfinite(reports[0]["update_scale"])
+    assert reports[0]["update_scale"] > 0
+
+
+@pytest.mark.distributed
 def test_a_pool_decides_its_frozen_fp8_sites_on_process_zero(tmp_path):
     """The frozen FP8 sites decide which kernels a rank's train state holds
     packed, so process 0 decides them for the pool: on CPUs it refuses for
