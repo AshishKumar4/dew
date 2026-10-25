@@ -192,11 +192,13 @@ honors on a CPU."""
 WIDE_CPU_ARITHMETIC = "DEW_WIDE_CPU_ARITHMETIC"
 """The environment variable that, set to 1, has a process's CPU programs take the arithmetic Dew's
 tests hold a CPU to: float32 products summed in float64 and rounded once (`accumulated`, `spread`), a
-row's logsumexp reduced in two levels (`dew.objectives.lm.chunked`) and a float64 division divided
-as written (`dew.diffusion.schedules.common.divided`). Read as each program is traced; set by the
-tests' environment (tests/lane_environment.py), never by the library, whose products are the plain
-products on every platform. Each such site chooses the wide form by the platform the program is
-lowered for (`platform_dependent`), so a test that lowers for an accelerator keeps the target's."""
+loop's running sum of them compensated so it rounds once too (`compensates_loops`), a row's logsumexp
+reduced in levels of short blocks (`dew.objectives.lm.chunked`) and a float64 division divided as
+written (`dew.diffusion.schedules.common.divided`). Read as each program is traced; set by the tests'
+environment (tests/lane_environment.py), never by the library, whose products, sums and divisions
+are the plain ones on every platform. Each such site chooses the wide form by the platform the
+program is lowered for (`platform_dependent`, or for a loop's carry the platform its code is chosen
+for), so a test that lowers for an accelerator keeps the target's."""
 
 
 def wide_cpu_arithmetic() -> bool:
@@ -217,8 +219,9 @@ def _sums_in_float64(*operands) -> bool:
 def float64_sum(product: Callable[..., jax.Array], *operands, dtype: DTypeLike) -> jax.Array:
     """`product(*operands)`, a sum of products, taken in float64 from its operands widened exactly and
     rounded once to `dtype`, under `jax.enable_x64` for its own trace: the sum `accumulated` takes on a
-    CPU, with no platform of its own to choose. Its products run at HIGHEST precision, whatever fp32
-    algorithm the caller bound, which would narrow float64 operands back to float32."""
+    CPU under Dew's wide arithmetic (`WIDE_CPU_ARITHMETIC`), with no platform of its own to choose.
+    Its products run at HIGHEST precision, whatever fp32 algorithm the caller bound, which would
+    narrow float64 operands back to float32."""
     with jax.enable_x64(new_val=True):
         wide = product(*_widened(operands), precision=jax.lax.Precision.HIGHEST, preferred_element_type=None)
         return wide.astype(dtype)

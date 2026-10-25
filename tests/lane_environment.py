@@ -90,7 +90,8 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     # 1e-2 between two correct implementations.
     environ.setdefault("JAX_DEFAULT_MATMUL_PRECISION", "highest")
     # The arithmetic the suite holds a CPU to (`dew.nn.precision.WIDE_CPU_ARITHMETIC`): float32
-    # products summed in float64, a row's logsumexp in two levels, a float64 division as written.
+    # products summed in float64 and a loop's running sum of them compensated, a row's logsumexp in
+    # levels of short blocks, a float64 division as written.
     # Dew's test setting, never the library's default.
     environ.setdefault("DEW_WIDE_CPU_ARITHMETIC", "1")
 
