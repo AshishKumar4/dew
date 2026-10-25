@@ -12,7 +12,8 @@ of `steps` pipeline steps, `stages` of them in flight, issues each step's loads 
 before it needs them, so each step waits at least the global load latency over `stages - 1`; a
 multiprocessor's `resident` programs (`resident`) wait together (Little's law). A mainloop that keeps
 `in_flight` steps' products running past their step holds their stages too, so it loads `stages - 1 -
-in_flight` ahead, and with none ahead each step's wait is serial with its work. Per multiprocessor,
+in_flight` ahead, and with none ahead each step's wait and its transfer (its staged bytes at the
+program's share of the bandwidth) are serial with its work. Per multiprocessor,
 
     program  = max(program_flops / tensor rate, program_staged / shared-memory rate,
                    program_exponentials / special-function rate)
@@ -118,8 +119,11 @@ def seconds(cost: Cost, target: generation.GpuTarget) -> float:
     program = program_seconds(cost, rate, clock) + cost.serial_stored * multiprocessors / bandwidth
     waiting = 0.0 if latency is None else waiting_seconds(cost, latency, clock)
     if cost.stages - 1 - cost.in_flight < 1:
-        # No step loads ahead: each waits for its own load, serial with the products.
-        program, waiting = program + waiting, 0.0
+        # No step loads ahead: each waits for its own load, its transfer at the program's share of the
+        # memory's bandwidth, serial with the products (H100 PCIe sweeps: a two-stage warpgroup-MMA tile,
+        # which loads nothing ahead, ran 1.16 to 1.94 times its three-stage twin, R1/R3-sweep-h100).
+        program += waiting + cost.program_staged * multiprocessors / bandwidth
+        waiting = 0.0
     waves = math.ceil(cost.programs / (multiprocessors * cost.resident))
     # A multiprocessor holds no more programs at once than a wave gives it.
     resident = min(cost.resident, max(math.ceil(cost.programs / multiprocessors), 1))

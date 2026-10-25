@@ -125,6 +125,14 @@ def _covering(extent: int) -> int:
     return 1 << (max(extent, 1) - 1).bit_length()
 
 
+TRITON_IN_FLIGHT = 1
+"""The stages of a Triton launch's pipeline that load nothing ahead (`cost.Cost.in_flight`): on Ampere its
+step being consumed (Triton allocates `stages - 1` buffers, as an A100 and an L4 request, TSMEM-a100/l4),
+on Hopper its warpgroup MMA kept in flight. Counted, the model's picks over the R1/R3 sampled sweeps ran
+within 10% of the best at 26 of 28 A100 records and 24 of 28 H100 ones, against 11 and 8 without
+(scripts/eval_sweeps.py)."""
+
+
 TRITON_CALIBRATED = {'block_m': (64, 256), 'block_n': (128, 256), 'block_k': (32, 128), 'stages': (2, 4)}
 """The least and most of each tile axis the Triton sweeps measured (GMMT-a100, GMM-h100-2; the steps
 those of 16-bit operands): provenance a pick's record carries (`_Triton.calibrated`), never a bound."""
@@ -609,7 +617,7 @@ class Gmm(_Triton):
             programs=chunks * columns, device_bytes=moved,
             program_flops=flops / (chunks * columns), program_staged=staged,
             program_exponentials=exponentials, mode=_mode(tokens.dtype), steps=steps, stages=config.stages,
-            resident=self._resident(ba, config, target))
+            resident=self._resident(ba, config, target), in_flight=TRITON_IN_FLIGHT)
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
@@ -693,7 +701,7 @@ class Tgmm(_Triton):
         return cost.Cost(
             programs=programs, device_bytes=moved, program_flops=flops, program_staged=staged,
             program_exponentials=exponentials, mode=_mode(tokens.dtype), steps=steps, stages=config.stages,
-            resident=self._resident(ba, config, target))
+            resident=self._resident(ba, config, target), in_flight=TRITON_IN_FLIGHT)
 
     def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,
