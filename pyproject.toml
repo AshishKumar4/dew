@@ -189,6 +189,10 @@ streaming = ["datasets>=5.0.1"]
 # holds it, so locks/cpu.txt, which the container installs under, pins every one.
 live = ["websockets==17.1", "jupyter-kernel-gateway==3.0.1", "ipykernel", "ipywidgets"]
 delta = ["deltalake>=1.0"]
+# dew.data.text's curation steps (Language, Quality, Classifier, Decontaminated): DataTrove's language,
+# quality, fastText and n-gram decontamination filters. DataTrove splits English into words with a blank
+# spaCy pipeline, which its own multilingual extra brings beside TensorFlow; spaCy alone is enough here.
+curation = ["datatrove[processing]==0.10.1", "spacy>=3.8.2"]
 # lm-evaluation-harness task suites through dew.eval.harness.DewLM, which
 # subclasses TemplateLM. Before 0.4.10, TemplateLM keeps the BOS that DewLM's
 # tokenizer puts at the start of an empty-context continuation, and scores it
@@ -244,7 +248,7 @@ kernel-compile = ["jax-cuda12-plugin==0.12.0.1; sys_platform == 'linux' and plat
 # The test suite's one environment: every package a test file imports, so no test skips for want
 # of one. CI's jobs, armada's (tools/armada/install.sh), the GPU nodes' and dew-ops' GPU jobs install
 # it under constraints.txt, locked in locks/ (tools/lock_environment.sh).
-ci = ["dewml[test,av,tfds,metrics,inference-clients,serve,environments,vision,augment,quantization,profile,torchax,gguf]",
+ci = ["dewml[test,av,tfds,metrics,inference-clients,serve,environments,vision,augment,quantization,profile,torchax,gguf,curation]",
       "flake8"]
 # The tutorial notebooks' environment outside Colab: the extras they import and a Jupyter kernel.
 # Tutorial 01, Diffusion from scratch, draws with matplotlib, which Colab installs.
