@@ -1157,7 +1157,13 @@ def _input_quantization(model: nn.Module, variables: Variables, layouts: tuple[W
                      InputQuantizer.nvfp4(value, codec.input_scale_dtype == 'float8_e4m3fn',
                                           format=codec.input_format))
         for path in layout.paths:
-            sites[path[1:-1]] = (quantizer.kind, quantizer.scale)
+            site, bound = path[1:-1], (quantizer.kind, quantizer.scale)
+            # A fused tensor and an equal member stored beside it bind one Linear twice: they must
+            # quantize its input alike, or one calibration would be silently dropped.
+            held = sites.setdefault(site, bound)
+            if held[0] != bound[0] or not np.array_equal(np.asarray(held[1]), np.asarray(bound[1])):
+                raise ValueError(f"{layout.name}'s input quantizer and another stored for "
+                                 f"{'/'.join(site)} disagree; one Linear takes one")
     unbound = {name for name in grid if name.endswith(codec.input_suffix)} - consumed
     if unbound:
         raise ValueError(f"input scales {sorted(unbound)} bind no Linear; an unbound scale would "

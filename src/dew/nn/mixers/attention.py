@@ -451,9 +451,8 @@ class CausalSelfAttention(nn.Module):
 
     def _placed_query(self, query, rotary_positions, places, uncached):
         """The query with its positions applied, and the rotation's angles (None without one): rotated
-        by its places, or under NoPE only scaled to the logit scale the checkpoint asks for, then
-        tuned to its temperature (`temperature_tuning`). `uncached` is the call's tokens where it
-        reads no cache."""
+        by its places, or under NoPE only scaled to the logit scale the checkpoint asks for.
+        `uncached` is the call's tokens where it reads no cache."""
         freqs_cos = freqs_sin = None
         if self.nope:
             # NoPE rotates nothing; the query still carries the logit scale
@@ -468,13 +467,17 @@ class CausalSelfAttention(nn.Module):
                 self._turned(query), freqs_cos, freqs_sin, pairs=self.rotary_pairs,
                 scale=(None if self.ctx.attention_scale is None
                        else self.ctx.attention_scale * math.sqrt(self.ctx.head_dim)))
-        if self.temperature_tuning is not None:
-            # A scalar a position, so it commutes with the rotation: a rotated kind's queries scale as
-            # an unrotated one's.
-            scale = temperature_scale(places, *self.temperature_tuning, dtype=at_least_fp32(query.dtype))
-            query = query * (scale[..., None, None] if scale.ndim == 2
-                             else scale[None, :, None, None]).astype(query.dtype)
         return query, freqs_cos, freqs_sin
+
+    def _tuned(self, query, places):
+        """The query times its position's temperature (`temperature_tuning`), the last thing done to
+        it before it attends: after its rotation and after any normalization (nGPT's unit sphere), so
+        no normalization undoes it. A scalar a position, rotated kind or not."""
+        if self.temperature_tuning is None:
+            return query
+        scale = temperature_scale(places, *self.temperature_tuning, dtype=at_least_fp32(query.dtype))
+        return query * (scale[..., None, None] if scale.ndim == 2
+                        else scale[None, :, None, None]).astype(query.dtype)
 
     def _rotary_angles(self, rotary_positions, heads: jax.Array, tokens: Coordinates | None = None,
                        places=None):
@@ -683,6 +686,7 @@ class CausalSelfAttention(nn.Module):
                 # Post-norm, post-rope, the same tensors the reference hands
                 # its sharing layers (modeling_gemma4.py, Gemma4TextAttention).
                 kv_store[self.ctx.kv_store_key] = (key, value, positions, places, {})
+        query = self._tuned(query, places)
         if decode and attention_metadata is not None and attention_metadata.admitted is not None:
             attention = self._mixed_attended(query, key, value, positions, attention_metadata)
             return self._output(attention, gate, B, S, own_value)
