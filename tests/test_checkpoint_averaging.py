@@ -86,7 +86,7 @@ def test_a_lora_run_and_a_fine_tune_average_their_effective_weights_as_float64_d
         halves = (np.asarray(one, np.float64) + np.asarray(other, np.float64)) / 2
         assert np.asarray(leaf).dtype == np.float32
         assert np.array_equal(np.asarray(leaf), halves.astype(np.float32))
-    assert average.model.adapter is None
+    assert recorded_adapter(average.model.wrappers) is None
     logits = average.model.build().apply(average.variables, TOKENS)
     assert logits.shape == (1, 8, 16) and bool(jnp.all(jnp.isfinite(logits)))
     assert average.runs == ((str(epath.Path(runs[0])), 2, False), (str(epath.Path(runs[1])), 1, False))
