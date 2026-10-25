@@ -38,7 +38,10 @@ def assumed(generation: str | GpuTarget | None) -> Iterator[None]:
     `KERNELS` choice and kernel refusal acts as on that GPU while a step traces and lowers for one on
     a CPU (`dew.training._lowering`). Given a target's facts (a GPU no row names, its multiprocessors,
     shared memory, clock and bandwidth its own), `gpu_target` answers with them, so every launch is sized
-    and costed by them alone. None assumes nothing."""
+    and costed by them alone. None assumes nothing. JAX keys its trace and compile caches on the device
+    assumed (`dew.cache.KERNEL_ASSUMED`), so a function jitted for one traces again for another."""
+    from dew import cache
+
     if isinstance(generation, GpuTarget):
         target, name = generation, generation.generation
     else:
@@ -46,7 +49,8 @@ def assumed(generation: str | GpuTarget | None) -> Iterator[None]:
     token = ASSUMED.set(name)
     facts = ASSUMED_TARGET.set(target)
     try:
-        yield
+        with cache.KERNEL_ASSUMED((name, None if target is None else repr(target))):
+            yield
     finally:
         ASSUMED_TARGET.reset(facts)
         ASSUMED.reset(token)

@@ -94,6 +94,7 @@ class Mma(mosaic.Family):
     operands_in_registers = True
     asynchronous = False
     rhs_copies = 4
+    most_shared = 163 * 1024  # sm80's and sm87's opt-in block (sm86's and sm89's 99 KiB)
 
     def registers(self, consumers: int) -> int:
         del consumers  # one role, at a thread's whole budget

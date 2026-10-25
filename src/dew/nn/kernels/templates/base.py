@@ -86,6 +86,23 @@ class Template[Config: Hashable](tuning.KernelOp):
             raise Unfitted(type(self).__name__, least, generation.shared_budget(target), target.generation)
         return fits
 
+    def calibrated(self, config: Config) -> bool:
+        """Whether `config` lies in the region its cost model is calibrated over (the extents its sweeps
+        measured): a measured search restriction, apart from what is legal (`space`, `fitting`). Every
+        config does unless the launch states one."""
+        return True
+
+    def searched(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[Config, ...]:
+        """The fitting configs (`fitting`) the estimate ranks and a measurement times: those its cost model
+        is calibrated over (`calibrated`), or every fitting one where none is, in `space`'s order."""
+        fits = self.fitting(ba, target)
+        calibrated = tuple(config for config in fits if self.calibrated(config))
+        return calibrated if calibrated else fits
+
+    def pinnable(self, ba: tokamax.BoundArguments) -> set[Config]:
+        # Every legal config, calibrated or not: a pin is the caller's measurement.
+        return set(self.fitting(ba, generation.gpu_target()))
+
     def unpinnable(self, ba: tokamax.BoundArguments, config: Hashable) -> str:
         """Why `config` is not among `ba`'s legal configs: outside `space`, holding more registers than a
         thread does, or staging more shared memory than a block of the GPU holds."""
@@ -101,15 +118,15 @@ class Template[Config: Hashable](tuning.KernelOp):
                 f"{generation.shared_budget(target)} a block of {target.generation} holds")
 
     def estimate(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[float, Config]:
-        """The seconds `cost` estimates at the launch's fastest fitting config on `target`, and that
-        config, the first of `space`'s order where several tie."""
-        fits = self.fitting(ba, target)
+        """The seconds `cost` estimates at the launch's fastest searched config on `target` (`searched`),
+        and that config, the first of `space`'s order where several tie."""
+        fits = self.searched(ba, target)
         costs = [self.cost(ba, config, target) for config in fits]
         fastest = min(range(len(fits)), key=lambda index: (costs[index], index))
         return costs[fastest], fits[fastest]
 
     def _get_autotuning_configs(self, ba: tokamax.BoundArguments) -> set[Config]:
-        return set(self.fitting(ba, generation.gpu_target()))
+        return set(self.searched(ba, generation.gpu_target()))
 
     def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> Config:
         return self.estimate(ba, generation.gpu_target())[1]
