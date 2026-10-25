@@ -15,6 +15,7 @@ import numpy as np
 import optax
 import pytest
 from block_support import VOCAB, block_causal, model
+from model_support import TINY_DECODER
 from reference_error import assert_as_exact, seeds_for
 
 from dew.data.chat import Role
@@ -25,7 +26,9 @@ from dew.inference.tasks import TextGeneration
 from dew.nn.inputs import coordinates
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixers import AttentionMixer
+from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.visibility import prompt_blocks
+from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.objectives.lm import TEXT_KEY, LMObjective
 from dew.objectives.lm.objective import batch_text
 from dew.sampling import Sampling
@@ -169,8 +172,15 @@ def test_a_prefix_run_is_refused_where_its_model_or_its_length_cannot_take_it():
 
 
 def test_a_served_prompt_shorter_than_its_prefix_is_refused():
+    """A prompt shorter than its prefix is refused where it is served, by the count of its real tokens the
+    caller holds: its trained block would cover tokens it does not hold."""
+    decoder = blocky().clone(max_seq_len=128)
+    variables = decoder.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+    task = TextGeneration(decoder, variables, sampling=Sampling(temperature=0, pad_token_id=0), prefix=PREFIX)
     with pytest.raises(ValueError):
-        prompt_blocks(np.ones((1, PREFIX - 1), bool), PREFIX, xp=np)
+        task(np.asarray([[1, 2]]), NEW, key=0)
+    with pytest.raises(ValueError):
+        Server.from_task(task, slots=2, capacity=64).submit([1, 2], NEW, key=0)
 
 
 def test_the_block_stage_refuses_a_source_it_cannot_read():
@@ -252,3 +262,132 @@ def test_a_prefix_run_served_in_pieces_refuses_a_block_longer_than_a_piece():
     server = Server.from_task(task, slots=2, capacity=64, kv_cache=KVCache(page_size=16, pages=8), chunk=2)
     with pytest.raises(ValueError):
         server.submit(SERVED_PROMPTS[0], SERVED_BUDGETS[0], key=0)
+
+
+def chunked(size: int, *, unchunked: bool = False):
+    """A decoder whose block-reading kind cuts its attention into chunks of `size` places, with a second
+    block-reading kind that has no chunk beside it when `unchunked`."""
+    kinds = {"chunked": {"mixer": AttentionMixer(bidirectional_blocks=True), "chunk": size}}
+    if unchunked:
+        kinds["whole"] = {"mixer": AttentionMixer(bidirectional_blocks=True)}
+    return model(TINY_DECODER["num_layers"], **kinds)
+
+
+def test_a_prefix_run_needs_a_trunk_layer_that_reads_blocks():
+    """A block-reading kind only the prediction depth uses leaves the trunk causal, so a prefix run would drop
+    in-block targets the trunk never saw: refused."""
+    depth_only = model(full_attention={}).clone(
+        kinds={"full_attention": {}, "depth": {"mixer": AttentionMixer(bidirectional_blocks=True)}},
+        mtp_layer_type="depth", num_nextn_predict_layers=1)
+    with pytest.raises(ValueError):
+        LMObjective(depth_only, SEQ, prefix=PREFIX)
+
+
+def test_a_prefix_run_refuses_a_block_that_crosses_an_attention_chunk():
+    """A block-reading layer whose chunks cut a block reads it in part, so a target across the cut is
+    invisible to its source while the loss drops it. Refused where no layer reads the block whole: a prompt's
+    block is of any length, so it needs an unchunked layer, and serving refuses the same. A chunk the block
+    fits in, or an unchunked layer beside the chunked one, reads it whole."""
+    with pytest.raises(ValueError):
+        LMObjective(chunked(2), SEQ, prefix=PREFIX)
+    with pytest.raises(ValueError):
+        LMObjective(chunked(2), SEQ, prefix="prompt")
+    decoder = chunked(2).clone(max_seq_len=128)
+    with pytest.raises(ValueError):
+        TextGeneration(decoder, decoder.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)), prefix=PREFIX)
+    assert LMObjective(chunked(PREFIX), SEQ, prefix=PREFIX).prefix == PREFIX
+    assert LMObjective(chunked(2, unchunked=True), SEQ, prefix=PREFIX).prefix == PREFIX
+    assert LMObjective(chunked(SEQ), SEQ, prefix="prompt").prefix == "prompt"
+
+
+UNPACKED_BLOCKS = np.broadcast_to(np.where(np.arange(ROW) < PREFIX, 1, -1).astype(np.int32), (BATCH, ROW))
+"""Each unpacked row's blocks under `PREFIX`: its first tokens, one block."""
+
+
+def test_a_batch_of_blocks_is_refused_where_every_layer_that_reads_them_is_chunked():
+    """A batch's blocks are runs of any place, which a chunk cuts unless a row fits in it: a model whose only
+    block-reading layer is chunked refuses them, and one with an unchunked layer beside it scores them."""
+    tokens = jax.random.randint(jax.random.key(1), (BATCH, ROW), 0, VOCAB)
+    batch = batch_text({TEXT_KEY: tokens, "text_block_groups": UNPACKED_BLOCKS})
+    cut = chunked(2)
+    with pytest.raises(ValueError):
+        LMObjective(cut, SEQ).token_scores(cut.init(jax.random.key(0), tokens[:, :-1]), batch)
+    whole = chunked(2, unchunked=True)
+    scored = LMObjective(whole, SEQ).token_scores(whole.init(jax.random.key(0), tokens[:, :-1]), batch)
+    assert np.asarray(scored.weights).sum() > 0
+
+
+def wrapped(decoder):
+    """`decoder` under a multimodal wrapper, with a tiny vision tower and projector beside it."""
+    return MultimodalTransformer(
+        decoder, SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2, image_size=8,
+                              patch_size=4),
+        GemmaProjector(text_width=TINY_DECODER["emb_features"], patches_per_side=2, tokens_per_side=1),
+        family="gemma3", image_token_id=1)
+
+
+def test_a_prefix_run_trains_and_serves_through_a_wrapper_of_a_block_reading_decoder():
+    """A wrapper answers for its decoder's block reading (`DecoderWrapper`): its prefix run is built, scored
+    as the bare decoder's objective scores it (check 1, float64 from the widened decoder), and served the
+    draws the bare decoder's task serves."""
+    decoder = blocky()
+    wrapper = wrapped(decoder)
+    objective = LMObjective(wrapper, SEQ, prefix=PREFIX)
+    bare = LMObjective(decoder, SEQ, prefix=PREFIX)
+    wide = LMObjective(decoder.clone(dtype=jnp.float64, attention_impl="reference"), SEQ, prefix=PREFIX)
+    init = jax.jit(wrapper.init)
+
+    def draw(seed):
+        tokens = jax.random.randint(jax.random.fold_in(jax.random.key(1), seed), (BATCH, ROW), 0, VOCAB)
+        return init(jax.random.fold_in(jax.random.key(0), seed), tokens[:, :-1]), tokens
+
+    def language_model(variables):
+        return {"params": variables["params"][wrapper.wraps]}
+
+    def scored(scorer, variables, tokens):
+        batch = batch_text({TEXT_KEY: tokens, "text_block_groups": UNPACKED_BLOCKS})
+        scores = scorer.token_scores(variables, batch)
+        return scores.losses, scores.weights
+
+    reference = jax.jit(lambda variables, tokens: scored(bare, language_model(variables), tokens))
+    truth = jax.jit(lambda variables, tokens: scored(wide, language_model(variables), tokens))
+    dew = jax.jit(lambda variables, tokens: scored(objective, variables, tokens))
+    seeds = seeds_for(reference, draw, "wrapped prefix run loss", truth_fn=truth)
+    assert_as_exact(dew, reference, draw, "wrapped prefix run loss", seeds=seeds, truth_fn=truth)
+    variables = init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+    prompt = np.asarray([[3, 1, 4, 1, 5]])
+    sampling = Sampling(temperature=0, pad_token_id=0)
+    served = TextGeneration(wrapper, variables, sampling=sampling, prefix=PREFIX)
+    alone = TextGeneration(decoder, language_model(variables), sampling=sampling, prefix=PREFIX)
+    expected = alone(prompt, NEW, key=0).host().tokens
+    np.testing.assert_array_equal(served(prompt, NEW, key=0).host().tokens, expected)
+
+
+def test_a_served_prompt_block_is_made_under_a_trace_as_on_the_host():
+    """`prompt_blocks` reads no host value, so a trace makes the blocks the host makes of the same mask."""
+    valid = np.asarray([[0, 1, 1, 1, 1, 0], [1, 1, 1, 1, 1, 1]], bool)
+    traced = jax.jit(lambda mask: prompt_blocks(mask, PREFIX))(jnp.asarray(valid))
+    np.testing.assert_array_equal(np.asarray(traced), prompt_blocks(valid, PREFIX, xp=np))
+
+
+def test_a_shared_prefix_page_inside_a_block_is_reused_only_with_a_block_of_the_same_tokens():
+    """A paged server reuses a prefix page only where the page's keys read the same block: a later request
+    whose block holds the same tokens shares its pages, and one whose first page holds the same tokens under
+    another block shares none. Each draws what it draws alone."""
+    decoder = blocky().clone(max_seq_len=128)
+    variables = decoder.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+    task = TextGeneration(decoder, variables, sampling=Sampling(temperature=0, pad_token_id=0), prefix=8)
+    server = Server.from_task(task, slots=2, capacity=64, kv_cache=KVCache(page_size=4, pages=40),
+                              prefix_cache=True)
+    prompts = [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], [1, 2, 3, 4, 5, 6, 7, 8, 12, 13, 14],
+               [1, 2, 3, 4, 20, 21, 22, 23, 24]]
+    reused, tickets = [], []
+    for prompt in prompts:
+        before = server.prefix_hits
+        tickets.append(server.submit(prompt, NEW, key=0))
+        server.run()
+        reused.append(server.prefix_hits - before)
+    assert reused[0] == 0 and reused[1] > 0 and reused[2] == 0
+    for ticket, prompt in zip(tickets, prompts, strict=True):
+        lone = task(np.asarray([prompt]), NEW, key=0).host().tokens
+        np.testing.assert_array_equal(ticket.result().host().tokens, lone)
