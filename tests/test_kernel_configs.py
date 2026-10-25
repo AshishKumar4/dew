@@ -12,26 +12,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import tokamax
-from fla_gdn_support import CONV_SHAPES, conv_config_cases, conv_training_cases, kda_training_cases
+from fla_gdn_support import CONV_SHAPES, conv_training_cases, kda_training_cases
 from generation_support import generations, lowers
 from kernel_compile import compile_kernels, failures
 
-from dew.nn.kernels import (
-    chunked_launch,
-    fla_gdn,
-    fla_kda,
-    generation,
-    grouped_matmul,
-    recurrence,
-    short_conv,
-    tuning,
-)
+from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, grouped_matmul, recurrence, tuning
 from dew.nn.kernels.templates import mosaic_sm80
-
-LAUNCHES = {launch for module in (fla_gdn, fla_kda, recurrence) for launch in vars(module).values()
-            if isinstance(launch, chunked_launch._Launch)}
-"""Every launch of the two ports and the recurrence template's chunked stages."""
 
 
 def test_the_compiled_shapes_reach_the_widest_keys_and_values_the_port_takes():
@@ -49,21 +35,9 @@ def test_a_gpu_takes_an_a100s_picks_where_its_block_holds_as_much_shared_memory(
         assert chunked_launch._wide() is wide
 
 
-@pytest.mark.parametrize("target", [*generation.TARGETS, "sm110", "cpu"])
-def test_each_targets_space_holds_its_picks(target):
-    """On every target `generation.TARGETS` lists, a GPU it does not and a CPU, every kernel's 16-bit
-    space at the target's width holds its unmeasured pick, Kimi delta attention's own kernels' too, and
-    fp32 has a pick for every kernel."""
-    with generation.assumed(target):
-        wide = chunked_launch._wide()
-    for launch in LAUNCHES:
-        assert launch.PICKS["bfloat16", wide] in launch.SPACES[wide], launch.NAME
-        assert {"bfloat16", "float32"} <= {dtype for dtype, _ in launch.PICKS}, launch.NAME
-
-
-def rule_launches(module) -> tuple:
-    """The launches the rule of `module` (`fla_gdn`, `fla_kda`) makes forward and backward, as the
-    tuner reads them from its lowering (`tuning.launches`)."""
+def rule_launches(module) -> list:
+    """The launches the rule of `module` (`fla_gdn`, `fla_kda`) makes forward and backward, as its trace
+    records them (`tuning.seen`)."""
     per_key = module is fla_kda
     q = jax.ShapeDtypeStruct((1, 64, 1, 64), jnp.bfloat16)
     v = jax.ShapeDtypeStruct((1, 64, 2, 64), jnp.bfloat16)
@@ -78,17 +52,17 @@ def rule_launches(module) -> tuple:
         (_, final), pull = jax.vjp(rule, q, k, v, g, beta, h0)
         return pull((do, jnp.zeros_like(final)))
 
-    with tuning.launches():
-        beta = g.update(shape=g.shape[:3], dtype=jnp.bfloat16)
-        return tokamax.autotuning.get_bound_args(jax.jit(both), q, q, v, g, beta, h0, v)
+    beta = g.update(shape=g.shape[:3], dtype=jnp.bfloat16)
+    with tuning.seen() as found:
+        jax.make_jaxpr(both)(q, q, v, g, beta, h0, v)
+    return [ba for _, ba in found]
 
 
 @pytest.mark.parametrize("module", [fla_gdn, fla_kda])
-def test_the_tuner_finds_each_of_the_rules_launches_in_its_lowering(module):
-    """The rule's forward and backward, traced as the tuner reads a program (`tuning.launches`): each
-    of its kernels is a launch tokamax describes, its arguments serializable into its key; the gated
-    delta rule's eight and the recurrence template's decay prefix, and Kimi delta attention's seven with
-    the prefix and the memory kernels it shares."""
+def test_a_trace_finds_each_of_the_rules_launches(module):
+    """The rule's forward and backward, traced (`tuning.seen`): each of its kernels is a launch; the
+    gated delta rule's eight and the recurrence template's decay prefix, and Kimi delta attention's
+    seven with the prefix and the memory kernels it shares."""
     shared = {recurrence.ChunkLocalCumsum, *((fla_gdn.ChunkFwdH, fla_gdn.ChunkBwdDhu) if module is fla_kda
                                              else ())}
     assert {type(ba.op) for ba in rule_launches(module)} == shared | {
@@ -97,8 +71,7 @@ def test_the_tuner_finds_each_of_the_rules_launches_in_its_lowering(module):
 
 def test_a_launch_clips_its_blocks_to_the_operands():
     """Blocks wider than a call's keys or values shrink to them: on an A100, whose picks block 64 values
-    or more, the heuristic and every config the tuner measures fit a call's 64-wide keys and 32-wide
-    values, the heuristic among them."""
+    or more, the heuristic fits a call's 64-wide keys and 32-wide values."""
     q = jax.ShapeDtypeStruct((1, 64, 1, 64), jnp.bfloat16)
     v = jax.ShapeDtypeStruct((1, 64, 1, 32), jnp.bfloat16)
     h = jax.ShapeDtypeStruct((1, 1, 64, 32), jnp.bfloat16)
@@ -106,11 +79,8 @@ def test_a_launch_clips_its_blocks_to_the_operands():
     spans = chunked_launch.sequences(1, 64)
     ba = fla_gdn._CHUNK_FWD_O.bind(q, q, v, h, g, *spans, scale=1.0, chunk=64, interpret=True)
     with generation.assumed("sm80"):
-        heuristic = fla_gdn._CHUNK_FWD_O._get_heuristics_config(ba)
-        space = fla_gdn._CHUNK_FWD_O._get_autotuning_configs(ba)
-    assert heuristic in space
-    for tiles in space:
-        assert tiles.bk <= q.shape[-1] and tiles.bv <= v.shape[-1], tiles
+        tiles = fla_gdn._CHUNK_FWD_O._get_heuristics_config(ba)
+    assert tiles.bk <= q.shape[-1] and tiles.bv <= v.shape[-1], tiles
 
 
 @pytest.mark.parametrize("target", ["sm80", "sm120"])
@@ -190,15 +160,6 @@ def test_the_short_convs_kernels_compile_on_tritons_compiler_within_each_gpus_bl
     assert len(found) == 2 * len(CONV_SHAPES) + 2
     assert not failures(found), "\n".join(failures(found))
 
-
-@pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
-def test_every_short_conv_config_compiles_on_tritons_compiler_within_each_gpus_block(target):
-    """Each config the tuner may give either launch of the short conv (`short_conv.TILES`,
-    `short_conv.WALKS`), pinned at the 9B's packed delta conv, compiled for each GPU within the compile
-    bound and the block's shared memory."""
-    found = compile_kernels(conv_config_cases(), target)
-    assert len(found) == len(short_conv.TILES) + len(short_conv.WALKS)
-    assert not failures(found), "\n".join(failures(found))
 
 
 @lowers("sm90")
