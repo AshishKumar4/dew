@@ -342,13 +342,16 @@ def test_the_dense_decoders_gradient_is_the_references():
                   for dtype in (torch.float32, torch.float64)}
     pad = references[torch.float32].config.pad_token_id
 
+    assert pad is not None
+
     def draw(seed):
-        """Rows of ids drawn uniformly from the vocabulary but the pad id, and the loss's cotangent, one.
-        The reference's embeddings are `nn.Embedding(padding_idx=pad)`, whose pad row takes no gradient
-        whatever reads it, where Dew's takes its own: a padding convention, apart from the arithmetic
-        held here, which ledger row 1372 tracks."""
-        ids = np.setdiff1d(np.arange(int(dense.vocab_size)), [] if pad is None else [pad])
-        rows = ids[np.random.default_rng([0xDE, seed]).integers(0, len(ids), (DENSE_ROWS, STEP_LENGTH))]
+        """Rows of ids drawn uniformly from the vocabulary, each reading the pad id at its sixth place,
+        and the loss's cotangent, one: both embeddings are the reference's
+        `nn.Embedding(padding_idx=pad)` and Dew's `padding_idx`, whose pad rows take no gradient from
+        what reads them."""
+        rows = np.random.default_rng([0xDE, seed]).integers(
+            0, int(dense.vocab_size), (DENSE_ROWS, STEP_LENGTH))
+        rows[:, 5] = pad
         return rows.astype(np.int32), np.float32(1)
 
     def orders(inputs):
