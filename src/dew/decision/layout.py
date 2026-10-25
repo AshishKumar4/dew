@@ -21,7 +21,7 @@ import json
 import weakref
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypeGuard
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, TypeGuard
 
 import jax.numpy as jnp
 import numpy as np
@@ -205,18 +205,48 @@ def _blocked(row: Encoded, boundary: int) -> Encoded:
     return dataclasses.replace(row, blocks=(0,) * boundary + (1,) * (len(row.tokens) - boundary))
 
 
+OPTIONS: Literal["options"] = "options"
+"""A question field's axis of one entry per option slot (`QuestionField.shape`)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class QuestionField:
+    """One array a row holds along its questions: its name, the shape each question slot holds
+    (`OPTIONS` for an axis of one entry per option slot), its dtype, its value in a slot that holds
+    no question, and when a row carries it: always, where its options stand under labels
+    (`labelled`), in training (`trained`), or where its questions stand in consistency groups
+    (`grouped`)."""
+
+    name: str
+    shape: tuple[int | Literal["options"], ...]
+    dtype: type
+    fill: int = 0
+    when: Literal["always", "labelled", "trained", "grouped"] = "always"
+
+    def empty(self, questions: int, width: int) -> np.ndarray:
+        """The field over `questions` slots of `width` options each, every slot at its fill."""
+        shape = tuple(width if isinstance(axis, str) else axis for axis in self.shape)
+        return np.full((questions, *shape), self.fill, self.dtype)
+
+
+QUESTION_FIELDS = (QuestionField("kinds", (), np.int32), QuestionField("questions", (), np.bool_),
+                   QuestionField("spans", (2,), np.int32),
+                   QuestionField("option_spans", (OPTIONS, 2), np.int32),
+                   QuestionField("options", (OPTIONS,), np.bool_),
+                   QuestionField("readout", (), np.int32, when="labelled"))
+"""The fields along a row's questions a model reads (`DecisionInputs`): `kinds`, `questions` (the
+real ones), `spans`, `option_spans`, `options` (the real ones), and where its options stand under
+labels (`Labels`) `readout`, each question's answer cue. Every producer, packer and consumer of a
+row's questions reads their names, shapes and fills here; a training row extends them
+(`dew.decision.objective.TRAINING_FIELDS`)."""
+
+
 def question_fields(row: Encoded, count: int, width: int, labelled: bool = False) -> dict[str, np.ndarray]:
-    """`row`'s questions as fixed-shape arrays, `count` question slots of
-    `width` option slots each: `kinds` [Q], `questions` [Q] (the real ones),
-    `spans` [Q, 2], `option_spans` [Q, K, 2] and `options` [Q, K] (the real
-    ones), and where its options stand under labels (`labelled`, `Labels`),
-    `readout` [Q]. A training row (`Encoding`) and a served batch
-    (`DecisionInputs.collate`) both read a row through this."""
-    fields = {"kinds": np.zeros(count, np.int32), "questions": np.zeros(count, bool),
-              "spans": np.zeros((count, 2), np.int32), "option_spans": np.zeros((count, width, 2), np.int32),
-              "options": np.zeros((count, width), bool)}
-    if labelled:
-        fields["readout"] = np.zeros(count, np.int32)
+    """`row`'s questions as fixed-shape arrays (`QUESTION_FIELDS`), `count` question slots of `width`
+    option slots each, `readout` where its options stand under labels (`labelled`). A training row
+    (`Encoding`) and a served batch (`DecisionInputs.collate`) both read a row through this."""
+    fields = {field.name: field.empty(count, width) for field in QUESTION_FIELDS
+              if field.when == "always" or (field.when == "labelled" and labelled)}
     for slot, laid in enumerate(row.questions):
         fields["kinds"][slot], fields["questions"][slot], fields["spans"][slot] = laid.kind, True, laid.span
         fields["option_spans"][slot, : len(laid.options)] = laid.options
@@ -1424,9 +1454,9 @@ class DecisionInputs:
         width = max(options or 1, *(len(laid.options) for row in rows for laid in row.questions))
         labelled = labelled_rows(rows)
         laid = [question_fields(row, count, width, labelled) for row in rows]
-        kinds, real, spans, option_spans, real_options = (
-            np.stack([fields[name] for fields in laid])
-            for name in ("kinds", "questions", "spans", "option_spans", "options"))
+        stacked = {name: np.stack([fields[name] for fields in laid]) for name in laid[0]}
+        along: dict[str, Any] = {name: jnp.asarray(value) for name, value in stacked.items()}
+        real_options = stacked["options"]
         if option_slots is None:
             most = int(real_options.reshape(len(rows), -1).sum(axis=1).max())
             option_slots = -(-max(most, 1) // OPTION_TILE) * OPTION_TILE
@@ -1434,6 +1464,9 @@ class DecisionInputs:
         else:
             compact = True
         indexed = [compacted(row, option_slots) for row in real_options] if compact else None
+        slots_of, slotted = ((None, None) if indexed is None else
+                             (jnp.asarray(np.stack([slot for slot, _ in indexed])),
+                              jnp.asarray(np.stack([real for _, real in indexed]))))
         context = lengths = None
         if context_length is not None:
             held = [row.context or () for row in rows]
@@ -1443,16 +1476,14 @@ class DecisionInputs:
             context = jnp.asarray([[*tokens, *[pad] * (context_length - len(tokens))] for tokens in held],
                                   jnp.int32)
             lengths = jnp.asarray([len(tokens) for tokens in held], jnp.int32)
-        return cls(jnp.asarray(tokens), jnp.asarray(valid, jnp.int32), jnp.asarray(kinds), jnp.asarray(real),
-                   jnp.asarray(spans), jnp.asarray(option_spans), jnp.asarray(real_options),
-                   jnp.asarray(padded["positions"], jnp.int32) if parallel else None,
-                   jnp.asarray(padded["slots"], jnp.int32) if parallel else None,
-                   None if indexed is None else jnp.asarray(np.stack([slots for slots, _ in indexed])),
-                   None if indexed is None else jnp.asarray(np.stack([real for _, real in indexed])),
-                   context, lengths,
-                   jnp.asarray(np.stack([fields["readout"] for fields in laid])) if labelled else None,
+        return cls(tokens=jnp.asarray(tokens), segments=jnp.asarray(valid, jnp.int32),
+                   **along,
+                   positions=jnp.asarray(padded["positions"], jnp.int32) if parallel else None,
+                   slots=jnp.asarray(padded["slots"], jnp.int32) if parallel else None,
+                   option_slots=slots_of, slotted=slotted,
+                   context=context, context_lengths=lengths,
                    # The padding is in no block.
-                   jnp.asarray(np.where(valid, padded["blocks"], -1), jnp.int32) if blocked else None,
+                   blocks=jnp.asarray(np.where(valid, padded["blocks"], -1), jnp.int32) if blocked else None,
                    spans_in_context=in_context)
 
 
