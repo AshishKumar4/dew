@@ -403,6 +403,7 @@ def test_a_split_plan_is_timed_against_its_batch_whole_a_rung_up_and_the_faster_
     assert np.isfinite(float(loss))
 
 
+@pytest.mark.mesh(devices=2)
 def test_a_plan_over_several_devices_that_fits_whole_is_timed_against_its_batch_whole_a_rung_up(monkeypatch):
     """Over two devices a plan that fits the batch whole without recomputing is timed against the batch
     whole one rung up too, whose freed memory lets the scheduler overlap the collectives, and the faster
