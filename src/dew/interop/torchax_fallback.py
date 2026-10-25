@@ -656,7 +656,10 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     if not isinstance(head_weight, torch.Tensor):
         raise ValueError(f"{type(model).__name__}'s output head holds no weight tensor")
     head_name = next((name for name, value in jittable.params.items() if value is head_weight), None)
-    if head_name is not None and not _plain_head(model, head):
+    # The head's structure, which a forward shows: the loaded model's, or without its weights the
+    # same class at the probe's sizes (`verify.shrink`), since a forward on the meta device reads no
+    # values, which some forwards do.
+    if head_name is not None and not (_plain_head(model, head) if weights else _shrunk_plain_head(config)):
         head_name = None
     # Host views of torch's storage: nothing reaches a device before the
     # caller's placement. Without the weights, their shapes and dtypes.
@@ -692,6 +695,18 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
                               built, generation_config, export_adapter=graph.export, revision=revision)
 
 
+def _shrunk_plain_head(config: Mapping[str, object]) -> bool:
+    """`_plain_head` of the class `config` builds, at the probe's sizes (`verify.shrink`) with
+    transformers' own initialization: the head's structure, which no size changes."""
+    import torch
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    fields = {key: value for key, value in verify.shrink(config).items() if key != "model_type"}
+    stated = AutoConfig.for_model(str(config["model_type"]), **fields)
+    model = AutoModelForCausalLM.from_config(stated, dtype=torch.float32, experts_implementation=EXPERTS)
+    return _plain_head(model.eval(), model.get_output_embeddings())
+
+
 def _plain_head(model: PreTrainedModel, head: torch.nn.Module) -> bool:
     """Whether `model`'s logits are by construction its head input times its
     head weight: the head a plain bias-free torch Linear, and the logits the
@@ -707,7 +722,7 @@ def _plain_head(model: PreTrainedModel, head: torch.nn.Module) -> bool:
         return False
     made: list[object] = []
     hook = head.register_forward_hook(lambda _, __, output: made.append(output))
-    tokens = torch.arange(min(8, int(head.out_features)), device=head.weight.device)[None]
+    tokens = torch.arange(min(8, int(head.out_features)))[None]
     try:
         with torch.no_grad():
             logits = model(input_ids=tokens, use_cache=False).logits
