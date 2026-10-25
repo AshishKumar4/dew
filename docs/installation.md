@@ -99,7 +99,7 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.11.2.post19,<0.11.3`.
+Dew requires `jax>=0.11.2.post21,<0.11.3`.
 <!-- END JAX requirement -->
 
 It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves jax alone. Every other package, jaxlib and its CUDA plugins included, comes from PyPI. The fixes:
@@ -113,8 +113,10 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - Mosaic GPU relays an MMA's accumulator out to a 16-bit MMA's left operand in registers, and an abstract device states its compute capability, which Mosaic GPU lowers for: the templates' Mosaic kernels need both on sm80.
 - The persistent compilation cache keys a program by jax's own build as well as jaxlib's, so two builds over one jaxlib never read each other's programs (on GPU nodes that ran several, reads of the other build's entries failed).
 - Mosaic GPU and Pallas Mosaic GPU lower `ceil` and `floor`, which a template's Mosaic kernel that rounds a value needs on an H100.
-- Pallas Mosaic GPU lowers `add_any` and `integer_pow` of every integer exponent, which a template's Mosaic backward under a score hook needs (a hook's pullback sums its terms, and a temperature's divides).
-- Splash attention's backward can form its delta from the weights, sum_k p · dp, in a pass of its own (`BlockSizes.delta_from_weights`), which a query that reads one key needs for its query gradient's exact zero.
+- Pallas Mosaic GPU lowers `add_any` and `integer_pow` of every integer exponent, which the Mosaic attention backward under a score hook needs: a hook's transposed pullback sums its cotangents, and a temperature's backward raises it to the power -2.
+- Splash attention's `BlockSizes.delta_from_weights` forms its backward's D from the weights, in a dq pass of its own, so a query with one key gets exactly zero gradient; it is off unless a kernel turns it on.
+- Mosaic GPU's layout inference solves groups of unknowns that no constraint relates separately, so sm80's `mma.sync` GEMM tiles find their layouts.
+- A platform-dependent conditional whose lowering keeps one branch lowers that branch inline, so a collective inside it is not a runtime conditional; on the CPU, devices diverged on such a conditional.
 
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
 
