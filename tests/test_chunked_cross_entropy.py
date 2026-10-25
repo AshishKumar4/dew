@@ -275,11 +275,12 @@ def columns(vocab: int, seed: int = 0):
 SEEDS = {'bias': 128, 'fused': 512, 'quantized': 64, 'scale and bias': 128, 'vocabulary split': 512,
          'column orders': 32, 'split bias': 32, 'quantized split': 32, 'backbone states': 16, 'backbone': 128,
          'small vocabulary': 128, 'small vocabulary training': 128, 'bounded': 32, 'saturated': 256,
-         'excluded': 32, 'token tiles': 16, 'both outputs': 64, 'gemma': 256, 'bf16 cotangent': 512,
+         'excluded': 32, 'token tiles': 16, 'both outputs': 64, 'gemma': 256, 'bf16 cotangent': 256,
          'whole logits': 512}
-"""Check 1's declared seeds for each site of the file, sized by `seeds_for` on each platform its suite
-runs on (armada; an A100 under JAX 0.12 for 'gemma', 256 at softcap 30, and 'bf16 cotangent', 512 at the
-first tile): the most any of a site's cases took."""
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` on each platform the site
+runs on, the most any of its cases took: on armada, and paired (Dew's arm as `dew_fn`) on an A100 under
+JAX 0.12 for 'bf16 cotangent', 256 at the first tile, and for 'gemma', which runs on a GPU alone, 256 at
+softcap 30."""
 
 
 @pytest.mark.parametrize('dtype', [jnp.float32, jnp.bfloat16])
@@ -1064,6 +1065,9 @@ TILE = (1024, 8192)
 """The tiled head's tile on the Gemma-sized vocabulary: 1024 tokens by 8192 columns."""
 
 
+# A Gemma-sized vocabulary's float64 truth over the seeds its softcapped cases need is numeric work at
+# model size, a GPU's: on a CPU each case takes about eleven minutes.
+@pytest.mark.gpu(reason="a Gemma-sized vocabulary's float64 truth at the seeds it needs")
 @pytest.mark.parametrize("softcap", [None, 30.0], ids=["plain", "softcap-30"])
 @pytest.mark.parametrize("chunks", [4, 16], ids=["4-chunks", "16-chunks"])
 def test_a_gemma_sized_vocabulary_is_as_exact_as_the_whole_logits(chunks, softcap):
