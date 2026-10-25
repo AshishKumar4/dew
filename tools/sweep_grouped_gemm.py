@@ -124,18 +124,22 @@ def main() -> None:
                 ba = launch.bind(*specs, **options)
                 if not launch.eligible(ba, target):
                     continue
-                # Each config's outputs from its first timed run (`tuning.measured`), checked with no compile.
-                outputs: dict = {}
-                timings = tuning.measured(launch, ba, arrays=list(call), outputs=outputs,
+                # Each config's outputs from its first timed run (`tuning.measured`), checked as they come,
+                # with no compile of their own and one config's outputs held at a time.
+                errors: dict[str, float] = {}
+
+                def check(config, got, want=want, errors=errors):
+                    got = np.asarray(got, np.float32)
+                    errors[repr(config)] = float(np.max(np.abs(got - want)) / np.max(np.abs(want)))
+
+                timings = tuning.measured(launch, ba, arrays=list(call), outputs=check,
                                           configs=sampled(launch, ba, target, args.sample))
-                times, failures, errors = {}, {}, {}
+                times, failures = {}, {}
                 for config, timing in timings.items():
                     if isinstance(timing, Exception):
                         failures[repr(config)] = f"{type(timing).__name__}: {str(timing)[:300]}"
                         continue
                     times[repr(config)] = statistics.median(timing.evaluation_times_ms)
-                    got = np.asarray(outputs.pop(config), np.float32)
-                    errors[repr(config)] = float(np.max(np.abs(got - want)) / np.max(np.abs(want)))
                 record = {"shape": name, "product": product, "implementation": launch.name,
                           "heuristic": repr(launch.estimate(ba, target)[1]), "times": times,
                           "failures": failures, "worst_error": max(errors.values(), default=None)}
