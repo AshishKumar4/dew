@@ -85,20 +85,17 @@ def as_upstream(request: dict) -> dict:
     return {**request, "questions": questions}
 
 
-def float64_twin(model_class, upstream, head, head_config: dict):
-    """The joint model's float64 truth: the backbone read from its fixture and the head built from its
-    config, both inside `float64`, so every table their constructors compute (Qwen 3.5's rotary
-    `inv_freq`) is float64's, where a float32 build cast afterwards keeps float32's; the head's weights
-    `head`'s, loaded strictly. Run it inside `float64` too."""
-    from torch_precision import float64
+def joint_twin(model_class, upstream, backbone, head, head_config: dict):
+    """The joint model's float64 truth: the backbone's and the head's each their float64 twin
+    (`torch_precision.float64_twin`), the backbone read from its fixture at float64 and the head built
+    from its config, each holding the float32 model's weights. Run it inside `float64` too."""
+    from torch_precision import float64_twin
     from transformers import Qwen3_5ForConditionalGeneration
 
-    with float64():
-        backbone = Qwen3_5ForConditionalGeneration.from_pretrained(BACKBONE, dtype=torch.float64,
-                                                                   attn_implementation="eager").eval()
-        wide_head = upstream.JointSchemaHead(**head_config).eval()
-    wide_head.load_state_dict(head.state_dict(), strict=True)
-    return model_class(backbone, wide_head).eval()
+    wide_backbone = float64_twin(backbone, lambda: Qwen3_5ForConditionalGeneration.from_pretrained(
+        BACKBONE, dtype=torch.float64, attn_implementation="eager"))
+    wide_head = float64_twin(head, lambda: upstream.JointSchemaHead(**head_config))
+    return model_class(wide_backbone, wide_head).eval()
 
 
 def main() -> None:
@@ -119,8 +116,7 @@ def main() -> None:
         head.prior_logit_scale.fill_(0.7)
         head.joint_logit_scale.fill_(1.3)
         head.residual_gate.fill_(-0.4)
-    model = model_class(backbone, head).eval()
-    exact = float64_twin(model_class, upstream, head, HEAD)
+    exact = joint_twin(model_class, upstream, backbone, head, HEAD)
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / "joint_head_config.json").write_text(json.dumps(HEAD, indent=1) + "\n")
     save_file({name: tensor.contiguous() for name, tensor in head.state_dict().items()},
@@ -239,7 +235,7 @@ def images() -> None:
     head = upstream.JointSchemaHead(**head_config).eval()
     head.load_state_dict(load_file(OUT / "joint_head.safetensors"), strict=True)
     model = model_class(backbone, head).eval()
-    exact = float64_twin(model_class, upstream, head, head_config)
+    exact = joint_twin(model_class, upstream, backbone, head, head_config)
     request = json.loads((ROOT / "tests" / "fixtures" / "laya" / "cases.json").read_text())["quickstart"]
     pictures = [Image.fromarray(array) for array in np.load(BACKBONE / "images.npy")]
     encoded = upstream.encode_record(processor.tokenizer, {**as_upstream(request), "images": pictures},

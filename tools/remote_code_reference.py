@@ -45,7 +45,7 @@ import torch
 import transformers
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file, save_file
-from torch_precision import float64
+from torch_precision import float64, float64_twin
 from transformers import AutoConfig
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
@@ -106,11 +106,11 @@ def main() -> None:
             ids = torch.from_numpy(np.load(FIXTURES / name / "input_ids.npy").astype(np.int64))
             with torch.no_grad():
                 fp32 = model.float()(input_ids=ids).logits.numpy()
-                # Built inside `float64` from the same weights, so the rotary tables its constructor
-                # computes are float64's (a float32 build cast afterwards keeps float32's, Dream's
-                # `inv_freq`), and run there, so a pin its forward carries widens too.
+                # Its float64 twin (`float64_twin`), so the rotary tables its constructor computes are
+                # float64's (a float32 build cast afterwards keeps float32's, Dream's `inv_freq`), run
+                # inside `float64`, so a pin its forward carries widens too.
+                wide = float64_twin(model, lambda: released_model(name, Path(scratch) / "f64"))
                 with float64():
-                    wide = released_model(name, Path(scratch) / "f64").double()
                     f64 = wide(input_ids=ids).logits.numpy()
             if arguments.check:
                 same = np.array_equal(np.load(FIXTURES / name / "logits.npy"), fp32)

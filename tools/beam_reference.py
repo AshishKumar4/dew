@@ -39,7 +39,7 @@ import torch
 import transformers
 import transformers.generation.utils as generation
 from numerics_reference import FIXTURES, decoder, prompts
-from torch_precision import float64
+from torch_precision import float64, float64_twin
 
 FAMILIES = ("llama-tiny", "qwen3-tiny")
 WIDTH, NEW_TOKENS = 3, 6
@@ -79,10 +79,9 @@ def searched(model, ids, mask, eos, pad, penalty, early, **shaping) -> tuple[np.
 
 def write(name: str) -> None:
     model = decoder(name, torch.float32)
-    # The float64 truth built and run inside `float64`: built outside it, its rotary table would be
-    # float32's, the `arange` its constructor pins.
-    with float64():
-        float64_model = decoder(name, torch.float64)
+    # The float64 truth, its twin (`float64_twin`), built and run inside `float64`: built outside it, its
+    # rotary table would be float32's, the `arange` its constructor pins.
+    float64_model = float64_twin(model, lambda: decoder(name, torch.float64))
 
     def exact(*arguments, **shaping):
         with float64():

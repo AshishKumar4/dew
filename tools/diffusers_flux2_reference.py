@@ -39,7 +39,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from diffusers_reference_helpers import perturb, recording, saved_pipeline, tiny_qwen3_encoder
-from torch_precision import float64
+from torch_precision import float64, float64_twin
 from reference_releases import RELEASES
 
 DIFFUSERS = RELEASES["diffusers-0.40"]["diffusers"]
@@ -76,23 +76,6 @@ def ids(rows: int, columns: int) -> tuple[torch.Tensor, torch.Tensor]:
     return text, image
 
 
-def wide_twin(model: torch.nn.Module) -> torch.nn.Module:
-    """`model`'s float64 truth: its class built from a copy of its config inside `float64`, through its
-    library's public construction (transformers' class from its config at float64, Diffusers'
-    `from_config`), so every table its constructor computes is float64's, where a float32 build cast
-    afterwards keeps float32's (the Qwen3 and Mistral-3 encoders' rotary `inv_freq`); its weights and
-    persistent buffers `model`'s, loaded strictly."""
-    config = copy.deepcopy(model.config)
-    with float64():
-        if hasattr(type(model), "from_config") and not hasattr(config, "to_dict"):
-            twin = type(model).from_config(config)
-        else:
-            config.dtype = torch.float64
-            twin = type(model)(config)
-    twin.load_state_dict(model.state_dict(), strict=True)
-    return twin.eval()
-
-
 def widened_walk(walk, model) -> dict[str, np.ndarray]:
     """`walk(model, torch.float64)` inside `float64`, the flow-matching scheduler's own tables widened
     around every call into it (`float64_scheduler`)."""
@@ -104,9 +87,9 @@ def widened_walk(walk, model) -> dict[str, np.ndarray]:
 
 
 def twice(walk, model) -> dict[str, np.ndarray]:
-    """`walk(model, dtype)` in float32 and, on `model`'s float64 twin (`wide_twin`), in float64 (`fp64.`)."""
+    """`walk(model, dtype)` in float32 and, on `model`'s float64 twin (`float64_twin`), in float64 (`fp64.`)."""
     narrow = walk(model, torch.float32)
-    wide = widened_walk(walk, wide_twin(model))
+    wide = widened_walk(walk, float64_twin(model))
     return {**narrow, **{f"fp64.{key}": value for key, value in wide.items()}}
 
 
@@ -306,11 +289,11 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
         return arrays
 
     narrow = walk(pipe, torch.float32)
-    # The pipeline's float64 run: each of its modules' float64 twin (`wide_twin`).
+    # The pipeline's float64 run: each of its modules' float64 twin (`float64_twin`).
     twin = copy.deepcopy(pipe)
     for name, component in pipe.components.items():
         if isinstance(component, torch.nn.Module):
-            setattr(twin, name, wide_twin(component))
+            setattr(twin, name, float64_twin(component))
     wide = widened_walk(walk, twin)
     print(f"pipeline: latents {narrow['latents.0'].shape} images {narrow['images.0'].shape}")
     return {"pipeline.x_T": latents.numpy(), **{f"pipeline.{key}": value for key, value in narrow.items()},

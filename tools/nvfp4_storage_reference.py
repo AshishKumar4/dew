@@ -35,7 +35,7 @@ from compressed_tensors.compressors.nvfp4.helpers import unpack_fp4_from_uint8
 from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme, QuantizationStatus
 from compressed_tensors.quantization.lifecycle.forward import dequantize, set_forward_quantized
 from compressed_tensors.quantization.utils.helpers import calculate_qparams, generate_gparam
-from torch_precision import float64
+from torch_precision import float64, float64_twin
 from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
 
@@ -123,14 +123,10 @@ def checkpoint(kind: str) -> None:
                                    global_scale=tensors[stem + ".weight_global_scale"], dtype=torch.float32)
             np.testing.assert_array_equal(unrounded.bfloat16().float().numpy(), decoded[name])
             decoded[name + "/unrounded"] = unrounded.numpy()
-    # The float64 truth read from the same files inside `float64`, so its rotary table is float64's (the
-    # float32 read cast afterwards keeps float32's); the weights it decodes, bf16 whatever the dtype
-    # asked, are promoted, which computes nothing a construction did, and take the float32 read's values.
-    with float64():
-        exact = AutoModelForCausalLM.from_pretrained(directory, dtype=torch.float64,
-                                                     attn_implementation="eager").eval()
-    torch.nn.Module.double(exact)
-    exact.load_state_dict(loaded.state_dict(), strict=True)
+    # The float64 truth read from the same files inside `float64` (`float64_twin`), so its rotary table is
+    # float64's (the float32 read cast afterwards keeps float32's), the float32 read's values in it.
+    exact = float64_twin(loaded, lambda: AutoModelForCausalLM.from_pretrained(
+        directory, dtype=torch.float64, attn_implementation="eager"))
     for module in exact.modules():
         module.quantization_enabled = False
     with float64(), torch.no_grad():
