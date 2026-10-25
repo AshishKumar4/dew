@@ -134,8 +134,9 @@ class DecisionRunConfig(RunConfig):
     reads no context."""
     context_length: int = 256
     """The most tokens of an example's context the cross-attention reads; an
-    example with a longer context refuses the run before it trains, as a request
-    with one is refused. With `context_layers` alone."""
+    example with a longer context refuses the run where its data reads it,
+    before training for data read into memory, as a request with one is
+    refused. With `context_layers` alone."""
     context_encoder: ContextEncoder = "table"
     """How a context becomes the states its cross-attention reads
     (`DecisionModel.context_encoder`): the backbone's token table, or the
