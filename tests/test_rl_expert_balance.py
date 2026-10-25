@@ -12,7 +12,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from flax.traverse_util import flatten_dict, unflatten_dict
+from moe_support import favour_expert_zero, uniform_gates
 
 from dew.data.preferences import IDS_KEY as PAIRS_KEY, MASK_KEY as PAIR_MASK_KEY
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -37,6 +37,9 @@ WIDTH = 9
 PAD = 4
 RATE = 0.05
 KINDS = ("grpo", "dpo", "ppo")
+CHAIN = np.arange(WIDTH) < WIDTH - 1
+"""The columns a row's chain fills: its last column is padding, so the chain's last token is an input the
+forward reads, which holds whether or not the row is padded after it (as an LM's shifted rows do)."""
 
 
 class Critic(nn.Module):
@@ -54,29 +57,12 @@ def routed(max_seq_len):
                                       "score_function": "softmax"})
 
 
-def skewed(variables, amount):
-    """`variables` with expert 0's balancing bias raised in every router, so every token favours it."""
-    moe = flatten_dict(variables["moe"])
-    moe = {path: leaf.at[0].add(amount) if path[-1] == "e_score_correction_bias" else leaf
-           for path, leaf in moe.items()}
-    return {**variables, "moe": unflatten_dict(moe)}
-
-
-def uniform(variables):
-    """`variables` with every router's gate at zero. Its scores are then the same for every token, so its
-    choice is its balancing bias alone, and no mask a microbatch draws can change what it counts."""
-    params = flatten_dict(variables["params"])
-    params = {path: jnp.zeros_like(leaf) if path[-2:] == ("gate", "kernel") else leaf
-              for path, leaf in params.items()}
-    return {**variables, "params": unflatten_dict(params)}
-
-
 def objective(kind, extra=0):
     """The `kind` objective over the routed decoder, balancing its routers, with rows `extra` columns
     wider than `WIDTH`. It starts from routers that favour expert 0 through their biases alone."""
     model = routed(WIDTH + extra)
     initial = routed(WIDTH).init(jax.random.key(0), jnp.zeros((1, WIDTH - 1), jnp.int32))
-    variables = uniform(skewed(initial, 1.0))
+    variables = uniform_gates(favour_expert_zero(initial, 1.0))
     balance = ExpertBalance(balance_rate=RATE, aux_loss_alpha=0.2)
     length = WIDTH - 1 + extra
     if kind == "grpo":
@@ -91,12 +77,14 @@ def step_for(variables):
 
 
 def chains(seed, rows, kind):
-    """Packed rows of one chain each, for GRPO and PPO: a prompt of `PROMPT` ids, then a completion."""
+    """Packed rows of one chain each, for GRPO and PPO: a prompt of `PROMPT` ids, then a completion, then
+    the row's padding column."""
     rng = np.random.default_rng(seed)
-    response = np.broadcast_to(np.arange(WIDTH) >= PROMPT, (rows, WIDTH)).astype(np.float32)
+    trained = (np.arange(WIDTH) >= PROMPT) & CHAIN
+    response = np.broadcast_to(trained, (rows, WIDTH)).astype(np.float32)
     batch = {
         IDS_KEY: rng.integers(0, VOCAB, size=(rows, WIDTH)).astype(np.int32),
-        SEGMENT_IDS_KEY: np.ones((rows, WIDTH), np.int32),
+        SEGMENT_IDS_KEY: np.broadcast_to(CHAIN.astype(np.int32), (rows, WIDTH)),
         POSITIONS_KEY: np.broadcast_to(np.arange(WIDTH, dtype=np.int32), (rows, WIDTH)),
         RESPONSE_MASK_KEY: response,
         ADVANTAGES_KEY: rng.normal(size=(rows, WIDTH)).astype(np.float32),
@@ -109,9 +97,10 @@ def chains(seed, rows, kind):
 
 
 def pairs(seed, rows):
-    """Preference pairs: `[rows, 2, WIDTH]` ids, the chosen half first, and each half's completion mask."""
+    """Preference pairs: `[rows, 2, WIDTH]` ids, the chosen half first, and each half's completion mask,
+    which leaves the row's padding column out as `chains` does."""
     rng = np.random.default_rng(seed)
-    completion = np.broadcast_to(np.arange(WIDTH) >= PROMPT, (rows, 2, WIDTH)).astype(np.float32)
+    completion = np.broadcast_to((np.arange(WIDTH) >= PROMPT) & CHAIN, (rows, 2, WIDTH)).astype(np.float32)
     return {PAIRS_KEY: rng.integers(0, VOCAB, size=(rows, 2, WIDTH)).astype(np.int32),
             PAIR_MASK_KEY: completion}
 
@@ -171,7 +160,7 @@ def test_a_policy_run_moves_each_balancing_bias_once_per_committed_update(kind):
 @pytest.mark.parametrize("kind", KINDS)
 @pytest.mark.parametrize("change", ["padding", "untrained"])
 def test_tokens_that_train_nothing_add_nothing_to_a_policy_runs_router_counts(kind, change):
-    """Padding after every chain counts exactly what the trained rows count, and a batch with no trained
+    """Padding after every row counts exactly what the trained rows count, and a batch with no trained
     token counts nothing, so the biases move exactly as they move for the trained rows alone (the
     invariant rows 17 and 18 hold for LM)."""
     obj = objective(kind)
