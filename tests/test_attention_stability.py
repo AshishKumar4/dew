@@ -491,7 +491,8 @@ def _families() -> dict[str, Family]:
         "ties at scale 1/4, cotangents near 2**125": Family(_ties(16, 2.0 ** 125), _kept(1, 2), folded=False),
         # The fold's divergences at extreme inputs, which run in the accurate form alone (docs/design/
         # kernel-templates.md, §3, the exponent's forms): a logit near fp32's largest, whose contracted
-        # weight is 0 or infinite; values near fp32's largest, whose weighted sum overflows; a sink there.
+        # weight is 0 or infinite; values near fp32's largest, whose weighted sum overflows where a walk
+        # does not guard its sums (every mainloop's default does, `overflows`); a sink there.
         "a logit near fp32's largest": Family(_near_max_logit(1), _kept(1, 1), folded=False),
         # Folded at scale 1/4, the backward takes the base-2 maximum back to natural units, which near fp32's
         # largest rounds the key's own weight away from 1, as at logits near 1e30.
@@ -712,26 +713,30 @@ def _differentiated(forward: Callable, backward: Callable) -> Callable:
     return attend
 
 
+def _differentiable(family: Family, forward: Callable, backward: Callable) -> Callable:
+    """A mainloop's `forward` and `backward` as `(query, key, value, extra) -> out` over `family`'s spans,
+    its derivative the mainloop's own backward, the sinks' or resumed state's gradient through the softmax's
+    initial state."""
+    def run(query, key, value, extra):
+        spans, hooks = _spans(family, query, key), _hooks(query, extra)
+
+        def ahead(query, key, value, initial):
+            return forward(query, key, value, spans, template.Hooks(initial=initial))
+
+        def back(query, key, value, initial, dout):
+            return backward(query, key, value, spans, template.Hooks(initial=initial), dout)
+
+        initial = None if hooks is None else hooks.initial
+        return _differentiated(ahead, back)(query, key, value, initial)
+    return run
+
+
 def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
     """Each template mainloop as `(query, key, value, extra) -> out` at the form `options` names (`ACCURATE`,
-    or none for the default), its derivative the mainloop's own backward, the sinks' or resumed state's
-    gradient through the softmax's initial state."""
+    or none for the default), its derivative the mainloop's own backward (`_differentiable`)."""
     forward_options = {name: value for name, value in options.items() if name in ("natural", "scale")}
     tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
-
-    def mainloop(forward: Callable, backward: Callable) -> Callable:
-        def run(query, key, value, extra):
-            spans, hooks = _spans(family, query, key), _hooks(query, extra)
-
-            def ahead(query, key, value, initial):
-                return forward(query, key, value, spans, template.Hooks(initial=initial))
-
-            def back(query, key, value, initial, dout):
-                return backward(query, key, value, spans, template.Hooks(initial=initial), dout)
-
-            initial = None if hooks is None else hooks.initial
-            return _differentiated(ahead, back)(query, key, value, initial)
-        return run
+    mainloop = functools.partial(_differentiable, family)
 
     def triton_forward(*operands):
         with tuning.pinned(PINS):
@@ -746,7 +751,7 @@ def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
 
     def mosaic_backward(query, key, value, spans, hooks, dout):
         # From the plain-JAX training forward's residuals, a guarded one's (the Triton forward walks without
-        # the guards, so an overflowing row's split sums would be infinite).
+        # the fold's reach, so a row past it would take the fold's divergence).
         residuals = attention_portable.attend(query, key, value, spans, hooks, **tiles, residuals=True,
                                               **forward_options)[1:]
         return attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
@@ -858,6 +863,28 @@ def test_the_frozen_triton_mainloops_default_is_finite_where_the_reference_is_at
     _default_is_finite(family, "triton")
 
 
+@pytest.mark.parametrize("family", [family for family in TEMPLATE_FAMILIES if FAMILIES[family].overflows])
+def test_the_frozen_triton_backward_reads_a_guarded_forwards_rows_whatever_its_pass(family):
+    """The Triton mainloop's default backward asked for its unsplit first pass (`split=False`) over sums that
+    pass fp32's largest, finite wherever the reference is: a guarded forward's live rows carry normalized
+    split sums, which only the split pass reads, so it takes that pass wherever the values can overflow
+    (`attention_triton.backward`), in either form."""
+    seeds, family_of = SEEDS[family], FAMILIES[family]
+
+    def forward(*operands):
+        with tuning.pinned(PINS):
+            return attention_triton.forward(*operands, interpret=True)
+
+    def backward(*operands):
+        with tuning.pinned(PINS):
+            return attention_triton.backward(*operands, interpret=True, split=False)
+
+    reference = jax.jit(with_gradients(_reference(family_of, anchored=False)))
+    unsplit = jax.jit(with_gradients(_differentiable(family_of, forward, backward)))
+    assert_finite(unsplit, reference, _cast(family_of, family_of.draw), f"triton unsplit {family_of.dtype}",
+                  seeds=seeds)
+
+
 def test_a_resumed_state_of_large_values_under_the_folds_guard_is_finite():
     """fp32, the default form: one query over one key of logit m0 = 24576.005859375 (folded below the fold's
     reach, `algebra.FOLD_REACH`, and naturalized back below m0), resumed from a state of maximum m0,
@@ -949,13 +976,12 @@ def _cache(array: jax.Array) -> jax.Array:
     return jnp.pad(array, ((0, 0), (0, slots), (0, 0), (0, 0)))
 
 
-@pytest.mark.parametrize("family, form", DECODED, ids=[f"{family}-{form}" for family, form in DECODED])
-def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, form):
-    """The decode kernel's output, interpreted, each row's keys the first `K` of its cache, check 1 over
-    the family's draws."""
-    seeds, family = SEEDS[family], FAMILIES[family]
-    natural = {} if FORMS[form] is None else {"natural": FORMS[form]}
+def _decoded(family: Family, natural: bool | None) -> tuple[Callable, Callable]:
+    """The decode kernel over `family`'s step, interpreted, each row's keys the first `K` of its cache, in
+    the form `natural` names (None, the default), and the family's draw without its cotangent (a decode step
+    has no backward)."""
     lengths = family.spans.get("lengths")
+    form = {} if natural is None else {"natural": natural}
 
     def decoded(query, key, value, sinks):
         count = np.full(query.shape[0], key.shape[1]) if lengths is None else lengths
@@ -963,12 +989,20 @@ def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, f
         pin = {decode_attention.DecodeAttention: decode_attention.Split(family.splits)}
         with generation.assumed("sm80"), tuning.pinned(pin):
             return decode_attention.attend(query, _cache(key), _cache(value), jnp.asarray(count, jnp.int32),
-                                           sinks=sinks, interpret=True, **natural)
+                                           sinks=sinks, interpret=True, **form)
 
     def forward(seed):
-        # A decode step has no backward: its draw without the cotangent.
         return _cast(family, family.draw)(seed)[:4]
 
+    return decoded, forward
+
+
+@pytest.mark.parametrize("family, form", DECODED, ids=[f"{family}-{form}" for family, form in DECODED])
+def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, form):
+    """The decode kernel's output, interpreted, each row's keys the first `K` of its cache, check 1 over
+    the family's draws."""
+    seeds, family = SEEDS[family], FAMILIES[family]
+    decoded, forward = _decoded(family, FORMS[form])
     assert_as_exact(jax.jit(decoded), jax.jit(_reference(family, anchored=False)), forward,
                     f"decode {form} {family.dtype}", seeds=seeds,
                     truth_fn=_reference(family, anchored=True))
@@ -984,17 +1018,7 @@ def test_decodes_default_is_finite_where_its_sums_pass_fp32s_largest(family):
     over the families whose weighted values' sums pass fp32's largest: it guards its sums' headroom in
     either form (`algebra.Forward.headroom`)."""
     seeds, family = SEEDS[family], FAMILIES[family]
-
-    def decoded(query, key, value, sinks):
-        count = np.full(query.shape[0], key.shape[1])
-        pin = {decode_attention.DecodeAttention: decode_attention.Split(family.splits)}
-        with generation.assumed("sm80"), tuning.pinned(pin):
-            return decode_attention.attend(query, _cache(key), _cache(value), jnp.asarray(count, jnp.int32),
-                                           sinks=sinks, interpret=True)
-
-    def forward(seed):
-        return _cast(family, family.draw)(seed)[:4]
-
+    decoded, forward = _decoded(family, None)
     assert_finite(jax.jit(decoded), jax.jit(_reference(family, anchored=False)), forward,
                   f"decode default {family.dtype}", seeds=seeds)
 
