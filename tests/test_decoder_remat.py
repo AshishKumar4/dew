@@ -99,8 +99,9 @@ STEP_SEEDS = 8
 """Check 1's declared seeds for a recomputed block's committed step against the plain block's (`seeds_for`,
 paired: both arms are one decoder's arithmetic, saved or recomputed), and for its forward."""
 
-MLA_STEP_SEEDS = 16
-"""The latent-attention block's step, unscanned, sized at 16 (`seeds_for`, paired)."""
+SIZED_STEP_SEEDS = {("mla", False): 16, ("altup", True): 128}
+"""The steps that size past STEP_SEEDS (`seeds_for`, paired): the latent-attention block unscanned, and
+the scanned AltUp block, whose initialized draws (zero momentum) spread its step's error wider."""
 
 
 def wide_step(model):
@@ -113,8 +114,9 @@ def drawn_steps(plain, stepped, *, routed: bool, within=contextlib.nullcontext, 
     optimizer state, the batch and the step's key. An even seed's decoder is initialized, its momentum
     zero; an odd seed's has taken one plain step under its own key, its momentum a step's. A routed
     decoder takes the seed's first draw whose routing clears `selection_margins.MARGIN` in the step's
-    own training forward (its dropout, its prediction depth, `within` the step's context on the
-    inputs as `place` lays them out), so its float32 runs and its float64 run route alike; routing
+    own training forward (its dropout, its prediction depth) and in the inference forward the forward
+    check reads, each `within` the step's context on the inputs as `place` lays them out, so its
+    float32 runs and its float64 run route alike; routing
     near a tie is the router's own tests'. `stepped` is `training_step(plain)`, compiled once for the
     draws and the reference arm."""
     run, solver = stepped
@@ -123,7 +125,9 @@ def drawn_steps(plain, stepped, *, routed: bool, within=contextlib.nullcontext, 
     objective = objective_for(plain)
     scored = jax.jit(lambda variables, tokens, key: objective.token_scores(
         variables, tokens, train=True, rngs=model_rngs(key, training=True), routing=True,
-        depths=objective.mtp_weight is not None, qk_stats=objective.qk_stats).sown)
+        depths=objective.mtp_weight is not None, qk_stats=objective.qk_stats).routing)
+    inferred = jax.jit(lambda variables, tokens: objective.token_scores(
+        variables, tokens, routing=True).routing)
 
     def phase(primed: bool):
         def keyed(seed):
@@ -140,12 +144,13 @@ def drawn_steps(plain, stepped, *, routed: bool, within=contextlib.nullcontext, 
         variables, _, tokens, key = inputs
         laid = (variables, tokens) if place is None else place(variables, tokens)
         with within():
-            sown = scored(laid[0], laid[1]["text"], jax.random.wrap_key_data(key))
-        return selection_margins.routing_margin(jax.device_get(sown), variables.get("moe", {}), 2) \
-            >= selection_margins.MARGIN
+            sown = [scored(laid[0], laid[1]["text"], jax.random.wrap_key_data(key)),
+                    inferred(laid[0], laid[1]["text"])]
+        return all(selection_margins.routing_margin(jax.device_get(one), variables.get("moe", {}), 2)
+                   >= selection_margins.MARGIN for one in sown)
 
     initial, primed = phase(primed=False), phase(primed=True)
-    return lambda seed: (primed if seed % 2 else initial)(seed // 2)
+    return lambda seed: (primed if seed % 2 else initial)(seed)
 
 
 def committed(step):
@@ -189,7 +194,7 @@ def test_recomputed_blocks_train_the_same_model(shape, scan):
                     truth_fn=jax.jit(lambda variables, *_: wide.apply(variables, ids)))
     assert_as_exact(without_ynn(committed(rerun)), without_ynn(committed(run)), draw,
                     f"a recomputed {shape} block's step, scan {scan}",
-                    seeds=MLA_STEP_SEEDS if shape == "mla" and not scan else STEP_SEEDS,
+                    seeds=SIZED_STEP_SEEDS.get((shape, scan), STEP_SEEDS),
                     truth_fn=committed(wide_step(plain)))
     moved, state, tokens, key = draw(0)
     key = jax.random.wrap_key_data(key)

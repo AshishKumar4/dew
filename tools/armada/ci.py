@@ -508,6 +508,21 @@ def policy(base: str) -> str:
     return "on"
 
 
+def borrowed(timings: dict, python: str) -> dict:
+    """`timings` with each file's and row's time `python` has none of taken from another Python's
+    (the most of theirs): 3.14 runs every file only on the daily run, and a file weighed by its
+    tests' least recorded times instead is dispatched late by armada's longest-first order (train
+    143: 3.14 tasks of 500-800 s started 550-760 s into the run)."""
+    def filled(times: dict) -> dict:
+        others: dict[str, float] = {}
+        for name, seconds in times.items():
+            other, rest = name.split(":", 1)
+            if other != python and f"{python}:{rest}" not in times:
+                others[f"{python}:{rest}"] = max(seconds, others.get(f"{python}:{rest}", 0.0))
+        return {**times, **others}
+    return {**timings, **{key: filled(timings.get(key, {})) for key in ("files", "rows")}}
+
+
 def plan(target: float, timings: dict) -> list[dict]:
     """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has
     timed runs alone, so however long it takes it holds up no other file, and its time is known from
@@ -521,6 +536,7 @@ def plan(target: float, timings: dict) -> list[dict]:
         # Every file on every Python daily; on a pushed run the newest takes `NEWEST_FILES` whole.
         whole = python == PYTHONS[0] or cache == "off"
         files = every if whole else [name for name in every if name in NEWEST_FILES]
+        timings = borrowed(timings, python)
         timed = weights(files, timings, python)
         tasks: list[tuple[list[str], str, float]] = [
             ([name], "", target) for name, seconds in timed.items() if seconds is None]

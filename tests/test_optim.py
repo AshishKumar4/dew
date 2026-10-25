@@ -18,8 +18,8 @@ import optax
 import pytest
 from jax.extend.core import ClosedJaxpr, Jaxpr, Literal
 from jax.sharding import NamedSharding, PartitionSpec as P
-from learning_gate import assert_learns, within
 from model_support import largest_difference
+from optim_support import LR, decoder_params, drawn_tree
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference, equations, without_ynn
 
 from dew.config import OptimConfig
@@ -46,8 +46,6 @@ from dew.optim import (
 from dew.training import MeshSpec
 from tools.muonclip_reference import clip_mla_reference, clip_qk_kernel, clip_scale
 
-LR = 1e-3
-
 
 @pytest.mark.parametrize("warmup, updates", [(3, 3), (5, 3)])
 def test_cosine_names_the_warmup_and_decay_horizon_it_cannot_fit(warmup, updates):
@@ -60,13 +58,6 @@ def test_cosine_uses_its_explicit_horizon_when_the_run_has_no_step_cap():
     np.testing.assert_array_equal([float(schedule(i)) for i in (0, 2, 4)], [0, 1, 0])
     with pytest.raises(ValueError):
         Cosine(peak_value=1.0, warmup_steps=2).schedule(None)
-
-
-def decoder_params():
-    model = CausalTransformer(
-        vocab_size=64, emb_features=32, num_layers=2, num_heads=2, num_kv_heads=1,
-        mlp_features=64, max_seq_len=8, tie_embeddings=False)
-    return model.init(jax.random.key(0), jnp.ones((1, 8), jnp.int32))
 
 
 def dit_params():
@@ -104,17 +95,6 @@ def at(tree, path):
 UPDATE_SEEDS = 8
 """Check 1's declared seeds for a group's update against optax's transform on the parameter alone
 (`seeds_for`)."""
-
-
-def drawn_tree(params, seed):
-    """`params`'s tree drawn afresh for a seed, its parameters and a gradient of each, both standard
-    normal scaled as the decoder's own init and its gradients run (a gradient a hundredth)."""
-    keys = iter(jax.random.split(jax.random.key(seed), 2 * len(jax.tree.leaves(params))))
-
-    def normal(scale):
-        return lambda leaf: np.asarray(scale * jax.random.normal(next(keys), leaf.shape, leaf.dtype))
-
-    return jax.tree.map(normal(1.0), params), jax.tree.map(normal(1e-2), params)
 
 
 def assert_updates_as(solver, reference, params, paths, label, *, flatten=None, seeds=UPDATE_SEEDS):
@@ -837,106 +817,6 @@ def test_policy_steps_carry_live_qk_statistics_to_muonclip(kind):
         before = start["layers_0"]["self_attn"][name]["kernel"]
         updated = np.asarray(after["params"]["layers_0"]["self_attn"][name]["kernel"])
         assert np.linalg.norm(updated) < np.linalg.norm(before)
-
-
-# --- bf16 optimizer state ---------------------------------------------------
-
-def bf16_state_adamw(**kwargs):
-    return OptimConfig(optimizer='adamw', learning_rate=LR, weight_decay=0.0,
-                                       state_dtype='bfloat16', **kwargs).build(10)
-
-
-BF16_SECOND_SEEDS = 16
-"""Check 1's declared seeds for the bf16 state's second step against optax's from its moments
-(`seeds_for`, paired)."""
-
-
-def test_bf16_state_takes_optax_adamw_steps_from_the_fp32_moments():
-    """The update is computed from the fp32 moments before they are rounded.
-    The first starts from zero moments, which bf16 holds exactly, so it is
-    the fp32-state AdamW update (`OPTIMIZER_MAP`), its options (nesterov,
-    eps_root, b2) included; the second is AdamW's update from the bf16 state's
-    own moments, widened. Each over drawn parameters and gradients, on par
-    with optax's (check 1), its truth optax's float64 run from the same
-    moments. What the state stores is each fp32 moment of the independent
-    fp32-state run rounded to one of its two bf16 neighbours, entry for
-    entry: from zero moments both runs compute each moment by the same
-    products and nothing added, which no contraction can fuse otherwise, so
-    the storage is held exactly; with the second step's arithmetic it holds
-    the second update within the storage's rounding of the fp32 run's."""
-    opts = {'nesterov': True, 'eps_root': 1e-8}
-    reference = OPTIMIZER_MAP['adamw'](LR, b2=0.99, weight_decay=0.0, **opts)
-    solver = bf16_state_adamw(b2=0.99, optimizer_opts=opts)
-    first = jax.jit(lambda grads, params: solver.update(grads, solver.init(params), params)[1])
-
-    def draw(seed):
-        params, grads = drawn_tree(decoder_params(), seed)
-        moments = first(grads, params).inner_state[0]
-        # The bf16 state's moments after one step, widened exactly, and its count.
-        return params, grads, np.asarray(moments.count), *(jax.tree.map(
-            lambda leaf: np.asarray(leaf, np.float32), tree) for tree in (moments.mu, moments.nu))
-
-    def second(params, grads, count, mu, nu):
-        state = first(grads, params)
-        update, after = solver.update(grads, state, params)
-        for held in (state, after):
-            moments = held.inner_state[0]
-            assert {leaf.dtype for leaf in jax.tree.leaves((moments.mu, moments.nu))} == {
-                jnp.dtype(jnp.bfloat16)}
-        return update
-
-    def from_moments(params, grads, count, mu, nu):
-        state = reference.init(params)
-        adam = state[0]._replace(count=jnp.asarray(count), mu=mu, nu=nu)
-        return reference.update(grads, (adam, *state[1:]), params)[0]
-
-    def fresh(params, grads, *_):
-        return reference.update(grads, reference.init(params), params)[0]
-
-    assert_as_exact(jax.jit(lambda params, grads, *_: solver.update(grads, solver.init(params), params)[0]),
-                    jax.jit(fresh), draw, "the bf16 state's first step", seeds=UPDATE_SEEDS, truth_fn=fresh)
-    assert_as_exact(second, jax.jit(from_moments), draw, "the bf16 state's second step",
-                    seeds=BF16_SECOND_SEEDS, truth_fn=from_moments)
-
-    params, grads = drawn_tree(decoder_params(), 0)
-    stored = first(grads, params).inner_state[0]
-    exact = reference.update(grads, reference.init(params), params)[1][0]
-    for name in ("mu", "nu"):
-        for moment, held in zip(jax.tree.leaves(getattr(exact, name)), jax.tree.leaves(getattr(stored, name)),
-                                strict=True):
-            bits = np.asarray(moment, np.float32).view(np.uint32)
-            # bf16 keeps a float32's top 16 bits: the neighbour toward zero drops the rest, the one
-            # away from zero is the next, and a moment bf16 holds exactly has only itself.
-            toward = bits & np.uint32(0xFFFF0000)
-            away = np.where(bits & np.uint32(0xFFFF), toward + np.uint32(0x10000), toward)
-            kept = np.asarray(held, np.float32).view(np.uint32)
-            assert np.all((kept == toward) | (kept == away)), name
-
-
-def test_bf16_state_keeps_the_second_moments_small_increments():
-    """At b2 = 0.999 an increment of the second moment is under half a bf16
-    spacing, which round to nearest drops every step: nu started at 1 would
-    never decay. The stochastic rounding keeps each increment in expectation,
-    so the mean over many entries follows the fp32 moment."""
-    params = {'w': jnp.zeros((8192,), jnp.float32)}
-    grads = {'w': jnp.full((8192,), 1e-3, jnp.float32)}
-    reference, solver = optax.scale_by_adam(), bf16_state_adamw()
-    expected = reference.init(params)
-    expected = expected._replace(nu={'w': jnp.ones(8192, jnp.float32)})
-    state = solver.init(params)
-    moments = state.inner_state[0]._replace(nu={'w': jnp.ones(8192, jnp.bfloat16)})
-    state = state._replace(inner_state=(moments, *state.inner_state[1:]))
-    reference_update, solver_update = jax.jit(reference.update), jax.jit(solver.update)
-    for _ in range(1000):
-        _, expected = reference_update(grads, expected, params)
-        _, state = solver_update(grads, state, params)
-    want = float(expected.nu['w'][0])
-    assert want < 0.4
-    # Each entry's rounding is its own draw: over the entries, their mean within a hundredth of the fp32
-    # moment (the learning gate's two one-sided contrasts, each entry a unit).
-    entries = np.asarray(state.inner_state[0].nu['w'], np.float64)
-    assert_learns(lambda numbers: within("the second moment", entries[numbers], want, 1e-2 * want),
-                  "stochastically rounded second moments", units=entries.size)
 
 
 def program_of(closed) -> tuple:
