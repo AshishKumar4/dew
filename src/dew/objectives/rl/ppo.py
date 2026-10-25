@@ -3,6 +3,7 @@
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -49,6 +50,9 @@ from .sessions import (
     SESSION_INDEX_KEY,
     TOKEN_REWARDS_KEY,
 )
+
+if TYPE_CHECKING:
+    from dew.objectives.base import SavedTask, Task
 
 OLD_VALUES_KEY = "old_values"
 RETURNS_KEY = "returns"
@@ -187,8 +191,9 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         return self.actor.recorded_model()
 
     def build_task(self, variables: Variables, *,
-                   processor: Processor | None | Omitted = OMITTED) -> TextGeneration:
-        """Return the trained actor as a `TextGeneration`, without the critic or the frozen KL reference."""
+                   processor: Processor | None | Omitted = OMITTED) -> "Task | SavedTask":
+        """Return the trained actor's task, its `TextGeneration`, without the critic or the frozen KL
+        reference."""
         return self.actor.build_task(part(variables, "policy"), processor=processor)
 
     def values(self, variables: Variables, batch: Mapping[str, object]) -> jax.Array:

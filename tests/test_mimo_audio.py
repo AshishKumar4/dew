@@ -146,7 +146,7 @@ def test_the_code_encoder_in_bf16_rounds_as_its_qwen2_reference_does():
     from transformers import Qwen2Config, Qwen2Model
     from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     config, variables, refs = load()
     audio = json.loads((FIXTURE / "config.json").read_text())["audio_config"]

@@ -136,7 +136,7 @@ def author_weight(stored: dict[str, torch.Tensor], stem: str) -> torch.Tensor:
 
 
 def tiny(*, mixed: bool = False) -> None:
-    from diffusers_wan_reference import float64
+    from torch_precision import float64
 
     torch.manual_seed(2049)
     config = Qwen3Config(vocab_size=96, hidden_size=64, intermediate_size=128, num_hidden_layers=1,
