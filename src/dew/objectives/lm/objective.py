@@ -451,10 +451,11 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
     `Objective.bind_model`), the row length `seq_len`, and how the head is
     scored: `head_chunks` and `head_tile`, the head policy every token objective takes
     (`dew.objectives.lm.head`; `LMObjective` describes each).
-    `samples` draws previews. A loss built on it keeps no average unless it
-    sets `ema`; `LMObjective` adds the language-model
-    terms and loss, and the options only they read, `pad_id` and
-    `token_accuracy`.
+    `samples` draws previews. `balance` trains the routers of a mixture as
+    `ExpertBalance` describes (`dew.objectives.routing`), which every scorer
+    composes. A loss built on it keeps no average unless it sets `ema`;
+    `LMObjective` adds the language-model terms and loss, and the options
+    only they read, `pad_id` and `token_accuracy`.
     """
 
     saved_task = TextGeneration
@@ -499,6 +500,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
     def __init__(self, model, seq_len: int, *, head_chunks: int = 4,
                  head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
                  samples: Samples | None = None, variables: Variables | None | Omitted = OMITTED,
+                 balance: ExpertBalance | None = None,
                  processor: Processor | None | Omitted = OMITTED):
         """Bind the decoder and set how its tokens are scored; the class docstring describes each argument."""
         model = self.bind_model(model, variables=variables, processor=processor)
@@ -507,9 +509,18 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         self.seq_len = seq_len
         self.use_head(head_chunks, head_tile)
         self.samples = samples
+        self.balance = balance
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len + 1,)))
         if samples is not None and samples.max_new_tokens > 0:
             self._prompt = prompt_batch(samples.prompt)
+
+    def reduce_loss(self, stats: Ratio | RoutedStatistics) -> tuple[jax.Array, jax.Array]:
+        """The objective value of the statistics, with the router terms `balance` adds (`reduce_routed`)."""
+        return reduce_routed(self.balance, stats)
+
+    def apply_effects(self, variables: Variables, effects: Variables) -> Variables:
+        """`variables` with the router counts `balance` took applied, once per committed update."""
+        return apply_routed(self.balance, variables, effects)
 
     def _missing_flops(self, model) -> str | None:
         """What the forward and training counts both lack, or None."""
@@ -1117,7 +1128,7 @@ class LMObjective(TokenScorer):
     ):
         """Build the objective; the class docstring describes each argument."""
         super().__init__(model, seq_len, head_chunks=head_chunks, head_tile=head_tile, samples=samples,
-                         variables=variables, processor=processor)
+                         variables=variables, balance=balance, processor=processor)
         self.pad_id = pad_id
         self.token_accuracy = token_accuracy
         refuse_prefix(self.model, prefix, longest=seq_len)
@@ -1126,7 +1137,6 @@ class LMObjective(TokenScorer):
                              "blocks beyond its own source, so mtp_weight is refused with prefix")
         self.prefix = prefix
         _check_terms(self.model, mtp_weight=mtp_weight, z_loss=z_loss)
-        self.balance = balance
         self.loss_role = loss_role
         self.mtp_weight = mtp_weight
         self.z_loss = z_loss
@@ -1328,22 +1338,14 @@ class LMObjective(TokenScorer):
         if balance is not None:
             queries = (self._query_weights(prepared, bool)
                        & (self.row_weights(batch, weights.shape[0]) > 0)[:, None])
-            statistics, balanced = balance.terms(prediction, routing or {}, batch, queries,
-                                                 prepared.token_fields)
-            effects, load = balance.effects(params, routing or {}, queries, prepared.token_fields)
-            reported.update(balanced)
-            reported.update(load)
+            statistics, effects, metrics = balance.compose(
+                params, prediction, routing or {}, batch, queries, prepared.token_fields)
+            reported.update(metrics)
         if step.qk_stats:
             peak = _global_qk_max(qk)
             if peak is not None:
                 reported["qk/max_logit"] = peak
         return statistics, Aux(reported, qk_stats=qk, effects=effects), scores
-
-    def reduce_loss(self, stats: Ratio | RoutedStatistics) -> tuple[jax.Array, jax.Array]:
-        return reduce_routed(self.balance, stats)
-
-    def apply_effects(self, variables: Variables, effects: Variables) -> Variables:
-        return apply_routed(self.balance, variables, effects)
 
     def evaluate(self, params, batch, step: Step):
         """Score the complete batch teacher-forced, using EMA when present; the

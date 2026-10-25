@@ -30,6 +30,7 @@ from dew.objectives.base import (
     projected_draw,
     projected_parts,
 )
+from dew.objectives.routing import RoutedStatistics
 from dew.rl.advantage import gae_advantages, masked_whiten
 from dew.rl.surrogate import clipped_value_loss_terms
 from dew.sampling.text import Generation, Sampling
@@ -92,9 +93,10 @@ class _Policy:
 
 @struct.dataclass
 class PPOStatistics:
-    """The actor's loss statistics and the critic's independently normalized value error."""
+    """The actor's loss statistics, with the router terms its policy adds where it balances, and the
+    critic's independently normalized value error."""
 
-    actor: Ratio
+    actor: Ratio | RoutedStatistics
     critic: Ratio
 
 
@@ -108,7 +110,7 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
 
     The policy is a `GRPOObjective` built from `model`, `seq_len` and the
     remaining keyword arguments, so its aggregation, sequence masks, `beta`
-    and clip settings work as they do there. The critic always averages
+    and clip settings, and its `balance`, work as they do there. The critic always averages
     over the response tokens, independently of the actor's weighting.
     `value_coefficient` weights verl's half-squared, clipped value error, and
     `value_clip` is that error's clip range.
@@ -240,16 +242,22 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         qk = None if aux.qk_stats is None else {"policy": aux.qk_stats}
         if critic_qk is not None:
             qk = {**(qk or {}), "critic": critic_qk}
-        return PPOStatistics(pg, critic), Aux(metrics, qk_stats=qk)
+        return PPOStatistics(pg, critic), Aux(metrics, qk_stats=qk, effects=aux.effects)
 
     def reduce_loss(self, stats: PPOStatistics | Ratio) -> tuple[jax.Array, jax.Array]:
         """Combine the independently normalized actor and weighted critic losses, or the validation NLL."""
         if isinstance(stats, Ratio):
             return stats.mean()
-        actor, _ = stats.actor.mean()
+        actor, actor_active = self.actor.reduce_loss(stats.actor)
         critic, _ = stats.critic.mean()
-        support = stats.actor.mass + self.value_coefficient * stats.critic.mass
-        return actor + self.value_coefficient * critic, support > 0
+        critic_active = self.value_coefficient * stats.critic.mass > 0
+        return actor + self.value_coefficient * critic, actor_active | critic_active
+
+    def apply_effects(self, variables: Variables, effects: Variables) -> Variables:
+        """The policy's router counts applied (`GRPOObjective.apply_effects`), in the policy's own
+        collections and the critic's left as they are."""
+        policy = self.actor.apply_effects(part(variables, "policy"), effects)
+        return {name: {**variables[name], "policy": tree} for name, tree in policy.items()}
 
     def validation_loss(self, variables: Variables, batch, step: Step):
         """Score source prompts under the live actor, without rollout targets or the critic."""

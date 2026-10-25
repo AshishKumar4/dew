@@ -203,10 +203,9 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
             rows = tokens.shape[0]
             queries = real_slots(fields, tokens.shape) & (self.row_weights(batch, rows) > 0)[:, None]
             routing = sown.get(ROUTER_COLLECTION, {})
-            statistics, balanced = self.balance.terms(prediction, routing, batch, queries, fields)
-            effects, load = self.balance.effects(params, routing, queries, fields)
-            reported.update(balanced)
-            reported.update(load)
+            statistics, effects, metrics = self.balance.compose(
+                params, prediction, routing, batch, queries, fields)
+            reported.update(metrics)
         qk = sown.get("qk", {}) if step.qk_stats else None
         return statistics, Aux(metrics=reported, qk_stats=qk, effects=effects), TokenScores(
             losses * weights, real.astype(losses.dtype), correct)

@@ -5,7 +5,7 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
-- A run trains its routers by one policy, `dew.objectives.routing.ExpertBalance`, which `LMObjective` and `MaskedDiffusionObjective` take as `balance`: the aux-loss-free balancing bias (`balance_rate`), DeepSeek V2's balance loss (`aux_loss_alpha`, `seq_aux`) and ST-MoE's router z-loss (`router_z_loss`), each optional. The policy adds its terms to the loss statistics and its bias counts to the step's effects, and the commit applies the counts once per update. `LMObjective`'s four balance arguments are replaced by `balance`, and a recorded run's four read as one `balance` record. A masked-diffusion run balances the routers of an LLaDA-MoE mixture as an LM does. The RL and decision objectives do not take the policy yet.
+- A run trains its routers by one policy, `dew.objectives.routing.ExpertBalance`, which `LMObjective`, `MaskedDiffusionObjective`, `GRPOObjective` and `DPOObjective` take as `balance`, and `PPOObjective` takes through its policy: the aux-loss-free balancing bias (`balance_rate`), DeepSeek V2's balance loss (`aux_loss_alpha`, `seq_aux`) and ST-MoE's router z-loss (`router_z_loss`), each optional. The policy adds its terms to the loss statistics and its bias counts to the step's effects, and the commit applies the counts once per update. `LMObjective`'s four balance arguments are replaced by `balance`, and a recorded run's four read as one `balance` record. A masked-diffusion run balances the routers of an LLaDA-MoE mixture as an LM does. A GRPO, DPO or PPO run counts the response tokens its loss trains, and a DPO pair's two halves both count. The decision objectives do not take the policy yet.
 - Every token objective runs its vocabulary head by one policy (`dew.objectives.lm.head.HeadedObjective`):
   the masked- and block-diffusion objectives take `head_chunks` and `head_tile` as an LM's, keep the whole
   logits where they fit, and the fit ladder tiles them where they do not, where they scored a fixed
@@ -20,9 +20,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   block an attention chunk cuts is refused where no trunk layer reads it whole.
 - MuonClip clips the attention of whatever objective a run trains, or refuses it: a run whose optimizer
   holds a QK-Clip (`dew.optim.clips_qk`, its state a `QKClipState`) asks its objective for the step's
-  attention logit maxima (`Step.qk_stats`), so a masked-diffusion run clips as an LM, RL or preference
-  run does, and the run refuses a step whose objective returns none, where a decision or block-diffusion
-  run trained unclipped with no sign of it. `LMObjective`'s, `TokenScorer`'s and the RL objectives' `qk_stats`
+  attention logit maxima (`Step.qk_stats`), so a masked- or block-diffusion run clips as an LM, RL or preference
+  run does, and the run refuses a step whose objective returns none, where a decision run trained unclipped
+  with no sign of it. `LMObjective`'s, `TokenScorer`'s and the RL objectives' `qk_stats`
   argument is removed: the run asks for them.
 - A filtered or packed read resumes on any number of readers once it is prepared: publish its rows (and
   a terminal pack's plan) as a generation with `dew data publish` and read it by index, and a new run
