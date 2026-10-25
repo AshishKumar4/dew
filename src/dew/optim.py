@@ -342,6 +342,114 @@ def _muonclip_groups(learning_rate, qk_clip_threshold: float = 100.0, **opts):
         scale_by_qk_clip(qk_clip_threshold))
 
 
+class M3State(NamedTuple):
+    """`scale_by_m3`'s state: the updates made so far, the fast momentum `M1`, the second moment `V`, the slow
+    momentum `M2`, the gradients of the chunk in progress summed, and `M2` orthogonalized as the chunk
+    began, `O2`."""
+    updates: jax.Array
+    fast: optax.Updates
+    second: optax.Updates
+    slow: optax.Updates
+    chunk: optax.Updates
+    slow_direction: optax.Updates
+
+
+def scale_by_m3(*, beta1: float, beta2: float, beta3: float, alpha: float, eps: float, frequency: int,
+                ns_steps: int = 5, weight_dimension_numbers=None) -> optax.GradientTransformation:
+    """Multi-scale Momentum Muon, M3 (Behrouz et al., Nested Learning, arXiv 2512.24695, Algorithm 1):
+    the direction `(O1 + alpha O2) / sqrt(V + eps)`, which `optax.scale_by_learning_rate` steps by.
+
+    Each update adds `beta1 g` to the fast momentum `M1` and `beta2 g**2` to the second moment `V`, the
+    algorithm's sums, neither decaying, and orthogonalizes `M1` by `ns_steps` Newton-Schulz iterations,
+    Muon's (`optax.contrib.scale_by_muon`, its momentum off, shaping each leaf by
+    `weight_dimension_numbers` as Muon does; every leaf is a matrix where they are None). Once every
+    `frequency` updates the slow momentum `M2` adds `beta3` times the chunk's gradients and is
+    orthogonalized, `O2`, which the next chunk's updates read: the first chunk's is zero. The algorithm's
+    sum, over `i = (k-1) f .. k f`, and eq. 75's, over `i = t - C .. t`, each hold f + 1 gradients, the one
+    at a chunk's boundary in two chunks; here each enters `M2` once, with its own chunk's. The paper states
+    no values for its factors, so each is the caller's.
+    """
+    if frequency < 1:
+        raise ValueError(f"M3 updates its slow momentum once every `frequency` updates, got {frequency}")
+    orthogonal = optax.contrib.scale_by_muon(ns_steps=ns_steps, beta=0.0, nesterov=False,
+                                             weight_dimension_numbers=weight_dimension_numbers)
+
+    def orthogonalized(moment):
+        return orthogonal.update(moment, orthogonal.init(moment))[0]
+
+    def init_fn(params) -> M3State:
+        zeros = optax.tree.zeros_like(params)
+        return M3State(jnp.zeros([], jnp.int32), zeros, zeros, zeros, zeros, zeros)
+
+    def update_fn(updates, state, params=None):
+        del params
+        count = jnp.asarray(optax.safe_increment(state.updates))
+        fast = jax.tree.map(lambda moment, gradient: moment + beta1 * gradient, state.fast, updates)
+        second = jax.tree.map(lambda moment, gradient: moment + beta2 * jnp.square(gradient), state.second,
+                              updates)
+        direction = jax.tree.map(lambda fast, slow, second: (fast + alpha * slow) / jnp.sqrt(second + eps),
+                                 orthogonalized(fast), state.slow_direction, second)
+        chunk = jax.tree.map(jnp.add, state.chunk, updates)
+
+        def closed(chunk):
+            slow = jax.tree.map(lambda moment, summed: moment + beta3 * summed, state.slow, chunk)
+            return slow, optax.tree.zeros_like(chunk), orthogonalized(slow)
+
+        # The slow momentum and its orthogonalization run once a chunk, not every update.
+        slow, chunk, slow_direction = jax.lax.cond(
+            count % frequency == 0, closed, lambda chunk: (state.slow, chunk, state.slow_direction), chunk)
+        return direction, M3State(count, fast, second, slow, chunk, slow_direction)
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+class DeltaState(NamedTuple):
+    """`delta_gradient_descent`'s state: the updates made so far, which a scheduled rate reads."""
+    updates: jax.Array
+
+
+def delta_gradient_descent(learning_rate: float | optax.Schedule) -> optax.GradientTransformationExtraArgs:
+    """Delta gradient descent (Behrouz et al., Nested Learning, arXiv 2512.24695, eqs. 56-57): each
+    matrix steps to the minimizer of `|W x - u|**2 / 2 + |W - W_t|**2 / (2 eta)`, where `x` is the step's
+    input and `u = -dL/dy` its output's negative gradient, so the step forgets what `W_t` held along `x`.
+
+    By Sherman-Morrison the minimizer is `W_t (I - eta' x x^T) - eta' dL/dW` with
+    `eta' = eta / (1 + eta |x|**2)`, the paper's `eta / (1 + eta)` at its normalized `|x| = 1`. A kernel
+    holds its input on axis 0, as a Linen kernel does (`y = x K`), so its step is
+    `-eta' (x (x^T K) + dL/dK)` over its other axes. The update takes `inputs`, a tree of `x` per leaf,
+    the parameters' structure with None where a leaf has none: that leaf steps by gradient descent, the
+    rule at `x = 0`. An update given no inputs, or no parameters, is refused rather than run as plain
+    gradient descent.
+    """
+
+    def init_fn(params) -> DeltaState:
+        del params
+        return DeltaState(jnp.zeros([], jnp.int32))
+
+    def update_fn(updates, state, params=None, *, inputs=None, **extra_args):
+        # A chain hands every transform each extra argument; the others' are not this one's.
+        del extra_args
+        if params is None or inputs is None:
+            raise ValueError("delta gradient descent steps by each matrix's input and its weights: an update "
+                             "takes `params` and `inputs` (None for a leaf with no input)")
+        rate = jnp.asarray(learning_rate(state.updates) if callable(learning_rate) else learning_rate)
+
+        def stepped(x, gradient, kernel):
+            if x is None:
+                return -rate * gradient
+            if x.shape != kernel.shape[:1]:
+                raise ValueError(f"an input of shape {x.shape} is not the input axis of a kernel shaped "
+                                 f"{kernel.shape}")
+            shrunk = rate / (1 + rate * jnp.sum(jnp.square(x)))
+            along = jnp.tensordot(x, jnp.tensordot(x, kernel, axes=(0, 0)), axes=0)
+            return -shrunk * (along + gradient)
+
+        stepped_updates = jax.tree.map(stepped, inputs, updates, params, is_leaf=lambda leaf: leaf is None)
+        return stepped_updates, DeltaState(jnp.asarray(optax.safe_increment(state.updates)))
+
+    return optax.GradientTransformationExtraArgs(init_fn, update_fn)
+
+
 def stochastic_round_bf16(x: jax.Array, seed: jax.Array) -> jax.Array:
     """`x` rounded to bf16 up or down with the probability of its distance to
     each, from a hash of `seed` and each element's flat index.
@@ -1104,5 +1212,5 @@ class Exponential(ScheduleBase):
         return lambda count: self.offset + decay(count)
 
 
-__all__ = ["Cosine", "Exponential", "Linear", "OneCycle", "ParamGroup", "Power", "PowerProfilesState",
-           "PowerTail", "ScheduleBase"]
+__all__ = ["Cosine", "DeltaState", "Exponential", "Linear", "M3State", "OneCycle", "ParamGroup", "Power",
+           "PowerProfilesState", "PowerTail", "ScheduleBase", "delta_gradient_descent", "scale_by_m3"]
