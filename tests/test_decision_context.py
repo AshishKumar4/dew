@@ -349,8 +349,8 @@ def test_a_backbone_encoded_context_is_the_backbones_own_pass_over_it():
 
 def test_a_context_its_cross_attention_cannot_hold_is_refused_never_cut():
     """A context of more tokens than the cross-attention reads is refused, by a task and over the wire
-    (ValueError, which a server turns into the request's own refusal), and refuses a run's data before
-    it trains; one of exactly that many is read whole."""
+    (ValueError, which a server turns into the request's own refusal), and refuses a run's data where
+    its fitting reads the record; one of exactly that many is read whole."""
     from dew.decision.objective import Fit
 
     objective = conditioned(16, (0,))

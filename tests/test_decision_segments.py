@@ -63,11 +63,12 @@ def test_the_state_takes_what_the_rest_of_the_row_leaves_wherever_it_stands():
             laid.span[1] - laid.span[0] for laid in whole.questions]
 
 
-def test_a_row_holds_the_schema_once_and_the_state_and_images_at_most_once():
-    """Segments without the schema, or with two states, or two places for images, are refused when
-    the layout is built; images given to segments with no place for them are refused when a row is
-    laid out."""
-    refused = ((State(),), (Schema(), Schema()), (Schema(), State(), State()), (Schema(), Media(), Media()))
+def test_a_row_holds_the_schema_once_and_the_images_at_most_once():
+    """Segments without the schema, or with two places for images, are refused when the layout is
+    built, and two states are not; images given to segments with no place for them are refused when a
+    row is laid out."""
+    refused = ((State(),), (Schema(), Schema()), (Schema(), Media(), Media()))
+    JointLayout(segments=(Schema(), State(), State()))
     for segments in refused:
         with pytest.raises(ValueError):
             JointLayout(segments=segments)
@@ -187,9 +188,9 @@ def test_a_joint_row_holds_the_state_twice_each_copy_cut_to_its_own_budget():
     layout = JointLayout(max_len=1 << 20, segments=twice)
     [row] = layout.rows(TOKENIZER, SPECIALS, state, QUESTIONS)
     written = text(row.tokens)
-    compact = '"one two three four five six seven"'
-    assert written.startswith("FIRST:" + compact[:5] + "\nLAST:" + compact[-9:])
-    assert (row.state_tokens, row.state_kept) == (len(compact), 5)
+    # A string state is its own compact text (`_compact`), each byte a token of the byte vocabulary.
+    assert ("FIRST:" + state[:5] + "\nLAST:" + state[-9:]) in written
+    assert (row.state_tokens, row.state_kept) == (len(state), 5)
     assert from_record(Layout, to_record(layout, Layout), dtypes=False) == layout
     once = JointLayout(max_len=1 << 20, segments=(State(), Schema()))
     again = JointLayout(max_len=1 << 20, segments=(State(max_tokens=None), Schema()))

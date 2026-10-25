@@ -271,8 +271,9 @@ class Fit(pygrain.MapTransform):
     head: Head
     context_length: int | None = None
     """The most context tokens the backbone's cross-attention reads, or None where it reads none: an
-    example whose context is longer refuses the run (ValueError), which the data plan's compile meets
-    before training, so no example is silently cut or dropped."""
+    example whose context is longer refuses the run (ValueError) where the data reads it, which the
+    data plan's compile meets before training for data read into memory and a streamed or indexed
+    read meets at that record, so no example is silently cut or dropped."""
     grouped: bool = False
     """Whether the objective reads consistency groups, whose members a layout of a question a row lays
     out in different rows: an example with groups under one refuses the run (ValueError)."""
