@@ -74,7 +74,7 @@ def pytest_runtest_makereport(item, call):
     """A test the gate fails reports its findings as data (`reference_error.Finding`), the JUnit property
     `gate_findings`, a JSON list of each finding's leaf, rule and measure (an infinite one `Infinity`):
     what a promotion matches a candidate's failures to its parent's by."""
-    outcome = yield
+    yield
     if call.excinfo is not None:
         from reference_error import GateFailure
 
