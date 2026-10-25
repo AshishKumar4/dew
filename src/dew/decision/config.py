@@ -174,30 +174,31 @@ class DecisionRunConfig(RunConfig):
         start = Pretrained.load(self.pretrained, subfolder=self.subfolder, revision=self.revision,
                                 dtype=dtype, param_dtype=self.param_dtype, attention_impl=attention_impl,
                                 **self.trainer.source_placement(frozen=frozen))
+        release = isinstance(start, PretrainedDecision)
+        if release and self.head is not None:
+            raise ValueError("--head draws a head over a fresh backbone; a decision release reads with "
+                             "its own")
+        # The backbone's own transformations, a release's as a fresh backbone's: its head and layout
+        # stay as the release states them.
+        if self.remat is not None:
+            if not isinstance(start.model, RematChoosing):
+                raise ValueError(f"--remat chooses a decoder's layer policy (RematChoosing), which "
+                                 f"{type(start.model).__name__} does not support")
+            start = dataclasses.replace(start, model=start.model.with_remat(remat_policy(self.remat)))
+        if (self.loop_steps is not None or self.loop_layers is not None
+                or self.loop_backprop_steps is not None or self.loop_remat):
+            start = looping(start, self.loop_steps, self.loop_layers,
+                            backprop_steps=self.loop_backprop_steps, remat=self.loop_remat or None)
+        if self.context_layers is not None:
+            # Drawn from a key of their own, apart from the adapter's and the head's.
+            blocks = CrossAttention(self.context_layers, self.context_length)
+            start = start.with_cross_attention(blocks, key=jax.random.fold_in(
+                jax.random.key(self.trainer.key), 1))
+        start = start if self.lora is None else start.adapt(self.lora, key=self.trainer.key)
         if isinstance(start, PretrainedDecision):
-            if any(choice is not None for choice in (self.lora, self.head, self.loop_steps,
-                                                    self.loop_layers, self.loop_backprop_steps,
-                                                    self.remat, self.context_layers)) or self.loop_remat:
-                raise ValueError("--lora, --head, --remat, --context-layers and the loop shape a fresh "
-                                 "backbone; a decision release trains whole under its own head")
             start = Decide.of(start)
             derived["layout"] = _budgeted(start.layout, budgets)
         else:
-            if self.remat is not None:
-                if not isinstance(start.model, RematChoosing):
-                    raise ValueError(f"--remat chooses a decoder's layer policy (RematChoosing), which "
-                                     f"{type(start.model).__name__} does not support")
-                start = dataclasses.replace(start, model=start.model.with_remat(remat_policy(self.remat)))
-            if (self.loop_steps is not None or self.loop_layers is not None
-                    or self.loop_backprop_steps is not None or self.loop_remat):
-                start = looping(start, self.loop_steps, self.loop_layers,
-                                backprop_steps=self.loop_backprop_steps, remat=self.loop_remat or None)
-            if self.context_layers is not None:
-                # Drawn from a key of their own, apart from the adapter's and the head's.
-                blocks = CrossAttention(self.context_layers, self.context_length)
-                start = start.with_cross_attention(blocks, key=jax.random.fold_in(
-                    jax.random.key(self.trainer.key), 1))
-            start = start if self.lora is None else start.adapt(self.lora, key=self.trainer.key)
             if self.head is not None:
                 width, head_dtype = DecisionModel.head_size(start.model)
                 derived["head"] = JointSchemaHead(hidden_size=width, dtype=head_dtype,

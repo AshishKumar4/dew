@@ -2237,13 +2237,12 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def inference_projection_groups(self, variables: Mapping[str, Mapping]) -> tuple[ProjectionGroup, ...]:
         """Its layers', depths' and drafter's groups, bound without tracing a
-        forward; an encoder serves no decode step and names none. The groups
-        read which parameters the layers hold, never their values, so the
-        layers are bound over the variables' shapes: flax's bound tree is
-        cyclic, and bound over the weights themselves it would keep them alive
-        after the caller drops them until a full collection."""
-        if not self.causal:
-            return ()
+        forward, causal or not: a bidirectional model's masked denoising reads
+        its projections packed as a decoder's steps do. The groups read which
+        parameters the layers hold, never their values, so the layers are
+        bound over the variables' shapes: flax's bound tree is cyclic, and
+        bound over the weights themselves it would keep them alive after the
+        caller drops them until a full collection."""
         bound = self.bind(jax.tree.map(
             lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), jnp.result_type(leaf)), variables))
         return declared_groups(*bound.layers, *bound.mtp,

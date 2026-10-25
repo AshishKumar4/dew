@@ -23,7 +23,7 @@ from jax.sharding import Mesh, NamedSharding
 from dew.batch import Variables
 from dew.inference.tasks import cache_sized
 from dew.mesh import logical_spec
-from dew.nn.cross_attention import CROSS_KEY, CROSS_VALUE
+from dew.nn.attention import CROSS_KEY, CROSS_VALUE
 from dew.nn.inputs import Admitted, ModelInputs, default_placement
 from dew.nn.kernels.options import compiler_options
 from dew.nn.kernels.tuning import tune
