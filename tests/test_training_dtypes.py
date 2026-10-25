@@ -363,6 +363,18 @@ def test_an_ema_leaf_the_step_left_alone_keeps_its_average_bit_for_bit(dtype, de
     assert kept.dtype == average.dtype and np.array_equal(np.asarray(kept), np.asarray(average))
 
 
+def test_an_ema_of_finite_leaves_of_opposite_signs_stays_their_finite_average():
+    """`ema_update` between finite leaves returns their weighted average wherever it is finite, at the ends
+    of fp32's range too: an average of 2**127 and a live value of -(2**127) at decay 0.5 average to exactly 0,
+    where their difference alone overflows."""
+    from dew.training.transaction import ema_update
+
+    average = jnp.asarray([2.0 ** 127, -(2.0 ** 127), 3e38], jnp.float32)
+    live = jnp.asarray([-(2.0 ** 127), 2.0 ** 127, -3e38], jnp.float32)
+    updated = jax.jit(ema_update)({"w": average}, {"w": live}, 0.5)["w"]
+    assert np.array_equal(np.asarray(updated), np.zeros(3, np.float32))
+
+
 @pytest.mark.parametrize("parameter_kind", ["bfloat16", "mixed", "float64", "mixed64"])
 def test_ema_storage_dtype_and_precision_survive_real_updates_and_restart(tmp_path, parameter_kind):
     with jax.enable_x64():
