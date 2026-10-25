@@ -354,6 +354,8 @@ class Decide:
                              "calibration of them to hold; save a task from `pipeline` or `from_run`")
         if self.weights.averaged:
             self._claimed(directory)
+            # A directory of its own, made before its calibration file is written into it.
+            epath.Path(directory).mkdir(parents=True, exist_ok=True)
         write_atomically(epath.Path(directory) / TASK_FILE, json.dumps({
             "weights": to_record(self.weights, Weights),
             "calibration": to_record(self.calibration, Calibration),
