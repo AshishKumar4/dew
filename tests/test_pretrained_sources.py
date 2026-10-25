@@ -222,6 +222,23 @@ def test_tier_three_admits_a_causal_lm_it_can_train_and_refuses_the_rest():
         source_route(tiny_config("bert", is_decoder=True, max_position_embeddings=8).to_dict())
 
 
+def test_tier_three_runs_dews_attention_where_every_layer_asks_the_interface_for_it():
+    """Tier 3 observes, on the probe's model, whether every decoder layer asks transformers' attention
+    interface for its attention with a mask Dew's visibility reproduces: StableLM's do, though its
+    class declares no attention backend, and run on Dew's; OpenAI GPT's and GPT-NeoX Japanese's compute
+    their own, and keep them, saying why."""
+    from dew.interop.pretrained import source_route
+
+    stablelm = source_route(tiny_config("stablelm").to_dict()).admitted
+    assert stablelm.attends and not stablelm.why
+    openai = source_route(tiny_config("openai-gpt").to_dict()).admitted
+    assert not openai.attends and openai.why
+    # GPT-NeoX Japanese adds the mask it is given to its scores in its own code: the probe's mask is
+    # transformers' eager one, so its attention stays causal and the type is admitted on its own.
+    japanese = source_route(tiny_config("gpt_neox_japanese").to_dict()).admitted
+    assert not japanese.attends and japanese.why
+
+
 @pytest.mark.parametrize("spelled", ["its own names", "the standard names"])
 def test_the_probe_shrinks_a_config_by_whichever_names_its_class_reads(spelled):
     """OpenAI-GPT's class reads its width, heads and depth as `n_embd`, `n_head` and `n_layer`, and the
