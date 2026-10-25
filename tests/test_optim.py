@@ -42,6 +42,7 @@ from dew.optim import (
     scale_by_qk_clip,
     stepped,
     weight_decay_mask,
+    with_rates,
 )
 from dew.training import MeshSpec
 from tools.muonclip_reference import clip_mla_reference, clip_qk_kernel, clip_scale
@@ -1052,6 +1053,30 @@ def test_a_scheduled_rate_is_as_near_float64_as_optaxs(name):
                 for step in range(10)}
 
     assert_as_exact(dew, optax_rates, draw, f"the {name} rate", seeds=RATE_SEEDS, truth_fn=truth)
+
+
+@pytest.mark.parametrize("name", ["constant", "cosine"])
+def test_a_resumed_rate_reaches_a_solver_inside_an_injected_wrapper(name):
+    """A resume sets a configured solver's rate (`with_rates`) where a run's own injected wrapper holds
+    the solver, as an objective may wrap the optimizer it is given: the wrapped run then steps at the
+    configured rate, the rate a run built at it steps at, bit for bit, and its wrapper's own
+    hyperparameter stays as it was."""
+    def configured(scale):
+        rate = 3e-3 * scale if name == "constant" else dataclasses.replace(
+            SCHEDULES["cosine"], peak_value=1e-2 * scale, init_value=1e-4 * scale, end_value=1e-3 * scale)
+        config = OptimConfig(optimizer="adam", learning_rate=rate, clip_grads=0)
+        solver = config.build(10)
+        return config, optax.inject_hyperparams(lambda gain: optax.chain(solver, optax.scale(gain)))(gain=2.0)
+
+    params, grads = {"w": jnp.ones(3)}, {"w": jnp.ones(3)}
+    _, wrapped = configured(1.0)
+    doubled, fresh = configured(2.0)
+    state, want = with_rates(wrapped.init(params), doubled.rates()), fresh.init(params)
+    for _ in range(3):
+        _, state = wrapped.update(grads, state, params)
+        _, want = fresh.update(grads, want, params)
+        np.testing.assert_array_equal(learning_rate(state), learning_rate(want))
+    np.testing.assert_array_equal(state.hyperparams["gain"], 2.0)
 
 
 def test_adamw_steps_land_as_near_float64_as_torchs():
