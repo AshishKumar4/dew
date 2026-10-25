@@ -123,11 +123,10 @@ def _holding(least: int, holds) -> list[int]:
 def generated(families, *, depth: int | None, width: int, dtype) -> tuple[Tiles, ...]:
     """Every tile a GEMM mainloop may take on each of `families`, from the family's facts and the call's
     extents alone (no table of tiles): each count of consumer roles it has; columns in multiples of its
-    column unit dividing the call's `width`, at most its widest product (`Family.widest_product`) and one
-    copy's extent (`Family.copy_extent`); a step of each of its depths dividing `depth` (any, where None:
-    steps over rows padded to whole steps); rows in multiples of its roles' (`Family.role_rows`), at most
-    one copy's extent, while its consumer threads hold the tile in their registers
-    (`mosaic.tile_registers`, `Family.registers`); each count of stages from two (a step loading
+    column unit dividing the call's `width`, at most its widest product (`Family.widest_product`); a step
+    of each of its depths dividing `depth` (any, where None: steps over rows padded to whole steps); rows
+    in multiples of its roles' (`Family.role_rows`) while its consumer threads hold the tile in their
+    registers (`mosaic.tile_registers`, `Family.registers`); each count of stages from two (a step loading
     while one computes) to as many as a block of the family holds (`Family.most_shared`), deeper first;
     and each band of column tiles (`Tiles.grid_block_n`) doubling from one to the call's column tiles,
     wider first, which share a row block's loads across more column tiles in the L2 while a band is in
@@ -138,13 +137,11 @@ def generated(families, *, depth: int | None, width: int, dtype) -> tuple[Tiles,
     size = jnp.dtype(dtype).itemsize
     tiles = []
     for family in families:
-        copied = family.copy_extent or width
-        unit, widest = family.column_unit(dtype), min(width, family.widest_product or width, copied)
+        unit, widest = family.column_unit(dtype), min(width, family.widest_product or width)
         steps = [step for step in family.depths(dtype) if depth is None or depth % step == 0]
         for consumers in range(1, family.consumers + 1):
             def holds(block, consumers=consumers, family=family):
-                held = mosaic.tile_registers(family, consumers, block, dtype) <= family.registers(consumers)
-                return held and block[0] <= (family.copy_extent or block[0])
+                return mosaic.tile_registers(family, consumers, block, dtype) <= family.registers(consumers)
 
             shapes = {(block_m, block_n, block_k)
                       for block_n in range(unit, widest + 1, unit) if width % block_n == 0

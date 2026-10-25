@@ -49,11 +49,24 @@ def assumed(generation: str | GpuTarget | None) -> Iterator[None]:
     token = ASSUMED.set(name)
     facts = ASSUMED_TARGET.set(target)
     try:
-        with cache.KERNEL_ASSUMED((name, None if target is None else repr(target))):
+        with cache.KERNEL_ASSUMED((name, None if target is None else _facts(target))):
             yield
     finally:
         ASSUMED_TARGET.reset(facts)
         ASSUMED.reset(token)
+
+
+def _facts(value):
+    """`value`'s facts as a hashable tree, equal wherever the facts are: a dataclass's fields by name, a
+    mapping's entries sorted by key, a sequence's items in order."""
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return (type(value).__name__, *((field.name, _facts(getattr(value, field.name)))
+                                       for field in dataclasses.fields(value)))
+    if isinstance(value, Mapping):
+        return tuple(sorted((key, _facts(item)) for key, item in value.items()))
+    if isinstance(value, (tuple, list)):
+        return tuple(_facts(item) for item in value)
+    return value
 
 
 CHOICES = frozenset({'attention', 'attention_narrow', 'attention_packed', 'attention_sinks',

@@ -378,9 +378,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     are at most; None where a tile's columns are many products' (mma.sync's 8 each), held by its
     registers alone (`tile_registers`)."""
     copy_extent: int | None = None
-    """The most elements one asynchronous copy moves along a dimension (TMA's box, 256), which a tile's
-    rows and columns, each loaded by one, are at most; None where cp.async moves a block (mma.sync's),
-    whose tiles registers bound alone."""
+    """The most elements one asynchronous copy moves along a dimension of its box after the copy's tiling
+    (TMA's, 256): an operand block tiled in 8 rows by a swizzled row stays far below it at any tile its
+    registers hold, and a one-dimensional side operand's block, untiled, is at most it
+    (`grouped_matmul._Mosaic.fitting`); None where cp.async moves a block (mma.sync's)."""
     most_shared: int
     """The most shared memory a block of any GPU of the family holds (CUDA's opt-in limit), which bounds
     the stages a generated tile takes; a GPU's own (`generation.shared_budget`) bounds the tiles its

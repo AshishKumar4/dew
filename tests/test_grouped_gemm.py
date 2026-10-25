@@ -260,7 +260,8 @@ block and another L2 bandwidth than an H100's."""
 
 def test_a_program_traced_for_one_gpu_traces_again_for_another_of_its_family():
     """Two GPUs of one family whose facts differ key a jitted program's traces apart
-    (`generation.assumed`), so neither's launches are sized and picked by the other's facts."""
+    (`generation.assumed`), so neither's launches are sized and picked by the other's facts; the same
+    facts, their measurements stated in another order, share one trace."""
     traced = []
 
     @jax.jit
@@ -268,11 +269,14 @@ def test_a_program_traced_for_one_gpu_traces_again_for_another_of_its_family():
         traced.append(generation.gpu_target())
         return x + 1
 
-    targets = (UNSEEN["hopper-class"], generation.TARGETS["sm90"])
+    measured = dataclasses.replace(UNSEEN["hopper-class"], calibration={"load_latency": 600.0,
+                                                                         "l2_bandwidth": 4.0e12})
+    restated = dataclasses.replace(measured, calibration={"l2_bandwidth": 4.0e12, "load_latency": 600.0})
+    targets = (UNSEEN["hopper-class"], generation.TARGETS["sm90"], measured, restated)
     for target in targets:
         with generation.assumed(target):
             program(jnp.zeros(2))
-    assert traced == list(targets)
+    assert traced == list(targets[:3])
 
 
 @INTERPRETS
@@ -290,28 +294,35 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
     # mma.sync's tiles run the product and the input gradient; the kernel gradient is warpgroup MMA's.
     launched = {"MosaicGmm", "MosaicTgmm"} if target.wgmma else {"MosaicGmm"}
 
-    def calls(rows, depth, width, groups):
-        def bf16(shape):
-            return jax.ShapeDtypeStruct(shape, jnp.bfloat16)
+    def products(rows, depth, width, groups):
+        # The forward, and its input and kernel gradients as the reverse pass launches them, each alone.
+        sizes = jnp.full((groups,), rows // groups, jnp.int32)
+        forward = functools.partial(template.gemm, group_sizes=sizes, out_dtype=jnp.bfloat16,
+                                    precision="default", interpret_on_cpu=True)
+        bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
         x, w, dy = bf16((rows, depth)), bf16((groups, depth, width)), bf16((rows, width))
-        sizes = jax.ShapeDtypeStruct((groups,), jnp.int32)
-        return ((grouped_matmul.MosaicGmm(), (x, w, sizes), {"trans_rhs": False}),
-                (grouped_matmul.MosaicGmm(), (dy, w, sizes), {"trans_rhs": True}),
-                (grouped_matmul.MosaicTgmm(), (x, dy, sizes), {}))
+        named = [(forward, (x, w)), (functools.partial(forward, transpose_rhs=True), (dy, w))]
+        if target.wgmma:
+            named.append((functools.partial(template.gemm_t, group_sizes=sizes, out_dtype=jnp.bfloat16,
+                                            interpret_on_cpu=True), (x, dy)))
+        return named
 
-    picks = {}
-    with generation.assumed(target):
-        for launch, args, options in calls(65536, 2048, 1536, 128):
-            if type(launch).__name__ not in launched:
+    # At a Qwen3 MoE projection's extents, traced (never run): each launch takes the tile the cost model
+    # picks on the GPU's facts among its family's fitting ones, not every one the canonical device's.
+    budget = generation.shared_budget(target)
+    differs = []
+    with (generation.assumed(target), generation.chosen(grouped_matmul="mosaic_gpu"),
+          tuning.seen() as launches):
+        for product, shapes in products(65536, 2048, 1536, 128):
+            jax.jit(product).trace(*shapes)
+        for (launch, ba), tile in zip(launches, launches.taken, strict=True):
+            if not isinstance(launch, grouped_matmul._Mosaic):
                 continue
-            ba = launch.bind(*args, out_dtype="bfloat16", interpret=grouped_matmul.INTERPRETED, **options)
-            fits = launch.fitting(ba, target)
-            assert fits and {tile.family for tile in fits} == {family}
-            budget = generation.shared_budget(target)
-            assert all(launch.staged_bytes(ba, tile, target) <= budget for tile in fits)
-            picks[type(launch).__name__, options.get("trans_rhs")] = (
-                launch.estimate(ba, target)[1], launch.estimate(ba, canonical)[1])
-    assert any(here != there for here, there in picks.values())
+            assert tile.family == family and tile in launch.fitting(ba, target)
+            assert launch.staged_bytes(ba, tile, target) <= budget
+            assert tile == launch.estimate(ba, target)[1]
+            differs.append(tile != launch.estimate(ba, canonical)[1])
+    assert any(differs)
 
     sizes = SIZES["ragged"]
     group_sizes = jnp.asarray(sizes, jnp.int32)
@@ -335,10 +346,11 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
     with tuning.seen() as launches:
         assert_as_exact(through_mosaic, jax.jit(with_gradients(projection())), ragged_draw,
                         f"unseen {unseen}", seeds=SEEDS, truth_fn=with_gradients(projection(jnp.float64)))
-    mosaic = [(launch, ba) for launch, ba in launches if isinstance(launch, grouped_matmul._Mosaic)]
-    assert {type(launch).__name__ for launch, _ in mosaic} == launched
+    mosaic = [(launch, ba, tile) for (launch, ba), tile in zip(launches, launches.taken, strict=True)
+              if isinstance(launch, grouped_matmul._Mosaic)]
+    assert {type(launch).__name__ for launch, _, _ in mosaic} == launched
     with generation.assumed(target):
-        assert all(launch.chosen(ba) == launch.estimate(ba, target)[1] for launch, ba in mosaic)
+        assert all(tile == launch.estimate(ba, target)[1] for launch, ba, tile in mosaic)
 
 
 @INTERPRETS
@@ -364,15 +376,16 @@ def test_a_gpu_no_one_measured_runs_the_triton_tiles_its_facts_fit_exactly(unsee
         assert_as_exact(jax.jit(through_triton), jax.jit(with_gradients(projection())), ragged_draw,
                         f"unseen {unseen} Triton", seeds=SEEDS,
                         truth_fn=with_gradients(projection(jnp.float64)))
-    triton = [(launch, ba) for launch, ba in launches if isinstance(launch, grouped_matmul._Triton)]
-    assert {type(launch).__name__ for launch, _ in triton} == {"Gmm", "Tgmm"}
+    triton = [(launch, ba, tile) for (launch, ba), tile in zip(launches, launches.taken, strict=True)
+              if isinstance(launch, grouped_matmul._Triton)]
+    assert {type(launch).__name__ for launch, _, _ in triton} == {"Gmm", "Tgmm"}
     budget = generation.shared_budget(target)
     with generation.assumed(target):
-        for launch, ba in triton:
+        for launch, ba, tile in triton:
             fits = launch.fitting(ba, target)
             assert set(fits) <= set(launch.space(ba))
-            assert all(launch.staged_bytes(ba, tile, target) <= budget for tile in fits)
-            assert launch.chosen(ba) == launch.estimate(ba, target)[1]
+            assert all(launch.staged_bytes(ba, fit, target) <= budget for fit in fits)
+            assert tile == launch.estimate(ba, target)[1]
 
 
 @INTERPRETS
