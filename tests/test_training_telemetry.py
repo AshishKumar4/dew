@@ -17,8 +17,7 @@ from dew.config import RunConfig, TrainerConfig
 from dew.data.dataset import Loader
 from dew.objectives import Aux, Objective
 from dew.optim import Cosine, OptimConfig
-from dew.training import Trainer, WandbTracker
-from dew.training.tracker import Wandb
+from dew.training import Trainer, Wandb, WandbTracker
 
 
 class Squared(Objective):

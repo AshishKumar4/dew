@@ -21,8 +21,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.optim import OptimConfig
 from dew.registry import Aliases, ModelConfig, projectors, towers
-from dew.training import Checkpoints, Layout, MeshSpec
-from dew.training.tracker import Wandb
+from dew.training import Checkpoints, Layout, MeshSpec, Wandb
 
 
 @pytest.mark.parametrize("dataset", ["tfds", "arrayrecord_shards"])

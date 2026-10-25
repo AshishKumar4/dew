@@ -1672,8 +1672,6 @@ def record_argument[Value](annotation: type[Value]) -> tyro.constructors.Primiti
     flag, a default and `run.json` hold the same record. Use it as the
     field's metadata: `Annotated[Mapping[str, ScheduleSpec],
     record_argument(Mapping[str, ScheduleSpec])]`."""
-    from dew.registry import from_record, to_record
-
     container = typing.get_origin(annotation) or annotation
     if container is Mapping:
         container = dict
