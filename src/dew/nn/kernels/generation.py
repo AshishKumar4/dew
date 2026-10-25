@@ -730,7 +730,8 @@ def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Re
     return found
 
 
-def linear_tangent(forward: Callable, backward: Callable, portable: Callable) -> Callable:
+def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
+                   live_cotangents: bool = False) -> Callable:
     """A fused kernel as one function of its operands, differentiated at every order through
     `portable`, the same arithmetic in XLA, while every level of it runs the kernels.
     `forward(*operands)` gives the kernel's output and what its backward reads (`saved`, a tree of
@@ -746,7 +747,11 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable) ->
     `saved` holds is a function of the operands, whose tangents carry it. This composes with
     `jax.vmap` of a gradient and with forward over reverse on Dew's jax build (0.11.2.post5 on),
     whose `linear_call` batches and carries its residual tangents; a stock jax raises its own
-    error for either."""
+    error for either.
+
+    With `live_cotangents`, `backward(saved, operands, cotangent, live)` gives the cotangents of the
+    operands at the indices `live` alone, those a reverse pass differentiates, so a frozen operand's
+    cotangent is never formed."""
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -762,19 +767,21 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable) ->
         # `saved` reaches only `pulled`, whose tangent reads the operands' instead.
         return (output, saved), (jax.jvp(portable, primals, tangents)[1], jax.tree.map(jnp.zeros_like, saved))
 
-    @jax.custom_jvp
-    def pulled(saved, operands, cotangent):
-        return backward(saved, operands, cotangent)
+    @functools.partial(jax.custom_jvp, nondiff_argnums=(3,))
+    def pulled(saved, operands, cotangent, live):
+        arguments = (saved, operands, cotangent) if live is None else (saved, operands, cotangent, live)
+        return backward(*arguments)
 
     @pulled.defjvp
-    def _(primals, tangents):
+    def _(live, primals, tangents):
         _, operands, cotangent = primals
         _, doperands, dcotangent = tangents
 
         def pullback(operands, cotangent):
-            return jax.vjp(portable, *operands)[1](cotangent)
+            whole = jax.vjp(portable, *operands)[1](cotangent)
+            return whole if live is None else tuple(whole[index] for index in live)
 
-        return pulled(*primals), jax.jvp(pullback, (operands, cotangent), (doperands, dcotangent))[1]
+        return pulled(*primals, live), jax.jvp(pullback, (operands, cotangent), (doperands, dcotangent))[1]
 
     @jax.custom_jvp
     def bounded(*operands):
@@ -801,7 +808,9 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable) ->
 
         def transposed(residuals, cotangent):
             operands, saved = residuals
-            pulled_back = jax.tree.leaves(pulled(saved, operands, cotangent))
+            if live_cotangents:
+                return list(jax.tree.leaves(pulled(saved, operands, cotangent, tuple(live))))
+            pulled_back = jax.tree.leaves(pulled(saved, operands, cotangent, None))
             return [pulled_back[index] for index in live]
 
         moving = [directions[index] for index in live]

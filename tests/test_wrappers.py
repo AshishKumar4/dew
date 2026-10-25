@@ -24,13 +24,129 @@ on CPU:
 import json
 from pathlib import Path
 
+import jax.numpy as jnp
 import numpy as np
+import pytest
 from safetensors.numpy import load_file
 
 from dew.interop.hf_decoders import translate_wrapper_config, translate_wrapper_weights
 from dew.registry import projectors, towers
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
+
+
+@pytest.mark.parametrize("family", ["gemma3-tiny-mm", "gemma4-tiny-mm"])
+def test_a_gemma_wrapper_keeps_image_and_source_block_visibility_together(tmp_path, family):
+    import shutil
+
+    from dew.interop import Pretrained
+
+    directory = tmp_path / "source"
+    shutil.copytree(FIXTURES / family, directory)
+    config = json.loads((directory / "config.json").read_text())
+    config["modeling_overrides"] = {"attention": {"sliding_attention": "block_bidirectional"}}
+    (directory / "config.json").write_text(json.dumps(config))
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    tokens = jnp.asarray([[10, 11, 12, 13]], jnp.int32)
+    altered = tokens.at[0, 1].set(14)
+    groups = jnp.asarray([[0, 0, -1, -1]], jnp.int32)
+
+    def first(ids, **metadata):
+        return np.asarray(loaded.model.apply(loaded.variables, ids, **metadata))[0, 0]
+
+    np.testing.assert_array_equal(first(tokens), first(altered))
+    for field in ("image_groups", "block_groups"):
+        assert np.any(first(tokens, **{field: groups}) != first(altered, **{field: groups})), field
+
+
+def test_an_explicit_causal_source_override_exports_through_the_native_decoder(tmp_path):
+    import shutil
+
+    from dew.interop import Pretrained
+    from dew.interop.pretrained import PretrainedDecoder
+
+    directory = tmp_path / "source"
+    shutil.copytree(FIXTURES / "llama-tiny", directory)
+    config = json.loads((directory / "config.json").read_text())
+    config["modeling_overrides"] = {"attention": {"full_attention": "causal"}}
+    (directory / "config.json").write_text(json.dumps(config))
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    exported = tmp_path / "derived"
+    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(exported)
+    restored = Pretrained.load(exported, dtype="float32", attention_impl="reference")
+    tokens = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
+    np.testing.assert_array_equal(restored.model.apply(restored.variables, tokens),
+                                  loaded.model.apply(loaded.variables, tokens))
+
+
+def test_a_wrapper_dtype_change_reaches_the_decoder_that_computes_its_logits():
+    """Changing the multimodal model's run dtype changes its native text decoder too, while the
+    fp32 master variables remain reusable by the original model."""
+    from dew.config import ModelConfig
+    from dew.interop import Pretrained
+
+    loaded = Pretrained.load(FIXTURES / "qwen35-tiny-mm", dtype="float32", attention_impl="reference")
+    changed = ModelConfig.from_model(loaded.model).with_dtype("bfloat16").build()
+    ids = jnp.asarray([[1, 2, 3]], jnp.int32)
+    original = loaded.model.apply(loaded.variables, ids)
+    narrowed = changed.apply(loaded.variables, ids)
+    hidden = changed.apply(loaded.variables, ids, method=changed.hidden_states)
+    assert original.dtype == narrowed.dtype == jnp.float32
+    assert hidden.dtype == jnp.bfloat16
+    assert np.isfinite(np.asarray(narrowed, np.float32)).all()
+    np.testing.assert_array_equal(loaded.model.apply(loaded.variables, ids), original)
+
+
+def test_released_block_attention_matches_transformers_against_float64():
+    """The release's own mask adapter over independent block layouts, including causal-only
+    rows, judged against the paired fp32 and float64 transformers recordings."""
+    import jax
+    from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording
+
+    from dew.interop import Pretrained
+
+    directory = FIXTURES / "qwen35-blocks-tiny"
+    source = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    path = directory / "reference.npz"
+    seeds = declared_seeds(path)["blocks"]
+    draw, reference, truth = indexed_recording(recording(path), "blocks", seeds)
+
+    @jax.jit
+    def forward(index, inputs):
+        return {"logits": source.model.apply(
+            source.variables, inputs["input_ids"], block_groups=inputs["block_groups"])}
+
+    assert_as_exact(forward, reference, draw, "Qwen3.5 released block attention",
+                    seeds=seeds, truth_fn=truth)
+
+
+def test_wrapper_block_overrides_survive_export_and_admit_their_future_block_mate(tmp_path):
+    """A source declaring block attention changes visibility only where runtime block IDs admit
+    it. A future block mate can affect the earlier token, and source export preserves that rule."""
+    import shutil
+
+    from dew.interop import Pretrained
+
+    directory = tmp_path / "source"
+    shutil.copytree(FIXTURES / "qwen35-tiny-mm", directory)
+    config = json.loads((directory / "config.json").read_text())
+    config["modeling_overrides"] = {"attention": {
+        "full_attention": "block_bidirectional", "linear_attention": "causal"}}
+    (directory / "config.json").write_text(json.dumps(config))
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
+    altered = ids.at[0, 1].set(7)
+    blocked = jnp.asarray([[0, 0, -1, -1]], jnp.int32)
+
+    def first(bundle, tokens, groups=None):
+        return np.asarray(bundle.model.apply(bundle.variables, tokens, block_groups=groups))[0, 0]
+
+    np.testing.assert_array_equal(first(loaded, ids), first(loaded, altered))
+    assert np.any(first(loaded, ids, blocked) != first(loaded, altered, blocked))
+    loaded.save(tmp_path / "export")
+    restored = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
+    np.testing.assert_array_equal(first(restored, ids, blocked), first(loaded, ids, blocked))
+    np.testing.assert_array_equal(first(restored, ids), first(loaded, ids))
 
 
 def load_wrapper(name):

@@ -37,16 +37,26 @@ PACKED_HIDDEN = (*MLP_HIDDEN[:-1], None, MLP_HIDDEN[-1])
 
 
 
-def gaussian_topk(x, sparsity: float):
+def gaussian_topk(x, sparsity: float, kept=None):
     """Zero all but the top `1 - sparsity` fraction of each row, assuming the row is Gaussian.
 
     The cutoff is the row's mean plus `norm.ppf(sparsity)` times its
-    population standard deviation, and a value above the cutoff is kept as
-    its distance above it. The quantile is formed as the reference's icdf of
-    a float32 tensor forms it, erfinv(2 p - 1) sqrt(2), each step in fp32, or
-    in the row's own dtype where that is wider (`at_least_fp32`). `sparsity`
-    must be within (0, 1).
+    population standard deviation (`gaussian_cutoff`), and a value above the
+    cutoff is kept as its distance above it. `kept`, where given, is which
+    values stay, the choice `GatedMLP.kept_units` makes of the same cutoff;
+    the rest are the relu of their distance, zero or, where the row holds a
+    NaN, NaN, as relu propagates it.
     """
+    cutoff = gaussian_cutoff(x, sparsity)
+    distance = x - cutoff
+    return jnp.where(x > cutoff if kept is None else kept, distance, nn.relu(distance))
+
+
+def gaussian_cutoff(x, sparsity: float):
+    """The cutoff of `gaussian_topk` for each row of `x`, `[..., 1]`: the row's mean plus
+    `norm.ppf(sparsity)` times its population standard deviation. The quantile is formed as the
+    reference's icdf of a float32 tensor forms it, erfinv(2 p - 1) sqrt(2), each step in fp32, or in
+    the row's own dtype where that is wider (`at_least_fp32`). `sparsity` must be within (0, 1)."""
     # modeling_gemma3n.py, Gemma3nTextMLP._gaussian_topk. The erfinv is taken on
     # the host in float64 and rounded once: jax's fp32 erfinv lands two ulps from
     # torch's at 0.95, a cutoff the reference never computes. Python's default
@@ -63,7 +73,7 @@ def gaussian_topk(x, sparsity: float):
     # A constant row (a padded row of zeros) has deviation zero, which takes a
     # zero gradient, as torch's std backward gives it.
     std = sqrt_or_zero(jnp.mean(jnp.square(x - mean), axis=-1, keepdims=True))
-    return nn.relu(x - (mean + std * multiplier))
+    return mean + std * multiplier
 
 
 def _erfinv(value: float) -> float:
@@ -203,8 +213,14 @@ class GatedMLP(nn.Module):
             return self._down(self._ngpt_hidden(self.ngpt, gate, up, activation), train)
         gate, up = swiglu_clamped(gate, up, self.swiglu_limit)
         if self.activation_sparsity:
-            gate = gaussian_topk(gate, self.activation_sparsity)
+            gate = gaussian_topk(gate, self.activation_sparsity, kept=self.kept_units(gate))
         return self._down(gated_product(activation, axes=MLP_HIDDEN)(gate, up), train)
+
+    def kept_units(self, gate):
+        """Which of the gate's activations Gemma 3n's gaussian top-k keeps (`activation_sparsity`):
+        those above their row's cutoff (`gaussian_cutoff`). The choice is a method of its own, so a
+        caller can read the one a forward made (`capture_intermediates`)."""
+        return gate > gaussian_cutoff(gate, self.activation_sparsity)
 
     def _ngpt_hidden(self, ngpt: NGPT, gate, up, activation):
         """nGPT's hidden activations: the gate and up projections times their gains in at least fp32,
