@@ -32,7 +32,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Kind, natural_exp, within
+from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Kind, within
 from dew.nn.precision import two_product, two_sum
 
 
@@ -103,7 +103,7 @@ class Forward:
         natural."""
         if self.base2:
             return jnp.exp2(x)
-        return jnp.exp2(x * (self.scale * LOG2E)) if self.raw else natural_exp(x)
+        return natural_exp(x, self.scale) if self.raw else natural_exp(x)
 
     def carry(self, x: jax.Array) -> jax.Array:
         """The factor a softmax state takes from one maximum to another `x` below it: exp2 folded, and
@@ -380,6 +380,37 @@ def power2(x: jax.Array, k: jax.Array) -> jax.Array:
     first = jnp.trunc(k / 3)
     second = jnp.trunc((k - first) / 2)
     return x * exact_power2(first) * exact_power2(second) * exact_power2(k - first - second)
+
+
+def natural_exp(x: jax.Array, scale: float = 1.0) -> jax.Array:
+    """The natural form's forward exponential (`Forward.power`): `exp(x * scale)` as the hardware's
+    base-2 exponential of `x * scale * log2(e)`, the logits staying natural. The conversion keeps its
+    rounded product and its residual (`two_product`), the factor's own rounding among them, and the
+    exponential takes the residual as a linear correction on the reduced exponent's fractional part
+    (`power2` the integral one), so the conversion's rounding does not reach a large value under a small
+    weight: one rounding more than `jnp.exp` no longer, where XLA had folded `exp2(x * log2(e))` back to
+    `exp(x)` until JAX 0.12 stopped reassociating constant products (jax-ml/jax 2d3744395). The residual is
+    about an fp32 ulp of the exponent, whose square is below the exponential's rounding. The backward's
+    weights and the factors that carry a state keep `jnp.exp`, as the reference does."""
+    # Normalize the factor before splitting: at a tiny raw scale its residual would be subnormal.
+    factor, exponent = np.frexp(scale * LOG2E)
+    x = x * np.float32(2.0 ** int(exponent))
+    high = np.float32(factor)
+    low = np.float32(factor - float(high))
+    # Bit splitting avoids overflowing Dekker's splitter where raw logits are large and scale is small.
+    hi, error = two_product(x, high, bit_split=True)
+    lo = error + x * low
+    # XLA's CPU exp2 is exp(hi * ln(2)), so reduce first: that multiply must not round a large exponent.
+    # Outside these bounds every fp32 exponential is zero or infinite; infinities have no residual.
+    bounded = jnp.clip(hi, -150.0, 128.0)
+    exponent = jnp.floor(bounded)
+    exponent += (bounded - exponent >= 0.5).astype(x.dtype)
+    live = (jnp.abs(x) < jnp.inf) & (hi >= -150.0) & (hi <= 128.0)
+    lo = jnp.where(live, lo, 0.0)
+    base = jnp.exp2(bounded - exponent)
+    # Add the small correction, rather than rounding 1 + correction before its product.
+    corrected = base + base * (lo * np.float32(np.log(2.0)))
+    return power2(corrected, exponent)
 
 
 def headroom(dtype) -> bool:
