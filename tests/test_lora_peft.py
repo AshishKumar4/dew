@@ -14,7 +14,12 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, assert_as_exact_over_orders
+from reference_error import (
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    assert_as_exact_over_orders,
+    with_gradients,
+)
 from safetensors.numpy import load_file
 
 from dew import lora
@@ -244,8 +249,7 @@ def test_a_multi_axis_target_steps_as_its_flattened_matrix_does():
             node = {"kernel": kernel, "bias": bias, **factors}
             return adapter.model.apply({"params": {"proj": node}}, x)
 
-        forward, pullback = jax.vjp(output, {"lora_A": a, "lora_B": b})
-        (gradient,) = pullback(cotangent)
+        forward, gradient = with_gradients(output)({"lora_A": a, "lora_B": b}, cotangent)
         return {"the output": forward, "lora_A's gradient": gradient["lora_A"],
                 "lora_B's gradient": gradient["lora_B"]}
 
