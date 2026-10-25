@@ -489,7 +489,10 @@ ORBIT = 4
 ORBIT - 1 more, each arm's worst row its worst over them. A routed expert's row of a step's momentum
 can nearly cancel on one draw, its rounding then set by the order its few tokens sum in; one order's
 worst row of either arm is then an extreme of that order alone (ledger 1531), where over the same
-orders both arms meet the same cancellation."""
+orders both arms meet the same cancellation. A mitigation measured, not a bound: over fresh windows of
+the one-step 8x1-data site, the seven mixture cells' own arms failed 2 of 898 verdicts over four orders
+where they failed 12 at the draw's order alone, and every arm scaled 1.6 times or given an independent
+error 2.5 times its own failed at both."""
 
 
 def orbit(width: int):
