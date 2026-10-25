@@ -4,6 +4,8 @@ Restoring the ranked training state is Dew's lifecycle; Orbax oracles storage an
 """
 import dataclasses
 import datetime
+import itertools
+from collections.abc import Iterator
 from typing import ClassVar
 
 import jax
@@ -50,6 +52,24 @@ class Value:
 
     def merge(self, left, right):
         return (left + right) / 2
+
+    def finalize(self, value):
+        return value
+
+
+@dataclasses.dataclass
+class Scripted:
+    """A lower-is-better metric that scores each evaluation `scores`' next value, whatever it reads."""
+    name: str
+    scores: Iterator[float]
+    shown: Shown = dataclasses.field(default_factory=lambda: Shown(better='lower'))
+    reads = TokenScores
+
+    def __call__(self, artifact, batch):
+        return next(self.scores)
+
+    def merge(self, left, right):
+        return left
 
     def finalize(self, value):
         return value
@@ -293,6 +313,36 @@ def test_ranked_loss_and_periodic_retention(tmp_path):
         checkpoints.wait()
     assert checkpoints.best == 2
     assert {entry.step for entry in checkpoints.kept()} == {2, 4, 5}
+
+
+def test_ranked_ties_keep_the_older_steps(tmp_path):
+    """A ranking's best `top` steps are Orbax's `BestN` over the steps it scored: of tied scores the
+    older steps are kept, and a step the ranking never scored is not among them. The run's own first
+    step ranks by its higher training loss."""
+    run = trainer(tmp_path / 'run', keep=Keep(latest=1))
+    state = run.fit(dataclasses.replace(data(), val=None), steps=1, log_every=1)
+    checkpoints = run.checkpoints
+    for step, loss in [(2, .5), (3, .5), (4, None), (5, .5), (6, .7), (7, .9)]:
+        ranking = None if loss is None else Ranking('train/loss', loss, 'min', top=2)
+        checkpoints.save(step, state.replace(step=jnp.int32(step)), None, ranking=ranking)
+        checkpoints.wait()
+    assert {entry.step for entry in checkpoints.kept()} == {2, 3, 7}
+
+
+def test_plateau_counts_an_improvement_as_flax_early_stopping_does(tmp_path):
+    """An evaluation improves on the best where Flax's `EarlyStopping` says it does, by more than
+    `min_delta` (`best - value > min_delta`): 1 - 2**-24 improves on 1 by 2**-24, more than a
+    `min_delta` of 2**-24 - 2**-60, though `1 - min_delta` rounds to it in float64. So a plateau of one
+    evaluation stops at the first evaluation that does not improve, the third, not the second."""
+    delta, value = 2.0 ** -24 - 2.0 ** -60, 1.0 - 2.0 ** -24
+    assert 1.0 - delta == value
+    metric = Scripted('value', itertools.chain([1.0], itertools.repeat(value)))
+    run = trainer(tmp_path / 'run')
+    state = run.fit(data(), steps=10, log_every=1, eval_every=1, checkpoint_every=1, metrics=[metric],
+                    stop=Plateau(metric, evals=1, min_delta=delta))
+    assert int(state.step) == 3
+    held = run.checkpoints.control(3)['plateau:val/value']
+    assert (held['best'], held['bad']) == (value, 1)
 
 
 def test_plateau_restores_patience_and_stops_after_eligible_evaluations(tmp_path):

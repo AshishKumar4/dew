@@ -33,6 +33,7 @@ import optax
 from flax import linen as nn
 from flax.core import unfreeze
 from flax.training import dynamic_scale as dynamic_scale_lib
+from flax.training.early_stopping import EarlyStopping
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
@@ -2030,12 +2031,14 @@ class Trainer(Generic[Loss, Effects]):
             )
         if held is not None and held.get('step') == run.current:
             return held['bad'] >= stop.evals
-        if held is None or value < held['best'] - stop.min_delta:
-            run.stop_control[key] = {'best': value, 'bad': 0, 'step': run.current, 'rule': rule}
-            return False
-        held['bad'] += 1
-        held['step'] = run.current
-        return held['bad'] >= stop.evals
+        # Flax's recurrence, which stops at its `patience`-th bad evaluation past the first.
+        stopping = EarlyStopping(min_delta=stop.min_delta, patience=stop.evals - 1)
+        if held is not None:
+            stopping = stopping.replace(best_metric=held['best'], patience_count=held['bad'])
+        stopping = stopping.update(value)
+        run.stop_control[key] = {'best': stopping.best_metric, 'bad': stopping.patience_count,
+                                 'step': run.current, 'rule': rule}
+        return stopping.should_stop
 
     def _warm_evaluations(self, plan: _FitPlan, state: TrainState, shardings: Placement[TrainState]) -> None:
         """Compile the programs the run's evaluations run beside a step's compile, where any runs
