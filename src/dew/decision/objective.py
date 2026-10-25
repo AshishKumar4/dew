@@ -115,7 +115,7 @@ class Encoding:
             names = [names[int(index)] for index in rng.permutation(len(names))]
         asked: dict[str, Question] = {}
         golds: dict[str, np.ndarray] = {}
-        dropped: dict[str, str] = {}
+        dropped: dict[str, str | None] = {}
         for name in names:
             question = example.questions[name]
             gold = example.distribution(name) if name in labels else None
