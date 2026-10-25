@@ -109,10 +109,6 @@
    "comparisons": 4,
    "lane": "Training"
   },
-  "tests/test_dataset_chain.py": {
-   "comparisons": 1,
-   "lane": "Data"
-  },
   "tests/test_dc_ae.py": {
    "comparisons": 4,
    "lane": "Models, Serving & RL"
