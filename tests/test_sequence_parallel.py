@@ -24,6 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import two_documents
+from reference_error import FEWEST_SEEDS, assert_as_exact
 from token_support import token_rows
 
 from dew.nn.attention import (
@@ -134,6 +135,51 @@ def test_the_seam_agrees_with_whole_sequences(name, implementation, exchange):
 # Heads split over tensor then sequence (2x2), and four sequence shards over
 # two key heads, which the exchange repeats to four and no further.
 HEAD_SPLITS = [MeshSpec(fsdp=2, tensor=2, sequence=2), MeshSpec(fsdp=2, sequence=4)]
+
+
+HEADS_BEFORE_ROWS = (("activation_heads", ("tensor", "expert")), ("activation_kv", ("tensor", "expert")),
+                     ("activation_batch", "expert"))
+"""Rules under which the query heads take the expert axis before the rows can: the query keeps every row on
+each shard, where a `[B]` or `[B, H, Q, K]` argument alone would split its rows over the expert axis."""
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("exchange", sorted(EXCHANGES))
+@pytest.mark.parametrize("name", ["causal_key_lengths", "bias", "sinks"])
+def test_row_arguments_split_as_the_query_rows_do_where_the_heads_contend_for_the_axis(name, exchange):
+    """Eight query heads over a tensor and an expert axis of two each, which the heads take before the rows
+    (`HEADS_BEFORE_ROWS`), and a sequence axis of two: a call's key lengths, bias and sinks split as the
+    query's own rows and heads do (`query_split`), not as their names alone would, so each shard reads its
+    own rows'. The same output as whole sequences."""
+    from flax import linen as nn
+
+    from dew.nn.sharding import DEFAULT_RULES
+
+    call = dict(CALLS[name])
+    if name == "bias":
+        call["bias"] = jax.random.normal(jax.random.key(3), (BATCH, 8, SEQ_LEN, SEQ_LEN))
+    if name == "sinks":
+        call["sinks"] = jax.random.normal(jax.random.key(4), (8,))
+
+    def draw(seed):
+        q_key, k_key, v_key = jax.random.split(jax.random.key(seed), 3)
+        query = jax.random.normal(q_key, (BATCH, SEQ_LEN, 8, 8), jnp.float32)
+        key, value = (jax.random.normal(k, (BATCH, SEQ_LEN, 2, 8), jnp.float32) for k in (k_key, v_key))
+        return query, key, value
+
+    def whole(query, key, value):
+        return scaled_dot_product_attention(query, key, value, **call)
+
+    mesh = MeshSpec(tensor=2, expert=2, sequence=2).build()
+    exchanged = jax.jit(lambda q, k, v: through(exchange, q, k, v, **call))
+
+    def split(query, key, value):
+        # The exchange under the mesh and the contending rules; the whole sequence outside them.
+        with jax.set_mesh(mesh), nn.logical_axis_rules((*HEADS_BEFORE_ROWS, *DEFAULT_RULES)):
+            return exchanged(query, key, value)
+
+    assert_as_exact(split, jax.jit(whole), draw, f"{exchange} exchange, {name}, under contending heads",
+                    seeds=FEWEST_SEEDS)
 
 
 @pytest.mark.mesh
