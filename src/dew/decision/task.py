@@ -270,13 +270,15 @@ class Decide:
             return task
         settings = records.record(json.loads(saved.read_text()), TASK_FILE)
         fitted = from_record(Weights, records.json_value(settings["weights"], "weights"))
-        if fitted != task.weights:
+        # An average's own directory names the runs it averages beside the step it holds (`save`).
+        if (fitted.step, fitted.ema) != (step, averaged):
             raise ValueError(
                 f"{TASK_FILE} was fitted on step {fitted.step}'s {'averaged' if fitted.ema else 'live'} "
                 f"weights, and this loads step {step}'s {'averaged' if averaged else 'live'} ones; "
                 "fit them again with `calibrated` and `save`, or load the step it was fitted on")
-        return replace(task, calibration=from_record(Calibration, records.json_value(settings["calibration"],
-                                                                                    "calibration")),
+        return replace(task, weights=fitted,
+                       calibration=from_record(Calibration, records.json_value(settings["calibration"],
+                                                                               "calibration")),
                        budget=from_record(Budget, records.json_value(settings["budget"], "budget")),
                        name=records.text(settings["name"], "name"))
 
@@ -337,7 +339,13 @@ class Decide:
 
         It also records the checkpoint the weights came from, so `from_run` and
         `dew.pipeline` read the calibration back for that checkpoint. The file is
-        written whole or not at all.
+        written whole or not at all. An average of runs (`averaged`), whose
+        weights no one run holds, is written to a `directory` of its own: a run of
+        one weights-only checkpoint of the average under the record its runs
+        share (`DecisionObjective.inference_record`), its model the base an
+        adapter merged into, which `from_run` and `dew.pipeline` then read as any
+        run's, whatever its layout; a directory holding another run's checkpoints
+        is refused (ValueError).
         """
         from dew.registry import to_record
 
@@ -345,12 +353,43 @@ class Decide:
             raise ValueError("this task's weights came from no run checkpoint, so a run has no "
                              "calibration of them to hold; save a task from `pipeline` or `from_run`")
         if self.weights.averaged:
-            raise ValueError("this task's weights are an average of runs, which no one run holds, so its "
-                             "calibration belongs in no run's directory; release it with `save_pretrained`")
+            self._persisted(directory)
         write_atomically(epath.Path(directory) / TASK_FILE, json.dumps({
             "weights": to_record(self.weights, Weights),
             "calibration": to_record(self.calibration, Calibration),
             "budget": to_record(self.budget, Budget), "name": self.name}, indent=1) + "\n")
+
+    def _persisted(self, directory: str) -> None:
+        """The average's weights written to `directory` as a run of its own (`save`): one weights-only
+        checkpoint at its weights' step under its record, where the directory holds none; where it
+        holds this average already, as a reloaded average's own directory does, it is as it is."""
+        import optax
+
+        from dew.decision.objective import DecisionObjective
+        from dew.registry import from_record
+        from dew.training.state import TrainState
+
+        assert self.weights is not None
+        with Checkpoints(directory) as checkpoints:
+            if checkpoints.latest is not None:
+                saved = epath.Path(directory) / TASK_FILE
+                held = None
+                if saved.exists():
+                    fitted = records.record(json.loads(saved.read_text()), TASK_FILE)["weights"]
+                    held = from_record(Weights, records.json_value(fitted, "weights"))
+                if (held is None or held.averaged != self.weights.averaged
+                        or checkpoints.latest != self.weights.step):
+                    raise ValueError(f"{directory} holds a run's checkpoints other than this average, which "
+                                     "its calibration does not describe; save the average to a directory "
+                                     "of its own")
+                return
+            counter = jnp.asarray(self.weights.step, jnp.int32)
+            state = TrainState(step=counter, microstep=counter, updates=counter, variables=self.variables,
+                               opt_state=optax.EmptyState(), ema=None, key=jax.random.key(0), scale=None,
+                               window_size=jnp.asarray(1, jnp.int32))
+            checkpoints.save(self.weights.step, state, weights_only=True,
+                             artifact=DecisionObjective(self).inference_record())
+            checkpoints.wait()
 
     def __call__(self, state: JSON, questions: Mapping[str, Question], *,
                  images: Sequence[Image.Image] = (), context: JSON | None = None) -> dict[str, Answer]:
