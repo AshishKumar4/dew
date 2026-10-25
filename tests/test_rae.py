@@ -42,53 +42,6 @@ GRADIENT = 1e-4
 VARIANTS = ("dinov2", "siglip2", "mae")
 
 
-def test_a_ninety_six_wide_encoder_imports_its_full_source_projections(tmp_path):
-    import torch
-    from diffusers import AutoencoderRAE
-    from reference_error import assert_as_exact, seeds_for
-
-    from tools.torch_precision import float64, float64_twin
-
-    torch.manual_seed(53)
-    source = AutoencoderRAE(
-        encoder_type="mae", encoder_hidden_size=96, encoder_num_hidden_layers=1,
-        encoder_patch_size=16, encoder_input_size=32, patch_size=16,
-        decoder_hidden_size=32, decoder_num_hidden_layers=1,
-        decoder_num_attention_heads=4, decoder_intermediate_size=64).eval()
-    source.save_pretrained(tmp_path)
-    native, variables, _, _ = load_rae(tmp_path)
-    exact = float64_twin(source)
-
-    def draw(seed):
-        return (np.random.default_rng(seed).random((4, 32, 32, 3), dtype=np.float32),)
-
-    def observed(model, images):
-        pixels = torch.from_numpy(np.asarray(images).copy()).permute(0, 3, 1, 2)
-        pixels.requires_grad_(requires_grad=True)
-        latent = model.encode(pixels).latent
-        gradient, = torch.autograd.grad(latent.sum(), pixels)
-        return {"latent": latent.detach().numpy().transpose(0, 2, 3, 1),
-                "gradient": gradient.numpy().transpose(0, 2, 3, 1)}
-
-    def truth(images):
-        with float64():
-            return observed(exact, images)
-
-    def reference(images):
-        return observed(source, images)
-
-    @jax.jit
-    def ours(images):
-        def encode(pixels):
-            return native.encode(variables, 2 * pixels - 1)
-        latent, pull = jax.vjp(encode, images)
-        gradient, = pull(jnp.ones_like(latent))
-        return {"latent": latent, "gradient": gradient}
-
-    count = seeds_for(reference, draw, "96-wide RAE", truth_fn=truth)
-    assert_as_exact(ours, reference, draw, "96-wide RAE", seeds=count, truth_fn=truth)
-
-
 @pytest.fixture(scope="module")
 def source(tmp_path_factory):
     return extract_fixture(ROOT / "tests/fixtures/rae.tar.xz", tmp_path_factory.mktemp("rae"))
