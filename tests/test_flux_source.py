@@ -82,7 +82,7 @@ def test_native_flux_matches_the_source_forward_and_every_gradient(name, source)
     import torch
     from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     record = json.loads((source / "flux_transformer.json").read_text())
     case = record["cases"][name]

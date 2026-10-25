@@ -118,7 +118,7 @@ def idefics_block(wide: bool):
     from transformers.models.idefics.configuration_idefics import IdeficsConfig
     from transformers.models.idefics.modeling_idefics import IdeficsGatedCrossAttentionLayer
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     def forward(x, context, params, *, lengths):
         with float64() if wide else contextlib.nullcontext():
