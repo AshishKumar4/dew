@@ -32,7 +32,7 @@ from affine_run import Replaying
 from flax import linen as nn
 from interop_support import extract_fixture, hub_cache
 from model_support import flat_tree
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened, without_ynn
 from safetensors.numpy import load_file
 from test_joined import row_joins
 
@@ -781,7 +781,7 @@ def test_a_registry_model_adapts_through_the_names_its_own_kernels_carry(tmp_pat
                                     ("params", "layers_1", "mlp", "up_proj")}
     factors = [leaf for path, leaf in flat_tree(adapted["params"]).items() if path.endswith("lora_B")]
     assert len(factors) == 3 and not any(np.any(np.asarray(factor)) for factor in factors)
-    adapted_logits, base_logits = jax.jit(adapter.model.apply), jax.jit(model.apply)
+    adapted_logits, base_logits = without_ynn(adapter.model.apply), without_ynn(model.apply)
     wide = model.clone(dtype=jnp.float64)
 
     def draw(seed):
