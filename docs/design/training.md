@@ -138,6 +138,7 @@ state = trainer.fit(
 - One budget: `steps=`, `epochs=` or `tokens=` (committed valid target tokens, the same clock the data `schedule` reads). A run's tokens grow only at a committed update. `fit` checks the budget between steps, so after a rejected microbatch a split step can reach it at a commit and keep a later partial window; ending at that commit is not built yet.
 - `validation` is one chain or a dict of named chains, each reported separately.
 - `fit` returns the final `TrainState`. `state=` supplies initial state rather than a continuation; checkpoint restore also restores the data position.
+- An update moves the weights as Optax applies it, and then by each post-step effect the optimizer's state holds for that update, in the chain's order: MuonClip's rescale of the query and key kernels, one rounding of `gamma * (W + update)` as the paper and Megatron Core write it, and a bounded param group's exact clamp, as torch recipes clamp after `optimizer.step()`. `dew.optim.stepped(params, updates, before, after)` forms them, from the optimizer's state before and after the update; the trainer's step and `power_profiles` call it, and so does a loop of your own. A transform the update did not run, a group a mask left out or an update `optax.MultiSteps` or `optax.apply_if_finite` deferred or rejected, returns its state as it was, and its effect is left out.
 
 ### The batch contract
 

@@ -140,7 +140,7 @@ def training_step_figure():
         box(svg, 288, 90, 432, 66, "objective.loss(variables, batch, step)",
             ["→ Ratio(total, mass), Aux(metrics)"], accent=True)
         box(svg, 288, 172, 432, 66, "gradient", ["of the mean over the accumulation window"])
-        box(svg, 288, 254, 432, 66, "optimizer.update, optax.apply_updates",
+        box(svg, 288, 254, 432, 66, "optimizer.update, dew.optim.stepped",
             ["when the window closes"])
         box(svg, 288, 336, 432, 62, "ema_update", ["of the leaves objective.ema selects"])
         for y in (156, 238, 320):
