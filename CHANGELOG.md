@@ -15,8 +15,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   tokens, or its prompt, a block the model's block-reading layers see whole, scores no target in its
   source's block, and gives a served prompt the same block (`TextSettings.prefix`, `TextGeneration`,
   `Server`). The data stage `dew.data.steps.blocks.Blocks` makes blocks for any chain from a prefix, a
-  chat row's roles, or a user's per-token runs (`given=`), and a run with blocks refuses a model that
-  reads none. A prediction depth reads blocks beyond its source, so a prefix run refuses `mtp_weight`.
+  chat row's roles, or a user's per-token runs (`given=`), and a run with blocks refuses a model whose trunk
+  reads none. A prediction depth reads blocks beyond its source, so a prefix run refuses `mtp_weight`, and a
+  block an attention chunk cuts is refused where no trunk layer reads it whole.
 - MuonClip clips the attention of whatever objective a run trains, or refuses it: a run whose optimizer
   holds a QK-Clip (`dew.optim.clips_qk`, its state a `QKClipState`) asks its objective for the step's
   attention logit maxima (`Step.qk_stats`), so a masked-diffusion run clips as an LM, RL or preference
