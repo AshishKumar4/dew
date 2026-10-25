@@ -9,7 +9,7 @@ import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Self, overload
+from typing import TYPE_CHECKING, Any, Self, overload
 
 import jax
 import jax.numpy as jnp
@@ -36,6 +36,7 @@ from dew.decision.head import Head
 from dew.decision.images import Images
 from dew.decision.laya import LAYA, LayaCheckpoint
 from dew.decision.layout import (
+    QUESTION_FIELDS,
     DecisionInputs,
     Encoded,
     JointLayout,
@@ -880,13 +881,13 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
     def given(name: str) -> jax.Array | None:
         return array(name) if name in batch else None
 
-    return DecisionInputs(tokens=array("tokens"), segments=array("segments"), kinds=array("kinds"),
-                          questions=array("questions"), spans=array("spans"),
-                          option_spans=array("option_spans"), options=array("options"),
+    questions: dict[str, Any] = {field.name: array(field.name) if field.when == "always"
+                                 else given(field.name) for field in QUESTION_FIELDS}
+    return DecisionInputs(tokens=array("tokens"), segments=array("segments"), **questions,
                           positions=array("positions"), slots=given("slots"),
                           option_slots=given("option_slots"), slotted=given("slotted"),
                           context=given("context"), context_lengths=given("context_lengths"),
-                          readout=given("readout"), blocks=given("blocks"), max_segments=max_segments,
+                          blocks=given("blocks"), max_segments=max_segments,
                           spans_in_context=spans_in_context)
 
 
