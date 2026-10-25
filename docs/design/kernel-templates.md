@@ -182,7 +182,7 @@ A device that needs a formulation the set lacks gets it added to the algebra onc
 
 A hook is a traced JAX callable plus typed parameters (HEAD, QUERY, KEY, TILE, ROW, OUTPUT). Its backward is `jax.vjp` of the callable, traced inside the backward kernel: Flex's joint graph, done by JAX. Its parameter cotangents are the algebra's per-kind reductions, each owned by one scan (§3). A hook that needs a cross-tile reduction is algebra, not a hook.
 
-**Hook identity is a compile key.** A hook is a plain JAX callable traced into the kernel, so its identity is its traced program: one canonical fingerprint covering the jaxpr, its static constants and the parameter and precision schema, which keys compiles. No kernel config is stored, so nothing keys a pick or rebuilds a callable.
+**Hook identity is what it computes.** A hook is a plain JAX callable traced into the kernel, so its identity is its traced program: a fingerprint of the jaxpr at a fixed tile, its side operands' layouts and dtypes, and the hook's axes and output dtypes (`tuning.program`; `grouped_matmul._GroupedLaunch.traced`, `attention.hook_program`, which adds a differentiated hook's pullback). That fingerprint keys compiles and the opt-in tuner's stored picks, never the function object, so two calls whose hooks compute the same thing share a pick, and a hook that computes something else never takes another's.
 
 **Load contract per kind.** On sm90, loads belong to the producer warpgroup:
 - KEY and TILE ride the K stream's ring;
