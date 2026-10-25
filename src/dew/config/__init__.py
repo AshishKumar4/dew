@@ -60,8 +60,8 @@ from dew.inputs import Field
 from dew.lora import AdapterRecord, LoRA
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.optim import (
-    BF16_STATE_OPTIMIZERS,
     OPTIMIZER_MAP,
+    STATE_OPTIMIZERS,
     Optimizer,
     ParamGroup,
     ScheduleBase,
@@ -506,14 +506,17 @@ class OptimConfig:
     Empty runs one optimizer over every parameter. `ParamGroup.mup` is lm-engine's muP split.
     """
     clip_grads: float = 0.0
-    state_dtype: Literal["float32", "bfloat16"] = "float32"
+    state_dtype: Literal["float32", "bfloat16", "int8"] = "float32"
     """The dtype of Adam's moments in memory.
 
     float32 stores adam's and adamw's two moments, and Muon's momentum, in
     float32 whatever the parameters' dtype, so bfloat16 or float16 weights
     train on full-precision moments. bfloat16 stores both with stochastic
     rounding (`dew.optim.bf16_moments`), for adam and adamw only. That halves
-    the optimizer state and reduces the update's memory traffic.
+    the optimizer state and reduces the update's memory traffic. int8 stores
+    both blockwise in 8 bits (`dew.optim.int8_moments`, bitsandbytes' and
+    torchao's 8-bit Adam), for adam and adamw only: a quarter of float32's,
+    about 2 bytes a parameter for the two.
     """
     forced_weight_normalization: bool = False
     """Whether to renormalize every magnitude-preserving weight (`dew.nn.mp.MPConv`) after each update.
@@ -548,12 +551,12 @@ class OptimConfig:
         given = {'b1': self.b1, 'b2': self.b2, 'weight_decay': self.weight_decay}
         opts.update({name: value for name, value in given.items() if value is not None})
         make: Callable[..., optax.GradientTransformation] = OPTIMIZER_MAP[self.optimizer]
-        if self.state_dtype == 'bfloat16':
-            if self.optimizer not in BF16_STATE_OPTIMIZERS:
+        if self.state_dtype != 'float32':
+            if self.optimizer not in STATE_OPTIMIZERS[self.state_dtype]:
                 raise ValueError(
-                    f"state_dtype='bfloat16' stores Adam's moments in bf16, which "
-                    f"{sorted(BF16_STATE_OPTIMIZERS)} have; {self.optimizer!r} does not")
-            make = BF16_STATE_OPTIMIZERS[self.optimizer]
+                    f"state_dtype={self.state_dtype!r} stores Adam's moments, which "
+                    f"{sorted(STATE_OPTIMIZERS[self.state_dtype])} have; {self.optimizer!r} does not")
+            make = STATE_OPTIMIZERS[self.state_dtype][self.optimizer]
         elif self.optimizer in ('adam', 'adamw'):
             opts = {'mu_dtype': 'float32', 'nu_dtype': 'float32', **opts}
         elif self.optimizer in ('muon', 'muonclip'):
