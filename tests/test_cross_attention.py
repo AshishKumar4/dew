@@ -44,7 +44,7 @@ from dew.nn.cross_attention import (
 )
 from dew.nn.gemma3n import AltUp
 from dew.nn.hyper_connections import HyperConnections
-from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CrossContext, ModelInputs
+from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CrossContext, ModelInputs, coordinates
 from dew.nn.kv_cache import KVCache
 from dew.nn.mlp import GatedMLP
 from dew.nn.ngpt import NGPT
@@ -638,32 +638,45 @@ TOKEN_CONTEXT = CrossAttention(layer_ids=(0, 2), context_length=6,
 
 def test_a_decoder_reads_a_context_of_its_own_tokens_by_its_table_or_its_own_pass():
     """A decoder with blocks reads a context of token ids as `encode_context` says: `table`, each
-    token's row of its own table, padding included, the lengths as given; `backbone`, its final states
-    over each context alone, a row's padding never reaching its real tokens. The conditioning reads as
-    the same states handed in at the blocks' dtype do. A decoder without blocks, and another encoder,
-    are refused."""
+    token's row of its own table at its compute dtype; `backbone`, its final states over each context
+    alone, its real tokens one document, a row's padding never reaching them. The states keep the
+    dtype they are computed in, a bf16 decoder's bf16 where its blocks take fp32, and its open blocks
+    read them as the same states handed in at their own dtype, a context that moves its logits. A
+    decoder without blocks, and another encoder, are refused."""
     model = CausalTransformer(**{"vocab_size": VOCAB, **TINY_DECODER, "num_layers": 3, "num_kv_heads": 2,
-                                 "cross_attention": TOKEN_CONTEXT})
+                                 "cross_attention": TOKEN_CONTEXT, "dtype": "bfloat16"})
     rng = np.random.default_rng(0)
     ids = jnp.asarray(rng.integers(0, VOCAB, (B, SEQ)), jnp.int32)
     tokens = jnp.asarray(rng.integers(0, VOCAB, (B, TOKEN_CONTEXT.context_length)), jnp.int32)
     lengths = jnp.asarray(rng.integers(1, TOKEN_CONTEXT.context_length + 1, B), jnp.int32)
-    variables = model.init(jax.random.key(0), ids)
-    table = np.asarray(variables["params"]["embed_tokens"]["embedding"])
+    # Open gates, so a block reads its context.
+    variables = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: (rng.uniform(-1, 1, leaf.shape).astype(np.float32)
+                            if path[-1].key.startswith("alpha_") else leaf),
+        model.init(jax.random.key(0), ids))
+    table = jnp.asarray(variables["params"]["embed_tokens"]["embedding"])
     encoded = encode_context(model, variables, tokens, lengths, encoder="table")
-    np.testing.assert_array_equal(np.asarray(encoded[CONTEXT]), table[np.asarray(tokens)])
+    assert encoded[CONTEXT].dtype == jnp.bfloat16 and model.context_dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(encoded[CONTEXT], np.float32),
+                                  np.asarray(table[tokens].astype(jnp.bfloat16), np.float32))
     np.testing.assert_array_equal(np.asarray(encoded[CONTEXT_LENGTHS]), np.asarray(lengths))
+    real = jnp.arange(tokens.shape[1])[None, :] < lengths[:, None]
     passed = encode_context(model, variables, tokens, lengths, encoder="backbone")[CONTEXT]
-    noise = jnp.where(jnp.arange(tokens.shape[1])[None, :] < lengths[:, None], tokens, (tokens + 1) % VOCAB)
+    alone = model.apply(variables, tokens, method="hidden_states", coordinates=coordinates(
+        segments=real.astype(jnp.int32), max_segments=1, right_padded=True))
+    np.testing.assert_array_equal(np.asarray(passed, np.float32), np.asarray(alone, np.float32))
+    noise = jnp.where(real, tokens, (tokens + 1) % VOCAB)
     repadded = encode_context(model, variables, noise, lengths, encoder="backbone")[CONTEXT]
-    real = np.arange(tokens.shape[1])[None, :] < np.asarray(lengths)[:, None]
-    np.testing.assert_array_equal(np.asarray(passed)[real], np.asarray(repadded)[real])
+    np.testing.assert_array_equal(np.asarray(passed, np.float32)[np.asarray(real)],
+                                  np.asarray(repadded, np.float32)[np.asarray(real)])
+    unread = model.apply(variables, ids, conditioning={CONTEXT: encoded[CONTEXT],
+                                                       CONTEXT_LENGTHS: jnp.zeros_like(lengths)})
     for states in (encoded[CONTEXT], passed):
-        direct = model.apply(variables, ids, conditioning={CONTEXT: states, CONTEXT_LENGTHS: lengths})
-        conditioned = model.apply(variables, ids, conditioning={
+        native = model.apply(variables, ids, conditioning={CONTEXT: states, CONTEXT_LENGTHS: lengths})
+        widened = model.apply(variables, ids, conditioning={
             CONTEXT: jnp.asarray(states, model.context_dtype), CONTEXT_LENGTHS: lengths})
-        np.testing.assert_array_equal(np.asarray(direct), np.asarray(conditioned))
-
+        np.testing.assert_array_equal(np.asarray(native, np.float32), np.asarray(widened, np.float32))
+        assert not np.array_equal(np.asarray(native, np.float32), np.asarray(unread, np.float32))
     with pytest.raises(TypeError):
         encode_context(model.with_cross_attention(None), variables, tokens, lengths, encoder="table")
     with pytest.raises(ValueError):
