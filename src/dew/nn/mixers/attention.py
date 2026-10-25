@@ -449,6 +449,33 @@ class CausalSelfAttention(nn.Module):
             value = self.values_norm(value)
         return constrain(key, KV_HEADS), constrain(value, KV_HEADS)
 
+    def _placed_query(self, query, rotary_positions, places, uncached):
+        """The query with its positions applied, and the rotation's angles (None without one): rotated
+        by its places, or under NoPE only scaled to the logit scale the checkpoint asks for, then
+        tuned to its temperature (`temperature_tuning`). `uncached` is the call's tokens where it
+        reads no cache."""
+        freqs_cos = freqs_sin = None
+        if self.nope:
+            # NoPE rotates nothing; the query still carries the logit scale
+            # the checkpoint asks for, which rotate folds in otherwise.
+            if self.ctx.attention_scale is not None:
+                query = scaled(query, self.ctx.attention_scale * math.sqrt(self.ctx.head_dim))
+        else:
+            freqs_cos, freqs_sin = self._rotary_angles(rotary_positions, query, uncached, places)
+            # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
+            # query carries the ratio to the scale the checkpoint asks for.
+            query = rotate(
+                self._turned(query), freqs_cos, freqs_sin, pairs=self.rotary_pairs,
+                scale=(None if self.ctx.attention_scale is None
+                       else self.ctx.attention_scale * math.sqrt(self.ctx.head_dim)))
+        if self.temperature_tuning is not None:
+            # A scalar a position, so it commutes with the rotation: a rotated kind's queries scale as
+            # an unrotated one's.
+            scale = temperature_scale(places, *self.temperature_tuning, dtype=at_least_fp32(query.dtype))
+            query = query * (scale[..., None, None] if scale.ndim == 2
+                             else scale[None, :, None, None]).astype(query.dtype)
+        return query, freqs_cos, freqs_sin
+
     def _rotary_angles(self, rotary_positions, heads: jax.Array, tokens: Coordinates | None = None,
                        places=None):
         """Build the rotary cos and sin this layer rotates its heads by, in
@@ -644,27 +671,8 @@ class CausalSelfAttention(nn.Module):
         rotary_positions = places
         if attention_metadata is not None and attention_metadata.rotary_positions is not None:
             rotary_positions = attention_metadata.rotary_positions
-        freqs_cos = freqs_sin = None
-        if self.nope:
-            # NoPE rotates nothing; the query still carries the logit scale
-            # the checkpoint asks for, which rotate folds in otherwise.
-            if self.ctx.attention_scale is not None:
-                query = scaled(query, self.ctx.attention_scale * math.sqrt(self.ctx.head_dim))
-        else:
-            uncached = None if decode else tokens
-            freqs_cos, freqs_sin = self._rotary_angles(rotary_positions, query, uncached, places)
-            # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
-            # query carries the ratio to the scale the checkpoint asks for.
-            query = rotate(
-                self._turned(query), freqs_cos, freqs_sin, pairs=self.rotary_pairs,
-                scale=(None if self.ctx.attention_scale is None
-                       else self.ctx.attention_scale * math.sqrt(self.ctx.head_dim)))
-        if self.temperature_tuning is not None:
-            # A scalar a position, so it commutes with the rotation: a rotated kind's queries scale as
-            # an unrotated one's.
-            scale = temperature_scale(places, *self.temperature_tuning, dtype=at_least_fp32(query.dtype))
-            query = query * (scale[..., None, None] if scale.ndim == 2
-                             else scale[None, :, None, None]).astype(query.dtype)
+        query, freqs_cos, freqs_sin = self._placed_query(query, rotary_positions, places,
+                                                         None if decode else tokens)
         own_value = value
         if not self.ctx.kv_shared:
             if freqs_cos is not None and freqs_sin is not None:
